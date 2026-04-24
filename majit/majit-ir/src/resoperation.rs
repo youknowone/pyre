@@ -7,7 +7,7 @@
 use smallvec::SmallVec;
 
 use crate::descr::DescrRef;
-use crate::value::{GcRef, Type};
+use crate::value::{Const, GcRef, Type};
 
 /// Index into an operation list, used as a reference to an operation's result.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -533,7 +533,7 @@ pub struct Op {
     /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
     pub rd_numb: Option<Vec<u8>>,
     /// resume.py:451 — shared constant pool referenced by rd_numb.
-    pub rd_consts: Option<Vec<(i64, Type)>>,
+    pub rd_consts: Option<Vec<Const>>,
     /// resume.py:488 — virtual object field info.
     /// Each entry describes a virtual's type, field descriptors, and fieldnums.
     /// Entries are `Rc<RdVirtualInfo>` so two guards that reference the same
@@ -1968,7 +1968,6 @@ static OPARITY: [Option<u8>; OPCODE_COUNT] = {
     set!(VirtualRefFinish, 2);
     set!(Copystrcontent, 5);
     set!(Copyunicodecontent, 5);
-    // resoperation.py:1137 QUASIIMMUT_FIELD/1d/n — arity=1 + fielddescr.
     set!(QuasiimmutField, 1);
     set!(AssertNotNone, 1);
     set!(RecordExactClass, 2);
@@ -2749,11 +2748,7 @@ mod tests {
             OpCode::Unicodehash,
             OpCode::CheckMemoryError,
             OpCode::ForceSpill,
-            // QuasiimmutField dropped from the unary set — pyre emits it
-            // variadically (arity=None) from both `state.rs` (1-arg + descr)
-            // and `opcode_handler_impls_post.template.rs` (2-arg + no descr)
-            // for celldict-style namespace lookups. See arity-table
-            // PRE-EXISTING-ADAPTATION note above.
+            OpCode::QuasiimmutField,
             OpCode::AssertNotNone,
             OpCode::Keepalive,
             OpCode::CondCallGcWb,

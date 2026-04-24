@@ -1672,19 +1672,19 @@ impl OptRewrite {
                         Some(None),
                     );
                     ctx.new_operations[old_idx] = combined;
-                    // rewrite.py:426 return self.emit(op), then
-                    // postprocess_GUARD_CLASS calls make_constant_class.
-                    // We replaced the old guard in place instead of
-                    // appending a new op, so keep the old last_guard_pos and
-                    // only update `_known_class`.
+                    // postprocess: record known class
                     if let Some(class_val) = ctx.get_constant_int(op.arg(1)).or_else(|| {
                         ctx.get_constant(op.arg(1)).and_then(|v| match v {
                             majit_ir::Value::Ref(r) => Some(r.0 as i64),
                             _ => None,
                         })
                     }) {
-                        crate::optimizeopt::optimizer::Optimizer::make_constant_class(
-                            ctx, obj, class_val, false,
+                        ctx.set_ptr_info(
+                            obj,
+                            crate::optimizeopt::info::PtrInfo::known_class(
+                                majit_ir::GcRef(class_val as usize),
+                                true,
+                            ),
                         );
                     }
                     return OptimizationResult::Remove;
@@ -1701,8 +1701,14 @@ impl OptRewrite {
                     _ => None,
                 })
             }) {
-                ctx.pending_guard_class_postprocess =
-                    Some(crate::optimizeopt::PendingGuardClassPostprocess { obj, class_val });
+                let is_virtual = ctx
+                    .get_ptr_info(obj)
+                    .map(|info| info.is_virtual())
+                    .unwrap_or(false);
+                if !is_virtual {
+                    ctx.pending_guard_class_postprocess =
+                        Some(crate::optimizeopt::PendingGuardClassPostprocess { obj, class_val });
+                }
             }
         }
         OptimizationResult::PassOn

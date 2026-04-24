@@ -55,7 +55,7 @@ use crate::virtualizable::VirtualizableInfo;
 use majit_gc::GcAllocator;
 use majit_ir::OpRef;
 use majit_ir::descr::DescrRef;
-use majit_ir::{GreenKey, GreenType, JitDriverVar, Type, Value, VarKind};
+use majit_ir::{Const, GreenKey, GreenType, JitDriverVar, Type, Value, VarKind};
 
 /// Descriptor for a JitDriver's variable layout.
 ///
@@ -585,15 +585,15 @@ impl<S: JitState> JitDriver<S> {
             .get_recovery_slot_types(green_key, trace_id, fail_index)
     }
 
-    /// resume.py:1312 blackhole_from_resumedata parity: get rd_numb and
-    /// rd_consts for ResumeDataDirectReader-based blackhole resume.
-    pub fn get_rd_numb(
+    /// compile.py:853 `ResumeGuardDescr` storage handle forwarder.
+    pub fn get_resume_storage(
         &self,
         green_key: u64,
         trace_id: u64,
         fail_index: u32,
-    ) -> Option<(Vec<u8>, Vec<(i64, Type)>)> {
-        self.meta.get_rd_numb(green_key, trace_id, fail_index)
+    ) -> Option<std::sync::Arc<crate::resume::ResumeStorage>> {
+        self.meta
+            .get_resume_storage(green_key, trace_id, fail_index)
     }
 
     pub fn get_exit_types(
@@ -603,26 +603,6 @@ impl<S: JitState> JitDriver<S> {
         fail_index: u32,
     ) -> Option<Vec<Type>> {
         self.meta.get_exit_types(green_key, trace_id, fail_index)
-    }
-
-    pub fn get_rd_virtuals(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>> {
-        self.meta.get_rd_virtuals(green_key, trace_id, fail_index)
-    }
-
-    /// resume.py:926 _prepare parity: get rd_pendingfields for a guard.
-    pub fn get_rd_pendingfields(
-        &self,
-        green_key: u64,
-        trace_id: u64,
-        fail_index: u32,
-    ) -> Option<Vec<majit_ir::GuardPendingFieldEntry>> {
-        self.meta
-            .get_rd_pendingfields(green_key, trace_id, fail_index)
     }
 
     /// compile.py:710 recovery_layout header_pc parity: get the merge point
@@ -846,21 +826,6 @@ impl<S: JitState> JitDriver<S> {
                         .iter()
                         .map(|opref| ctx.get_opref_type(*opref).unwrap_or(majit_ir::Type::Int))
                         .collect();
-                    // PRE-EXISTING-ADAPTATION (diverges from
-                    // pyjitpl.py:1626 `_create_segmented_trace_and_blackhole`
-                    // which calls `metainterp.generate_guard(rop.GUARD_ALWAYS_FAILS)`):
-                    // this fallback uses `S::collect_jump_args(sym)`
-                    // + explicit `fail_args` via the `_guard_fail_args`
-                    // side-table because the frontend's live state lives
-                    // in `S::Sym`, not `MetaInterp::framestack` — routing
-                    // through `self.meta.generate_guard(...)` here would
-                    // walk an empty framestack and emit
-                    // `create_empty_top_snapshot` with no frame data,
-                    // leaving the bridge retrace path with nothing to
-                    // rehydrate from. Same structural divergence as
-                    // `pyjitpl/dispatch.rs::record_state_guard` (Task
-                    // #84 follow-up: lift `S::Sym` into `MIFrame`
-                    // population at trace_fn time).
                     ctx.record_guard_typed_with_fail_args(
                         majit_ir::OpCode::GuardAlwaysFails,
                         &[],
@@ -1517,24 +1482,31 @@ impl<S: JitState> JitDriver<S> {
             }
 
             // compile.py:711 resume_in_blackhole
-            if let Some(rd_numb) = exit_layout.rd_numb.as_ref() {
-                let rd_consts_i64: Vec<i64> = exit_layout
-                    .rd_consts
-                    .as_ref()
-                    .map(|c| c.iter().map(|(v, _)| *v).collect())
-                    .unwrap_or_default();
+            // compile.py:853 `ResumeGuardDescr` storage — borrow
+            // `rd_numb` / `rd_consts()` / `rd_virtuals` off the shared
+            // Arc so blackhole resume observes the guard-owned pool
+            // the GC walker updates (no per-call Vec clone).
+            if let Some(storage) = exit_layout.storage.as_deref() {
+                let rd_numb = storage.rd_numb.as_slice();
+                let rd_consts_slice: &[Const] = storage.rd_consts();
 
                 // Convert RdVirtualInfo → VirtualInfo for blackhole resume.
-                let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> =
-                    exit_layout.rd_virtuals.as_ref().map(|rd_virts| {
-                        let count = raw_values.len() as i32;
-                        rd_virts
+                let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> = {
+                    let count = raw_values.len() as i32;
+                    Some(
+                        storage
+                            .rd_virtuals
                             .iter()
                             .map(|rd| {
-                                crate::resume::rd_virtual_to_virtual_info(rd, &rd_consts_i64, count)
+                                crate::resume::rd_virtual_to_virtual_info(
+                                    rd,
+                                    rd_consts_slice,
+                                    count,
+                                )
                             })
-                            .collect()
-                    });
+                            .collect(),
+                    )
+                };
                 let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
                 // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
@@ -1565,13 +1537,13 @@ impl<S: JitState> JitDriver<S> {
                     &mut bh_builder,
                     &resolve_jitcode,
                     rd_numb,
-                    &rd_consts_i64,
+                    rd_consts_slice,
                     all_liveness,
                     &raw_values,
                     Some(&exit_layout.exit_types),
                     rd_virtuals_slice,
-                    None, // rd_pendingfields (PendingFieldInfo)
-                    exit_layout.rd_pendingfields.as_deref(), // rd_guard_pendingfields
+                    None,                            // rd_pendingfields (PendingFieldInfo)
+                    Some(&storage.rd_pendingfields), // rd_guard_pendingfields
                     Some(&self.meta_interp().virtualref_info as &dyn crate::resume::VRefInfo),
                     None, // vinfo
                     None, // ginfo
@@ -2031,6 +2003,14 @@ impl<S: JitState> JitDriver<S> {
     /// Get mutable access to the underlying MetaInterp.
     pub fn meta_interp_mut(&mut self) -> &mut MetaInterp<S::Meta> {
         &mut self.meta
+    }
+
+    /// framework.py `root_walker.walk_roots` parity: visit every Ref-typed
+    /// entry in every live compiled trace's `rd_consts` pool so the minor
+    /// collector can forward them. See `MetaInterp::walk_rd_consts_refs`
+    /// for the full rationale.
+    pub fn walk_rd_consts_refs(&mut self, visitor: impl FnMut(&mut majit_ir::GcRef)) {
+        self.meta.walk_rd_consts_refs(visitor);
     }
 
     pub fn run_compiled_with_blackhole_fallback_keyed(
@@ -2732,15 +2712,9 @@ impl<S: JitState> JitDriver<S> {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> (OpRef, Value) {
-        self.meta.opimpl_getarrayitem_vable_int(
-            vable_opref,
-            index,
-            index_runtime_value,
-            fdescr,
-            adescr,
-        )
+        self.meta
+            .opimpl_getarrayitem_vable_int(vable_opref, index, index_runtime_value, fdescr)
     }
 
     pub fn opimpl_getarrayitem_vable_ref(
@@ -2749,15 +2723,9 @@ impl<S: JitState> JitDriver<S> {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> (OpRef, Value) {
-        self.meta.opimpl_getarrayitem_vable_ref(
-            vable_opref,
-            index,
-            index_runtime_value,
-            fdescr,
-            adescr,
-        )
+        self.meta
+            .opimpl_getarrayitem_vable_ref(vable_opref, index, index_runtime_value, fdescr)
     }
 
     pub fn opimpl_getarrayitem_vable_float(
@@ -2766,15 +2734,9 @@ impl<S: JitState> JitDriver<S> {
         index: OpRef,
         index_runtime_value: i64,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) -> (OpRef, Value) {
-        self.meta.opimpl_getarrayitem_vable_float(
-            vable_opref,
-            index,
-            index_runtime_value,
-            fdescr,
-            adescr,
-        )
+        self.meta
+            .opimpl_getarrayitem_vable_float(vable_opref, index, index_runtime_value, fdescr)
     }
 
     pub fn opimpl_setarrayitem_vable_int(
@@ -2785,7 +2747,6 @@ impl<S: JitState> JitDriver<S> {
         value: OpRef,
         concrete: Value,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_int(
             vable_opref,
@@ -2794,7 +2755,6 @@ impl<S: JitState> JitDriver<S> {
             value,
             concrete,
             fdescr,
-            adescr,
         );
     }
 
@@ -2806,7 +2766,6 @@ impl<S: JitState> JitDriver<S> {
         value: OpRef,
         concrete: Value,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_ref(
             vable_opref,
@@ -2815,7 +2774,6 @@ impl<S: JitState> JitDriver<S> {
             value,
             concrete,
             fdescr,
-            adescr,
         );
     }
 
@@ -2827,7 +2785,6 @@ impl<S: JitState> JitDriver<S> {
         value: OpRef,
         concrete: Value,
         fdescr: DescrRef,
-        adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_float(
             vable_opref,
@@ -2836,17 +2793,11 @@ impl<S: JitState> JitDriver<S> {
             value,
             concrete,
             fdescr,
-            adescr,
         );
     }
 
-    pub fn opimpl_arraylen_vable(
-        &mut self,
-        vable_opref: OpRef,
-        fdescr: DescrRef,
-        adescr: DescrRef,
-    ) -> OpRef {
-        self.meta.opimpl_arraylen_vable(vable_opref, fdescr, adescr)
+    pub fn opimpl_arraylen_vable(&mut self, vable_opref: OpRef, fdescr: DescrRef) -> OpRef {
+        self.meta.opimpl_arraylen_vable(vable_opref, fdescr)
     }
 
     /// Start bridge tracing from a guard failure point.
@@ -2898,11 +2849,15 @@ impl<S: JitState> JitDriver<S> {
         // to reconstruct the complete frame for bridge tracing.
         // Falls back to update_meta_for_bridge (legacy truncation) when
         // rd_numb is not available.
+        //
+        // compile.py:853 `ResumeGuardDescr` storage — pass the shared
+        // Arc to the decoder so it borrows the guard-owned pool (no
+        // clone) and can thread the same handle into
+        // `ResumeDataResult`.
         let resume_data_result = S::rebuild_from_resumedata(
             &mut trace_meta,
             &retrace.fail_types,
-            retrace.rd_numb.as_deref(),
-            retrace.rd_consts.as_deref(),
+            retrace.storage.as_ref(),
         );
         if resume_data_result.is_none() {
             S::update_meta_for_bridge(&mut trace_meta, &retrace.fail_types);
@@ -2936,6 +2891,20 @@ impl<S: JitState> JitDriver<S> {
         // NEW_WITH_VTABLE/SETFIELD_GC ops via the active trace ctx so the
         // bridge has fresh local instances instead of stale vable-array reads.
         if let Some(ref bfm) = resume_data_result {
+            // bridgeopt.py:124 / resume.py:1260 parity: `Box(n, tp)` in
+            // `rd_numb` indexes the guard's encoder-time liveboxes, whose
+            // runtime values are the backend's raw deadframe (the guard's
+            // `fail_args` image). `extract_live` returns the virtualizable
+            // array in vable layout order — a different stream with a
+            // different length. Pass the raw deadframe values that the
+            // caller stashed via `set_pending_frontend_boxes` so
+            // `decode_concrete(Box(n, tp))` reads `raw_values[n]` and
+            // `fail_types[n]` (length-aligned with `fail_descr.fail_arg_types`).
+            let raw_values: Vec<i64> = self
+                .meta
+                .pending_frontend_boxes_ref()
+                .map(|s| s.to_vec())
+                .unwrap_or_default();
             if let (Some(ref mut sym), Some(ref mut ctx)) =
                 (self.sym.as_mut(), self.meta.tracing.as_mut())
             {
@@ -2943,8 +2912,8 @@ impl<S: JitState> JitDriver<S> {
                     sym,
                     ctx,
                     bfm,
-                    retrace.rd_virtuals.as_deref(),
-                    &live_values,
+                    retrace.storage.as_deref().map(|s| s.rd_virtuals.as_slice()),
+                    &raw_values,
                     &retrace.fail_types,
                 );
             }
@@ -3173,24 +3142,29 @@ impl<S: JitState> JitDriver<S> {
             }
 
             // compile.py:711 resume_in_blackhole
-            if let Some(rd_numb) = exit_layout.rd_numb.as_ref() {
-                let rd_consts_i64: Vec<i64> = exit_layout
-                    .rd_consts
-                    .as_ref()
-                    .map(|c| c.iter().map(|(v, _)| *v).collect())
-                    .unwrap_or_default();
+            // compile.py:853 `ResumeGuardDescr` storage — see the
+            // companion site above.
+            if let Some(storage) = exit_layout.storage.as_deref() {
+                let rd_numb = storage.rd_numb.as_slice();
+                let rd_consts_slice: &[Const] = storage.rd_consts();
 
                 // Convert RdVirtualInfo → VirtualInfo for blackhole resume.
-                let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> =
-                    exit_layout.rd_virtuals.as_ref().map(|rd_virts| {
-                        let count = raw_values.len() as i32;
-                        rd_virts
+                let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> = {
+                    let count = raw_values.len() as i32;
+                    Some(
+                        storage
+                            .rd_virtuals
                             .iter()
                             .map(|rd| {
-                                crate::resume::rd_virtual_to_virtual_info(rd, &rd_consts_i64, count)
+                                crate::resume::rd_virtual_to_virtual_info(
+                                    rd,
+                                    rd_consts_slice,
+                                    count,
+                                )
                             })
-                            .collect()
-                    });
+                            .collect(),
+                    )
+                };
                 let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
                 // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
@@ -3222,13 +3196,13 @@ impl<S: JitState> JitDriver<S> {
                     &mut bh_builder,
                     &resolve_jitcode,
                     rd_numb,
-                    &rd_consts_i64,
+                    rd_consts_slice,
                     all_liveness,
                     &raw_values,
                     Some(exit_layout.exit_types.as_slice()),
                     rd_virtuals_slice,
-                    None, // rd_pendingfields (PendingFieldInfo)
-                    exit_layout.rd_pendingfields.as_deref(), // rd_guard_pendingfields
+                    None,                            // rd_pendingfields (PendingFieldInfo)
+                    Some(&storage.rd_pendingfields), // rd_guard_pendingfields
                     Some(&self.meta_interp().virtualref_info as &dyn crate::resume::VRefInfo),
                     None, // vinfo
                     None, // ginfo

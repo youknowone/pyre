@@ -44,7 +44,7 @@ unsafe fn pyre_libc_jitframe_tracer(obj_addr: usize, update: &mut dyn FnMut(*mut
 
 /// Bridge pyre-object's `GcAllocHookFn` to `majit_gc::alloc_nursery_typed`.
 /// pyre-object deliberately carries no majit-gc dep, so pyre-jit owns
-/// the `GcRef` -> `*mut u8` conversion.
+/// the `GcRef` → `*mut u8` conversion.
 fn pyre_object_gc_alloc_trampoline(type_id: u32, size: usize) -> *mut u8 {
     majit_gc::alloc_nursery_typed(type_id, size).0 as *mut u8
 }
@@ -286,14 +286,22 @@ thread_local! {
             }
         }
         d.set_gc_allocator(Box::new(gc));
-        // Route pyre-object host-side allocators through the backend's
-        // nursery. `set_gc_allocator` populated
-        // `majit_gc::ACTIVE_ALLOC_NURSERY_TYPED` with the active
-        // backend's trampoline; the one registered here converts
-        // `GcRef` -> `*mut u8` for the pyre-object side. pyre-object
-        // deliberately does not depend on majit-gc, so the trampoline
-        // lives here.
-        pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
+        // framework.py `root_walker.walk_roots` parity: the interpreter's
+        // `PyFrame.locals_cells_stack_w` stores GC refs that must survive
+        // minor collection. Compiled JIT code registers its own jitframe
+        // shadow stack and blackhole register banks; the interpreter
+        // path (`eval_with_jit` → `eval_loop_jit`) has no equivalent
+        // until we plug this extra walker in. Register once per process;
+        // `register_extra_root_walker` dedups on identity.
+        pyre_interpreter::eval::register_pyframe_root_walker();
+        // framework.py `root_walker.walk_roots` parity for JIT-side const
+        // pools: every compiled guard's `rd_consts` (resume.py:451) may
+        // hold nursery-resident GC refs for TAGCONST-encoded Ref values.
+        // Without this walker, minor collection would leave stale
+        // pointers in `rd_consts` and the next guard failure would
+        // dereference freed memory. See
+        // `majit_metainterp::MetaInterp::walk_rd_consts_refs`.
+        majit_gc::shadow_stack::register_extra_root_walker(rd_consts_root_walker);
         // llmodel.py:67-69 self.vtable_offset, _ = symbolic.get_field_token(
         //     rclass.OBJECT, 'typeptr', translate_support_code)
         // pyre's PyObject.ob_type is the equivalent of RPython's typeptr.
@@ -320,6 +328,24 @@ thread_local! {
 #[inline]
 pub fn driver_pair() -> &'static mut JitDriverPair {
     JIT_DRIVER.with(|cell| unsafe { &mut *cell.get() })
+}
+
+/// framework.py `root_walker.walk_roots` hook for
+/// `storage.rd_consts` (resume.py:451) across every live compiled
+/// trace.
+///
+/// Registered once during `JIT_DRIVER` init (see
+/// `register_extra_root_walker` call above). Routes into the
+/// thread-local `JitDriver`'s `walk_rd_consts_refs`, which in turn
+/// iterates `MetaInterp::compiled_loops` and visits the Ref-typed
+/// entries in every `StoredExitLayout::rd_consts`.
+fn rd_consts_root_walker(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    // SAFETY: the GC collection happens on the same thread that owns
+    // `JIT_DRIVER`; no re-entrant collection touches the MetaInterp
+    // concurrently. `driver_pair()` returns a `&'static mut`, which is
+    // fine because the thread-local `UnsafeCell` is single-owner.
+    let pair = driver_pair();
+    pair.0.walk_rd_consts_refs(visitor);
 }
 
 // GREEN_KEY_ALIASES removed: compile.py:269 parity — cross-loop cut
@@ -1075,16 +1101,29 @@ pub(crate) fn pyre_portal_runner(
     all_i.extend(red_int);
     let mut all_r = green_ref.clone();
     all_r.extend(red_ref);
-    let mut all_f = green_float.clone();
-    all_f.extend(red_float);
+    let _all_f = (green_float, red_float);
 
     // warmspot.py:976-978: result = portal_ptr(*args)
-    let result = crate::call_jit::bh_portal_runner(&all_i, &all_r, &all_f);
-    if result == 0 || result == pyre_object::PY_NULL as i64 {
-        Ok((BhReturnType::Void, 0))
-    } else {
-        // warmspot.py:982: result = unspecialize_value(result)
-        Ok((BhReturnType::Ref, result))
+    let next_instr = all_i.first().copied().unwrap_or(0) as usize;
+    let pycode = all_r.first().copied().unwrap_or(0) as pyre_object::PyObjectRef;
+    let frame_ptr = all_r.get(1).copied().unwrap_or(0) as *mut PyFrame;
+    let ec = all_r.get(2).copied().unwrap_or(0) as *const pyre_interpreter::PyExecutionContext;
+    if frame_ptr.is_null() {
+        return Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(0)));
+    }
+    let frame = unsafe { &mut *frame_ptr };
+    if !pycode.is_null() {
+        frame.pycode = pycode as *const ();
+    }
+    if !ec.is_null() {
+        frame.execution_context = ec;
+    }
+    frame.set_last_instr_from_next_instr(next_instr);
+    match portal_runner_result(frame) {
+        Ok(result) => Ok((BhReturnType::Ref, result as i64)),
+        Err(err) => Err(JitException::ExitFrameWithExceptionRef(majit_ir::GcRef(
+            err.exc_object as usize,
+        ))),
     }
 }
 
@@ -1133,7 +1172,7 @@ fn debug_first_arg_int(frame: &PyFrame) -> Option<i64> {
 ///   return portal_ptr(*args)
 ///
 /// warmspot.py:997-1005: ExitFrameWithExceptionRef → re-raise.
-pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
+pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     // warmspot.py:941-955 ll_portal_runner:
     //   maybe_compile_and_run(state.increment_function_threshold, *args)
     //   return portal_ptr(*args)
@@ -1145,12 +1184,15 @@ pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
     // opcode of the recursive portal frame, which breaks parity for
     // bhimpl_recursive_call_* paths.
     frame.fix_array_ptrs();
-    let result = if let Some(result) = try_function_entry_jit(frame) {
+    if let Some(result) = try_function_entry_jit(frame) {
         result
     } else {
         handle_jitexception(frame)
-    };
-    match result {
+    }
+}
+
+pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {
+    match portal_runner_result(frame) {
         Ok(r) => r,
         Err(err) => {
             #[cfg(feature = "cranelift")]
@@ -1598,7 +1640,7 @@ fn resume_in_blackhole_from_exit_layout(
             "[dynasm-debug] resume_in_blackhole: raw_values.len={} exit_types.len={} rd_numb={:?}",
             raw_values.len(),
             exit_layout.exit_types.len(),
-            exit_layout.rd_numb.as_ref().map(|n| n.len())
+            exit_layout.storage.as_deref().map(|s| s.rd_numb.len())
         );
     }
     // Save frame state before consume_vable_info modifies it.
@@ -2405,7 +2447,7 @@ fn materialize_virtual_from_rd(
     vidx: usize,
     dead_frame: &[Value],
     num_failargs: i32,
-    rd_consts: &[(i64, majit_ir::Type)],
+    rd_consts: &[majit_ir::Const],
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Value {
@@ -2424,7 +2466,7 @@ fn materialize_virtual_from_rd(
         tagged: i16,
         dead_frame: &[Value],
         num_failargs: i32,
-        rd_consts: &[(i64, majit_ir::Type)],
+        rd_consts: &[majit_ir::Const],
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         virtuals_cache: &mut HashMap<usize, Value>,
     ) -> Option<Value> {
@@ -2449,15 +2491,11 @@ fn materialize_virtual_from_rd(
                     return Some(Value::Ref(majit_ir::GcRef::NULL));
                 }
                 let ci = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
-                let (c, tp) = rd_consts
+                rd_consts
                     .get(ci)
                     .copied()
-                    .unwrap_or((0, majit_ir::Type::Int));
-                match tp {
-                    majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(c as usize)),
-                    majit_ir::Type::Float => Value::Float(f64::from_bits(c as u64)),
-                    _ => Value::Int(c),
-                }
+                    .unwrap_or(majit_ir::Const::Int(0))
+                    .to_value()
             }
             majit_ir::resumedata::TAGVIRTUAL => {
                 return Some(materialize_virtual_from_rd(
@@ -2478,7 +2516,7 @@ fn materialize_virtual_from_rd(
         tagged: i16,
         dead_frame: &[Value],
         num_failargs: i32,
-        rd_consts: &[(i64, majit_ir::Type)],
+        rd_consts: &[majit_ir::Const],
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         virtuals_cache: &mut HashMap<usize, Value>,
     ) -> i64 {
@@ -2503,7 +2541,7 @@ fn materialize_virtual_from_rd(
         tagged: i16,
         dead_frame: &[Value],
         num_failargs: i32,
-        rd_consts: &[(i64, majit_ir::Type)],
+        rd_consts: &[majit_ir::Const],
         rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
         virtuals_cache: &mut HashMap<usize, Value>,
     ) -> f64 {
@@ -3175,27 +3213,6 @@ fn materialize_virtual_from_rd(
             }
         }
     }
-    // Constructors for container objects with embedded inline arrays repair
-    // self-referential `ptr` fields after field initialization. Virtual
-    // materialization must restore the same invariant for resumed virtuals.
-    if let VirtualKind::Instance { known_class, .. } = kind {
-        let list_type_addr = &pyre_object::pyobject::LIST_TYPE as *const _ as i64;
-        let tuple_type_addr = &pyre_object::pyobject::TUPLE_TYPE as *const _ as i64;
-        if known_class == Some(list_type_addr) {
-            unsafe {
-                let list = &mut *(obj_ptr as *mut pyre_object::listobject::W_ListObject);
-                list.items.fix_ptr();
-                list.int_items.fix_ptr();
-                list.float_items.fix_ptr();
-            }
-        } else if known_class == Some(tuple_type_addr) {
-            unsafe {
-                let tuple = &mut *(obj_ptr as *mut pyre_object::tupleobject::W_TupleObject);
-                tuple.items.fix_ptr();
-            }
-        }
-    }
-
     obj_ref
 }
 
@@ -3208,7 +3225,7 @@ fn decode_tagged_value(
     tagged: i16,
     dead_frame: &[Value],
     num_failargs: i32,
-    rd_consts: &[(i64, majit_ir::Type)],
+    rd_consts: &[majit_ir::Const],
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     virtuals_cache: &mut HashMap<usize, Value>,
 ) -> Value {
@@ -3223,17 +3240,11 @@ fn decode_tagged_value(
             dead_frame.get(idx).cloned().unwrap_or(Value::Int(0))
         }
         majit_metainterp::resume::TAGINT => Value::Int(val as i64),
-        majit_metainterp::resume::TAGCONST => {
-            let (c, tp) = rd_consts
-                .get((val - majit_metainterp::resume::TAG_CONST_OFFSET) as usize)
-                .copied()
-                .unwrap_or((0, majit_ir::Type::Int));
-            match tp {
-                majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(c as usize)),
-                majit_ir::Type::Float => Value::Float(f64::from_bits(c as u64)),
-                _ => Value::Int(c),
-            }
-        }
+        majit_metainterp::resume::TAGCONST => rd_consts
+            .get((val - majit_metainterp::resume::TAG_CONST_OFFSET) as usize)
+            .copied()
+            .unwrap_or(majit_ir::Const::Int(0))
+            .to_value(),
         majit_metainterp::resume::TAGVIRTUAL => {
             // resume.py:1572: decode_ref(TAGVIRTUAL) → getvirtual_ptr(num)
             materialize_virtual_from_rd(
@@ -3282,7 +3293,11 @@ pub(crate) fn decode_and_restore_guard_failure(
             exit_layout.trace_id,
             exit_layout.fail_index,
             exit_layout.source_op_index,
-            exit_layout.rd_numb.as_ref().map(|v| v.len()).unwrap_or(0),
+            exit_layout
+                .storage
+                .as_deref()
+                .map(|s| s.rd_numb.len())
+                .unwrap_or(0),
             exit_layout.recovery_layout.is_some(),
             exit_layout.resume_layout.is_some(),
         );
@@ -3302,9 +3317,13 @@ pub(crate) fn decode_and_restore_guard_failure(
     }
     let dead_frame_typed = decode_exit_layout_values(raw_values, exit_layout);
     // resume.py:1042 rebuild_from_resumedata: decode rd_numb into typed values.
+    // compile.py:853 `ResumeGuardDescr` storage — borrow rd_numb / rd_consts
+    // from the guard-owned shared Arc instead of a per-guard Vec copy.
     let (typed, mut pending_virtuals_cache) = {
-        let rd_numb = exit_layout.rd_numb.as_deref().unwrap_or(&[]);
-        let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
+        let storage = exit_layout.storage.as_deref();
+        let rd_numb = storage.map(|s| s.rd_numb.as_slice()).unwrap_or(&[]);
+        let empty_consts: Vec<majit_ir::Const> = Vec::new();
+        let rd_consts: &[majit_ir::Const] = storage.map(|s| s.rd_consts()).unwrap_or(&empty_consts);
         if rd_numb.is_empty() {
             (dead_frame_typed.clone(), HashMap::new())
         } else {
@@ -3348,20 +3367,22 @@ pub(crate) fn decode_and_restore_guard_failure(
     // assert so the gap surfaces rather than silently degrade via a
     // pyre-only single-frame synthesis.
     let resumed_frames = {
-        let rd_numb = exit_layout
-            .rd_numb
+        // compile.py:853 `ResumeGuardDescr` storage — borrow rd_numb /
+        // rd_consts from the guard-owned shared Arc instead of a
+        // per-guard Vec copy.
+        let storage = exit_layout
+            .storage
             .as_deref()
-            .expect("rebuild_guard_fail_state: exit_layout.rd_numb missing");
-        let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
+            .expect("rebuild_guard_fail_state: exit_layout.storage missing");
         assert!(
-            !rd_numb.is_empty(),
-            "rebuild_guard_fail_state: exit_layout.rd_numb is empty (fail_index={})",
+            !storage.rd_numb.is_empty(),
+            "rebuild_guard_fail_state: storage.rd_numb is empty (fail_index={})",
             exit_layout.fail_index
         );
         build_resumed_frames(
             raw_values,
-            rd_numb,
-            rd_consts,
+            storage.rd_numb.as_slice(),
+            storage.rd_consts(),
             exit_layout,
             ResumeVableMode::GuardFailureSync,
         )
@@ -3398,16 +3419,18 @@ pub(crate) fn build_blackhole_frames_from_deadframe(
     // resume.py:1312-1343 blackhole_from_resumedata: rd_numb is mandatory.
     // RPython dereferences `storage.rd_numb_list` inside `ResumeDataDirectReader._prepare`
     // (resume.py:1369-1372); there is no fallback for a missing numbering.
-    // Pyre propagates `rd_numb` through `FailDescrLayout` (commit c7ea7cb58b)
-    // so post-eviction backend-origin layouts still carry it.
-    let rd_numb = exit_layout
-        .rd_numb
+    // Pyre borrows `rd_numb` / `rd_consts` from the guard-owned shared
+    // `ResumeStorage` Arc (compile.py:853 `ResumeGuardDescr`) so post-
+    // eviction backend-origin layouts still carry it.
+    let storage = exit_layout
+        .storage
         .as_deref()
-        .expect("build_blackhole_frames_from_deadframe: exit_layout.rd_numb missing");
-    let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
+        .expect("build_blackhole_frames_from_deadframe: exit_layout.storage missing");
+    let rd_numb = storage.rd_numb.as_slice();
+    let rd_consts = storage.rd_consts();
     assert!(
         !rd_numb.is_empty(),
-        "build_blackhole_frames_from_deadframe: exit_layout.rd_numb is empty (fail_index={})",
+        "build_blackhole_frames_from_deadframe: storage.rd_numb is empty (fail_index={})",
         exit_layout.fail_index
     );
     if majit_metainterp::majit_log_enabled() {
@@ -3442,7 +3465,7 @@ pub(crate) fn build_blackhole_frames_from_deadframe(
 fn rebuild_typed_from_rd_numb(
     raw_values: &[i64],
     rd_numb: &[u8],
-    rd_consts: &[(i64, majit_ir::Type)],
+    rd_consts: &[majit_ir::Const],
     exit_layout: &CompiledExitLayout,
 ) -> (Vec<Value>, Option<usize>, HashMap<usize, Value>) {
     use majit_ir::resumedata::rebuild_from_numbering;
@@ -3479,21 +3502,21 @@ fn rebuild_typed_from_rd_numb(
             RebuiltValue::Box(idx, _tp) => {
                 dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
             }
-            RebuiltValue::Int(i) => Value::Int(*i as i64),
-            RebuiltValue::Const(c, tp) => match tp {
-                majit_ir::Type::Int => Value::Int(*c),
-                majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
-                majit_ir::Type::Float => Value::Float(f64::from_bits(*c as u64)),
-                _ => Value::Int(*c),
-            },
-            RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
-                *vidx,
-                dead_frame_typed,
-                exit_layout.exit_types.len() as i32,
-                exit_layout.rd_consts.as_deref().unwrap_or(&[]),
-                exit_layout.rd_virtuals.as_deref(),
-                virtuals_cache,
-            ),
+            // history.py:220-360 Const → Value: direct variant projection.
+            RebuiltValue::Const(c) => c.to_value(),
+            RebuiltValue::Virtual(vidx) => {
+                let storage = exit_layout.storage.as_deref();
+                let rd_consts = storage.map(|s| s.rd_consts()).unwrap_or(&[]);
+                let rd_virtuals = storage.map(|s| s.rd_virtuals.as_slice());
+                materialize_virtual_from_rd(
+                    *vidx,
+                    dead_frame_typed,
+                    exit_layout.exit_types.len() as i32,
+                    rd_consts,
+                    rd_virtuals,
+                    virtuals_cache,
+                )
+            }
             _ => Value::Int(0),
         }
     }
@@ -3670,7 +3693,7 @@ fn sync_virtualizable_after_guard_failure(
 fn build_resumed_frames(
     raw_values: &[i64],
     rd_numb: &[u8],
-    rd_consts: &[(i64, majit_ir::Type)],
+    rd_consts: &[majit_ir::Const],
     exit_layout: &CompiledExitLayout,
     vable_mode: ResumeVableMode,
 ) -> Vec<crate::call_jit::ResumedFrame> {
@@ -3709,20 +3732,21 @@ fn build_resumed_frames(
             RebuiltValue::Box(idx, _tp) => {
                 dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
             }
-            RebuiltValue::Int(i) => Value::Int(*i as i64),
-            RebuiltValue::Const(c, tp) => match tp {
-                majit_ir::Type::Int => Value::Int(*c),
-                majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
-                _ => Value::Int(*c),
-            },
-            RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
-                *vidx,
-                dead_frame_typed,
-                exit_layout.exit_types.len() as i32,
-                exit_layout.rd_consts.as_deref().unwrap_or(&[]),
-                exit_layout.rd_virtuals.as_deref(),
-                virtuals_cache,
-            ),
+            // history.py:220-360 Const → Value: direct variant projection.
+            RebuiltValue::Const(c) => c.to_value(),
+            RebuiltValue::Virtual(vidx) => {
+                let storage = exit_layout.storage.as_deref();
+                let rd_consts = storage.map(|s| s.rd_consts()).unwrap_or(&[]);
+                let rd_virtuals = storage.map(|s| s.rd_virtuals.as_slice());
+                materialize_virtual_from_rd(
+                    *vidx,
+                    dead_frame_typed,
+                    exit_layout.exit_types.len() as i32,
+                    rd_consts,
+                    rd_virtuals,
+                    virtuals_cache,
+                )
+            }
             _ => Value::Int(0),
         }
     }
@@ -3866,7 +3890,13 @@ fn build_resumed_frames(
     // `ResumeVableMode::GuardFailureSync`.
     if !vable_frame_ptr.is_null() {
         let frame_u8 = vable_frame_ptr as *mut u8;
-        let vinfo = pyre_jit_trace::frame_layout::build_pyframe_virtualizable_info();
+        // resume.py:1312-1314 blackhole_from_resumedata parity:
+        //     vinfo = self.jitdriver_sd.virtualizable_info
+        // Use the JIT driver's cached `Arc<VirtualizableInfo>` set once by
+        // `set_virtualizable_info` at JIT_DRIVER init rather than rebuilding
+        // a fresh instance, so the guard-failure recovery path shares a
+        // single vinfo identity with the tracing / blackhole consumers.
+        let vinfo = crate::eval::driver_pair().1.clone();
         match vable_mode {
             ResumeVableMode::GuardFailureSync => {
                 sync_virtualizable_after_guard_failure(&resolved_vable, frame_u8, &vinfo);
@@ -4068,21 +4098,17 @@ fn _prepare_next_section(
     virtuals_cache: &mut HashMap<usize, Value>,
 ) {
     use majit_ir::resumedata::RebuiltValue;
-    let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
-    let rd_virtuals = exit_layout.rd_virtuals.as_deref();
+    let storage = exit_layout.storage.as_deref();
+    let rd_consts = storage.map(|s| s.rd_consts()).unwrap_or(&[]);
+    let rd_virtuals = storage.map(|s| s.rd_virtuals.as_slice());
     let num_failargs = exit_layout.exit_types.len() as i32;
     for val in &frame.values {
         typed.push(match val {
             RebuiltValue::Box(idx, _tp) => {
                 dead_frame_typed.get(*idx).cloned().unwrap_or(Value::Int(0))
             }
-            RebuiltValue::Const(c, tp) => match tp {
-                majit_ir::Type::Int => Value::Int(*c),
-                majit_ir::Type::Ref => Value::Ref(majit_ir::GcRef(*c as usize)),
-                majit_ir::Type::Float => Value::Float(f64::from_bits(*c as u64)),
-                majit_ir::Type::Void => Value::Void,
-            },
-            RebuiltValue::Int(i) => Value::Int(*i as i64),
+            // history.py:220-360 Const → Value: direct variant projection.
+            RebuiltValue::Const(c) => c.to_value(),
             // resume.py:1572: decode_ref(TAGVIRTUAL) → getvirtual_ptr(num)
             RebuiltValue::Virtual(vidx) => materialize_virtual_from_rd(
                 *vidx,
@@ -4137,8 +4163,16 @@ fn replay_pending_fields(
         return;
     }
 
-    let rd_consts = exit_layout.rd_consts.as_deref().unwrap_or(&[]);
-    let rd_virtuals = exit_layout.rd_virtuals.as_deref();
+    let empty_consts: Vec<majit_ir::Const> = Vec::new();
+    let rd_consts: &[majit_ir::Const] = exit_layout
+        .storage
+        .as_deref()
+        .map(|s| s.rd_consts())
+        .unwrap_or(&empty_consts);
+    let rd_virtuals = exit_layout
+        .storage
+        .as_deref()
+        .map(|s| s.rd_virtuals.as_slice());
     let num_failargs = exit_layout.exit_types.len() as i32;
     let value_to_raw_bits = |value: Value| match value {
         Value::Int(i) => i,
@@ -4896,16 +4930,16 @@ mod tests {
                     .expect("local should load");
             assert_eq!(loaded.opref, local);
 
-            let ops = ctx.ops();
+            let recorder = ctx.into_recorder();
             match expected_guard {
                 Some(opcode) => {
                     assert!(
-                        ops.iter().any(|op| op.opcode == opcode),
+                        recorder.ops().iter().any(|op| op.opcode == opcode),
                         "expected guard opcode {opcode:?} in {:?}",
-                        ops
+                        recorder.ops()
                     );
                 }
-                None => assert_eq!(ops.iter().filter(|op| op.opcode.is_guard()).count(), 0),
+                None => assert_eq!(recorder.num_guards(), 0),
             }
         };
 
@@ -4968,8 +5002,8 @@ mod tests {
 
         state.capture_guard_class(obj, &INT_TYPE as *const _);
 
-        let ops = ctx.ops();
-        let op = ops.last().expect("guard op should be present");
+        let recorder = ctx.into_recorder();
+        let op = recorder.ops().last().expect("guard op should be present");
         assert_eq!(op.opcode, OpCode::GuardNonnullClass);
         assert_eq!(op.args[0], obj);
     }
@@ -5030,12 +5064,15 @@ mod tests {
 
         let _ = state.capture_trace_guarded_int_payload(int_obj);
 
-        let ops = ctx.ops();
+        let recorder = ctx.into_recorder();
         let mut saw_guard_nonnull_class = false;
         let mut saw_pure_payload = false;
-        let recorded_ops: Vec<(OpCode, Vec<OpRef>)> =
-            ops.iter().map(|op| (op.opcode, op.args.to_vec())).collect();
-        for op in &ops {
+        let recorded_ops: Vec<(OpCode, Vec<OpRef>)> = recorder
+            .ops()
+            .iter()
+            .map(|op| (op.opcode, op.args.to_vec()))
+            .collect();
+        for op in recorder.ops() {
             if op.opcode == OpCode::GuardNonnullClass {
                 saw_guard_nonnull_class = true;
             }
@@ -5115,8 +5152,11 @@ mod tests {
                 state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
             }
 
-            let ops = ctx.ops();
-            let guard = ops.last().expect("branch guard should be recorded");
+            let recorder = ctx.into_recorder();
+            let guard = recorder
+                .ops()
+                .last()
+                .expect("branch guard should be recorded");
             let fail_args = guard
                 .fail_args
                 .as_ref()
@@ -5202,8 +5242,8 @@ mod tests {
         );
         <MIFrame as BranchOpcodeHandler>::leave_branch_truth(&mut state).unwrap();
 
-        let ops = ctx.ops();
-        let guard = ops.last().expect("guard op should be present");
+        let recorder = ctx.into_recorder();
+        let guard = recorder.ops().last().expect("guard op should be present");
         let fail_args = guard
             .fail_args
             .as_ref()
@@ -5315,19 +5355,23 @@ mod tests {
         let raw_index = state.capture_trace_dynamic_list_index(key, len, 2);
         assert_eq!(raw_index, key);
 
-        let ops = ctx.ops();
-        assert_eq!(ops.iter().filter(|op| op.opcode.is_guard()).count(), 2);
+        let recorder = ctx.into_recorder();
+        assert_eq!(recorder.num_guards(), 2);
         assert!(
-            ops.iter()
+            recorder
+                .ops()
+                .iter()
                 .all(|op| op.opcode != majit_ir::OpCode::GuardNonnullClass),
             "typed-int index should not guard object class for an unbox fast path: {:?}",
-            ops
+            recorder.ops()
         );
         assert!(
-            ops.iter()
+            recorder
+                .ops()
+                .iter()
                 .all(|op| op.opcode != majit_ir::OpCode::GetfieldGcPureI),
             "typed-int index should not read boxed int payloads: {:?}",
-            ops
+            recorder.ops()
         );
     }
 
@@ -5371,12 +5415,15 @@ mod tests {
             .expect("integer-list len fast path should trace");
         assert_eq!(state.capture_value_type(len), Type::Int);
 
-        let num_ops = ctx.num_ops() as u32;
-        assert_ne!(ctx.ops().last().map(|op| op.opcode), Some(OpCode::CallI));
+        let recorder = ctx.into_recorder();
+        assert_ne!(
+            recorder.ops().last().map(|op| op.opcode),
+            Some(OpCode::CallI)
+        );
         let mut saw_len_field = false;
         let mut saw_new = false;
-        for pos in 2..(2 + num_ops) {
-            let Some(op) = ctx.get_op_by_pos(OpRef(pos)) else {
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
                 continue;
             };
             if op.opcode == OpCode::New {
@@ -5437,12 +5484,12 @@ mod tests {
         let result = state.capture_generated_list_getitem_by_strategy(list, key, 2, 2);
         assert_eq!(state.capture_value_type(result), Type::Float);
 
-        let num_ops = ctx.num_ops() as u32;
+        let recorder = ctx.into_recorder();
         let mut saw_gc_field = false;
         let mut saw_raw_field = false;
         let mut saw_raw_array = false;
-        for pos in 2..(2 + num_ops) {
-            let Some(op) = ctx.get_op_by_pos(OpRef(pos)) else {
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
                 continue;
             };
             match op.opcode {
@@ -5496,11 +5543,15 @@ mod tests {
                 .capture_list_append_value(list, value, concrete_list, concrete_value)
                 .expect("raw-storage append fast path should trace");
 
+            let recorder = ctx.into_recorder();
             let mut saw_raw_setitem = false;
             let mut saw_len_update = false;
             let mut saw_call = false;
             let mut saw_new = false;
-            for op in ctx.ops() {
+            for pos in 2..(2 + recorder.num_ops() as u32) {
+                let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                    continue;
+                };
                 if matches!(
                     op.opcode,
                     OpCode::CallI | OpCode::CallN | OpCode::CallR | OpCode::CallF
@@ -5601,13 +5652,17 @@ mod tests {
         <MIFrame as IterOpcodeHandler>::guard_optional_value(&mut state, next, true)
             .expect("typed range next should not need optional guard");
 
+        let recorder = ctx.into_recorder();
         let mut saw_getfield_gc = false;
         let mut saw_setfield_gc = false;
         let mut saw_setfield_raw = false;
         let mut saw_getfield_raw = false;
         let mut saw_new = false;
         let mut saw_optional_guard = false;
-        for op in ctx.ops() {
+        for pos in 1..(1 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
             match op.opcode {
                 OpCode::GetfieldGcI if op.args.first().copied() == Some(iter) => {
                     saw_getfield_gc = true

@@ -196,30 +196,19 @@ impl ConstantPool {
     }
 
     /// Release shadow stack roots.
-    ///
     /// gcreftracer.py parity: release GC roots for this pool's constants.
-    ///
-    /// Pops unconditionally to `shadow_stack_base` even when
-    /// `rooted_refs` is empty. The owning `TraceCtx`'s
-    /// `TraceRecordBuffer::_encode_ptr` also pushes GC roots into the
-    /// range `[pool_base, depth)` (interleaved with the pool's own
-    /// pushes), and the recorder's `Drop` deliberately does not pop.
-    /// Gating the pop on `!self.rooted_refs.is_empty()` would leak
-    /// those interleaved recorder roots until thread termination
-    /// whenever a trace recorded a TAGCONSTPTR but the pool did not
-    /// intern any Ref constants of its own. Treat the pool as owner
-    /// of the whole `[pool_base, depth)` range.
-    ///
     /// XXX majit-only: in RPython, ConstantPool consumption is strictly
     /// LIFO so pop_to always succeeds. In majit, ExportedState may pop
     /// the shadow stack between this pool's creation and release. Until
     /// the LIFO ordering is enforced structurally, guard against this.
     fn release_roots(&mut self) {
-        let current = shadow_stack::depth();
-        if current >= self.shadow_stack_base {
-            shadow_stack::pop_to(self.shadow_stack_base);
+        if !self.rooted_refs.is_empty() {
+            let current = shadow_stack::depth();
+            if current >= self.shadow_stack_base {
+                shadow_stack::pop_to(self.shadow_stack_base);
+            }
+            self.rooted_refs.clear();
         }
-        self.rooted_refs.clear();
     }
 
     /// Consume the pool and return the constants map.

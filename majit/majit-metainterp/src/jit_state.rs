@@ -115,12 +115,13 @@ pub struct ResumeDataResult {
     pub virtualizable_values: Vec<majit_ir::resumedata::RebuiltValue>,
     /// resume.py:1045: virtualref box pairs (decoded from vref section).
     pub virtualref_values: Vec<majit_ir::resumedata::RebuiltValue>,
-    /// resume.py:1071 self.consts = storage.rd_consts parity. Bridge
-    /// resume reads use `consts[num - TAG_CONST_OFFSET]` (resume.py:1251)
-    /// so virtual materialization needs the rd_consts table verbatim;
-    /// decoded values reach the bridge tracer via `ctx.const_*` calls
-    /// at `decode_box` time, not via a parallel index table.
-    pub rd_consts: Vec<(i64, Type)>,
+    /// compile.py:853 `ResumeGuardDescr` storage handle — the shared
+    /// `Arc<ResumeStorage>` owned by the guard whose rd_numb we just
+    /// decoded. Virtual materialization (resume.py:1251
+    /// `decode_box` → `self.consts[num-TAG_CONST_OFFSET]`) reads
+    /// `storage.rd_consts()` directly; no owned copy lives on this
+    /// struct.
+    pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
     /// resume.py:1042 num_failargs read from rd_numb header.
     /// Needed by `materialize_bridge_virtual` to translate negative TAGBOX
     /// numbers in `rd_virtuals` fieldnums (resume.py:1556-1564 decode_box:
@@ -234,12 +235,15 @@ pub trait JitState: Sized {
     /// sections, fills MIFrame registers with InputArgBox/ConstBox mix,
     /// returns (liveboxes, virtualizable_boxes, virtualref_boxes).
     ///
-    /// Returns None when rd_numb is not available (legacy path).
+    /// Returns None when storage is not available (legacy path).
+    /// `storage` is the guard-owned shared `Arc<ResumeStorage>` handle
+    /// (compile.py:853 `ResumeGuardDescr`); readers borrow
+    /// `storage.rd_numb` / `storage.rd_consts()` instead of owned
+    /// copies.
     fn rebuild_from_resumedata(
         _meta: &mut Self::Meta,
         _fail_arg_types: &[Type],
-        _rd_numb: Option<&[u8]>,
-        _rd_consts: Option<&[(i64, Type)]>,
+        _storage: Option<&std::sync::Arc<crate::resume::ResumeStorage>>,
     ) -> Option<ResumeDataResult> {
         None
     }

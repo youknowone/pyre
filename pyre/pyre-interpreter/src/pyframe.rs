@@ -133,19 +133,83 @@ unsafe fn alloc_with_gc_header<T>(value: T) -> *mut T {
     }
 }
 
-/// Allocate a `FixedObjectArray` with a zeroed GC header prepended.
-pub unsafe fn alloc_array_with_gc_header(array: FixedObjectArray) -> *mut FixedObjectArray {
-    unsafe { alloc_with_gc_header(array) }
+/// Allocation size (in bytes, including the GC header) for a
+/// `FixedObjectArray` of the given length.
+#[inline]
+fn fixed_array_alloc_size(len: usize) -> usize {
+    GC_HEADER_SIZE
+        + pyre_object::FIXED_ARRAY_ITEMS_OFFSET
+        + len * std::mem::size_of::<pyre_object::PyObjectRef>()
 }
 
-/// Deallocate a `FixedObjectArray` allocated with [`alloc_array_with_gc_header`].
-pub unsafe fn dealloc_array_with_gc_header(ptr: *mut FixedObjectArray) {
+#[inline]
+fn fixed_array_layout(len: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(fixed_array_alloc_size(len), 8).unwrap()
+}
+
+/// Allocate a fixed-length GcArray-shaped `FixedObjectArray` with all
+/// slots initialised to `fill`. The allocation is prefixed with a
+/// zeroed GC header (same convention as [`alloc_with_gc_header`]) so the
+/// write barrier fast-path sees `TRACK_YOUNG_PTRS=0`.
+///
+/// The returned pointer points at the length prefix; items follow
+/// immediately in memory at `FIXED_ARRAY_ITEMS_OFFSET` — matching
+/// RPython `Ptr(GcArray(PyObjectRef))`.
+pub unsafe fn alloc_fixed_array_with_header(
+    len: usize,
+    fill: pyre_object::PyObjectRef,
+) -> *mut FixedObjectArray {
     unsafe {
-        std::ptr::drop_in_place(ptr);
+        let layout = fixed_array_layout(len);
+        let raw = std::alloc::alloc_zeroed(layout);
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let arr = raw.add(GC_HEADER_SIZE) as *mut FixedObjectArray;
+        (*arr).len = len;
+        let items = (arr as *mut u8).add(pyre_object::FIXED_ARRAY_ITEMS_OFFSET)
+            as *mut pyre_object::PyObjectRef;
+        for i in 0..len {
+            items.add(i).write(fill);
+        }
+        arr
+    }
+}
+
+/// Allocate a `FixedObjectArray` pre-populated from `values`. The
+/// resulting array has `values.len()` slots; allocation layout matches
+/// [`alloc_fixed_array_with_header`].
+pub unsafe fn alloc_fixed_array_from_vec(
+    values: Vec<pyre_object::PyObjectRef>,
+) -> *mut FixedObjectArray {
+    unsafe {
+        let len = values.len();
+        let layout = fixed_array_layout(len);
+        let raw = std::alloc::alloc_zeroed(layout);
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let arr = raw.add(GC_HEADER_SIZE) as *mut FixedObjectArray;
+        (*arr).len = len;
+        let items = (arr as *mut u8).add(pyre_object::FIXED_ARRAY_ITEMS_OFFSET)
+            as *mut pyre_object::PyObjectRef;
+        for (i, v) in values.into_iter().enumerate() {
+            items.add(i).write(v);
+        }
+        arr
+    }
+}
+
+/// Deallocate a `FixedObjectArray` allocated with
+/// [`alloc_fixed_array_with_header`] or [`alloc_fixed_array_from_vec`].
+pub unsafe fn dealloc_array_with_gc_header(ptr: *mut FixedObjectArray) {
+    if ptr.is_null() {
+        return;
+    }
+    unsafe {
+        let len = (*ptr).len;
         let raw = (ptr as *mut u8).sub(GC_HEADER_SIZE);
-        let total = GC_HEADER_SIZE + std::mem::size_of::<FixedObjectArray>();
-        let layout = std::alloc::Layout::from_size_align(total, 8).unwrap();
-        std::alloc::dealloc(raw, layout);
+        std::alloc::dealloc(raw, fixed_array_layout(len));
     }
 }
 
@@ -487,10 +551,10 @@ impl PyFrame {
         self.w_globals = w_globals;
         unsafe { dealloc_array_with_gc_header(self.locals_cells_stack_w) };
         self.locals_cells_stack_w = unsafe {
-            alloc_array_with_gc_header(FixedObjectArray::filled(
+            alloc_fixed_array_with_header(
                 (&*raw).varnames.len() + ncells(&*raw) + (&*raw).max_stackdepth as usize,
                 PY_NULL,
-            ))
+            )
         };
         self.valuestackdepth = unsafe { (&*raw).varnames.len() + ncells(&*raw) };
         self.last_instr = -1;
@@ -636,10 +700,7 @@ impl PyFrame {
             execution_context,
             pycode: code,
             locals_cells_stack_w: unsafe {
-                alloc_array_with_gc_header(FixedObjectArray::from_vec(vec![
-                    pyre_object::PY_NULL;
-                    size
-                ]))
+                alloc_fixed_array_from_vec(vec![pyre_object::PY_NULL; size])
             },
             valuestackdepth: nlocals + ncells,
             last_instr: -1,
@@ -708,10 +769,7 @@ impl PyFrame {
             execution_context,
             pycode: code,
             locals_cells_stack_w: unsafe {
-                alloc_array_with_gc_header(FixedObjectArray::filled(
-                    num_locals + num_cells + max_stack,
-                    PY_NULL,
-                ))
+                alloc_fixed_array_with_header(num_locals + num_cells + max_stack, PY_NULL)
             },
             valuestackdepth: num_locals + num_cells,
             last_instr: -1,
@@ -750,9 +808,7 @@ impl PyFrame {
         let mut frame = Box::new(PyFrame {
             execution_context: self.execution_context,
             pycode: self.pycode,
-            locals_cells_stack_w: unsafe {
-                alloc_array_with_gc_header(FixedObjectArray::from_vec(self.locals_w().to_vec()))
-            },
+            locals_cells_stack_w: unsafe { alloc_fixed_array_from_vec(self.locals_w().to_vec()) },
             valuestackdepth: self.valuestackdepth,
             last_instr: self.last_instr,
             escaped: self.escaped,
@@ -1515,25 +1571,30 @@ impl PyFrame {
         let num_cells = ncells(code_ref);
         let max_stack = code_ref.max_stackdepth as usize;
 
-        let mut locals_cells_stack_w_arr =
-            FixedObjectArray::filled(num_locals + num_cells + max_stack, PY_NULL);
+        let locals_cells_stack_w =
+            unsafe { alloc_fixed_array_with_header(num_locals + num_cells + max_stack, PY_NULL) };
 
-        // Bind positional arguments directly -- no intermediate Vec.
-        let nargs = args.len().min(num_locals);
-        for i in 0..nargs {
-            locals_cells_stack_w_arr[i] = args[i];
-        }
+        {
+            // Populate the freshly-allocated array via its mutable slice.
+            let arr = unsafe { &mut *locals_cells_stack_w };
 
-        // pyframe.py:229-236: copy free variables from closure into freevar slots
-        for i in 0..code_ref.cellvars.len() {
-            locals_cells_stack_w_arr[num_locals + i] = pyre_object::w_cell_new(PY_NULL);
-        }
-        if !closure.is_null() {
-            let ncellvars = code_ref.cellvars.len();
-            let nfreevars = code_ref.freevars.len();
-            for i in 0..nfreevars {
-                let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
-                locals_cells_stack_w_arr[num_locals + ncellvars + i] = cell;
+            // Bind positional arguments directly -- no intermediate Vec.
+            let nargs = args.len().min(num_locals);
+            for i in 0..nargs {
+                arr[i] = args[i];
+            }
+
+            // pyframe.py:229-236: copy free variables from closure into freevar slots
+            for i in 0..code_ref.cellvars.len() {
+                arr[num_locals + i] = pyre_object::w_cell_new(PY_NULL);
+            }
+            if !closure.is_null() {
+                let ncellvars = code_ref.cellvars.len();
+                let nfreevars = code_ref.freevars.len();
+                for i in 0..nfreevars {
+                    let cell = unsafe { w_tuple_getitem(closure, i as i64).unwrap() };
+                    arr[num_locals + ncellvars + i] = cell;
+                }
             }
         }
 
@@ -1543,7 +1604,7 @@ impl PyFrame {
         let mut frame = PyFrame {
             execution_context,
             pycode: code,
-            locals_cells_stack_w: unsafe { alloc_array_with_gc_header(locals_cells_stack_w_arr) },
+            locals_cells_stack_w,
             valuestackdepth: num_locals + num_cells,
             last_instr: -1,
             escaped: false,

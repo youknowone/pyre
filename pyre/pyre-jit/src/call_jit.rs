@@ -484,7 +484,13 @@ pub(crate) fn bh_portal_runner(all_i: &[i64], all_r: &[i64], _all_f: &[i64]) -> 
         frame.execution_context = ec;
     }
     frame.set_last_instr_from_next_instr(next_instr);
-    crate::eval::portal_runner(frame) as i64
+    match crate::eval::portal_runner_result(frame) {
+        Ok(result) => result as i64,
+        Err(err) => {
+            majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.exc_object as i64));
+            pyre_object::PY_NULL as i64
+        }
+    }
 }
 
 /// jitexc.py JitException hierarchy — structural parity with RPython.
@@ -1054,13 +1060,22 @@ pub fn resume_in_blackhole(
                 // blackhole.py:1679-1682 _exit_frame_with_exception:
                 //   e = cast_opaque_ptr(GCREF, e)
                 //   raise ExitFrameWithExceptionRef(e)
-                // TODO(parity): should be ExitFrameWithExceptionRef(e).
-                // Currently returns Failed because pyre's blackhole state
-                // reconstruction is incomplete (not all live registers are
-                // filled from resume data), causing spurious exceptions
-                // that would crash the program if propagated. Fix the
-                // resume data / liveness encoder first, then switch to
-                // ExitFrameWithExceptionRef.
+                //
+                // Known parity gap. Verified on 2026-04-20: converting
+                // exc_value with PyError::from_exc_object and returning
+                // ExitFrameWithExceptionRef breaks raise_catch_loop /
+                // nbody_50k / spectral_norm / fannkuch with a spurious
+                // "call on non-function callable" TypeError. The
+                // exc_value pointer survives from an earlier
+                // bh_call_fn_impl setting BH_LAST_EXC_VALUE that the
+                // blackhole never cleared even though the residual
+                // call's exception was handled in-frame. Returning
+                // Failed triggers eval.rs:1594 rollback which
+                // reinterprets the bytecode correctly. The real fix
+                // lives in the BH side: clear exception_last_value on
+                // handle_exception_in_frame + reset the caller
+                // BH_LAST_EXC_VALUE thread-local once the exception is
+                // consumed. Until that lands, Failed is load-bearing.
                 return BlackholeResult::Failed;
             };
 
@@ -1561,34 +1576,34 @@ fn jit_blackhole_resume_from_guard(
     // --- Path 1: rd_numb-based resume (resume.py:1312 exact parity) ---
     // When rd_numb is present, use ResumeDataDirectReader to decode
     // frame sections precisely, matching RPython blackhole_from_resumedata.
-    if let Some((rd_numb, rd_consts_typed)) =
-        driver.get_rd_numb(actual_green_key, trace_id, fail_index)
-    {
-        let rd_consts: Vec<i64> = rd_consts_typed.iter().map(|(v, _)| *v).collect();
+    //
+    // compile.py:853 guard-owned `ResumeGuardDescr` storage — share the
+    // pool through `Arc<ResumeStorage>` so blackhole resume reads the
+    // same `rd_consts` the GC root walker updates. No owned-Vec copy.
+    if let Some(storage) = driver.get_resume_storage(actual_green_key, trace_id, fail_index) {
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
                 "[blackhole-resume] rd_numb len={} rd_consts len={} raw_deadframe len={}",
-                rd_numb.len(),
-                rd_consts.len(),
+                storage.rd_numb.len(),
+                storage.rd_consts().len(),
                 raw_deadframe.len(),
             );
         }
-        // resume.py:924-926 _prepare: get rd_virtuals for TAGVIRTUAL materialization.
-        let rd_virtuals = driver.get_rd_virtuals(actual_green_key, trace_id, fail_index);
-        let rd_virtuals_ref = rd_virtuals.as_deref();
-        // resume.py:926 _prepare_pendingfields: get rd_pendingfields for deferred writes.
-        let rd_pendingfields = driver.get_rd_pendingfields(actual_green_key, trace_id, fail_index);
         // resume.py parity: deadframe_types tells decode_ref() whether a
         // TAGBOX slot holds a raw int (needs boxing) or a GcRef (use as-is).
         // Without this, unboxed ints are treated as pointers → SIGSEGV.
         let deadframe_types =
             driver.get_recovery_slot_types(actual_green_key, trace_id, fail_index);
+        // resume.py:922 storage.rd_consts: the decoder borrows the shared
+        // pool; TAGCONST Ref entries stay visible to `walk_rd_consts_refs`.
+        // resume.py:924 _prepare_pendingfields(storage.rd_pendingfields):
+        // deferred field writes must be replayed before consume_vref_and_vable.
         let result = blackhole_resume_via_rd_numb(
-            &rd_numb,
-            &rd_consts,
+            &storage.rd_numb,
+            storage.rd_consts(),
             raw_deadframe,
-            rd_pendingfields.as_deref(),
-            rd_virtuals_ref,
+            Some(&storage.rd_pendingfields),
+            Some(&storage.rd_virtuals),
             deadframe_types.as_deref(),
         );
         return handle_blackhole_result(result, actual_green_key);
@@ -1611,7 +1626,7 @@ fn jit_blackhole_resume_from_guard(
 /// run _run_forever.
 pub fn blackhole_resume_via_rd_numb(
     rd_numb: &[u8],
-    rd_consts: &[i64],
+    rd_consts: &[majit_ir::Const],
     deadframe: &[i64],
     rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
@@ -1683,10 +1698,17 @@ pub fn blackhole_resume_via_rd_numb(
 
     // resume.py:1312-1343 blackhole_from_resumedata:
     // ResumeDataDirectReader decodes rd_numb, builds BH chain.
-    // compile.py:990: vinfo = self.jitdriver_sd.virtualizable_info
-    let vinfo = pyre_jit_trace::frame_layout::build_pyframe_virtualizable_info();
-    // resume.py:1314: vrefinfo = metainterp_sd.virtualref_info
-    // resume.py:1316: ginfo = jitdriver_sd.greenfield_info
+    // compile.py:990 parity: vinfo = self.jitdriver_sd.virtualizable_info —
+    // read the active driver's cached Arc instead of rebuilding a fresh
+    // VirtualizableInfo, so a single VirtualizableInfo identity is shared
+    // with tracing, setup_bridge_sym, and the guard-failure recovery
+    // consumers. resume.py:1314 vrefinfo = metainterp_sd.virtualref_info —
+    // hand the metainterp's own VRefInfo through so consume_virtualref_info
+    // can decode JIT_VIRTUAL_REF handles. resume.py:1316 ginfo is currently
+    // unused in pyre (no greenfield_info installed on the driver).
+    let (driver, driver_vinfo) = crate::eval::driver_pair();
+    let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
+    let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
     let allocator = crate::eval::PyreBlackholeAllocator;
     // pyjitpl.py:2264: metainterp_sd.liveness_info — single shared pool.
     // Snapshot once per call so the slice outlives ResumeDataDirectReader.
@@ -1707,9 +1729,9 @@ pub fn blackhole_resume_via_rd_numb(
             rd_virtuals_slice,      // rd_virtuals
             None,                   // rd_pendingfields
             rd_guard_pendingfields, // rd_guard_pendingfields
-            None,                   // vrefinfo — pyre has no virtualref mechanism
-            Some(vinfo.as_ref() as &dyn resume::VirtualizableInfo),
-            None, // ginfo — pyre has no greenfield mechanism
+            Some(vrefinfo_dyn),     // resume.py:1314 metainterp_sd.virtualref_info
+            Some(vinfo_dyn),        // resume.py:1312 self.jitdriver_sd.virtualizable_info
+            None,                   // resume.py:1316 greenfield_info unused in pyre
             &allocator,
         )
     });
@@ -1954,9 +1976,40 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
                     all_i, all_r,
                 );
             }
-            // warmspot.py:976-978: result = portal_ptr(*args)
-            let result = bh_portal_runner(&all_i, &all_r, &all_f);
-            if result == 0 { None } else { Some(result) }
+            // warmspot.py:976-1005: portal_ptr(*args), and if it raises a
+            // regular exception propagate it like ExitFrameWithExceptionRef
+            // instead of collapsing it to a null Ref.
+            let next_instr = all_i.first().copied().unwrap_or(0) as usize;
+            let pycode = all_r.first().copied().unwrap_or(0) as PyObjectRef;
+            let frame_ptr = all_r.get(1).copied().unwrap_or(0) as *mut PyFrame;
+            let ec =
+                all_r.get(2).copied().unwrap_or(0) as *const pyre_interpreter::PyExecutionContext;
+            if frame_ptr.is_null() {
+                return Some(pyre_object::PY_NULL as i64);
+            }
+            let frame = unsafe { &mut *frame_ptr };
+            if !pycode.is_null() {
+                frame.pycode = pycode as *const ();
+            }
+            if !ec.is_null() {
+                frame.execution_context = ec;
+            }
+            frame.set_last_instr_from_next_instr(next_instr);
+            match crate::eval::portal_runner_result(frame) {
+                Ok(result) => Some(result as i64),
+                Err(err) => {
+                    let exc_obj = err.exc_object;
+                    if exc_obj != pyre_object::PY_NULL {
+                        majit_metainterp::blackhole::BH_LAST_EXC_VALUE
+                            .with(|c| c.set(exc_obj as i64));
+                        #[cfg(feature = "cranelift")]
+                        majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
+                        #[cfg(feature = "dynasm")]
+                        majit_backend_dynasm::jit_exc_raise(exc_obj as i64);
+                    }
+                    Some(0)
+                }
+            }
         }
         BlackholeResult::Failed => {
             if majit_metainterp::majit_log_enabled() {

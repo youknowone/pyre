@@ -871,47 +871,6 @@ impl VirtualizableInfo {
         }
     }
 
-    /// Write a single slot (identified by the flat virtualizable_boxes
-    /// index) back to the heap object.  Inverse of `get_index_in_array`:
-    /// `flat_idx < num_static_extra_boxes` → static field, otherwise
-    /// walk the array-length prefix sum to land on the right array item.
-    ///
-    /// Used by `TraceCtx::synchronize_virtualizable_slot` so per-store
-    /// vable-mirror writes stay O(1) instead of walking every slot
-    /// (write_all_boxes).  Returns `false` when `flat_idx` falls past
-    /// the last array item (the trailing vable-identity slot at
-    /// `num_static + sum(array_lengths)` is never written — RPython
-    /// `virtualizable.py:113` `assert len(boxes) == i + 1` parity).
-    ///
-    /// # Safety
-    /// `obj_ptr` must point to a valid virtualizable object.
-    pub unsafe fn write_box_at_flat(
-        &self,
-        obj_ptr: *mut u8,
-        flat_idx: usize,
-        value: i64,
-        array_lengths: &[usize],
-    ) -> bool {
-        if flat_idx < self.num_static_extra_boxes {
-            unsafe {
-                self.write_field(obj_ptr, flat_idx, value);
-            }
-            return true;
-        }
-        let mut cursor = self.num_static_extra_boxes;
-        for (array_index, &len) in array_lengths.iter().enumerate() {
-            if flat_idx < cursor + len {
-                let item_index = flat_idx - cursor;
-                unsafe {
-                    self.write_array_item(obj_ptr, array_index, item_index, value);
-                }
-                return true;
-            }
-            cursor += len;
-        }
-        false
-    }
-
     /// Write an array element to the heap object.
     ///
     /// RPython equivalent: `vinfo.write_to_array(virtualizable, array_index, item_index, value)`

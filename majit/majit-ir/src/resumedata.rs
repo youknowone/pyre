@@ -1,12 +1,13 @@
-//! Resume data numbering primitives.
+//! Resume data decoding primitives.
 //!
-//! Direct port of rpython/jit/metainterp/resume.py tag/numbering infrastructure.
-//! Shared between majit-opt (store_final_boxes_in_guard) and majit-meta (rebuild).
-
-use std::collections::HashMap;
+//! resume.py tag layout + `rebuild_from_numbering` (decode-side) shared by
+//! `majit-metainterp` (guard failure) and `pyre-jit-trace` (trace-side
+//! recovery). The encoder-side (`Snapshot`, `NumberingState`,
+//! `ResumeDataLoopMemo`) lives in `majit-metainterp/src/resume.rs` to stay
+//! colocated with the metainterp context that drives it.
 
 use crate::resumecode;
-use crate::{BoxEnv, OpRef, Type};
+use crate::{Const, Type};
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 
@@ -45,309 +46,11 @@ pub const NULLREF: i16 = ((-1i32 << 2) | TAGCONST as i32) as i16;
 pub const UNINITIALIZED_TAG: i16 = ((-2i32 << 2) | TAGCONST as i32) as i16;
 pub const TAG_CONST_OFFSET: i32 = 0;
 
-#[derive(Debug)]
-pub struct TagOverflow;
-
-/// resume.py:96-100
-pub fn tag(value: i32, tagbits: u8) -> Result<i16, TagOverflow> {
-    debug_assert!(tagbits <= 3);
-    let sx = value >> 13;
-    if sx != 0 && sx != -1 {
-        return Err(TagOverflow);
-    }
-    Ok(((value << 2) | tagbits as i32) as i16)
-}
-
 /// resume.py:106-109
 pub fn untag(value: i16) -> (i32, u8) {
     let widened = value as i32;
     let tagbits = (widened & TAGMASK as i32) as u8;
     (widened >> 2, tagbits)
-}
-
-// ── Snapshot types for numbering ──
-
-/// One frame in a snapshot's frame chain.
-/// resume.py: Snapshot → framestack entries.
-#[derive(Debug, Clone)]
-pub struct SnapshotFrame {
-    pub jitcode_index: i32,
-    pub pc: i32,
-    pub boxes: Vec<OpRef>,
-}
-
-/// Full snapshot for numbering.
-/// resume.py:234-253 layout.
-#[derive(Debug, Clone)]
-pub struct Snapshot {
-    pub vable_array: Vec<OpRef>,
-    pub vref_array: Vec<OpRef>,
-    pub framestack: Vec<SnapshotFrame>,
-}
-
-impl Snapshot {
-    pub fn estimated_size(&self) -> usize {
-        let mut n = 4; // header ints
-        n += self.vable_array.len();
-        n += self.vref_array.len();
-        for f in &self.framestack {
-            n += 2 + f.boxes.len(); // jitcode_index + pc + boxes
-        }
-        n
-    }
-
-    /// Create a single-frame snapshot from a flat list of OpRefs.
-    pub fn single_frame(pc: i32, boxes: Vec<OpRef>) -> Self {
-        Snapshot {
-            vable_array: Vec::new(),
-            vref_array: Vec::new(),
-            framestack: vec![SnapshotFrame {
-                jitcode_index: 0,
-                pc,
-                boxes,
-            }],
-        }
-    }
-
-    /// Create a multi-frame snapshot from per-frame (jitcode_index, pc, boxes) tuples.
-    /// RPython's read-side framestack order is outermost frame first,
-    /// innermost frame last.
-    pub fn multi_frame(frames: Vec<(i32, i32, Vec<OpRef>)>) -> Self {
-        Snapshot {
-            vable_array: Vec::new(),
-            vref_array: Vec::new(),
-            framestack: frames
-                .into_iter()
-                .map(|(jitcode_index, pc, boxes)| SnapshotFrame {
-                    jitcode_index,
-                    pc,
-                    boxes,
-                })
-                .collect(),
-        }
-    }
-}
-
-// ── NumberingState ──
-
-/// resume.py:70-98 NumberingState equivalent.
-pub struct NumberingState {
-    pub writer: resumecode::Writer,
-    /// Maps OpRef.0 → tagged value (TAGBOX/TAGCONST/TAGVIRTUAL).
-    pub liveboxes: HashMap<u32, i16>,
-    pub num_boxes: i32,
-    pub num_virtuals: i32,
-    /// RPython Box.type parity: type of each TAGBOX livebox, captured at
-    /// numbering time. Equivalent to Box.type being intrinsic in RPython.
-    pub livebox_types: HashMap<u32, Type>,
-}
-
-impl NumberingState {
-    pub fn new(size: usize) -> Self {
-        NumberingState {
-            writer: resumecode::Writer::new(size),
-            liveboxes: HashMap::new(),
-            num_boxes: 0,
-            num_virtuals: 0,
-            livebox_types: HashMap::new(),
-        }
-    }
-
-    pub fn append_short(&mut self, item: i16) {
-        self.writer.append_short(item as i32);
-    }
-
-    pub fn append_int(&mut self, item: i32) {
-        self.writer.append_int(item);
-    }
-
-    pub fn patch_current_size(&mut self, index: usize) {
-        self.writer.patch_current_size(index);
-    }
-
-    pub fn patch(&mut self, index: usize, item: i32) {
-        self.writer.patch(index, item);
-    }
-
-    pub fn create_numbering(&self) -> Vec<u8> {
-        self.writer.create_numbering()
-    }
-}
-
-// ── ResumeDataLoopMemo (numbering part) ──
-
-/// resume.py:145-165 ResumeDataLoopMemo — shared constant pool + numbering.
-pub struct ResumeDataLoopMemo {
-    /// resume.py:147 — constant pool (value, type).
-    consts: Vec<(i64, Type)>,
-    /// resume.py:148 — large integers → tagged const.
-    large_ints: HashMap<i64, i16>,
-    /// resume.py:149 — ref pointers → tagged const.
-    refs: HashMap<i64, i16>,
-}
-
-impl ResumeDataLoopMemo {
-    pub fn new() -> Self {
-        ResumeDataLoopMemo {
-            consts: Vec::new(),
-            large_ints: HashMap::new(),
-            refs: HashMap::new(),
-        }
-    }
-
-    pub fn consts(&self) -> &[(i64, Type)] {
-        &self.consts
-    }
-
-    fn newconst(&mut self, val: i64, tp: Type) -> i16 {
-        let idx = self.consts.len() as i32 + TAG_CONST_OFFSET;
-        self.consts.push((val, tp));
-        tag(idx, TAGCONST).unwrap_or(NULLREF)
-    }
-
-    /// resume.py:172-181
-    fn getconst_int(&mut self, val: i64) -> i16 {
-        // Small ints → TAGINT
-        let small = val as i32;
-        if small as i64 == val {
-            if let Ok(t) = tag(small, TAGINT) {
-                return t;
-            }
-        }
-        if let Some(&t) = self.large_ints.get(&val) {
-            return t;
-        }
-        let t = self.newconst(val, Type::Int);
-        self.large_ints.insert(val, t);
-        t
-    }
-
-    fn getconst_ref(&mut self, val: i64) -> i16 {
-        // resume.py:174-176: null ref → NULLREF
-        if val == 0 {
-            return NULLREF;
-        }
-        if let Some(&t) = self.refs.get(&val) {
-            return t;
-        }
-        let t = self.newconst(val, Type::Ref);
-        self.refs.insert(val, t);
-        t
-    }
-
-    fn getconst_float(&mut self, val: i64) -> i16 {
-        self.newconst(val, Type::Float)
-    }
-
-    /// resume.py:186-192
-    pub fn getconst(&mut self, val: i64, tp: Type) -> i16 {
-        match tp {
-            Type::Int => self.getconst_int(val),
-            Type::Ref => self.getconst_ref(val),
-            Type::Float => self.getconst_float(val),
-            Type::Void => self.newconst(val, tp),
-        }
-    }
-
-    /// resume.py:196-223 _number_boxes — tag each box in the snapshot.
-    pub fn _number_boxes(
-        &mut self,
-        boxes: &[OpRef],
-        numb_state: &mut NumberingState,
-        env: &dyn BoxEnv,
-    ) -> Result<(), TagOverflow> {
-        for &raw_opref in boxes {
-            // resume.py:561-562 _gettagged: box is None → UNINITIALIZED
-            if raw_opref.is_none() {
-                numb_state.append_short(UNINITIALIZED_TAG);
-                continue;
-            }
-
-            // resume.py:201-202
-            let opref = env.get_box_replacement(raw_opref);
-
-            // resume.py:561-562: forwarded-away box → UNINITIALIZED
-            if opref.is_none() {
-                numb_state.append_short(UNINITIALIZED_TAG);
-                continue;
-            }
-
-            // resume.py:204-205: isinstance(box, Const)
-            if env.is_const(opref) {
-                let (val, tp) = env.get_const(opref);
-                let tagged = self.getconst(val, tp);
-                numb_state.append_short(tagged);
-                continue;
-            }
-            // resume.py:207-208: already seen
-            if let Some(&tagged) = numb_state.liveboxes.get(&opref.0) {
-                numb_state.append_short(tagged);
-                continue;
-            }
-            // resume.py:210-216: virtual check
-            let box_type = env.get_type(opref);
-            let is_virtual = match box_type {
-                Type::Ref => env.is_virtual_ref(opref),
-                Type::Int => env.is_virtual_raw(opref),
-                _ => false,
-            };
-            // resume.py:217-223: tag
-            let tagged = if is_virtual {
-                let t = tag(numb_state.num_virtuals, TAGVIRTUAL)?;
-                numb_state.num_virtuals += 1;
-                t
-            } else {
-                numb_state.livebox_types.insert(opref.0, box_type);
-                let t = tag(numb_state.num_boxes, TAGBOX)?;
-                numb_state.num_boxes += 1;
-                t
-            };
-            numb_state.liveboxes.insert(opref.0, tagged);
-            numb_state.append_short(tagged);
-        }
-        Ok(())
-    }
-
-    /// resume.py:228-256 number() — serialize a snapshot into NumberingState.
-    pub fn number(
-        &mut self,
-        snapshot: &Snapshot,
-        env: &dyn BoxEnv,
-    ) -> Result<NumberingState, TagOverflow> {
-        let size_hint = snapshot.estimated_size();
-        let mut numb_state = NumberingState::new(size_hint);
-
-        // resume.py:231-232: patch later
-        numb_state.append_int(0); // slot 0: size of resume section
-        numb_state.append_int(0); // slot 1: number of failargs (patched by finish())
-
-        // resume.py:240-241: virtualizable array. RPython numbers the
-        // vable section with the same `_number_boxes` as everything
-        // else; fresh Box identity is supplied by `read_boxes`/`wrap`
-        // at tracing time (virtualizable.py:86, warmstate.py:73), not
-        // by a resume-time bypass.
-        numb_state.append_int(snapshot.vable_array.len() as i32);
-        self._number_boxes(&snapshot.vable_array, &mut numb_state, env)?;
-
-        // resume.py:243-247: virtualref array
-        let vref_len = snapshot.vref_array.len();
-        debug_assert!(vref_len & 1 == 0, "vref_array length must be even");
-        numb_state.append_int((vref_len >> 1) as i32);
-        self._number_boxes(&snapshot.vref_array, &mut numb_state, env)?;
-
-        // resume.py:249-253: frame chain.
-        // Per-frame: jitcode_index, pc, [tagged_values...].
-        for frame in &snapshot.framestack {
-            numb_state.append_int(frame.jitcode_index);
-            numb_state.append_int(frame.pc);
-            self._number_boxes(&frame.boxes, &mut numb_state, env)?;
-        }
-
-        // resume.py:254: patch total size
-        numb_state.patch_current_size(0);
-
-        Ok(numb_state)
-    }
 }
 
 // ── Decoding (for guard failure recovery) ──
@@ -363,10 +66,12 @@ pub enum RebuiltValue {
     /// box's `.type` matches that kind. majit stores the kind on the
     /// variant so consumers don't need a parallel `fail_arg_types` lookup.
     Box(usize, Type),
-    /// TAGCONST: compile-time constant with type.
-    Const(i64, Type),
-    /// TAGINT: small integer encoded inline.
-    Int(i32),
+    /// TAGCONST / TAGINT: compile-time constant. Carries a `Const`
+    /// (Int/Float/Ref), matching RPython's `decode_box` which returns a
+    /// `ConstInt`/`ConstFloat`/`ConstPtr` regardless of whether the value
+    /// came from the inline TAGINT encoding or the TAGCONST pool
+    /// (resume.py:1250-1270).
+    Const(crate::Const),
     /// TAGVIRTUAL(n): virtual object index n.
     Virtual(usize),
     /// Uninitialized/unassigned slot.
@@ -384,21 +89,25 @@ pub struct RebuiltFrame {
 fn decode_tagged(
     tagged: i16,
     num_failargs: i32,
-    rd_consts: &[(i64, Type)],
+    rd_consts: &[Const],
     fail_arg_types: &[Type],
 ) -> RebuiltValue {
     let (val, tagbits) = untag(tagged);
     match tagbits {
-        TAGINT => RebuiltValue::Int(val),
+        // resume.py:1257 ConstInt(num) — TAGINT always produces an int box.
+        TAGINT => RebuiltValue::Const(crate::Const::Int(val as i64)),
         TAGCONST => {
             if tagged == NULLREF {
-                RebuiltValue::Const(0, Type::Ref)
+                // history.py:361 CONST_NULL = ConstPtr(null).
+                RebuiltValue::Const(crate::Const::Ref(crate::GcRef::NULL))
             } else if tagged == UNINITIALIZED_TAG {
                 RebuiltValue::Unassigned
             } else {
                 let idx = (val - TAG_CONST_OFFSET) as usize;
-                let (c, tp) = rd_consts.get(idx).copied().unwrap_or((0, Type::Int));
-                RebuiltValue::Const(c, tp)
+                // resume.py:1555/1571/1583 self.consts[num - TAG_CONST_OFFSET]
+                // — the Const carries its type with it.
+                let c = rd_consts.get(idx).copied().unwrap_or(Const::Int(0));
+                RebuiltValue::Const(c)
             }
         }
         TAGBOX => {
@@ -447,7 +156,7 @@ fn decode_tagged(
 /// downstream consumers don't need a parallel side channel.
 pub fn rebuild_from_numbering(
     rd_numb: &[u8],
-    rd_consts: &[(i64, Type)],
+    rd_consts: &[Const],
     fail_arg_types: &[Type],
     frame_value_count: Option<&dyn Fn(i32, i32) -> usize>,
 ) -> (i32, Vec<RebuiltValue>, Vec<RebuiltValue>, Vec<RebuiltFrame>) {
@@ -525,68 +234,4 @@ pub fn rebuild_from_numbering(
         });
     }
     (num_failargs, vable_values, vref_values, frames)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::resoperation::BoxEnv;
-
-    struct TestEnv;
-
-    impl BoxEnv for TestEnv {
-        fn get_box_replacement(&self, opref: OpRef) -> OpRef {
-            opref
-        }
-
-        fn is_const(&self, _opref: OpRef) -> bool {
-            false
-        }
-
-        fn get_const(&self, _opref: OpRef) -> (i64, Type) {
-            unreachable!("test env has no const boxes")
-        }
-
-        fn get_type(&self, _opref: OpRef) -> Type {
-            Type::Ref
-        }
-
-        fn is_virtual_ref(&self, _opref: OpRef) -> bool {
-            false
-        }
-
-        fn is_virtual_raw(&self, _opref: OpRef) -> bool {
-            false
-        }
-    }
-
-    /// resume.py:192-226 `_number_boxes` dedups by Box identity. RPython
-    /// uses fresh Box objects (virtualizable.py:86 `read_boxes` + warmstate.py:73
-    /// `wrap`) so vable and frame sections never collide. Distinct OpRefs in
-    /// majit's model reproduce that: each OpRef gets its own TAGBOX.
-    #[test]
-    fn number_boxes_keeps_distinct_oprefs_distinct() {
-        let vable_opref = OpRef(7);
-        let frame_opref = OpRef(8);
-        let snapshot = Snapshot {
-            vable_array: vec![vable_opref],
-            vref_array: Vec::new(),
-            framestack: vec![SnapshotFrame {
-                jitcode_index: 0,
-                pc: 0,
-                boxes: vec![frame_opref],
-            }],
-        };
-
-        let mut memo = ResumeDataLoopMemo::new();
-        let numb_state = memo.number(&snapshot, &TestEnv).unwrap();
-        let numbering = numb_state.create_numbering();
-        let (_, vable_values, _, frames) =
-            rebuild_from_numbering(&numbering, memo.consts(), &[Type::Ref, Type::Ref], None);
-
-        assert_eq!(numb_state.num_boxes, 2);
-        assert_eq!(vable_values, vec![RebuiltValue::Box(0, Type::Ref)]);
-        assert_eq!(frames.len(), 1);
-        assert_eq!(frames[0].values, vec![RebuiltValue::Box(1, Type::Ref)]);
-    }
 }

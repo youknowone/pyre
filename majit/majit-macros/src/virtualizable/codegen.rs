@@ -41,12 +41,23 @@ pub fn generate_vable_info_pub_fn(decl: &VirtualizableDecl) -> TokenStream {
                 majit_metainterp::virtualizable::item_size_for_type(#tp)
             };
             match &a.layout {
-                VableArrayLayoutDecl::Direct { field_offset } => quote! {
-                    __info.add_array_field(
-                        #aname, #tp, #field_offset, 0, 0,
-                        majit_ir::make_array_descr(0, #item_size_expr, #tp),
-                    );
-                },
+                VableArrayLayoutDecl::Direct {
+                    field_offset,
+                    length_offset,
+                    items_offset,
+                } => {
+                    let length_offset = length_offset
+                        .clone()
+                        .unwrap_or_else(|| syn::parse_quote!(0));
+                    let items_offset = items_offset.clone().unwrap_or_else(|| syn::parse_quote!(0));
+                    quote! {
+                        __info.add_array_field(
+                            #aname, #tp, #field_offset,
+                            #length_offset, #items_offset,
+                            majit_ir::make_array_descr(#items_offset, #item_size_expr, #tp),
+                        );
+                    }
+                }
                 VableArrayLayoutDecl::Embedded {
                     field_offset,
                     ptr_offset,

@@ -34,10 +34,11 @@ mod tests {
     const FAKE_FLOAT_TYPE: i64 = 0x1234_9876;
 
     /// Get ops from TraceCtx, excluding the dummy Finish we add for finalization.
-    fn get_ops(mut ctx: TraceCtx) -> Vec<OpCode> {
+    fn get_ops(ctx: TraceCtx) -> Vec<OpCode> {
+        let mut recorder = ctx.into_recorder();
         let dummy_descr = make_size_descr(0);
-        ctx.finish(&[], dummy_descr);
-        let trace = ctx.into_tree_loop();
+        recorder.finish(&[], dummy_descr);
+        let trace = recorder.get_trace();
         trace
             .ops
             .iter()

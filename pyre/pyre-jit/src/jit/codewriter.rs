@@ -3274,17 +3274,25 @@ impl CodeWriter {
         }
 
         // B6 Phase 3b dual emission for the `*_vable_*` field/array
-        // accessors. RPython parity: `jtransform.py:844/925` and
-        // `jtransform.py:763/797` all use `getkind(...)[0]`, so every
-        // vable opname uses the short suffix (`i` / `r` / `f`).
+        // accessors. RPython parity: `jtransform.py:844`
+        // `SpaceOperation('getfield_vable_%s' % kind, ...)` and
+        // `jtransform.py:923` `SpaceOperation('setfield_vable_%s' % kind,
+        // ...)` use the FULL kind name (`int` / `ref` / `float`);
+        // `jtransform.py` `SpaceOperation('getarrayitem_vable_%s' %
+        // kind[0], ...)` / `SpaceOperation('setarrayitem_vable_%s' %
+        // kind[0], ...)` use the SHORT form (`i` / `r` / `f`).
+        //
+        // The runtime dispatch arms in `assembler.rs:486-524` were
+        // already written against short-form field names; the SSA
+        // emission here uses the RPython-parity full-form names and
+        // relies on the Phase 3c dispatch aliases (added alongside)
+        // to route the full-form opnames to the same builder methods.
         macro_rules! emit_vable_getfield_ref {
             ($ssarepr:expr, $dst:expr, $field_idx:expr) => {{
                 let dst = $dst;
                 let field_idx = $field_idx;
-                // `jtransform.py:846` uses `getkind(RESULT)[0]`, so Ref
-                // fields use the short `_r` suffix.
                 let insn = Insn::op_with_result(
-                    "getfield_vable_r",
+                    "getfield_vable_ref",
                     vec![Operand::ConstInt(field_idx as i64)],
                     Register::new(Kind::Ref, dst),
                 );
@@ -3295,10 +3303,8 @@ impl CodeWriter {
             ($ssarepr:expr, $field_idx:expr, $src:expr) => {{
                 let field_idx = $field_idx;
                 let src = $src;
-                // `jtransform.py:927` uses `getkind(ARG)[0]`, so Int
-                // fields use the short `_i` suffix.
                 let insn = Insn::op(
-                    "setfield_vable_i",
+                    "setfield_vable_int",
                     vec![
                         Operand::ConstInt(field_idx as i64),
                         Operand::reg(Kind::Int, src),

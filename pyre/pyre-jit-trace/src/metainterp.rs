@@ -471,20 +471,22 @@ impl PyreMetaInterp {
             }
             parent_sym.symbolic_stack_types[result_idx] = result_type;
 
-            // Update concrete stack.  RPython BoxPtr-returning inline
-            // calls carry a GCREF (history.py:203), not an unboxed
-            // scalar; `concrete_result` is already a W_Object pointer
-            // from `concrete_execute_return`.  Keep it as a Ref so the
-            // parent's `concrete_stack` stays consistent with
-            // `push_typed_value`'s parallel-box invariant
-            // (trace_opcode.rs:742-779 — pyframe.py:84
-            // `list[W_Object]` parity).  `from_pyobj` would unbox
-            // W_IntObject / W_FloatObject into Int(v) / Float(v) and
-            // leave a mismatched shadow for the Ref-typed stack slot.
-            let cv = if concrete_result.is_null() {
-                ConcreteValue::Null
-            } else {
-                ConcreteValue::Ref(concrete_result)
+            // Update concrete stack. history.py:307 ConstPtr.getref_base
+            // parity: a Ref-typed return value carries the raw GCREF —
+            // the JIT never eagerly unboxes W_IntObject / W_FloatObject
+            // at shadow-set time. For Int/Float-typed results we extract
+            // the scalar because the opcode's signature said so.
+            let cv = match result_type {
+                Type::Int => ConcreteValue::from_pyobj(concrete_result),
+                Type::Float => ConcreteValue::from_pyobj(concrete_result),
+                Type::Ref => {
+                    if concrete_result.is_null() {
+                        ConcreteValue::Null
+                    } else {
+                        ConcreteValue::Ref(concrete_result)
+                    }
+                }
+                Type::Void => ConcreteValue::Null,
             };
             if result_idx < parent_sym.concrete_stack.len() {
                 parent_sym.concrete_stack[result_idx] = cv;

@@ -2,7 +2,7 @@ use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use majit_ir::{AccumInfo, DescrRef, FailDescr, OpCode, Type};
+use majit_ir::{AccumInfo, DescrRef, FailDescr, Type};
 
 use crate::resume::ResumeData;
 
@@ -37,25 +37,6 @@ pub fn reset_fail_index_counter() {
 /// Allocate the next unique fail_index.
 fn alloc_fail_index() -> u32 {
     NEXT_FAIL_INDEX.fetch_add(1, Ordering::SeqCst)
-}
-
-fn empty_resume_data() -> ResumeData {
-    ResumeData {
-        vable_array: Vec::new(),
-        vref_array: Vec::new(),
-        frames: Vec::new(),
-        virtuals: Vec::new(),
-        pending_fields: Vec::new(),
-    }
-}
-
-fn new_resume_guard_inner(types: Vec<Type>) -> ResumeGuardDescr {
-    ResumeGuardDescr {
-        fail_index: alloc_fail_index(),
-        types,
-        resume_data: empty_resume_data(),
-        vector_info: UnsafeCell::new(None),
-    }
 }
 
 /// Per-guard FailDescr carrying a unique index and type information.
@@ -159,14 +140,6 @@ impl FailDescr for ResumeGuardDescr {
     }
 }
 
-impl ResumeGuardDescr {
-    /// Access the resume data for deoptimization.
-    #[allow(dead_code)]
-    pub fn resume_data(&self) -> &ResumeData {
-        &self.resume_data
-    }
-}
-
 /// Create a FailDescr for `num_live` integer values with an auto-assigned
 /// unique fail_index.
 ///
@@ -198,202 +171,6 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
         fail_index: alloc_fail_index(),
         types,
         vector_info: UnsafeCell::new(None),
-    })
-}
-
-#[derive(Debug)]
-struct ResumeGuardExcDescr {
-    inner: ResumeGuardDescr,
-}
-
-unsafe impl Send for ResumeGuardExcDescr {}
-unsafe impl Sync for ResumeGuardExcDescr {}
-
-impl majit_ir::Descr for ResumeGuardExcDescr {
-    fn index(&self) -> u32 {
-        self.inner.fail_index
-    }
-    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
-        Some(self)
-    }
-    fn clone_descr(&self) -> Option<DescrRef> {
-        Some(Arc::new(ResumeGuardExcDescr {
-            inner: ResumeGuardDescr {
-                fail_index: alloc_fail_index(),
-                types: self.inner.types.clone(),
-                resume_data: self.inner.resume_data.clone(),
-                vector_info: UnsafeCell::new(unsafe { (&*self.inner.vector_info.get()).clone() }),
-            },
-        }))
-    }
-}
-
-impl FailDescr for ResumeGuardExcDescr {
-    fn fail_index(&self) -> u32 {
-        self.inner.fail_index
-    }
-    fn fail_arg_types(&self) -> &[Type] {
-        &self.inner.types
-    }
-    fn attach_vector_info(&self, info: AccumInfo) {
-        push_vector_info(unsafe { &mut *self.inner.vector_info.get() }, info);
-    }
-    fn vector_info(&self) -> Vec<AccumInfo> {
-        flatten_vector_info(unsafe { (&*self.inner.vector_info.get()).as_deref() })
-    }
-}
-
-#[derive(Debug)]
-struct ResumeGuardCopiedDescr {
-    inner: ResumeGuardDescr,
-}
-
-unsafe impl Send for ResumeGuardCopiedDescr {}
-unsafe impl Sync for ResumeGuardCopiedDescr {}
-
-impl majit_ir::Descr for ResumeGuardCopiedDescr {
-    fn index(&self) -> u32 {
-        self.inner.fail_index
-    }
-    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
-        Some(self)
-    }
-    fn clone_descr(&self) -> Option<DescrRef> {
-        Some(Arc::new(ResumeGuardCopiedDescr {
-            inner: ResumeGuardDescr {
-                fail_index: alloc_fail_index(),
-                types: self.inner.types.clone(),
-                resume_data: self.inner.resume_data.clone(),
-                vector_info: UnsafeCell::new(unsafe { (&*self.inner.vector_info.get()).clone() }),
-            },
-        }))
-    }
-}
-
-impl FailDescr for ResumeGuardCopiedDescr {
-    fn fail_index(&self) -> u32 {
-        self.inner.fail_index
-    }
-    fn fail_arg_types(&self) -> &[Type] {
-        &self.inner.types
-    }
-    fn attach_vector_info(&self, info: AccumInfo) {
-        push_vector_info(unsafe { &mut *self.inner.vector_info.get() }, info);
-    }
-    fn vector_info(&self) -> Vec<AccumInfo> {
-        flatten_vector_info(unsafe { (&*self.inner.vector_info.get()).as_deref() })
-    }
-}
-
-#[derive(Debug)]
-struct ResumeGuardCopiedExcDescr {
-    inner: ResumeGuardDescr,
-}
-
-unsafe impl Send for ResumeGuardCopiedExcDescr {}
-unsafe impl Sync for ResumeGuardCopiedExcDescr {}
-
-impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
-    fn index(&self) -> u32 {
-        self.inner.fail_index
-    }
-    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
-        Some(self)
-    }
-    fn clone_descr(&self) -> Option<DescrRef> {
-        Some(Arc::new(ResumeGuardCopiedExcDescr {
-            inner: ResumeGuardDescr {
-                fail_index: alloc_fail_index(),
-                types: self.inner.types.clone(),
-                resume_data: self.inner.resume_data.clone(),
-                vector_info: UnsafeCell::new(unsafe { (&*self.inner.vector_info.get()).clone() }),
-            },
-        }))
-    }
-}
-
-impl FailDescr for ResumeGuardCopiedExcDescr {
-    fn fail_index(&self) -> u32 {
-        self.inner.fail_index
-    }
-    fn fail_arg_types(&self) -> &[Type] {
-        &self.inner.types
-    }
-    fn attach_vector_info(&self, info: AccumInfo) {
-        push_vector_info(unsafe { &mut *self.inner.vector_info.get() }, info);
-    }
-    fn vector_info(&self) -> Vec<AccumInfo> {
-        flatten_vector_info(unsafe { (&*self.inner.vector_info.get()).as_deref() })
-    }
-}
-
-#[derive(Debug)]
-struct ResumeGuardForcedDescr {
-    inner: ResumeGuardDescr,
-}
-
-unsafe impl Send for ResumeGuardForcedDescr {}
-unsafe impl Sync for ResumeGuardForcedDescr {}
-
-impl majit_ir::Descr for ResumeGuardForcedDescr {
-    fn index(&self) -> u32 {
-        self.inner.fail_index
-    }
-    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
-        Some(self)
-    }
-    fn clone_descr(&self) -> Option<DescrRef> {
-        Some(Arc::new(ResumeGuardForcedDescr {
-            inner: ResumeGuardDescr {
-                fail_index: alloc_fail_index(),
-                types: self.inner.types.clone(),
-                resume_data: self.inner.resume_data.clone(),
-                vector_info: UnsafeCell::new(unsafe { (&*self.inner.vector_info.get()).clone() }),
-            },
-        }))
-    }
-}
-
-impl FailDescr for ResumeGuardForcedDescr {
-    fn fail_index(&self) -> u32 {
-        self.inner.fail_index
-    }
-    fn fail_arg_types(&self) -> &[Type] {
-        &self.inner.types
-    }
-    fn attach_vector_info(&self, info: AccumInfo) {
-        push_vector_info(unsafe { &mut *self.inner.vector_info.get() }, info);
-    }
-    fn vector_info(&self) -> Vec<AccumInfo> {
-        flatten_vector_info(unsafe { (&*self.inner.vector_info.get()).as_deref() })
-    }
-}
-
-pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
-    Arc::new(new_resume_guard_inner(types))
-}
-
-pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
-    Arc::new(ResumeGuardExcDescr {
-        inner: new_resume_guard_inner(types),
-    })
-}
-
-pub fn make_resume_guard_copied_descr_typed(types: Vec<Type>) -> DescrRef {
-    Arc::new(ResumeGuardCopiedDescr {
-        inner: new_resume_guard_inner(types),
-    })
-}
-
-pub fn make_resume_guard_copied_exc_descr_typed(types: Vec<Type>) -> DescrRef {
-    Arc::new(ResumeGuardCopiedExcDescr {
-        inner: new_resume_guard_inner(types),
-    })
-}
-
-pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
-    Arc::new(ResumeGuardForcedDescr {
-        inner: new_resume_guard_inner(types),
     })
 }
 
@@ -455,13 +232,18 @@ impl FailDescr for ResumeAtPositionDescr {
 /// empty resume data.
 pub fn make_resume_at_position_descr() -> DescrRef {
     Arc::new(ResumeAtPositionDescr {
-        inner: new_resume_guard_inner(Vec::new()),
-    })
-}
-
-pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
-    Arc::new(ResumeAtPositionDescr {
-        inner: new_resume_guard_inner(types),
+        inner: ResumeGuardDescr {
+            fail_index: alloc_fail_index(),
+            types: Vec::new(),
+            resume_data: ResumeData {
+                vable_array: Vec::new(),
+                vref_array: Vec::new(),
+                frames: Vec::new(),
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            },
+            vector_info: UnsafeCell::new(None),
+        },
     })
 }
 
@@ -548,54 +330,28 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
     Arc::new(CompileLoopVersionDescr {
         fail_index: alloc_fail_index(),
         types,
-        resume_data: empty_resume_data(),
+        resume_data: ResumeData {
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
+            frames: Vec::new(),
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        },
         // guard.py:91: descr.rd_vector_info = None
         vector_info: UnsafeCell::new(None),
     })
 }
 
-pub fn typed_guard_descr_for_op(opcode: OpCode, types: Vec<Type>) -> DescrRef {
-    match opcode {
-        OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
-            make_resume_guard_forced_descr_typed(types)
-        }
-        OpCode::GuardGcType | OpCode::GuardIsObject | OpCode::GuardSubclass => {
-            make_resume_at_position_descr_typed(types)
-        }
-        _ if opcode.is_guard_exception() => make_resume_guard_exc_descr_typed(types),
-        _ => make_resume_guard_descr_typed(types),
-    }
-}
-
-pub fn invent_fail_descr_for_op(opcode: OpCode, copied_from_descr: Option<&DescrRef>) -> DescrRef {
-    if matches!(opcode, OpCode::GuardNotForced | OpCode::GuardNotForced2) {
-        debug_assert!(
-            copied_from_descr.is_none(),
-            "invent_fail_descr_for_op: GUARD_NOT_FORCED* must not share resume descrs"
-        );
-    }
-    let types = copied_from_descr
-        .and_then(|descr| descr.as_fail_descr())
-        .map(|fd| fd.fail_arg_types().to_vec())
-        .unwrap_or_default();
-    match copied_from_descr {
-        Some(_) if opcode.is_guard_exception() => make_resume_guard_copied_exc_descr_typed(types),
-        Some(_) => make_resume_guard_copied_descr_typed(types),
-        None => typed_guard_descr_for_op(opcode, types),
-    }
-}
-
-pub fn finalize_guard_descr_for_op(
-    opcode: OpCode,
-    existing: Option<&DescrRef>,
-    types: Vec<Type>,
-) -> DescrRef {
-    if existing.is_some_and(|descr| descr.is_resume_at_position()) {
-        make_resume_at_position_descr_typed(types)
-    } else {
-        typed_guard_descr_for_op(opcode, types)
-    }
-}
+/// Extract resume data from a guard's FailDescr + MetaInterp's resume_data map.
+///
+/// The recommended pattern for resume data lookup:
+/// 1. The guard's FailDescr carries a unique `fail_index`
+/// 2. The MetaInterp stores `ResumeData` in a `HashMap<u32, ResumeData>`
+///    keyed by `fail_index`
+/// 3. On guard failure, look up `fail_index` in the map
+///
+/// This matches RPython's approach where `ResumeGuardDescr` points to
+/// snapshot data stored alongside the compiled loop.
 
 #[cfg(test)]
 mod tests {

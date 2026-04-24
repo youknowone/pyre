@@ -2019,7 +2019,16 @@ impl RegAlloc {
         output: &mut Vec<RegAllocOp>,
     ) {
         self.flush_moves(output);
-        let gcmap = self.get_gcmap(&[], false) as usize;
+        // aarch64/regalloc.py:970 prepare_op_call_malloc_nursery:
+        //   `gcmap = self.get_gcmap([r.x0, r.x1])`
+        // The malloc-nursery clobber regs are the result register plus a
+        // scratch temp — both are reserved for the slow-path convention
+        // (x0 = total_size in, allocated pointer out) and cannot carry a
+        // Ref spill through the collecting call. Excluding them from the
+        // bitmap prevents the collector from reading garbage out of
+        // jitframe slots 0/1 during `do_collect_nursery`.
+        let gcmap =
+            self.get_gcmap(&crate::aarch64::regalloc::MALLOC_NURSERY_CLOBBER, false) as usize;
         output.push(RegAllocOp::Perform {
             op_index,
             arglocs,

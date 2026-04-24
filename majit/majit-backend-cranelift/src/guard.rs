@@ -11,7 +11,7 @@
 use crate::compiler::{register_gc_roots, unregister_gc_roots};
 use majit_backend::{CompiledTraceInfo, ExitRecoveryLayout, FailDescrLayout, TerminalExitLayout};
 use majit_gc::GcMap;
-use majit_ir::{AccumInfo, DescrRef, FailDescr, GcRef, Type};
+use majit_ir::{AccumInfo, Const, DescrRef, FailDescr, GcRef, Type};
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -165,7 +165,7 @@ pub struct CraneliftFailDescr {
     /// remains reachable via its backend-side handle.
     pub rd_numb: Option<Vec<u8>>,
     /// resume.py:451 — shared constant pool referenced by `rd_numb`.
-    pub rd_consts: Option<Vec<(i64, Type)>>,
+    pub rd_consts: Option<Vec<Const>>,
     /// resume.py:488 — virtual object field info referenced by `rd_numb`.
     pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
     /// Deferred heap writes associated with this guard exit.

@@ -63,7 +63,81 @@ pub fn install_current_frame(frame: &mut PyFrame) -> CurrentFrameGuard {
         current.set(frame as *mut PyFrame);
         previous
     });
+    // executioncontext.py `enter()` parity: link the frame into the
+    // f_backref chain so walkers (GC roots, sys._getframe) can iterate
+    // all active frames. `eval_frame_plain` still calls
+    // `ExecutionContext::enter` which performs the same assignment; JIT
+    // path (`pyre-jit::eval::eval_with_jit`) relies on this helper.
+    frame.f_backref = previous;
     CurrentFrameGuard { previous }
+}
+
+/// rpython/memory/gctransform/framework.py `root_walker.walk_roots` parity:
+/// expose every live slot of `PyFrame.locals_cells_stack_w` on the active
+/// f_backref chain as a GC root.
+///
+/// pyre's JIT-compiled code allocates W_IntObject / result boxes into the
+/// nursery (`NewWithVtable` → `gc_alloc_typed_nursery_shim`). When the
+/// nursery fills and a minor collection runs, only registered roots are
+/// forwarded — unforwarded nursery refs become stale after
+/// `Nursery::reset` zero-fills the region. The interpreter stores live
+/// refs in `PyFrame.locals_cells_stack_w`; without this walker those
+/// slots turn into NULL-`ob_type` stale pointers on the next LOAD_FAST
+/// (reproduced by `inline_helper` n >= 10000).
+///
+/// Walks 0..`valuestackdepth` entries because that range covers both
+/// the always-live locals+cells prefix (slots `0..nlocals+ncells`,
+/// written once at frame setup) and the operand stack region
+/// (`nlocals+ncells..valuestackdepth`). Dead stack slots past
+/// `valuestackdepth` are skipped.
+fn walk_pyframe_roots(visitor: &mut dyn FnMut(&mut majit_ir::GcRef)) {
+    CURRENT_FRAME.with(|cf| {
+        let mut frame = cf.get();
+        while !frame.is_null() {
+            // SAFETY: PyFrame pointers on the f_backref chain are valid
+            // for the duration of the enclosing `eval_with_jit` call. A
+            // minor collection is always synchronous with respect to the
+            // interpreter thread, so frames cannot be dropped mid-walk.
+            //
+            // We walk the FULL fixed-length array (not just the live
+            // `valuestackdepth` prefix). Argument values in transit —
+            // popped from the caller's stack before the callee frame
+            // is installed — are briefly invisible from `valuestackdepth`
+            // alone, yet still reachable from the popped-slot storage.
+            // Non-ref slots are filtered by `is_nursery_object_start`
+            // inside the collector, so walking past the live depth is
+            // harmless for the bump-pointer nursery.
+            let (arr_ptr, depth) = unsafe {
+                let f = &*frame;
+                if f.locals_cells_stack_w.is_null() {
+                    (std::ptr::null_mut::<PyObjectRef>(), 0)
+                } else {
+                    let arr = &*f.locals_cells_stack_w;
+                    (arr.items_ptr() as *mut PyObjectRef, arr.len())
+                }
+            };
+            if !arr_ptr.is_null() && depth > 0 {
+                for i in 0..depth {
+                    let slot_ptr = unsafe { arr_ptr.add(i) } as *mut majit_ir::GcRef;
+                    // SAFETY: slot lies inside the FixedObjectArray's
+                    // heap allocation, which outlives the frame. The
+                    // visitor reads, conditionally forwards, and stores
+                    // back a `GcRef` (same layout as `*mut PyObject`).
+                    visitor(unsafe { &mut *slot_ptr });
+                }
+            }
+            frame = unsafe { (*frame).f_backref };
+        }
+    });
+}
+
+/// Install the PyFrame GC root walker with the majit-gc collector.
+///
+/// Called once at process startup from the JIT driver / pyrex main.
+/// Stored in a per-thread slot; calling again with the same fn pointer
+/// is idempotent.
+pub fn register_pyframe_root_walker() {
+    majit_gc::set_active_extra_root_walker(Some(walk_pyframe_roots));
 }
 
 pub fn get_current_exception() -> PyObjectRef {

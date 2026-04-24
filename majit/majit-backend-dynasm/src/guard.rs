@@ -8,7 +8,7 @@ use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use majit_backend::ExitRecoveryLayout;
-use majit_ir::{Descr, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type};
+use majit_ir::{Const, Descr, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type};
 
 /// Re-export the shared per-cpu descr attachment types so existing
 /// `crate::guard::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrHandle}`
@@ -44,10 +44,8 @@ pub struct DynasmFailDescr {
     /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
     pub rd_numb: Option<Vec<u8>>,
     /// resume.py:451 — shared constant pool referenced by rd_numb.
-    pub rd_consts: Option<Vec<(i64, Type)>>,
-    /// resume.py:488 — virtual object field info. Entries are
-    /// `Rc<RdVirtualInfo>` so cache-hit dedup at resume.py:307-315 preserves
-    /// object identity across guard boundaries.
+    pub rd_consts: Option<Vec<Const>>,
+    /// resume.py:488 — virtual object field info.
     pub rd_virtuals: Option<Vec<std::rc::Rc<RdVirtualInfo>>>,
     /// Deferred heap writes (SETFIELD_GC/SETARRAYITEM_GC with virtual values).
     pub rd_pendingfields: Option<Vec<GuardPendingFieldEntry>>,

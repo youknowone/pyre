@@ -5053,9 +5053,40 @@ impl AssemblerARM64 {
             ; b =>done
         );
 
-        // Slow path: aarch64/assembler.py:707-713 parity.
-        // push_gcmap(store=True) → call malloc_slowpath → pop_gcmap
+        // Slow path: aarch64/assembler.py:605-676 `_build_malloc_slowpath` parity.
+        //
+        // Before calling `dynasm_nursery_slowpath` (which may trigger a
+        // minor collection) we must spill every managed register holding a
+        // live Ref into its canonical jitframe slot. `gcmap` identifies
+        // those slots by the same register-index table that
+        // `get_gcmap` writes bits from (`core_reg_index`:
+        //   x0..x13 → slots 0..13, x19 → 14, x20 → 15).
+        //
+        // Without this spill the GC walks `jf_frame` slots 0..15 (per
+        // gcmap bits), finds garbage, and returns with live Refs in CPU
+        // registers left pointing into the pre-collection nursery. A
+        // subsequent guard then captures those stale pointers into its
+        // deadframe and the blackhole decoder crashes when reading the
+        // freed object (observed in fib_recursive: `bh_binary_op_fn` gets
+        // an int object with `ob_type=NULL` after minor GC).
+        //
+        // Matches RPython's `_push_all_regs_to_jitframe(mc, [r.x0, r.x1], True)`
+        // before the `BL` and `_pop_all_regs_from_jitframe(mc, [r.x0, r.x1], ...)` after.
+        // x0 is the total_size argument / return pointer; x1 is an internal
+        // temp that regalloc already guarantees doesn't hold a live Ref at
+        // the malloc site (see `MALLOC_NURSERY_CLOBBER`).
         dynasm!(self.mc ; .arch aarch64 ; =>slow_path);
+        let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
+        // Save x2..x13 to slots 2..13 (x0/x1 excluded per ignored_regs).
+        dynasm!(self.mc ; .arch aarch64
+            ; stp x2, x3, [x29, base_ofs + 2 * 8]
+            ; stp x4, x5, [x29, base_ofs + 4 * 8]
+            ; stp x6, x7, [x29, base_ofs + 6 * 8]
+            ; stp x8, x9, [x29, base_ofs + 8 * 8]
+            ; stp x10, x11, [x29, base_ofs + 10 * 8]
+            ; stp x12, x13, [x29, base_ofs + 12 * 8]
+            ; stp x19, x20, [x29, base_ofs + 14 * 8]
+        );
         // assembler.py:649-650: store gcmap to jf_gcmap so the collector
         // can trace live Refs pinned to frame slots during the slow-path
         // allocator call. The gcmap was captured at regalloc time in
@@ -5075,6 +5106,18 @@ impl AssemblerARM64 {
         // pop_gcmap: clear jf_gcmap after collecting call
         let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS as u32;
         dynasm!(self.mc ; .arch aarch64 ; str xzr, [x29, gcmap_ofs]);
+        // Restore x2..x13, x19, x20 from jitframe slots (GC may have
+        // updated the stored pointers). x0 keeps the allocated payload ptr.
+        let base_ofs_r = crate::jitframe::FIRST_ITEM_OFFSET as i32;
+        dynasm!(self.mc ; .arch aarch64
+            ; ldp x2, x3, [x29, base_ofs_r + 2 * 8]
+            ; ldp x4, x5, [x29, base_ofs_r + 4 * 8]
+            ; ldp x6, x7, [x29, base_ofs_r + 6 * 8]
+            ; ldp x8, x9, [x29, base_ofs_r + 8 * 8]
+            ; ldp x10, x11, [x29, base_ofs_r + 10 * 8]
+            ; ldp x12, x13, [x29, base_ofs_r + 12 * 8]
+            ; ldp x19, x20, [x29, base_ofs_r + 14 * 8]
+        );
 
         dynasm!(self.mc ; .arch aarch64 ; =>done);
     }

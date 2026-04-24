@@ -1,3 +1,4 @@
+use majit_ir::Const;
 use majit_metainterp::resume::{
     FrameInfo, FrameSlotSource, ReconstructedValue, ResumeData, VirtualFieldSource, VirtualInfo,
 };
@@ -24,8 +25,8 @@ fn resume_py_public_encoding_uses_tagged_numbering() {
             pc: 123,
             slot_map: vec![
                 FrameSlotSource::FailArg(0),
-                FrameSlotSource::Constant(7),
-                FrameSlotSource::Constant(large_const),
+                FrameSlotSource::Constant(Const::Int(7)),
+                FrameSlotSource::Constant(Const::Int(large_const)),
                 FrameSlotSource::Virtual(0),
                 FrameSlotSource::Uninitialized,
                 FrameSlotSource::Unavailable,
@@ -35,14 +36,14 @@ fn resume_py_public_encoding_uses_tagged_numbering() {
             arraydescr: None,
             descr_index: 9,
             clear: false,
-            items: vec![VirtualFieldSource::Constant(large_const)],
+            items: vec![VirtualFieldSource::Constant(Const::Int(large_const))],
         }],
         pending_fields: Vec::new(),
     };
 
     let encoded = rd.encode();
     assert_eq!(encoded.rd_numb[0] as usize, encoded.rd_numb.len());
-    assert_eq!(encoded.rd_consts, vec![large_const]);
+    assert_eq!(encoded.rd_consts, vec![Const::Int(large_const)]);
     // Header layout (resume.py:231-253):
     // [size, count, vable_array_len, vref_array_len, jitcode_index, pc, ...slots]
     // rd_numb[1] = count: 1 livebox (FailArg(0) in frame slot)
@@ -67,7 +68,7 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
             pc: 77,
             slot_map: vec![
                 FrameSlotSource::FailArg(0),
-                FrameSlotSource::Constant(42),
+                FrameSlotSource::Constant(Const::Int(42)),
                 FrameSlotSource::Virtual(0),
                 FrameSlotSource::Unavailable,
             ],
@@ -79,7 +80,7 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
             known_class: None,
             fields: vec![
                 (0, VirtualFieldSource::FailArg(1)),
-                (1, VirtualFieldSource::Constant(99)),
+                (1, VirtualFieldSource::Constant(Const::Int(99))),
             ],
             fielddescrs: vec![],
             descr_size: 0,
@@ -87,7 +88,7 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
         pending_fields: vec![majit_metainterp::resume::PendingFieldInfo {
             descr_index: 5,
             target: FrameSlotSource::FailArg(0),
-            value: FrameSlotSource::Constant(123),
+            value: FrameSlotSource::Constant(Const::Int(123)),
             item_index: Some(2),
         }],
     };
@@ -146,7 +147,10 @@ fn resume_py_count_includes_virtual_and_pending_field_failargs() {
         frames: vec![FrameInfo {
             jitcode_index: 0,
             pc: 10,
-            slot_map: vec![FrameSlotSource::FailArg(0), FrameSlotSource::Constant(42)],
+            slot_map: vec![
+                FrameSlotSource::FailArg(0),
+                FrameSlotSource::Constant(Const::Int(42)),
+            ],
         }],
         virtuals: vec![VirtualInfo::VirtualObj {
             descr: None,
@@ -206,7 +210,7 @@ fn resume_py_compact_liveboxes_numbering() {
             slot_map: vec![
                 FrameSlotSource::FailArg(0),
                 FrameSlotSource::FailArg(7),
-                FrameSlotSource::Constant(42),
+                FrameSlotSource::Constant(Const::Int(42)),
             ],
         }],
         virtuals: vec![],

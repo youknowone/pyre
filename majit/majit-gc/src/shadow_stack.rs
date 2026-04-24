@@ -557,6 +557,76 @@ pub fn bh_regs_depth() -> usize {
     BH_REGS_STACK.with(|ss| ss.borrow().len())
 }
 
+// ── Extra root walkers registered by the embedder ───────────────
+//
+// rpython/memory/gctransform/framework.py `root_walker.walk_roots` parity:
+// RPython registers GcRootMap sources (shadow stack, thread-local refs,
+// jitframes, stack roots) once during setup; at collection time, the GC
+// iterates all registered sources.
+//
+// pyre's interpreter holds live GC refs in `PyFrame.locals_cells_stack_w`
+// and must register a walker for that storage from outside majit-gc
+// (a crate-level upward dependency would cycle). The hook lets any
+// embedder (pyre-interpreter, pyre-jit) plug a callback that the
+// collector will call during `Phase 1e` of `do_collect_nursery`.
+
+/// Signature expected by `register_extra_root_walker`.
+///
+/// The registered function receives an opaque visitor that must be
+/// invoked once per GC root slot. Each slot is exposed as
+/// `&mut GcRef`; writing back through the reference forwards the
+/// root if the GC moved the referenced object.
+pub type ExtraRootWalkerFn = fn(&mut dyn FnMut(&mut GcRef));
+
+const MAX_EXTRA_ROOT_WALKERS: usize = 8;
+
+/// Registered root walkers. Each slot is either `None` or a function
+/// pointer. We cap the count to keep the set stack-allocatable and
+/// avoid dynamic allocation in the GC hot path.
+static EXTRA_ROOT_WALKERS: std::sync::RwLock<[Option<ExtraRootWalkerFn>; MAX_EXTRA_ROOT_WALKERS]> =
+    std::sync::RwLock::new([None; MAX_EXTRA_ROOT_WALKERS]);
+
+/// Register an additional root walker.
+///
+/// Called at process start (or module init) by the embedder once per
+/// root source. Duplicate registrations are tolerated — the walker is
+/// only appended if not already present.
+pub fn register_extra_root_walker(walker: ExtraRootWalkerFn) {
+    let mut guard = EXTRA_ROOT_WALKERS.write().unwrap();
+    for slot in guard.iter_mut() {
+        match slot {
+            Some(existing) if std::ptr::fn_addr_eq(*existing, walker) => return,
+            None => {
+                *slot = Some(walker);
+                return;
+            }
+            _ => {}
+        }
+    }
+    panic!(
+        "register_extra_root_walker: capacity exceeded ({} walkers already registered)",
+        MAX_EXTRA_ROOT_WALKERS
+    );
+}
+
+/// Invoke every registered extra root walker with the given visitor.
+///
+/// Called by `MiniMarkGC::do_collect_nursery` (Phase 1e).
+pub fn walk_extra_roots(mut visitor: impl FnMut(&mut GcRef)) {
+    // Snapshot the walker list under a read guard so a walker that
+    // triggers further allocation (and recursively a collection) does
+    // not observe the lock held in write mode.
+    let walkers = {
+        let guard = EXTRA_ROOT_WALKERS.read().unwrap();
+        *guard
+    };
+    for slot in walkers.iter() {
+        if let Some(walker) = slot {
+            walker(&mut visitor);
+        }
+    }
+}
+
 // ── Extern "C" interface for compiled code ──────────────────────
 
 /// Push a GC reference from compiled code.

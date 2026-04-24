@@ -235,69 +235,67 @@ impl IndexMut<usize> for PyObjectArray {
 // ─── FixedObjectArray: pyframe.py:112 make_sure_not_resized parity ────────
 //
 // RPython `locals_cells_stack_w = [None] * size; make_sure_not_resized(...)`
-// becomes a fixed-length GcArray. This type mirrors that: len is immutable
-// after creation, no push/grow/spare_capacity.
+// becomes a fixed-length GcArray (`Ptr(GcArray(PyObjectRef))`). The layout
+// here matches that upstream shape so `GETFIELD_GC_R(frame, locals_cells_stack)
+// + GETARRAYITEM_GC_R(array_ptr, i)` means the same thing in both worlds:
+// single-indirection, items immediately after the length header.
+//
+// Layout: `[len: usize] [items: PyObjectRef; len]` (variable-length,
+// flexible-array tail). Allocation happens via a custom `Layout` at the
+// caller site (see `pyre_interpreter::pyframe::alloc_fixed_array_with_header`).
 
-/// Offset of `ptr` within `FixedObjectArray`.
-pub const FIXED_ARRAY_PTR_OFFSET: usize = std::mem::offset_of!(FixedObjectArray, ptr);
+/// Offset of the length prefix within `FixedObjectArray` (always 0).
+pub const FIXED_ARRAY_LEN_OFFSET: usize = 0;
 
-/// Offset of `len` within `FixedObjectArray`.
-pub const FIXED_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(FixedObjectArray, len);
+/// Offset of the first item within `FixedObjectArray` (immediately after
+/// the length prefix). The JIT-visible array descriptor uses this as
+/// `base_size` so `GETARRAYITEM_GC_*` reads items directly.
+pub const FIXED_ARRAY_ITEMS_OFFSET: usize = std::mem::size_of::<usize>();
 
 /// pyframe.py:110-112: fixed-length GcArray for `locals_cells_stack_w`.
 ///
 /// Once created, the length never changes. No push, no grow.
 /// Items are mutable (stack operations write via index) but the
 /// array cannot be resized.
+///
+/// `_items` is a zero-sized flexible-array marker: the real items live
+/// immediately after `len` in the allocation, accessed via pointer
+/// arithmetic through `items_ptr` / `as_slice`.
 #[repr(C)]
 pub struct FixedObjectArray {
-    /// Raw pointer to heap-allocated storage. JIT reads at offset 0.
-    pub ptr: *mut PyObjectRef,
-    /// Fixed length (== allocation capacity).
-    len: usize,
+    /// Length prefix. Matches RPython `Ptr(GcArray(T))` header so that
+    /// the JIT's arraydescr `base_size = FIXED_ARRAY_ITEMS_OFFSET` lands
+    /// on items[0].
+    pub len: usize,
+    /// Flexible-array tail marker. Actual items follow immediately in
+    /// memory (sized to `len` at allocation time); this field has size 0.
+    _items: [PyObjectRef; 0],
 }
 
 impl FixedObjectArray {
-    /// pyframe.py:110: `[None] * size`
-    pub fn filled(len: usize, value: PyObjectRef) -> Self {
-        if len == 0 {
-            return Self {
-                ptr: std::ptr::NonNull::dangling().as_ptr(),
-                len: 0,
-            };
-        }
-        let storage = vec![value; len];
-        let mut boxed = storage.into_boxed_slice();
-        let ptr = boxed.as_mut_ptr();
-        std::mem::forget(boxed);
-        Self { ptr, len }
-    }
-
-    pub fn from_vec(values: Vec<PyObjectRef>) -> Self {
-        if values.is_empty() {
-            return Self {
-                ptr: std::ptr::NonNull::dangling().as_ptr(),
-                len: 0,
-            };
-        }
-        let mut boxed = values.into_boxed_slice();
-        let len = boxed.len();
-        let ptr = boxed.as_mut_ptr();
-        std::mem::forget(boxed);
-        Self { ptr, len }
-    }
-
     #[inline]
     pub fn len(&self) -> usize {
         self.len
     }
 
+    #[inline]
+    pub fn items_ptr(&self) -> *const PyObjectRef {
+        unsafe {
+            (self as *const Self as *const u8).add(FIXED_ARRAY_ITEMS_OFFSET) as *const PyObjectRef
+        }
+    }
+
+    #[inline]
+    pub fn items_mut_ptr(&mut self) -> *mut PyObjectRef {
+        unsafe { (self as *mut Self as *mut u8).add(FIXED_ARRAY_ITEMS_OFFSET) as *mut PyObjectRef }
+    }
+
     pub fn as_slice(&self) -> &[PyObjectRef] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        unsafe { std::slice::from_raw_parts(self.items_ptr(), self.len) }
     }
 
     pub fn as_mut_slice(&mut self) -> &mut [PyObjectRef] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
+        unsafe { std::slice::from_raw_parts_mut(self.items_mut_ptr(), self.len) }
     }
 
     pub fn to_vec(&self) -> Vec<PyObjectRef> {
@@ -309,28 +307,18 @@ impl FixedObjectArray {
     }
 }
 
-impl Drop for FixedObjectArray {
-    fn drop(&mut self) {
-        if self.len > 0 && !self.ptr.is_null() {
-            unsafe {
-                drop(Vec::from_raw_parts(self.ptr, self.len, self.len));
-            }
-        }
-    }
-}
-
 impl Index<usize> for FixedObjectArray {
     type Output = PyObjectRef;
     #[inline]
     fn index(&self, index: usize) -> &Self::Output {
-        unsafe { &*self.ptr.add(index) }
+        &self.as_slice()[index]
     }
 }
 
 impl IndexMut<usize> for FixedObjectArray {
     #[inline]
     fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        unsafe { &mut *self.ptr.add(index) }
+        &mut self.as_mut_slice()[index]
     }
 }
 

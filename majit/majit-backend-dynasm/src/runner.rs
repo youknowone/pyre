@@ -1141,6 +1141,13 @@ impl Backend for DynasmBackend {
         let jf_ptr = unsafe { libc::calloc(1, JitFrame::alloc_size(num_slots)) as *mut JitFrame };
         assert!(!jf_ptr.is_null(), "execute_token_ints_raw: calloc failed");
         unsafe { JitFrame::init(jf_ptr, std::ptr::null(), num_slots) };
+        // Same registration as `execute_token` above: the libc-allocated
+        // jitframe must be visible to the minor-collection walker so its
+        // `jf_gcmap`-marked Ref slots get traced during
+        // CallMallocNursery-triggered collections. Without this the
+        // inner-loop jitframe's live Refs go un-updated and later guard
+        // deadframes read stale (freed-nursery) pointers.
+        majit_gc::shadow_stack::register_libc_jitframe(jf_ptr as usize);
 
         for (i, &val) in args.iter().enumerate() {
             unsafe { crate::llmodel::set_int_value(jf_ptr, Self::input_slot(i), val as isize) };

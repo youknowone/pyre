@@ -1096,7 +1096,9 @@ mod tests {
             jc.constants_f = vec![1.5f64.to_bits() as i64];
         }
         let sd = Arc::new(crate::MetaInterpStaticData::new());
-        let mut ctx = crate::trace_ctx::TraceCtx::new_with_input_types(&[Type::Int], 0, sd);
+        let mut recorder = crate::recorder::Trace::new();
+        let _ = recorder.record_input_arg(Type::Int);
+        let mut ctx = crate::trace_ctx::TraceCtx::new(recorder, 0, sd);
 
         let frame = MIFrame::setup(jitcode, 7, Some(0xfeed), Some(&mut ctx));
 

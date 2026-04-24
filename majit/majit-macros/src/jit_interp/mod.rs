@@ -132,8 +132,19 @@ pub struct VableArrayDecl {
 
 /// Layout description for a virtualizable array field.
 pub enum VableArrayLayoutDecl {
-    /// Direct pointer field: the virtualizable stores a pointer to the array.
-    Direct { field_offset: Expr },
+    /// Direct pointer field: the virtualizable stores a pointer to the
+    /// array object. `length_offset` and `items_offset` describe where,
+    /// relative to that pointer, the length prefix and items begin.
+    /// Matches RPython `Ptr(GcArray(T))`: `length_offset = 0`,
+    /// `items_offset = size_of::<usize>()` (8 on 64-bit).
+    ///
+    /// `None` defaults to `0` for back-compat with pointer-to-items shapes
+    /// where items sit directly at the field pointer.
+    Direct {
+        field_offset: Expr,
+        length_offset: Option<Expr>,
+        items_offset: Option<Expr>,
+    },
     /// Embedded container layout: pointer/length live in sibling fields or
     /// an inline container relative to the declared field offset.
     Embedded {
@@ -528,29 +539,36 @@ fn parse_virtualizable_decl(input: ParseStream) -> syn::Result<VirtualizableDecl
                             }
                             let _ = layout_content.parse::<Token![,]>();
                         }
-                        VableArrayLayoutDecl::Embedded {
-                            field_offset,
-                            ptr_offset: ptr_offset.ok_or_else(|| {
-                                syn::Error::new(
-                                    inner.span(),
-                                    "missing `ptr_offset` in embedded virtualizable array layout",
-                                )
-                            })?,
-                            length_offset: length_offset.ok_or_else(|| {
-                                syn::Error::new(
-                                    inner.span(),
-                                    "missing `length_offset` in embedded virtualizable array layout",
-                                )
-                            })?,
-                            items_offset: items_offset.ok_or_else(|| {
-                                syn::Error::new(
-                                    inner.span(),
-                                    "missing `items_offset` in embedded virtualizable array layout",
-                                )
-                            })?,
+                        if let Some(ptr_offset) = ptr_offset {
+                            VableArrayLayoutDecl::Embedded {
+                                field_offset,
+                                ptr_offset,
+                                length_offset: length_offset.ok_or_else(|| {
+                                    syn::Error::new(
+                                        inner.span(),
+                                        "missing `length_offset` in embedded virtualizable array layout",
+                                    )
+                                })?,
+                                items_offset: items_offset.ok_or_else(|| {
+                                    syn::Error::new(
+                                        inner.span(),
+                                        "missing `items_offset` in embedded virtualizable array layout",
+                                    )
+                                })?,
+                            }
+                        } else {
+                            VableArrayLayoutDecl::Direct {
+                                field_offset,
+                                length_offset,
+                                items_offset,
+                            }
                         }
                     } else {
-                        VableArrayLayoutDecl::Direct { field_offset }
+                        VableArrayLayoutDecl::Direct {
+                            field_offset,
+                            length_offset: None,
+                            items_offset: None,
+                        }
                     };
                     arrays.push(VableArrayDecl {
                         name,
@@ -1074,8 +1092,14 @@ mod tests {
         let parsed = syn::parse2::<VirtualizableWrapper>(tokens).unwrap().0;
         assert_eq!(parsed.arrays.len(), 1);
         match &parsed.arrays[0].layout {
-            VableArrayLayoutDecl::Direct { field_offset } => {
+            VableArrayLayoutDecl::Direct {
+                field_offset,
+                length_offset,
+                items_offset,
+            } => {
                 assert_eq!(quote::quote!(#field_offset).to_string(), "LOCALS_OFFSET");
+                assert!(length_offset.is_none());
+                assert!(items_offset.is_none());
             }
             VableArrayLayoutDecl::Embedded { .. } => {
                 panic!("expected direct array layout");

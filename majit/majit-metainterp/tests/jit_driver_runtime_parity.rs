@@ -1656,9 +1656,9 @@ fn declarative_driver_guard_failure_restores_from_reconstructed_resume_frame() {
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 444);
-    resume.set_slot_constant(0, frame_ptr as i64);
+    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
     resume.map_slot(1, 0);
-    resume.set_slot_constant(2, 99);
+    resume.set_slot_constant(2, majit_ir::Const::Int(99));
     driver
         .meta_interp_mut()
         .attach_resume_data(444, 1, resume.build());
@@ -1694,7 +1694,10 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
         None,
         0,
         7,
-        vec![(3, majit_metainterp::resume::ResumeValueSource::Constant(55))],
+        vec![(
+            3,
+            majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(55)),
+        )],
         vec![],
         0,
     );
@@ -1731,7 +1734,10 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
         None,
         0,
         10,
-        vec![(0, majit_metainterp::resume::ResumeValueSource::Constant(77))],
+        vec![(
+            0,
+            majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(77)),
+        )],
         vec![],
         0,
     );
@@ -1745,7 +1751,10 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
                 0,
                 majit_metainterp::resume::ResumeValueSource::Virtual(inner),
             ),
-            (1, majit_metainterp::resume::ResumeValueSource::Constant(99)),
+            (
+                1,
+                majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(99)),
+            ),
         ],
         vec![],
         0,
@@ -1828,12 +1837,14 @@ fn declarative_driver_guard_failure_replays_pending_field_writes() {
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 666);
-    resume.set_slot_constant(0, state.obj as i64);
+    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(state.obj as usize)));
     resume.map_slot(1, 0);
     resume.add_pending_field_write(
         9,
-        majit_metainterp::resume::ResumeValueSource::Constant(state.obj as i64),
-        majit_metainterp::resume::ResumeValueSource::Constant(77),
+        majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Ref(GcRef(
+            state.obj as usize,
+        ))),
+        majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(77)),
     );
     driver
         .meta_interp_mut()
@@ -1863,13 +1874,15 @@ fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 888);
-    resume.set_slot_constant(0, state.array as i64);
+    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(state.array as usize)));
     resume.map_slot(1, 0);
     resume.add_pending_arrayitem_write(
         12,
-        majit_metainterp::resume::ResumeValueSource::Constant(state.array as i64),
+        majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Ref(GcRef(
+            state.array as usize,
+        ))),
         1,
-        majit_metainterp::resume::ResumeValueSource::Constant(88),
+        majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(88)),
     );
     driver
         .meta_interp_mut()
@@ -1899,10 +1912,10 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_resume_state() {
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 100);
-    resume.set_slot_constant(0, frame_ptr as i64);
-    resume.set_slot_constant(1, 1);
+    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
+    resume.set_slot_constant(1, majit_ir::Const::Int(1));
     resume.push_frame(0, 200);
-    resume.set_slot_constant(0, frame_ptr as i64);
+    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
     resume.map_slot(1, 0);
     driver
         .meta_interp_mut()
@@ -1939,7 +1952,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_fr
     resume.push_frame(0, 300);
     let virtual_index = resume.add_virtual_struct(None, 0, 55, vec![], vec![], 0);
     resume.set_slot_virtual(0, virtual_index);
-    resume.set_slot_constant(1, 1);
+    resume.set_slot_constant(1, majit_ir::Const::Int(1));
     resume.push_frame(0, 400);
     resume.set_slot_virtual(0, virtual_index);
     resume.map_slot(1, 0);
@@ -1983,14 +1996,14 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
     resume.push_frame(0, 500);
     let virtual_index = resume.add_virtual_struct(None, 0, 56, vec![], vec![], 0);
     resume.set_slot_virtual(0, virtual_index);
-    resume.set_slot_constant(1, 1);
+    resume.set_slot_constant(1, majit_ir::Const::Int(1));
     resume.push_frame(0, 600);
     resume.set_slot_virtual(0, virtual_index);
     resume.map_slot(1, 0);
     resume.add_pending_field_write(
         31,
         majit_metainterp::resume::ResumeValueSource::Virtual(virtual_index),
-        majit_metainterp::resume::ResumeValueSource::Constant(77),
+        majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(77)),
     );
     driver
         .meta_interp_mut()
@@ -2022,7 +2035,7 @@ fn declarative_driver_guard_failure_uses_resume_layout_slot_types_for_generic_re
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 780);
-    resume.set_slot_constant(0, frame_ptr as i64);
+    resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(frame_ptr as usize)));
     resume.map_slot(1, 0);
     driver
         .meta_interp_mut()

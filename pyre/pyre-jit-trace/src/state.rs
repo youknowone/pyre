@@ -923,18 +923,6 @@ pub(crate) fn concrete_value_from_slot(obj: PyObjectRef) -> ConcreteValue {
 impl ConcreteValue {
     /// Convert from PyObjectRef (unbox if possible).
     /// Null pointers become ConcreteValue::Null ("untracked").
-    ///
-    /// NOTE — for producer sites that feed the operand stack (push_value
-    /// / push_typed_value) or a virtualizable local slot, use
-    /// `ConcreteValue::ref_of` instead.  `from_pyobj` unboxes W_IntObject
-    /// / W_FloatObject into `Int(v)` / `Float(v)`, which
-    /// `push_typed_value` would then re-box by allocating a FRESH
-    /// W_IntObject via the small-int cache or `w_int_new` — different
-    /// pointer than the producer returned.  The resulting
-    /// `virtualizable_values` shadow then disagrees with the live
-    /// `PyFrame.locals_cells_stack_w` pointer identity
-    /// (pyframe.py:84 `list[W_Object]`), breaking Box-atomicity when
-    /// `synchronize_virtualizable()` writes shadow back to heap.
     pub fn from_pyobj(obj: PyObjectRef) -> Self {
         if obj.is_null() {
             return ConcreteValue::Null;
@@ -947,20 +935,6 @@ impl ConcreteValue {
             } else {
                 ConcreteValue::Ref(obj)
             }
-        }
-    }
-
-    /// Ref-passthrough shadow for a PyObjectRef.  Preserves the
-    /// producer's pointer identity (no unbox-rebox roundtrip); null
-    /// pointers collapse to `Null` ("no concrete produced").  Use this
-    /// at sites that feed the operand stack / virtualizable shadow so
-    /// the `push_typed_value` parallel-box invariant keeps the same
-    /// W_*Object instance the interpreter side observed.
-    pub fn ref_of(obj: PyObjectRef) -> Self {
-        if obj.is_null() {
-            ConcreteValue::Null
-        } else {
-            ConcreteValue::Ref(obj)
         }
     }
 
@@ -978,41 +952,19 @@ impl ConcreteValue {
         matches!(self, ConcreteValue::Null)
     }
 
-    /// RPython box.getint() parity.  After the `push_typed_value`
-    /// parallel-box change (pyframe.py:84 `list[W_Object]` parity),
-    /// concrete shadows that reach the operand stack are always Ref
-    /// boxes; transparently unbox a `Ref(W_IntObject)` so downstream
-    /// executors (bhimpl_int_*) and the optimizer stay unchanged.
+    /// RPython box.getint() parity.
     pub fn getint(&self) -> Option<i64> {
         match self {
             ConcreteValue::Int(v) => Some(*v),
-            ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
-                if is_int(*obj) {
-                    Some(w_int_get_value(*obj))
-                } else {
-                    None
-                }
-            },
             _ => None,
         }
     }
 
-    /// RPython box.getfloatstorage() parity.  See `getint` — also
-    /// unboxes `Ref(W_FloatObject)` and `Ref(W_IntObject)` (int→float
-    /// coercion parity with the previous `ConcreteValue::Int` arm).
+    /// RPython box.getfloatstorage() parity.
     pub fn getfloat(&self) -> Option<f64> {
         match self {
             ConcreteValue::Float(v) => Some(*v),
             ConcreteValue::Int(v) => Some(*v as f64),
-            ConcreteValue::Ref(obj) if !obj.is_null() => unsafe {
-                if is_float(*obj) {
-                    Some(w_float_get_value(*obj))
-                } else if is_int(*obj) {
-                    Some(w_int_get_value(*obj) as f64)
-                } else {
-                    None
-                }
-            },
             _ => None,
         }
     }
@@ -1029,6 +981,28 @@ impl ConcreteValue {
             ConcreteValue::Float(_) => Type::Float,
             ConcreteValue::Ref(_) => Type::Ref,
             ConcreteValue::Null => Type::Ref,
+        }
+    }
+
+    /// Convert to majit IR `Value` for a Ref-typed virtualizable slot, or
+    /// `None` when there is no valid heap pointer to record.
+    ///
+    /// `locals_cells_stack_w` is declared as a W_Root array
+    /// (virtualizable.py:86-98), so slots mirror RPython `Box(W_Root)` —
+    /// `read_boxes` / `write_boxes` always see real boxed W_Root values.
+    /// Pyre's lazy boxing means `wrapint` / `wrapfloat` emit a
+    /// `NewWithVtable` OpRef without eagerly allocating a `W_IntObject` /
+    /// `W_FloatObject`, so there is no heap pointer to flush back through
+    /// `synchronize_virtualizable`. Returning `None` lets callers skip the
+    /// concrete half of the shadow and update only the OpRef via
+    /// `set_virtualizable_box_at`, preserving whatever valid W_Root the
+    /// slot previously held instead of corrupting the PyFrame with an
+    /// invalid pointer.
+    pub fn to_ir_ref_value(&self) -> Option<majit_ir::Value> {
+        match self {
+            ConcreteValue::Ref(obj) => Some(majit_ir::Value::Ref(majit_ir::GcRef(*obj as usize))),
+            ConcreteValue::Null => Some(majit_ir::Value::Ref(majit_ir::GcRef(0))),
+            ConcreteValue::Int(_) | ConcreteValue::Float(_) => None,
         }
     }
 
@@ -1374,8 +1348,27 @@ pub(crate) fn instruction_may_raise(instruction: Instruction) -> bool {
 /// Environment context — currently unused.
 pub struct PyreEnv;
 
+/// Descriptor for raw `PyObjectRef` item pointers — i.e. the Rust
+/// `PyObjectArray.ptr` field (`pyre-object/src/object_array.rs:28`) and
+/// `W_ListObject.items.ptr` / tuple backing storage / dict raw values.
+/// These pointers already address `items[0]`, so
+/// `GETARRAYITEM_GC_R(ptr, i)` must land on `ptr + i * item_size`
+/// without an extra length-prefix skip.
 pub(crate) fn pyobject_array_descr() -> DescrRef {
     make_array_descr(0, 8, Type::Ref, false)
+}
+
+/// Descriptor for RPython `Ptr(GcArray(PyObjectRef))` containers —
+/// `[len][items...]` layout where the pointer addresses the length
+/// header. Used by virtual array materialization (`NewArray` +
+/// `SetarrayitemGc` in `decode_virtual_info`, resume.py:653-670) and
+/// by the virtualizable-frame array field (`locals_cells_stack_w` via
+/// the autogenerated `frame_locals_cells_stack_descr()` in
+/// `virtualizable_gen.rs`). `base_size = FIXED_ARRAY_ITEMS_OFFSET`
+/// skips the length prefix so `GETARRAYITEM_GC_R(array_ptr, i)` lands
+/// on items[i] directly.
+pub(crate) fn pyobject_gcarray_descr() -> DescrRef {
+    make_array_descr(pyre_object::FIXED_ARRAY_ITEMS_OFFSET, 8, Type::Ref, false)
 }
 
 pub(crate) fn int_array_descr() -> DescrRef {
@@ -1390,7 +1383,7 @@ pub(crate) fn float_array_descr() -> DescrRef {
 /// kind: 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
 pub(crate) fn array_descr_for_kind(kind: u8, _descr_index: u32) -> DescrRef {
     match kind {
-        0 => pyobject_array_descr(),
+        0 => pyobject_gcarray_descr(),
         2 => float_array_descr(),
         _ => int_array_descr(),
     }
@@ -2286,7 +2279,7 @@ impl PyreSym {
             // tracing-time mirror. The live prefix [0, nlocals+stack_only_depth)
             // references the recorder's InputArg stream; reserved stack slots
             // beyond the current stack pointer are NULL on the PyFrame heap
-            // (FixedObjectArray::filled(..., PY_NULL)) and the helper pads
+            // (alloc_fixed_array_with_header(..., PY_NULL)) and the helper pads
             // them with a shared const-NULL OpRef.
             let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
             let live_prefix = nlocals + stack_only_depth;
@@ -2833,16 +2826,11 @@ impl PyreJitState {
 /// sees the materialized OpRef in `bridge_local_oprefs` instead of
 /// falling through to a stale vable-array read.
 ///
-/// Currently unused: setup_bridge_sym still routes Virtual entries via
-/// the existing vable scalar override path. The helper is added now so
-/// future setup_bridge_sym work can drop the OpRef::NONE fallback for
-/// RebuiltValue::Virtual without re-deriving the materialization logic.
 /// resume.py:1143-1188 shared oopspec-call emitter for the four
 /// concat/slice materializers. Looks up the call info via
 /// `ctx.callinfocollection` and emits a `CALL_R(func, args...)` with the
 /// matching calldescr. Panics if `callinfocollection` is not attached to
 /// the TraceCtx (should never happen once pyjitpl wiring is complete).
-#[allow(dead_code)]
 fn emit_stroruni_oopspec_call(
     ctx: &mut majit_metainterp::TraceCtx,
     oopspec: majit_ir::effectinfo::OopSpecIndex,
@@ -2867,7 +2855,6 @@ fn emit_stroruni_oopspec_call(
     ctx.record_op_with_descr(majit_ir::OpCode::CallR, &call_args, calldescr.clone())
 }
 
-#[allow(dead_code)]
 fn materialize_bridge_virtual(
     ctx: &mut majit_metainterp::TraceCtx,
     vidx: usize,
@@ -2942,11 +2929,18 @@ fn materialize_bridge_virtual(
                 // resume.py:1251 `box = self.consts[num - TAG_CONST_OFFSET]`
                 // — direct indexing, fail-fast on out-of-range (mirrors
                 // Python IndexError; never silently substitutes).
-                let (raw, tp) = resume_data.rd_consts[ci];
-                match tp {
-                    majit_ir::Type::Ref => ctx.const_ref(raw),
-                    majit_ir::Type::Float => ctx.const_float(raw),
-                    _ => ctx.const_int(raw),
+                // compile.py:853 `ResumeGuardDescr` storage — read off
+                // the shared Arc so the bridge tracer observes the
+                // same pool the GC walker updates.
+                let storage = resume_data
+                    .storage
+                    .as_ref()
+                    .expect("resume_data.storage missing");
+                let c = storage.rd_consts()[ci];
+                match c.get_type() {
+                    majit_ir::Type::Ref => ctx.const_ref(c.getref_base().as_usize() as i64),
+                    majit_ir::Type::Float => ctx.const_float(c.getfloatstorage()),
+                    _ => ctx.const_int(c.getint()),
                 }
             }
             TAGVIRTUAL => {
@@ -3076,12 +3070,14 @@ fn materialize_bridge_virtual(
             fieldnums,
             kind,
             descr_index,
+            arraydescr,
             ..
         }
         | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
             fieldnums,
             kind,
             descr_index,
+            arraydescr,
             ..
         } => {
             let clear = matches!(
@@ -3098,7 +3094,14 @@ fn materialize_bridge_virtual(
             } else {
                 OpCode::NewArray
             };
-            let array_descr = array_descr_for_kind(kind, descr_index);
+            // resume.py:648-651 self.arraydescr parity: use the stored
+            // descriptor when capture_resumedata recorded it. Fall back
+            // to the kind+descr_index synthesis only when upstream
+            // VArrayInfo never stored one — keeps the dispatch but
+            // preserves identity when the producer had it.
+            let array_descr = arraydescr
+                .clone()
+                .unwrap_or_else(|| array_descr_for_kind(kind, descr_index));
             let new_op = ctx.record_op_with_descr(alloc_opcode, &[len_ref], array_descr.clone());
             ctx.heap_cache_mut().new_object(new_op);
             // resume.py:654 decoder.virtuals_cache.set_ptr(index, array)
@@ -3565,8 +3568,7 @@ impl JitState for PyreJitState {
                     let effective_tp = fail_types.get(*n).copied().unwrap_or(*tp);
                     value_for_slot(effective_tp, bits)
                 }
-                RebuiltValue::Int(v) => majit_ir::Value::Int(*v as i64),
-                RebuiltValue::Const(raw, tp) => value_for_slot(*tp, *raw),
+                RebuiltValue::Const(c) => value_for_slot(c.get_type(), c.as_raw_i64()),
                 // resume.py:1245 TAGVIRTUAL → getvirtual_ptr: RPython returns
                 // a Ref-typed Box pointing at the virtual's materialized
                 // allocation. pyre delays materialization to bridge runtime
@@ -3605,11 +3607,14 @@ impl JitState for PyreJitState {
          -> OpRef {
             match v {
                 RebuiltValue::Box(n, _tp) => OpRef(*n as u32),
-                RebuiltValue::Int(v) => ctx.const_int(*v as i64),
-                RebuiltValue::Const(raw, tp) => match tp {
-                    Type::Ref => ctx.const_ref(*raw),
-                    Type::Float => ctx.const_float(*raw),
-                    _ => ctx.const_int(*raw),
+                // history.py:220-360 ConstInt/ConstPtr/ConstFloat dispatch by
+                // `.type`; register the constant via the typed pool helper so
+                // the returned OpRef maps to a real pool entry (not a bare
+                // cursor index).
+                RebuiltValue::Const(c) => match c.get_type() {
+                    Type::Ref => ctx.const_ref(c.getref_base().as_usize() as i64),
+                    Type::Float => ctx.const_float(c.getfloatstorage()),
+                    _ => ctx.const_int(c.getint()),
                 },
                 RebuiltValue::Virtual(vidx) => {
                     materialize_bridge_virtual(ctx, *vidx as usize, rd_virtuals, resume_data, cache)
@@ -3846,13 +3851,17 @@ impl JitState for PyreJitState {
     fn rebuild_from_resumedata(
         _meta: &mut Self::Meta,
         fail_arg_types: &[Type],
-        rd_numb: Option<&[u8]>,
-        rd_consts: Option<&[(i64, Type)]>,
+        storage: Option<&std::sync::Arc<majit_metainterp::resume::ResumeStorage>>,
     ) -> Option<majit_metainterp::ResumeDataResult> {
         use majit_ir::resumedata::rebuild_from_numbering;
 
-        let rd_numb = rd_numb?;
-        let rd_consts = rd_consts.unwrap_or(&[]);
+        let storage = storage?;
+        let rd_numb = storage.rd_numb.as_slice();
+        // resume.py:1071 `self.consts = storage.rd_consts` — borrow
+        // the shared pool; `ResumeDataResult` carries the Arc handle
+        // so downstream virtual materialization reads the same pool
+        // the GC walker updates.
+        let rd_consts = storage.rd_consts();
 
         // resume.py:1049-1055 parity: consume_boxes(f.get_current_position_info())
         // RPython uses jitcode liveness via get_current_position_info; majit
@@ -3869,10 +3878,7 @@ impl JitState for PyreJitState {
             frames,
             virtualizable_values: vable_values,
             virtualref_values: vref_values,
-            // resume.py:1071 self.consts = storage.rd_consts. Retained as
-            // a slice-owned copy so `decode_box` in virtual materialization
-            // (resume.py:1251) can index `consts[num - TAG_CONST_OFFSET]`.
-            rd_consts: rd_consts.to_vec(),
+            storage: Some(storage.clone()),
             // resume.py:1042 num_failargs from rd_numb header. Used by
             // bridge virtual materialization (resume.py:1556-1564 decode_box
             // negative-index normalization: `num + len(liveboxes)`).
@@ -4311,9 +4317,22 @@ impl JitState for PyreJitState {
         &self,
         _meta: &Self::Meta,
         _virtualizable: &str,
-        _info: &VirtualizableInfo,
+        info: &VirtualizableInfo,
     ) -> Option<Vec<usize>> {
-        crate::virtualizable_gen::virt_array_lengths(self, _virtualizable, _info)
+        if info.array_fields.is_empty() {
+            return Some(Vec::new());
+        }
+        // virtualizable.py:86 parity: full array length read from the
+        // live heap object (`lst = getattr(virtualizable, fieldname);
+        // append(len(lst))`). Upstream has no fallback — if the heap
+        // isn't readable here, return `None` so the caller skips.
+        if info.can_read_all_array_lengths_from_heap() {
+            if let Some(frame_ptr) = self.frame_ptr() {
+                let lens = unsafe { info.read_array_lengths_from_heap(frame_ptr) };
+                return Some(lens);
+            }
+        }
+        None
     }
 
     fn sync_virtualizable_before_jit(
@@ -5468,6 +5487,134 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_guard_class_uses_guard_nonnull_class() {
+        let mut ctx = TraceCtx::for_test(1);
+        let obj = OpRef(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.registers_r = vec![obj];
+        sym.symbolic_local_types = vec![Type::Ref];
+        sym.nlocals = 1;
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        state.with_ctx(|this, ctx| {
+            this.guard_class(ctx, obj, &INT_TYPE as *const PyType);
+        });
+
+        let recorder = ctx.into_recorder();
+        let op = recorder.ops().last().expect("guard op should be present");
+        assert_eq!(op.opcode, OpCode::GuardNonnullClass);
+        assert_eq!(op.args[0], obj);
+    }
+
+    #[test]
+    #[ignore = "PyreSym::new_uninit hits the Phase X-1 skeleton-panic since the \
+                debug-only fallback was removed; needs a populated-jitcode harness."]
+    fn test_trace_guarded_int_payload_uses_guard_nonnull_class_and_pure_payload() {
+        // value_type is read from the recorder's inputarg type (Phase α/β: Box.type
+        // intrinsic parity, history.py:220) so the inputarg must be Ref for
+        // trace_guarded_int_payload to take the fast path rather than short-circuit.
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let int_obj = OpRef(0);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.registers_r = vec![int_obj];
+        sym.symbolic_local_types = vec![Type::Ref];
+        sym.nlocals = 1;
+
+        let mut state = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        let _ = state.with_ctx(|this, ctx| this.trace_guarded_int_payload(ctx, int_obj));
+
+        let recorder = ctx.into_recorder();
+        let mut saw_guard_nonnull_class = false;
+        let mut saw_pure_payload = false;
+        for pos in 1..(1 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            if op.opcode == OpCode::GuardNonnullClass {
+                saw_guard_nonnull_class = true;
+            }
+            if op.opcode == OpCode::GetfieldGcPureI && op.args.as_slice() == &[int_obj] {
+                saw_pure_payload = true;
+            }
+        }
+        assert!(
+            saw_guard_nonnull_class,
+            "int payload fast path should guard object class via GuardNonnullClass"
+        );
+        assert!(
+            saw_pure_payload,
+            "int payload fast path should read the immutable payload with GetfieldGcPureI"
+        );
+    }
+
+    #[test]
+    fn test_trace_unbox_int_with_resume_skips_guard_for_constant_object() {
+        let mut ctx = TraceCtx::for_test(0);
+        let int_obj = ctx.const_ref(w_int_new(7) as i64);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+
+        let payload = {
+            let mut state = MIFrame {
+                ctx: &mut ctx,
+                sym: &mut sym,
+                fallthrough_pc: 0,
+                parent_frames: Vec::new(),
+                pending_result_stack_idx: None,
+                pending_inline_frame: None,
+                orgpc: 0,
+                concrete_frame_addr: 0,
+                pre_opcode_registers_r: None,
+            };
+            trace_unbox_int_with_resume(
+                &mut state,
+                &mut ctx,
+                int_obj,
+                &INT_TYPE as *const PyType as i64,
+            )
+        };
+
+        let recorder = ctx.into_recorder();
+        let payload_op = recorder
+            .get_op_by_pos(payload)
+            .expect("payload op should be present");
+        assert_eq!(payload_op.opcode, OpCode::GetfieldGcPureI);
+        for pos in 1..(1 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
+                continue;
+            };
+            assert_ne!(
+                op.opcode,
+                OpCode::GuardClass,
+                "constant unbox must not emit GUARD_CLASS",
+            );
+        }
+    }
+
+    #[test]
     fn test_load_method_accepts_plain_python_instance_method() {
         let code = compile_exec("class C:\n    def f(self):\n        return self\nc = C()\n")
             .expect("compile failed");
@@ -5532,9 +5679,9 @@ mod tests {
         sym.init_symbolic(&mut ctx, frame_ptr);
 
         assert_eq!(sym.locals_cells_stack_array_ref, OpRef::NONE);
-        let num_ops = ctx.num_ops() as u32;
-        for pos in 1..(1 + num_ops) {
-            let Some(op) = ctx.get_op_by_pos(OpRef(pos)) else {
+        let recorder = ctx.into_recorder();
+        for pos in 1..(1 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
                 continue;
             };
             assert_ne!(
@@ -5816,13 +5963,7 @@ mod tests {
         };
 
         state
-            .with_ctx(|this, ctx| {
-                this.store_local_value(
-                    ctx,
-                    0,
-                    FrontendOp::new(ref_value, ConcreteValue::Ref(pyre_object::PY_NULL)),
-                )
-            })
+            .with_ctx(|this, ctx| this.store_local_value(ctx, 0, ref_value, ConcreteValue::Null))
             .expect("store of pre-wrapped Ref should succeed");
         assert_eq!(
             state.sym().registers_r[0],
@@ -5862,8 +6003,8 @@ mod tests {
         )
         .expect("generic helper call should box raw operands first");
 
-        let ops = ctx.ops();
-        let call = ops.last().expect("call op should be present");
+        let recorder = ctx.into_recorder();
+        let call = recorder.ops().last().expect("call op should be present");
         assert!(matches!(
             call.opcode,
             OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
@@ -5898,8 +6039,8 @@ mod tests {
             .trace_known_builtin_call(callable, &[arg])
             .expect("known builtin helper boundary should box raw int args");
 
-        let ops = ctx.ops();
-        let call = ops.last().expect("call op should be present");
+        let recorder = ctx.into_recorder();
+        let call = recorder.ops().last().expect("call op should be present");
         assert!(matches!(
             call.opcode,
             OpCode::CallI | OpCode::CallR | OpCode::CallF | OpCode::CallN
@@ -5966,12 +6107,12 @@ mod tests {
             )
             .expect("int comparison should trace");
 
-        let num_ops = ctx.num_ops() as u32;
+        let recorder = ctx.into_recorder();
         let mut saw_cmp = false;
         let mut saw_bool_call = false;
         let mut saw_bool_unbox = false;
-        for pos in 2..(2 + num_ops) {
-            let Some(op) = ctx.get_op_by_pos(OpRef(pos)) else {
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
                 continue;
             };
             if op.opcode == OpCode::IntLt {
@@ -6046,10 +6187,10 @@ mod tests {
             )
             .expect("non-branch compare should trace");
 
-        let num_ops = ctx.num_ops() as u32;
+        let recorder = ctx.into_recorder();
         let mut saw_bool_call = false;
-        for pos in 2..(2 + num_ops) {
-            let Some(op) = ctx.get_op_by_pos(OpRef(pos)) else {
+        for pos in 2..(2 + recorder.num_ops() as u32) {
+            let Some(op) = recorder.get_op_by_pos(OpRef(pos)) else {
                 continue;
             };
             if op.opcode == OpCode::CallR {

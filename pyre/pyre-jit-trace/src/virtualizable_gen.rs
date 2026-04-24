@@ -10,7 +10,7 @@ use crate::frame_layout::{
     PYFRAME_VALUESTACKDEPTH_OFFSET, PYFRAME_W_GLOBALS_OFFSET,
 };
 use crate::state::PyreJitState;
-use pyre_object::{FIXED_ARRAY_LEN_OFFSET, FIXED_ARRAY_PTR_OFFSET};
+use pyre_object::{FIXED_ARRAY_ITEMS_OFFSET, FIXED_ARRAY_LEN_OFFSET};
 
 majit_macros::virtualizable! {
     state = PyreJitState,
@@ -49,12 +49,15 @@ majit_macros::virtualizable! {
         w_globals: ref @ PYFRAME_W_GLOBALS_OFFSET,
     },
 
+    // RPython virtualizable.py:28 parity: the array field holds a pointer
+    // to a `Ptr(GcArray(PyObjectRef))` whose header is `[len][items...]`.
+    // So GETFIELD_GC_R(frame, locals_cells_stack) + GETARRAYITEM_GC_R(p, i)
+    // with `base_size = FIXED_ARRAY_ITEMS_OFFSET` reads items[i] directly,
+    // no container indirection.
     arrays = {
         locals_cells_stack_w: ref @ PYFRAME_LOCALS_CELLS_STACK_OFFSET {
-            embedded,
-            ptr_offset: FIXED_ARRAY_PTR_OFFSET,
             length_offset: FIXED_ARRAY_LEN_OFFSET,
-            items_offset: 0,
+            items_offset: FIXED_ARRAY_ITEMS_OFFSET,
         },
     },
 }

@@ -146,26 +146,11 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         let ns = self.sym().concrete_namespace;
         let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
             let opref = self.trace_load_name(name)?;
-            // runtime_ops::jit_load_name_from_namespace parity — read the
-            // concrete namespace so the OpRef carries the real W_Object
-            // pointer as its Box shadow (RPython `FrontendOp._resref`
-            // parity).  Producers must attach concrete here, else the
-            // consumer (store_local_value → vable mirror) has no safe
-            // way to update virtualizable_values.
-            let result_concrete = if ns.is_null() {
-                crate::state::ConcreteValue::Null
-            } else {
-                unsafe {
-                    let obj = pyre_interpreter::dict_storage_get(&*ns, name)
-                        .unwrap_or(std::ptr::null_mut());
-                    crate::state::ConcreteValue::ref_of(obj)
-                }
-            };
-            return Ok(crate::state::FrontendOp::new(opref, result_concrete));
+            return Ok(crate::state::FrontendOp::opref_only(opref));
         };
         let concrete_cv = crate::state::dict_storage_value_direct(ns, slot);
         let result_concrete = concrete_cv
-            .map(crate::state::ConcreteValue::ref_of)
+            .map(crate::state::ConcreteValue::from_pyobj)
             .unwrap_or(crate::state::ConcreteValue::Null);
         if let Some(concrete_value) = concrete_cv {
             if !concrete_value.is_null() {
@@ -179,24 +164,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
                 let opref = self.with_ctx(|_this, ctx| {
                     let ns_const = ctx.const_ref(ns as i64);
                     let slot_const = ctx.const_int(slot as i64);
-                    // resoperation.py:1137 `QUASIIMMUT_FIELD/1d/n` — arity=1
-                    // + fielddescr. celldict mints a synthetic FieldDescr
-                    // whose `index()` carries the namespace slot so
-                    // heap.py:781 `optimize_QUASIIMMUT_FIELD` can register
-                    // the per-slot dep through `descr.index()` uniformly
-                    // with regular quasi-immutable fields.
-                    let slot_descr = majit_ir::descr::make_field_descr_full(
-                        slot as u32,
-                        0,
-                        0,
-                        majit_ir::Type::Ref,
-                        true,
-                    );
-                    ctx.record_op_with_descr(
-                        majit_ir::OpCode::QuasiimmutField,
-                        &[ns_const],
-                        slot_descr,
-                    );
+                    ctx.record_op(majit_ir::OpCode::QuasiimmutField, &[ns_const, slot_const]);
                     let result_const = ctx.const_ref(concrete_value as i64);
                     ctx.record_op(
                         majit_ir::OpCode::RecordKnownResult,

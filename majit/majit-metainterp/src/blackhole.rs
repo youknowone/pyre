@@ -1578,6 +1578,11 @@ impl BlackholeInterpreter {
                 }
                 let target = (code[position + 1] as usize) | ((code[position + 2] as usize) << 8);
                 self.position = target;
+                // blackhole.py:407 parity: once the handler is dispatched the
+                // residual-call TLS slot is stale. Clear it so a subsequent
+                // opcode that reads `BH_LAST_EXC_VALUE` without issuing a new
+                // call can't pick up this already-caught exception.
+                BH_LAST_EXC_VALUE.with(|c| c.set(0));
                 return true;
             }
             if opcode == self.op_rvmprof_code {
@@ -3438,7 +3443,7 @@ pub fn resume_in_blackhole(
     builder: &mut BlackholeInterpBuilder,
     resolve_jitcode: &dyn Fn(i32, i32) -> Option<crate::resume::ResolvedJitCode>,
     rd_numb: &[u8],
-    rd_consts: &[i64],
+    rd_consts: &[majit_ir::Const],
     all_liveness: &[u8],
     deadframe: &[i64],
     deadframe_exc: i64,

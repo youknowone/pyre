@@ -1024,7 +1024,7 @@ pub fn serialize_optimizer_knowledge(
 ///   a runtime Ref object. Returns the class pointer as i64.
 pub fn deserialize_optimizer_knowledge(
     rd_numb: &[u8],
-    rd_consts: &[(i64, majit_ir::Type)],
+    rd_consts: &[majit_ir::Const],
     frontend_boxes: &[i64],
     liveboxes: &[OpRef],
     livebox_types: &[majit_ir::Type],
@@ -1124,7 +1124,7 @@ pub fn deserialize_optimizer_knowledge(
         let tagged1 = reader.next_item() as i16;
         let const_box = decode_box(tagged1, rd_consts, liveboxes);
         // bridgeopt.py:179-180: assert isinstance(const, ConstInt); i = const.getint()
-        let DecodedBox::ConstInt(const_int) = const_box else {
+        let DecodedBox::Const(majit_ir::Const::Int(const_int)) = const_box else {
             panic!(
                 "bridgeopt: loopinvariant entry must be ConstInt, got {:?}",
                 const_box
@@ -1149,15 +1149,11 @@ pub fn deserialize_optimizer_knowledge(
 /// constants must be registered in the optimizer's context to get an OpRef.
 fn decoded_box_to_opref(decoded: &crate::resume::DecodedBox, ctx: &mut OptContext) -> OpRef {
     use crate::resume::DecodedBox;
+    use majit_ir::Const;
     match decoded {
         DecodedBox::LiveBox(opref) => *opref,
-        DecodedBox::ConstInt(val) => ctx.make_constant_int(*val),
-        DecodedBox::Const(val, tp) => match tp {
-            majit_ir::Type::Int => ctx.make_constant_int(*val),
-            majit_ir::Type::Ref => ctx.make_constant_ref(GcRef(*val as usize)),
-            majit_ir::Type::Float => ctx.make_constant_float(f64::from_bits(*val as u64)),
-            _ => ctx.make_constant_int(*val),
-        },
-        DecodedBox::NullRef => ctx.make_constant_ref(GcRef(0)),
+        DecodedBox::Const(Const::Int(v)) => ctx.make_constant_int(*v),
+        DecodedBox::Const(Const::Ref(r)) => ctx.make_constant_ref(*r),
+        DecodedBox::Const(Const::Float(f)) => ctx.make_constant_float(*f),
     }
 }

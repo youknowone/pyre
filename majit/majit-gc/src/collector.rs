@@ -391,6 +391,7 @@ impl MiniMarkGC {
         let ptr = self.nursery.alloc(total_size);
         if ptr.is_null() {
             // Nursery full: trigger minor collection and retry.
+            // minimark.py:1282 collect_and_reserve parity.
             self.do_collect_nursery();
             let ptr = self.nursery.alloc(total_size);
             if ptr.is_null() {
@@ -554,8 +555,21 @@ impl MiniMarkGC {
             }
         });
 
-        // Runtime-owned roots outside the generic shadow stack.
+        // Phase 1e: framework.py `root_walker.walk_roots` parity — the
+        // embedding runtime plugs a walker that visits
+        // `PyFrame.locals_cells_stack_w` across the active f_backref chain
+        // so nursery refs held only by a Python frame local or operand-stack
+        // slot survive collection.
         crate::walk_active_extra_roots(&mut |gcref| {
+            if self.is_nursery_object_start(gcref.0) {
+                if !self.pinned_objects.contains(&gcref.0) {
+                    *gcref = self.copy_nursery_object(gcref.0);
+                }
+            }
+        });
+
+        // Multi-registrar walker fan-out (rd_consts const-pool, etc.).
+        crate::shadow_stack::walk_extra_roots(|gcref| {
             if self.is_nursery_object_start(gcref.0) {
                 if !self.pinned_objects.contains(&gcref.0) {
                     *gcref = self.copy_nursery_object(gcref.0);
@@ -847,6 +861,10 @@ impl MiniMarkGC {
         });
 
         crate::walk_active_extra_roots(&mut |gcref| {
+            self.seed_major_root(*gcref);
+        });
+
+        crate::shadow_stack::walk_extra_roots(|gcref| {
             self.seed_major_root(*gcref);
         });
     }

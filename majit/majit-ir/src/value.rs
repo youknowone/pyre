@@ -156,6 +156,54 @@ impl Const {
             Const::Ref(v) => Value::Ref(v),
         }
     }
+
+    /// history.py:225 ConstInt.getint — unsigned/signed integer value.
+    /// Method belongs to ConstInt upstream; Rust single-enum collapses
+    /// all variants, so assert variant at call time instead of
+    /// silently cross-casting.
+    pub fn getint(&self) -> i64 {
+        match self {
+            Const::Int(v) => *v,
+            other => panic!("Const::getint on non-Int variant: {other:?}"),
+        }
+    }
+
+    /// history.py:316 ConstPtr.getref_base — raw GC pointer value.
+    pub fn getref_base(&self) -> GcRef {
+        match self {
+            Const::Ref(v) => *v,
+            other => panic!("Const::getref_base on non-Ref variant: {other:?}"),
+        }
+    }
+
+    /// history.py:265 ConstFloat.getfloatstorage — i64 bit-pattern.
+    pub fn getfloatstorage(&self) -> i64 {
+        match self {
+            Const::Float(v) => v.to_bits() as i64,
+            other => panic!("Const::getfloatstorage on non-Float variant: {other:?}"),
+        }
+    }
+
+    /// Raw i64 projection. For Int it's the value, for Ref the pointer bits,
+    /// for Float the bit-pattern of the `f64`. Matches the encoded
+    /// `rd_consts[idx].0` layout.
+    pub fn as_raw_i64(&self) -> i64 {
+        match self {
+            Const::Int(v) => *v,
+            Const::Ref(GcRef(v)) => *v as i64,
+            Const::Float(v) => v.to_bits() as i64,
+        }
+    }
+
+    /// Reconstruct a Const from the encoded `(raw_i64, Type)` pair.
+    pub fn from_raw_i64(raw: i64, tp: Type) -> Self {
+        match tp {
+            Type::Int => Const::Int(raw),
+            Type::Ref => Const::Ref(GcRef(raw as usize)),
+            Type::Float => Const::Float(f64::from_bits(raw as u64)),
+            Type::Void => Const::Int(raw),
+        }
+    }
 }
 
 /// An input argument to a loop or bridge.

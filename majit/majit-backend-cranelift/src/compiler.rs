@@ -11158,7 +11158,7 @@ fn collect_guards(
         if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
             let rd_vi = op.rd_virtuals.as_deref();
             use majit_ir::resumedata::{self, RebuiltValue, rebuild_from_numbering};
-            let rd_consts_ref: &[(i64, Type)] = rd_consts_data;
+            let rd_consts_ref: &[majit_ir::Const] = rd_consts_data;
             let fvc = majit_ir::resumedata::get_frame_value_count_fn();
             let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                 fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
@@ -11178,8 +11178,7 @@ fn collect_guards(
                             vidx_to_slot.insert(*vidx, new_slots.len());
                             ExitValueSourceLayout::Virtual(*vidx)
                         }
-                        RebuiltValue::Const(c, _tp) => ExitValueSourceLayout::Constant(*c),
-                        RebuiltValue::Int(i) => ExitValueSourceLayout::Constant(*i as i64),
+                        RebuiltValue::Const(c) => ExitValueSourceLayout::Constant(c.as_raw_i64()),
                         RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
                     });
                 }
@@ -11231,8 +11230,11 @@ fn collect_guards(
                     resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64),
                     resumedata::TAGCONST => {
                         let idx = (val - resumedata::TAG_CONST_OFFSET) as usize;
-                        let c = rd_consts_ref.get(idx).map(|(v, _)| *v).unwrap_or(0);
-                        ExitValueSourceLayout::Constant(c)
+                        let c = rd_consts_ref
+                            .get(idx)
+                            .copied()
+                            .unwrap_or(majit_ir::Const::Int(0));
+                        ExitValueSourceLayout::Constant(c.as_raw_i64())
                     }
                     _ => ExitValueSourceLayout::Constant(0),
                 }

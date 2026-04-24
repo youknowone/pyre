@@ -73,21 +73,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
     ) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
         let opref = self.trace_make_function(code_obj.opref)?;
-        // pyre/pyre-interpreter/src/eval.rs:331 parity — mirror the
-        // plain interpreter's `make_function_from_code_obj(code_obj,
-        // globals)` concrete result so the emitted OpRef carries a
-        // real W_Function pointer as its Box shadow (RPython
-        // `FrontendOp._resref` parity: resref of a residual call is
-        // the actual heap pointer).
-        let concrete_code = code_obj.concrete.to_pyobj();
-        let result_concrete = if concrete_code.is_null() {
-            crate::state::ConcreteValue::Null
-        } else {
-            let ns = self.sym().concrete_namespace;
-            let fn_obj = pyre_interpreter::make_function_from_code_obj(concrete_code, ns);
-            crate::state::ConcreteValue::ref_of(fn_obj)
-        };
-        Ok(crate::state::FrontendOp::new(opref, result_concrete))
+        Ok(crate::state::FrontendOp::opref_only(opref))
     }
 
     fn call_callable(
@@ -113,7 +99,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
                         code as pyre_object::PyObjectRef,
                     );
                     let result = func(&concrete_args).unwrap_or(pyre_object::PY_NULL);
-                    result_concrete = crate::state::ConcreteValue::ref_of(result);
+                    result_concrete = crate::state::ConcreteValue::from_pyobj(result);
                 } else if pyre_interpreter::is_function(concrete_callable) {
                     // pyjitpl.py:2025 concrete execution only.
                     use std::cell::Cell;
@@ -132,7 +118,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
                             );
                         CONCRETE_CALL_DEPTH.with(|d| d.set(depth));
                         if let Ok(result) = result {
-                            result_concrete = crate::state::ConcreteValue::ref_of(result);
+                            result_concrete = crate::state::ConcreteValue::from_pyobj(result);
                         }
                     }
                 }
@@ -158,7 +144,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         let mut result_concrete = crate::state::ConcreteValue::Null;
         if concrete_items.iter().all(|v| !v.is_null()) {
             let list = pyre_interpreter::build_list_from_refs(&concrete_items);
-            result_concrete = crate::state::ConcreteValue::ref_of(list);
+            result_concrete = crate::state::ConcreteValue::from_pyobj(list);
         }
         let item_oprefs: Vec<majit_ir::OpRef> = items.iter().map(|i| i.opref).collect();
         let opref = self.trace_build_list(&item_oprefs)?;
@@ -175,7 +161,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         let mut result_concrete = crate::state::ConcreteValue::Null;
         if concrete_items.iter().all(|v| !v.is_null()) {
             let tuple = pyre_interpreter::build_tuple_from_refs(&concrete_items);
-            result_concrete = crate::state::ConcreteValue::ref_of(tuple);
+            result_concrete = crate::state::ConcreteValue::from_pyobj(tuple);
         }
         let item_oprefs: Vec<majit_ir::OpRef> = items.iter().map(|i| i.opref).collect();
         let opref = self.trace_build_tuple(&item_oprefs)?;
@@ -192,7 +178,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         let mut result_concrete = crate::state::ConcreteValue::Null;
         if concrete_items.iter().all(|v| !v.is_null()) {
             let dict = pyre_interpreter::build_map_from_refs(&concrete_items);
-            result_concrete = crate::state::ConcreteValue::ref_of(dict);
+            result_concrete = crate::state::ConcreteValue::from_pyobj(dict);
         }
         let item_oprefs: Vec<majit_ir::OpRef> = items.iter().map(|i| i.opref).collect();
         let opref = self.trace_build_map(&item_oprefs)?;
@@ -250,7 +236,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
         let c_obj = obj.concrete.to_pyobj();
         if !c_obj.is_null() {
             if let Ok(result) = pyre_interpreter::baseobjspace::getattr(c_obj, name) {
-                result_concrete = crate::state::ConcreteValue::ref_of(result);
+                result_concrete = crate::state::ConcreteValue::from_pyobj(result);
             }
         }
         let opref = self.trace_load_attr(obj.opref, name)?;

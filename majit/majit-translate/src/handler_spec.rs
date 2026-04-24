@@ -306,16 +306,14 @@ fn emit_local_impl(out: &mut String) {
     out.push_str("        idx: usize,\n");
     out.push_str("        value: Self::Value,\n");
     out.push_str("    ) -> Result<(), pyre_interpreter::PyError> {\n");
-    // Pass the whole FrontendOp through so the callee owns the Box copy
-    // (RPython `pyjitpl.py:1245 virtualizable_boxes[index] = valuebox`
-    // parity — the whole Box is carried, not an opref + synthesized
-    // concrete). Synthesizing a `majit_ir::Value` from ConcreteValue
-    // here (Null → Value::Ref(GcRef::NULL), Int/Float → unboxed scalar)
-    // conflates state.rs:897's distinction between "untracked" and
-    // "known null", and lies about Ref-slot concrete when the producer
-    // handed us an unboxed scalar.
+    out.push_str("        if idx < self.sym().concrete_locals.len() {\n");
+    out.push_str("            self.sym_mut().concrete_locals[idx] = value.concrete;\n");
+    out.push_str("        }\n");
+    out.push_str("        let concrete = value.concrete;\n");
     out.push_str("        self.with_ctx(|this, ctx| {\n");
-    out.push_str("            crate::state::MIFrame::store_local_value(this, ctx, idx, value)\n");
+    out.push_str(
+        "            crate::state::MIFrame::store_local_value(this, ctx, idx, value.opref, concrete)\n",
+    );
     out.push_str("        })\n");
     out.push_str("    }\n");
     out.push_str("}\n");

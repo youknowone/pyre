@@ -12,7 +12,9 @@ use majit_backend::{
     Backend, BackendError, CompiledTraceInfo, ExitFrameLayout, ExitRecoveryLayout, FailDescrLayout,
     JitCellToken, TerminalExitLayout,
 };
-use majit_ir::{Descr, DescrRef, FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value};
+use majit_ir::{
+    Const, Descr, DescrRef, FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
+};
 
 use crate::blackhole::ExceptionState;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout, StoredResumeData};
@@ -83,14 +85,9 @@ pub struct CompiledExitLayout {
     pub force_token_slots: Vec<usize>,
     pub recovery_layout: Option<ExitRecoveryLayout>,
     pub resume_layout: Option<ResumeLayoutSummary>,
-    /// resume.py:450 — compact resume numbering for this guard.
-    pub rd_numb: Option<Vec<u8>>,
-    /// resume.py:451 — shared constant pool.
-    pub rd_consts: Option<Vec<(i64, Type)>>,
-    /// resume.py:488 — virtual object blueprints.
-    pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
-    /// resume.py:858 rd_pendingfields — deferred heap writes.
-    pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
+    /// compile.py:853 `ResumeGuardDescr` storage handle — shared
+    /// pool with rd_numb / rd_consts / rd_virtuals / rd_pendingfields.
+    pub storage: Option<std::sync::Arc<crate::resume::ResumeStorage>>,
 }
 
 /// Typed result from running compiled code.
@@ -244,7 +241,7 @@ pub(crate) fn build_guard_metadata(
             inputargs.iter().map(|arg| arg.tp).collect()
         };
         let resume_layout;
-        if is_guard {
+        let storage = if is_guard {
             let mut builder = ResumeDataVirtualAdder::new();
 
             // store_final_boxes parity: when rd_numb is present, fail_args
@@ -263,8 +260,7 @@ pub(crate) fn build_guard_metadata(
                     .iter()
                     .map(|val| match val {
                         RebuiltValue::Box(idx, _) => ResumeValueSource::FailArg(*idx),
-                        RebuiltValue::Const(c, _tp) => ResumeValueSource::Constant(*c),
-                        RebuiltValue::Int(i) => ResumeValueSource::Constant(*i as i64),
+                        RebuiltValue::Const(c) => ResumeValueSource::Constant(*c),
                         RebuiltValue::Virtual(vidx) => ResumeValueSource::Virtual(*vidx),
                         RebuiltValue::Unassigned => ResumeValueSource::Unavailable,
                     })
@@ -276,11 +272,8 @@ pub(crate) fn build_guard_metadata(
                             RebuiltValue::Box(idx, _) => {
                                 builder.map_slot(slot_idx, *idx);
                             }
-                            RebuiltValue::Const(c, _tp) => {
+                            RebuiltValue::Const(c) => {
                                 builder.set_slot_constant(slot_idx, *c);
-                            }
-                            RebuiltValue::Int(i) => {
-                                builder.set_slot_constant(slot_idx, *i as i64);
                             }
                             RebuiltValue::Virtual(vidx) => {
                                 builder.set_slot_virtual(slot_idx, *vidx);
@@ -317,18 +310,33 @@ pub(crate) fn build_guard_metadata(
                 }
             }
 
-            let stored = StoredResumeData::with_loop_memo(builder.build(), &mut resume_memo);
+            let mut stored = StoredResumeData::with_loop_memo(builder.build(), &mut resume_memo);
             resume_layout = Some(stored.layout.clone());
+            // compile.py:853 `ResumeGuardDescr` storage — build the shared
+            // Arc once from the guard op's `rd_*` fields so every reader
+            // (StoredResumeData, StoredExitLayout, bridge retrace,
+            // blackhole resume, GC root walker) observes the same pool.
+            let storage_for_guard = if let Some(numb) = op.rd_numb.clone() {
+                Some(crate::resume::ResumeStorage::new(
+                    numb,
+                    op.rd_consts.clone().unwrap_or_default(),
+                    op.rd_virtuals.clone().unwrap_or_default(),
+                    op.rd_pendingfields.clone().unwrap_or_default(),
+                ))
+            } else {
+                None
+            };
+            stored.storage = storage_for_guard.clone();
             result.insert(fail_index, stored);
+            storage_for_guard
         } else {
             resume_layout = None;
-        }
+            None
+        };
 
-        // Store rd_numb/rd_consts/rd_virtuals/rd_pendingfields for guard failure recovery.
-        let rd_numb = op.rd_numb.clone();
-        let rd_consts = op.rd_consts.clone();
-        let rd_virtuals = op.rd_virtuals.clone();
-        let rd_pendingfields = op.rd_pendingfields.clone();
+        // rd_* values are now carried inside `storage` (an
+        // `Arc<ResumeStorage>` installed above). They still feed into
+        // `recovery_layout` below via the guard op's rd_numb / rd_consts.
         let recovery_layout = if op.rd_numb.is_some() {
             // Consumer switchover path: rd_numb contains the full frame encoding.
             // Build recovery_layout from rd_numb + rd_virtuals.
@@ -349,8 +357,7 @@ pub(crate) fn build_guard_metadata(
                     let to_exit_source = |val: &RebuiltValue| match val {
                         RebuiltValue::Box(idx, _) => ExitValueSourceLayout::ExitValue(*idx),
                         RebuiltValue::Virtual(vidx) => ExitValueSourceLayout::Virtual(*vidx),
-                        RebuiltValue::Const(c, _tp) => ExitValueSourceLayout::Constant(*c),
-                        RebuiltValue::Int(i) => ExitValueSourceLayout::Constant(*i as i64),
+                        RebuiltValue::Const(c) => ExitValueSourceLayout::Constant(c.as_raw_i64()),
                         RebuiltValue::Unassigned => ExitValueSourceLayout::Uninitialized,
                     };
                     (
@@ -406,8 +413,8 @@ pub(crate) fn build_guard_metadata(
                     majit_ir::resumedata::TAGINT => ExitValueSourceLayout::Constant(val as i64),
                     majit_ir::resumedata::TAGCONST => {
                         let idx = (val - majit_ir::resumedata::TAG_CONST_OFFSET) as usize;
-                        let c = rd_consts_ref.get(idx).map(|(v, _)| *v).unwrap_or(0);
-                        ExitValueSourceLayout::Constant(c)
+                        let c = rd_consts_ref.get(idx).copied().unwrap_or(Const::Int(0));
+                        ExitValueSourceLayout::Constant(c.as_raw_i64())
                     }
                     _ => ExitValueSourceLayout::Constant(0),
                 }
@@ -742,10 +749,7 @@ pub(crate) fn build_guard_metadata(
                 is_finish,
                 recovery_layout,
                 resume_layout,
-                rd_numb,
-                rd_consts,
-                rd_virtuals,
-                rd_pendingfields,
+                storage,
             },
         );
         fail_index += 1;
@@ -759,6 +763,20 @@ pub(crate) fn merge_backend_exit_layouts(
     backend_layouts: &[FailDescrLayout],
 ) {
     for layout in backend_layouts {
+        // compile.py:861 copy_all_attributes_from parity: when the backend
+        // exposes resume data (rd_numb / rd_consts / rd_virtuals /
+        // rd_pendingfields) for an exit the frontend never saw, assemble
+        // them into a `ResumeStorage` so downstream consumers
+        // (rebuild_guard_fail_state, build_blackhole_frames_from_deadframe)
+        // see the same shared pool they get on the frontend-primed path.
+        let storage_from_backend = layout.rd_numb.clone().map(|numb| {
+            crate::resume::ResumeStorage::new(
+                numb,
+                layout.rd_consts.clone().unwrap_or_default(),
+                layout.rd_virtuals.clone().unwrap_or_default(),
+                layout.rd_pendingfields.clone().unwrap_or_default(),
+            )
+        });
         let entry: &mut StoredExitLayout =
             exit_layouts
                 .entry(layout.fail_index)
@@ -770,14 +788,7 @@ pub(crate) fn merge_backend_exit_layouts(
                     force_token_slots: layout.force_token_slots.clone(),
                     recovery_layout: layout.recovery_layout.clone(),
                     resume_layout: None,
-                    // Seed rd_* from the backend layout so freshly-inserted
-                    // entries carry resume data even when the frontend never
-                    // populated this `fail_index` in `finish_and_compile`
-                    // (e.g. bridges attached after the main trace).
-                    rd_numb: layout.rd_numb.clone(),
-                    rd_consts: layout.rd_consts.clone(),
-                    rd_virtuals: layout.rd_virtuals.clone(),
-                    rd_pendingfields: layout.rd_pendingfields.clone(),
+                    storage: storage_from_backend.clone(),
                 });
         entry.source_op_index = layout.source_op_index;
         // Preserve exit_types from build_guard_metadata (which reconciles
@@ -790,16 +801,13 @@ pub(crate) fn merge_backend_exit_layouts(
         entry.gc_ref_slots = layout.gc_ref_slots.clone();
         entry.force_token_slots = layout.force_token_slots.clone();
         entry.recovery_layout = layout.recovery_layout.clone();
-
-        // rd_* is owned by the frontend optimizer (`store_final_boxes_in_guard`).
-        // Only backfill when the entry's rd_numb is None — never overwrite a
-        // frontend-computed numbering with a backend copy. The backend value
-        // mirrors the frontend's, but the frontend's is authoritative.
-        if entry.rd_numb.is_none() && layout.rd_numb.is_some() {
-            entry.rd_numb = layout.rd_numb.clone();
-            entry.rd_consts = layout.rd_consts.clone();
-            entry.rd_virtuals = layout.rd_virtuals.clone();
-            entry.rd_pendingfields = layout.rd_pendingfields.clone();
+        // compile.py:861 copy_all_attributes_from parity: fill missing
+        // resume storage from the backend-side rd_* propagation. Entries
+        // already primed by the frontend keep their Arc (same bytes
+        // either way, but preserving the handle avoids dropping shared
+        // downstream references).
+        if entry.storage.is_none() {
+            entry.storage = storage_from_backend.clone();
         }
 
         // Merge backend frame_stack metadata into the stored resume layout.
@@ -1035,10 +1043,7 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
                 force_token_slots: layout.force_token_slots.clone(),
                 recovery_layout: layout.recovery_layout.clone(),
                 resume_layout: None,
-                rd_numb: None,
-                rd_consts: None,
-                rd_virtuals: None,
-                rd_pendingfields: None,
+                storage: None,
             });
         entry.source_op_index = Some(layout.op_index);
         entry.exit_types = layout.exit_types.clone();
@@ -1189,10 +1194,7 @@ pub(crate) fn infer_terminal_exit_layout(
         force_token_slots,
         recovery_layout: None,
         resume_layout: None,
-        rd_numb: None,
-        rd_consts: None,
-        rd_virtuals: None,
-        rd_pendingfields: None,
+        storage: None,
     })
 }
 
@@ -1216,10 +1218,7 @@ pub(crate) fn build_terminal_exit_layouts(
                     force_token_slots: layout.force_token_slots,
                     recovery_layout: None,
                     resume_layout: None,
-                    rd_numb: None,
-                    rd_consts: None,
-                    rd_virtuals: None,
-                    rd_pendingfields: None,
+                    storage: None,
                 },
             );
         }

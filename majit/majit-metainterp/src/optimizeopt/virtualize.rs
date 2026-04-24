@@ -1351,6 +1351,8 @@ impl Optimization for OptVirtualize {
             // The actual arg forcing belongs later in Optimizer._emit_operation,
             // after the queued guard has been flushed ahead of FINISH.
             OpCode::Finish => {
+                // Force all virtual args (same as escaping op).
+                let result = self.optimize_escaping_op(op, ctx);
                 if let Some(stashed) = self.last_guard_not_forced_2.take() {
                     let after = ctx.current_pass_idx;
                     ctx.emit_extra(after, stashed);

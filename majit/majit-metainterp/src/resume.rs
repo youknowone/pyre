@@ -6,13 +6,15 @@
 //!
 //! This is the RPython equivalent of `rpython/jit/metainterp/resume.py`.
 
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use majit_backend::{
     ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitValueSourceLayout,
     ExitVirtualLayout,
 };
-use majit_ir::{GcRef, Type};
+use majit_ir::{Const, GcRef, Type};
 
 /// resume.py:656-670: element kind from arraydescr.
 /// 0=ref (is_array_of_pointers), 1=int, 2=float (is_array_of_floats).
@@ -321,12 +323,107 @@ impl BoxEnv for SimpleBoxEnv {
 // resume.py:123-132 — tag constants (i64 widened for rd_numb encoding).
 // Same values as the i16 TAGCONST/TAGINT/TAGBOX/TAGVIRTUAL above.
 const TAGMASK_I64: i64 = TAGMASK as i64;
+// resume.py:130 `NULLREF = tag(-1, TAGCONST)` — pre-shift num for
+// `Const::Ref(NULL)`. Shared by the i16 `NULLREF` constant and the
+// i64 `getconst_i64`/`decode_box` pair.
+const ENCODED_NULLREF: i64 = -1;
 const ENCODED_UNINITIALIZED: i64 = -2;
 const ENCODED_UNAVAILABLE: i64 = -3;
 
 // Two low bits are reserved for the tag.
 const INLINE_TAGGED_MIN: i64 = -(1_i64 << 61);
 const INLINE_TAGGED_MAX: i64 = (1_i64 << 61) - 1;
+
+/// compile.py:853-876 `ResumeGuardDescr` storage.
+///
+/// Canonical, guard-owned resume payload (`storage.rd_numb/rd_consts/
+/// rd_virtuals/rd_pendingfields`). Shared via `Arc<ResumeStorage>` so
+/// every reader — `StoredResumeData`, `StoredExitLayout`, bridge
+/// retrace, blackhole resume, GC root walker — observes the **same**
+/// pool, matching RPython's guard-owned `ResumeGuardDescr` singleton.
+///
+/// `rd_consts` uses `UnsafeCell` because the GC root walker
+/// (framework.py `root_walker.walk_roots` parity) rewrites `Const::Ref`
+/// slots in place during minor collection, and the pyre runtime is
+/// single-threaded so `Mutex` overhead is unnecessary.
+pub struct ResumeStorage {
+    /// resume.py:466 `storage.rd_numb` — packed byte stream (NUMBERING
+    /// lltype equivalent). Immutable once installed.
+    pub rd_numb: Vec<u8>,
+    /// resume.py:467 `storage.rd_consts` — shared constant pool.
+    ///
+    /// Interior mutability: the minor-collection root walker visits
+    /// `Const::Ref` slots to update forwarded GCREFs, so the slice
+    /// must remain mutable after the `Arc` is shared. `UnsafeCell`
+    /// is sound here because pyre is single-threaded and the walker
+    /// holds exclusive access for the duration of each GC cycle.
+    pub rd_consts: UnsafeCell<Vec<Const>>,
+    /// compile.py:858 `storage.rd_virtuals` — live `RdVirtualInfo`
+    /// entries describing virtual objects to materialize on resume.
+    pub rd_virtuals: Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
+    /// resume.py:468 `storage.rd_pendingfields` — pending field writes
+    /// replayed during blackhole resume.
+    pub rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
+}
+
+// Pyre is single-threaded; UnsafeCell prevents auto-Send/Sync so
+// provide them explicitly (matches RPython's non-thread-safe
+// ResumeGuardDescr).
+unsafe impl Send for ResumeStorage {}
+unsafe impl Sync for ResumeStorage {}
+
+impl std::fmt::Debug for ResumeStorage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let consts_len = unsafe { (*self.rd_consts.get()).len() };
+        f.debug_struct("ResumeStorage")
+            .field("rd_numb_len", &self.rd_numb.len())
+            .field("rd_consts_len", &consts_len)
+            .field("rd_virtuals_len", &self.rd_virtuals.len())
+            .field("rd_pendingfields_len", &self.rd_pendingfields.len())
+            .finish()
+    }
+}
+
+impl ResumeStorage {
+    pub fn new(
+        rd_numb: Vec<u8>,
+        rd_consts: Vec<Const>,
+        rd_virtuals: Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
+        rd_pendingfields: Vec<majit_ir::GuardPendingFieldEntry>,
+    ) -> Arc<Self> {
+        Arc::new(ResumeStorage {
+            rd_numb,
+            rd_consts: UnsafeCell::new(rd_consts),
+            rd_virtuals,
+            rd_pendingfields,
+        })
+    }
+
+    /// Empty storage (pre-finalization placeholder).
+    pub fn empty() -> Arc<Self> {
+        Self::new(Vec::new(), Vec::new(), Vec::new(), Vec::new())
+    }
+
+    /// Snapshot the constant pool (for readers that need an owned
+    /// copy — e.g. legacy `Vec<Const>`-typed APIs before their
+    /// migration to the shared storage handle).
+    pub fn rd_consts_snapshot(&self) -> Vec<Const> {
+        unsafe { (*self.rd_consts.get()).clone() }
+    }
+
+    /// Borrow `rd_consts` for reading. Safety: the root walker holds
+    /// the only writer and runs during GC, outside of reader scope.
+    pub fn rd_consts(&self) -> &[Const] {
+        unsafe { &*self.rd_consts.get() }
+    }
+
+    /// Internal accessor for the GC root walker. SAFETY: caller must
+    /// ensure exclusive access — only the minor-collection walker in
+    /// `MetaInterp::walk_rd_consts_refs` uses this.
+    pub(crate) unsafe fn rd_consts_mut_for_gc(&self) -> &mut Vec<Const> {
+        unsafe { &mut *self.rd_consts.get() }
+    }
+}
 
 /// resume.py: ResumeGuardDescr storage fields.
 ///
@@ -346,7 +443,11 @@ pub struct EncodedResumeData {
     /// resume.py:466 storage.rd_numb — flat encoded numbering section.
     pub rd_numb: Vec<i64>,
     /// resume.py:467 storage.rd_consts — shared constant pool.
-    pub rd_consts: Vec<i64>,
+    ///
+    /// RPython stores `list[Const]` (history.py:220/261/307). We keep the
+    /// same shape so Ref entries stay visible to the minor-collection root
+    /// walker (framework.py `root_walker.walk_roots` parity).
+    pub rd_consts: Vec<Const>,
     /// resume.py:468 storage.rd_pendingfields — pending field writes.
     pub rd_pendingfields: Vec<EncodedPendingFieldWrite>,
     /// compile.py:858 storage.rd_virtuals — live VirtualInfo objects.
@@ -361,7 +462,7 @@ pub struct EncodedResumeData {
     pub frame_sizes: Vec<usize>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 struct DecodedResumeLayout {
     vable_array: Vec<ResumeValueSource>,
     vref_array: Vec<ResumeValueSource>,
@@ -384,7 +485,12 @@ pub struct ResumeValueLayoutSummary {
     pub kind: ResumeValueKind,
     pub fail_arg_index: usize,
     pub raw_fail_arg_position: Option<usize>,
+    /// RPython parity: `Const.value` raw bits (getint/getref_base/getfloatstorage
+    /// all project to `i64`).
     pub constant: Option<i64>,
+    /// RPython parity: `Const.type` — paired with `constant` so the summary
+    /// round-trips back into a typed `ResumeValueSource::Constant(Const)`.
+    pub constant_type: Option<Type>,
     pub virtual_index: Option<usize>,
 }
 
@@ -513,7 +619,9 @@ impl ResumeValueLayoutSummary {
         match self.kind {
             ResumeValueKind::FailArg => ResumeValueSource::FailArg(self.raw_fail_arg_position()),
             ResumeValueKind::Constant => {
-                ResumeValueSource::Constant(self.constant.expect("missing constant value"))
+                let raw = self.constant.expect("missing constant value");
+                let tp = self.constant_type.unwrap_or(Type::Int);
+                ResumeValueSource::Constant(majit_ir::Const::from_raw_i64(raw, tp))
             }
             ResumeValueKind::Virtual => {
                 ResumeValueSource::Virtual(self.virtual_index.expect("missing virtual index"))
@@ -596,6 +704,9 @@ impl ResumeFrameLayoutSummary {
 
 impl ResumeValueLayoutSummary {
     /// Build a `ResumeValueLayoutSummary` from a backend-origin `ExitValueSourceLayout`.
+    ///
+    /// Backend-origin constants are always `Int` (numeric or tagged) — the
+    /// backend layer is untyped, so we default the Const type to Int here.
     pub fn from_exit_value_source(source: &ExitValueSourceLayout) -> Self {
         match source {
             ExitValueSourceLayout::ExitValue(index) => Self {
@@ -603,6 +714,7 @@ impl ResumeValueLayoutSummary {
                 fail_arg_index: *index,
                 raw_fail_arg_position: Some(*index),
                 constant: None,
+                constant_type: None,
                 virtual_index: None,
             },
             ExitValueSourceLayout::Constant(value) => Self {
@@ -610,6 +722,7 @@ impl ResumeValueLayoutSummary {
                 fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: Some(*value),
+                constant_type: Some(Type::Int),
                 virtual_index: None,
             },
             ExitValueSourceLayout::Virtual(index) => Self {
@@ -617,6 +730,7 @@ impl ResumeValueLayoutSummary {
                 fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
+                constant_type: None,
                 virtual_index: Some(*index),
             },
             ExitValueSourceLayout::Uninitialized => Self {
@@ -624,6 +738,7 @@ impl ResumeValueLayoutSummary {
                 fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
+                constant_type: None,
                 virtual_index: None,
             },
             ExitValueSourceLayout::Unavailable => Self {
@@ -631,6 +746,7 @@ impl ResumeValueLayoutSummary {
                 fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
+                constant_type: None,
                 virtual_index: None,
             },
         }
@@ -1020,48 +1136,10 @@ fn can_inline_tagged(value: i64) -> bool {
     (INLINE_TAGGED_MIN..=INLINE_TAGGED_MAX).contains(&value)
 }
 
-/// resume.py:161-188 getconst + resume.py:199-226 _number_boxes
-///
-/// Encode a ResumeValueSource as an i64 tagged value for rd_numb.
-/// Assigns compact sequential TAGBOX numbers via liveboxes/box_map,
-/// matching RPython's `_number_boxes` dedup assignment.
-fn encode_tagged_source(
-    source: &ResumeValueSource,
-    rd_consts: &mut Vec<i64>,
-    const_indices: &mut HashMap<i64, usize>,
-    liveboxes: &mut Vec<usize>,
-    box_map: &mut HashMap<usize, usize>,
-) -> i64 {
-    match source {
-        // resume.py:214-224: new box → liveboxes[box] = tag(num_boxes, TAGBOX)
-        ResumeValueSource::FailArg(index) => {
-            let compact = *box_map.entry(*index).or_insert_with(|| {
-                let n = liveboxes.len();
-                liveboxes.push(*index);
-                n
-            });
-            tag_i64(encode_len(compact), TAGBOX)
-        }
-        // resume.py:209: isinstance(box, Const) → self.getconst(box)
-        ResumeValueSource::Constant(value) if can_inline_tagged(*value) => {
-            // resume.py:163-167: try tag(val, TAGINT)
-            tag_i64(*value, TAGINT)
-        }
-        ResumeValueSource::Constant(value) => {
-            // resume.py:168-172: large int → _newconst → tag(index, TAGCONST)
-            let next_index = rd_consts.len();
-            let index = *const_indices.entry(*value).or_insert_with(|| {
-                rd_consts.push(*value);
-                next_index
-            });
-            tag_i64(encode_len(index), TAGCONST)
-        }
-        // resume.py:219-221: virtual → tag(num_virtuals, TAGVIRTUAL)
-        ResumeValueSource::Virtual(index) => tag_i64(encode_len(*index), TAGVIRTUAL),
-        ResumeValueSource::Uninitialized => tag_i64(ENCODED_UNINITIALIZED, TAGCONST),
-        ResumeValueSource::Unavailable => tag_i64(ENCODED_UNAVAILABLE, TAGCONST),
-    }
-}
+// `encode_tagged_source` has been promoted to a method on
+// `ResumeDataLoopMemo` (see `ResumeDataLoopMemo::encode_tagged_source`)
+// so it can share `self.consts` with `getconst`/`newconst` — matching
+// RPython's single `self.consts: list[Const]` pool (resume.py:147).
 
 /// resume.py:99-104 tag() — i64 widened variant for rd_numb encoding.
 fn tag_i64(value: i64, tagbits: u8) -> i64 {
@@ -1098,7 +1176,7 @@ fn decode_u64(value: i64) -> u64 {
 ///
 /// Each frame has a bytecode position (pc) and a set of named/indexed slots
 /// that map to tagged resume sources.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct FrameInfo {
     /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
     pub jitcode_index: i32,
@@ -1112,7 +1190,7 @@ pub struct FrameInfo {
 ///
 /// Contains enough information to reconstruct the full interpreter state
 /// from the values stored in a DeadFrame.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct ResumeData {
     /// resume.py: snapshot_iter.vable_array / virtualizable_boxes
     pub vable_array: Vec<ResumeValueSource>,
@@ -1135,13 +1213,17 @@ pub struct ResumeData {
 /// Tagged source for a value that must be reconstructed on resume.
 ///
 /// This is the majit equivalent of the tagged numbering used by
-/// `rpython/jit/metainterp/resume.py`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// `rpython/jit/metainterp/resume.py`. Each `Constant` entry carries a
+/// full `majit_ir::Const` (Int/Float/Ref) so the encoder's `getconst`
+/// dispatch (resume.py:157-188) can route through the shared pool
+/// (`ResumeDataLoopMemo.consts`) without losing type information.
+#[derive(Debug, Clone, PartialEq)]
 pub enum ResumeValueSource {
     /// Value comes from the deadframe fail-args array.
     FailArg(usize),
-    /// Value is a compile-time constant.
-    Constant(i64),
+    /// Value is a compile-time constant — carries the Const so that the
+    /// type survives encoding, matching RPython's `Const` object.
+    Constant(majit_ir::Const),
     /// Value is a virtual object that must be materialized on resume.
     Virtual(usize),
     /// Value exists conceptually but is still uninitialized.
@@ -1170,13 +1252,15 @@ impl ResumeValueSource {
                 fail_arg_index: *index,
                 raw_fail_arg_position: Some(*index),
                 constant: None,
+                constant_type: None,
                 virtual_index: None,
             },
-            ResumeValueSource::Constant(value) => ResumeValueLayoutSummary {
+            ResumeValueSource::Constant(c) => ResumeValueLayoutSummary {
                 kind: ResumeValueKind::Constant,
                 fail_arg_index: 0,
                 raw_fail_arg_position: None,
-                constant: Some(*value),
+                constant: Some(c.as_raw_i64()),
+                constant_type: Some(c.get_type()),
                 virtual_index: None,
             },
             ResumeValueSource::Virtual(index) => ResumeValueLayoutSummary {
@@ -1184,6 +1268,7 @@ impl ResumeValueSource {
                 fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
+                constant_type: None,
                 virtual_index: Some(*index),
             },
             ResumeValueSource::Uninitialized => ResumeValueLayoutSummary {
@@ -1191,6 +1276,7 @@ impl ResumeValueSource {
                 fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
+                constant_type: None,
                 virtual_index: None,
             },
             ResumeValueSource::Unavailable => ResumeValueLayoutSummary {
@@ -1198,6 +1284,7 @@ impl ResumeValueSource {
                 fail_arg_index: 0,
                 raw_fail_arg_position: None,
                 constant: None,
+                constant_type: None,
                 virtual_index: None,
             },
         }
@@ -1541,7 +1628,7 @@ pub type VirtualFieldSource = ResumeValueSource;
 /// `consts` is the rd_consts array. `count` is the number of fail_args
 /// (used for negative TAGBOX indices). Both come from the containing
 /// ResumeGuardDescr / EncodedResumeData.
-pub fn tagged_to_source(tagged: i16, consts: &[i64], count: i32) -> VirtualFieldSource {
+pub fn tagged_to_source(tagged: i16, consts: &[majit_ir::Const], count: i32) -> VirtualFieldSource {
     if tagged_eq(tagged, UNASSIGNED) {
         return ResumeValueSource::Unavailable;
     }
@@ -1549,19 +1636,23 @@ pub fn tagged_to_source(tagged: i16, consts: &[i64], count: i32) -> VirtualField
         return ResumeValueSource::Uninitialized;
     }
     if tagged_eq(tagged, NULLREF) {
-        return ResumeValueSource::Constant(0);
+        // history.py:361 CONST_NULL = ConstPtr(null). resume.py:1589 parity.
+        return ResumeValueSource::Constant(majit_ir::Const::Ref(majit_ir::GcRef::NULL));
     }
     let (num, tag_bits) = untag(tagged);
     match tag_bits {
         TAGCONST => {
             let idx = (num - TAG_CONST_OFFSET) as usize;
             if idx < consts.len() {
+                // resume.py:1568 self.consts[num - TAG_CONST_OFFSET] — the
+                // Const object carries its type (ConstInt/ConstFloat/ConstPtr).
                 ResumeValueSource::Constant(consts[idx])
             } else {
-                ResumeValueSource::Constant(0)
+                ResumeValueSource::Constant(majit_ir::Const::Int(0))
             }
         }
-        TAGINT => ResumeValueSource::Constant(num as i64),
+        // resume.py:1581 ConstInt(num) — always Int type for TAGINT.
+        TAGINT => ResumeValueSource::Constant(majit_ir::Const::Int(num as i64)),
         TAGBOX => {
             let mut idx = num;
             if idx < 0 {
@@ -1580,7 +1671,7 @@ pub fn tagged_to_source(tagged: i16, consts: &[i64], count: i32) -> VirtualField
 /// `consts` and `count` are needed to decode tagged fieldnums.
 pub fn rd_virtual_to_virtual_info(
     rd: &majit_ir::RdVirtualInfo,
-    consts: &[i64],
+    consts: &[majit_ir::Const],
     count: i32,
 ) -> VirtualInfo {
     match rd {
@@ -1783,7 +1874,7 @@ pub fn rd_virtual_to_virtual_info(
 }
 
 /// Deferred heap write to replay during resume.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct PendingFieldInfo {
     /// Descriptor index identifying the target field or array descriptor.
     pub descr_index: u32,
@@ -1846,6 +1937,12 @@ impl EncodedResumeData {
     ///
     /// Walks all frames via _number_boxes, assigning compact sequential
     /// TAGBOX numbers to unique liveboxes (resume.py:199-226).
+    ///
+    /// Unlike `ResumeDataLoopMemo::encode_shared`, this is a single-shot
+    /// encoder (no cross-guard dedup). It builds a local memo that shares
+    /// the same encoding logic so the tagged output is bit-compatible with
+    /// the shared path. Used by tests and standalone embedders that don't
+    /// carry a memo instance.
     fn from_semantic(
         vable_array: &[ResumeValueSource],
         vref_array: &[ResumeValueSource],
@@ -1853,11 +1950,9 @@ impl EncodedResumeData {
         virtuals: &[VirtualInfo],
         pending_fields: &[PendingFieldInfo],
     ) -> Self {
+        let mut memo = ResumeDataLoopMemo::new();
         let mut rd_numb = Vec::new();
-        let mut rd_consts = Vec::new();
-        let mut const_indices = HashMap::new();
         // resume.py:138 numb_state.liveboxes — compact TAGBOX numbering state.
-        // liveboxes[compact_n] = original FailArg index.
         let mut liveboxes: Vec<usize> = Vec::new();
         let mut box_map: HashMap<usize, usize> = HashMap::new();
 
@@ -1866,13 +1961,7 @@ impl EncodedResumeData {
         rd_numb.push(0); // [1] = count (patched later)
         rd_numb.push(encode_len(vable_array.len()));
         for source in vable_array {
-            let tagged = encode_tagged_source(
-                source,
-                &mut rd_consts,
-                &mut const_indices,
-                &mut liveboxes,
-                &mut box_map,
-            );
+            let tagged = memo.encode_tagged_source(source, &mut liveboxes, &mut box_map);
             rd_numb.push(tagged);
         }
         // resume.py:243-247: vref_array (pairs).
@@ -1882,31 +1971,18 @@ impl EncodedResumeData {
         );
         rd_numb.push(encode_len(vref_array.len() / 2));
         for source in vref_array {
-            let tagged = encode_tagged_source(
-                source,
-                &mut rd_consts,
-                &mut const_indices,
-                &mut liveboxes,
-                &mut box_map,
-            );
+            let tagged = memo.encode_tagged_source(source, &mut liveboxes, &mut box_map);
             rd_numb.push(tagged);
         }
 
         // resume.py:249-253: per-frame encoding via _number_boxes.
-        // Per-frame: jitcode_index, pc, [tagged_values...].
         let mut frame_sizes = Vec::with_capacity(frames.len());
         for frame in frames {
             rd_numb.push(frame.jitcode_index as i64);
             rd_numb.push(encode_u64(frame.pc));
             // resume.py:253 _number_boxes(snapshot_iter, iter_array(snapshot), numb_state)
             for source in &frame.slot_map {
-                let tagged = encode_tagged_source(
-                    source,
-                    &mut rd_consts,
-                    &mut const_indices,
-                    &mut liveboxes,
-                    &mut box_map,
-                );
+                let tagged = memo.encode_tagged_source(source, &mut liveboxes, &mut box_map);
                 rd_numb.push(tagged);
             }
             frame_sizes.push(frame.slot_map.len());
@@ -1933,23 +2009,12 @@ impl EncodedResumeData {
             .iter()
             .map(|pending| EncodedPendingFieldWrite {
                 descr_index: pending.descr_index,
-                target: encode_tagged_source(
-                    &pending.target,
-                    &mut rd_consts,
-                    &mut const_indices,
-                    &mut liveboxes,
-                    &mut box_map,
-                ),
-                value: encode_tagged_source(
-                    &pending.value,
-                    &mut rd_consts,
-                    &mut const_indices,
-                    &mut liveboxes,
-                    &mut box_map,
-                ),
+                target: memo.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
+                value: memo.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
                 item_index: pending.item_index,
             })
             .collect();
+        let rd_consts = memo.take_consts();
 
         // resume.py:260: numb_state.patch_current_size(0) → items_resume_section
         rd_numb[0] = encode_len(rd_numb.len());
@@ -2060,7 +2125,8 @@ impl EncodedResumeData {
     fn decode_box(&self, encoded: i64) -> ResumeValueSource {
         let (value, tag) = untag_i64(encoded);
         match tag {
-            TAGINT => ResumeValueSource::Constant(value),
+            // resume.py:1257 ConstInt(num).
+            TAGINT => ResumeValueSource::Constant(majit_ir::Const::Int(value)),
             // resume.py:1261 self.liveboxes[num] — compact TAGBOX → original FailArg.
             TAGBOX => {
                 let compact_idx = decode_len(value);
@@ -2069,14 +2135,24 @@ impl EncodedResumeData {
             }
             TAGVIRTUAL => ResumeValueSource::Virtual(decode_len(value)),
             TAGCONST => match value {
+                // resume.py:1552-1596 decode_ref: `if tagged_eq(tagged,
+                // NULLREF): return CONST_NULL`. The i64 decoder mirrors
+                // the i16 `decode_box`'s NULLREF fast-path (resume.rs
+                // line 4363) so encoder/decoder stay symmetric.
+                ENCODED_NULLREF => {
+                    ResumeValueSource::Constant(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
+                }
                 ENCODED_UNINITIALIZED => ResumeValueSource::Uninitialized,
                 ENCODED_UNAVAILABLE => ResumeValueSource::Unavailable,
-                index if index >= 0 => ResumeValueSource::Constant(
-                    *self
+                index if index >= 0 => {
+                    // resume.py:1555/1571/1583 self.consts[num - TAG_CONST_OFFSET]
+                    // — the Const carries its own type.
+                    let c = *self
                         .rd_consts
                         .get(decode_len(index))
-                        .expect("resume const pool index out of bounds"),
-                ),
+                        .expect("resume const pool index out of bounds");
+                    ResumeValueSource::Constant(c)
+                }
                 other => panic!("unknown CONST-tagged resume sentinel {other}"),
             },
             other => panic!("unknown resume tag {other}"),
@@ -2335,7 +2411,7 @@ impl ResumeData {
             ResumeValueSource::FailArg(idx) => {
                 MaterializedValue::Value(fail_values.get(*idx).copied().unwrap_or(0))
             }
-            ResumeValueSource::Constant(val) => MaterializedValue::Value(*val),
+            ResumeValueSource::Constant(c) => MaterializedValue::Value(c.as_raw_i64()),
             ResumeValueSource::Virtual(idx) => MaterializedValue::VirtualRef(*idx),
             ResumeValueSource::Uninitialized | ResumeValueSource::Unavailable => {
                 MaterializedValue::Value(0)
@@ -2352,7 +2428,7 @@ impl ResumeData {
             ResumeValueSource::FailArg(idx) => {
                 ReconstructedValue::Value(fail_values.get(*idx).copied().unwrap_or(0))
             }
-            ResumeValueSource::Constant(val) => ReconstructedValue::Value(*val),
+            ResumeValueSource::Constant(c) => ReconstructedValue::Value(c.as_raw_i64()),
             ResumeValueSource::Virtual(idx) => ReconstructedValue::Virtual(*idx),
             ResumeValueSource::Uninitialized => ReconstructedValue::Uninitialized,
             ResumeValueSource::Unavailable => ReconstructedValue::Unavailable,
@@ -2810,8 +2886,8 @@ impl ResumeDataVirtualAdder {
     }
 
     /// Set a frame slot to a compile-time constant.
-    pub fn set_slot_constant(&mut self, slot_idx: usize, value: i64) {
-        self.set_slot_source(slot_idx, FrameSlotSource::Constant(value));
+    pub fn set_slot_constant(&mut self, slot_idx: usize, constant: majit_ir::Const) {
+        self.set_slot_source(slot_idx, FrameSlotSource::Constant(constant));
     }
 
     /// Set a frame slot to reference a virtual object.
@@ -3011,26 +3087,14 @@ pub struct ResumeDataLoopMemo {
     /// resume.py:147 — shared constant pool.
     /// RPython stores Const objects (with type INT/REF/FLOAT).
     /// We store (value, type) pairs to preserve type information.
-    consts: Vec<(i64, majit_ir::Type)>,
+    consts: Vec<majit_ir::Const>,
     /// resume.py:148 — large integers (outside TAGINT range) → tagged const.
     large_ints: HashMap<i64, i16>,
     /// resume.py:149 — ref pointers → tagged const.
     refs: HashMap<i64, i16>,
-    /// NEW-DEVIATION from resume.py: parallel i64 constant pool used by
-    /// `encode_tagged_source` (via `encode_shared`) to build
-    /// `storage.rd_consts`. RPython has a single `self.consts` pool —
-    /// `_newconst(const)` appends to it and `tag(len, TAGCONST)` indexes
-    /// it. majit split the pool because rd_numb encoding stores i64
-    /// values instead of RPython's i16 `append_short` tagged values. A
-    /// future refactor should collapse `consts` + `rd_consts_pool` once
-    /// the numbering representation is unified.
-    rd_consts_pool: Vec<i64>,
-    /// NEW-DEVIATION companion to `rd_consts_pool`: dedup index (value →
-    /// position in `rd_consts_pool`). RPython does not have a separate
-    /// const-index table — `self.large_ints` / `self.refs` serve that
-    /// role, keyed by value and storing the tagged i16 result directly.
-    /// Collapses along with `rd_consts_pool` once the pools unify.
-    const_indices: HashMap<i64, usize>,
+    /// resume.py:147 self.consts — constant pool for encode_shared.
+    /// Becomes storage.rd_consts (resume.py:467).
+    ///
     /// resume.py:150-151 — cached box/virtual numbering.
     pub cached_boxes: HashMap<u32, i32>,
     pub cached_virtuals: HashMap<u32, i32>,
@@ -3046,13 +3110,45 @@ impl ResumeDataLoopMemo {
             consts: Vec::new(),
             large_ints: HashMap::new(),
             refs: HashMap::new(),
-            rd_consts_pool: Vec::new(),
-            const_indices: HashMap::new(),
             cached_boxes: HashMap::new(),
             cached_virtuals: HashMap::new(),
             nvirtuals: 0,
             nvholes: 0,
             nvreused: 0,
+        }
+    }
+
+    /// resume.py:199-226 `_number_boxes` + resume.py:209 `getconst` parity.
+    ///
+    /// Encode one `ResumeValueSource` into the i64 tagged form written to
+    /// `rd_numb`. `liveboxes` / `box_map` track compact TAGBOX numbering
+    /// identical to RPython's `numb_state.liveboxes` dict.
+    ///
+    /// Pushes Ref/Float/large-Int constants through `getconst_i64`, which
+    /// shares `self.consts` with the i16 `getconst` path — so there is
+    /// exactly one pool per memo (RPython parity: `self.consts: list[Const]`).
+    pub fn encode_tagged_source(
+        &mut self,
+        source: &ResumeValueSource,
+        liveboxes: &mut Vec<usize>,
+        box_map: &mut HashMap<usize, usize>,
+    ) -> i64 {
+        match source {
+            // resume.py:214-224: new box → liveboxes[box] = tag(num_boxes, TAGBOX)
+            ResumeValueSource::FailArg(index) => {
+                let compact = *box_map.entry(*index).or_insert_with(|| {
+                    let n = liveboxes.len();
+                    liveboxes.push(*index);
+                    n
+                });
+                tag_i64(encode_len(compact), TAGBOX)
+            }
+            // resume.py:209: isinstance(box, Const) → self.getconst(box).
+            ResumeValueSource::Constant(c) => self.getconst_i64(c),
+            // resume.py:219-221: virtual → tag(num_virtuals, TAGVIRTUAL)
+            ResumeValueSource::Virtual(index) => tag_i64(encode_len(*index), TAGVIRTUAL),
+            ResumeValueSource::Uninitialized => tag_i64(ENCODED_UNINITIALIZED, TAGCONST),
+            ResumeValueSource::Unavailable => tag_i64(ENCODED_UNAVAILABLE, TAGCONST),
         }
     }
 
@@ -3107,8 +3203,62 @@ impl ResumeDataLoopMemo {
     /// resume.py:185 _newconst — add to consts pool, return TAGCONST-tagged.
     fn newconst(&mut self, val: i64, tp: majit_ir::Type) -> i16 {
         let index = self.consts.len() as i32 + TAG_CONST_OFFSET;
-        self.consts.push((val, tp));
+        self.consts.push(majit_ir::Const::from_raw_i64(val, tp));
         ((index << 2) | TAGCONST as i32) as i16
+    }
+
+    /// resume.py:161-188 getconst — i64-sized variant used by the rd_numb
+    /// encoder (`encode_shared`). Shares the pool (`self.consts`) with the
+    /// i16 variant (`getconst`) so there is exactly one `rd_consts` per
+    /// memo, matching RPython's single `self.consts: list[Const]`.
+    fn getconst_i64(&mut self, c: &majit_ir::Const) -> i64 {
+        match c {
+            // resume.py:163-167: try tag(val, TAGINT).
+            majit_ir::Const::Int(value) if can_inline_tagged(*value) => tag_i64(*value, TAGINT),
+            majit_ir::Const::Int(value) => {
+                // resume.py:168-172 large int.
+                if let Some(&tagged_i16) = self.large_ints.get(value) {
+                    let (num, _) = untag(tagged_i16);
+                    return tag_i64(encode_len((num - TAG_CONST_OFFSET) as usize), TAGCONST);
+                }
+                let index = self.consts.len();
+                self.consts.push(majit_ir::Const::Int(*value));
+                // Also publish through the i16 cache so that a later
+                // `getconst_int(value)` returns the same pool slot
+                // (resume.py:171 self.large_ints[val] = tagged).
+                let tagged_i16 =
+                    ((((index as i32) + TAG_CONST_OFFSET) << 2) | TAGCONST as i32) as i16;
+                self.large_ints.insert(*value, tagged_i16);
+                tag_i64(encode_len(index), TAGCONST)
+            }
+            majit_ir::Const::Ref(gcref) => {
+                // resume.py:174-176 val = 0 → NULLREF sentinel (no pool
+                // entry allocated). `NULLREF = tag(-1, TAGCONST)` —
+                // encoder emits `tag_i64(-1, TAGCONST)` and the
+                // matching decoder in `decode_box` recognizes
+                // `ENCODED_NULLREF` before the positive-index branch.
+                let raw = gcref.as_usize() as i64;
+                if raw == 0 {
+                    return tag_i64(ENCODED_NULLREF, TAGCONST);
+                }
+                if let Some(&tagged_i16) = self.refs.get(&raw) {
+                    let (num, _) = untag(tagged_i16);
+                    return tag_i64(encode_len((num - TAG_CONST_OFFSET) as usize), TAGCONST);
+                }
+                let index = self.consts.len();
+                self.consts.push(majit_ir::Const::Ref(*gcref));
+                let tagged_i16 =
+                    ((((index as i32) + TAG_CONST_OFFSET) << 2) | TAGCONST as i32) as i16;
+                self.refs.insert(raw, tagged_i16);
+                tag_i64(encode_len(index), TAGCONST)
+            }
+            majit_ir::Const::Float(v) => {
+                // resume.py:183 _newconst (no dedup for floats in RPython).
+                let index = self.consts.len();
+                self.consts.push(majit_ir::Const::Float(*v));
+                tag_i64(encode_len(index), TAGCONST)
+            }
+        }
     }
 
     /// resume.py:261-262 num_cached_boxes — length of the box dedup cache.
@@ -3188,18 +3338,15 @@ impl ResumeDataLoopMemo {
         self.cached_virtuals.clear();
     }
 
-    /// Access the shared constant pool (value, type) pairs.
-    pub fn consts(&self) -> &[(i64, majit_ir::Type)] {
+    /// Access the shared constant pool (value, type) pairs. Parity with
+    /// RPython `memo.consts` list access (resume.py:147).
+    pub fn consts(&self) -> &[majit_ir::Const] {
         &self.consts
     }
 
-    /// Access constant values only (for decode compatibility).
-    pub fn const_values(&self) -> Vec<i64> {
-        self.consts.iter().map(|&(v, _)| v).collect()
-    }
-
-    /// Take ownership of the shared constant pool.
-    pub fn take_consts(&mut self) -> Vec<(i64, majit_ir::Type)> {
+    /// Take ownership of the shared constant pool — used by single-shot
+    /// encoders that discard the memo after encoding.
+    pub fn take_consts(&mut self) -> Vec<majit_ir::Const> {
         std::mem::take(&mut self.consts)
     }
 
@@ -3525,7 +3672,7 @@ impl ResumeDataLoopMemo {
     /// - `get_type(opref)` → box.type ('i', 'r', 'f') (resume.py:211,214)
     /// - `is_virtual_ref(opref)` → getptrinfo(box).is_virtual() (resume.py:212-213)
     /// - `is_virtual_raw(opref)` → getrawptrinfo(box).is_virtual() (resume.py:215-216)
-    /// See `majit_ir::resumedata::ResumeDataLoopMemo::_number_boxes` for docs.
+    /// resume.py:192-226 `_number_boxes` — tag each box in a snapshot section.
     pub fn _number_boxes(
         &mut self,
         boxes: &[majit_ir::OpRef],
@@ -3693,7 +3840,7 @@ impl ResumeDataLoopMemo {
         optimizer_knowledge: Option<&OptimizerKnowledgeForResume>,
     ) -> (
         Vec<u8>,
-        Vec<(i64, majit_ir::Type)>,
+        Vec<majit_ir::Const>,
         Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>,
         Vec<majit_ir::OpRef>,
         std::collections::HashMap<u32, majit_ir::Type>,
@@ -3943,13 +4090,7 @@ impl ResumeDataLoopMemo {
         rd_numb.push(0); // [1] = count
         rd_numb.push(encode_len(rd.vable_array.len()));
         for source in &rd.vable_array {
-            let tagged = encode_tagged_source(
-                source,
-                &mut self.rd_consts_pool,
-                &mut self.const_indices,
-                &mut liveboxes,
-                &mut box_map,
-            );
+            let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
             rd_numb.push(tagged);
         }
         // resume.py:243-247: vref_array (pairs).
@@ -3959,13 +4100,7 @@ impl ResumeDataLoopMemo {
         );
         rd_numb.push(encode_len(rd.vref_array.len() / 2));
         for source in &rd.vref_array {
-            let tagged = encode_tagged_source(
-                source,
-                &mut self.rd_consts_pool,
-                &mut self.const_indices,
-                &mut liveboxes,
-                &mut box_map,
-            );
+            let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
             rd_numb.push(tagged);
         }
 
@@ -3975,13 +4110,7 @@ impl ResumeDataLoopMemo {
             rd_numb.push(frame.jitcode_index as i64);
             rd_numb.push(encode_u64(frame.pc));
             for source in &frame.slot_map {
-                let tagged = encode_tagged_source(
-                    source,
-                    &mut self.rd_consts_pool,
-                    &mut self.const_indices,
-                    &mut liveboxes,
-                    &mut box_map,
-                );
+                let tagged = self.encode_tagged_source(source, &mut liveboxes, &mut box_map);
                 rd_numb.push(tagged);
             }
             frame_sizes.push(frame.slot_map.len());
@@ -4003,25 +4132,15 @@ impl ResumeDataLoopMemo {
         }
 
         // resume.py:420-430: walk pending fields — register + encode.
-        let rd_pendingfields: Vec<_> = rd
-            .pending_fields
-            .iter()
+        // Collect first, then encode — can't hold iter borrow and call
+        // `&mut self` method in the same expression.
+        let pending_fields_snapshot: Vec<_> = rd.pending_fields.iter().cloned().collect();
+        let rd_pendingfields: Vec<_> = pending_fields_snapshot
+            .into_iter()
             .map(|pending| EncodedPendingFieldWrite {
                 descr_index: pending.descr_index,
-                target: encode_tagged_source(
-                    &pending.target,
-                    &mut self.rd_consts_pool,
-                    &mut self.const_indices,
-                    &mut liveboxes,
-                    &mut box_map,
-                ),
-                value: encode_tagged_source(
-                    &pending.value,
-                    &mut self.rd_consts_pool,
-                    &mut self.const_indices,
-                    &mut liveboxes,
-                    &mut box_map,
-                ),
+                target: self.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
+                value: self.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
                 item_index: pending.item_index,
             })
             .collect();
@@ -4032,7 +4151,8 @@ impl ResumeDataLoopMemo {
 
         EncodedResumeData {
             rd_numb,
-            rd_consts: self.rd_consts_pool.clone(),
+            // resume.py:451 storage.rd_consts = self.memo.consts — single pool.
+            rd_consts: self.consts.clone(),
             rd_pendingfields,
             rd_virtuals,
             liveboxes,
@@ -4087,7 +4207,7 @@ impl<'a> ResumeDataReader<'a> {
     pub fn decode_value(&self, source: &ResumeValueSource) -> i64 {
         match source {
             ResumeValueSource::FailArg(idx) => self.fail_values.get(*idx).copied().unwrap_or(0),
-            ResumeValueSource::Constant(val) => *val,
+            ResumeValueSource::Constant(c) => c.as_raw_i64(),
             ResumeValueSource::Virtual(vidx) => {
                 self.virtuals.get(*vidx).copied().flatten().unwrap_or(0)
             }
@@ -4173,19 +4293,16 @@ impl OptimizerKnowledgeForResume {
 
 /// bridgeopt.py:44-61 decode_box return type.
 ///
-/// RPython's decode_box returns actual Const/Box objects. Rust uses this
-/// enum to preserve the distinction between constants and live boxes,
-/// matching RPython's Const vs Box class hierarchy.
+/// RPython's decode_box returns actual Const/Box objects. Two Rust
+/// variants mirror that: `LiveBox` for `Box` references (TAGBOX) and
+/// `Const` for all Const subtypes (TAGINT/TAGCONST/NULLREF), collapsing
+/// into a single `majit_ir::Const` that carries its own type.
 #[derive(Clone, Debug, PartialEq)]
 pub enum DecodedBox {
-    /// TAGBOX → liveboxes[num] (bridge inputarg / optimizer box)
+    /// TAGBOX → liveboxes[num] (bridge inputarg / optimizer box).
     LiveBox(majit_ir::OpRef),
-    /// TAGINT → ConstInt(num) — signed inline integer
-    ConstInt(i64),
-    /// TAGCONST → rd_consts[idx] constant (value, type)
-    Const(i64, majit_ir::Type),
-    /// NULLREF → CONST_NULL
-    NullRef,
+    /// TAGINT / TAGCONST / NULLREF — all Const subtypes.
+    Const(majit_ir::Const),
 }
 
 /// bridgeopt.py:44-61 decode_box: untag a tagged value from rd_numb.
@@ -4195,44 +4312,41 @@ pub enum DecodedBox {
 /// Python class hierarchy.
 pub fn decode_box(
     tagged: i16,
-    rd_consts: &[(i64, majit_ir::Type)],
+    rd_consts: &[majit_ir::Const],
     liveboxes: &[majit_ir::OpRef],
 ) -> DecodedBox {
     let (num, tag_type) = untag(tagged);
     // NB: the TAGVIRTUAL case can't happen here, because this code runs after
-    // virtuals are already forced again
+    // virtuals are already forced again.
     match tag_type {
         TAGCONST => {
             if tagged_eq(tagged, NULLREF) {
-                // bridgeopt.py:51: box = CONST_NULL
-                DecodedBox::NullRef
+                // bridgeopt.py:51: box = CONST_NULL (history.py:361).
+                DecodedBox::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
             } else {
                 // bridgeopt.py:54: box = resumestorage.rd_consts[num - TAG_CONST_OFFSET]
                 let idx = (num - TAG_CONST_OFFSET) as usize;
                 if idx < rd_consts.len() {
-                    let (val, tp) = rd_consts[idx];
-                    DecodedBox::Const(val, tp)
+                    DecodedBox::Const(rd_consts[idx])
                 } else {
-                    DecodedBox::NullRef
+                    DecodedBox::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
                 }
             }
         }
-        TAGINT => {
-            // bridgeopt.py:56: box = ConstInt(num)
-            DecodedBox::ConstInt(num as i64)
-        }
+        // bridgeopt.py:56: box = ConstInt(num)
+        TAGINT => DecodedBox::Const(majit_ir::Const::Int(num as i64)),
         TAGBOX => {
             // bridgeopt.py:58: box = liveboxes[num]
             if (num as usize) < liveboxes.len() {
                 DecodedBox::LiveBox(liveboxes[num as usize])
             } else {
-                DecodedBox::NullRef
+                DecodedBox::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
             }
         }
         _ => {
             // bridgeopt.py:60: raise AssertionError("unreachable")
             debug_assert!(false, "decode_box: unexpected tag type {}", tag_type);
-            DecodedBox::NullRef
+            DecodedBox::Const(majit_ir::Const::Ref(majit_ir::GcRef::NULL))
         }
     }
 }
@@ -4405,7 +4519,10 @@ mod tests {
         assert_eq!(rebuilt_frames.len(), 1);
         assert_eq!(rebuilt_frames[0].pc, 8);
         assert_eq!(rebuilt_frames[0].values.len(), 3);
-        assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Int(42));
+        assert_eq!(
+            rebuilt_frames[0].values[0],
+            RebuiltValue::Const(majit_ir::Const::Int(42))
+        );
         assert_eq!(
             rebuilt_frames[0].values[1],
             RebuiltValue::Box(0, majit_ir::Type::Int)
@@ -4512,7 +4629,7 @@ mod tests {
         assert_eq!(items[9], 20);
 
         // Roundtrip with liveness-based closure.
-        let rd_consts: Vec<(i64, majit_ir::Type)> = memo.consts().to_vec();
+        let rd_consts: Vec<majit_ir::Const> = memo.consts().to_vec();
         let frame_count = |jitcode_index: i32, _pc: i32| -> usize {
             match jitcode_index {
                 0 => 2, // Frame 0 has 2 boxes
@@ -4567,7 +4684,10 @@ mod tests {
             rebuild_from_numbering(&rd_numb, &rd_consts, &fail_arg_types, None);
         assert_eq!(num_failargs, 2);
         assert_eq!(rebuilt_frames.len(), 1);
-        assert_eq!(rebuilt_frames[0].values[0], RebuiltValue::Int(42));
+        assert_eq!(
+            rebuilt_frames[0].values[0],
+            RebuiltValue::Const(majit_ir::Const::Int(42))
+        );
         assert_eq!(
             rebuilt_frames[0].values[1],
             RebuiltValue::Box(0, majit_ir::Type::Int)
@@ -4857,8 +4977,18 @@ pub struct ResumeDataDirectReader<'a> {
     pub items_resume_section: i32,
     /// resume.py:921 count — number of failargs
     pub count: i32,
-    /// resume.py:922 consts — constant pool from rd_consts
-    pub consts: &'a [i64],
+    /// resume.py:922 consts — constant pool from rd_consts.
+    ///
+    /// RPython stores `list[Const]` where each `Const` carries its own type
+    /// (history.py:220 ConstInt / :261 ConstFloat / :307 ConstPtr). In the
+    /// Rust port we represent each entry as `(raw_i64, Type)` so that
+    /// `ConstPtr.getref_base()` parity (returning a GC-tracked pointer) can
+    /// be surfaced to the minor-collection root walker — see
+    /// `walk_rd_consts_refs` on `MetaInterp`. Raw `Vec<i64>` hid the
+    /// Ref-typed entries from the GC and caused nursery use-after-free in
+    /// TAGCONST decode paths (resume.py:1557 decode_int / :1566 decode_ref /
+    /// :1578 decode_float).
+    pub consts: &'a [majit_ir::Const],
 
     // ResumeDataDirectReader fields (resume.py:1364-1367)
     /// resume.py:1366 deadframe — raw fail_args values
@@ -5243,7 +5373,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// resume.py:1364 __init__
     pub fn new(
         rd_numb: &'a [u8],
-        rd_consts: &'a [i64],
+        rd_consts: &'a [majit_ir::Const],
         all_liveness: &'a [u8],
         deadframe: &'a [i64],
         deadframe_types: Option<&'a [majit_ir::Type]>,
@@ -5307,7 +5437,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             // resume.py:1002: struct = self.decode_ref(num)
             let struct_ptr = match &pf.target {
                 ResumeValueSource::FailArg(idx) => self.deadframe[*idx],
-                ResumeValueSource::Constant(val) => *val,
+                ResumeValueSource::Constant(c) => c.as_raw_i64(),
                 ResumeValueSource::Virtual(idx) => self.getvirtual_ptr(*idx),
                 _ => 0,
             };
@@ -5317,7 +5447,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                     // resume.py:1004-1005: self.setfield(struct, fieldnum, descr)
                     let value = match &pf.value {
                         ResumeValueSource::FailArg(idx) => self.deadframe[*idx],
-                        ResumeValueSource::Constant(val) => *val,
+                        ResumeValueSource::Constant(c) => c.as_raw_i64(),
                         ResumeValueSource::Virtual(idx) => self.getvirtual_ptr(*idx),
                         _ => 0,
                     };
@@ -5328,7 +5458,7 @@ impl<'a> ResumeDataDirectReader<'a> {
                     // resume.py:1007: self.setarrayitem(struct, itemindex, fieldnum, descr)
                     let value = match &pf.value {
                         ResumeValueSource::FailArg(idx) => self.deadframe[*idx],
-                        ResumeValueSource::Constant(val) => *val,
+                        ResumeValueSource::Constant(c) => c.as_raw_i64(),
                         ResumeValueSource::Virtual(idx) => self.getvirtual_ptr(*idx),
                         _ => 0,
                     };
@@ -5711,9 +5841,9 @@ impl<'a> ResumeDataDirectReader<'a> {
         let (num, tag) = untag(tagged);
         match tag {
             TAGCONST => {
-                // resume.py:1555
+                // resume.py:1555 — ConstInt.getint(): return the i64 value.
                 let idx = (num - TAG_CONST_OFFSET) as usize;
-                self.consts[idx]
+                self.consts[idx].getint()
             }
             TAGINT => {
                 // resume.py:1557
@@ -5746,7 +5876,8 @@ impl<'a> ResumeDataDirectReader<'a> {
                 }
                 // resume.py:1571
                 let idx = (num - TAG_CONST_OFFSET) as usize;
-                self.consts[idx]
+                // history.py:316 ConstPtr.getref_base() returns the GCREF value.
+                self.consts[idx].getref_base().as_usize() as i64
             }
             TAGVIRTUAL => {
                 // resume.py:1573
@@ -5791,9 +5922,9 @@ impl<'a> ResumeDataDirectReader<'a> {
         let (num, tag) = untag(tagged);
         match tag {
             TAGCONST => {
-                // resume.py:1583
+                // resume.py:1583 — ConstFloat.getfloatstorage(): i64 bits.
                 let idx = (num - TAG_CONST_OFFSET) as usize;
-                self.consts[idx]
+                self.consts[idx].getfloatstorage()
             }
             TAGBOX => {
                 // resume.py:1585-1588
@@ -5816,7 +5947,8 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn decode_field_source(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
             ResumeValueSource::FailArg(index) => self.deadframe[*index],
-            ResumeValueSource::Constant(value) => *value,
+            // resume.py:1568 ConstPtr.getref_base() — the Const carries its type.
+            ResumeValueSource::Constant(c) => c.getref_base().as_usize() as i64,
             ResumeValueSource::Virtual(index) => self.getvirtual_ptr(*index),
             ResumeValueSource::Uninitialized => 0,
             ResumeValueSource::Unavailable => 0,
@@ -5829,7 +5961,8 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn decode_field_source_int(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
             ResumeValueSource::FailArg(index) => self.deadframe[*index],
-            ResumeValueSource::Constant(value) => *value,
+            // resume.py:1555 ConstInt.getint().
+            ResumeValueSource::Constant(c) => c.getint(),
             ResumeValueSource::Virtual(index) => self.getvirtual_int(*index),
             ResumeValueSource::Uninitialized => 0,
             ResumeValueSource::Unavailable => 0,
@@ -5844,7 +5977,8 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn decode_field_source_float(&mut self, source: &VirtualFieldSource) -> i64 {
         match source {
             ResumeValueSource::FailArg(index) => self.deadframe[*index],
-            ResumeValueSource::Constant(value) => *value,
+            // resume.py:1583 ConstFloat.getfloatstorage().
+            ResumeValueSource::Constant(c) => c.getfloatstorage(),
             ResumeValueSource::Virtual(_) => {
                 panic!("decode_field_source_float: TAGVIRTUAL not valid for float field")
             }
@@ -5920,7 +6054,7 @@ pub fn blackhole_from_resumedata<'a>(
     builder: &mut crate::blackhole::BlackholeInterpBuilder,
     resolve_jitcode: &dyn Fn(i32, i32) -> Option<ResolvedJitCode>,
     rd_numb: &'a [u8],
-    rd_consts: &'a [i64],
+    rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
     deadframe: &'a [i64],
     deadframe_types: Option<&'a [majit_ir::Type]>,
@@ -5999,7 +6133,7 @@ pub fn blackhole_from_resumedata<'a>(
 /// Returns (virtuals_cache_ptr, virtuals_cache_int) — RPython VirtualCache parity.
 pub fn force_from_resumedata<'a>(
     rd_numb: &'a [u8],
-    rd_consts: &'a [i64],
+    rd_consts: &'a [majit_ir::Const],
     all_liveness: &'a [u8],
     deadframe: &'a [i64],
     deadframe_types: Option<&'a [majit_ir::Type]>,

@@ -190,10 +190,18 @@ impl Parse for VirtualizableMacroInput {
                                     })?,
                                 }
                             } else {
-                                VableArrayLayoutDecl::Direct { field_offset }
+                                VableArrayLayoutDecl::Direct {
+                                    field_offset,
+                                    length_offset,
+                                    items_offset,
+                                }
                             }
                         } else {
-                            VableArrayLayoutDecl::Direct { field_offset }
+                            VableArrayLayoutDecl::Direct {
+                                field_offset,
+                                length_offset: None,
+                                items_offset: None,
+                            }
                         };
                         arrays.push(VableArrayDecl {
                             name,
