@@ -309,25 +309,9 @@ fn emit_local_impl(out: &mut String) {
     out.push_str("        if idx < self.sym().concrete_locals.len() {\n");
     out.push_str("            self.sym_mut().concrete_locals[idx] = value.concrete;\n");
     out.push_str("        }\n");
-    // Convert ConcreteValue → majit_ir::Value so the callee can write the
-    // Box atomically (opref + concrete shadow) without recomputing from
-    // the operand-stack shadow, which is ambiguous after multi-pop
-    // opcodes such as STORE_FAST_STORE_FAST.
-    out.push_str("        let concrete_value = match value.concrete {\n");
-    out.push_str(
-        "            crate::state::ConcreteValue::Ref(obj) => majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)),\n",
-    );
-    out.push_str("            crate::state::ConcreteValue::Int(v) => majit_ir::Value::Int(v),\n");
-    out.push_str(
-        "            crate::state::ConcreteValue::Float(v) => majit_ir::Value::Float(v),\n",
-    );
-    out.push_str(
-        "            crate::state::ConcreteValue::Null => majit_ir::Value::Ref(majit_ir::GcRef::NULL),\n",
-    );
-    out.push_str("        };\n");
     out.push_str("        self.with_ctx(|this, ctx| {\n");
     out.push_str(
-        "            crate::state::MIFrame::store_local_value(this, ctx, idx, value.opref, concrete_value)\n",
+        "            crate::state::MIFrame::store_local_value(this, ctx, idx, value.opref)\n",
     );
     out.push_str("        })\n");
     out.push_str("    }\n");

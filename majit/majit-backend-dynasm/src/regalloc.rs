@@ -1445,7 +1445,10 @@ impl RegisterManager {
             while move_or_spill.len() > free_regs.len() {
                 let v =
                     self._pick_variable_to_spill(&[], None, false, Some(&move_or_spill), longevity);
-                self._bc_spill(v, Type::Int, &mut new_free_regs, longevity, fm);
+                // RPython llsupport/regalloc.py:804 routes through _bc_spill(v)
+                // on the manager that owns `v`; the spill type follows that
+                // manager (xrm -> Float, rm -> Int/Ref), not a hardcoded Int.
+                self._bc_spill(v, self._type_of(v), &mut new_free_regs, longevity, fm);
                 move_or_spill.retain(|x| *x != v);
             }
             // regalloc.py:807-821

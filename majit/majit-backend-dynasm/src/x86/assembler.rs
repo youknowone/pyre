@@ -300,6 +300,14 @@ pub struct Assembler386 {
     /// `self.cpu.propagate_exception_descr` at every FINISH /
     /// CALL_ASSEMBLER emission site.
     attached_descrs: crate::guard::AttachedDescrPtrs,
+    /// `Arc` clone of the owning cpu's attachment handle.  Its heap
+    /// address is baked into the CALL_ASSEMBLER helper call site as a
+    /// compile-time immediate (`Arc::as_ptr`) and the `Arc` is moved
+    /// into the resulting `CompiledCode` so the pointee outlives any
+    /// subsequent `DynasmBackend` drop — same role as RPython's
+    /// `self.cpu` attribute-access after whole-program translation,
+    /// where the `cpu` object's identity is guaranteed by Python.
+    cpu_handle: crate::guard::CpuDescrHandle,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -335,6 +343,12 @@ pub struct CompiledCode {
     pub fail_descrs: Vec<Arc<DynasmFailDescr>>,
     /// Input argument types.
     pub input_types: Vec<Type>,
+    /// `compile.py:665-674` parity: `Arc` clone of the owning cpu's
+    /// attachment handle.  Keeps the heap pointee alive for the whole
+    /// lifetime of this compiled trace so the `cpu_handle` immediate
+    /// baked into the CALL_ASSEMBLER helper call site never dangles,
+    /// even if the emitting `DynasmBackend` is dropped first.
+    pub cpu_attachments: crate::guard::CpuDescrHandle,
     /// trace_id.
     pub trace_id: u64,
     /// header_pc (green_key).
@@ -354,6 +368,7 @@ impl Assembler386 {
         vtable_offset: Option<usize>,
         classptr_to_typeid: HashMap<i64, u32>,
         attached_descrs: crate::guard::AttachedDescrPtrs,
+        cpu_handle: crate::guard::CpuDescrHandle,
     ) -> Self {
         Assembler386 {
             mc: Assembler::new().unwrap(),
@@ -386,7 +401,15 @@ impl Assembler386 {
             },
             pending_force_descr: None,
             attached_descrs,
+            cpu_handle,
         }
+    }
+
+    /// `compile.py:665` parity: heap-pinned address of `self.cpu`'s
+    /// attachment handle, derived from the Arc clone.  Baked into the
+    /// CALL_ASSEMBLER helper call site.
+    fn cpu_handle_ptr(&self) -> i64 {
+        Arc::as_ptr(&self.cpu_handle) as *const () as i64
     }
 
     /// `compile.py:665-674` parity: attach the six metainterp descrs on
@@ -1115,6 +1138,7 @@ impl Assembler386 {
             entry_offset: entry,
             fail_descrs: self.fail_descrs,
             input_types: self.input_types,
+            cpu_attachments: self.cpu_handle,
             trace_id: self.trace_id,
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
@@ -1202,6 +1226,7 @@ impl Assembler386 {
             entry_offset: entry,
             fail_descrs: self.fail_descrs,
             input_types: self.input_types,
+            cpu_attachments: self.cpu_handle,
             trace_id: self.trace_id,
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
@@ -4580,10 +4605,16 @@ impl Assembler386 {
             );
 
             // Path A (slow): guard failure.
-            // assembler.py:345-350 _call_assembler_emit_helper_call
+            // assembler.py:345-350 _call_assembler_emit_helper_call.
+            // `compile.py:665` parity: pass `cpu_ptr` as arg0 so the
+            // trampoline resolves `self.cpu.done_with_this_frame_descr_*` /
+            // `exit_frame_with_exception_descr_ref` through the owning
+            // backend instance rather than a per-thread fallback.
+            let cpu_ptr = self.cpu_handle_ptr();
             dynasm!(self.mc ; .arch x64
-                ; mov rdi, rdx                      // arg0 = callee_jf_ptr
-                ; mov rsi, QWORD green_key as i64   // arg1 = green_key
+                ; mov rdi, QWORD cpu_ptr            // arg0 = cpu_handle
+                ; mov rsi, rdx                      // arg1 = callee_jf_ptr
+                ; mov rdx, QWORD green_key as i64   // arg2 = green_key
                 ; sub rsp, 8
                 ; mov rax, QWORD helper_addr
                 ; call rax                          // rax = helper result

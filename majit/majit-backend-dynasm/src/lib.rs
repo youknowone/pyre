@@ -209,6 +209,7 @@ pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
 ///
 /// Always frees the callee jitframe before returning.
 pub extern "C" fn call_assembler_helper_trampoline(
+    cpu_handle: *const std::sync::RwLock<guard::CpuDescrAttachments>,
     callee_jf_ptr: *mut jitframe::JitFrame,
     green_key: u64,
 ) -> i64 {
@@ -218,8 +219,26 @@ pub extern "C" fn call_assembler_helper_trampoline(
     let frame_ptr = callee_jf_ptr;
     // warmspot.py:1022 `fail_descr = cpu.get_latest_descr(deadframe)`.
     let descr_raw = unsafe { llmodel::get_latest_descr(frame_ptr) };
+    // `compile.py:665-674` parity: resolve the attached `DoneWithThisFrame*`
+    // + `ExitFrameWithExceptionDescrRef` identities from the cpu instance
+    // that emitted the CALL_ASSEMBLER.  `cpu_handle` is the heap-pinned
+    // `Arc<RwLock<CpuDescrAttachments>>` address baked as a compile-time
+    // constant into the emitted call site — same role as RPython's
+    // `self.cpu` closure capture in the translated code.  A compiled
+    // trace keeps an `Arc` clone alive alongside its executable buffer
+    // so the pointee outlives any subsequent `DynasmBackend` drop.
+    //
+    // A null `cpu_handle` means "no attached cpu" — only reachable from
+    // direct-trampoline unit tests that construct the jitframe without
+    // going through `compile_loop`.  In that mode no finish descr can
+    // match, so dispatch falls through to `handle_fail_resume_guard`.
+    let attached = if cpu_handle.is_null() {
+        majit_backend::AttachedDescrPtrs::default()
+    } else {
+        unsafe { (*cpu_handle).read().unwrap().descr_ptrs() }
+    };
     // warmspot.py:1023-1028 `fail_descr.handle_fail(deadframe, ...)`.
-    let result = handle_fail_dispatch(descr_raw, frame_ptr, green_key);
+    let result = handle_fail_dispatch(&attached, descr_raw, frame_ptr, green_key);
     unsafe { libc::free(frame_ptr as *mut std::ffi::c_void) };
     result
 }
@@ -228,6 +247,7 @@ pub extern "C" fn call_assembler_helper_trampoline(
 /// Upstream equivalent: the virtual-method call in warmspot.py:1024,
 /// resolved at runtime by the Python class of `fail_descr`.
 fn handle_fail_dispatch(
+    attached: &majit_backend::AttachedDescrPtrs,
     descr_raw: usize,
     frame_ptr: *mut jitframe::JitFrame,
     green_key: u64,
@@ -238,12 +258,21 @@ fn handle_fail_dispatch(
         // CALL_ASSEMBLER emits the call. Retained as a safety fence.
         return 0;
     }
-    if guard::is_done_with_this_frame_descr(descr_raw) {
+    // `compile.py:665-674` parity: the finish descrs attached to
+    // `self.cpu` are compared by pointer identity.  RPython backend
+    // code reaches them through `cpu.done_with_this_frame_descr_*`;
+    // pyre resolves them from the heap-pinned cpu handle baked into
+    // the CALL_ASSEMBLER emit site (resolved in the trampoline).
+    if descr_raw == attached.done_with_this_frame_descr_void
+        || descr_raw == attached.done_with_this_frame_descr_int
+        || descr_raw == attached.done_with_this_frame_descr_ref
+        || descr_raw == attached.done_with_this_frame_descr_float
+    {
         // compile.py:626-656 `_DoneWithThisFrameDescr` subclasses
         // (Void/Int/Ref/Float) — the four finish singletons.
-        return handle_fail_done_with_this_frame(descr_raw, frame_ptr);
+        return handle_fail_done_with_this_frame(attached, descr_raw, frame_ptr);
     }
-    if guard::is_exit_frame_with_exception_descr(descr_raw) {
+    if descr_raw == attached.exit_frame_with_exception_descr_ref {
         // compile.py:658-662 `ExitFrameWithExceptionDescrRef.handle_fail`:
         //   value = cpu.get_ref_value(deadframe, 0)
         //   raise jitexc.ExitFrameWithExceptionRef(value)
@@ -280,21 +309,25 @@ fn handle_fail_dispatch(
 /// `guard::done_with_this_frame_descr_*_ptr()` singletons rather than
 /// a `fail_arg_types[0]` probe, because the Void descr carries no type
 /// entry at all.
-fn handle_fail_done_with_this_frame(descr_raw: usize, frame_ptr: *mut jitframe::JitFrame) -> i64 {
-    if descr_raw == guard::done_with_this_frame_descr_void_ptr() {
+fn handle_fail_done_with_this_frame(
+    attached: &majit_backend::AttachedDescrPtrs,
+    descr_raw: usize,
+    frame_ptr: *mut jitframe::JitFrame,
+) -> i64 {
+    if descr_raw == attached.done_with_this_frame_descr_void {
         return 0;
     }
-    if descr_raw == guard::done_with_this_frame_descr_int_ptr() {
+    if descr_raw == attached.done_with_this_frame_descr_int {
         return unsafe { llmodel::get_int_value_direct(frame_ptr, 0) as i64 };
     }
-    if descr_raw == guard::done_with_this_frame_descr_ref_ptr() {
+    if descr_raw == attached.done_with_this_frame_descr_ref {
         return unsafe { llmodel::get_ref_value_direct(frame_ptr, 0) as i64 };
     }
-    if descr_raw == guard::done_with_this_frame_descr_float_ptr() {
+    if descr_raw == attached.done_with_this_frame_descr_float {
         return unsafe { llmodel::get_float_value_direct(frame_ptr, 0) as i64 };
     }
-    // Unreachable: `is_done_with_this_frame_descr` gate above already
-    // narrowed `descr_raw` to one of the four singletons.
+    // Unreachable: the dispatch gate above already narrowed
+    // `descr_raw` to one of the four singletons.
     0
 }
 
@@ -457,9 +490,15 @@ mod tests {
         ptr
     }
 
+    // Placeholder bridge body referenced by `set_bridge_addr` in
+    // `test_helper_trampoline_does_not_execute_bridge`.  `call_assembler_helper_trampoline`
+    // never invokes bridges (they're executed via patched guard jumps,
+    // not the helper), so this body is unreachable in the test — the
+    // descr value written here is arbitrary and its identity is never
+    // classified against a cpu's attachments.
     extern "C" fn test_bridge_finish_int(jf: *mut jitframe::JitFrame) -> *mut jitframe::JitFrame {
         unsafe {
-            llmodel::set_latest_descr(jf, guard::done_with_this_frame_descr_int_ptr());
+            llmodel::set_latest_descr(jf, 0xFEEDBEEF);
             llmodel::set_int_value(jf, 0, 321);
         }
         jf
@@ -472,14 +511,14 @@ mod tests {
 
     #[test]
     fn test_helper_trampoline_null_jf_returns_zero() {
-        let result = call_assembler_helper_trampoline(std::ptr::null_mut(), 0);
+        let result = call_assembler_helper_trampoline(std::ptr::null(), std::ptr::null_mut(), 0);
         assert_eq!(result, 0);
     }
 
     #[test]
     fn test_helper_trampoline_descr_zero_returns_zero() {
         let jf = unsafe { alloc_test_jitframe(0, &[0, 0, 0, 0]) };
-        let result = call_assembler_helper_trampoline(jf, 42);
+        let result = call_assembler_helper_trampoline(std::ptr::null(), jf, 42);
         assert_eq!(result, 0);
     }
 
@@ -504,7 +543,7 @@ mod tests {
         let descr_ptr = Arc::as_ptr(&descr) as i64;
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr as usize, &[100, 200, 0, 0]) };
-        let result = call_assembler_helper_trampoline(jf, 42);
+        let result = call_assembler_helper_trampoline(std::ptr::null(), jf, 42);
         // No blackhole registered → returns 0, no crash.
         assert_eq!(result, 0);
         drop(descr);
@@ -519,7 +558,7 @@ mod tests {
         let descr_ptr = Arc::as_ptr(&descr) as usize;
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr, &[123, 0, 0, 0]) };
-        let result = call_assembler_helper_trampoline(jf, 99);
+        let result = call_assembler_helper_trampoline(std::ptr::null(), jf, 99);
         // Helper blackhole-resumes (no blackhole registered → 0), NOT bridge result.
         assert_eq!(result, 0);
 
@@ -538,7 +577,8 @@ mod tests {
         // green_key is the second parameter (rsi on x86_64).
         // Direct call test — not through generated code.
         let green_key: u64 = 0xDEAD_BEEF_CAFE;
-        let result = call_assembler_helper_trampoline(std::ptr::null_mut(), green_key);
+        let result =
+            call_assembler_helper_trampoline(std::ptr::null(), std::ptr::null_mut(), green_key);
         // Null ptr → early return 0, but the function accepted green_key.
         assert_eq!(result, 0);
         // The real verification is compile-time: the signature is
@@ -583,21 +623,35 @@ mod tests {
         let ref_: majit_ir::DescrRef = Arc::new(TestMarker(Type::Ref));
         let float: majit_ir::DescrRef = Arc::new(TestMarker(Type::Float));
 
-        // OnceLock-backed setters accept the first caller and ignore
-        // subsequent writes.  A prior test in the same process (or the
-        // `make_and_attach_done_descrs` path exercised via a MetaInterp)
-        // may have already filled some or all slots; either way, once
-        // the slot has a value, `_ptr()` returns a stable non-zero
-        // address for each of the four result types.
-        guard::set_done_with_this_frame_descr_void(void);
-        guard::set_done_with_this_frame_descr_int(int);
-        guard::set_done_with_this_frame_descr_ref(ref_);
-        guard::set_done_with_this_frame_descr_float(float);
+        // `pyjitpl.py:2222` `make_and_attach_done_descrs([self, cpu])`
+        // parity: the four `DoneWithThisFrameDescr*` singletons live on
+        // the owning cpu instance.  Construct a per-test backend, attach
+        // the descrs through the Backend trait, and read pointers out of
+        // `attached_descr_ptrs()` — matching RPython's
+        // `self.cpu.done_with_this_frame_descr_*` access pattern.
+        let mut backend = runner::DynasmBackend::new();
+        <runner::DynasmBackend as majit_backend::Backend>::set_done_with_this_frame_descr_void(
+            &mut backend,
+            void,
+        );
+        <runner::DynasmBackend as majit_backend::Backend>::set_done_with_this_frame_descr_int(
+            &mut backend,
+            int,
+        );
+        <runner::DynasmBackend as majit_backend::Backend>::set_done_with_this_frame_descr_ref(
+            &mut backend,
+            ref_,
+        );
+        <runner::DynasmBackend as majit_backend::Backend>::set_done_with_this_frame_descr_float(
+            &mut backend,
+            float,
+        );
 
-        let void_ptr = guard::done_with_this_frame_descr_void_ptr();
-        let int_ptr = guard::done_with_this_frame_descr_int_ptr();
-        let ref_ptr = guard::done_with_this_frame_descr_ref_ptr();
-        let float_ptr = guard::done_with_this_frame_descr_float_ptr();
+        let ptrs = backend.attached_descr_ptrs();
+        let void_ptr = ptrs.done_with_this_frame_descr_void;
+        let int_ptr = ptrs.done_with_this_frame_descr_int;
+        let ref_ptr = ptrs.done_with_this_frame_descr_ref;
+        let float_ptr = ptrs.done_with_this_frame_descr_float;
 
         // All four must be distinct (metainterp-side `DoneWithThisFrameDescr*`
         // singletons are separate Arcs per result type).
@@ -613,30 +667,30 @@ mod tests {
         assert_ne!(ref_ptr, float_ptr);
 
         // is_done_with_this_frame_descr must recognize all four.
-        assert!(guard::is_done_with_this_frame_descr(void_ptr));
-        assert!(guard::is_done_with_this_frame_descr(int_ptr));
-        assert!(guard::is_done_with_this_frame_descr(ref_ptr));
-        assert!(guard::is_done_with_this_frame_descr(float_ptr));
+        assert!(ptrs.is_done_with_this_frame_descr(void_ptr));
+        assert!(ptrs.is_done_with_this_frame_descr(int_ptr));
+        assert!(ptrs.is_done_with_this_frame_descr(ref_ptr));
+        assert!(ptrs.is_done_with_this_frame_descr(float_ptr));
 
         // Arbitrary pointer must NOT be recognized.
-        assert!(!guard::is_done_with_this_frame_descr(0x12345678));
-        assert!(!guard::is_done_with_this_frame_descr(0));
+        assert!(!ptrs.is_done_with_this_frame_descr(0x12345678));
+        assert!(!ptrs.is_done_with_this_frame_descr(0));
 
         // ptr_for_type must route correctly.
         assert_eq!(
-            guard::done_with_this_frame_descr_ptr_for_type(Type::Void),
+            ptrs.done_with_this_frame_descr_ptr_for_type(Type::Void),
             void_ptr
         );
         assert_eq!(
-            guard::done_with_this_frame_descr_ptr_for_type(Type::Int),
+            ptrs.done_with_this_frame_descr_ptr_for_type(Type::Int),
             int_ptr
         );
         assert_eq!(
-            guard::done_with_this_frame_descr_ptr_for_type(Type::Ref),
+            ptrs.done_with_this_frame_descr_ptr_for_type(Type::Ref),
             ref_ptr
         );
         assert_eq!(
-            guard::done_with_this_frame_descr_ptr_for_type(Type::Float),
+            ptrs.done_with_this_frame_descr_ptr_for_type(Type::Float),
             float_ptr
         );
     }

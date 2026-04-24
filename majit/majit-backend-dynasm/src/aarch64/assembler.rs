@@ -265,6 +265,14 @@ pub struct AssemblerARM64 {
     /// `self.cpu.propagate_exception_descr` at every FINISH /
     /// CALL_ASSEMBLER emission site.
     attached_descrs: crate::guard::AttachedDescrPtrs,
+    /// `Arc` clone of the owning cpu's attachment handle.  Its heap
+    /// address is baked into the CALL_ASSEMBLER helper call site as a
+    /// compile-time immediate (`Arc::as_ptr`) and the `Arc` is moved
+    /// into the resulting `CompiledCode` so the pointee outlives any
+    /// subsequent `DynasmBackend` drop — same role as RPython's
+    /// `self.cpu` attribute-access after whole-program translation,
+    /// where the `cpu` object's identity is guaranteed by Python.
+    cpu_handle: crate::guard::CpuDescrHandle,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -292,6 +300,12 @@ pub struct CompiledCode {
     pub fail_descrs: Vec<Arc<DynasmFailDescr>>,
     /// Input argument types.
     pub input_types: Vec<Type>,
+    /// `compile.py:665-674` parity: `Arc` clone of the owning cpu's
+    /// attachment handle.  Keeps the heap pointee alive for the whole
+    /// lifetime of this compiled trace so the `cpu_handle` immediate
+    /// baked into the CALL_ASSEMBLER helper call site never dangles,
+    /// even if the emitting `DynasmBackend` is dropped first.
+    pub cpu_attachments: crate::guard::CpuDescrHandle,
     /// trace_id.
     pub trace_id: u64,
     /// header_pc (green_key).
@@ -312,6 +326,7 @@ impl AssemblerARM64 {
         vtable_offset: Option<usize>,
         classptr_to_typeid: HashMap<i64, u32>,
         attached_descrs: crate::guard::AttachedDescrPtrs,
+        cpu_handle: crate::guard::CpuDescrHandle,
     ) -> Self {
         AssemblerARM64 {
             mc: Assembler::new().unwrap(),
@@ -344,7 +359,15 @@ impl AssemblerARM64 {
             },
             pending_force_descr: None,
             attached_descrs,
+            cpu_handle,
         }
+    }
+
+    /// `compile.py:665` parity: heap-pinned address of `self.cpu`'s
+    /// attachment handle, derived from the Arc clone.  Baked into the
+    /// CALL_ASSEMBLER helper call site.
+    fn cpu_handle_ptr(&self) -> i64 {
+        Arc::as_ptr(&self.cpu_handle) as *const () as i64
     }
 
     /// `compile.py:665-674` parity: attach the six metainterp descrs on
@@ -411,6 +434,9 @@ impl AssemblerARM64 {
     /// assembler.py:1145 regalloc_mov(from_loc, to_loc).
     /// Emit a move between any two locations: reg↔reg, reg↔frame, imm→reg, imm→frame.
     pub(crate) fn regalloc_mov(&mut self, src: &Loc, dst: &Loc) {
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!("[dynasm] remap-mov: {:?} -> {:?}", src, dst);
+        }
         match (src, dst) {
             (Loc::Reg(s), Loc::Reg(d)) if s == d => {}
             (Loc::Reg(s), Loc::Reg(d)) => {
@@ -1174,6 +1200,7 @@ impl AssemblerARM64 {
             entry_offset: entry,
             fail_descrs: self.fail_descrs,
             input_types: self.input_types,
+            cpu_attachments: self.cpu_handle,
             trace_id: self.trace_id,
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
@@ -1236,6 +1263,13 @@ impl AssemblerARM64 {
         ops: &[Op],
         arglocs: &[Loc],
     ) -> Result<CompiledCode, BackendError> {
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[dynasm] assemble_bridge: input_types={:?} arglocs={:?}",
+                inputargs.iter().map(|ia| ia.tp).collect::<Vec<_>>(),
+                arglocs
+            );
+        }
         self.input_types = inputargs.iter().map(|ia| ia.tp).collect();
         self.bridge_input_locs = if arglocs.is_empty() {
             None
@@ -1261,6 +1295,7 @@ impl AssemblerARM64 {
             entry_offset: entry,
             fail_descrs: self.fail_descrs,
             input_types: self.input_types,
+            cpu_attachments: self.cpu_handle,
             trace_id: self.trace_id,
             header_pc: self.header_pc,
             frame_depth: std::sync::atomic::AtomicUsize::new(self.frame_depth),
@@ -1417,7 +1452,13 @@ impl AssemblerARM64 {
                 RegAllocOp::PerformDiscard { op_index, arglocs } => {
                     let op = &ops[*op_index];
                     if std::env::var_os("MAJIT_LOG").is_some() {
-                        eprintln!("[dynasm] discard[{}]: {:?}", op_index, op.opcode);
+                        let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
+                        eprintln!(
+                            "[dynasm] discard[{}]: {:?} args=[{}]",
+                            op_index,
+                            op.opcode,
+                            al.join(", ")
+                        );
                     }
                     self.regalloc_perform(op, *op_index, arglocs, None, fail_index, ops);
                     if op.opcode.is_guard() || op.opcode == OpCode::Finish {
@@ -2098,6 +2139,12 @@ impl AssemblerARM64 {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
+                if std::env::var_os("MAJIT_LOG").is_some() {
+                    eprintln!(
+                        "[dynasm] JUMP remap: src={:?} dst={:?}",
+                        arglocs, target_arglocs
+                    );
+                }
                 let mut src_locations1 = Vec::new();
                 let mut dst_locations1 = Vec::new();
                 let mut src_locations2 = Vec::new();
@@ -2122,19 +2169,18 @@ impl AssemblerARM64 {
                         let dst_ofs = crate::regalloc::get_ebp_ofs(0, i);
                         Loc::Frame(crate::regloc::FrameLoc::new(i, dst_ofs, false))
                     };
-                    match src_loc {
-                        Loc::Reg(r) if r.is_xmm => {
-                            src_locations2.push(*src_loc);
-                            dst_locations2.push(dst_loc);
-                        }
-                        Loc::Frame(f) if f.ebp_loc.is_float => {
-                            src_locations2.push(*src_loc);
-                            dst_locations2.push(dst_loc);
-                        }
-                        _ => {
-                            src_locations1.push(*src_loc);
-                            dst_locations1.push(dst_loc);
-                        }
+                    let arg_tp = op
+                        .args
+                        .get(i)
+                        .and_then(|arg| self.value_types.get(&arg.0))
+                        .copied()
+                        .unwrap_or(Type::Int);
+                    if arg_tp == Type::Float {
+                        src_locations2.push(*src_loc);
+                        dst_locations2.push(dst_loc);
+                    } else {
+                        src_locations1.push(*src_loc);
+                        dst_locations1.push(dst_loc);
                     }
                 }
                 let tmpreg1 = Loc::Reg(crate::regloc::RegLoc::new(16, false));
@@ -2226,17 +2272,22 @@ impl AssemblerARM64 {
                 let label = self.mc.new_dynamic_label();
                 let label_descr = loop_target_descr(op);
                 if std::env::var_os("MAJIT_LOG").is_some() {
-                    eprintln!("[dynasm] LABEL: new DynamicLabel({:?})", label);
+                    eprintln!(
+                        "[dynasm] LABEL: new DynamicLabel({:?}) arglocs={:?}",
+                        label, arglocs
+                    );
                 }
                 dynasm!(self.mc ; =>label);
                 if let Some(descr) = label_descr {
-                    descr.set_target_arglocs(
-                        arglocs
-                            .iter()
-                            .copied()
-                            .map(target_argloc_from_loc)
-                            .collect(),
-                    );
+                    let stored_arglocs = arglocs
+                        .iter()
+                        .copied()
+                        .map(target_argloc_from_loc)
+                        .collect::<Vec<_>>();
+                    if std::env::var_os("MAJIT_LOG").is_some() {
+                        eprintln!("[dynasm] LABEL target_arglocs={:?}", stored_arglocs);
+                    }
+                    descr.set_target_arglocs(stored_arglocs);
                     descr.set_ll_loop_code(self.mc.offset().0);
                     if let Some(id) = loop_target_id(op) {
                         self.target_tokens_currently_compiling.insert(id, label);
@@ -4600,12 +4651,20 @@ impl AssemblerARM64 {
                 ; b.eq =>fast_path
             );
             // Path A (slow)
+            // `compile.py:665` parity: pass `cpu_ptr` as arg0 so the
+            // trampoline resolves the attached
+            // `done_with_this_frame_descr_*` / `exit_frame_with_exception_descr_ref`
+            // identities through the owning backend instance.
             {
-                self.emit_mov_imm64(2, helper_addr);
-                self.emit_mov_imm64(1, green_key); // x1 = green_key
+                let cpu_ptr = self.cpu_handle_ptr();
+                self.emit_mov_imm64(3, helper_addr);
                 dynasm!(self.mc ; .arch aarch64
-                    ; mov x0, x20                   // arg0 = callee_jf_ptr
-                    ; blr x2                        // x0 = helper result
+                    ; mov x1, x20                   // arg1 = callee_jf_ptr
+                );
+                self.emit_mov_imm64(2, green_key); // arg2 = green_key
+                self.emit_mov_imm64(0, cpu_ptr); // arg0 = cpu_handle
+                dynasm!(self.mc ; .arch aarch64
+                    ; blr x3                        // x0 = helper result
                 );
                 self.reload_frame_if_necessary();
                 dynasm!(self.mc ; .arch aarch64 ; b =>merge);

@@ -18,6 +18,7 @@ use majit_backend_dynasm::runner::DynasmBackend;
 fn test_just_finish() {
     // Simplest possible trace: just FINISH with no args
     let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(1);
 
     let inputargs = vec![];
@@ -40,6 +41,7 @@ fn test_just_finish() {
 #[test]
 fn test_simple_int_add() {
     let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(1);
 
     // Simple trace: i1 = int_add(i0, CONST_1)
@@ -86,6 +88,7 @@ fn test_simple_int_add() {
 #[test]
 fn test_finish_infers_int_type_when_explicit_types_are_empty() {
     let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(11);
 
     let i0 = OpRef(0);
@@ -123,6 +126,7 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
 #[test]
 fn test_float_add() {
     let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(1);
 
     let i0 = OpRef(0); // input: f64
@@ -176,6 +180,7 @@ fn test_guard_and_loop() {
     // guard_true(i2)   [fail_args: i1]
     // jump(i1)
     let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(1);
 
     let mut constants = HashMap::new();
@@ -228,6 +233,7 @@ fn test_guard_and_loop() {
 #[test]
 fn test_float_loop_carried_across_jump() {
     let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
     let mut token = JitCellToken::new(1);
 
     let mut constants = HashMap::new();

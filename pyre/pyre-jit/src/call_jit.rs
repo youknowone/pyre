@@ -649,7 +649,11 @@ pub fn resume_in_blackhole(
     _caller_frame: &mut PyFrame,
     frames: &[ResumedFrame],
 ) -> BlackholeResult {
+    let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
     if frames.is_empty() {
+        if nbody_debug {
+            eprintln!("[nbody-debug] resume_in_blackhole failed: empty frames");
+        }
         if majit_metainterp::majit_log_enabled() {
             eprintln!("[jit][bh-fail] resume_in_blackhole: empty frames");
         }
@@ -711,6 +715,9 @@ pub fn resume_in_blackhole(
         .map(|f| f.frame_ptr)
         .unwrap_or(std::ptr::null_mut());
     if chain_vable_ptr.is_null() {
+        if nbody_debug {
+            eprintln!("[nbody-debug] resume_in_blackhole failed: chain virtualizable is null");
+        }
         if majit_metainterp::majit_log_enabled() {
             eprintln!("[jit][bh-fail] resume_in_blackhole: chain virtualizable is null",);
         }
@@ -724,6 +731,12 @@ pub fn resume_in_blackhole(
 
     for (sec_idx, section) in frames.iter().enumerate().rev() {
         if section.code.is_null() {
+            if nbody_debug {
+                eprintln!(
+                    "[nbody-debug] resume_in_blackhole failed: null code sec={} py_pc={}",
+                    sec_idx, section.py_pc,
+                );
+            }
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][bh-fail] resume_in_blackhole: null code at sec={} py_pc={}",
@@ -754,6 +767,14 @@ pub fn resume_in_blackhole(
             }
         }
         if py_pc >= code.instructions.len() {
+            if nbody_debug {
+                eprintln!(
+                    "[nbody-debug] resume_in_blackhole failed: py_pc out of bounds sec={} py_pc={} instr_len={}",
+                    sec_idx,
+                    py_pc,
+                    code.instructions.len()
+                );
+            }
             release_chain_bh(prev_bh);
             return BlackholeResult::Failed;
         }
@@ -767,6 +788,12 @@ pub fn resume_in_blackhole(
         let pyjitcode = match writer.callcontrol().find_jitcode(code as *const _) {
             Some(pjc) => pjc,
             None => {
+                if nbody_debug {
+                    eprintln!(
+                        "[nbody-debug] resume_in_blackhole failed: find_jitcode miss sec={} code={:#x} py_pc={}",
+                        sec_idx, section.code as usize, py_pc
+                    );
+                }
                 release_chain_bh(prev_bh);
                 return BlackholeResult::Failed;
             }
@@ -774,6 +801,14 @@ pub fn resume_in_blackhole(
         let jitcode_pc = if py_pc < pyjitcode.metadata.pc_map.len() {
             pyjitcode.metadata.pc_map[py_pc]
         } else {
+            if nbody_debug {
+                eprintln!(
+                    "[nbody-debug] resume_in_blackhole failed: pc_map miss sec={} py_pc={} pc_map_len={}",
+                    sec_idx,
+                    py_pc,
+                    pyjitcode.metadata.pc_map.len()
+                );
+            }
             release_chain_bh(prev_bh);
             return BlackholeResult::Failed;
         };
@@ -910,6 +945,9 @@ pub fn resume_in_blackhole(
     }
 
     let Some(mut bh) = prev_bh else {
+        if nbody_debug {
+            eprintln!("[nbody-debug] resume_in_blackhole failed: empty blackhole chain");
+        }
         return BlackholeResult::Failed;
     };
 
@@ -951,6 +989,12 @@ pub fn resume_in_blackhole(
 
         // BC_ABORT: unsupported bytecode hit during execution.
         if bh.aborted {
+            if nbody_debug {
+                eprintln!(
+                    "[nbody-debug] resume_in_blackhole failed: bh.aborted position={} last_opcode_position={}",
+                    bh.position, bh.last_opcode_position
+                );
+            }
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][blackhole] ABORT at jitcode_pc={} last_opcode_pos={}",
@@ -1001,6 +1045,12 @@ pub fn resume_in_blackhole(
             release_bh(bh);
 
             let Some(mut caller_bh) = next.map(|b| *b) else {
+                if nbody_debug {
+                    eprintln!(
+                        "[nbody-debug] resume_in_blackhole failed: uncaught exception at outermost exc_value={:#x}",
+                        exc_value as usize
+                    );
+                }
                 // blackhole.py:1679-1682 _exit_frame_with_exception:
                 //   e = cast_opaque_ptr(GCREF, e)
                 //   raise ExitFrameWithExceptionRef(e)
@@ -1567,6 +1617,7 @@ pub fn blackhole_resume_via_rd_numb(
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     deadframe_types: Option<&[majit_ir::Type]>,
 ) -> BlackholeResult {
+    let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
     use majit_metainterp::resume;
 
     // Thread-local BH pool (RPython BlackholeInterpBuilder). Each access
@@ -1664,6 +1715,9 @@ pub fn blackhole_resume_via_rd_numb(
     });
 
     let Some((mut bh, virtualizable_ptr)) = bh else {
+        if nbody_debug {
+            eprintln!("[nbody-debug] blackhole_resume_via_rd_numb failed: builder returned None");
+        }
         return BlackholeResult::Failed;
     };
 
@@ -1750,6 +1804,12 @@ pub fn blackhole_resume_via_rd_numb(
             };
         }
         if bh.aborted {
+            if nbody_debug {
+                eprintln!(
+                    "[nbody-debug] blackhole_resume_via_rd_numb failed: bh.aborted position={} last_opcode_position={}",
+                    bh.position, bh.last_opcode_position
+                );
+            }
             release_bh_rd(bh);
             return BlackholeResult::Failed;
         }
@@ -1990,6 +2050,36 @@ pub fn trace_and_compile_from_bridge(
             "[jit][bridge-trace] start key={} trace={} fail={} resume_pc={}",
             green_key, trace_id, fail_index, resume_pc
         );
+        if trace_id == 2 && fail_index == 2 && resume_pc == 153 {
+            let debug_values: Vec<String> = raw_values
+                .iter()
+                .zip(exit_layout.exit_types.iter())
+                .enumerate()
+                .map(|(idx, (&raw, &tp))| match tp {
+                    majit_ir::Type::Ref => {
+                        let obj = raw as pyre_object::PyObjectRef;
+                        let detail = unsafe {
+                            if obj.is_null() {
+                                "null".to_string()
+                            } else if pyre_object::is_float(obj) {
+                                format!("float({})", pyre_object::w_float_get_value(obj))
+                            } else if pyre_object::is_int(obj) {
+                                format!("int({})", pyre_object::w_int_get_value(obj))
+                            } else if pyre_object::is_list(obj) {
+                                "list".to_string()
+                            } else {
+                                format!("ref({:#x})", obj as usize)
+                            }
+                        };
+                        format!("#{idx}:Ref {detail}")
+                    }
+                    majit_ir::Type::Int => format!("#{idx}:Int {}", raw),
+                    majit_ir::Type::Float => format!("#{idx}:Float {}", f64::from_bits(raw as u64)),
+                    majit_ir::Type::Void => format!("#{idx}:Void"),
+                })
+                .collect();
+            eprintln!("[jit][bridge-raw] {}", debug_values.join(", "));
+        }
     }
 
     // bridgeopt.py:124 parity: frontend_boxes = raw dead frame values

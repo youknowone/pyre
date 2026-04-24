@@ -21,9 +21,9 @@ use cranelift_module::{FuncId, Linkage, Module};
 use cranelift_codegen::ir::Value as CValue;
 
 use majit_backend::{
-    AsmInfo, BackendError, CompiledLoopToken, CompiledTraceInfo, DeadFrame, ExitFrameLayout,
-    ExitRecoveryLayout, ExitValueSourceLayout, ExitVirtualLayout, FailDescrLayout, JitCellToken,
-    TerminalExitLayout,
+    AsmInfo, BackendError, CompiledLoopToken, CompiledTraceInfo, CpuDescrAttachments,
+    CpuDescrHandle, DeadFrame, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout,
+    ExitVirtualLayout, FailDescrLayout, JitCellToken, TerminalExitLayout,
 };
 use majit_gc::header::{GcHeader, TYPE_ID_MASK};
 use majit_gc::rewrite::GcRewriterImpl;
@@ -37,25 +37,26 @@ use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
 
 // ── compile.py:665-674 done_with_this_frame singletons ──────────────
 //
-// Per-result-type `DoneWithThisFrame*` singletons.  Two slots coexist
-// for now (see Medium #2 follow-up in `majit-metainterp/src/compile.rs`
-// "Identity follow-up"):
+// Per-result-type `DoneWithThisFrame*` singletons.  Two kinds of
+// instances coexist:
 //
 //   - the cranelift-side `CraneliftFailDescr` `LazyLock`s below, used
-//     for the runtime classifier / `direct_descr` path that casts
-//     `jf_descr_raw` back to `*const CraneliftFailDescr`; and
+//     as fallback identity when the metainterp has not attached yet
+//     (backend-only integration tests) and as the runtime-classifier
+//     companion that carries the result_type signature downstream
+//     `bridge_ref()` / `fail_arg_types` code needs; and
 //
-//   - `OnceLock<DescrRef>` slots populated by
-//     `Backend::set_done_with_this_frame_descr_*` from the metainterp's
-//     `MetaInterpStaticData`.  `done_with_this_frame_descr_ptr`
-//     returns the metainterp `Arc::as_ptr` for embedding in jf_descr
-//     so `_call_assembler_check_descr` (assembler.py:2274) observes
-//     the same address the metainterp `handle_fail` does.
+//   - `majit_ir::DescrRef`s the metainterp attaches through
+//     `Backend::set_done_with_this_frame_descr_*` into the per-cpu
+//     `CpuDescrAttachments` (`majit_backend::CpuDescrHandle`).  Their
+//     `Arc::as_ptr` address is what gets stamped into `jf_descr` so
+//     `_call_assembler_check_descr` (assembler.py:2274) observes the
+//     same identity the metainterp `handle_fail` does.
 //
-// The two slots are kept pointer-stable independently; fully merging
-// them (dropping `CraneliftFailDescr` singletons and threading a
-// `DescrRef`-based classifier) is tracked as a follow-up because it
-// restructures the `direct_descr` / `run_compiled_code` type flow.
+// Fully merging them (dropping `CraneliftFailDescr` singletons and
+// threading a `DescrRef`-based classifier) is tracked as a follow-up
+// because it restructures the `direct_descr` / `run_compiled_code`
+// type flow.
 
 static DONE_WITH_THIS_FRAME_DESCR_INT: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
@@ -149,130 +150,50 @@ fn done_with_this_frame_descr(result_types: &[Type]) -> &'static Arc<CraneliftFa
     }
 }
 
-// `pyjitpl.py:2222` `make_and_attach_done_descrs([self, cpu])` —
-// metainterp-side `Arc<DoneWithThisFrameDescr*>` re-published here
-// via `Backend::set_done_with_this_frame_descr_*`.  Used for the
-// jf_descr pointer written at FINISH emission so that pointer
-// identity matches the `Arc` stored on `MetaInterpStaticData`.
-//
-// `compile.py:665` `setattr(cpu, name, descr)` binds the descr to a
-// specific cpu instance; each `(metainterp_sd, cpu)` pair gets its
-// own attachment, and re-running `make_and_attach_done_descrs`
-// overwrites.  Pyre stores the descrs in per-thread slots instead of
-// per-`Backend` instance fields: Cranelift-emitted machine code and
-// extern-C callbacks resolve the identity without a backend receiver
-// in scope, and production deploys one backend per thread — so the
-// thread-local captures the same "one attachment per backend"
-// lifetime the RPython instance attribute does.  Tests that spin up
-// multiple backend instances on the same thread observe
-// last-attach-wins, also matching `setattr` semantics.
-
-thread_local! {
-    static METAINTERP_DONE_VOID: std::cell::RefCell<Option<majit_ir::DescrRef>> =
-        const { std::cell::RefCell::new(None) };
-    static METAINTERP_DONE_INT: std::cell::RefCell<Option<majit_ir::DescrRef>> =
-        const { std::cell::RefCell::new(None) };
-    static METAINTERP_DONE_REF: std::cell::RefCell<Option<majit_ir::DescrRef>> =
-        const { std::cell::RefCell::new(None) };
-    static METAINTERP_DONE_FLOAT: std::cell::RefCell<Option<majit_ir::DescrRef>> =
-        const { std::cell::RefCell::new(None) };
-    static METAINTERP_EXIT_EXC_REF: std::cell::RefCell<Option<majit_ir::DescrRef>> =
-        const { std::cell::RefCell::new(None) };
-    static METAINTERP_PROPAGATE_EXC: std::cell::RefCell<Option<majit_ir::DescrRef>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-pub(crate) fn set_done_with_this_frame_descr_void(descr: majit_ir::DescrRef) {
-    METAINTERP_DONE_VOID.with(|c| *c.borrow_mut() = Some(descr));
-}
-pub(crate) fn set_done_with_this_frame_descr_int(descr: majit_ir::DescrRef) {
-    METAINTERP_DONE_INT.with(|c| *c.borrow_mut() = Some(descr));
-}
-pub(crate) fn set_done_with_this_frame_descr_ref(descr: majit_ir::DescrRef) {
-    METAINTERP_DONE_REF.with(|c| *c.borrow_mut() = Some(descr));
-}
-pub(crate) fn set_done_with_this_frame_descr_float(descr: majit_ir::DescrRef) {
-    METAINTERP_DONE_FLOAT.with(|c| *c.borrow_mut() = Some(descr));
-}
-pub(crate) fn set_exit_frame_with_exception_descr_ref(descr: majit_ir::DescrRef) {
-    METAINTERP_EXIT_EXC_REF.with(|c| *c.borrow_mut() = Some(descr));
-}
-pub(crate) fn set_propagate_exception_descr(descr: majit_ir::DescrRef) {
-    METAINTERP_PROPAGATE_EXC.with(|c| *c.borrow_mut() = Some(descr));
-}
-
-/// `pyjitpl.py:2222` parity: pointer of the metainterp-attached
-/// `Arc<DoneWithThisFrameDescr*>` matching `result_types`.  Falls
-/// back to `done_with_this_frame_descr` (the cranelift-side
-/// singleton) when the metainterp has not attached yet; the
-/// classifier path keeps working in either case because both
-/// pointers route through the same FINISH fast path.
-fn done_with_this_frame_descr_ptr(result_types: &[Type]) -> i64 {
-    fn attached_ptr(
-        slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<majit_ir::DescrRef>>>,
-    ) -> Option<i64> {
-        slot.with(|c| {
-            c.borrow()
-                .as_ref()
-                .map(|arc| Arc::as_ptr(arc) as *const () as i64)
-        })
-    }
-    let attached = match result_types {
-        [Type::Float] => attached_ptr(&METAINTERP_DONE_FLOAT),
-        [Type::Ref] => attached_ptr(&METAINTERP_DONE_REF),
-        [] => attached_ptr(&METAINTERP_DONE_VOID),
-        _ => attached_ptr(&METAINTERP_DONE_INT),
-    };
-    attached.unwrap_or_else(|| Arc::as_ptr(done_with_this_frame_descr(result_types)) as i64)
-}
-
-/// `compile.py:658` parity: pointer of the metainterp-attached
-/// `Arc<ExitFrameWithExceptionDescrRef>`.  Falls back to the
-/// cranelift-side singleton when the metainterp has not attached yet.
-fn exit_frame_with_exception_descr_ref_ptr() -> i64 {
-    let attached = METAINTERP_EXIT_EXC_REF.with(|c| {
-        c.borrow()
-            .as_ref()
-            .map(|arc| Arc::as_ptr(arc) as *const () as i64)
-    });
-    attached.unwrap_or_else(|| Arc::as_ptr(&*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL) as i64)
-}
-
 /// Match `jf_descr_raw` against the metainterp-attached
-/// `DoneWithThisFrameDescr*` set.  Returns `Some((metainterp_arc,
-/// cranelift_singleton))` when the address is a metainterp finish
-/// descr; the paired cranelift singleton carries the result_type
-/// signature that runtime classifiers (`bridge_ref`, fail_arg_types)
-/// expect.
+/// `DoneWithThisFrameDescr*` set on a specific cpu instance.  Returns
+/// `Some((metainterp_arc, cranelift_singleton))` when the address is
+/// one of the six attached finish descrs; the paired cranelift
+/// singleton carries the result_type signature that runtime
+/// classifiers (`bridge_ref`, fail_arg_types) expect.
+///
+/// Parameter-threaded rather than thread-local because
+/// `compile.py:665 setattr(cpu, name, descr)` binds the attachment to
+/// a specific `cpu` instance — every caller must identify *which* cpu
+/// the descr should be resolved against, not consult an ambient slot.
 fn match_metainterp_finish_descr(
     jf_descr_raw: i64,
+    attachments: &CpuDescrAttachments,
 ) -> Option<(majit_ir::DescrRef, Arc<CraneliftFailDescr>)> {
     let ptr = jf_descr_raw as usize;
-    fn check(
-        slot: &'static std::thread::LocalKey<std::cell::RefCell<Option<majit_ir::DescrRef>>>,
-        expected: usize,
-    ) -> Option<majit_ir::DescrRef> {
-        slot.with(|c| {
-            c.borrow().as_ref().and_then(|arc| {
-                if Arc::as_ptr(arc) as *const () as usize == expected {
-                    Some(arc.clone())
-                } else {
-                    None
-                }
-            })
+    fn check(slot: &Option<majit_ir::DescrRef>, expected: usize) -> Option<majit_ir::DescrRef> {
+        slot.as_ref().and_then(|arc| {
+            if Arc::as_ptr(arc) as *const () as usize == expected {
+                Some(arc.clone())
+            } else {
+                None
+            }
         })
     }
     for (slot, cl_singleton) in [
         (
-            &METAINTERP_DONE_INT
-                as &'static std::thread::LocalKey<std::cell::RefCell<Option<majit_ir::DescrRef>>>,
+            &attachments.done_with_this_frame_descr_int,
             &*DONE_WITH_THIS_FRAME_DESCR_INT,
         ),
-        (&METAINTERP_DONE_FLOAT, &*DONE_WITH_THIS_FRAME_DESCR_FLOAT),
-        (&METAINTERP_DONE_REF, &*DONE_WITH_THIS_FRAME_DESCR_REF),
-        (&METAINTERP_DONE_VOID, &*DONE_WITH_THIS_FRAME_DESCR_VOID),
         (
-            &METAINTERP_EXIT_EXC_REF,
+            &attachments.done_with_this_frame_descr_float,
+            &*DONE_WITH_THIS_FRAME_DESCR_FLOAT,
+        ),
+        (
+            &attachments.done_with_this_frame_descr_ref,
+            &*DONE_WITH_THIS_FRAME_DESCR_REF,
+        ),
+        (
+            &attachments.done_with_this_frame_descr_void,
+            &*DONE_WITH_THIS_FRAME_DESCR_VOID,
+        ),
+        (
+            &attachments.exit_frame_with_exception_descr_ref,
             &*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL,
         ),
     ] {
@@ -287,8 +208,12 @@ fn match_metainterp_finish_descr(
 /// fast-path slot-0 result loader must fire ONLY for normal
 /// `DoneWithThisFrame*` finish, not `ExitFrameWithExceptionDescrRef`. Exception
 /// finish goes through the slow-path / top-level classifier instead.
-fn is_normal_finish_descr(jf_descr_raw: i64) -> bool {
-    if let Some((descr_ref, _)) = match_metainterp_finish_descr(jf_descr_raw) {
+///
+/// The `attachments` snapshot disambiguates which cpu instance owns
+/// the descr identity — matches RPython `self.cpu.done_with_this_frame_descr_*`
+/// attribute access pattern.
+fn is_normal_finish_descr(jf_descr_raw: i64, attachments: &CpuDescrAttachments) -> bool {
+    if let Some((descr_ref, _)) = match_metainterp_finish_descr(jf_descr_raw, attachments) {
         if let Some(fd) = descr_ref.as_fail_descr() {
             return fd.is_finish() && !fd.is_exit_frame_with_exception();
         }
@@ -547,6 +472,13 @@ struct RegisteredLoopTarget {
     /// adopting the pending Arc onto `token.compiled_loop_token` in
     /// `register_call_assembler_target`.
     compiled_loop_token: Arc<CompiledLoopToken>,
+    /// `compile.py:665 setattr(cpu, name, descr)` — heap-stable clone of
+    /// the owning `CraneliftBackend`'s per-cpu descr attachments.  Kept
+    /// here so `execute_registered_loop_target` (a free fn reached from
+    /// extern-C trampolines) can pass a snapshot into
+    /// `match_metainterp_finish_descr` / `is_normal_finish_descr`
+    /// without a `&self` receiver.
+    cpu_attachments: CpuDescrHandle,
 }
 
 unsafe impl Send for RegisteredLoopTarget {}
@@ -2421,6 +2353,7 @@ fn register_call_assembler_target(
             .map(|i| i as i32)
             .unwrap_or(-1),
         compiled_loop_token: clt,
+        cpu_attachments: Arc::clone(&compiled.cpu_attachments),
     };
     validate_registered_target_against_call_assembler_expectations(token.number, &target)?;
     // Invalidate thread-local cache in case a pending placeholder was cached.
@@ -2469,12 +2402,13 @@ fn unregister_call_assembler_target(token_number: u64) {
 /// with null code_ptr for a pending token. call_assembler_fast_path
 /// detects null code_ptr and falls back to force_fn (interpreter).
 /// When compilation completes, the placeholder is replaced by the real target.
-pub fn register_pending_call_assembler_target(
+pub(crate) fn register_pending_call_assembler_target(
     token_number: u64,
     inputarg_types: Vec<Type>,
     num_inputs: usize,
     num_scalar_inputargs: usize,
     index_of_virtualizable: i32,
+    cpu_attachments: CpuDescrHandle,
 ) {
     // compile.py: compile_tmp_callback installs a placeholder target that must
     // not retain dispatch metadata from a previous token incarnation.
@@ -2503,6 +2437,7 @@ pub fn register_pending_call_assembler_target(
         num_scalar_inputargs,
         index_of_virtualizable,
         compiled_loop_token: pending_clt,
+        cpu_attachments,
     };
     with_call_assembler_registry(|m| m.insert(token_number, target));
 }
@@ -2743,6 +2678,15 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
     let mut cur_num_ref_roots = target.num_ref_roots;
     let mut cur_max_output_slots = target.max_output_slots;
     let mut current_inputs = inputs.to_vec();
+    // `compile.py:665 setattr(cpu, name, descr)` — borrow the owning
+    // cpu's descr set for the whole dispatch loop.  External-JUMP
+    // bridge dispatch swaps the code entry but stays within the same
+    // cpu, so the attachments are invariant across the loop.  Holding
+    // the read lock is safe: `Backend::set_done_with_this_frame_descr_*`
+    // only fires during `MetaInterpStaticData.finish_setup`, long
+    // before compiled code runs.
+    let attachments_guard = target.cpu_attachments.read().unwrap();
+    let attachments: &CpuDescrAttachments = &*attachments_guard;
     loop {
         let exec = run_compiled_code(
             cur_code_ptr,
@@ -2751,6 +2695,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             cur_num_ref_roots,
             cur_max_output_slots,
             &current_inputs,
+            &attachments,
         );
         let fail_index = exec.fail_index;
         let direct_descr = exec.direct_descr.clone();
@@ -2788,6 +2733,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                     bridge,
                     &raw_outputs,
                     &fail_descr.fail_arg_types,
+                    &attachments,
                 );
                 let _ = bridge_guard;
                 let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
@@ -2828,6 +2774,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 bridge,
                 &mat_outputs,
                 &fail_descr.fail_arg_types,
+                &attachments,
             );
         }
         let _ = bridge_guard;
@@ -2924,8 +2871,17 @@ fn emit_call_footer_shadowstack(
 /// direct call_assembler path. Ultra-lightweight: just increments
 /// fail count, checks bridge (atomic + mutex only when bridge exists),
 /// and defers bridge compilation. Falls back to force_fn.
+///
+/// `cpu_handle` is the heap-stable `Arc<RwLock<CpuDescrAttachments>>`
+/// address baked as an immediate at emit time so the runtime
+/// classifier (`is_normal_finish_descr`) can resolve
+/// `DoneWithThisFrame*` identity against the owning cpu's attachments
+/// (`compile.py:665 setattr(cpu, name, descr)`).  Never null in
+/// production — `CompiledLoop.cpu_attachments` keeps the allocation
+/// alive for the lifetime of the emitted code.
 #[inline(never)]
 extern "C" fn call_assembler_guard_failure(
+    cpu_handle: *const std::sync::RwLock<CpuDescrAttachments>,
     token_number: u64,
     fail_descr_ptr: i64,
     frame_ptr: i64,
@@ -2943,6 +2899,7 @@ extern "C" fn call_assembler_guard_failure(
     // rpython/jit/backend/x86/assembler.py:1085) measures against the
     // same `PYRE_STACKTOOBIG.stack_end` the rest of the runtime uses.
     call_assembler_guard_failure_inner(
+        cpu_handle,
         token_number,
         fail_descr_ptr,
         frame_ptr,
@@ -2952,12 +2909,28 @@ extern "C" fn call_assembler_guard_failure(
 }
 
 fn call_assembler_guard_failure_inner(
+    cpu_handle: *const std::sync::RwLock<CpuDescrAttachments>,
     token_number: u64,
     fail_descr_ptr: i64,
     frame_ptr: i64,
     outputs_ptr: *const i64,
     inputs_ptr: *const i64,
 ) -> i64 {
+    // `compile.py:665 setattr(cpu, name, descr)` — borrow the read lock
+    // for the duration of this call so `is_normal_finish_descr` sees
+    // the owning cpu's attachments without cloning Arc<DescrRef>s on
+    // every guard failure.  Setters (`set_done_with_this_frame_descr_*`
+    // etc.) only run at `MetaInterpStaticData.finish_setup` so write
+    // contention is effectively nil.
+    let attachments_guard;
+    let default_attachments;
+    let attachments: &CpuDescrAttachments = if cpu_handle.is_null() {
+        default_attachments = CpuDescrAttachments::default();
+        &default_attachments
+    } else {
+        attachments_guard = unsafe { (*cpu_handle).read().unwrap() };
+        &*attachments_guard
+    };
     // Handle deadframe sentinel (nested CALL_ASSEMBLER propagation).
     if fail_descr_ptr == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
         let frame = take_call_assembler_deadframe_from_outputs(unsafe {
@@ -2981,7 +2954,7 @@ fn call_assembler_guard_failure_inner(
         // _call_assembler_check_descr (x86/assembler.py:2274-2278):
         // CMP [eax + jf_descr_ofs], done_descr → JE path B
         let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
-        if jf_descr_raw != 0 && is_normal_finish_descr(jf_descr_raw) {
+        if jf_descr_raw != 0 && is_normal_finish_descr(jf_descr_raw, attachments) {
             // _call_assembler_load_result (x86/assembler.py:2291-2303):
             // MOV eax, [eax + ofs] — load from returned frame, not original.
             let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
@@ -3023,7 +2996,7 @@ fn call_assembler_guard_failure_inner(
                 };
                 let result_jf = unsafe { func(jf_ptr) };
                 let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
-                if jf_descr_raw != 0 && is_normal_finish_descr(jf_descr_raw) {
+                if jf_descr_raw != 0 && is_normal_finish_descr(jf_descr_raw, attachments) {
                     // x86/assembler.py:2291-2303: load from returned frame.
                     let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
                     return unsafe { *result_jf.add(header_words) };
@@ -3130,6 +3103,8 @@ fn call_assembler_fast_path_heap(
     force_fn: extern "C" fn(i64) -> i64,
 ) -> u64 {
     let actual_outputs = target.max_output_slots.max(1);
+    let attachments_guard = target.cpu_attachments.read().unwrap();
+    let attachments: &CpuDescrAttachments = &*attachments_guard;
     let exec = run_compiled_code(
         target.code_ptr,
         &target.fail_descrs,
@@ -3137,6 +3112,7 @@ fn call_assembler_fast_path_heap(
         target.num_ref_roots,
         target.max_output_slots,
         inputs,
+        attachments,
     );
     let fail_index = exec.fail_index;
     let outputs = exec.extract_outputs(actual_outputs);
@@ -3182,8 +3158,12 @@ fn call_assembler_fast_path_heap(
             fail_descr.recovery_layout_ref().as_ref(),
             bridge.num_inputs,
         );
-        let mut frame =
-            CraneliftBackend::execute_bridge(bridge, &bridge_outputs, &fail_descr.fail_arg_types);
+        let mut frame = CraneliftBackend::execute_bridge(
+            bridge,
+            &bridge_outputs,
+            &fail_descr.fail_arg_types,
+            &attachments,
+        );
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
             .expect("bridge deadframe must have a descriptor");
         if bridge_descr.is_finish() {
@@ -5001,6 +4981,12 @@ struct CompiledLoop {
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
+    /// `compile.py:665 setattr(cpu, name, descr)` — heap-stable clone of
+    /// the owning `CraneliftBackend`'s per-cpu descr attachments.  The
+    /// JIT-emitted CALL_ASSEMBLER slow path bakes this Arc's address as
+    /// an immediate; holding the clone here keeps the `RwLock`
+    /// allocation alive for the lifetime of the compiled code.
+    cpu_attachments: CpuDescrHandle,
 }
 
 unsafe impl Send for CompiledLoop {}
@@ -5142,6 +5128,7 @@ fn run_compiled_code(
     num_ref_roots: usize,
     max_output_slots: usize,
     inputs: &[i64],
+    attachments: &CpuDescrAttachments,
 ) -> JitExecResult {
     // No alternate-stack switch here. The compiled prologue's inline
     // SP probe (`_call_header_with_stack_check`,
@@ -5156,6 +5143,7 @@ fn run_compiled_code(
         num_ref_roots,
         max_output_slots,
         inputs,
+        attachments,
     )
 }
 
@@ -5166,6 +5154,7 @@ fn run_compiled_code_inner(
     num_ref_roots: usize,
     max_output_slots: usize,
     inputs: &[i64],
+    attachments: &CpuDescrAttachments,
 ) -> JitExecResult {
     // RPython llmodel.py:298: frame = gc_ll_descr.malloc_jitframe(frame_info)
     // jitframe.py:48-52: jitframe_allocate(frame_info)
@@ -5297,7 +5286,7 @@ fn run_compiled_code_inner(
     } else if jf_descr_raw == 0 {
         (0u32, None)
     } else if let Some((metainterp_finish, cl_singleton)) =
-        match_metainterp_finish_descr(jf_descr_raw)
+        match_metainterp_finish_descr(jf_descr_raw, attachments)
     {
         // `pyjitpl.py:2222` match — the metainterp-side
         // `Arc<DoneWithThisFrameDescr*>` was written into jf_descr at
@@ -5598,16 +5587,12 @@ pub struct CraneliftBackend {
     /// `compile.py:665` `setattr(cpu, name, descr)` per-cpu attachments.
     /// Each `Backend` instance owns its own copy of the metainterp-side
     /// `DoneWithThisFrameDescr*` / `ExitFrameWithExceptionDescrRef` /
-    /// `PropagateExceptionDescr` singletons.  Reader sites that cannot
-    /// reach a `&self` receiver (Cranelift-emitted IR, extern-C
-    /// callbacks) continue to consult the per-thread slots in this
-    /// module — the setters write to both so the two views stay in sync.
-    done_descr_void: Option<majit_ir::DescrRef>,
-    done_descr_int: Option<majit_ir::DescrRef>,
-    done_descr_ref: Option<majit_ir::DescrRef>,
-    done_descr_float: Option<majit_ir::DescrRef>,
-    exit_frame_with_exception_descr_ref: Option<majit_ir::DescrRef>,
-    propagate_exception_descr: Option<majit_ir::DescrRef>,
+    /// `PropagateExceptionDescr` singletons, held in a heap-pinned
+    /// `Arc<RwLock<CpuDescrAttachments>>` so the address is stable even
+    /// when `CraneliftBackend` is moved.  `CompiledLoop` carries an Arc
+    /// clone so the attachments outlive this backend for the lifetime of
+    /// emitted code that baked the handle as an immediate.
+    descr_attachments: CpuDescrHandle,
 }
 
 impl CraneliftBackend {
@@ -5760,12 +5745,7 @@ impl CraneliftBackend {
             //   symbolic.get_field_token(rclass.OBJECT, 'typeptr', ...).
             // Callers configure pyre's PyObject layout via set_vtable_offset.
             vtable_offset: None,
-            done_descr_void: None,
-            done_descr_int: None,
-            done_descr_ref: None,
-            done_descr_float: None,
-            exit_frame_with_exception_descr_ref: None,
-            propagate_exception_descr: None,
+            descr_attachments: Arc::new(std::sync::RwLock::new(CpuDescrAttachments::default())),
         }
     }
 
@@ -5790,42 +5770,51 @@ impl CraneliftBackend {
     /// consumers (`collect_guards` FINISH sites, `register_call_assembler_target`).
     /// The metainterp attaches the real descrs through
     /// `Backend::set_done_with_this_frame_descr_*` during
-    /// `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222); until then,
-    /// the per-thread fallback slots in this module answer so
-    /// backend-only integration tests that skip `MetaInterp::new` still
-    /// get a non-zero pointer per result type.
+    /// `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222); the
+    /// fallback cranelift singletons below answer for the
+    /// backend-only integration tests that skip `MetaInterp::new` so
+    /// every result-type bucket still has a non-zero pointer.
     pub(crate) fn attached_descr_ptrs(&self) -> majit_backend::AttachedDescrPtrs {
-        fn ptr_or(d: &Option<majit_ir::DescrRef>, fallback: i64) -> usize {
-            d.as_ref().map_or(fallback as usize, |arc| {
-                Arc::as_ptr(arc) as *const () as usize
-            })
+        let attached = self.descr_attachments.read().unwrap().descr_ptrs();
+        fn or_fallback(attached: usize, fallback: i64) -> usize {
+            if attached != 0 {
+                attached
+            } else {
+                fallback as usize
+            }
         }
         majit_backend::AttachedDescrPtrs {
-            done_with_this_frame_descr_void: ptr_or(
-                &self.done_descr_void,
-                done_with_this_frame_descr_ptr(&[]),
+            done_with_this_frame_descr_void: or_fallback(
+                attached.done_with_this_frame_descr_void,
+                Arc::as_ptr(done_with_this_frame_descr(&[])) as i64,
             ),
-            done_with_this_frame_descr_int: ptr_or(
-                &self.done_descr_int,
-                done_with_this_frame_descr_ptr(&[Type::Int]),
+            done_with_this_frame_descr_int: or_fallback(
+                attached.done_with_this_frame_descr_int,
+                Arc::as_ptr(done_with_this_frame_descr(&[Type::Int])) as i64,
             ),
-            done_with_this_frame_descr_ref: ptr_or(
-                &self.done_descr_ref,
-                done_with_this_frame_descr_ptr(&[Type::Ref]),
+            done_with_this_frame_descr_ref: or_fallback(
+                attached.done_with_this_frame_descr_ref,
+                Arc::as_ptr(done_with_this_frame_descr(&[Type::Ref])) as i64,
             ),
-            done_with_this_frame_descr_float: ptr_or(
-                &self.done_descr_float,
-                done_with_this_frame_descr_ptr(&[Type::Float]),
+            done_with_this_frame_descr_float: or_fallback(
+                attached.done_with_this_frame_descr_float,
+                Arc::as_ptr(done_with_this_frame_descr(&[Type::Float])) as i64,
             ),
-            exit_frame_with_exception_descr_ref: ptr_or(
-                &self.exit_frame_with_exception_descr_ref,
-                exit_frame_with_exception_descr_ref_ptr(),
+            exit_frame_with_exception_descr_ref: or_fallback(
+                attached.exit_frame_with_exception_descr_ref,
+                Arc::as_ptr(&*EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL) as i64,
             ),
-            propagate_exception_descr: self
-                .propagate_exception_descr
-                .as_ref()
-                .map_or(0, |arc| Arc::as_ptr(arc) as *const () as usize),
+            propagate_exception_descr: attached.propagate_exception_descr,
         }
+    }
+
+    /// Heap-stable `Arc<RwLock<CpuDescrAttachments>>` address for embedding
+    /// in cranelift-emitted CALL_ASSEMBLER helpers; the extern-C trampoline
+    /// dereferences it to snapshot the attached descr pointers at dispatch.
+    /// Matches dynasm's `cpu_handle_ptr()` semantics so both backends share
+    /// the same runtime classifier contract.
+    pub(crate) fn cpu_handle(&self) -> CpuDescrHandle {
+        Arc::clone(&self.descr_attachments)
     }
 
     /// llsupport/gc.py:563 GcLLDescr_framework
@@ -5995,6 +5984,13 @@ impl CraneliftBackend {
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = inputs.to_vec();
+        // `compile.py:665 setattr(cpu, name, descr)` — borrow the owning
+        // cpu's descr set for the whole dispatch loop.  Holding the read
+        // lock is safe: `Backend::set_done_with_this_frame_descr_*` only
+        // fires during `MetaInterpStaticData.finish_setup`, long before
+        // compiled code runs.
+        let attachments_guard = compiled.cpu_attachments.read().unwrap();
+        let attachments: &CpuDescrAttachments = &*attachments_guard;
 
         loop {
             let exec = run_compiled_code(
@@ -6004,6 +6000,7 @@ impl CraneliftBackend {
                 cur_num_ref_roots,
                 cur_max_output_slots,
                 &cur_inputs,
+                attachments,
             );
             let fail_index = exec.fail_index;
             let direct_descr = exec.direct_descr.clone();
@@ -6127,6 +6124,7 @@ impl CraneliftBackend {
         bridge: &BridgeData,
         parent_outputs: &[i64],
         parent_types: &[Type],
+        attachments: &CpuDescrAttachments,
     ) -> DeadFrame {
         // The bridge's inputs are the parent guard's fail args.
         let num_bridge_inputs = bridge.num_inputs.min(parent_types.len());
@@ -6138,6 +6136,7 @@ impl CraneliftBackend {
             bridge.num_ref_roots,
             bridge.max_output_slots,
             bridge_inputs,
+            attachments,
         );
         let fail_index = exec.fail_index;
         let direct_descr = exec.direct_descr.clone();
@@ -6176,7 +6175,12 @@ impl CraneliftBackend {
 
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref next_bridge) = *bridge_guard {
-            return Self::execute_bridge(next_bridge, &outputs, &fail_descr.fail_arg_types);
+            return Self::execute_bridge(
+                next_bridge,
+                &outputs,
+                &fail_descr.fail_arg_types,
+                attachments,
+            );
         }
         let _ = bridge_guard;
 
@@ -8275,6 +8279,15 @@ impl CraneliftBackend {
                             builder.ins().iadd_imm(result_jf, JF_FRAME_ITEM0_OFS as i64);
                         let result_jf_data_i64 =
                             ptr_arg_as_i64(&mut builder, result_jf_data, ptr_type);
+                        // `compile.py:665 setattr(cpu, name, descr)` — bake the
+                        // heap-stable `Arc<RwLock<CpuDescrAttachments>>` address
+                        // so the trampoline's runtime classifier resolves
+                        // `DoneWithThisFrame*` identity against the owning cpu.
+                        // `CompiledLoop.cpu_attachments` keeps the allocation
+                        // alive for the lifetime of this emitted code.
+                        let cpu_handle_imm = builder
+                            .ins()
+                            .iconst(cl_types::I64, Arc::as_ptr(&self.descr_attachments) as i64);
                         // RPython assembler.py:349-350: assembler_helper(tmploc, vloc).
                         let force_result = emit_host_call(
                             &mut builder,
@@ -8282,6 +8295,7 @@ impl CraneliftBackend {
                             call_conv,
                             call_assembler_guard_failure as *const () as usize,
                             &[
+                                cpu_handle_imm,
                                 target_token,
                                 fail_idx_raw,
                                 frame_ptr,
@@ -10936,6 +10950,7 @@ impl CraneliftBackend {
             num_inputs: inputargs.len(),
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
+            cpu_attachments: self.cpu_handle(),
         })
     }
 }
@@ -11693,28 +11708,40 @@ impl majit_backend::Backend for CraneliftBackend {
     }
 
     fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
-        self.done_descr_void = Some(descr.clone());
-        set_done_with_this_frame_descr_void(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .done_with_this_frame_descr_void = Some(descr);
     }
     fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
-        self.done_descr_int = Some(descr.clone());
-        set_done_with_this_frame_descr_int(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .done_with_this_frame_descr_int = Some(descr);
     }
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
-        self.done_descr_ref = Some(descr.clone());
-        set_done_with_this_frame_descr_ref(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .done_with_this_frame_descr_ref = Some(descr);
     }
     fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
-        self.done_descr_float = Some(descr.clone());
-        set_done_with_this_frame_descr_float(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .done_with_this_frame_descr_float = Some(descr);
     }
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: majit_ir::DescrRef) {
-        self.exit_frame_with_exception_descr_ref = Some(descr.clone());
-        set_exit_frame_with_exception_descr_ref(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .exit_frame_with_exception_descr_ref = Some(descr);
     }
     fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
-        self.propagate_exception_descr = Some(descr.clone());
-        set_propagate_exception_descr(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .propagate_exception_descr = Some(descr);
     }
 
     fn register_pending_target(
@@ -11731,6 +11758,7 @@ impl majit_backend::Backend for CraneliftBackend {
             num_inputs,
             num_scalar_inputargs,
             index_of_virtualizable,
+            self.cpu_handle(),
         );
     }
 
@@ -12101,6 +12129,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .downcast_ref::<CompiledLoop>()
             .expect("compiled data is not CompiledLoop");
 
+        let attachments_guard = compiled.cpu_attachments.read().unwrap();
         let exec = run_compiled_code(
             compiled.code_ptr,
             &compiled.fail_descrs,
@@ -12108,6 +12137,7 @@ impl majit_backend::Backend for CraneliftBackend {
             compiled.num_ref_roots,
             compiled.max_output_slots,
             args,
+            &*attachments_guard,
         );
         let fail_index = exec.fail_index;
         let direct_descr = exec.direct_descr.clone();
@@ -12190,7 +12220,12 @@ impl majit_backend::Backend for CraneliftBackend {
         }
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
-            let frame = Self::execute_bridge(bridge, &outputs, &fail_descr.fail_arg_types);
+            let frame = Self::execute_bridge(
+                bridge,
+                &outputs,
+                &fail_descr.fail_arg_types,
+                &*attachments_guard,
+            );
             let descr = frame
                 .data
                 .downcast_ref::<JitFrameDeadFrame>()
@@ -16954,7 +16989,14 @@ mod tests {
             .clear();
 
         let token_number = 1500_199;
-        register_pending_call_assembler_target(token_number, vec![Type::Int], 2, 1, -1);
+        register_pending_call_assembler_target(
+            token_number,
+            vec![Type::Int],
+            2,
+            1,
+            -1,
+            Arc::new(std::sync::RwLock::new(CpuDescrAttachments::default())),
+        );
 
         let target_ptr = unsafe { fast_lookup_ca_target(token_number) };
         assert!(!target_ptr.is_null(), "pending target should be registered");

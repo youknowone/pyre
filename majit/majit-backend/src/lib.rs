@@ -1126,7 +1126,85 @@ impl AttachedDescrPtrs {
             Type::Float => self.done_with_this_frame_descr_float,
         }
     }
+
+    /// `compile.py:665-670` parity: is `ptr` one of the four
+    /// `DoneWithThisFrameDescr*` pointers attached to this cpu?
+    /// Zero pointers (unattached slots) are never considered matches
+    /// — a test with some slots unset would otherwise make
+    /// `is_done_with_this_frame_descr(0)` spuriously true.
+    pub fn is_done_with_this_frame_descr(&self, ptr: usize) -> bool {
+        ptr != 0
+            && (ptr == self.done_with_this_frame_descr_void
+                || ptr == self.done_with_this_frame_descr_int
+                || ptr == self.done_with_this_frame_descr_ref
+                || ptr == self.done_with_this_frame_descr_float)
+    }
+
+    /// `compile.py:671` parity: does `ptr` match the attached
+    /// `exit_frame_with_exception_descr_ref` singleton?
+    pub fn is_exit_frame_with_exception_descr(&self, ptr: usize) -> bool {
+        ptr != 0 && ptr == self.exit_frame_with_exception_descr_ref
+    }
 }
+
+/// `compile.py:665-674` `make_and_attach_done_descrs` + `pyjitpl.py:2283`:
+/// the six descrs the metainterp attaches to each cpu instance at
+/// `MetaInterpStaticData.finish_setup`.
+///
+/// Stored inside a heap-pinned `Arc<RwLock<CpuDescrAttachments>>` on every
+/// `Backend` impl ([`CpuDescrHandle`] below):
+///
+///   * The `Arc` allocation address stays stable when the `Backend`
+///     value is moved (the metainterp keeps `backend: <Backend>` by value
+///     in `MetaInterp`; tests hold stack-local `<Backend>::new()`).
+///     RPython gets this property for free from Python object identity;
+///     pyre pays one heap indirection to recreate it.
+///   * Compiled code produced by `compile_loop` carries an `Arc` clone
+///     so the attachments outlive the owning backend — the JIT-emitted
+///     CALL_ASSEMBLER slow path dereferences the baked handle pointer
+///     long after `compile_loop` returns.
+///   * The `RwLock` permits `Backend::set_done_with_this_frame_descr_*`
+///     to mutate through `&Backend` (via the Arc) without requiring
+///     `&mut self` access to the inner; the extern-C trampoline takes a
+///     read lock to snapshot pointers for dispatch.
+///
+/// Field names mirror the RPython attribute names 1:1 for parity with
+/// `compile.make_and_attach_done_descrs` targets.
+#[derive(Default)]
+pub struct CpuDescrAttachments {
+    pub done_with_this_frame_descr_void: Option<majit_ir::DescrRef>,
+    pub done_with_this_frame_descr_int: Option<majit_ir::DescrRef>,
+    pub done_with_this_frame_descr_ref: Option<majit_ir::DescrRef>,
+    pub done_with_this_frame_descr_float: Option<majit_ir::DescrRef>,
+    pub exit_frame_with_exception_descr_ref: Option<majit_ir::DescrRef>,
+    pub propagate_exception_descr: Option<majit_ir::DescrRef>,
+}
+
+impl CpuDescrAttachments {
+    /// Snapshot the six attached pointers for emission / dispatch sites
+    /// that need compile-time or runtime-immediate access.
+    pub fn descr_ptrs(&self) -> AttachedDescrPtrs {
+        fn ptr(d: &Option<majit_ir::DescrRef>) -> usize {
+            d.as_ref()
+                .map_or(0, |arc| Arc::as_ptr(arc) as *const () as usize)
+        }
+        AttachedDescrPtrs {
+            done_with_this_frame_descr_void: ptr(&self.done_with_this_frame_descr_void),
+            done_with_this_frame_descr_int: ptr(&self.done_with_this_frame_descr_int),
+            done_with_this_frame_descr_ref: ptr(&self.done_with_this_frame_descr_ref),
+            done_with_this_frame_descr_float: ptr(&self.done_with_this_frame_descr_float),
+            exit_frame_with_exception_descr_ref: ptr(&self.exit_frame_with_exception_descr_ref),
+            propagate_exception_descr: ptr(&self.propagate_exception_descr),
+        }
+    }
+}
+
+/// Heap-pinned handle for the six per-cpu descr attachments.  The
+/// `Arc`'s payload (the `RwLock<CpuDescrAttachments>`) lives at a
+/// stable heap address so `compile_loop` can bake that address as an
+/// immediate in the JIT-emitted CALL_ASSEMBLER helper call site and
+/// the extern-C trampoline can dereference it later.
+pub type CpuDescrHandle = Arc<std::sync::RwLock<CpuDescrAttachments>>;
 
 /// The backend trait — implemented by Cranelift (or other code generators).
 ///

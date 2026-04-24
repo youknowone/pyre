@@ -955,7 +955,6 @@ impl MIFrame {
         ctx: &mut TraceCtx,
         idx: usize,
         value: OpRef,
-        concrete_value: majit_ir::Value,
     ) -> Result<(), PyError> {
         // RPython `_opimpl_setarrayitem_vable` (pyjitpl.py:1242-1247)
         // writes the value's Ref box directly into
@@ -983,15 +982,6 @@ impl MIFrame {
             self.value_type(value),
             value,
         );
-        // Box-atomicity parity (RPython `pyjitpl.py:1245`
-        // `virtualizable_boxes[index] = valuebox` — Box carries both
-        // OpRef AND concrete Value atomically).  Pyre splits Box into
-        // two arrays (`virtualizable_boxes: Vec<OpRef>` +
-        // `virtualizable_values: Vec<Value>`), so we must write both to
-        // preserve Box semantics.  The concrete is an explicit parameter
-        // because `STORE_FAST_STORE_FAST` pops two operands before any
-        // store: reading from `concrete_stack[valuestackdepth - nlocals]`
-        // after the second pop would return the wrong operand's shadow.
         let (has_vable, frame_ref, nlocals) = {
             let s = self.sym_mut();
             if idx >= s.registers_r.len() {
@@ -1009,6 +999,12 @@ impl MIFrame {
         // RPython pyjitpl.py:1242-1247 `_opimpl_setarrayitem_vable` parity:
         //     self.metainterp.virtualizable_boxes[flat_idx] = valuebox
         //     self.metainterp.synchronize_virtualizable()
+        //
+        // `virtualizable_boxes` is the RPython tracing-time mirror of
+        // the PyFrame's `locals_cells_stack_w` array. Keep it in sync
+        // with `registers_r` so `close_loop_args_at`'s
+        // `set_virtualizable_box_at` writes the current SSA opref (not
+        // the preamble InputArg) into every slot.
         if has_vable && idx < nlocals {
             let _ = frame_ref;
             // NUM_SCALAR_INPUTARGS - 1 = 6 (scalar fields excluding the
@@ -1016,7 +1012,7 @@ impl MIFrame {
             // virtualizable_boxes layout is [scalars.., array_items..,
             // vable_ref], so local idx maps to `(NUM_SCALARS - 1) + idx`.
             let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + idx;
-            ctx.set_virtualizable_entry_at(flat_idx, value, concrete_value);
+            ctx.set_virtualizable_box_at(flat_idx, value);
         }
         Ok(())
     }
@@ -2301,38 +2297,20 @@ impl MIFrame {
             // `vable_ref` is at `virtualizable_boxes[-1]` and NEVER covers
             // an array slot — skip it via `.get()`.
             let shadow_entry = ctx.virtualizable_box_at(num_static + i);
-            // PRE-EXISTING-ADAPTATION: for stack slots within the
-            // current symbolic stack depth (`valid_stack_only`), prefer
-            // `registers_r_view[i]` over the shadow.
-            // `seed_virtualizable_boxes` pads reserved stack slots with
-            // `const_ref(PY_NULL)` to mirror the heap state at portal
-            // entry, but pyre's `push_typed_value` updates only
-            // `sym.registers_r`, not the shadow. Upstream
-            // `_opimpl_setarrayitem_vable` (pyjitpl.py:1237-1247) would
-            // mirror every stack push into `virtualizable_boxes`, but
-            // pyre does not yet emit the `setarrayitem_vable` IR op for
-            // symbolic stack pushes (Task #135). Until that full port
-            // lands, compensate on the snapshot side so a stale PY_NULL
-            // pad cannot override a freshly pushed value.
-            let is_live_stack_slot = i >= sym.nlocals && i < sym.nlocals + valid_stack_only;
-            let opref = if is_live_stack_slot && i < registers_r_view.len() {
-                registers_r_view[i]
-            } else {
-                match shadow_entry {
-                    Some(op) if !op.is_none() => op,
-                    _ => {
-                        // pyre stack temporaries live in the `registers_r` tail,
-                        // not the vable shadow — keep the legacy fallback for
-                        // those slots.
-                        if i < sym.registers_r.len() {
-                            sym.registers_r[i]
+            let opref = match shadow_entry {
+                Some(op) if !op.is_none() => op,
+                _ => {
+                    // pyre stack temporaries live in the `registers_r` tail,
+                    // not the vable shadow — keep the legacy fallback for
+                    // those slots.
+                    if i < sym.registers_r.len() {
+                        sym.registers_r[i]
+                    } else {
+                        let stack_idx = i - sym.nlocals;
+                        if stack_idx < stack_values.len() {
+                            stack_values[stack_idx]
                         } else {
-                            let stack_idx = i - sym.nlocals;
-                            if stack_idx < stack_values.len() {
-                                stack_values[stack_idx]
-                            } else {
-                                OpRef::NONE
-                            }
+                            OpRef::NONE
                         }
                     }
                 }
@@ -5590,14 +5568,6 @@ impl OpcodeStepExecutor for MIFrame {
             let cause = if raw_cause_obj.is_null() {
                 None
             } else {
-                // pyopcode.py:706 `w_cause = space.call_function(w_cause)`
-                // runs on the interpreter path; in pyre's tracer context
-                // the call must be forced onto the plain eval loop so it
-                // does not re-enter the tracer. Mirrors the exc-path
-                // guard at `call_function(exc, &[])` below (commit
-                // bef2ee2035 symmetrized JIT + blackhole helpers but
-                // missed this tracer-time site).
-                let _plain_guard = pyre_interpreter::call::force_plain_eval();
                 Some(normalize_raise_cause(raw_cause_obj)?)
             };
             (exc_val, cause, raw_cause.opref)

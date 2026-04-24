@@ -175,20 +175,16 @@ pub struct DynasmBackend {
     /// llmodel.py:64-69 self.vtable_offset — byte offset of the typeptr
     /// field inside instance objects. None when gcremovetypeptr is enabled.
     vtable_offset: Option<usize>,
-    /// `compile.py:665` `setattr(cpu, name, descr)` per-cpu attachments.
-    /// Each `Backend` instance owns its own copy of the metainterp-side
-    /// `DoneWithThisFrameDescr*` / `ExitFrameWithExceptionDescrRef` /
-    /// `PropagateExceptionDescr` singletons.  Reader sites that cannot
-    /// reach a `&self` receiver (JIT-emitted assembly, extern-C
-    /// trampoline) continue to consult the per-thread slots in
-    /// `guard.rs` — the setters write to both so the two views stay in
-    /// sync.
-    done_descr_void: Option<majit_ir::DescrRef>,
-    done_descr_int: Option<majit_ir::DescrRef>,
-    done_descr_ref: Option<majit_ir::DescrRef>,
-    done_descr_float: Option<majit_ir::DescrRef>,
-    exit_frame_with_exception_descr_ref: Option<majit_ir::DescrRef>,
-    propagate_exception_descr: Option<majit_ir::DescrRef>,
+    /// `compile.py:665` `setattr(cpu, name, descr)` per-cpu attachments,
+    /// held in a heap-pinned `Arc<RwLock<CpuDescrAttachments>>` so the
+    /// pointer baked into the CALL_ASSEMBLER helper call site
+    /// (`compile_loop` / `compile_bridge`) stays valid even when
+    /// `DynasmBackend` is moved (the metainterp stores it by value; tests
+    /// hold stack-local `DynasmBackend::new()`).  Compiled traces clone
+    /// the `Arc` into `CompiledCode` so the attachments outlive the
+    /// owning backend — matches the lifetime guarantee RPython gets from
+    /// `cpu` being a long-lived Python object.
+    descr_attachments: crate::guard::CpuDescrHandle,
     /// ptr → Arc<DynasmFailDescr> registry enabling cross-token
     /// resolution of guard fail descriptors. RPython resolves
     /// `AbstractDescr.show(jf_descr)` via direct pointer dereference,
@@ -254,20 +250,68 @@ impl DynasmBackend {
     }
 
     pub fn new() -> Self {
+        // `rpython/jit/backend/model.py` `AbstractCPU.__init__` parity:
+        // the cpu is constructed with no attached descrs.  The
+        // `DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`
+        // singletons are attached later by
+        // `compile.make_and_attach_done_descrs([self, cpu])` during
+        // `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222).
         DynasmBackend {
             next_trace_id: 1,
             next_header_pc: 0,
             constants: std::collections::HashMap::new(),
             constant_types: std::collections::HashMap::new(),
             vtable_offset: None,
-            done_descr_void: None,
-            done_descr_int: None,
-            done_descr_ref: None,
-            done_descr_float: None,
-            exit_frame_with_exception_descr_ref: None,
-            propagate_exception_descr: None,
+            descr_attachments: Arc::new(std::sync::RwLock::new(
+                crate::guard::CpuDescrAttachments::default(),
+            )),
             fail_descr_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Test helper: attach synthetic per-cpu `DoneWithThisFrame*` +
+    /// `ExitFrameWithExceptionDescrRef` descrs, mirroring the state
+    /// `MetaInterpStaticData.attach_descrs_to_cpu(cpu)` leaves the
+    /// backend in at `finish_setup` (pyjitpl.py:2222).  Production
+    /// code reaches this state through `MetaInterp::new`; backend-
+    /// only unit/integration tests that skip the metainterp call
+    /// this to get a populated cpu before running `compile_loop`.
+    pub fn attach_default_test_descrs(&mut self) {
+        use majit_ir::Type;
+        let void: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
+            u32::MAX,
+            0,
+            vec![],
+            true,
+        ));
+        let int: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
+            u32::MAX,
+            0,
+            vec![Type::Int],
+            true,
+        ));
+        let r: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
+            u32::MAX,
+            0,
+            vec![Type::Ref],
+            true,
+        ));
+        let float: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
+            u32::MAX,
+            0,
+            vec![Type::Float],
+            true,
+        ));
+        let exit_exc: majit_ir::DescrRef = {
+            let mut d = crate::guard::DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true);
+            d.is_exit_frame_with_exception = true;
+            Arc::new(d)
+        };
+        <Self as Backend>::set_done_with_this_frame_descr_void(self, void);
+        <Self as Backend>::set_done_with_this_frame_descr_int(self, int);
+        <Self as Backend>::set_done_with_this_frame_descr_ref(self, r);
+        <Self as Backend>::set_done_with_this_frame_descr_float(self, float);
+        <Self as Backend>::set_exit_frame_with_exception_descr_ref(self, exit_exc);
     }
 
     /// Active vtable_offset for the assembler to consume during codegen.
@@ -280,41 +324,26 @@ impl DynasmBackend {
     /// consumers (Assembler386 / AssemblerARM64 FINISH + CALL_ASSEMBLER
     /// sites).  The metainterp attaches the real descrs through
     /// `Backend::set_done_with_this_frame_descr_*` during
-    /// `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222); until then,
-    /// the per-thread fallback singletons in `crate::guard` answer so
-    /// backend-only integration tests that skip `MetaInterp::new` still
-    /// get a non-zero pointer per result type.
+    /// `MetaInterpStaticData.finish_setup` (pyjitpl.py:2222); before that
+    /// the per-cpu fallback descrs installed by `DynasmBackend::new()`
+    /// answer, so backend-only integration tests see distinct, non-zero
+    /// pointers per result type without ever consulting per-thread state.
     pub(crate) fn attached_descr_ptrs(&self) -> crate::guard::AttachedDescrPtrs {
-        fn ptr_or(d: &Option<majit_ir::DescrRef>, fallback: usize) -> usize {
-            d.as_ref()
-                .map_or(fallback, |arc| Arc::as_ptr(arc) as *const () as usize)
-        }
-        crate::guard::AttachedDescrPtrs {
-            done_with_this_frame_descr_void: ptr_or(
-                &self.done_descr_void,
-                crate::guard::done_with_this_frame_descr_void_ptr(),
-            ),
-            done_with_this_frame_descr_int: ptr_or(
-                &self.done_descr_int,
-                crate::guard::done_with_this_frame_descr_int_ptr(),
-            ),
-            done_with_this_frame_descr_ref: ptr_or(
-                &self.done_descr_ref,
-                crate::guard::done_with_this_frame_descr_ref_ptr(),
-            ),
-            done_with_this_frame_descr_float: ptr_or(
-                &self.done_descr_float,
-                crate::guard::done_with_this_frame_descr_float_ptr(),
-            ),
-            exit_frame_with_exception_descr_ref: ptr_or(
-                &self.exit_frame_with_exception_descr_ref,
-                crate::guard::exit_frame_with_exception_descr_ref_ptr(),
-            ),
-            propagate_exception_descr: ptr_or(
-                &self.propagate_exception_descr,
-                crate::guard::propagate_exception_descr_ptr(),
-            ),
-        }
+        self.descr_attachments.read().unwrap().descr_ptrs()
+    }
+
+    /// `Arc` clone of the attachment handle, for compiled traces to
+    /// keep alive alongside their executable buffer.  The `Arc`'s
+    /// payload (the `RwLock<CpuDescrAttachments>`) lives at a heap-
+    /// pinned address; `Arc::as_ptr(&clone)` is baked by emission into
+    /// the CALL_ASSEMBLER helper call site as a compile-time immediate
+    /// (same role as RPython's `self.cpu` closure capture in the
+    /// translated code).  Cloning into `CompiledCode` keeps the pointee
+    /// alive past any subsequent `DynasmBackend` drop — matches the
+    /// lifetime guarantee RPython gets from `cpu` being a long-lived
+    /// Python object.
+    pub(crate) fn cpu_handle(&self) -> crate::guard::CpuDescrHandle {
+        Arc::clone(&self.descr_attachments)
     }
 
     /// Add a newly-compiled loop/bridge's fail_descrs to the ptr-indexed
@@ -500,17 +529,29 @@ impl DynasmBackend {
     /// asmmemmgr_blocks. RPython does this via AbstractDescr.show()
     /// which works for any descr from any loop/bridge.
     ///
+    /// `compile.py:618-671` parity: the four `DoneWithThisFrame*`
+    /// + `ExitFrameWithExceptionDescrRef` singletons attached to
+    /// `self.cpu` are compared by pointer identity against the raw
+    /// `jf_descr` value — same as RPython
+    /// `llgraph/runner.py:1478-1484` (`faildescr == self.cpu.done_with_this_frame_descr_*`).
+    ///
     /// Panics if not found — RPython uses object identity, so lookup
     /// failure is impossible in well-formed execution.
     fn find_descr_by_ptr(&self, token: &JitCellToken, ptr: usize) -> Arc<DynasmFailDescr> {
+        let attached = self.attached_descr_ptrs();
         // compile.py:618-669 done_with_this_frame_descr — check all 4 variants
-        if crate::guard::is_done_with_this_frame_descr(ptr) {
+        if ptr != 0
+            && (ptr == attached.done_with_this_frame_descr_void
+                || ptr == attached.done_with_this_frame_descr_int
+                || ptr == attached.done_with_this_frame_descr_ref
+                || ptr == attached.done_with_this_frame_descr_float)
+        {
             // Determine type from which variant matched
-            let types = if ptr == crate::guard::done_with_this_frame_descr_void_ptr() {
+            let types = if ptr == attached.done_with_this_frame_descr_void {
                 vec![]
-            } else if ptr == crate::guard::done_with_this_frame_descr_float_ptr() {
+            } else if ptr == attached.done_with_this_frame_descr_float {
                 vec![Type::Float]
-            } else if ptr == crate::guard::done_with_this_frame_descr_ref_ptr() {
+            } else if ptr == attached.done_with_this_frame_descr_ref {
                 vec![Type::Ref]
             } else {
                 vec![Type::Int]
@@ -521,7 +562,7 @@ impl DynasmBackend {
         // compile.py:658-662 ExitFrameWithExceptionDescrRef — route to
         // jitexc.ExitFrameWithExceptionRef via is_exit_frame_with_exception.
         // Result type is Ref (exc value at slot 0, jitexc.py:45).
-        if crate::guard::is_exit_frame_with_exception_descr(ptr) {
+        if ptr != 0 && ptr == attached.exit_frame_with_exception_descr_ref {
             let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true);
             d.is_exit_frame_with_exception = true;
             return Arc::new(d);
@@ -694,6 +735,7 @@ impl Backend for DynasmBackend {
         let constant_types = std::mem::take(&mut self.constant_types);
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
+        let cpu_handle = self.cpu_handle();
         let mut asm = Asm::new(
             trace_id,
             header_pc,
@@ -701,6 +743,7 @@ impl Backend for DynasmBackend {
             self.vtable_offset,
             typeid_table,
             attached_descrs,
+            cpu_handle,
         );
         asm.set_constant_types(constant_types);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());
@@ -769,28 +812,40 @@ impl Backend for DynasmBackend {
     }
 
     fn set_done_with_this_frame_descr_void(&mut self, descr: majit_ir::DescrRef) {
-        self.done_descr_void = Some(descr.clone());
-        crate::guard::set_done_with_this_frame_descr_void(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .done_with_this_frame_descr_void = Some(descr);
     }
     fn set_done_with_this_frame_descr_int(&mut self, descr: majit_ir::DescrRef) {
-        self.done_descr_int = Some(descr.clone());
-        crate::guard::set_done_with_this_frame_descr_int(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .done_with_this_frame_descr_int = Some(descr);
     }
     fn set_done_with_this_frame_descr_ref(&mut self, descr: majit_ir::DescrRef) {
-        self.done_descr_ref = Some(descr.clone());
-        crate::guard::set_done_with_this_frame_descr_ref(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .done_with_this_frame_descr_ref = Some(descr);
     }
     fn set_done_with_this_frame_descr_float(&mut self, descr: majit_ir::DescrRef) {
-        self.done_descr_float = Some(descr.clone());
-        crate::guard::set_done_with_this_frame_descr_float(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .done_with_this_frame_descr_float = Some(descr);
     }
     fn set_exit_frame_with_exception_descr_ref(&mut self, descr: majit_ir::DescrRef) {
-        self.exit_frame_with_exception_descr_ref = Some(descr.clone());
-        crate::guard::set_exit_frame_with_exception_descr_ref(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .exit_frame_with_exception_descr_ref = Some(descr);
     }
     fn set_propagate_exception_descr(&mut self, descr: majit_ir::DescrRef) {
-        self.propagate_exception_descr = Some(descr.clone());
-        crate::guard::set_propagate_exception_descr(descr);
+        self.descr_attachments
+            .write()
+            .unwrap()
+            .propagate_exception_descr = Some(descr);
     }
 
     fn compile_bridge(
@@ -807,8 +862,17 @@ impl Backend for DynasmBackend {
         let prepared_ops = self.prepare_ops_for_compile(inputargs, ops);
         let constants = std::mem::take(&mut self.constants);
         let constant_types = std::mem::take(&mut self.constant_types);
+        if std::env::var_os("MAJIT_LOG").is_some() && trace_id == 2 {
+            eprintln!(
+                "--- dynasm bridge prepared ops (trace_id={}, fail_index={}) ---\n{}",
+                trace_id,
+                fail_descr.fail_index(),
+                majit_ir::format_trace(&prepared_ops, &constants)
+            );
+        }
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
+        let cpu_handle = self.cpu_handle();
         let mut asm = Asm::new(
             trace_id,
             0,
@@ -816,6 +880,7 @@ impl Backend for DynasmBackend {
             self.vtable_offset,
             typeid_table,
             attached_descrs,
+            cpu_handle,
         );
         asm.set_constant_types(constant_types);
         asm.set_call_assembler_targets(Self::call_assembler_targets_snapshot());

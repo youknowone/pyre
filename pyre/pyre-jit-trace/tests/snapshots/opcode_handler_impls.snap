@@ -452,14 +452,8 @@ impl pyre_interpreter::LocalOpcodeHandler for crate::state::MIFrame {
         if idx < self.sym().concrete_locals.len() {
             self.sym_mut().concrete_locals[idx] = value.concrete;
         }
-        let concrete_value = match value.concrete {
-            crate::state::ConcreteValue::Ref(obj) => majit_ir::Value::Ref(majit_ir::GcRef(obj as usize)),
-            crate::state::ConcreteValue::Int(v) => majit_ir::Value::Int(v),
-            crate::state::ConcreteValue::Float(v) => majit_ir::Value::Float(v),
-            crate::state::ConcreteValue::Null => majit_ir::Value::Ref(majit_ir::GcRef::NULL),
-        };
         self.with_ctx(|this, ctx| {
-            crate::state::MIFrame::store_local_value(this, ctx, idx, value.opref, concrete_value)
+            crate::state::MIFrame::store_local_value(this, ctx, idx, value.opref)
         })
     }
 }
