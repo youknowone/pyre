@@ -1355,9 +1355,9 @@ impl<M: Clone> MetaInterp<M> {
     /// `TraceCtx::init_virtualizable_boxes` helper which performs the
     /// actual `virtualizable_boxes = [..., vable_ref]` push (matching
     /// the `read_boxes(...) ; append(virtualizable_box)` shape from
-    /// pyjitpl.py:3302-3306). The `vable_box` is currently the first
-    /// inputarg `OpRef(0)` — the structural divergence from RPython
-    /// (where the vable_box is held in the side-channel
+    /// pyjitpl.py:3302-3306). The `vable_box` comes from
+    /// `virtualizable_arg_index()` within the red inputarg prefix — the
+    /// structural divergence from RPython (where the vable_box is held in the side-channel
     /// `virtualizable_boxes[-1]` separate from threading through every
     /// JUMP arg) is tracked by the `virtualizable_boxes[-1]
     /// line-by-line port` epic.
@@ -1372,19 +1372,40 @@ impl<M: Clone> MetaInterp<M> {
         let array_lengths = self.trace_entry_vable_lengths(info);
         let num_array_elems: usize = array_lengths.iter().sum();
         let total_vable = num_static + num_array_elems;
-        if total_vable == 0 || live_values.len() < 1 + total_vable {
+        // pyjitpl.py:3293-3302 parity:
+        //     index = num_green_args + index_of_virtualizable
+        //     virtualizable_box = original_boxes[index]
+        //     startindex = len(original_boxes) - num_green_args  # == num_red_args
+        //     self.virtualizable_boxes = vinfo.read_boxes(cpu, virtualizable, startindex)
+        //     original_boxes += self.virtualizable_boxes
+        //
+        // In pyre, `live_values` plays the role of `original_boxes` and
+        // greens are stripped out before this helper runs, so index maps
+        // directly to `virtualizable_arg_index()` and `startindex` becomes
+        // `num_reds`. The expanded static/array slots occupy
+        // `live_values[num_reds .. num_reds + total_vable]`.
+        let vable_index = ctx
+            .driver_descriptor()
+            .and_then(|driver| driver.virtualizable_arg_index())
+            .unwrap_or(0);
+        let num_reds = ctx
+            .driver_descriptor()
+            .map(|driver| driver.num_reds())
+            .unwrap_or(1);
+        if total_vable == 0 || live_values.len() < num_reds + total_vable {
             return;
         }
-        // pyjitpl.py:3293-3295: index = num_green_args + index_of_virtualizable
-        // pyre uses single-jitdriver / num_green_args=0 / index_of_virtualizable=0,
-        // so virtualizable_box = original_boxes[0] = OpRef(0).
-        let virtualizable_box = OpRef(0);
-        let virtualizable_value = live_values[0];
+        let virtualizable_box = OpRef(vable_index as u32);
+        let virtualizable_value = live_values[vable_index];
         // pyjitpl.py:3302: virtualizable_boxes = vinfo.read_boxes(...)
-        // pyre lays out the static + array slots immediately after the
-        // virtualizable input arg, mirroring how `read_boxes` returns one
-        // box per static field followed by one box per array element.
-        let vable_oprefs: Vec<OpRef> = (0..total_vable).map(|i| OpRef((1 + i) as u32)).collect();
+        // read_boxes returns one box per static field followed by one box
+        // per array element. They land in the reds tail starting at
+        // position `num_reds` (original_boxes[num_reds..] before
+        // `read_boxes` = the old tail; after the extension, the appended
+        // boxes occupy [num_reds .. num_reds + total_vable)).
+        let vable_oprefs: Vec<OpRef> = (0..total_vable)
+            .map(|i| OpRef((num_reds + i) as u32))
+            .collect();
         // pyjitpl.py:3302 parity: seed the concrete shadow from
         // `vinfo.read_boxes(cpu, virtualizable, startindex)` — RPython reads
         // the heap-authoritative value for every slot, typed per the
@@ -1409,7 +1430,7 @@ impl<M: Clone> MetaInterp<M> {
             }
             out
         } else {
-            live_values[1..=total_vable].to_vec()
+            live_values[num_reds..num_reds + total_vable].to_vec()
         };
         // pyjitpl.py:3306: virtualizable_boxes.append(virtualizable_box)
         // is folded inside init_virtualizable_boxes (it pushes vable_ref
@@ -13895,7 +13916,6 @@ mod tests {
                 front_target_tokens: Vec::new(),
                 retraced_count: 0,
                 root_trace_id: trace_id,
-
                 traces,
                 previous_tokens: Vec::new(),
             },

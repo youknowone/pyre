@@ -472,7 +472,22 @@ impl Optimizer {
                 let widened = bound.widen();
                 ctx.setintbound(opref, &widened);
             }
-            VirtualStateInfo::Unknown(_) => {}
+            VirtualStateInfo::Unknown(tp) => {
+                // virtualstate.py:655-683 make_inputargs parity: each
+                // NotVirtualStateInfo leaf is realized as an InputArg* whose
+                // `Box.type` is intrinsic. pyre has no Box object, so the
+                // `tp` tag carried on `Unknown(tp)` must populate the
+                // authoritative type map. `or_insert` so Phase 2 inputarg
+                // seeds (trace_inputarg_types, optimizer.rs:1719-1721) and
+                // constant types (seeded via get_constant) continue to win
+                // when they are already present; the VSI tag only fills in
+                // label_args that have no external typing (capacity-padded
+                // JUMP args emitted by pyre when virt_extract_live_values
+                // expands to the heap FixedObjectArray length).
+                if *tp != majit_ir::Type::Void {
+                    ctx.value_types.entry(opref.0).or_insert(*tp);
+                }
+            }
         }
     }
 
