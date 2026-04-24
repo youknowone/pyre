@@ -458,6 +458,15 @@ impl MiniMarkGC {
     /// 3. Iteratively process newly discovered references until stable.
     /// 4. Reset nursery.
     pub fn do_collect_nursery(&mut self) {
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[gc][minor] start count={} nursery_objects={} remembered={} cards_set={}",
+                self.minor_collections + 1,
+                self.nursery_object_starts.len(),
+                self.remembered_set.len(),
+                self.old_objects_with_cards_set.len(),
+            );
+        }
         self.minor_collections += 1;
 
         // Phase 1: Process roots — copy nursery objects they point to.
@@ -538,6 +547,15 @@ impl MiniMarkGC {
         // (Box arrays); pyre stores raw i64 in Vec<i64> so we walk the
         // explicit thread-local stack of register banks.
         crate::shadow_stack::walk_bh_regs(|gcref| {
+            if self.is_nursery_object_start(gcref.0) {
+                if !self.pinned_objects.contains(&gcref.0) {
+                    *gcref = self.copy_nursery_object(gcref.0);
+                }
+            }
+        });
+
+        // Runtime-owned roots outside the generic shadow stack.
+        crate::walk_active_extra_roots(&mut |gcref| {
             if self.is_nursery_object_start(gcref.0) {
                 if !self.pinned_objects.contains(&gcref.0) {
                     *gcref = self.copy_nursery_object(gcref.0);
@@ -775,18 +793,62 @@ impl MiniMarkGC {
         self.incr_state.gray_stack.clear();
         self.incr_state.objects_marked = 0;
 
-        // Seed gray stack from roots.
-        let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
-        for root_ptr in roots {
-            let gcref = unsafe { *root_ptr };
-            if !gcref.is_null() && self.is_managed_heap_object(gcref.0) {
-                let hdr = unsafe { header_of(gcref.0) };
-                if unsafe { !(*hdr).has_flag(flags::VISITED) } {
-                    unsafe { (*hdr).set_flag(flags::VISITED) };
+        self.seed_major_roots();
+    }
+
+    fn seed_major_root(&mut self, gcref: GcRef) {
+        if !gcref.is_null() && self.is_managed_heap_object(gcref.0) {
+            let hdr = unsafe { header_of(gcref.0) };
+            // SAFETY: header_of returns a raw pointer; keep each access
+            // short-lived to avoid creating overlapping exclusive borrows.
+            unsafe {
+                if !(*hdr).has_flag(flags::VISITED) {
+                    (*hdr).set_flag(flags::VISITED);
                     self.incr_state.gray_stack.push(gcref.0);
                 }
             }
         }
+    }
+
+    fn seed_major_roots(&mut self) {
+        // incminimark.py:2717 collect_roots: root_walker.walk_roots()
+        // seeds stack roots for a major marking cycle. Mirror the same
+        // root sets as minor collection, but mark old objects instead of
+        // copying nursery objects.
+        let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
+        for root_ptr in roots {
+            let gcref = unsafe { *root_ptr };
+            self.seed_major_root(gcref);
+        }
+
+        crate::shadow_stack::walk_roots(|gcref| {
+            self.seed_major_root(*gcref);
+        });
+
+        let mut libc_jf_refs: Vec<GcRef> = Vec::new();
+        crate::shadow_stack::walk_jf_roots(|gcref| {
+            if !gcref.is_null() && crate::shadow_stack::is_libc_jitframe(gcref.0) {
+                crate::shadow_stack::trace_libc_jitframe(gcref.0, &mut |slot_ptr| {
+                    let field_ref = unsafe { *slot_ptr };
+                    if !field_ref.is_null() {
+                        libc_jf_refs.push(field_ref);
+                    }
+                });
+            } else {
+                self.seed_major_root(*gcref);
+            }
+        });
+        for gcref in libc_jf_refs {
+            self.seed_major_root(gcref);
+        }
+
+        crate::shadow_stack::walk_bh_regs(|gcref| {
+            self.seed_major_root(*gcref);
+        });
+
+        crate::walk_active_extra_roots(&mut |gcref| {
+            self.seed_major_root(*gcref);
+        });
     }
 
     /// Drive incremental major-collection progress after a minor collection.
@@ -972,18 +1034,7 @@ impl MiniMarkGC {
             // mark-sweep using the same mark_object infrastructure.
             self.incr_state.gray_stack.clear();
 
-            // Seed from roots.
-            let roots: Vec<*mut GcRef> = self.roots.roots.iter().copied().collect();
-            for root_ptr in roots {
-                let gcref = unsafe { *root_ptr };
-                if !gcref.is_null() && self.is_managed_heap_object(gcref.0) {
-                    let hdr = unsafe { header_of(gcref.0) };
-                    if unsafe { !(*hdr).has_flag(flags::VISITED) } {
-                        unsafe { (*hdr).set_flag(flags::VISITED) };
-                        self.incr_state.gray_stack.push(gcref.0);
-                    }
-                }
-            }
+            self.seed_major_roots();
 
             // Drain gray stack completely.
             while let Some(obj_addr) = self.incr_state.gray_stack.pop() {
@@ -1924,6 +1975,8 @@ impl GcAllocator for MiniMarkGC {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static SHADOW_STACK_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// Helper: create a GC with a small nursery for testing.
     fn test_gc(nursery_size: usize) -> MiniMarkGC {
@@ -4003,6 +4056,49 @@ mod tests {
         unsafe {
             drop(Box::from_raw(external.0 as *mut u64));
         }
+    }
+
+    #[test]
+    fn test_incremental_cycle_marks_jitframe_shadow_stack_roots() {
+        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        crate::shadow_stack::clear();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_with_type(tid, 16);
+        let depth = crate::shadow_stack::jf_depth();
+        crate::shadow_stack::push_jf(obj);
+
+        gc.do_collect_nursery();
+        let rooted = crate::shadow_stack::jf_top_ptr();
+        assert!(gc.oldgen.contains(rooted.0));
+
+        gc.start_incremental_cycle();
+        gc.finish_incremental_cycle();
+
+        assert!(gc.oldgen.contains(rooted.0));
+        crate::shadow_stack::pop_jf_to(depth);
+    }
+
+    #[test]
+    fn test_full_collection_marks_jitframe_shadow_stack_roots() {
+        let _guard = SHADOW_STACK_TEST_LOCK.lock().unwrap();
+        crate::shadow_stack::clear();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::simple(16));
+
+        let obj = gc.alloc_with_type(tid, 16);
+        let depth = crate::shadow_stack::jf_depth();
+        crate::shadow_stack::push_jf(obj);
+
+        gc.do_collect_nursery();
+        let rooted = crate::shadow_stack::jf_top_ptr();
+        assert!(gc.oldgen.contains(rooted.0));
+
+        gc.do_collect_full();
+
+        assert!(gc.oldgen.contains(rooted.0));
+        crate::shadow_stack::pop_jf_to(depth);
     }
 
     // Note: a `test_minor_root_walk_skips_interior_nursery_pointers`

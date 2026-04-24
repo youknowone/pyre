@@ -2762,14 +2762,6 @@ impl<M: Clone> MetaInterp<M> {
         }
 
         let vable_config = self.current_virtualizable_optimizer_config();
-        // compile.py:504-511 `send_loop_to_backend` needs the driver descriptor
-        // to call `patch_new_loop_to_load_virtualizable_fields` below. Capture
-        // it before the `self.tracing.take()` consumes the context.
-        let driver_descriptor = self
-            .tracing
-            .as_ref()
-            .and_then(|ctx| ctx.driver_descriptor())
-            .cloned();
         // pyjitpl.py:3015-3032 parity: compile_loop uses `self.history`
         // without consuming it, so cancel paths can fall through to
         // `current_merge_points.append(...)` and keep tracing. Before
@@ -3202,19 +3194,16 @@ impl<M: Clone> MetaInterp<M> {
         // virtualizable.py:86 read_boxes: set num_scalar_inputargs on token
         // so the backend can find the first local in force_fn paths.
         token.num_scalar_inputargs = self.num_scalar_inputargs;
-        // compile.py:504-511 `send_loop_to_backend` invokes
-        // `patch_new_loop_to_load_virtualizable_fields` for every loop — the
-        // JUMP-terminated unroll/retry paths run the same hook as the
-        // FINISH-terminated `finish_and_compile`. Apply before the backend
-        // takes ownership of `constants` / `constant_types` so the reload
-        // prolog's ConstInt subscripts land in the same pool.
-        self.patch_new_loop_to_load_virtualizable_fields(
-            &mut inputargs,
-            &mut compiled_ops,
-            &mut constants,
-            &mut constant_types,
-            driver_descriptor.as_ref(),
-        );
+        // NOTE: `patch_new_loop_to_load_virtualizable_fields` is NOT invoked
+        // on this JUMP-terminated compile path. compile.py:504 wires it into
+        // every `send_loop_to_backend`, but the pyre helper currently only
+        // supports the FINISH-terminated `finish_and_compile` site — the
+        // JUMP path requires the closing JUMP to carry red_args only (not
+        // the expanded vable fields) so that LABEL and JUMP arities stay
+        // aligned after the truncation. That restructure is the pyre-tracer
+        // / CALL_ASSEMBLER epic (VableExpansion removal + RPython
+        // `direct_assembler_call` layout); enabling the hook here before
+        // that lands would desync backend LABEL/JUMP arity.
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
@@ -3768,15 +3757,6 @@ impl<M: Clone> MetaInterp<M> {
             Some(ctx) => ctx.green_key,
             None => return false,
         };
-        // compile.py:504-511 `send_loop_to_backend` needs the driver
-        // descriptor to call `patch_new_loop_to_load_virtualizable_fields`.
-        // Capture it before `self.tracing.take()` consumes the context.
-        let driver_descriptor = self
-            .tracing
-            .as_ref()
-            .and_then(|ctx| ctx.driver_descriptor())
-            .cloned();
-
         let vable_config = self.current_virtualizable_optimizer_config();
         self.force_finish_trace = false;
         let mut ctx = match self.tracing.take() {
@@ -3937,15 +3917,9 @@ impl<M: Clone> MetaInterp<M> {
             return false;
         }
 
-        // compile.py:504-511 `send_loop_to_backend` — apply the virtualizable
-        // reload prolog and truncate LABEL/JUMP before the backend snapshot.
-        self.patch_new_loop_to_load_virtualizable_fields(
-            &mut inputargs,
-            &mut combined_ops,
-            &mut constants,
-            &mut constant_types,
-            driver_descriptor.as_ref(),
-        );
+        // NOTE: compile_retrace is a JUMP-terminated path — see the parity
+        // note at `compile_loop` above for why
+        // `patch_new_loop_to_load_virtualizable_fields` is not called here.
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);
@@ -4584,13 +4558,6 @@ impl<M: Clone> MetaInterp<M> {
     /// attach_procedure_to_interp), None on failure.
     pub fn compile_simple_loop(&mut self, meta: M) -> Option<u64> {
         let vable_config = self.current_virtualizable_optimizer_config();
-        // compile.py:504-511 `send_loop_to_backend` needs the driver
-        // descriptor. Capture it before `self.tracing.take()` consumes ctx.
-        let driver_descriptor = self
-            .tracing
-            .as_ref()
-            .and_then(|ctx| ctx.driver_descriptor())
-            .cloned();
         self.force_finish_trace = false;
         let mut ctx = match self.tracing.take() {
             Some(ctx) => ctx,
@@ -4726,15 +4693,9 @@ impl<M: Clone> MetaInterp<M> {
         label_op.descr = Some(target_token.as_jump_target_descr());
         compiled_ops.insert(0, label_op);
 
-        // compile.py:504-511 `send_loop_to_backend` — virtualizable reload
-        // prolog and LABEL/JUMP truncation before the backend snapshot.
-        self.patch_new_loop_to_load_virtualizable_fields(
-            &mut inputargs,
-            &mut compiled_ops,
-            &mut constants,
-            &mut constant_types,
-            driver_descriptor.as_ref(),
-        );
+        // NOTE: compile_simple_loop is a JUMP-terminated path — see the
+        // parity note at `compile_loop` above for why
+        // `patch_new_loop_to_load_virtualizable_fields` is not called here.
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);

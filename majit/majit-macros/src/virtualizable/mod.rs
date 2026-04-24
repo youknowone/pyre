@@ -437,16 +437,22 @@ fn generate_layout_helpers(
         ///
         /// Layout: `[frame:Ref, scalars..., array[0..len(lst)]:ItemT]`
         ///
+        /// `__array_capacity` is `len(lst)` — the concrete
+        /// FixedObjectArray length of the virtualizable's backing
+        /// storage, i.e. `nlocals + co_stacksize`. This is the full
+        /// `read_boxes()` iteration extent regardless of the live
+        /// Python-level stack depth at the merge point.
+        ///
         /// `local_at(i)` returns the raw value of array slot `i` (direct index).
         pub fn virt_extract_live_values(
             __frame: usize,
             #(#scalar_params,)*
             __num_locals: usize,
-            __valuestackdepth: usize,
+            __array_capacity: usize,
             local_at: impl Fn(usize) -> usize,
             stack_at: impl Fn(usize) -> usize,
         ) -> Vec<majit_ir::Value> {
-            let stack_only = __valuestackdepth.saturating_sub(__num_locals);
+            let stack_only = __array_capacity.saturating_sub(__num_locals);
             let mut __vals = Vec::with_capacity(#num_scalars + __num_locals + stack_only);
             __vals.push(#frame_value);
             #(#scalar_value_pushes)*

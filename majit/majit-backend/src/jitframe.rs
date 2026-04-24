@@ -364,3 +364,76 @@ pub fn jitframe_type_info() -> majit_gc::trace::TypeInfo {
 pub fn jitframe_prefer_oldgen() -> bool {
     true
 }
+
+// ── realloc_frame (llmodel.py:127-154) ──────────────────────────────
+
+/// Reallocate a JITFRAME when the frame-depth requirement exceeds its
+/// current allocation. Ported from `rpython/jit/backend/llsupport/
+/// llmodel.py:127-154 realloc_frame`.
+///
+/// The assembler-emitted `_frame_realloc_slowpath`
+/// (`aarch64/assembler.py:434-493`) calls this helper after
+/// `_check_frame_depth` (`aarch64/assembler.py:927-961`) detects
+/// `jf_frame.length < expected_depth`.
+///
+/// `alloc` is a raw allocator: given `size_bytes` it must return a
+/// zero-filled `*mut JitFrame` payload whose GC header is registered
+/// with the jitframe custom-trace hook. `write_barrier` marks `new_jf`
+/// as having received writes (generational barrier on the copied
+/// `jf_frame` / `jf_savedata` / `jf_guard_exc` stores).
+///
+/// # Safety
+/// - `old_jf` must be a live, resolved `*mut JitFrame`.
+/// - `old_jf->jf_frame_info` must point to a `JitFrameInfo` that is
+///   writable when `expected_depth > jfi_frame_depth` — RPython wraps
+///   the mutation in `enter_assembler_writing()` /
+///   `leave_assembler_writing()`; pyre keeps the frame_info in ordinary
+///   heap memory so no permission flip is required.
+pub unsafe fn realloc_frame<A, B>(
+    old_jf: *mut JitFrame,
+    expected_depth: isize,
+    base_ofs: isize,
+    alloc: A,
+    write_barrier: B,
+) -> *mut JitFrame
+where
+    A: FnOnce(isize) -> *mut JitFrame,
+    B: FnOnce(*mut JitFrame),
+{
+    unsafe {
+        // llmodel.py:132-139 — widen frame_info when we need more depth.
+        let fi = (*old_jf).jf_frame_info as *mut JitFrameInfo;
+        if expected_depth > (*fi).jfi_frame_depth {
+            (*fi).update_depth(base_ofs, expected_depth);
+        }
+        let size_bytes = (*fi).jfi_frame_size;
+
+        // llmodel.py:140 — new_frame = jitframe.JITFRAME.allocate(frame_info)
+        let new_jf = alloc(size_bytes);
+        debug_assert!(!new_jf.is_null(), "realloc_frame: alloc returned null");
+        JitFrame::init(new_jf, fi, (*fi).jfi_frame_depth as usize);
+
+        // llmodel.py:141 — frame.jf_forward = new_frame
+        (*old_jf).jf_forward = new_jf;
+
+        // llmodel.py:142-146 — copy jf_frame items, zero source slots.
+        let old_len = JitFrame::frame_length(old_jf) as usize;
+        let new_len = JitFrame::frame_length(new_jf) as usize;
+        let copy_len = old_len.min(new_len);
+        let old_slots = JitFrame::frame_slots_mut(old_jf, old_len);
+        let new_slots = JitFrame::frame_slots_mut(new_jf, new_len);
+        for i in 0..copy_len {
+            new_slots[i] = old_slots[i];
+            old_slots[i] = 0;
+        }
+
+        // llmodel.py:147-148 — copy jf_savedata / jf_guard_exc.
+        (*new_jf).jf_savedata = (*old_jf).jf_savedata;
+        (*new_jf).jf_guard_exc = (*old_jf).jf_guard_exc;
+
+        // llmodel.py:150 — llop.gc_writebarrier(new_frame)
+        write_barrier(new_jf);
+
+        new_jf
+    }
+}

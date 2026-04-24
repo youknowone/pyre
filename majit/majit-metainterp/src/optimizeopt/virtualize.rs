@@ -204,6 +204,46 @@ impl OptVirtualize {
         ctx.set_ptr_info(OpRef(0), PtrInfo::Virtualizable(state));
     }
 
+    /// Given a virtualizable array field descr's byte offset, return the
+    /// array's index into `VirtualizableFieldState::arrays`
+    /// (= position in `VirtualizableConfig::array_field_offsets`).
+    fn virtualizable_array_idx_for_offset(&self, offset: usize) -> Option<u32> {
+        self.vable_config
+            .as_ref()?
+            .array_field_offsets
+            .iter()
+            .position(|&off| off == offset)
+            .map(|idx| idx as u32)
+    }
+
+    /// Recover the standard virtualizable array slot that produced `array_ref`.
+    ///
+    /// RPython/PyPy do not keep a separate array-pointer side table here;
+    /// the virtualizable state itself is the source of truth. In Rust we
+    /// recover the alias on demand from the emitted producer op instead of
+    /// persisting an extra `HashMap<OpRef, ...>` beside PtrInfo.
+    fn resolve_virtualizable_array_source(
+        &self,
+        array_ref: OpRef,
+        ctx: &OptContext,
+    ) -> Option<(OpRef, u32)> {
+        let producer = ctx.get_producing_op(array_ref)?;
+        if !matches!(
+            producer.opcode,
+            OpCode::GetfieldRawI | OpCode::GetfieldRawR | OpCode::GetfieldRawF
+        ) {
+            return None;
+        }
+        let frame_ref = ctx.get_box_replacement(producer.arg(0));
+        if !self.is_standard_virtualizable_ref(frame_ref, ctx) {
+            return None;
+        }
+        let field_idx = descr_index(&producer.descr);
+        let offset = extract_field_offset(field_idx)?;
+        let array_idx = self.virtualizable_array_idx_for_offset(offset)?;
+        Some((frame_ref, array_idx))
+    }
+
     // ── PtrInfo accessors (delegated to ctx) ──
 
     fn is_virtual(opref: OpRef, ctx: &OptContext) -> bool {
@@ -678,6 +718,17 @@ impl OptVirtualize {
                         vinfo.items[idx] = value_ref;
                         return OptimizationResult::Remove;
                     }
+                }
+            }
+            // virtualizable.py:134-137 write-back parity: mirror writes to
+            // the virtualizable heap arrays into `PtrInfo::Virtualizable`
+            // so end-of-preamble export sees the updated STORE_FAST values.
+            if let Some((frame_ref, array_idx)) =
+                self.resolve_virtualizable_array_source(array_ref, ctx)
+            {
+                let elem_idx = index as usize;
+                if let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info_mut(frame_ref) {
+                    set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_ref);
                 }
             }
         }
@@ -1705,6 +1756,37 @@ fn extract_field_offset(descr_idx: u32) -> Option<usize> {
         return None;
     }
     Some(((descr_idx >> 4) & 0x000f_ffff) as usize)
+}
+
+/// Lookup helper for `PtrInfo::Virtualizable.arrays` — returns the OpRef
+/// stored at `arrays[arr_idx][elem_idx]` if present and non-NONE.
+fn get_array_element(arrays: &[(u32, Vec<OpRef>)], arr_idx: u32, elem_idx: usize) -> Option<OpRef> {
+    arrays
+        .iter()
+        .find(|(i, _)| *i == arr_idx)
+        .and_then(|(_, e)| e.get(elem_idx).copied())
+        .filter(|r| !r.is_none())
+}
+
+/// Write helper for `PtrInfo::Virtualizable.arrays` — grows the inner Vec
+/// with `OpRef::NONE` placeholders as needed, then stores `value` at
+/// `arr_idx`/`elem_idx`.
+fn set_array_element(
+    arrays: &mut Vec<(u32, Vec<OpRef>)>,
+    arr_idx: u32,
+    elem_idx: usize,
+    value: OpRef,
+) {
+    if let Some((_, elems)) = arrays.iter_mut().find(|(i, _)| *i == arr_idx) {
+        if elem_idx >= elems.len() {
+            elems.resize(elem_idx + 1, OpRef::NONE);
+        }
+        elems[elem_idx] = value;
+    } else {
+        let mut elems = vec![OpRef::NONE; elem_idx + 1];
+        elems[elem_idx] = value;
+        arrays.push((arr_idx, elems));
+    }
 }
 
 #[cfg(test)]

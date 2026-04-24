@@ -581,6 +581,7 @@ pub type TypeidSubclassRangeFn = fn(typeid: u32) -> Option<(i64, i64)>;
 /// via the `get_actual_typeid` seam, avoiding a second indirection
 /// through `check_is_object` (which would re-resolve the typeid).
 pub type TypeidIsObjectFn = fn(typeid: u32) -> Option<bool>;
+pub type ExtraRootWalkerFn = fn(&mut dyn FnMut(&mut GcRef));
 
 thread_local! {
     static ACTIVE_CHECK_IS_OBJECT: Cell<Option<CheckIsObjectFn>> = const { Cell::new(None) };
@@ -589,6 +590,7 @@ thread_local! {
     static ACTIVE_TYPEID_SUBCLASS_RANGE: Cell<Option<TypeidSubclassRangeFn>> = const { Cell::new(None) };
     static ACTIVE_TYPEID_IS_OBJECT: Cell<Option<TypeidIsObjectFn>> = const { Cell::new(None) };
     static ACTIVE_SUPPORTS_GUARD_GC_TYPE: Cell<bool> = const { Cell::new(false) };
+    static ACTIVE_EXTRA_ROOT_WALKER: Cell<Option<ExtraRootWalkerFn>> = const { Cell::new(None) };
 }
 
 /// Bundle of callbacks the metainterp / executor can reach through
@@ -619,6 +621,21 @@ pub fn set_active_gc_guard_hooks(hooks: ActiveGcGuardHooks) {
     ACTIVE_TYPEID_SUBCLASS_RANGE.with(|c| c.set(hooks.typeid_subclass_range));
     ACTIVE_TYPEID_IS_OBJECT.with(|c| c.set(hooks.typeid_is_object));
     ACTIVE_SUPPORTS_GUARD_GC_TYPE.with(|c| c.set(hooks.supports_guard_gc_type));
+}
+
+/// Install a thread-local callback that exposes non-shadow-stack roots
+/// owned by the embedding runtime.
+pub fn set_active_extra_root_walker(walker: Option<ExtraRootWalkerFn>) {
+    ACTIVE_EXTRA_ROOT_WALKER.with(|c| c.set(walker));
+}
+
+/// Walk the active runtime's extra GC roots.
+pub fn walk_active_extra_roots(visitor: &mut dyn FnMut(&mut GcRef)) {
+    ACTIVE_EXTRA_ROOT_WALKER.with(|c| {
+        if let Some(f) = c.get() {
+            f(visitor);
+        }
+    });
 }
 
 /// llmodel.py:541-546 `cpu.check_is_object(gcptr)` shim. Returns whether

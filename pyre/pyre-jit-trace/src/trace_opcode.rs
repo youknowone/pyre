@@ -1507,11 +1507,22 @@ impl MIFrame {
             let stack_only = s.stack_only_depth();
             // virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
             // is a W_Root array → every item is declared Ref. The loop-carried
-            // types passed to the JUMP / merge point therefore MUST be Ref for
-            // every array slot; tracker-observed Int/Float types are internal
-            // to unboxing lowering and must not leak into the inputarg contract.
-            s.symbolic_local_types = vec![Type::Ref; concrete_nlocals];
-            s.symbolic_stack_types = vec![Type::Ref; stack_only];
+            // types passed to the JUMP / merge point MUST be Ref for every
+            // array slot; tracker-observed Int/Float types are internal to
+            // unboxing lowering and must not leak into the inputarg contract.
+            //
+            // The type-map reset is deferred until AFTER the materialize loop
+            // below. Resetting here would poison `self.value_type(value)` used
+            // by `materialize_loop_carried_value` — an Int-typed OpRef on the
+            // symbolic stack (e.g. a GetarrayitemRawI result LOAD_FASTed onto
+            // the stack) would appear Ref to the materializer and skip the
+            // Int→Ref boxing, handing the MIFrame merge-point a raw Int value
+            // in a Ref-typed slot. Cut_trace_from then installs that raw Int
+            // at a cut-inputarg position whose declared type is Ref, and the
+            // downstream unroll pass produces JUMP args that pass an Int into
+            // a Ref slot at runtime → SIGSEGV (str x24, [x12, #0x10] with x12
+            // carrying the unboxed int payload).
+            //
             // `registers_r` is the unified abstract register file;
             // reserve `[nlocals..nlocals+stack_only)` for the stack so
             // merge-point JUMP args have a stable slice.
@@ -1626,6 +1637,18 @@ impl MIFrame {
             let value =
                 self.materialize_fail_arg_slot(ctx, value, target_type, nlocals + stack_idx);
             args.push(self.materialize_loop_carried_value(ctx, value, target_type));
+        }
+        // virtualizable.py:44 parity (delayed): now that all materialize_loop_
+        // carried_value calls have consulted each OpRef's actual type, flip the
+        // symbolic type maps to the post-loop invariant where every array slot
+        // is Ref. Downstream consumers (reached_loop_header's live_types, the
+        // merge-point snapshot it stores) observe the Ref contract while the
+        // box/unbox decisions above still see the pre-loop truth.
+        {
+            let s = self.sym_mut();
+            let stack_only = s.stack_only_depth();
+            s.symbolic_local_types = vec![Type::Ref; concrete_nlocals];
+            s.symbolic_stack_types = vec![Type::Ref; stack_only];
         }
         // pyjitpl.py:2934-2965 remove_consts_and_duplicates:
         //     def remove_consts_and_duplicates(self, boxes, endindex, duplicates):
