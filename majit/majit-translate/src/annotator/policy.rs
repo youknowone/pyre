@@ -36,6 +36,9 @@
 //!   `no_more_blocks_to_annotate` is the single point to wire into
 //!   real `make_sandbox_trampoline(name, params_s, s_result)`.
 
+use std::fmt::Debug;
+use std::rc::Rc;
+
 use crate::annotator::bookkeeper::Bookkeeper;
 
 /// Enumerates the specializer entry points referenced by upstream
@@ -53,6 +56,16 @@ pub enum Specializer {
     /// RPython `default_specialize` (specialize.py) — the no-op
     /// fallback used when `directive` is `None`.
     Default,
+    /// RPython `LowLevelAnnotatorPolicy.default_specialize`
+    /// (annlowlevel.py:78-80) reached when the active policy is
+    /// `LowLevelAnnotatorPolicy` and the callee has no explicit
+    /// `_annspecialcase_` tag.
+    LowLevelDefault,
+    /// RPython `MixLevelAnnotatorPolicy.default_specialize`
+    /// (annlowlevel.py:105-111) reached when the active policy is
+    /// `MixLevelAnnotatorPolicy` and the callee has no explicit
+    /// `_annspecialcase_` tag.
+    MixLevelDefault,
     /// `specialize:memo` → `specialize.memo`.
     Memo,
     /// `specialize:arg(N)` → `specialize.specialize_argvalue`. The
@@ -73,6 +86,43 @@ pub enum Specializer {
     /// `specialize:ll_and_arg` →
     /// `LowLevelAnnotatorPolicy.specialize__ll_and_arg`.
     LlAndArg { parms: Vec<String> },
+    /// `specialize:arglltype` →
+    /// `MixLevelAnnotatorPolicy.specialize__arglltype`.
+    ArgLltype { parms: Vec<String> },
+    /// `specialize:genconst` →
+    /// `MixLevelAnnotatorPolicy.specialize__genconst`.
+    GenConst { parms: Vec<String> },
+}
+
+pub trait PolicyOps: Debug {
+    fn get_specializer(&self, directive: Option<&str>) -> Result<Specializer, PolicyError>;
+    fn no_more_blocks_to_annotate(&self, ann: &super::annrpython::RPythonAnnotator);
+}
+
+#[derive(Clone)]
+pub struct PolicyHandle(Rc<dyn PolicyOps>);
+
+impl PolicyHandle {
+    pub fn new<P>(policy: P) -> Self
+    where
+        P: PolicyOps + 'static,
+    {
+        PolicyHandle(Rc::new(policy))
+    }
+
+    pub fn get_specializer(&self, directive: Option<&str>) -> Result<Specializer, PolicyError> {
+        self.0.get_specializer(directive)
+    }
+
+    pub fn no_more_blocks_to_annotate(&self, ann: &super::annrpython::RPythonAnnotator) {
+        self.0.no_more_blocks_to_annotate(ann);
+    }
+}
+
+impl std::fmt::Debug for PolicyHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        Debug::fmt(&*self.0, f)
+    }
 }
 
 /// RPython `class AnnotatorPolicy` (policy.py:11-100).
@@ -116,46 +166,8 @@ impl AnnotatorPolicy {
             // upstream: `if directive is None: return pol.default_specialize`.
             return Ok(Specializer::Default);
         };
-
-        // upstream: `directive_parts = directive.split('(', 1)`.
-        let (name, parms_src) = match directive.split_once('(') {
-            None => (directive.to_string(), None),
-            Some((n, rest)) => {
-                // Upstream strips the trailing `)` via `eval("...)" +
-                // rest)` — the Rust version drops the trailing `)`
-                // explicitly.
-                let parms = rest.strip_suffix(')').ok_or_else(|| {
-                    PolicyError(format!("broken specialize directive parms: {directive}"))
-                })?;
-                (n.to_string(), Some(parms.to_string()))
-            }
-        };
-        let parms: Vec<String> = match parms_src {
-            None => Vec::new(),
-            Some(s) if s.trim().is_empty() => Vec::new(),
-            Some(s) => s.split(',').map(|p| p.trim().to_string()).collect(),
-        };
-
-        // upstream: `name = name.replace(':', '__')`. The directive
-        // namespace uses `:` (e.g. `specialize:arg`); upstream maps
-        // that to the `specialize__arg` attribute lookup. The Rust
-        // match below uses the post-replace form.
-        let normalized = name.replace(':', "__");
-
-        match normalized.as_str() {
-            "default_specialize" => Ok(Specializer::Default),
-            "specialize__memo" => Ok(Specializer::Memo),
-            "specialize__arg" => Ok(Specializer::Arg { parms }),
-            "specialize__arg_or_var" => Ok(Specializer::ArgOrVar { parms }),
-            "specialize__argtype" => Ok(Specializer::Argtype { parms }),
-            "specialize__arglistitemtype" => Ok(Specializer::Arglistitemtype { parms }),
-            "specialize__call_location" => Ok(Specializer::CallLocation),
-            "specialize__ll" => Ok(Specializer::Ll { parms }),
-            "specialize__ll_and_arg" => Ok(Specializer::LlAndArg { parms }),
-            other => Err(PolicyError(format!(
-                "{other:?} specialize tag not defined in annotation policy AnnotatorPolicy"
-            ))),
-        }
+        let (normalized, parms) = parse_specializer_directive(directive)?;
+        specializer_from_normalized(&normalized, parms)
     }
 
     /// RPython `AnnotatorPolicy.no_more_blocks_to_annotate(pol, annotator)`
@@ -326,6 +338,62 @@ impl AnnotatorPolicy {
                 let _ = std::marker::PhantomData::<SomePBC>;
             }
         }
+    }
+}
+
+impl PolicyOps for AnnotatorPolicy {
+    fn get_specializer(&self, directive: Option<&str>) -> Result<Specializer, PolicyError> {
+        AnnotatorPolicy::get_specializer(self, directive)
+    }
+
+    fn no_more_blocks_to_annotate(&self, ann: &super::annrpython::RPythonAnnotator) {
+        AnnotatorPolicy::no_more_blocks_to_annotate(self, ann)
+    }
+}
+
+impl From<AnnotatorPolicy> for PolicyHandle {
+    fn from(value: AnnotatorPolicy) -> Self {
+        PolicyHandle::new(value)
+    }
+}
+
+pub(crate) fn parse_specializer_directive(
+    directive: &str,
+) -> Result<(String, Vec<String>), PolicyError> {
+    let (name, parms_src) = match directive.split_once('(') {
+        None => (directive.to_string(), None),
+        Some((n, rest)) => {
+            let parms = rest.strip_suffix(')').ok_or_else(|| {
+                PolicyError(format!("broken specialize directive parms: {directive}"))
+            })?;
+            (n.to_string(), Some(parms.to_string()))
+        }
+    };
+    let parms: Vec<String> = match parms_src {
+        None => Vec::new(),
+        Some(s) if s.trim().is_empty() => Vec::new(),
+        Some(s) => s.split(',').map(|p| p.trim().to_string()).collect(),
+    };
+    Ok((name.replace(':', "__"), parms))
+}
+
+pub(crate) fn specializer_from_normalized(
+    normalized: &str,
+    parms: Vec<String>,
+) -> Result<Specializer, PolicyError> {
+    match normalized {
+        "default_specialize" => Ok(Specializer::Default),
+        "specialize__memo" => Ok(Specializer::Memo),
+        "specialize__arg" => Ok(Specializer::Arg { parms }),
+        "specialize__arg_or_var" => Ok(Specializer::ArgOrVar { parms }),
+        "specialize__argtype" => Ok(Specializer::Argtype { parms }),
+        "specialize__arglistitemtype" => Ok(Specializer::Arglistitemtype { parms }),
+        "specialize__call_location" => Ok(Specializer::CallLocation),
+        "specialize__ll" => Ok(Specializer::Ll { parms }),
+        "specialize__ll_and_arg" => Ok(Specializer::LlAndArg { parms }),
+        other => Err(PolicyError(format!(
+            "{other:?} specialize tag not defined in annotation policy AnnotatorPolicy"
+        ))),
     }
 }
 

@@ -1643,7 +1643,13 @@ pub struct SomeBuiltinMethod {
     /// Opaque identifier for the special-cased analyser hook.
     pub analyser_name: String,
     /// Bound-method receiver annotation (`self.s_self` upstream).
-    pub s_self: Box<SomeValue>,
+    ///
+    /// Stored as an `Rc` (rather than a `Box`) so that `rtyper_makekey`
+    /// can hash the receiver by its stable pointer identity — upstream's
+    /// `id(self.s_self)` (rbuiltin.py:41-50) reuses the same Python
+    /// object for every clone, and `Box` addresses would move on every
+    /// `.clone()` of `SomeBuiltinMethod`.
+    pub s_self: Rc<SomeValue>,
     /// Bound method name (`self.methodname` upstream).
     pub methodname: String,
 }
@@ -1657,7 +1663,7 @@ impl SomeBuiltinMethod {
         SomeBuiltinMethod {
             base: SomeObjectBase::new(KnownType::BuiltinFunctionOrMethod, true),
             analyser_name: analyser_name.into(),
-            s_self: Box::new(s_self),
+            s_self: Rc::new(s_self),
             methodname: methodname.into(),
         }
     }
@@ -4107,7 +4113,7 @@ mod tests {
         let SomeValue::BuiltinMethod(method) = merged else {
             panic!("expected SomeBuiltinMethod");
         };
-        let SomeValue::List(list) = *method.s_self else {
+        let SomeValue::List(list) = method.s_self.as_ref().clone() else {
             panic!("expected SomeList receiver");
         };
         let SomeValue::Integer(elem) = list.listdef.s_value() else {

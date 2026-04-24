@@ -1,14 +1,14 @@
 //! Call-family signature / annotation normalization.
 //!
 //! RPython upstream: `rpython/rtyper/normalizecalls.py` (414 LOC, of
-//! which lines 14-204 + 373-389 cover the pieces this module ports).
-//! The remaining class/PBC halves (`merge_classpbc_getattr_into_classdef`,
-//! `create_class_constructors`, `create_instantiate_functions`) land
-//! with the rtyper specialization epic; they depend on
+//! which lines 14-204, 266-295, and 373-389 cover the pieces this
+//! module ports). The remaining class-PBC halves
+//! (`merge_classpbc_getattr_into_classdef`, `create_class_constructors`)
+//! land with the rtyper specialization epic; they depend on
 //! `rpython/rtyper/rclass.py` infrastructure that pyre still has as
 //! scaffolding only. [`perform_normalizations`] is the driver entry
-//! point and runs the call-family + inheritance-id halves that are
-//! ported in this module.
+//! point and runs the call-family, inheritance-id, and
+//! instantiate-function halves that are ported in this module.
 //!
 //! ## What is ported here (upstream lines 14-204 + 373-389)
 //!
@@ -25,6 +25,13 @@
 //! - [`assign_inheritance_ids`] — reversed-MRO witness ordering for the
 //!   `classdef.minid` / `classdef.maxid` subclass-range brackets
 //!   consumed by `rclass.py:ll_issubclass_const` (upstream line 373-389).
+//! - [`create_instantiate_function`] / [`create_instantiate_functions`]
+//!   — build the `my_instantiate_graph` helper consumed by
+//!   `ClassRepr.fill_vtable_root` (upstream line 266-295). The source
+//!   of the `bookkeeper.needs_generic_instantiate` set is
+//!   `merge_classpbc_getattr_into_classdef`, not yet ported; callers
+//!   that populate the set manually (tests / downstream R3 helpers)
+//!   will exercise this driver immediately.
 //!
 //! ## Upstream call-family clarification
 //!
@@ -49,8 +56,8 @@ use crate::annotator::description::{CallFamily, CallTableRow};
 use crate::annotator::model::AnnotatorError;
 use crate::flowspace::argument::{CallShape, Signature};
 use crate::flowspace::model::{
-    Block, BlockKey, BlockRefExt, ConstValue, Constant, GraphKey, Hlvalue, Link, Variable,
-    checkgraph,
+    Block, BlockKey, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphKey, Hlvalue, Link,
+    Variable, checkgraph,
 };
 use crate::flowspace::pygraph::PyGraph;
 
@@ -106,10 +113,27 @@ pub fn normalize_call_familes(annotator: &RPythonAnnotator) -> Result<(), Annota
 
 /// RPython `perform_normalizations(annotator)` (normalizecalls.py:404-413).
 ///
-/// The current Rust port wires the driver entry point to the ported
-/// call-family normalization pass + [`assign_inheritance_ids`]. The
-/// class-constructor, class-PBC, and instantiate-function phases still
-/// depend on rclass infrastructure that is not in this tree yet.
+/// ```python
+/// def perform_normalizations(annotator):
+///     create_class_constructors(annotator)
+///     annotator.frozen += 1
+///     try:
+///         normalize_call_familes(annotator)
+///         merge_classpbc_getattr_into_classdef(annotator)
+///         assign_inheritance_ids(annotator)
+///     finally:
+///         annotator.frozen -= 1
+///     create_instantiate_functions(annotator)
+/// ```
+///
+/// The Rust port wires the driver entry point to the call-family
+/// normalization pass + [`assign_inheritance_ids`] +
+/// [`create_instantiate_functions`]. The class-constructor and
+/// `merge_classpbc_getattr_into_classdef` phases still depend on rclass
+/// / PBC infrastructure that is not in this tree yet — the
+/// `bookkeeper.needs_generic_instantiate` set therefore stays empty
+/// until a caller populates it explicitly, which makes
+/// `create_instantiate_functions` a no-op in the current pipeline.
 pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), AnnotatorError> {
     struct FrozenGuard<'a> {
         annotator: &'a RPythonAnnotator,
@@ -125,13 +149,19 @@ pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), Annota
     // Upstream increments `annotator.frozen` around the middle
     // normalization section and restores it in `finally`. Rust models
     // the field as a bool, so preserve the old value for nested callers.
-    let old_frozen = std::mem::replace(&mut *annotator.frozen.borrow_mut(), true);
-    let _guard = FrozenGuard {
-        annotator,
-        saved: old_frozen,
-    };
-    normalize_call_familes(annotator)?;
-    assign_inheritance_ids(annotator);
+    {
+        let old_frozen = std::mem::replace(&mut *annotator.frozen.borrow_mut(), true);
+        let _guard = FrozenGuard {
+            annotator,
+            saved: old_frozen,
+        };
+        normalize_call_familes(annotator)?;
+        assign_inheritance_ids(annotator);
+    }
+    // upstream: `create_instantiate_functions(annotator)` runs AFTER
+    // the frozen-try block so the newly-built graphs register with the
+    // annotator's non-frozen state.
+    create_instantiate_functions(annotator)?;
     Ok(())
 }
 
@@ -698,6 +728,140 @@ pub(crate) fn normalize_calltable_row_annotation(
     Ok(conversion)
 }
 
+/// RPython `create_instantiate_functions(annotator)`
+/// (normalizecalls.py:266-273).
+///
+/// ```python
+/// def create_instantiate_functions(annotator):
+///     needs_generic_instantiate = annotator.bookkeeper.needs_generic_instantiate
+///     for classdef in needs_generic_instantiate:
+///         assert getgcflavor(classdef) == 'gc'   # only gc-case
+///         create_instantiate_function(annotator, classdef)
+/// ```
+pub fn create_instantiate_functions(annotator: &RPythonAnnotator) -> Result<(), AnnotatorError> {
+    // Snapshot the pending classdefs so the inner helper can mutate
+    // `annotator.bookkeeper.needs_generic_instantiate` without
+    // invalidating the iteration (upstream's Python dict iteration
+    // keeps pointing at the original keys even if callers push more).
+    let pending: Vec<Rc<RefCell<ClassDef>>> = annotator
+        .bookkeeper
+        .needs_generic_instantiate
+        .borrow()
+        .values()
+        .cloned()
+        .collect();
+    for classdef in pending {
+        // upstream: `assert getgcflavor(classdef) == 'gc'`.
+        let flavor = super::rclass::getgcflavor(&classdef)
+            .map_err(|e| AnnotatorError::new(e.to_string()))?;
+        if flavor != super::rclass::Flavor::Gc {
+            return Err(AnnotatorError::new(format!(
+                "create_instantiate_functions: classdef {:?} has gc flavor {:?}, expected Gc",
+                classdef.borrow().name,
+                flavor,
+            )));
+        }
+        create_instantiate_function(annotator, &classdef)?;
+    }
+    Ok(())
+}
+
+/// RPython `create_instantiate_function(annotator, classdef)`
+/// (normalizecalls.py:275-295).
+///
+/// ```python
+/// def create_instantiate_function(annotator, classdef):
+///     if hasattr(classdef, 'my_instantiate_graph'):
+///         return
+///     v = Variable()
+///     block = Block([])
+///     block.operations.append(SpaceOperation('instantiate1', [], v))
+///     name = valid_identifier('instantiate_' + classdef.name)
+///     graph = FunctionGraph(name, block)
+///     block.closeblock(Link([v], graph.returnblock))
+///     annotator.setbinding(v, annmodel.SomeInstance(classdef))
+///     annotator.annotated[block] = graph
+///     generalizedresult = annmodel.SomeInstance(classdef=None)
+///     annotator.setbinding(graph.getreturnvar(), generalizedresult)
+///     classdef.my_instantiate_graph = graph
+///     annotator.translator.graphs.append(graph)
+/// ```
+pub fn create_instantiate_function(
+    annotator: &RPythonAnnotator,
+    classdef: &Rc<RefCell<ClassDef>>,
+) -> Result<(), AnnotatorError> {
+    // upstream: `if hasattr(classdef, 'my_instantiate_graph'): return`.
+    if classdef.borrow().my_instantiate_graph.is_some() {
+        return Ok(());
+    }
+
+    // upstream: `v = Variable()` + `SpaceOperation('instantiate1', [], v)`.
+    let mut v = Variable::new();
+    let v_result = Hlvalue::Variable(v.clone());
+    let op = crate::flowspace::model::SpaceOperation::new("instantiate1", vec![], v_result.clone());
+
+    // upstream: `block = Block([])` and append op.
+    let block = Block::shared(vec![]);
+    block.borrow_mut().operations.push(op);
+
+    // upstream: `name = valid_identifier('instantiate_' + classdef.name)`.
+    let classdef_name = classdef.borrow().name.clone();
+    let name = super::annlowlevel::valid_identifier(format!("instantiate_{classdef_name}"));
+
+    // upstream: `graph = FunctionGraph(name, block)` — fresh
+    // returnblock/exceptblock allocated inside the ctor.
+    let graph = FunctionGraph::new(name, block.clone());
+    let returnblock = graph.returnblock.clone();
+    let graph_rc = Rc::new(RefCell::new(graph));
+
+    // upstream: `block.closeblock(Link([v], graph.returnblock))`.
+    let link = Link::new(vec![v_result.clone()], Some(returnblock.clone()), None);
+    block
+        .borrow_mut()
+        .closeblock(vec![Rc::new(RefCell::new(link))]);
+
+    // upstream: `annotator.setbinding(v, annmodel.SomeInstance(classdef))`.
+    annotator.setbinding(
+        &mut v,
+        crate::annotator::model::SomeValue::Instance(crate::annotator::model::SomeInstance::new(
+            Some(classdef.clone()),
+            false,
+            Default::default(),
+        )),
+    );
+
+    // upstream: `annotator.annotated[block] = graph`. Pyre also tracks
+    // the reverse BlockKey → BlockRef index in `all_blocks` so
+    // `perform_normalizations` / `specialize_more_blocks` can resurface
+    // the block from the key alone.
+    let block_key = BlockKey::of(&block);
+    annotator
+        .annotated
+        .borrow_mut()
+        .insert(block_key.clone(), Some(graph_rc.clone()));
+    annotator
+        .all_blocks
+        .borrow_mut()
+        .insert(block_key, block.clone());
+
+    // upstream: `generalizedresult = annmodel.SomeInstance(classdef=None)`
+    // + `annotator.setbinding(graph.getreturnvar(), generalizedresult)`.
+    let generalized = crate::annotator::model::SomeValue::Instance(
+        crate::annotator::model::SomeInstance::new(None, false, Default::default()),
+    );
+    if let Hlvalue::Variable(mut retvar) = graph_rc.borrow().getreturnvar() {
+        annotator.setbinding(&mut retvar, generalized);
+    }
+
+    // upstream: `classdef.my_instantiate_graph = graph`.
+    classdef.borrow_mut().my_instantiate_graph = Some(graph_rc.clone());
+
+    // upstream: `annotator.translator.graphs.append(graph)`.
+    annotator.translator.graphs.borrow_mut().push(graph_rc);
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1079,5 +1243,96 @@ mod tests {
         let child_max = child.borrow().maxid.unwrap();
 
         assert!(root_min <= child_min && child_max <= root_max);
+    }
+
+    #[test]
+    fn create_instantiate_function_builds_my_instantiate_graph_and_registers_with_translator() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let classdef = register_classdef(&ann, "pkg.Leaf", None);
+        let before = ann.translator.graphs.borrow().len();
+
+        create_instantiate_function(&ann, &classdef).expect("create_instantiate_function");
+
+        // upstream: `classdef.my_instantiate_graph = graph`.
+        let graph_rc = classdef
+            .borrow()
+            .my_instantiate_graph
+            .clone()
+            .expect("my_instantiate_graph must be set");
+        assert!(graph_rc.borrow().name.starts_with("instantiate_"));
+
+        // upstream: `annotator.translator.graphs.append(graph)`.
+        assert_eq!(ann.translator.graphs.borrow().len(), before + 1);
+        assert!(Rc::ptr_eq(
+            ann.translator.graphs.borrow().last().unwrap(),
+            &graph_rc,
+        ));
+
+        // upstream: `block.operations.append(SpaceOperation('instantiate1', [], v))`.
+        let startblock = graph_rc.borrow().startblock.clone();
+        let block_ref = startblock.borrow();
+        assert_eq!(block_ref.operations.len(), 1);
+        assert_eq!(block_ref.operations[0].opname, "instantiate1");
+        assert_eq!(block_ref.exits.len(), 1);
+
+        // upstream: annotator.annotated[block] = graph.
+        let block_key = BlockKey::of(&startblock);
+        let annotated = ann.annotated.borrow();
+        let graph_in_annotated = annotated.get(&block_key).cloned().flatten();
+        assert!(graph_in_annotated.is_some());
+        assert!(Rc::ptr_eq(&graph_in_annotated.unwrap(), &graph_rc));
+    }
+
+    #[test]
+    fn create_instantiate_function_is_idempotent_on_second_call() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let classdef = register_classdef(&ann, "pkg.Once", None);
+        create_instantiate_function(&ann, &classdef).expect("first call");
+        let first = classdef.borrow().my_instantiate_graph.clone().unwrap();
+        let count_after_first = ann.translator.graphs.borrow().len();
+
+        create_instantiate_function(&ann, &classdef).expect("second call");
+        let second = classdef.borrow().my_instantiate_graph.clone().unwrap();
+
+        assert!(Rc::ptr_eq(&first, &second));
+        assert_eq!(ann.translator.graphs.borrow().len(), count_after_first);
+    }
+
+    #[test]
+    fn create_instantiate_functions_drains_needs_generic_instantiate() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let a = register_classdef(&ann, "pkg.A", None);
+        let b = register_classdef(&ann, "pkg.B", None);
+        ann.bookkeeper.push_needs_generic_instantiate(&a);
+        ann.bookkeeper.push_needs_generic_instantiate(&b);
+
+        create_instantiate_functions(&ann).expect("create_instantiate_functions");
+
+        assert!(a.borrow().my_instantiate_graph.is_some());
+        assert!(b.borrow().my_instantiate_graph.is_some());
+    }
+
+    #[test]
+    fn create_instantiate_functions_noop_when_bookkeeper_set_empty() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        register_classdef(&ann, "pkg.Unused", None);
+        let before = ann.translator.graphs.borrow().len();
+        create_instantiate_functions(&ann).expect("empty drain");
+        assert_eq!(ann.translator.graphs.borrow().len(), before);
+    }
+
+    #[test]
+    fn perform_normalizations_runs_create_instantiate_functions_after_frozen_drops() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let classdef = register_classdef(&ann, "pkg.Chain", None);
+        ann.bookkeeper.push_needs_generic_instantiate(&classdef);
+
+        perform_normalizations(&ann).expect("perform_normalizations");
+
+        // upstream executes the create_instantiate_functions pass AFTER
+        // the frozen decrement, so by the time it writes my_instantiate_graph
+        // the annotator is already unfrozen again.
+        assert!(!*ann.frozen.borrow());
+        assert!(classdef.borrow().my_instantiate_graph.is_some());
     }
 }

@@ -40,10 +40,11 @@ use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation, ValueId};
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO, StructType,
+    self, _ptr, ForwardReference, GcKind, LowLevelType, Ptr, PtrTarget, RUNTIME_TYPE_INFO,
+    StructType,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
-use crate::translator::rtyper::rmodel::{Repr, ReprState, mangle};
+use crate::translator::rtyper::rmodel::{DescOrConst, Repr, ReprState, mangle};
 use crate::translator::rtyper::rtyper::RPythonTyper;
 
 // ---------------------------------------------------------------------
@@ -303,7 +304,7 @@ fn classdesc_get_param(
     default
 }
 
-fn getgcflavor(classdef: &Rc<RefCell<ClassDef>>) -> Result<Flavor, TyperError> {
+pub(super) fn getgcflavor(classdef: &Rc<RefCell<ClassDef>>) -> Result<Flavor, TyperError> {
     let alloc_flavor = classdesc_get_param(
         classdef,
         "_alloc_flavor_",
@@ -329,6 +330,7 @@ fn lowleveltype_size_hint(lltype: &LowLevelType) -> Option<usize> {
         | LowLevelType::UnsignedLongLong
         | LowLevelType::Float
         | LowLevelType::LongFloat
+        | LowLevelType::Address
         | LowLevelType::Ptr(_)
         | LowLevelType::InteriorPtr(_) => Some(std::mem::size_of::<usize>()),
         LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => Some(16),
@@ -365,6 +367,52 @@ pub fn object_by_flavor(flavor: Flavor) -> LowLevelType {
     match flavor {
         Flavor::Gc => OBJECT.clone(),
         Flavor::Raw => NONGCOBJECT.clone(),
+    }
+}
+
+/// Adapter from a converted [`Constant`] (produced by
+/// [`crate::translator::rtyper::rmodel::Repr::convert_const`] /
+/// [`crate::translator::rtyper::rmodel::Repr::convert_desc_or_const`])
+/// to the
+/// [`crate::translator::rtyper::lltypesystem::lltype::LowLevelValue`]
+/// shape that [`_ptr::setattr`](crate::translator::rtyper::lltypesystem::lltype::_ptr::setattr)
+/// consumes for vtable slot writes (rclass.py:321 `setattr(vtable,
+/// mangled_name, llvalue)`).
+///
+/// Upstream Python performs no explicit conversion — the `Constant`
+/// object itself is stored through the live lltype container's
+/// `__setattr__`. The Rust port has separate `LowLevelValue` and
+/// `ConstValue` enums, so this helper picks the variant that matches
+/// the target field type carried on `c.concretetype`.
+///
+/// Scope: covers the concrete shapes needed by `setup_vtable`'s
+/// vtable-field writes — `Void`, `Signed`, `Bool`, `Float`, and `Ptr`.
+/// `Unsigned` / `Char` / `UniChar` / `SingleFloat` / `LongFloat` etc.
+/// surface as `TyperError` until their repr ports land.
+pub(super) fn constant_to_lowlevel_value(
+    c: &crate::flowspace::model::Constant,
+) -> Result<lltype::LowLevelValue, TyperError> {
+    let target = c.concretetype.as_ref().ok_or_else(|| {
+        TyperError::message(format!(
+            "constant_to_lowlevel_value: constant {:?} lacks concretetype",
+            c.value
+        ))
+    })?;
+    match (target, &c.value) {
+        (LowLevelType::Void, _) => Ok(lltype::LowLevelValue::Void),
+        (LowLevelType::Signed, ConstValue::Int(n)) => Ok(lltype::LowLevelValue::Signed(*n)),
+        (LowLevelType::Signed, ConstValue::Bool(b)) => {
+            Ok(lltype::LowLevelValue::Signed(i64::from(*b)))
+        }
+        (LowLevelType::Bool, ConstValue::Bool(b)) => Ok(lltype::LowLevelValue::Bool(*b)),
+        (LowLevelType::Float, ConstValue::Float(bits)) => Ok(lltype::LowLevelValue::Float(*bits)),
+        (LowLevelType::Ptr(_), ConstValue::LLPtr(ptr)) => {
+            Ok(lltype::LowLevelValue::Ptr(ptr.clone()))
+        }
+        _ => Err(TyperError::message(format!(
+            "constant_to_lowlevel_value: unsupported ConstValue→LowLevelValue for target {target:?} and value {:?}",
+            c.value
+        ))),
     }
 }
 
@@ -507,6 +555,160 @@ impl ClassRepr {
         // not propagate `s_unbound.can_be_none` (would alter the
         // nullable-method-PBC repr/key shape).
         Ok(Some(SomeValue::PBC(SomePBC::new(funcdescs, false))))
+    }
+
+    /// RPython `ClassRepr.setup_vtable(self, vtable, r_parentcls)`
+    /// (rclass.py:307-336).
+    ///
+    /// ```python
+    /// def setup_vtable(self, vtable, r_parentcls):
+    ///     def assign(mangled_name, value):
+    ///         if value is None:
+    ///             llvalue = r.special_uninitialized_value()
+    ///             if llvalue is None:
+    ///                 return
+    ///         else:
+    ///             if (isinstance(value, Constant) and
+    ///                     isinstance(value.value, staticmethod)):
+    ///                 value = Constant(value.value.__get__(42))
+    ///             llvalue = r.convert_desc_or_const(value)
+    ///         setattr(vtable, mangled_name, llvalue)
+    ///
+    ///     for fldname in r_parentcls.clsfields:
+    ///         mangled_name, r = r_parentcls.clsfields[fldname]
+    ///         if r.lowleveltype is Void:
+    ///             continue
+    ///         value = self.classdef.classdesc.read_attribute(fldname, None)
+    ///         assign(mangled_name, value)
+    ///     for (access_set, attr), (mangled_name, r) in r_parentcls.pbcfields.items():
+    ///         if self.classdef.classdesc not in access_set.descs:
+    ///             continue
+    ///         if r.lowleveltype is Void:
+    ///             continue
+    ///         attrvalue = self.classdef.classdesc.read_attribute(attr, None)
+    ///         assign(mangled_name, attrvalue)
+    /// ```
+    ///
+    /// `vtable` points at the vtable sub-struct for the level
+    /// `r_parentcls` describes (rclass.py:298-304 walks the super chain
+    /// via `init_vtable`, not yet ported). Upstream calls `setattr` on
+    /// the live `_struct` container; the Rust port routes through
+    /// [`_ptr::setattr`] after mapping the converted
+    /// [`crate::flowspace::model::Constant`] to a
+    /// [`lltype::LowLevelValue`] via [`constant_to_lowlevel_value`].
+    pub fn setup_vtable(
+        &self,
+        vtable: &mut _ptr,
+        r_parentcls: &Arc<ClassRepr>,
+    ) -> Result<(), TyperError> {
+        let classdesc = self.classdef.borrow().classdesc.clone();
+        let classdesc_key = crate::annotator::description::DescKey::from_rc(&classdesc);
+
+        // upstream: `for fldname in r_parentcls.clsfields`.
+        let clsfields_snapshot: Vec<(String, (String, Arc<dyn Repr>))> = r_parentcls
+            .clsfields
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for (fldname, (mangled_name, r)) in &clsfields_snapshot {
+            if matches!(r.lowleveltype(), LowLevelType::Void) {
+                continue;
+            }
+            let value = crate::annotator::classdesc::ClassDesc::read_attribute(&classdesc, fldname);
+            self.setup_vtable_assign(vtable, mangled_name, r, value)?;
+        }
+
+        // upstream: extra PBC attributes —
+        // `for (access_set, attr), (mangled_name, r) in r_parentcls.pbcfields.items()`.
+        let pbcfields_snapshot: Vec<((usize, String), (String, Arc<dyn Repr>))> = r_parentcls
+            .pbcfields
+            .borrow()
+            .iter()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .collect();
+        for ((access_set_id, attr), (mangled_name, r)) in &pbcfields_snapshot {
+            // upstream: `if self.classdef.classdesc not in access_set.descs: continue`.
+            let Some(access_set) = r_parentcls
+                .classdef
+                .borrow()
+                .extra_access_sets
+                .values()
+                .find_map(|(family, _, _)| {
+                    (class_attr_family_key(family) == *access_set_id).then(|| family.clone())
+                })
+            else {
+                // r_parentcls snapshot did not expose the access set
+                // this pbcfield originated from — shouldn't happen in a
+                // consistent setup but bail defensively.
+                continue;
+            };
+            if !access_set.borrow().descs.contains_key(&classdesc_key) {
+                continue;
+            }
+            if matches!(r.lowleveltype(), LowLevelType::Void) {
+                continue;
+            }
+            let attrvalue =
+                crate::annotator::classdesc::ClassDesc::read_attribute(&classdesc, attr);
+            self.setup_vtable_assign(vtable, mangled_name, r, attrvalue)?;
+        }
+        Ok(())
+    }
+
+    /// Helper that mirrors the nested `def assign(...)` closure in
+    /// upstream `ClassRepr.setup_vtable` (rclass.py:310-321). Kept as a
+    /// method rather than a free function because it reads through
+    /// `self` only to surface `TyperError`-convertible errors.
+    fn setup_vtable_assign(
+        &self,
+        vtable: &mut _ptr,
+        mangled_name: &str,
+        r: &Arc<dyn Repr>,
+        value: Option<crate::annotator::classdesc::ClassDictEntry>,
+    ) -> Result<(), TyperError> {
+        let llvalue = match value {
+            None => {
+                // upstream: `llvalue = r.special_uninitialized_value()`
+                // + `if llvalue is None: return`.
+                let Some(raw) = r.special_uninitialized_value() else {
+                    return Ok(());
+                };
+                let constant = crate::flowspace::model::Constant::with_concretetype(
+                    raw,
+                    r.lowleveltype().clone(),
+                );
+                constant_to_lowlevel_value(&constant)?
+            }
+            Some(entry) => {
+                // upstream: staticmethod unwrap — `if isinstance(value,
+                // Constant) and isinstance(value.value, staticmethod):
+                // value = Constant(value.value.__get__(42))`.
+                let entry = match entry {
+                    crate::annotator::classdesc::ClassDictEntry::Constant(c) => {
+                        let c = match &c.value {
+                            ConstValue::HostObject(host) if host.is_staticmethod() => {
+                                let Some(func) = host.staticmethod_func().cloned() else {
+                                    return Err(TyperError::message(
+                                        "setup_vtable_assign: staticmethod without underlying func",
+                                    ));
+                                };
+                                crate::flowspace::model::Constant::new(ConstValue::HostObject(func))
+                            }
+                            _ => c,
+                        };
+                        DescOrConst::Const(c)
+                    }
+                    crate::annotator::classdesc::ClassDictEntry::Desc(d) => DescOrConst::Desc(d),
+                };
+                let converted = r.convert_desc_or_const(&entry)?;
+                constant_to_lowlevel_value(&converted)?
+            }
+        };
+        vtable
+            .setattr(mangled_name, llvalue)
+            .map_err(TyperError::message)?;
+        Ok(())
     }
 }
 
@@ -2062,5 +2264,139 @@ mod tests {
         assert_eq!(body._names[0], "super");
         assert_eq!(body._names[1], "inst_z_int");
         assert_eq!(body._names[2], "inst_a_bool");
+    }
+
+    // ---------------------------------------------------------------
+    // R3 — `ClassRepr::setup_vtable` + constant→lowlevel adapter.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn constant_to_lowlevel_value_unwraps_int_bool_float_ptr_and_void() {
+        use crate::flowspace::model::Constant;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelValue, MallocFlavor, malloc,
+        };
+
+        let signed = Constant::with_concretetype(ConstValue::Int(7), LowLevelType::Signed);
+        assert_eq!(
+            constant_to_lowlevel_value(&signed).unwrap(),
+            LowLevelValue::Signed(7)
+        );
+
+        // rint.convert_const(Bool) → Int(b as i64); adapter routes through Signed.
+        let signed_from_bool =
+            Constant::with_concretetype(ConstValue::Bool(true), LowLevelType::Signed);
+        assert_eq!(
+            constant_to_lowlevel_value(&signed_from_bool).unwrap(),
+            LowLevelValue::Signed(1)
+        );
+
+        let bool_const = Constant::with_concretetype(ConstValue::Bool(false), LowLevelType::Bool);
+        assert_eq!(
+            constant_to_lowlevel_value(&bool_const).unwrap(),
+            LowLevelValue::Bool(false)
+        );
+
+        let float_const = Constant::with_concretetype(
+            ConstValue::Float(0x4020_0000_0000_0000),
+            LowLevelType::Float,
+        );
+        assert_eq!(
+            constant_to_lowlevel_value(&float_const).unwrap(),
+            LowLevelValue::Float(0x4020_0000_0000_0000)
+        );
+
+        let void_const = Constant::with_concretetype(ConstValue::None, LowLevelType::Void);
+        assert_eq!(
+            constant_to_lowlevel_value(&void_const).unwrap(),
+            LowLevelValue::Void
+        );
+
+        // LLPtr case — forge a _ptr via malloc and verify the adapter returns
+        // a Ptr variant carrying the exact same _ptr identity.
+        let struct_t = LowLevelType::Struct(Box::new(StructType::gc(
+            "pkg.P",
+            vec![("x".into(), LowLevelType::Signed)],
+        )));
+        let ptr = malloc(struct_t.clone(), None, MallocFlavor::Gc, true).unwrap();
+        let ptr_t = LowLevelType::Ptr(Box::new(Ptr {
+            TO: PtrTarget::Struct(StructType::gc(
+                "pkg.P",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        }));
+        let ptr_const =
+            Constant::with_concretetype(ConstValue::LLPtr(Box::new(ptr.clone())), ptr_t.clone());
+        let llvalue = constant_to_lowlevel_value(&ptr_const).unwrap();
+        match llvalue {
+            LowLevelValue::Ptr(got) => assert_eq!(got._identity, ptr._identity),
+            other => panic!("expected Ptr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn constant_to_lowlevel_value_rejects_mismatched_shape() {
+        use crate::flowspace::model::Constant;
+
+        let bad = Constant::with_concretetype(ConstValue::Int(3), LowLevelType::Bool);
+        let err = constant_to_lowlevel_value(&bad).unwrap_err().to_string();
+        assert!(
+            err.contains("unsupported ConstValue→LowLevelValue"),
+            "unexpected error: {err}",
+        );
+    }
+
+    #[test]
+    fn setup_vtable_writes_readonly_int_attr_into_vtable_field() {
+        use crate::annotator::classdesc::ClassDictEntry;
+        use crate::annotator::model::SomeInteger;
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelValue, MallocFlavor, malloc,
+        };
+
+        let rtyper = fresh_rtyper();
+        let classdef = ClassDef::new_standalone("pkg.C", None);
+        // Seed readonly class attr on ClassDef so _setup_repr populates
+        // clsfields with ("cls_LIMIT", IntegerRepr).
+        attach_attr(
+            &classdef,
+            "LIMIT",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            true,
+        );
+        // Seed the classdesc's dictionary so read_attribute("LIMIT")
+        // returns Constant(Int(7)) — the concrete value upstream resolves
+        // via self.classdef.classdesc.read_attribute(fldname, None).
+        {
+            let cdesc = classdef.borrow().classdesc.clone();
+            cdesc
+                .borrow_mut()
+                .classdict
+                .insert("LIMIT".into(), ClassDictEntry::constant(ConstValue::Int(7)));
+        }
+
+        let repr_arc = match getclassrepr_arc(&rtyper, Some(&classdef)).expect("getclassrepr") {
+            ClassReprArc::Inst(r) => r,
+            _ => panic!("classdef != None routes to Inst"),
+        };
+        Repr::setup(repr_arc.as_ref()).expect("_setup_repr");
+
+        // Allocate the vtable container — malloc produces an immortal
+        // gc-Struct _ptr whose type matches `repr.lowleveltype` after
+        // ForwardReference resolution.
+        let LowLevelType::ForwardReference(fwd) = repr_arc.vtable_type() else {
+            panic!("vtable_type must be ForwardReference");
+        };
+        let resolved = fwd.resolved().expect("resolved vtable_type");
+        let mut vtable = malloc(resolved, None, MallocFlavor::Gc, true).expect("malloc vtable");
+
+        repr_arc
+            .setup_vtable(&mut vtable, &repr_arc)
+            .expect("setup_vtable");
+
+        // rclass.py:321 — `setattr(vtable, mangled_name, llvalue)` is
+        // observable via the struct's getattr.
+        let value = vtable.getattr("cls_LIMIT").expect("cls_LIMIT stored");
+        assert_eq!(value, LowLevelValue::Signed(7));
     }
 }

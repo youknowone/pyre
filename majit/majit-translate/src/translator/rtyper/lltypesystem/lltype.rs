@@ -18,6 +18,7 @@
 //!   `Array`, `ForwardReference`) land with the commit that consumes
 //!   them.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -26,6 +27,15 @@ use std::sync::{Arc, LazyLock, Mutex};
 use crate::annotator::model::KnownType;
 use crate::flowspace::model::{ConcretetypePlaceholder, ConstValue, GraphKey, GraphRef, Hlvalue};
 use crate::translator::rtyper::error::TyperError;
+
+thread_local! {
+    /// RPython `_ptr._become()` mutates the pointer object in place so
+    /// every alias starts resolving to the real target. Rust `_ptr`
+    /// values are plain cloned structs, so the narrow annlowlevel port
+    /// records the post-`_become` target by pointer identity here and
+    /// routes read-side operations through the redirect.
+    static PTR_BECOME_TARGETS: RefCell<HashMap<u64, _ptr>> = RefCell::new(HashMap::new());
+}
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub struct DelayedPointer;
@@ -161,6 +171,7 @@ impl LowLevelType {
                 | LowLevelType::LongFloat
                 | LowLevelType::Char
                 | LowLevelType::UniChar
+                | LowLevelType::Address
         )
     }
 
@@ -216,6 +227,13 @@ impl LowLevelType {
             // downstream via _enforce on malformed constants).
             LowLevelType::Char => matches!(value, ConstValue::Str(_)),
             LowLevelType::UniChar => matches!(value, ConstValue::Str(_)),
+            // Address is a Primitive with `_defl = NULL`. No ConstValue
+            // variant models a fakeaddress yet; until the llmemory
+            // cast helpers land, only Placeholder (handled above) is
+            // accepted. Downstream TyperError surfaces fakeaddress
+            // constants through the same Placeholder path upstream uses
+            // for `NODEFAULT`.
+            LowLevelType::Address => false,
             // upstream `Ptr(FuncType)` accepts `_ptr` instances — pyre's
             // `ConstValue::LLPtr` is the direct equivalent.
             LowLevelType::Ptr(_) => matches!(value, ConstValue::LLPtr(_)),
@@ -250,6 +268,7 @@ impl LowLevelType {
             LowLevelType::LongFloat => "LongFloat".to_string(),
             LowLevelType::Char => "Char".to_string(),
             LowLevelType::UniChar => "UniChar".to_string(),
+            LowLevelType::Address => "Address".to_string(),
             LowLevelType::Struct(t) => t._short_name(),
             LowLevelType::Array(t) => t._short_name(),
             LowLevelType::FixedSizeArray(t) => t._short_name(),
@@ -291,11 +310,28 @@ pub enum LowLevelValue {
     LongFloat(u64),
     Char(char),
     UniChar(char),
+    /// RPython `llmemory.Address` values — `fakeaddress(ptr)` / `NULL`.
+    /// The NULL sentinel is [`_address::Null`]; richer `fakeaddress`
+    /// bodies will extend [`_address`] as llmemory wrappers land.
+    Address(_address),
     Struct(Box<_struct>),
     Array(Box<_array>),
     Opaque(Box<_opaque>),
     Ptr(Box<_ptr>),
     InteriorPtr(Box<_interior_ptr>),
+}
+
+/// RPython `_fakeaddress(self, ptr)` (`llmemory.py:441-570`).
+///
+/// Upstream carries the underlying `_ptr` (or `None` for NULL) and
+/// exposes `_cast_to_ptr` / `_cast_to_int` / dereference helpers.
+/// Pyre lands only the NULL sentinel in this commit — the `Fake(_ptr)`
+/// arm will extend when the first consumer (MultipleUnrelatedFrozenPBCRepr
+/// `convert_pbc`) hits it.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum _address {
+    /// `NULL = fakeaddress(None)` (`llmemory.py:649`).
+    Null,
 }
 
 #[derive(Clone, Debug)]
@@ -313,6 +349,11 @@ pub enum LowLevelType {
     LongFloat,
     Char,
     UniChar,
+    /// RPython `Address = lltype.Primitive("Address", NULL)`
+    /// (`llmemory.py:650`). Represents the primitive address type used
+    /// by `MultipleUnrelatedFrozenPBCRepr.lowleveltype` and `adr_eq` /
+    /// `adr_ne` operations. Values are [`LowLevelValue::Address`].
+    Address,
     Func(Box<FuncType>),
     Struct(Box<StructType>),
     Array(Box<ArrayType>),
@@ -348,7 +389,8 @@ impl PartialEq for LowLevelType {
             | (LowLevelType::SingleFloat, LowLevelType::SingleFloat)
             | (LowLevelType::LongFloat, LowLevelType::LongFloat)
             | (LowLevelType::Char, LowLevelType::Char)
-            | (LowLevelType::UniChar, LowLevelType::UniChar) => true,
+            | (LowLevelType::UniChar, LowLevelType::UniChar)
+            | (LowLevelType::Address, LowLevelType::Address) => true,
             (LowLevelType::Func(left), LowLevelType::Func(right)) => left == right,
             (LowLevelType::Struct(left), LowLevelType::Struct(right)) => left == right,
             (LowLevelType::Array(left), LowLevelType::Array(right)) => left == right,
@@ -420,6 +462,7 @@ impl Hash for LowLevelType {
                 20_u8.hash(state);
                 t.hash(state);
             }
+            LowLevelType::Address => 21_u8.hash(state),
         }
     }
 }
@@ -897,6 +940,11 @@ pub struct _ptr {
     pub _TYPE: Ptr,
     pub _solid: bool,
     pub _obj0: Result<Option<_ptr_obj>, DelayedPointer>,
+    /// RPython `self._set_weak(False)` from `_ptr.__init__`
+    /// (lltype.py:1410-1413). `_become` asserts `not self._weak`
+    /// (lltype.py:1416-1418); reserved for the weak-ptr variants
+    /// (`weakref_create` family) when those land.
+    pub _weak: bool,
 }
 
 /// RPython `_abstract_ptr.__eq__` (`lltype.py:1185-1195`). Order:
@@ -908,12 +956,17 @@ pub struct _ptr {
 ///    and `_func.__eq__`'s structural dict comparison for Func).
 impl PartialEq for _ptr {
     fn eq(&self, other: &Self) -> bool {
-        if self._TYPE != other._TYPE {
-            panic!("comparing {:?} and {:?}", self._TYPE, other._TYPE);
+        let self_resolved = self._resolved_ptr();
+        let other_resolved = other._resolved_ptr();
+        if self_resolved._TYPE != other_resolved._TYPE {
+            panic!(
+                "comparing {:?} and {:?}",
+                self_resolved._TYPE, other_resolved._TYPE
+            );
         }
-        match (&self._obj0, &other._obj0) {
+        match (&self_resolved._obj0, &other_resolved._obj0) {
             (Ok(a), Ok(b)) => a == b,
-            _ => std::ptr::eq(self, other),
+            _ => self._identity == other._identity,
         }
     }
 }
@@ -935,6 +988,7 @@ impl _ptr {
             _TYPE,
             _solid,
             _obj0,
+            _weak: false,
         }
     }
 
@@ -950,14 +1004,52 @@ impl _ptr {
         self._TYPE._needsgc()
     }
 
+    fn _resolved_ptr(&self) -> _ptr {
+        let mut current = self.clone();
+        loop {
+            let next = PTR_BECOME_TARGETS
+                .with(|targets| targets.borrow().get(&current._identity).cloned());
+            match next {
+                Some(target) => current = target,
+                None => return current,
+            }
+        }
+    }
+
+    /// RPython `_ptr._become(self, other)` (`lltype.py:1416-1419`).
+    ///
+    /// ```python
+    /// def _become(self, other):
+    ///     assert self._TYPE == other._TYPE
+    ///     assert not self._weak
+    ///     self._setobj(other._obj, other._solid)
+    /// ```
+    ///
+    /// The Python object mutates in place. Rust `_ptr` values are copied
+    /// by clone, so this records the resolved target by `_identity` and
+    /// read-side operations consult the redirect table.
+    pub fn _become(&self, other: &_ptr) {
+        assert_eq!(
+            self._TYPE, other._TYPE,
+            "_ptr._become: type mismatch (self={:?}, other={:?})",
+            self._TYPE, other._TYPE,
+        );
+        assert!(!self._weak, "_ptr._become: cannot reassign a weak pointer",);
+        let resolved = other._resolved_ptr();
+        PTR_BECOME_TARGETS.with(|targets| {
+            targets.borrow_mut().insert(self._identity, resolved);
+        });
+    }
+
     /// RPython `_abstract_ptr._getobj` (`lltype.py:1226-1240`). Returns
     /// the underlying container (non-null required by callers that
     /// dereference); delayed pointers surface as `Err(DelayedPointer)`.
     /// Null pointers panic at the dereference site — upstream raises
     /// `AttributeError` on `self._obj.getattr(...)` implicitly, so
     /// either outcome is a programmer error.
-    pub fn _obj(&self) -> Result<&_ptr_obj, DelayedPointer> {
-        match &self._obj0 {
+    pub fn _obj(&self) -> Result<_ptr_obj, DelayedPointer> {
+        let resolved = self._resolved_ptr();
+        match resolved._obj0 {
             Ok(Some(obj)) => Ok(obj),
             Ok(None) => panic!("null low-level pointer has no underlying object"),
             Err(_) => Err(DelayedPointer),
@@ -968,14 +1060,16 @@ impl _ptr {
     /// Compares `_obj` values directly (handles null-null equality)
     /// and surfaces `DelayedPointer` for either-side delayed.
     pub fn _same_obj(&self, other: &_ptr) -> Result<bool, DelayedPointer> {
-        match (&self._obj0, &other._obj0) {
+        let self_resolved = self._resolved_ptr();
+        let other_resolved = other._resolved_ptr();
+        match (&self_resolved._obj0, &other_resolved._obj0) {
             (Ok(a), Ok(b)) => Ok(a == b),
             _ => Err(DelayedPointer),
         }
     }
 
     pub fn nonzero(&self) -> bool {
-        match &self._obj0 {
+        match &self._resolved_ptr()._obj0 {
             Ok(Some(_)) => true,
             Ok(None) => false,
             Err(DelayedPointer) => true,
@@ -1477,6 +1571,10 @@ impl LowLevelType {
             LowLevelType::LongFloat => LowLevelValue::LongFloat(0.0f64.to_bits()),
             LowLevelType::Char => LowLevelValue::Char('\0'),
             LowLevelType::UniChar => LowLevelValue::UniChar('\0'),
+            // upstream `Address = Primitive("Address", NULL)` with
+            // `NULL = fakeaddress(None)` — `_defl` returns the NULL
+            // sentinel.
+            LowLevelType::Address => LowLevelValue::Address(_address::Null),
             LowLevelType::Func(_) => {
                 panic!("FuncType has no standalone low-level value default")
             }
@@ -1492,9 +1590,16 @@ impl LowLevelType {
             LowLevelType::Opaque(opaque_t) => {
                 LowLevelValue::Opaque(Box::new(opaque_t._container_example()))
             }
-            LowLevelType::ForwardReference(_) => {
-                panic!("ForwardReference must be resolved before _defl()")
-            }
+            LowLevelType::ForwardReference(fwd) => match fwd.resolved() {
+                // Once a ForwardReference has `become` its real type, its
+                // `_defl()` must mirror the resolved container — upstream
+                // mutates `fwd.__class__` / `fwd.__dict__` at `become` so the
+                // `_defl` lookup dispatches through the real type directly
+                // (lltype.py:624-625). Pyre carries the `ForwardReference`
+                // wrapper, so resolve explicitly here.
+                Some(resolved) => resolved._defl(),
+                None => panic!("ForwardReference must be resolved before _defl()"),
+            },
             LowLevelType::Ptr(ptr) => LowLevelValue::Ptr(Box::new(ptr._defl())),
             LowLevelType::InteriorPtr(ptr) => LowLevelValue::InteriorPtr(Box::new(ptr._example())),
         }
@@ -1521,6 +1626,7 @@ pub fn typeOf_value(value: &LowLevelValue) -> ConcretetypePlaceholder {
         LowLevelValue::LongFloat(_) => LowLevelType::LongFloat,
         LowLevelValue::Char(_) => LowLevelType::Char,
         LowLevelValue::UniChar(_) => LowLevelType::UniChar,
+        LowLevelValue::Address(_) => LowLevelType::Address,
         LowLevelValue::Struct(obj) => LowLevelType::Struct(Box::new(obj.TYPE.clone())),
         LowLevelValue::Array(obj) => match &obj.TYPE {
             ArrayContainer::Array(array_t) => LowLevelType::Array(Box::new(array_t.clone())),
@@ -2264,7 +2370,8 @@ impl LowLevelType {
             | LowLevelType::SingleFloat
             | LowLevelType::LongFloat
             | LowLevelType::Char
-            | LowLevelType::UniChar => true,
+            | LowLevelType::UniChar
+            | LowLevelType::Address => true,
             LowLevelType::Struct(t) => t._is_atomic(),
             _ => false,
         }
@@ -2292,6 +2399,7 @@ impl LowLevelType {
             | LowLevelType::LongFloat
             | LowLevelType::Char
             | LowLevelType::UniChar
+            | LowLevelType::Address
             | LowLevelType::Ptr(_)
             | LowLevelType::InteriorPtr(_) => Ok(()),
             LowLevelType::Struct(t) => t._note_inlined_into(parent, first),
@@ -2415,7 +2523,8 @@ impl Ptr {
                         | LowLevelType::SingleFloat
                         | LowLevelType::LongFloat
                         | LowLevelType::Char
-                        | LowLevelType::UniChar => {
+                        | LowLevelType::UniChar
+                        | LowLevelType::Address => {
                             panic!("ForwardReference target must resolve to a container type")
                         }
                     }
@@ -3361,6 +3470,47 @@ mod tests {
         assert_eq!(LowLevelType::LongFloat.short_name(), "LongFloat");
         assert_eq!(LowLevelType::Char.short_name(), "Char");
         assert_eq!(LowLevelType::UniChar.short_name(), "UniChar");
+        assert_eq!(LowLevelType::Address.short_name(), "Address");
+    }
+
+    #[test]
+    fn lowleveltype_address_is_primitive_atomic_and_equal_to_self() {
+        // rpython/rtyper/lltypesystem/llmemory.py:650 —
+        // `Address = lltype.Primitive("Address", NULL)`. Address must
+        // behave as an atomic primitive (is_primitive / _is_atomic) and
+        // its default value is the NULL sentinel.
+        assert!(LowLevelType::Address.is_primitive());
+        assert!(LowLevelType::Address._is_atomic());
+        assert_eq!(LowLevelType::Address, LowLevelType::Address);
+        assert_ne!(LowLevelType::Address, LowLevelType::Signed);
+    }
+
+    #[test]
+    fn lowleveltype_address_defl_returns_null_sentinel() {
+        // upstream `NULL = fakeaddress(None)`; `Address._defl()` returns
+        // NULL. Pyre models the NULL sentinel as `_address::Null` until
+        // richer fakeaddress bodies land.
+        match LowLevelType::Address._defl() {
+            LowLevelValue::Address(_address::Null) => {}
+            other => panic!("expected NULL address, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn typeof_value_address_round_trips_to_address_lowleveltype() {
+        let v = LowLevelValue::Address(_address::Null);
+        assert_eq!(typeOf_value(&v), LowLevelType::Address);
+    }
+
+    #[test]
+    fn lowleveltype_address_contains_value_rejects_constants_until_fakeaddress_lands() {
+        use crate::flowspace::model::ConstValue;
+        // No ConstValue variant models fakeaddress yet. Until the
+        // llmemory cast helpers land, Address rejects everything
+        // except the universal Placeholder sentinel.
+        assert!(!LowLevelType::Address.contains_value(&ConstValue::Int(0)));
+        assert!(!LowLevelType::Address.contains_value(&ConstValue::None));
+        assert!(LowLevelType::Address.contains_value(&ConstValue::Placeholder));
     }
 
     #[test]
@@ -3475,6 +3625,7 @@ mod tests {
             _TYPE: ptr1._TYPE.clone(),
             _solid: ptr1._solid,
             _obj0: ptr1._obj0.clone(),
+            _weak: ptr1._weak,
         };
         let ptr3 = Ptr {
             TO: PtrTarget::Struct(StructType::gc(
@@ -3676,6 +3827,49 @@ mod tests {
         let forward_ref = ForwardReference::new();
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         forward_ref.hash(&mut hasher);
+    }
+
+    #[test]
+    #[should_panic(expected = "_ptr._become: type mismatch")]
+    fn ptr_become_panics_on_type_mismatch() {
+        // lltype.py:1416 — `assert self._TYPE == other._TYPE` in `_become`.
+        let self_ptr = Ptr {
+            TO: PtrTarget::Struct(StructType::gc(
+                "A",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        }
+        ._example();
+        let other_ptr = Ptr {
+            TO: PtrTarget::Struct(StructType::gc(
+                "B",
+                vec![("y".into(), LowLevelType::Signed)],
+            )),
+        }
+        ._example();
+        self_ptr._become(&other_ptr);
+    }
+
+    #[test]
+    #[should_panic(expected = "_ptr._become: cannot reassign a weak pointer")]
+    fn ptr_become_panics_when_self_is_weak() {
+        // lltype.py:1417 — `assert not self._weak` in `_become`.
+        let mut self_ptr = Ptr {
+            TO: PtrTarget::Struct(StructType::gc(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        }
+        ._example();
+        self_ptr._weak = true;
+        let other_ptr = Ptr {
+            TO: PtrTarget::Struct(StructType::gc(
+                "S",
+                vec![("x".into(), LowLevelType::Signed)],
+            )),
+        }
+        ._example();
+        self_ptr._become(&other_ptr);
     }
 
     #[test]

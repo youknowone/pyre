@@ -31,7 +31,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use super::argument::{ArgErr, ArgumentsForTranslation};
 use super::bookkeeper::{Bookkeeper, PositionKey};
 use super::model::{
-    AnnotatorError, SomeInstance, SomeObjectTrait, SomePBC, SomeValue, s_impossible_value, union,
+    AnnotatorError, SomeInstance, SomeObjectTrait, SomePBC, SomeValue, SomeValueTag,
+    s_impossible_value, union,
 };
 use super::policy::Specializer;
 use super::signature::ParamType;
@@ -123,12 +124,15 @@ fn row_eq(a: &CallTableRow, b: &CallTableRow) -> bool {
 pub(crate) enum GraphCacheKey {
     None,
     Const(ConstValue),
+    LowLevelType(crate::translator::rtyper::lltypesystem::lltype::LowLevelType),
     KnownType(super::model::KnownType),
     Desc { key: DescKey, name: String },
+    KeyComp(crate::translator::rtyper::annlowlevel::KeyComp),
     String(String),
     Int(i64),
     Position(PositionKey),
     AccessDirect,
+    SomeValueTag(SomeValueTag),
     Tuple(Vec<GraphCacheKey>),
 }
 
@@ -927,11 +931,47 @@ impl FunctionDesc {
     }
 
     fn nameof_cache_key(key: &GraphCacheKey) -> String {
+        fn nameof_somevalue_tag(tag: SomeValueTag) -> &'static str {
+            match tag {
+                SomeValueTag::Impossible => "SomeImpossibleValue",
+                SomeValueTag::Object => "SomeObject",
+                SomeValueTag::Type => "SomeType",
+                SomeValueTag::Float => "SomeFloat",
+                SomeValueTag::SingleFloat => "SomeSingleFloat",
+                SomeValueTag::LongFloat => "SomeLongFloat",
+                SomeValueTag::Integer => "SomeInteger",
+                SomeValueTag::Bool => "SomeBool",
+                SomeValueTag::String => "SomeString",
+                SomeValueTag::UnicodeString => "SomeUnicodeString",
+                SomeValueTag::ByteArray => "SomeByteArray",
+                SomeValueTag::Char => "SomeChar",
+                SomeValueTag::UnicodeCodePoint => "SomeUnicodeCodePoint",
+                SomeValueTag::List => "SomeList",
+                SomeValueTag::Tuple => "SomeTuple",
+                SomeValueTag::Dict => "SomeDict",
+                SomeValueTag::Iterator => "SomeIterator",
+                SomeValueTag::Instance => "SomeInstance",
+                SomeValueTag::Exception => "SomeException",
+                SomeValueTag::PBC => "SomePBC",
+                SomeValueTag::None_ => "SomeNone",
+                SomeValueTag::Property => "SomeProperty",
+                SomeValueTag::Ptr => "SomePtr",
+                SomeValueTag::InteriorPtr => "SomeInteriorPtr",
+                SomeValueTag::LLADTMeth => "SomeLLADTMeth",
+                SomeValueTag::Builtin => "SomeBuiltin",
+                SomeValueTag::BuiltinMethod => "SomeBuiltinMethod",
+                SomeValueTag::WeakRef => "SomeWeakRef",
+                SomeValueTag::TypeOf => "SomeTypeOf",
+            }
+        }
+
         match key {
             GraphCacheKey::None => "None".to_string(),
             GraphCacheKey::Const(value) => Self::nameof_const(value),
+            GraphCacheKey::LowLevelType(lltype) => lltype.short_name(),
             GraphCacheKey::KnownType(known_type) => known_type.to_string(),
             GraphCacheKey::Desc { name, .. } => name.clone(),
+            GraphCacheKey::KeyComp(keycomp) => keycomp.to_string(),
             GraphCacheKey::String(value) => value.clone(),
             GraphCacheKey::Int(value) => value.to_string(),
             GraphCacheKey::Position(pk) => {
@@ -941,6 +981,7 @@ impl FunctionDesc {
                 )
             }
             GraphCacheKey::AccessDirect => "AccessDirect".to_string(),
+            GraphCacheKey::SomeValueTag(tag) => nameof_somevalue_tag(*tag).to_string(),
             GraphCacheKey::Tuple(items) => items
                 .iter()
                 .map(Self::nameof_cache_key)
@@ -973,7 +1014,7 @@ impl FunctionDesc {
 
     /// RPython `FunctionDesc.cachedgraph(key, alt_name=None, builder=None)`
     /// (description.py:228-248).
-    fn cachedgraph(
+    pub(crate) fn cachedgraph(
         &self,
         key: GraphCacheKey,
         alt_name: Option<&str>,
@@ -1246,6 +1287,55 @@ impl FunctionDesc {
         self.cachedgraph(combined_key, None, builder)
     }
 
+    pub(crate) fn default_specialize(
+        &self,
+        inputcells: &mut Vec<SomeValue>,
+    ) -> Result<Rc<PyGraph>, AnnotatorError> {
+        // upstream `default_specialize(funcdesc, args_s)`
+        // (specialize.py:60-85).
+        let (flattened_cells, mut key, builder) = self.flatten_star_args(inputcells)?;
+        let mut flattened_cells = flattened_cells;
+        let inputcells: &mut [SomeValue] = if !matches!(key, GraphCacheKey::None) {
+            flattened_cells.as_mut_slice()
+        } else {
+            inputcells.as_mut_slice()
+        };
+
+        let jit_look_inside = self
+            .base
+            .pyobj
+            .as_ref()
+            .and_then(|pyobj| pyobj.user_function())
+            .and_then(|func| func._jit_look_inside_)
+            .unwrap_or(true);
+        let mut access_directly = false;
+        for s_obj in inputcells.iter_mut() {
+            if let SomeValue::Instance(inst) = s_obj {
+                let has_flag = inst.flags.get("access_directly").copied().unwrap_or(false);
+                if has_flag {
+                    if jit_look_inside {
+                        access_directly = true;
+                        key = GraphCacheKey::Tuple(vec![GraphCacheKey::AccessDirect, key.clone()]);
+                        break;
+                    } else {
+                        let mut new_flags = inst.flags.clone();
+                        new_flags.remove("access_directly");
+                        *s_obj = SomeValue::Instance(SomeInstance::new(
+                            inst.classdef.clone(),
+                            inst.can_be_none,
+                            new_flags,
+                        ));
+                    }
+                }
+            }
+        }
+        let graph = self.cachedgraph(key, None, builder)?;
+        if access_directly {
+            graph.access_directly.set(true);
+        }
+        Ok(graph)
+    }
+
     fn specialize_argvalue(
         &self,
         args_s: &[SomeValue],
@@ -1383,66 +1473,13 @@ impl FunctionDesc {
     /// dispatching to the specializer.
     pub fn specialize(
         &self,
-        inputcells: &mut [SomeValue],
+        inputcells: &mut Vec<SomeValue>,
         op_key: Option<PositionKey>,
     ) -> Result<Rc<PyGraph>, AnnotatorError> {
         let op_key = op_key.or_else(|| self.base.bookkeeper.current_position_key());
         self.normalize_args(inputcells)?;
         match self.specializer.as_ref().unwrap_or(&Specializer::Default) {
-            Specializer::Default => {
-                // upstream `default_specialize(funcdesc, args_s)`
-                // (specialize.py:60-85).
-                //
-                // `flatten_star_args` (specialize.py:14-58) runs first
-                // on the raw args_s. For signatures without a *arg it
-                // is the pass-through identity; [`Self::flatten_star_args`]
-                // handles the flattening + key-suffix + graph-mutation
-                // builder for the vararg case.
-                let (flattened_cells, mut key, builder) = self.flatten_star_args(inputcells)?;
-                let mut flattened_cells = flattened_cells;
-                let inputcells: &mut [SomeValue] = if !matches!(key, GraphCacheKey::None) {
-                    flattened_cells.as_mut_slice()
-                } else {
-                    inputcells
-                };
-
-                let jit_look_inside = self
-                    .base
-                    .pyobj
-                    .as_ref()
-                    .and_then(|pyobj| pyobj.user_function())
-                    .and_then(|func| func._jit_look_inside_)
-                    .unwrap_or(true);
-                let mut access_directly = false;
-                for s_obj in inputcells.iter_mut() {
-                    if let SomeValue::Instance(inst) = s_obj {
-                        let has_flag = inst.flags.get("access_directly").copied().unwrap_or(false);
-                        if has_flag {
-                            if jit_look_inside {
-                                access_directly = true;
-                                key = GraphCacheKey::Tuple(vec![
-                                    GraphCacheKey::AccessDirect,
-                                    key.clone(),
-                                ]);
-                                break;
-                            } else {
-                                let mut new_flags = inst.flags.clone();
-                                new_flags.remove("access_directly");
-                                *s_obj = SomeValue::Instance(SomeInstance::new(
-                                    inst.classdef.clone(),
-                                    inst.can_be_none,
-                                    new_flags,
-                                ));
-                            }
-                        }
-                    }
-                }
-                let graph = self.cachedgraph(key, None, builder)?;
-                if access_directly {
-                    graph.access_directly.set(true);
-                }
-                Ok(graph)
-            }
+            Specializer::Default => self.default_specialize(inputcells),
             Specializer::Arg { parms } => self.specialize_argvalue(inputcells, parms),
             Specializer::ArgOrVar { parms } => {
                 for parm in parms {
@@ -1515,9 +1552,109 @@ impl FunctionDesc {
                 "FunctionDesc.specialize: memo specializer still requires \
                  rpython/annotator/specialize.py MemoTable support",
             )),
-            Specializer::Ll { .. } | Specializer::LlAndArg { .. } => Err(AnnotatorError::new(
-                "FunctionDesc.specialize: low-level specializers require annlowlevel.py",
-            )),
+            Specializer::LowLevelDefault => {
+                crate::translator::rtyper::annlowlevel::LowLevelAnnotatorPolicy::new(None)
+                    .default_specialize(self, inputcells)
+                    .map_err(|e| AnnotatorError::new(e.to_string()))
+            }
+            Specializer::MixLevelDefault => {
+                let rtyper = self
+                    .base
+                    .bookkeeper
+                    .annotator()
+                    .translator
+                    .rtyper()
+                    .ok_or_else(|| {
+                        AnnotatorError::new(
+                            "FunctionDesc.specialize: MixLevel specializer requires translator.rtyper",
+                        )
+                    })?;
+                crate::translator::rtyper::annlowlevel::MixLevelAnnotatorPolicy {
+                    ll: crate::translator::rtyper::annlowlevel::LowLevelAnnotatorPolicy::new(Some(
+                        &rtyper,
+                    )),
+                }
+                .default_specialize(self, inputcells)
+                .map_err(|e| AnnotatorError::new(e.to_string()))
+            }
+            Specializer::Ll { .. } => {
+                crate::translator::rtyper::annlowlevel::LowLevelAnnotatorPolicy::new(None)
+                    .specialize_ll(self, inputcells)
+                    .map_err(|e| AnnotatorError::new(e.to_string()))
+            }
+            Specializer::LlAndArg { parms } => {
+                let argindices: Vec<usize> = parms
+                    .iter()
+                    .map(|parm| {
+                        parm.parse().map_err(|_| {
+                            AnnotatorError::new(format!(
+                                "specialize:ll_and_arg expects integer indices, got {parm:?}"
+                            ))
+                        })
+                    })
+                    .collect::<Result<_, _>>()?;
+                crate::translator::rtyper::annlowlevel::LowLevelAnnotatorPolicy::new(None)
+                    .specialize_ll_and_arg(self, inputcells, &argindices)
+                    .map_err(|e| AnnotatorError::new(e.to_string()))
+            }
+            Specializer::ArgLltype { parms } => {
+                let i: usize = parms
+                    .first()
+                    .ok_or_else(|| AnnotatorError::new("specialize:arglltype requires one index"))?
+                    .parse()
+                    .map_err(|_| {
+                        AnnotatorError::new(format!(
+                            "specialize:arglltype expects integer indices, got {parms:?}"
+                        ))
+                    })?;
+                let rtyper = self
+                    .base
+                    .bookkeeper
+                    .annotator()
+                    .translator
+                    .rtyper()
+                    .ok_or_else(|| {
+                        AnnotatorError::new(
+                            "FunctionDesc.specialize: arglltype requires translator.rtyper",
+                        )
+                    })?;
+                crate::translator::rtyper::annlowlevel::MixLevelAnnotatorPolicy {
+                    ll: crate::translator::rtyper::annlowlevel::LowLevelAnnotatorPolicy::new(Some(
+                        &rtyper,
+                    )),
+                }
+                .specialize_arglltype(self, inputcells, i)
+                .map_err(|e| AnnotatorError::new(e.to_string()))
+            }
+            Specializer::GenConst { parms } => {
+                let i: usize = parms
+                    .first()
+                    .ok_or_else(|| AnnotatorError::new("specialize:genconst requires one index"))?
+                    .parse()
+                    .map_err(|_| {
+                        AnnotatorError::new(format!(
+                            "specialize:genconst expects integer indices, got {parms:?}"
+                        ))
+                    })?;
+                let rtyper = self
+                    .base
+                    .bookkeeper
+                    .annotator()
+                    .translator
+                    .rtyper()
+                    .ok_or_else(|| {
+                        AnnotatorError::new(
+                            "FunctionDesc.specialize: genconst requires translator.rtyper",
+                        )
+                    })?;
+                crate::translator::rtyper::annlowlevel::MixLevelAnnotatorPolicy {
+                    ll: crate::translator::rtyper::annlowlevel::LowLevelAnnotatorPolicy::new(Some(
+                        &rtyper,
+                    )),
+                }
+                .specialize_genconst(self, inputcells, i)
+                .map_err(|e| AnnotatorError::new(e.to_string()))
+            }
         }
     }
 
@@ -1892,7 +2029,7 @@ impl MemoDesc {
 /// [`MethodDesc::originclassdef`] / `selfclassdef`. Upstream carries
 /// a live `ClassDef` object; Rust keeps a pointer-identity handle
 /// until `classdesc.py` lands the real registry.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClassDefKey(pub usize);
 
 impl ClassDefKey {

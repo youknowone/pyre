@@ -2031,6 +2031,16 @@ pub struct ClassDef {
     /// — strictly greater than every descendant's `minid`. `None` until
     /// `assign_inheritance_ids` runs.
     pub maxid: Option<i64>,
+    /// RPython `classdef.my_instantiate_graph = graph`
+    /// (normalizecalls.py:294). Set by
+    /// [`crate::translator::rtyper::normalizecalls::create_instantiate_function`]
+    /// for every classdef whose constructor participates in a
+    /// polymorphic `ClassesPBCRepr.call()` — consumed by
+    /// `ClassRepr.fill_vtable_root` (rclass.py:356-358) to emit the
+    /// `vtable.instantiate` slot. Upstream tests this with
+    /// `hasattr(classdef, 'my_instantiate_graph')`; the Rust port uses
+    /// `Option::is_some` instead.
+    pub my_instantiate_graph: Option<crate::flowspace::model::GraphRef>,
 }
 
 impl ClassDef {
@@ -2078,6 +2088,7 @@ impl ClassDef {
             unique_cdef_id: None,
             minid: None,
             maxid: None,
+            my_instantiate_graph: None,
         }));
 
         if let Some(base) = basedef.as_ref() {

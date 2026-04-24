@@ -46,6 +46,13 @@ pub struct TranslationOptions {
     /// (`rpython/rtyper/rclass.py:103`) to gate the
     /// `TaggedInstanceRepr` path for `UnboxedValue` subclasses.
     pub taggedpointers: bool,
+    /// RPython `config.translation.withsmallfuncsets` (upstream
+    /// default `0`, i.e. disabled). Gate read by
+    /// `rpython/rtyper/rpbc.py:27 small_cand` — when the PBC's
+    /// desc-set size is strictly less than `withsmallfuncsets`,
+    /// `SmallFunctionSetPBCRepr` becomes a candidate instead of
+    /// `FunctionsPBCRepr`.
+    pub withsmallfuncsets: usize,
 }
 
 impl Default for TranslationOptions {
@@ -57,6 +64,7 @@ impl Default for TranslationOptions {
             sandbox: false,
             check_str_without_nul: false,
             taggedpointers: false,
+            withsmallfuncsets: 0,
         }
     }
 }

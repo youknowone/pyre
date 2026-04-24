@@ -3475,7 +3475,9 @@ fn init_object_call_args_transform(
 /// Decode the `CallShape` triple encoded in a `call_args` shape
 /// constant (see `flowcontext::build_call_shape_constant` for the
 /// encoder — ConstValue::Tuple([Int(cnt), Tuple([Str(key), …]), Bool(star)])).
-fn decode_call_shape(cv: &ConstValue) -> Option<super::super::flowspace::argument::CallShape> {
+pub(crate) fn decode_call_shape(
+    cv: &ConstValue,
+) -> Option<super::super::flowspace::argument::CallShape> {
     let items = match cv {
         ConstValue::Tuple(items) if items.len() == 3 => items,
         _ => return None,

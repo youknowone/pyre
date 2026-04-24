@@ -21,7 +21,7 @@ use super::super::flowspace::model::{
 };
 use super::bookkeeper::Bookkeeper;
 use super::model::{SomeValue, TLS, UnionError, unionof};
-use super::policy::AnnotatorPolicy;
+use super::policy::{AnnotatorPolicy, PolicyHandle};
 use crate::translator::translator::TranslationContext;
 
 /// RPython `class RPythonAnnotator(object)` (annrpython.py:22).
@@ -93,7 +93,7 @@ pub struct RPythonAnnotator {
     /// RPython `self.frozen = False` (annrpython.py:46).
     pub frozen: RefCell<bool>,
     /// RPython `self.policy` (annrpython.py:47-51).
-    pub policy: RefCell<AnnotatorPolicy>,
+    pub policy: RefCell<PolicyHandle>,
     /// RPython `self.bookkeeper` (annrpython.py:52-54).
     pub bookkeeper: Rc<Bookkeeper>,
     /// RPython `self.keepgoing` (annrpython.py:55).
@@ -271,7 +271,7 @@ pub fn gather_error(
 /// self.using_policy(policy):`.
 pub struct PolicyGuard<'a> {
     ann: &'a RPythonAnnotator,
-    saved: Option<AnnotatorPolicy>,
+    saved: Option<PolicyHandle>,
 }
 
 impl<'a> Drop for PolicyGuard<'a> {
@@ -336,6 +336,7 @@ impl RPythonAnnotator {
     ) -> Rc<Self> {
         let translator_was_provided = translator.is_some();
         let policy = policy.unwrap_or_else(AnnotatorPolicy::new);
+        let annotator_policy = PolicyHandle::from(policy.clone());
         let bookkeeper =
             bookkeeper.unwrap_or_else(|| Rc::new(Bookkeeper::new_with_policy(policy.clone())));
         // upstream annrpython.py:30-34 — default to a fresh
@@ -359,7 +360,7 @@ impl RPythonAnnotator {
                 blocked_blocks: RefCell::new(HashMap::new()),
                 blocked_graphs: RefCell::new(HashMap::new()),
                 frozen: RefCell::new(false),
-                policy: RefCell::new(policy),
+                policy: RefCell::new(annotator_policy),
                 bookkeeper: Rc::clone(&bookkeeper),
                 keepgoing,
                 failed_blocks: RefCell::new(HashMap::new()),
@@ -526,7 +527,7 @@ impl RPythonAnnotator {
 
         // upstream: `from rpython.annotator.policy import AnnotatorPolicy`
         //           `policy = AnnotatorPolicy()`.
-        let policy = AnnotatorPolicy::new();
+        let policy = PolicyHandle::from(AnnotatorPolicy::new());
 
         // upstream: `args_s = [self.typeannotation(t) for t in input_arg_types]`.
         let mut args_s: Vec<SomeValue> = Vec::with_capacity(input_arg_types.len());
@@ -610,13 +611,13 @@ impl RPythonAnnotator {
         self: &Rc<Self>,
         function: &crate::flowspace::model::HostObject,
         args_s: Vec<SomeValue>,
-        policy: Option<AnnotatorPolicy>,
+        policy: Option<PolicyHandle>,
     ) -> Result<Rc<crate::flowspace::pygraph::PyGraph>, super::model::AnnotatorError> {
         // upstream: `if policy is None: ...`.
         let policy = match policy {
             Some(p) => p,
             None => {
-                let p = AnnotatorPolicy::new();
+                let p = PolicyHandle::from(AnnotatorPolicy::new());
                 // upstream: `annmodel.TLS.check_str_without_nul = (
                 //     self.translator.config.translation.check_str_without_nul)`.
                 let check_str_without_nul =
@@ -719,8 +720,11 @@ impl RPythonAnnotator {
     /// A context manager that temporarily swaps `self.policy`. The
     /// Rust port returns a RAII guard that restores the saved policy
     /// on drop, matching the upstream `try ... finally` contract.
-    pub fn using_policy(&self, policy: AnnotatorPolicy) -> PolicyGuard<'_> {
-        let saved = std::mem::replace(&mut *self.policy.borrow_mut(), policy);
+    pub fn using_policy<P>(&self, policy: P) -> PolicyGuard<'_>
+    where
+        P: Into<PolicyHandle>,
+    {
+        let saved = std::mem::replace(&mut *self.policy.borrow_mut(), policy.into());
         PolicyGuard {
             ann: self,
             saved: Some(saved),

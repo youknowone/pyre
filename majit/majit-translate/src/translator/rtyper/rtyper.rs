@@ -114,6 +114,23 @@ impl ExceptionData {
     }
 }
 
+/// RPython `rtyper.pbc_reprs` dict key (`rpbc.py:621-630`). Upstream
+/// uses the Python object `'unrelated'` string sentinel for
+/// `MultipleUnrelatedFrozenPBCRepr` and the `access_set` identity for
+/// `MultipleFrozenPBCRepr`. Pyre collapses both into this enum — the
+/// `Access` variant keys on `FrozenAttrFamily` pointer identity (via
+/// `Rc::as_ptr as usize`).
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PbcReprKey {
+    /// `rtyper.pbc_reprs['unrelated']` (rpbc.py:621).
+    Unrelated,
+    /// `rtyper.pbc_reprs[access_set]` (rpbc.py:627) — keyed by the
+    /// `FrozenAttrFamily` pointer identity. Reserved for
+    /// MultipleFrozenPBCRepr caching when that repr lands; currently
+    /// unused.
+    Access(usize),
+}
+
 pub struct RPythonTyper {
     /// RPython `self.annotator`.
     ///
@@ -174,6 +191,12 @@ pub struct RPythonTyper {
     pub seen_reprs_must_call_setup: RefCell<Vec<*const ()>>,
     /// RPython `self.primitive_to_repr = {}` (`rtyper.py:53`).
     pub primitive_to_repr: RefCell<HashMap<LowLevelType, Arc<dyn Repr>>>,
+    /// RPython `self.pbc_reprs = {}` (`rtyper.py:58`, populated by
+    /// `rpbc.getFrozenPBCRepr` at rpbc.py:621-630). Keyed by
+    /// [`PbcReprKey`] — singleton cache for
+    /// [`crate::translator::rtyper::rpbc::MultipleUnrelatedFrozenPBCRepr`]
+    /// (and future `MultipleFrozenPBCRepr`).
+    pub pbc_reprs: RefCell<HashMap<PbcReprKey, Arc<dyn Repr>>>,
     /// RPython low-level helper graphs are cached by
     /// `FunctionDesc.cachedgraph()` under `annlowlevel.py`'s
     /// `LowLevelAnnotatorPolicy.lowlevelspecialize`. The Rust port has
@@ -219,6 +242,7 @@ impl RPythonTyper {
             reprs_must_call_setup: RefCell::new(Vec::new()),
             seen_reprs_must_call_setup: RefCell::new(Vec::new()),
             primitive_to_repr: RefCell::new(HashMap::new()),
+            pbc_reprs: RefCell::new(HashMap::new()),
             lowlevel_helper_graphs: RefCell::new(HashMap::new()),
         }
     }
@@ -276,6 +300,24 @@ impl RPythonTyper {
         };
         *self.exceptiondata.borrow_mut() = Some(Rc::new(ed));
         Ok(())
+    }
+
+    /// RPython `RPythonTyper.getconfig(self)` (rtyper.py).
+    ///
+    /// ```python
+    /// def getconfig(self):
+    ///     return self.annotator.translator.config
+    /// ```
+    ///
+    /// Returns `None` when the weak-ref to the annotator cannot be
+    /// upgraded (e.g. in unit tests that drop the annotator after
+    /// constructing the rtyper). Call sites that treat a missing
+    /// config as "use defaults" should `.unwrap_or_default()` or
+    /// mirror upstream's option defaults explicitly.
+    pub fn getconfig(&self) -> Option<crate::translator::translator::TranslationConfig> {
+        self.annotator
+            .upgrade()
+            .map(|ann| ann.translator.config.clone())
     }
 
     /// Upgrade the stored self-weak (populated by

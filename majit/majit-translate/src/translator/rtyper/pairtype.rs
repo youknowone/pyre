@@ -90,6 +90,20 @@ pub enum ReprClassId {
     InteriorPtrRepr,
     /// `rptr.py:195 LLADTMethRepr`.
     LLADTMethRepr,
+    /// `rpbc.py:315 FunctionRepr`.
+    FunctionRepr,
+    /// `rpbc.py:224 FunctionsPBCRepr`.
+    FunctionsPBCRepr,
+    /// `rbuiltin.py:67 BuiltinFunctionRepr`.
+    BuiltinFunctionRepr,
+    /// `rbuiltin.py:113 BuiltinMethodRepr`.
+    BuiltinMethodRepr,
+    /// `rpbc.py:635 SingleFrozenPBCRepr`.
+    SingleFrozenPBCRepr,
+    /// `rpbc.py:675 MultipleUnrelatedFrozenPBCRepr`.
+    MultipleUnrelatedFrozenPBCRepr,
+    /// `rpbc.py:920 ClassesPBCRepr`.
+    ClassesPBCRepr,
 }
 
 impl ReprClassId {
@@ -120,6 +134,13 @@ impl ReprClassId {
             PtrRepr => &[PtrRepr, Repr],
             InteriorPtrRepr => &[InteriorPtrRepr, Repr],
             LLADTMethRepr => &[LLADTMethRepr, Repr],
+            FunctionRepr => &[FunctionRepr, Repr],
+            FunctionsPBCRepr => &[FunctionsPBCRepr, Repr],
+            BuiltinFunctionRepr => &[BuiltinFunctionRepr, Repr],
+            BuiltinMethodRepr => &[BuiltinMethodRepr, Repr],
+            SingleFrozenPBCRepr => &[SingleFrozenPBCRepr, Repr],
+            MultipleUnrelatedFrozenPBCRepr => &[MultipleUnrelatedFrozenPBCRepr, Repr],
+            ClassesPBCRepr => &[ClassesPBCRepr, Repr],
         }
     }
 }
@@ -218,6 +239,33 @@ fn dispatch_convert_from_to(
         (FloatRepr, IntegerRepr) => {
             super::rint::pair_float_integer_convert_from_to(r_from, r_to, v, llops)
         }
+        // rbuiltin.py:144-151 — pairtype(BuiltinMethodRepr,
+        // BuiltinMethodRepr).convert_from_to: only converts between
+        // same-methodname reprs, delegating the receiver lowering via
+        // llops.convertvar(v, r_from.self_repr, r_to.self_repr).
+        (BuiltinMethodRepr, BuiltinMethodRepr) => {
+            super::rbuiltin::pair_builtin_method_convert_from_to(r_from, r_to, v, llops)
+        }
+        // rpbc.py:373-375 — pairtype(FunctionRepr,
+        // FunctionRepr).convert_from_to: upstream `return v`. Both
+        // ends are Void-typed so the Variable can be passed through
+        // unmodified — no need to emit any operation.
+        (FunctionRepr, FunctionRepr) => Ok(Some(v.clone())),
+        // rpbc.py:381-383 — pairtype(FunctionsPBCRepr,
+        // FunctionRepr).convert_from_to: upstream
+        // `return inputconst(Void, None)`. FunctionRepr is Void-typed,
+        // so the conversion collapses to a Void None constant
+        // regardless of the FunctionsPBCRepr source variable.
+        (FunctionsPBCRepr, FunctionRepr) => Ok(Some(Hlvalue::Constant(inputconst_from_lltype(
+            &LowLevelType::Void,
+            &ConstValue::None,
+        )?))),
+        // rpbc.py:385-390 — pairtype(FunctionsPBCRepr,
+        // FunctionsPBCRepr).convert_from_to: upstream identity if
+        // `r_fpbc1.lowleveltype == r_fpbc2.lowleveltype`, else
+        // `NotImplemented`. The rtyper distinguishes different spec-func
+        // Struct pointer types even within the same Repr subclass.
+        (FunctionsPBCRepr, FunctionsPBCRepr) => same_lowleveltype_convert_from_to(r_from, r_to, v),
         // rmodel.py:361-363 — `pairtype(Repr, VoidRepr).convert_from_to`
         // returns `inputconst(Void, None)`.
         (Repr, VoidRepr) => Ok(Some(Hlvalue::Constant(inputconst_from_lltype(
@@ -552,6 +600,15 @@ fn dispatch_rtype_is_(
         // rnone.py:61-64 — `pairtype(NoneRepr, Repr).rtype_is_` calls
         // `rtype_is_None(robj2, rnone1, hop, pos=1)`.
         (NoneRepr, Repr) => super::rnone::pair_none_any_rtype_is_(r1, r2, hop),
+        // rpbc.py:713-725 — `pairtype(MultipleUnrelatedFrozenPBCRepr,
+        // MultipleUnrelatedFrozenPBCRepr).rtype_is_` emits adr_eq.
+        // The (MU, Single) / (Single, MU) arms in the same upstream
+        // block depend on a Single->MU convert_from_to that has not
+        // landed yet; those shapes still fall through to the generic
+        // (Repr, Repr) dispatcher below.
+        (MultipleUnrelatedFrozenPBCRepr, MultipleUnrelatedFrozenPBCRepr) => {
+            super::rpbc::pair_mu_mu_rtype_is_(r1, r2, hop).map(Some)
+        }
         // rmodel.py:300-318 — generic identity comparison for pointer
         // low-level values, with Void adopting the opposite repr.
         (Repr, Repr) => pair_repr_repr_rtype_is_(r1, r2, hop).map(Some),
@@ -1144,5 +1201,223 @@ mod tests {
         assert_eq!(ops.ops.len(), 2);
         assert_eq!(ops.ops[0].opname, "cast_int_to_float");
         assert_eq!(ops.ops[1].opname, "float_add");
+    }
+
+    #[test]
+    fn pair_function_function_convert_from_to_is_identity_and_emits_no_ops() {
+        // rpbc.py:373-375 — pairtype(FunctionRepr,
+        // FunctionRepr).convert_from_to is upstream `return v`. Both
+        // reprs are Void-typed; the conversion should be a pass-through.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::annotator::model::SomePBC;
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rpbc::FunctionRepr;
+        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        fn f_entry(bk: &Rc<Bookkeeper>, name: &str) -> DescEntry {
+            DescEntry::Function(Rc::new(StdRefCell::new(FunctionDesc::new(
+                bk.clone(),
+                None,
+                name,
+                Signature::new(vec![], None, None),
+                None,
+                None,
+            ))))
+        }
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+
+        let r_from: Arc<dyn Repr> = Arc::new(
+            FunctionRepr::new(
+                &rtyper,
+                SomePBC::new(vec![f_entry(&ann.bookkeeper, "f")], false),
+            )
+            .unwrap(),
+        );
+        let r_to: Arc<dyn Repr> = Arc::new(
+            FunctionRepr::new(
+                &rtyper,
+                SomePBC::new(vec![f_entry(&ann.bookkeeper, "g")], false),
+            )
+            .unwrap(),
+        );
+
+        let input_var = Variable::new();
+        input_var.set_concretetype(Some(
+            crate::translator::rtyper::lltypesystem::lltype::LowLevelType::Void,
+        ));
+        let v_in = Hlvalue::Variable(input_var);
+
+        let converted =
+            pair_convert_from_to(r_from.as_ref(), r_to.as_ref(), &v_in, &mut llops).unwrap();
+        assert_eq!(converted, Some(v_in));
+        assert!(
+            llops.ops.is_empty(),
+            "identity conversion should not emit ops"
+        );
+    }
+
+    #[test]
+    fn pair_functions_pbc_to_function_returns_void_none_constant() {
+        // rpbc.py:381-383 — FunctionsPBCRepr → FunctionRepr is
+        // `inputconst(Void, None)`, irrespective of the source variable.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::description::{DescEntry, FunctionDesc, GraphCacheKey};
+        use crate::annotator::model::{SomeInteger, SomePBC, SomeValue};
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::{ConstValue, Variable};
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        use crate::translator::rtyper::rpbc::{FunctionRepr, FunctionsPBCRepr};
+        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        fn f_entry(bk: &Rc<Bookkeeper>, name: &str) -> DescEntry {
+            DescEntry::Function(Rc::new(StdRefCell::new(FunctionDesc::new(
+                bk.clone(),
+                None,
+                name,
+                Signature::new(vec!["x".to_string()], None, None),
+                None,
+                None,
+            ))))
+        }
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+
+        let fd_f = match f_entry(&ann.bookkeeper, "f") {
+            DescEntry::Function(rc) => rc,
+            _ => unreachable!(),
+        };
+        let fd_g = match f_entry(&ann.bookkeeper, "g") {
+            DescEntry::Function(rc) => rc,
+            _ => unreachable!(),
+        };
+        for (desc, name) in [(&fd_f, "f_graph"), (&fd_g, "g_graph")] {
+            desc.borrow().cache.borrow_mut().insert(
+                GraphCacheKey::None,
+                crate::translator::rtyper::rpbc::tests::make_pygraph(name),
+            );
+        }
+        let args = crate::annotator::argument::ArgumentsForTranslation::new(
+            vec![SomeValue::Integer(SomeInteger::default())],
+            None,
+            None,
+        );
+        FunctionDesc::consider_call_site(
+            &[fd_f.clone(), fd_g.clone()],
+            &args,
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap();
+
+        let s_from = SomePBC::new(
+            vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g.clone())],
+            false,
+        );
+        let r_from: Arc<dyn Repr> = Arc::new(FunctionsPBCRepr::new(&rtyper, s_from).unwrap());
+        let r_to: Arc<dyn Repr> = Arc::new(
+            FunctionRepr::new(
+                &rtyper,
+                SomePBC::new(vec![DescEntry::Function(fd_g)], false),
+            )
+            .unwrap(),
+        );
+
+        let input_var = Variable::new();
+        input_var.set_concretetype(Some(LowLevelType::Void));
+        let v_in = Hlvalue::Variable(input_var);
+        let converted =
+            pair_convert_from_to(r_from.as_ref(), r_to.as_ref(), &v_in, &mut llops).unwrap();
+        match converted {
+            Some(Hlvalue::Constant(c)) => {
+                assert!(matches!(c.value, ConstValue::None));
+                assert_eq!(c.concretetype, Some(LowLevelType::Void));
+            }
+            other => panic!("expected Void None constant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pair_functions_pbc_identity_passes_through_when_lowleveltypes_match() {
+        // rpbc.py:385-390 — two FunctionsPBCRepr reprs with matching
+        // lowleveltype collapse to `return v`. Re-using the same
+        // FunctionsPBCRepr on both ends is the simplest way to trigger
+        // the identity arm.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::description::{DescEntry, FunctionDesc, GraphCacheKey};
+        use crate::annotator::model::{SomeInteger, SomePBC, SomeValue};
+        use crate::flowspace::argument::Signature;
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rpbc::FunctionsPBCRepr;
+        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
+        use std::cell::RefCell as StdRefCell;
+        use std::rc::Rc;
+
+        fn f_entry(bk: &Rc<Bookkeeper>, name: &str) -> DescEntry {
+            DescEntry::Function(Rc::new(StdRefCell::new(FunctionDesc::new(
+                bk.clone(),
+                None,
+                name,
+                Signature::new(vec!["x".to_string()], None, None),
+                None,
+                None,
+            ))))
+        }
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+
+        let fd_f = match f_entry(&ann.bookkeeper, "f") {
+            DescEntry::Function(rc) => rc,
+            _ => unreachable!(),
+        };
+        let fd_g = match f_entry(&ann.bookkeeper, "g") {
+            DescEntry::Function(rc) => rc,
+            _ => unreachable!(),
+        };
+        for (desc, name) in [(&fd_f, "f_graph"), (&fd_g, "g_graph")] {
+            desc.borrow().cache.borrow_mut().insert(
+                GraphCacheKey::None,
+                crate::translator::rtyper::rpbc::tests::make_pygraph(name),
+            );
+        }
+        let args = crate::annotator::argument::ArgumentsForTranslation::new(
+            vec![SomeValue::Integer(SomeInteger::default())],
+            None,
+            None,
+        );
+        FunctionDesc::consider_call_site(
+            &[fd_f.clone(), fd_g.clone()],
+            &args,
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap();
+
+        let s_pbc = SomePBC::new(
+            vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g)],
+            false,
+        );
+        let r: Arc<dyn Repr> = Arc::new(FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap());
+
+        let input_var = Variable::new();
+        input_var.set_concretetype(Some(r.lowleveltype().clone()));
+        let v_in = Hlvalue::Variable(input_var);
+        let converted = pair_convert_from_to(r.as_ref(), r.as_ref(), &v_in, &mut llops).unwrap();
+        assert_eq!(converted, Some(v_in));
+        assert!(llops.ops.is_empty());
     }
 }

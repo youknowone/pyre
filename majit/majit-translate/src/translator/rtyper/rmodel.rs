@@ -28,9 +28,13 @@
 //!   must invoke [`Repr::setup`] explicitly before reading derived
 //!   fields; this matches upstream's own `setup()` call sequencing in
 //!   `rtyper.py:call_all_setups` (`:241`).
-//! * `CanBeNull` / `IteratorRepr` / `VoidRepr.get_ll_*` secondary
-//!   methods — land alongside `rtyper.py:bindingrepr` / `getrepr`
-//!   dispatch in Commit 3.2.
+//! * `CanBeNull.rtype_bool` ports as the free helper
+//!   [`can_be_null_rtype_bool`] — Rust has no mixin, so each
+//!   `Repr` that upstream derives from `CanBeNull` overrides
+//!   [`Repr::rtype_bool`] and dispatches to that helper.
+//! * `IteratorRepr` / `VoidRepr.get_ll_*` secondary methods — land
+//!   alongside `rtyper.py:bindingrepr` / `getrepr` dispatch in
+//!   Commit 3.2.
 //! * `pairtype(Repr, Repr)` default conversions (`rmodel.py:298-348`) —
 //!   upstream's double-dispatch mechanism lands with the conversion
 //!   table port.
@@ -60,6 +64,20 @@ use std::sync::{Arc, OnceLock};
 
 use crate::annotator::model::{KnownType, SomeValue};
 use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+
+/// RPython `description.Desc | flowspace.model.Constant` union used
+/// by [`Repr::convert_desc_or_const`] (rmodel.py:111-118). The
+/// concrete Python union is open — upstream accepts any `Desc`
+/// subclass or a `Constant` value; the Rust port encodes that via
+/// [`DescEntry`] (pointer-id wrapped `Desc`-subclass) and a borrowed
+/// [`Constant`].
+#[derive(Clone, Debug)]
+pub enum DescOrConst {
+    /// upstream `description.Desc`-subclass branch.
+    Desc(crate::annotator::description::DescEntry),
+    /// upstream `flowspace.model.Constant` branch.
+    Const(Constant),
+}
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::llannotation::lltype_to_annotation;
 use crate::translator::rtyper::lltypesystem::lltype::{self, LowLevelType};
@@ -298,7 +316,14 @@ impl Default for ReprState {
 /// Repr>>` (future 3.2 commit) can store heterogeneous Repr instances.
 /// Most default methods match upstream's `Repr` base methods verbatim;
 /// only the required fields (`lowleveltype`, state) are abstract.
-pub trait Repr: Debug {
+///
+/// The `std::any::Any` supertrait enables `&dyn Repr` → `&dyn Any`
+/// upcasting for the rare pairtype paths that need concrete-type
+/// introspection (e.g. `pairtype(BuiltinMethodRepr, BuiltinMethodRepr)
+/// .convert_from_to` reads both sides' `methodname` + `self_repr`).
+/// All concrete `Repr` impls are `'static` today so the bound is
+/// satisfied implicitly.
+pub trait Repr: Debug + std::any::Any {
     /// RPython `Repr.lowleveltype` (`rmodel.py:26` + each subclass).
     fn lowleveltype(&self) -> &LowLevelType;
 
@@ -503,6 +528,27 @@ pub trait Repr: Debug {
         matches!(state.get(), Setupstate::Delayed)
     }
 
+    /// RPython `Repr.get_r_implfunc(self)` (`rmodel.py:241-242`).
+    ///
+    /// ```python
+    /// def get_r_implfunc(self):
+    ///     raise TyperError("%s has no corresponding implementation function representation" % (self,))
+    /// ```
+    ///
+    /// Returns the `(r_func, nimplicitarg)` pair used by
+    /// `rbuiltin.rtype_hlinvoke` (`rbuiltin.py:312`) to walk from an
+    /// opaque callable repr to the underlying `FunctionReprBase` that
+    /// exposes `get_s_signatures`. The base trait raises; concrete
+    /// reprs (FunctionRepr / FunctionsPBCRepr / MethodOfFrozenPBCRepr /
+    /// MethodsPBCRepr) override to return themselves or a `getrepr`-
+    /// resolved sibling alongside the implicit-arg count.
+    fn get_r_implfunc(&self) -> Result<(&dyn Repr, usize), TyperError> {
+        Err(TyperError::message(format!(
+            "{} has no corresponding implementation function representation",
+            self.repr_string()
+        )))
+    }
+
     /// RPython `Repr.convert_const(self, value)` (`rmodel.py:120-125`).
     ///
     /// ```python
@@ -536,6 +582,49 @@ pub trait Repr: Debug {
     /// RPython `Repr.special_uninitialized_value(self)` (`rmodel.py:127-128`).
     fn special_uninitialized_value(&self) -> Option<ConstValue> {
         None
+    }
+
+    /// RPython `Repr.convert_desc(self, desc)` — not defined on the base
+    /// class upstream (Python raises `AttributeError` implicitly when
+    /// hit). Only PBC / class reprs override it (`rpbc.py:255`, `:320`,
+    /// `:428`, `:647`, `:685`, `:769`, `:878`, `:950` and
+    /// `rclass.py:212`).
+    ///
+    /// The Rust port surfaces the same "not supported" outcome as a
+    /// structured [`TyperError::missing_rtype_operation`] so callers get
+    /// a typed error rather than a panic.
+    fn convert_desc(
+        &self,
+        _desc: &crate::annotator::description::DescEntry,
+    ) -> Result<Constant, TyperError> {
+        Err(TyperError::missing_rtype_operation(format!(
+            "convert_desc(self = {})",
+            self.repr_string()
+        )))
+    }
+
+    /// RPython `Repr.convert_desc_or_const(self, desc_or_const)`
+    /// (`rmodel.py:111-118`).
+    ///
+    /// ```python
+    /// def convert_desc_or_const(self, desc_or_const):
+    ///     if isinstance(desc_or_const, description.Desc):
+    ///         return self.convert_desc(desc_or_const)
+    ///     elif isinstance(desc_or_const, Constant):
+    ///         return self.convert_const(desc_or_const.value)
+    ///     else:
+    ///         raise TyperError("convert_desc_or_const expects a Desc"
+    ///                          "or Constant: %r" % desc_or_const)
+    /// ```
+    ///
+    /// The Rust port takes a [`DescOrConst`] union so the call site
+    /// names its choice explicitly; the two arms dispatch through the
+    /// Repr trait's own `convert_desc` / `convert_const` overrides.
+    fn convert_desc_or_const(&self, value: &DescOrConst) -> Result<Constant, TyperError> {
+        match value {
+            DescOrConst::Desc(desc) => self.convert_desc(desc),
+            DescOrConst::Const(c) => self.convert_const(&c.value),
+        }
     }
 
     /// RPython `Repr.can_ll_be_null(self, s_value)` (`rmodel.py:150-155`).
@@ -777,6 +866,29 @@ pub trait Repr: Debug {
         Err(self.missing_rtype_operation("chr"))
     }
 
+    /// RPython `Repr.rtype_unicode(self, hop)` — default routes to the
+    /// `MissingRTypeOperation` path. Concrete reprs (e.g. `StringRepr`,
+    /// `UnicodeRepr`) override. Used by `@typer_for(unicode)` in
+    /// rbuiltin.py:201-203.
+    fn rtype_unicode(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("unicode"))
+    }
+
+    /// RPython `Repr.rtype_bytearray(self, hop)` — default routes to
+    /// the `MissingRTypeOperation` path. Used by `@typer_for(bytearray)`
+    /// in rbuiltin.py:205-207.
+    fn rtype_bytearray(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("bytearray"))
+    }
+
+    /// RPython `Repr.rtype_bltn_list(self, hop)` — default routes to
+    /// the `MissingRTypeOperation` path. The `_bltn` infix
+    /// distinguishes the `list(x)` builtin from `x.list()`. Used by
+    /// `@typer_for(list)` in rbuiltin.py:209-211.
+    fn rtype_bltn_list(&self, _hop: &HighLevelOp) -> RTypeResult {
+        Err(self.missing_rtype_operation("bltn_list"))
+    }
+
     /// RPython `Repr.rtype_unichr(self, hop)` (`rmodel.py:177-178`).
     fn rtype_unichr(&self, _hop: &HighLevelOp) -> RTypeResult {
         Err(TyperError::message(format!(
@@ -789,6 +901,22 @@ pub trait Repr: Debug {
     /// Always true — Repr instances are immutable once created.
     fn freeze(&self) -> bool {
         true
+    }
+
+    /// Dispatch table for `rtype_method_<method_name>`.
+    ///
+    /// Upstream's `BuiltinMethodRepr.rtype_simple_call` (rbuiltin.py:
+    /// 125-132) performs a Python-level `getattr(self.self_repr,
+    /// 'rtype_method_' + methodname)`. The Rust port materialises the
+    /// same lookup as a trait method that every concrete `Repr`
+    /// overrides to route each supported `methodname`. The default
+    /// surface here raises the same `TyperError` upstream's
+    /// `AttributeError` branch does.
+    fn rtype_method(&self, method_name: &str, _hop: &HighLevelOp) -> RTypeResult {
+        Err(TyperError::message(format!(
+            "missing {}.rtype_method_{method_name}",
+            self.class_name()
+        )))
     }
 }
 
@@ -865,6 +993,58 @@ pub fn mangle(prefix: &str, name: &str) -> String {
     } else {
         format!("{prefix}_{name}")
     }
+}
+
+/// RPython `class CanBeNull(object).rtype_bool(self, hop)`
+/// (`rmodel.py:251-260`).
+///
+/// ```python
+/// class CanBeNull(object):
+///     """A mix-in base class for subclasses of Repr that represent None as
+///     'null' and true values as non-'null'.
+///     """
+///     def rtype_bool(self, hop):
+///         if hop.s_result.is_constant():
+///             return hop.inputconst(Bool, hop.s_result.const)
+///         else:
+///             vlist = hop.inputargs(self)
+///             return hop.genop('ptr_nonzero', vlist, resulttype=Bool)
+/// ```
+///
+/// Python surfaces `CanBeNull` as a mixin class; every `Repr` subclass
+/// that inherits from it gets this single method. Rust has no mixins so
+/// the body lands as a free helper; each CanBeNull-inheriting `Repr`
+/// overrides [`Repr::rtype_bool`] and dispatches here with `self` as
+/// the receiver. The constant fast-path is what distinguishes this
+/// from the plain `PtrRepr.rtype_bool` (`rmodel.py:1231`) — CanBeNull
+/// reprs may live in the Void space (e.g. `FunctionRepr`) where a
+/// constant pyobj forces `is_constant()` true.
+pub fn can_be_null_rtype_bool(
+    r: &dyn Repr,
+    hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+) -> RTypeResult {
+    // upstream: `if hop.s_result.is_constant(): return
+    //     hop.inputconst(Bool, hop.s_result.const)`.
+    let s_const = hop
+        .s_result
+        .borrow()
+        .as_ref()
+        .and_then(|s| s.const_())
+        .cloned();
+    if let Some(value) = s_const {
+        let c = inputconst_from_lltype(&LowLevelType::Bool, &value)?;
+        return Ok(Some(crate::flowspace::model::Hlvalue::Constant(c)));
+    }
+    // upstream: `vlist = hop.inputargs(self); return
+    //     hop.genop('ptr_nonzero', vlist, resulttype=Bool)`.
+    let vlist = hop.inputargs(vec![crate::translator::rtyper::rtyper::ConvertedTo::Repr(
+        r,
+    )])?;
+    Ok(hop.genop(
+        "ptr_nonzero",
+        vlist,
+        crate::translator::rtyper::rtyper::GenopResult::LLType(LowLevelType::Bool),
+    ))
 }
 
 // ____________________________________________________________
@@ -1687,6 +1867,38 @@ impl Repr for LLADTMethRepr {
 // `rtyper_makekey` / `rtyper_makerepr` per-SomeXxx dispatch
 // (rmodel.py:276-293 + each r*.py `__extend__(SomeXxx)` block).
 
+/// Discriminator inside [`ReprKey::Builtin`] — mirrors upstream
+/// `SomeBuiltin.rtyper_makekey`'s `const` slot (rbuiltin.py:29-33).
+///
+/// Upstream swaps `const` for the registered `ExtRegistryEntry`
+/// singleton when `extregistry.is_registered(const)`; pyre keys on a
+/// stable tag per `ExtRegistryEntry` variant to get the same
+/// "identical-entry collapses to one cache bucket" semantics. Hosts
+/// fall back to `HostObject` pointer identity.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum BuiltinConstKey {
+    /// The const is registered in the extregistry. The tag names the
+    /// `ExtRegistryEntry` variant so two builtin consts routed to the
+    /// same entry type share a single cache entry (matching upstream's
+    /// identity comparison against the singleton entry instance).
+    ExtRegistry(ExtRegistryEntryTag),
+    /// Non-registered const. Pyre stores the [`HostObject`] pointer
+    /// identity, which is the closest analogue to upstream's
+    /// `(self.__class__, const)` tuple where `const` is a Python
+    /// callable or attribute.
+    Host(usize),
+}
+
+/// Which [`crate::translator::rtyper::extregistry::ExtRegistryEntry`]
+/// variant a builtin const was mapped to by `extregistry.lookup`. Kept
+/// as a separate enum so adding new extregistry variants does not
+/// require rewiring every cache-key consumer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum ExtRegistryEntryTag {
+    /// Upstream `lltype.py:1513-1518 _ptrEntry`.
+    Ptr,
+}
+
 /// RPython `S.rtyper_makekey()` upstream tuple hashed by
 /// `RPythonTyper.reprs` (rtyper.py:54+149).
 ///
@@ -1735,6 +1947,129 @@ pub enum ReprKey {
     /// RPython `SomeType.rtyper_makekey = (self.__class__,)`
     /// (rclass.py:463-464).
     Type,
+    /// RPython `SomeIterator.rtyper_makekey` (rmodel.py:284-285).
+    ///
+    /// ```python
+    /// def rtyper_makekey(self):
+    ///     return self.__class__, self.s_container.rtyper_makekey(), self.variant
+    /// ```
+    ///
+    /// Recursively keys on the container's `rtyper_makekey` + the
+    /// variant tuple (e.g. `("items",)`, `("keys",)`, `("enumerate",)`).
+    Iterator {
+        container: Box<ReprKey>,
+        variant: Vec<String>,
+    },
+    /// RPython `SomeWeakRef.rtyper_makekey = (self.__class__,)`
+    /// (rweakref.py:19-20).
+    WeakRef,
+    /// RPython `SomeTuple.rtyper_makekey` (rtuple.py:22-24).
+    ///
+    /// ```python
+    /// def rtyper_makekey(self):
+    ///     keys = [s_item.rtyper_makekey() for s_item in self.items]
+    ///     return tuple([self.__class__] + keys)
+    /// ```
+    ///
+    /// Recursively keys every item — two `SomeTuple`s with identical
+    /// element-shape collapse to the same cache entry.
+    Tuple(Vec<ReprKey>),
+    /// RPython `SomeList.rtyper_makekey` (rlist.py:59-61).
+    ///
+    /// ```python
+    /// def rtyper_makekey(self):
+    ///     self.listdef.listitem.dont_change_any_more = True
+    ///     return self.__class__, self.listdef.listitem
+    /// ```
+    ///
+    /// `listitem_id` is the `Rc::as_ptr` identity of the list's
+    /// `ListItem` — upstream `id(self.listdef.listitem)` with the
+    /// `dont_change_any_more` side-effect deferred (pyre's `ListItem`
+    /// has the flag but pyre's bookkeeper has not wired the freeze
+    /// yet).
+    List(usize),
+    /// RPython `SomeDict.rtyper_makekey` (rdict.py:28-31).
+    ///
+    /// ```python
+    /// def rtyper_makekey(self):
+    ///     self.dictdef.dictkey  .dont_change_any_more = True
+    ///     self.dictdef.dictvalue.dont_change_any_more = True
+    ///     return (self.__class__, self.dictdef.dictkey, self.dictdef.dictvalue)
+    /// ```
+    Dict {
+        dictkey_id: usize,
+        dictvalue_id: usize,
+    },
+    /// RPython `SomeString.rtyper_makekey = (self.__class__,)`
+    /// (rstr.py:573-574).
+    String,
+    /// RPython `SomeUnicodeString.rtyper_makekey = (self.__class__,)`
+    /// (rstr.py:581-582).
+    UnicodeString,
+    /// RPython `SomeChar.rtyper_makekey = (self.__class__,)`
+    /// (rstr.py:589-590).
+    Char,
+    /// RPython `SomeUnicodeCodePoint.rtyper_makekey = (self.__class__,)`
+    /// (rstr.py:597-598).
+    UnicodeCodePoint,
+    /// RPython `SomeByteArray.rtyper_makekey = (self.__class__,)`
+    /// (rbytearray.py — mirrored for parity even though the repr
+    /// itself is pending).
+    ByteArray,
+    /// RPython `SomeBuiltin.rtyper_makekey` (rbuiltin.py:29-33).
+    ///
+    /// ```python
+    /// def rtyper_makekey(self):
+    ///     const = getattr(self, 'const', None)
+    ///     if extregistry.is_registered(const):
+    ///         const = extregistry.lookup(const)
+    ///     return self.__class__, const
+    /// ```
+    ///
+    /// The extregistry remap routes all consts that resolve to the
+    /// same [`crate::translator::rtyper::extregistry::ExtRegistryEntry`]
+    /// variant into one cache bucket — matching upstream's identity
+    /// comparison against the (singleton) entry object. Non-registered
+    /// consts key on the [`HostObject`] pointer identity; `None`
+    /// covers the non-constant fallback.
+    Builtin(Option<BuiltinConstKey>),
+    /// RPython `SomeBuiltinMethod.rtyper_makekey` (rbuiltin.py:41-50).
+    ///
+    /// ```python
+    /// def rtyper_makekey(self):
+    ///     return (self.__class__, self.methodname, id(self.s_self))
+    /// ```
+    ///
+    /// `s_self_id` is the pointer identity of the receiver annotation
+    /// so two `SomeBuiltinMethod`s with distinct receivers stay in
+    /// separate cache entries, matching upstream's `id(self.s_self)`.
+    BuiltinMethod {
+        methodname: String,
+        s_self_id: usize,
+    },
+    /// RPython `SomePBC.rtyper_makekey` (rpbc.py:64-71).
+    ///
+    /// ```python
+    /// def rtyper_makekey(self):
+    ///     lst = list(self.descriptions)
+    ///     lst.sort()
+    ///     if self.subset_of:
+    ///         t = self.subset_of.rtyper_makekey()
+    ///     else:
+    ///         t = ()
+    ///     return tuple([self.__class__, self.can_be_None] + lst) + t
+    /// ```
+    ///
+    /// `descriptions` is sorted ascending by [`DescKey`] (pointer
+    /// identity) to mirror upstream's `lst.sort()`; this means two
+    /// `SomePBC`s with identical desc sets + can_be_None + subset_of
+    /// collide on the same cache entry regardless of insertion order
+    /// — the upstream set-equality contract.
+    PBC {
+        descriptions: Vec<crate::annotator::description::DescKey>,
+        can_be_none: bool,
+        subset_of: Option<Box<ReprKey>>,
+    },
     /// Pending variant — carries a textual discriminator from
     /// `rtyper_makekey` arm that hasn't been ported yet.
     Pending(String),
@@ -1781,6 +2116,102 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
         }
         // rclass.py:463-464: SomeType.rtyper_makekey = (self.__class__,).
         SomeValue::Type(_) => ReprKey::Type,
+        // rmodel.py:284-285 — SomeIterator.rtyper_makekey recursively
+        // keys on container + variant tuple.
+        SomeValue::Iterator(s) => ReprKey::Iterator {
+            container: Box::new(rtyper_makekey(&s.s_container)),
+            variant: s.variant.clone(),
+        },
+        // rweakref.py:19-20 — SomeWeakRef.rtyper_makekey class tag only.
+        SomeValue::WeakRef(_) => ReprKey::WeakRef,
+        // rtuple.py:22-24 — SomeTuple.rtyper_makekey recursively keys
+        // every item.
+        SomeValue::Tuple(s) => ReprKey::Tuple(s.items.iter().map(rtyper_makekey).collect()),
+        // rlist.py:59-61 — SomeList.rtyper_makekey sets
+        // `listitem.dont_change_any_more = True` then keys on listitem
+        // pointer identity.
+        SomeValue::List(s) => {
+            let listitem_ref = s.listdef.inner.listitem.borrow();
+            listitem_ref.borrow_mut().dont_change_any_more = true;
+            ReprKey::List(std::rc::Rc::as_ptr(&*listitem_ref) as usize)
+        }
+        // rdict.py:28-31 — SomeDict.rtyper_makekey sets
+        // `dictkey.dont_change_any_more = True` and
+        // `dictvalue.dont_change_any_more = True`, then keys on the
+        // (dictkey, dictvalue) pointer identity pair.
+        SomeValue::Dict(s) => {
+            let key_ref = s.dictdef.inner.dictkey.borrow();
+            let value_ref = s.dictdef.inner.dictvalue.borrow();
+            key_ref.borrow_mut().dont_change_any_more = true;
+            value_ref.borrow_mut().dont_change_any_more = true;
+            ReprKey::Dict {
+                dictkey_id: std::rc::Rc::as_ptr(&*key_ref) as usize,
+                dictvalue_id: std::rc::Rc::as_ptr(&*value_ref) as usize,
+            }
+        }
+        // rstr.py:573-598 — SomeString / SomeUnicodeString / SomeChar
+        // / SomeUnicodeCodePoint each key on their class tag alone.
+        SomeValue::String(_) => ReprKey::String,
+        SomeValue::UnicodeString(_) => ReprKey::UnicodeString,
+        SomeValue::Char(_) => ReprKey::Char,
+        SomeValue::UnicodeCodePoint(_) => ReprKey::UnicodeCodePoint,
+        SomeValue::ByteArray(_) => ReprKey::ByteArray,
+        // rbuiltin.py:29-33 — SomeBuiltin.rtyper_makekey keys on
+        // `self.const`, remapping through `extregistry.lookup(const)`
+        // when `extregistry.is_registered(const)` is true so that
+        // multiple builtin consts registered under the same entry
+        // share one cache bucket. The HostObject identity fallback
+        // covers the "plain builtin callable" case upstream encodes
+        // as `(__class__, const)`.
+        SomeValue::Builtin(s) => {
+            use crate::translator::rtyper::extregistry;
+            let key = s.base.const_box.as_ref().and_then(|c| {
+                if extregistry::is_registered(&c.value) {
+                    extregistry::lookup(&c.value).map(|entry| match entry {
+                        extregistry::ExtRegistryEntry::Ptr(_) => {
+                            BuiltinConstKey::ExtRegistry(ExtRegistryEntryTag::Ptr)
+                        }
+                    })
+                } else {
+                    match &c.value {
+                        crate::flowspace::model::ConstValue::HostObject(host) => {
+                            Some(BuiltinConstKey::Host(host.identity_id()))
+                        }
+                        _ => None,
+                    }
+                }
+            });
+            ReprKey::Builtin(key)
+        }
+        // rbuiltin.py:41-50 — SomeBuiltinMethod.rtyper_makekey keys on
+        // `(self.methodname, id(self.s_self))`. `s.s_self` is an `Rc`
+        // so its pointer identity is stable across clones of the
+        // outer `SomeBuiltinMethod`, matching upstream's
+        // `id(self.s_self)` invariant.
+        SomeValue::BuiltinMethod(s) => ReprKey::BuiltinMethod {
+            methodname: s.methodname.clone(),
+            s_self_id: std::rc::Rc::as_ptr(&s.s_self) as usize,
+        },
+        // rpbc.py:64-71: SomePBC.rtyper_makekey lifts descriptions into
+        // a sorted tuple prefixed by (class, can_be_None) and appends
+        // the recursive `subset_of` key.
+        SomeValue::PBC(s_pbc) => {
+            let mut descriptions: Vec<crate::annotator::description::DescKey> =
+                s_pbc.descriptions.keys().copied().collect();
+            // Upstream: `lst.sort()` — descriptions list is sorted so
+            // two PBCs with identical desc sets share a cache entry.
+            descriptions.sort();
+            let subset_of = s_pbc.subset_of.as_ref().map(|sub| {
+                Box::new(rtyper_makekey(&crate::annotator::model::SomeValue::PBC(
+                    (**sub).clone(),
+                )))
+            });
+            ReprKey::PBC {
+                descriptions,
+                can_be_none: s_pbc.can_be_none,
+                subset_of,
+            }
+        }
         // Remaining variants defer to their r*.rs ports. Emit a
         // deterministic `Pending` key so the reprs cache still
         // distinguishes entries by variant-shape — identical
@@ -1871,13 +2302,19 @@ pub fn rtyper_makerepr(
         SomeValue::Iterator(_) => Err(TyperError::missing_rtype_operation(
             "SomeIterator.rtyper_makerepr — port rpython/rtyper/rrange.py EnumerateIteratorRepr etc.",
         )),
-        SomeValue::PBC(_) => Err(TyperError::missing_rtype_operation(
-            "SomePBC.rtyper_makerepr — port rpython/rtyper/rpbc.py PBCRepr family",
-        )),
+        // rpbc.py:35-62 — SomePBC.rtyper_makerepr. Only the degenerate
+        // single-FunctionDesc / can_be_None=False branch is ported
+        // today; the remaining arms surface as
+        // `MissingRTypeOperation` from [`somepbc_rtyper_makerepr`].
+        SomeValue::PBC(s_pbc) => {
+            let self_rc = rtyper.self_rc()?;
+            crate::translator::rtyper::rpbc::somepbc_rtyper_makerepr(s_pbc, &self_rc)
+        }
+        // rbuiltin.py:23-39 — SomeBuiltin.rtyper_makerepr /
+        // SomeBuiltinMethod.rtyper_makerepr. Routed into the rbuiltin
+        // module which owns the concrete repr types.
         SomeValue::Builtin(_) | SomeValue::BuiltinMethod(_) => {
-            Err(TyperError::missing_rtype_operation(
-                "SomeBuiltin.rtyper_makerepr — port rpython/rtyper/rpbc.py FunctionRepr",
-            ))
+            crate::translator::rtyper::rbuiltin::dispatch_rtyper_makerepr(s_obj, rtyper)
         }
         // rnone.py:35-37: SomeNone.rtyper_makerepr returns the singleton
         // `none_repr`.
@@ -2815,6 +3252,339 @@ mod tests {
         let sv = SomeValue::Type(SomeType::new());
         let repr = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr");
         assert_eq!(repr.class_name(), "RootClassRepr");
+    }
+
+    // -----------------------------------------------------------------
+    // SomePBC.rtyper_makekey (rpbc.py:64-71).
+    // -----------------------------------------------------------------
+
+    fn pbc_test_desc_function(
+        bk: &Rc<crate::annotator::bookkeeper::Bookkeeper>,
+        name: &str,
+    ) -> crate::annotator::description::DescEntry {
+        use crate::annotator::description::{DescEntry, FunctionDesc};
+        use crate::flowspace::argument::Signature;
+        DescEntry::Function(Rc::new(std::cell::RefCell::new(FunctionDesc::new(
+            bk.clone(),
+            None,
+            name,
+            Signature::new(vec![], None, None),
+            None,
+            None,
+        ))))
+    }
+
+    #[test]
+    fn rtyper_makekey_somepbc_keys_by_sorted_descs_and_can_be_none() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomePBC;
+        let bk = Rc::new(Bookkeeper::new());
+        let f = pbc_test_desc_function(&bk, "f");
+        let g = pbc_test_desc_function(&bk, "g");
+
+        let s1 = SomeValue::PBC(SomePBC::new(vec![f.clone(), g.clone()], false));
+        // Upstream `lst.sort()` — inserting the same set in reverse
+        // order must yield the same cache key.
+        let s2 = SomeValue::PBC(SomePBC::new(vec![g, f.clone()], false));
+        assert_eq!(rtyper_makekey(&s1), rtyper_makekey(&s2));
+
+        // Differing `can_be_none` must separate entries.
+        let s3 = SomeValue::PBC(SomePBC::new(vec![f.clone()], true));
+        let s4 = SomeValue::PBC(SomePBC::new(vec![f], false));
+        assert_ne!(rtyper_makekey(&s3), rtyper_makekey(&s4));
+    }
+
+    #[test]
+    fn rtyper_makekey_somepbc_nests_subset_of_recursive_key() {
+        use crate::annotator::bookkeeper::Bookkeeper;
+        use crate::annotator::model::SomePBC;
+        let bk = Rc::new(Bookkeeper::new());
+        let f = pbc_test_desc_function(&bk, "f");
+
+        let parent = SomePBC::new(vec![f.clone()], false);
+        let with_subset =
+            SomePBC::with_subset(vec![f.clone()], false, Some(Box::new(parent.clone())));
+        let key = rtyper_makekey(&SomeValue::PBC(with_subset));
+        match key {
+            ReprKey::PBC {
+                subset_of: Some(sub),
+                ..
+            } => {
+                // The nested key is the plain no-subset SomePBC's key.
+                let bare_key = rtyper_makekey(&SomeValue::PBC(parent));
+                assert_eq!(*sub, bare_key);
+            }
+            other => panic!("expected ReprKey::PBC with subset_of=Some, got {other:?}"),
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // SomeBuiltin / SomeBuiltinMethod.rtyper_makekey (rbuiltin.py:29-50).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn rtyper_makekey_someiterator_recursively_keys_on_container_and_variant() {
+        use crate::annotator::listdef::ListDef;
+        use crate::annotator::model::{SomeIterator, SomeList};
+
+        let ldef = ListDef::new(None, SomeValue::Impossible, false, false);
+        let container = SomeValue::List(SomeList::new(ldef.clone()));
+
+        // Two iterators over the same container with the same variant:
+        // same key.
+        let a = SomeValue::Iterator(SomeIterator::new(container.clone(), vec!["items".into()]));
+        let b = SomeValue::Iterator(SomeIterator::new(container.clone(), vec!["items".into()]));
+        assert_eq!(rtyper_makekey(&a), rtyper_makekey(&b));
+
+        // Differing variant separates them (upstream `self.variant`
+        // tuple inequality).
+        let c = SomeValue::Iterator(SomeIterator::new(container, vec!["keys".into()]));
+        assert_ne!(rtyper_makekey(&a), rtyper_makekey(&c));
+    }
+
+    #[test]
+    fn rtyper_makekey_someweakref_is_class_tag_singleton() {
+        use crate::annotator::model::SomeWeakRef;
+        let a = SomeValue::WeakRef(SomeWeakRef::new(None));
+        let b = SomeValue::WeakRef(SomeWeakRef::new(None));
+        assert_eq!(rtyper_makekey(&a), rtyper_makekey(&b));
+        assert_eq!(rtyper_makekey(&a), ReprKey::WeakRef);
+    }
+
+    #[test]
+    fn rtyper_makekey_sometuple_keys_on_element_shape_recursively() {
+        use crate::annotator::model::{SomeBool, SomeInteger, SomeTuple};
+        let t_bool = SomeValue::Bool(SomeBool::new());
+        let t_int = SomeValue::Integer(SomeInteger::new(false, false));
+
+        // Two tuples with the same element shape collapse.
+        let a = SomeValue::Tuple(SomeTuple::new(vec![t_bool.clone(), t_int.clone()]));
+        let b = SomeValue::Tuple(SomeTuple::new(vec![t_bool.clone(), t_int.clone()]));
+        assert_eq!(rtyper_makekey(&a), rtyper_makekey(&b));
+
+        // Changing one element's tag separates them.
+        let c = SomeValue::Tuple(SomeTuple::new(vec![t_int.clone(), t_bool.clone()]));
+        assert_ne!(rtyper_makekey(&a), rtyper_makekey(&c));
+    }
+
+    #[test]
+    fn rtyper_makekey_somelist_keys_on_listitem_pointer_identity() {
+        use crate::annotator::listdef::ListDef;
+        use crate::annotator::model::SomeList;
+
+        let ldef = ListDef::new(None, SomeValue::Impossible, false, false);
+        let a = SomeValue::List(SomeList::new(ldef.clone()));
+        let b = SomeValue::List(SomeList::new(ldef));
+        // Same `ListDef.inner` Rc — same cache entry.
+        assert_eq!(rtyper_makekey(&a), rtyper_makekey(&b));
+
+        // Fresh ListDef yields a different listitem identity → separate key.
+        let other = SomeValue::List(SomeList::new(ListDef::new(
+            None,
+            SomeValue::Impossible,
+            false,
+            false,
+        )));
+        assert_ne!(rtyper_makekey(&a), rtyper_makekey(&other));
+    }
+
+    #[test]
+    fn rtyper_makekey_somedict_keys_on_dictkey_and_dictvalue_identities() {
+        use crate::annotator::dictdef::DictDef;
+        use crate::annotator::model::SomeDict;
+
+        let ddef = DictDef::new(
+            None,
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+            false,
+            false,
+            false,
+        );
+        let a = SomeValue::Dict(SomeDict::new(ddef.clone()));
+        let b = SomeValue::Dict(SomeDict::new(ddef));
+        assert_eq!(rtyper_makekey(&a), rtyper_makekey(&b));
+
+        // Fresh DictDef = different key/value identity.
+        let other = SomeValue::Dict(SomeDict::new(DictDef::new(
+            None,
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+            false,
+            false,
+            false,
+        )));
+        assert_ne!(rtyper_makekey(&a), rtyper_makekey(&other));
+    }
+
+    #[test]
+    fn rtyper_makekey_somelist_sets_listitem_dont_change_any_more() {
+        use crate::annotator::listdef::ListDef;
+        use crate::annotator::model::SomeList;
+
+        // Seed a mutable-origin ListDef by manually resetting the flag
+        // so the makekey effect is observable (upstream mirrors the
+        // default-True case from bookkeeper=None, so exercise the
+        // bookkeeper-owned shape by flipping it back to False first).
+        let ldef = ListDef::new(None, SomeValue::Impossible, false, false);
+        let listitem = ldef.inner.listitem.borrow().clone();
+        listitem.borrow_mut().dont_change_any_more = false;
+        let v = SomeValue::List(SomeList::new(ldef));
+        let _ = rtyper_makekey(&v);
+        assert!(listitem.borrow().dont_change_any_more);
+    }
+
+    #[test]
+    fn rtyper_makekey_somedict_sets_dictkey_and_dictvalue_dont_change_any_more() {
+        use crate::annotator::dictdef::DictDef;
+        use crate::annotator::model::SomeDict;
+
+        let ddef = DictDef::new(
+            None,
+            SomeValue::Impossible,
+            SomeValue::Impossible,
+            false,
+            false,
+            false,
+        );
+        let dictkey = ddef.inner.dictkey.borrow().clone();
+        let dictvalue = ddef.inner.dictvalue.borrow().clone();
+        dictkey.borrow_mut().dont_change_any_more = false;
+        dictvalue.borrow_mut().dont_change_any_more = false;
+        let v = SomeValue::Dict(SomeDict::new(ddef));
+        let _ = rtyper_makekey(&v);
+        assert!(dictkey.borrow().dont_change_any_more);
+        assert!(dictvalue.borrow().dont_change_any_more);
+    }
+
+    #[test]
+    fn rtyper_makekey_sometring_family_keys_per_class_tag() {
+        use crate::annotator::model::{
+            SomeByteArray, SomeChar, SomeString, SomeUnicodeCodePoint, SomeUnicodeString,
+        };
+        assert_eq!(
+            rtyper_makekey(&SomeValue::String(SomeString::new(false, false))),
+            ReprKey::String
+        );
+        assert_eq!(
+            rtyper_makekey(&SomeValue::UnicodeString(SomeUnicodeString::new(
+                false, false
+            ))),
+            ReprKey::UnicodeString
+        );
+        assert_eq!(
+            rtyper_makekey(&SomeValue::Char(SomeChar::new(false))),
+            ReprKey::Char
+        );
+        assert_eq!(
+            rtyper_makekey(&SomeValue::UnicodeCodePoint(SomeUnicodeCodePoint::new(
+                false
+            ))),
+            ReprKey::UnicodeCodePoint
+        );
+        assert_eq!(
+            rtyper_makekey(&SomeValue::ByteArray(SomeByteArray::new(false))),
+            ReprKey::ByteArray
+        );
+    }
+
+    #[test]
+    fn rtyper_makekey_somebuiltin_with_hostobject_const_uses_identity_id() {
+        use crate::annotator::model::SomeBuiltin;
+        use crate::flowspace::model::{ConstValue, Constant, HostObject};
+        let host = HostObject::new_builtin_callable("len");
+        let mut sb = SomeBuiltin::new("len", None, None);
+        sb.base.const_box = Some(Constant::new(ConstValue::HostObject(host.clone())));
+
+        // Two clones of the same SomeBuiltin share const identity →
+        // collapse to the same cache entry.
+        let mut sb2 = SomeBuiltin::new("len", None, None);
+        sb2.base.const_box = Some(Constant::new(ConstValue::HostObject(host.clone())));
+        let key_a = rtyper_makekey(&SomeValue::Builtin(sb));
+        let key_b = rtyper_makekey(&SomeValue::Builtin(sb2));
+        assert_eq!(key_a, key_b);
+        assert!(matches!(
+            key_a,
+            ReprKey::Builtin(Some(BuiltinConstKey::Host(_)))
+        ));
+    }
+
+    #[test]
+    fn rtyper_makekey_somebuiltin_without_const_uses_none_sentinel() {
+        use crate::annotator::model::SomeBuiltin;
+        let sb = SomeBuiltin::new("len", None, None);
+        assert_eq!(
+            rtyper_makekey(&SomeValue::Builtin(sb)),
+            ReprKey::Builtin(None),
+        );
+    }
+
+    #[test]
+    fn rtyper_makekey_somebuiltin_with_llptr_const_collapses_via_extregistry_entry() {
+        // Upstream rbuiltin.py:29-33 remaps `extregistry.is_registered(const)`
+        // through `extregistry.lookup(const)` so two distinct `_ptr`
+        // consts still share one cache entry. Pyre mirrors this via
+        // `BuiltinConstKey::ExtRegistry(ExtRegistryEntryTag::Ptr)`.
+        use crate::annotator::model::SomeBuiltin;
+        use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            _ptr, FuncType, LowLevelType, Ptr, PtrTarget,
+        };
+        fn make_llptr(arg: LowLevelType) -> _ptr {
+            _ptr::new(
+                Ptr {
+                    TO: PtrTarget::Func(FuncType {
+                        args: vec![arg],
+                        result: LowLevelType::Void,
+                    }),
+                },
+                Ok(None),
+            )
+        }
+        let mut sb1 = SomeBuiltin::new("fn1", None, None);
+        sb1.base.const_box = Some(Constant::new(ConstValue::LLPtr(Box::new(make_llptr(
+            LowLevelType::Signed,
+        )))));
+        let mut sb2 = SomeBuiltin::new("fn2", None, None);
+        sb2.base.const_box = Some(Constant::new(ConstValue::LLPtr(Box::new(make_llptr(
+            LowLevelType::Float,
+        )))));
+        let key1 = rtyper_makekey(&SomeValue::Builtin(sb1));
+        let key2 = rtyper_makekey(&SomeValue::Builtin(sb2));
+        assert_eq!(
+            key1,
+            ReprKey::Builtin(Some(BuiltinConstKey::ExtRegistry(ExtRegistryEntryTag::Ptr)))
+        );
+        assert_eq!(key1, key2);
+    }
+
+    #[test]
+    fn rtyper_makekey_somebuiltinmethod_keys_by_methodname_and_receiver_identity() {
+        use crate::annotator::model::SomeBuiltinMethod;
+        let sbm = SomeBuiltinMethod::new("append", SomeValue::Impossible, "append");
+        let ReprKey::BuiltinMethod {
+            methodname,
+            s_self_id,
+        } = rtyper_makekey(&SomeValue::BuiltinMethod(sbm))
+        else {
+            panic!("expected ReprKey::BuiltinMethod");
+        };
+        assert_eq!(methodname, "append");
+        assert_ne!(s_self_id, 0);
+    }
+
+    #[test]
+    fn rtyper_makekey_somebuiltinmethod_s_self_id_stable_across_clones() {
+        // Upstream (rbuiltin.py:41-50) uses `id(self.s_self)`, i.e. the
+        // identity of the shared Python receiver object. Pyre mirrors
+        // that via an `Rc<SomeValue>`; clones of the outer
+        // `SomeBuiltinMethod` must keep the same s_self pointer.
+        use crate::annotator::model::SomeBuiltinMethod;
+        let sbm = SomeBuiltinMethod::new("append", SomeValue::Impossible, "append");
+        let cloned = sbm.clone();
+        let key_a = rtyper_makekey(&SomeValue::BuiltinMethod(sbm));
+        let key_b = rtyper_makekey(&SomeValue::BuiltinMethod(cloned));
+        assert_eq!(key_a, key_b);
     }
 
     #[test]

@@ -43,7 +43,7 @@ use super::policy::AnnotatorPolicy;
 use crate::flowspace::argument::CallShape;
 use crate::flowspace::argument::Signature;
 use crate::flowspace::bytecode::cpython_code_signature;
-use crate::flowspace::model::{BlockRef, ConstValue, Constant, GraphRef, HostObject};
+use crate::flowspace::model::{BlockRef, ConstValue, Constant, GraphKey, GraphRef, HostObject};
 use crate::tool::algo::unionfind::UnionFind;
 
 /// RPython `bookkeeper.position_key` (bookkeeper.py:147) — the tuple
@@ -241,6 +241,28 @@ pub struct Bookkeeper {
     /// None). Rust carries [`Self::position_key`] as `Option<_>` in both
     /// cases, so this flag tracks the enter/leave invariant explicitly.
     pub position_entered: std::cell::Cell<bool>,
+    /// RPython `self.needs_generic_instantiate = {}` (bookkeeper.py:72).
+    ///
+    /// Populated by `merge_classpbc_getattr_into_classdef`
+    /// (normalizecalls.py:260-262) for every class-PBC call family that
+    /// spans more than one class — `ClassesPBCRepr.call()` needs the
+    /// generic instantiator. Drained by
+    /// `create_instantiate_functions` (normalizecalls.py:266-273).
+    ///
+    /// Upstream is a `{}` dict keyed by `ClassDef` identity with every
+    /// value set to `True` — i.e. used as a set with upstream's
+    /// insertion-order iteration. Pyre mirrors the dict shape via a
+    /// `BTreeMap<ClassDefKey, Rc<RefCell<ClassDef>>>`: keys are the
+    /// `ClassDefKey` pointer-identity wrapper (matching upstream's
+    /// `id(classdef)` hash) and the value retains the `Rc` needed by
+    /// consumers. Iteration order is deterministic (sorted by the
+    /// pointer-derived key) which differs from upstream's insertion
+    /// order, but the consumer
+    /// ([`crate::translator::rtyper::normalizecalls::create_instantiate_functions`])
+    /// processes each classdef independently so iteration order is not
+    /// observable.
+    pub needs_generic_instantiate:
+        RefCell<std::collections::BTreeMap<ClassDefKey, Rc<RefCell<ClassDef>>>>,
 }
 
 impl std::fmt::Debug for Bookkeeper {
@@ -286,6 +308,7 @@ pub struct MethodDescKey {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum EmulatedPbcCallKey {
     Position(PositionKey),
+    Graph(GraphKey),
     ClassDef(ClassDefKey),
     RDictCall {
         item_id: usize,
@@ -409,7 +432,17 @@ impl Bookkeeper {
             immutable_cache: RefCell::new(HashMap::new()),
             pending_specializations: RefCell::new(Vec::new()),
             position_entered: std::cell::Cell::new(false),
+            needs_generic_instantiate: RefCell::new(std::collections::BTreeMap::new()),
         }
+    }
+
+    /// Push a classdef into [`Self::needs_generic_instantiate`] unless
+    /// it is already present (upstream `dict[cdef] = True` idempotence).
+    pub fn push_needs_generic_instantiate(&self, classdef: &Rc<RefCell<ClassDef>>) {
+        self.needs_generic_instantiate
+            .borrow_mut()
+            .entry(ClassDefKey::from_classdef(classdef))
+            .or_insert_with(|| classdef.clone());
     }
 
     /// Wire up the `self.annotator` backlink. Invoked from
@@ -1017,10 +1050,22 @@ impl Bookkeeper {
         } else {
             Some(gf.defaults.clone())
         };
-        let specializer = self
-            .policy
-            .get_specializer(gf.annspecialcase.as_deref())
-            .map_err(|e| AnnotatorError::new(e.to_string()))?;
+        // Prefer the live annotator policy (respects `using_policy`
+        // swap) when the backlink is present; fall back to the
+        // bookkeeper-owned static `policy` slot in unit-test
+        // configurations that construct `Bookkeeper::new()` without
+        // attaching an annotator.
+        let specializer = match self.annotator.borrow().upgrade() {
+            Some(ann) => ann
+                .policy
+                .borrow()
+                .get_specializer(gf.annspecialcase.as_deref())
+                .map_err(|e| AnnotatorError::new(e.to_string()))?,
+            None => self
+                .policy
+                .get_specializer(gf.annspecialcase.as_deref())
+                .map_err(|e| AnnotatorError::new(e.to_string()))?,
+        };
         let fd = FunctionDesc::new(
             self.clone(),
             Some(pyfunc.clone()),
