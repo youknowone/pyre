@@ -5,7 +5,6 @@
 /// address in compiled code where the guard's conditional jump can be
 /// patched to redirect to a bridge (assembler.py:966).
 use std::cell::UnsafeCell;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use majit_backend::ExitRecoveryLayout;
@@ -70,6 +69,12 @@ pub struct DynasmFailDescr {
     pub bridge_addr: UnsafeCell<usize>,
     // fail_args_slots removed: bridge source_slots are derived from
     // fail_arg_locs via rebuild_faillocs_from_descr (assembler.py:201).
+    /// `compile.py:186` `descr.rd_loop_token = clt` — the owning
+    /// `CompiledLoopToken`, stored as pyre's stable `u64` **green_key**
+    /// (the handle `MetaInterp.compiled_loops` is indexed by).  Late-set
+    /// by the post-compile walker that ports `compile.py:183-203
+    /// record_loop_or_bridge`.
+    pub rd_loop_token: UnsafeCell<Option<u64>>,
 }
 
 // Safety: single-threaded JIT (like RPython with GIL).
@@ -105,7 +110,20 @@ impl DynasmFailDescr {
             status: AtomicU64::new(0),
             adr_jump_offset: UnsafeCell::new(0),
             bridge_addr: UnsafeCell::new(0),
+            rd_loop_token: UnsafeCell::new(None),
         }
+    }
+
+    /// `compile.py:186` read side: owning loop's green_key, or `None` if
+    /// `record_loop_or_bridge` has not yet run for this descr.
+    pub fn rd_loop_token(&self) -> Option<u64> {
+        unsafe { *self.rd_loop_token.get() }
+    }
+
+    /// `compile.py:186` write side: invoked by the post-compile walker
+    /// once per ResumeDescr in the newly-compiled trace.
+    pub fn set_rd_loop_token(&self, green_key: u64) {
+        unsafe { *self.rd_loop_token.get() = Some(green_key) };
     }
 
     /// compile.py:826-830 store_hash.
@@ -230,7 +248,11 @@ impl std::fmt::Debug for DynasmFailDescr {
 /// `attached_descr_ptrs()` and runtime consumers dereference a baked
 /// `cpu_handle` pointer.  There is no ambient thread-local — classifier
 /// results always identify which cpu they were resolved against.
-impl Descr for DynasmFailDescr {}
+impl Descr for DynasmFailDescr {
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+}
 
 impl FailDescr for DynasmFailDescr {
     fn fail_index(&self) -> u32 {
@@ -251,6 +273,10 @@ impl FailDescr for DynasmFailDescr {
 
     fn trace_id(&self) -> u64 {
         self.trace_id
+    }
+
+    fn rd_loop_token(&self) -> Option<u64> {
+        DynasmFailDescr::rd_loop_token(self)
     }
 
     fn get_status(&self) -> u64 {

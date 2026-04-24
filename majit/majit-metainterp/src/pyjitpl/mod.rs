@@ -873,6 +873,25 @@ impl<M: Clone> MetaInterp<M> {
             .map(|trace| (trace_id, trace))
     }
 
+    /// O(1) owner lookup via `descr.rd_loop_token` (compile.py:186 stamp,
+    /// stored as the owning loop's green_key).  Replaces the O(N) scan in
+    /// `trace_for_exit_any` for every descr that went through Session 2's
+    /// `record_loop_or_bridge` walker — i.e. every guard produced by the
+    /// regular compile_loop / compile_bridge paths.  Returns `None` for
+    /// pre-populated descrs (`compile_tmp_callback` stubs) so callers
+    /// fall through to the legacy scan.
+    fn trace_for_exit_by_rd_loop_token<'a>(
+        &'a self,
+        rd_loop_token: Option<u64>,
+        trace_id: u64,
+    ) -> Option<(u64, u64, &'a CompiledTrace)> {
+        let green_key = rd_loop_token?;
+        let compiled = self.compiled_loops.get(&green_key)?;
+        let resolved = Self::normalize_trace_id(compiled, trace_id);
+        let trace = compiled.traces.get(&resolved)?;
+        Some((green_key, resolved, trace))
+    }
+
     /// Find `(owning_green_key, trace_id, CompiledTrace)` for a
     /// trace_id that may not belong to the currently-executing token.
     /// Needed when a bridge attached to loop A JUMPs into loop B's body
@@ -5262,6 +5281,11 @@ impl<M: Clone> MetaInterp<M> {
         let force_token_slots = descr.force_token_slots().to_vec();
         let status = descr.get_status();
         let descr_addr = descr as *const dyn majit_ir::FailDescr as *const () as usize;
+        // compile.py:186 `descr.rd_loop_token` — owning loop's green_key,
+        // stamped at compile time. Used to resolve guard exits that belong
+        // to a loop other than the one currently executing (bridge-into-B
+        // while running A). O(1) replacement for `trace_for_exit_any` scan.
+        let rd_loop_token = descr.rd_loop_token();
         Self::finish_compiled_run_io();
 
         if Self::should_record_guard_failure(is_finish, fail_index) {
@@ -5272,6 +5296,7 @@ impl<M: Clone> MetaInterp<M> {
         let compiled = self.compiled_loops.get(&green_key).unwrap();
         let mut exit_layout = Self::trace_for_exit(compiled, trace_id)
             .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+            .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
             .or_else(|| self.trace_for_exit_any(trace_id))
             .and_then(|(owning_key, resolved_id, trace)| {
                 Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
@@ -5380,6 +5405,8 @@ impl<M: Clone> MetaInterp<M> {
         let force_token_slots = descr.force_token_slots().to_vec();
         let status = descr.get_status();
         let descr_addr = descr as *const dyn majit_ir::FailDescr as *const () as usize;
+        // compile.py:186 `descr.rd_loop_token` — see `run_compiled_detailed`.
+        let rd_loop_token = descr.rd_loop_token();
         Self::finish_compiled_run_io();
 
         // RPython: guard failure counter tick and bridge compilation happen
@@ -5393,6 +5420,7 @@ impl<M: Clone> MetaInterp<M> {
         let compiled = self.compiled_loops.get(&green_key).unwrap();
         let mut exit_layout = Self::trace_for_exit(compiled, trace_id)
             .map(|(resolved_id, trace)| (green_key, resolved_id, trace))
+            .or_else(|| self.trace_for_exit_by_rd_loop_token(rd_loop_token, trace_id))
             .or_else(|| self.trace_for_exit_any(trace_id))
             .and_then(|(owning_key, resolved_id, trace)| {
                 Self::compiled_exit_layout_from_trace(trace, owning_key, resolved_id, fail_index)
@@ -11877,6 +11905,7 @@ mod metainterp_static_data_tests {
         jitcode.jitdriver_sd = Some(0);
         let mut meta = MetaInterp::<()>::new(0);
         let driver = crate::jitdriver::JitDriverStaticData {
+            index: None,
             vars: vec![],
             virtualizable: None,
             result_type: majit_ir::Type::Ref,

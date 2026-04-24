@@ -1954,14 +1954,12 @@ impl GcRewriterImpl {
         let lookup = self.call_assembler_callee_locs.as_ref().unwrap();
 
         // rewrite.py:667-668 — loop_token = op.getdescr(); JitCellToken
-        let call_descr = op
+        let loop_token_descr = op
             .descr
             .as_ref()
-            .and_then(|d| d.as_call_descr())
-            .expect("CallAssembler op must have a CallDescr");
-        let token = call_descr
-            .call_target_token()
-            .expect("CallAssembler descr must have a target token");
+            .and_then(|d| d.as_loop_token_descr())
+            .expect("CallAssembler op must carry a loop-token descriptor");
+        let token = loop_token_descr.loop_token_number();
 
         // rewrite.py:673 — index_list = loop_token.compiled_loop_token._ll_initial_locs
         // RPython: compiled_loop_token is pre-allocated with the token;

@@ -16,6 +16,7 @@ pub mod liveness;
 pub mod metainterp;
 pub mod pyjitcode;
 pub mod state;
+pub mod super_inst_expand;
 mod trace_opcode;
 pub use pyjitcode::{PyJitCode, PyJitCodeMetadata};
 pub use state::{CompileJitcodeFn, set_compile_jitcode_fn};

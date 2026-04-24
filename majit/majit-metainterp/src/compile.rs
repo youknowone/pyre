@@ -2112,6 +2112,8 @@ pub fn compile_tmp_callback(
     let mut jitcell_token = JitCellToken::new(token_number);
     jitcell_token.green_key = green_key;
     jitcell_token.virtualizable_arg_index = jitdriver_sd.virtualizable_arg_index();
+    // `compile.py:168` `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`.
+    jitcell_token.outermost_jitdriver_index = jitdriver_sd.index;
     //
     // `compile.py:1110` `jl.tmp_callback(jitcell_token)` — JIT logger
     // marker.  PRE-EXISTING-ADAPTATION: `rpython/rlib/jit.py`'s `jl`
@@ -2246,7 +2248,13 @@ pub fn compile_tmp_callback(
     // `set_procedure_token(token, tmp=true)` runs in `warmstate.rs`.
     //
     // `compile.py:1150` `return jitcell_token`.
-    Ok(Arc::new(jitcell_token))
+    let arc_token = Arc::new(jitcell_token);
+    // `compile.py:179-180` record_loop_or_bridge: the tmp-callback loop is a
+    // real compiled loop even though MetaInterp never inserts it into
+    // compiled_loops. Register it with the backend so `find_descr_by_ptr`
+    // can still walk its fail_descrs on cross-token guard resolution.
+    backend.track_compiled_token(Arc::clone(&arc_token));
+    Ok(arc_token)
 }
 
 #[cfg(test)]

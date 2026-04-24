@@ -962,6 +962,11 @@ pub struct JitCellToken {
     /// Index inside the original CALL_ASSEMBLER arglist before rewrite
     /// collapses it to `[frame]` or `[frame, virtualizable]`.
     pub virtualizable_arg_index: Option<usize>,
+    /// compile.py:168 `jitcell_token.outermost_jitdriver_sd = jitdriver_sd`.
+    ///
+    /// The backend crate stores the registered jitdriver slot index
+    /// rather than a direct metainterp object pointer.
+    pub outermost_jitdriver_index: Option<usize>,
     /// Backend-specific compiled data.
     pub compiled: Option<Box<dyn std::any::Any + Send>>,
     /// Flag indicating whether the compiled code has been invalidated.
@@ -1002,6 +1007,7 @@ impl JitCellToken {
             inputarg_types: Vec::new(),
             num_scalar_inputargs: 0,
             virtualizable_arg_index: None,
+            outermost_jitdriver_index: None,
             compiled: None,
             invalidated: Arc::new(AtomicBool::new(false)),
             version_info: None,
@@ -1082,6 +1088,18 @@ impl std::fmt::Debug for JitCellToken {
             .finish()
     }
 }
+
+// pyre is single-threaded (no-GIL → still one JIT thread in practice,
+// matching RPython's single-interpreter assumption).  `JitCellToken`
+// embeds `Rc<RdVirtualInfo>` and `Box<dyn Any + Send>` which are not
+// automatically `Sync`; marking the parent struct `Send + Sync` here
+// is sound under the same invariant that `DynasmFailDescr` /
+// `CraneliftFailDescr` rely on — a promise held by the JIT scheduler
+// that tokens are only touched from the JIT thread.  Backends store
+// `Weak<JitCellToken>` handles for cross-token `find_descr_by_ptr`
+// fallback and need these impls to satisfy their `Send` trait bound.
+unsafe impl Send for JitCellToken {}
+unsafe impl Sync for JitCellToken {}
 
 /// A "dead frame" — the state after JIT execution finishes or hits a guard.
 ///
@@ -1330,6 +1348,16 @@ pub trait Backend: Send {
         }
         Ok(results)
     }
+
+    /// Register a freshly-compiled JitCellToken as still reachable from
+    /// the frontend.  Backends that need to resolve `jf_descr` pointers
+    /// across token boundaries (dynasm's `find_descr_by_ptr` cross-token
+    /// fallback) use this to iterate all live tokens without maintaining
+    /// a separate ptr-to-Arc side table.  Called by `MetaInterp` after
+    /// `compile_loop` / `compile_versions` succeeds.  Default no-op for
+    /// backends whose descr-resolution paths do not cross tokens
+    /// (cranelift resolves via `CompiledLoop::fail_descrs` directly).
+    fn track_compiled_token(&mut self, _token: Arc<JitCellToken>) {}
 
     /// Mark the most recently compiled bridge on the given guard as a
     /// loop-closing bridge: on Finish, its outputs should re-enter the

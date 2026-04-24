@@ -625,6 +625,9 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn as_call_descr(&self) -> Option<&dyn CallDescr> {
         None
     }
+    fn as_loop_token_descr(&self) -> Option<&dyn LoopTokenDescr> {
+        None
+    }
     fn as_interior_field_descr(&self) -> Option<&dyn InteriorFieldDescr> {
         None
     }
@@ -740,6 +743,23 @@ pub trait FailDescr: Descr {
     /// this to let the frontend distinguish root-loop exits from bridge exits.
     fn trace_id(&self) -> u64 {
         0
+    }
+
+    /// `compile.py:186` `descr.rd_loop_token = clt` parity: the owning
+    /// `CompiledLoopToken` of the loop that emitted this guard.
+    ///
+    /// Returned as pyre's stable `u64` **green_key** — the sticky handle
+    /// `MetaInterp.compiled_loops` is indexed by.  Upstream uses the
+    /// `CompiledLoopToken` object itself and reaches the owning
+    /// `JitCellToken` via `rd_loop_token.loop_token_wref()`; pyre reaches
+    /// the same `CompiledEntry` via `compiled_loops.get(&green_key)`.
+    ///
+    /// Late-set: returns `None` only for synthetic descrs fabricated
+    /// inside `find_descr_by_ptr` for per-cpu FINISH-exit matches.
+    /// All real guard descrs are stamped by the post-compile walker
+    /// equivalent of `record_loop_or_bridge` (`compile.py:183-203`).
+    fn rd_loop_token(&self) -> Option<u64> {
+        None
     }
 
     /// Whether the given exit slot should be treated as a real GC root.
@@ -1267,6 +1287,21 @@ pub trait CallDescr: Descr {
     /// When present, the backend expands a single frame reference arg into the
     /// callee's full inputarg layout by reading fields from the frame object.
     fn vable_expansion(&self) -> Option<&VableExpansion> {
+        None
+    }
+}
+
+/// Descriptor carrying a `CALL_ASSEMBLER` loop token.
+///
+/// RPython routes these ops through `JitCellToken` itself
+/// (`rewrite.py:667 assert isinstance(loop_token, JitCellToken)`), so the
+/// token-specific queries live outside generic `CallDescr`.
+pub trait LoopTokenDescr: Descr {
+    /// history.py:443 `JitCellToken.number`.
+    fn loop_token_number(&self) -> u64;
+
+    /// rewrite.py:685-689 `jd.index_of_virtualizable`.
+    fn call_virtualizable_index(&self) -> Option<usize> {
         None
     }
 }

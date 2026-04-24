@@ -2,6 +2,7 @@
 /// Stores saved values and descriptor reference from guard failure.
 use std::sync::Arc;
 
+use majit_ir::DescrRef;
 use majit_ir::GcRef;
 
 use crate::guard::DynasmFailDescr;
@@ -10,8 +11,11 @@ use crate::guard::DynasmFailDescr;
 pub struct FrameData {
     /// Raw exit slot values.
     pub(crate) raw_values: Vec<i64>,
-    /// The fail descriptor that identifies which guard failed.
+    /// Backend-local fail descriptor used for slot decoding / bridge data.
     pub(crate) fail_descr: Arc<DynasmFailDescr>,
+    /// Original `jf_descr` object identity when the exit used an attached
+    /// metainterp descr (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
+    pub(crate) latest_descr: Option<DescrRef>,
 }
 
 impl std::fmt::Debug for FrameData {
@@ -19,15 +23,24 @@ impl std::fmt::Debug for FrameData {
         f.debug_struct("FrameData")
             .field("num_values", &self.raw_values.len())
             .field("fail_descr", &self.fail_descr)
+            .field(
+                "latest_descr",
+                &self.latest_descr.as_ref().map(|descr| descr.repr()),
+            )
             .finish()
     }
 }
 
 impl FrameData {
-    pub fn new(raw_values: Vec<i64>, fail_descr: Arc<DynasmFailDescr>) -> Self {
+    pub fn new(
+        raw_values: Vec<i64>,
+        fail_descr: Arc<DynasmFailDescr>,
+        latest_descr: Option<DescrRef>,
+    ) -> Self {
         FrameData {
             raw_values,
             fail_descr,
+            latest_descr,
         }
     }
 

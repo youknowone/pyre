@@ -2013,6 +2013,7 @@ impl BlackholeInterpreter {
                 // blackhole.py:1066-1093 bhimpl_jit_merge_point parity.
                 // @arguments("self", "i", "I", "R", "F", "I", "R", "F")
                 // Decode jdindex + 6 typed register lists from bytecode.
+                let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
                 let jdindex = self.next_u8() as usize;
                 let gi = self._get_list_of_values_i();
                 let gr = self._get_list_of_values_r();
@@ -2020,6 +2021,12 @@ impl BlackholeInterpreter {
                 let ri = self._get_list_of_values_i();
                 let rr = self._get_list_of_values_r();
                 let rf = self._get_list_of_values_f();
+                if nbody_debug {
+                    eprintln!(
+                        "[nbody-debug][bh-jmp] pos={} jdindex={} gi={:?} gr={:?} ri={:?} rr={:#x?}",
+                        self.last_opcode_position, jdindex, gi, gr, ri, rr,
+                    );
+                }
 
                 if self.nextblackholeinterp.is_none() {
                     // blackhole.py:1068-1069: bottommost level.
@@ -2470,6 +2477,7 @@ impl BlackholeInterpreter {
             jitcode::BC_GETARRAYITEM_VABLE_I
             | jitcode::BC_GETARRAYITEM_VABLE_R
             | jitcode::BC_GETARRAYITEM_VABLE_F => {
+                let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
                 let array_idx = self.next_u16() as usize;
                 let index_reg = self.next_u16() as usize;
                 let dst = self.next_u16() as usize;
@@ -2481,6 +2489,12 @@ impl BlackholeInterpreter {
                 let value = unsafe {
                     crate::virtualizable::vable_read_array_item(ptr as *const u8, ainfo, index)
                 };
+                if nbody_debug && array_idx == 0 && matches!(index, 5 | 6 | 8 | 9) {
+                    eprintln!(
+                        "[nbody-debug][bh-vable-get-inline] position={} opcode={} index={} value={:#x}",
+                        self.position, opcode, index, value as usize
+                    );
+                }
                 match opcode {
                     jitcode::BC_GETARRAYITEM_VABLE_I => self.registers_i[dst] = value,
                     jitcode::BC_GETARRAYITEM_VABLE_R => self.registers_r[dst] = value,
@@ -2491,6 +2505,7 @@ impl BlackholeInterpreter {
             jitcode::BC_SETARRAYITEM_VABLE_I
             | jitcode::BC_SETARRAYITEM_VABLE_R
             | jitcode::BC_SETARRAYITEM_VABLE_F => {
+                let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
                 let array_idx = self.next_u16() as usize;
                 let index_reg = self.next_u16() as usize;
                 let src = self.next_u16() as usize;
@@ -2504,6 +2519,12 @@ impl BlackholeInterpreter {
                     jitcode::BC_SETARRAYITEM_VABLE_R => self.registers_r[src],
                     _ => self.registers_f[src],
                 };
+                if nbody_debug && array_idx == 0 && matches!(index, 5 | 6 | 8 | 9) {
+                    eprintln!(
+                        "[nbody-debug][bh-vable-set-inline] position={} opcode={} index={} value={:#x}",
+                        self.position, opcode, index, value as usize
+                    );
+                }
                 unsafe {
                     crate::virtualizable::vable_write_array_item(ptr, ainfo, index, value);
                 }
@@ -7371,6 +7392,7 @@ fn handler_getarrayitem_vable_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
+    let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     if !bh.virtualizable_info.is_null() {
@@ -7381,7 +7403,14 @@ fn handler_getarrayitem_vable_r(
     let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
     let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
-    bh.registers_r[code[p] as usize] = cpu.bh_getarrayitem_gc_r(array, index, array_descr).0 as i64;
+    let value = cpu.bh_getarrayitem_gc_r(array, index, array_descr).0 as i64;
+    if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
+        eprintln!(
+            "[nbody-debug][bh-vable-get-r] position={} last_opcode_position={} index={} value={:#x}",
+            bh.position, bh.last_opcode_position, index, value as usize
+        );
+    }
+    bh.registers_r[code[p] as usize] = value;
     Ok(p + 1)
 }
 fn handler_setarrayitem_vable_i(
@@ -7408,6 +7437,7 @@ fn handler_setarrayitem_vable_r(
     code: &[u8],
     p: usize,
 ) -> Result<usize, DispatchError> {
+    let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
     let vable = bh.registers_r[code[p] as usize];
     let index = bh.registers_i[code[p + 1] as usize];
     let value = bh.registers_r[code[p + 2] as usize];
@@ -7419,6 +7449,12 @@ fn handler_setarrayitem_vable_r(
     let (array_descr, p) = read_descr(bh, code, p);
     let cpu = bh.cpu.expect("cpu not set");
     let array = cpu.bh_getfield_gc_r(vable, &field_descr).0 as i64;
+    if nbody_debug && matches!(index, 5 | 6 | 8 | 9) {
+        eprintln!(
+            "[nbody-debug][bh-vable-set-r] position={} last_opcode_position={} index={} value={:#x}",
+            bh.position, bh.last_opcode_position, index, value as usize
+        );
+    }
     cpu.bh_setarrayitem_gc_r(array, index, majit_ir::GcRef(value as usize), array_descr);
     Ok(p)
 }

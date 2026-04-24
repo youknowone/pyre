@@ -67,6 +67,12 @@ use majit_ir::{GreenKey, GreenType, JitDriverVar, Type, Value, VarKind};
 /// MetaInterp for structured green/red handling.
 #[derive(Clone, Debug)]
 pub struct JitDriverStaticData {
+    /// warmspot.py / pyjitpl.py parity: registered driver slot index.
+    ///
+    /// RPython stores this on `jitdriver_sd.index` and threads it
+    /// through portal-frame bookkeeping plus `JitCellToken` ownership.
+    /// It stays `None` until `register_jitdriver_sd` assigns the slot.
+    pub index: Option<usize>,
     /// All variables in declaration order.
     pub vars: Vec<JitDriverVar>,
     /// Optional name of the virtualizable red variable.
@@ -162,6 +168,7 @@ impl JitDriverStaticData {
             vars.push(JitDriverVar::red(name, tp));
         }
         let mut sd = JitDriverStaticData {
+            index: None,
             vars,
             virtualizable: virtualizable.map(str::to_string),
             result_type: Type::Ref,

@@ -755,6 +755,14 @@ impl Backend for DynasmBackend {
         Self::register_call_assembler_target(token.number, code_addr);
         self.register_fail_descrs(&compiled.fail_descrs);
 
+        // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
+        // in the newly-compiled trace, stamp the owning CompiledLoopToken.
+        // pyre stores `green_key` — the handle `MetaInterp.compiled_loops`
+        // is indexed by — rather than the CLT object.
+        for descr in &compiled.fail_descrs {
+            descr.set_rd_loop_token(token.green_key);
+        }
+
         // `rpython/jit/backend/x86/assembler.py:513-526` initializes the
         // per-loop `CompiledLoopToken` fields at assemble_loop entry:
         //   * frame_info is allocated and assigned (line 526-530)
@@ -923,6 +931,15 @@ impl Backend for DynasmBackend {
         // RPython's asmmemmgr ties code blocks and their resume
         // descriptors to the same compiled_loop_token lifetime.
         self.register_fail_descrs(&compiled.fail_descrs);
+
+        // `compile.py:183-186 record_loop_or_bridge`: a bridge's ResumeDescrs
+        // inherit the original loop's CompiledLoopToken.  `loop.original_
+        // jitcell_token` at :176 is the parent — same handle pyre reaches
+        // via `original_token.green_key`.
+        for descr in &compiled.fail_descrs {
+            descr.set_rd_loop_token(original_token.green_key);
+        }
+
         original_token.asmmemmgr_blocks().push(Box::new(compiled));
 
         Ok(AsmInfo {
@@ -1073,7 +1090,7 @@ impl Backend for DynasmBackend {
         unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
 
         DeadFrame {
-            data: Box::new(FrameData::new(raw_values, descr)),
+            data: Box::new(FrameData::new(raw_values, descr, None)),
         }
     }
 

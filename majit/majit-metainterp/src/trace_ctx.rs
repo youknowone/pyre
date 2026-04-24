@@ -3727,9 +3727,16 @@ mod tests {
             .as_ref()
             .and_then(|descr| descr.as_call_descr())
             .expect("call op should carry CallDescr");
+        let loop_token = op
+            .descr
+            .as_ref()
+            .and_then(|descr| descr.as_loop_token_descr())
+            .expect("call op should carry loop-token metadata");
         assert_eq!(call_descr.arg_types(), &[Type::Ref, Type::Float, Type::Int]);
         assert_eq!(call_descr.call_target_token(), Some(777));
         assert_eq!(call_descr.call_virtualizable_index(), Some(1));
+        assert_eq!(loop_token.loop_token_number(), 777);
+        assert_eq!(loop_token.call_virtualizable_index(), Some(1));
     }
 
     fn take_all_ops(ctx: TraceCtx) -> Vec<majit_ir::Op> {

@@ -2602,6 +2602,7 @@ fn deadframe_from_jitframe(
     let mut frame = Box::new(JitFrameDeadFrame::new(
         jf_gcref,
         fail_descr,
+        None,
         gc_runtime_id,
         heap_owner,
     ));
@@ -11687,6 +11688,15 @@ impl majit_backend::Backend for CraneliftBackend {
             return Err(err);
         }
         self.registered_call_assembler_tokens.insert(token.number);
+
+        // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
+        // in the newly-compiled trace, stamp the owning CompiledLoopToken.
+        // pyre stores `green_key` — the handle `MetaInterp.compiled_loops`
+        // is indexed by — rather than the CLT object.
+        for descr in &compiled.fail_descrs {
+            descr.set_rd_loop_token(token.green_key);
+        }
+
         token.compiled = Some(Box::new(compiled));
         Ok(info)
     }
@@ -11835,6 +11845,11 @@ impl majit_backend::Backend for CraneliftBackend {
         };
         for descr in &compiled.fail_descrs {
             descr.set_trace_info(bridge_trace_info.clone());
+            // `compile.py:183-186 record_loop_or_bridge`: a bridge's
+            // ResumeDescrs inherit the original loop's CompiledLoopToken.
+            // pyre uses `original_token.green_key` as the handle into
+            // `MetaInterp.compiled_loops`.
+            descr.set_rd_loop_token(original_token.green_key);
         }
         {
             let terminal_exit_layouts = compiled.terminal_exit_layouts_mut();

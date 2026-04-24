@@ -10,7 +10,9 @@
 use std::collections::HashMap;
 
 use majit_backend::{Backend, JitCellToken};
-use majit_ir::{InputArg, Op, OpCode, OpRef, Type, Value, make_loop_target_descr};
+use majit_ir::{
+    GcRef, InputArg, Op, OpCode, OpRef, Type, Value, make_array_descr, make_loop_target_descr,
+};
 
 use majit_backend_dynasm::runner::DynasmBackend;
 
@@ -168,6 +170,117 @@ fn test_float_add() {
         "1.5 + 0.5 should be 2.0, got {}",
         result_val
     );
+}
+
+#[test]
+fn test_setarrayitem_raw_float_roundtrip() {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let mut token = JitCellToken::new(23);
+
+    let base = OpRef(0);
+    let value = OpRef(1);
+    let const_index = OpRef::from_const(3);
+
+    let mut constants = HashMap::new();
+    constants.insert(const_index.0, 3i64);
+    backend.set_constants(constants);
+
+    let array_descr = make_array_descr(0, 8, Type::Float);
+
+    let inputargs = vec![
+        InputArg {
+            tp: Type::Ref,
+            index: 0,
+        },
+        InputArg {
+            tp: Type::Float,
+            index: 1,
+        },
+    ];
+
+    let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[base, const_index, value]);
+    set_op.pos = OpRef(2);
+    set_op.descr = Some(array_descr.clone());
+
+    let mut get_op = Op::new(OpCode::GetarrayitemRawF, &[base, const_index]);
+    get_op.pos = OpRef(3);
+    get_op.descr = Some(array_descr);
+
+    let mut finish_op = Op::new(OpCode::Finish, &[OpRef(3)]);
+    finish_op.pos = OpRef(4);
+    finish_op.fail_arg_types = Some(vec![Type::Float]);
+    finish_op.fail_args = Some(vec![OpRef(3)].into());
+
+    let ops = vec![set_op, get_op, finish_op];
+    let result = backend.compile_loop(&inputargs, &ops, &mut token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let mut items = vec![0.0f64; 8];
+    let base_ref = GcRef(items.as_mut_ptr() as usize);
+    let frame = backend.execute_token(&token, &[Value::Ref(base_ref), Value::Float(1.25)]);
+
+    let descr = backend.get_latest_descr(&frame);
+    assert!(descr.is_finish());
+    assert_eq!(items[3], 1.25);
+    assert_eq!(backend.get_float_value(&frame, 0), 1.25);
+}
+
+#[test]
+fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let mut token = JitCellToken::new(24);
+
+    let base = OpRef(0);
+    let index = OpRef(1);
+    let value = OpRef(2);
+
+    let array_descr = make_array_descr(0, 8, Type::Float);
+
+    let inputargs = vec![
+        InputArg {
+            tp: Type::Ref,
+            index: 0,
+        },
+        InputArg {
+            tp: Type::Int,
+            index: 1,
+        },
+        InputArg {
+            tp: Type::Float,
+            index: 2,
+        },
+    ];
+
+    let mut set_op = Op::new(OpCode::SetarrayitemRaw, &[base, index, value]);
+    set_op.pos = OpRef(3);
+    set_op.descr = Some(array_descr.clone());
+
+    let mut get_op = Op::new(OpCode::GetarrayitemRawF, &[base, index]);
+    get_op.pos = OpRef(4);
+    get_op.descr = Some(array_descr);
+
+    let mut finish_op = Op::new(OpCode::Finish, &[OpRef(4)]);
+    finish_op.pos = OpRef(5);
+    finish_op.fail_arg_types = Some(vec![Type::Float]);
+    finish_op.fail_args = Some(vec![OpRef(4)].into());
+
+    let ops = vec![set_op, get_op, finish_op];
+    let result = backend.compile_loop(&inputargs, &ops, &mut token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let mut items = vec![0.0f64; 8];
+    let base_ref = GcRef(items.as_mut_ptr() as usize);
+    let frame = backend.execute_token(
+        &token,
+        &[Value::Ref(base_ref), Value::Int(5), Value::Float(-2.5)],
+    );
+
+    let descr = backend.get_latest_descr(&frame);
+    assert!(descr.is_finish());
+    assert_eq!(items[5], -2.5);
+    assert_eq!(backend.get_float_value(&frame, 0), -2.5);
 }
 
 #[test]

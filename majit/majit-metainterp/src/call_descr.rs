@@ -55,6 +55,9 @@ impl majit_ir::Descr for MetaCallAssemblerDescr {
     fn as_call_descr(&self) -> Option<&dyn CallDescr> {
         Some(self)
     }
+    fn as_loop_token_descr(&self) -> Option<&dyn majit_ir::descr::LoopTokenDescr> {
+        Some(self)
+    }
 }
 
 impl CallDescr for MetaCallAssemblerDescr {
@@ -79,6 +82,16 @@ impl CallDescr for MetaCallAssemblerDescr {
     }
     fn vable_expansion(&self) -> Option<&VableExpansion> {
         self.vable_expansion.as_ref()
+    }
+}
+
+impl majit_ir::descr::LoopTokenDescr for MetaCallAssemblerDescr {
+    fn loop_token_number(&self) -> u64 {
+        self.target_token
+    }
+
+    fn call_virtualizable_index(&self) -> Option<usize> {
+        self.virtualizable_arg_index
     }
 }
 

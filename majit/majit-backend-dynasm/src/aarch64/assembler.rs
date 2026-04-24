@@ -1952,6 +1952,75 @@ impl AssemblerARM64 {
                     }
                 }
             }
+            // ── Memory stores: setarrayitem pattern ──
+            OpCode::SetarrayitemGc | OpCode::SetarrayitemRaw => {
+                if let (Some(Loc::Reg(base)), Some(index_loc), Some(value_loc)) =
+                    (arglocs.first(), arglocs.get(1), arglocs.get(2))
+                {
+                    let (base_size, item_size) = op
+                        .descr
+                        .as_ref()
+                        .and_then(|d| d.as_array_descr())
+                        .map(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+                        .unwrap_or((0, 8));
+                    let index_reg = 16u8;
+                    let value_reg = 17u8;
+
+                    self.regalloc_mov(
+                        index_loc,
+                        &Loc::Reg(crate::regloc::RegLoc::new(index_reg, false)),
+                    );
+                    if item_size != 1 {
+                        self.emit_mov_imm64(value_reg.into(), item_size as i64);
+                        dynasm!(self.mc ; .arch aarch64 ; mul X(index_reg), X(index_reg), X(value_reg));
+                    }
+                    if base_size != 0 {
+                        self.emit_mov_imm64(value_reg.into(), base_size as i64);
+                        dynasm!(self.mc ; .arch aarch64 ; add X(index_reg), X(index_reg), X(value_reg));
+                    }
+                    dynasm!(self.mc ; .arch aarch64 ; add X(index_reg), X(base.value), X(index_reg));
+
+                    match value_loc {
+                        Loc::Reg(val) if val.is_xmm => {
+                            dynasm!(self.mc ; .arch aarch64 ; str D(val.value), [X(index_reg)]);
+                        }
+                        Loc::Reg(val) => match item_size {
+                            1 => {
+                                dynasm!(self.mc ; .arch aarch64 ; strb W(val.value), [X(index_reg)])
+                            }
+                            2 => {
+                                dynasm!(self.mc ; .arch aarch64 ; strh W(val.value), [X(index_reg)])
+                            }
+                            4 => {
+                                dynasm!(self.mc ; .arch aarch64 ; str W(val.value), [X(index_reg)])
+                            }
+                            _ => {
+                                dynasm!(self.mc ; .arch aarch64 ; str X(val.value), [X(index_reg)])
+                            }
+                        },
+                        _ => {
+                            self.regalloc_mov(
+                                value_loc,
+                                &Loc::Reg(crate::regloc::RegLoc::new(value_reg, false)),
+                            );
+                            match item_size {
+                                1 => {
+                                    dynasm!(self.mc ; .arch aarch64 ; strb W(value_reg), [X(index_reg)])
+                                }
+                                2 => {
+                                    dynasm!(self.mc ; .arch aarch64 ; strh W(value_reg), [X(index_reg)])
+                                }
+                                4 => {
+                                    dynasm!(self.mc ; .arch aarch64 ; str W(value_reg), [X(index_reg)])
+                                }
+                                _ => {
+                                    dynasm!(self.mc ; .arch aarch64 ; str X(value_reg), [X(index_reg)])
+                                }
+                            }
+                        }
+                    }
+                }
+            }
             // ── Memory stores: opassembler.rs emit_op_setfield_regalloc ──
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
                 if let (Some(Loc::Reg(base)), Some(val_loc)) = (arglocs.first(), arglocs.get(1)) {
@@ -4557,8 +4626,8 @@ impl AssemblerARM64 {
         let target_addr: Option<usize> = op
             .descr
             .as_ref()
-            .and_then(|d| d.as_call_descr())
-            .and_then(|cd| cd.call_target_token())
+            .and_then(|d| d.as_loop_token_descr())
+            .map(|td| td.loop_token_number())
             .and_then(|token| self.call_assembler_targets.get(&token).copied());
 
         // Exclude address 0 (pending token placeholder) to avoid calling null.

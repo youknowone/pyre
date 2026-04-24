@@ -122,8 +122,9 @@ pub struct CraneliftFailDescr {
     /// a different compiled function). assembler.py:2456-2462 closing_jump
     /// emits a raw JMP to `target_token._ll_loop_code`. Cranelift can't
     /// emit raw inter-function JMPs, so the exit returns to the dispatcher
-    /// which reads `target_descr` and re-enters the target loop's code_ptr
-    /// (looked up via `lookup_loop_target`). Mutually exclusive with is_finish.
+    /// which reads `target_descr` and re-enters the target loop via the
+    /// registered `JitCellToken.number -> RegisteredLoopTarget` metadata.
+    /// Mutually exclusive with is_finish.
     pub is_external_jump: bool,
     /// The TargetToken descriptor this JUMP targets, used by the dispatcher
     /// to look up the target loop. Present only when is_external_jump=true.
@@ -169,6 +170,12 @@ pub struct CraneliftFailDescr {
     pub rd_virtuals: Option<Vec<std::rc::Rc<majit_ir::RdVirtualInfo>>>,
     /// Deferred heap writes associated with this guard exit.
     pub rd_pendingfields: Option<Vec<majit_ir::GuardPendingFieldEntry>>,
+    /// `compile.py:186` `descr.rd_loop_token = clt` — the owning
+    /// `CompiledLoopToken`, stored as pyre's stable `u64` **green_key**
+    /// (the handle `MetaInterp.compiled_loops` is indexed by).  Late-set
+    /// by the post-compile walker that ports `compile.py:183-203
+    /// record_loop_or_bridge`.
+    pub rd_loop_token: UnsafeCell<Option<u64>>,
 }
 
 impl std::fmt::Debug for CraneliftFailDescr {
@@ -286,6 +293,7 @@ impl CraneliftFailDescr {
             rd_consts: None,
             rd_virtuals: None,
             rd_pendingfields: None,
+            rd_loop_token: UnsafeCell::new(None),
         }
     }
 
@@ -293,7 +301,7 @@ impl CraneliftFailDescr {
     /// assembler.py:2456-2462 closing_jump parity: JUMP whose target
     /// TargetToken lives in a different compiled function. Cranelift can't
     /// emit raw inter-function JMPs, so the dispatcher receives this descr
-    /// and re-enters the target loop via `lookup_loop_target(target_descr)`.
+    /// and re-enters the target loop via the registered target token.
     pub fn new_external_jump(
         fail_index: u32,
         trace_id: u64,
@@ -328,7 +336,20 @@ impl CraneliftFailDescr {
             rd_consts: None,
             rd_virtuals: None,
             rd_pendingfields: None,
+            rd_loop_token: UnsafeCell::new(None),
         }
+    }
+
+    /// `compile.py:186` read side: owning loop's green_key, or `None` if
+    /// `record_loop_or_bridge` has not yet run for this descr.
+    pub fn rd_loop_token(&self) -> Option<u64> {
+        unsafe { *self.rd_loop_token.get() }
+    }
+
+    /// `compile.py:186` write side: invoked by the post-compile walker
+    /// once per ResumeDescr in the newly-compiled trace.
+    pub fn set_rd_loop_token(&self, green_key: u64) {
+        unsafe { *self.rd_loop_token.get() = Some(green_key) };
     }
 
     // UnsafeCell accessor helpers — single-threaded, no lock needed.
@@ -532,6 +553,10 @@ impl FailDescr for CraneliftFailDescr {
         self.trace_id
     }
 
+    fn rd_loop_token(&self) -> Option<u64> {
+        CraneliftFailDescr::rd_loop_token(self)
+    }
+
     fn is_gc_ref_slot(&self, slot: usize) -> bool {
         self.gc_map.is_ref(slot)
     }
@@ -573,6 +598,9 @@ pub struct JitFrameDeadFrame {
     pub jf_gcref: GcRef,
     /// The fail descriptor for this exit.
     pub fail_descr: Arc<CraneliftFailDescr>,
+    /// Original attached `jf_descr` identity for finish exits emitted by
+    /// the metainterp (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
+    pub latest_descr: Option<DescrRef>,
     /// GC runtime id for root cleanup on Drop.
     pub gc_runtime_id: Option<u64>,
     /// Keeps the frame memory alive for non-GC allocations.
@@ -590,12 +618,14 @@ impl JitFrameDeadFrame {
     pub fn new(
         jf_gcref: GcRef,
         fail_descr: Arc<CraneliftFailDescr>,
+        latest_descr: Option<DescrRef>,
         gc_runtime_id: Option<u64>,
         heap_owner: Option<Vec<i64>>,
     ) -> Self {
         JitFrameDeadFrame {
             jf_gcref,
             fail_descr,
+            latest_descr,
             gc_runtime_id,
             _heap_owner: heap_owner,
         }

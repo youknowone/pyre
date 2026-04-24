@@ -564,6 +564,22 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, supplied))
 }
 
+/// Replace the trace-side payload for an already-known code object with a
+/// freshly-refined `PyJitCode` from the codewriter.
+///
+/// This is the explicit cross-store propagation path for pyre's
+/// `merge_point_pc`-driven portal recompiles: `CallControl.jitcodes`
+/// rebuilds first, then the shared `Arc<PyJitCode>` is written into the
+/// trace-side `MetaInterpStaticData.jitcodes` slot so blackhole/resume
+/// reads observe the same refined payload.
+#[doc(hidden)]
+pub fn refresh_jitcode_payload(code: *const (), payload: std::sync::Arc<crate::PyJitCode>) {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        r.borrow_mut().jitcode_for(code, Some(payload));
+    });
+}
+
 /// Ensure the trace-side staticdata has a JitCode slot for this
 /// `W_CodeObject` and return its SD-local `jitcode.index`.
 ///

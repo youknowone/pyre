@@ -642,6 +642,23 @@ impl WarmEnterState {
         cell.set_procedure_token(token, false);
     }
 
+    /// warmstate.py:716-723 `cell.set_procedure_token(procedure_token, tmp=True)`.
+    ///
+    /// Installs a temporary CALL_ASSEMBLER fallback token without
+    /// changing the tracing flags or compiled state.
+    pub fn attach_tmp_callback_to_interp(
+        &mut self,
+        green_key_hash: u64,
+        token: impl Into<Arc<JitCellToken>>,
+    ) {
+        let token = token.into();
+        let cell = self
+            .cells
+            .entry(green_key_hash)
+            .or_insert_with(BaseJitCell::new);
+        cell.set_procedure_token(token, true);
+    }
+
     /// warmstate.py:444 `finally: cell.flags &= ~JC_TRACING` parity —
     /// unconditional flag clear on the starting cell after tracing ends.
     /// Called from the tracing entry point (bound_reached / jit_merge_point_hook)
@@ -666,6 +683,13 @@ impl WarmEnterState {
         self.cells
             .get(&green_key_hash)
             .and_then(|cell| cell.loop_token.as_ref())
+    }
+
+    /// warmstate.py:191-196 `get_procedure_token`.
+    pub fn get_procedure_token(&self, green_key_hash: u64) -> Option<Arc<JitCellToken>> {
+        self.cells
+            .get(&green_key_hash)
+            .and_then(|cell| cell.get_procedure_token().cloned())
     }
 
     /// Allocate a new unique JitCellToken number.
