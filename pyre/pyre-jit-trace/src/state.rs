@@ -2003,6 +2003,23 @@ impl PyreSym {
         }
     }
 
+    /// True when this frame owns the tracing-time `virtualizable_boxes`
+    /// shadow for the current trace — i.e. portal entry (`vable_array_base`
+    /// seeded by `init_vable_indices`) or bridge entry (`bridge_local_oprefs`
+    /// populated by `setup_bridge_sym` after `seed_virtualizable_boxes`
+    /// reseeds the shadow). Callee inline frames allocated via
+    /// `PyreSym::new_uninit` in `push_inline_frame` (metainterp.rs:366-410)
+    /// keep both fields `None` and must NOT mirror into the caller's shadow
+    /// — their `nlocals + stack_idx` space is the callee's own, not the
+    /// caller's, so writing to `(NUM_SCALAR_INPUTARGS - 1) + reg_idx` in the
+    /// shared `TraceCtx` shadow would corrupt the caller's portal layout.
+    /// opencoder.py:718 `_list_of_boxes_virtualizable` treats
+    /// `self.virtualizable_boxes` as the single source of truth; this
+    /// predicate names the set of syms that are allowed to update it.
+    pub(crate) fn owns_virtualizable_shadow(&self) -> bool {
+        self.vable_array_base.is_some() || self.bridge_local_oprefs.is_some()
+    }
+
     #[doc(hidden)]
     pub fn from_test_state(state: TestSymState) -> Self {
         let mut sym = Self::new_uninit(state.frame);

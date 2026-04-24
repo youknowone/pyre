@@ -1184,15 +1184,6 @@ impl BlackholeInterpreter {
         (fnptr, jd.mainjitcode_calldescr.clone())
     }
 
-    /// Lookup helper for the jdindex-keyed runner pointer used by the
-    /// no-cpu fallback in `bhimpl_recursive_call_r` (pyre-only path
-    /// kept until the cpu surface fully covers blackhole's bh_call_*).
-    fn jitdrivers_sd_runner(&self, jdindex: usize) -> Option<fn(&[i64], &[i64], &[i64]) -> i64> {
-        self.jitdrivers_sd
-            .get(jdindex)
-            .and_then(|jd| jd.portal_runner_ptr)
-    }
-
     /// Resolve field descriptor offsets in this interpreter's descrs table.
     /// Delegates to the same logic as BlackholeInterpBuilder::resolve_field_offsets.
     pub fn resolve_field_offsets(&mut self, resolver: impl Fn(&str, &str) -> usize) {
@@ -1248,15 +1239,8 @@ impl BlackholeInterpreter {
         all_r.extend(&reds_r);
         let mut all_f = greens_f;
         all_f.extend(&reds_f);
-        if let Some(cpu) = self.cpu {
-            // RPython path: cpu.bh_call_r(fnptr, all_i, all_r, all_f, calldescr)
-            cpu.bh_call_r(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
-        } else if let Some(runner) = self.jitdrivers_sd_runner(jdindex) {
-            // blackhole.py:1113-1116: portal_runner(all_i, all_r, all_f)
-            majit_ir::GcRef(runner(&all_i, &all_r, &all_f) as usize)
-        } else {
-            majit_ir::GcRef::NULL
-        }
+        self.cpu()
+            .bh_call_r(fnptr, Some(&all_i), Some(&all_r), Some(&all_f), &calldescr)
     }
 
     /// Set an integer register value.

@@ -744,22 +744,39 @@ impl MIFrame {
             Type::Float => wrapfloat(ctx, value),
             _ => value,
         };
-        let s = self.sym_mut();
-        let stack_idx = s.stack_only_depth();
-        let reg_idx = s.nlocals + stack_idx;
-        if reg_idx >= s.registers_r.len() {
-            s.registers_r.resize(reg_idx + 1, OpRef::NONE);
+        let (has_vable, reg_idx) = {
+            let s = self.sym_mut();
+            let stack_idx = s.stack_only_depth();
+            let reg_idx = s.nlocals + stack_idx;
+            if reg_idx >= s.registers_r.len() {
+                s.registers_r.resize(reg_idx + 1, OpRef::NONE);
+            }
+            s.registers_r[reg_idx] = boxed;
+            if stack_idx >= s.symbolic_stack_types.len() {
+                s.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
+            }
+            s.symbolic_stack_types[stack_idx] = Type::Ref;
+            if stack_idx >= s.concrete_stack.len() {
+                s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
+            }
+            s.concrete_stack[stack_idx] = concrete;
+            s.valuestackdepth += 1;
+            (s.owns_virtualizable_shadow(), reg_idx)
+        };
+        // pyjitpl.py:1242-1247 `_opimpl_setarrayitem_vable` parity:
+        //     self.metainterp.virtualizable_boxes[flat_idx] = valuebox
+        // The symbolic stack slice of `locals_cells_stack_w` must stay in
+        // lock-step with the virtualizable_boxes shadow — the shadow is
+        // the single source of truth for `build_virtualizable_boxes`
+        // (opencoder.py:718 `_list_of_boxes_virtualizable` parity). Stack
+        // pushes mirror into the same flat layout that
+        // `store_local_value` uses for locals: slot `reg_idx` →
+        // `(NUM_SCALAR_INPUTARGS - 1) + reg_idx` in virtualizable_boxes.
+        if has_vable {
+            let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_idx;
+            let concrete_value = ctx.concrete_of_opref(boxed);
+            ctx.set_virtualizable_entry_at(flat_idx, boxed, concrete_value);
         }
-        s.registers_r[reg_idx] = boxed;
-        if stack_idx >= s.symbolic_stack_types.len() {
-            s.symbolic_stack_types.resize(stack_idx + 1, Type::Ref);
-        }
-        s.symbolic_stack_types[stack_idx] = Type::Ref;
-        if stack_idx >= s.concrete_stack.len() {
-            s.concrete_stack.resize(stack_idx + 1, ConcreteValue::Null);
-        }
-        s.concrete_stack[stack_idx] = concrete;
-        s.valuestackdepth += 1;
     }
 
     pub(crate) fn push_value(
@@ -773,24 +790,53 @@ impl MIFrame {
     }
 
     pub(crate) fn pop_value(&mut self, ctx: &mut TraceCtx) -> Result<OpRef, PyError> {
-        let s = self.sym_mut();
-        let nlocals = s.nlocals;
-        let stack_idx = s
-            .valuestackdepth
-            .checked_sub(nlocals + 1)
-            .ok_or_else(|| pyre_interpreter::stack_underflow_error("trace opcode"))?;
-        let reg_idx = nlocals + stack_idx;
-        if reg_idx >= s.registers_r.len() {
-            s.registers_r.resize(reg_idx + 1, OpRef::NONE);
+        let (value, has_vable, reg_idx) = {
+            let s = self.sym_mut();
+            let nlocals = s.nlocals;
+            let stack_idx = s
+                .valuestackdepth
+                .checked_sub(nlocals + 1)
+                .ok_or_else(|| pyre_interpreter::stack_underflow_error("trace opcode"))?;
+            let reg_idx = nlocals + stack_idx;
+            if reg_idx >= s.registers_r.len() {
+                s.registers_r.resize(reg_idx + 1, OpRef::NONE);
+            }
+            if s.registers_r[reg_idx] == OpRef::NONE {
+                let abs_idx = reg_idx;
+                let idx_const = ctx.const_int(abs_idx as i64);
+                s.registers_r[reg_idx] =
+                    trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
+            }
+            let value = s.registers_r[reg_idx];
+            s.valuestackdepth -= 1;
+            // Task #136 partial: gating on `vable_array_base.is_some()`
+            // intentionally does NOT cover bridges here. Unlike the other
+            // four mirror sites (push_typed_value / swap_values /
+            // store_local_value / finishframe_exception, all flipped to
+            // `owns_virtualizable_shadow()`), clearing the bridge shadow
+            // to NULL on every pop exposes a pre-existing BH resume
+            // consumer gap: `consume_one_section` + downstream BH opcode
+            // dispatch trust the shadow's OpRef/concrete halves without
+            // NULL validation. Bench repro: fib_recursive dynasm + cranelift
+            // TIMEOUT (>5s) with bridges populating fail_args NULLs that
+            // the BH then reads back into registers_r and operates on.
+            // Blocked on Task #137 B (BH concrete-consumer audit) before
+            // flipping this to `owns_virtualizable_shadow()`.
+            (value, s.vable_array_base.is_some(), reg_idx)
+        };
+        // pyframe.py:411-417 `popvalue_maybe_none` parity: the popped slot
+        // is cleared to None in `locals_cells_stack_w`. Upstream lowers
+        // this via `setarrayitem_vable_r(locals_cells_stack_w, depth,
+        // None)`, which `_opimpl_setarrayitem_vable` mirrors into
+        // `virtualizable_boxes`. Mirror the clear into the shadow so
+        // subsequent snapshots do not pick up a stale pushed OpRef above
+        // the current stack depth.
+        if has_vable {
+            let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_idx;
+            let null_opref = ctx.const_ref(pyre_object::PY_NULL as i64);
+            let null_value = majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
+            ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
         }
-        if s.registers_r[reg_idx] == OpRef::NONE {
-            let abs_idx = reg_idx;
-            let idx_const = ctx.const_int(abs_idx as i64);
-            s.registers_r[reg_idx] =
-                trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
-        }
-        let value = s.registers_r[reg_idx];
-        s.valuestackdepth -= 1;
         Ok(value)
     }
 
@@ -848,37 +894,57 @@ impl MIFrame {
     }
 
     pub(crate) fn swap_values(&mut self, ctx: &mut TraceCtx, depth: usize) -> Result<(), PyError> {
-        let s = self.sym_mut();
-        let stack_only = s.stack_only_depth();
-        if depth == 0 || stack_only < depth {
-            return Err(PyError::type_error("stack underflow during trace swap"));
-        }
-        let top_idx = stack_only - 1;
-        let other_idx = stack_only - depth;
-        let nlocals = s.nlocals;
-        let reg_top = nlocals + top_idx;
-        let reg_other = nlocals + other_idx;
-        let needed = reg_top.max(reg_other) + 1;
-        if s.registers_r.len() < needed {
-            s.registers_r.resize(needed, OpRef::NONE);
-        }
-        if s.registers_r[reg_top] == OpRef::NONE {
-            let idx_const = ctx.const_int(reg_top as i64);
-            s.registers_r[reg_top] =
-                trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
-        }
-        if s.registers_r[reg_other] == OpRef::NONE {
-            let idx_const = ctx.const_int(reg_other as i64);
-            s.registers_r[reg_other] =
-                trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
-        }
-        s.registers_r.swap(reg_top, reg_other);
-        if top_idx < s.symbolic_stack_types.len() && other_idx < s.symbolic_stack_types.len() {
-            s.symbolic_stack_types.swap(top_idx, other_idx);
-        }
-        // MIFrame Box tracking: swap concrete values too
-        if top_idx < s.concrete_stack.len() && other_idx < s.concrete_stack.len() {
-            s.concrete_stack.swap(top_idx, other_idx);
+        let (has_vable, reg_top, reg_other) = {
+            let s = self.sym_mut();
+            let stack_only = s.stack_only_depth();
+            if depth == 0 || stack_only < depth {
+                return Err(PyError::type_error("stack underflow during trace swap"));
+            }
+            let top_idx = stack_only - 1;
+            let other_idx = stack_only - depth;
+            let nlocals = s.nlocals;
+            let reg_top = nlocals + top_idx;
+            let reg_other = nlocals + other_idx;
+            let needed = reg_top.max(reg_other) + 1;
+            if s.registers_r.len() < needed {
+                s.registers_r.resize(needed, OpRef::NONE);
+            }
+            if s.registers_r[reg_top] == OpRef::NONE {
+                let idx_const = ctx.const_int(reg_top as i64);
+                s.registers_r[reg_top] =
+                    trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
+            }
+            if s.registers_r[reg_other] == OpRef::NONE {
+                let idx_const = ctx.const_int(reg_other as i64);
+                s.registers_r[reg_other] =
+                    trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
+            }
+            s.registers_r.swap(reg_top, reg_other);
+            if top_idx < s.symbolic_stack_types.len() && other_idx < s.symbolic_stack_types.len() {
+                s.symbolic_stack_types.swap(top_idx, other_idx);
+            }
+            // MIFrame Box tracking: swap concrete values too
+            if top_idx < s.concrete_stack.len() && other_idx < s.concrete_stack.len() {
+                s.concrete_stack.swap(top_idx, other_idx);
+            }
+            (s.owns_virtualizable_shadow(), reg_top, reg_other)
+        };
+        // `virtualizable_boxes` is the single source of truth for the
+        // frame's Ref array (opencoder.py:718). SWAP rewrites two slots
+        // of `locals_cells_stack_w`, so swap the (OpRef, concrete) pairs
+        // atomically via `virtualizable_entry_at`; reading each half
+        // separately and reconstructing concrete via `concrete_of_opref`
+        // would drop non-const Box identity into the sentinel fallback.
+        if has_vable {
+            let flat_top = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_top;
+            let flat_other = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_other;
+            if let (Some((op_top, val_top)), Some((op_other, val_other))) = (
+                ctx.virtualizable_entry_at(flat_top),
+                ctx.virtualizable_entry_at(flat_other),
+            ) {
+                ctx.set_virtualizable_entry_at(flat_top, op_other, val_other);
+                ctx.set_virtualizable_entry_at(flat_other, op_top, val_top);
+            }
         }
         Ok(())
     }
@@ -994,7 +1060,7 @@ impl MIFrame {
             // virtualizable.py:86-98 read_boxes() parity: every item of
             // locals_cells_stack_w is Ref.
             s.symbolic_local_types[idx] = Type::Ref;
-            (s.vable_array_base.is_some(), s.frame, s.nlocals)
+            (s.owns_virtualizable_shadow(), s.frame, s.nlocals)
         };
         // RPython pyjitpl.py:1242-1247 `_opimpl_setarrayitem_vable` parity:
         //     self.metainterp.virtualizable_boxes[flat_idx] = valuebox
@@ -2218,25 +2284,11 @@ impl MIFrame {
             ));
         }
         // Array items: locals + stack (virtualizable.py:86 read_boxes).
-        // `stack_values` is kept for the `physical_array_len` fallback
-        // below (frame height calculation), where the symbolic stack
-        // depth still drives the target array length.
-        let (valid_stack_only, source_len) = if let Some(ref pre_r) = self.pre_opcode_registers_r {
-            let pre_stack_only = pre_r.len().saturating_sub(sym.nlocals);
-            (pre_stack_only, pre_r.len())
+        let _ = stack_only;
+        let symbolic_stack_len = if let Some(ref pre_r) = self.pre_opcode_registers_r {
+            pre_r.len().saturating_sub(sym.nlocals)
         } else {
-            (stack_only, sym.registers_r.len())
-        };
-        let valid_len = (sym.nlocals + valid_stack_only).min(source_len);
-        let registers_r_view: Vec<OpRef> = if let Some(ref pre_r) = self.pre_opcode_registers_r {
-            pre_r[..valid_len.min(pre_r.len())].to_vec()
-        } else {
-            sym.registers_r[..valid_len.min(sym.registers_r.len())].to_vec()
-        };
-        let stack_values: Vec<OpRef> = if registers_r_view.len() > sym.nlocals {
-            registers_r_view[sym.nlocals..].to_vec()
-        } else {
-            Vec::new()
+            sym.registers_r.len().saturating_sub(sym.nlocals)
         };
         let concrete_frame = if !sym.concrete_vable_ptr.is_null() {
             Some(unsafe { &*(sym.concrete_vable_ptr as *const pyre_interpreter::pyframe::PyFrame) })
@@ -2264,7 +2316,7 @@ impl MIFrame {
                     .unwrap_or(sym.valuestackdepth);
                 let stack_depth = current_vsd
                     .saturating_sub(sym.nlocals)
-                    .min(stack_values.len());
+                    .min(symbolic_stack_len);
                 sym.nlocals + stack_depth
             });
         let full_array_len = physical_array_len;
@@ -2280,12 +2332,13 @@ impl MIFrame {
             .unwrap_or(majit_ir::Type::Ref);
         // virtualizable.py:86 read_boxes / opencoder.py:718 _list_of_boxes_virtualizable
         // parity: RPython snapshot reads directly from `self.virtualizable_boxes`,
-        // which is the single source of truth mirrored by every `_opimpl_setarrayitem_vable`
-        // via `synchronize_virtualizable`. pyre's tracer mirrors stores into
-        // `ctx.virtualizable_boxes[num_static + i]` for local slots, so prefer that
-        // shadow over the legacy `sym.registers_r[i]` / `stack_values[stack_idx]`
-        // pair. Fall back to the legacy path only when the shadow slot is OpRef::NONE
-        // (stack temporaries that the tracer never mirrored into the shadow).
+        // which is the single source of truth mirrored by every
+        // `_opimpl_setarrayitem_vable` via `synchronize_virtualizable`.
+        // pyre's tracer mirrors EVERY write into `locals_cells_stack_w`
+        // (locals via `store_local_value`, stack via `push_typed_value`
+        // + `pop_value` + `swap_values` + `finishframe_exception`) into
+        // `virtualizable_boxes`, so the shadow is the only source we
+        // read here.
         let num_static = ctx
             .virtualizable_info()
             .map(|info| info.num_static_extra_boxes)
@@ -2296,25 +2349,9 @@ impl MIFrame {
             // so array slot `i` lives at `num_static + i`. The trailing
             // `vable_ref` is at `virtualizable_boxes[-1]` and NEVER covers
             // an array slot — skip it via `.get()`.
-            let shadow_entry = ctx.virtualizable_box_at(num_static + i);
-            let opref = match shadow_entry {
-                Some(op) if !op.is_none() => op,
-                _ => {
-                    // pyre stack temporaries live in the `registers_r` tail,
-                    // not the vable shadow — keep the legacy fallback for
-                    // those slots.
-                    if i < sym.registers_r.len() {
-                        sym.registers_r[i]
-                    } else {
-                        let stack_idx = i - sym.nlocals;
-                        if stack_idx < stack_values.len() {
-                            stack_values[stack_idx]
-                        } else {
-                            OpRef::NONE
-                        }
-                    }
-                }
-            };
+            let opref = ctx
+                .virtualizable_box_at(num_static + i)
+                .unwrap_or(OpRef::NONE);
             if !opref.is_none() {
                 boxes.push(Self::opref_to_snapshot_tagged_for_slot(
                     opref,
@@ -4702,8 +4739,9 @@ impl MIFrame {
             let ncells = code.cellvars.len() + code.freevars.len();
             let nlocals = self.sym().nlocals;
             let target_stack_len = ncells + handler_depth;
-            {
+            let (has_vable, old_vsd, new_vsd, lasti_reg_idx, exc_reg_idx) = {
                 let s = self.sym_mut();
+                let old_vsd = s.valuestackdepth;
                 s.symbolic_stack_types.truncate(target_stack_len);
                 s.concrete_stack.truncate(target_stack_len);
                 s.valuestackdepth = nlocals + target_stack_len;
@@ -4713,17 +4751,62 @@ impl MIFrame {
                 if s.registers_r.len() > nlocals + target_stack_len {
                     s.registers_r.truncate(nlocals + target_stack_len);
                 }
-                if entry.push_lasti {
+                let lasti_reg_idx = if entry.push_lasti {
+                    let idx = s.registers_r.len();
                     s.symbolic_stack_types.push(Type::Ref);
                     s.concrete_stack
                         .push(ConcreteValue::Ref(pyre_object::w_int_new(pc as i64)));
                     s.valuestackdepth += 1;
                     s.registers_r.push(OpRef::NONE);
-                }
+                    Some(idx)
+                } else {
+                    None
+                };
+                let exc_reg_idx = s.registers_r.len();
                 s.symbolic_stack_types.push(Type::Ref);
                 s.concrete_stack.push(ConcreteValue::Ref(exc_obj));
                 s.valuestackdepth += 1;
                 s.registers_r.push(exc_opref);
+                (
+                    s.owns_virtualizable_shadow(),
+                    old_vsd,
+                    s.valuestackdepth,
+                    lasti_reg_idx,
+                    exc_reg_idx,
+                )
+            };
+            // opencoder.py:718 `_list_of_boxes_virtualizable` parity: the
+            // snapshot reads only `virtualizable_boxes`, so the unwind
+            // must also mirror onto the shadow. Clear truncated slots to
+            // PY_NULL (pyframe.py:411 popvalue_maybe_none) and write the
+            // push_lasti / exc_box slots to match registers_r.
+            if has_vable {
+                let null_opref =
+                    self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::PY_NULL as i64));
+                let null_value =
+                    majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
+                let static_offset = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1;
+                // Clear shadow slots that were above new_vsd up to old_vsd.
+                let lo = new_vsd.min(old_vsd);
+                let hi = new_vsd.max(old_vsd);
+                self.with_ctx(|_this, ctx| {
+                    for reg_idx in lo..hi {
+                        let flat_idx = static_offset + reg_idx;
+                        ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
+                    }
+                    if let Some(idx) = lasti_reg_idx {
+                        // registers_r stored OpRef::NONE for the lasti
+                        // slot; mirror that as PY_NULL shadow. The
+                        // concrete int is not tracked here because the
+                        // caller pushed a ConcreteValue::Ref directly
+                        // without an OpRef.
+                        let flat_idx = static_offset + idx;
+                        ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
+                    }
+                    let flat_idx = static_offset + exc_reg_idx;
+                    let exc_concrete = majit_ir::Value::Ref(majit_ir::GcRef(exc_obj as usize));
+                    ctx.set_virtualizable_entry_at(flat_idx, exc_opref, exc_concrete);
+                });
             }
             // Sync concrete frame.
             let frame = unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::PyFrame) };
@@ -5568,6 +5651,14 @@ impl OpcodeStepExecutor for MIFrame {
             let cause = if raw_cause_obj.is_null() {
                 None
             } else {
+                // pyopcode.py:706 `w_cause = space.call_function(w_cause)`
+                // runs on the interpreter path; in pyre's tracer context
+                // the call must be forced onto the plain eval loop so it
+                // does not re-enter the tracer. Mirrors the exc-path
+                // guard at `call_function(exc, &[])` below (commit
+                // bef2ee2035 symmetrized JIT + blackhole helpers but
+                // missed this tracer-time site).
+                let _plain_guard = pyre_interpreter::call::force_plain_eval();
                 Some(normalize_raise_cause(raw_cause_obj)?)
             };
             (exc_val, cause, raw_cause.opref)

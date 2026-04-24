@@ -1820,36 +1820,21 @@ fn register_helper_fn_pointers(
 /// `SSARepr` to find each Python PC's `-live-` marker instead of caching
 /// pre-rewrite insn indices.
 ///
-/// After the dataflow, pyre applies an in-place post-filter to each
-/// `-live-` marker so the args carry only the subset of registers
-/// the runtime contract is currently wired to consume (see rules
-/// below). `get_liveness_info` at assemble time
-/// (`assembler.rs:422-437`) partitions by kind and emits the
-/// `all_liveness` byte stream. Both the tracer's
-/// `get_list_of_active_boxes` and the blackhole's bridge-resume
-/// `consume_one_section` read `all_liveness` via `LivenessIterator`,
-/// so the single post-rename `-live-` marker is the sole source.
+/// After the dataflow, pyre rewrites each `-live-` marker so the
+/// args are split into live_i / live_r / live_f sequences, mirroring
+/// upstream `assembler.py:150-152`
+/// (`get_liveness_info(insn[1:], 'int'/'ref'/'float')`). The
+/// tracer (`trace_opcode.rs:670`) and the blackhole bridge-resume
+/// (`call_jit.rs:870-887`) read the three banks in order via
+/// `LivenessIterator`, so the post-rename `-live-` marker is the
+/// sole source.
 ///
-/// Post-filter rules (pyre-only adaptation on top of SSA output):
-///   - Only Ref-kind registers: pyre Int/Float regs are scratch
-///     tmps (int_tmp0/1, op_code_reg) or constant-as-reg encodings
-///     inside `jit_merge_point`; they never carry a Python box
-///     across py_pc boundaries. Leaving live_i / live_f empty keeps
-///     the tracer / blackhole (which index box arrays by raw
-///     register index at `trace_opcode.rs:229-263` /
-///     `call_jit.rs:965-982`) from pulling a Ref box through an
-///     Int/Float slot.
-///   - Only indices inside the Python-frame range: locals
-///     `0..nlocals` or in-depth stack slots
-///     `stack_base..stack_base+depth`. Helper Ref regs above that
-///     range (obj_tmp0/1, arg_regs_start, null_ref_reg,
-///     portal_{frame,ec}_reg) are correctly dead across py_pcs and
-///     would desynchronise box layout if leaked.
-///   - Every in-depth stack slot `stack_base + d` for
-///     `d in 0..depth_at_pc[py_pc]` is force-added even if SSA
-///     didn't mark it alive, because pyre's runtime invariant at
-///     every `-live-` marker is "all stack slots up to the current
-///     depth hold a live box".
+/// The Ref bank carries a pyre-specific PRE-EXISTING-ADAPTATION
+/// (Python-frame index range + force-add in-depth stack slots +
+/// LV∩SSA intersection) required because pyre's pre-regalloc
+/// register space conflates Python frame slots with scratch Ref
+/// tmps; see `filter_liveness_in_place` for the full rationale.
+/// Int/Float banks are emitted line-by-line parity with no filter.
 ///
 /// Unreachable PCs still get emptied in place via the bytecode
 /// `LiveVars` analysis. The direct-dispatch walker emits one
@@ -1971,11 +1956,33 @@ fn filter_liveness_in_place(
         let mut live_r: Vec<u16> = Vec::new();
         let mut live_i: Vec<u16> = Vec::new();
         let mut live_f: Vec<u16> = Vec::new();
-        // `liveness.py:67-75` `compute_liveness` adds every Register read
-        // to the alive set without a kind filter. Preserve Int/Float
-        // registers as-is; only Ref registers carry pyre's stack-base /
-        // in-range adaptation (PRE-EXISTING-ADAPTATION, see the vable
-        // locals/stack decoding contract below).
+        // liveness.py:67-75 `compute_liveness` adds every Register to
+        // the alive set; assembler.py:150-152 splits the `-live-` args
+        // into live_i / live_r / live_f by kind via
+        // `get_liveness_info(insn[1:], 'int'/'ref'/'float')`. The
+        // Int/Float banks mirror that shape exactly.
+        //
+        // PRE-EXISTING-ADAPTATION (Ref bank):
+        // upstream RPython registers are strictly post-regalloc SSA
+        // colors in `0..num_regs_r`, all carrying Python boxes.
+        // pyre's pre-regalloc register index space conflates Python
+        // frame slots (`0..nlocals` + `stack_base..stack_base+depth`)
+        // with scratch Ref tmps allocated at fixed offsets beyond
+        // `nlocals + max_stackdepth` (`obj_tmp0` / `arg_regs_start` /
+        // `null_ref_reg` / `portal_{frame,ec}_reg` — see
+        // `RegisterLayout::compute` at codewriter.rs:1670-1692). Those
+        // scratch registers appear in `compute_liveness`'s alive set
+        // but are NOT Python boxes; leaking them into live_r causes
+        // the blackhole consumer at `call_jit.rs:876-881` to call
+        // `setarg_r` with scratch contents, crashing on nbody /
+        // fannkuch / spectral_norm.
+        //
+        // Until pyre's register layout is refactored to a
+        // post-regalloc-color-only space matching RPython (Task #62
+        // scope, multi-session), constrain live_r to the Python-frame
+        // range and force-add in-depth stack slots so the "all stack
+        // slots up to current depth hold a live box" runtime contract
+        // holds at every `-live-` marker.
         for op in existing.iter() {
             let SsaOperand::Register(reg) = op else {
                 continue;
@@ -2008,6 +2015,13 @@ fn filter_liveness_in_place(
                 live_r.push(idx);
             }
         }
+        // PRE-EXISTING-ADAPTATION: pyre's tracer + blackhole are still
+        // wired to Python's per-bytecode LiveVars answer for locals
+        // (which omits function parameters at pc=0 and dead locals).
+        // Narrowing live_r to LV∩SSA restores that contract until
+        // SSA liveness becomes the sole authority — see
+        // `phase4_ssa_liveness_blocker_2026_04_18.md` for the rework
+        // required to drop this intersection (Task #62 scope).
         let lv_live: std::collections::BTreeSet<u16> = {
             let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
                 .filter(|&idx| live_vars.is_local_live(py_pc, idx))
@@ -3290,18 +3304,26 @@ impl CodeWriter {
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, w_object)`
         // + `setfield_vable_i(valuestackdepth, depth + 1)` via
         // jtransform.py:1898 `do_fixed_list_setitem` +
-        // jtransform.py:920-928. RPython's optimizer folds the
-        // per-push `setarrayitem_vable_r` via OptVirtualize so that the
-        // compiled trace pays only the final force-vable cost. pyre's
-        // OptVirtualize does not yet fold these at the same grain
-        // (benchmark: enabling per-push mirror regresses nbody from
-        // ~1.9s to ~22s). Emit only the SSA-stack `ref_copy` +
-        // `setfield_vable_i` here until that fold lands; the parity
-        // gap is the pyre side's optimizer, not this lowering.
+        // jtransform.py:920-928. RPython's optimizer folds the per-push
+        // `setarrayitem_vable_r` via OptVirtualize so that the compiled
+        // trace pays only the final force-vable cost; pyre's
+        // OptVirtualize does not yet fold these at the same grain, so
+        // the emission is load-bearing for shadow parity with
+        // `build_virtualizable_boxes` + BH `virtualizable_boxes`
+        // reconstruction and the per-push cost is recovered only as the
+        // optimizer port progresses.
         macro_rules! emit_pushvalue_ref {
             ($ssarepr:expr, $depth:ident, $src:expr) => {{
                 let src_reg = $src;
                 emit_ref_copy!($ssarepr, stack_base + $depth, src_reg);
+                if is_portal {
+                    emit_load_const_i!(
+                        $ssarepr,
+                        int_tmp0,
+                        (stack_base_absolute + $depth as usize) as i64
+                    );
+                    emit_vable_setarrayitem_ref!($ssarepr, 0_u16, int_tmp0, src_reg);
+                }
                 $depth += 1;
                 emit_vsd!($depth);
             }};
@@ -3309,16 +3331,22 @@ impl CodeWriter {
 
         // pyframe.py:411-417 `popvalue_maybe_none` lowers to
         // `setarrayitem_vable_r(locals_cells_stack_w, depth, None)` +
-        // `setfield_vable_i(valuestackdepth, depth)`. The per-pop
-        // null-clear mirror is folded by RPython OptVirtualize; pyre's
-        // optimizer does not yet do that (same overhead pattern as
-        // `emit_pushvalue_ref!`). Emit only the SSA-stack pop + depth
-        // write here; the popped value stays available in the returned
-        // SSA register for downstream uses.
+        // `setfield_vable_i(valuestackdepth, depth)`. Mirror the None
+        // clear by writing `null_ref_reg` (already initialized to
+        // `pyre_object::PY_NULL`) at the freshly-vacated slot. The
+        // popped SSA register stays available for downstream uses.
         macro_rules! emit_popvalue_ref {
             ($ssarepr:expr, $depth:ident) => {{
                 $depth -= 1;
                 let popped_reg = stack_base + $depth;
+                if is_portal {
+                    emit_load_const_i!(
+                        $ssarepr,
+                        int_tmp0,
+                        (stack_base_absolute + $depth as usize) as i64
+                    );
+                    emit_vable_setarrayitem_ref!($ssarepr, 0_u16, int_tmp0, null_ref_reg);
+                }
                 emit_vsd!($depth);
                 popped_reg
             }};
@@ -3326,13 +3354,11 @@ impl CodeWriter {
 
         // pyopcode.py:500-507 LOAD_FAST + pyframe.py:378-381 pushvalue.
         // Portal case lowers the local read to `getarrayitem_vable_r`
-        // (jtransform.py:1877 `do_fixed_list_getitem`). The subsequent
-        // pushvalue's `setarrayitem_vable_r` mirror would be required
-        // per jtransform.py:1898, but RPython's OptVirtualize folds it
-        // at trace time. pyre's optimizer does not — emitting the
-        // mirror regresses nbody ~12x (see `emit_pushvalue_ref!`
-        // comment). Emit the vable read + stack-slot ref_copy only; the
-        // push mirror is deferred to the OptVirtualize port.
+        // (jtransform.py:1877 `do_fixed_list_getitem`). Both the load
+        // and the subsequent pushvalue's `setarrayitem_vable_r` mirror
+        // (jtransform.py:1898) are emitted here so the shadow
+        // `locals_cells_stack_w` slot mirrors the value loaded into the
+        // stack-side SSA register.
         macro_rules! emit_load_fast_ref {
             ($ssarepr:expr, $depth:ident, $reg:expr) => {{
                 let reg = $reg;
@@ -3343,6 +3369,12 @@ impl CodeWriter {
                         local_to_vable_slot(reg as usize) as i64
                     );
                     emit_vable_getarrayitem_ref!($ssarepr, stack_base + $depth, 0_u16, int_tmp0);
+                    emit_load_const_i!(
+                        $ssarepr,
+                        int_tmp0,
+                        (stack_base_absolute + $depth as usize) as i64
+                    );
+                    emit_vable_setarrayitem_ref!($ssarepr, 0_u16, int_tmp0, stack_base + $depth);
                     let loaded = current_state
                         .locals_w
                         .get(reg as usize)
@@ -4918,9 +4950,10 @@ impl CodeWriter {
         // codewriter.py:55-56 parity: `compute_liveness(ssarepr)` runs
         // AFTER regalloc + flatten, so the live-register indices the
         // pass writes into each `-live-` marker are already the
-        // post-rename colors. pyre's `filter_liveness_in_place` keeps
-        // that ordering and then applies the pyre-only runtime-contract
-        // filter (Ref-only, in-range, stack-complete, LiveVars-intersected).
+        // post-rename colors. `filter_liveness_in_place` then splits
+        // them into live_i/live_r/live_f per assembler.py:150-152,
+        // with a PRE-EXISTING-ADAPTATION narrowing live_r to Python
+        // boxes (see that function's header comment).
         filter_liveness_in_place(&mut ssarepr, code, nlocals, stack_base, &depth_at_pc);
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
