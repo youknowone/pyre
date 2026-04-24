@@ -220,24 +220,20 @@ pub(crate) fn build_guard_metadata(
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
         } else if let Some(ref fail_args) = op.fail_args {
-            // Derive exit_types from value_types (post-unbox) first,
-            // falling back to fail_arg_types then fail_arg_type.
-            let fa_types = op.fail_arg_types.as_ref();
-            fail_args
-                .iter()
-                .enumerate()
-                .map(|(i, opref)| {
-                    if let Some(&tp) = value_types.get(&opref.0) {
-                        return tp;
-                    }
-                    if let Some(types) = fa_types {
-                        if let Some(&tp) = types.get(i) {
-                            return tp;
-                        }
-                    }
-                    fail_arg_type(opref, &value_types, constant_types)
-                })
-                .collect()
+            if let Some(types) = op
+                .fail_arg_types
+                .as_ref()
+                .filter(|t| t.len() == fail_args.len())
+            {
+                types.clone()
+            } else {
+                // Reconstruct per-arg types from the current OpRefs only
+                // when the guard carries no full fail_arg_types vector.
+                fail_args
+                    .iter()
+                    .map(|opref| fail_arg_type(opref, &value_types, constant_types))
+                    .collect()
+            }
         } else if let Some(ref types) = op.fail_arg_types {
             types.clone()
         } else {

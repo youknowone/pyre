@@ -360,19 +360,14 @@ impl UnrollOptimizer {
 
             match opt_p1.exported_loop_state.take() {
                 Some(mut state) => {
-                    // Determine types of end_args from Phase 1's output ops.
-                    {
-                        let op_types: HashMap<OpRef, Type> = p1_ops
-                            .iter()
-                            .filter(|op| !op.pos.is_none())
-                            .map(|op| (op.pos, op.opcode.result_type()))
-                            .collect();
-                        state.end_arg_types = state
-                            .end_args
-                            .iter()
-                            .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
-                            .collect();
-                    }
+                    // end_arg_types is already populated by
+                    // `Optimizer::optimize_with_constants_and_inputs_at`
+                    // using the optimizer-visible `ctx.opref_type()` (see
+                    // optimizer.rs:2345-2357). Overwriting it here with
+                    // `opcode.result_type()` + `Type::Ref` default would
+                    // retype Phase 1 inputarg OpRefs (absent from `p1_ops`)
+                    // as `Ref`, which later feeds the cross-type forward
+                    // assertion in `OptContext::replace_op`.
                     // RPython Phase 1 → Phase 2 heap cache transfer:
                     // RPython does NOT serialize heap cache in ExportedState.
                     // HeapOps in the short preamble are replayed during Phase 2's
@@ -450,19 +445,10 @@ impl UnrollOptimizer {
                 }
             }
         };
-        // Determine types of end_args from Phase 1's output ops.
-        {
-            let op_types: HashMap<OpRef, Type> = p1_ops
-                .iter()
-                .filter(|op| !op.pos.is_none())
-                .map(|op| (op.pos, op.opcode.result_type()))
-                .collect();
-            exported_state.end_arg_types = exported_state
-                .end_args
-                .iter()
-                .map(|&arg| op_types.get(&arg).copied().unwrap_or(Type::Ref))
-                .collect();
-        }
+        // end_arg_types is already populated by
+        // `Optimizer::optimize_with_constants_and_inputs_at`
+        // using the optimizer-visible `ctx.opref_type()` (see
+        // optimizer.rs:2345-2357).
         // RPython parity: Phase 2 needs patchguardop from Phase 1's
         // GuardFutureCondition (unroll.py:333). Extract before dropping opt_p1.
         let p1_patchguardop = exported_state.patchguardop.clone();
@@ -2078,7 +2064,38 @@ impl OptUnroll {
         )
     }
 
-    /// unroll.py:432-443: _expand_info
+    /// unroll.py:432-443 `_expand_info`:
+    ///
+    /// ```python
+    /// def _expand_info(self, arg, infos):
+    ///     arg1 = self.optimizer.as_operation(arg)
+    ///     if arg1 is not None and rop.is_same_as(arg1.opnum):
+    ///         info = self.optimizer.getinfo(arg1.getarg(0))
+    ///     else:
+    ///         info = self.optimizer.getinfo(arg)
+    ///     if arg in infos:
+    ///         return
+    ///     if info:
+    ///         infos[arg] = info
+    ///         if info.is_virtual():
+    ///             self._expand_infos_from_virtual(info, infos)
+    /// ```
+    ///
+    /// The dict key is the caller-supplied `arg` (line 441 `infos[arg] =
+    /// info`), never the box-replacement terminal. Callers in `export_state`
+    /// already pre-resolve the argument via `get_box_replacement` at
+    /// unroll.py:458 before the loop, so `arg` is resolved at the top-level
+    /// entry; the recursive virtual-field walk at
+    /// `_expand_infos_from_virtual` passes the field's own box as `arg`, so
+    /// the subsequent `setinfo_from_preamble_list(info.all_items(), infos)`
+    /// at mod.rs lookup uses the same field-box key.
+    ///
+    /// `collect_exported_info(resolved, ...)` stands in for the RPython
+    /// `as_operation + is_same_as + getinfo` chain: follows the forwarding
+    /// chain to the terminal box and reads its PtrInfo/IntBound. RPython
+    /// walks only one SAME_AS hop there; pyre's `get_box_replacement`
+    /// collapses the full chain, which is equivalent when the chain is all
+    /// SAME_AS-like forwards.
     fn expand_info(
         &self,
         arg: OpRef,
@@ -2086,38 +2103,23 @@ impl OptUnroll {
         exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
         infos: &mut HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
-        let resolved = ctx.get_box_replacement(arg);
-        if infos.contains_key(&resolved) {
-            // Also store under the original key so import_state can
-            // find the info using the unresolved next_iteration_args key.
-            if arg != resolved {
-                if let Some(info) = infos.get(&resolved).cloned() {
-                    infos.insert(arg, info);
-                }
-            }
+        // unroll.py:438 `if arg in infos: return`
+        if infos.contains_key(&arg) {
             return;
         }
-        // unroll.py:438-443 `_expand_info`:
-        //     if arg in infos:
-        //         return
-        //     if info:
-        //         infos[arg] = info
-        //         if info.is_virtual():
-        //             self._expand_infos_from_virtual(info, infos)
-        //
-        // RPython stores the entry only when `info` is truthy — a falsy
-        // `info` (None) simply skips the insert, so downstream
-        // `setinfo_from_preamble_list` at unroll.py:45-51 sees "no entry"
-        // and drops any inherited forwarded via `item.set_forwarded(None)`.
+        // unroll.py:433-437 resolve the SAME_AS chain for info lookup.
+        let resolved = ctx.get_box_replacement(arg);
+        // unroll.py:440 `if info:` — skip when no info at all.
         let Some(info) = self.collect_exported_info(resolved, ctx, exported_int_bounds) else {
             return;
         };
-        let has_fields = matches!(ctx.get_ptr_info(resolved), Some(pi) if pi.is_virtual() || !pi.all_items().is_empty());
-        infos.insert(resolved, info.clone());
-        // Also store under the original (unresolved) key.
-        if arg != resolved {
-            infos.insert(arg, info);
-        }
+        let has_fields = matches!(
+            ctx.get_ptr_info(resolved),
+            Some(pi) if pi.is_virtual() || !pi.all_items().is_empty()
+        );
+        // unroll.py:441 `infos[arg] = info` — key is the caller-supplied arg.
+        infos.insert(arg, info);
+        // unroll.py:442-443 `if info.is_virtual(): _expand_infos_from_virtual(info, infos)`.
         if has_fields {
             self.expand_infos_from_virtual(resolved, ctx, exported_int_bounds, infos);
         }
@@ -3110,13 +3112,21 @@ impl OptUnroll {
             if let Some(&opref) = imported_constants.get(&source) {
                 return opref;
             }
-            // Preserve the exported constant's source OpRef identity across
-            // import. RPython keeps the same Const object reachable from the
-            // short preamble; using the original source position here lets
-            // dependency chains and tests observe the same stable constant box.
-            ctx.seed_constant(source, value.clone());
-            imported_constants.insert(source, source);
-            source
+            // The exported `source` OpRef belongs to the producing trace's
+            // const-pool namespace and can numerically collide with an
+            // existing entry in THIS retrace's `ctx.constant_types` (the
+            // pre-seed at `optimizer.rs:1802`). Since the two pools
+            // allocate const indices independently, reusing `source` as
+            // the key in `ctx.const_pool` risks aliasing Int vs Ref, which
+            // `seed_constant` correctly asserts against. Allocate a fresh
+            // const OpRef in the current context so the imported constant
+            // carries its value through without touching the pre-seeded
+            // slots. RPython uses Box identity for this; the fresh OpRef
+            // is majit's Box-identity analogue.
+            let fresh = ctx.reserve_const_ref();
+            ctx.seed_constant(fresh, value.clone());
+            imported_constants.insert(source, fresh);
+            fresh
         }
 
         fn resolve_exported_short_result(
@@ -5403,10 +5413,21 @@ mod tests {
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(8, 2);
         let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut optimizer, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(12), OpRef(11)]);
-        assert_eq!(
-            ctx2.get_constant(OpRef::from_const(23)),
-            Some(&Value::Ref(ptr))
-        );
+        // Imported constants get a fresh const-index in the new context's
+        // const-pool namespace so they can never collide with entries pre-
+        // seeded at `optimizer.rs:1802` from the retrace's `constant_types`.
+        // The returned OpRef (captured via `imported_short_pure_ops`) is the
+        // authoritative handle; the producing trace's `source` OpRef (23)
+        // has no meaning in this context.
+        let imported_arg = match &ctx2.imported_short_pure_ops[0].args[0] {
+            crate::optimizeopt::ImportedShortPureArg::Const(value, opref) => {
+                assert_eq!(*value, Value::Ref(ptr));
+                *opref
+            }
+            other => panic!("expected Const arg, got {other:?}"),
+        };
+        assert!(imported_arg.is_constant());
+        assert_eq!(ctx2.get_constant(imported_arg), Some(&Value::Ref(ptr)));
         assert_eq!(
             ctx2.imported_short_pure_ops,
             vec![crate::optimizeopt::ImportedShortPureOp::new(
@@ -5414,7 +5435,7 @@ mod tests {
                 Some(field_descr.clone()),
                 vec![crate::optimizeopt::ImportedShortPureArg::Const(
                     Value::Ref(ptr),
-                    OpRef::from_const(23)
+                    imported_arg,
                 )],
                 OpRef(11),
                 OpRef(11),

@@ -574,6 +574,9 @@ impl Optimizer {
                 // still works.
                 let raw = OpRef(ctx.inputarg_base + iv.inputarg_index as u32);
                 let virtual_head = ctx.get_box_replacement(raw);
+                if !virtual_head.is_none() && !ctx.is_constant(virtual_head) {
+                    ctx.register_value_type(virtual_head, majit_ir::Type::Ref);
+                }
                 walk_visited.insert(top_key, virtual_head);
                 let mut fields = Vec::new();
                 let mut field_descrs = Vec::new();
@@ -756,6 +759,7 @@ impl Optimizer {
                 field_descrs,
             } => {
                 let opref = ctx.alloc_op_position();
+                ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_fields: Vec<(u32, OpRef)> = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
@@ -800,6 +804,7 @@ impl Optimizer {
             }
             VirtualStateInfo::VArray { descr, items, .. } => {
                 let opref = ctx.alloc_op_position();
+                ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_items = items
                     .iter()
                     .map(|item_info| {
@@ -832,6 +837,7 @@ impl Optimizer {
                 field_descrs,
             } => {
                 let opref = ctx.alloc_op_position();
+                ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_fields = fields
                     .iter()
                     .map(|(field_idx, field_info)| {
@@ -867,6 +873,7 @@ impl Optimizer {
                 element_fields,
             } => {
                 let opref = ctx.alloc_op_position();
+                ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let imported_elements = element_fields
                     .iter()
                     .map(|fields| {
@@ -908,6 +915,7 @@ impl Optimizer {
                 descrs,
             } => {
                 let opref = ctx.alloc_op_position();
+                ctx.register_value_type(opref, majit_ir::Type::Ref);
                 let mut offsets = Vec::with_capacity(entries.len());
                 let mut lengths = Vec::with_capacity(entries.len());
                 let mut values = Vec::with_capacity(entries.len());
@@ -2343,6 +2351,17 @@ impl Optimizer {
         // is a Box whose `.type` is already fixed; falling back to a pyre-only
         // default like Int can silently corrupt retrace input typing.
         if let Some(ref mut es) = self.exported_loop_state {
+            if es.end_arg_types.is_empty() {
+                es.end_arg_types = es
+                    .end_args
+                    .iter()
+                    .map(|&opref| {
+                        ctx.opref_type(opref).unwrap_or_else(|| {
+                            panic!("missing type for exported end_arg {:?}", opref)
+                        })
+                    })
+                    .collect();
+            }
             if es.renamed_inputarg_types.is_empty() {
                 es.renamed_inputarg_types = es
                     .renamed_inputargs

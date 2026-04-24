@@ -1412,8 +1412,21 @@ impl BlackholeInterpreter {
             }
         }
 
-        // blackhole.py:1621 — run the bytecode
-        self.run();
+        // blackhole.py:1621 — run the bytecode.  `run()` returns
+        // `Some(MergePointArgs)` when the bottommost frame reached a
+        // jit_merge_point and raised `ContinueRunningNormally`
+        // (blackhole.py:1068); propagate that as a `JitException` so
+        // `run_forever` can hand it off to `handle_jitexception`.
+        if let Some(args) = self.run() {
+            return Err(JitException::ContinueRunningNormally {
+                green_int: args.green_int,
+                green_ref: args.green_ref,
+                green_float: args.green_float,
+                red_int: args.red_int,
+                red_ref: args.red_ref,
+                red_float: args.red_float,
+            });
+        }
 
         // Check for exception during execution
         if self.got_exception {
