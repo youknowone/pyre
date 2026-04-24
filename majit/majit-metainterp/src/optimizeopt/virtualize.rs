@@ -1291,13 +1291,20 @@ impl Optimization for OptVirtualize {
             // RPython's "insert at len-1" final layout. The guard's resume
             // data is finalized when `emit_guard_operation` calls
             // `store_final_boxes_in_guard` during its emission.
+            //
+            // RPython parity: optimize_FINISH does NOT call the generic
+            // escaping-op force path here. Forcing the FINISH args in the
+            // virtualize pass would happen before the stashed
+            // GUARD_NOT_FORCED_2 is reinserted, and store_final_boxes_in_guard
+            // would then see the already-forced return box in vable_array.
+            // The actual arg forcing belongs later in Optimizer._emit_operation,
+            // after the queued guard has been flushed ahead of FINISH.
             OpCode::Finish => {
                 if let Some(stashed) = self.last_guard_not_forced_2.take() {
                     let after = ctx.current_pass_idx;
                     ctx.emit_extra(after, stashed);
                 }
-                // Force all virtual args (same as escaping op).
-                self.optimize_escaping_op(op, ctx)
+                OptimizationResult::PassOn
             }
 
             // virtualize.py: optimize_COND_CALL — if the call is
@@ -1820,6 +1827,38 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct TestFloatFieldDescr {
+        idx: u32,
+    }
+
+    impl Descr for TestFloatFieldDescr {
+        fn index(&self) -> u32 {
+            self.idx
+        }
+        fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+            Some(self)
+        }
+    }
+
+    impl FieldDescr for TestFloatFieldDescr {
+        fn get_parent_descr(&self) -> Option<DescrRef> {
+            Some(test_parent_size_descr(self.idx, majit_ir::Type::Float))
+        }
+        fn offset(&self) -> usize {
+            self.idx as usize * 8
+        }
+        fn field_size(&self) -> usize {
+            8
+        }
+        fn field_type(&self) -> majit_ir::Type {
+            majit_ir::Type::Float
+        }
+        fn index_in_parent(&self) -> usize {
+            self.idx as usize
+        }
+    }
+
     impl Descr for TestParentSizeDescr {
         fn index(&self) -> u32 {
             0xFFFF_0000 | self.idx
@@ -1920,6 +1959,10 @@ mod tests {
         Arc::new(TestRefFieldDescr { idx })
     }
 
+    fn float_field_descr(idx: u32) -> DescrRef {
+        Arc::new(TestFloatFieldDescr { idx })
+    }
+
     fn array_descr(idx: u32) -> DescrRef {
         Arc::new(TestArrayDescr { idx })
     }
@@ -1958,6 +2001,19 @@ mod tests {
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::default_pipeline();
         opt.trace_inputarg_types = vec![Type::Ref; 1024];
+        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
+    }
+
+    fn run_default_pipeline_typed(ops: &[Op], int_slots: &[u32], float_slots: &[u32]) -> Vec<Op> {
+        let mut opt = Optimizer::default_pipeline();
+        let mut types = vec![Type::Ref; 1024];
+        for &idx in int_slots {
+            types[idx as usize] = Type::Int;
+        }
+        for &idx in float_slots {
+            types[idx as usize] = Type::Float;
+        }
+        opt.trace_inputarg_types = types;
         opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
     }
 
@@ -3224,6 +3280,51 @@ mod tests {
         assert_eq!(
             new_count, 1,
             "virtual New should be materialized when lazy SetfieldGc is emitted at Jump; got {result:?}"
+        );
+    }
+
+    // OptHeap's `force_from_effectinfo` path (heap.rs:2584) selectively
+    // forces lazy_sets based on the call's EffectInfo write_descrs_fields
+    // bitstring. A CallR with default EffectInfo (no writes) skips the
+    // force; the pending SetfieldGc lazy_set never gets emitted before the
+    // escape. RPython heap.py's `force_from_effectinfo` consults
+    // `effectinfo.check_forces_virtual_or_virtualizable()` and the
+    // EF_* extraeffect class to decide when to force unconditionally —
+    // pyre's port is incomplete here. Fix spans heap.rs force_from_effectinfo
+    // + virtualize.rs force_virtual ordering; multi-session.
+    #[ignore = "OptHeap force_from_effectinfo: fresh-object escape via non-random-effects call skips lazy_set flush"]
+    #[test]
+    fn test_callr_preserves_float_field_store_on_escaping_fresh_object() {
+        let float_sd = size_descr(1);
+        let float_fd = float_field_descr(10);
+        let call_descr: DescrRef = Arc::new(majit_ir::SimpleCallDescr::new(
+            77,
+            vec![Type::Ref],
+            Type::Ref,
+            false,
+            8,
+            majit_ir::EffectInfo::default(),
+        ));
+
+        let mut ops = vec![
+            Op::with_descr(OpCode::NewWithVtable, &[], float_sd),
+            Op::with_descr(OpCode::SetfieldGc, &[OpRef(0), OpRef(100)], float_fd),
+            Op::with_descr(OpCode::CallR, &[OpRef(0)], call_descr),
+            Op::new(OpCode::Jump, &[]),
+        ];
+        assign_positions(&mut ops);
+
+        let result = run_default_pipeline_typed(&ops, &[], &[100]);
+        let opcodes: Vec<_> = result.iter().map(|o| o.opcode).collect();
+        assert_eq!(
+            opcodes,
+            vec![
+                OpCode::NewWithVtable,
+                OpCode::SetfieldGc,
+                OpCode::CallR,
+                OpCode::Jump,
+            ],
+            "escaping fresh float object must keep its floatval store before the call; got {result:?}"
         );
     }
 

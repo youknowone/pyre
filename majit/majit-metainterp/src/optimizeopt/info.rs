@@ -1403,10 +1403,21 @@ impl PtrInfo {
                     last_guard_pos: -1,
                 });
                 let mut new_op = Op::new(OpCode::New, &[]);
+                // RPython info.py:146-151 force_box emits the ORIGINAL box op.
+                // Preserve that identity here instead of inventing a fresh
+                // OpRef, so later passes (earlyforce → heap → call) all talk
+                // about the same concrete allocation.
+                new_op.pos = opref;
                 new_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
                 // Store preserved info on alloc_ref (canonical after force).
                 ctx.set_ptr_info(alloc_ref, preserved);
+                if crate::optimizeopt::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][force-box] virtual-struct {:?} -> {:?} in_final_emission={} pass_idx={}",
+                        opref, alloc_ref, ctx.in_final_emission, ctx.current_pass_idx
+                    );
+                }
                 if opref != alloc_ref {
                     ctx.replace_op(opref, alloc_ref);
                 }
@@ -1441,9 +1452,20 @@ impl PtrInfo {
                     last_guard_pos: -1,
                 });
                 let mut new_op = Op::new(OpCode::NewWithVtable, &[]);
+                // RPython info.py:146-151 force_box emits the ORIGINAL box op.
+                // Preserve that identity here instead of inventing a fresh
+                // OpRef, so later passes (earlyforce → heap → call) all talk
+                // about the same concrete allocation.
+                new_op.pos = opref;
                 new_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, new_op);
                 ctx.set_ptr_info(alloc_ref, preserved);
+                if crate::optimizeopt::majit_log_enabled() {
+                    eprintln!(
+                        "[jit][force-box] virtual {:?} -> {:?} in_final_emission={} pass_idx={}",
+                        opref, alloc_ref, ctx.in_final_emission, ctx.current_pass_idx
+                    );
+                }
                 if opref != alloc_ref {
                     ctx.replace_op(opref, alloc_ref);
                 }
@@ -1471,6 +1493,7 @@ impl PtrInfo {
                     OpCode::NewArray
                 };
                 let mut alloc_op = Op::new(alloc_opcode, &[len_ref]);
+                alloc_op.pos = opref;
                 alloc_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, alloc_op);
                 if opref != alloc_ref {
@@ -1517,6 +1540,7 @@ impl PtrInfo {
 
                 let len_ref = ctx.emit_constant_int(num_elements as i64);
                 let mut alloc_op = Op::new(OpCode::NewArrayClear, &[len_ref]);
+                alloc_op.pos = opref;
                 alloc_op.descr = Some(vinfo.descr.clone());
                 let alloc_ref = emit_op(ctx, alloc_op);
                 if opref != alloc_ref {
@@ -1570,6 +1594,7 @@ impl PtrInfo {
                 let func_ref = ctx.emit_constant_int(func);
                 let size_ref = ctx.emit_constant_int(size as i64);
                 let mut call_op = Op::new(OpCode::CallI, &[func_ref, size_ref]);
+                call_op.pos = opref;
                 call_op.descr = calldescr;
                 let alloc_ref = emit_op(ctx, call_op);
 
@@ -1619,7 +1644,8 @@ impl PtrInfo {
                 let parent_forced = force_child(slice.parent, ctx);
                 let parent_forced = ctx.get_box_replacement(parent_forced);
                 let offset_ref = ctx.emit_constant_int(slice.offset as i64);
-                let add_op = Op::new(OpCode::IntAdd, &[parent_forced, offset_ref]);
+                let mut add_op = Op::new(OpCode::IntAdd, &[parent_forced, offset_ref]);
+                add_op.pos = opref;
                 let new_ref = emit_op(ctx, add_op);
                 // Preserve raw-slice identity; mark non-virtual via
                 // `parent = OpRef::NONE` (RPython `self.parent = None`).
@@ -1689,7 +1715,8 @@ impl PtrInfo {
                 } else {
                     OpCode::Newstr
                 };
-                let newstr_op = Op::new(new_opcode, &[lengthbox]);
+                let mut newstr_op = Op::new(new_opcode, &[lengthbox]);
+                newstr_op.pos = opref;
                 let newop = emit_op(ctx, newstr_op);
 
                 // vstring.py:98: newop.set_forwarded(self)
@@ -2184,6 +2211,16 @@ impl PtrInfo {
     }
 
     /// info.py:273-303: _is_immutable_and_filled_with_constants
+    ///
+    /// ```text
+    /// if not self.descr.is_immutable():
+    ///     return False
+    /// for op in self._fields:
+    ///     if op is None:
+    ///         return False     # uninitialized field
+    ///     ...
+    /// ```
+    ///
     /// Check if this virtual is immutable and all fields are constants.
     /// Used by force_box to determine if the virtual can be constant-folded.
     pub fn is_immutable_and_filled_with_constants(
@@ -2195,7 +2232,19 @@ impl PtrInfo {
             PtrInfo::VirtualStruct(v) => (&v.fields, &v.descr),
             _ => return false,
         };
-        if !descr.is_always_pure() {
+        // info.py:281: `if not self.descr.is_immutable()`.
+        let Some(size_descr) = descr.as_size_descr() else {
+            return false;
+        };
+        if !size_descr.is_immutable() {
+            return false;
+        }
+        // info.py:286-288: `for op in self._fields: if op is None: return False`.
+        // RPython's _fields is pre-allocated to len(descr.get_all_fielddescrs())
+        // with None for unset slots; pyre stores only set entries in `fields`,
+        // so parity requires fields.len() to match all_field_descrs().len()
+        // before treating the virtual as filled.
+        if fields.len() != size_descr.all_field_descrs().len() {
             return false;
         }
         for &(_, val) in fields {

@@ -3697,11 +3697,14 @@ fn assemble_peeled_trace_with_jump_args(
     // `extra_jump_args[idx]` value that the JUMP was supposed to deliver
     // into that slot disappears along with it).
     //
-    // The only entries that legitimately drop out here are constants:
-    // those become immediates in the body and carry no live-in slot.
+    // The only entries that legitimately drop out here are literal Const
+    // boxes. `used_boxes` / `short_preamble_jump` are RPython Box lists;
+    // a stale backend-constants entry must not make us drop a live runtime
+    // Box from the LABEL/JUMP contract (e.g. an imported short-preamble
+    // HeapField result that still has optimizer constant knowledge attached).
     for (idx, &label_arg) in extra_label_args.iter().enumerate() {
         let jump_arg = extra_jump_args.get(idx).copied().unwrap_or(label_arg);
-        if is_trace_constant_ref(label_arg, constants) {
+        if label_arg.is_constant() {
             continue;
         }
         filtered_extra_label_args.push(label_arg);
@@ -5767,6 +5770,65 @@ mod tests {
     }
 
     #[test]
+    fn test_assemble_peeled_trace_keeps_used_box_with_stale_constant_entry() {
+        let p1_ops = vec![{
+            let mut op = Op::new(OpCode::SameAsI, &[OpRef(37)]);
+            op.pos = OpRef(857);
+            op
+        }];
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::GuardValue, &[OpRef(857), OpRef::from_const(0)]);
+                op.fail_args = Some(vec![OpRef(857)].into());
+                op
+            },
+            Op::new(
+                OpCode::Jump,
+                &[OpRef(10), OpRef(853), OpRef(857), OpRef(850)],
+            ),
+        ];
+        let constants = std::collections::HashMap::from([
+            (OpRef(857).0, 2_i64),
+            (OpRef::from_const(0).0, 2_i64),
+        ]);
+
+        let combined = assemble_peeled_trace_with_jump_args(
+            &p1_ops,
+            &p2_ops,
+            &[OpRef(10)],
+            &[OpRef(0)],
+            &[OpRef(22), OpRef(857), OpRef(150)],
+            &[OpRef(853), OpRef(857), OpRef(850)],
+            1,
+            0,
+            true,
+            &[],
+            &[],
+            &constants,
+            None,
+            None,
+            &[],
+            &[],
+        );
+
+        assert_eq!(combined[1].opcode, OpCode::Label);
+        assert_eq!(
+            combined[1].args.as_slice(),
+            &[OpRef(10), OpRef(22), OpRef(857), OpRef(150)]
+        );
+        assert_eq!(combined[2].opcode, OpCode::GuardValue);
+        assert_eq!(
+            combined[2].args.as_slice(),
+            &[OpRef(857), OpRef::from_const(0)]
+        );
+        assert_eq!(combined[3].opcode, OpCode::Jump);
+        assert_eq!(
+            combined[3].args.as_slice(),
+            &[OpRef(10), OpRef(22), OpRef(857), OpRef(150)]
+        );
+    }
+
+    #[test]
     fn test_assemble_peeled_trace_remaps_extra_label_source_slots() {
         // Production caller pre-resolves body args through
         // ctx.get_box_replacement; OpRef(0) (Phase 2 inputarg slot) is
@@ -5988,15 +6050,22 @@ mod tests {
         // Production caller pre-resolves the Jump's body inputarg ref
         // (OpRef(0)) to label_args[0] = OpRef(10) before it reaches the
         // assembler.
+        //
+        // `extra_label_args` holds one literal Const entry and one Box.
+        // The filter keeps Boxes (they still back runtime slots) and drops
+        // literal Const entries (their value is emitted inline at use
+        // sites). Mirrors `assemble_peeled_trace_with_jump_args`'s
+        // `label_arg.is_constant()` predicate.
+        let const_extra = OpRef::from_const(7);
         let p2_ops = vec![Op::new(OpCode::Jump, &[OpRef(10)])];
-        let constants = std::collections::HashMap::from([(7_u32, 606_i64)]);
+        let constants = std::collections::HashMap::from([(const_extra.0, 606_i64)]);
 
         let combined = assemble_peeled_trace(
             &[],
             &p2_ops,
             &[OpRef(10)],
             &[OpRef(0)],
-            &[OpRef(7), OpRef(8)],
+            &[const_extra, OpRef(8)],
             1,
             true,
             &[],

@@ -4752,10 +4752,13 @@ mod tests {
         assert!(ctx.new_operations.iter().any(|op| {
             op.opcode == OpCode::SetfieldGc && op.arg(1) == OpRef(11) && op.descr.is_some()
         }));
+        // info.py:146-151: force_box emits the ORIGINAL box op, so the
+        // forced GuardNonnull keeps arg(0) = OpRef(10) (matches the virtual's
+        // original identity). force_box_impl preserves `new_op.pos = opref`.
         assert!(
             ctx.new_operations
                 .iter()
-                .any(|op| op.opcode == OpCode::GuardNonnull && op.arg(0) != OpRef(10))
+                .any(|op| op.opcode == OpCode::GuardNonnull && op.arg(0) == OpRef(10))
         );
     }
 

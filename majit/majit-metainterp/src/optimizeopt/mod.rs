@@ -518,9 +518,14 @@ impl<'a> majit_ir::BoxEnv for OptBoxEnv<'a> {
     }
 
     fn is_virtual_ref(&self, opref: OpRef) -> bool {
-        // resume.py:210-216: info = getptrinfo(box); is_virtual = info.is_virtual()
+        // info.py:880-886 getptrinfo(op) first applies get_box_replacement(op)
+        // before reading PtrInfo. Guard resume numbering walks ORIGINAL
+        // snapshot boxes, so virtual classification must follow the same
+        // replacement chain or forwarded virtual boxes get mis-tagged as
+        // ordinary liveboxes.
+        let resolved = self.ctx.get_box_replacement(opref);
         self.ctx
-            .get_ptr_info(opref)
+            .get_ptr_info(resolved)
             .is_some_and(|info| info.is_virtual())
     }
 
@@ -3299,6 +3304,39 @@ impl OptContext {
         // _number_boxes deduplicates via liveboxes HashMap.
         snapshot.vable_array = vable_oprefs;
 
+        if majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
+            let env = OptBoxEnv { ctx: self };
+            let snapshot_debug: Vec<(OpRef, OpRef, bool, Type)> = snapshot_boxes
+                .iter()
+                .copied()
+                .map(|boxref| {
+                    let resolved = self.get_box_replacement(boxref);
+                    let is_virtual = self
+                        .get_ptr_info(resolved)
+                        .is_some_and(|info| info.is_virtual());
+                    let tp = majit_ir::BoxEnv::get_type(&env, boxref);
+                    (boxref, resolved, is_virtual, tp)
+                })
+                .collect();
+            let vable_debug: Vec<(OpRef, OpRef, bool, Type)> = snapshot
+                .vable_array
+                .iter()
+                .copied()
+                .map(|boxref| {
+                    let resolved = self.get_box_replacement(boxref);
+                    let is_virtual = self
+                        .get_ptr_info(resolved)
+                        .is_some_and(|info| info.is_virtual());
+                    let tp = majit_ir::BoxEnv::get_type(&env, boxref);
+                    (boxref, resolved, is_virtual, tp)
+                })
+                .collect();
+            eprintln!(
+                "[jit][guard-resume] pos={:?} snapshot={:?} vable={:?}",
+                op.pos, snapshot_debug, vable_debug
+            );
+        }
+
         // resume.py:389-452: delegate to ResumeDataVirtualAdder.finish()
         let env = OptBoxEnv { ctx: self };
         let mut memo = ResumeDataLoopMemo::new();
@@ -3312,6 +3350,16 @@ impl OptContext {
 
         let (rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types) =
             memo.finish(numb_state, &env, &mut pending_slice, knowledge.as_ref());
+
+        if majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
+            eprintln!(
+                "[jit][guard-resume] pos={:?} liveboxes={:?} rd_virtuals={} livebox_types={:?}",
+                op.pos,
+                liveboxes,
+                rd_virtuals.len(),
+                livebox_types
+            );
+        }
 
         // RPython Box.type parity: types captured at numbering time via
         // env.get_type(), equivalent to RPython's intrinsic Box.type.
@@ -5288,5 +5336,74 @@ mod imported_short_preamble_fallback_tests {
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
         assert_eq!(sp.ops[0].op.args.as_slice(), &[OpRef(7), OpRef(8)]);
         assert_eq!(sp.ops[0].op.pos, OpRef(14));
+    }
+}
+
+#[cfg(test)]
+mod opt_box_env_tests {
+    use super::*;
+    use crate::optimizeopt::info::VirtualInfo;
+    use majit_ir::{BoxEnv, DescrRef, GcRef, OpRef};
+    use std::sync::Arc;
+
+    #[derive(Debug)]
+    struct DummySizeDescr;
+
+    impl majit_ir::Descr for DummySizeDescr {
+        fn index(&self) -> u32 {
+            0
+        }
+
+        fn clone_descr(&self) -> Option<DescrRef> {
+            Some(Arc::new(DummySizeDescr))
+        }
+
+        fn as_size_descr(&self) -> Option<&dyn majit_ir::SizeDescr> {
+            Some(self)
+        }
+    }
+
+    impl majit_ir::SizeDescr for DummySizeDescr {
+        fn size(&self) -> usize {
+            24
+        }
+
+        fn vtable(&self) -> usize {
+            0x1234
+        }
+
+        fn type_id(&self) -> u32 {
+            7
+        }
+
+        fn is_immutable(&self) -> bool {
+            false
+        }
+    }
+
+    #[test]
+    fn opt_box_env_is_virtual_ref_follows_box_replacement() {
+        let mut ctx = OptContext::with_num_inputs(16, 0);
+        let source = OpRef(12);
+        let target = OpRef(21);
+        ctx.replace_op(source, target);
+        ctx.set_ptr_info(
+            target,
+            PtrInfo::Virtual(VirtualInfo {
+                descr: Arc::new(DummySizeDescr),
+                known_class: Some(GcRef(0x1234)),
+                ob_type_descr: None,
+                fields: Vec::new(),
+                field_descrs: Vec::new(),
+                last_guard_pos: -1,
+                cached_vinfo: std::cell::RefCell::new(None),
+            }),
+        );
+
+        let env = OptBoxEnv { ctx: &ctx };
+        assert!(
+            env.is_virtual_ref(source),
+            "forwarded snapshot boxes must classify as virtual via replacement"
+        );
     }
 }
