@@ -10,11 +10,111 @@ use syn::{Item, ItemFn};
 use crate::ParsedInterpreter;
 use crate::model::{
     BlockId, CallTarget, ExitSwitch, FunctionGraph, ImmutableRank, Link, LinkArg, OpKind,
-    UnknownKind, ValueId, ValueType, exception_exitcase,
+    UnknownKind, UnsupportedExprKind, UnsupportedLiteralKind, ValueId, ValueType,
+    exception_exitcase,
 };
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct AstGraphOptions;
+
+/// Signal that lowering was halted due to an unsupported construct.
+///
+/// RPython `rpython/flowspace/flowcontext.py:258,417` raises `FlowingError`
+/// when the abstract interpreter hits a bytecode it cannot model; that
+/// error propagates all the way out of `build_flow_graph`, aborting the
+/// current graph rather than silently continuing with a synthetic value.
+///
+/// Pyre's `Option<ValueId>` return conflates "expression legitimately
+/// produced no value" (e.g. `return` / `break`) with "lowering halted"
+/// — making the latter an explicit `Err` variant restores the RPython
+/// invariant that unsupported constructs stop the walk at once.  The
+/// `Unknown` op is still emitted at the failure site so downstream
+/// passes see evidence of the drop; the `Err` just guarantees no
+/// synthesised SSA value follows it.
+///
+/// PyPy distinguishes two kinds of "stop this walk":
+///
+/// 1. `FlowingError` — unsupported opcode encountered, the whole graph
+///    is invalid and `build_flow` re-raises upward
+///    (`rpython/flowspace/objspace.py:38`,
+///    `rpython/flowspace/flowcontext.py:417`).  This is the `Err` arm
+///    here.
+/// 2. `FlowSignal::Return` / `FlowSignal::Raise` / `FlowSignal::Break`
+///    / `FlowSignal::Continue` — the current block is closed (return
+///    to caller, raise into exceptblock, goto loop tail/header), but
+///    sibling walks (the other arm of a conditional, arms of a match)
+///    continue normally
+///    (`rpython/flowspace/flowcontext.py:1253`
+///    `Raise.nomoreblocks`).  These are signalled via
+///    `Lowered { path_closed: true }` on the `Ok` arm — the caller
+///    stops lowering into the closed block but keeps walking siblings.
+#[derive(Debug, Clone)]
+pub enum FlowingError {
+    Unsupported { kind: UnknownKind },
+}
+
+/// Result of lowering one expression or statement-list tail.
+///
+/// `path_closed` tracks the RPython `FlowSignal` state-machine.  When a
+/// sub-expression raises `Return` / `Raise` / `Break` / `Continue`, the
+/// block where the signal fires is closed with the appropriate
+/// terminator and `path_closed` becomes `true`; parent walkers stop
+/// lowering into that block but continue their sibling walks.
+#[derive(Debug, Clone, Copy)]
+pub struct Lowered {
+    pub value: Option<ValueId>,
+    pub path_closed: bool,
+}
+
+impl Lowered {
+    pub fn value(v: ValueId) -> Self {
+        Lowered {
+            value: Some(v),
+            path_closed: false,
+        }
+    }
+    pub fn no_value() -> Self {
+        Lowered {
+            value: None,
+            path_closed: false,
+        }
+    }
+    pub fn path_closed() -> Self {
+        Lowered {
+            value: None,
+            path_closed: true,
+        }
+    }
+}
+
+/// Propagate `path_closed` up the call chain, or unwrap the inner
+/// `ValueId` if the child produced one.  Used in expression contexts
+/// that REQUIRE a value from the sub-expression — if the sub-expr
+/// returned `None` with the path still open, that is a FlowingError
+/// (well-typed Rust does not produce such a state).
+macro_rules! get_value {
+    ($lowered:expr) => {{
+        let __l = $lowered;
+        if __l.path_closed {
+            return Ok(Lowered::path_closed());
+        }
+        match __l.value {
+            Some(v) => v,
+            None => {
+                return Err(FlowingError::Unsupported {
+                    kind: UnknownKind::UnsupportedExpr {
+                        variant: UnsupportedExprKind::OtherExpr,
+                    },
+                });
+            }
+        }
+    }};
+}
+
+/// Legacy alias: callers that pre-date the `FlowingError` / `Lowered`
+/// split in this file still reference `LoweringAbort`.  Keep the name
+/// pointing at `FlowingError` until all in-crate consumers migrate.
+pub type LoweringAbort = FlowingError;
 
 #[derive(Debug, Clone)]
 pub struct SemanticFunction {
@@ -97,13 +197,13 @@ pub struct SemanticProgram {
     pub immutable_fields: HashMap<String, Vec<(String, ImmutableRank)>>,
 }
 
-pub fn build_semantic_program(parsed: &ParsedInterpreter) -> SemanticProgram {
+pub fn build_semantic_program(parsed: &ParsedInterpreter) -> Result<SemanticProgram, FlowingError> {
     build_semantic_program_with_options(parsed, &AstGraphOptions::default())
 }
 
 pub fn build_semantic_program_from_parsed_files(
     parsed_files: &[ParsedInterpreter],
-) -> SemanticProgram {
+) -> Result<SemanticProgram, FlowingError> {
     build_semantic_program_from_parsed_files_with_options(parsed_files, &AstGraphOptions::default())
 }
 
@@ -389,6 +489,13 @@ fn collect_fields_and_returns(
 /// RPython: pass 2 graph building with Item::Mod recursion.
 /// Mirrors collect_types_from_items traversal so that module-internal
 /// functions get proper SemanticFunction entries with qualified names.
+///
+/// RPython `flowspace/objspace.py:49` + `flowspace/flowcontext.py:417`
+/// + `translator/translator.py:55` — `build_flow()` / `buildflowgraph()`
+/// re-raise `FlowingError`, and the top-level translator observes the
+/// unsupported construct as a hard failure.  This batch collector
+/// propagates `FlowingError` the same way rather than silently dropping
+/// a graph whose body hit an unsupported construct.
 fn build_graphs_from_items(
     items: &[Item],
     prefix: &str,
@@ -398,7 +505,7 @@ fn build_graphs_from_items(
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
     functions: &mut Vec<SemanticFunction>,
-) {
+) -> Result<(), FlowingError> {
     for item in items {
         match item {
             Item::Fn(func) => {
@@ -411,7 +518,7 @@ fn build_graphs_from_items(
                     prefix,
                     known_struct_names,
                     known_trait_names,
-                );
+                )?;
                 // RPython: exact graph identity — module-qualified name.
                 if !prefix.is_empty() {
                     sf.name = format!("{}::{}", prefix, sf.name);
@@ -430,7 +537,7 @@ fn build_graphs_from_items(
                             sig: method.sig.clone(),
                             block: Box::new(method.block.clone()),
                         };
-                        functions.push(build_function_graph(
+                        let sf = build_function_graph(
                             &fake_fn,
                             options,
                             self_ty_root.clone(),
@@ -439,7 +546,8 @@ fn build_graphs_from_items(
                             prefix,
                             known_struct_names,
                             known_trait_names,
-                        ));
+                        )?;
+                        functions.push(sf);
                     }
                 }
             }
@@ -459,18 +567,19 @@ fn build_graphs_from_items(
                         known_struct_names,
                         known_trait_names,
                         functions,
-                    );
+                    )?;
                 }
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 pub fn build_semantic_program_with_options(
     parsed: &ParsedInterpreter,
     options: &AstGraphOptions,
-) -> SemanticProgram {
+) -> Result<SemanticProgram, FlowingError> {
     let mut functions = Vec::new();
     let mut known_struct_names = std::collections::HashSet::new();
     let mut known_trait_names = std::collections::HashSet::new();
@@ -504,22 +613,22 @@ pub fn build_semantic_program_with_options(
         &known_struct_names,
         &known_trait_names,
         &mut functions,
-    );
+    )?;
 
-    SemanticProgram {
+    Ok(SemanticProgram {
         functions,
         known_struct_names,
         known_trait_names,
         struct_fields,
         fn_return_types,
         immutable_fields,
-    }
+    })
 }
 
 pub fn build_semantic_program_from_parsed_files_with_options(
     parsed_files: &[ParsedInterpreter],
     options: &AstGraphOptions,
-) -> SemanticProgram {
+) -> Result<SemanticProgram, FlowingError> {
     // RPython: annotator/rtyper provides whole-program type info before
     // the codewriter runs. We emulate this with a 2-pass approach:
     // Pass 1: collect ALL struct definitions and function return types across ALL files.
@@ -560,22 +669,31 @@ pub fn build_semantic_program_from_parsed_files_with_options(
             &known_struct_names,
             &known_trait_names,
             &mut functions,
-        );
+        )?;
     }
-    SemanticProgram {
+    Ok(SemanticProgram {
         functions,
         known_struct_names,
         known_trait_names,
         struct_fields,
         fn_return_types,
         immutable_fields,
-    }
+    })
 }
 
 /// Public entry for building a graph from a single function AST node.
 /// Lower a standalone expression into an existing graph.
 /// Used to build semantic graphs from opcode match arm bodies.
-pub fn lower_expr_into_graph(graph: &mut FunctionGraph, expr: &syn::Expr) {
+///
+/// RPython `flowspace/objspace.py:38` — `build_flow()` re-raises
+/// `FlowingError` so callers observe the unsupported construct as an
+/// error rather than receiving a partially-constructed graph.  The
+/// `Unknown` marker op that `stop_unsupported` already emitted stays in
+/// the graph; the caller decides whether to keep, discard, or close it.
+pub fn lower_expr_into_graph(
+    graph: &mut FunctionGraph,
+    expr: &syn::Expr,
+) -> Result<(), FlowingError> {
     let mut block = graph.startblock;
     let empty_registry = StructFieldRegistry::default();
     let empty_fn_ret = HashMap::new();
@@ -588,17 +706,20 @@ pub fn lower_expr_into_graph(graph: &mut FunctionGraph, expr: &syn::Expr) {
         &empty_names,
         &empty_trait_names,
     );
-    let result = lower_expr(
+    let lowered = lower_expr(
         graph,
         &mut block,
         expr,
         &AstGraphOptions::default(),
         &mut ctx,
-    );
-    graph.set_return(block, result);
+    )?;
+    if graph.block(block).is_open() {
+        graph.set_return(block, lowered.value);
+    }
+    Ok(())
 }
 
-pub fn build_function_graph_pub(func: &ItemFn) -> SemanticFunction {
+pub fn build_function_graph_pub(func: &ItemFn) -> Result<SemanticFunction, FlowingError> {
     let empty_registry = StructFieldRegistry::default();
     let empty_fn_ret = HashMap::new();
     let empty_names = std::collections::HashSet::new();
@@ -623,7 +744,7 @@ pub fn build_function_graph_with_self_ty_pub(
     module_prefix: &str,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
-) -> SemanticFunction {
+) -> Result<SemanticFunction, FlowingError> {
     build_function_graph(
         func,
         &AstGraphOptions::default(),
@@ -634,6 +755,12 @@ pub fn build_function_graph_with_self_ty_pub(
         known_struct_names,
         known_trait_names,
     )
+}
+
+/// Expose `collect_jit_hints` so `parse.rs` can hoist trait-method
+/// hints from AST attributes when the strict graph build returns Err.
+pub fn collect_jit_hints_pub(attrs: &[syn::Attribute]) -> Vec<String> {
+    collect_jit_hints(attrs)
 }
 
 #[derive(Debug, Clone)]
@@ -663,6 +790,23 @@ struct GraphBuildContext<'a> {
     module_prefix: String,
     known_struct_names: &'a std::collections::HashSet<String>,
     known_trait_names: &'a std::collections::HashSet<String>,
+    /// Loop targets active at the current lowering point.  Pushed on
+    /// entry to `Loop` / `While` / `ForLoop` and popped after the body
+    /// is walked.  `break` closes the current block with a goto to the
+    /// innermost `break_target`; `continue` goes to `continue_target`.
+    /// RPython: `flowspace/flowcontext.py:525` BreakLoop signal +
+    /// `:1341` LoopBlock.handle_signal dispatches to end/header.
+    loop_stack: Vec<LoopFrame>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct LoopFrame {
+    /// Block that `continue` jumps to.  For `while` / `for` this is
+    /// the header; for `loop` this is the body entry (which also acts
+    /// as the loop head).
+    continue_target: BlockId,
+    /// Block that `break` jumps to — the loop's exit block.
+    break_target: BlockId,
 }
 
 impl<'a> GraphBuildContext<'a> {
@@ -682,10 +826,14 @@ impl<'a> GraphBuildContext<'a> {
             module_prefix: module_prefix.to_string(),
             known_struct_names,
             known_trait_names,
+            loop_stack: Vec::new(),
         }
     }
 }
 
+/// Build a SemanticFunction from a Rust function AST.  Mirrors
+/// RPython `flowspace/objspace.py:38` `build_flow()` — `FlowingError`
+/// propagates to the caller rather than producing a partial graph.
 fn build_function_graph(
     func: &ItemFn,
     options: &AstGraphOptions,
@@ -695,7 +843,7 @@ fn build_function_graph(
     module_prefix: &str,
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
-) -> SemanticFunction {
+) -> Result<SemanticFunction, FlowingError> {
     let mut graph = FunctionGraph::new(func.sig.ident.to_string());
     let mut entry = graph.startblock;
     let mut ctx = GraphBuildContext::new(
@@ -790,9 +938,20 @@ fn build_function_graph(
         }
     }
 
-    // Lower function body
+    // Lower function body.  RPython `flowspace/flowcontext.py` stops
+    // abstract-interpreting the current graph on `FlowingError`
+    // (unsupported opcode) — the exception propagates out of
+    // `build_flow()` (`flowspace/objspace.py:38`) so the translator
+    // observes the failure instead of receiving a partial graph.  A
+    // path-closing `FlowSignal::Return` / `Raise` at the top level is
+    // orderly termination: after `return x` there's nothing more to
+    // walk but the graph is well-formed, so we break without
+    // propagating.
     for stmt in &func.block.stmts {
-        lower_stmt(&mut graph, &mut entry, stmt, options, &mut ctx);
+        match lower_stmt(&mut graph, &mut entry, stmt, options, &mut ctx)? {
+            false => continue,
+            true => break,
+        }
     }
 
     // Default terminator if none was set
@@ -813,14 +972,14 @@ fn build_function_graph(
     // close_stack, cannot_collect, gc_effects.
     let hints = collect_jit_hints(&func.attrs);
 
-    SemanticFunction {
+    Ok(SemanticFunction {
         name: func.sig.ident.to_string(),
         graph,
         return_type,
         self_ty_root,
         hints,
         access_directly: false,
-    }
+    })
 }
 
 /// RPython: extract function-level JIT hints from attributes.
@@ -868,7 +1027,17 @@ fn collect_jit_hints(attrs: &[syn::Attribute]) -> Vec<String> {
 
 /// Public entry point for lowering a single statement into a graph.
 /// Used by the graph-based classifier in lib.rs to analyze resolved method bodies.
-pub fn lower_stmt_pub(graph: &mut FunctionGraph, block: BlockId, stmt: &syn::Stmt) {
+///
+/// RPython `flowspace/objspace.py:38` — `FlowingError` propagates.  The
+/// caller is responsible for handling the unsupported-construct signal
+/// (typically by discarding the partially-built graph).  The boolean
+/// result mirrors `lower_stmt`: `true` means the path terminated
+/// (return/break/continue/raise) and the enclosing walker should stop.
+pub fn lower_stmt_pub(
+    graph: &mut FunctionGraph,
+    block: BlockId,
+    stmt: &syn::Stmt,
+) -> Result<bool, FlowingError> {
     let mut block = block;
     let empty_registry = StructFieldRegistry::default();
     let empty_fn_ret = HashMap::new();
@@ -887,7 +1056,7 @@ pub fn lower_stmt_pub(graph: &mut FunctionGraph, block: BlockId, stmt: &syn::Stm
         stmt,
         &AstGraphOptions::default(),
         &mut ctx,
-    );
+    )
 }
 
 /// Lower a sequence of statements whose final element may be a tail
@@ -907,18 +1076,29 @@ fn lower_stmt_list_with_tail_value(
     stmts: &[syn::Stmt],
     options: &AstGraphOptions,
     ctx: &mut GraphBuildContext,
-) -> Option<ValueId> {
+) -> Result<Lowered, FlowingError> {
     let Some((last, prefix)) = stmts.split_last() else {
-        return None;
+        return Ok(Lowered::no_value());
     };
+    // Prefix stmts: walk each; if one closes the path
+    // (`return x;`, `panic!();`, ...), stop — remaining stmts are
+    // unreachable, mirroring RPython `flowspace/flowcontext.py`'s
+    // `FlowSignal` propagation where `Return`/`Raise` halts the
+    // current recorder before the next bytecode runs.
     for stmt in prefix {
-        lower_stmt(graph, block, stmt, options, ctx);
+        let path_closed = lower_stmt(graph, block, stmt, options, ctx)?;
+        if path_closed {
+            return Ok(Lowered::path_closed());
+        }
     }
     match last {
         syn::Stmt::Expr(expr, None) => lower_expr(graph, block, expr, options, ctx),
         _ => {
-            lower_stmt(graph, block, last, options, ctx);
-            None
+            let path_closed = lower_stmt(graph, block, last, options, ctx)?;
+            Ok(Lowered {
+                value: None,
+                path_closed,
+            })
         }
     }
 }
@@ -929,10 +1109,11 @@ fn lower_stmt(
     stmt: &syn::Stmt,
     options: &AstGraphOptions,
     ctx: &mut GraphBuildContext,
-) {
+) -> Result<bool, FlowingError> {
     match stmt {
         syn::Stmt::Expr(expr, _) => {
-            lower_expr(graph, block, expr, options, ctx);
+            let lowered = lower_expr(graph, block, expr, options, ctx)?;
+            return Ok(lowered.path_closed);
         }
         syn::Stmt::Local(local) => {
             // RPython: rtyper assigns concretetype to let-bound variables.
@@ -960,9 +1141,12 @@ fn lower_stmt(
                 }
             }
             if let Some(init) = &local.init {
-                let result = lower_expr(graph, block, &init.expr, options, ctx);
+                let lowered = lower_expr(graph, block, &init.expr, options, ctx)?;
+                if lowered.path_closed {
+                    return Ok(true);
+                }
                 // Record variable name (RPython Variable._name)
-                if let Some(vid) = result {
+                if let Some(vid) = lowered.value {
                     if let syn::Pat::Ident(pat_ident) = &local.pat {
                         graph.name_value(vid, pat_ident.ident.to_string());
                     } else if let syn::Pat::Type(pat_type) = &local.pat {
@@ -972,13 +1156,52 @@ fn lower_stmt(
                 }
             }
         }
-        syn::Stmt::Macro(_) => {
-            // Macros (`debug_assert!`, `println!`, etc.) are compile-time
-            // artifacts with no RPython analog. Skip — they do not belong
-            // in the flow graph.
+        syn::Stmt::Macro(stmt_macro) => {
+            // Rust macros are syntactic, not part of the flow graph —
+            // RPython has no construct counterpart.  Only forward
+            // macros whose Rust semantics have an explicit RPython
+            // mapping through `lower_expr`:
+            //   * abort-family (`panic!`, `unreachable!`, `todo!`,
+            //     `unimplemented!`) → `set_raise` (canonical
+            //     exceptblock Link per `flowspace/model.py:21-25`).
+            //   * assert-family (`assert!`, `assert_eq!`, `assert_ne!`,
+            //     and `debug_` variants) → conditional `set_branch` +
+            //     `set_raise` on the failing arm.
+            // Other statement-position macros (`dbg!`, `println!`,
+            // `vec!`, `format!`, `write!`, `writeln!`, ...) are
+            // skipped, matching the pre-`92725722af` behaviour.
+            let name = stmt_macro
+                .mac
+                .path
+                .segments
+                .last()
+                .map(|s| s.ident.to_string())
+                .unwrap_or_default();
+            if matches!(
+                name.as_str(),
+                "panic"
+                    | "unreachable"
+                    | "todo"
+                    | "unimplemented"
+                    | "assert"
+                    | "assert_eq"
+                    | "assert_ne"
+                    | "debug_assert"
+                    | "debug_assert_eq"
+                    | "debug_assert_ne"
+            ) {
+                let expr_macro = syn::ExprMacro {
+                    attrs: stmt_macro.attrs.clone(),
+                    mac: stmt_macro.mac.clone(),
+                };
+                let expr = syn::Expr::Macro(expr_macro);
+                let lowered = lower_expr(graph, block, &expr, options, ctx)?;
+                return Ok(lowered.path_closed);
+            }
         }
         syn::Stmt::Item(_) => {}
     }
+    Ok(false)
 }
 
 // ── Expression lowering (block-splitting for control flow) ───────
@@ -995,16 +1218,71 @@ fn lower_expr(
     expr: &syn::Expr,
     options: &AstGraphOptions,
     ctx: &mut GraphBuildContext,
-) -> Option<ValueId> {
+) -> Result<Lowered, FlowingError> {
+    // RPython `flowspace/flowcontext.py:258,417` — when the abstract
+    // interpreter hits an unsupported bytecode it raises `FlowingError`
+    // and the walk stops at once.  Pyre's analogue: emit an
+    // `UnsupportedExpr` marker op in *block (so downstream passes see
+    // evidence of the drop) and return `Err(FlowingError::Unsupported)`
+    // so every caller in the chain aborts via `?` rather than
+    // synthesising a fabricated SSA value.  The helper centralises
+    // that pair so every failure site emits exactly one Unknown.
+    let stop_unsupported = |graph: &mut FunctionGraph,
+                            block: BlockId,
+                            variant: UnsupportedExprKind|
+     -> Result<Lowered, FlowingError> {
+        graph.push_op(
+            block,
+            OpKind::Unknown {
+                kind: UnknownKind::UnsupportedExpr { variant },
+            },
+            true,
+        );
+        Err(FlowingError::Unsupported {
+            kind: UnknownKind::UnsupportedExpr { variant },
+        })
+    };
+    // Non-fatal counterpart of `stop_unsupported`: emit the `Unknown`
+    // marker so coverage auditing still flags the gap, but hand its
+    // ValueId back so the enclosing walker keeps going.  Matches
+    // RPython `LOAD_CONST` (`flowspace/flowcontext.py:841`) — the
+    // bytecode pushes a value of an un-modelled shape and the flow
+    // walk continues without raising `FlowingError`.
+    let continue_with_unknown =
+        |graph: &mut FunctionGraph, block: BlockId, variant: UnsupportedExprKind| -> Lowered {
+            let v = graph.push_op(
+                block,
+                OpKind::Unknown {
+                    kind: UnknownKind::UnsupportedExpr { variant },
+                },
+                true,
+            );
+            Lowered {
+                value: v,
+                path_closed: false,
+            }
+        };
+    let continue_with_unknown_literal =
+        |graph: &mut FunctionGraph, block: BlockId, variant: UnsupportedLiteralKind| -> Lowered {
+            let v = graph.push_op(
+                block,
+                OpKind::Unknown {
+                    kind: UnknownKind::UnsupportedLiteral { variant },
+                },
+                true,
+            );
+            Lowered {
+                value: v,
+                path_closed: false,
+            }
+        };
     match expr {
         // ── receiver.field / arr[i].field ──
         syn::Expr::Field(field) => {
             if let syn::Expr::Index(idx) = &*field.base {
                 // RPython: getinteriorfield_gc — arr[i].field as a single op.
-                let base = lower_expr(graph, block, &idx.expr, options, ctx)
-                    .unwrap_or_else(|| graph.alloc_value());
-                let index = lower_expr(graph, block, &idx.index, options, ctx)
-                    .unwrap_or_else(|| graph.alloc_value());
+                let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
+                let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
                 let field_name = member_name(&field.member);
                 let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                 // Element struct type is the field owner for interiorfield descriptors.
@@ -1018,73 +1296,80 @@ fn lower_expr(
                     .and_then(|owner| ctx.struct_fields.field_type(owner, &field_name))
                     .map(type_string_to_value_type)
                     .unwrap_or(ValueType::Unknown);
-                graph.push_op(
-                    *block,
-                    OpKind::InteriorFieldRead {
-                        base,
-                        index,
-                        field: crate::model::FieldDescriptor::new(field_name, elem_type),
-                        item_ty,
-                        array_type_id,
-                    },
-                    true,
-                )
+                Ok(Lowered {
+                    value: graph.push_op(
+                        *block,
+                        OpKind::InteriorFieldRead {
+                            base,
+                            index,
+                            field: crate::model::FieldDescriptor::new(field_name, elem_type),
+                            item_ty,
+                            array_type_id,
+                        },
+                        true,
+                    ),
+                    path_closed: false,
+                })
             } else {
-                let base = lower_expr(graph, block, &field.base, options, ctx)
-                    .unwrap_or_else(|| graph.alloc_value());
+                let base = get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
                 let field_name = member_name(&field.member);
                 let ty = field_value_type_from_expr(&field.base, &field.member, ctx)
                     .unwrap_or(ValueType::Unknown);
-                graph.push_op(
-                    *block,
-                    OpKind::FieldRead {
-                        base,
-                        field: crate::model::FieldDescriptor::new(
-                            field_name,
-                            receiver_type_root(&field.base, ctx),
-                        ),
-                        ty,
-                        pure: false,
-                    },
-                    true,
-                )
+                Ok(Lowered {
+                    value: graph.push_op(
+                        *block,
+                        OpKind::FieldRead {
+                            base,
+                            field: crate::model::FieldDescriptor::new(
+                                field_name,
+                                receiver_type_root(&field.base, ctx),
+                            ),
+                            ty,
+                            pure: false,
+                        },
+                        true,
+                    ),
+                    path_closed: false,
+                })
             }
         }
 
         // ── base[index] ──
         syn::Expr::Index(idx) => {
-            let base = lower_expr(graph, block, &idx.expr, options, ctx)
-                .unwrap_or_else(|| graph.alloc_value());
-            let index = lower_expr(graph, block, &idx.index, options, ctx)
-                .unwrap_or_else(|| graph.alloc_value());
+            let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
+            let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
             let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
             let item_ty = array_item_value_type_from_array_type_id(array_type_id.as_deref())
                 .unwrap_or(ValueType::Unknown);
-            graph.push_op(
-                *block,
-                OpKind::ArrayRead {
-                    base,
-                    index,
-                    item_ty,
-                    array_type_id,
-                },
-                true,
-            )
+            Ok(Lowered {
+                value: graph.push_op(
+                    *block,
+                    OpKind::ArrayRead {
+                        base,
+                        index,
+                        item_ty,
+                        array_type_id,
+                    },
+                    true,
+                ),
+                path_closed: false,
+            })
         }
 
         // ── lhs = rhs ──
         syn::Expr::Assign(assign) => {
-            let value = lower_expr(graph, block, &assign.right, options, ctx)
-                .unwrap_or_else(|| graph.alloc_value());
+            // RPython `flowcontext.py` evaluates rhs first; if it raises
+            // `FlowingError`, the whole assignment is dropped.  `get_value!`
+            // propagates both `FlowingError` (`Err(..)`) and `path_closed`
+            // (`Ok(Lowered { path_closed: true })`) up the walk.
+            let value = get_value!(lower_expr(graph, block, &assign.right, options, ctx)?);
 
             match &*assign.left {
                 syn::Expr::Field(field) => {
                     if let syn::Expr::Index(idx) = &*field.base {
                         // RPython: setinteriorfield_gc — arr[i].field = value.
-                        let base = lower_expr(graph, block, &idx.expr, options, ctx)
-                            .unwrap_or_else(|| graph.alloc_value());
-                        let index = lower_expr(graph, block, &idx.index, options, ctx)
-                            .unwrap_or_else(|| graph.alloc_value());
+                        let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
+                        let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
                         let field_name = member_name(&field.member);
                         let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                         let elem_type = array_type_id
@@ -1110,8 +1395,7 @@ fn lower_expr(
                             false,
                         );
                     } else {
-                        let base = lower_expr(graph, block, &field.base, options, ctx)
-                            .unwrap_or_else(|| graph.alloc_value());
+                        let base = get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
                         let field_name = member_name(&field.member);
                         let ty = field_value_type_from_expr(&field.base, &field.member, ctx)
                             .unwrap_or(ValueType::Unknown);
@@ -1131,10 +1415,8 @@ fn lower_expr(
                     }
                 }
                 syn::Expr::Index(idx) => {
-                    let base = lower_expr(graph, block, &idx.expr, options, ctx)
-                        .unwrap_or_else(|| graph.alloc_value());
-                    let index = lower_expr(graph, block, &idx.index, options, ctx)
-                        .unwrap_or_else(|| graph.alloc_value());
+                    let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
+                    let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
                     let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                     let item_ty =
                         array_item_value_type_from_array_type_id(array_type_id.as_deref())
@@ -1155,38 +1437,39 @@ fn lower_expr(
                     // Generic assignment — value already lowered
                 }
             }
-            None
+            Ok(Lowered::no_value())
         }
 
         // ── function call ──
         syn::Expr::Call(call) => {
-            let args: Vec<ValueId> = call
-                .args
-                .iter()
-                .filter_map(|a| lower_expr(graph, block, a, options, ctx))
-                .collect();
+            let mut args: Vec<ValueId> = Vec::with_capacity(call.args.len());
+            for a in &call.args {
+                let v = get_value!(lower_expr(graph, block, a, options, ctx)?);
+                args.push(v);
+            }
             let target = canonical_call_target(&call.func, &ctx.module_prefix);
-            graph.push_op(
-                *block,
-                OpKind::Call {
-                    target,
-                    args,
-                    result_ty: ValueType::Unknown,
-                },
-                true,
-            )
+            Ok(Lowered {
+                value: graph.push_op(
+                    *block,
+                    OpKind::Call {
+                        target,
+                        args,
+                        result_ty: ValueType::Unknown,
+                    },
+                    true,
+                ),
+                path_closed: false,
+            })
         }
 
         // ── method call ──
         syn::Expr::MethodCall(mc) => {
             let mut args = Vec::new();
-            if let Some(recv) = lower_expr(graph, block, &mc.receiver, options, ctx) {
-                args.push(recv);
-            }
+            let recv = get_value!(lower_expr(graph, block, &mc.receiver, options, ctx)?);
+            args.push(recv);
             for a in &mc.args {
-                if let Some(v) = lower_expr(graph, block, a, options, ctx) {
-                    args.push(v);
-                }
+                let v = get_value!(lower_expr(graph, block, a, options, ctx)?);
+                args.push(v);
             }
             // RPython `jtransform.py:410-412`: a polymorphic receiver
             // (dyn Trait) lowers to `indirect_call`, not `direct_call`.
@@ -1198,15 +1481,18 @@ fn lower_expr(
             } else {
                 CallTarget::method(mc.method.to_string(), receiver_type_root(&mc.receiver, ctx))
             };
-            graph.push_op(
-                *block,
-                OpKind::Call {
-                    target,
-                    args,
-                    result_ty: ValueType::Unknown,
-                },
-                true,
-            )
+            Ok(Lowered {
+                value: graph.push_op(
+                    *block,
+                    OpKind::Call {
+                        target,
+                        args,
+                        result_ty: ValueType::Unknown,
+                    },
+                    true,
+                ),
+                path_closed: false,
+            })
         }
 
         // ── if/else → block split (RPython FlowContext.guessbool) ──
@@ -1215,8 +1501,11 @@ fn lower_expr(
         // If both branches produce a value, merge_block gets an inputarg
         // (Phi node) that receives the value from each branch via Link args.
         syn::Expr::If(if_expr) => {
-            let cond = lower_expr(graph, block, &if_expr.cond, options, ctx)
-                .unwrap_or_else(|| graph.alloc_value());
+            // RPython `flowspace/flowcontext.py:91,107,364`: unsupported
+            // cond raises `FlowingError`, halting the walk.  A child
+            // that closed its path (`if return_early { ... } else ...`)
+            // also has no truth value — propagate via `get_value!`.
+            let cond = get_value!(lower_expr(graph, block, &if_expr.cond, options, ctx)?);
 
             let mut then_block = graph.create_block();
             let mut else_block = graph.create_block();
@@ -1224,54 +1513,90 @@ fn lower_expr(
             graph.set_branch(*block, cond, then_block, vec![], else_block, vec![]);
 
             // Lower then branch — collect result value
-            let then_result = lower_stmt_list_with_tail_value(
+            let then_lowered = lower_stmt_list_with_tail_value(
                 graph,
                 &mut then_block,
                 &if_expr.then_branch.stmts,
                 options,
                 ctx,
-            );
+            )?;
 
             // Lower else branch
-            let mut else_result = None;
+            let mut else_lowered = Lowered::no_value();
             if let Some((_, else_branch)) = &if_expr.else_branch {
-                else_result = lower_expr(graph, &mut else_block, else_branch, options, ctx);
+                else_lowered = lower_expr(graph, &mut else_block, else_branch, options, ctx)?;
             }
 
-            // Create merge block with Phi if both branches have values
-            let (merge_block, phi_result) = if then_result.is_some() && else_result.is_some() {
+            // RPython `flowspace/flowcontext.py` merges via Link: a
+            // branch whose path is closed (`return`/`raise`/`break`)
+            // does not `goto` the merge — the `is_open` check below
+            // already skips it.  A phi inputarg is introduced when both
+            // arms *produced a value*, mirroring the old all-or-nothing
+            // shape; arity is kept consistent by skipping the closed
+            // arm's goto so only the open arm sends a `vec![value]` to
+            // the one-inputarg merge block.
+            let then_value = then_lowered.value;
+            let else_value = else_lowered.value;
+            let then_open = graph.block(then_block).is_open();
+            let else_open = graph.block(else_block).is_open();
+            let want_phi = then_value.is_some() && else_value.is_some();
+
+            let (merge_block, phi_result) = if want_phi {
                 let (merge, phi_args) = graph.create_block_with_args(1);
-                // Link args: then → merge(then_result), else → merge(else_result)
-                if graph.block(then_block).is_open() {
-                    graph.set_goto(then_block, merge, vec![then_result.unwrap()]);
+                if then_open {
+                    graph.set_goto(then_block, merge, vec![then_value.unwrap()]);
                 }
-                if graph.block(else_block).is_open() {
-                    graph.set_goto(else_block, merge, vec![else_result.unwrap()]);
+                if else_open {
+                    graph.set_goto(else_block, merge, vec![else_value.unwrap()]);
                 }
                 (merge, Some(phi_args[0]))
             } else {
                 let merge = graph.create_block();
-                if graph.block(then_block).is_open() {
+                if then_open {
                     graph.set_goto(then_block, merge, vec![]);
                 }
-                if graph.block(else_block).is_open() {
+                if else_open {
                     graph.set_goto(else_block, merge, vec![]);
                 }
                 (merge, None)
             };
 
             *block = merge_block;
-            phi_result
+            // If NEITHER arm remains open, the merge block is
+            // unreachable — mark the enclosing path as closed so the
+            // caller stops lowering into it.  RPython parity:
+            // `flowspace/flowcontext.py` never keeps a merge block
+            // reachable when all incoming links closed with
+            // `FlowSignal::Return` / `Raise`.
+            if !then_open && !else_open {
+                Ok(Lowered::path_closed())
+            } else {
+                Ok(Lowered {
+                    value: phi_result,
+                    path_closed: false,
+                })
+            }
         }
 
         // ── return ──
         syn::Expr::Return(ret) => {
-            let val = ret
-                .expr
-                .as_ref()
-                .and_then(|e| lower_expr(graph, block, e, options, ctx));
+            // RPython `RETURN_VALUE` (`flowspace/flowcontext.py`):
+            // `popvalue()` then `raise Return(w_result)`.  Pyre
+            // equivalent: evaluate the return value (propagating
+            // path_closed / FlowingError), then `set_return(..)` closes
+            // the block and `Lowered::path_closed()` tells the caller
+            // to stop walking this path.
+            let val = if let Some(e) = &ret.expr {
+                let lowered = lower_expr(graph, block, e, options, ctx)?;
+                if lowered.path_closed {
+                    return Ok(Lowered::path_closed());
+                }
+                lowered.value
+            } else {
+                None
+            };
             graph.set_return(*block, val);
-            None
+            Ok(Lowered::path_closed())
         }
 
         // ── block { stmts } ──
@@ -1290,7 +1615,10 @@ fn lower_expr(
             match &lit.lit {
                 syn::Lit::Int(int_lit) => {
                     if let Ok(v) = int_lit.base10_parse::<i64>() {
-                        return graph.push_op(*block, OpKind::ConstInt(v), true);
+                        return Ok(Lowered {
+                            value: graph.push_op(*block, OpKind::ConstInt(v), true),
+                            path_closed: false,
+                        });
                     }
                 }
                 // RPython lowers `True`/`False` to `Constant(1)`/`Constant(0)`
@@ -1299,27 +1627,46 @@ fn lower_expr(
                 // so the value lives in an int register exactly like a
                 // regular integer constant.  Emit as `ConstInt` to match.
                 syn::Lit::Bool(b) => {
-                    return graph.push_op(*block, OpKind::ConstInt(b.value as i64), true);
+                    return Ok(Lowered {
+                        value: graph.push_op(*block, OpKind::ConstInt(b.value as i64), true),
+                        path_closed: false,
+                    });
                 }
                 // RPython treats `chr(x)` / single-char byte literals as
                 // `lltype.Char` which is also kind `'int'` (single unsigned
                 // byte).  Rust `b'x'` (syn::Lit::Byte) and `'x'`
                 // (syn::Lit::Char as u32) map to the same shape.
                 syn::Lit::Byte(b) => {
-                    return graph.push_op(*block, OpKind::ConstInt(b.value() as i64), true);
+                    return Ok(Lowered {
+                        value: graph.push_op(*block, OpKind::ConstInt(b.value() as i64), true),
+                        path_closed: false,
+                    });
                 }
                 syn::Lit::Char(c) => {
-                    return graph.push_op(*block, OpKind::ConstInt(c.value() as i64), true);
+                    return Ok(Lowered {
+                        value: graph.push_op(*block, OpKind::ConstInt(c.value() as i64), true),
+                        path_closed: false,
+                    });
                 }
                 _ => {}
             }
-            graph.push_op(
-                *block,
-                OpKind::Unknown {
-                    kind: UnknownKind::UnsupportedLiteral,
-                },
-                true,
-            )
+            // Unsupported literal kind — tag the specific variant so
+            // the `Unknown` marker + diagnostics still identify the
+            // remaining rtyper-side port gap (Str / Float / ByteStr /
+            // Verbatim).  RPython `LOAD_CONST`
+            // (`flowspace/flowcontext.py:841`) pushes the constant and
+            // the flow walk continues; Err here would abort the whole
+            // function graph and cascade through consumers like
+            // `assert!("...")` / `panic!("...")` (which can legitimately
+            // carry string literals next to side-effecting args).
+            let variant = match &lit.lit {
+                syn::Lit::Str(_) => UnsupportedLiteralKind::Str,
+                syn::Lit::Float(_) => UnsupportedLiteralKind::Float,
+                syn::Lit::ByteStr(_) => UnsupportedLiteralKind::ByteStr,
+                syn::Lit::Verbatim(_) => UnsupportedLiteralKind::Verbatim,
+                _ => UnsupportedLiteralKind::Other,
+            };
+            Ok(continue_with_unknown_literal(graph, *block, variant))
         }
 
         // ── path (variable reference) ──
@@ -1331,14 +1678,17 @@ fn lower_expr(
                 .map(|seg| seg.ident.to_string())
                 .collect::<Vec<_>>()
                 .join("::");
-            graph.push_op(
-                *block,
-                OpKind::Input {
-                    name,
-                    ty: ValueType::Unknown,
-                },
-                true,
-            )
+            Ok(Lowered {
+                value: graph.push_op(
+                    *block,
+                    OpKind::Input {
+                        name,
+                        ty: ValueType::Unknown,
+                    },
+                    true,
+                ),
+                path_closed: false,
+            })
         }
 
         // ── reference &expr ──
@@ -1349,35 +1699,38 @@ fn lower_expr(
 
         // ── unary !x, -x ──
         syn::Expr::Unary(u) => {
-            let operand = lower_expr(graph, block, &u.expr, options, ctx)
-                .unwrap_or_else(|| graph.alloc_value());
-            graph.push_op(
-                *block,
-                OpKind::UnaryOp {
-                    op: unary_op_name(&u.op).into(),
-                    operand,
-                    result_ty: ValueType::Unknown,
-                },
-                true,
-            )
+            let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+            Ok(Lowered {
+                value: graph.push_op(
+                    *block,
+                    OpKind::UnaryOp {
+                        op: unary_op_name(&u.op).into(),
+                        operand,
+                        result_ty: ValueType::Unknown,
+                    },
+                    true,
+                ),
+                path_closed: false,
+            })
         }
 
         // ── binary a + b ──
         syn::Expr::Binary(bin) => {
-            let lhs = lower_expr(graph, block, &bin.left, options, ctx)
-                .unwrap_or_else(|| graph.alloc_value());
-            let rhs = lower_expr(graph, block, &bin.right, options, ctx)
-                .unwrap_or_else(|| graph.alloc_value());
-            graph.push_op(
-                *block,
-                OpKind::BinOp {
-                    op: binary_op_name(&bin.op).into(),
-                    lhs,
-                    rhs,
-                    result_ty: ValueType::Unknown,
-                },
-                true,
-            )
+            let lhs = get_value!(lower_expr(graph, block, &bin.left, options, ctx)?);
+            let rhs = get_value!(lower_expr(graph, block, &bin.right, options, ctx)?);
+            Ok(Lowered {
+                value: graph.push_op(
+                    *block,
+                    OpKind::BinOp {
+                        op: binary_op_name(&bin.op).into(),
+                        lhs,
+                        rhs,
+                        result_ty: ValueType::Unknown,
+                    },
+                    true,
+                ),
+                path_closed: false,
+            })
         }
 
         // ── cast: expr as T ──
@@ -1385,11 +1738,10 @@ fn lower_expr(
 
         // ── match expr { arms } → multi-block (RPython switch) ──
         syn::Expr::Match(m) => {
-            let scrutinee = lower_expr(graph, block, &m.expr, options, ctx)
-                .unwrap_or_else(|| graph.alloc_value());
+            let scrutinee = get_value!(lower_expr(graph, block, &m.expr, options, ctx)?);
 
             if m.arms.is_empty() {
-                return None;
+                return Ok(Lowered::no_value());
             }
 
             // Lower each arm body into its own block, collecting both
@@ -1404,71 +1756,98 @@ fn lower_expr(
             // length as every outgoing Goto's args (flatten.py:308
             // assumption), so we defer merge creation until we know
             // whether any arm actually produced a value.
+            //
+            // RPython `flowspace/flowcontext.py:417` — `FlowingError`
+            // from any arm aborts the whole function graph, not just
+            // the current arm.  `?` here propagates that out of the
+            // whole match so the enclosing `build_function_graph` body
+            // loop breaks at the first unsupported construct, matching
+            // upstream's all-or-nothing flowgraph semantics.
             let mut arm_entries: Vec<BlockId> = Vec::with_capacity(m.arms.len());
             let mut arm_tails: Vec<(BlockId, Option<ValueId>)> = Vec::with_capacity(m.arms.len());
             for arm in &m.arms {
                 let entry = graph.create_block();
                 let mut tail = entry;
-                let result = lower_expr(graph, &mut tail, &arm.body, options, ctx);
+                let arm_lowered = lower_expr(graph, &mut tail, &arm.body, options, ctx)?;
+                // A closed arm (body is `return x` / `break` / `panic!`
+                // / `raise`) does not contribute a value to the merge —
+                // its path terminates inside `tail` and no outgoing
+                // goto is synthesised.  Per RPython
+                // `flowspace/flowcontext.py:1253` `Raise.nomoreblocks`,
+                // sibling walks continue irrespective of this arm's
+                // closure.
                 arm_entries.push(entry);
-                arm_tails.push((tail, result));
+                arm_tails.push((tail, arm_lowered.value));
             }
 
-            // Any-arm-has-value → merge gets a Phi inputarg; otherwise
-            // merge is a plain block and all arm gotos carry no args.
-            let any_has_value = arm_tails.iter().any(|(_, r)| r.is_some());
-            let (merge, merge_phi) = if any_has_value {
+            // Merge gets a Phi inputarg iff every arm that actually
+            // reaches the merge carries a value.  Closed arms (early
+            // `return` / `break`) don't emit a goto to merge, so they
+            // contribute nothing to the phi arity.  Mixing some-value
+            // and no-value open arms would require a fake phi arg for
+            // the no-value arms (RPython `jit/codewriter/flatten.py:308`
+            // — every outgoing goto's arg list must match the target's
+            // inputarg arity), so in that case we emit no phi at all.
+            let all_open_arms_have_value = arm_tails
+                .iter()
+                .all(|(tail, r)| !graph.block(*tail).is_open() || r.is_some());
+            let (merge, merge_phi) = if all_open_arms_have_value {
                 let (m_block, phi_args) = graph.create_block_with_args(1);
                 (m_block, Some(phi_args[0]))
             } else {
                 (graph.create_block(), None)
             };
 
+            let mut any_open = false;
             for (tail, result) in &arm_tails {
                 if !graph.block(*tail).is_open() {
                     continue;
                 }
-                let goto_args = if any_has_value {
-                    vec![result.unwrap_or_else(|| graph.alloc_value())]
+                any_open = true;
+                let goto_args = if all_open_arms_have_value {
+                    // Safe: the filter above guarantees every open arm's
+                    // `result` is `Some`.
+                    vec![result.unwrap()]
                 } else {
                     Vec::new()
                 };
                 graph.set_goto(*tail, merge, goto_args);
             }
 
-            // First arm as default branch (simplified)
+            // First arm as default branch (simplified).
+            // In the else branch `m.arms.len() >= 2` → `arm_entries` has
+            // at least 2 entries, so `second_block` is always a real arm
+            // entry block (never `merge`), and no false_args workaround
+            // is needed.
             if m.arms.len() == 1 {
                 graph.set_goto(*block, arm_entries[0], vec![]);
             } else {
-                // Binary branch on scrutinee for first arm, else second.
-                // If the else-fallthrough goes to `merge` directly
-                // (arm count < 2), carry the matching phi argument so
-                // merge's inputarg arity is respected.
-                let first_block = arm_entries[0];
-                let second_block = arm_entries.get(1).copied().unwrap_or(merge);
-                let false_args = if second_block == merge && any_has_value {
-                    vec![graph.alloc_value()]
-                } else {
-                    Vec::new()
-                };
                 graph.set_branch(
                     *block,
                     scrutinee,
-                    first_block,
+                    arm_entries[0],
                     vec![],
-                    second_block,
-                    false_args,
+                    arm_entries[1],
+                    vec![],
                 );
             }
 
             *block = merge;
-            merge_phi
+            if !any_open {
+                // All arms terminated — the enclosing walk has no open
+                // path to continue.
+                Ok(Lowered::path_closed())
+            } else {
+                Ok(Lowered {
+                    value: merge_phi,
+                    path_closed: false,
+                })
+            }
         }
 
         // ── while → header block + body block + exit block ──
         syn::Expr::While(w) => {
             let header_entry = graph.create_block();
-            let body_entry = graph.create_block();
             let exit = graph.create_block();
 
             // Current block → header_entry (loop-head, 0 inputargs).
@@ -1478,23 +1857,41 @@ fn lower_expr(
             // `lower_expr(&mut header_tail, ...)` may rewire to a
             // sub-merge; the cond-branch attaches to header_tail so
             // the branch lives at the header's actual end.
+            //
+            // RPython `flowspace/flowcontext.py:91,107,364`: unsupported
+            // cond raises `FlowingError`.  We propagate that via `?` —
+            // no fake cond, no fallback goto-exit.  The exit block we
+            // pre-created above becomes dead; simplify prunes it.
             let mut header_tail = header_entry;
-            let cond = lower_expr(graph, &mut header_tail, &w.cond, options, ctx)
-                .unwrap_or_else(|| graph.alloc_value());
+            let cond = get_value!(lower_expr(graph, &mut header_tail, &w.cond, options, ctx)?);
+            let body_entry = graph.create_block();
             graph.set_branch(header_tail, cond, body_entry, vec![], exit, vec![]);
 
             // Body → back to header_entry (entry, not tail —
-            // header_entry is the 0-inputarg loop-head).
+            // header_entry is the 0-inputarg loop-head).  Each stmt may
+            // close its path (inner `return` / `break` / `panic!`); on
+            // closure we stop walking the body and the back-edge is
+            // skipped via the `is_open` check below.  The loop frame
+            // makes `break` / `continue` in the body route to exit /
+            // header.
+            ctx.loop_stack.push(LoopFrame {
+                continue_target: header_entry,
+                break_target: exit,
+            });
             let mut body_tail = body_entry;
             for stmt in &w.body.stmts {
-                lower_stmt(graph, &mut body_tail, stmt, options, ctx);
+                let closed = lower_stmt(graph, &mut body_tail, stmt, options, ctx)?;
+                if closed {
+                    break;
+                }
             }
+            ctx.loop_stack.pop();
             if graph.block(body_tail).is_open() {
                 graph.set_goto(body_tail, header_entry, vec![]);
             }
 
             *block = exit;
-            None
+            Ok(Lowered::no_value())
         }
         syn::Expr::Loop(l) => {
             let body_entry = graph.create_block();
@@ -1502,60 +1899,165 @@ fn lower_expr(
 
             graph.set_goto(*block, body_entry, vec![]);
 
+            ctx.loop_stack.push(LoopFrame {
+                continue_target: body_entry,
+                break_target: exit,
+            });
             let mut body_tail = body_entry;
             for stmt in &l.body.stmts {
-                lower_stmt(graph, &mut body_tail, stmt, options, ctx);
+                let closed = lower_stmt(graph, &mut body_tail, stmt, options, ctx)?;
+                if closed {
+                    break;
+                }
             }
+            ctx.loop_stack.pop();
             if graph.block(body_tail).is_open() {
                 graph.set_goto(body_tail, body_entry, vec![]);
             }
 
             *block = exit;
-            None
+            Ok(Lowered::no_value())
         }
         syn::Expr::ForLoop(f) => {
+            // RPython `for` lowers to the iterator protocol: `GET_ITER`
+            // on the iterable, then a `FOR_ITER` at the header whose
+            // true arm binds the next item into the body and whose
+            // false arm falls through (`rpython/flowspace/
+            // flowcontext.py:782,787,1378`).  Pyre has NO `Iter` /
+            // `Next` op yet (Slice 6 port).  The shape below is
+            // deliberately NOT claiming op-level equivalence with
+            // upstream's iter/next — it emits a SINGLE `Unknown`
+            // marker tagged `ForLoop` at the header that stands for
+            // the whole iterator protocol, and walks the iterable
+            // sub-expression for its side effects so the
+            // `build_flow`-visible part of the construct is complete
+            // even when the loop ops themselves are stubbed.
+            let iterable = get_value!(lower_expr(graph, block, &f.expr, options, ctx)?);
+            let _ = iterable;
+
             let header_entry = graph.create_block();
             let body_entry = graph.create_block();
             let exit = graph.create_block();
-
             graph.set_goto(*block, header_entry, vec![]);
 
-            let mut header_tail = header_entry;
-            lower_expr(graph, &mut header_tail, &f.expr, options, ctx);
-            let iter_cond = graph.alloc_value();
-            graph.set_branch(header_tail, iter_cond, body_entry, vec![], exit, vec![]);
+            // Single iterator-protocol placeholder, NOT two separate
+            // iter/next markers.  The branch shape is required to
+            // make `exit` reachable from the normal control-flow
+            // fallthrough (without it, loops without `break` would
+            // leave every statement after the `for` unreachable).
+            let for_cond = graph.push_op(
+                header_entry,
+                OpKind::Unknown {
+                    kind: UnknownKind::UnsupportedExpr {
+                        variant: UnsupportedExprKind::ForLoop,
+                    },
+                },
+                true,
+            );
+            if let Some(cond) = for_cond {
+                graph.set_branch(header_entry, cond, body_entry, vec![], exit, vec![]);
+            } else {
+                graph.set_goto(header_entry, body_entry, vec![]);
+            }
 
+            ctx.loop_stack.push(LoopFrame {
+                continue_target: header_entry,
+                break_target: exit,
+            });
             let mut body_tail = body_entry;
             for stmt in &f.body.stmts {
-                lower_stmt(graph, &mut body_tail, stmt, options, ctx);
+                let closed = lower_stmt(graph, &mut body_tail, stmt, options, ctx)?;
+                if closed {
+                    break;
+                }
             }
+            ctx.loop_stack.pop();
             if graph.block(body_tail).is_open() {
                 graph.set_goto(body_tail, header_entry, vec![]);
             }
 
             *block = exit;
-            None
+            Ok(Lowered::no_value())
         }
 
         // ── break/continue ──
+        //
+        // RPython `flowspace/flowcontext.py:525` models these as
+        // `Break` / `Continue` `FlowSignal`s; `LoopBlock.handle_signal`
+        // (`:1341`) rewrites the current block with a Link to the
+        // loop's end / header.  Pyre's port: look up the enclosing
+        // `LoopFrame` on `ctx.loop_stack` and close the current block
+        // with `set_goto(*block, target)`, then report path_closed so
+        // the surrounding walker stops emitting ops into a
+        // now-terminated block.  A break/continue outside any loop is
+        // orphaned — `path_closed` alone gives the surrounding walker
+        // the stop signal without corrupting the graph.
         syn::Expr::Break(b) => {
             if let Some(e) = &b.expr {
-                lower_expr(graph, block, e, options, ctx);
+                let lowered = lower_expr(graph, block, e, options, ctx)?;
+                if lowered.path_closed {
+                    return Ok(Lowered::path_closed());
+                }
             }
-            None
+            if let Some(frame) = ctx.loop_stack.last().copied() {
+                if graph.block(*block).is_open() {
+                    graph.set_goto(*block, frame.break_target, vec![]);
+                }
+            }
+            Ok(Lowered::path_closed())
         }
-        syn::Expr::Continue(_) => None,
+        syn::Expr::Continue(_) => {
+            if let Some(frame) = ctx.loop_stack.last().copied() {
+                if graph.block(*block).is_open() {
+                    graph.set_goto(*block, frame.continue_target, vec![]);
+                }
+            }
+            Ok(Lowered::path_closed())
+        }
 
         // ── closure ──
-        syn::Expr::Closure(c) => lower_expr(graph, block, &c.body, options, ctx),
+        //
+        // RPython `MAKE_FUNCTION` (`pypy/interpreter/pyopcode.py:1144`,
+        // `flowspace/flowcontext.py:1177`) pushes a fresh function
+        // value onto the stack — the `def`/`lambda` body becomes a
+        // separate graph, NOT inlined into the enclosing flow.  Pyre
+        // has no per-closure graph yet (the closure body is usually
+        // captured via an `fn` pointer arg), so the expression lowers
+        // to a single `Unknown` marker representing the closure
+        // value.  The body is NOT walked here: inlining it into the
+        // caller's flow was a New-Deviation that treated the closure
+        // as a synchronous block, which broke callers that pass the
+        // closure itself as a function-typed argument (e.g. empty
+        // `|_| {}` body produced no value for `get_value!`).
+        syn::Expr::Closure(_) => Ok(continue_with_unknown(
+            graph,
+            *block,
+            UnsupportedExprKind::OtherExpr,
+        )),
 
         // ── tuple (a, b, c) ──
         syn::Expr::Tuple(t) => {
-            let mut last = None;
+            // RPython `BUILD_TUPLE` (`pypy/interpreter/pyopcode.py:955`,
+            // `flowspace/flowcontext.py:1163`) always pushes a fresh
+            // tuple object — the result is a NEW value distinct from
+            // any individual element.  Pyre has no `NewTuple` op yet
+            // (Slice 5 port), so the construct lowers to a single
+            // `Unknown` marker tagged `Tuple` that stands in for the
+            // whole tuple-builder; callers that read the result get a
+            // well-formed ValueId but coverage audits still flag the
+            // port gap.  Elements lower for their side effects and
+            // path-closed propagation but do NOT feed the result.
             for e in &t.elems {
-                last = lower_expr(graph, block, e, options, ctx);
+                let lowered = lower_expr(graph, block, e, options, ctx)?;
+                if lowered.path_closed {
+                    return Ok(Lowered::path_closed());
+                }
             }
-            last
+            Ok(continue_with_unknown(
+                graph,
+                *block,
+                UnsupportedExprKind::Tuple,
+            ))
         }
 
         // ── try expr? ──
@@ -1573,7 +2075,7 @@ fn lower_expr(
         // are prevblock-side values" invariant at
         // `flowspace/model.py:114`.
         syn::Expr::Try(t) => {
-            let inner = lower_expr(graph, block, &t.expr, options, ctx)?;
+            let inner = get_value!(lower_expr(graph, block, &t.expr, options, ctx)?);
             let continuation = graph.create_block();
             let continuation_arg = graph.alloc_value();
             graph
@@ -1608,7 +2110,7 @@ fn lower_expr(
                 ],
             );
             *block = continuation;
-            Some(continuation_arg)
+            Ok(Lowered::value(continuation_arg))
         }
 
         // ── unsafe { stmts } ──
@@ -1625,36 +2127,403 @@ fn lower_expr(
         }
 
         // ── fallback ──
+        //
+        // RPython `flowspace/flowcontext.py` evaluates sub-expressions
+        // eagerly as bytecode streams in; `FlowingError` halts the
+        // walk AT the unsupported op, not BEFORE the sub-expression
+        // push operations.  For Rust variants whose AST carries named
+        // sub-expressions (Range endpoints, Struct field values, Array
+        // / Repeat elements, `if let` scrutinee) we walk those first
+        // so their Call / FieldRead / etc. ops land in the graph
+        // before the Unknown marker + abort.
         other => {
-            if std::env::var("MAJIT_UNKNOWN_DUMP").is_ok() {
-                let variant = match other {
-                    syn::Expr::Array(_) => "Array",
-                    syn::Expr::Async(_) => "Async",
-                    syn::Expr::Await(_) => "Await",
-                    syn::Expr::Const(_) => "Const",
-                    syn::Expr::Group(_) => "Group",
-                    syn::Expr::Infer(_) => "Infer",
-                    syn::Expr::Let(_) => "Let",
-                    syn::Expr::Macro(_) => "Macro",
-                    syn::Expr::Range(_) => "Range",
-                    syn::Expr::RawAddr(_) => "RawAddr",
-                    syn::Expr::Repeat(_) => "Repeat",
-                    syn::Expr::Struct(_) => "Struct",
-                    syn::Expr::TryBlock(_) => "TryBlock",
-                    syn::Expr::Unsafe(_) => "Unsafe",
-                    syn::Expr::Verbatim(_) => "Verbatim",
-                    syn::Expr::Yield(_) => "Yield",
-                    _ => "OtherExpr",
-                };
-                println!("cargo:warning=[UnsupportedExpr] variant={variant}");
+            // Conditional-raise macro family (assert!, debug_assert!,
+            // assert_eq!, assert_ne!, debug_assert_eq!,
+            // debug_assert_ne!) expand to `if !cond { panic }` — a
+            // runtime check that either continues or unconditionally
+            // raises.  Port to the RPython-canonical shape of a
+            // `set_branch` whose false side routes through the
+            // exceptblock via `set_raise`
+            // (`rpython/flowspace/model.py:21-25`).  Unlike panic!, the
+            // macro expression itself has type `()` — on the pass side
+            // the enclosing walk continues normally.
+            if let syn::Expr::Macro(m) = other {
+                let macro_name = m
+                    .mac
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                let is_assert = matches!(macro_name.as_str(), "assert" | "debug_assert");
+                let is_assert_cmp = matches!(
+                    macro_name.as_str(),
+                    "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne"
+                );
+                if is_assert || is_assert_cmp {
+                    if let Ok(args) = m.mac.parse_body_with(
+                        syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
+                    ) {
+                        let mut it = args.iter();
+                        let cond_opt: Option<ValueId> = if is_assert {
+                            if let Some(cond_expr) = it.next() {
+                                let lowered = lower_expr(graph, block, cond_expr, options, ctx)?;
+                                if lowered.path_closed {
+                                    return Ok(Lowered::path_closed());
+                                }
+                                lowered.value
+                            } else {
+                                None
+                            }
+                        } else {
+                            let lhs_expr = it.next();
+                            let rhs_expr = it.next();
+                            match (lhs_expr, rhs_expr) {
+                                (Some(le), Some(re)) => {
+                                    let lhs =
+                                        get_value!(lower_expr(graph, block, le, options, ctx)?);
+                                    let rhs =
+                                        get_value!(lower_expr(graph, block, re, options, ctx)?);
+                                    let op_name = if macro_name.contains("_ne") {
+                                        "ne"
+                                    } else {
+                                        "eq"
+                                    };
+                                    graph.push_op(
+                                        *block,
+                                        OpKind::BinOp {
+                                            op: op_name.into(),
+                                            lhs,
+                                            rhs,
+                                            result_ty: ValueType::Unknown,
+                                        },
+                                        true,
+                                    )
+                                }
+                                _ => None,
+                            }
+                        };
+                        if let Some(cond) = cond_opt {
+                            // Split into pass/fail arms BEFORE walking
+                            // the message expressions.  Per RPython
+                            // `flowspace/flowcontext.py:107`
+                            // (`BlockRecorder.guessbool`), the two
+                            // arms of a conditional are independent
+                            // walks — the message-format arguments
+                            // are only reachable on the failing path
+                            // and must not land ops on the pass path.
+                            //
+                            // Message format arguments walk on the
+                            // fail branch: RPython `LOAD_CONST`
+                            // (`flowspace/flowcontext.py:841`) pushes a
+                            // constant and the walk continues, so Str /
+                            // Float / ByteStr literals are no longer
+                            // fatal — the non-fatal Lit handler above
+                            // emits an `Unknown` marker and returns a
+                            // value.  We therefore walk every rest arg
+                            // unconditionally (side-effect-preserving
+                            // order).
+                            let pass_block = graph.create_block();
+                            let mut fail_block = graph.create_block();
+                            graph.set_branch(*block, cond, pass_block, vec![], fail_block, vec![]);
+                            // Walk every message-expr on the fail
+                            // branch to preserve its side effects
+                            // (Call / FieldRead / …) on the graph,
+                            // then hand the evaluated ValueIds to the
+                            // shared `exc_from_raise` lowering as the
+                            // positional args of `simple_call(AssertionError,
+                            // *args)`.  Upstream parity: RPython
+                            // `RAISE_VARARGS` (`flowcontext.py:638-656`)
+                            // popvalue's all args before reaching
+                            // `exc_from_raise`; the adapter here picks
+                            // `AssertionError` as the `w_arg1` for
+                            // every assert-family macro so
+                            // `front::raise::lower_exc_from_raise`
+                            // walks the same op sequence as the
+                            // flowspace port at
+                            // `flowspace/flowcontext.rs:1189`.
+                            let mut message_args: Vec<ValueId> = Vec::new();
+                            for rest in it {
+                                // The fail-branch walk is independent
+                                // of the pass-branch walk; a
+                                // path-closing construct inside the
+                                // message format (`panic!` nested
+                                // inside the format arg) still leaves
+                                // the pass branch open, so we don't
+                                // propagate path_closed out here.
+                                // FlowingError still propagates via
+                                // `?`.
+                                let lowered =
+                                    lower_expr(graph, &mut fail_block, rest, options, ctx)?;
+                                if let Some(v) = lowered.value {
+                                    message_args.push(v);
+                                }
+                            }
+                            let _ = &macro_name; // name is only used for diagnostics; class is fixed.
+                            crate::front::raise::lower_exc_from_raise(
+                                graph,
+                                fail_block,
+                                "AssertionError",
+                                message_args,
+                            );
+                            *block = pass_block;
+                            // Pass block is still open — the assert
+                            // expression itself has type `()`, no value.
+                            return Ok(Lowered::no_value());
+                        }
+                    }
+                }
             }
-            graph.push_op(
-                *block,
-                OpKind::Unknown {
-                    kind: UnknownKind::UnsupportedExpr,
-                },
-                true,
-            )
+            // Abort-family macros (`panic!`, `unreachable!`, `todo!`,
+            // `unimplemented!`) have type `!` and terminate the current
+            // control-flow path with an unconditional raise.  Matches
+            // RPython `flowspace/flowcontext.py:1253` `Raise.nomoreblocks`
+            // where the enclosing block is closed with a Link to
+            // `exceptblock` regardless of the exception argument shape.
+            //
+            // Per RPython `RAISE_VARARGS`
+            // (`flowspace/flowcontext.py:638-656`), the raise target /
+            // arguments are `popvalue()`'d off the stack — they have
+            // already been evaluated before the Raise.  The same
+            // happens in Rust: `panic!("{}", side_effect())` evaluates
+            // `side_effect()` before panicking.  Walk every macro arg
+            // before `set_raise` so its side effects land in the graph.
+            // Literal args are no longer fatal (Lit handler above emits
+            // `Unknown` + returns a value), so no skip is needed.
+            if let syn::Expr::Macro(m) = other {
+                let name = m
+                    .mac
+                    .path
+                    .segments
+                    .last()
+                    .map(|s| s.ident.to_string())
+                    .unwrap_or_default();
+                if matches!(
+                    name.as_str(),
+                    "panic" | "unreachable" | "todo" | "unimplemented"
+                ) {
+                    // Walk every message-arg for its side effects
+                    // (popvalue-before-raise semantic of RPython
+                    // `RAISE_VARARGS`, `flowcontext.py:638-656`), then
+                    // forward the evaluated ValueIds as the positional
+                    // args of `simple_call(PanicError, *args)` inside
+                    // the shared `exc_from_raise` lowering
+                    // (`front::raise::lower_exc_from_raise` →
+                    // `flowcontext.rs:1189` parity).
+                    let mut message_args: Vec<ValueId> = Vec::new();
+                    if let Ok(args) = m.mac.parse_body_with(
+                        syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
+                    ) {
+                        for arg in args.iter() {
+                            let lowered = lower_expr(graph, block, arg, options, ctx)?;
+                            if lowered.path_closed {
+                                // A path-closing sub-expression already
+                                // terminated `*block`; the outer panic!
+                                // has nothing more to do — propagate
+                                // path_closed so the enclosing walker
+                                // stops.
+                                return Ok(Lowered::path_closed());
+                            }
+                            if let Some(v) = lowered.value {
+                                message_args.push(v);
+                            }
+                        }
+                    }
+                    // RPython `flowspace/flowcontext.py:1253`
+                    // `Raise.nomoreblocks`: close the current block
+                    // with a Link to `exceptblock`, then signal the
+                    // path terminated.  RPython raises `StopFlowing`,
+                    // which is the same kind of FlowSignal as Return —
+                    // sibling walks continue normally.  Pyre equivalent:
+                    // `Lowered::path_closed()` on the `Ok` arm, NOT
+                    // `Err(FlowingError)` (which would abort the whole
+                    // function graph).  The Rust panic-family macros
+                    // (panic!, unreachable!, todo!, unimplemented!)
+                    // all share the `PanicError` adapter class — their
+                    // runtime-distinct PanicInfo shape is not modelled
+                    // at the flow-graph layer, mirroring reviewer
+                    // guidance (`flowcontext.py:2861 Raise` bytecode
+                    // adapter — version-specific variants converge on
+                    // `exc_from_raise(w_arg1, w_arg2)`).
+                    let _ = &name; // macro name carried for diagnostics only.
+                    crate::front::raise::lower_exc_from_raise(
+                        graph,
+                        *block,
+                        "PanicError",
+                        message_args,
+                    );
+                    return Ok(Lowered::path_closed());
+                }
+            }
+            let variant = match other {
+                syn::Expr::Array(_) => UnsupportedExprKind::Array,
+                syn::Expr::Async(_) => UnsupportedExprKind::Async,
+                syn::Expr::Await(_) => UnsupportedExprKind::Await,
+                syn::Expr::Const(_) => UnsupportedExprKind::Const,
+                syn::Expr::Group(_) => UnsupportedExprKind::Group,
+                syn::Expr::Infer(_) => UnsupportedExprKind::Infer,
+                syn::Expr::Let(_) => UnsupportedExprKind::Let,
+                syn::Expr::Macro(_) => UnsupportedExprKind::Macro,
+                syn::Expr::Range(_) => UnsupportedExprKind::Range,
+                syn::Expr::RawAddr(_) => UnsupportedExprKind::RawAddr,
+                syn::Expr::Repeat(_) => UnsupportedExprKind::Repeat,
+                syn::Expr::Struct(_) => UnsupportedExprKind::Struct,
+                syn::Expr::TryBlock(_) => UnsupportedExprKind::TryBlock,
+                syn::Expr::Verbatim(_) => UnsupportedExprKind::Verbatim,
+                syn::Expr::Yield(_) => UnsupportedExprKind::Yield,
+                _ => UnsupportedExprKind::OtherExpr,
+            };
+            if std::env::var("MAJIT_UNKNOWN_DUMP").is_ok() {
+                if let syn::Expr::Macro(m) = other {
+                    let path = m
+                        .mac
+                        .path
+                        .segments
+                        .iter()
+                        .map(|s| s.ident.to_string())
+                        .collect::<Vec<_>>()
+                        .join("::");
+                    let last = m
+                        .mac
+                        .path
+                        .segments
+                        .last()
+                        .map(|s| s.ident.to_string())
+                        .unwrap_or_default();
+                    let tag = if matches!(
+                        last.as_str(),
+                        "panic" | "unreachable" | "todo" | "unimplemented"
+                    ) {
+                        "[Raise]"
+                    } else {
+                        "[UnsupportedExpr]"
+                    };
+                    println!("cargo:warning={tag} variant=Macro path={path}");
+                } else {
+                    println!("cargo:warning=[UnsupportedExpr] variant={variant:?}");
+                }
+            }
+            // Helper: walk a sub-expression purely for its side effects
+            // (the parent composite is about to be marked unsupported,
+            // so the returned value is unused).  Propagate FlowingError
+            // via `?`; on path_closed, bail out of the parent walk too
+            // — the enclosing block is already terminated and a later
+            // `stop_unsupported` would push into a closed block.
+            macro_rules! walk_for_side_effects {
+                ($e:expr) => {{
+                    let lowered = lower_expr(graph, block, $e, options, ctx)?;
+                    if lowered.path_closed {
+                        return Ok(Lowered::path_closed());
+                    }
+                }};
+            }
+            // Non-fatal families mirror RPython bytecodes that push a
+            // value and continue the flow walk:
+            //   • Data constructors — `BUILD_LIST` / `BUILD_TUPLE` /
+            //     `newslice` (`flowspace/flowcontext.py:1168`,
+            //     `pypy/interpreter/pyopcode.py:960`).  Pyre does not
+            //     yet emit `NewList` / `NewStruct` / `NewRange` IR
+            //     ops, so element walks land in the graph and a
+            //     single `Unknown` marker stands in for the
+            //     allocation.  The local Rust-parity adapter
+            //     `flowspace/rust_source/build_flow.rs:1889`
+            //     (`lower_array -> newlist`) uses the same shape.
+            //   • Generic (non-abort) macros — `format!`, `write!`,
+            //     `vec!`, `matches!`, …  treat these as opaque ops
+            //     whose result is an opaque value; sub-expr walks
+            //     still capture side effects before the marker.
+            //     Abort-family macros are handled separately by the
+            //     `set_raise` branch earlier in the Macro arm above.
+            let is_data_creation = matches!(
+                other,
+                syn::Expr::Array(_)
+                    | syn::Expr::Repeat(_)
+                    | syn::Expr::Struct(_)
+                    | syn::Expr::Range(_)
+                    | syn::Expr::Let(_)
+                    | syn::Expr::Macro(_)
+                    | syn::Expr::RawAddr(_)
+            );
+            match other {
+                // `a..b` / `a..=b` / `..b` / `a..` / `..` — evaluate
+                // the endpoint expressions so side effects in them are
+                // captured.  Per RPython `newslice` (implicit in
+                // `BUILD_SLICE` at `pypy/interpreter/pyopcode.py`), the
+                // endpoints land as separate pushes before the slice
+                // is constructed.
+                syn::Expr::Range(r) => {
+                    if let Some(from) = &r.start {
+                        walk_for_side_effects!(from);
+                    }
+                    if let Some(to) = &r.end {
+                        walk_for_side_effects!(to);
+                    }
+                }
+                // `[a, b, c]` — evaluate each element.  RPython
+                // `BUILD_LIST` (`flowspace/flowcontext.py:1168`) pops
+                // N items and pushes `space.newlist(items)`; we emit
+                // an `Unknown` marker for the `newlist` step, which
+                // matches the local Rust-parity adapter in
+                // `flowspace/rust_source/build_flow.rs:1889`
+                // (`lower_array -> newlist`) until a proper
+                // `OpKind::NewList` lands.
+                syn::Expr::Array(a) => {
+                    for e in &a.elems {
+                        walk_for_side_effects!(e);
+                    }
+                }
+                // `[v; N]` — evaluate the element expression and the
+                // repeat count expression.  N is commonly a literal
+                // integer; walking it emits a `ConstInt` op that the
+                // annotator can still see.
+                syn::Expr::Repeat(r) => {
+                    walk_for_side_effects!(&r.expr);
+                    walk_for_side_effects!(&r.len);
+                }
+                // `S { f: v, g: w, ..rest }` — evaluate each field
+                // value, then any `..rest` base.  Parallels RPython
+                // `newstruct` / `BUILD_MAP`-style constructors.
+                syn::Expr::Struct(s) => {
+                    for field in &s.fields {
+                        walk_for_side_effects!(&field.expr);
+                    }
+                    if let Some(rest) = &s.rest {
+                        walk_for_side_effects!(rest);
+                    }
+                }
+                // `let PAT = EXPR` (only reachable as the cond of an
+                // `if let` / `while let`).  Evaluate the scrutinee so
+                // side effects are captured; the pattern match itself
+                // remains opaque until enum-variant dispatch lands.
+                syn::Expr::Let(l) => {
+                    walk_for_side_effects!(&l.expr);
+                }
+                // `foo!(a, b, c)` / `foo![a, b, c]` / `foo!{a, b, c}`
+                // — most Rust macros whose bodies reach this point
+                // (vec!, format!, matches!, write!, writeln!, ...)
+                // accept comma-separated expressions as arguments.
+                // Parse the token stream as `Punctuated<Expr, ,>` and
+                // walk each; on parse failure (e.g. macros with
+                // non-expression syntax), fall through to bare abort.
+                // Matches the RPython FlowingError convention at
+                // `rpython/flowspace/flowcontext.py:258` where
+                // sub-expression push ops land BEFORE the abort point.
+                syn::Expr::Macro(m) => {
+                    if let Ok(args) = m.mac.parse_body_with(
+                        syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
+                    ) {
+                        for arg in args.iter() {
+                            walk_for_side_effects!(arg);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            if is_data_creation {
+                Ok(continue_with_unknown(graph, *block, variant))
+            } else {
+                stop_unsupported(graph, *block, variant)
+            }
         }
     }
 }
@@ -2425,7 +3294,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         assert_eq!(program.functions.len(), 1);
         let graph = &program.functions[0].graph;
         // Should have Input ops for params + ops for body
@@ -2442,7 +3311,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         let ops = &graph.block(graph.startblock).operations;
         // Should contain a FieldRead op
@@ -2488,7 +3357,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         assert_eq!(
             count_field_reads(graph, "x"),
@@ -2511,7 +3380,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         assert_eq!(
             count_field_reads(graph, "x"),
@@ -2534,7 +3403,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         assert_eq!(
             count_field_reads(graph, "x"),
@@ -2554,7 +3423,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         let ops = &graph.block(graph.startblock).operations;
         assert!(
@@ -2587,7 +3456,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         let ops = &graph.block(graph.startblock).operations;
         assert!(
@@ -2621,7 +3490,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         let ops = &graph.block(graph.startblock).operations;
         assert!(
@@ -2644,7 +3513,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         let ops = &graph.block(graph.startblock).operations;
         assert!(
@@ -2670,7 +3539,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let run = program
             .functions
             .iter()
@@ -2697,7 +3566,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         let ops = &graph.block(graph.startblock).operations;
         assert!(
@@ -2722,7 +3591,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         assert_eq!(program.functions.len(), 2);
         assert_eq!(program.functions[0].name, "bar");
         assert_eq!(program.functions[1].name, "baz");
@@ -2737,7 +3606,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         // entry + then + else + merge = at least 4 blocks
         assert!(
@@ -2767,7 +3636,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         // entry + header + body + exit = at least 4 blocks
         assert!(
@@ -2786,7 +3655,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         let op = graph
             .block(graph.startblock)
@@ -2810,7 +3679,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         let ops = &graph.block(graph.startblock).operations;
         assert!(
@@ -2842,7 +3711,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         let ops = &graph.block(graph.startblock).operations;
         assert!(
@@ -2864,7 +3733,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let graph = &program.functions[0].graph;
         let op = graph
             .block(graph.startblock)
@@ -2895,7 +3764,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
 
         for func in &program.functions {
             let graph = &func.graph;
@@ -2937,7 +3806,7 @@ mod tests {
             }
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let mut seen = std::collections::HashMap::<String, String>::new();
         for func in &program.functions {
             let Some(trait_root) = func
@@ -2974,7 +3843,7 @@ mod tests {
             fn noop() {}
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let entries = program
             .immutable_fields
             .get("S")
@@ -3002,7 +3871,7 @@ mod tests {
             fn noop() {}
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let entries = program
             .immutable_fields
             .get("S")
@@ -3034,7 +3903,7 @@ mod tests {
             fn noop() {}
         "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let entries = program
             .immutable_fields
             .get("S")
@@ -3061,7 +3930,7 @@ mod tests {
             }
             "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let func = program
             .functions
             .iter()
@@ -3108,7 +3977,7 @@ mod tests {
             fn ret_dispatch() { make_boxed().run(); }
             "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         for fname in &["dispatch", "list_dispatch", "ret_dispatch"] {
             let func = program
                 .functions
@@ -3144,7 +4013,7 @@ mod tests {
             fn returns_one() -> i64 { return 1; }
             "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let func = program
             .functions
             .iter()
@@ -3173,7 +4042,7 @@ mod tests {
             fn returns_unit() { return; }
             "#,
         );
-        let program = build_semantic_program(&parsed);
+        let program = build_semantic_program(&parsed).expect("source must lower");
         let func = program
             .functions
             .iter()

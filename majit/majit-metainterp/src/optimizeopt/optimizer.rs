@@ -1537,6 +1537,16 @@ impl Optimizer {
     /// existing info. When `update_last_guard` is false (RECORD_EXACT_CLASS),
     /// the guard position is NOT updated — preserving guard strengthening
     /// opportunities for subsequent GUARD_CLASS ops.
+    ///
+    /// PyPy `InstancePtrInfo(descr, known_class, is_virtual)` is one class
+    /// (info.py:313) that covers both virtual and non-virtual instances via
+    /// the `is_virtual` flag. The Rust port splits that into two PtrInfo
+    /// enum variants — `Instance` (is_virtual=False) and `Virtual`
+    /// (is_virtual=True) — for ergonomic dispatch. `isinstance(opinfo,
+    /// InstancePtrInfo)` at optimizer.py:140 is therefore true for *either*
+    /// Rust variant, so both must update `_known_class` in place rather
+    /// than being overwritten by a fresh known-class info (which would
+    /// drop the `Virtual` fields / descr / cached_vinfo state).
     pub fn make_constant_class(
         ctx: &mut OptContext,
         opref: OpRef,
@@ -1545,14 +1555,23 @@ impl Optimizer {
     ) {
         let class_ptr = GcRef(class_value as usize);
         let resolved = ctx.get_box_replacement(opref);
-        // optimizer.py:139: isinstance(opinfo, info.InstancePtrInfo)
-        let is_instance = matches!(ctx.get_ptr_info(resolved), Some(PtrInfo::Instance(_)));
-        if is_instance {
-            // optimizer.py:140: opinfo._known_class = class_const
-            if let Some(PtrInfo::Instance(iinfo)) = ctx.get_ptr_info_mut(resolved) {
+        // optimizer.py:139: isinstance(opinfo, info.InstancePtrInfo).
+        // RPython's InstancePtrInfo covers both virtual and non-virtual
+        // instances (`is_virtual` is a field). Rust splits those states into
+        // PtrInfo::Instance and PtrInfo::Virtual, so both arms must preserve
+        // the existing object info and only update `_known_class`.
+        let updated_existing = match ctx.get_ptr_info_mut(resolved) {
+            Some(PtrInfo::Instance(iinfo)) => {
                 iinfo.known_class = Some(class_ptr);
+                true
             }
-        } else {
+            Some(PtrInfo::Virtual(vinfo)) => {
+                vinfo.known_class = Some(class_ptr);
+                true
+            }
+            _ => false,
+        };
+        if !updated_existing {
             // optimizer.py:142-148: preserve last_guard_pos from old info
             let old_guard_pos = ctx
                 .get_ptr_info(resolved)
@@ -3288,30 +3307,21 @@ impl Optimizer {
             // rewrite.py:430-436 postprocess_GUARD_CLASS:
             //   update_last_guard = not old_guard or isinstance(descr, ResumeAtPositionDescr)
             //   make_constant_class(arg0, expectedclassbox, update_last_guard)
+            //
+            // Delegate to `Optimizer::make_constant_class` rather than
+            // inlining a fresh `PtrInfo::known_class` overwrite — the
+            // helper preserves existing `Instance` / `Virtual` PtrInfo
+            // (fields, descr, cached_vinfo, virtual state) and only
+            // refreshes `_known_class`, matching upstream
+            // `optimizer.py:137-151` where `isinstance(opinfo,
+            // InstancePtrInfo)` mutates in place.
             let old_guard_pos = ctx
                 .get_ptr_info(pp.obj)
                 .and_then(|info| info.last_guard_pos())
                 .unwrap_or(-1);
             let update_last_guard =
                 old_guard_pos < 0 || ctx.is_resume_at_position_guard(old_guard_pos);
-            // optimizer.py:137-151 make_constant_class:
-            //   opinfo._known_class = class_const
-            //   if update_last_guard: mark_last_guard → len(_newoperations) - 1
-            let new_guard_pos = if update_last_guard {
-                (ctx.new_operations.len() as i32) - 1 // NOW correct: guard is in new_operations
-            } else {
-                old_guard_pos
-            };
-            // optimizer.py:147 InstancePtrInfo(None, class_const) +
-            // last_guard_pos = new_guard_pos. The Rust port stores this as
-            // Instance(descr=None, known_class=Some(class)) via the
-            // `known_class` factory and then sets last_guard_pos.
-            let mut new_info = crate::optimizeopt::info::PtrInfo::known_class(
-                majit_ir::GcRef(pp.class_val as usize),
-                true,
-            );
-            new_info.set_last_guard_pos(new_guard_pos);
-            ctx.set_ptr_info(pp.obj, new_info);
+            Self::make_constant_class(ctx, pp.obj, pp.class_val, update_last_guard);
         }
         ctx.in_final_emission = saved_in_final_emission;
     }

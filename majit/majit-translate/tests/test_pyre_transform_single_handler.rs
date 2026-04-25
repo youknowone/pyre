@@ -76,7 +76,7 @@ fn transform_opcode_load_fast_load_fast_to_jitcode() {
 
     let handler = find_opcode_handler(&pyopcode.file, "opcode_load_fast_load_fast")
         .expect("opcode_load_fast_load_fast is present in pyopcode.rs");
-    let sf = build_function_graph_pub(handler);
+    let sf = build_function_graph_pub(handler).expect("handler must lower without FlowingError");
     assert_eq!(
         sf.graph.block(sf.graph.exceptblock).inputargs.len(),
         2,
@@ -108,18 +108,19 @@ fn transform_opcode_load_fast_load_fast_to_jitcode() {
     let empty_fn_ret = std::collections::HashMap::new();
     let empty_struct_names = std::collections::HashSet::new();
     let mut impls = Vec::new();
-    impls.extend(extract_trait_impls(
-        &pyopcode,
-        &empty_registry,
-        &empty_fn_ret,
-        &empty_struct_names,
-    ));
-    impls.extend(extract_trait_impls(
-        &eval,
-        &empty_registry,
-        &empty_fn_ret,
-        &empty_struct_names,
-    ));
+    impls.extend(
+        extract_trait_impls(
+            &pyopcode,
+            &empty_registry,
+            &empty_fn_ret,
+            &empty_struct_names,
+        )
+        .expect("pyopcode trait impls must lower"),
+    );
+    impls.extend(
+        extract_trait_impls(&eval, &empty_registry, &empty_fn_ret, &empty_struct_names)
+            .expect("eval trait impls must lower"),
+    );
     for imp in &impls {
         for method in &imp.methods {
             if let Some(graph) = method.graph.clone() {

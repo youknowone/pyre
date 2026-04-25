@@ -249,11 +249,11 @@ impl Assembler {
                 let mut live_r = Vec::new();
                 let mut live_f = Vec::new();
                 for &v in live_values {
-                    match self.lookup_kind(v, regallocs) {
-                        Some(RegKind::Int) => live_i.push(self.lookup_reg(v, regallocs)),
-                        Some(RegKind::Ref) => live_r.push(self.lookup_reg(v, regallocs)),
-                        Some(RegKind::Float) => live_f.push(self.lookup_reg(v, regallocs)),
-                        None => {}
+                    let (color, kind) = self.lookup_coloring(v, regallocs);
+                    match kind {
+                        RegKind::Int => live_i.push(color),
+                        RegKind::Ref => live_r.push(color),
+                        RegKind::Float => live_f.push(color),
                     }
                 }
                 let opnum = self.get_opnum("live/");
@@ -1372,86 +1372,67 @@ impl Assembler {
         *self.insns.entry(key.to_string()).or_insert(next)
     }
 
-    /// Look up the register index (as u8) for a ValueId.
-    /// RPython: registers are single-byte indices.
+    /// Resolve `(register_index, kind)` for a `ValueId`.
     ///
-    /// Iterates in fixed `[Int, Ref, Float]` order so the resolution
-    /// is reproducible across processes.  Rust `HashMap` uses SipHash
-    /// with a per-process random seed, whereas RPython's `regalloc.py`
-    /// derives kind directly from `getkind(v.concretetype)` — there is
-    /// no HashMap iteration.  Mirroring that determinism here keeps
-    /// downstream artefacts (`opcode_insns.bin`, `MAJIT_COVERAGE_PANIC`
-    /// reports) byte-stable run to run.
-    fn lookup_reg(&self, v: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> u8 {
+    /// RPython parity: every `Variable` reaching the assembler has a
+    /// `concretetype` and therefore exactly one `(kind, color)` pair
+    /// via `getkind()` + `regalloc.py` (`rpython/jit/codewriter/
+    /// regalloc.py`).  A miss here means the upstream rtyper invariant
+    /// is broken, so we panic with the full per-class coverage so the
+    /// gap surfaces immediately instead of propagating a wrong
+    /// (register, kind) pair into `opcode_insns.bin`.
+    ///
+    /// Iterates in fixed `[Int, Ref, Float]` order so the diagnostic
+    /// message and the resolution are reproducible across processes.
+    /// Rust `HashMap` uses SipHash with a per-process random seed,
+    /// whereas RPython has no HashMap iteration on this path.
+    fn lookup_coloring(
+        &self,
+        v: ValueId,
+        regallocs: &HashMap<RegKind, RegAllocResult>,
+    ) -> (u8, RegKind) {
         for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
             if let Some(ra) = regallocs.get(&kind) {
                 if let Some(&color) = ra.coloring.get(&v) {
-                    return color as u8;
+                    return (color as u8, kind);
                 }
             }
         }
-        0
+        let class_coverage: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+            .iter()
+            .filter_map(|k| regallocs.get(k).map(|ra| (*k, ra)))
+            .map(|(k, ra)| {
+                let min = ra.coloring.keys().map(|v| v.0).min();
+                let max = ra.coloring.keys().map(|v| v.0).max();
+                (k, ra.coloring.len(), min, max)
+            })
+            .collect();
+        panic!(
+            "lookup_coloring: value {v:?} has no regalloc coloring \
+             (graph={:?}, op={:?}, regalloc_coverage={:?})",
+            self.current_graph_name, self.current_flatop_debug, class_coverage
+        );
+    }
+
+    /// Look up the register index (as u8) for a ValueId.
+    fn lookup_reg(&self, v: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> u8 {
+        self.lookup_coloring(v, regallocs).0
     }
 
     /// Look up register index AND kind character for a ValueId.
     /// Returns (register_index, kind_char) where kind_char ∈ {'i','r','f'}.
-    ///
-    /// Same fixed-order iteration as `lookup_reg`; see that method for
-    /// the rationale.
     fn lookup_reg_with_kind(
         &self,
         v: ValueId,
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> (u8, char) {
-        for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-            let Some(ra) = regallocs.get(&kind) else {
-                continue;
-            };
-            if let Some(&color) = ra.coloring.get(&v) {
-                let kind_char = match kind {
-                    RegKind::Int => 'i',
-                    RegKind::Ref => 'r',
-                    RegKind::Float => 'f',
-                };
-                return (color as u8, kind_char);
-            }
-        }
-        // RPython `rpython/jit/codewriter/regalloc.py` + rtyper parity:
-        // every `Variable` reaching the assembler has a `concretetype`
-        // and therefore a regalloc coloring in exactly one of the
-        // three classes.  Pyre's annotator/rtyper still leaves a
-        // handful of edge-case values untyped (ExprIf/ExprMatch/
-        // ExprWhile/ExprForLoop conds when the cond expression cannot
-        // yet be lowered — iterator protocol / switch-based match /
-        // Let variant not yet ported); closing those gaps is tracked
-        // as structural follow-ups (task #71).  Until then, fall back
-        // to `(0, 'r')` — the same canonical default
-        // `jtransform.get_value_kind` picks — so `opcode_insns.bin`
-        // never re-enters the silent `(0, 'i')` → `_intbase` alias
-        // path.  The `MAJIT_COVERAGE_PANIC=1` env var surfaces the
-        // gap at debug time with a full class-coverage snapshot.
-        if std::env::var("MAJIT_COVERAGE_PANIC").is_ok() {
-            // Iterate in fixed `[Int, Ref, Float]` order so the
-            // coverage report for the same `(graph, op, ValueId)` is
-            // byte-stable across processes.  HashMap iteration order
-            // would otherwise vary per-process and mask whether the
-            // same gap reappears between runs.
-            let class_coverage: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
-                .iter()
-                .filter_map(|k| regallocs.get(k).map(|ra| (*k, ra)))
-                .map(|(k, ra)| {
-                    let min = ra.coloring.keys().map(|v| v.0).min();
-                    let max = ra.coloring.keys().map(|v| v.0).max();
-                    (k, ra.coloring.len(), min, max)
-                })
-                .collect();
-            panic!(
-                "lookup_reg_with_kind: value {v:?} has no regalloc coloring \
-                 (graph={:?}, op={:?}, regalloc_coverage={:?})",
-                self.current_graph_name, self.current_flatop_debug, class_coverage
-            );
-        }
-        (0, 'r')
+        let (color, kind) = self.lookup_coloring(v, regallocs);
+        let kind_char = match kind {
+            RegKind::Int => 'i',
+            RegKind::Ref => 'r',
+            RegKind::Float => 'f',
+        };
+        (color, kind_char)
     }
 
     /// Eagerly walk every `FlatOp` in `ssarepr.insns` and report every
@@ -1640,21 +1621,8 @@ impl Assembler {
     }
 
     /// Look up just the kind for a ValueId.
-    ///
-    /// Fixed-order iteration, same rationale as `lookup_reg`.
-    fn lookup_kind(
-        &self,
-        v: ValueId,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
-    ) -> Option<RegKind> {
-        for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-            if let Some(ra) = regallocs.get(&kind) {
-                if ra.coloring.contains_key(&v) {
-                    return Some(kind);
-                }
-            }
-        }
-        None
+    fn lookup_kind(&self, v: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> RegKind {
+        self.lookup_coloring(v, regallocs).1
     }
 
     /// RPython assembler.py:80-138: emit_const for integer constants.
@@ -2325,6 +2293,10 @@ mod tests {
                 true,
             )
             .unwrap();
+        // Per RPython `flatten.py:373-380` `serialize_op` — an op whose
+        // result has `getkind(concretetype) == 'void'` does not get a
+        // color lookup.  Mirror that here by passing `has_result=false`
+        // so no `ValueId` is allocated on the void `run()` return.
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -2332,7 +2304,7 @@ mod tests {
                 args: vec![receiver],
                 result_ty: ValueType::Void,
             },
-            true,
+            false,
         );
         graph.set_return(graph.startblock, None);
 

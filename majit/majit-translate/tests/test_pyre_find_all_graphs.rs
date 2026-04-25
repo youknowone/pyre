@@ -78,7 +78,9 @@ fn find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal() {
     // direct-call edges.
     let mut helper_names = Vec::new();
     for func in iter_opcode_handler_fns(&pyopcode.file) {
-        let sf = build_function_graph_pub(func);
+        let Ok(sf) = build_function_graph_pub(func) else {
+            continue;
+        };
         let path = CallPath::from_segments([sf.name.clone()]);
         cc.register_function_graph(path.clone(), sf.graph);
         helper_names.push(sf.name);
@@ -95,18 +97,19 @@ fn find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal() {
     let empty_fn_ret = std::collections::HashMap::new();
     let empty_struct_names = std::collections::HashSet::new();
     let mut impls = Vec::new();
-    impls.extend(extract_trait_impls(
-        &pyopcode,
-        &empty_registry,
-        &empty_fn_ret,
-        &empty_struct_names,
-    ));
-    impls.extend(extract_trait_impls(
-        &eval,
-        &empty_registry,
-        &empty_fn_ret,
-        &empty_struct_names,
-    ));
+    impls.extend(
+        extract_trait_impls(
+            &pyopcode,
+            &empty_registry,
+            &empty_fn_ret,
+            &empty_struct_names,
+        )
+        .expect("pyopcode trait impls must lower"),
+    );
+    impls.extend(
+        extract_trait_impls(&eval, &empty_registry, &empty_fn_ret, &empty_struct_names)
+            .expect("eval trait impls must lower"),
+    );
     for imp in &impls {
         for method in &imp.methods {
             if let Some(graph) = method.graph.clone() {
@@ -121,7 +124,8 @@ fn find_all_graphs_closure_reaches_handler_graphs_from_dispatch_portal() {
     // of the opcode pipeline; `find_all_graphs` seeds BFS from it.
     let dispatch_fn = find_dispatch_fn(&pyopcode.file)
         .expect("execute_opcode_step must be present in pyopcode.rs");
-    let dispatch_sf = build_function_graph_pub(dispatch_fn);
+    let dispatch_sf =
+        build_function_graph_pub(dispatch_fn).expect("dispatch_fn must lower without FlowingError");
     let portal_path = CallPath::from_segments([dispatch_sf.name.clone()]);
     cc.register_function_graph(portal_path.clone(), dispatch_sf.graph);
     cc.mark_portal(portal_path.clone());

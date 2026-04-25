@@ -390,12 +390,21 @@ impl RewriteState {
     }
 
     /// Emit an op. Void ops do not consume a result id.
+    ///
+    /// For non-Void results this also registers `op.result_type()` in
+    /// `result_types`.  RPython Boxes carry `.type` intrinsically
+    /// (rewrite.py:930 `v.type`); the Rust port uses `result_types` as
+    /// the structural equivalent, so any newly emitted result op must
+    /// populate the table, not only the input-trace ops copied in by
+    /// `run_with_constants` (line 2137-2142).
     fn emit(&mut self, mut op: Op) -> OpRef {
-        let pos = if op.result_type() == Type::Void {
+        let rt = op.result_type();
+        let pos = if rt == Type::Void {
             OpRef::NONE
         } else {
             let pos = OpRef(self.next_pos);
             self.next_pos += 1;
+            self.result_types.insert(pos.0, rt);
             pos
         };
         op.pos = pos;
@@ -405,7 +414,15 @@ impl RewriteState {
 
     /// Emit a result-producing op, preserving the provided position when the
     /// source trace already assigned one.
+    ///
+    /// Registers `op.result_type()` in `result_types` for both the
+    /// fresh-position and preserved-position cases — see `emit()` doc.
+    /// For a preserved position the table already holds an entry from
+    /// the input-trace scan, but re-registering is either a no-op
+    /// (matching type) or an explicit overwrite when the caller built
+    /// a rewritten op with a different type at the same position.
     fn emit_result(&mut self, mut op: Op, preferred_pos: OpRef) -> OpRef {
+        let rt = op.result_type();
         let pos = if preferred_pos.is_none() {
             let pos = OpRef(self.next_pos);
             self.next_pos += 1;
@@ -413,6 +430,7 @@ impl RewriteState {
         } else {
             preferred_pos
         };
+        self.result_types.insert(pos.0, rt);
         op.pos = pos;
         self.out.push(op);
         pos
@@ -744,7 +762,6 @@ impl GcRewriterImpl {
         let const_ref = st.const_int(value);
         let same = Op::new(OpCode::SameAsI, &[const_ref]);
         let same_pos = st.emit_result(same, OpRef::NONE);
-        st.result_types.insert(same_pos.0, Type::Int);
 
         // rewrite.py:466-469 — rewrite failargs + stash the copy-and-changed
         // guard for the next iteration to pick up.
@@ -999,7 +1016,6 @@ impl GcRewriterImpl {
                 Op::new(OpCode::IntMul, &[v_length, scale_ref])
             };
             let scaled = st.emit_result(mul_op, OpRef::NONE);
-            st.result_types.insert(scaled.0, Type::Int);
             v_length_scaled = scaled;
             scale = 1;
         }
@@ -1104,9 +1120,7 @@ impl GcRewriterImpl {
                 // rewrite.py:1075-1078 — emit INT_LSHIFT.
                 let shift_ref = st.const_int(itemscale);
                 let lshift = Op::new(OpCode::IntLshift, &[v_length, shift_ref]);
-                let pos = st.emit_result(lshift, OpRef::NONE);
-                st.result_types.insert(pos.0, Type::Int);
-                pos
+                st.emit_result(lshift, OpRef::NONE)
             }
         };
 
@@ -1138,9 +1152,7 @@ impl GcRewriterImpl {
             OpCode::LoadEffectiveAddress,
             &[v_gcptr, v_index, base_ref, shift_ref],
         );
-        let pos = st.emit_result(lea, OpRef::NONE);
-        st.result_types.insert(pos.0, Type::Int);
-        pos
+        st.emit_result(lea, OpRef::NONE)
     }
 
     // ────────────────────────────────────────────────────────
@@ -1359,7 +1371,6 @@ impl GcRewriterImpl {
             // rewrite.py:169-170 — the pre-scale op is emitted directly
             // (not forwarded) even when the final store is forwarded.
             let scaled = st.emit_result(mul_op, OpRef::NONE);
-            st.result_types.insert(scaled.0, Type::Int);
             index = scaled;
             factor = 1;
         }
@@ -1454,7 +1465,6 @@ impl GcRewriterImpl {
                 Op::new(OpCode::IntMul, &[index, factor_ref])
             };
             let scaled = st.emit_result(mul_op, OpRef::NONE);
-            st.result_types.insert(scaled.0, Type::Int);
             index = scaled;
             factor = 1;
         }
@@ -2268,7 +2278,6 @@ impl GcRewriter for GcRewriterImpl {
                     let one = st.const_int(1);
                     let same = Op::new(OpCode::SameAsI, &[zero]);
                     let same_pos = st.emit_result(same, OpRef::NONE);
-                    st.result_types.insert(same_pos.0, Type::Int);
                     let newop =
                         op.copy_and_change(OpCode::GuardValue, Some(&[same_pos, one]), None);
                     let rewritten = st.rewrite_op(&newop);

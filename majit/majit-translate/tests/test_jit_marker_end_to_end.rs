@@ -65,7 +65,7 @@ fn find_fn<'a>(file: &'a syn::File, name: &str) -> Option<&'a ItemFn> {
 fn jit_marker_emissions_reach_ssarepr_through_full_pipeline() {
     let file = syn::parse_file(SOURCE).expect("SOURCE must parse");
     let portal_fn = find_fn(&file, "portal").expect("portal fn present");
-    let sf = build_function_graph_pub(portal_fn);
+    let sf = build_function_graph_pub(portal_fn).expect("portal fn must lower");
     let portal_path = CallPath::from_segments([sf.name.clone()]);
 
     let mut cc = CallControl::new();

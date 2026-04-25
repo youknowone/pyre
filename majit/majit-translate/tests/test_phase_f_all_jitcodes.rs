@@ -235,7 +235,8 @@ fn all_jitcodes_source_manifest_covers_shared_opcode_helpers() {
             "../../../pyre/pyre-interpreter/src/shared_opcode.rs"
         )),
     ];
-    let program = build_semantic_program_from_parsed_files(&parsed);
+    let program = build_semantic_program_from_parsed_files(&parsed)
+        .expect("pyre source must lower without FlowingError");
     let names: std::collections::HashSet<&str> =
         program.functions.iter().map(|f| f.name.as_str()).collect();
     // All 10 helpers (both the 8 inlinable + the 2 loop-rejected) must

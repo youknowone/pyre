@@ -146,7 +146,7 @@ mod tests {
             }
         "#,
         );
-        let program = front::build_semantic_program(&parsed);
+        let program = front::build_semantic_program(&parsed).expect("source must lower");
         let config = PipelineConfig::default();
         let result = analyze_program(&program, &config);
 
@@ -169,7 +169,7 @@ mod tests {
             }
         "#,
         );
-        let program = front::build_semantic_program(&parsed);
+        let program = front::build_semantic_program(&parsed).expect("source must lower");
         let config = PipelineConfig {
             transform: GraphTransformConfig {
                 vable_fields: vec![crate::jtransform::VirtualizableFieldDescriptor::new(
@@ -219,7 +219,7 @@ mod tests {
             }
         "#,
         );
-        let program = front::build_semantic_program(&parsed);
+        let program = front::build_semantic_program(&parsed).expect("source must lower");
         let config = PipelineConfig::default();
         let result = analyze_program(&program, &config);
 

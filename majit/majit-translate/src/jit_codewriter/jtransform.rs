@@ -3310,7 +3310,9 @@ mod tests {
         graph.push_op(
             graph.startblock,
             OpKind::Unknown {
-                kind: crate::model::UnknownKind::UnsupportedExpr,
+                kind: crate::model::UnknownKind::UnsupportedExpr {
+                    variant: crate::model::UnsupportedExprKind::OtherExpr,
+                },
             },
             false,
         );

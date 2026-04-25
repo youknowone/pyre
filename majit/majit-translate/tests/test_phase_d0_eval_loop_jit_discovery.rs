@@ -81,7 +81,7 @@ fn eval_loop_jit_lowers_to_function_graph() {
     // Lower through the adapter. A panic here is Phase D0's first concrete
     // blocker: an unsupported Rust pattern inside the portal runner that
     // `front::ast` cannot yet express in `FunctionGraph` form.
-    let sf = build_function_graph_pub(func);
+    let sf = build_function_graph_pub(func).expect("eval_loop_jit must lower");
     assert_eq!(
         sf.name, "eval_loop_jit",
         "SemanticFunction.name must match the source ident"

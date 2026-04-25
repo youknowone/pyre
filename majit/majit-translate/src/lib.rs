@@ -70,8 +70,9 @@ pub use model::{
 pub use opcode_dispatch::PipelineOpcodeArm;
 pub use parse::{
     CallPath, ExtractedHandlerCall, ExtractedOpcodeArm, OpcodeDispatchSelector, ParsedInterpreter,
-    ReceiverTraitBindings, extract_opcode_dispatch_arms, extract_opcode_dispatch_receiver_traits,
-    extract_trait_impls, find_opcode_dispatch_match, parse_source,
+    ReceiverTraitBindings, extract_inherent_impl_methods, extract_opcode_dispatch_arms,
+    extract_opcode_dispatch_receiver_traits, extract_trait_impls, find_opcode_dispatch_match,
+    parse_source,
 };
 pub use pipeline::{PipelineConfig, PipelineResult, PortalSpec, ProgramPipelineResult};
 pub use translate_legacy::annotator::annrpython::annotate as annotate_graph;
@@ -309,25 +310,39 @@ fn analyze_pipeline_from_parsed(
     fnaddr_bindings: &FnAddrBindings<'_>,
     impl_fnaddr_bindings: &ImplFnAddrBindings<'_>,
 ) -> pipeline::ProgramPipelineResult {
-    let program = front::build_semantic_program_from_parsed_files(parsed_files);
+    // RPython `translator/translator.py:55 buildflowgraph` — FlowingError
+    // propagates out and translation halts.  Pyre's top-level analyzer
+    // requires a complete program; a FlowingError here means a user-
+    // facing source file contains a construct we cannot yet lower, and
+    // the correct response is to abort loudly so the coverage audit
+    // surfaces the unsupported expression rather than silently dropping
+    // a graph.
+    let program = front::build_semantic_program_from_parsed_files(parsed_files)
+        .expect("pyre-interpreter source must lower without FlowingError");
     let mut pipeline = legacy_pipeline::analyze_program(&program, &config.pipeline);
     let mut canonical_trait_impls = Vec::new();
     let mut canonical_inherent_methods = Vec::new();
     let mut canonical_function_graphs = std::collections::HashMap::new();
 
     for parsed in parsed_files {
-        canonical_trait_impls.extend(parse::extract_trait_impls(
-            parsed,
-            &program.struct_fields,
-            &program.fn_return_types,
-            &program.known_struct_names,
-        ));
-        canonical_inherent_methods.extend(parse::extract_inherent_impl_methods(
-            parsed,
-            &program.struct_fields,
-            &program.fn_return_types,
-            &program.known_struct_names,
-        ));
+        canonical_trait_impls.extend(
+            parse::extract_trait_impls(
+                parsed,
+                &program.struct_fields,
+                &program.fn_return_types,
+                &program.known_struct_names,
+            )
+            .expect("trait impls must lower without FlowingError"),
+        );
+        canonical_inherent_methods.extend(
+            parse::extract_inherent_impl_methods(
+                parsed,
+                &program.struct_fields,
+                &program.fn_return_types,
+                &program.known_struct_names,
+            )
+            .expect("inherent methods must lower without FlowingError"),
+        );
     }
     // RPython: use the rtyped graphs (with concretetype info) for all analysis.
     // Use program.functions' graphs which were built with full struct_fields
@@ -1259,6 +1274,7 @@ mod tests {
                     &empty_frt,
                     &std::collections::HashSet::new(),
                 )
+                .expect("trait impls must lower")
             })
             .collect();
 
@@ -1494,7 +1510,7 @@ mod tests {
         );
 
         // Step 1: AST → semantic graph
-        let program = front::build_semantic_program(&parsed);
+        let program = front::build_semantic_program(&parsed).expect("source must lower");
         assert_eq!(
             program.functions.len(),
             2,
@@ -1547,7 +1563,7 @@ mod tests {
         // This validates that the pipeline handles real-world Rust code.
         let source = read_pyre_file("pyre-interpreter/src/pyopcode.rs");
         let parsed = parse::parse_source(&source);
-        let program = front::build_semantic_program(&parsed);
+        let program = front::build_semantic_program(&parsed).expect("pyopcode.rs must lower");
 
         let config = PipelineConfig::default();
         let result = analyze_program(&program, &config);
@@ -1808,15 +1824,18 @@ mod tests {
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("trait impls must lower");
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("inherent methods must lower");
         let mut function_graphs = std::collections::HashMap::new();
-        parse::collect_function_graphs(&parsed, &mut function_graphs);
+        parse::collect_function_graphs(&parsed, &mut function_graphs)
+            .expect("free functions must lower");
         let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
         let arms = parse::extract_opcode_dispatch_arms(&parsed);
         let resolved = resolve_handler_calls(
@@ -1871,15 +1890,18 @@ mod tests {
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("trait impls must lower");
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("inherent methods must lower");
         let mut function_graphs = std::collections::HashMap::new();
-        parse::collect_function_graphs(&parsed, &mut function_graphs);
+        parse::collect_function_graphs(&parsed, &mut function_graphs)
+            .expect("free functions must lower");
         let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
         let arms = parse::extract_opcode_dispatch_arms(&parsed);
         let resolved = resolve_handler_calls(
@@ -1922,15 +1944,18 @@ mod tests {
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("trait impls must lower");
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("inherent methods must lower");
         let mut function_graphs = std::collections::HashMap::new();
-        parse::collect_function_graphs(&parsed, &mut function_graphs);
+        parse::collect_function_graphs(&parsed, &mut function_graphs)
+            .expect("free functions must lower");
         let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
         let arms = parse::extract_opcode_dispatch_arms(&parsed);
         let resolved = resolve_handler_calls(
@@ -1980,15 +2005,18 @@ mod tests {
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("trait impls must lower");
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("inherent methods must lower");
         let mut function_graphs = std::collections::HashMap::new();
-        parse::collect_function_graphs(&parsed, &mut function_graphs);
+        parse::collect_function_graphs(&parsed, &mut function_graphs)
+            .expect("free functions must lower");
         let receiver_traits = parse::extract_opcode_dispatch_receiver_traits(&parsed);
         let arms = parse::extract_opcode_dispatch_arms(&parsed);
         let resolved = resolve_handler_calls(
@@ -2030,13 +2058,15 @@ mod tests {
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("trait impls must lower");
         let inherent_methods = parse::extract_inherent_impl_methods(
             &parsed,
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("inherent methods must lower");
         let function_graphs = std::collections::HashMap::new();
         let handler_calls = vec![parse::ExtractedHandlerCall::Method {
             name: "helper".into(),
@@ -2090,6 +2120,7 @@ mod tests {
                     &empty_frt2,
                     &std::collections::HashSet::new(),
                 )
+                .expect("trait impls must lower")
             })
             .collect();
         for impl_info in &trait_impls {

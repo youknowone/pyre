@@ -25,6 +25,7 @@
 //!
 
 pub mod ast;
+pub mod raise;
 
 pub use ast::{
     AstGraphOptions, SemanticFunction, SemanticProgram, StructFieldRegistry,

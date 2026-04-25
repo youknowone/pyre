@@ -79,18 +79,19 @@ fn resolve_super_inst_method_calls_against_pyframe_impls() {
     let empty_fn_ret = std::collections::HashMap::new();
     let empty_struct_names = std::collections::HashSet::new();
     let mut impls = Vec::new();
-    impls.extend(extract_trait_impls(
-        &pyopcode,
-        &empty_registry,
-        &empty_fn_ret,
-        &empty_struct_names,
-    ));
-    impls.extend(extract_trait_impls(
-        &eval,
-        &empty_registry,
-        &empty_fn_ret,
-        &empty_struct_names,
-    ));
+    impls.extend(
+        extract_trait_impls(
+            &pyopcode,
+            &empty_registry,
+            &empty_fn_ret,
+            &empty_struct_names,
+        )
+        .expect("pyopcode trait impls must lower"),
+    );
+    impls.extend(
+        extract_trait_impls(&eval, &empty_registry, &empty_fn_ret, &empty_struct_names)
+            .expect("eval trait impls must lower"),
+    );
 
     let pyframe_impl_count = impls.iter().filter(|i| i.for_type == "PyFrame").count();
     assert!(

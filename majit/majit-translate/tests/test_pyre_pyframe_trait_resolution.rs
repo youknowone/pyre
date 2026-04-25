@@ -66,12 +66,10 @@ fn collect_all_trait_impls() -> Vec<TraitImplInfo> {
     let mut out = Vec::new();
     for src in [PYOPCODE_SRC, EVAL_SRC, PYFRAME_SRC, SHARED_OPCODE_SRC] {
         let parsed = parse_pyre_source(src);
-        out.extend(extract_trait_impls(
-            &parsed,
-            &empty_registry,
-            &empty_fn_ret,
-            &empty_struct_names,
-        ));
+        out.extend(
+            extract_trait_impls(&parsed, &empty_registry, &empty_fn_ret, &empty_struct_names)
+                .expect("pyre source must lower"),
+        );
     }
     out
 }

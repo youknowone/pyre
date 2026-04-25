@@ -100,24 +100,26 @@ fn transform_all_handlers_to_jitcode() {
 
     // Pre-collect trait impls once — they do not change across handlers.
     let mut impls = Vec::new();
-    impls.extend(extract_trait_impls(
-        &pyopcode,
-        &empty_registry,
-        &empty_fn_ret,
-        &empty_struct_names,
-    ));
-    impls.extend(extract_trait_impls(
-        &eval,
-        &empty_registry,
-        &empty_fn_ret,
-        &empty_struct_names,
-    ));
+    impls.extend(
+        extract_trait_impls(
+            &pyopcode,
+            &empty_registry,
+            &empty_fn_ret,
+            &empty_struct_names,
+        )
+        .expect("pyopcode trait impls must lower"),
+    );
+    impls.extend(
+        extract_trait_impls(&eval, &empty_registry, &empty_fn_ret, &empty_struct_names)
+            .expect("eval trait impls must lower"),
+    );
 
     let mut results: Vec<HandlerResult> = Vec::new();
 
     for handler in &handlers {
         let name = handler.sig.ident.to_string();
-        let sf = build_function_graph_pub(handler);
+        let sf =
+            build_function_graph_pub(handler).expect("handler must lower without FlowingError");
         let path = CallPath::from_segments([sf.name.clone()]);
 
         let mut cc = CallControl::new();

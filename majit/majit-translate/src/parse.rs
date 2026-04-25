@@ -176,12 +176,20 @@ pub fn find_opcode_dispatch_match(parsed: &ParsedInterpreter) -> Option<&ExprMat
 
 /// Extract trait implementations AND trait default methods from the parsed source.
 /// Recurses into `Item::Mod` for whole-program visibility (RPython parity).
+///
+/// RPython `flowspace/objspace.py:49` + `flowcontext.py:417` —
+/// `build_flow()` / `buildflowgraph()` re-raise `FlowingError`, and the
+/// translator observes unsupported constructs as a hard failure.  The
+/// extractor mirrors that: if any trait method's body hits an
+/// unsupported construct, the whole extraction aborts with Err rather
+/// than silently recording a `MethodInfo.graph = None` that dispatch
+/// could later route through without a semantic graph.
 pub fn extract_trait_impls(
     parsed: &ParsedInterpreter,
     struct_fields: &crate::front::StructFieldRegistry,
     fn_return_types: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
-) -> Vec<TraitImplInfo> {
+) -> Result<Vec<TraitImplInfo>, crate::front::ast::FlowingError> {
     let mut impls = Vec::new();
     let mut known_trait_names = std::collections::HashSet::new();
     collect_trait_names(&parsed.file.items, "", &mut known_trait_names);
@@ -193,8 +201,8 @@ pub fn extract_trait_impls(
         known_struct_names,
         &known_trait_names,
         &mut impls,
-    );
-    impls
+    )?;
+    Ok(impls)
 }
 
 fn collect_trait_impls_from_items(
@@ -205,7 +213,7 @@ fn collect_trait_impls_from_items(
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
     impls: &mut Vec<TraitImplInfo>,
-) {
+) -> Result<(), crate::front::ast::FlowingError> {
     for item in items {
         match item {
             // Concrete trait impls (impl Trait for Type)
@@ -218,52 +226,46 @@ fn collect_trait_impls_from_items(
                     // Qualify bare type name with module prefix (RPython: unique type identity).
                     let self_ty_root = type_root_ident(self_ty)
                         .map(|t| crate::front::ast::qualify_type_name(&t, prefix));
-                    let methods: Vec<MethodInfo> = impl_block
-                        .items
-                        .iter()
-                        .filter_map(|item| {
-                            if let syn::ImplItem::Fn(method) = item {
-                                let (graph, hints) = {
-                                    let fake_fn = syn::ItemFn {
-                                        attrs: method.attrs.clone(),
-                                        vis: syn::Visibility::Inherited,
-                                        sig: method.sig.clone(),
-                                        block: Box::new(method.block.clone()),
-                                    };
-                                    let sf =
-                                        crate::front::ast::build_function_graph_with_self_ty_pub(
-                                            &fake_fn,
-                                            self_ty_root.clone(),
-                                            struct_fields,
-                                            fn_return_types,
-                                            prefix,
-                                            known_struct_names,
-                                            known_trait_names,
-                                        );
-                                    (Some(sf.graph), sf.hints)
-                                };
-                                let return_type = match &method.sig.output {
-                                    syn::ReturnType::Type(_, ty) => {
-                                        crate::front::ast::qualified_full_type_string(
-                                            ty,
-                                            prefix,
-                                            known_struct_names,
-                                            known_trait_names,
-                                        )
-                                    }
-                                    syn::ReturnType::Default => None,
-                                };
-                                Some(MethodInfo {
-                                    name: method.sig.ident.to_string(),
-                                    graph,
-                                    return_type,
-                                    hints,
-                                })
-                            } else {
-                                None
-                            }
-                        })
-                        .collect();
+                    let mut methods: Vec<MethodInfo> = Vec::new();
+                    for item in &impl_block.items {
+                        if let syn::ImplItem::Fn(method) = item {
+                            let fake_fn = syn::ItemFn {
+                                attrs: method.attrs.clone(),
+                                vis: syn::Visibility::Inherited,
+                                sig: method.sig.clone(),
+                                block: Box::new(method.block.clone()),
+                            };
+                            // `?` propagates `FlowingError` out of the
+                            // extractor (RPython re-raise at
+                            // `flowspace/flowcontext.py:417`).
+                            let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
+                                &fake_fn,
+                                self_ty_root.clone(),
+                                struct_fields,
+                                fn_return_types,
+                                prefix,
+                                known_struct_names,
+                                known_trait_names,
+                            )?;
+                            let return_type = match &method.sig.output {
+                                syn::ReturnType::Type(_, ty) => {
+                                    crate::front::ast::qualified_full_type_string(
+                                        ty,
+                                        prefix,
+                                        known_struct_names,
+                                        known_trait_names,
+                                    )
+                                }
+                                syn::ReturnType::Default => None,
+                            };
+                            methods.push(MethodInfo {
+                                name: method.sig.ident.to_string(),
+                                graph: Some(sf.graph),
+                                return_type,
+                                hints: sf.hints,
+                            });
+                        }
+                    }
                     impls.push(TraitImplInfo {
                         trait_name,
                         for_type,
@@ -279,50 +281,45 @@ fn collect_trait_impls_from_items(
                     prefix,
                     known_trait_names,
                 );
-                let methods: Vec<MethodInfo> = trait_def
-                    .items
-                    .iter()
-                    .filter_map(|item| {
-                        if let syn::TraitItem::Fn(method) = item {
-                            method.default.as_ref().map(|block| {
-                                let fake_fn = syn::ItemFn {
-                                    attrs: method.attrs.clone(),
-                                    vis: syn::Visibility::Inherited,
-                                    sig: method.sig.clone(),
-                                    block: Box::new(block.clone()),
-                                };
-                                let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
-                                    &fake_fn,
-                                    None,
-                                    struct_fields,
-                                    fn_return_types,
-                                    prefix,
-                                    known_struct_names,
-                                    known_trait_names,
-                                );
-                                let return_type = match &method.sig.output {
-                                    syn::ReturnType::Type(_, ty) => {
-                                        crate::front::ast::qualified_full_type_string(
-                                            ty,
-                                            prefix,
-                                            known_struct_names,
-                                            known_trait_names,
-                                        )
-                                    }
-                                    syn::ReturnType::Default => None,
-                                };
-                                MethodInfo {
-                                    name: method.sig.ident.to_string(),
-                                    graph: Some(sf.graph),
-                                    return_type,
-                                    hints: sf.hints,
+                let mut methods: Vec<MethodInfo> = Vec::new();
+                for item in &trait_def.items {
+                    if let syn::TraitItem::Fn(method) = item {
+                        if let Some(block) = &method.default {
+                            let fake_fn = syn::ItemFn {
+                                attrs: method.attrs.clone(),
+                                vis: syn::Visibility::Inherited,
+                                sig: method.sig.clone(),
+                                block: Box::new(block.clone()),
+                            };
+                            let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
+                                &fake_fn,
+                                None,
+                                struct_fields,
+                                fn_return_types,
+                                prefix,
+                                known_struct_names,
+                                known_trait_names,
+                            )?;
+                            let return_type = match &method.sig.output {
+                                syn::ReturnType::Type(_, ty) => {
+                                    crate::front::ast::qualified_full_type_string(
+                                        ty,
+                                        prefix,
+                                        known_struct_names,
+                                        known_trait_names,
+                                    )
                                 }
-                            })
-                        } else {
-                            None
+                                syn::ReturnType::Default => None,
+                            };
+                            methods.push(MethodInfo {
+                                name: method.sig.ident.to_string(),
+                                graph: Some(sf.graph),
+                                return_type,
+                                hints: sf.hints,
+                            });
                         }
-                    })
-                    .collect();
+                    }
+                }
                 if !methods.is_empty() {
                     impls.push(TraitImplInfo {
                         trait_name: trait_name.clone(),
@@ -348,12 +345,13 @@ fn collect_trait_impls_from_items(
                         known_struct_names,
                         known_trait_names,
                         impls,
-                    );
+                    )?;
                 }
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 fn collect_trait_names(
@@ -387,12 +385,18 @@ fn collect_trait_names(
 
 /// Extract inherent impl methods (impl Type { ... }) as canonical call targets.
 /// Recurses into `Item::Mod` for whole-program visibility (RPython parity).
+///
+/// RPython `flowspace/objspace.py:49` — `build_flow()` re-raises
+/// `FlowingError` rather than silently skipping a function.  Pyre's
+/// inherent-method extractor mirrors that: `FlowingError` in any
+/// method body aborts the whole extraction so dispatch resolution
+/// never sees a silently-dropped method.
 pub fn extract_inherent_impl_methods(
     parsed: &ParsedInterpreter,
     struct_fields: &crate::front::StructFieldRegistry,
     fn_return_types: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
-) -> Vec<InherentMethodInfo> {
+) -> Result<Vec<InherentMethodInfo>, crate::front::ast::FlowingError> {
     let mut methods = Vec::new();
     collect_inherent_methods_from_items(
         &parsed.file.items,
@@ -401,8 +405,8 @@ pub fn extract_inherent_impl_methods(
         fn_return_types,
         known_struct_names,
         &mut methods,
-    );
-    methods
+    )?;
+    Ok(methods)
 }
 
 fn collect_inherent_methods_from_items(
@@ -412,7 +416,7 @@ fn collect_inherent_methods_from_items(
     fn_return_types: &std::collections::HashMap<String, String>,
     known_struct_names: &std::collections::HashSet<String>,
     methods: &mut Vec<InherentMethodInfo>,
-) {
+) -> Result<(), crate::front::ast::FlowingError> {
     for item in items {
         match item {
             Item::Impl(impl_block) => {
@@ -431,6 +435,8 @@ fn collect_inherent_methods_from_items(
                             sig: method.sig.clone(),
                             block: Box::new(method.block.clone()),
                         };
+                        // `?` propagates `FlowingError` — RPython
+                        // re-raise at `flowspace/flowcontext.py:417`.
                         let sf = crate::front::ast::build_function_graph_with_self_ty_pub(
                             &fake_fn,
                             self_ty_root.clone(),
@@ -439,7 +445,7 @@ fn collect_inherent_methods_from_items(
                             prefix,
                             known_struct_names,
                             &std::collections::HashSet::new(),
-                        );
+                        )?;
                         let return_type = match &method.sig.output {
                             syn::ReturnType::Type(_, ty) => {
                                 crate::front::ast::qualified_full_type_string(
@@ -477,12 +483,13 @@ fn collect_inherent_methods_from_items(
                         fn_return_types,
                         known_struct_names,
                         methods,
-                    );
+                    )?;
                 }
             }
             _ => {}
         }
     }
+    Ok(())
 }
 
 /// Extract canonical opcode dispatch arms from `execute_opcode_step`.
@@ -520,38 +527,50 @@ pub fn extract_opcode_dispatch_receiver_traits(
 }
 
 /// Collect canonical function names and graphs for the active pipeline path.
+///
+/// Test-only helper.  RPython `flowspace/objspace.py:49` re-raise
+/// semantics — `FlowingError` propagates out rather than silently
+/// dropping the graph.
 #[cfg(test)]
 pub fn collect_function_graphs(
     parsed: &ParsedInterpreter,
     graphs: &mut std::collections::HashMap<CallPath, crate::model::FunctionGraph>,
-) {
+) -> Result<(), crate::front::ast::FlowingError> {
     for item in &parsed.file.items {
         if let Item::Fn(func) = item {
             let name = func.sig.ident.to_string();
-            let sf = crate::front::ast::build_function_graph_pub(func);
+            let sf = crate::front::ast::build_function_graph_pub(func)?;
             graphs.insert(CallPath::from_segments([name.clone()]), sf.graph.clone());
             graphs.insert(CallPath::from_segments(["crate", name.as_str()]), sf.graph);
         }
     }
+    Ok(())
 }
 
 /// Extract opcode-dispatch arms from the canonical dispatch match only.
+///
+/// RPython `flowspace/objspace.py:49` + `flowcontext.py:417` —
+/// `FlowingError` propagates out of `build_flow()`, making unsupported
+/// constructs a hard failure.  Pyre's dispatch extractor mirrors that:
+/// an arm body that hits an unsupported construct aborts the walk with
+/// a panic rather than silently dropping the arm's graph.  Silently
+/// dropping would let a `PipelineOpcodeArm` reach the codewriter
+/// without the semantic graph the downstream jitcode path depends on.
 fn extract_match_arms(expr: &ExprMatch) -> Vec<ExtractedOpcodeArm> {
     expr.arms
         .iter()
         .map(|arm| {
             let handler_calls = extract_handler_calls(&arm.body);
             let selector = extract_opcode_dispatch_selector(&arm.pat);
-            let body_graph = {
-                let name = selector.canonical_key();
-                let mut graph = crate::model::FunctionGraph::new(name);
-                crate::front::ast::lower_expr_into_graph(&mut graph, &arm.body);
-                Some(graph)
-            };
+            let name = selector.canonical_key();
+            let mut graph = crate::model::FunctionGraph::new(name.clone());
+            crate::front::ast::lower_expr_into_graph(&mut graph, &arm.body).unwrap_or_else(|e| {
+                panic!("opcode dispatch arm `{name}` must lower without FlowingError: {e:?}")
+            });
             ExtractedOpcodeArm {
                 selector,
                 handler_calls,
-                body_graph,
+                body_graph: Some(graph),
             }
         })
         .collect()
@@ -964,7 +983,8 @@ mod tests {
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("trait impls must lower");
         let trait_names: std::collections::HashSet<&str> =
             impls.iter().map(|imp| imp.trait_name.as_str()).collect();
         assert!(trait_names.contains("a::Handler"));
@@ -987,7 +1007,8 @@ mod tests {
             &crate::front::StructFieldRegistry::default(),
             &std::collections::HashMap::new(),
             &std::collections::HashSet::new(),
-        );
+        )
+        .expect("trait impls must lower");
         let helper = impls[0]
             .methods
             .iter()

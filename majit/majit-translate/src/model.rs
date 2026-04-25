@@ -26,9 +26,60 @@ pub enum ValueType {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum UnknownKind {
+    /// `syn::Stmt::Macro` — any macro invocation at statement position
+    /// (`panic!(...)`, `debug_assert!(...)`, `println!(...)`, etc).
+    /// Always skipped in `lower_stmt` (no flow-graph analogue — RPython
+    /// source has no macros).
     MacroStmt,
-    UnsupportedLiteral,
-    UnsupportedExpr,
+    /// `syn::Expr::Lit` with a kind pyre cannot yet model.  The `variant`
+    /// tag names the specific syn literal kind (`Str`, `Float`,
+    /// `ByteStr`, `Verbatim`) so downstream diagnostics and
+    /// `MAJIT_UNKNOWN_DUMP` logs show the exact failure category
+    /// without re-walking the syn AST.
+    UnsupportedLiteral { variant: UnsupportedLiteralKind },
+    /// `syn::Expr::*` variants pyre cannot yet lower.  Tag names the
+    /// specific expression kind so diagnostics and the `Unknown`
+    /// markers left in SSA graphs identify the remaining port gap.
+    UnsupportedExpr { variant: UnsupportedExprKind },
+}
+
+/// Reason an `syn::Lit::*` could not be lowered.  Parity with RPython
+/// `flowspace/flowcontext.py` — unsupported literals raise
+/// `FlowingError` with a kind-specific message; pyre's analogue
+/// records the kind on the Unknown marker op so the abort path is
+/// traceable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnsupportedLiteralKind {
+    Str,
+    Float,
+    ByteStr,
+    Verbatim,
+    Other,
+}
+
+/// Reason an `syn::Expr::*` could not be lowered.  Same role as
+/// `UnsupportedLiteralKind` — tags the specific `FlowingError`-
+/// equivalent abort cause.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UnsupportedExprKind {
+    Array,
+    Async,
+    Await,
+    Const,
+    ForLoop,
+    Group,
+    Infer,
+    Let,
+    Macro,
+    Range,
+    RawAddr,
+    Repeat,
+    Struct,
+    Tuple,
+    TryBlock,
+    Verbatim,
+    Yield,
+    OtherExpr,
 }
 
 /// RPython `rpython/rtyper/rclass.py:57-60` — `IR_IMMUTABLE` / `IR_IMMUTABLE_ARRAY`
@@ -1095,10 +1146,33 @@ impl FunctionGraph {
     /// string is retained for optional GraphTransformNote annotations
     /// (see `jtransform.rs::rewrite_graph`'s abort note); pass `""`
     /// when not applicable.
+    ///
+    /// Used only where no concrete exception payload is available at
+    /// the raise site — the evaluated arguments path should call
+    /// `set_raise_values` instead.
     pub fn set_raise(&mut self, block: BlockId, _reason: &str) {
         let (exceptblock, _, _) = self.exceptblock_args();
         let etype = self.alloc_value();
         let evalue = self.alloc_value();
+        self.set_goto(block, exceptblock, vec![etype, evalue]);
+    }
+
+    /// Terminate `block` with a Link to `exceptblock` carrying the
+    /// caller-provided `(etype, evalue)` pair.
+    ///
+    /// RPython `flowspace/flowcontext.py:1253 Raise.nomoreblocks`:
+    /// ```python
+    /// raise FSException(self.w_type, self.w_value)
+    /// ```
+    /// The two `W_*` values flow from the preceding `RAISE_VARARGS`
+    /// at `flowspace/flowcontext.py:638-656`, where `popvalue()`s
+    /// provide the exception type / value already on the stack.
+    /// This API lets pyre's macro lowering thread the evaluated
+    /// ValueIds into the exceptblock Link so the exception payload
+    /// is preserved, not discarded in favor of fresh `alloc_value()`
+    /// placeholders as `set_raise` does.
+    pub fn set_raise_values(&mut self, block: BlockId, etype: ValueId, evalue: ValueId) {
+        let (exceptblock, _, _) = self.exceptblock_args();
         self.set_goto(block, exceptblock, vec![etype, evalue]);
     }
 

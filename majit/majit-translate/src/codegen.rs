@@ -2126,7 +2126,7 @@ mod tests {
             fn sub(a: i64, b: i64) -> i64 { a - b }
         "#,
         );
-        let program = crate::front::build_semantic_program(&parsed);
+        let program = crate::front::build_semantic_program(&parsed).expect("source must lower");
         let pipeline = crate::translate_legacy::pipeline::analyze_program(
             &program,
             &crate::pipeline::PipelineConfig::default(),

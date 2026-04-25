@@ -67,7 +67,9 @@ struct HandlerGraphStats {
 }
 
 fn lower_handler(func: &syn::ItemFn) -> HandlerGraphStats {
-    let sf = build_function_graph_pub(func);
+    let name = func.sig.ident.to_string();
+    let sf = build_function_graph_pub(func)
+        .unwrap_or_else(|e| panic!("handler {} must lower without FlowingError: {:?}", name, e));
     let blocks = sf.graph.blocks.len();
     let ops: usize = sf.graph.blocks.iter().map(|b| b.operations.len()).sum();
     let canraise_blocks = sf.graph.blocks.iter().filter(|b| b.canraise()).count();

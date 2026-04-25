@@ -68,7 +68,7 @@ fn test_question_mark_produces_exceptional_successor() {
     let file = parse_pyopcode();
     let func = find_fn(&file, "opcode_load_const");
 
-    let sf = build_function_graph_pub(func);
+    let sf = build_function_graph_pub(func).expect("opcode_load_const must lower");
 
     // RPython `flowspace/model.py:214` — at least one block must have
     // `exitswitch == c_last_exception` once the lowering has emitted

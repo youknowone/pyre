@@ -1672,19 +1672,30 @@ impl OptRewrite {
                         Some(None),
                     );
                     ctx.new_operations[old_idx] = combined;
-                    // postprocess: record known class
+                    // rewrite.py:430-436 postprocess_GUARD_CLASS parity
+                    // (invoked inline here because the replacement path
+                    // rewrites `new_operations[old_idx]` directly instead
+                    // of going through `emit_operation`, which would have
+                    // triggered the regular postprocess dispatch).
+                    //
+                    // The replacement happened because the old guard is
+                    // not a ResumeAtPositionDescr (guarded at
+                    // `is_resume_at_position_guard(old_idx)` above), so
+                    // rewrite.py:434-435 `update_last_guard = not
+                    // old_guard_op or isinstance(descr, RAPD)` evaluates
+                    // to False — pass `update_last_guard=false` so that
+                    // make_constant_class preserves the strengthened
+                    // guard's position in last_guard_pos (optimizer.py:137
+                    // parity) rather than snapping it to the tail of
+                    // new_operations.
                     if let Some(class_val) = ctx.get_constant_int(op.arg(1)).or_else(|| {
                         ctx.get_constant(op.arg(1)).and_then(|v| match v {
                             majit_ir::Value::Ref(r) => Some(r.0 as i64),
                             _ => None,
                         })
                     }) {
-                        ctx.set_ptr_info(
-                            obj,
-                            crate::optimizeopt::info::PtrInfo::known_class(
-                                majit_ir::GcRef(class_val as usize),
-                                true,
-                            ),
+                        crate::optimizeopt::optimizer::Optimizer::make_constant_class(
+                            ctx, obj, class_val, /* update_last_guard = */ false,
                         );
                     }
                     return OptimizationResult::Remove;
@@ -1693,7 +1704,13 @@ impl OptRewrite {
         }
         // rewrite.py:430-436 postprocess_GUARD_CLASS: runs AFTER emit.
         // Register deferred postprocess — executed by emit_operation
-        // after the guard is added to new_operations.
+        // after the guard is added to new_operations.  Upstream
+        // `postprocess_GUARD_CLASS` runs unconditionally (no
+        // virtual-skip): `make_constant_class` already preserves
+        // existing `InstancePtrInfo` whether or not `is_virtual=True`
+        // (`optimizer.py:137-151`), so the Rust port skips the local
+        // `is_virtual` guard and lets `Optimizer::make_constant_class`
+        // dispatch on the live `Instance` / `Virtual` arm.
         if op.num_args() >= 2 {
             if let Some(class_val) = ctx.get_constant_int(op.arg(1)).or_else(|| {
                 ctx.get_constant(op.arg(1)).and_then(|v| match v {
@@ -1701,14 +1718,8 @@ impl OptRewrite {
                     _ => None,
                 })
             }) {
-                let is_virtual = ctx
-                    .get_ptr_info(obj)
-                    .map(|info| info.is_virtual())
-                    .unwrap_or(false);
-                if !is_virtual {
-                    ctx.pending_guard_class_postprocess =
-                        Some(crate::optimizeopt::PendingGuardClassPostprocess { obj, class_val });
-                }
+                ctx.pending_guard_class_postprocess =
+                    Some(crate::optimizeopt::PendingGuardClassPostprocess { obj, class_val });
             }
         }
         OptimizationResult::PassOn
