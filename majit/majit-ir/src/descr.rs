@@ -285,7 +285,7 @@ impl GcCache {
         self._cache_size.insert(key, descr.clone());
         self._cache_size_order.push(descr.clone());
         // descr.py:123-126: gc_fielddescrs / all_fielddescrs
-        // populated externally via SimpleSizeDescr::with_all_field_descrs
+        // populated externally via SimpleSizeDescr::with_all_fielddescrs
         // since we lack the heaptracker to auto-discover fields.
         descr
     }
@@ -930,20 +930,23 @@ pub trait SizeDescr: Descr {
         )
     }
 
-    /// Field descriptors for fields containing GC pointers.
-    fn gc_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
+    /// descr.py:76 `get_all_fielddescrs(self): return self.all_fielddescrs`.
+    /// Populated by `heaptracker.all_fielddescrs(gccache, STRUCT)` at
+    /// `get_size_descr` construction time (descr.py:125-126).  pyre has no
+    /// lltype STRUCT walker, so concrete impls thread this in via a
+    /// builder; the default is empty.
+    fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
         &[]
     }
 
-    /// All field descriptors (not just GC pointer ones).
-    /// descr.py: get_all_interiorfielddescrs()
-    fn all_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
-        self.gc_field_descrs() // default: same as gc_field_descrs
-    }
-
-    /// Number of fields.
-    fn num_fields(&self) -> usize {
-        self.all_field_descrs().len()
+    /// descr.py:71 `self.gc_fielddescrs = gc_fielddescrs`, populated by
+    /// `heaptracker.gc_fielddescrs(gccache, STRUCT)` which is
+    /// `all_fielddescrs(only_gc=True)` (heaptracker.py:94-95 + :70 filter
+    /// `isinstance(FIELD, lltype.Ptr) and FIELD._needsgc()`).  Concrete
+    /// impls precompute the subset; the default filter here is for
+    /// impls that omit the override.
+    fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+        &[]
     }
 }
 
@@ -1434,7 +1437,7 @@ pub struct SimpleFieldDescr {
     flag: ArrayFlag,
     virtualizable: bool,
     /// descr.py:158 FieldDescr.index — slot position within the
-    /// parent struct's `all_field_descrs`.
+    /// parent struct's `all_fielddescrs`.
     pub index_in_parent: usize,
     /// descr.py:238 FieldDescr.parent_descr — backreference to the SizeDescr
     /// of the containing struct/object. Required by
@@ -1657,7 +1660,13 @@ pub struct SimpleSizeDescr {
     /// descr.py:64,112: SizeDescr.immutable_flag
     pub is_immutable: bool,
     vtable: usize,
-    all_field_descrs: Vec<Arc<dyn FieldDescr>>,
+    /// descr.py:72 `self.all_fielddescrs = all_fielddescrs`.
+    all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
+    /// descr.py:71 `self.gc_fielddescrs = gc_fielddescrs`.
+    /// Precomputed subset of `all_fielddescrs` via `is_pointer_field()`
+    /// (heaptracker.py:94-95 `gc_fielddescrs = all_fielddescrs(only_gc=True)`
+    /// + heaptracker.py:70 `FIELD._needsgc()` filter).
+    gc_fielddescrs: Vec<Arc<dyn FieldDescr>>,
 }
 
 impl Clone for SimpleSizeDescr {
@@ -1669,7 +1678,8 @@ impl Clone for SimpleSizeDescr {
             type_id: self.type_id,
             is_immutable: self.is_immutable,
             vtable: self.vtable,
-            all_field_descrs: self.all_field_descrs.clone(),
+            all_fielddescrs: self.all_fielddescrs.clone(),
+            gc_fielddescrs: self.gc_fielddescrs.clone(),
         }
     }
 }
@@ -1683,7 +1693,8 @@ impl SimpleSizeDescr {
             type_id,
             is_immutable: false,
             vtable: 0,
-            all_field_descrs: Vec::new(),
+            all_fielddescrs: Vec::new(),
+            gc_fielddescrs: Vec::new(),
         }
     }
 
@@ -1695,12 +1706,24 @@ impl SimpleSizeDescr {
             type_id,
             is_immutable: false,
             vtable,
-            all_field_descrs: Vec::new(),
+            all_fielddescrs: Vec::new(),
+            gc_fielddescrs: Vec::new(),
         }
     }
 
-    pub fn with_all_field_descrs(mut self, all_field_descrs: Vec<Arc<dyn FieldDescr>>) -> Self {
-        self.all_field_descrs = all_field_descrs;
+    /// descr.py:123-126 — `get_size_descr` calls
+    /// `heaptracker.gc_fielddescrs(...)` / `heaptracker.all_fielddescrs(...)`
+    /// and stores both onto the descriptor.  pyre lacks heaptracker, so
+    /// callers thread `all_fielddescrs` in via this builder; the
+    /// `gc_fielddescrs` subset is derived by filtering on
+    /// `FieldDescr::is_pointer_field()` (heaptracker.py:70).
+    pub fn with_all_fielddescrs(mut self, all_fielddescrs: Vec<Arc<dyn FieldDescr>>) -> Self {
+        self.gc_fielddescrs = all_fielddescrs
+            .iter()
+            .filter(|fd| fd.is_pointer_field())
+            .cloned()
+            .collect();
+        self.all_fielddescrs = all_fielddescrs;
         self
     }
 
@@ -1736,8 +1759,11 @@ impl SizeDescr for SimpleSizeDescr {
     fn is_immutable(&self) -> bool {
         self.is_immutable
     }
-    fn all_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
-        &self.all_field_descrs
+    fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+        &self.all_fielddescrs
+    }
+    fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+        &self.gc_fielddescrs
     }
     fn is_object(&self) -> bool {
         self.vtable != 0
@@ -1805,20 +1831,15 @@ pub fn make_simple_descr_group(
             })
             .collect();
         *field_descrs_cell.borrow_mut() = field_descrs.clone();
-        let all_field_descrs: Vec<Arc<dyn FieldDescr>> = field_descrs
+        let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = field_descrs
             .iter()
             .cloned()
             .map(|field_descr| field_descr as Arc<dyn FieldDescr>)
             .collect();
-        SimpleSizeDescr {
-            index,
-            descr_index: AtomicI32::new(-1),
-            size,
-            type_id,
-            is_immutable: false,
-            vtable,
-            all_field_descrs,
-        }
+        // descr.py:123-126 precompute both lists — `with_all_fielddescrs`
+        // derives the `gc_fielddescrs` subset via `is_pointer_field()`.
+        SimpleSizeDescr::with_vtable(index, size, type_id, vtable)
+            .with_all_fielddescrs(all_fielddescrs)
     });
     let field_descrs = field_descrs_cell.into_inner();
     SimpleDescrGroup {

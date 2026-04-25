@@ -973,10 +973,23 @@ impl MiniMarkGC {
         let length_offset = type_info.length_offset;
         let base_size = type_info.size;
 
-        // Trace fixed-part fields.
+        // Trace fixed-part fields. The `is_managed_heap_object` guard
+        // mirrors the `custom_trace` path above and `seed_major_root`
+        // (line 814): a `Ptr(GcStruct)` field can transiently point at
+        // memory outside the GC-managed heap during the L1/L2 stepping-
+        // stone state (e.g. `W_TupleObject.wrappeditems` →
+        // `std::alloc`'d ItemsBlock until Task #98 lands). In that
+        // window calling `header_of` on the field would dereference
+        // memory before the std::alloc'd block. Upstream RPython
+        // `_collect_obj` (incminimark.py:2739-2752) does not need this
+        // guard because RPython's type system guarantees every
+        // `Ptr(GcStruct)` is GC-managed. PRE-EXISTING-ADAPTATION:
+        // matches `mark_object`'s own custom_trace-path guard and
+        // converges away once every gc_ptr_offsets target is a real
+        // GC allocation.
         for &offset in &gc_ptr_offsets {
             let field_ref = unsafe { *((obj_addr + offset) as *const GcRef) };
-            if !field_ref.is_null() {
+            if !field_ref.is_null() && self.is_managed_heap_object(field_ref.0) {
                 let hdr = unsafe { header_of(field_ref.0) };
                 if unsafe { !(*hdr).has_flag(flags::VISITED) } {
                     unsafe { (*hdr).set_flag(flags::VISITED) };
@@ -985,13 +998,17 @@ impl MiniMarkGC {
             }
         }
 
-        // Trace variable-part items.
+        // Trace variable-part items. Same `is_managed_heap_object`
+        // guard as the fixed-part loop — `items_have_gc_ptrs` blocks
+        // (e.g. `ItemsBlock` once it migrates to GC varsize) may
+        // transiently coexist with std::alloc'd siblings during the
+        // L1/L2 stepping-stone window.
         if items_have_gc_ptrs && item_size > 0 {
             let length = unsafe { *((obj_addr + length_offset) as *const usize) };
             let items_start = obj_addr + base_size;
             for i in 0..length {
                 let field_ref = unsafe { *((items_start + i * item_size) as *const GcRef) };
-                if !field_ref.is_null() {
+                if !field_ref.is_null() && self.is_managed_heap_object(field_ref.0) {
                     let hdr = unsafe { header_of(field_ref.0) };
                     if unsafe { !(*hdr).has_flag(flags::VISITED) } {
                         unsafe { (*hdr).set_flag(flags::VISITED) };
@@ -1708,6 +1725,15 @@ impl GcAllocator for MiniMarkGC {
     ) -> GcRef {
         let payload_size = base_size + item_size * length;
         self.alloc_with_type_no_collect(0, payload_size)
+    }
+
+    fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        let total_size = GcHeader::SIZE + size;
+        self.alloc_in_oldgen(type_id, total_size)
+    }
+
+    fn is_managed_heap_object(&self, addr: usize) -> bool {
+        self.nursery.contains(addr) || self.oldgen.contains(addr)
     }
 
     fn write_barrier(&mut self, obj: GcRef) {
@@ -2515,6 +2541,95 @@ mod tests {
         assert_eq!(gc.oldgen.object_count(), 4);
 
         gc.roots.clear();
+    }
+
+    #[test]
+    fn major_mark_skips_unmanaged_field_target() {
+        // Stepping-stone parity: an old-gen object's `gc_ptr_offsets`
+        // field may transiently point at a `std::alloc`-backed
+        // (non-GC) block during the L1/L2 partial migration window.
+        // The major-mark walker must skip such fields rather than
+        // dereferencing memory before the unmanaged block as a
+        // `GcHeader`. This test catches regression of the
+        // `is_managed_heap_object` guard in `mark_object`.
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::with_gc_ptrs(ptr_size, vec![0]));
+
+        // Allocate parent in old-gen. Field pointer will be set to a
+        // raw `Box::into_raw` block — what `std::alloc` does for an
+        // unmigrated `wrappeditems` / `items` slot today.
+        let parent = gc.alloc_in_oldgen(tid, GcHeader::SIZE + ptr_size);
+        let unmanaged = Box::into_raw(Box::new(0xCAFEBABEu64));
+        unsafe {
+            *(parent.0 as *mut GcRef) = GcRef(unmanaged as usize);
+        }
+
+        let mut root = parent;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+
+        // Major collection — without the guard this would crash on
+        // `header_of(unmanaged)` reading invalid memory.
+        gc.collect_full();
+
+        // Parent survived because it is rooted; the unmanaged target
+        // was correctly skipped.
+        assert_eq!(gc.oldgen.object_count(), 1);
+
+        gc.roots.clear();
+        unsafe {
+            drop(Box::from_raw(unmanaged));
+        }
+    }
+
+    #[test]
+    fn major_mark_skips_unmanaged_varsize_item_target() {
+        // Same stepping-stone scenario, varsize variant: an
+        // `items_have_gc_ptrs = true` array can hold transient
+        // unmanaged pointers during partial migration. The mark
+        // walker's variable-part loop must also guard with
+        // `is_managed_heap_object`.
+        let ptr_size = std::mem::size_of::<GcRef>();
+        let length_offset = 0;
+        let base_size = 8; // length field (Signed)
+        let length = 2usize;
+
+        let mut gc = test_gc(4096);
+        let tid = gc.register_type(TypeInfo::varsize(
+            base_size,
+            ptr_size,
+            length_offset,
+            true,
+            Vec::new(),
+        ));
+
+        let total_payload = base_size + ptr_size * length;
+        let parent = gc.alloc_in_oldgen(tid, GcHeader::SIZE + total_payload);
+        unsafe {
+            *(parent.0 as *mut usize) = length;
+        }
+        let unmanaged_a = Box::into_raw(Box::new(0xDEADBEEFu64));
+        let unmanaged_b = Box::into_raw(Box::new(0xFEEDFACEu64));
+        unsafe {
+            *((parent.0 + base_size) as *mut GcRef) = GcRef(unmanaged_a as usize);
+            *((parent.0 + base_size + ptr_size) as *mut GcRef) = GcRef(unmanaged_b as usize);
+        }
+
+        let mut root = parent;
+        unsafe {
+            gc.roots.add(&mut root);
+        }
+
+        gc.collect_full();
+        assert_eq!(gc.oldgen.object_count(), 1);
+
+        gc.roots.clear();
+        unsafe {
+            drop(Box::from_raw(unmanaged_a));
+            drop(Box::from_raw(unmanaged_b));
+        }
     }
 
     #[test]

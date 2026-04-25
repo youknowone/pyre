@@ -1207,6 +1207,23 @@ pub fn generated_unary_int_value(
     Some(result)
 }
 
+/// `pyjitpl.py:832` `arraybox = opimpl_getfield_gc_r(listbox, itemsdescr)`.
+/// Loads `W_List.items` / `W_Tuple.wrappeditems` (`Ptr(GcArray(
+/// OBJECTPTR))`, rlist.py:116) as a Ref-typed `items_block` op.
+///
+/// Pair with [`crate::state::trace_items_block_getitem_value`] /
+/// [`crate::state::trace_items_block_setitem_value`] which apply the
+/// `pyobject_gcarray_descr` (`base_size = ITEMS_BLOCK_ITEMS_OFFSET`,
+/// `item_type = Ref`) to land on `block + base_size + idx * 8`.
+#[inline]
+fn load_items_block(
+    ctx: &mut majit_metainterp::TraceCtx,
+    obj: majit_ir::OpRef,
+    items_descr: majit_ir::DescrRef,
+) -> majit_ir::OpRef {
+    crate::state::opimpl_getfield_gc_r(ctx, obj, items_descr)
+}
+
 /// Trace list[int_key] setitem: guard_class → guard_strategy → arraylen →
 /// index computation → items_ptr → raw array setitem.
 ///
@@ -1231,19 +1248,27 @@ pub fn generated_list_setitem_by_strategy(
 ) {
     frame.guard_class(ctx, obj, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
     frame.guard_list_strategy(ctx, obj, strategy_id);
-    let (len_descr, ptr_descr) = match strategy_id {
-        0 => (crate::descr::list_items_len_descr(), crate::descr::list_items_ptr_descr()),
-        1 => (crate::descr::list_int_items_len_descr(), crate::descr::list_int_items_ptr_descr()),
-        2 => (crate::descr::list_float_items_len_descr(), crate::descr::list_float_items_ptr_descr()),
+    let len_descr = match strategy_id {
+        0 => crate::descr::list_length_descr(),
+        1 => crate::descr::list_int_items_len_descr(),
+        2 => crate::descr::list_float_items_len_descr(),
         _ => unreachable!(),
     };
     // pyjitpl.py:841: opimpl_check_resizable_neg_index for index normalization
     let index = opimpl_check_resizable_neg_index(frame, ctx, obj, key, len_descr, concrete_key);
-    // pyjitpl.py:832: arraybox = opimpl_getfield_gc_r(listbox, itemsdescr)
-    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx, obj, ptr_descr);
     match strategy_id {
-        0 => crate::state::trace_raw_array_setitem_value(ctx, items_ptr, index, value),
+        0 => {
+            // pyjitpl.py:832: arraybox = opimpl_getfield_gc_r(listbox, itemsdescr)
+            // followed by setarrayitem_gc(arraybox, index, value, arraydescr).
+            let items_block = load_items_block(ctx, obj, crate::descr::list_items_descr());
+            crate::state::trace_items_block_setitem_value(ctx, items_block, index, value);
+        }
         1 => {
+            let items_ptr = crate::state::opimpl_getfield_gc_i(
+                ctx,
+                obj,
+                crate::descr::list_int_items_ptr_descr(),
+            );
             let raw = if frame.value_type(value) == majit_ir::Type::Int {
                 value
             } else {
@@ -1253,6 +1278,11 @@ pub fn generated_list_setitem_by_strategy(
             crate::state::trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
         }
         2 => {
+            let items_ptr = crate::state::opimpl_getfield_gc_i(
+                ctx,
+                obj,
+                crate::descr::list_float_items_ptr_descr(),
+            );
             let raw = if frame.value_type(value) == majit_ir::Type::Float {
                 value
             } else {
@@ -1369,7 +1399,7 @@ pub fn generated_truth_value_direct(
             frame.guard_class(ctx, value, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
             let len_descr = if pyre_object::w_list_uses_object_storage(concrete_val) {
                 frame.guard_list_strategy(ctx, value, 0);
-                crate::descr::list_items_len_descr()
+                crate::descr::list_length_descr()
             } else if pyre_object::w_list_uses_int_storage(concrete_val) {
                 frame.guard_list_strategy(ctx, value, 1);
                 crate::descr::list_int_items_len_descr()
@@ -1383,10 +1413,17 @@ pub fn generated_truth_value_direct(
             let zero = ctx.const_int(0);
             return Some(ctx.record_op(OpCode::IntNe, &[len, zero]));
         }
-        // tupleobject.py: tuple truth → guard_class + getfield_raw(items_len) → int_ne(0)
+        // tupleobject.py: tuple truth → guard_class + getfield_gc_pure_r(wrappeditems)
+        //                                + arraylen_gc(items_block) → int_ne(0)
         if pyre_object::is_tuple(concrete_val) {
             frame.guard_class(ctx, value, &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType);
-            let len = ctx.record_op_with_descr(OpCode::GetfieldRawI, &[value], crate::descr::tuple_items_len_descr());
+            let items_block =
+                crate::state::opimpl_getfield_gc_r(ctx, value, crate::descr::tuple_wrappeditems_descr());
+            let len = crate::state::opimpl_arraylen_gc(
+                ctx,
+                items_block,
+                crate::state::pyobject_gcarray_descr(),
+            );
             let zero = ctx.const_int(0);
             return Some(ctx.record_op(OpCode::IntNe, &[len, zero]));
         }
@@ -1418,15 +1455,27 @@ pub fn generated_list_append_by_strategy(
     frame.guard_class(ctx, list, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
     frame.guard_list_strategy(ctx, list, strategy_id);
 
-    let (len_descr, ptr_descr, heap_cap_descr) = match strategy_id {
-        0 => (crate::descr::list_items_len_descr(), crate::descr::list_items_ptr_descr(), crate::descr::list_items_heap_cap_descr()),
-        1 => (crate::descr::list_int_items_len_descr(), crate::descr::list_int_items_ptr_descr(), crate::descr::list_int_items_heap_cap_descr()),
-        2 => (crate::descr::list_float_items_len_descr(), crate::descr::list_float_items_ptr_descr(), crate::descr::list_float_items_heap_cap_descr()),
+    let len_descr = match strategy_id {
+        0 => crate::descr::list_length_descr(),
+        1 => crate::descr::list_int_items_len_descr(),
+        2 => crate::descr::list_float_items_len_descr(),
         _ => unreachable!(),
     };
 
-    // Capacity guard: inline storage → guard heap_cap==0, else guard len==concrete_len.
-    if is_inline {
+    // Capacity guard. For Int/Float strategies: if inline storage,
+    // guard heap_cap==0; else guard len==concrete_len. Object
+    // strategy post-L1 has no "inline" option (ItemsBlock is always
+    // heap-allocated per rlist.py:116 `Ptr(GcArray(OBJECTPTR))`), so
+    // the inline branch is skipped.
+    if strategy_id == 0 {
+        let len = crate::state::trace_arraylen_gc(ctx, list, len_descr.clone());
+        frame.implement_guard_value(ctx, len, concrete_len as i64);
+    } else if is_inline {
+        let heap_cap_descr = match strategy_id {
+            1 => crate::descr::list_int_items_heap_cap_descr(),
+            2 => crate::descr::list_float_items_heap_cap_descr(),
+            _ => unreachable!(),
+        };
         let heap_cap = ctx.record_op_with_descr(OpCode::GetfieldGcI, &[list], heap_cap_descr);
         frame.implement_guard_value(ctx, heap_cap, 0);
     } else {
@@ -1434,13 +1483,20 @@ pub fn generated_list_append_by_strategy(
         frame.implement_guard_value(ctx, len, concrete_len as i64);
     }
 
-    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx, list, ptr_descr);
     let index = ctx.const_int(concrete_len as i64);
 
     // Write value: object strategy stores directly, int/float unbox first.
     match strategy_id {
-        0 => crate::state::trace_raw_array_setitem_value(ctx, items_ptr, index, value),
+        0 => {
+            let items_block = load_items_block(ctx, list, crate::descr::list_items_descr());
+            crate::state::trace_items_block_setitem_value(ctx, items_block, index, value);
+        }
         1 => {
+            let items_ptr = crate::state::opimpl_getfield_gc_i(
+                ctx,
+                list,
+                crate::descr::list_int_items_ptr_descr(),
+            );
             let raw = if frame.value_type(value) == majit_ir::Type::Int {
                 value
             } else {
@@ -1450,6 +1506,11 @@ pub fn generated_list_append_by_strategy(
             crate::state::trace_raw_int_array_setitem_value(ctx, items_ptr, index, raw);
         }
         2 => {
+            let items_ptr = crate::state::opimpl_getfield_gc_i(
+                ctx,
+                list,
+                crate::descr::list_float_items_ptr_descr(),
+            );
             let raw = if frame.value_type(value) == majit_ir::Type::Float {
                 value
             } else {
@@ -1498,7 +1559,7 @@ pub fn generated_direct_len_value(
             frame.guard_class(ctx, value, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
             let len_descr = if pyre_object::w_list_uses_object_storage(concrete_value) {
                 frame.guard_list_strategy(ctx, value, 0);
-                crate::descr::list_items_len_descr()
+                crate::descr::list_length_descr()
             } else if pyre_object::w_list_uses_int_storage(concrete_value) {
                 frame.guard_list_strategy(ctx, value, 1);
                 crate::descr::list_int_items_len_descr()
@@ -1513,7 +1574,15 @@ pub fn generated_direct_len_value(
         }
         if pyre_object::is_tuple(concrete_value) {
             frame.guard_class(ctx, value, &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType);
-            let len = crate::state::trace_arraylen_gc(ctx, value, crate::descr::tuple_items_len_descr());
+            // tupleobject.py:376-390 W_TupleObject — len comes from
+            // arraylen_gc on the GcArray header, not a length field.
+            let items_block =
+                crate::state::opimpl_getfield_gc_r(ctx, value, crate::descr::tuple_wrappeditems_descr());
+            let len = crate::state::opimpl_arraylen_gc(
+                ctx,
+                items_block,
+                crate::state::pyobject_gcarray_descr(),
+            );
             return Some(len);
         }
     }
@@ -1710,26 +1779,117 @@ pub fn generated_direct_minmax_value(
 ///   guard_class + opimpl_check_neg_index + getarrayitem_gc_r_pure.
 ///
 /// Tuples are fixed-size arrays: uses opimpl_check_neg_index for index
-/// normalization (ARRAYLEN_GC for length).
+/// normalization (ARRAYLEN_GC for length). For arity-2 specialised
+/// variants (`Cls_ii / Cls_ff / Cls_oo` per
+/// `pypy/objspace/std/specialisedtupleobject.py`) the trace dispatches
+/// on the runtime `ob_type` and emits a direct inline-field load —
+/// `value0` / `value1` are immutable so the `GetfieldGcPureI/F/R` op
+/// is constant-foldable.
 #[inline]
 pub fn generated_tuple_getitem(
     frame: &mut crate::state::MIFrame,
     ctx: &mut majit_metainterp::TraceCtx,
     obj: majit_ir::OpRef,
     key: majit_ir::OpRef,
+    concrete_obj: pyre_object::PyObjectRef,
     concrete_key: i64,
     _concrete_len: usize,
 ) -> majit_ir::OpRef {
-    let expected_type = &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType;
-    let items_ptr_descr = crate::descr::tuple_items_ptr_descr();
-    let items_len_descr = crate::descr::tuple_items_len_descr();
+    use majit_ir::OpCode;
+    let ob_type = unsafe { (*concrete_obj).ob_type };
+
+    // pypy/objspace/std/specialisedtupleobject.py — three arity-2
+    // variants. All have arity exactly 2 by construction; bounds and
+    // index normalisation collapse into a single `guard_value` against
+    // the trace-time `concrete_key`.
+    let spec_ii = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_II_TYPE
+        as *const _ as *const pyre_object::PyType;
+    let spec_ff = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_FF_TYPE
+        as *const _ as *const pyre_object::PyType;
+    let spec_oo = &pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_TYPE
+        as *const _ as *const pyre_object::PyType;
+
+    if std::ptr::eq(ob_type, spec_ii) {
+        let normalised = if concrete_key < 0 { concrete_key + 2 } else { concrete_key };
+        frame.guard_class(ctx, obj, spec_ii);
+        // Lock the trace to the runtime index. Caller already validated
+        // 0 <= normalised < 2 via `check_index_in_bounds`.
+        let key_unboxed = if frame.value_type(key) == majit_ir::Type::Int {
+            key
+        } else {
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            crate::state::trace_unbox_int_with_resume(frame, ctx, key, int_type_addr)
+        };
+        frame.implement_guard_value(ctx, key_unboxed, concrete_key);
+        let descr = if normalised == 0 {
+            crate::descr::specialised_tuple_ii_value0_descr()
+        } else {
+            crate::descr::specialised_tuple_ii_value1_descr()
+        };
+        let raw = ctx.record_op_with_descr(OpCode::GetfieldGcPureI, &[obj], descr);
+        return crate::state::wrapint(ctx, raw);
+    }
+
+    if std::ptr::eq(ob_type, spec_ff) {
+        let normalised = if concrete_key < 0 { concrete_key + 2 } else { concrete_key };
+        frame.guard_class(ctx, obj, spec_ff);
+        let key_unboxed = if frame.value_type(key) == majit_ir::Type::Int {
+            key
+        } else {
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            crate::state::trace_unbox_int_with_resume(frame, ctx, key, int_type_addr)
+        };
+        frame.implement_guard_value(ctx, key_unboxed, concrete_key);
+        let descr = if normalised == 0 {
+            crate::descr::specialised_tuple_ff_value0_descr()
+        } else {
+            crate::descr::specialised_tuple_ff_value1_descr()
+        };
+        let raw = ctx.record_op_with_descr(OpCode::GetfieldGcPureF, &[obj], descr);
+        return crate::state::wrapfloat(ctx, raw);
+    }
+
+    if std::ptr::eq(ob_type, spec_oo) {
+        let normalised = if concrete_key < 0 { concrete_key + 2 } else { concrete_key };
+        frame.guard_class(ctx, obj, spec_oo);
+        let key_unboxed = if frame.value_type(key) == majit_ir::Type::Int {
+            key
+        } else {
+            let int_type_addr = &pyre_object::pyobject::INT_TYPE as *const _ as i64;
+            crate::state::trace_unbox_int_with_resume(frame, ctx, key, int_type_addr)
+        };
+        frame.implement_guard_value(ctx, key_unboxed, concrete_key);
+        let descr = if normalised == 0 {
+            crate::descr::specialised_tuple_oo_value0_descr()
+        } else {
+            crate::descr::specialised_tuple_oo_value1_descr()
+        };
+        return ctx.record_op_with_descr(OpCode::GetfieldGcPureR, &[obj], descr);
+    }
+
+    // Canonical W_TupleObject array-backed path. After dropping the
+    // inline length cache (tupleobject.py:376-390 parity), the
+    // arraydescr handed to opimpl_check_neg_index is the
+    // pyobject_gcarray_descr — `arraylen_gc(items_block)` reads the
+    // GcArray header directly per pyjitpl.py:773.
+    let expected_type =
+        &pyre_object::pyobject::TUPLE_TYPE as *const _ as *const pyre_object::PyType;
 
     frame.guard_class(ctx, obj, expected_type);
-    // pyjitpl.py:767-776 opimpl_check_neg_index
-    let index = opimpl_check_neg_index(frame, ctx, obj, key, items_len_descr, concrete_key);
 
-    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx, obj, items_ptr_descr);
-    crate::state::trace_raw_array_getitem_value(ctx, items_ptr, index)
+    let items_block = load_items_block(ctx, obj, crate::descr::tuple_wrappeditems_descr());
+    // pyjitpl.py:767-776 opimpl_check_neg_index — arraybox is the
+    // GcArray (items_block), arraydescr is pyobject_gcarray_descr.
+    let index = opimpl_check_neg_index(
+        frame,
+        ctx,
+        items_block,
+        key,
+        crate::state::pyobject_gcarray_descr(),
+        concrete_key,
+    );
+
+    crate::state::trace_items_block_getitem_value(ctx, items_block, index)
 }
 
 /// pyjitpl.py:767-776 opimpl_check_neg_index:
@@ -1764,7 +1924,7 @@ pub fn opimpl_check_neg_index(
     frame.implement_guard_value(ctx, negbox, if concrete_key < 0 { 1 } else { 0 });
     if concrete_key < 0 {
         // pyjitpl.py:773: lengthbox = self.opimpl_arraylen_gc(arraybox, arraydescr)
-        let lengthbox = crate::state::trace_arraylen_gc(ctx, arraybox, arraydescr);
+        let lengthbox = crate::state::opimpl_arraylen_gc(ctx, arraybox, arraydescr);
         // pyjitpl.py:774-775: indexbox = INT_ADD(indexbox, lengthbox)
         let indexbox = ctx.record_op(OpCode::IntAdd, &[raw_index, lengthbox]);
         // bounds guard (raw-pointer safety, not in RPython meta-interp)
@@ -1774,7 +1934,7 @@ pub fn opimpl_check_neg_index(
     } else {
         // RPython: no bounds check in check_neg_index for positive index.
         // We add one for raw-pointer safety (no GC array bounds check).
-        let lengthbox = crate::state::trace_arraylen_gc(ctx, arraybox, arraydescr);
+        let lengthbox = crate::state::opimpl_arraylen_gc(ctx, arraybox, arraydescr);
         let in_bounds = ctx.record_op(OpCode::IntLt, &[raw_index, lengthbox]);
         frame.generate_guard(ctx, OpCode::GuardTrue, &[in_bounds]);
         raw_index
@@ -1886,23 +2046,33 @@ pub fn generated_list_getitem_by_strategy(
 ) -> majit_ir::OpRef {
     frame.guard_class(ctx, obj, &pyre_object::pyobject::LIST_TYPE as *const _ as *const pyre_object::PyType);
     frame.guard_list_strategy(ctx, obj, strategy_id);
-    let (len_descr, ptr_descr) = match strategy_id {
-        0 => (crate::descr::list_items_len_descr(), crate::descr::list_items_ptr_descr()),
-        1 => (crate::descr::list_int_items_len_descr(), crate::descr::list_int_items_ptr_descr()),
-        2 => (crate::descr::list_float_items_len_descr(), crate::descr::list_float_items_ptr_descr()),
+    let len_descr = match strategy_id {
+        0 => crate::descr::list_length_descr(),
+        1 => crate::descr::list_int_items_len_descr(),
+        2 => crate::descr::list_float_items_len_descr(),
         _ => unreachable!(),
     };
     let index = opimpl_check_resizable_neg_index(frame, ctx, obj, key, len_descr, concrete_key);
-    let items_ptr = crate::state::opimpl_getfield_gc_i(ctx, obj, ptr_descr);
     match strategy_id {
-        0 => crate::state::trace_raw_array_getitem_value(ctx, items_ptr, index),
+        0 => {
+            let items_block = load_items_block(ctx, obj, crate::descr::list_items_descr());
+            crate::state::trace_items_block_getitem_value(ctx, items_block, index)
+        }
         1 => {
-            let raw = crate::state::trace_raw_int_array_getitem_value(ctx, items_ptr, index);
-            raw
+            let items_ptr = crate::state::opimpl_getfield_gc_i(
+                ctx,
+                obj,
+                crate::descr::list_int_items_ptr_descr(),
+            );
+            crate::state::trace_raw_int_array_getitem_value(ctx, items_ptr, index)
         }
         2 => {
-            let raw = crate::state::trace_raw_float_array_getitem_value(ctx, items_ptr, index);
-            raw
+            let items_ptr = crate::state::opimpl_getfield_gc_i(
+                ctx,
+                obj,
+                crate::descr::list_float_items_ptr_descr(),
+            );
+            crate::state::trace_raw_float_array_getitem_value(ctx, items_ptr, index)
         }
         _ => unreachable!(),
     }
@@ -1937,7 +2107,15 @@ pub fn generated_binary_subscr_value(
         if pyre_object::pyobject::is_tuple(concrete_obj) {
             let concrete_len = pyre_object::w_tuple_len(concrete_obj);
             if check_index_in_bounds(index, concrete_len) {
-                return Some(generated_tuple_getitem(frame, ctx, a, b, index, concrete_len));
+                return Some(generated_tuple_getitem(
+                    frame,
+                    ctx,
+                    a,
+                    b,
+                    concrete_obj,
+                    index,
+                    concrete_len,
+                ));
             }
         } else if pyre_object::pyobject::is_list(concrete_obj) {
             if let Some(sid) = detect_list_getitem_strategy(concrete_obj) {

@@ -7,9 +7,13 @@
 
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use crate::object_array::{
+    ItemsBlock, alloc_list_items_block, dealloc_list_items_block, grow_list_items_block,
+    items_block_capacity, items_block_items_base,
+};
 use crate::pyobject::*;
 use crate::{
-    FloatArray, IntArray, PyObjectArray, floatobject::w_float_get_value, floatobject::w_float_new,
+    FloatArray, IntArray, floatobject::w_float_get_value, floatobject::w_float_new,
     intobject::w_int_get_value, intobject::w_int_new, longobject::w_long_fits_int,
     longobject::w_long_get_value,
 };
@@ -28,23 +32,207 @@ pub enum ListStrategy {
 
 /// Python list object.
 ///
-/// Layout: `[ob_type: *const PyType | items: *mut Vec<PyObjectRef>]`
-/// Items are stored on the heap via `Box::into_raw`.
+/// Layout matches upstream `rpython/rtyper/lltypesystem/rlist.py:116`
+/// `GcStruct("list", ("length", Signed), ("items",
+/// Ptr(GcArray(OBJECTPTR))))`. The JIT parity-field pair is
+/// `(length, items)`; `items` points at an `ItemsBlock` whose
+/// offset-0 header holds the allocated capacity
+/// (upstream `len(l.items)` per rlist.py:251).
+///
+/// `strategy`, `int_items`, `float_items` are pyre-only
+/// PRE-EXISTING-ADAPTATIONs for PyPy's list strategy split
+/// (`pypy/objspace/std/listobject.py`). Only the Object strategy
+/// reads/writes `length` + `items`; Integer/Float strategies operate
+/// on their own typed arrays and keep `length = 0`, `items = null`.
 #[repr(C)]
 pub struct W_ListObject {
     pub ob_header: PyObject,
-    pub items: PyObjectArray,
+    /// Live length under the Object strategy. Upstream `l.length`
+    /// (rlist.py:116). Under Integer/Float strategies this mirrors
+    /// `int_items.len()` / `float_items.len()` only when a strategy
+    /// switch rewrites both together — typed-strategy operations do
+    /// NOT update this field. Callers must read length via
+    /// `w_list_len()` which dispatches on strategy.
+    pub length: usize,
+    /// `Ptr(GcArray(OBJECTPTR))` — rlist.py:116 `l.items`. Points at
+    /// the `ItemsBlock` whose offset-0 header is the allocated
+    /// capacity (= upstream `len(l.items)` per rlist.py:251). Null
+    /// when the list is in a non-Object strategy (Empty/Integer/
+    /// Float); lazily allocated on strategy switch.
+    pub items: *mut ItemsBlock,
     pub strategy: ListStrategy,
     pub int_items: IntArray,
     pub float_items: FloatArray,
 }
 
+/// GC type id assigned to `W_ListObject` at `JitDriver` init time.
+/// Held as a constant here (rather than runtime-queried) so
+/// pyre-object's host-side allocator can reach it without a
+/// back-channel; `pyre-jit/src/eval.rs` asserts the same id is
+/// returned by `gc.register_type(...)` so any drift panics on
+/// startup. Re-exported from `pyre_jit_trace::descr` for existing
+/// call sites.
+pub const W_LIST_GC_TYPE_ID: u32 = 7;
+pub const W_LIST_OBJECT_SIZE: usize = std::mem::size_of::<W_ListObject>();
+
+impl W_ListObject {
+    /// Borrow a slice over object-strategy items. Must only be called
+    /// when `self.strategy == ListStrategy::Object`.
+    #[inline]
+    unsafe fn object_items_slice(&self) -> &[PyObjectRef] {
+        let base = items_block_items_base(self.items);
+        std::slice::from_raw_parts(base, self.length)
+    }
+
+    #[inline]
+    unsafe fn object_items_slice_mut(&mut self) -> &mut [PyObjectRef] {
+        let base = items_block_items_base(self.items);
+        std::slice::from_raw_parts_mut(base, self.length)
+    }
+
+    #[inline]
+    unsafe fn object_items_capacity(&self) -> usize {
+        items_block_capacity(self.items)
+    }
+
+    #[inline]
+    unsafe fn object_spare_capacity(&self) -> usize {
+        self.object_items_capacity().saturating_sub(self.length)
+    }
+
+    /// Grow `items` to accommodate at least `min_cap` slots. Upstream
+    /// `_ll_list_resize_really` (rlist.py:262-267) — allocate fresh,
+    /// copy, swap, free.
+    unsafe fn object_grow(&mut self, min_cap: usize) {
+        let current_cap = self.object_items_capacity();
+        let target_cap = min_cap.max(current_cap.saturating_mul(2).max(4));
+        self.items = grow_list_items_block(self.items, target_cap, self.length);
+    }
+
+    /// Upstream list.append equivalent for the object strategy.
+    /// (listobject.py:1695 `AbstractUnwrappedStrategy.append` for the
+    /// Object case: no unwrap, just append.)
+    unsafe fn object_push(&mut self, value: PyObjectRef) {
+        if self.length == self.object_items_capacity() {
+            self.object_grow(self.length + 1);
+        }
+        let base = items_block_items_base(self.items);
+        *base.add(self.length) = value;
+        self.length += 1;
+    }
+
+    unsafe fn object_insert(&mut self, index: usize, value: PyObjectRef) {
+        assert!(index <= self.length);
+        if self.length == self.object_items_capacity() {
+            self.object_grow(self.length + 1);
+        }
+        let base = items_block_items_base(self.items);
+        let p = base.add(index);
+        std::ptr::copy(p, p.add(1), self.length - index);
+        *p = value;
+        self.length += 1;
+    }
+
+    unsafe fn object_remove(&mut self, index: usize) -> PyObjectRef {
+        assert!(index < self.length);
+        let base = items_block_items_base(self.items);
+        let value = *base.add(index);
+        let p = base.add(index);
+        std::ptr::copy(p.add(1), p, self.length - index - 1);
+        self.length -= 1;
+        value
+    }
+
+    unsafe fn object_pop(&mut self) -> PyObjectRef {
+        assert!(self.length > 0);
+        let base = items_block_items_base(self.items);
+        let value = *base.add(self.length - 1);
+        self.length -= 1;
+        value
+    }
+
+    unsafe fn object_reverse(&mut self) {
+        self.object_items_slice_mut().reverse();
+    }
+
+    unsafe fn object_drain(&mut self, range: std::ops::Range<usize>) {
+        let start = range.start;
+        let end = range.end;
+        assert!(start <= end && end <= self.length);
+        let count = end - start;
+        if count == 0 {
+            return;
+        }
+        let base = items_block_items_base(self.items);
+        let p = base.add(start);
+        std::ptr::copy(p.add(count), p, self.length - end);
+        self.length -= count;
+    }
+
+    unsafe fn object_splice(
+        &mut self,
+        start: usize,
+        remove_count: usize,
+        new_values: &[PyObjectRef],
+    ) {
+        let old_len = self.length;
+        let s = start.min(old_len);
+        let slicelength = remove_count.min(old_len - s);
+        let len2 = new_values.len();
+        let new_len = old_len - slicelength + len2;
+        if len2 > slicelength {
+            if new_len > self.object_items_capacity() {
+                self.object_grow(new_len);
+            }
+            let base = items_block_items_base(self.items);
+            std::ptr::copy(
+                base.add(s + slicelength),
+                base.add(s + len2),
+                old_len - s - slicelength,
+            );
+            self.length = new_len;
+        } else if slicelength > len2 {
+            let base = items_block_items_base(self.items);
+            std::ptr::copy(
+                base.add(s + slicelength),
+                base.add(s + len2),
+                old_len - s - slicelength,
+            );
+            self.length = new_len;
+        }
+        if len2 > 0 {
+            self.object_items_slice_mut()[s..s + len2].copy_from_slice(new_values);
+        }
+    }
+
+    unsafe fn object_to_vec(&self) -> Vec<PyObjectRef> {
+        self.object_items_slice().to_vec()
+    }
+
+    /// Free the current `items` block and install a freshly allocated
+    /// one populated with `values`. `length` is reset to `values.len()`.
+    unsafe fn set_object_items_from_vec(&mut self, values: Vec<PyObjectRef>) {
+        dealloc_list_items_block(self.items);
+        self.items = alloc_list_items_block(&values);
+        self.length = values.len();
+    }
+
+    /// Drop the object-strategy backing (used when switching to a typed
+    /// strategy). Sets `items = null` and `length = 0`.
+    unsafe fn drop_object_items(&mut self) {
+        dealloc_list_items_block(self.items);
+        self.items = std::ptr::null_mut();
+        self.length = 0;
+    }
+}
+
 /// listobject.py:2390-2392 is_plain_int1(w_obj)
 ///
 /// Accepts exact W_IntObject (not bool, not int subclass) or W_LongObject
-/// whose value fits in a machine-word integer.
+/// whose value fits in a machine-word integer. Shared with
+/// `specialisedtupleobject.py:172-175 makespecialisedtuple2`.
 #[inline]
-unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
+pub(crate) unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     if item.is_null() {
         return false;
     }
@@ -67,10 +255,11 @@ unsafe fn is_plain_int1(item: PyObjectRef) -> bool {
     false
 }
 
-/// Unwrap a plain int value from W_IntObject or W_LongObject.
-/// Caller must ensure `is_plain_int1(item)` is true.
+/// listobject.py:2394-2398 `plain_int_w(space, w_obj)`. Unwraps a plain
+/// int value from W_IntObject or W_LongObject. Caller must ensure
+/// `is_plain_int1(item)` returned true.
 #[inline]
-unsafe fn unwrap_plain_int(item: PyObjectRef) -> i64 {
+pub(crate) unsafe fn plain_int_w(item: PyObjectRef) -> i64 {
     if is_int(item) {
         w_int_get_value(item)
     } else {
@@ -89,26 +278,24 @@ fn all_floats(items: &[PyObjectRef]) -> bool {
         .all(|&item| !item.is_null() && unsafe { is_float(item) })
 }
 
-fn object_array_from_ints(values: &[i64]) -> PyObjectArray {
-    let boxed: Vec<PyObjectRef> = values.iter().map(|&value| w_int_new(value)).collect();
-    PyObjectArray::from_vec(boxed)
+fn boxed_from_ints(values: &[i64]) -> Vec<PyObjectRef> {
+    values.iter().map(|&value| w_int_new(value)).collect()
 }
 
-fn object_array_from_floats(values: &[f64]) -> PyObjectArray {
-    let boxed: Vec<PyObjectRef> = values.iter().map(|&value| w_float_new(value)).collect();
-    PyObjectArray::from_vec(boxed)
+fn boxed_from_floats(values: &[f64]) -> Vec<PyObjectRef> {
+    values.iter().map(|&value| w_float_new(value)).collect()
 }
 
 unsafe fn switch_to_object_strategy(list: &mut W_ListObject) {
     if list.strategy == ListStrategy::Object {
         return;
     }
-    list.items = match list.strategy {
-        ListStrategy::Integer => object_array_from_ints(list.int_items.as_slice()),
-        ListStrategy::Float => object_array_from_floats(list.float_items.as_slice()),
-        ListStrategy::Object | ListStrategy::Empty => PyObjectArray::from_vec(Vec::new()),
+    let seed: Vec<PyObjectRef> = match list.strategy {
+        ListStrategy::Integer => boxed_from_ints(list.int_items.as_slice()),
+        ListStrategy::Float => boxed_from_floats(list.float_items.as_slice()),
+        ListStrategy::Object | ListStrategy::Empty => Vec::new(),
     };
-    list.items.fix_ptr();
+    list.set_object_items_from_vec(seed);
     list.int_items = IntArray::from_vec(Vec::new());
     list.int_items.fix_ptr();
     list.float_items = FloatArray::from_vec(Vec::new());
@@ -131,8 +318,7 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
         list.float_items.fix_ptr();
         list.strategy = ListStrategy::Float;
     } else {
-        list.items = PyObjectArray::from_vec(Vec::new());
-        list.items.fix_ptr();
+        list.set_object_items_from_vec(Vec::new());
         list.strategy = ListStrategy::Object;
     }
 }
@@ -150,54 +336,84 @@ pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
     } else {
         ListStrategy::Object
     };
-    let (items, int_items, float_items) = match strategy {
-        ListStrategy::Empty => (
-            PyObjectArray::from_vec(Vec::new()),
-            IntArray::from_vec(Vec::new()),
-            FloatArray::from_vec(Vec::new()),
-        ),
-        ListStrategy::Object => (
-            PyObjectArray::from_vec(items),
-            IntArray::from_vec(Vec::new()),
-            FloatArray::from_vec(Vec::new()),
-        ),
-        ListStrategy::Integer => {
-            let values = items
-                .into_iter()
-                .map(|item| unsafe { unwrap_plain_int(item) })
-                .collect();
+    let (length, items_block, int_items, float_items) = match strategy {
+        ListStrategy::Empty | ListStrategy::Integer | ListStrategy::Float => {
+            let int_items = if let ListStrategy::Integer = strategy {
+                let values = items
+                    .iter()
+                    .map(|&item| unsafe { plain_int_w(item) })
+                    .collect();
+                IntArray::from_vec(values)
+            } else {
+                IntArray::from_vec(Vec::new())
+            };
+            let float_items = if let ListStrategy::Float = strategy {
+                let values = items
+                    .iter()
+                    .map(|&item| unsafe { w_float_get_value(item) })
+                    .collect();
+                FloatArray::from_vec(values)
+            } else {
+                FloatArray::from_vec(Vec::new())
+            };
+            (0usize, std::ptr::null_mut(), int_items, float_items)
+        }
+        ListStrategy::Object => {
+            let length = items.len();
+            let items_block = unsafe { alloc_list_items_block(&items) };
             (
-                PyObjectArray::from_vec(Vec::new()),
-                IntArray::from_vec(values),
+                length,
+                items_block,
+                IntArray::from_vec(Vec::new()),
                 FloatArray::from_vec(Vec::new()),
             )
         }
-        ListStrategy::Float => {
-            let values = items
-                .into_iter()
-                .map(|item| unsafe { w_float_get_value(item) })
-                .collect();
-            (
-                PyObjectArray::from_vec(Vec::new()),
-                IntArray::from_vec(Vec::new()),
-                FloatArray::from_vec(values),
-            )
+    };
+    let header = PyObject {
+        ob_type: &LIST_TYPE as *const PyType,
+        w_class: get_instantiate(&LIST_TYPE),
+    };
+    // Allocate body via GC old-gen (mark-sweep, non-moving). The
+    // `items` field carries `gc_ptr_offsets = [offset_of(items)]`
+    // (`eval.rs:274`) and still points at a `std::alloc`'d
+    // `ItemsBlock` until Task #98; the mark walker's
+    // `is_managed_heap_object` guard (collector.rs:991/1008) keeps
+    // that stepping-stone correctness-safe.
+    let raw = match crate::gc_hook::try_gc_alloc_stable(W_LIST_GC_TYPE_ID, W_LIST_OBJECT_SIZE)
+        .filter(|p| !p.is_null())
+    {
+        Some(p) => p,
+        None => {
+            let mut boxed = Box::new(W_ListObject {
+                ob_header: header,
+                length,
+                items: items_block,
+                strategy,
+                int_items,
+                float_items,
+            });
+            boxed.int_items.fix_ptr();
+            boxed.float_items.fix_ptr();
+            return Box::into_raw(boxed) as PyObjectRef;
         }
     };
-    let mut obj = Box::new(W_ListObject {
-        ob_header: PyObject {
-            ob_type: &LIST_TYPE as *const PyType,
-            w_class: get_instantiate(&LIST_TYPE),
-        },
-        items,
-        strategy,
-        int_items,
-        float_items,
-    });
-    obj.items.fix_ptr();
-    obj.int_items.fix_ptr();
-    obj.float_items.fix_ptr();
-    Box::into_raw(obj) as PyObjectRef
+    unsafe {
+        std::ptr::write(
+            raw as *mut W_ListObject,
+            W_ListObject {
+                ob_header: header,
+                length,
+                items: items_block,
+                strategy,
+                int_items,
+                float_items,
+            },
+        );
+        let obj = &mut *(raw as *mut W_ListObject);
+        obj.int_items.fix_ptr();
+        obj.float_items.fix_ptr();
+    }
+    raw as PyObjectRef
 }
 
 /// Get the item at the given index from a list.
@@ -212,7 +428,7 @@ pub unsafe fn w_list_getitem(obj: PyObjectRef, index: i64) -> Option<PyObjectRef
         // listobject.py:1134 EmptyListStrategy.getitem raises IndexError.
         ListStrategy::Empty => None,
         ListStrategy::Object => {
-            let items = list.items.as_slice();
+            let items = list.object_items_slice();
             let len = items.len() as i64;
             let idx = if index < 0 { index + len } else { index };
             if idx < 0 || idx >= len {
@@ -253,7 +469,7 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
         // listobject.py:1185 EmptyListStrategy.setitem raises IndexError.
         ListStrategy::Empty => false,
         ListStrategy::Object => {
-            let items = list.items.as_mut_slice();
+            let items = list.object_items_slice_mut();
             let len = items.len() as i64;
             let idx = if index < 0 { index + len } else { index };
             if idx < 0 || idx >= len {
@@ -270,7 +486,7 @@ pub unsafe fn w_list_setitem(obj: PyObjectRef, index: i64, value: PyObjectRef) -
             }
             // AbstractUnwrappedStrategy.setitem (listobject.py:1737): plain_int_w (unwrap)
             if is_plain_int1(value) {
-                list.int_items[idx as usize] = unwrap_plain_int(value);
+                list.int_items[idx as usize] = plain_int_w(value);
                 true
             } else {
                 switch_to_object_strategy(list);
@@ -310,13 +526,13 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
         // AbstractUnwrappedStrategy.append (listobject.py:1695):
         //   if self.is_correct_type(w_item): l.append(self.unwrap(w_item)); return
         //   self.switch_to_next_strategy(w_list, w_item); w_list.append(w_item)
-        ListStrategy::Object => list.items.push(value),
+        ListStrategy::Object => list.object_push(value),
         ListStrategy::Integer => {
             if is_plain_int1(value) {
-                list.int_items.push(unwrap_plain_int(value));
+                list.int_items.push(plain_int_w(value));
             } else {
                 switch_to_object_strategy(list);
-                list.items.push(value);
+                list.object_push(value);
             }
         }
         ListStrategy::Float => {
@@ -324,7 +540,7 @@ pub unsafe fn w_list_append(obj: PyObjectRef, value: PyObjectRef) {
                 list.float_items.push(w_float_get_value(value));
             } else {
                 switch_to_object_strategy(list);
-                list.items.push(value);
+                list.object_push(value);
             }
         }
     }
@@ -339,7 +555,7 @@ pub unsafe fn w_list_len(obj: PyObjectRef) -> usize {
     match list.strategy {
         // listobject.py:1131 EmptyListStrategy.length returns 0.
         ListStrategy::Empty => 0,
-        ListStrategy::Object => list.items.len(),
+        ListStrategy::Object => list.length,
         ListStrategy::Integer => list.int_items.len(),
         ListStrategy::Float => list.float_items.len(),
     }
@@ -354,7 +570,7 @@ pub unsafe fn w_list_can_append_without_realloc(obj: PyObjectRef) -> bool {
     match list.strategy {
         // EmptyListStrategy holds no array yet — first append always reallocates.
         ListStrategy::Empty => false,
-        ListStrategy::Object => list.items.spare_capacity() > 0,
+        ListStrategy::Object => list.object_spare_capacity() > 0,
         ListStrategy::Integer => list.int_items.spare_capacity() > 0,
         ListStrategy::Float => list.float_items.spare_capacity() > 0,
     }
@@ -369,7 +585,10 @@ pub unsafe fn w_list_is_inline_storage(obj: PyObjectRef) -> bool {
     match list.strategy {
         // EmptyListStrategy.lstorage = self.erase(None) — no backing array.
         ListStrategy::Empty => false,
-        ListStrategy::Object => list.items.is_inline(),
+        // Object strategy stores items in a GC-shaped `ItemsBlock`, never
+        // an inline allocation — upstream rlist.py doesn't have an
+        // "inline" bit either.
+        ListStrategy::Object => false,
         ListStrategy::Integer => list.int_items.is_inline(),
         ListStrategy::Float => list.float_items.is_inline(),
     }
@@ -397,8 +616,21 @@ pub unsafe fn w_list_uses_empty_storage(obj: PyObjectRef) -> bool {
 
 /// Rebuild the list's object storage from a Vec.
 unsafe fn rebuild_object_items(list: &mut W_ListObject, items: Vec<PyObjectRef>) {
-    list.items = PyObjectArray::from_vec(items);
-    list.items.fix_ptr();
+    list.set_object_items_from_vec(items);
+}
+
+/// Snapshot all items of a list as a `Vec<PyObjectRef>`, regardless of
+/// strategy. Integer/Float items are wrapped into `W_IntObject` /
+/// `W_FloatObject`, matching listobject.py:363-371
+/// `_temporarily_as_objects()`. Used by callers outside `pyre-object`
+/// (e.g. the interpreter's unpack / set-update / list-to-tuple paths)
+/// that need a uniform object view.
+///
+/// # Safety
+/// `obj` must point to a valid `W_ListObject`.
+pub unsafe fn w_list_items_copy_as_vec(obj: PyObjectRef) -> Vec<PyObjectRef> {
+    let list = &*(obj as *const W_ListObject);
+    temporarily_as_objects(list)
 }
 
 /// listobject.py:363-371 _temporarily_as_objects()
@@ -410,7 +642,7 @@ unsafe fn temporarily_as_objects(list: &W_ListObject) -> Vec<PyObjectRef> {
     match list.strategy {
         // listobject.py:1142 EmptyListStrategy.getitems returns [].
         ListStrategy::Empty => Vec::new(),
-        ListStrategy::Object => list.items.to_vec(),
+        ListStrategy::Object => list.object_to_vec(),
         ListStrategy::Integer => list
             .int_items
             .as_slice()
@@ -450,7 +682,7 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
         ListStrategy::Integer => {
             if is_plain_int1(value) {
                 let idx = normalize_insert_index(index, list.int_items.len());
-                list.int_items.insert(idx, unwrap_plain_int(value));
+                list.int_items.insert(idx, plain_int_w(value));
                 return;
             }
             switch_to_object_strategy(list);
@@ -466,8 +698,8 @@ pub unsafe fn w_list_insert(obj: PyObjectRef, index: i64, value: PyObjectRef) {
             w_list_insert(obj, index, value);
         }
         ListStrategy::Object => {
-            let idx = normalize_insert_index(index, list.items.len());
-            list.items.insert(idx, value);
+            let idx = normalize_insert_index(index, list.length);
+            list.object_insert(idx, value);
         }
     }
 }
@@ -504,7 +736,7 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
             Some(w_float_new(item))
         }
         ListStrategy::Object => {
-            let len = list.items.len() as i64;
+            let len = list.length as i64;
             if len == 0 {
                 return None;
             }
@@ -512,7 +744,7 @@ pub unsafe fn w_list_pop(obj: PyObjectRef, index: i64) -> Option<PyObjectRef> {
             if idx < 0 || idx >= len {
                 return None;
             }
-            Some(list.items.remove(idx as usize))
+            Some(list.object_remove(idx as usize))
         }
     }
 }
@@ -536,10 +768,10 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
             Some(w_float_new(list.float_items.pop()))
         }
         ListStrategy::Object => {
-            if list.items.len() == 0 {
+            if list.length == 0 {
                 return None;
             }
-            Some(list.items.pop())
+            Some(list.object_pop())
         }
     }
 }
@@ -551,8 +783,7 @@ pub unsafe fn w_list_pop_end(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// strategy via switch_to_correct_strategy.
 pub unsafe fn w_list_clear(obj: PyObjectRef) {
     let list = &mut *(obj as *mut W_ListObject);
-    list.items = PyObjectArray::from_vec(Vec::new());
-    list.items.fix_ptr();
+    list.drop_object_items();
     list.int_items = IntArray::from_vec(Vec::new());
     list.int_items.fix_ptr();
     list.float_items = FloatArray::from_vec(Vec::new());
@@ -570,7 +801,7 @@ pub unsafe fn w_list_reverse(obj: PyObjectRef) {
         ListStrategy::Empty => {}
         ListStrategy::Integer => list.int_items.as_mut_slice().reverse(),
         ListStrategy::Float => list.float_items.as_mut_slice().reverse(),
-        ListStrategy::Object => list.items.as_mut_slice().reverse(),
+        ListStrategy::Object => list.object_reverse(),
     }
 }
 
@@ -598,11 +829,11 @@ pub unsafe fn w_list_delslice(obj: PyObjectRef, start: usize, end: usize) {
             }
         }
         ListStrategy::Object => {
-            let len = list.items.len();
+            let len = list.length;
             let s = start.min(len);
             let e = end.min(len);
             if s < e {
-                list.items.drain(s..e);
+                list.object_drain(s..e);
             }
         }
     }
@@ -772,8 +1003,7 @@ pub unsafe fn w_list_setslice(
                     return Ok(());
                 }
                 ListStrategy::Object => {
-                    list.items = PyObjectArray::from_vec(other.items.to_vec());
-                    list.items.fix_ptr();
+                    list.set_object_items_from_vec(other.object_to_vec());
                     list.strategy = ListStrategy::Object;
                     return Ok(());
                 }
@@ -827,7 +1057,7 @@ pub unsafe fn w_list_setslice(
         return Err("non-list iterable");
     };
     switch_to_object_strategy(list);
-    let mut v = list.items.to_vec();
+    let mut v = list.object_to_vec();
     let s = start.min(v.len());
     let e = end.min(v.len());
     v.splice(s..e, new_items);

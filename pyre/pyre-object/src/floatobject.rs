@@ -23,7 +23,10 @@ pub const W_FLOAT_GC_TYPE_ID: u32 = 2;
 /// Allocate a new W_FloatObject on the heap.
 ///
 /// Phase 1: uses `Box::leak` for simplicity (objects are never freed).
-/// A proper GC will replace this allocation strategy.
+/// A proper GC will replace this allocation strategy — see Task #141
+/// for why option (b) (route straight to old-gen via the stable
+/// hook) is insufficient: nbody-style workloads emit floats per loop
+/// iteration and pinning them all in old-gen regresses bench.
 pub fn w_float_new(value: f64) -> PyObjectRef {
     let obj = Box::new(W_FloatObject {
         ob_header: PyObject {

@@ -49,6 +49,44 @@ fn pyre_object_gc_alloc_trampoline(type_id: u32, size: usize) -> *mut u8 {
     majit_gc::alloc_nursery_typed(type_id, size).0 as *mut u8
 }
 
+/// Task #141 trampoline for stable-address host-side allocations.
+/// Routes pyre-object's stable-allocation hook to the backend's
+/// `alloc_oldgen_typed`. MiniMark's old-gen is mark-sweep
+/// (non-moving), so the returned pointer is safe to hold on the Rust
+/// stack across subsequent allocations.
+fn pyre_object_gc_alloc_stable_trampoline(type_id: u32, size: usize) -> *mut u8 {
+    majit_gc::alloc_oldgen_typed(type_id, size).0 as *mut u8
+}
+
+/// Task #141 option (a) trampoline: register a caller-owned slot as
+/// a GC root with the active backend. Bridges `*mut *mut u8` (the
+/// pyre-object-facing shape that does not depend on majit-gc) to
+/// `*mut GcRef` expected by `majit_gc::gc_add_root`. `GcRef` is
+/// `#[repr(transparent)]` over `usize`, so the pointer-pointer and
+/// `*mut GcRef` share representation.
+///
+/// # Safety
+/// Caller must keep `slot` valid until
+/// [`pyre_object_gc_remove_root_trampoline`] is called with the same
+/// pointer.
+unsafe fn pyre_object_gc_add_root_trampoline(slot: *mut *mut u8) {
+    unsafe { majit_gc::gc_add_root(slot as *mut majit_ir::GcRef) };
+}
+
+/// Companion to [`pyre_object_gc_add_root_trampoline`].
+fn pyre_object_gc_remove_root_trampoline(slot: *mut *mut u8) {
+    majit_gc::gc_remove_root(slot as *mut majit_ir::GcRef);
+}
+
+/// Bridge pyre-object's `is_managed_heap_object` query to
+/// `majit_gc::gc_owns_object`. Used by host-side allocators
+/// (`pyre_object::dealloc_items_block`) to discriminate
+/// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
+/// fallback blocks.
+fn pyre_object_gc_owns_object_trampoline(addr: usize) -> bool {
+    majit_gc::gc_owns_object(addr)
+}
+
 /// resume.py:1312 blackhole_from_resumedata parity: preserve per-frame
 /// resume data from the last guard failure. rd_numb provides frame
 /// boundaries (jitcode_index, pc); values are resolved from deadframe.
@@ -77,7 +115,10 @@ enum JitAction {
 }
 
 use crate::jit::descr::{
-    JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, VREF_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID, W_INT_GC_TYPE_ID,
+    JITFRAME_GC_TYPE_ID, OBJECT_GC_TYPE_ID, PY_OBJECT_ARRAY_GC_TYPE_ID, RANGE_ITER_GC_TYPE_ID,
+    SPECIALISED_TUPLE_FF_GC_TYPE_ID, SPECIALISED_TUPLE_II_GC_TYPE_ID,
+    SPECIALISED_TUPLE_OO_GC_TYPE_ID, VREF_GC_TYPE_ID, W_BOOL_GC_TYPE_ID, W_FLOAT_GC_TYPE_ID,
+    W_INT_GC_TYPE_ID, W_LIST_GC_TYPE_ID, W_TUPLE_GC_TYPE_ID,
 };
 use majit_gc::collector::MiniMarkGC;
 use majit_metainterp::JitDriver;
@@ -199,6 +240,129 @@ thread_local! {
         debug_assert_eq!(vref_tid, VREF_GC_TYPE_ID);
         // Tell the virtualref optimizer about the registered type id.
         majit_metainterp::virtualref::set_vref_gc_type_id(vref_tid);
+        // Dedicated typeids for the JIT-NEW'd / JIT-guard'd PyObject
+        // subclasses whose payload is NOT `sizeof(PyObject)`. RPython
+        // registers one typeid per distinct STRUCT through
+        // `heaptracker.setup_cache_gcstruct2vtable` (heaptracker.py:23-30)
+        // and `add_vtable_after_typeinfo` (gctypelayout.py:359-374). pyre's
+        // earlier one-typeid-per-root-layout approximation under-walked
+        // lists/tuples/range-iters as soon as their descr groups carried
+        // `type_id = 0`. `gc_ptr_offsets` stays empty for all four — this
+        // slice is pure bookkeeping (see gc_retype_epic_plan_2026_04_24.md
+        // Session 1); Sessions 2-5 will add the real pointer fields.
+        let w_bool_tid = gc.register_type(TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::boolobject::W_BoolObject>(),
+            w_int_tid,
+        ));
+        debug_assert_eq!(w_bool_tid, W_BOOL_GC_TYPE_ID);
+        let range_iter_tid = gc.register_type(TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::rangeobject::W_RangeIterator>(),
+            object_tid,
+        ));
+        debug_assert_eq!(range_iter_tid, RANGE_ITER_GC_TYPE_ID);
+        // rlist.py:116 parity: W_ListObject has a single GC pointer
+        // field — `items: Ptr(GcArray(OBJECTPTR))` — directly at
+        // `offset_of!(items)`. Phase L1 retired the `PyObjectArray`
+        // fat wrapper, so the GC offset no longer goes through an
+        // intermediate block-start field.
+        //
+        // STEPPING-STONE (Phase L2 pending). The pointer shape is now
+        // correct but the block `items` points to is still
+        // `std::alloc`-owned (`alloc_items_block` in
+        // `pyre_object::object_array`), so
+        // `is_nursery_object_start` (collector.rs:377) rejects it
+        // and the walker no-ops. Activates end-to-end only after
+        // Phase L2's allocator cutover (blocked on Task #141 GC-root
+        // infrastructure). Do NOT promote `W_LIST_GC_TYPE_ID` to
+        // "fully-parity" status in docs/MEMORY while this stepping-
+        // stone state holds.
+        let mut w_list_ti = TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::listobject::W_ListObject>(),
+            object_tid,
+        );
+        w_list_ti.gc_ptr_offsets = vec![std::mem::offset_of!(
+            pyre_object::listobject::W_ListObject,
+            items
+        )];
+        w_list_ti.has_gc_ptrs = true;
+        let w_list_tid = gc.register_type(w_list_ti);
+        debug_assert_eq!(w_list_tid, W_LIST_GC_TYPE_ID);
+        // Same stepping-stone caveat as W_LIST above; Phase T1-full
+        // (specialised arity-2 variants per
+        // `pypy/objspace/std/specialisedtupleobject.py`) + Phase L2
+        // allocator cutover together complete the tuple convergence.
+        let mut w_tuple_ti = TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::tupleobject::W_TupleObject>(),
+            object_tid,
+        );
+        w_tuple_ti.gc_ptr_offsets = vec![std::mem::offset_of!(
+            pyre_object::tupleobject::W_TupleObject,
+            wrappeditems
+        )];
+        w_tuple_ti.has_gc_ptrs = true;
+        let w_tuple_tid = gc.register_type(w_tuple_ti);
+        debug_assert_eq!(w_tuple_tid, W_TUPLE_GC_TYPE_ID);
+        // `rlist.py Ptr(GcArray(OBJECTPTR))` — the variable-length
+        // backing block behind `PyObjectArray`. `base=8` single-slot
+        // header (`capacity`), `item_size=8` Ref, `length_offset=0`
+        // so `gctypelayout.py:266-291` reads `capacity` as the
+        // GcArray length (rlist.py:251 `len(l.items)` = allocated
+        // slot count — upstream's GcArray header IS the capacity,
+        // not live length).  `items_have_gc_ptrs=true` activates
+        // `T_IS_GCARRAY_OF_GCPTR` so the nursery walker traces every
+        // item slot as a Ref; NULL-initialized spare slots past the
+        // live length are benign.
+        //
+        // STEPPING-STONE (metadata precedes runtime). This typeid
+        // only governs blocks allocated *through the GC*. Today
+        // `alloc_items_block` uses `std::alloc::alloc`, so no
+        // concrete allocation carries this typeid at runtime — the
+        // registration shapes the GC's type table but no walker
+        // ever visits a PY_OBJECT_ARRAY_GC_TYPE_ID-tagged object.
+        // Activates once Phase L2 swaps the allocator (blocked on
+        // Task #141). See comments on
+        // `pyre_jit_trace::descr::PY_OBJECT_ARRAY_GC_TYPE_ID` and
+        // `pyre_object::object_array::ItemsBlock` for the
+        // companion stepping-stone notices.
+        let py_object_array_tid = gc.register_type(TypeInfo::varsize(
+            pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET,
+            std::mem::size_of::<pyre_object::pyobject::PyObjectRef>(),
+            0,
+            true,
+            Vec::new(),
+        ));
+        debug_assert_eq!(py_object_array_tid, PY_OBJECT_ARRAY_GC_TYPE_ID);
+        // `pypy/objspace/std/specialisedtupleobject.py` `Cls_ii / Cls_ff
+        // / Cls_oo` — three subclasses of `W_AbstractTupleObject` with
+        // inline `value0` / `value1` fields. Each gets a distinct
+        // `ob_type` so the JIT's `GUARD_CLASS` reaches the inline-field
+        // shape directly. `Cls_oo` carries two GC-pointer slots; the
+        // other two are GC-leaf for the payload (header still has w_class).
+        let mut spec_tuple_ii_ti = TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::specialisedtupleobject::W_SpecialisedTupleObject_ii>(),
+            object_tid,
+        );
+        spec_tuple_ii_ti.has_gc_ptrs = false;
+        let spec_tuple_ii_tid = gc.register_type(spec_tuple_ii_ti);
+        debug_assert_eq!(spec_tuple_ii_tid, SPECIALISED_TUPLE_II_GC_TYPE_ID);
+        let mut spec_tuple_ff_ti = TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::specialisedtupleobject::W_SpecialisedTupleObject_ff>(),
+            object_tid,
+        );
+        spec_tuple_ff_ti.has_gc_ptrs = false;
+        let spec_tuple_ff_tid = gc.register_type(spec_tuple_ff_ti);
+        debug_assert_eq!(spec_tuple_ff_tid, SPECIALISED_TUPLE_FF_GC_TYPE_ID);
+        let mut spec_tuple_oo_ti = TypeInfo::object_subclass(
+            std::mem::size_of::<pyre_object::specialisedtupleobject::W_SpecialisedTupleObject_oo>(),
+            object_tid,
+        );
+        spec_tuple_oo_ti.gc_ptr_offsets = vec![
+            pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_VALUE0_OFFSET,
+            pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_OO_VALUE1_OFFSET,
+        ];
+        spec_tuple_oo_ti.has_gc_ptrs = true;
+        let spec_tuple_oo_tid = gc.register_type(spec_tuple_oo_ti);
+        debug_assert_eq!(spec_tuple_oo_tid, SPECIALISED_TUPLE_OO_GC_TYPE_ID);
         // Tell the cranelift backend which type id to use for the
         // nursery allocations that it issues for jitframes. Without
         // this, the backend's default u32::MAX sentinel would trip the
@@ -244,6 +408,48 @@ thread_local! {
             &pyre_object::pyobject::FLOAT_TYPE as *const _ as usize,
             w_float_tid,
         );
+        // Bind the four dedicated typeids registered above to their
+        // static PyType pointers. The foreign-pytype loop below skips
+        // any PyType already present in `pytype_to_tid`, so these four
+        // pre-bindings override the loop's would-be
+        // `object_subclass(sizeof(PyObject))` registration with the
+        // correct per-struct size.
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::pyobject::BOOL_TYPE as *const _ as usize,
+            w_bool_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::pyobject::BOOL_TYPE as *const _ as usize,
+            w_bool_tid,
+        );
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::rangeobject::RANGE_ITER_TYPE as *const _ as usize,
+            range_iter_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::rangeobject::RANGE_ITER_TYPE as *const _ as usize,
+            range_iter_tid,
+        );
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::pyobject::LIST_TYPE as *const _ as usize,
+            w_list_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::pyobject::LIST_TYPE as *const _ as usize,
+            w_list_tid,
+        );
+        majit_gc::GcAllocator::register_vtable_for_type(
+            &mut gc,
+            &pyre_object::pyobject::TUPLE_TYPE as *const _ as usize,
+            w_tuple_tid,
+        );
+        pytype_to_tid.insert(
+            &pyre_object::pyobject::TUPLE_TYPE as *const _ as usize,
+            w_tuple_tid,
+        );
         // Walk every remaining built-in PyType and register one
         // `TypeInfo::object_subclass` per class, mirroring how
         // `assign_inheritance_ids` (normalizecalls.py:373-389) walks
@@ -259,6 +465,14 @@ thread_local! {
             .iter()
             .chain(pyre_interpreter::all_foreign_pytypes().iter())
         {
+            let pytype_ptr = *pytype as *const _ as usize;
+            // BOOL_TYPE / LIST_TYPE / TUPLE_TYPE / RANGE_ITER_TYPE are
+            // pre-registered above with their real struct sizes. Leave
+            // those bindings intact instead of overwriting them with a
+            // `sizeof(PyObject)` approximation.
+            if pytype_to_tid.contains_key(&pytype_ptr) {
+                continue;
+            }
             let parent_tid = *pytype_to_tid
                 .get(&(*parent as *const _ as usize))
                 .expect("foreign pytype parent must be registered before its subclass");
@@ -268,10 +482,10 @@ thread_local! {
             ));
             majit_gc::GcAllocator::register_vtable_for_type(
                 &mut gc,
-                *pytype as *const _ as usize,
+                pytype_ptr,
                 tid,
             );
-            pytype_to_tid.insert(*pytype as *const _ as usize, tid);
+            pytype_to_tid.insert(pytype_ptr, tid);
         }
         // rclass.py:340-346 — assign subclassrange_{min,max} to each
         // vtable entry. freeze_types() runs assign_inheritance_ids
@@ -302,6 +516,20 @@ thread_local! {
         // dereference freed memory. See
         // `majit_metainterp::MetaInterp::walk_rd_consts_refs`.
         majit_gc::shadow_stack::register_extra_root_walker(rd_consts_root_walker);
+        // Route pyre-object host-side allocators through the backend's
+        // nursery. `set_gc_allocator` populated
+        // `majit_gc::ACTIVE_ALLOC_NURSERY_TYPED` with the active
+        // backend's trampoline; the one registered here converts
+        // `GcRef` -> `*mut u8` for the pyre-object side. pyre-object
+        // deliberately does not depend on majit-gc, so the trampoline
+        // lives here.
+        pyre_object::register_gc_alloc_hook(pyre_object_gc_alloc_trampoline);
+        pyre_object::register_gc_alloc_stable_hook(pyre_object_gc_alloc_stable_trampoline);
+        pyre_object::register_gc_root_hooks(
+            pyre_object_gc_add_root_trampoline,
+            pyre_object_gc_remove_root_trampoline,
+        );
+        pyre_object::register_gc_owns_object_hook(pyre_object_gc_owns_object_trampoline);
         // llmodel.py:67-69 self.vtable_offset, _ = symbolic.get_field_token(
         //     rclass.OBJECT, 'typeptr', translate_support_code)
         // pyre's PyObject.ob_type is the equivalent of RPython's typeptr.

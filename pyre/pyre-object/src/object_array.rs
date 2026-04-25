@@ -1,234 +1,244 @@
+use std::alloc::{Layout, alloc, dealloc};
 use std::ops::{Index, IndexMut};
 
 use crate::{PY_NULL, PyObjectRef};
 
-/// Offset of the backing pointer inside `PyObjectArray`.
-pub const PYOBJECT_ARRAY_PTR_OFFSET: usize = std::mem::offset_of!(PyObjectArray, ptr);
+/// GC type id for the variable-length backing block of
+/// `W_ListObject.items` / `W_TupleObject.wrappeditems` /
+/// `DictStorage.values`. Shape matches RPython's
+/// `GcArray(OBJECTPTR)` from `rpython/rtyper/lltypesystem/rlist.py:84,116`
+/// — a `T_IS_VARSIZE` block with an 8-byte single-slot `capacity`
+/// header followed by inline `PyObjectRef` items. Registered with
+/// `TypeInfo::varsize(8, 8, 0, items_have_gc_ptrs=true, [])` so the
+/// GC walks each item slot as a Ref. Re-exported from
+/// `pyre_jit_trace::descr` for existing call sites.
+pub const PY_OBJECT_ARRAY_GC_TYPE_ID: u32 = 9;
 
-/// Offset of the live length inside `PyObjectArray`.
-pub const PYOBJECT_ARRAY_LEN_OFFSET: usize = std::mem::offset_of!(PyObjectArray, len);
-
-/// Offset of the capacity inside `PyObjectArray`.
-pub const PYOBJECT_ARRAY_CAP_OFFSET: usize = std::mem::offset_of!(PyObjectArray, cap);
-
-/// pypy/interpreter/pyframe.py:110 — RPython allocates locals_cells_stack_w
-/// as a fixed-size GC array (`[None] * size` + `make_sure_not_resized`).
-/// Always heap-allocated so the JIT `ptr` field stays valid across frame
-/// moves and the GC can trace elements via the pointer.
+/// `#[repr(C)] { capacity, items: [PyObjectRef; 0] }` — the single-block
+/// inline-varsize GcArray body used by `W_ListObject.items` /
+/// `W_TupleObject.items` / `DictStorage.values`.
+/// Shape matches RPython's `GcArray(OBJECTPTR)` from
+/// `rpython/rtyper/lltypesystem/rlist.py:84`: a length header at
+/// offset 0 followed by inline items. Upstream's GcArray length IS
+/// the allocated capacity (rlist.py:251 `len(l.items)` = allocated
+/// slot count, fixed for the block's lifetime); live list length
+/// lives on the enclosing `W_ListObject` wrapper per rlist.py:116
+/// `("length", Signed)`.
 ///
-/// Two usage modes:
-/// - **Fixed (frame)**: created via `filled()`, never resized.
-///   Corresponds to RPython's `make_sure_not_resized` GcArray.
-///   virtualizable.py:50 requires this for JIT virtualizable fields.
-/// - **Resizable (list)**: created via `from_vec()`, supports
-///   push/insert/remove/drain/clear for list mutation.
+/// Layout: offset 0 = `capacity` (= GcArray length header),
+/// offset 8 = items[0..capacity]. Total allocation size =
+/// `ITEMS_BLOCK_ITEMS_OFFSET + capacity * sizeof(PyObjectRef)`.
 ///
-/// The `ptr` field (offset 0) is used by the JIT for direct memory access.
+/// STEPPING-STONE (metadata precedes runtime, Phase L2 pending).
+/// The header layout already matches upstream but the allocator
+/// does NOT: `alloc_items_block` / `grow_items_block` below still
+/// use `std::alloc::alloc`, not
+/// `MiniMarkGC::alloc_varsize_typed(PY_OBJECT_ARRAY_GC_TYPE_ID,
+/// cap)`. Until Phase L2 cuts the allocator over (blocked on
+/// Task #141 GC-root infrastructure + Drop source-of-truth
+/// decision), the matching `PY_OBJECT_ARRAY_GC_TYPE_ID` and
+/// `W_LIST_GC_TYPE_ID.gc_ptr_offsets = [offset_of!(items)]` are
+/// inactive at collection time — the walker rejects the
+/// non-nursery block pointer (collector.rs:377). Phase L1 of the
+/// epic already landed: `W_ListObject` / `W_TupleObject` hold
+/// `{length: usize, items: *mut ItemsBlock}` fields directly
+/// (no more `PyObjectArray` fat wrapper for list/tuple).
 #[repr(C)]
-pub struct PyObjectArray {
-    /// Raw pointer to the heap-allocated storage. JIT reads this at offset 0.
-    pub ptr: *mut PyObjectRef,
-    /// Number of live elements.
-    len: usize,
-    /// Heap capacity (always > 0).
-    cap: usize,
+pub struct ItemsBlock {
+    /// Allocated capacity — treated as the GcArray-length header
+    /// (rlist.py:251 `len(l.items)`). The GC registration sets
+    /// `length_offset=0` to this field so the walker iterates
+    /// `0..capacity`. Fixed from `alloc_items_block()` through
+    /// `dealloc_items_block()`; a `grow_items_block()` call
+    /// allocates a fresh block rather than mutating this field.
+    pub capacity: usize,
+    /// Items inline after the header. Size known only at allocation
+    /// time — accessed via pointer arithmetic from
+    /// `items_block_items_base()`.
+    items: [PyObjectRef; 0],
 }
 
-impl PyObjectArray {
-    pub fn filled(len: usize, value: PyObjectRef) -> Self {
-        let mut storage = vec![value; len.max(1)];
-        let ptr = storage.as_mut_ptr();
-        let cap = storage.capacity();
-        std::mem::forget(storage);
-        Self { ptr, len, cap }
-    }
+pub const ITEMS_BLOCK_ITEMS_OFFSET: usize = std::mem::offset_of!(ItemsBlock, items);
 
-    pub fn from_vec(mut values: Vec<PyObjectRef>) -> Self {
-        let len = values.len();
-        if values.is_empty() {
-            values.push(PY_NULL);
+/// Return the items base pointer (i.e. `&items[0]`) of an
+/// `ItemsBlock`. Null-safe: returns a null `*mut PyObjectRef` if the
+/// block itself is null, so callers can treat a null items pointer as
+/// an empty list without branching through `Option`.
+#[inline]
+pub unsafe fn items_block_items_base(block: *mut ItemsBlock) -> *mut PyObjectRef {
+    if block.is_null() {
+        return std::ptr::null_mut();
+    }
+    unsafe { (block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET) as *mut PyObjectRef }
+}
+
+/// Allocated capacity (GcArray length header) of an `ItemsBlock`.
+/// Returns 0 for a null pointer so "empty list" is represented by
+/// a null `items` field.
+#[inline]
+pub unsafe fn items_block_capacity(block: *mut ItemsBlock) -> usize {
+    if block.is_null() {
+        return 0;
+    }
+    unsafe { (*block).capacity }
+}
+
+/// Allocate a fresh `ItemsBlock` populated with the given values. The
+/// capacity is `values.len().max(1)`; unused slots past `values.len()`
+/// are NULL-initialised so the GC walker (once Phase L2 activates
+/// `PY_OBJECT_ARRAY_GC_TYPE_ID`) sees valid NULL refs past the live
+/// prefix — upstream `gc_malloc_array` zero-fills (rlist.py:262-267
+/// `_ll_list_resize_really`). Used by `W_ListObject::from_vec`.
+///
+/// The `max(1)` clamp is the list-strategy overallocation policy
+/// (rlist.py:251 `_ll_list_resize_*` always keeps at least one slot
+/// for in-place growth). Tuples must NOT use this allocator — see
+/// [`alloc_tuple_items_block`] for the exact-size variant.
+pub unsafe fn alloc_list_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock {
+    let len = values.len();
+    let cap = len.max(1);
+    unsafe {
+        let block = alloc_items_block(cap);
+        let base = items_block_items_base(block);
+        for (i, v) in values.iter().enumerate() {
+            *base.add(i) = *v;
         }
-        let ptr = values.as_mut_ptr();
-        let cap = values.capacity();
-        std::mem::forget(values);
-        Self { ptr, len, cap }
-    }
-
-    #[inline]
-    fn capacity(&self) -> usize {
-        self.cap
-    }
-
-    #[inline]
-    pub fn spare_capacity(&self) -> usize {
-        self.cap.saturating_sub(self.len)
-    }
-
-    fn grow(&mut self, min_cap: usize) {
-        let target_cap = min_cap.max(self.cap.saturating_mul(2).max(4));
-        unsafe {
-            let mut values = Vec::from_raw_parts(self.ptr, self.len, self.cap);
-            values.reserve(target_cap.saturating_sub(values.capacity()));
-            self.ptr = values.as_mut_ptr();
-            self.cap = values.capacity();
-            std::mem::forget(values);
+        for i in len..cap {
+            *base.add(i) = PY_NULL;
         }
-    }
-
-    pub fn push(&mut self, value: PyObjectRef) {
-        if self.len == self.cap {
-            self.grow(self.len + 1);
-        }
-        unsafe {
-            *self.ptr.add(self.len) = value;
-        }
-        self.len += 1;
-    }
-
-    #[inline]
-    pub fn is_inline(&self) -> bool {
-        false
-    }
-
-    /// No-op — heap-backed arrays don't need pointer fixup after moves.
-    /// Retained for API compatibility during transition.
-    #[inline]
-    pub fn fix_ptr(&mut self) {}
-
-    #[inline]
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn as_slice(&self) -> &[PyObjectRef] {
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
-    }
-
-    pub fn as_mut_slice(&mut self) -> &mut [PyObjectRef] {
-        unsafe { std::slice::from_raw_parts_mut(self.ptr, self.len) }
-    }
-
-    pub fn to_vec(&self) -> Vec<PyObjectRef> {
-        self.as_slice().to_vec()
-    }
-
-    pub fn swap(&mut self, a: usize, b: usize) {
-        self.as_mut_slice().swap(a, b);
-    }
-
-    pub fn insert(&mut self, index: usize, value: PyObjectRef) {
-        assert!(index <= self.len);
-        if self.len == self.cap {
-            self.grow(self.len + 1);
-        }
-        unsafe {
-            let p = self.ptr.add(index);
-            std::ptr::copy(p, p.add(1), self.len - index);
-            *p = value;
-        }
-        self.len += 1;
-    }
-
-    pub fn remove(&mut self, index: usize) -> PyObjectRef {
-        assert!(index < self.len);
-        let value = unsafe { *self.ptr.add(index) };
-        unsafe {
-            let p = self.ptr.add(index);
-            std::ptr::copy(p.add(1), p, self.len - index - 1);
-        }
-        self.len -= 1;
-        value
-    }
-
-    pub fn pop(&mut self) -> PyObjectRef {
-        assert!(self.len > 0);
-        let value = self.as_slice()[self.len - 1];
-        self.len -= 1;
-        value
-    }
-
-    pub fn reverse(&mut self) {
-        self.as_mut_slice().reverse();
-    }
-
-    /// Replace `[start .. start+remove_count]` with `new_values` in one pass.
-    ///
-    /// # Safety
-    /// All pointers in `new_values` and in the existing storage must be valid.
-    pub unsafe fn splice(&mut self, start: usize, remove_count: usize, new_values: &[PyObjectRef]) {
-        unsafe {
-            let old_len = self.len;
-            let s = start.min(old_len);
-            let slicelength = remove_count.min(old_len - s);
-            let len2 = new_values.len();
-            let new_len = old_len - slicelength + len2;
-            if len2 > slicelength {
-                if new_len > self.capacity() {
-                    self.grow(new_len);
-                }
-                std::ptr::copy(
-                    self.ptr.add(s + slicelength),
-                    self.ptr.add(s + len2),
-                    old_len - s - slicelength,
-                );
-                self.len = new_len;
-            } else if slicelength > len2 {
-                std::ptr::copy(
-                    self.ptr.add(s + slicelength),
-                    self.ptr.add(s + len2),
-                    old_len - s - slicelength,
-                );
-                self.len = new_len;
-            }
-            if len2 > 0 {
-                self.as_mut_slice()[s..s + len2].copy_from_slice(new_values);
-            }
-        }
-    }
-
-    pub fn drain(&mut self, range: std::ops::Range<usize>) {
-        let start = range.start;
-        let end = range.end;
-        assert!(start <= end && end <= self.len);
-        let count = end - start;
-        if count == 0 {
-            return;
-        }
-        unsafe {
-            let p = self.ptr.add(start);
-            std::ptr::copy(p.add(count), p, self.len - end);
-        }
-        self.len -= count;
-    }
-
-    pub fn clear(&mut self) {
-        self.len = 0;
+        block
     }
 }
 
-impl Drop for PyObjectArray {
-    fn drop(&mut self) {
-        if self.cap > 0 {
-            unsafe {
-                drop(Vec::from_raw_parts(self.ptr, self.len, self.cap));
-            }
+/// `pypy/objspace/std/tupleobject.py:376-390` `W_TupleObject`
+/// allocator. Allocates an `ItemsBlock` with capacity exactly equal to
+/// `values.len()` — tuples are immutable so the GcArray header
+/// `length` IS the live tuple length (no overallocation room). For an
+/// empty tuple this yields a 0-cap header-only block; the GcArray
+/// pointer is non-null but addresses zero items.
+///
+/// Read length back via `arraylen_gc(items_block, pyobject_gcarray_descr)`
+/// or [`items_block_capacity`] on the host side. No companion length
+/// cache lives on `W_TupleObject` (`_immutable_fields_ =
+/// ['wrappeditems[*]']` per upstream tupleobject.py:381).
+pub unsafe fn alloc_tuple_items_block(values: &[PyObjectRef]) -> *mut ItemsBlock {
+    let cap = values.len();
+    unsafe {
+        let block = alloc_items_block(cap);
+        let base = items_block_items_base(block);
+        for (i, v) in values.iter().enumerate() {
+            *base.add(i) = *v;
         }
+        block
     }
 }
 
-impl Index<usize> for PyObjectArray {
-    type Output = PyObjectRef;
+/// Grow an `ItemsBlock` to `new_cap` capacity, copying `live_len`
+/// existing items from `old`, NULL-initialising the rest, and
+/// deallocating `old`. Returns the new block. `old` may be null
+/// (fresh allocation). rlist.py:262-267 parity.
+pub unsafe fn grow_list_items_block(
+    old: *mut ItemsBlock,
+    new_cap: usize,
+    live_len: usize,
+) -> *mut ItemsBlock {
+    unsafe { grow_items_block(old, new_cap, live_len) }
+}
 
-    #[inline]
-    fn index(&self, index: usize) -> &Self::Output {
-        unsafe { &*self.ptr.add(index) }
+/// Deallocate an `ItemsBlock` previously allocated via
+/// `alloc_list_items_block` / `grow_list_items_block`. No-op on null.
+pub unsafe fn dealloc_list_items_block(block: *mut ItemsBlock) {
+    unsafe { dealloc_items_block(block) }
+}
+
+/// Allocate a fresh `ItemsBlock` with the given capacity.
+///
+/// STEPPING-STONE: still uses `std::alloc::alloc`. The
+/// `try_gc_alloc_stable` migration was attempted but routes the
+/// per-iteration list allocations through MiniMark's old-gen
+/// (mark-sweep, non-moving), which regresses bench (cranelift
+/// fannkuch timeout, dynasm nbody timeout) — old-gen-only
+/// containers accumulate until major GC fires. The correct
+/// long-term path is a nursery allocation behind caller-side
+/// root tracking; the `try_gc_owns_object` infra in
+/// `gc_hook.rs` is in place to support that follow-up. See
+/// `40d4a041d7` docstring for the same finding on `w_int_new`/
+/// `w_float_new`. Captured in Task #98 / `l1_step4ab*` memory.
+///
+/// The capacity header is initialized; items are left uninitialized —
+/// the caller must write all `capacity` slots before exposing the
+/// pointer to the GC walker. `cap` may be zero; the resulting block
+/// holds only the 8-byte capacity header (used by tuple — see
+/// [`alloc_tuple_items_block`] — for empty tuples).
+unsafe fn alloc_items_block(cap: usize) -> *mut ItemsBlock {
+    let layout = items_block_layout(cap);
+    unsafe {
+        let raw = alloc(layout);
+        if raw.is_null() {
+            std::alloc::handle_alloc_error(layout);
+        }
+        let block = raw as *mut ItemsBlock;
+        (*block).capacity = cap;
+        block
     }
 }
 
-impl IndexMut<usize> for PyObjectArray {
-    #[inline]
-    fn index_mut(&mut self, index: usize) -> &mut Self::Output {
-        unsafe { &mut *self.ptr.add(index) }
+/// Deallocate an `ItemsBlock` previously allocated via
+/// [`alloc_items_block`] or [`grow_items_block`]. STEPPING-STONE:
+/// still bound to the matching `std::alloc` allocator above. Once
+/// the alloc path migrates, this should discriminate via
+/// `crate::gc_hook::try_gc_owns_object` so GC-managed blocks are
+/// left for the major sweep instead of being dealloc'd directly.
+unsafe fn dealloc_items_block(block: *mut ItemsBlock) {
+    if block.is_null() {
+        return;
+    }
+    unsafe {
+        let cap = (*block).capacity;
+        let layout = items_block_layout(cap);
+        dealloc(block as *mut u8, layout);
+    }
+}
+
+fn items_block_layout(cap: usize) -> Layout {
+    let total = ITEMS_BLOCK_ITEMS_OFFSET + cap * std::mem::size_of::<PyObjectRef>();
+    Layout::from_size_align(total, std::mem::align_of::<ItemsBlock>()).expect("ItemsBlock layout")
+}
+
+/// Return the items base pointer of an `ItemsBlock`.
+#[inline]
+unsafe fn items_block_items_ptr(block: *mut ItemsBlock) -> *mut PyObjectRef {
+    unsafe { (block as *mut u8).add(ITEMS_BLOCK_ITEMS_OFFSET) as *mut PyObjectRef }
+}
+
+/// Reallocate an `ItemsBlock` to a new capacity, copying live items.
+/// Spare slots `live_len..capacity` are NULL-initialized so the GC
+/// walker (once `PY_OBJECT_ARRAY_GC_TYPE_ID` is active on the
+/// allocation) sees valid NULL refs in unused slots — upstream
+/// relies on `gc_malloc_array` zero-filling the fresh block
+/// (rlist.py:262-267 `_ll_list_resize_really`); pyre's `alloc`
+/// uses `std::alloc::alloc` which is not zero-filled so we
+/// explicit-init here.
+/// Old block is deallocated. Returns the new block.
+unsafe fn grow_items_block(
+    old: *mut ItemsBlock,
+    new_cap: usize,
+    live_len: usize,
+) -> *mut ItemsBlock {
+    unsafe {
+        let fresh = alloc_items_block(new_cap);
+        let new_base = items_block_items_ptr(fresh);
+        if !old.is_null() && live_len > 0 {
+            std::ptr::copy_nonoverlapping(items_block_items_ptr(old), new_base, live_len);
+        }
+        let fresh_cap = (*fresh).capacity;
+        for i in live_len..fresh_cap {
+            *new_base.add(i) = PY_NULL;
+        }
+        if !old.is_null() {
+            dealloc_items_block(old);
+        }
+        fresh
     }
 }
 

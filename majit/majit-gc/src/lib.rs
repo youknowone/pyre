@@ -175,6 +175,22 @@ pub trait GcAllocator: Send {
         length: usize,
     ) -> GcRef;
 
+    /// Allocate a stable-address object directly in old-gen.
+    ///
+    /// Used by host-side allocators (e.g. pyre-object `w_int_new`
+    /// non-cached path) that return a raw pointer the caller holds on
+    /// the Rust stack before it can be stored into a GC-tracked slot.
+    /// Old-gen objects never move in MiniMark mark-sweep collection,
+    /// so a subsequent minor collection cannot invalidate the pointer.
+    ///
+    /// Default implementation routes to
+    /// `alloc_nursery_no_collect_typed` so backends without a
+    /// distinct old-gen still compile; backends with a real old-gen
+    /// override to force placement there.
+    fn alloc_oldgen_typed(&mut self, type_id: u32, size: usize) -> GcRef {
+        self.alloc_nursery_no_collect_typed(type_id, size)
+    }
+
     /// incminimark.py:1569: jit_remember_young_pointer(obj)
     /// Perform a write barrier check on `obj`.
     /// Must be called before storing a GC reference into `obj`.
@@ -218,6 +234,17 @@ pub trait GcAllocator: Send {
 
     /// Remove a previously-registered root slot.
     fn remove_root(&mut self, _root: *mut GcRef) {}
+
+    /// Whether `addr` lies inside this GC's managed heap (nursery or
+    /// old-gen). Used by host-side allocators to discriminate
+    /// GC-allocated blocks from `std::alloc`-backed ones during the
+    /// L1/L2 stepping-stone window — `dealloc_items_block` must
+    /// early-return for GC-managed pointers (the GC sweeps them) and
+    /// fall through to `std::alloc::dealloc` for non-managed ones.
+    /// Default `false` matches stub allocators (no managed heap).
+    fn is_managed_heap_object(&self, _addr: usize) -> bool {
+        false
+    }
 
     /// Current nursery free pointer.
     fn nursery_free(&self) -> *mut u8;
@@ -732,4 +759,113 @@ pub fn alloc_nursery_typed(type_id: u32, payload_size: usize) -> GcRef {
         Some(f) => f(type_id, payload_size),
         None => GcRef(0),
     })
+}
+
+/// Thread-local callback that performs a stable-address old-gen
+/// allocation for the currently active backend. Used by host-side
+/// allocators whose callers hold the returned pointer on the Rust
+/// stack without registering it as a GC root (Task #141). MiniMark's
+/// old-gen is mark-sweep (non-moving), so a subsequent minor
+/// collection cannot invalidate the pointer. The callback returns
+/// `GcRef(0)` on allocation failure.
+pub type AllocOldgenTypedFn = fn(type_id: u32, payload_size: usize) -> GcRef;
+
+thread_local! {
+    static ACTIVE_ALLOC_OLDGEN_TYPED: Cell<Option<AllocOldgenTypedFn>> =
+        const { Cell::new(None) };
+}
+
+/// Install the active backend's old-gen allocator callback. Pass
+/// `None` to clear.
+pub fn set_active_alloc_oldgen_typed(hook: Option<AllocOldgenTypedFn>) {
+    ACTIVE_ALLOC_OLDGEN_TYPED.with(|c| c.set(hook));
+}
+
+/// Allocate a stable-address (old-gen) object through the active
+/// backend's GC. Returns `GcRef(0)` when no backend is installed on
+/// this thread.
+pub fn alloc_oldgen_typed(type_id: u32, payload_size: usize) -> GcRef {
+    ACTIVE_ALLOC_OLDGEN_TYPED.with(|c| match c.get() {
+        Some(f) => f(type_id, payload_size),
+        None => GcRef(0),
+    })
+}
+
+/// Thread-local callback that reports whether a raw address is owned
+/// by the active backend's GC heap. Used by host-side allocators
+/// (`pyre-object`'s `dealloc_items_block`) to discriminate
+/// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
+/// fallback blocks during the L1/L2 stepping-stone window:
+/// `dealloc` must early-return for GC-managed pointers (the GC
+/// sweeps them) and fall through to `std::alloc::dealloc` for
+/// `std::alloc`-allocated ones.
+pub type GcOwnsObjectFn = fn(addr: usize) -> bool;
+
+thread_local! {
+    static ACTIVE_GC_OWNS_OBJECT: Cell<Option<GcOwnsObjectFn>> = const { Cell::new(None) };
+}
+
+/// Install the active backend's `is_managed_heap_object` trampoline.
+pub fn set_active_gc_owns_object(hook: Option<GcOwnsObjectFn>) {
+    ACTIVE_GC_OWNS_OBJECT.with(|c| c.set(hook));
+}
+
+/// Whether `addr` lies inside the active backend's managed GC heap.
+/// Returns `false` when no backend is installed on this thread —
+/// callers treat that as "no GC owns this pointer" and fall through
+/// to their non-GC dealloc path.
+pub fn gc_owns_object(addr: usize) -> bool {
+    ACTIVE_GC_OWNS_OBJECT.with(|c| match c.get() {
+        Some(f) => f(addr),
+        None => false,
+    })
+}
+
+/// Thread-local callbacks for registering/removing a Rust-stack slot
+/// as a GC root with the currently active backend (Task #141 option
+/// a). Used by host-side allocators whose callers need to keep a
+/// just-allocated nursery pointer alive across a subsequent
+/// potentially-collecting allocation.
+///
+/// RPython accomplishes the same thing automatically via its GC
+/// transform pass (shadowstack save/restore around safepoints). pyre
+/// lacks that pass, so root registration is explicit at the call
+/// site. This is a documented PRE-EXISTING-ADAPTATION.
+pub type AddRootFn = unsafe fn(slot: *mut GcRef);
+pub type RemoveRootFn = fn(slot: *mut GcRef);
+
+thread_local! {
+    static ACTIVE_ADD_ROOT: Cell<Option<AddRootFn>> = const { Cell::new(None) };
+    static ACTIVE_REMOVE_ROOT: Cell<Option<RemoveRootFn>> = const { Cell::new(None) };
+}
+
+/// Install the active backend's root-register callbacks. Pass `None`
+/// to clear.
+pub fn set_active_root_hooks(add: Option<AddRootFn>, remove: Option<RemoveRootFn>) {
+    ACTIVE_ADD_ROOT.with(|c| c.set(add));
+    ACTIVE_REMOVE_ROOT.with(|c| c.set(remove));
+}
+
+/// Register a stack slot as a GC root with the active backend. No-op
+/// when no backend is installed on this thread.
+///
+/// # Safety
+/// The caller must ensure the slot remains valid until
+/// [`gc_remove_root`] is called with the same pointer.
+pub unsafe fn gc_add_root(slot: *mut GcRef) {
+    ACTIVE_ADD_ROOT.with(|c| {
+        if let Some(f) = c.get() {
+            unsafe { f(slot) }
+        }
+    });
+}
+
+/// Remove a previously-registered root slot from the active backend.
+/// No-op when no backend is installed on this thread.
+pub fn gc_remove_root(slot: *mut GcRef) {
+    ACTIVE_REMOVE_ROOT.with(|c| {
+        if let Some(f) = c.get() {
+            f(slot)
+        }
+    });
 }

@@ -194,9 +194,7 @@ use pyre_object::{
 
 use crate::descr::{
     dict_storage_values_len_descr, dict_storage_values_ptr_descr, float_floatval_descr,
-    int_intval_descr, list_items_len_descr, list_items_ptr_descr, list_strategy_descr,
-    ob_type_descr, tuple_items_len_descr, tuple_items_ptr_descr, w_float_size_descr,
-    w_int_size_descr,
+    int_intval_descr, list_strategy_descr, ob_type_descr, w_float_size_descr, w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_PYCODE_OFFSET,
@@ -1163,11 +1161,17 @@ impl MIFrame {
             dict_storage_values_len_descr(),
         );
         self.guard_len_gt_index(ctx, len, idx);
-        let values = ctx.record_op_with_descr(
+        // Post-L1: `dict_storage_values_ptr_descr()` now points at
+        // `*mut ItemsBlock` (not the legacy fat-pointer items base).
+        // Add `ITEMS_BLOCK_ITEMS_OFFSET` to recover the raw items-base
+        // pointer that `trace_raw_array_getitem_value` expects.
+        let block = ctx.record_op_with_descr(
             OpCode::GetfieldRawI,
             &[namespace],
             dict_storage_values_ptr_descr(),
         );
+        let offset = ctx.const_int(pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET as i64);
+        let values = ctx.record_op(OpCode::IntAdd, &[block, offset]);
         let idx_const = ctx.const_int(idx as i64);
         Ok(trace_raw_array_getitem_value(ctx, values, idx_const))
     }
@@ -1186,11 +1190,17 @@ impl MIFrame {
             dict_storage_values_len_descr(),
         );
         self.guard_len_gt_index(ctx, len, idx);
-        let values = ctx.record_op_with_descr(
+        // Post-L1: `dict_storage_values_ptr_descr()` now returns a
+        // `*mut ItemsBlock`. Recover the items-base pointer via
+        // `+ ITEMS_BLOCK_ITEMS_OFFSET` before emitting the raw
+        // setitem.
+        let block = ctx.record_op_with_descr(
             OpCode::GetfieldRawI,
             &[namespace],
             dict_storage_values_ptr_descr(),
         );
+        let offset = ctx.const_int(pyre_object::object_array::ITEMS_BLOCK_ITEMS_OFFSET as i64);
+        let values = ctx.record_op(OpCode::IntAdd, &[block, offset]);
         let idx_const = ctx.const_int(idx as i64);
         trace_raw_array_setitem_value(ctx, values, idx_const, value);
         Ok(())
@@ -2930,25 +2940,62 @@ impl MIFrame {
         crate::generated_dynamic_list_index(self, ctx, key, len, concrete_key)
     }
 
-    fn trace_unpack_known_sequence(
+    /// Unpack a known-length tuple. `tupleobject.py:376-390`
+    /// `W_TupleObject` carries `wrappeditems` only; length is read
+    /// from the GcArray header via `arraylen_gc(items_block,
+    /// pyobject_gcarray_descr)`. Guard order matches pyjitpl.py:832-836:
+    /// `guard_class(tuple) → getfield_gc_pure_r(wrappeditems) →
+    /// arraylen_gc(items_block) → implement_guard_value(len, count) →
+    /// per-index getarrayitem_gc_pure_r`.
+    fn trace_unpack_known_tuple(
         &mut self,
         ctx: &mut TraceCtx,
         seq: OpRef,
         count: usize,
-        expected_type: *const PyType,
-        items_ptr_descr: DescrRef,
-        items_len_descr: DescrRef,
+        items_descr: DescrRef,
     ) -> Vec<OpRef> {
-        self.guard_class(ctx, seq, expected_type);
+        self.guard_class(ctx, seq, &TUPLE_TYPE as *const PyType);
 
-        let len = trace_arraylen_gc(ctx, seq, items_len_descr);
+        let items_block = crate::state::opimpl_getfield_gc_r(ctx, seq, items_descr);
+        let len = crate::state::opimpl_arraylen_gc(
+            ctx,
+            items_block,
+            crate::state::pyobject_gcarray_descr(),
+        );
         self.implement_guard_value(ctx, len, count as i64);
 
-        let items_ptr = opimpl_getfield_gc_i(ctx, seq, items_ptr_descr);
         (0..count)
             .map(|idx| {
                 let idx = ctx.const_int(idx as i64);
-                trace_raw_array_getitem_value(ctx, items_ptr, idx)
+                crate::state::trace_items_block_getitem_value(ctx, items_block, idx)
+            })
+            .collect()
+    }
+
+    /// Unpack a known-length list under the Object strategy. List
+    /// keeps the inline `length` field (rlist.py:116 `("length",
+    /// Signed)`) so the length comes via `getfield_gc_i(length_descr)`,
+    /// not `arraylen_gc`. Items live in the same `Ptr(GcArray(
+    /// OBJECTPTR))` shape as tuples, read via `getarrayitem_gc_r`
+    /// against `pyobject_gcarray_descr`.
+    fn trace_unpack_known_list(
+        &mut self,
+        ctx: &mut TraceCtx,
+        seq: OpRef,
+        count: usize,
+        length_descr: DescrRef,
+        items_descr: DescrRef,
+    ) -> Vec<OpRef> {
+        self.guard_class(ctx, seq, &LIST_TYPE as *const PyType);
+
+        let len = opimpl_getfield_gc_i(ctx, seq, length_descr);
+        self.implement_guard_value(ctx, len, count as i64);
+
+        let items_block = crate::state::opimpl_getfield_gc_r(ctx, seq, items_descr);
+        (0..count)
+            .map(|idx| {
+                let idx = ctx.const_int(idx as i64);
+                crate::state::trace_items_block_getitem_value(ctx, items_block, idx)
             })
             .collect()
     }
@@ -2981,26 +3028,23 @@ impl MIFrame {
 
         let oprefs = self.with_ctx(|this, ctx| unsafe {
             if is_tuple(concrete_seq) && w_tuple_len(concrete_seq) == count {
-                return Ok(this.trace_unpack_known_sequence(
+                return Ok(this.trace_unpack_known_tuple(
                     ctx,
                     seq,
                     count,
-                    &TUPLE_TYPE as *const PyType,
-                    tuple_items_ptr_descr(),
-                    tuple_items_len_descr(),
+                    crate::descr::tuple_wrappeditems_descr(),
                 ));
             }
             if is_list(concrete_seq)
                 && w_list_uses_object_storage(concrete_seq)
                 && w_list_len(concrete_seq) == count
             {
-                return Ok(this.trace_unpack_known_sequence(
+                return Ok(this.trace_unpack_known_list(
                     ctx,
                     seq,
                     count,
-                    &LIST_TYPE as *const PyType,
-                    list_items_ptr_descr(),
-                    list_items_len_descr(),
+                    crate::descr::list_length_descr(),
+                    crate::descr::list_items_descr(),
                 ));
             }
             TraceHelperAccess::trace_unpack_sequence(this, seq, count)

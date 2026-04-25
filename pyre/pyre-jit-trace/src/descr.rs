@@ -175,7 +175,7 @@ pub fn make_field_descr(
 /// sequential index), causing OOM in `ensure_field_descr_slot`.
 ///
 /// The `index_in_parent` is computed by scanning the parent SizeDescr's
-/// `all_field_descrs` for a matching offset.
+/// `all_fielddescrs` for a matching offset.
 pub fn make_field_descr_with_parent(
     parent: DescrRef,
     offset: usize,
@@ -187,7 +187,7 @@ pub fn make_field_descr_with_parent(
     let index = parent
         .as_size_descr()
         .and_then(|sd| {
-            sd.all_field_descrs()
+            sd.all_fielddescrs()
                 .iter()
                 .enumerate()
                 .find(|(_, fd)| fd.as_field_descr().map_or(false, |f| f.offset() == offset))
@@ -277,7 +277,12 @@ pub struct PyreSizeDescr {
     /// descr.get_vtable() parity: ob_type pointer for NewWithVtable.
     /// optimize_new_with_vtable reads this to set VirtualInfo.known_class.
     vtable: usize,
-    all_field_descrs: Vec<Arc<dyn FieldDescr>>,
+    /// descr.py:72 `self.all_fielddescrs = all_fielddescrs`.
+    all_fielddescrs: Vec<Arc<dyn FieldDescr>>,
+    /// descr.py:71 `self.gc_fielddescrs = gc_fielddescrs` — precomputed
+    /// subset of `all_fielddescrs` via `is_pointer_field()`
+    /// (heaptracker.py:94-95 + :70 filter).
+    gc_fielddescrs: Vec<Arc<dyn FieldDescr>>,
 }
 
 struct PyreObjectDescrGroup {
@@ -302,11 +307,48 @@ pub use pyre_object::intobject::W_INT_GC_TYPE_ID;
 pub const JITFRAME_GC_TYPE_ID: u32 = 3;
 /// GC type id for JitVirtualRef (virtualref.py — JIT_VIRTUAL_REF).
 pub const VREF_GC_TYPE_ID: u32 = 4;
+/// GC type id for W_BoolObject. `bool` inherits from `int` per
+/// `objectobject.py W_BoolObject.typedef`, so this chains to
+/// `W_INT_GC_TYPE_ID` as its parent via `TypeInfo::object_subclass`
+/// (heaptracker.py:23-30 setup_cache_gcstruct2vtable — one typeid per
+/// distinct STRUCT, not per root layout).
+pub const W_BOOL_GC_TYPE_ID: u32 = 5;
+/// GC type id for W_RangeIterator. Inherits from `object`
+/// (rangeobject.rs:10 RANGE_ITER_TYPE).
+pub const RANGE_ITER_GC_TYPE_ID: u32 = 6;
+// `W_LIST_GC_TYPE_ID` / `W_TUPLE_GC_TYPE_ID` live in `pyre-object`
+// alongside their structs (matching W_INT/W_FLOAT pattern); re-exported
+// here for existing call sites.
+pub use pyre_object::listobject::W_LIST_GC_TYPE_ID;
+/// GC type id for the variable-length backing block of `PyObjectArray`
+/// (the list/tuple items storage). Shape matches `rlist.py:84,116`
+/// `GcArray(OBJECTPTR)` — a `T_IS_VARSIZE` block with an 8-byte
+/// single-slot `capacity` header (= upstream's GcArray length header,
+/// rlist.py:251 `len(l.items)`) followed by inline `PyObjectRef`
+/// items. Registered via `TypeInfo::varsize(8, 8, 0,
+/// items_have_gc_ptrs=true, [])` so the GC walks each item slot as a
+/// Ref (`gctypelayout.py:266-291 T_IS_VARSIZE / T_IS_GCARRAY_OF_GCPTR`);
+/// live list length is stored on the enclosing `W_ListObject` wrapper
+/// (`PyObjectArray.len`) to match rlist.py:116 `("length", Signed)`.
+///
+// `PY_OBJECT_ARRAY_GC_TYPE_ID` lives in `pyre-object` alongside the
+// `ItemsBlock` struct it describes (matching W_INT/W_FLOAT/W_LIST/
+// W_TUPLE pattern). Re-exported here for existing call sites.
+pub use pyre_object::object_array::PY_OBJECT_ARRAY_GC_TYPE_ID;
+pub use pyre_object::tupleobject::W_TUPLE_GC_TYPE_ID;
+// GC type ids for `W_SpecialisedTupleObject_{ii,ff,oo}` live in
+// `pyre-object` alongside the structs they describe; re-exported here
+// for existing call sites. See
+// `pyre_object::specialisedtupleobject::SPECIALISED_TUPLE_*_GC_TYPE_ID`.
+pub use pyre_object::specialisedtupleobject::{
+    SPECIALISED_TUPLE_FF_GC_TYPE_ID, SPECIALISED_TUPLE_II_GC_TYPE_ID,
+    SPECIALISED_TUPLE_OO_GC_TYPE_ID,
+};
 
 fn field_descr_from_group(group: &PyreObjectDescrGroup, index: usize) -> DescrRef {
     let field_descr = group
         .size_descr
-        .all_field_descrs
+        .all_fielddescrs
         .get(index)
         .expect("field descriptor index out of bounds")
         .clone();
@@ -321,7 +363,7 @@ fn build_object_descr_group(
 ) -> PyreObjectDescrGroup {
     let size_descr = Arc::new_cyclic(|weak_size: &Weak<PyreSizeDescr>| {
         let parent_descr: Weak<dyn Descr> = weak_size.clone();
-        let all_field_descrs: Vec<Arc<dyn FieldDescr>> = fields
+        let all_fielddescrs: Vec<Arc<dyn FieldDescr>> = fields
             .iter()
             .enumerate()
             .map(
@@ -343,11 +385,19 @@ fn build_object_descr_group(
                 },
             )
             .collect();
+        // descr.py:123-126 precompute both lists; `gc_fielddescrs` is
+        // `all_fielddescrs(only_gc=True)` per heaptracker.py:94-95.
+        let gc_fielddescrs: Vec<Arc<dyn FieldDescr>> = all_fielddescrs
+            .iter()
+            .filter(|fd| fd.is_pointer_field())
+            .cloned()
+            .collect();
         PyreSizeDescr {
             obj_size,
             type_id,
             vtable,
-            all_field_descrs,
+            all_fielddescrs,
+            gc_fielddescrs,
         }
     });
     PyreObjectDescrGroup { size_descr }
@@ -390,7 +440,7 @@ static W_FLOAT_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group(
         std::mem::size_of::<pyre_object::boolobject::W_BoolObject>(),
-        0,
+        W_BOOL_GC_TYPE_ID,
         &pyre_object::pyobject::BOOL_TYPE as *const _ as usize,
         &[(
             "W_BoolObject.boolval",
@@ -407,7 +457,7 @@ static W_BOOL_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
 static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
     build_object_descr_group(
         std::mem::size_of::<pyre_object::rangeobject::W_RangeIterator>(),
-        0,
+        RANGE_ITER_GC_TYPE_ID,
         &pyre_object::rangeobject::RANGE_ITER_TYPE as *const _ as usize,
         &[
             (
@@ -442,33 +492,56 @@ static RANGE_ITER_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(||
 });
 
 static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    // Upstream `rpython/rtyper/lltypesystem/rlist.py:116`
+    //     GcStruct("list", ("length", Signed), ("items", Ptr(ITEMARRAY)))
+    // The parity-field pair is `(length, items)`. `strategy` +
+    // `int_items` / `float_items` are pyre-only PRE-EXISTING-
+    // ADAPTATIONs for the PyPy interp-level strategy split.
     build_object_descr_group(
         std::mem::size_of::<W_ListObject>(),
-        0,
+        W_LIST_GC_TYPE_ID,
         &pyre_object::pyobject::LIST_TYPE as *const _ as usize,
         &[
+            // rlist.py:116 `("length", Signed)`. Mutable: Object-strategy
+            // push/pop/insert/remove/drain update it.
             (
-                "W_ListObject.items.ptr",
-                std::mem::offset_of!(W_ListObject, items),
+                "W_ListObject.length",
+                std::mem::offset_of!(W_ListObject, length),
                 8,
                 Type::Int,
                 false,
                 false,
                 false,
             ),
+            // rlist.py:116 `("items", Ptr(GcArray(OBJECTPTR)))`. Points
+            // at the `ItemsBlock` GcArray body. Mutable: re-pointed when
+            // the Object-strategy storage is reallocated
+            // (`list.object_grow` → `grow_list_items_block`) or when the
+            // strategy switches.
+            (
+                "W_ListObject.items",
+                std::mem::offset_of!(W_ListObject, items),
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
             (
                 // `W_ListObject.strategy` is MUTABLE: `switch_to_object_strategy`
-                // (listobject.rs:99-113) flips it from Integer/Float to Object
-                // when an incompatible item is stored.  A trace that folded
-                // strategy == Float at trace-time into a constant would then
-                // read from `float_items.ptr` (now empty after the switch)
-                // and dereference garbage — this is the spectral_norm n=10
+                // flips it from Integer/Float to Object when an
+                // incompatible item is stored. A trace that folded
+                // `strategy == Float` at trace-time into a constant would
+                // then read from `float_items.ptr` (empty after the
+                // switch) and dereference garbage — spectral_norm n=10
                 // SIGSEGV root cause diagnosed in
                 // memory/spectral_norm_small_n_crash_2026_04_17.md.
                 //
-                // Upstream PyPy handles this with a quasi-immutable flag +
-                // invalidate_compiled_code hook on strategy change; pyre
-                // has no such hook yet, so strategy stays plain-mutable.
+                // Upstream PyPy handles this with a quasi-immutable flag
+                // + invalidate_compiled_code hook on strategy change;
+                // pyre has no such hook yet, so `strategy` stays
+                // plain-mutable. NEW-DEVIATION — strategy split itself
+                // is a pyre-only adaptation vs rlist.py.
                 "W_ListObject.strategy",
                 std::mem::offset_of!(W_ListObject, strategy),
                 1,
@@ -477,15 +550,11 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
-            (
-                "W_ListObject.items.len",
-                std::mem::offset_of!(W_ListObject, items) + PYOBJECT_ARRAY_LEN_OFFSET,
-                8,
-                Type::Int,
-                false,
-                false,
-                false,
-            ),
+            // Integer-strategy typed storage (pyre-only
+            // PRE-EXISTING-ADAPTATION vs listobject.py's
+            // IntegerListStrategy at the interp level — upstream keeps
+            // the unwrap inline and doesn't add a separate backing
+            // array).
             (
                 "W_ListObject.int_items.ptr",
                 std::mem::offset_of!(W_ListObject, int_items) + INT_ARRAY_PTR_OFFSET,
@@ -513,6 +582,7 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            // Float-strategy typed storage.
             (
                 "W_ListObject.float_items.ptr",
                 std::mem::offset_of!(W_ListObject, float_items) + FLOAT_ARRAY_PTR_OFFSET,
@@ -540,39 +610,119 @@ static W_LIST_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+        ],
+    )
+});
+
+static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    // `pypy/objspace/std/tupleobject.py:376-390` `W_TupleObject` stores
+    // `wrappeditems: list` with `_immutable_fields_ =
+    // ['wrappeditems[*]']`. After translation this becomes
+    // `Ptr(GcArray(OBJECTPTR))`; `wrappeditems[*]` flows into both
+    // the field descr (`immutable: true`) AND the GcArray contents
+    // (read via `getfield_gc_pure_r`). Length comes from the GcArray
+    // header via `arraylen_gc(items_block)` — no inline length cache.
+    build_object_descr_group(
+        std::mem::size_of::<W_TupleObject>(),
+        W_TUPLE_GC_TYPE_ID,
+        &pyre_object::pyobject::TUPLE_TYPE as *const _ as usize,
+        &[
+            // `Ptr(GcArray(OBJECTPTR))` — wrappeditems body. Immutable.
             (
-                "W_ListObject.items.cap",
-                std::mem::offset_of!(W_ListObject, items) + PYOBJECT_ARRAY_CAP_OFFSET,
+                "W_TupleObject.wrappeditems",
+                std::mem::offset_of!(W_TupleObject, wrappeditems),
                 8,
-                Type::Int,
+                Type::Ref,
                 false,
-                false,
+                true,
                 false,
             ),
         ],
     )
 });
 
-static W_TUPLE_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+static SPECIALISED_TUPLE_II_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    // `specialisedtupleobject.py:34` `_immutable_fields_ = ['value0',
+    // 'value1']` — both fields immutable. Inline-field shape, no array
+    // indirection.
+    use pyre_object::specialisedtupleobject::*;
     build_object_descr_group(
-        std::mem::size_of::<W_TupleObject>(),
-        0,
-        &pyre_object::pyobject::TUPLE_TYPE as *const _ as usize,
+        std::mem::size_of::<W_SpecialisedTupleObject_ii>(),
+        SPECIALISED_TUPLE_II_GC_TYPE_ID,
+        &SPECIALISED_TUPLE_II_TYPE as *const _ as usize,
         &[
             (
-                "W_TupleObject.items.ptr",
-                std::mem::offset_of!(W_TupleObject, items),
+                "W_SpecialisedTupleObject_ii.value0",
+                SPECIALISED_TUPLE_II_VALUE0_OFFSET,
                 8,
                 Type::Int,
+                true,
+                true,
+                false,
+            ),
+            (
+                "W_SpecialisedTupleObject_ii.value1",
+                SPECIALISED_TUPLE_II_VALUE1_OFFSET,
+                8,
+                Type::Int,
+                true,
+                true,
+                false,
+            ),
+        ],
+    )
+});
+
+static SPECIALISED_TUPLE_FF_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::specialisedtupleobject::*;
+    build_object_descr_group(
+        std::mem::size_of::<W_SpecialisedTupleObject_ff>(),
+        SPECIALISED_TUPLE_FF_GC_TYPE_ID,
+        &SPECIALISED_TUPLE_FF_TYPE as *const _ as usize,
+        &[
+            (
+                "W_SpecialisedTupleObject_ff.value0",
+                SPECIALISED_TUPLE_FF_VALUE0_OFFSET,
+                8,
+                Type::Float,
                 false,
                 true,
                 false,
             ),
             (
-                "W_TupleObject.items.len",
-                std::mem::offset_of!(W_TupleObject, items) + PYOBJECT_ARRAY_LEN_OFFSET,
+                "W_SpecialisedTupleObject_ff.value1",
+                SPECIALISED_TUPLE_FF_VALUE1_OFFSET,
                 8,
-                Type::Int,
+                Type::Float,
+                false,
+                true,
+                false,
+            ),
+        ],
+    )
+});
+
+static SPECIALISED_TUPLE_OO_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
+    use pyre_object::specialisedtupleobject::*;
+    build_object_descr_group(
+        std::mem::size_of::<W_SpecialisedTupleObject_oo>(),
+        SPECIALISED_TUPLE_OO_GC_TYPE_ID,
+        &SPECIALISED_TUPLE_OO_TYPE as *const _ as usize,
+        &[
+            (
+                "W_SpecialisedTupleObject_oo.value0",
+                SPECIALISED_TUPLE_OO_VALUE0_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                true,
+                false,
+            ),
+            (
+                "W_SpecialisedTupleObject_oo.value1",
+                SPECIALISED_TUPLE_OO_VALUE1_OFFSET,
+                8,
+                Type::Ref,
                 false,
                 true,
                 false,
@@ -690,8 +840,11 @@ impl SizeDescr for PyreSizeDescr {
     fn is_immutable(&self) -> bool {
         false
     }
-    fn all_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
-        &self.all_field_descrs
+    fn all_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+        &self.all_fielddescrs
+    }
+    fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
+        &self.gc_fielddescrs
     }
     /// descr.py SizeDescr.is_object: every PyreSizeDescr that ships a
     /// vtable corresponds to a Python object (W_IntObject / W_ListObject /
@@ -708,7 +861,8 @@ pub fn make_size_descr(obj_size: usize) -> DescrRef {
         obj_size,
         type_id: 0,
         vtable: 0,
-        all_field_descrs: Vec::new(),
+        all_fielddescrs: Vec::new(),
+        gc_fielddescrs: Vec::new(),
     })
 }
 
@@ -717,7 +871,8 @@ pub fn make_size_descr_with_type(obj_size: usize, type_id: u32) -> DescrRef {
         obj_size,
         type_id,
         vtable: 0,
-        all_field_descrs: Vec::new(),
+        all_fielddescrs: Vec::new(),
+        gc_fielddescrs: Vec::new(),
     })
 }
 
@@ -748,8 +903,7 @@ use pyre_object::rangeobject::{
 use pyre_object::{
     BOOL_BOOLVAL_OFFSET, DICT_LEN_OFFSET, FLOAT_ARRAY_HEAP_CAP_OFFSET, FLOAT_ARRAY_LEN_OFFSET,
     FLOAT_ARRAY_PTR_OFFSET, INT_ARRAY_HEAP_CAP_OFFSET, INT_ARRAY_LEN_OFFSET, INT_ARRAY_PTR_OFFSET,
-    INT_INTVAL_OFFSET, PYOBJECT_ARRAY_CAP_OFFSET, PYOBJECT_ARRAY_LEN_OFFSET, STR_LEN_OFFSET,
-    W_ListObject, W_TupleObject,
+    INT_INTVAL_OFFSET, STR_LEN_OFFSET, W_ListObject, W_TupleObject,
 };
 use pyre_object::{FLOAT_TYPE, INT_TYPE};
 
@@ -787,15 +941,23 @@ pub fn range_iter_step_descr() -> DescrRef {
     field_descr_from_group(&RANGE_ITER_DESCR_GROUP, 2)
 }
 
-pub fn list_items_ptr_descr() -> DescrRef {
+/// rlist.py:116 `l.length` — live length of a list under the Object
+/// strategy. Under Integer/Float strategies this field is 0 and
+/// consumers must dispatch on `list.strategy` first.
+pub fn list_length_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 0)
 }
 
-pub fn list_strategy_descr() -> DescrRef {
+/// rlist.py:116 `l.items: Ptr(GcArray(OBJECTPTR))` — pointer to the
+/// `ItemsBlock` GcArray body. Callers that need items[i] must combine
+/// with the `PY_OBJECT_ARRAY` array descr (item_size=8, Ref,
+/// base_size=`ITEMS_BLOCK_ITEMS_OFFSET`); callers that need capacity
+/// must issue `ArraylenGc` against the same array descr.
+pub fn list_items_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 1)
 }
 
-pub fn list_items_len_descr() -> DescrRef {
+pub fn list_strategy_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 2)
 }
 
@@ -823,16 +985,55 @@ pub fn list_float_items_heap_cap_descr() -> DescrRef {
     field_descr_from_group(&W_LIST_DESCR_GROUP, 8)
 }
 
-pub fn tuple_items_ptr_descr() -> DescrRef {
+/// `Ptr(GcArray(OBJECTPTR))` — `wrappeditems` body per
+/// `tupleobject.py:381` `_immutable_fields_ = ['wrappeditems[*]']`.
+/// Immutable. Length comes from `arraylen_gc(items_block,
+/// pyobject_gcarray_descr)` against the GcArray header — no
+/// `tuple_length_descr` exists per upstream tupleobject.py:376-390
+/// (`W_TupleObject` carries `wrappeditems` only).
+pub fn tuple_wrappeditems_descr() -> DescrRef {
     field_descr_from_group(&W_TUPLE_DESCR_GROUP, 0)
 }
 
-pub fn tuple_items_len_descr() -> DescrRef {
-    field_descr_from_group(&W_TUPLE_DESCR_GROUP, 1)
+/// `W_SpecialisedTupleObject_ii.value0` — inline `i64` per
+/// `specialisedtupleobject.py:34-44`. Immutable.
+pub fn specialised_tuple_ii_value0_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 0)
 }
 
-pub fn list_items_heap_cap_descr() -> DescrRef {
-    field_descr_from_group(&W_LIST_DESCR_GROUP, 9)
+/// `W_SpecialisedTupleObject_ii.value1` — inline `i64`. Immutable.
+pub fn specialised_tuple_ii_value1_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_II_DESCR_GROUP, 1)
+}
+
+/// `W_SpecialisedTupleObject_ff.value0` — inline `f64`. Immutable.
+pub fn specialised_tuple_ff_value0_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 0)
+}
+
+/// `W_SpecialisedTupleObject_ff.value1` — inline `f64`. Immutable.
+pub fn specialised_tuple_ff_value1_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_FF_DESCR_GROUP, 1)
+}
+
+/// `W_SpecialisedTupleObject_oo.value0` — inline `PyObjectRef`. Immutable.
+pub fn specialised_tuple_oo_value0_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 0)
+}
+
+/// `W_SpecialisedTupleObject_oo.value1` — inline `PyObjectRef`. Immutable.
+pub fn specialised_tuple_oo_value1_descr() -> DescrRef {
+    field_descr_from_group(&SPECIALISED_TUPLE_OO_DESCR_GROUP, 1)
+}
+
+/// `ItemsBlock.capacity` — the GcArray length header at offset 0 of
+/// an `ItemsBlock`, matching `rlist.py:84/251` `len(l.items)`
+/// (allocated capacity, not live length). Immutable: once a block is
+/// allocated the capacity is fixed; resize allocates a fresh block.
+/// Callers combine `list_items_descr()` / `tuple_wrappeditems_descr()`
+/// → `ItemsBlock*` with this descr to read the block's allocated size.
+pub fn items_block_capacity_descr() -> DescrRef {
+    make_immutable_field_descr(0, 8, Type::Int, false)
 }
 
 pub fn int_intval_descr() -> DescrRef {

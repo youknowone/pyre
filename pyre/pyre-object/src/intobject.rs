@@ -56,13 +56,15 @@ static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| {
 /// Values in -5..=256 are returned from a pre-allocated cache (no heap
 /// allocation). Values outside this range are heap-allocated via
 /// `Box::into_raw` (Phase 1 leak). A future phase routes the
-/// non-cached path through `crate::gc_hook::try_gc_alloc`, but a
-/// direct substitution is unsafe today: the caller holds the returned
-/// `PyObjectRef` on the Rust stack without registering it as a GC
-/// root, so a minor-collection-driven nursery copy between
-/// `w_int_new` returning and the caller writing into a tracked slot
-/// leaves a dangling pointer. See Task #140 memory for the
-/// SIGSEGV reproduced when attempting the migration.
+/// non-cached path through `crate::gc_hook::try_gc_alloc` — see
+/// Task #140 / Task #141. Option (b) (route straight to old-gen via
+/// `try_gc_alloc_stable`) is correctness-safe (MiniMark old-gen is
+/// mark-sweep non-moving) but causes heavy regressions in bench
+/// (fannkuch timeout, nbody/spectral_norm slower) because every
+/// non-cached large-int allocation pins into oldgen and accumulates
+/// until major GC. The full fix routes through a caller-side
+/// `rgc.add_root` / `out: &mut slot` pattern (option a or d) so
+/// short-lived ints can still land in the nursery.
 #[inline]
 pub fn w_int_new(value: i64) -> PyObjectRef {
     if value >= SMALL_INT_MIN && value <= SMALL_INT_MAX {

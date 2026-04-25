@@ -5166,7 +5166,7 @@ mod ensure_ptr_info_arg0_tests {
         let mut ctx = OptContext::with_num_inputs(4, 1);
         // Keep a strong reference to the parent alive for the duration
         // of the test: `SimpleFieldDescr::parent_descr` is a
-        // `Weak<DescrRef>` (breaks the cycle between SizeDescr.all_field_descrs
+        // `Weak<DescrRef>` (breaks the cycle between SizeDescr.all_fielddescrs
         // and FieldDescr.parent_descr), so the test must hold the parent
         // Arc until `get_parent_descr()` has been called.
         let _parent = struct_parent_descr();

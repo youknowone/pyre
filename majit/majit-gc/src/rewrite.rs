@@ -848,7 +848,7 @@ impl GcRewriterImpl {
         // rewrite.py:501-504 — populate `delayed_zero_setfields[result][ofs] = None`
         // per GC-pointer field (`descr.gc_fielddescrs` / unpack_fielddescr).
         let entries = st.delayed_zero_setfields(result);
-        for fd in descr.gc_field_descrs() {
+        for fd in descr.gc_fielddescrs() {
             entries.insert(fd.offset() as i64, ());
         }
     }
@@ -2387,7 +2387,7 @@ mod tests {
         fn vtable(&self) -> usize {
             self.vtable
         }
-        fn gc_field_descrs(&self) -> &[Arc<dyn FieldDescr>] {
+        fn gc_fielddescrs(&self) -> &[Arc<dyn FieldDescr>] {
             &self.gc_fields
         }
     }

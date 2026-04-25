@@ -1524,6 +1524,27 @@ pub(crate) fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef)
     opimpl_getfield_gc_i(ctx, obj, descr)
 }
 
+/// pyjitpl.py:744-748 `opimpl_arraylen_gc`. Emits the actual
+/// `ArraylenGc` op against the GcArray header (rlist.py:251
+/// `len(l.items)` reads the array's length-prefix). Caller is the
+/// items_block Ref (output of `opimpl_getfield_gc_r` on
+/// `tuple_wrappeditems_descr` / `list_items_descr`); `descr` is the
+/// matching array descr (e.g. `pyobject_gcarray_descr`).
+///
+/// Distinct from `trace_arraylen_gc` above — that helper reads
+/// pyre-specific length FIELDS off the host wrapper struct via
+/// getfield (PRE-EXISTING-ADAPTATION) and is reserved for callers
+/// that still go through that path (`str_len`, `dict_len`,
+/// `list_length`, typed list `int_items.len`).
+pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrRef) -> OpRef {
+    if let Some(cached) = ctx.heap_cache().arraylen(array) {
+        return cached;
+    }
+    let result = ctx.record_op_with_descr(OpCode::ArraylenGc, &[array], descr);
+    ctx.heap_cache_mut().arraylen_now_known(array, result);
+    result
+}
+
 pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
     // pyjitpl.py:opimpl_getfield_gc_i parity: the tracer does NOT fold
     // pure field reads on constant objects. Folding happens in the
@@ -1554,6 +1575,33 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
         OpCode::GetfieldGcPureI
     } else {
         OpCode::GetfieldGcI
+    };
+    let result = ctx.record_op_with_descr(opcode, &[obj], descr);
+    ctx.heap_cache_mut()
+        .getfield_now_known(obj, field_index, result);
+    result
+}
+
+/// pyjitpl.py:874-882 `opimpl_getfield_gc_r`. Same shape as `_i`
+/// modulo the rop variant — folding lives in the optimizer
+/// (`optimize_GETFIELD_GC_R = optimize_GETFIELD_GC_I` per RPython's
+/// alias), so the tracer only records the GC op.
+pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
+    let field_index = descr.index();
+    if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
+        return cached;
+    }
+    if descr.is_quasi_immutable() && !ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
+        ctx.heap_cache_mut().quasi_immut_now_known(obj, field_index);
+        ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
+        if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+            ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
+        }
+    }
+    let opcode = if descr.is_always_pure() {
+        OpCode::GetfieldGcPureR
+    } else {
+        OpCode::GetfieldGcR
     };
     let result = ctx.record_op_with_descr(opcode, &[obj], descr);
     ctx.heap_cache_mut()
@@ -1726,6 +1774,49 @@ pub(crate) fn trace_raw_array_getitem_value(
     ctx.heap_cache_mut()
         .getarrayitem_now_known(array, index, descr_idx, result);
     result
+}
+
+/// `pyjitpl.py:832` `arraybox = opimpl_getfield_gc_r(listbox, itemsdescr)`
+/// followed by `getarrayitem_gc(arraybox, idx, arraydescr)`.
+///
+/// Caller passes the `items_block` Ref (output of
+/// `opimpl_getfield_gc_r` against the `items` /  `wrappeditems` field)
+/// directly. The `pyobject_gcarray_descr` here is
+/// `Ptr(GcArray(OBJECTPTR))` with `base_size = ITEMS_BLOCK_ITEMS_OFFSET`
+/// (= length-prefix size), `item_size = 8`, `item_type = Ref`,
+/// matching `rpython/rtyper/lltypesystem/rlist.py:84` `GcArray(OBJECTPTR)`.
+///
+/// Replaces the prior two-step `IntAdd(items_block, OFFSET) +
+/// raw-array op` NEW-DEVIATION with the upstream single-op shape.
+pub(crate) fn trace_items_block_getitem_value(
+    ctx: &mut TraceCtx,
+    block: OpRef,
+    index: OpRef,
+) -> OpRef {
+    let descr = pyobject_gcarray_descr();
+    let descr_idx = descr.index();
+    if let Some(cached) = ctx.heap_cache().getarrayitem_cache(block, index, descr_idx) {
+        return cached;
+    }
+    let result = ctx.record_op_with_descr(OpCode::GetarrayitemGcR, &[block, index], descr);
+    ctx.heap_cache_mut()
+        .getarrayitem_now_known(block, index, descr_idx, result);
+    result
+}
+
+/// Companion of [`trace_items_block_getitem_value`] — emits
+/// `setarrayitem_gc(block, index, value)` against `pyobject_gcarray_descr`.
+pub(crate) fn trace_items_block_setitem_value(
+    ctx: &mut TraceCtx,
+    block: OpRef,
+    index: OpRef,
+    value: OpRef,
+) {
+    let descr = pyobject_gcarray_descr();
+    let descr_idx = descr.index();
+    ctx.record_op_with_descr(OpCode::SetarrayitemGc, &[block, index, value], descr);
+    ctx.heap_cache_mut()
+        .setarrayitem_cache(block, index, descr_idx, value);
 }
 
 pub(crate) fn trace_raw_int_array_getitem_value(
@@ -4518,7 +4609,7 @@ impl PyreJitState {
 /// Allocates `descr.size()` bytes aligned to 8, seeds the PyObject header
 /// (`ob_type = descr.vtable()`, `w_class = get_instantiate(vtable)`), then
 /// replays each traced field using the FieldDescr's byte offset/size/type
-/// from the SizeDescr's `all_field_descrs()` table (resume.py:597-603
+/// from the SizeDescr's `all_fielddescrs()` table (resume.py:597-603
 /// setfields loop — `decoder.setfield(struct, num, descr)`).
 ///
 /// The vtable source is the descr itself — there is no `type_id` special-casing,
@@ -4566,7 +4657,7 @@ fn materialize_virtual_object(
     // value at descr.offset() with descr.field_size() bytes.
     for (field_idx, value) in fields {
         let Some(field_descr) = size_descr
-            .all_field_descrs()
+            .all_fielddescrs()
             .iter()
             .find(|fd| fd.index() == *field_idx)
         else {
@@ -4620,7 +4711,7 @@ fn materialize_virtual_struct(
     }
     for (field_idx, value) in fields {
         let Some(field_descr) = size_descr
-            .all_field_descrs()
+            .all_fielddescrs()
             .iter()
             .find(|fd| fd.index() == *field_idx)
         else {
@@ -5874,16 +5965,12 @@ mod tests {
                     MaterializedValue::Value(&LIST_TYPE as *const PyType as usize as i64),
                 ),
                 (
-                    crate::descr::list_items_ptr_descr().index(),
+                    crate::descr::list_length_descr().index(),
+                    MaterializedValue::Value(2),
+                ),
+                (
+                    crate::descr::list_items_descr().index(),
                     MaterializedValue::VirtualRef(0),
-                ),
-                (
-                    crate::descr::list_items_len_descr().index(),
-                    MaterializedValue::Value(2),
-                ),
-                (
-                    crate::descr::list_items_heap_cap_descr().index(),
-                    MaterializedValue::Value(2),
                 ),
             ],
         };

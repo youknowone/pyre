@@ -78,6 +78,53 @@ fn wasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     })
 }
 
+/// Host-side old-gen allocation trampoline (Task #141). Stable
+/// across minor/major collections — see dynasm counterpart.
+fn wasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
+    WASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_deref_mut() {
+            Some(gc) => gc.alloc_oldgen_typed(type_id, size),
+            None => GcRef(0),
+        }
+    })
+}
+
+/// Host-side root-register trampoline (Task #141 option a).
+///
+/// # Safety
+/// Caller must keep `slot` valid until [`wasm_gc_remove_root`] is
+/// called with the same pointer.
+unsafe fn wasm_gc_add_root(slot: *mut GcRef) {
+    WASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_deref_mut() {
+            unsafe { gc.add_root(slot) };
+        }
+    });
+}
+
+/// Companion to [`wasm_gc_add_root`].
+fn wasm_gc_remove_root(slot: *mut GcRef) {
+    WASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_deref_mut() {
+            gc.remove_root(slot);
+        }
+    });
+}
+
+/// Host-side `is_managed_heap_object` trampoline.
+fn wasm_gc_owns_object(addr: usize) -> bool {
+    WASM_ACTIVE_GC.with(|cell| {
+        let guard = cell.borrow();
+        match guard.as_deref() {
+            Some(gc) => gc.is_managed_heap_object(addr),
+            None => false,
+        }
+    })
+}
+
 pub struct WasmBackend {
     trace_counter: u64,
     /// Optimizer constant pool (constant-namespace OpRef → i64 value).
@@ -128,6 +175,9 @@ impl WasmBackend {
             supports_guard_gc_type,
         });
         majit_gc::set_active_alloc_nursery_typed(Some(wasm_alloc_nursery_typed));
+        majit_gc::set_active_alloc_oldgen_typed(Some(wasm_alloc_oldgen_typed));
+        majit_gc::set_active_root_hooks(Some(wasm_gc_add_root), Some(wasm_gc_remove_root));
+        majit_gc::set_active_gc_owns_object(Some(wasm_gc_owns_object));
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.

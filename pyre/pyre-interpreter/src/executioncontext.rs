@@ -1,4 +1,8 @@
-use pyre_object::{PYOBJECT_ARRAY_LEN_OFFSET, PyObjectArray, PyObjectRef};
+use pyre_object::PyObjectRef;
+use pyre_object::object_array::{
+    ITEMS_BLOCK_ITEMS_OFFSET, ItemsBlock, alloc_list_items_block, dealloc_list_items_block,
+    grow_list_items_block, items_block_capacity, items_block_items_base,
+};
 
 use crate::{PyFrame, new_builtin_dict_storage};
 
@@ -15,12 +19,16 @@ pub fn app_profile_call(
     let _ = (_space, _w_callable, _frame, _event, _w_arg);
 }
 
-/// Byte offset of the value-array storage inside `DictStorage`.
+/// Byte offset of the GC-owning `values` pointer inside `DictStorage`.
+/// Post-L1 DictStorage holds a `*mut ItemsBlock` directly (no fat
+/// wrapper); the JIT reads this field to obtain the items-block
+/// pointer, then adds `ITEMS_BLOCK_ITEMS_OFFSET` for the items base.
 pub const DICT_STORAGE_VALUES_OFFSET: usize = std::mem::offset_of!(DictStorage, values);
 
 /// Byte offset of the live dict slot count inside `DictStorage`.
-pub const DICT_STORAGE_VALUES_LEN_OFFSET: usize =
-    DICT_STORAGE_VALUES_OFFSET + PYOBJECT_ARRAY_LEN_OFFSET;
+/// Post-L1 reads `DictStorage.length` directly (upstream
+/// `rdict.py` `l.length` equivalent for the values array).
+pub const DICT_STORAGE_VALUES_LEN_OFFSET: usize = std::mem::offset_of!(DictStorage, length);
 
 /// Internal dict backing used for globals, module dicts, and type dicts.
 ///
@@ -29,13 +37,23 @@ pub const DICT_STORAGE_VALUES_LEN_OFFSET: usize =
 /// string-keyed dict state such as `w_globals`, module dictionaries backed by
 /// `W_DictMultiObject`/`ModuleDictStrategy`, and type-level `dict_w`.
 ///
-/// Names are stored in insertion order and values live in a pointer-backed
-/// `PyObjectArray`, giving the JIT a stable slot model for hot global loads and
-/// stores.
+/// Names are stored in insertion order. Values live in an `ItemsBlock`
+/// GcArray body with an `(length, items)` pair matching upstream
+/// `rpython/rtyper/lltypesystem/rlist.py:116`
+/// `GcStruct("list", ("length", Signed), ("items", Ptr(ITEMARRAY)))`.
+/// The JIT reads `length` at a fixed offset and combines `values` with
+/// `ITEMS_BLOCK_ITEMS_OFFSET` for the items base pointer.
 #[repr(C)]
 pub struct DictStorage {
     names: Vec<String>,
-    values: PyObjectArray,
+    /// Number of live entries. Matches upstream `l.length` (rlist.py:
+    /// 116).
+    length: usize,
+    /// `Ptr(GcArray(OBJECTPTR))` — `l.items` (rlist.py:116). Points
+    /// at the `ItemsBlock` whose offset-0 header is the allocated
+    /// capacity (= upstream `len(l.items)` per rlist.py:251). Never
+    /// null — `DictStorage::new()` seeds a 1-slot block.
+    values: *mut ItemsBlock,
     /// Per-slot JIT invalidation watchers.
     /// RPython quasiimmut.py parity: each dict entry has its own
     /// QuasiImmut watcher list. Only loops that depend on a specific
@@ -45,15 +63,19 @@ pub struct DictStorage {
 
 impl Clone for DictStorage {
     fn clone(&self) -> Self {
-        let mut dict_storage = Self {
+        let snapshot = unsafe {
+            let base = items_block_items_base(self.values);
+            std::slice::from_raw_parts(base, self.length).to_vec()
+        };
+        let values = unsafe { alloc_list_items_block(&snapshot) };
+        Self {
             names: self.names.clone(),
-            values: PyObjectArray::from_vec(self.values.to_vec()),
+            length: snapshot.len(),
+            values,
             // Cloned storages start with no registered invalidation watchers,
             // but the per-slot shape must stay aligned with names/values.
             slot_watchers: vec![Vec::new(); self.names.len()],
-        };
-        dict_storage.fix_ptr();
-        dict_storage
+        }
     }
 }
 
@@ -65,18 +87,66 @@ impl Default for DictStorage {
 
 impl DictStorage {
     pub fn new() -> Self {
-        let mut dict_storage = Self {
+        let values = unsafe { alloc_list_items_block(&[]) };
+        Self {
             names: Vec::new(),
-            values: PyObjectArray::from_vec(Vec::new()),
+            length: 0,
+            values,
             slot_watchers: Vec::new(),
-        };
-        dict_storage.fix_ptr();
-        dict_storage
+        }
+    }
+
+    /// Reallocate `values` to fit at least `min_cap` entries, copying
+    /// the live prefix. Upstream `_ll_list_resize_really`
+    /// (rlist.py:262-267) parity.
+    unsafe fn grow(&mut self, min_cap: usize) {
+        let current_cap = items_block_capacity(self.values);
+        let target_cap = min_cap.max(current_cap.saturating_mul(2).max(4));
+        self.values = grow_list_items_block(self.values, target_cap, self.length);
+    }
+
+    unsafe fn push(&mut self, value: PyObjectRef) {
+        if self.length == items_block_capacity(self.values) {
+            self.grow(self.length + 1);
+        }
+        let base = items_block_items_base(self.values);
+        *base.add(self.length) = value;
+        self.length += 1;
+    }
+
+    unsafe fn remove_at(&mut self, idx: usize) -> PyObjectRef {
+        assert!(idx < self.length);
+        let base = items_block_items_base(self.values);
+        let value = *base.add(idx);
+        let p = base.add(idx);
+        std::ptr::copy(p.add(1), p, self.length - idx - 1);
+        self.length -= 1;
+        value
+    }
+
+    unsafe fn values_slice(&self) -> &[PyObjectRef] {
+        let base = items_block_items_base(self.values);
+        std::slice::from_raw_parts(base, self.length)
+    }
+
+    unsafe fn values_slice_mut(&mut self) -> &mut [PyObjectRef] {
+        let base = items_block_items_base(self.values);
+        std::slice::from_raw_parts_mut(base, self.length)
+    }
+
+    /// Replace the entire values backing with a freshly allocated
+    /// empty block. Used by `clear()`.
+    unsafe fn reset_values(&mut self) {
+        dealloc_list_items_block(self.values);
+        self.values = alloc_list_items_block(&[]);
+        self.length = 0;
     }
 
     #[inline]
     pub fn fix_ptr(&mut self) {
-        self.values.fix_ptr();
+        // Post-L1 `values` is a direct `*mut ItemsBlock` — no moves,
+        // no interior pointer to rebase. Retained as a no-op for
+        // source-compatibility with existing callers.
     }
 
     #[inline]
@@ -89,28 +159,29 @@ impl DictStorage {
         self.names.iter().position(|candidate| candidate == name)
     }
 
-    #[inline]
     pub fn get(&self, name: &str) -> Option<&PyObjectRef> {
-        self.slot_of(name).map(|idx| &self.values[idx])
+        let idx = self.slot_of(name)?;
+        Some(unsafe { &self.values_slice()[idx] })
     }
 
     /// Iterate over (name, value) pairs, skipping tombstoned slots.
     pub fn entries(&self) -> impl Iterator<Item = (&str, &PyObjectRef)> {
+        let values = unsafe { self.values_slice() };
         self.names
             .iter()
-            .enumerate()
-            .filter(|(_, name)| !name.is_empty())
-            .map(move |(i, name)| (name.as_str(), &self.values[i]))
+            .zip(values.iter())
+            .filter(|(name, _)| !name.is_empty())
+            .map(|(name, value)| (name.as_str(), value))
     }
 
     #[inline]
     pub fn get_slot(&self, idx: usize) -> Option<PyObjectRef> {
-        self.values.as_slice().get(idx).copied()
+        unsafe { self.values_slice().get(idx).copied() }
     }
 
     #[inline]
     pub fn values_mut(&mut self) -> &mut [PyObjectRef] {
-        self.values.as_mut_slice()
+        unsafe { self.values_slice_mut() }
     }
 
     pub fn get_or_insert_with(
@@ -119,26 +190,27 @@ impl DictStorage {
         make: impl FnOnce() -> PyObjectRef,
     ) -> PyObjectRef {
         if let Some(idx) = self.slot_of(name) {
-            return self.values[idx];
+            return unsafe { self.values_slice()[idx] };
         }
         let value = make();
         self.names.push(name.to_string());
-        self.values.push(value);
+        unsafe { self.push(value) };
         self.slot_watchers.push(Vec::new());
         value
     }
 
     pub fn insert(&mut self, name: String, value: PyObjectRef) -> Option<PyObjectRef> {
         if let Some(idx) = self.slot_of(&name) {
-            let old = self.values[idx];
-            self.values[idx] = value;
+            let slice = unsafe { self.values_slice_mut() };
+            let old = slice[idx];
+            slice[idx] = value;
             if old != value {
                 self.notify_slot_watchers(idx);
             }
             Some(old)
         } else {
             self.names.push(name);
-            self.values.push(value);
+            unsafe { self.push(value) };
             self.slot_watchers.push(Vec::new());
             None
         }
@@ -150,7 +222,7 @@ impl DictStorage {
         if let Some(idx) = self.slot_of(name) {
             self.notify_slot_watchers(idx);
             self.names.remove(idx);
-            let old = self.values.remove(idx);
+            let old = unsafe { self.remove_at(idx) };
             self.slot_watchers.remove(idx);
             Some(old)
         } else {
@@ -160,7 +232,7 @@ impl DictStorage {
 
     #[inline]
     pub fn set_slot(&mut self, idx: usize, value: PyObjectRef) -> bool {
-        let slice = self.values.as_mut_slice();
+        let slice = unsafe { self.values_slice_mut() };
         let Some(slot) = slice.get_mut(idx) else {
             return false;
         };
@@ -215,8 +287,14 @@ impl DictStorage {
     #[inline]
     pub fn clear(&mut self) {
         self.names.clear();
-        self.values = PyObjectArray::from_vec(Vec::new());
+        unsafe { self.reset_values() };
         self.slot_watchers.clear();
+    }
+}
+
+impl Drop for DictStorage {
+    fn drop(&mut self) {
+        unsafe { dealloc_list_items_block(self.values) };
     }
 }
 

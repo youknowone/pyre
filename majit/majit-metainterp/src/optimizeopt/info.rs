@@ -1990,8 +1990,8 @@ impl PtrInfo {
         let Some(size_descr) = descr.as_size_descr() else {
             return;
         };
-        let all_field_descrs: Vec<DescrRef> = size_descr
-            .all_field_descrs()
+        let all_fielddescrs: Vec<DescrRef> = size_descr
+            .all_fielddescrs()
             .iter()
             .map(|field_descr| field_descr.clone() as DescrRef)
             .collect();
@@ -1999,41 +1999,41 @@ impl PtrInfo {
             PtrInfo::Instance(v) => {
                 if v.field_descrs.is_empty() {
                     v.descr = Some(descr);
-                    v.field_descrs = all_field_descrs;
+                    v.field_descrs = all_fielddescrs;
                 } else if index >= v.field_descrs.len() {
                     v.descr = Some(descr);
                     v.field_descrs
-                        .extend(all_field_descrs.into_iter().skip(v.field_descrs.len()));
+                        .extend(all_fielddescrs.into_iter().skip(v.field_descrs.len()));
                 }
             }
             PtrInfo::Struct(v) => {
                 if v.field_descrs.is_empty() {
                     v.descr = descr;
-                    v.field_descrs = all_field_descrs;
+                    v.field_descrs = all_fielddescrs;
                 } else if index >= v.field_descrs.len() {
                     v.descr = descr;
                     v.field_descrs
-                        .extend(all_field_descrs.into_iter().skip(v.field_descrs.len()));
+                        .extend(all_fielddescrs.into_iter().skip(v.field_descrs.len()));
                 }
             }
             PtrInfo::Virtual(v) => {
                 if v.field_descrs.is_empty() {
                     v.descr = descr;
-                    v.field_descrs = all_field_descrs;
+                    v.field_descrs = all_fielddescrs;
                 } else if index >= v.field_descrs.len() {
                     v.descr = descr;
                     v.field_descrs
-                        .extend(all_field_descrs.into_iter().skip(v.field_descrs.len()));
+                        .extend(all_fielddescrs.into_iter().skip(v.field_descrs.len()));
                 }
             }
             PtrInfo::VirtualStruct(v) => {
                 if v.field_descrs.is_empty() {
                     v.descr = descr;
-                    v.field_descrs = all_field_descrs;
+                    v.field_descrs = all_fielddescrs;
                 } else if index >= v.field_descrs.len() {
                     v.descr = descr;
                     v.field_descrs
-                        .extend(all_field_descrs.into_iter().skip(v.field_descrs.len()));
+                        .extend(all_fielddescrs.into_iter().skip(v.field_descrs.len()));
                 }
             }
             _ => {}
@@ -2242,9 +2242,9 @@ impl PtrInfo {
         // info.py:286-288: `for op in self._fields: if op is None: return False`.
         // RPython's _fields is pre-allocated to len(descr.get_all_fielddescrs())
         // with None for unset slots; pyre stores only set entries in `fields`,
-        // so parity requires fields.len() to match all_field_descrs().len()
+        // so parity requires fields.len() to match all_fielddescrs().len()
         // before treating the virtual as filled.
-        if fields.len() != size_descr.all_field_descrs().len() {
+        if fields.len() != size_descr.all_fielddescrs().len() {
             return false;
         }
         for &(_, val) in fields {

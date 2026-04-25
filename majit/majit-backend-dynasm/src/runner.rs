@@ -118,6 +118,63 @@ fn dynasm_alloc_nursery_typed(type_id: u32, size: usize) -> GcRef {
     })
 }
 
+/// Host-side old-gen allocation trampoline (Task #141). Used by
+/// pyre-object allocators (`w_int_new`, `w_float_new`) whose
+/// callers cannot register the returned pointer as a GC root before
+/// subsequent allocations. MiniMark's old-gen is mark-sweep
+/// (non-moving), so the returned pointer is stable across minor and
+/// major collections.
+fn dynasm_alloc_oldgen_typed(type_id: u32, size: usize) -> GcRef {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_deref_mut() {
+            Some(gc) => gc.alloc_oldgen_typed(type_id, size),
+            None => GcRef(0),
+        }
+    })
+}
+
+/// Host-side root-register trampoline (Task #141 option a). Bridges
+/// `majit_gc::gc_add_root` to the active backend's `RootSet`.
+///
+/// # Safety
+/// Caller must keep `slot` valid until [`dynasm_gc_remove_root`] is
+/// called with the same pointer.
+unsafe fn dynasm_gc_add_root(slot: *mut GcRef) {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_deref_mut() {
+            unsafe { gc.add_root(slot) };
+        }
+    });
+}
+
+/// Companion to [`dynasm_gc_add_root`].
+fn dynasm_gc_remove_root(slot: *mut GcRef) {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        if let Some(gc) = guard.as_deref_mut() {
+            gc.remove_root(slot);
+        }
+    });
+}
+
+/// Host-side `is_managed_heap_object` trampoline. Lets host-side
+/// allocators (`pyre_object::dealloc_items_block`) discriminate
+/// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
+/// fallback blocks during the L1/L2 stepping-stone window. Returns
+/// `false` when no GC is installed (caller falls through to
+/// `std::alloc::dealloc`).
+fn dynasm_gc_owns_object(addr: usize) -> bool {
+    DYNASM_ACTIVE_GC.with(|cell| {
+        let guard = cell.borrow();
+        match guard.as_deref() {
+            Some(gc) => gc.is_managed_heap_object(addr),
+            None => false,
+        }
+    })
+}
+
 /// _build_malloc_slowpath parity: nursery overflow slow path.
 ///
 /// Called from JIT-compiled code when inline nursery bump allocation
@@ -485,6 +542,9 @@ impl DynasmBackend {
             supports_guard_gc_type,
         });
         majit_gc::set_active_alloc_nursery_typed(Some(dynasm_alloc_nursery_typed));
+        majit_gc::set_active_alloc_oldgen_typed(Some(dynasm_alloc_oldgen_typed));
+        majit_gc::set_active_root_hooks(Some(dynasm_gc_add_root), Some(dynasm_gc_remove_root));
+        majit_gc::set_active_gc_owns_object(Some(dynasm_gc_owns_object));
     }
 
     /// llmodel.py:64-69 self.vtable_offset configuration.

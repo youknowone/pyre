@@ -1209,6 +1209,75 @@ fn alloc_nursery_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
     })
 }
 
+/// `majit_gc::AllocOldgenTypedFn` installed by `set_gc_allocator`.
+/// Routes host-side allocations that need a stable (non-moving)
+/// pointer through the active cranelift-owned GC's old-gen. Used by
+/// pyre-object `w_int_new` / `w_float_new` non-cached paths (Task
+/// #141) where the caller holds the returned pointer on the Rust
+/// stack across subsequent allocations. Returns `GcRef(0)` when no
+/// active runtime is set on this thread.
+fn alloc_oldgen_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
+    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
+        return GcRef(0);
+    };
+    GC_RUNTIMES.with(|r| {
+        let mut guard = r.borrow_mut();
+        match guard.get_mut(&id) {
+            Some(runtime) => runtime.alloc_oldgen_typed(type_id, size),
+            None => GcRef(0),
+        }
+    })
+}
+
+/// Host-side root-register trampoline (Task #141 option a). Bridges
+/// `majit_gc::gc_add_root` to the active cranelift-owned GC's
+/// `RootSet`.
+///
+/// # Safety
+/// Caller must keep `slot` valid until [`gc_remove_root_via_active_runtime`]
+/// is called with the same pointer.
+unsafe fn gc_add_root_via_active_runtime(slot: *mut GcRef) {
+    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
+        return;
+    };
+    GC_RUNTIMES.with(|r| {
+        let mut guard = r.borrow_mut();
+        if let Some(runtime) = guard.get_mut(&id) {
+            unsafe { runtime.add_root(slot) };
+        }
+    });
+}
+
+/// Companion to [`gc_add_root_via_active_runtime`].
+fn gc_remove_root_via_active_runtime(slot: *mut GcRef) {
+    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
+        return;
+    };
+    GC_RUNTIMES.with(|r| {
+        let mut guard = r.borrow_mut();
+        if let Some(runtime) = guard.get_mut(&id) {
+            runtime.remove_root(slot);
+        }
+    });
+}
+
+/// Host-side `is_managed_heap_object` trampoline. Lets host-side
+/// allocators (`pyre_object::dealloc_items_block`) discriminate
+/// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
+/// fallback blocks during the L1/L2 stepping-stone window.
+fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
+    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
+        return false;
+    };
+    GC_RUNTIMES.with(|r| {
+        let guard = r.borrow();
+        match guard.get(&id) {
+            Some(runtime) => runtime.is_managed_heap_object(addr),
+            None => false,
+        }
+    })
+}
+
 pub(crate) fn register_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
     if roots.is_empty() {
         return;
@@ -5896,6 +5965,12 @@ impl CraneliftBackend {
             supports_guard_gc_type,
         });
         majit_gc::set_active_alloc_nursery_typed(Some(alloc_nursery_typed_via_active_runtime));
+        majit_gc::set_active_alloc_oldgen_typed(Some(alloc_oldgen_typed_via_active_runtime));
+        majit_gc::set_active_root_hooks(
+            Some(gc_add_root_via_active_runtime),
+            Some(gc_remove_root_via_active_runtime),
+        );
+        majit_gc::set_active_gc_owns_object(Some(gc_owns_object_via_active_runtime));
     }
 
     // `set_constants`, `set_constant_types`, `set_next_trace_id`,

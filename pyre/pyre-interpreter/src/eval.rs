@@ -1526,8 +1526,7 @@ impl OpcodeStepExecutor for PyFrame {
     fn list_to_tuple(&mut self, val: PyObjectRef) -> Result<PyObjectRef, Self::Error> {
         unsafe {
             if pyre_object::is_list(val) {
-                let list = &*(val as *const pyre_object::listobject::W_ListObject);
-                let items = list.items.as_slice().to_vec();
+                let items = pyre_object::w_list_items_copy_as_vec(val);
                 return Ok(pyre_object::w_tuple_new(items));
             }
         }
@@ -2052,11 +2051,9 @@ impl OpcodeStepExecutor for PyFrame {
 
         let elements: Vec<PyObjectRef> = unsafe {
             if pyre_object::is_tuple(value) {
-                let t = &*(value as *const pyre_object::tupleobject::W_TupleObject);
-                t.items.as_slice().to_vec()
+                pyre_object::w_tuple_items_copy_as_vec(value)
             } else if pyre_object::is_list(value) {
-                let l = &*(value as *const pyre_object::listobject::W_ListObject);
-                l.items.as_slice().to_vec()
+                pyre_object::w_list_items_copy_as_vec(value)
             } else {
                 return Err(PyError::type_error("cannot unpack non-sequence"));
             }
@@ -2107,13 +2104,12 @@ impl OpcodeStepExecutor for PyFrame {
                 }
             } else if pyre_object::is_list(set) {
                 if pyre_object::is_list(iterable) {
-                    let src = &*(iterable as *const pyre_object::listobject::W_ListObject);
-                    for &item in src.items.as_slice() {
+                    let items = pyre_object::w_list_items_copy_as_vec(iterable);
+                    for item in items {
                         pyre_object::w_list_append(set, item);
                     }
                 } else if pyre_object::is_tuple(iterable) {
-                    let src = &*(iterable as *const pyre_object::tupleobject::W_TupleObject);
-                    for &item in src.items.as_slice() {
+                    for item in pyre_object::w_tuple_items_copy_as_vec(iterable) {
                         pyre_object::w_list_append(set, item);
                     }
                 }

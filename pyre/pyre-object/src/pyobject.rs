@@ -334,9 +334,24 @@ pub unsafe fn is_list(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &LIST_TYPE) }
 }
 
+/// Recognise any of the four tuple variants —
+/// canonical `W_TupleObject` plus the three `W_SpecialisedTupleObject_*`
+/// arity-2 specialisations from
+/// `pypy/objspace/std/specialisedtupleobject.py`. All four share the
+/// same Python `tuple` typedef in pypy; pyre encodes that by giving
+/// each variant a distinct `ob_type` (RPython-vtable equivalent) while
+/// `w_class` always resolves to the canonical `tuple` class object.
 #[inline]
 pub unsafe fn is_tuple(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &TUPLE_TYPE) }
+    use crate::specialisedtupleobject::{
+        SPECIALISED_TUPLE_FF_TYPE, SPECIALISED_TUPLE_II_TYPE, SPECIALISED_TUPLE_OO_TYPE,
+    };
+    unsafe {
+        py_type_check(obj, &TUPLE_TYPE)
+            || py_type_check(obj, &SPECIALISED_TUPLE_II_TYPE)
+            || py_type_check(obj, &SPECIALISED_TUPLE_FF_TYPE)
+            || py_type_check(obj, &SPECIALISED_TUPLE_OO_TYPE)
+    }
 }
 
 #[inline]
