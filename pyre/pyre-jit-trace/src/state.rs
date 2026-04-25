@@ -98,7 +98,11 @@ struct MetaInterpStaticData {
     /// this is set once at `finish_setup` time; in pyre the assembler is
     /// long-lived and liveness accumulates across lazy JitCode compiles,
     /// so this field is resynced after every `intern_liveness` write.
-    liveness_info: Vec<u8>,
+    ///
+    /// Stored as `Arc<[u8]>` so `liveness_info_snapshot()` can hand out
+    /// shared read-only slices (`metainterp_sd.liveness_info` parity in
+    /// resume.py:1022) without cloning the byte buffer per BH entry.
+    liveness_info: std::sync::Arc<[u8]>,
     /// pyjitpl.py:2255 `finish_setup` is per MetaInterpStaticData instance.
     /// `METAINTERP_SD` is thread-local in pyre, so this guard must live on
     /// the thread-local object rather than in a process-global `Once`.
@@ -148,7 +152,7 @@ impl MetaInterpStaticData {
         Self {
             by_code: std::collections::HashMap::new(),
             jitcodes: Vec::new(),
-            liveness_info: Vec::new(),
+            liveness_info: std::sync::Arc::<[u8]>::from(Vec::<u8>::new().into_boxed_slice()),
             finish_setup_done: false,
             op_live: u8::MAX,
             op_goto: u8::MAX,
@@ -203,14 +207,14 @@ impl MetaInterpStaticData {
     /// into this staticdata object and snapshot the current `all_liveness`.
     fn finish_setup_if_needed(&mut self, insns: &HashMap<String, u8>, all_liveness: Vec<u8>) {
         self.setup_insns(insns);
-        self.liveness_info = all_liveness;
+        self.liveness_info = std::sync::Arc::<[u8]>::from(all_liveness.into_boxed_slice());
         self.finish_setup_done = true;
     }
 
     /// pyjitpl.py:2264 `self.liveness_info = "".join(asm.all_liveness)` —
     /// refreshes the staticdata mirror after each writer-side append.
     pub(crate) fn set_liveness_info(&mut self, bytes: Vec<u8>) {
-        self.liveness_info = bytes;
+        self.liveness_info = std::sync::Arc::<[u8]>::from(bytes.into_boxed_slice());
     }
 }
 
@@ -383,16 +387,24 @@ pub fn intern_liveness(live_i: &[u8], live_r: &[u8], live_f: &[u8]) -> Option<u1
     })?;
 
     let (pos, all_liveness) = snapshot;
-    METAINTERP_SD.with(|r| r.borrow_mut().liveness_info = all_liveness);
+    METAINTERP_SD.with(|r| {
+        r.borrow_mut().liveness_info = std::sync::Arc::<[u8]>::from(all_liveness.into_boxed_slice())
+    });
     Some(pos)
 }
 
 /// RPython resume.py:1022 parity: read-only snapshot of
-/// `metainterp_sd.liveness_info` for the ResumeDataDirectReader. Returns a
-/// Vec copy because thread-local borrows cannot escape the closure.
-pub fn liveness_info_snapshot() -> Vec<u8> {
+/// `metainterp_sd.liveness_info` for the ResumeDataDirectReader.
+///
+/// Returns a shared `Arc<[u8]>` so the caller observes the same packed
+/// buffer the assembler published via `intern_liveness` /
+/// `publish_liveness_info` without copying its bytes (the previous
+/// implementation cloned the underlying `Vec<u8>` per BH entry — RPython
+/// upstream simply reads `metainterp_sd.liveness_info` straight off the
+/// staticdata object).
+pub fn liveness_info_snapshot() -> std::sync::Arc<[u8]> {
     ensure_finish_setup();
-    METAINTERP_SD.with(|r| r.borrow().liveness_info.clone())
+    METAINTERP_SD.with(|r| std::sync::Arc::clone(&r.borrow().liveness_info))
 }
 
 /// pyjitpl.py:2236 parity: expose the staticdata `live/` opcode for callers
@@ -694,7 +706,7 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
         let payload = &jc.payload;
         if let Some(&jit_pc) = payload.metadata.pc_map.get(pc as usize) {
             let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
-            let all_liveness = &sd.liveness_info;
+            let all_liveness: &[u8] = &sd.liveness_info;
             if off + 2 < all_liveness.len() {
                 let length_i = all_liveness[off] as usize;
                 let length_r = all_liveness[off + 1] as usize;
@@ -6643,7 +6655,7 @@ mod finish_setup_tests {
         assert_eq!(sd.op_ref_return, 76);
         assert_eq!(sd.op_float_return, 149);
         assert_eq!(sd.op_void_return, 150);
-        assert_eq!(sd.liveness_info, vec![1, 2, 3]);
+        assert_eq!(&*sd.liveness_info, &[1u8, 2, 3][..]);
         assert!(sd.finish_setup_done);
     }
 
