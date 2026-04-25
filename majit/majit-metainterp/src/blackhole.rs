@@ -2018,6 +2018,18 @@ impl BlackholeInterpreter {
                 // blackhole.py:1066-1093 bhimpl_jit_merge_point parity.
                 // @arguments("self", "i", "I", "R", "F", "I", "R", "F")
                 // Decode jdindex + 6 typed register lists from bytecode.
+                //
+                // PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): upstream
+                // `@arguments("i")` decodes the byte as a `registers_i`
+                // register index (the jdindex constant lives in the
+                // constants_i pool). pyre reads it as the value directly
+                // because both assemblers
+                // (`majit-translate/src/jit_codewriter/assembler.rs`
+                // LoopHeader/JitMergePoint arms,
+                // `majit-metainterp/src/jitcode/assembler.rs:639,705`)
+                // push a raw byte. Migration target: Phase G/H of the
+                // codewriter graph-keyed parity plan
+                // (`~/.claude/plans/lucky-growing-puzzle.md`).
                 let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
                 let jdindex = self.next_u8() as usize;
                 let gi = self._get_list_of_values_i();
@@ -2084,6 +2096,13 @@ impl BlackholeInterpreter {
             jitcode::BC_LOOP_HEADER => {
                 // blackhole.py:1062-1064 bhimpl_loop_header(jdindex): no-op.
                 // Argument byte is the jitdriver index (unused in blackhole).
+                //
+                // PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): see the
+                // matching note on `BC_JIT_MERGE_POINT` above — pyre reads
+                // the byte as the value directly instead of as a
+                // `registers_i` index (upstream `@arguments("i")`).
+                // Migration deferred to Phase G/H of the codewriter
+                // graph-keyed parity plan.
                 let _jdindex = self.next_u8();
             }
             jitcode::BC_REF_RETURN => {

@@ -7,6 +7,35 @@
 //! `look_inside_function`; subclasses (e.g. `StopAtXPolicy`) override that
 //! one method.  In Rust we use a trait + state struct so subclasses share
 //! the bookkeeping fields.
+//!
+//! ## Parity shape: allowlist via registration, not blacklist via module name
+//!
+//! Upstream `pypy/module/pypyjit/policy.py::PyPyJitPolicy.look_inside_function`
+//! returns `False` for functions whose Python module matches a rejection
+//! list (`pypy.interpreter.astcompiler.*`, `rpython.rlib.rlocale`, …). The
+//! base `JitPolicy.look_inside_function` defaults to `True`; the PyPy
+//! subclass flips that to `False` for the excluded modules. Un-excluded
+//! functions inline; excluded functions stay at the residual-call
+//! boundary.
+//!
+//! Pyre converges on the same observable behaviour through a different
+//! mechanism: the `PYRE_JIT_GRAPH_SOURCES` whitelist in
+//! `generated.rs` plus `CallControl::register_function_graph` plays the
+//! role of the allowed-module set. A callee whose `CallPath` is not
+//! present in `CallControl::function_graphs` is treated as residual at
+//! BFS time (`call.rs::find_all_graphs_bfs` only pulls callees into
+//! `candidate_graphs` when a matching graph exists).
+//!
+//! Consequence: pyre does **not** need a `PyPyJitPolicy`-style subclass
+//! listing excluded Rust modules. The analysed-source set is the policy;
+//! anything outside it is residual by construction. Per-graph hints
+//! (`_elidable_function_`, `_jit_look_inside_`, `_jit_unroll_safe_`,
+//! `access_directly`) still apply identically to upstream — they filter
+//! allowed graphs further.
+//!
+//! The contract is locked down by
+//! `tests/test_phase_d_find_all_graphs_parity.rs::
+//! find_all_graphs_leaves_unregistered_targets_as_residual`.
 
 use std::collections::HashSet;
 
@@ -140,9 +169,31 @@ pub trait JitPolicy {
                 .insert(func.name.clone());
         }
         let res = res && !contains_loop;
-        // policy.py:71-83: access_directly check.  Pyre has no
-        // `access_directly` annotation so this branch is omitted; it can
-        // be re-added when the virtualizable annotation lands.
+        // policy.py:71-83 `access_directly` virtualizable safety gate.
+        //
+        // RPython raises `ValueError("access_directly on a function which
+        // we don't see ...")` when three conditions meet:
+        //   - `see_function` is True (annotator determined the function is
+        //     part of the JIT-visible graph set),
+        //   - `res` is False (loops or unsupported types mean
+        //     `look_inside_graph` decided not to trace into it),
+        //   - `graph.access_directly` is True (annotator set this because
+        //     an argument carried the `access_directly` flag, see
+        //     `default_specialize` in `pypy/annotation/specialize.py`).
+        //
+        // Turning the call into a residual call while the function
+        // accesses a virtualizable would silently desynchronise the
+        // virtualizable from the JIT's view; upstream therefore aborts
+        // translation loudly. Pyre carries the same flag on
+        // `SemanticFunction.access_directly` (populated by the
+        // annotator-to-front bridge once it lands) so the gate fires the
+        // moment the same invariant breaks.
+        if see_function && !res && func.access_directly {
+            panic!(
+                "access_directly on a function which we don't see: {}",
+                func.name
+            );
+        }
         res
     }
 }
@@ -347,6 +398,7 @@ mod tests {
             return_type: None,
             self_ty_root: None,
             hints: hints.into_iter().map(|h| h.to_string()).collect(),
+            access_directly: false,
         }
     }
 
@@ -393,6 +445,7 @@ mod tests {
             return_type: None,
             self_ty_root: None,
             hints: vec![],
+            access_directly: false,
         };
         // Without `unroll_safe`, the loop disqualifies the graph.
         assert!(!policy.look_inside_graph(&loopy));
@@ -405,6 +458,7 @@ mod tests {
             return_type: None,
             self_ty_root: None,
             hints: vec!["unroll_safe".into()],
+            access_directly: false,
         };
         assert!(policy.look_inside_graph(&unroll_safe));
     }

@@ -573,6 +573,26 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
             kind_char: *kind_char,
         },
         OpKind::Live => OpKind::Live,
+        OpKind::JitMergePoint {
+            jitdriver_index,
+            greens_i,
+            greens_r,
+            greens_f,
+            reds_i,
+            reds_r,
+            reds_f,
+        } => OpKind::JitMergePoint {
+            jitdriver_index: *jitdriver_index,
+            greens_i: greens_i.iter().map(remap).collect(),
+            greens_r: greens_r.iter().map(remap).collect(),
+            greens_f: greens_f.iter().map(remap).collect(),
+            reds_i: reds_i.iter().map(remap).collect(),
+            reds_r: reds_r.iter().map(remap).collect(),
+            reds_f: reds_f.iter().map(remap).collect(),
+        },
+        OpKind::LoopHeader { jitdriver_index } => OpKind::LoopHeader {
+            jitdriver_index: *jitdriver_index,
+        },
         OpKind::CallElidable {
             funcptr,
             descriptor,
@@ -696,8 +716,34 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
         | OpKind::VableForce
         | OpKind::CurrentTraceLength
         | OpKind::Live
+        | OpKind::LoopHeader { .. }
         | OpKind::Unknown { .. } => {
             vec![]
+        }
+        OpKind::JitMergePoint {
+            greens_i,
+            greens_r,
+            greens_f,
+            reds_i,
+            reds_r,
+            reds_f,
+            ..
+        } => {
+            let mut v = Vec::with_capacity(
+                greens_i.len()
+                    + greens_r.len()
+                    + greens_f.len()
+                    + reds_i.len()
+                    + reds_r.len()
+                    + reds_f.len(),
+            );
+            v.extend(greens_i.iter().copied());
+            v.extend(greens_r.iter().copied());
+            v.extend(greens_f.iter().copied());
+            v.extend(reds_i.iter().copied());
+            v.extend(reds_r.iter().copied());
+            v.extend(reds_f.iter().copied());
+            v
         }
         OpKind::FieldRead { base, .. } => vec![*base],
         OpKind::FieldWrite { base, value, .. } => vec![*base, *value],

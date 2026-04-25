@@ -588,6 +588,31 @@ pub enum OpKind {
     /// this point. RPython: jtransform.py:469,481,533.
     Live,
 
+    /// JitDriver merge-point marker — RPython `jit_merge_point` opname.
+    /// Emitted by `handle_jit_marker__jit_merge_point` (jtransform.py:1690-1712)
+    /// with the portal jitdriver's index and green/red arguments split by
+    /// kind (`make_three_lists`). In upstream the args are a flat
+    /// `SpaceOperation.args` vec `[index_const, greens_i, greens_r,
+    /// greens_f, reds_i, reds_r, reds_f]`; pyre stores them as structured
+    /// fields to avoid re-splitting on every consumer.
+    JitMergePoint {
+        jitdriver_index: usize,
+        greens_i: Vec<ValueId>,
+        greens_r: Vec<ValueId>,
+        greens_f: Vec<ValueId>,
+        reds_i: Vec<ValueId>,
+        reds_r: Vec<ValueId>,
+        reds_f: Vec<ValueId>,
+    },
+
+    /// JitDriver loop-header marker — RPython `loop_header` opname.
+    /// Emitted by `handle_jit_marker__loop_header` (jtransform.py:1714-1718)
+    /// with the jitdriver's index as its single Constant arg.
+    /// `can_enter_jit` markers alias to this (jtransform.py:1723).
+    LoopHeader {
+        jitdriver_index: usize,
+    },
+
     Unknown {
         kind: UnknownKind,
     },

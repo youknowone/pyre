@@ -50,6 +50,13 @@ fn main() {
         // / opcode_store_attr). Imported from `pyopcode.rs:6` and called
         // directly by default trait methods (pyopcode.rs:821).
         "../../pyre/pyre-interpreter/src/shared_opcode.rs",
+        // Phase D0 — portal runner `eval_loop_jit` + resume helpers
+        // (`allocate_struct` / `allocate_with_vtable` / exception glue).
+        // RPython `warmspot.py::portal_runner` analogue: this is the
+        // graph `find_all_graphs(portal)` seeds from at
+        // `call.py:57`. Handlers reached from here (opcode_*) are
+        // discovered as BFS callees, not as entry points.
+        "../../pyre/pyre-jit/src/eval.rs",
     ] {
         println!("cargo:rerun-if-changed={}", path);
     }

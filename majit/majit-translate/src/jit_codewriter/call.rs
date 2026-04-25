@@ -1475,6 +1475,7 @@ impl CallControl {
                             return_type: None,
                             self_ty_root: None,
                             hints,
+                            access_directly: false,
                         };
                         if policy.look_inside_graph(&func) {
                             self.candidate_graphs.insert(callee_path.clone());
@@ -3799,7 +3800,11 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
         // jtransform.py:901-903 — `record_quasiimmut_field` is pure bookkeeping
         // that the metainterp converts into a guard; cannot raise.
         | OpKind::RecordQuasiImmutField { .. }
-        | OpKind::Live => RaiseClass::No,
+        | OpKind::Live
+        // jtransform.py:1707 `jit_merge_point` / :1718 `loop_header` — pure
+        // markers consumed by the metainterp; cannot raise.
+        | OpKind::JitMergePoint { .. }
+        | OpKind::LoopHeader { .. } => RaiseClass::No,
         // Virtualizable field/array access (from boxes, no heap) → cannot raise
         OpKind::VableFieldRead { .. }
         | OpKind::VableFieldWrite { .. }

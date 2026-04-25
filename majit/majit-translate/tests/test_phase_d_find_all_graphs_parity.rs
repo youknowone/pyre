@@ -141,3 +141,49 @@ fn find_all_graphs_does_not_follow_portal_recursive_edges() {
     // step, regardless of the recursive edge.
     assert!(cc.is_candidate(&portal_path));
 }
+
+#[test]
+fn find_all_graphs_leaves_unregistered_targets_as_residual() {
+    // Phase D.2 parity contract: upstream `PyPyJitPolicy.look_inside_function`
+    // (`pypy/module/pypyjit/policy.py:25-39`) excludes per-module by name
+    // (`pypy.interpreter.astcompiler.*`, `rpython.rlib.rlocale`, …) so
+    // those functions become residual calls even when the BFS would
+    // otherwise follow them. Pyre uses a different but structurally
+    // equivalent mechanism: the `PYRE_JIT_GRAPH_SOURCES` whitelist plus
+    // `register_function_graph` plays the "allowed module" role, and an
+    // unregistered callee is treated as residual by construction —
+    // `find_all_graphs_bfs` at `call.rs:1466` only pulls a callee into
+    // `candidate_graphs` when `function_graphs.get(callee_path)` succeeds.
+    //
+    // The two mechanisms converge on the same observable behaviour: a
+    // direct_call whose callee lies outside the JIT-analysable surface
+    // stays residual. This test pins that contract so a future change
+    // that starts synthesising graphs for unregistered callees (or
+    // otherwise short-circuits the residual fallback) surfaces loudly.
+    let portal_path = CallPath::from_segments(["portal"]);
+    let unregistered_path = CallPath::from_segments(["external_helper"]);
+
+    let mut cc = CallControl::new();
+    cc.register_function_graph(
+        portal_path.clone(),
+        build_caller_graph("portal", &unregistered_path),
+    );
+    // NOTE: `unregistered_path` has no `register_function_graph` call — it
+    // represents an opaque callee (Rust stdlib, unregistered module,
+    // externally linked helper, etc.).
+    cc.mark_portal(portal_path.clone());
+
+    let mut policy = DefaultJitPolicy::new();
+    cc.find_all_graphs(&mut policy);
+
+    assert!(
+        cc.is_candidate(&portal_path),
+        "portal seeded by mark_portal must always be a candidate"
+    );
+    assert!(
+        !cc.is_candidate(&unregistered_path),
+        "Phase D.2: unregistered direct_call targets must stay residual — \
+         they are the pyre analogue of PyPyJitPolicy.look_inside_function=False, \
+         and BFS must not pull them into candidate_graphs"
+    );
+}

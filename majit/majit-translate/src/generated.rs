@@ -90,19 +90,28 @@ pub use crate::codewriter::AllJitCodes;
 /// upstream treats it as inlinable graph.
 ///
 /// Current roots:
-/// - `pyopcode.rs` — freestanding `opcode_*` handlers.
-/// - `eval.rs` — `PyFrame` trait impls (LocalOpcodeHandler /
-///   SharedOpcodeHandler / ControlOpcodeHandler / …).
-/// - `pyframe.rs` — inherent `impl PyFrame` helpers (push / pop /
-///   peek / check_exc_match).
-/// - `shared_opcode.rs` — freestanding `opcode_make_function`,
-///   `opcode_call`, `opcode_build_{list,tuple,map}`,
-///   `opcode_store_subscr`, `opcode_list_append`,
-///   `opcode_unpack_sequence`, `opcode_load_attr`, `opcode_store_attr`.
-///   These are imported at `pyopcode.rs:6` and called directly from
-///   default trait methods (pyopcode.rs:821). Before their inclusion,
-///   `analyze_multiple_pipeline` would report them as unresolved
-///   `direct_call` targets.
+/// - `pyre-interpreter/src/pyopcode.rs` — freestanding `opcode_*`
+///   handlers.
+/// - `pyre-interpreter/src/eval.rs` — `PyFrame` trait impls
+///   (LocalOpcodeHandler / SharedOpcodeHandler / ControlOpcodeHandler
+///   / …).
+/// - `pyre-interpreter/src/pyframe.rs` — inherent `impl PyFrame`
+///   helpers (push / pop / peek / check_exc_match).
+/// - `pyre-interpreter/src/shared_opcode.rs` — freestanding
+///   `opcode_make_function`, `opcode_call`,
+///   `opcode_build_{list,tuple,map}`, `opcode_store_subscr`,
+///   `opcode_list_append`, `opcode_unpack_sequence`, `opcode_load_attr`,
+///   `opcode_store_attr`. These are imported at `pyopcode.rs:6` and
+///   called directly from default trait methods (pyopcode.rs:821).
+///   Before their inclusion, `analyze_multiple_pipeline` would report
+///   them as unresolved `direct_call` targets.
+/// - `pyre-jit/src/eval.rs` — Phase D0 portal runner `eval_loop_jit`
+///   (pyre analogue of upstream `warmspot.py::portal_runner`) and
+///   its resume/allocation helpers (`allocate_struct`,
+///   `allocate_with_vtable`). Seeding this root lets
+///   `find_all_graphs(portal, policy)` find the portal graph for
+///   `setup_jitdriver`; opcode handlers become BFS callees, not
+///   entry points.
 ///
 /// `build.rs` carries a parallel `cargo:rerun-if-changed=...` entry for
 /// every string in this manifest; keep the two lists in lock-step.
@@ -111,6 +120,7 @@ const PYRE_JIT_GRAPH_SOURCES: &[&str] = &[
     include_str!("../../../pyre/pyre-interpreter/src/eval.rs"),
     include_str!("../../../pyre/pyre-interpreter/src/pyframe.rs"),
     include_str!("../../../pyre/pyre-interpreter/src/shared_opcode.rs"),
+    include_str!("../../../pyre/pyre-jit/src/eval.rs"),
 ];
 
 static ALL_JITCODES: OnceLock<AllJitCodes> = OnceLock::new();
@@ -200,5 +210,40 @@ mod tests {
                 path.segments
             );
         }
+    }
+
+    /// Phase D acceptance: `eval_loop_jit` is the portal (upstream
+    /// `warmspot.py::portal_runner` analogue, seeded into
+    /// `find_all_graphs(portal, policy)` at `call.py:57`). When the
+    /// portal runner lives in `PYRE_JIT_GRAPH_SOURCES`
+    /// (`pyre-jit/src/eval.rs`), the production pipeline must register a
+    /// JitCode for it *and* keep the match-arm callee
+    /// `execute_opcode_step` reachable as a BFS-discovered inlinee (not
+    /// as a separate entry point). A missing `eval_loop_jit` JitCode
+    /// here would indicate that `setup_jitdriver` silently fell back to
+    /// `execute_opcode_step`, reintroducing the "handler-as-portal"
+    /// shape Phase D eliminates.
+    #[test]
+    fn eval_loop_jit_portal_produces_jitcode_with_handler_closure() {
+        let reg = all_jitcodes();
+        let portal = CallPath::from_segments(["eval_loop_jit"]);
+        assert!(
+            reg.by_path.contains_key(&portal),
+            "Phase D parity: eval_loop_jit must have a JitCode after \
+             analyze_multiple_pipeline runs (production seeds portal via \
+             setup_jitdriver, find_all_graphs BFSes from it). Missing the \
+             entry means the portal fallback unexpectedly chose \
+             execute_opcode_step."
+        );
+        // The portal seed + BFS must bring `execute_opcode_step` (match
+        // dispatch, reached via `eval_loop_jit → execute_opcode_step` at
+        // `pyre-jit/src/eval.rs:1355`) into the candidate set.
+        assert!(
+            reg.by_path
+                .contains_key(&CallPath::from_segments(["execute_opcode_step"])),
+            "Phase D parity: execute_opcode_step must reach candidate_graphs \
+             as a BFS callee from eval_loop_jit; a JitCode must be present \
+             for it."
+        );
     }
 }

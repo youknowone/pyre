@@ -601,6 +601,31 @@ fn analyze_pipeline_from_parsed(
     // PyPy interp_jit.py: greens = ['next_instr', 'is_being_profiled', 'pycode'],
     //                      reds = ['frame', 'ec'], virtualizables = ['frame']
     // Callers can override the portal binding via `PipelineConfig::portal`.
+    //
+    // Default portal identity: prefer `eval_loop_jit`
+    // (pyre-jit/src/eval.rs:1187), the pyre analogue of upstream's
+    // `warmspot.py::portal_runner` and the single graph seeded into
+    // `find_all_graphs(portal, policy)` at `call.py:57`. When the graph
+    // set does not include pyre-jit/src/eval.rs (e.g. compact test
+    // inputs whose PYRE_JIT_GRAPH_SOURCES stops at pyre-interpreter),
+    // fall back to `execute_opcode_step` so those tests retain a portal
+    // target. `execute_opcode_step` itself is a handler reached from the
+    // real portal's match arm, so seeding BFS from it treats a handler
+    // as an entry point — tolerable only for the legacy test
+    // configurations that have no `eval_loop_jit` at all; once those
+    // tests feed the full Phase D0 source set the fallback is never
+    // exercised and the eval_loop_jit-only identity locks in.
+    let default_portal_name = {
+        let eval_loop_jit_path = parse::CallPath::from_segments(["eval_loop_jit"]);
+        if call_control
+            .function_graphs()
+            .contains_key(&eval_loop_jit_path)
+        {
+            "eval_loop_jit"
+        } else {
+            "execute_opcode_step"
+        }
+    };
     let (portal_name, portal_greens, portal_reds, portal_virtualizables, portal_red_types) =
         match &config.pipeline.portal {
             Some(spec) => (
@@ -611,7 +636,7 @@ fn analyze_pipeline_from_parsed(
                 spec.red_types.clone(),
             ),
             None => (
-                "execute_opcode_step".to_string(),
+                default_portal_name.to_string(),
                 vec![
                     "next_instr".to_string(),
                     "is_being_profiled".to_string(),

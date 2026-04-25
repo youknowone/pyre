@@ -247,7 +247,11 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
         | OpKind::AssertGreen { .. }
         | OpKind::RecordKnownResult { .. }
         // jtransform.py:901-903 — `record_quasiimmut_field` has no result.
-        | OpKind::RecordQuasiImmutField { .. } => ValueType::Void,
+        | OpKind::RecordQuasiImmutField { .. }
+        // jtransform.py:1707,1718 — jit_merge_point / loop_header have no
+        // result; upstream emits them with `op1 = SpaceOperation(..., None)`.
+        | OpKind::JitMergePoint { .. }
+        | OpKind::LoopHeader { .. } => ValueType::Void,
         OpKind::CurrentTraceLength => ValueType::Int,
         OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => ValueType::Int,
         // RPython: vtable entry is a `Ptr(FuncType)` address.

@@ -1209,6 +1209,99 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
 
+            // RPython jtransform.py:1714-1718 handle_jit_marker__loop_header
+            // emits `SpaceOperation('loop_header', [c_index], None)`; upstream
+            // assembler.py encodes that Constant via `emit_const(allow_short=
+            // False)` which registers it in `constants_i` and emits a single
+            // byte register index (argcodes `i`). The bhimpl signature
+            // (`blackhole.py:1062 @arguments("i")`) looks the byte up in
+            // `registers_i`. The canonical runtime key is `loop_header/i`
+            // (`majit-metainterp/src/jitcode/mod.rs:293`), and the payload is
+            // 1 byte. Emitting via the generic fallback would push zero
+            // operand bytes (because `op_value_refs(LoopHeader)` is empty),
+            // misaligning the dispatch cursor.
+            //
+            // PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): pyre's runtime
+            // shortcuts the `/i` register-file lookup and reads the byte as
+            // the jdindex value directly (see `blackhole.rs:2079-2083` and
+            // `pyjitpl/dispatch.rs:1097-1108`). portals have a single
+            // jitdriver so jdindex is always 0 and the two models collide
+            // on the same byte value, but structurally this diverges from
+            // upstream `@arguments("i")`. majit-translate mirrors the
+            // runtime shortcut to stay consistent with the legacy emitter
+            // (`majit-metainterp/src/jitcode/assembler.rs:639,705`) which
+            // also pushes the raw value — migrating only one side would
+            // desynchronise the two emitters. Migration target: Phase G/H
+            // of the `codewriter graph-keyed parity` plan
+            // (`~/.claude/plans/lucky-growing-puzzle.md`) removes the
+            // legacy emitter; at that point introduce `emit_const_i(jdindex)`
+            // here and switch runtime to `registers_i[next_u8()]`.
+            OpKind::LoopHeader { jitdriver_index } => {
+                assert!(
+                    *jitdriver_index <= u8::MAX as usize,
+                    "loop_header jitdriver_index {jitdriver_index} does not fit in one byte"
+                );
+                state.code.push(*jitdriver_index as u8);
+                argcodes.push('i');
+                let opnum = self.get_opnum("loop_header/i");
+                state.code[startposition] = opnum;
+            }
+
+            // RPython jtransform.py:1690-1712 handle_jit_marker__jit_merge_point
+            // emits `SpaceOperation('jit_merge_point',
+            //   [Constant(jdindex), greens_i, greens_r, greens_f,
+            //    reds_i, reds_r, reds_f], None)`. Upstream bhimpl signature
+            // (`blackhole.py:1066 @arguments("self","i","I","R","F",
+            // "I","R","F")`) reads jdindex + six typed register lists, each
+            // encoded as `[len:u8][reg:u8 * N]` (assembler.py:181-196 ListOfKind).
+            // pyre's runtime (`blackhole.rs:2012-2029`) consumes exactly this
+            // six-list shape. The canonical runtime key is
+            // `jit_merge_point/IRR` (`majit-metainterp/src/jitcode/mod.rs:309`)
+            // — the argcodes label is historical (original pyre portal only
+            // used greens_i / greens_r / reds_r), but the payload matches
+            // the full six-list shape per
+            // `majit-metainterp/src/jitcode/assembler.rs:706-729`. The
+            // generic fallback would flatten SSA register bytes without the
+            // length prefix and without the jdindex byte, corrupting the
+            // stream.
+            //
+            // PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): jdindex is
+            // emitted as a raw byte value instead of a `registers_i`
+            // register index (upstream `@arguments("i")`). Same rationale
+            // as OpKind::LoopHeader above — see that arm for the migration
+            // plan pinned to Phase G/H of the codewriter graph-keyed
+            // parity epic.
+            OpKind::JitMergePoint {
+                jitdriver_index,
+                greens_i,
+                greens_r,
+                greens_f,
+                reds_i,
+                reds_r,
+                reds_f,
+            } => {
+                assert!(
+                    *jitdriver_index <= u8::MAX as usize,
+                    "jit_merge_point jitdriver_index {jitdriver_index} does not fit in one byte"
+                );
+                state.code.push(*jitdriver_index as u8);
+                self.emit_list_of_kind(greens_i, RegKind::Int, regallocs, state);
+                self.emit_list_of_kind(greens_r, RegKind::Ref, regallocs, state);
+                self.emit_list_of_kind(greens_f, RegKind::Float, regallocs, state);
+                self.emit_list_of_kind(reds_i, RegKind::Int, regallocs, state);
+                self.emit_list_of_kind(reds_r, RegKind::Ref, regallocs, state);
+                self.emit_list_of_kind(reds_f, RegKind::Float, regallocs, state);
+                // Preserve the legacy `/IRR` key shape so the runtime
+                // dispatch table continues to resolve to BC_JIT_MERGE_POINT.
+                // Upstream argcodes would be `iIRRIRF`; pyre keeps the
+                // three-letter historical label.
+                argcodes.push('I');
+                argcodes.push('R');
+                argcodes.push('R');
+                let opnum = self.get_opnum("jit_merge_point/IRR");
+                state.code[startposition] = opnum;
+            }
+
             // Default: encode operand registers + result register (no descriptor)
             other => {
                 for v in crate::inline::op_value_refs(other) {
@@ -1430,6 +1523,8 @@ impl Assembler {
                 OpKind::RecordKnownResult { .. } => "RecordKnownResult",
                 OpKind::RecordQuasiImmutField { .. } => "RecordQuasiImmutField",
                 OpKind::Live => "Live",
+                OpKind::JitMergePoint { .. } => "JitMergePoint",
+                OpKind::LoopHeader { .. } => "LoopHeader",
                 OpKind::Unknown { .. } => "Unknown",
             }
         }
@@ -1860,6 +1955,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             format!("conditional_call_value_{result_kind}")
         }
         OpKind::Live => "live".into(),
+        // jtransform.py:1707,1718 — jit_merge_point / loop_header markers.
+        OpKind::JitMergePoint { .. } => "jit_merge_point".into(),
+        OpKind::LoopHeader { .. } => "loop_header".into(),
         // Call variants are handled by encode_op directly, not here.
         OpKind::CallElidable { .. } => "call_elidable".into(),
         OpKind::CallResidual { .. } => "residual_call".into(),
@@ -1993,6 +2091,24 @@ mod tests {
             },
         );
         regallocs
+    }
+
+    #[test]
+    fn jit_merge_point_and_loop_header_opnames() {
+        // jtransform.py:1707 `op1 = SpaceOperation('jit_merge_point', args, None)`
+        let merge = crate::model::OpKind::JitMergePoint {
+            jitdriver_index: 0,
+            greens_i: vec![],
+            greens_r: vec![],
+            greens_f: vec![],
+            reds_i: vec![],
+            reds_r: vec![],
+            reds_f: vec![],
+        };
+        assert_eq!(op_kind_to_opname(&merge), "jit_merge_point");
+        // jtransform.py:1718 `SpaceOperation('loop_header', [c_index], None)`
+        let header = crate::model::OpKind::LoopHeader { jitdriver_index: 0 };
+        assert_eq!(op_kind_to_opname(&header), "loop_header");
     }
 
     #[test]

@@ -33,6 +33,19 @@ pub struct SemanticFunction {
     /// "elidable" → _elidable_function_
     /// "loopinvariant" → _jit_loop_invariant_
     pub hints: Vec<String>,
+    /// RPython `graph.access_directly` (flowspace attribute set by the
+    /// annotator's `default_specialize` rewrite — see
+    /// `description.rs:1333-1335` + `pygraph.rs:53-56`). Carried into
+    /// `SemanticFunction` so `policy::look_inside_graph` can port the
+    /// `policy.py:71-83` virtualizable safety gate without reaching back
+    /// into the PyGraph layer.
+    ///
+    /// Today every SemanticFunction produced by `build_function_graph`
+    /// defaults to `false` because the `front::ast` parser does not yet
+    /// consult the annotator result; when the annotator-to-front bridge
+    /// lands, the bridge assigns this field from
+    /// `PyGraph.access_directly.get()` for the matching graph.
+    pub access_directly: bool,
 }
 
 /// RPython: struct field type info for `heaptracker.all_interiorfielddescrs`.
@@ -806,6 +819,7 @@ fn build_function_graph(
         return_type,
         self_ty_root,
         hints,
+        access_directly: false,
     }
 }
 

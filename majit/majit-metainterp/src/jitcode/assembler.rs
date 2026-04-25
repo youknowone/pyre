@@ -636,6 +636,27 @@ impl JitCodeBuilder {
     /// SpaceOperation('loop_header', [c_index], None). blackhole.py:1063
     /// bhimpl_loop_header(jdindex) is a no-op; pyjitpl.py:1527
     /// opimpl_loop_header records the jitdriver index for the trace.
+    ///
+    /// PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): upstream encodes the
+    /// jdindex Constant through `emit_const(allow_short=False)` which
+    /// registers it in `constants_i` and emits `num_regs_i + pool_idx` as
+    /// a single register-index byte (argcodes `i`); the runtime looks the
+    /// byte up in `registers_i` (blackhole.py:1062 `@arguments("i")`).
+    /// pyre pushes the raw jdindex byte and pairs it with a runtime that
+    /// reads the byte as the value directly (blackhole.rs:2082,
+    /// pyjitpl/dispatch.rs:1115). The shortcut coincidentally works
+    /// because portals have a single jitdriver, so jdindex is always 0.
+    /// A proper pool routing here is blocked on a u8 const-patch pass —
+    /// this emitter's `num_regs_i` grows monotonically during emission,
+    /// so `num_regs_i + pool_idx` computed at call time is wrong once a
+    /// later `touch_reg` widens the register file. The existing
+    /// `patch_const_refs()` (line 1846) only rewrites u16 operands;
+    /// extending it to u8 plus auditing every `add_const_i` site is
+    /// multi-session scope. Migration target: Phase G/H of the
+    /// `codewriter graph-keyed parity` plan
+    /// (`~/.claude/plans/lucky-growing-puzzle.md`) removes this forked
+    /// emitter entirely, at which point the pool-bypass vanishes with
+    /// the file and only the majit-translate assembler needs updating.
     pub fn loop_header(&mut self, jdindex: u8) {
         self.write_insn("loop_header/i");
         self.push_u8(jdindex);
@@ -702,6 +723,12 @@ impl JitCodeBuilder {
     /// `greens_i` = [next_instr_reg, is_being_profiled_reg] (constant slots)
     /// `greens_r` = [pycode_reg] (constant slot)
     /// `reds_r`   = [frame_reg, ec_reg] (dedicated portal registers)
+    ///
+    /// PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): jdindex is pushed as
+    /// a raw byte value (hard-coded 0 for pyre's single-portal case)
+    /// instead of a `registers_i` register index via `add_const_i`. See
+    /// the matching note on `loop_header` above for rationale and the
+    /// Phase G/H migration path that removes this emitter.
     pub fn jit_merge_point(&mut self, greens_i: &[u8], greens_r: &[u8], reds_r: &[u8]) {
         self.write_insn("jit_merge_point/IRR");
         self.push_u8(0); // jdindex

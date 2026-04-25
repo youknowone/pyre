@@ -14,9 +14,10 @@
 //! This module provides a single entry point that runs all passes
 //! in sequence on a SemanticProgram.
 
+use crate::call::CallControl;
 use crate::flatten;
 use crate::front::SemanticFunction;
-use crate::jtransform::rewrite_graph;
+use crate::jtransform::rewrite_graph_with_callcontrol;
 use crate::pipeline::{PipelineConfig, PipelineResult, ProgramPipelineResult};
 use crate::translate_legacy::annotator::annrpython::annotate;
 use crate::translate_legacy::rtyper::rtyper::resolve_types;
@@ -34,11 +35,36 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     let annotations_count = annotations.types.len();
 
     // Pass 2: Type resolution (RPython rtyper)
-    let types = resolve_types(graph, &annotations);
+    let mut types = resolve_types(graph, &annotations);
     let concrete_types_count = types.concrete_types.len();
 
-    // Pass 3: JIT transform (RPython jtransform)
-    let transform_result = rewrite_graph(graph, &config.transform);
+    // Pass 2b: rtyper-equivalent indirect_call lowering. RPython's rtyper
+    // (rpbc.py:199-217) always emits `indirect_call(funcptr, *args,
+    // c_graphs)` before jtransform sees the graph. Pyre's canonical
+    // `codewriter::transform_graph_to_jitcode` runs this pass before
+    // `rewrite_graph`; the legacy driver must do the same so callers that
+    // consume `&dyn Trait` receivers (e.g. `pyre-jit/src/eval.rs`'s
+    // `allocate_struct(typedescr: &dyn majit_ir::SizeDescr)`) do not trip
+    // the `assert_no_indirect_call_targets` debug invariant inside
+    // `rewrite_graph`. Legacy analyze is not plugged into CallControl, so
+    // pass an empty one — `lower_indirect_calls` treats the resulting
+    // empty `all_impls_for_indirect` family as "unknown" (graphs = None),
+    // which is the conservative RPython-orthodox fallback.
+    let mut legacy_callcontrol = CallControl::new();
+    let mut graph_owned = graph.clone();
+    crate::translator::rtyper::rpbc::lower_indirect_calls(
+        &mut graph_owned,
+        &mut types,
+        &legacy_callcontrol,
+    );
+
+    // Pass 3: JIT transform (RPython jtransform) — thread the same empty
+    // CallControl so `lower_indirect_call_op` has access to `getcalldescr`
+    // / `guess_call_kind` / `graphs_from`. With no registered candidates
+    // the op resolves to `CallKind::Residual`, matching upstream's
+    // conservative fallback for `indirect_call` with unknown family.
+    let transform_result =
+        rewrite_graph_with_callcontrol(&graph_owned, &config.transform, &mut legacy_callcontrol);
     let vable_rewrites = transform_result.vable_rewrites;
     let calls_classified = transform_result.calls_classified;
     let transform_notes = transform_result.notes.clone();

@@ -177,6 +177,24 @@ pub fn rewrite_graph(graph: &FunctionGraph, config: &GraphTransformConfig) -> Gr
     transformer.transform(graph)
 }
 
+/// Variant of `rewrite_graph` that threads a `&mut CallControl` into the
+/// `Transformer`. Required when the graph contains `OpKind::IndirectCall`
+/// (emitted by `translator/rtyper/rpbc.rs::lower_indirect_calls`), since
+/// `lower_indirect_call_op` needs `CallControl::getcalldescr` +
+/// `guess_call_kind` + `graphs_from`. Used by
+/// `translate_legacy::pipeline::analyze_function` after it calls
+/// `lower_indirect_calls` upstream.
+pub fn rewrite_graph_with_callcontrol(
+    graph: &FunctionGraph,
+    config: &GraphTransformConfig,
+    callcontrol: &mut crate::call::CallControl,
+) -> GraphTransformResult {
+    #[cfg(debug_assertions)]
+    crate::translator::rtyper::rpbc::assert_no_indirect_call_targets(graph);
+    let mut transformer = Transformer::new(config).with_callcontrol(callcontrol);
+    transformer.transform(graph)
+}
+
 /// JIT graph transformer.
 ///
 /// RPython equivalent: `jtransform.py` class `Transformer`.
@@ -241,6 +259,73 @@ enum RewriteResult {
     Identity(ValueId),
     /// Keep the op unchanged
     Keep,
+}
+
+/// RPython: the `key` value stored as `op.args[0]` of a
+/// `SpaceOperation('jit_marker', [key, jitdriver, *args])` operation
+/// (`jtransform.py:1658-1663`). pyre's front-end does not carry the
+/// `jit_marker` opname explicitly — the markers reach the codewriter as
+/// `direct_call` s to `PyPyJitDriver::{jit_merge_point, can_enter_jit,
+/// loop_header}`. This enum keeps the upstream key distinction inside
+/// the dispatch hook.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum JitMarkerKey {
+    JitMergePoint,
+    /// `can_enter_jit` aliases to `handle_jit_marker__loop_header`
+    /// (jtransform.py:1723).
+    CanEnterJit,
+    LoopHeader,
+}
+
+fn jit_marker_key_from_target(target: &CallTarget) -> Option<JitMarkerKey> {
+    let CallTarget::Method {
+        name,
+        receiver_root: Some(receiver_root),
+    } = target
+    else {
+        return None;
+    };
+    if receiver_root != "PyPyJitDriver" {
+        return None;
+    }
+    match name.as_str() {
+        "jit_merge_point" => Some(JitMarkerKey::JitMergePoint),
+        "can_enter_jit" => Some(JitMarkerKey::CanEnterJit),
+        "loop_header" => Some(JitMarkerKey::LoopHeader),
+        _ => None,
+    }
+}
+
+/// Split a run of `ValueId`s into (ints, refs, floats) per upstream
+/// `make_three_lists` (`jtransform.py:1616-1627`). Void values are
+/// dropped, matching the upstream filter; Unknown defaults to `Ref`.
+fn split_args_by_kind(
+    args: &[ValueId],
+    type_state: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
+) -> (Vec<ValueId>, Vec<ValueId>, Vec<ValueId>) {
+    let mut ints = Vec::new();
+    let mut refs = Vec::new();
+    let mut floats = Vec::new();
+    for &v in args {
+        let kind = if let Some(ts) = type_state {
+            match ts.concrete_types.get(&v) {
+                Some(crate::jit_codewriter::type_state::ConcreteType::Signed) => 'i',
+                Some(crate::jit_codewriter::type_state::ConcreteType::Float) => 'f',
+                Some(crate::jit_codewriter::type_state::ConcreteType::Void) => 'v',
+                // RPython: GcRef or Unknown → 'r'
+                _ => 'r',
+            }
+        } else {
+            'r'
+        };
+        match kind {
+            'i' => ints.push(v),
+            'f' => floats.push(v),
+            'v' => {}
+            _ => refs.push(v),
+        }
+    }
+    (ints, refs, floats)
 }
 
 impl<'a> Transformer<'a> {
@@ -1020,6 +1105,16 @@ impl<'a> Transformer<'a> {
             "CallTarget::Indirect must be lowered by translator/rtyper/rpbc.rs \
              before reaching rewrite_op_direct_call",
         );
+        // RPython `jtransform.py:1658-1663 rewrite_op_jit_marker`:
+        // marker calls never reach `guess_call_kind` — they dispatch straight
+        // to `handle_jit_marker__*`. Upstream keys on `op.args[0].value`;
+        // pyre keys on the direct_call callee identity since the front-end
+        // lowers `driver.jit_merge_point(...)` etc. to `CallTarget::Method`.
+        if let Some(key) = jit_marker_key_from_target(target) {
+            if let Some(ops) = self.try_handle_jit_marker(key, args) {
+                return RewriteResult::Replace(ops);
+            }
+        }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
             let kind = cc.guess_call_kind(op);
@@ -1676,6 +1771,130 @@ impl<'a> Transformer<'a> {
         self._rewrite_op_cond_call(op, target, args, result_ty, graph_name, true)
     }
 
+    /// RPython: `Transformer.rewrite_op_jit_marker(op)` (jtransform.py:1658-1663)
+    /// — dispatch portion only. Upstream keys on `op.args[0].value`; pyre
+    /// already matched the callee identity in `rewrite_op_direct_call` via
+    /// `jit_marker_key_from_target`. Returns `None` when marker state is not
+    /// yet wired (no `portal_jd_index`, no `CallControl`, or not enough args
+    /// to separate greens from reds) so the caller can fall through to the
+    /// regular direct-call handling.
+    ///
+    /// Upstream also honours `jitdriver.active` (jtransform.py:1661-1662);
+    /// when `active=False` the marker is dropped. pyre has no `active` flag
+    /// yet — once annotator-level JitDriver config lands it can emit
+    /// `Some(Vec::new())` from this hook to match the `return []` shape.
+    fn try_handle_jit_marker(
+        &mut self,
+        key: JitMarkerKey,
+        args: &[ValueId],
+    ) -> Option<Vec<SpaceOperation>> {
+        match key {
+            JitMarkerKey::LoopHeader | JitMarkerKey::CanEnterJit => {
+                // jtransform.py:1723 `handle_jit_marker__can_enter_jit =
+                // handle_jit_marker__loop_header`.
+                let jitdriver_index = self.portal_jd_index?;
+                Some(self.handle_jit_marker__loop_header(jitdriver_index))
+            }
+            JitMarkerKey::JitMergePoint => {
+                let jitdriver_index = self.portal_jd_index?;
+                let cc = self.callcontrol.as_deref()?;
+                let jd = cc.jitdriver_sd_from_jitdriver(jitdriver_index)?;
+                let num_greens = jd.greens.len();
+                // Skip the receiver: pyre lowers `driver.jit_merge_point(...)`
+                // (`front/ast.rs::lower_expr:1181-1209`) as a method call whose
+                // `Call.args[0]` is the `PyPyJitDriver` receiver; the user-facing
+                // green/red arguments start at index 1. Upstream's equivalent
+                // `jit_marker` op has `args[0]=marker_name_const` and
+                // `args[1]=driver_const`, so `op.args[2:]` is the user payload.
+                // `jit_marker_key_from_target` already consumed the method name
+                // before reaching this branch, leaving only the driver receiver
+                // to strip.
+                let user_args = match args.split_first() {
+                    Some((_receiver, rest)) if rest.len() >= num_greens => rest,
+                    _ => return None,
+                };
+                // jtransform.py:1695 `ops = self.promote_greens(...)` —
+                // prepends per-green `-live-` + `{kind}_guard_value` pairs.
+                let greens_raw = &user_args[..num_greens];
+                let mut ops = self.promote_greens(greens_raw);
+                let (greens_i, greens_r, greens_f) =
+                    split_args_by_kind(greens_raw, self.type_state);
+                let (reds_i, reds_r, reds_f) =
+                    split_args_by_kind(&user_args[num_greens..], self.type_state);
+                // jtransform.py:1712 final shape is `ops + [op3, op1, op2]`.
+                ops.extend(self.handle_jit_marker__jit_merge_point(
+                    greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+                ));
+                Some(ops)
+            }
+        }
+    }
+
+    /// RPython: `Transformer.handle_jit_marker__jit_merge_point(op, jitdriver)`
+    /// (jtransform.py:1690-1712). Called from `rewrite_op_jit_marker` when the
+    /// marker key is `'jit_merge_point'`.
+    ///
+    /// Upstream takes a `SpaceOperation('jit_marker', [key, jitdriver, *args])`
+    /// and `make_three_lists` both green and red args inside. pyre's
+    /// `rewrite_op_direct_call` already splits call args by kind, so this port
+    /// accepts already-split vectors — the caller feeds `args_i/args_r/args_f`
+    /// partitioned at the green/red boundary.
+    ///
+    /// Returns `[live_preamble, jit_merge_point, live_recursive]`, matching
+    /// upstream's `ops + [op3, op1, op2]` shape. The leading `promote_greens`
+    /// prefix (`ops`) is empty until a follow-up slice ports `promote_greens`;
+    /// until then greens arrive as Variables/Constants and are forwarded to
+    /// the marker unchanged.
+    fn handle_jit_marker__jit_merge_point(
+        &mut self,
+        greens_i: Vec<ValueId>,
+        greens_r: Vec<ValueId>,
+        greens_f: Vec<ValueId>,
+        reds_i: Vec<ValueId>,
+        reds_r: Vec<ValueId>,
+        reds_f: Vec<ValueId>,
+    ) -> Vec<SpaceOperation> {
+        // jtransform.py:1691-1692 `assert self.portal_jd is not None`
+        let jitdriver_index = self
+            .portal_jd_index
+            .expect("'jit_merge_point' in non-portal graph!");
+        let merge = SpaceOperation {
+            result: None,
+            kind: OpKind::JitMergePoint {
+                jitdriver_index,
+                greens_i,
+                greens_r,
+                greens_f,
+                reds_i,
+                reds_r,
+                reds_f,
+            },
+        };
+        // jtransform.py:1708-1712 — `op2` live for `do_recursive_call()`,
+        // `op3` live for inlined short preambles. Final shape is
+        // `ops + [op3, op1, op2]`.
+        let live_preamble = SpaceOperation {
+            result: None,
+            kind: OpKind::Live,
+        };
+        let live_recursive = SpaceOperation {
+            result: None,
+            kind: OpKind::Live,
+        };
+        vec![live_preamble, merge, live_recursive]
+    }
+
+    /// RPython: `Transformer.handle_jit_marker__loop_header(op, jitdriver)`
+    /// (jtransform.py:1714-1718). `handle_jit_marker__can_enter_jit` aliases
+    /// to the same function (jtransform.py:1723); pyre keeps the alias at the
+    /// `try_handle_jit_marker` dispatch layer rather than inside this method.
+    fn handle_jit_marker__loop_header(&mut self, jitdriver_index: usize) -> Vec<SpaceOperation> {
+        vec![SpaceOperation {
+            result: None,
+            kind: OpKind::LoopHeader { jitdriver_index },
+        }]
+    }
+
     /// RPython: `Transformer.rewrite_op_jit_record_known_result(op)`
     /// (jtransform.py:292-313).
     #[allow(dead_code)]
@@ -2186,9 +2405,27 @@ fn remap_op(
         | OpKind::VableForce
         | OpKind::CurrentTraceLength
         | OpKind::Live
+        | OpKind::LoopHeader { .. }
         | OpKind::GuardValue { .. }
         | OpKind::VtableMethodPtr { .. }
         | OpKind::Unknown { .. } => op.kind.clone(),
+        OpKind::JitMergePoint {
+            jitdriver_index,
+            greens_i,
+            greens_r,
+            greens_f,
+            reds_i,
+            reds_r,
+            reds_f,
+        } => OpKind::JitMergePoint {
+            jitdriver_index: *jitdriver_index,
+            greens_i: remap_list(greens_i, aliases),
+            greens_r: remap_list(greens_r, aliases),
+            greens_f: remap_list(greens_f, aliases),
+            reds_i: remap_list(reds_i, aliases),
+            reds_r: remap_list(reds_r, aliases),
+            reds_f: remap_list(reds_f, aliases),
+        },
         OpKind::IndirectCall {
             funcptr,
             args,
@@ -4013,6 +4250,155 @@ mod tests {
                 } if field.name == "x"
             )),
             "FieldRead for x should become a pure read"
+        );
+    }
+
+    #[test]
+    fn handle_jit_marker_loop_header_emits_single_loop_header_op() {
+        // jtransform.py:1714-1718 `SpaceOperation('loop_header', [c_index], None)`.
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        let ops = transformer.handle_jit_marker__loop_header(7);
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::LoopHeader { jitdriver_index } => assert_eq!(*jitdriver_index, 7),
+            other => panic!("expected OpKind::LoopHeader, got {other:?}"),
+        }
+        assert!(ops[0].result.is_none(), "loop_header produces no result");
+    }
+
+    #[test]
+    fn handle_jit_marker_jit_merge_point_emits_live_merge_live_sequence() {
+        // jtransform.py:1707-1712 — return shape is `ops + [op3, op1, op2]`
+        // where op3=live_preamble, op1=jit_merge_point, op2=live_recursive.
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_portal_jd(Some(3));
+        let ops = transformer.handle_jit_marker__jit_merge_point(
+            vec![ValueId(0)],
+            vec![],
+            vec![],
+            vec![ValueId(1), ValueId(2)],
+            vec![ValueId(3)],
+            vec![],
+        );
+        assert_eq!(ops.len(), 3, "expect live + merge + live");
+        assert!(matches!(ops[0].kind, OpKind::Live));
+        match &ops[1].kind {
+            OpKind::JitMergePoint {
+                jitdriver_index,
+                greens_i,
+                reds_i,
+                reds_r,
+                ..
+            } => {
+                assert_eq!(*jitdriver_index, 3);
+                assert_eq!(greens_i, &vec![ValueId(0)]);
+                assert_eq!(reds_i, &vec![ValueId(1), ValueId(2)]);
+                assert_eq!(reds_r, &vec![ValueId(3)]);
+            }
+            other => panic!("expected OpKind::JitMergePoint, got {other:?}"),
+        }
+        assert!(matches!(ops[2].kind, OpKind::Live));
+    }
+
+    #[test]
+    fn jit_marker_key_recognises_pypyjitdriver_methods() {
+        let merge = CallTarget::method("jit_merge_point", Some("PyPyJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&merge),
+            Some(JitMarkerKey::JitMergePoint)
+        );
+        let cej = CallTarget::method("can_enter_jit", Some("PyPyJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&cej),
+            Some(JitMarkerKey::CanEnterJit)
+        );
+        let lh = CallTarget::method("loop_header", Some("PyPyJitDriver".into()));
+        assert_eq!(
+            jit_marker_key_from_target(&lh),
+            Some(JitMarkerKey::LoopHeader)
+        );
+        // Other receivers or other methods must not match.
+        let other = CallTarget::method("jit_merge_point", Some("OtherDriver".into()));
+        assert_eq!(jit_marker_key_from_target(&other), None);
+        let other_method = CallTarget::method("something_else", Some("PyPyJitDriver".into()));
+        assert_eq!(jit_marker_key_from_target(&other_method), None);
+        // Non-method targets are never markers.
+        let free_fn = CallTarget::function_path(["module", "jit_merge_point"]);
+        assert_eq!(jit_marker_key_from_target(&free_fn), None);
+    }
+
+    #[test]
+    fn try_handle_jit_marker_can_enter_jit_aliases_to_loop_header() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config).with_portal_jd(Some(2));
+        let ops = transformer
+            .try_handle_jit_marker(JitMarkerKey::CanEnterJit, &[])
+            .expect("can_enter_jit should dispatch when portal_jd is set");
+        assert_eq!(ops.len(), 1);
+        match &ops[0].kind {
+            OpKind::LoopHeader { jitdriver_index } => assert_eq!(*jitdriver_index, 2),
+            other => panic!("expected LoopHeader, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn promote_greens_emits_live_guard_value_pair_per_green() {
+        // jtransform.py:1646-1656. One `-live-` + `{kind}_guard_value` pair
+        // per green, in input order. Without a type_state every green falls
+        // back to kind 'r'.
+        let config = GraphTransformConfig::default();
+        let transformer = Transformer::new(&config);
+        let greens = vec![ValueId(0), ValueId(1), ValueId(2)];
+        let ops = transformer.promote_greens(&greens);
+        assert_eq!(ops.len(), 6, "expect 2 ops per green");
+        for i in 0..greens.len() {
+            assert!(
+                matches!(ops[i * 2].kind, OpKind::Live),
+                "slot {i} should start with Live"
+            );
+            match &ops[i * 2 + 1].kind {
+                OpKind::GuardValue { value, kind_char } => {
+                    assert_eq!(*value, greens[i]);
+                    assert_eq!(*kind_char, 'r');
+                }
+                other => panic!("slot {i} expected GuardValue, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn promote_greens_empty_input_yields_empty_output() {
+        let config = GraphTransformConfig::default();
+        let transformer = Transformer::new(&config);
+        assert!(transformer.promote_greens(&[]).is_empty());
+    }
+
+    #[test]
+    fn try_handle_jit_marker_returns_none_without_portal() {
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        // No portal_jd set → dispatch is a no-op (caller falls through).
+        assert!(
+            transformer
+                .try_handle_jit_marker(JitMarkerKey::LoopHeader, &[])
+                .is_none()
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "'jit_merge_point' in non-portal graph!")]
+    fn handle_jit_marker_jit_merge_point_without_portal_panics() {
+        // jtransform.py:1691 `assert self.portal_jd is not None`.
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config);
+        transformer.handle_jit_marker__jit_merge_point(
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
+            vec![],
         );
     }
 }
