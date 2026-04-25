@@ -5,6 +5,8 @@
 //!
 //! | majit                 | rpython/rlib/                 |
 //! |-----------------------|-------------------------------|
+//! | `entrypoint`          | `entrypoint.py`               |
 //! | `rarithmetic`         | `rarithmetic.py`              |
 
+pub mod entrypoint;
 pub mod rarithmetic;

@@ -3058,6 +3058,15 @@ pub struct GraphFunc {
     /// can apply the same default as upstream's
     /// `getattr(func, 'relax_sig_check', False)`.
     pub relax_sig_check: Option<bool>,
+    /// Upstream `func.exported_symbol` attribute set by
+    /// `rpython/rlib/entrypoint.py:10-12 export_symbol(func)` —
+    /// `func.exported_symbol = True; return func`. Consumed only by
+    /// the C backend (`rpython/translator/c/database.py` walks
+    /// `getattr(callable, 'exported_symbol', False)`), which is not
+    /// ported; the flag still rides along on `GraphFunc` so line-by-
+    /// line surface with `interactive.py:18 export_symbol(entry_point)`
+    /// stays intact.
+    pub exported_symbol: bool,
     /// Upstream `func._llfnobjattrs_` consumed by
     /// `lltype.getfunctionptr()`. It can force `_name`, `_callable`, or
     /// arbitrary fields on the low-level function object.
@@ -3094,6 +3103,7 @@ impl GraphFunc {
             _generator_next_method_of_: None,
             _jit_look_inside_: None,
             relax_sig_check: None,
+            exported_symbol: false,
             _llfnobjattrs_: HashMap::new(),
             globals,
             closure: Vec::new(),

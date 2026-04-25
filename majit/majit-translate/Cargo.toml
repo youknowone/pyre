@@ -9,7 +9,12 @@ description = "Rust port of RPython's translation pipeline (flowspace → annota
 [dependencies]
 syn = { version = "2", features = ["full", "parsing", "visit"] }
 quote = "1"
-proc-macro2 = "1"
+# `span-locations` exposes `Span::start()` / `Span::end()` for spans
+# created outside a proc-macro runtime, so `build_host_function_from_rust`
+# can read `syn::ItemFn`'s source line into the synthetic
+# `HostCode.co_firstlineno` (bytecode.py:46-60 parity). Without it
+# spans carry no line info and `co_firstlineno` falls back to 0.
+proc-macro2 = { version = "1", features = ["span-locations"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 majit-ir = { workspace = true }

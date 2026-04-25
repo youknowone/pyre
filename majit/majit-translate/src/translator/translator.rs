@@ -7,7 +7,7 @@
 //! annotator port currently consumes is declared here; additional
 //! fields land as the driver calls them.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::{Rc, Weak};
 
@@ -84,6 +84,66 @@ pub struct TranslationConfig {
     pub translating: bool,
     /// RPython `config.translation` OptionGroup.
     pub translation: TranslationOptions,
+}
+
+impl TranslationConfig {
+    /// Reads the typed-struct's seven `translation.<name>` fields out
+    /// of the schema-driven [`crate::config::config::Config`] used by
+    /// `TranslationDriver.config`. Mirrors the read path upstream's
+    /// `TranslationContext.__init__` takes when handed
+    /// `config=self.driver.config` at `interactive.py:19` /
+    /// `driver.py:194`: each `config.translation.<name>` access is a
+    /// `__getattr__` dispatch into the same `_cfgimpl_values` dict the
+    /// driver's overrides write into.
+    ///
+    /// Errors out if the schema layout drifts (missing key, wrong
+    /// variant) — that's a structural bug, not a runtime input error,
+    /// so surfacing it via `Result::Err` rather than defaulting keeps
+    /// the call site honest.
+    pub fn from_rc_config(
+        config: &std::rc::Rc<crate::config::config::Config>,
+    ) -> Result<Self, crate::config::config::ConfigError> {
+        use crate::config::config::{ConfigError, ConfigValue, OptionValue};
+        fn get_bool(
+            config: &std::rc::Rc<crate::config::config::Config>,
+            path: &str,
+        ) -> Result<bool, ConfigError> {
+            match config.get(path)? {
+                ConfigValue::Value(OptionValue::Bool(b)) => Ok(b),
+                ConfigValue::Value(OptionValue::None) => Ok(false),
+                other => Err(ConfigError::Generic(format!(
+                    "TranslationConfig::from_rc_config: {path} expected Bool, got {other:?}"
+                ))),
+            }
+        }
+        fn get_int(
+            config: &std::rc::Rc<crate::config::config::Config>,
+            path: &str,
+        ) -> Result<i64, ConfigError> {
+            match config.get(path)? {
+                ConfigValue::Value(OptionValue::Int(i)) => Ok(i),
+                ConfigValue::Value(OptionValue::None) => Ok(0),
+                other => Err(ConfigError::Generic(format!(
+                    "TranslationConfig::from_rc_config: {path} expected Int, got {other:?}"
+                ))),
+            }
+        }
+        Ok(TranslationConfig {
+            translating: get_bool(config, "translating")?,
+            translation: TranslationOptions {
+                verbose: get_bool(config, "translation.verbose")?,
+                list_comprehension_operations: get_bool(
+                    config,
+                    "translation.list_comprehension_operations",
+                )?,
+                keepgoing: get_bool(config, "translation.keepgoing")?,
+                sandbox: get_bool(config, "translation.sandbox")?,
+                check_str_without_nul: get_bool(config, "translation.check_str_without_nul")?,
+                taggedpointers: get_bool(config, "translation.taggedpointers")?,
+                withsmallfuncsets: get_int(config, "translation.withsmallfuncsets")? as usize,
+            },
+        })
+    }
 }
 
 /// Rust carrier for upstream `**flowing_flags` in
@@ -168,6 +228,9 @@ pub struct TranslationContext {
     pub rtyper: RefCell<Option<Rc<RPythonTyper>>>,
     /// RPython `self.platform = get_platform(config)` (translator.py:36).
     pub platform: Platform,
+    /// RPython `translator.frozen`, set by `driver.task_database_c`
+    /// before the C database builder walks annotated graphs.
+    pub frozen: Cell<bool>,
     // `self.exceptiontransformer = None` (translator.py:33) lands
     // when `rpython/translator/exceptiontransform.py` is ported. See
     // module header.
@@ -215,6 +278,7 @@ impl TranslationContext {
         TranslationContext {
             config,
             platform,
+            frozen: Cell::new(false),
             annotator: RefCell::new(None),
             rtyper: RefCell::new(None),
             graphs: RefCell::new(Vec::new()),
@@ -297,6 +361,14 @@ impl TranslationContext {
             panic!("ValueError: we already have an rtyper");
         }
         let rtyper = Rc::new(RPythonTyper::new(&annotator));
+        // Upstream `rtyper.py:71`: `self.exceptiondata = ExceptionData(self)`
+        // is part of `RPythonTyper.__init__`. The Rust port defers the
+        // initialisation so the rtyper can be wrapped in `Rc<Self>`
+        // before populating; call it now so callers observe the same
+        // post-`buildrtyper()` invariants upstream guarantees.
+        rtyper
+            .initialize_exceptiondata()
+            .expect("RPythonTyper::initialize_exceptiondata");
         *self.rtyper.borrow_mut() = Some(rtyper.clone());
         rtyper
     }

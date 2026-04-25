@@ -11,8 +11,13 @@
 //! belongs in `translator_legacy/` instead.
 
 pub mod backendopt;
+pub mod driver;
+pub mod goal;
+pub mod interactive;
 pub mod rtyper;
 pub mod simplify;
+pub mod timing;
+pub mod tool;
 pub mod transform;
 pub mod translator;
 pub mod unsimplify;

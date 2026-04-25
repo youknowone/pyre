@@ -11,6 +11,7 @@
 //! rtyper/normalizecalls.py) that Cargo's DAG crate boundary cannot model.
 
 pub mod annotator;
+pub mod config;
 pub mod flowspace;
 pub mod jit_codewriter;
 pub mod tool;

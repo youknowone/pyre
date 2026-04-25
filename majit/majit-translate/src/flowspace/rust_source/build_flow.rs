@@ -94,17 +94,43 @@ pub fn build_flow_from_rust(func: &ItemFn) -> Result<FunctionGraph, AdapterError
         loop_stack: Vec::new(),
     };
 
-    let tail = lower_block(&mut builder, &func.block)?;
-
-    // Terminate the currently-open block with a Link into returnblock.
-    let link = Rc::new(RefCell::new(Link::new(
-        vec![tail],
-        Some(builder.returnblock.clone()),
-        None,
-    )));
-    builder.finalize_current(vec![link], None);
+    match lower_block(&mut builder, &func.block)? {
+        BlockExit::FallThrough(tail) => {
+            // Body reached its closing `}` with a tail value —
+            // terminate the currently-open block with a Link into
+            // returnblock carrying that value (upstream implicit
+            // `RETURN_VALUE` at the function-body tail).
+            let link = Rc::new(RefCell::new(Link::new(
+                vec![tail],
+                Some(builder.returnblock.clone()),
+                None,
+            )));
+            builder.finalize_current(vec![link], None);
+        }
+        BlockExit::Terminated => {
+            // Body already closed itself via an explicit `return` —
+            // `Return.nomoreblocks()` at `flowcontext.py:1232` ran,
+            // so the returnblock Link has already been emitted and
+            // the current block is gone. Nothing further to do here;
+            // upstream's StopFlowing at the same site terminates the
+            // pending-block scheduler identically.
+        }
+    }
 
     Ok(graph)
+}
+
+/// Result of lowering a block-shaped construct. Mirrors the control-
+/// flow dichotomy in upstream `flowcontext.py`: either the block
+/// reached its closing `}` with a tail value (`FallThrough`), or
+/// execution left the block via a non-fallthrough terminator —
+/// `return` in the current subset (`Terminated`). Upstream analogue:
+/// `Return.nomoreblocks(ctx)` at `flowcontext.py:1232` closes the
+/// current block straight to `graph.returnblock` and raises
+/// `StopFlowing`; downstream code in the same block never runs.
+enum BlockExit {
+    FallThrough(Hlvalue),
+    Terminated,
 }
 
 // ____________________________________________________________
@@ -279,7 +305,7 @@ impl Builder {
 // ____________________________________________________________
 // Statement & expression lowering.
 
-fn lower_block(b: &mut Builder, block: &SynBlock) -> Result<Hlvalue, AdapterError> {
+fn lower_block(b: &mut Builder, block: &SynBlock) -> Result<BlockExit, AdapterError> {
     let mut tail: Option<Hlvalue> = None;
     for (idx, stmt) in block.stmts.iter().enumerate() {
         let is_last = idx + 1 == block.stmts.len();
@@ -288,6 +314,29 @@ fn lower_block(b: &mut Builder, block: &SynBlock) -> Result<Hlvalue, AdapterErro
                 lower_let(b, local)?;
             }
             Stmt::Expr(expr, semi) => {
+                // `return` is a structural terminator in upstream:
+                // `flowcontext.py:687 RETURN_VALUE` raises `Return`,
+                // `flowcontext.py:1232 Return.nomoreblocks()` closes
+                // the current block straight to `graph.returnblock`
+                // and raises `StopFlowing`. Anything following in the
+                // same block is dead code — mirror that by rejecting
+                // non-last `return` and threading `BlockExit::Terminated`
+                // out of `lower_block` on the last-stmt case. Works
+                // identically with or without the trailing `;` (Rust
+                // syntax allows both; syn preserves the semi flag but
+                // the flow semantic is identical).
+                if let Expr::Return(ret) = expr {
+                    if !is_last {
+                        return Err(AdapterError::Unsupported {
+                            reason: "statement after `return` — upstream \
+                                `flowcontext.py:1232` closes the block to \
+                                graph.returnblock on Return, making any \
+                                subsequent ops unreachable"
+                                .into(),
+                        });
+                    }
+                    return lower_return(b, ret);
+                }
                 // `while` / `loop` are statement-only in the M2.5b
                 // slice-3 subset — they produce upstream's bytecode
                 // `SETUP_LOOP` + back-edge shape but carry no tail
@@ -306,6 +355,28 @@ fn lower_block(b: &mut Builder, block: &SynBlock) -> Result<Hlvalue, AdapterErro
                     Expr::ForLoop(for_expr) => {
                         lower_for(b, for_expr)?;
                         continue;
+                    }
+                    // `if cond { body }` without `else` is a statement
+                    // producing `()` (upstream Python: `None` via the
+                    // implicit RETURN_VALUE on `if x: body` fallthrough
+                    // — `flowcontext.py:756 POP_JUMP_IF_FALSE`). Treat
+                    // it the same as while/loop: always a statement,
+                    // never a tail. When it IS the last stmt, the
+                    // function falls through to the implicit-None tail
+                    // handled by `lower_block`'s terminal fallback.
+                    //
+                    // `lower_if_without_else` unconditionally falls
+                    // through (the Bool(false) exit shortcuts to
+                    // join, so join is always reachable), so it never
+                    // produces `Terminated` — but match structurally
+                    // so a future slice that tightens this invariant
+                    // forwards termination out of the enclosing block
+                    // correctly.
+                    Expr::If(if_expr) if if_expr.else_branch.is_none() => {
+                        match lower_if(b, if_expr)? {
+                            BlockExit::FallThrough(_) => continue,
+                            BlockExit::Terminated => return Ok(BlockExit::Terminated),
+                        }
                     }
                     // `break` / `continue` appearing at the statement
                     // level of a non-loop block is unconditionally an
@@ -326,29 +397,31 @@ fn lower_block(b: &mut Builder, block: &SynBlock) -> Result<Hlvalue, AdapterErro
                     _ => {}
                 }
                 if semi.is_some() {
-                    if let Expr::Return(ret) = expr {
-                        if !is_last {
-                            return Err(AdapterError::Unsupported {
-                                reason: "return before end of block (control flow lands in M2.5b)"
-                                    .into(),
-                            });
-                        }
-                        tail = Some(lower_return(b, ret)?);
-                    } else {
-                        // Expression statement: lower for side effect,
-                        // discard the result. Upstream CPython emits
-                        // `POP_TOP` after a stack-producing op —
-                        // `flowcontext.py:488` covers the same
-                        // semantic at the bytecode level.
-                        let _ = lower_expr(b, expr)?;
-                    }
+                    // Expression statement: lower for side effect,
+                    // discard the result. Upstream CPython emits
+                    // `POP_TOP` after a stack-producing op —
+                    // `flowcontext.py:488` covers the same
+                    // semantic at the bytecode level.
+                    let _ = lower_expr(b, expr)?;
                 } else {
                     if !is_last {
                         return Err(AdapterError::Unsupported {
                             reason: "non-tail expression without trailing `;`".into(),
                         });
                     }
-                    tail = Some(lower_expr(b, expr)?);
+                    // Tail expression: evaluated as the block's
+                    // value. Control-flow-bearing constructs
+                    // (`if`/`match`/`return`/nested block) may
+                    // terminate when every path returns — thread
+                    // the `BlockExit` out so the enclosing lowering
+                    // observes termination. Non-control-flow
+                    // expressions always fall through with a value,
+                    // so `lower_arm_body`'s default arm routes them
+                    // through `lower_expr`.
+                    match lower_arm_body(b, expr)? {
+                        BlockExit::FallThrough(v) => tail = Some(v),
+                        BlockExit::Terminated => return Ok(BlockExit::Terminated),
+                    }
                 }
             }
             Stmt::Item(_) => {
@@ -363,9 +436,18 @@ fn lower_block(b: &mut Builder, block: &SynBlock) -> Result<Hlvalue, AdapterErro
             }
         }
     }
-    tail.ok_or(AdapterError::Unsupported {
-        reason: "function body has no tail expression / explicit return".into(),
-    })
+    // No explicit tail expression → implicit `None` return. Upstream
+    // CPython's bytecode compiler emits `LOAD_CONST None;
+    // RETURN_VALUE` as the default terminator of any function body
+    // that doesn't end in an explicit return, so the flowspace sees
+    // the returnblock Link carrying `Constant(None)`. The adapter
+    // mirrors that directly: blocks tail-less by virtue of ending in
+    // a statement (`if x: body`, `while …`, `let …;`) produce the
+    // same None sentinel both at function-body scope and inside
+    // `Expr::Block` / if-branch bodies.
+    Ok(BlockExit::FallThrough(tail.unwrap_or_else(|| {
+        Hlvalue::Constant(Constant::new(ConstValue::None))
+    })))
 }
 
 fn lower_let(b: &mut Builder, local: &Local) -> Result<(), AdapterError> {
@@ -419,11 +501,34 @@ fn lower_let(b: &mut Builder, local: &Local) -> Result<(), AdapterError> {
     Ok(())
 }
 
-fn lower_return(b: &mut Builder, ret: &ExprReturn) -> Result<Hlvalue, AdapterError> {
-    match &ret.expr {
-        Some(expr) => lower_expr(b, expr),
-        None => Ok(Hlvalue::Constant(Constant::new(ConstValue::None))),
-    }
+/// Close the currently-open block with a Link into `graph.returnblock`
+/// carrying the return value, then report `Terminated` so enclosing
+/// control-flow lowering knows not to emit a fallthrough link from the
+/// now-closed block.
+///
+/// Upstream basis: `flowcontext.py:687 RETURN_VALUE` raises `Return`;
+/// `flowcontext.py:1232 Return.nomoreblocks(ctx)` does
+/// `Link([w_result], ctx.graph.returnblock)` on `ctx.recorder.crnt_block`
+/// and raises `StopFlowing`. Our `BlockExit::Terminated` is the Rust
+/// analogue of StopFlowing — it tells the caller not to wire further
+/// exits from the closed block.
+fn lower_return(b: &mut Builder, ret: &ExprReturn) -> Result<BlockExit, AdapterError> {
+    let value = match &ret.expr {
+        Some(expr) => lower_expr(b, expr)?,
+        // Bare `return;` — upstream has no syntactic analogue since
+        // Python `return` without a value implicitly pushes `None`
+        // (`flowcontext.py:687` pops whatever `compile.c` pushed, which
+        // is `LOAD_CONST None` for bare `return`). Mirror that:
+        // `ConstValue::None` carried through the returnblock link.
+        None => Hlvalue::Constant(Constant::new(ConstValue::None)),
+    };
+    let link = Rc::new(RefCell::new(Link::new(
+        vec![value],
+        Some(b.returnblock.clone()),
+        None,
+    )));
+    b.finalize_current(vec![link], None);
+    Ok(BlockExit::Terminated)
 }
 
 fn lower_expr(b: &mut Builder, expr: &Expr) -> Result<Hlvalue, AdapterError> {
@@ -447,15 +552,58 @@ fn lower_expr(b: &mut Builder, expr: &Expr) -> Result<Hlvalue, AdapterError> {
             op, left, right, ..
         }) => lower_binop(b, *op, left, right),
         Expr::Paren(ExprParen { expr, .. }) => lower_expr(b, expr),
-        Expr::If(if_expr) => lower_if(b, if_expr),
-        Expr::Block(block_expr) => lower_block(b, &block_expr.block),
-        Expr::Return(ret) => {
-            let _ = ret;
-            Err(AdapterError::Unsupported {
-                reason: "return in expression position (control flow lands in M2.5b)".into(),
-            })
-        }
-        Expr::Match(match_expr) => lower_match(b, match_expr),
+        Expr::If(if_expr) => match lower_if(b, if_expr)? {
+            BlockExit::FallThrough(v) => Ok(v),
+            // Every branch terminated via `return` — the if-
+            // expression has no reachable value. Upstream bytecode
+            // would have raised `StopFlowing` inside each branch
+            // before the join PC was even reached; in Rust source
+            // position this is `let x = if c { return a } else {
+            // return b };` (type `!`) which is valid but produces no
+            // binding. Reject at the adapter boundary rather than
+            // silently synthesize an unreachable join.
+            BlockExit::Terminated => Err(AdapterError::Unsupported {
+                reason: "if-expression where every branch terminates via `return` — \
+                    the expression has no reachable value. Reshape so the \
+                    `return` is a semicolon-terminated statement instead of \
+                    an expression operand"
+                    .into(),
+            }),
+        },
+        Expr::Block(block_expr) => match lower_block(b, &block_expr.block)? {
+            BlockExit::FallThrough(v) => Ok(v),
+            BlockExit::Terminated => Err(AdapterError::Unsupported {
+                reason: "block-expression whose body terminates via `return` — the \
+                    expression has no reachable value. Reshape so the `return` \
+                    is a semicolon-terminated statement instead of an expression \
+                    operand"
+                    .into(),
+            }),
+        },
+        // Bare `return` in expression position (e.g. `let x = return
+        // 1;`). Upstream has no syntactic analogue — Python's
+        // `return` is a statement. Rust's expression-position
+        // `return` produces type `!`. The adapter's subset already
+        // supports `return` at every statement position (including
+        // the tails of if / match branches) via `lower_block`'s
+        // explicit `Expr::Return` branch, so rejecting here simply
+        // funnels users to the statement position.
+        Expr::Return(_) => Err(AdapterError::Unsupported {
+            reason: "return in expression position — put the `return` at statement \
+                position (a semicolon-terminated statement, or the tail of an if / \
+                match branch) instead"
+                .into(),
+        }),
+        Expr::Match(match_expr) => match lower_match(b, match_expr)? {
+            BlockExit::FallThrough(v) => Ok(v),
+            BlockExit::Terminated => Err(AdapterError::Unsupported {
+                reason: "match-expression where every arm terminates via `return` — \
+                    the expression has no reachable value. Reshape so the \
+                    `return` is a semicolon-terminated statement instead of an \
+                    expression operand"
+                    .into(),
+            }),
+        },
         Expr::ForLoop(_) | Expr::While(_) | Expr::Loop(_) => Err(AdapterError::Unsupported {
             reason: "loop construct in expression position produces `()` — use it as a statement \
                 (trailing `;` or non-last position) instead"
@@ -515,8 +663,23 @@ fn lower_literal(lit: &Lit) -> Result<Hlvalue, AdapterError> {
                 value.to_bits(),
             ))))
         }
-        Lit::ByteStr(_) | Lit::Byte(_) | Lit::Char(_) => Err(AdapterError::Unsupported {
-            reason: "byte / bytestring / char literal — upstream has no direct analogue".into(),
+        // Rust `char` literal is a single Unicode scalar. Upstream
+        // RPython has no `char` type; single-character strings fill
+        // the role (`model.py:658` switch-exitcase admits
+        // `isinstance(n, (str, unicode)) and len(n) == 1`; general
+        // `operation.py` string ops accept len==1 the same as any
+        // other str). Emit as `ConstValue::Str(c.to_string())` so
+        // expression-position `'a'` and match-arm `'a' =>` carry the
+        // identical constant — see `classify_pattern` for the
+        // match-arm side.
+        Lit::Char(ch) => Ok(Hlvalue::Constant(Constant::new(ConstValue::Str(
+            ch.value().to_string(),
+        )))),
+        Lit::ByteStr(_) | Lit::Byte(_) => Err(AdapterError::Unsupported {
+            reason: "byte / bytestring literal — upstream has no direct analogue \
+                (Python 2.7 collapses bytes into `str`, modern `bytes` is not in \
+                the flowspace vocabulary)"
+                .into(),
         }),
         _ => Err(AdapterError::Unsupported {
             reason: "unrecognised literal kind".into(),
@@ -607,7 +770,59 @@ fn binop_opname(op: BinOp) -> Result<&'static str, AdapterError> {
 // own `locals_w` and merge into the join block's inputargs via
 // `FrameState` union.
 
-fn lower_if(b: &mut Builder, if_expr: &ExprIf) -> Result<Hlvalue, AdapterError> {
+/// State captured after lowering a single branch's body. `None` when
+/// the branch terminated via `return` — in that case the branch's
+/// block has already been closed to `graph.returnblock` by
+/// `lower_return`, so no further link / op emission applies. `Some`
+/// captures the now-open current-block state so the caller can later
+/// attach a Link from that block into the post-if join.
+struct ArmCapture {
+    tail: Hlvalue,
+    block: BlockRef,
+    ops: Vec<SpaceOperation>,
+    locals: HashMap<String, Hlvalue>,
+}
+
+/// Finalize the current BlockBuilder state into an `ArmCapture` when
+/// the arm fell through, or discard it when the arm terminated.
+fn capture_arm_exit(b: &mut Builder, exit: BlockExit) -> Option<ArmCapture> {
+    match exit {
+        BlockExit::FallThrough(tail) => Some(ArmCapture {
+            tail,
+            block: b.current.block.clone(),
+            ops: std::mem::take(&mut b.current.ops),
+            locals: std::mem::take(&mut b.current.locals),
+        }),
+        BlockExit::Terminated => {
+            // `lower_return` already called `finalize_current` on the
+            // branch's last block. Clear b.current so the next
+            // `open_new_block` starts from a clean slate.
+            b.current.ops.clear();
+            b.current.locals.clear();
+            None
+        }
+    }
+}
+
+/// Dispatch the else-arm of an `if` / `else` chain. Per `syn`'s
+/// grammar, `ExprIf.else_branch` is always `Expr::Block` (a plain
+/// `else { … }`) or `Expr::If` (chained `else if …`). Both sub-
+/// routines return `BlockExit`, so termination threads through a
+/// chain of nested `else if` transparently.
+fn lower_else_arm(b: &mut Builder, else_expr: &Expr) -> Result<BlockExit, AdapterError> {
+    match else_expr {
+        Expr::Block(block_expr) => lower_block(b, &block_expr.block),
+        Expr::If(nested_if) => lower_if(b, nested_if),
+        _ => Err(AdapterError::Unsupported {
+            reason: "`else` branch is neither a block nor an `if` — syn's grammar \
+                should forbid this; if it fires, please file a bug citing the \
+                input fragment"
+                .into(),
+        }),
+    }
+}
+
+fn lower_if(b: &mut Builder, if_expr: &ExprIf) -> Result<BlockExit, AdapterError> {
     // 1. Evaluate condition into the current block, then coerce via
     //    `bool(cond)` — mirrors upstream POP_JUMP_IF_FALSE at
     //    `flowcontext.py:756` which always emits `op.bool(w_value)`
@@ -617,16 +832,11 @@ fn lower_if(b: &mut Builder, if_expr: &ExprIf) -> Result<Hlvalue, AdapterError> 
     let cond = Hlvalue::Variable(Variable::new());
     b.emit_op(SpaceOperation::new("bool", vec![cond_raw], cond.clone()));
 
-    // `if` without `else` in tail position produces `()`, which is
-    // outside the integer/bool subset. Defer to the M2.5d literal
-    // phase and reject cleanly here.
-    let (_else_tok, else_expr) = match &if_expr.else_branch {
-        Some(branch) => branch,
-        None => {
-            return Err(AdapterError::Unsupported {
-                reason: "if without else produces () — unit literal lands in M2.5d".into(),
-            });
-        }
+    // Extract the else-less path early so the rest of `lower_if` can
+    // assume `else_expr` is present; the common `bool(cond)` +
+    // locals-snapshot steps are shared.
+    let Some((_else_tok, else_expr)) = &if_expr.else_branch else {
+        return lower_if_without_else(b, cond, &if_expr.then_branch);
     };
 
     // 2. Snapshot state at the fork point. Upstream `FrameState.copy()`
@@ -668,33 +878,182 @@ fn lower_if(b: &mut Builder, if_expr: &ExprIf) -> Result<Hlvalue, AdapterError> 
     // 5. Lower the then-branch into its own BlockBuilder. Nested
     //    control flow may reassign `b.current.block` away from
     //    `then_block` to a nested join; we close whatever the final
-    //    current block is after the branch body returns.
+    //    current block is after the branch body returns. A
+    //    `Terminated` exit means `lower_return` already closed the
+    //    current block — we drop the capture in that case.
     b.open_new_block(BlockBuilder {
         block: then_block.clone(),
         ops: Vec::new(),
         locals: then_locals,
     });
-    let then_tail = lower_block(b, &if_expr.then_branch)?;
-    let then_exit_block = b.current.block.clone();
-    let then_exit_ops = std::mem::take(&mut b.current.ops);
-    let then_exit_locals = std::mem::take(&mut b.current.locals);
+    let then_exit = lower_block(b, &if_expr.then_branch)?;
+    let then_capture = capture_arm_exit(b, then_exit);
 
-    // 6. Lower the else-branch the same way.
+    // 6. Lower the else-branch the same way. `else_expr` is always
+    //    `Expr::Block` or `Expr::If` per syn's grammar — the two
+    //    variants route through `lower_else_arm` so nested `else if`
+    //    chains thread termination up transparently.
     b.open_new_block(BlockBuilder {
         block: else_block.clone(),
         ops: Vec::new(),
         locals: else_locals,
     });
-    let else_tail = lower_expr(b, else_expr)?;
-    let else_exit_block = b.current.block.clone();
-    let else_exit_ops = std::mem::take(&mut b.current.ops);
-    let else_exit_locals = std::mem::take(&mut b.current.locals);
+    let else_exit = lower_else_arm(b, else_expr)?;
+    let else_capture = capture_arm_exit(b, else_exit);
 
-    // 7. Build the join block.
-    //    inputargs = [tail_var, local_var_0, local_var_1, …].
+    // 7. Fork the post-branch wiring by which arms fell through.
+    //    Upstream analogue: `Return.nomoreblocks()` on a branch
+    //    raises `StopFlowing`, and the pending-block scheduler never
+    //    enqueues that branch's PC at the join. Here:
+    //    - both terminated → no join block, whole-if is Terminated
+    //    - exactly one fell through → join has one predecessor
+    //    - both fell through → canonical two-predecessor join
+    match (then_capture, else_capture) {
+        (None, None) => {
+            // Both branches closed themselves to returnblock via
+            // `return`. Nothing reaches the post-if PC; signal
+            // termination to the enclosing lowering.
+            Ok(BlockExit::Terminated)
+        }
+        (Some(cap), None) | (None, Some(cap)) => {
+            // Exactly one branch reached the post-if PC. Build a
+            // single-predecessor join: the branch's tail value is the
+            // if-expression's value, and its locals snapshot feeds
+            // the join's inputargs.
+            let (_join_block, tail_var) = build_if_join_block(&merged_names, b, &cap);
+            Ok(BlockExit::FallThrough(tail_var))
+        }
+        (Some(then_cap), Some(else_cap)) => {
+            // Canonical case — both branches reach the join.
+            // inputargs = [tail_var, local_var_0, …].
+            let tail_var = Hlvalue::Variable(Variable::new());
+            let mut join_inputargs: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
+            join_inputargs.push(tail_var.clone());
+            let mut join_locals: HashMap<String, Hlvalue> = HashMap::new();
+            for name in &merged_names {
+                let fresh = Hlvalue::Variable(Variable::named(name));
+                join_inputargs.push(fresh.clone());
+                join_locals.insert(name.clone(), fresh);
+            }
+            let join_block = Block::shared(join_inputargs);
+
+            // Close each arm's tail block with a Link into the join.
+            // `branch_link_args` reads from the arm's locals snapshot
+            // — branch-local `let` bindings (names absent from
+            // merged_names) never reach the join.
+            {
+                let link_args = branch_link_args(&then_cap.tail, &merged_names, &then_cap.locals);
+                let link = Rc::new(RefCell::new(Link::new(
+                    link_args,
+                    Some(join_block.clone()),
+                    None,
+                )));
+                then_cap.block.borrow_mut().operations = then_cap.ops;
+                then_cap.block.closeblock(vec![link]);
+            }
+            {
+                let link_args = branch_link_args(&else_cap.tail, &merged_names, &else_cap.locals);
+                let link = Rc::new(RefCell::new(Link::new(
+                    link_args,
+                    Some(join_block.clone()),
+                    None,
+                )));
+                else_cap.block.borrow_mut().operations = else_cap.ops;
+                else_cap.block.closeblock(vec![link]);
+            }
+
+            b.open_new_block(BlockBuilder {
+                block: join_block,
+                ops: Vec::new(),
+                locals: join_locals,
+            });
+            Ok(BlockExit::FallThrough(tail_var))
+        }
+    }
+}
+
+/// Build the post-if join block for the single-predecessor case and
+/// close the surviving branch's tail block into it. Returns the join
+/// block (for caller bookkeeping) and the `tail_var` representing the
+/// if-expression's value as seen from join-block locals.
+///
+/// Upstream analogue: `flowcontext.py` never creates a join block for
+/// a PC that only one arm jumps to (it would still be there, but with
+/// one incoming Link) — this routine mirrors that shape.
+fn build_if_join_block(
+    merged_names: &[String],
+    b: &mut Builder,
+    cap: &ArmCapture,
+) -> (BlockRef, Hlvalue) {
     let tail_var = Hlvalue::Variable(Variable::new());
     let mut join_inputargs: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
     join_inputargs.push(tail_var.clone());
+    let mut join_locals: HashMap<String, Hlvalue> = HashMap::new();
+    for name in merged_names {
+        let fresh = Hlvalue::Variable(Variable::named(name));
+        join_inputargs.push(fresh.clone());
+        join_locals.insert(name.clone(), fresh);
+    }
+    let join_block = Block::shared(join_inputargs);
+
+    // Close the surviving arm's tail block with the one-and-only Link
+    // into the join.
+    let link_args = branch_link_args(&cap.tail, merged_names, &cap.locals);
+    let link = Rc::new(RefCell::new(Link::new(
+        link_args,
+        Some(join_block.clone()),
+        None,
+    )));
+    cap.block.borrow_mut().operations = cap.ops.clone();
+    cap.block.closeblock(vec![link]);
+
+    // Open the join as the new current block.
+    b.open_new_block(BlockBuilder {
+        block: join_block.clone(),
+        ops: Vec::new(),
+        locals: join_locals,
+    });
+    (join_block, tail_var)
+}
+
+/// Lower `if cond { body }` without an `else` branch.
+///
+/// Shape mirrors upstream `flowcontext.py:756 POP_JUMP_IF_FALSE`: the
+/// false-branch target IS the post-body join PC (fallthrough of
+/// `body` lands on the same PC), so the fork block's `false` exit
+/// links directly to the join, and the `true` exit threads through a
+/// `then_block` whose body-tail also links to the join. No else
+/// block is allocated. The join's inputargs carry ONLY the merged
+/// locals — there is no tail-value slot, because `if` without `else`
+/// is a statement and the expression "produces" `None`
+/// (Python convention mirrored by `ConstValue::None`; upstream
+/// RPython bytecode never leaves a value on the stack for this
+/// construct).
+///
+/// Return value: `Constant(None)`. The `Stmt::Expr` loop in
+/// `lower_block` discards the tail of semicolon-terminated
+/// expressions, so in normal statement position this is erased. In
+/// tail position (`if cond { body }` as the function's last
+/// expression), the None flows into the returnblock — matching
+/// Python's implicit `return None` fallthrough.
+fn lower_if_without_else(
+    b: &mut Builder,
+    cond: Hlvalue,
+    then_branch: &SynBlock,
+) -> Result<BlockExit, AdapterError> {
+    // 1. Snapshot pre-fork locals. Same discipline as the with-else
+    //    path: deterministic ordering via sort, one entry per
+    //    live local name at the fork point.
+    let pre_fork_locals = b.locals().clone();
+    let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
+    merged_names.sort();
+
+    // 2. Allocate the then_block (sole branch block) and the join
+    //    block up-front — the fork's false Link needs the join as its
+    //    target, so the join must exist before `finalize_current`.
+    //    Join inputargs are just the merged locals; no tail slot.
+    let (then_block, then_locals) = branch_block_with_inputargs(&merged_names);
+    let mut join_inputargs: Vec<Hlvalue> = Vec::with_capacity(merged_names.len());
     let mut join_locals: HashMap<String, Hlvalue> = HashMap::new();
     for name in &merged_names {
         let fresh = Hlvalue::Variable(Variable::named(name));
@@ -703,14 +1062,52 @@ fn lower_if(b: &mut Builder, if_expr: &ExprIf) -> Result<Hlvalue, AdapterError> 
     }
     let join_block = Block::shared(join_inputargs);
 
-    // 8. Close each branch's tail block with a Link into the join.
-    //    `branch_link_args` reads from the branch's locals snapshot —
-    //    branch-local `let` bindings (names absent from merged_names)
-    //    never reach the join.
-    let then_link_args = branch_link_args(&then_tail, &merged_names, &then_exit_locals);
-    let else_link_args = branch_link_args(&else_tail, &merged_names, &else_exit_locals);
+    // 3. Close the fork block. `false` shortcuts directly to the
+    //    join; `true` routes through `then_block`.
+    let fork_args: Vec<Hlvalue> = merged_names
+        .iter()
+        .map(|name| pre_fork_locals[name].clone())
+        .collect();
+    let false_link = Rc::new(RefCell::new(Link::new(
+        fork_args.clone(),
+        Some(join_block.clone()),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
+    )));
+    let true_link = Rc::new(RefCell::new(Link::new(
+        fork_args,
+        Some(then_block.clone()),
+        Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
+    )));
+    b.finalize_current(vec![false_link, true_link], Some(cond));
 
-    {
+    // 4. Lower the then-branch. A `Terminated` exit (branch ends in
+    //    `return`) means `lower_return` has already wired the block
+    //    to `graph.returnblock`; skip the then→join link. The
+    //    false-path link into the join is already installed above,
+    //    so the join is always reachable — `lower_if_without_else`
+    //    therefore always returns FallThrough.
+    b.open_new_block(BlockBuilder {
+        block: then_block,
+        ops: Vec::new(),
+        locals: then_locals,
+    });
+    let then_exit = lower_block(b, then_branch)?;
+    if let BlockExit::FallThrough(_tail) = then_exit {
+        // Body's tail expression value is discarded — `if` without
+        // else has no tail slot in the join (it produces implicit
+        // `None` regardless of what the body evaluated to).
+        let then_exit_block = b.current.block.clone();
+        let then_exit_ops = std::mem::take(&mut b.current.ops);
+        let then_exit_locals = std::mem::take(&mut b.current.locals);
+        let then_link_args: Vec<Hlvalue> = merged_names
+            .iter()
+            .map(|name| {
+                then_exit_locals
+                    .get(name)
+                    .cloned()
+                    .expect("merged_names is a subset of branch entry locals")
+            })
+            .collect();
         let then_link = Rc::new(RefCell::new(Link::new(
             then_link_args,
             Some(join_block.clone()),
@@ -718,25 +1115,28 @@ fn lower_if(b: &mut Builder, if_expr: &ExprIf) -> Result<Hlvalue, AdapterError> 
         )));
         then_exit_block.borrow_mut().operations = then_exit_ops;
         then_exit_block.closeblock(vec![then_link]);
-    }
-    {
-        let else_link = Rc::new(RefCell::new(Link::new(
-            else_link_args,
-            Some(join_block.clone()),
-            None,
-        )));
-        else_exit_block.borrow_mut().operations = else_exit_ops;
-        else_exit_block.closeblock(vec![else_link]);
+    } else {
+        // Then-branch terminated via `return`. Clear any stale
+        // current-block state so `open_new_block` starts cleanly.
+        b.current.ops.clear();
+        b.current.locals.clear();
     }
 
-    // 9. Continue lowering into the join block. Subsequent reads of
-    //    any merged local see the join-block inputarg.
+    // 5. Continue lowering into the join block. The false-path link
+    //    is always installed, so the join is reachable whether the
+    //    then-branch fell through or terminated.
     b.open_new_block(BlockBuilder {
         block: join_block,
         ops: Vec::new(),
         locals: join_locals,
     });
-    Ok(tail_var)
+
+    // 6. The if-without-else expression value is `None` — Python
+    //    statement convention, upstream's bytecode never leaves a
+    //    value on the stack for `if x: body`.
+    Ok(BlockExit::FallThrough(Hlvalue::Constant(Constant::new(
+        ConstValue::None,
+    ))))
 }
 
 /// Create a branch block whose inputargs are fresh Variables — one
@@ -800,7 +1200,22 @@ fn branch_link_args(
 // `Pat::Range`, identifier-binding, guards, …) reject via
 // `AdapterError::Unsupported` — they land in M2.5c / M2.5d.
 
-fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<Hlvalue, AdapterError> {
+/// Dispatch a match-arm body across the control-flow-bearing
+/// expression kinds so termination (via `return`) threads up through
+/// the arm naturally. Arms with a non-control-flow body (literal,
+/// path, binop, etc.) fall back to `lower_expr` and report
+/// `FallThrough` with the evaluated value.
+fn lower_arm_body(b: &mut Builder, body: &Expr) -> Result<BlockExit, AdapterError> {
+    match body {
+        Expr::Block(block_expr) => lower_block(b, &block_expr.block),
+        Expr::If(if_expr) => lower_if(b, if_expr),
+        Expr::Match(match_expr) => lower_match(b, match_expr),
+        Expr::Return(ret) => lower_return(b, ret),
+        _ => Ok(BlockExit::FallThrough(lower_expr(b, body)?)),
+    }
+}
+
+fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<BlockExit, AdapterError> {
     // 1. Evaluate the scrutinee into the current block. Becomes the
     //    block's `exitswitch` when we close the fork.
     let scrutinee = lower_expr(b, &match_expr.expr)?;
@@ -910,36 +1325,36 @@ fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<Hlvalue, Adapt
     }
     b.finalize_current(fork_exits, Some(scrutinee));
 
-    // 6. Lower each arm's body. Record the exit block / ops / locals /
-    //    tail for the later join-block wiring. ONE body per original
-    //    arm, regardless of how many sub-patterns (Links) fed into the
-    //    branch block.
-    struct ArmExit {
-        block: BlockRef,
-        ops: Vec<SpaceOperation>,
-        locals: HashMap<String, Hlvalue>,
-        tail: Hlvalue,
-    }
-    let mut arm_exits: Vec<ArmExit> = Vec::with_capacity(match_expr.arms.len());
+    // 6. Lower each arm's body via `lower_arm_body` so termination
+    //    via `return` threads up per `flowcontext.py:1232`. Record
+    //    ONE capture per original arm — a `None` capture means the
+    //    arm terminated and is not linked to the join. Regardless of
+    //    how many sub-patterns (Links) feed into the arm's branch
+    //    block, the body is lowered exactly once.
+    let mut arm_captures: Vec<Option<ArmCapture>> = Vec::with_capacity(match_expr.arms.len());
     for ((branch_block, branch_locals), arm) in branch_blocks.into_iter().zip(&match_expr.arms) {
         b.open_new_block(BlockBuilder {
             block: branch_block,
             ops: Vec::new(),
             locals: branch_locals,
         });
-        let tail = lower_expr(b, &arm.body)?;
-        let exit_block = b.current.block.clone();
-        let exit_ops = std::mem::take(&mut b.current.ops);
-        let exit_locals = std::mem::take(&mut b.current.locals);
-        arm_exits.push(ArmExit {
-            block: exit_block,
-            ops: exit_ops,
-            locals: exit_locals,
-            tail,
-        });
+        let exit = lower_arm_body(b, &arm.body)?;
+        arm_captures.push(capture_arm_exit(b, exit));
     }
 
-    // 7. Build the join block — inputargs = [tail_var, local_var_0, …].
+    // 7. If every arm terminated, the post-match PC is unreachable:
+    //    no join block is allocated, and the enclosing lowering must
+    //    observe termination. Upstream analogue:
+    //    `Return.nomoreblocks()` on every pending arm raises
+    //    `StopFlowing` and the join PC is never enqueued.
+    if arm_captures.iter().all(|c| c.is_none()) {
+        return Ok(BlockExit::Terminated);
+    }
+
+    // 8. Build the join block — inputargs = [tail_var, local_var_0, …].
+    //    Every surviving arm contributes one Link; terminated arms
+    //    are silently skipped (their block was already closed to
+    //    returnblock by `lower_return`).
     let tail_var = Hlvalue::Variable(Variable::new());
     let mut join_inputargs: Vec<Hlvalue> = Vec::with_capacity(merged_names.len() + 1);
     join_inputargs.push(tail_var.clone());
@@ -951,25 +1366,26 @@ fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<Hlvalue, Adapt
     }
     let join_block = Block::shared(join_inputargs);
 
-    // 8. Close each arm's exit block with a Link into the join.
-    for arm_exit in arm_exits {
-        let link_args = branch_link_args(&arm_exit.tail, &merged_names, &arm_exit.locals);
+    // 9. Close each surviving arm's exit block with a Link into the
+    //    join.
+    for cap in arm_captures.into_iter().flatten() {
+        let link_args = branch_link_args(&cap.tail, &merged_names, &cap.locals);
         let link = Rc::new(RefCell::new(Link::new(
             link_args,
             Some(join_block.clone()),
             None,
         )));
-        arm_exit.block.borrow_mut().operations = arm_exit.ops;
-        arm_exit.block.closeblock(vec![link]);
+        cap.block.borrow_mut().operations = cap.ops;
+        cap.block.closeblock(vec![link]);
     }
 
-    // 9. Continue lowering into the join block.
+    // 10. Continue lowering into the join block.
     b.open_new_block(BlockBuilder {
         block: join_block,
         ops: Vec::new(),
         locals: join_locals,
     });
-    Ok(tail_var)
+    Ok(BlockExit::FallThrough(tail_var))
 }
 
 // ____________________________________________________________
@@ -1539,6 +1955,24 @@ fn lower_loop_body(b: &mut Builder, body: &SynBlock) -> Result<LoopBodyExit, Ada
                 lower_continue(b, cont)?;
                 return Ok(LoopBodyExit::Terminated);
             }
+            // `return` inside a loop body closes the current block
+            // to `graph.returnblock` just like at any other statement
+            // position (upstream `flowcontext.py:687, :1232`). That
+            // also ends this loop-body lowering — further body stmts
+            // would be dead code, and the loop's back-edge must NOT
+            // be emitted because execution never reaches the body's
+            // closing `}`.
+            Stmt::Expr(Expr::Return(ret), _) => {
+                if !is_last {
+                    return Err(AdapterError::Unsupported {
+                        reason: "dead code after `return` — the terminator must be the last \
+                            statement in the loop body"
+                            .into(),
+                    });
+                }
+                let _ = lower_return(b, ret)?;
+                return Ok(LoopBodyExit::Terminated);
+            }
             Stmt::Expr(Expr::While(while_expr), _) => {
                 lower_while(b, while_expr)?;
             }
@@ -2100,13 +2534,45 @@ fn classify_pattern(pat: &Pat, is_last: bool) -> Result<Option<Hlvalue>, Adapter
             Lit::Bool(bl) => Ok(Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(
                 bl.value,
             ))))),
-            Lit::Str(_) | Lit::ByteStr(_) | Lit::Byte(_) | Lit::Char(_) | Lit::Float(_) | _ => {
-                Err(AdapterError::Unsupported {
-                    reason: "match arm non-integer/bool literal pattern (string/float/char \
-                    patterns land in M2.5d)"
-                        .into(),
-                })
+            // Upstream `model.py:658` admits single-character strings as
+            // switch exitcases (`isinstance(n, (str, unicode)) and
+            // len(n) == 1`). Rust's `char` literal is the direct
+            // analogue — RPython has no `char` type; it uses one-char
+            // `str`. Emit `ConstValue::Str(c.to_string())` so the
+            // resulting exitcase passes `checkgraph`'s len==1 check.
+            Lit::Char(ch) => Ok(Some(Hlvalue::Constant(Constant::new(ConstValue::Str(
+                ch.value().to_string(),
+            ))))),
+            // Upstream `model.py:658` admits `isinstance(n, (str,
+            // unicode)) and len(n) == 1` as a valid switch exitcase,
+            // so single-character string patterns are legal. `char`
+            // literals lower to the same `ConstValue::Str(c.to_string())`
+            // shape (see the `Lit::Char` arm above), making
+            // `match x { "a" => … }` and `match x { 'a' => … }`
+            // structurally interchangeable. Multi-character strings
+            // still reject — `checkgraph` would flag them.
+            Lit::Str(s) => {
+                let value = s.value();
+                // `str.chars().count()` counts Unicode scalars,
+                // matching what `len(u"é")` observes on RPython's
+                // unicode side.
+                if value.chars().count() != 1 {
+                    return Err(AdapterError::Unsupported {
+                        reason: "match arm multi-character string-literal pattern — \
+                            upstream `model.py:658` admits only single-character \
+                            strings as switch exitcases"
+                            .into(),
+                    });
+                }
+                Ok(Some(Hlvalue::Constant(Constant::new(ConstValue::Str(
+                    value,
+                )))))
             }
+            Lit::ByteStr(_) | Lit::Byte(_) | Lit::Float(_) | _ => Err(AdapterError::Unsupported {
+                reason: "match arm non-integer/bool/char literal pattern \
+                        (byte/bytestring/float patterns have no upstream analogue)"
+                    .into(),
+            }),
         },
         Pat::Or(_) => {
             // Unreachable under `lower_match` which pre-flattens
@@ -2589,18 +3055,272 @@ mod tests {
     // below.
 
     #[test]
-    fn rejects_if_without_else() {
-        // `if` in expression position without `else` — triggers the
-        // lower_if else-branch check directly (not the semicolon-stmt
-        // gate).
-        match lower("fn f(x: i64) -> i64 { let _y = if x > 0 { 1 }; 2 }").unwrap_err() {
+    fn if_without_else_return_in_branch_closes_to_returnblock() {
+        // Upstream `flowcontext.py:687 RETURN_VALUE` raises `Return`
+        // and `flowcontext.py:1232 Return.nomoreblocks(ctx)` closes
+        // the current block straight to `graph.returnblock`. In an
+        // `if cond { return X; } tail` shape the then-branch's
+        // closing Link therefore targets `returnblock` (carrying the
+        // return value), while the `false` shortcut threads through
+        // the join and on to the function's implicit-None return
+        // tail.
+        let g = lower("fn f(x: i64) -> i64 { if x > 0 { return 1; } 2 }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.exits.len(), 2);
+        let false_exit = start.exits[0].borrow();
+        let true_exit = start.exits[1].borrow();
+        let true_target = true_exit
+            .target
+            .as_ref()
+            .expect("true branch has target")
+            .clone();
+        // The then_block's only exit Links to `graph.returnblock`
+        // with `Constant(1)` — upstream `flowcontext.py:1232`
+        // structural shape.
+        let then_exits = true_target.borrow().exits.clone();
+        assert_eq!(
+            then_exits.len(),
+            1,
+            "then_block closes with a single returnblock Link per flowcontext.py:1232"
+        );
+        let then_link = then_exits[0].borrow();
+        let then_link_target = then_link
+            .target
+            .as_ref()
+            .expect("then-Link has target")
+            .clone();
+        assert!(
+            Rc::ptr_eq(&then_link_target, &g.returnblock),
+            "then-branch `return` must Link directly to graph.returnblock (not join)"
+        );
+        assert_eq!(then_link.args.len(), 1);
+        match then_link.args[0].as_ref().unwrap() {
+            Hlvalue::Constant(c) => assert_eq!(c.value, ConstValue::Int(1)),
+            other => panic!("expected Constant(1), got {other:?}"),
+        }
+        // The `false` shortcut threads to the post-if join, which in
+        // turn closes via the `2` tail into `returnblock`. Walk it
+        // explicitly.
+        let false_target = false_exit
+            .target
+            .as_ref()
+            .expect("false branch has target")
+            .clone();
+        let join_exits = false_target.borrow().exits.clone();
+        assert_eq!(join_exits.len(), 1);
+        let join_link = join_exits[0].borrow();
+        assert!(Rc::ptr_eq(
+            join_link.target.as_ref().unwrap(),
+            &g.returnblock
+        ));
+        match join_link.args[0].as_ref().unwrap() {
+            Hlvalue::Constant(c) => assert_eq!(c.value, ConstValue::Int(2)),
+            other => panic!("expected Constant(2), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn if_else_both_branches_return_produces_no_join() {
+        // When every branch of an if/else terminates via `return`,
+        // upstream's `Return.nomoreblocks()` runs on both sides and
+        // `StopFlowing` prevents the pending-block scheduler from
+        // ever enqueueing a post-if PC. Result: no join block, just
+        // two fork-target blocks that each Link to `graph.returnblock`.
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                if x > 0 { return 1; } else { return 2; }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.exits.len(), 2);
+        // Each branch block has exactly one exit, which Links to
+        // graph.returnblock.
+        for exit in start.exits.iter() {
+            let branch = exit
+                .borrow()
+                .target
+                .as_ref()
+                .expect("fork exit has target")
+                .clone();
+            let branch_exits = branch.borrow().exits.clone();
+            assert_eq!(branch_exits.len(), 1);
+            let link = branch_exits[0].borrow();
+            assert!(Rc::ptr_eq(link.target.as_ref().unwrap(), &g.returnblock));
+        }
+    }
+
+    #[test]
+    fn if_else_then_returns_else_falls_through_yields_else_tail() {
+        // Mixed case: then terminates via `return`, else falls
+        // through with a tail value. The if-expression's value is
+        // the else-tail, and the join block has exactly one
+        // predecessor (the else arm).
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                if x > 0 { return 1; } else { 2 }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Walk to the returnblock from the else-side — its incoming
+        // Link should carry `Constant(2)` per the else-tail.
+        let ret = g.returnblock.borrow();
+        assert_eq!(ret.inputargs.len(), 1);
+        assert!(ret.is_final);
+    }
+
+    #[test]
+    fn match_all_arms_return_yields_no_join() {
+        // Upstream `model.py:648-692` builds the switch-exit table
+        // the same way `flowcontext.py:1232` closes each arm — if
+        // every arm's body raises `Return`, the post-match PC is
+        // unreachable and the scheduler never allocates a join.
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                match x {
+                    0 => return 10,
+                    _ => return 20,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Each arm's branch block ends in a Link straight to
+        // graph.returnblock.
+        let start = g.startblock.borrow();
+        assert_eq!(start.exits.len(), 2);
+        for exit in start.exits.iter() {
+            let branch = exit
+                .borrow()
+                .target
+                .as_ref()
+                .expect("fork exit has target")
+                .clone();
+            let branch_exits = branch.borrow().exits.clone();
+            assert_eq!(branch_exits.len(), 1);
+            let link = branch_exits[0].borrow();
+            assert!(Rc::ptr_eq(link.target.as_ref().unwrap(), &g.returnblock));
+        }
+    }
+
+    #[test]
+    fn return_before_end_of_block_rejects() {
+        // `return X; Y` with anything after the return is unreachable
+        // dead code in upstream terms — `flowcontext.py:1232` closes
+        // the block at Return; subsequent ops never emit. Reject
+        // cleanly so users get a parse-time error instead of silent
+        // dead-code emission.
+        match lower("fn f() -> i64 { return 1; 2 }").unwrap_err() {
             AdapterError::Unsupported { reason } => {
                 assert!(
-                    reason.contains("if without else") || reason.contains("unit"),
-                    "reason: {reason}"
+                    reason.contains("after `return`"),
+                    "reason should cite dead code: {reason}"
                 );
             }
-            other => panic!("expected Unsupported(if-without-else), got {other:?}"),
+            other => panic!("expected Unsupported(dead code after return), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn if_without_else_statement_shortcuts_false_link_to_join() {
+        // `if x > 0 { let _ = 1; }` as a statement lowers to the
+        // upstream `POP_JUMP_IF_FALSE` shape: fork block has two
+        // exits, the Bool(false) link shortcuts straight to the join
+        // block (no else block allocated), the Bool(true) link
+        // routes through the then_block which in turn Links into the
+        // same join.
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                if x > 0 { let _y = 1; }
+                2
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.exits.len(), 2, "if fork has exactly two exits");
+        let false_exit = start.exits[0].borrow();
+        let true_exit = start.exits[1].borrow();
+        assert!(
+            matches!(
+                &false_exit.exitcase,
+                Some(Hlvalue::Constant(c)) if matches!(c.value, ConstValue::Bool(false))
+            ),
+            "first exit must carry Bool(false)"
+        );
+        assert!(
+            matches!(
+                &true_exit.exitcase,
+                Some(Hlvalue::Constant(c)) if matches!(c.value, ConstValue::Bool(true))
+            ),
+            "second exit must carry Bool(true)"
+        );
+        // False shortcut: its target is reached from fork in one hop
+        // and each of its exits Links to the join. True path routes
+        // through a then_block whose single exit Links to the same
+        // join. Verified by following one hop from each side and
+        // asserting pointer-equality of their targets.
+        let false_target = false_exit
+            .target
+            .as_ref()
+            .expect("false has target")
+            .clone();
+        let true_target = true_exit.target.as_ref().expect("true has target").clone();
+        assert!(
+            !Rc::ptr_eq(&false_target, &true_target),
+            "false shortcut and true branch must head to distinct blocks from the fork"
+        );
+        // The false-side target IS the join directly; the true-side
+        // target is the then_block, whose single exit Links to the
+        // join.
+        let then_exits = true_target.borrow().exits.clone();
+        assert_eq!(then_exits.len(), 1, "then_block single-exit to join");
+        let then_link_target = then_exits[0]
+            .borrow()
+            .target
+            .as_ref()
+            .expect("then_block link has target")
+            .clone();
+        assert!(
+            Rc::ptr_eq(&false_target, &then_link_target),
+            "then_block's Link target must be the SAME join block the false shortcut points at"
+        );
+    }
+
+    #[test]
+    fn if_without_else_tail_returns_none() {
+        // In tail position, `if cond { body }` produces `None` as
+        // the expression value — matches Python's fallthrough
+        // convention. `ConstValue::None` should flow into the
+        // returnblock Link.
+        let g = lower(
+            "fn f(x: i64) -> i64 {
+                if x > 0 { let _y = 1; }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Walk to the returnblock: startblock → join → returnblock.
+        let start = g.startblock.borrow();
+        assert_eq!(start.exits.len(), 2);
+        let false_target = start.exits[0]
+            .borrow()
+            .target
+            .as_ref()
+            .expect("false target")
+            .clone();
+        // The join's single exit is the Link to the returnblock,
+        // carrying the None tail as its first (and only) arg.
+        let join_exits = false_target.borrow().exits.clone();
+        assert_eq!(join_exits.len(), 1);
+        let return_link = join_exits[0].borrow();
+        assert!(!return_link.args.is_empty(), "return link carries tail arg");
+        match return_link.args[0].as_ref().unwrap() {
+            Hlvalue::Constant(c) => assert_eq!(c.value, ConstValue::None),
+            other => panic!("expected Constant(None), got {other:?}"),
         }
     }
 
@@ -2726,6 +3446,117 @@ mod tests {
             }
             other => panic!("expected Unsupported(repeated), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn match_char_pattern_emits_single_char_str_exitcase() {
+        // Upstream `model.py:658` admits `isinstance(n, (str, unicode))
+        // and len(n) == 1` as a switch exitcase. Rust's `char` literal
+        // (`'a'`) is the direct analogue — RPython has no `char` type,
+        // so single-char strings fill the role. The arm exitcase
+        // should be `ConstValue::Str("a")` (len==1), passing
+        // `checkgraph`.
+        let g = lower("fn f(c: char) -> i64 { match c { 'a' => 1, 'b' => 2, _ => 0 } }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.exits.len(), 3, "two char arms + default");
+        let ec_a = start.exits[0].borrow().exitcase.clone().unwrap();
+        let ec_b = start.exits[1].borrow().exitcase.clone().unwrap();
+        let ec_d = start.exits[2].borrow().exitcase.clone().unwrap();
+        assert!(
+            matches!(
+                ec_a,
+                Hlvalue::Constant(ref c) if matches!(&c.value, ConstValue::Str(s) if s == "a")
+            ),
+            "first char arm should carry Str(\"a\") — got {ec_a:?}"
+        );
+        assert!(
+            matches!(
+                ec_b,
+                Hlvalue::Constant(ref c) if matches!(&c.value, ConstValue::Str(s) if s == "b")
+            ),
+            "second char arm should carry Str(\"b\") — got {ec_b:?}"
+        );
+        assert!(
+            matches!(
+                ec_d,
+                Hlvalue::Constant(ref c) if matches!(&c.value, ConstValue::Str(s) if s == "default")
+            ),
+            "wildcard arm should carry Str(\"default\") — got {ec_d:?}"
+        );
+    }
+
+    #[test]
+    fn rejects_match_multichar_string_literal_pattern() {
+        // `Lit::Str` with len > 1 violates upstream `model.py:658`'s
+        // `len(n) == 1` invariant for string exitcases. Single-char
+        // strings are accepted (see
+        // `match_single_char_str_pattern_emits_str_exitcase`).
+        match lower("fn f(s: &str) -> i64 { match s { \"abc\" => 1, _ => 0 } }").unwrap_err() {
+            AdapterError::Unsupported { reason } => {
+                assert!(
+                    reason.contains("multi-character"),
+                    "reason should cite multi-char rejection: {reason}"
+                );
+                assert!(
+                    reason.contains("model.py:658"),
+                    "reason should cite the upstream rule: {reason}"
+                );
+            }
+            other => panic!("expected Unsupported(multi-char string), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn match_single_char_str_pattern_emits_str_exitcase() {
+        // Upstream `model.py:658` admits single-character strings as
+        // valid switch exitcases; the adapter should accept `"a"` in
+        // a match arm the same way it accepts `'a'`. Both produce a
+        // `ConstValue::Str("a".into())` exitcase — structurally
+        // interchangeable at the graph layer.
+        let g = lower(
+            "fn f(s: &str) -> i64 {
+                match s { \"a\" => 1, _ => 0 }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        let ec = start.exits[0]
+            .borrow()
+            .exitcase
+            .clone()
+            .expect("arm has exitcase");
+        assert!(
+            matches!(
+                ec,
+                Hlvalue::Constant(ref c) if matches!(&c.value, ConstValue::Str(s) if s == "a")
+            ),
+            "single-char string pattern should carry Str(\"a\") — got {ec:?}"
+        );
+    }
+
+    #[test]
+    fn match_single_char_str_and_char_pattern_produce_identical_exitcase() {
+        // `match x { "a" => … }` and `match x { 'a' => … }` must
+        // produce the same `ConstValue::Str("a")` exitcase. This
+        // pins `lower_literal` / `classify_pattern`'s symmetry
+        // between the two syntactic forms.
+        let g_str = lower("fn f(s: &str) -> i64 { match s { \"a\" => 1, _ => 0 } }").unwrap();
+        let g_char = lower("fn f(c: char) -> i64 { match c { 'a' => 1, _ => 0 } }").unwrap();
+        let start_str = g_str.startblock.borrow();
+        let start_char = g_char.startblock.borrow();
+        let ec_str = start_str.exits[0]
+            .borrow()
+            .exitcase
+            .clone()
+            .expect("arm has exitcase");
+        let ec_char = start_char.exits[0]
+            .borrow()
+            .exitcase
+            .clone()
+            .expect("arm has exitcase");
+        assert_eq!(ec_str, ec_char);
     }
 
     #[test]
@@ -3723,12 +4554,59 @@ mod tests {
     }
 
     #[test]
-    fn rejects_char_literal() {
-        match lower("fn f() -> i64 { let _c = 'a'; 0 }").unwrap_err() {
+    fn char_literal_lowers_to_single_char_str() {
+        // Rust `char` → `ConstValue::Str(len==1)`. Matches the
+        // match-arm side (`classify_pattern`) so scrutinee and
+        // exitcase share the identical Constant for an end-to-end
+        // char match. No operations emitted — a bare `let _c = 'a'`
+        // is pure SSA binding.
+        let g = lower("fn f() -> i64 { let c = 'a'; 0 }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(
+            start.operations.len(),
+            0,
+            "bare char literal binding emits no ops"
+        );
+    }
+
+    #[test]
+    fn rejects_byte_literal() {
+        // `b'a'` parses as `Lit::Byte` and stays rejected — upstream
+        // Python 2.7 doesn't have a distinct byte vocabulary in
+        // flowspace.
+        match lower("fn f() -> i64 { let _b = b'a'; 0 }").unwrap_err() {
             AdapterError::Unsupported { reason } => {
-                assert!(reason.contains("char"), "reason: {reason}");
+                assert!(reason.contains("byte"), "reason: {reason}");
             }
-            other => panic!("expected Unsupported(char), got {other:?}"),
+            other => panic!("expected Unsupported(byte), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn char_literal_returned_as_single_char_str_constant() {
+        // Expression-position `'a'` must reach the returnblock as
+        // `Constant(Str("a"))` — same encoding the match-arm side
+        // emits in `classify_pattern`. An end-to-end test with a
+        // constant-scrutinee match would also need `guessbool` /
+        // `HLOperation.eval` constant-folding (PRE-EXISTING-ADAPTATION
+        // #3 in `mod.rs`) to close cleanly, so that composition is
+        // deferred to the constfold port; here we only pin the
+        // literal-to-Constant step.
+        let g = lower("fn f() -> &'static str { 'a' }").unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.exits.len(), 1);
+        let link = start.exits[0].borrow();
+        match link.args[0].as_ref().unwrap() {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::Str(s) => {
+                    assert_eq!(s, "a");
+                    assert_eq!(s.chars().count(), 1, "model.py:658 requires len==1");
+                }
+                other => panic!("expected Str, got {other:?}"),
+            },
+            other => panic!("expected Constant, got {other:?}"),
         }
     }
 
