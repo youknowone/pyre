@@ -51,8 +51,8 @@
 //! Commit 4 target.
 
 use crate::annotator::annrpython::RPythonAnnotator;
-use crate::annotator::classdesc::ClassDef;
-use crate::annotator::description::{CallFamily, CallTableRow};
+use crate::annotator::classdesc::{ClassDef, ClassDesc};
+use crate::annotator::description::{CallFamily, CallTableRow, ClassAttrFamily, DescEntry};
 use crate::annotator::model::AnnotatorError;
 use crate::flowspace::argument::{CallShape, Signature};
 use crate::flowspace::model::{
@@ -156,6 +156,7 @@ pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), Annota
             saved: old_frozen,
         };
         normalize_call_familes(annotator)?;
+        merge_classpbc_getattr_into_classdef(annotator)?;
         assign_inheritance_ids(annotator);
     }
     // upstream: `create_instantiate_functions(annotator)` runs AFTER
@@ -194,6 +195,193 @@ pub fn perform_normalizations(annotator: &RPythonAnnotator) -> Result<(), Annota
 /// preserves the bracket invariant `c.minid <= d.minid <= d.maxid <=
 /// c.maxid` for every descendant `d` of `c`, including when a later run
 /// adds a new subclass under an already-seen parent.
+/// RPython `merge_classpbc_getattr_into_classdef(annotator)`
+/// (normalizecalls.py:208-235).
+///
+/// ```python
+/// def merge_classpbc_getattr_into_classdef(annotator):
+///     all_families = annotator.bookkeeper.classpbc_attr_families
+///     for attrname, access_sets in all_families.items():
+///         for access_set in access_sets.infos():
+///             descs = access_set.descs
+///             if len(descs) <= 1:
+///                 continue
+///             if not isinstance(descs.iterkeys().next(), ClassDesc):
+///                 continue
+///             classdefs = [desc.getuniqueclassdef() for desc in descs]
+///             commonbase = classdefs[0]
+///             for cdef in classdefs[1:]:
+///                 commonbase = commonbase.commonbase(cdef)
+///                 if commonbase is None:
+///                     raise TyperError("reading attribute %r: no common base "
+///                                      "class for %r" % (attrname, descs.keys()))
+///             extra_access_sets = commonbase.extra_access_sets
+///             if commonbase.repr is not None:
+///                 assert access_set in extra_access_sets
+///                 continue
+///             access_set.commonbase = commonbase
+///             if access_set not in extra_access_sets:
+///                 counter = len(extra_access_sets)
+///                 extra_access_sets[access_set] = attrname, counter
+/// ```
+///
+/// For every class-PBC attribute access set this walks the matching
+/// classdefs, computes the deepest common ancestor, and stamps that
+/// `commonbase` onto both sides of the connection — onto the
+/// `ClassAttrFamily` itself (consumed by `ClassesPBCRepr.get_access_set`)
+/// and into `commonbase.extra_access_sets` (consumed by
+/// `ClassRepr._setup_repr_pbcfields`, rclass.py:280-285).
+///
+/// Pyre lookup deviation: upstream `descs.iterkeys().next()` exploits
+/// Python's hashed `Desc` identity; in Rust the family stores
+/// [`crate::annotator::description::DescKey`] values only, so we
+/// resolve them back to live `ClassDesc` `Rc`s by walking
+/// `bookkeeper.descs` (the by-`HostObject` registry) and matching
+/// keys. This is O(|bk.descs| * |access_set.descs|) per family, which
+/// is fine for the small per-attr access set populations and runs
+/// once per `perform_normalizations` invocation.
+pub fn merge_classpbc_getattr_into_classdef(
+    annotator: &RPythonAnnotator,
+) -> Result<(), AnnotatorError> {
+    use std::collections::HashSet;
+    let bk = &annotator.bookkeeper;
+
+    // Snapshot `(attrname, access_set)` pairs so we can release the
+    // outer `classpbc_attr_families` borrow before mutating individual
+    // families / commonbases below — the live `infos()` iterator holds
+    // a borrow on the UnionFind storage.
+    let pairs: Vec<(String, Rc<RefCell<ClassAttrFamily>>)> = {
+        let map = bk.classpbc_attr_families.borrow();
+        let mut out = Vec::new();
+        for (attrname, uf) in map.iter() {
+            for family in uf.infos() {
+                out.push((attrname.clone(), family.clone()));
+            }
+        }
+        out
+    };
+
+    for (attrname, access_set) in pairs {
+        // upstream `descs = access_set.descs; if len(descs) <= 1: continue`.
+        let desc_keys: HashSet<crate::annotator::description::DescKey> = {
+            let caf = access_set.borrow();
+            caf.descs.keys().copied().collect()
+        };
+        if desc_keys.len() <= 1 {
+            continue;
+        }
+
+        // upstream `if not isinstance(descs.iterkeys().next(), ClassDesc):
+        // continue`. Walk `bookkeeper.descs` to resolve each DescKey
+        // back to its live `Rc<RefCell<ClassDesc>>`. Non-Class descs
+        // that share the family are filtered out — but in practice the
+        // family is built from a uniform-kind PBC, so either all match
+        // or none does.
+        let class_descs: Vec<Rc<RefCell<ClassDesc>>> = {
+            let descs_map = bk.descs.borrow();
+            let mut out = Vec::new();
+            for entry in descs_map.values() {
+                if let DescEntry::Class(rc) = entry {
+                    let key = crate::annotator::description::DescKey::from_rc(rc);
+                    if desc_keys.contains(&key) {
+                        out.push(rc.clone());
+                    }
+                }
+            }
+            out
+        };
+        // Strictness: upstream rpython/rtyper/normalizecalls.py:217-219
+        // peeks at `descs.iterkeys().next()`. If the first desc is not
+        // a `ClassDesc`, the whole family is skipped — non-class
+        // PBCs share their access families through different reprs
+        // (FrozenAttrFamily etc.), so this branch is the right
+        // skip-path. The `class_descs.is_empty()` arm models that.
+        //
+        // The pyre port resolves DescKeys → live `ClassDesc`s by
+        // walking `bookkeeper.descs`; if every key matched a non-class
+        // entry we end up with `class_descs.is_empty()` and skip
+        // matches upstream. But if SOME keys matched class entries
+        // and others didn't, we'd be silently dropping descs the
+        // family thinks belong to it. That is upstream-impossible:
+        // an attr family is built from descs of a single kind.
+        // Surface a structured error rather than silently skipping
+        // the partial-match.
+        if class_descs.is_empty() {
+            continue;
+        }
+        if class_descs.len() != desc_keys.len() {
+            return Err(AnnotatorError::new(format!(
+                "merge_classpbc_getattr_into_classdef: mixed-kind family for \
+                 attr {:?} — {} descs in family, {} resolve to ClassDesc \
+                 in bookkeeper.descs",
+                attrname,
+                desc_keys.len(),
+                class_descs.len(),
+            )));
+        }
+        if class_descs.len() <= 1 {
+            continue;
+        }
+
+        // upstream `classdefs = [desc.getuniqueclassdef() for desc in descs]`
+        // followed by `commonbase = classdefs[0]; for cdef in classdefs[1:]:
+        //     commonbase = commonbase.commonbase(cdef); if commonbase is None: raise TyperError(...)`.
+        let mut commonbase = ClassDesc::getuniqueclassdef(&class_descs[0])?;
+        for other in &class_descs[1..] {
+            let cdef = ClassDesc::getuniqueclassdef(other)?;
+            commonbase = match ClassDef::commonbase(&commonbase, &cdef) {
+                Some(b) => b,
+                None => {
+                    return Err(AnnotatorError::new(format!(
+                        "reading attribute {:?}: no common base class for {} class descriptions",
+                        attrname,
+                        class_descs.len()
+                    )));
+                }
+            };
+        }
+
+        // upstream `extra_access_sets = commonbase.extra_access_sets;
+        // if commonbase.repr is not None: assert access_set in extra_access_sets; continue`.
+        let access_set_key = Rc::as_ptr(&access_set) as usize;
+        {
+            let cb = commonbase.borrow();
+            if cb.repr.is_some() {
+                // upstream rpython/rtyper/normalizecalls.py:230 —
+                // hard `assert access_set in extra_access_sets`. The
+                // pyre port mirrors that with a runtime `assert!`
+                // (not `debug_assert!`) so release builds preserve
+                // the invariant.
+                assert!(
+                    cb.extra_access_sets.contains_key(&access_set_key),
+                    "merge_classpbc_getattr_into_classdef invariant: commonbase \
+                     {:?} already has a repr but access_set is not in its \
+                     extra_access_sets",
+                    cb.name
+                );
+                continue;
+            }
+        }
+
+        // upstream `access_set.commonbase = commonbase`.
+        access_set.borrow_mut().commonbase = Some(commonbase.clone());
+
+        // upstream `if access_set not in extra_access_sets:
+        //     counter = len(extra_access_sets);
+        //     extra_access_sets[access_set] = attrname, counter`.
+        let mut cb_mut = commonbase.borrow_mut();
+        if !cb_mut.extra_access_sets.contains_key(&access_set_key) {
+            let counter = cb_mut.extra_access_sets.len();
+            cb_mut.extra_access_sets.insert(
+                access_set_key,
+                (access_set.clone(), attrname.clone(), counter),
+            );
+        }
+    }
+
+    Ok(())
+}
+
 pub fn assign_inheritance_ids(annotator: &RPythonAnnotator) {
     let snapshot: Vec<Rc<RefCell<ClassDef>>> = annotator
         .bookkeeper
@@ -1334,5 +1522,116 @@ mod tests {
         // the annotator is already unfrozen again.
         assert!(!*ann.frozen.borrow());
         assert!(classdef.borrow().my_instantiate_graph.is_some());
+    }
+
+    /// `merge_classpbc_getattr_into_classdef` walks every per-attr
+    /// access set, computes the deepest common base across the
+    /// classdescs that share it, and stamps that ClassDef both onto
+    /// `family.commonbase` and into `commonbase.extra_access_sets`.
+    ///
+    /// Two-class scenario: `Root <- Leaf` sharing attr "shared". The
+    /// common base must be `Root`, and `Root.extra_access_sets` must
+    /// carry one entry referencing the family.
+    #[test]
+    fn merge_classpbc_getattr_into_classdef_attaches_commonbase_and_extra_access_set() {
+        use crate::annotator::description::DescEntry as DE;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let root = register_classdef(&ann, "pkg.Root", None);
+        let leaf = register_classdef(&ann, "pkg.Leaf", Some(&root));
+
+        // Surface the classdescs in `bookkeeper.descs` so the merge
+        // pass can resolve `family.descs` keys back to live ClassDescs.
+        // Upstream populates this lazily via `getdesc`; the test bypass
+        // mirrors that side-effect.
+        let root_desc = root.borrow().classdesc.clone();
+        let leaf_desc = leaf.borrow().classdesc.clone();
+        {
+            let mut descs = ann.bookkeeper.descs.borrow_mut();
+            let root_pyobj = root_desc.borrow().pyobj.clone();
+            let leaf_pyobj = leaf_desc.borrow().pyobj.clone();
+            descs.insert(root_pyobj, DE::Class(root_desc.clone()));
+            descs.insert(leaf_pyobj, DE::Class(leaf_desc.clone()));
+        }
+
+        // Build a single ClassAttrFamily containing both descs by
+        // unioning them under the "shared" attr name.
+        let root_key = DescKey::from_rc(&root_desc);
+        let leaf_key = DescKey::from_rc(&leaf_desc);
+        ann.bookkeeper.with_classpbc_attr_families("shared", |uf| {
+            uf.find(root_key);
+            uf.union(root_key, leaf_key);
+            Some(())
+        });
+
+        merge_classpbc_getattr_into_classdef(&ann)
+            .expect("merge_classpbc_getattr_into_classdef must succeed");
+
+        // Find the family — there is exactly one root info in the UF.
+        let access_set = ann
+            .bookkeeper
+            .with_classpbc_attr_families("shared", |uf| uf.infos().next().cloned())
+            .expect("union must produce exactly one family");
+
+        // Side 1: family.commonbase is the root classdef.
+        let commonbase = access_set
+            .borrow()
+            .commonbase
+            .clone()
+            .expect("commonbase must be set after merge_classpbc_getattr_into_classdef");
+        assert!(
+            Rc::ptr_eq(&commonbase, &root),
+            "commonbase must equal the deepest common ancestor (Root)"
+        );
+
+        // Side 2: commonbase.extra_access_sets carries the family.
+        let key = Rc::as_ptr(&access_set) as usize;
+        let entry = root
+            .borrow()
+            .extra_access_sets
+            .get(&key)
+            .cloned()
+            .expect("extra_access_sets must carry the access_set keyed by Rc identity");
+        assert_eq!(entry.1, "shared", "stored attrname must match");
+        assert_eq!(entry.2, 0, "first registered family gets counter 0");
+        assert!(
+            Rc::ptr_eq(&entry.0, &access_set),
+            "stored Rc must equal the original family"
+        );
+    }
+
+    /// Single-desc families are skipped (no commonbase needed) — they
+    /// take the upstream `if len(descs) <= 1: continue` short-circuit.
+    #[test]
+    fn merge_classpbc_getattr_into_classdef_skips_singleton_family() {
+        use crate::annotator::description::DescEntry as DE;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let only = register_classdef(&ann, "pkg.Only", None);
+        let only_desc = only.borrow().classdesc.clone();
+        {
+            let mut descs = ann.bookkeeper.descs.borrow_mut();
+            let pyobj = only_desc.borrow().pyobj.clone();
+            descs.insert(pyobj, DE::Class(only_desc.clone()));
+        }
+        let only_key = DescKey::from_rc(&only_desc);
+        ann.bookkeeper.with_classpbc_attr_families("alone", |uf| {
+            uf.find(only_key);
+            Some(())
+        });
+
+        merge_classpbc_getattr_into_classdef(&ann).expect("must succeed");
+
+        // Singleton family must NOT have commonbase populated.
+        let access_set = ann
+            .bookkeeper
+            .with_classpbc_attr_families("alone", |uf| uf.infos().next().cloned())
+            .expect("singleton family present");
+        assert!(
+            access_set.borrow().commonbase.is_none(),
+            "singleton family must not get commonbase set"
+        );
+        assert!(
+            only.borrow().extra_access_sets.is_empty(),
+            "singleton class must not be touched"
+        );
     }
 }

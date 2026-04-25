@@ -585,6 +585,10 @@ pub fn builtin_bool(
             | ConstValue::Code(_)
             | ConstValue::Atom(_)
             | ConstValue::SpecTag(_) => true,
+            ConstValue::LLAddress(addr) => matches!(
+                addr,
+                crate::translator::rtyper::lltypesystem::lltype::_address::Fake(_)
+            ),
             // Placeholder never appears in production flow; stay
             // conservative rather than crash.
             ConstValue::Placeholder => return Ok(SomeValue::Bool(r)),

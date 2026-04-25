@@ -102,8 +102,12 @@ pub enum ReprClassId {
     SingleFrozenPBCRepr,
     /// `rpbc.py:675 MultipleUnrelatedFrozenPBCRepr`.
     MultipleUnrelatedFrozenPBCRepr,
+    /// `rpbc.py:728 MultipleFrozenPBCRepr`.
+    MultipleFrozenPBCRepr,
     /// `rpbc.py:920 ClassesPBCRepr`.
     ClassesPBCRepr,
+    /// `rtuple.py:129 TupleRepr`.
+    TupleRepr,
 }
 
 impl ReprClassId {
@@ -140,7 +144,9 @@ impl ReprClassId {
             BuiltinMethodRepr => &[BuiltinMethodRepr, Repr],
             SingleFrozenPBCRepr => &[SingleFrozenPBCRepr, Repr],
             MultipleUnrelatedFrozenPBCRepr => &[MultipleUnrelatedFrozenPBCRepr, Repr],
+            MultipleFrozenPBCRepr => &[MultipleFrozenPBCRepr, Repr],
             ClassesPBCRepr => &[ClassesPBCRepr, Repr],
+            TupleRepr => &[TupleRepr, Repr],
         }
     }
 }
@@ -266,6 +272,13 @@ fn dispatch_convert_from_to(
         // `NotImplemented`. The rtyper distinguishes different spec-func
         // Struct pointer types even within the same Repr subclass.
         (FunctionsPBCRepr, FunctionsPBCRepr) => same_lowleveltype_convert_from_to(r_from, r_to, v),
+        // rtuple.py:340-353 — `pairtype(TupleRepr, TupleRepr).convert_from_to`.
+        // Same-arity tuple-to-tuple: identity if lltypes match, else
+        // per-item getitem_internal + convertvar + newtuple.
+        // Different-arity returns NotImplemented.
+        (TupleRepr, TupleRepr) => {
+            super::rtuple::pair_tuple_tuple_convert_from_to(r_from, r_to, v, llops)
+        }
         // rmodel.py:361-363 — `pairtype(Repr, VoidRepr).convert_from_to`
         // returns `inputconst(Void, None)`.
         (Repr, VoidRepr) => Ok(Some(Hlvalue::Constant(inputconst_from_lltype(
@@ -338,6 +351,16 @@ fn dispatch_rtype_op(
         // rptr.py:126-159 / 301-329 — array and interior-array indexing.
         (PtrRepr, IntegerRepr, "getitem") | (InteriorPtrRepr, IntegerRepr, "getitem") => {
             committed(r1.rtype_getitem(hop))
+        }
+        // rtuple.py:264-273 — `pairtype(TupleRepr, IntegerRepr).rtype_getitem`.
+        (TupleRepr, IntegerRepr, "getitem") => {
+            committed(super::rtuple::pair_tuple_int_rtype_getitem(r1, hop))
+        }
+        // rtuple.py:319-327 — `pairtype(TupleRepr, TupleRepr).rtype_add`
+        // (and its `rtype_inplace_add` alias) concatenates two tuples
+        // by per-position getfield + newtuple_cached.
+        (TupleRepr, TupleRepr, "add") | (TupleRepr, TupleRepr, "inplace_add") => {
+            committed(super::rtuple::pair_tuple_tuple_rtype_add(r1, r2, hop))
         }
         (PtrRepr, IntegerRepr, "setitem") | (InteriorPtrRepr, IntegerRepr, "setitem") => {
             committed(r1.rtype_setitem(hop))
@@ -609,6 +632,12 @@ fn dispatch_rtype_is_(
         (MultipleUnrelatedFrozenPBCRepr, MultipleUnrelatedFrozenPBCRepr) => {
             super::rpbc::pair_mu_mu_rtype_is_(r1, r2, hop).map(Some)
         }
+        // rtuple.py:355-356 — `pairtype(TupleRepr, TupleRepr).rtype_is_`
+        // raises `TyperError("cannot compare tuples with 'is'")`. The
+        // identity check is structurally meaningless on a tuple value,
+        // and the rtyper rejects it eagerly so callers cannot route a
+        // tuple through ptr_eq via the generic `(Repr, Repr)` arm below.
+        (TupleRepr, TupleRepr) => super::rtuple::pair_tuple_tuple_rtype_is_(r1, r2, hop),
         // rmodel.py:300-318 — generic identity comparison for pointer
         // low-level values, with Void adopting the opposite repr.
         (Repr, Repr) => pair_repr_repr_rtype_is_(r1, r2, hop).map(Some),

@@ -2290,9 +2290,24 @@ pub fn rtyper_makerepr(
             let as_instance = s.as_some_instance();
             rtyper_makerepr(&as_instance, rtyper)
         }
-        SomeValue::Tuple(_) => Err(TyperError::missing_rtype_operation(
-            "SomeTuple.rtyper_makerepr — port rpython/rtyper/rtuple.py TupleRepr",
-        )),
+        SomeValue::Tuple(s_tuple) => {
+            // rtuple.py:18-20 — `return TupleRepr(rtyper, [rtyper.getrepr(s_item)
+            // for s_item in self.items])`.
+            let mut items_r: Vec<std::sync::Arc<dyn Repr>> =
+                Vec::with_capacity(s_tuple.items.len());
+            for s_item in &s_tuple.items {
+                items_r.push(rtyper.getrepr(s_item)?);
+            }
+            // `TupleRepr::new` calls `externalvsinternal` per item which
+            // needs the owning `Rc<RPythonTyper>` (route to root
+            // `getinstancerepr` for GC InstanceRepr items).
+            let rtyper_rc = rtyper.self_rc()?;
+            Ok(
+                std::sync::Arc::new(crate::translator::rtyper::rtuple::TupleRepr::new(
+                    &rtyper_rc, items_r,
+                )?) as std::sync::Arc<dyn Repr>,
+            )
+        }
         SomeValue::List(_) => Err(TyperError::missing_rtype_operation(
             "SomeList.rtyper_makerepr — port rpython/rtyper/rlist.py ListRepr",
         )),

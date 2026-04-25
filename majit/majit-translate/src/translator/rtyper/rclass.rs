@@ -35,7 +35,7 @@ use std::sync::{Arc, LazyLock};
 use crate::annotator::classdesc::ClassDef;
 use crate::annotator::description::{ClassDefKey, DescEntry};
 use crate::annotator::model::{DescKind, SomePBC, SomeValue};
-use crate::flowspace::model::{ConstValue, HostObject};
+use crate::flowspace::model::{ConstValue, Constant, Hlvalue, HostObject, Variable};
 use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
 use crate::model::{BlockId, FunctionGraph, OpKind, SpaceOperation, ValueId};
 use crate::translator::rtyper::error::TyperError;
@@ -44,8 +44,8 @@ use crate::translator::rtyper::lltypesystem::lltype::{
     StructType,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
-use crate::translator::rtyper::rmodel::{DescOrConst, Repr, ReprState, mangle};
-use crate::translator::rtyper::rtyper::RPythonTyper;
+use crate::translator::rtyper::rmodel::{DescOrConst, RTypeResult, Repr, ReprState, mangle};
+use crate::translator::rtyper::rtyper::{GenopResult, LowLevelOpList, RPythonTyper};
 
 // ---------------------------------------------------------------------
 // VtableMethodPtr helper (carried over from the pre-R1 rclass.rs scaffold).
@@ -121,20 +121,25 @@ pub const IR_IMMUTABLE: ImmutableRanking = ImmutableRanking {
 /// RPython module-level `OBJECT_VTABLE = lltype.ForwardReference()` resolved
 /// via `.become(Struct('object_vtable', ...))` (rclass.py:160, 167-174).
 ///
-/// Resolves the forward reference to `object_vtable` with the three
-/// already-landed head fields `subclassrange_min` / `subclassrange_max`
-/// / `rtti`. The remaining two upstream fields (`name: Ptr(rstr.STR)`,
-/// `instantiate: Ptr(FuncType([], OBJECTPTR))`) stay deferred until
-/// their dependencies (`rstr.STR` string repr, `my_instantiate_graph`
-/// from `create_instantiate_functions`) port. Structural equality of
-/// two independently-built `OBJECT_VTABLE` clones is preserved by
-/// `LowLevelType`'s field-wise `PartialEq`, and the shared
-/// `Arc<Mutex<_>>` inside the resolved `ForwardReference` keeps the
-/// identity-level singleton semantics that `cast_vtable_to_typeptr`
-/// relies on.
+/// Resolves the forward reference to `object_vtable` with four of the
+/// five upstream head fields: `subclassrange_min` /
+/// `subclassrange_max` / `rtti` / `name`. The remaining
+/// `instantiate: Ptr(FuncType([], OBJECTPTR))` stays deferred — its
+/// type would close the cycle `OBJECT_VTABLE → OBJECTPTR → OBJECT →
+/// CLASSTYPE → OBJECT_VTABLE` which the Rust port's `LazyLock`-based
+/// initialisation cannot resolve eagerly (upstream's mutable
+/// ForwardReference + post-hoc become() reads out of order).
+/// `name` does not participate in that cycle (`Ptr(rstr.STR)` lives
+/// in `lltypesystem/rstr.rs`) so it lands here.
+///
+/// Structural equality of two independently-built `OBJECT_VTABLE`
+/// clones is preserved by `LowLevelType`'s field-wise `PartialEq`,
+/// and the shared `Arc<Mutex<_>>` inside the resolved
+/// `ForwardReference` keeps the identity-level singleton semantics
+/// that `cast_vtable_to_typeptr` relies on.
 pub static OBJECT_VTABLE: LazyLock<LowLevelType> = LazyLock::new(|| {
     let mut fwd = ForwardReference::new();
-    // Upstream `Ptr(RuntimeTypeInfo)` (rclass.py:171). The Rust port
+    // Upstream `Ptr(RuntimeTypeInfo)` (rclass.py:170). The Rust port
     // reconstructs it via the ported `Ptr::from_container_type` helper
     // on the `RUNTIME_TYPE_INFO` opaque singleton.
     let rtti_ptr_type = LowLevelType::Ptr(Box::new(
@@ -142,12 +147,18 @@ pub static OBJECT_VTABLE: LazyLock<LowLevelType> = LazyLock::new(|| {
             "Ptr(RuntimeTypeInfo) must be constructible from the RUNTIME_TYPE_INFO singleton",
         ),
     ));
+    // Upstream `Ptr(rstr.STR)` (rclass.py:171). `rstr::STRPTR` is
+    // self-contained — STR is a GcStruct with `(hash: Signed, chars:
+    // Array(Char))`; no dependency on OBJECT/OBJECTPTR so it does not
+    // re-enter this LazyLock.
+    let name_ptr_type = crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone();
     let body = StructType::with_hints(
         "object_vtable",
         vec![
             ("subclassrange_min".into(), LowLevelType::Signed),
             ("subclassrange_max".into(), LowLevelType::Signed),
             ("rtti".into(), rtti_ptr_type),
+            ("name".into(), name_ptr_type),
         ],
         vec![
             ("immutable".into(), ConstValue::Bool(true)),
@@ -267,6 +278,7 @@ fn const_truthy(value: &ConstValue) -> bool {
         | ConstValue::Graphs(_)
         | ConstValue::LowLevelType(_)
         | ConstValue::LLPtr(_)
+        | ConstValue::LLAddress(_)
         | ConstValue::SpecTag(_)
         | ConstValue::HostObject(_) => true,
     }
@@ -389,7 +401,7 @@ pub fn object_by_flavor(flavor: Flavor) -> LowLevelType {
 /// vtable-field writes — `Void`, `Signed`, `Bool`, `Float`, and `Ptr`.
 /// `Unsigned` / `Char` / `UniChar` / `SingleFloat` / `LongFloat` etc.
 /// surface as `TyperError` until their repr ports land.
-pub(super) fn constant_to_lowlevel_value(
+pub(crate) fn constant_to_lowlevel_value(
     c: &crate::flowspace::model::Constant,
 ) -> Result<lltype::LowLevelValue, TyperError> {
     let target = c.concretetype.as_ref().ok_or_else(|| {
@@ -406,6 +418,9 @@ pub(super) fn constant_to_lowlevel_value(
         }
         (LowLevelType::Bool, ConstValue::Bool(b)) => Ok(lltype::LowLevelValue::Bool(*b)),
         (LowLevelType::Float, ConstValue::Float(bits)) => Ok(lltype::LowLevelValue::Float(*bits)),
+        (LowLevelType::Address, ConstValue::LLAddress(addr)) => {
+            Ok(lltype::LowLevelValue::Address(addr.clone()))
+        }
         (LowLevelType::Ptr(_), ConstValue::LLPtr(ptr)) => {
             Ok(lltype::LowLevelValue::Ptr(ptr.clone()))
         }
@@ -463,6 +478,10 @@ pub struct ClassRepr {
     allmethods: RefCell<HashMap<String, bool>>,
     /// RPython `self.rbase = getclassrepr(...)` (rclass.py:273).
     rbase: RefCell<Option<ClassReprArc>>,
+    /// RPython `self.vtable = None` (rclass.py:284). Lazily filled by
+    /// [`Self::init_vtable`] and read by [`Self::getvtable`]. Stores the
+    /// solid vtable pointer (`malloc(vtable_type, immortal=True)`).
+    vtable: RefCell<Option<_ptr>>,
     /// RPython `Repr._initialized` state machine.
     state: ReprState,
 }
@@ -492,6 +511,7 @@ impl ClassRepr {
             pbcfields: RefCell::new(HashMap::new()),
             allmethods: RefCell::new(HashMap::new()),
             rbase: RefCell::new(None),
+            vtable: RefCell::new(None),
             state: ReprState::new(),
         }
     }
@@ -601,6 +621,26 @@ impl ClassRepr {
         vtable: &mut _ptr,
         r_parentcls: &Arc<ClassRepr>,
     ) -> Result<(), TyperError> {
+        // Backward-compatible shim — leaf-level write at empty path.
+        // [`Self::init_vtable`] uses [`Self::setup_vtable_at_path`]
+        // directly to address nested levels.
+        self.setup_vtable_at_path(vtable, &[], r_parentcls)
+    }
+
+    /// Path-aware variant of [`Self::setup_vtable`] used by
+    /// [`Self::init_vtable`] to mutate nested vtable substructs.
+    /// `path` is a sequence of `"super"` segments naming the level to
+    /// write — empty for the leaf vtable, `["super"]` for the parent
+    /// level, and so on. Each `assign` call routes through
+    /// [`_ptr::setattr_at_path`] so writes alias the original allocation
+    /// instead of being lost on a detached substruct copy returned by
+    /// `_ptr.getattr("super")`.
+    pub fn setup_vtable_at_path(
+        &self,
+        vtable: &mut _ptr,
+        path: &[&str],
+        r_parentcls: &Arc<ClassRepr>,
+    ) -> Result<(), TyperError> {
         let classdesc = self.classdef.borrow().classdesc.clone();
         let classdesc_key = crate::annotator::description::DescKey::from_rc(&classdesc);
 
@@ -616,7 +656,7 @@ impl ClassRepr {
                 continue;
             }
             let value = crate::annotator::classdesc::ClassDesc::read_attribute(&classdesc, fldname);
-            self.setup_vtable_assign(vtable, mangled_name, r, value)?;
+            self.setup_vtable_assign(vtable, path, mangled_name, r, value)?;
         }
 
         // upstream: extra PBC attributes —
@@ -638,9 +678,6 @@ impl ClassRepr {
                     (class_attr_family_key(family) == *access_set_id).then(|| family.clone())
                 })
             else {
-                // r_parentcls snapshot did not expose the access set
-                // this pbcfield originated from — shouldn't happen in a
-                // consistent setup but bail defensively.
                 continue;
             };
             if !access_set.borrow().descs.contains_key(&classdesc_key) {
@@ -651,18 +688,19 @@ impl ClassRepr {
             }
             let attrvalue =
                 crate::annotator::classdesc::ClassDesc::read_attribute(&classdesc, attr);
-            self.setup_vtable_assign(vtable, mangled_name, r, attrvalue)?;
+            self.setup_vtable_assign(vtable, path, mangled_name, r, attrvalue)?;
         }
         Ok(())
     }
 
     /// Helper that mirrors the nested `def assign(...)` closure in
-    /// upstream `ClassRepr.setup_vtable` (rclass.py:310-321). Kept as a
-    /// method rather than a free function because it reads through
-    /// `self` only to surface `TyperError`-convertible errors.
+    /// upstream `ClassRepr.setup_vtable` (rclass.py:310-321). Routes
+    /// through [`_ptr::setattr_at_path`] so substruct writes propagate
+    /// back to the parent allocation.
     fn setup_vtable_assign(
         &self,
         vtable: &mut _ptr,
+        path: &[&str],
         mangled_name: &str,
         r: &Arc<dyn Repr>,
         value: Option<crate::annotator::classdesc::ClassDictEntry>,
@@ -705,10 +743,573 @@ impl ClassRepr {
                 constant_to_lowlevel_value(&converted)?
             }
         };
-        vtable
-            .setattr(mangled_name, llvalue)
-            .map_err(TyperError::message)?;
+        if path.is_empty() {
+            vtable
+                .setattr(mangled_name, llvalue)
+                .map_err(TyperError::message)?;
+        } else {
+            vtable
+                .setattr_at_path(path, mangled_name, llvalue)
+                .map_err(TyperError::message)?;
+        }
         Ok(())
+    }
+
+    /// RPython `ClassRepr.init_vtable(self)` (rclass.py:296-305).
+    ///
+    /// ```python
+    /// def init_vtable(self):
+    ///     """Create the actual vtable"""
+    ///     self.vtable = malloc(self.vtable_type, immortal=True)
+    ///     vtable_part = self.vtable
+    ///     r_parentcls = self
+    ///     while r_parentcls.classdef is not None:
+    ///         self.setup_vtable(vtable_part, r_parentcls)
+    ///         vtable_part = vtable_part.super
+    ///         r_parentcls = r_parentcls.rbase
+    ///     self.fill_vtable_root(vtable_part)
+    /// ```
+    ///
+    /// Walks the super-chain from `self` toward the root, invoking
+    /// `setup_vtable` for each ClassRepr level and finishing with
+    /// `fill_vtable_root` on the root vtable slice (the OBJECT_VTABLE
+    /// portion). Idempotent via the `vtable: Option<_ptr>` cache —
+    /// callers go through [`Self::getvtable`] instead of calling this
+    /// directly.
+    pub fn init_vtable(self: &Arc<Self>) -> Result<(), TyperError> {
+        // upstream: `self.vtable = malloc(self.vtable_type, immortal=True)`.
+        let vtable_lltype = match self.vtable_type.clone() {
+            LowLevelType::ForwardReference(fwd) => fwd.resolved().ok_or_else(|| {
+                TyperError::message(
+                    "ClassRepr.init_vtable: vtable_type ForwardReference not resolved \
+                     (call setup() first)",
+                )
+            })?,
+            other => other,
+        };
+        let mut vtable_root = crate::translator::rtyper::lltypesystem::lltype::malloc(
+            vtable_lltype,
+            None,
+            crate::translator::rtyper::lltypesystem::lltype::MallocFlavor::Gc,
+            true,
+        )
+        .map_err(TyperError::message)?;
+
+        // Walk the super-chain via increasing `path`, calling
+        // `setup_vtable_at_path(vtable_root, path, r_parentcls)` at
+        // each level. Upstream's `vtable_part = vtable_part.super`
+        // re-uses the same allocation by reference; the Rust port
+        // models that with a path-tracked address into the root
+        // allocation (see [`_ptr::setattr_at_path`]).
+        let mut path: Vec<&str> = Vec::new();
+        let mut r_parentcls: ClassReprArc = ClassReprArc::Inst(self.clone());
+        loop {
+            let ClassReprArc::Inst(parent_inst) = &r_parentcls else {
+                break;
+            };
+            // Receiver is `self` (the leaf class) — values come from
+            // `self.classdef.classdesc` while the field shape comes from
+            // `r_parentcls.clsfields`. Upstream rclass.py:302 reads
+            // `self.setup_vtable(vtable_part, r_parentcls)`.
+            self.setup_vtable_at_path(&mut vtable_root, &path, parent_inst)?;
+            // upstream: `vtable_part = vtable_part.super`.
+            path.push("super");
+            // upstream: `r_parentcls = r_parentcls.rbase`.
+            let next = parent_inst.rbase.borrow().clone().ok_or_else(|| {
+                TyperError::message("ClassRepr.init_vtable: rbase missing — call setup() first")
+            })?;
+            r_parentcls = next;
+        }
+        // upstream: `self.fill_vtable_root(vtable_part)` — at the
+        // OBJECT_VTABLE level, addressed by the accumulated `path`.
+        self.fill_vtable_root_at_path(&mut vtable_root, &path)?;
+
+        // Cache and return.
+        *self.vtable.borrow_mut() = Some(vtable_root);
+        Ok(())
+    }
+
+    /// RPython `ClassRepr.fill_vtable_root(self, vtable)` (rclass.py:338-360).
+    ///
+    /// ```python
+    /// def fill_vtable_root(self, vtable):
+    ///     if self.classdef is not None:
+    ///         vtable.subclassrange_min = self.classdef.minid
+    ///         vtable.subclassrange_max = self.classdef.maxid
+    ///     else:
+    ///         vtable.subclassrange_min = 0
+    ///         vtable.subclassrange_max = sys.maxint
+    ///     rinstance = getinstancerepr(self.rtyper, self.classdef)
+    ///     rinstance.setup()
+    ///     if rinstance.gcflavor == 'gc':
+    ///         vtable.rtti = getRuntimeTypeInfo(rinstance.object_type)
+    ///     ...
+    ///     vtable.name = alloc_array_name(name)
+    ///     if hasattr(self.classdef, 'my_instantiate_graph'):
+    ///         vtable.instantiate = self.rtyper.getcallable(graph)
+    /// ```
+    ///
+    /// Pyre-port deviations:
+    /// - `instantiate` slot: deferred; OBJECT_VTABLE omits the
+    ///   `instantiate: Ptr(FuncType([], OBJECTPTR))` field, and
+    ///   `my_instantiate_graph` is only attached after
+    ///   `normalizecalls.create_instantiate_functions` runs.
+    pub fn fill_vtable_root(&self, vtable: &mut _ptr) -> Result<(), TyperError> {
+        // Backward-compatible shim — leaf-level write at empty path.
+        self.fill_vtable_root_at_path(vtable, &[])
+    }
+
+    /// Path-aware variant of [`Self::fill_vtable_root`] used by
+    /// [`Self::init_vtable`] to address the OBJECT_VTABLE substruct
+    /// nested inside the per-class vtable allocation. `path` is the
+    /// chain of `"super"` segments leading from the leaf vtable to
+    /// the OBJECT_VTABLE level.
+    pub fn fill_vtable_root_at_path(
+        &self,
+        vtable: &mut _ptr,
+        path: &[&str],
+    ) -> Result<(), TyperError> {
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("ClassRepr.fill_vtable_root: RPythonTyper weak ref expired")
+        })?;
+        let classdef = self.classdef.clone();
+        // upstream: subclassrange_min / subclassrange_max.
+        let (minid, maxid) = {
+            let cd = classdef.borrow();
+            let minid = cd.minid.ok_or_else(|| {
+                TyperError::message(
+                    "ClassRepr.fill_vtable_root: classdef.minid not set — \
+                     run normalizecalls.assign_inheritance_ids first",
+                )
+            })?;
+            let maxid = cd.maxid.ok_or_else(|| {
+                TyperError::message(
+                    "ClassRepr.fill_vtable_root: classdef.maxid not set — \
+                     run normalizecalls.assign_inheritance_ids first",
+                )
+            })?;
+            (minid, maxid)
+        };
+        let setattr_path =
+            |vtable: &mut _ptr, name: &str, val: lltype::LowLevelValue| -> Result<(), TyperError> {
+                if path.is_empty() {
+                    vtable.setattr(name, val).map_err(TyperError::message)
+                } else {
+                    vtable
+                        .setattr_at_path(path, name, val)
+                        .map_err(TyperError::message)
+                }
+            };
+        setattr_path(
+            vtable,
+            "subclassrange_min",
+            lltype::LowLevelValue::Signed(minid),
+        )?;
+        setattr_path(
+            vtable,
+            "subclassrange_max",
+            lltype::LowLevelValue::Signed(maxid),
+        )?;
+
+        // upstream: `rinstance = getinstancerepr(self.rtyper, self.classdef);
+        //           rinstance.setup();
+        //           if rinstance.gcflavor == 'gc':
+        //               vtable.rtti = getRuntimeTypeInfo(rinstance.object_type)`.
+        let rinstance = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc)?;
+        Repr::setup(rinstance.as_ref() as &dyn Repr)?;
+        if rinstance.gcflavor() == Flavor::Gc {
+            // `object_type` for non-None classdefs is a
+            // ForwardReference that `_setup_repr.r#become` resolves to
+            // a `Struct`. `getRuntimeTypeInfo` only accepts `Struct`
+            // directly, so resolve before passing.
+            let object_lltype = match rinstance.object_type().clone() {
+                LowLevelType::ForwardReference(fwd) => fwd.resolved().ok_or_else(|| {
+                    TyperError::message(
+                        "ClassRepr.fill_vtable_root: InstanceRepr.object_type \
+                         ForwardReference not resolved",
+                    )
+                })?,
+                other => other,
+            };
+            let rtti =
+                crate::translator::rtyper::lltypesystem::lltype::getRuntimeTypeInfo(&object_lltype)
+                    .map_err(TyperError::message)?;
+            setattr_path(vtable, "rtti", lltype::LowLevelValue::Ptr(Box::new(rtti)))?;
+        }
+        // upstream rclass.py:351-355 — root uses "object"; non-root
+        // classdefs use `shortname`, not the fully-qualified name.
+        let class_shortname = classdef.borrow().shortname.clone();
+        let name_ptr =
+            crate::translator::rtyper::lltypesystem::rstr::alloc_array_name(&class_shortname)
+                .map_err(TyperError::message)?;
+        setattr_path(
+            vtable,
+            "name",
+            lltype::LowLevelValue::Ptr(Box::new(name_ptr)),
+        )?;
+        // `vtable.instantiate = ...` — deferred
+        // (LazyLock cycle on Ptr(FuncType([], OBJECTPTR));
+        // normalizecalls.create_instantiate_functions also pending).
+        Ok(())
+    }
+
+    /// RPython `ClassRepr.getvtable(self)` (rclass.py:286-290).
+    ///
+    /// ```python
+    /// def getvtable(self):
+    ///     if self.vtable is None:
+    ///         self.init_vtable()
+    ///     return cast_vtable_to_typeptr(self.vtable)
+    /// ```
+    pub fn getvtable(self: &Arc<Self>) -> Result<_ptr, TyperError> {
+        if self.vtable.borrow().is_none() {
+            self.init_vtable()?;
+        }
+        let vtable = self
+            .vtable
+            .borrow()
+            .clone()
+            .expect("init_vtable post-condition: vtable is Some");
+        Ok(cast_vtable_to_typeptr(vtable))
+    }
+
+    /// RPython `ClassRepr.getruntime(self, expected_type)` (rclass.py:292-294).
+    ///
+    /// ```python
+    /// def getruntime(self, expected_type):
+    ///     assert expected_type == CLASSTYPE
+    ///     return self.getvtable()
+    /// ```
+    pub fn getruntime(self: &Arc<Self>, expected_type: &LowLevelType) -> Result<_ptr, TyperError> {
+        if expected_type != &CLASSTYPE.clone() {
+            return Err(TyperError::message(format!(
+                "ClassRepr.getruntime: expected CLASSTYPE, got {expected_type:?}"
+            )));
+        }
+        self.getvtable()
+    }
+
+    /// RPython `ClassRepr.fromtypeptr(self, vcls, llops)`
+    /// (rclass.py:362-369).
+    ///
+    /// ```python
+    /// def fromtypeptr(self, vcls, llops):
+    ///     self.setup()
+    ///     castable(self.lowleveltype, vcls.concretetype)  # sanity check
+    ///     return llops.genop('cast_pointer', [vcls],
+    ///                        resulttype=self.lowleveltype)
+    /// ```
+    ///
+    /// The upstream `castable` sanity check is deferred — `genop` will
+    /// surface a TypeError on a malformed cast at lower codegen, and
+    /// our static `castable` helper has not landed.
+    pub fn fromtypeptr(
+        self: &Arc<Self>,
+        vcls: Hlvalue,
+        llops: &mut LowLevelOpList,
+    ) -> Result<Variable, TyperError> {
+        Repr::setup(self.as_ref() as &dyn Repr)?;
+        Ok(llops
+            .genop(
+                "cast_pointer",
+                vec![vcls],
+                GenopResult::LLType(self.lowleveltype.clone()),
+            )
+            .expect("cast_pointer with non-Void resulttype yields a Variable"))
+    }
+
+    /// RPython `ClassRepr.getclsfield(self, vcls, attr, llops)`
+    /// (rclass.py:371-381).
+    ///
+    /// ```python
+    /// def getclsfield(self, vcls, attr, llops):
+    ///     if attr in self.clsfields:
+    ///         mangled_name, r = self.clsfields[attr]
+    ///         v_vtable = self.fromtypeptr(vcls, llops)
+    ///         cname = inputconst(Void, mangled_name)
+    ///         return llops.genop('getfield', [v_vtable, cname], resulttype=r)
+    ///     else:
+    ///         if self.classdef is None:
+    ///             raise MissingRTypeAttribute(attr)
+    ///         return self.rbase.getclsfield(vcls, attr, llops)
+    /// ```
+    pub fn getclsfield(
+        self: &Arc<Self>,
+        vcls: Hlvalue,
+        attr: &str,
+        llops: &mut LowLevelOpList,
+    ) -> Result<Variable, TyperError> {
+        if let Some((mangled_name, r)) = self.clsfields.borrow().get(attr).cloned() {
+            let v_vtable = self.fromtypeptr(vcls, llops)?;
+            let cname = Constant::with_concretetype(
+                ConstValue::Str(mangled_name.clone()),
+                LowLevelType::Void,
+            );
+            return Ok(llops
+                .genop(
+                    "getfield",
+                    vec![Hlvalue::Variable(v_vtable), Hlvalue::Constant(cname)],
+                    GenopResult::LLType(r.lowleveltype().clone()),
+                )
+                .expect("getfield with non-Void result yields a Variable"));
+        }
+        // upstream: `if self.classdef is None: raise MissingRTypeAttribute(attr)`.
+        // ClassRepr always has classdef != None, so route to rbase.
+        let rbase = self.rbase.borrow().clone().ok_or_else(|| {
+            TyperError::message("ClassRepr.getclsfield: rbase missing — call setup() first")
+        })?;
+        match rbase {
+            ClassReprArc::Inst(inst) => inst.getclsfield(vcls, attr, llops),
+            ClassReprArc::Root(root) => root.getclsfield(vcls, attr, llops),
+        }
+    }
+
+    /// RPython `ClassRepr.setclsfield(self, vcls, attr, vvalue, llops)`
+    /// (rclass.py:383-393).
+    ///
+    /// ```python
+    /// def setclsfield(self, vcls, attr, vvalue, llops):
+    ///     if attr in self.clsfields:
+    ///         mangled_name, r = self.clsfields[attr]
+    ///         v_vtable = self.fromtypeptr(vcls, llops)
+    ///         cname = inputconst(Void, mangled_name)
+    ///         llops.genop('setfield', [v_vtable, cname, vvalue])
+    ///     else:
+    ///         if self.classdef is None:
+    ///             raise MissingRTypeAttribute(attr)
+    ///         self.rbase.setclsfield(vcls, attr, vvalue, llops)
+    /// ```
+    pub fn setclsfield(
+        self: &Arc<Self>,
+        vcls: Hlvalue,
+        attr: &str,
+        vvalue: Hlvalue,
+        llops: &mut LowLevelOpList,
+    ) -> Result<(), TyperError> {
+        if let Some((mangled_name, _r)) = self.clsfields.borrow().get(attr).cloned() {
+            let v_vtable = self.fromtypeptr(vcls, llops)?;
+            let cname = Constant::with_concretetype(
+                ConstValue::Str(mangled_name.clone()),
+                LowLevelType::Void,
+            );
+            llops.genop(
+                "setfield",
+                vec![
+                    Hlvalue::Variable(v_vtable),
+                    Hlvalue::Constant(cname),
+                    vvalue,
+                ],
+                GenopResult::Void,
+            );
+            return Ok(());
+        }
+        let rbase = self.rbase.borrow().clone().ok_or_else(|| {
+            TyperError::message("ClassRepr.setclsfield: rbase missing — call setup() first")
+        })?;
+        match rbase {
+            ClassReprArc::Inst(inst) => inst.setclsfield(vcls, attr, vvalue, llops),
+            ClassReprArc::Root(root) => root.setclsfield(vcls, attr, vvalue, llops),
+        }
+    }
+
+    /// RPython `ClassRepr.getpbcfield(self, vcls, access_set, attr,
+    /// llops)` (rclass.py:395-401).
+    ///
+    /// ```python
+    /// def getpbcfield(self, vcls, access_set, attr, llops):
+    ///     if (access_set, attr) not in self.pbcfields:
+    ///         raise TyperError("internal error: missing PBC field")
+    ///     mangled_name, r = self.pbcfields[access_set, attr]
+    ///     v_vtable = self.fromtypeptr(vcls, llops)
+    ///     cname = inputconst(Void, mangled_name)
+    ///     return llops.genop('getfield', [v_vtable, cname], resulttype=r)
+    /// ```
+    ///
+    /// The Rust port keys `pbcfields` on `(access_set_id: usize, attr:
+    /// String)` so callers pass the access-set pointer-identity hash
+    /// (via [`class_attr_family_key`]).
+    pub fn getpbcfield(
+        self: &Arc<Self>,
+        vcls: Hlvalue,
+        access_set_id: usize,
+        attr: &str,
+        llops: &mut LowLevelOpList,
+    ) -> Result<Variable, TyperError> {
+        let (mangled_name, r) = self
+            .pbcfields
+            .borrow()
+            .get(&(access_set_id, attr.to_string()))
+            .cloned()
+            .ok_or_else(|| {
+                TyperError::message(format!(
+                    "ClassRepr.getpbcfield: internal error: missing PBC field \
+                     (access_set={access_set_id}, attr={attr:?})"
+                ))
+            })?;
+        let v_vtable = self.fromtypeptr(vcls, llops)?;
+        let cname =
+            Constant::with_concretetype(ConstValue::Str(mangled_name.clone()), LowLevelType::Void);
+        Ok(llops
+            .genop(
+                "getfield",
+                vec![Hlvalue::Variable(v_vtable), Hlvalue::Constant(cname)],
+                GenopResult::LLType(r.lowleveltype().clone()),
+            )
+            .expect("getfield with non-Void result yields a Variable"))
+    }
+
+    /// RPython `ClassRepr.rtype_issubtype(self, hop)` (rclass.py:403-414).
+    ///
+    /// ```python
+    /// def rtype_issubtype(self, hop):
+    ///     class_repr = get_type_repr(self.rtyper)
+    ///     v_cls1, v_cls2 = hop.inputargs(class_repr, class_repr)
+    ///     if isinstance(v_cls2, Constant):
+    ///         cls2 = v_cls2.value
+    ///         minid = hop.inputconst(Signed, cls2.subclassrange_min)
+    ///         maxid = hop.inputconst(Signed, cls2.subclassrange_max)
+    ///         return hop.gendirectcall(ll_issubclass_const, v_cls1, minid, maxid)
+    ///     else:
+    ///         v_cls1, v_cls2 = hop.inputargs(class_repr, class_repr)
+    ///         return hop.gendirectcall(ll_issubclass, v_cls1, v_cls2)
+    /// ```
+    ///
+    /// Both branches dispatch to a low-level helper graph minted via
+    /// [`RPythonTyper::lowlevel_helper_function`]: `ll_issubclass`
+    /// (rclass.py:1133-1137) for the variable case and
+    /// `ll_issubclass_const` (rclass.py:1139-1140) for the constant
+    /// case. The helper bodies emit a single `int_between` op against
+    /// `cls.subclassrange_min` / `cls.subclassrange_max`.
+    /// Inherent method body — receiver is `&self` so the
+    /// [`Repr::rtype_issubtype`] trait override can forward to it
+    /// without needing the `Arc<Self>` smart pointer (no upstream
+    /// caller depends on the Arc handle here; only `self.rtyper.upgrade()`
+    /// is touched).
+    pub fn rtype_issubtype(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> RTypeResult {
+        rtype_issubtype_helper(&self.rtyper, hop, "ClassRepr.rtype_issubtype")
+    }
+}
+
+/// Shared body of `AbstractClassRepr.rtype_issubtype` (rclass.py:403-414).
+///
+/// Upstream both `ClassRepr` and `RootClassRepr` inherit this method
+/// from `AbstractClassRepr`. The Rust port has them as separate
+/// structs, so the body is hoisted into a free helper that both
+/// `Repr::rtype_issubtype` overrides forward to. The only
+/// per-receiver state the body uses is the `rtyper` weak ref, so the
+/// helper takes that explicitly.
+fn rtype_issubtype_helper(
+    rtyper_weak: &Weak<RPythonTyper>,
+    hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    caller: &'static str,
+) -> RTypeResult {
+    use crate::translator::rtyper::rtyper::ConvertedTo;
+    let rtyper = rtyper_weak
+        .upgrade()
+        .ok_or_else(|| TyperError::message(format!("{caller}: rtyper weak ref expired")))?;
+    let class_repr = get_type_repr(&rtyper)?;
+    let class_repr_dyn: &dyn Repr = class_repr.as_ref();
+    let v_args = hop.inputargs(vec![
+        ConvertedTo::Repr(class_repr_dyn),
+        ConvertedTo::Repr(class_repr_dyn),
+    ])?;
+    let v_cls1 = v_args[0].clone();
+    let v_cls2 = v_args[1].clone();
+
+    // upstream `if isinstance(v_cls2, Constant)`. The constant
+    // branch unpacks `cls2.value.subclassrange_{min,max}` so we
+    // need an `_ptr` carrying `subclassrange_min/max` Signed
+    // fields (the OBJECT_VTABLE struct, after fill_vtable_root).
+    if let Hlvalue::Constant(c) = &v_cls2 {
+        let ConstValue::LLPtr(c_ptr) = &c.value else {
+            return Err(TyperError::message(format!(
+                "{caller}: constant cls2 must carry an _ptr, got {:?}",
+                c.value
+            )));
+        };
+        let min_val = c_ptr
+            .getattr("subclassrange_min")
+            .map_err(TyperError::message)?;
+        let max_val = c_ptr
+            .getattr("subclassrange_max")
+            .map_err(TyperError::message)?;
+        let lltype::LowLevelValue::Signed(min_n) = min_val else {
+            return Err(TyperError::message(format!(
+                "{caller}: subclassrange_min not Signed, got {min_val:?}"
+            )));
+        };
+        let lltype::LowLevelValue::Signed(max_n) = max_val else {
+            return Err(TyperError::message(format!(
+                "{caller}: subclassrange_max not Signed, got {max_val:?}"
+            )));
+        };
+        let c_min = Constant::with_concretetype(ConstValue::Int(min_n), LowLevelType::Signed);
+        let c_max = Constant::with_concretetype(ConstValue::Int(max_n), LowLevelType::Signed);
+        // upstream: `gendirectcall(ll_issubclass_const, v_cls1,
+        //   minid, maxid)`.
+        let helper = rtyper.lowlevel_helper_function(
+            "ll_issubclass_const",
+            vec![
+                CLASSTYPE.clone(),
+                LowLevelType::Signed,
+                LowLevelType::Signed,
+            ],
+            LowLevelType::Bool,
+        )?;
+        return hop.gendirectcall(
+            &helper,
+            vec![v_cls1, Hlvalue::Constant(c_min), Hlvalue::Constant(c_max)],
+        );
+    }
+
+    // upstream variable case: `gendirectcall(ll_issubclass, v_cls1, v_cls2)`.
+    let helper = rtyper.lowlevel_helper_function(
+        "ll_issubclass",
+        vec![CLASSTYPE.clone(), CLASSTYPE.clone()],
+        LowLevelType::Bool,
+    )?;
+    hop.gendirectcall(&helper, vec![v_cls1, v_cls2])
+}
+
+/// RPython `cast_vtable_to_typeptr(vtable)` (rclass.py:182-185).
+///
+/// ```python
+/// def cast_vtable_to_typeptr(vtable):
+///     while typeOf(vtable).TO != OBJECT_VTABLE:
+///         vtable = vtable.super
+///     return vtable
+/// ```
+///
+/// Walks the per-class vtable Struct's `super` chain inward until the
+/// pointee type matches `OBJECT_VTABLE` (the root vtable Struct). At
+/// the OBJECT_VTABLE level the upstream `vtable.super` access would
+/// raise `AttributeError`, so the walk terminates by struct-type
+/// equality before that point.
+pub fn cast_vtable_to_typeptr(mut vtable: _ptr) -> _ptr {
+    let object_vtable = OBJECT_VTABLE.clone();
+    loop {
+        let to_lltype = LowLevelType::from(vtable._TYPE.TO.clone());
+        if to_lltype == object_vtable {
+            return vtable;
+        }
+        // upstream: `vtable = vtable.super`. The Rust port follows
+        // `_ptr.getattr("super")` which yields LowLevelValue::Ptr for
+        // raw substructs (per `_ptr._expose`).
+        let super_lv = vtable
+            .getattr("super")
+            .expect("vtable.super: per-class vtable must have a 'super' field");
+        let crate::translator::rtyper::lltypesystem::lltype::LowLevelValue::Ptr(super_ptr) =
+            super_lv
+        else {
+            panic!(
+                "cast_vtable_to_typeptr: vtable.super did not yield a Ptr value (got {:?})",
+                super_lv
+            );
+        };
+        vtable = *super_ptr;
     }
 }
 
@@ -727,6 +1328,97 @@ impl Repr for ClassRepr {
 
     fn repr_class_id(&self) -> ReprClassId {
         ReprClassId::Repr
+    }
+
+    /// `RPythonTyper.translate_op_issubtype` (rtyper.py:498-500)
+    /// dispatches `r.rtype_issubtype(hop)`. Without this override the
+    /// trait default would surface `MissingRTypeOperation`. Forwards
+    /// to the inherent [`ClassRepr::rtype_issubtype`] which mirrors
+    /// upstream rclass.py:403-414.
+    fn rtype_issubtype(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
+        ClassRepr::rtype_issubtype(self, hop)
+    }
+
+    /// RPython `ClassRepr.convert_desc(self, desc)` (rclass.py:212-220).
+    ///
+    /// ```python
+    /// def convert_desc(self, desc):
+    ///     subclassdef = desc.getuniqueclassdef()
+    ///     if self.classdef is not None:
+    ///         if self.classdef.commonbase(subclassdef) != self.classdef:
+    ///             raise TyperError("not a subclass of %r: %r" % (
+    ///                 self.classdef.name, desc))
+    ///     r_subclass = getclassrepr(self.rtyper, subclassdef)
+    ///     return r_subclass.getruntime(self.lowleveltype)
+    /// ```
+    fn convert_desc(
+        &self,
+        desc: &crate::annotator::description::DescEntry,
+    ) -> Result<Constant, TyperError> {
+        let crate::annotator::description::DescEntry::Class(class_rc) = desc else {
+            return Err(TyperError::message(format!(
+                "ClassRepr.convert_desc: expected ClassDesc, got {desc:?}"
+            )));
+        };
+        let subclassdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(class_rc)
+            .map_err(|e| TyperError::message(e.to_string()))?;
+        // upstream `self.classdef.commonbase(subclassdef) != self.classdef`
+        // — verify the candidate is a subclass of the receiver classdef.
+        let common =
+            crate::annotator::classdesc::ClassDef::commonbase(&self.classdef, &subclassdef);
+        let same_class = match &common {
+            Some(c) => Rc::ptr_eq(c, &self.classdef),
+            None => false,
+        };
+        if !same_class {
+            return Err(TyperError::message(format!(
+                "ClassRepr.convert_desc: {:?} is not a subclass of {:?}",
+                subclassdef.borrow().name,
+                self.classdef.borrow().name
+            )));
+        }
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("ClassRepr.convert_desc: rtyper weak ref expired")
+        })?;
+        let r_subclass = getclassrepr_arc(&rtyper, Some(&subclassdef))?;
+        let vtable_ptr = r_subclass.getruntime(&self.lowleveltype)?;
+        Ok(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(vtable_ptr)),
+            self.lowleveltype.clone(),
+        ))
+    }
+
+    /// RPython `ClassRepr.convert_const(self, value)` (rclass.py:222-226).
+    ///
+    /// ```python
+    /// def convert_const(self, value):
+    ///     if not isinstance(value, (type, types.ClassType)):
+    ///         raise TyperError("not a class: %r" % (value,))
+    ///     bk = self.rtyper.annotator.bookkeeper
+    ///     return self.convert_desc(bk.getdesc(value))
+    /// ```
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        let ConstValue::HostObject(host) = value else {
+            return Err(TyperError::message(format!(
+                "ClassRepr.convert_const: not a class: {value:?}"
+            )));
+        };
+        if !host.is_class() {
+            return Err(TyperError::message(format!(
+                "ClassRepr.convert_const: not a class: {host:?}"
+            )));
+        }
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("ClassRepr.convert_const: rtyper weak ref expired")
+        })?;
+        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+            TyperError::message("ClassRepr.convert_const: annotator weak ref dropped")
+        })?;
+        let desc = annotator
+            .bookkeeper
+            .getdesc(host)
+            .map_err(|e| TyperError::message(e.to_string()))?;
+        self.convert_desc(&desc)
     }
 
     /// RPython `ClassRepr._setup_repr` (rclass.py:242-284).
@@ -866,6 +1558,16 @@ impl ClassReprArc {
             Self::Inst(r) => r.clone() as Arc<dyn Repr>,
         }
     }
+
+    /// RPython `ClassRepr.getruntime(self, expected_type)` polymorphic
+    /// entry. Both branches assert `expected_type == CLASSTYPE` and
+    /// return `getvtable()`.
+    pub fn getruntime(&self, expected_type: &LowLevelType) -> Result<_ptr, TyperError> {
+        match self {
+            Self::Root(r) => r.getruntime(expected_type),
+            Self::Inst(r) => r.getruntime(expected_type),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------
@@ -882,30 +1584,32 @@ impl ClassReprArc {
 /// R2-B / R3 add their storage.
 #[derive(Debug)]
 pub struct RootClassRepr {
+    /// RPython `self.rtyper = rtyper` (rclass.py:425). Weak backref —
+    /// `init_vtable` calls `getinstancerepr(rtyper, None)` for the
+    /// `rtti` slot of the root vtable.
+    rtyper: Weak<RPythonTyper>,
     /// RPython `self.classdef = None` (rclass.py:422).
     classdef: Option<ClassDefKey>,
     /// RPython `self.vtable_type = OBJECT_VTABLE` (rclass.py:426).
     vtable_type: LowLevelType,
     /// RPython `self.lowleveltype = Ptr(self.vtable_type)` (rclass.py:427).
     lowleveltype: LowLevelType,
+    /// RPython `self.vtable = None` (rclass.py:433). Lazily filled by
+    /// [`Self::init_vtable`].
+    vtable: RefCell<Option<_ptr>>,
     /// RPython `Repr._initialized` state machine.
     state: ReprState,
-    // clsfields / pbcfields / allmethods / vtable fields are initialised by
-    // `_setup_repr` to empty / None. They'll carry real data once Phase R2
-    // / R3 port `setup_vtable` / `init_vtable`.
 }
 
 impl RootClassRepr {
     /// RPython `RootClassRepr.__init__(self, rtyper)` (rclass.py:424-427).
-    ///
-    /// Upstream stores `self.rtyper = rtyper`; the Rust port does not
-    /// yet read it from [`RootClassRepr`], so it is omitted until a
-    /// concrete method (`convert_desc`, `init_vtable`, ...) needs it.
-    pub fn new() -> Self {
+    pub fn new(rtyper: &Rc<RPythonTyper>) -> Self {
         RootClassRepr {
+            rtyper: Rc::downgrade(rtyper),
             classdef: None,
             vtable_type: OBJECT_VTABLE.clone(),
             lowleveltype: CLASSTYPE.clone(),
+            vtable: RefCell::new(None),
             state: ReprState::new(),
         }
     }
@@ -918,6 +1622,178 @@ impl RootClassRepr {
     /// RPython `RootClassRepr.vtable_type` (rclass.py:426).
     pub fn vtable_type(&self) -> &LowLevelType {
         &self.vtable_type
+    }
+
+    /// RPython `RootClassRepr.init_vtable(self)` (rclass.py:435-437).
+    ///
+    /// ```python
+    /// def init_vtable(self):
+    ///     self.vtable = malloc(self.vtable_type, immortal=True)
+    ///     self.fill_vtable_root(self.vtable)
+    /// ```
+    ///
+    /// The root has no `super` chain, so allocation + a single
+    /// `fill_vtable_root` finalises the OBJECT_VTABLE slot. Idempotent
+    /// via the `vtable: Option<_ptr>` cache.
+    pub fn init_vtable(&self) -> Result<(), TyperError> {
+        // upstream malloc rejects ForwardReference, so resolve the
+        // OBJECT_VTABLE forward-ref before passing.
+        let vtable_lltype = match self.vtable_type.clone() {
+            LowLevelType::ForwardReference(fwd) => fwd.resolved().ok_or_else(|| {
+                TyperError::message(
+                    "RootClassRepr.init_vtable: OBJECT_VTABLE ForwardReference not resolved",
+                )
+            })?,
+            other => other,
+        };
+        let mut vtable = crate::translator::rtyper::lltypesystem::lltype::malloc(
+            vtable_lltype,
+            None,
+            crate::translator::rtyper::lltypesystem::lltype::MallocFlavor::Gc,
+            true,
+        )
+        .map_err(TyperError::message)?;
+        self.fill_vtable_root(&mut vtable)?;
+        *self.vtable.borrow_mut() = Some(vtable);
+        Ok(())
+    }
+
+    /// RPython `ClassRepr.fill_vtable_root(self, vtable)` (rclass.py:338-360)
+    /// adapted for the `classdef is None` arm.
+    ///
+    /// Upstream uses `0` / `sys.maxint` for the root subclassrange. The
+    /// Rust port uses `i64::MAX` for the upper bound — RPython's
+    /// `sys.maxint` is the platform `intptr_t.max`; on 64-bit hosts
+    /// (the only target pyre supports today) that is `i64::MAX`. The
+    /// `rtti` slot is populated via `getinstancerepr(rtyper, None)`
+    /// + `getRuntimeTypeInfo(rinstance.object_type)`. The `name` slot
+    /// is the upstream `"object"` string; `instantiate` is deferred
+    /// until the `Ptr(FuncType([], OBJECTPTR))` cycle is resolved.
+    pub fn fill_vtable_root(&self, vtable: &mut _ptr) -> Result<(), TyperError> {
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("RootClassRepr.fill_vtable_root: RPythonTyper weak ref expired")
+        })?;
+        // upstream: classdef is None → `subclassrange_min = 0,
+        // subclassrange_max = sys.maxint`.
+        vtable
+            .setattr(
+                "subclassrange_min",
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelValue::Signed(0),
+            )
+            .map_err(TyperError::message)?;
+        vtable
+            .setattr(
+                "subclassrange_max",
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelValue::Signed(i64::MAX),
+            )
+            .map_err(TyperError::message)?;
+        // upstream: `rinstance = getinstancerepr(self.rtyper,
+        // self.classdef); rinstance.setup(); if rinstance.gcflavor ==
+        // 'gc': vtable.rtti = getRuntimeTypeInfo(rinstance.object_type)`.
+        let rinstance = getinstancerepr(&rtyper, None, Flavor::Gc)?;
+        Repr::setup(rinstance.as_ref() as &dyn Repr)?;
+        if rinstance.gcflavor() == Flavor::Gc {
+            let rtti = crate::translator::rtyper::lltypesystem::lltype::getRuntimeTypeInfo(
+                rinstance.object_type(),
+            )
+            .map_err(TyperError::message)?;
+            vtable
+                .setattr(
+                    "rtti",
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelValue::Ptr(Box::new(
+                        rtti,
+                    )),
+                )
+                .map_err(TyperError::message)?;
+        }
+        let name_ptr = crate::translator::rtyper::lltypesystem::rstr::alloc_array_name("object")
+            .map_err(TyperError::message)?;
+        vtable
+            .setattr(
+                "name",
+                crate::translator::rtyper::lltypesystem::lltype::LowLevelValue::Ptr(Box::new(
+                    name_ptr,
+                )),
+            )
+            .map_err(TyperError::message)?;
+        // `vtable.instantiate` deferred — see `ClassRepr::fill_vtable_root`.
+        Ok(())
+    }
+
+    /// RPython `ClassRepr.getvtable(self)` (rclass.py:286-290) for the
+    /// rootclass.
+    pub fn getvtable(&self) -> Result<_ptr, TyperError> {
+        if self.vtable.borrow().is_none() {
+            self.init_vtable()?;
+        }
+        let vtable = self
+            .vtable
+            .borrow()
+            .clone()
+            .expect("init_vtable post-condition: vtable is Some");
+        // The root vtable IS the OBJECT_VTABLE level, so
+        // `cast_vtable_to_typeptr` is a no-op (the `while typeOf(vtable).TO
+        // != OBJECT_VTABLE` loop terminates immediately).
+        Ok(cast_vtable_to_typeptr(vtable))
+    }
+
+    /// RPython `ClassRepr.getruntime(self, expected_type)` (rclass.py:292-294)
+    /// for the rootclass.
+    pub fn getruntime(&self, expected_type: &LowLevelType) -> Result<_ptr, TyperError> {
+        if expected_type != &CLASSTYPE.clone() {
+            return Err(TyperError::message(format!(
+                "RootClassRepr.getruntime: expected CLASSTYPE, got {expected_type:?}"
+            )));
+        }
+        self.getvtable()
+    }
+
+    /// RPython `ClassRepr.fromtypeptr(self, vcls, llops)` (rclass.py:362-369)
+    /// for the rootclass — `lowleveltype` is `CLASSTYPE` and the cast
+    /// reduces to a no-op-style `cast_pointer` that confirms the type.
+    pub fn fromtypeptr(
+        self: &Arc<Self>,
+        vcls: Hlvalue,
+        llops: &mut LowLevelOpList,
+    ) -> Result<Variable, TyperError> {
+        Repr::setup(self.as_ref() as &dyn Repr)?;
+        Ok(llops
+            .genop(
+                "cast_pointer",
+                vec![vcls],
+                GenopResult::LLType(self.lowleveltype.clone()),
+            )
+            .expect("cast_pointer with non-Void resulttype yields a Variable"))
+    }
+
+    /// RPython `ClassRepr.getclsfield` terminal arm (rclass.py:378-381):
+    /// `raise MissingRTypeAttribute(attr)` when the rootclass has no
+    /// matching clsfield. Pyre surfaces a structured `TyperError`.
+    pub fn getclsfield(
+        self: &Arc<Self>,
+        _vcls: Hlvalue,
+        attr: &str,
+        _llops: &mut LowLevelOpList,
+    ) -> Result<Variable, TyperError> {
+        Err(TyperError::message(format!(
+            "RootClassRepr.getclsfield: MissingRTypeAttribute({attr:?}) — \
+             attribute not found in any clsfields"
+        )))
+    }
+
+    /// RPython `ClassRepr.setclsfield` terminal arm (rclass.py:390-393):
+    /// `raise MissingRTypeAttribute(attr)`.
+    pub fn setclsfield(
+        self: &Arc<Self>,
+        _vcls: Hlvalue,
+        attr: &str,
+        _vvalue: Hlvalue,
+        _llops: &mut LowLevelOpList,
+    ) -> Result<(), TyperError> {
+        Err(TyperError::message(format!(
+            "RootClassRepr.setclsfield: MissingRTypeAttribute({attr:?}) — \
+             attribute not found in any clsfields"
+        )))
     }
 }
 
@@ -941,6 +1817,16 @@ impl Repr for RootClassRepr {
         ReprClassId::Repr
     }
 
+    /// `RPythonTyper.translate_op_issubtype` (rtyper.py:498-500)
+    /// dispatches `r.rtype_issubtype(hop)`. Upstream's
+    /// `RootClassRepr` inherits the body from `AbstractClassRepr`
+    /// (rclass.py:403-414); the Rust port forwards through the shared
+    /// [`rtype_issubtype_helper`] free fn so both ClassRepr and
+    /// RootClassRepr surface the same op.
+    fn rtype_issubtype(&self, hop: &crate::translator::rtyper::rtyper::HighLevelOp) -> RTypeResult {
+        rtype_issubtype_helper(&self.rtyper, hop, "RootClassRepr.rtype_issubtype")
+    }
+
     /// RPython `RootClassRepr._setup_repr(self)` (rclass.py:429-433).
     ///
     /// ```python
@@ -957,6 +1843,58 @@ impl Repr for RootClassRepr {
     /// them (`getvtable`, `getclsfield`, `get_field`) land with Phase R2.
     fn _setup_repr(&self) -> Result<(), TyperError> {
         Ok(())
+    }
+
+    /// RPython `ClassRepr.convert_desc(self, desc)` (rclass.py:212-220),
+    /// inherited by `RootClassRepr`. With `classdef is None` the
+    /// commonbase check is skipped (upstream `if self.classdef is not
+    /// None: ...`).
+    fn convert_desc(
+        &self,
+        desc: &crate::annotator::description::DescEntry,
+    ) -> Result<Constant, TyperError> {
+        let crate::annotator::description::DescEntry::Class(class_rc) = desc else {
+            return Err(TyperError::message(format!(
+                "RootClassRepr.convert_desc: expected ClassDesc, got {desc:?}"
+            )));
+        };
+        let subclassdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(class_rc)
+            .map_err(|e| TyperError::message(e.to_string()))?;
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("RootClassRepr.convert_desc: rtyper weak ref expired")
+        })?;
+        let r_subclass = getclassrepr_arc(&rtyper, Some(&subclassdef))?;
+        let vtable_ptr = r_subclass.getruntime(&self.lowleveltype)?;
+        Ok(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(vtable_ptr)),
+            self.lowleveltype.clone(),
+        ))
+    }
+
+    /// RPython `ClassRepr.convert_const(self, value)` (rclass.py:222-226),
+    /// inherited by `RootClassRepr`.
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        let ConstValue::HostObject(host) = value else {
+            return Err(TyperError::message(format!(
+                "RootClassRepr.convert_const: not a class: {value:?}"
+            )));
+        };
+        if !host.is_class() {
+            return Err(TyperError::message(format!(
+                "RootClassRepr.convert_const: not a class: {host:?}"
+            )));
+        }
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("RootClassRepr.convert_const: rtyper weak ref expired")
+        })?;
+        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+            TyperError::message("RootClassRepr.convert_const: annotator weak ref dropped")
+        })?;
+        let desc = annotator
+            .bookkeeper
+            .getdesc(host)
+            .map_err(|e| TyperError::message(e.to_string()))?;
+        self.convert_desc(&desc)
     }
 }
 
@@ -1011,6 +1949,10 @@ pub struct InstanceRepr {
     /// classdef!=None (rclass.py:576). R2-C keeps it as an empty set —
     /// the immutable-hint derivation lands in R2-D.
     immutable_field_set: RefCell<HashSet<String>>,
+    /// RPython `self._reusable_prebuilt_instance` (rclass.py:807).
+    /// Lazy-initialised by [`Self::get_reusable_prebuilt_instance`] —
+    /// stays `None` until the first call.
+    reusable_prebuilt_instance: RefCell<Option<_ptr>>,
     /// RPython `Repr._initialized` state machine.
     state: ReprState,
 }
@@ -1041,6 +1983,7 @@ impl InstanceRepr {
             rbase: RefCell::new(None),
             allinstancefields: RefCell::new(HashMap::new()),
             immutable_field_set: RefCell::new(HashSet::new()),
+            reusable_prebuilt_instance: RefCell::new(None),
             state: ReprState::new(),
         }
     }
@@ -1081,6 +2024,170 @@ impl InstanceRepr {
         &self,
     ) -> std::cell::Ref<'_, HashMap<String, (String, Arc<dyn Repr>)>> {
         self.allinstancefields.borrow()
+    }
+
+    /// RPython `InstanceRepr.create_instance(self)` (rclass.py:944-945):
+    ///
+    /// ```python
+    /// def create_instance(self):
+    ///     return malloc(self.object_type, flavor=self.gcflavor, immortal=True)
+    /// ```
+    ///
+    /// Allocates a fresh instance container in the appropriate gc flavor
+    /// with `immortal=True` so it survives the prebuilt-data lifetime.
+    /// The `object_type` ForwardReference (for non-root) must already be
+    /// resolved by `_setup_repr`; the caller is responsible for
+    /// `Repr::setup` first.
+    pub fn create_instance(&self) -> Result<_ptr, TyperError> {
+        let object_lltype = match self.object_type.clone() {
+            LowLevelType::ForwardReference(fwd) => fwd.resolved().ok_or_else(|| {
+                TyperError::message(
+                    "InstanceRepr.create_instance: object_type ForwardReference not \
+                     resolved (call setup() first)",
+                )
+            })?,
+            other => other,
+        };
+        let flavor = match self.gcflavor {
+            Flavor::Gc => lltype::MallocFlavor::Gc,
+            Flavor::Raw => lltype::MallocFlavor::Raw,
+        };
+        lltype::malloc(object_lltype, None, flavor, true).map_err(TyperError::message)
+    }
+
+    /// RPython `InstanceRepr.initialize_prebuilt_data(self, value,
+    /// classdef, result)` (rclass.py:947-975).
+    ///
+    /// Recursive helper that walks the `rbase` chain (each level
+    /// addressed via the per-step `path` of `"super"` segments,
+    /// matching the `setattr_at_path` semantics introduced for vtable
+    /// init) and writes each level's instance fields. Reaching the
+    /// root (`classdef is None`) writes the `typeptr` slot to point at
+    /// the leaf-class's vtable via `getclassrepr(rtyper, classdef)`.
+    ///
+    /// Pyre-port deviations:
+    /// - `value` is the live HostObject (or `None` for the upstream
+    ///   `Ellipsis` sentinel meaning "use defaults").
+    /// - The non-root branch's `getattr(value, name)` HostObject probe
+    ///   is deferred — exception classes have no readonly attrs in
+    ///   the standardexceptions set, so the field-init loop is a no-op
+    ///   for the immediate consumer.
+    pub fn initialize_prebuilt_data(
+        &self,
+        _value: Option<&HostObject>,
+        classdef: Option<&Rc<RefCell<ClassDef>>>,
+        result: &mut _ptr,
+        path: &[&str],
+    ) -> Result<(), TyperError> {
+        if let Some(_self_classdef) = self.classdef.as_ref() {
+            // upstream rclass.py:949 — recurse into rbase first.
+            let rbase = self.rbase.borrow().clone().ok_or_else(|| {
+                TyperError::message(
+                    "InstanceRepr.initialize_prebuilt_data: rbase missing — \
+                     call setup() first",
+                )
+            })?;
+            let mut next_path = Vec::with_capacity(path.len() + 1);
+            next_path.extend_from_slice(path);
+            next_path.push("super");
+            rbase.initialize_prebuilt_data(_value, classdef, result, &next_path)?;
+            // upstream rclass.py:951-971 — per-level fields. The
+            // standardexceptions classdefs carry no instance attrs, so
+            // `self.fields` is empty and this loop is a no-op for the
+            // immediate `get_standard_ll_exc_instance` consumer. The
+            // field-init body is left as a focused follow-up port.
+            if !self.fields.borrow().is_empty() && _value.is_none() {
+                return Err(TyperError::missing_rtype_operation(
+                    "InstanceRepr.initialize_prebuilt_data: per-level field-init \
+                     body (rclass.py:951-971) port pending — only empty-classdef \
+                     prebuilt instances supported today",
+                ));
+            }
+        } else {
+            // upstream rclass.py:973-975 — root sets typeptr.
+            // `result.typeptr = rclass.getvtable()`.
+            let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+                TyperError::message(
+                    "InstanceRepr.initialize_prebuilt_data: rtyper weak ref expired",
+                )
+            })?;
+            let rclass = getclassrepr_arc(&rtyper, classdef)?;
+            // The vtable is already cast to typeptr (CLASSTYPE) by
+            // `cast_vtable_to_typeptr` inside `getvtable`.
+            let vtable_ptr = match &rclass {
+                ClassReprArc::Inst(inst) => inst.getvtable()?,
+                ClassReprArc::Root(root) => root.getvtable()?,
+            };
+            let val = lltype::LowLevelValue::Ptr(Box::new(vtable_ptr));
+            if path.is_empty() {
+                result
+                    .setattr("typeptr", val)
+                    .map_err(TyperError::message)?;
+            } else {
+                result
+                    .setattr_at_path(path, "typeptr", val)
+                    .map_err(TyperError::message)?;
+            }
+        }
+        Ok(())
+    }
+
+    /// RPython `InstanceRepr.get_reusable_prebuilt_instance(self)`
+    /// (rclass.py:804-813):
+    ///
+    /// ```python
+    /// def get_reusable_prebuilt_instance(self):
+    ///     try:
+    ///         return self._reusable_prebuilt_instance
+    ///     except AttributeError:
+    ///         self.setup()
+    ///         result = self.create_instance()
+    ///         self._reusable_prebuilt_instance = result
+    ///         self.initialize_prebuilt_data(Ellipsis, self.classdef, result)
+    ///         return result
+    /// ```
+    ///
+    /// Lazy-cached `_ptr` to a single dummy instance, used by
+    /// `ExceptionData.get_standard_ll_exc_instance` to materialise the
+    /// canonical instance for a given exception class. Multiple calls
+    /// return the same `_ptr` value (same `_identity`).
+    pub fn get_reusable_prebuilt_instance(self: &Arc<Self>) -> Result<_ptr, TyperError> {
+        if let Some(cached) = self.reusable_prebuilt_instance.borrow().clone() {
+            return Ok(cached);
+        }
+        // upstream: `self.setup()`. Repr::setup is idempotent.
+        Repr::setup(self.as_ref() as &dyn Repr)?;
+        // upstream rclass.py:810-811 — `result = self.create_instance();
+        // self._reusable_prebuilt_instance = result` BEFORE calling
+        // `initialize_prebuilt_data`. Pyre's `_ptr` is value-typed
+        // (Clone deep-copies the underlying `_obj0`), so we cannot keep
+        // an aliased handle outside the cache. Instead we move the
+        // pointer into the cache up front, then mutate it through a
+        // brief `borrow_mut` for the duration of `initialize_prebuilt_data`.
+        // This matches upstream's "cache visible mid-init" semantics
+        // for the no-recursion case (`get_standard_ll_exc_instance`).
+        let result = self.create_instance()?;
+        *self.reusable_prebuilt_instance.borrow_mut() = Some(result);
+        // initialize_prebuilt_data may walk rbase but never re-enters
+        // the same InstanceRepr's prebuilt cache, so holding the
+        // `borrow_mut` for the call is safe today.
+        {
+            let mut cache = self.reusable_prebuilt_instance.borrow_mut();
+            let result_in_cache = cache.as_mut().expect("cache slot just inserted");
+            self.initialize_prebuilt_data(None, self.classdef.as_ref(), result_in_cache, &[])?;
+        }
+        // Clone the cached entry for return — observationally
+        // identical to returning `result` directly upstream.
+        let cached = self
+            .reusable_prebuilt_instance
+            .borrow()
+            .clone()
+            .ok_or_else(|| {
+                TyperError::message(
+                    "InstanceRepr.get_reusable_prebuilt_instance: cache disappeared mid-init",
+                )
+            })?;
+        Ok(cached)
     }
 }
 
@@ -1320,6 +2427,52 @@ pub(crate) fn getclassrepr_arc(
 ///     return result
 /// ```
 ///
+/// RPython `externalvsinternal(rtyper, item_repr, gcref=False)`
+/// (rmodel.py:417-429).
+///
+/// ```python
+/// def externalvsinternal(rtyper, item_repr, gcref=False):
+///     ...
+///     if (gcref and isinstance(item_repr.lowleveltype, Ptr) and
+///             item_repr.lowleveltype.TO._gckind == 'gc'):
+///         return item_repr, rgcref.GCRefRepr.make(item_repr, rtyper.gcrefreprcache)
+///     if (isinstance(item_repr, rclass.InstanceRepr) and
+///         getattr(item_repr, 'gcflavor', 'gc') == 'gc'):
+///         return item_repr, rclass.getinstancerepr(rtyper, None)
+///     else:
+///         return item_repr, item_repr
+/// ```
+///
+/// Returns `(external_repr, internal_repr)`. Used by container reprs
+/// (TupleRepr / ListRepr / DictRepr) to store GC `InstanceRepr`s as
+/// the root `InstanceRepr` (gcflavor='gc', classdef=None) internally
+/// while preserving the concrete external repr at the surface.
+///
+/// Pyre placement deviation: upstream lives in `rmodel.py` and lazy-
+/// imports `rclass`; the Rust port flips that — InstanceRepr lives in
+/// `rclass.rs` and `rmodel.rs` cannot import `rclass` without
+/// introducing a module-level cycle. Callers in `rtuple.rs` /
+/// follow-on `rlist.rs` import this directly from `rclass`.
+///
+/// `gcref=True` arm (rmodel.py:422-424) is deferred until `rgcref` is
+/// ported — the GCRef wrapping is dead code today (no caller passes
+/// `gcref=True` from the minimal slice we have).
+pub fn externalvsinternal(
+    rtyper: &Rc<RPythonTyper>,
+    item_repr: Arc<dyn Repr>,
+) -> Result<(Arc<dyn Repr>, Arc<dyn Repr>), TyperError> {
+    let any_r: &dyn std::any::Any = item_repr.as_ref();
+    if let Some(inst) = any_r.downcast_ref::<InstanceRepr>() {
+        if inst.gcflavor() == Flavor::Gc {
+            let internal = getinstancerepr(rtyper, None, Flavor::Gc)?;
+            let external = item_repr.clone();
+            return Ok((external, internal as Arc<dyn Repr>));
+        }
+    }
+    let external = item_repr.clone();
+    Ok((external, item_repr))
+}
+
 pub fn getinstancerepr(
     rtyper: &Rc<RPythonTyper>,
     classdef: Option<&Rc<RefCell<ClassDef>>>,
@@ -1464,6 +2617,39 @@ mod tests {
         );
     }
 
+    /// `OBJECT_VTABLE.name: Ptr(rstr.STR)` (rclass.py:171). The `name`
+    /// field is consumed by `ClassesPBCRepr.rtype_getattr('__name__')`
+    /// (rpbc.py:980-981), which emits a `getfield` op against this
+    /// slot. The lltype of the field must be `Ptr(STR)` resolving to
+    /// the `rpy_string` GcStruct.
+    #[test]
+    fn object_vtable_carries_name_ptr_to_str() {
+        let LowLevelType::ForwardReference(fwd) = OBJECT_VTABLE.clone() else {
+            panic!();
+        };
+        let LowLevelType::Struct(body) = fwd.resolved().expect("resolved") else {
+            panic!();
+        };
+        let name_type = body
+            ._flds
+            .get("name")
+            .expect("name field must be present (rclass.py:171)");
+        let LowLevelType::Ptr(ptr) = name_type else {
+            panic!("name must be a Ptr, got {name_type:?}");
+        };
+        // STR is a ForwardReference resolving to rpy_string.
+        let PtrTarget::ForwardReference(fwd) = &ptr.TO else {
+            panic!(
+                "name's Ptr target must be ForwardReference (STR), got {:?}",
+                ptr.TO
+            );
+        };
+        let LowLevelType::Struct(str_body) = fwd.resolved().expect("STR must resolve") else {
+            panic!("STR must resolve to a Struct");
+        };
+        assert_eq!(str_body._name, "rpy_string");
+    }
+
     #[test]
     fn object_vtable_carries_rtti_ptr_to_runtime_type_info() {
         let LowLevelType::ForwardReference(fwd) = OBJECT_VTABLE.clone() else {
@@ -1541,7 +2727,10 @@ mod tests {
 
     #[test]
     fn root_class_repr_lowleveltype_is_classtype() {
-        let repr = RootClassRepr::new();
+        use crate::annotator::annrpython::RPythonAnnotator;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let repr = RootClassRepr::new(&rtyper);
         assert_eq!(repr.lowleveltype(), &CLASSTYPE.clone());
         assert_eq!(repr.vtable_type(), &OBJECT_VTABLE.clone());
         assert_eq!(repr.classdef(), None);
@@ -1549,9 +2738,563 @@ mod tests {
 
     #[test]
     fn root_class_repr_setup_is_noop_idempotent() {
-        let repr = RootClassRepr::new();
+        use crate::annotator::annrpython::RPythonAnnotator;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        let repr = RootClassRepr::new(&rtyper);
         Repr::setup(&repr).expect("first setup");
         Repr::setup(&repr).expect("second setup re-enters Finished branch");
+    }
+
+    #[test]
+    fn root_class_repr_init_vtable_writes_subclassrange_and_rtti() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let repr = rtyper
+            .rootclass_repr
+            .borrow()
+            .clone()
+            .expect("rootclass_repr after initialize");
+        let vtable = repr.getvtable().expect("getvtable");
+        let min = vtable.getattr("subclassrange_min").unwrap();
+        let max = vtable.getattr("subclassrange_max").unwrap();
+        assert_eq!(min, lltype::LowLevelValue::Signed(0));
+        assert_eq!(max, lltype::LowLevelValue::Signed(i64::MAX));
+        // rtti slot is populated when gcflavor == Gc.
+        let rtti = vtable.getattr("rtti").unwrap();
+        let lltype::LowLevelValue::Ptr(rtti_ptr) = rtti else {
+            panic!("rtti must be a Ptr value");
+        };
+        assert!(
+            rtti_ptr.nonzero(),
+            "rtti pointer must be live for Gc flavor"
+        );
+    }
+
+    #[test]
+    fn class_repr_init_vtable_writes_subclassrange_from_classdef_minmax_id() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let host = HostObject::new_class("C", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(class_rc) = &entry else {
+            unreachable!();
+        };
+        let classdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(class_rc).unwrap();
+        {
+            let mut cd = classdef.borrow_mut();
+            cd.minid = Some(7);
+            cd.maxid = Some(11);
+        }
+        let r = getclassrepr_arc(&rtyper, Some(&classdef)).unwrap();
+        Repr::setup(&*r.as_repr()).expect("setup classrepr");
+
+        let ClassReprArc::Inst(inst_repr) = r else {
+            panic!("expected ClassReprArc::Inst");
+        };
+        let vtable = inst_repr.getvtable().expect("getvtable");
+        // The per-class vtable Struct is wrapped — `cast_vtable_to_typeptr`
+        // already walked `super` down to the OBJECT_VTABLE level, so the
+        // returned pointer carries the root subclassrange writes from
+        // `fill_vtable_root`.
+        let min = vtable.getattr("subclassrange_min").unwrap();
+        let max = vtable.getattr("subclassrange_max").unwrap();
+        assert_eq!(min, lltype::LowLevelValue::Signed(7));
+        assert_eq!(max, lltype::LowLevelValue::Signed(11));
+    }
+
+    #[test]
+    fn cast_vtable_to_typeptr_walks_super_chain_to_object_vtable() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let host = HostObject::new_class("C", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(class_rc) = &entry else {
+            unreachable!();
+        };
+        let classdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(class_rc).unwrap();
+        {
+            let mut cd = classdef.borrow_mut();
+            cd.minid = Some(2);
+            cd.maxid = Some(3);
+        }
+        let r = getclassrepr_arc(&rtyper, Some(&classdef)).unwrap();
+        Repr::setup(&*r.as_repr()).expect("setup classrepr");
+        let ClassReprArc::Inst(inst_repr) = r else {
+            unreachable!();
+        };
+        // Internal pre-cast vtable still points at the per-class
+        // struct (`C_vtable`); after `getvtable`'s
+        // `cast_vtable_to_typeptr` it points at `OBJECT_VTABLE`.
+        inst_repr.init_vtable().unwrap();
+        let raw = inst_repr.vtable.borrow().clone().unwrap();
+        let raw_to = LowLevelType::from(raw._TYPE.TO.clone());
+        assert_ne!(
+            raw_to,
+            OBJECT_VTABLE.clone(),
+            "raw vtable points at C_vtable"
+        );
+
+        let cast = cast_vtable_to_typeptr(raw);
+        let cast_to = LowLevelType::from(cast._TYPE.TO.clone());
+        assert_eq!(
+            cast_to,
+            OBJECT_VTABLE.clone(),
+            "cast walked to OBJECT_VTABLE"
+        );
+    }
+
+    #[test]
+    fn root_class_repr_convert_desc_returns_vtable_constant() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        // ClassRepr.convert_desc upstream is the conversion entry for
+        // SomeType-typed values (which route through `get_type_repr →
+        // rtyper.rootclass_repr`). The receiver is therefore the root
+        // ClassRepr whose `lowleveltype == CLASSTYPE`, satisfying the
+        // `getruntime` assert. Non-root ClassRepr.convert_desc is
+        // exercised only via the inherited shape but never reached
+        // with a mismatched `expected_type`.
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let host = HostObject::new_class("C", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(class_rc) = &entry else {
+            unreachable!();
+        };
+        let classdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(class_rc).unwrap();
+        classdef.borrow_mut().minid = Some(5);
+        classdef.borrow_mut().maxid = Some(5);
+        // Pre-setup the subclass ClassRepr so its vtable_type
+        // ForwardReference is resolved when `getruntime → init_vtable`
+        // runs from `convert_desc`. Real-world flow has this happen via
+        // `RPythonTyper.specialize` → `_setup_repr` chain.
+        let r_sub = getclassrepr_arc(&rtyper, Some(&classdef)).unwrap();
+        Repr::setup(&*r_sub.as_repr()).unwrap();
+
+        let root = rtyper.rootclass_repr.borrow().clone().unwrap();
+        let out = root.convert_desc(&entry).expect("convert_desc(C)");
+        let ConstValue::LLPtr(p) = &out.value else {
+            panic!("expected LLPtr, got {:?}", out.value);
+        };
+        assert!(p.nonzero());
+        assert_eq!(out.concretetype.as_ref(), Some(&CLASSTYPE.clone()));
+    }
+
+    #[test]
+    fn root_class_repr_convert_const_routes_through_bookkeeper() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let host = HostObject::new_class("D", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(class_rc) = &entry else {
+            unreachable!();
+        };
+        let classdef = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(class_rc).unwrap();
+        classdef.borrow_mut().minid = Some(13);
+        classdef.borrow_mut().maxid = Some(13);
+        let r_sub = getclassrepr_arc(&rtyper, Some(&classdef)).unwrap();
+        Repr::setup(&*r_sub.as_repr()).unwrap();
+        let root = rtyper.rootclass_repr.borrow().clone().unwrap();
+        let out = Repr::convert_const(root.as_ref(), &ConstValue::HostObject(host))
+            .expect("convert_const HostObject(class)");
+        let ConstValue::LLPtr(p) = &out.value else {
+            panic!("expected LLPtr, got {:?}", out.value);
+        };
+        assert!(p.nonzero());
+
+        // Non-class HostObject is rejected upfront.
+        let module_host = HostObject::new_module("not_a_class_mod");
+        let err =
+            Repr::convert_const(root.as_ref(), &ConstValue::HostObject(module_host)).unwrap_err();
+        assert!(err.to_string().contains("not a class"));
+    }
+
+    #[test]
+    fn class_repr_convert_desc_rejects_unrelated_class() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        // Two unrelated classes (no common ancestor in HostObject mro
+        // beyond `object`). The receiver `inst_a` rejects converting
+        // for desc(B) because B is not a subclass of A.
+        let host_a = HostObject::new_class("A", vec![]);
+        let host_b = HostObject::new_class("B", vec![]);
+        let entry_a = ann.bookkeeper.getdesc(&host_a).unwrap();
+        let entry_b = ann.bookkeeper.getdesc(&host_b).unwrap();
+        let crate::annotator::description::DescEntry::Class(rc_a) = &entry_a else {
+            unreachable!();
+        };
+        let cd_a = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc_a).unwrap();
+        cd_a.borrow_mut().minid = Some(1);
+        cd_a.borrow_mut().maxid = Some(1);
+
+        let r_a = getclassrepr_arc(&rtyper, Some(&cd_a)).unwrap();
+        Repr::setup(&*r_a.as_repr()).unwrap();
+        let ClassReprArc::Inst(inst_a) = r_a else {
+            unreachable!();
+        };
+        // Subclass check fires before the (assert-violating) getruntime
+        // call, so this exercises just the commonbase-rejection branch.
+        let err = inst_a.convert_desc(&entry_b).unwrap_err();
+        assert!(err.to_string().contains("not a subclass"), "{err}");
+    }
+
+    #[test]
+    fn class_repr_fromtypeptr_emits_cast_pointer_with_self_lowleveltype() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let host = HostObject::new_class("E", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(rc) = &entry else {
+            unreachable!();
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        cd.borrow_mut().minid = Some(1);
+        cd.borrow_mut().maxid = Some(1);
+        let r = getclassrepr_arc(&rtyper, Some(&cd)).unwrap();
+        Repr::setup(&*r.as_repr()).unwrap();
+        let ClassReprArc::Inst(inst) = r else {
+            unreachable!();
+        };
+
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let mut vcls = Variable::new();
+        vcls.set_concretetype(Some(CLASSTYPE.clone()));
+        let v = inst
+            .fromtypeptr(Hlvalue::Variable(vcls), &mut llops)
+            .expect("fromtypeptr");
+        assert_eq!(llops.ops.len(), 1);
+        assert_eq!(llops.ops[0].opname, "cast_pointer");
+        assert_eq!(v.concretetype().as_ref(), Some(inst.lowleveltype()));
+    }
+
+    #[test]
+    fn class_repr_getclsfield_traverses_rbase_until_root_then_errors() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let host = HostObject::new_class("F", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(rc) = &entry else {
+            unreachable!();
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        cd.borrow_mut().minid = Some(1);
+        cd.borrow_mut().maxid = Some(1);
+        let r = getclassrepr_arc(&rtyper, Some(&cd)).unwrap();
+        Repr::setup(&*r.as_repr()).unwrap();
+        let ClassReprArc::Inst(inst) = r else {
+            unreachable!();
+        };
+
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let mut vcls = Variable::new();
+        vcls.set_concretetype(Some(CLASSTYPE.clone()));
+        // No clsfield named "missing_attr" anywhere in the chain →
+        // routes through F → rbase (RootClassRepr) which terminates
+        // with a MissingRTypeAttribute-style structured error.
+        let err = inst
+            .getclsfield(Hlvalue::Variable(vcls), "missing_attr", &mut llops)
+            .unwrap_err();
+        assert!(err.to_string().contains("MissingRTypeAttribute"));
+    }
+
+    #[test]
+    fn class_repr_getpbcfield_internal_error_when_field_unknown() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let host = HostObject::new_class("G", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(rc) = &entry else {
+            unreachable!();
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        cd.borrow_mut().minid = Some(1);
+        cd.borrow_mut().maxid = Some(1);
+        let r = getclassrepr_arc(&rtyper, Some(&cd)).unwrap();
+        Repr::setup(&*r.as_repr()).unwrap();
+        let ClassReprArc::Inst(inst) = r else {
+            unreachable!();
+        };
+
+        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
+        let mut vcls = Variable::new();
+        vcls.set_concretetype(Some(CLASSTYPE.clone()));
+        let err = inst
+            .getpbcfield(Hlvalue::Variable(vcls), 0, "missing_pbc_attr", &mut llops)
+            .unwrap_err();
+        assert!(err.to_string().contains("missing PBC field"));
+    }
+
+    #[test]
+    fn class_repr_rtype_issubtype_const_branch_emits_direct_call_to_ll_issubclass_const() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::{HostObject, SpaceOperation};
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rtyper::HighLevelOp;
+        use std::cell::RefCell as StdRef;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let host = HostObject::new_class("Z", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(rc) = &entry else {
+            unreachable!();
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        cd.borrow_mut().minid = Some(2);
+        cd.borrow_mut().maxid = Some(2);
+        let r = getclassrepr_arc(&rtyper, Some(&cd)).unwrap();
+        Repr::setup(&*r.as_repr()).unwrap();
+        let ClassReprArc::Inst(inst) = r else {
+            unreachable!();
+        };
+
+        // Build a HighLevelOp where v_cls2 is a HostObject-typed
+        // class Constant. `inputargs(class_repr)` routes through
+        // RootClassRepr.convert_const → convert_desc → getruntime,
+        // producing a CLASSTYPE-typed Constant whose value is the
+        // vtable `_ptr`. The const-branch probe then reads
+        // `subclassrange_min/max` off that vtable.
+        let mut v_cls1 = Variable::new();
+        v_cls1.set_concretetype(Some(CLASSTYPE.clone()));
+        let v_cls1_h = Hlvalue::Variable(v_cls1);
+
+        let v_cls2_h = Hlvalue::Constant(Constant::new(ConstValue::HostObject(host)));
+
+        let result_var = Variable::new();
+        result_var.set_concretetype(Some(LowLevelType::Bool));
+        let spaceop = SpaceOperation::new(
+            OpKind::IsSubtype.opname(),
+            vec![v_cls1_h.clone(), v_cls2_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_cls1_h);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        let class_repr_arc: Arc<dyn Repr> =
+            rtyper.rootclass_repr.borrow().clone().unwrap() as Arc<dyn Repr>;
+        hop.args_r.borrow_mut().push(Some(class_repr_arc.clone()));
+        hop.args_v.borrow_mut().push(v_cls2_h);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(class_repr_arc));
+
+        let _ = inst.rtype_issubtype(&hop).expect("rtype_issubtype");
+        let ops = hop.llops.borrow();
+        let dc = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "direct_call")
+            .expect("direct_call to ll_issubclass_const helper expected");
+        // direct_call args: [funcptr, v_cls1, c_min, c_max]
+        assert_eq!(dc.args.len(), 4);
+        let Hlvalue::Constant(c_min) = &dc.args[2] else {
+            panic!("c_min must be a Constant");
+        };
+        let Hlvalue::Constant(c_max) = &dc.args[3] else {
+            panic!("c_max must be a Constant");
+        };
+        assert_eq!(c_min.value, ConstValue::Int(2));
+        assert_eq!(c_max.value, ConstValue::Int(2));
+    }
+
+    #[test]
+    fn class_repr_rtype_issubtype_var_branch_emits_direct_call_to_ll_issubclass() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::SpaceOperation;
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rtyper::HighLevelOp;
+        use std::cell::RefCell as StdRef;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let root = rtyper.rootclass_repr.borrow().clone().unwrap();
+        // Use rootclass to keep the example simple — the variable
+        // branch doesn't need a subclass classdef.
+
+        let mut v_cls1 = Variable::new();
+        v_cls1.set_concretetype(Some(CLASSTYPE.clone()));
+        let mut v_cls2 = Variable::new();
+        v_cls2.set_concretetype(Some(CLASSTYPE.clone()));
+        let v_cls1_h = Hlvalue::Variable(v_cls1);
+        let v_cls2_h = Hlvalue::Variable(v_cls2);
+        let result_var = Variable::new();
+        result_var.set_concretetype(Some(LowLevelType::Bool));
+        let spaceop = SpaceOperation::new(
+            OpKind::IsSubtype.opname(),
+            vec![v_cls1_h.clone(), v_cls2_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_cls1_h);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        let class_repr_arc: Arc<dyn Repr> = root.clone() as Arc<dyn Repr>;
+        hop.args_r.borrow_mut().push(Some(class_repr_arc.clone()));
+        hop.args_v.borrow_mut().push(v_cls2_h);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(class_repr_arc));
+
+        // Build a synthetic ClassRepr instance just so we can invoke
+        // rtype_issubtype. The receiver only needs `rtyper` for
+        // helper-function lookup; classdef.minid/maxid are not read in
+        // the variable branch.
+        let host = crate::flowspace::model::HostObject::new_class("V", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(rc) = &entry else {
+            unreachable!();
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        cd.borrow_mut().minid = Some(0);
+        cd.borrow_mut().maxid = Some(0);
+        let r = getclassrepr_arc(&rtyper, Some(&cd)).unwrap();
+        Repr::setup(&*r.as_repr()).unwrap();
+        let ClassReprArc::Inst(inst) = r else {
+            unreachable!();
+        };
+
+        let _ = inst.rtype_issubtype(&hop).expect("rtype_issubtype");
+        let ops = hop.llops.borrow();
+        let dc = ops
+            .ops
+            .iter()
+            .find(|op| op.opname == "direct_call")
+            .expect("direct_call expected");
+        // funcptr + 2 args.
+        assert_eq!(dc.args.len(), 3);
+    }
+
+    /// `RPythonTyper::translate_operation("issubtype")` dispatches
+    /// `r.rtype_issubtype(hop)` via the `Repr` trait. Without the
+    /// trait override on `RootClassRepr` (which is what `SomeType`
+    /// values rtype to) this would fall to the trait default
+    /// `missing_rtype_operation`. The test calls
+    /// `translate_operation` end-to-end to pin the trait dispatch
+    /// path — not just the inherent method.
+    #[test]
+    fn translate_operation_issubtype_routes_through_root_class_repr_trait_override() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::SpaceOperation;
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rtyper::HighLevelOp;
+        use std::cell::RefCell as StdRef;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let root = rtyper.rootclass_repr.borrow().clone().unwrap();
+
+        let mut v_cls1 = Variable::new();
+        v_cls1.set_concretetype(Some(CLASSTYPE.clone()));
+        let mut v_cls2 = Variable::new();
+        v_cls2.set_concretetype(Some(CLASSTYPE.clone()));
+        let v_cls1_h = Hlvalue::Variable(v_cls1);
+        let v_cls2_h = Hlvalue::Variable(v_cls2);
+        let result_var = Variable::new();
+        result_var.set_concretetype(Some(LowLevelType::Bool));
+        let spaceop = SpaceOperation::new(
+            OpKind::IsSubtype.opname(),
+            vec![v_cls1_h.clone(), v_cls2_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        let class_repr_arc: Arc<dyn Repr> = root as Arc<dyn Repr>;
+        hop.args_v.borrow_mut().push(v_cls1_h);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(class_repr_arc.clone()));
+        hop.args_v.borrow_mut().push(v_cls2_h);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(class_repr_arc));
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("translate_operation issubtype must dispatch through RootClassRepr");
+        let ops = hop.llops.borrow();
+        assert!(
+            ops.ops.iter().any(|op| op.opname == "direct_call"),
+            "translate_operation issubtype must emit a direct_call (ll_issubclass), \
+             got {:?}",
+            ops.ops.iter().map(|op| &op.opname).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn root_class_repr_getruntime_returns_vtable() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let repr = rtyper.rootclass_repr.borrow().clone().unwrap();
+        let v1 = repr.getruntime(&CLASSTYPE.clone()).unwrap();
+        let v2 = repr.getruntime(&CLASSTYPE.clone()).unwrap();
+        // Lazy cache: two calls return the same _ptr identity.
+        assert_eq!(v1._hashable_identity(), v2._hashable_identity());
+        let err = repr.getruntime(&LowLevelType::Signed).unwrap_err();
+        assert!(err.to_string().contains("expected CLASSTYPE"));
     }
 
     #[test]
@@ -1611,6 +3354,87 @@ mod tests {
         assert_eq!(mangled, "typeptr");
         assert_eq!(field_repr.lowleveltype(), &CLASSTYPE.clone());
         assert!(repr.allinstancefields().contains_key("__class__"));
+    }
+
+    #[test]
+    fn instance_repr_get_reusable_prebuilt_instance_caches_and_writes_typeptr() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        let host = HostObject::new_class("ExcClass", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(rc) = &entry else {
+            unreachable!();
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        cd.borrow_mut().minid = Some(11);
+        cd.borrow_mut().maxid = Some(11);
+
+        let inst = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(inst.as_ref() as &dyn Repr).expect("setup InstanceRepr");
+        // Setup the matching ClassRepr too so its vtable_type
+        // ForwardReference is resolved when `initialize_prebuilt_data`
+        // walks down to root and calls `getvtable`.
+        let rclass_arc = getclassrepr_arc(&rtyper, Some(&cd)).unwrap();
+        Repr::setup(&*rclass_arc.as_repr()).unwrap();
+
+        let p1 = inst.get_reusable_prebuilt_instance().expect("first call");
+        let p2 = inst.get_reusable_prebuilt_instance().expect("second call");
+        // upstream `try: return self._reusable_prebuilt_instance`
+        // returns the cached identity on subsequent calls.
+        assert_eq!(p1._hashable_identity(), p2._hashable_identity());
+        assert!(p1.nonzero(), "prebuilt instance must be live");
+
+        // The recursive initialize_prebuilt_data walked down to the
+        // OBJECT-level substruct via `setattr_at_path(["super"],
+        // "typeptr", ...)` so the root super substruct now carries the
+        // vtable pointer. Verify by fetching the parent allocation's
+        // `super._fields` directly.
+        let _ptr_obj_actual = p1
+            ._obj()
+            .expect("prebuilt _ptr must expose underlying object");
+        let lltype::_ptr_obj::Struct(outer) = _ptr_obj_actual else {
+            panic!("prebuilt instance must be a Struct");
+        };
+        let super_field = outer
+            ._getattr("super")
+            .expect("ExcClass instance has 'super' field");
+        let lltype::LowLevelValue::Struct(super_struct) = super_field else {
+            panic!("super field must be a Struct value");
+        };
+        let typeptr_val = super_struct
+            ._getattr("typeptr")
+            .expect("OBJECT.typeptr field present");
+        let lltype::LowLevelValue::Ptr(typeptr) = typeptr_val else {
+            panic!("typeptr must be a Ptr value");
+        };
+        assert!(typeptr.nonzero(), "typeptr must point at the class vtable");
+    }
+
+    #[test]
+    fn instance_repr_create_instance_allocates_immortal_struct() {
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let host = HostObject::new_class("Bare", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let crate::annotator::description::DescEntry::Class(rc) = &entry else {
+            unreachable!();
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        let inst = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).unwrap();
+        Repr::setup(inst.as_ref() as &dyn Repr).unwrap();
+        let p = inst.create_instance().expect("create_instance");
+        assert!(p.nonzero());
     }
 
     #[test]
@@ -2398,5 +4222,104 @@ mod tests {
         // observable via the struct's getattr.
         let value = vtable.getattr("cls_LIMIT").expect("cls_LIMIT stored");
         assert_eq!(value, LowLevelValue::Signed(7));
+    }
+
+    /// `init_vtable` walks the super-chain calling
+    /// `self.setup_vtable(vtable_part, r_parentcls)` (rclass.py:302) —
+    /// receiver is the leaf class, argument is the parent providing the
+    /// field shape. The values therefore come from the leaf's classdesc
+    /// (via `read_attribute` MRO walk), not from the parent's. A child
+    /// that overrides a parent class attr must see the child's value at
+    /// the parent's vtable slot.
+    #[test]
+    fn init_vtable_uses_leaf_classdesc_for_parent_level_field_values() {
+        use crate::annotator::classdesc::ClassDictEntry;
+        use crate::annotator::model::SomeInteger;
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelValue;
+
+        let rtyper = fresh_rtyper();
+
+        // Parent P: declares readonly class attr `LIMIT` (so it lands in
+        // P.clsfields after _setup_repr) with value 7 in classdict.
+        let parent = ClassDef::new_standalone("pkg.P", None);
+        attach_attr(
+            &parent,
+            "LIMIT",
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            true,
+        );
+        {
+            let cdesc = parent.borrow().classdesc.clone();
+            cdesc
+                .borrow_mut()
+                .classdict
+                .insert("LIMIT".into(), ClassDictEntry::constant(ConstValue::Int(7)));
+        }
+
+        // `fill_vtable_root` reads `self.classdef.{minid,maxid}` —
+        // assign_inheritance_ids would normally populate these. Provide
+        // distinct ranges for parent/child so the test does not depend
+        // on that pass.
+        {
+            let mut p = parent.borrow_mut();
+            p.minid = Some(2);
+            p.maxid = Some(9);
+        }
+
+        // Child C extends P with override `LIMIT = 42` in C's classdict.
+        // C does NOT redeclare the attribute so its own clsfields stay
+        // empty — the only `cls_LIMIT` slot lives at the parent (super)
+        // level of the vtable struct.
+        let child = ClassDef::new_standalone("pkg.C", Some(&parent));
+        {
+            let mut c = child.borrow_mut();
+            c.minid = Some(3);
+            c.maxid = Some(8);
+        }
+        {
+            let cdesc = child.borrow().classdesc.clone();
+            cdesc.borrow_mut().classdict.insert(
+                "LIMIT".into(),
+                ClassDictEntry::constant(ConstValue::Int(42)),
+            );
+        }
+
+        // Pre-setup the parent repr so its rbase + clsfields are
+        // populated before C's setup walks the chain.
+        let parent_repr = match getclassrepr_arc(&rtyper, Some(&parent)).expect("getclassrepr P") {
+            ClassReprArc::Inst(r) => r,
+            _ => panic!("classdef != None routes to Inst"),
+        };
+        Repr::setup(parent_repr.as_ref()).expect("_setup_repr P");
+
+        let child_repr = match getclassrepr_arc(&rtyper, Some(&child)).expect("getclassrepr C") {
+            ClassReprArc::Inst(r) => r,
+            _ => panic!("classdef != None routes to Inst"),
+        };
+        Repr::setup(child_repr.as_ref()).expect("_setup_repr C");
+
+        // Drive `init_vtable` on the leaf (child). Without the
+        // leaf-receiver fix the parent-level slot would be filled from
+        // P's classdesc (value 7) instead of C's override (42).
+        child_repr.init_vtable().expect("init_vtable C");
+
+        let raw = child_repr
+            .vtable
+            .borrow()
+            .clone()
+            .expect("init_vtable post-condition: vtable is Some");
+        // C_vtable.super → P_vtable; P_vtable carries `cls_LIMIT`.
+        // `_ptr.getattr` exposes substructs as a `Ptr` aliasing the
+        // parent allocation, so chain `.getattr` calls drill down.
+        let parent_slice = raw.getattr("super").expect("super substruct");
+        let LowLevelValue::Ptr(parent_ptr) = parent_slice else {
+            panic!("expected substruct ptr, got {parent_slice:?}");
+        };
+        let limit = parent_ptr.getattr("cls_LIMIT").expect("cls_LIMIT");
+        assert_eq!(
+            limit,
+            LowLevelValue::Signed(42),
+            "leaf-class override must win — value should come from C.classdesc"
+        );
     }
 }

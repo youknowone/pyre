@@ -336,6 +336,16 @@ pub struct ClassAttrFamily {
     pub read_locations: HashMap<super::bookkeeper::PositionKey, ()>,
     /// RPython `self.s_value = s_ImpossibleValue` (description.py:116).
     pub s_value: SomeValue,
+    /// Upstream sets this dynamically in
+    /// `rpython.rtyper.normalizecalls.merge_classpbc_getattr_into_classdef`
+    /// (normalizecalls.py:232) — Python attaches it to the live family
+    /// instance after computing the common base of `descs`. The Rust
+    /// port stores it as a real field that defaults to `None` and is
+    /// populated by [`crate::translator::rtyper::normalizecalls::
+    /// merge_classpbc_getattr_into_classdef`]. Consumed by
+    /// `ClassesPBCRepr.get_access_set` (rpbc.py:946) to look up the
+    /// `ClassRepr` that hosts the shared vtable slot for `attrname`.
+    pub commonbase: Option<std::rc::Rc<std::cell::RefCell<super::classdesc::ClassDef>>>,
 }
 
 impl ClassAttrFamily {
@@ -347,6 +357,7 @@ impl ClassAttrFamily {
             descs,
             read_locations: HashMap::new(),
             s_value: s_impossible_value(),
+            commonbase: None,
         }
     }
 
@@ -2826,6 +2837,20 @@ mod tests {
     fn no_standard_graph_error_carries_desc_key() {
         let err = NoStandardGraph(desc_key(42));
         assert!(format!("{err}").contains("42"));
+    }
+
+    /// `ClassAttrFamily.commonbase` defaults to `None` until populated
+    /// by `merge_classpbc_getattr_into_classdef` (normalizecalls.py:232).
+    /// `update`/`absorb` propagate descs / s_value but never touch
+    /// `commonbase` — upstream attaches it post-hoc on the live family
+    /// instance rather than during merging.
+    #[test]
+    fn class_attr_family_commonbase_default_none_and_unchanged_by_update() {
+        let mut a = ClassAttrFamily::new(desc_key(1));
+        let b = ClassAttrFamily::new(desc_key(2));
+        assert!(a.commonbase.is_none(), "default commonbase must be None");
+        a.update(&b).unwrap();
+        assert!(a.commonbase.is_none(), "update must not touch commonbase");
     }
 
     // ---- Desc + FunctionDesc (commit 2) ----

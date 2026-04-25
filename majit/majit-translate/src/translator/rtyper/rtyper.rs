@@ -33,7 +33,7 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::{TyperError, TyperWhere};
 use crate::translator::rtyper::llannotation::lltype_to_annotation;
 use crate::translator::rtyper::lltypesystem::lltype::{
-    _ptr, LowLevelType, PtrTarget, getfunctionptr,
+    _ptr, LowLevelType, LowLevelValue, PtrTarget, getfunctionptr,
 };
 use crate::translator::rtyper::rclass::{
     CLASSTYPE, Flavor, InstanceRepr, InstanceReprKey, OBJECTPTR, RootClassRepr, getinstancerepr,
@@ -111,6 +111,224 @@ impl ExceptionData {
             vec![self.lltype_of_exception_value.clone()],
             self.lltype_of_exception_type.clone(),
         )
+    }
+
+    /// RPython `ExceptionData.get_standard_ll_exc_instance(self, rtyper,
+    /// clsdef)` (`exceptiondata.py:34-38`).
+    ///
+    /// ```python
+    /// def get_standard_ll_exc_instance(self, rtyper, clsdef):
+    ///     r_inst = getinstancerepr(rtyper, clsdef)
+    ///     example = r_inst.get_reusable_prebuilt_instance()
+    ///     example = ll_cast_to_object(example)
+    ///     return example
+    /// ```
+    ///
+    /// `ll_cast_to_object` upstream is `cast_pointer(OBJECTPTR, obj)`
+    /// (rclass.py:1126-1127); the Rust port emits the static cast via
+    /// [`lltype::cast_pointer`]. The call chain depends on the leaf
+    /// `InstanceRepr` and its `ClassRepr` having had `_setup_repr` run
+    /// (so the vtable_type/object_type ForwardReferences are
+    /// resolved); upstream achieves this via the
+    /// `RPythonTyper.specialize` pipeline.
+    pub fn get_standard_ll_exc_instance(
+        &self,
+        rtyper: &RPythonTyper,
+        clsdef: Option<Rc<RefCell<crate::annotator::classdesc::ClassDef>>>,
+    ) -> Result<Constant, TyperError> {
+        let rtyper_rc = rtyper.self_rc()?;
+        // upstream: `r_inst = getinstancerepr(rtyper, clsdef)`.
+        let r_inst = getinstancerepr(&rtyper_rc, clsdef.as_ref(), Flavor::Gc)?;
+        // upstream: `example = r_inst.get_reusable_prebuilt_instance()`.
+        let example = r_inst.get_reusable_prebuilt_instance()?;
+        // upstream: `example = ll_cast_to_object(example)` =
+        // `cast_pointer(OBJECTPTR, example)`.
+        let LowLevelType::Ptr(objectptr) = OBJECTPTR.clone() else {
+            return Err(TyperError::message(
+                "ExceptionData.get_standard_ll_exc_instance: OBJECTPTR \
+                 is not a Ptr — internal error",
+            ));
+        };
+        let cast = crate::translator::rtyper::lltypesystem::lltype::cast_pointer(
+            objectptr.as_ref(),
+            &example,
+        )
+        .map_err(TyperError::message)?;
+        Ok(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(cast)),
+            OBJECTPTR.clone(),
+        ))
+    }
+
+    /// RPython `ExceptionData.get_standard_ll_exc_instance_by_class(self,
+    /// exceptionclass)` (`exceptiondata.py:40-45`).
+    ///
+    /// ```python
+    /// def get_standard_ll_exc_instance_by_class(self, exceptionclass):
+    ///     if exceptionclass not in self.standardexceptions:
+    ///         raise UnknownException(exceptionclass)
+    ///     clsdef = self.rtyper.annotator.bookkeeper.getuniqueclassdef(
+    ///         exceptionclass)
+    ///     return self.get_standard_ll_exc_instance(self.rtyper, clsdef)
+    /// ```
+    ///
+    /// Validates that the supplied `exceptionclass` (HostObject of a
+    /// class) is one of the standard exceptions, then defers to
+    /// [`Self::get_standard_ll_exc_instance`] for the actual instance
+    /// materialisation. Membership matches upstream
+    /// `exceptionclass in self.standardexceptions` — identity
+    /// comparison on the live class object (Pyre `HostObject`'s
+    /// `PartialEq` is `Arc::ptr_eq`).
+    pub fn get_standard_ll_exc_instance_by_class(
+        &self,
+        rtyper: &RPythonTyper,
+        exceptionclass: &crate::flowspace::model::HostObject,
+    ) -> Result<Constant, TyperError> {
+        // upstream: `if exceptionclass not in self.standardexceptions:
+        //     raise UnknownException(exceptionclass)`.
+        let known = crate::annotator::exception::standard_exception_classes()
+            .into_iter()
+            .any(|cls| &cls == exceptionclass);
+        if !known {
+            return Err(TyperError::message(format!(
+                "ExceptionData.get_standard_ll_exc_instance_by_class: \
+                 {} is not a standard exception (UnknownException)",
+                exceptionclass.qualname()
+            )));
+        }
+        // upstream: `clsdef = self.rtyper.annotator.bookkeeper.getuniqueclassdef(exceptionclass)`.
+        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+            TyperError::message(
+                "ExceptionData.get_standard_ll_exc_instance_by_class: annotator dropped",
+            )
+        })?;
+        let classdefs =
+            crate::annotator::exception::standard_exception_classdefs(&annotator.bookkeeper)
+                .map_err(|e| TyperError::message(e.to_string()))?;
+        let clsdef = classdefs
+            .into_iter()
+            .find(|cd| {
+                let cd_borrow = cd.borrow();
+                let cdesc = cd_borrow.classdesc.borrow();
+                &cdesc.pyobj == exceptionclass
+            })
+            .ok_or_else(|| {
+                TyperError::message(format!(
+                    "ExceptionData.get_standard_ll_exc_instance_by_class: \
+                     classdef for {} not in bookkeeper cache",
+                    exceptionclass.qualname()
+                ))
+            })?;
+        self.get_standard_ll_exc_instance(rtyper, Some(clsdef))
+    }
+
+    /// RPython `ExceptionData.generate_exception_match(self, oplist,
+    /// var_etype, const_etype)` (`exceptiondata.py:64-80`).
+    ///
+    /// ```python
+    /// def generate_exception_match(self, oplist, var_etype, const_etype):
+    ///     # generate the content of rclass.ll_issubclass(_const)
+    ///     llops = LowLevelOpList(None)
+    ///     field = llops.genop(
+    ///         'getfield',
+    ///         [var_etype, llops.genvoidconst('subclassrange_min')],
+    ///         lltype.Signed)
+    ///     res = llops.genop(
+    ///         'int_between', [
+    ///             llops.genconst(const_etype.value.subclassrange_min),
+    ///             field,
+    ///             llops.genconst(const_etype.value.subclassrange_max),
+    ///         ],
+    ///         lltype.Bool)
+    ///     oplist.extend(llops)
+    ///     return res
+    /// ```
+    ///
+    /// `oplist` upstream is a Python `block.operations` list which the
+    /// helper extends in place. The Rust port mirrors that contract by
+    /// taking `&mut Vec<SpaceOperation>` so callers (notably
+    /// `backendopt/inline.py:366` and the ExceptionData consumers in
+    /// rtyper.py exception branches) can extend the live block buffer
+    /// without reaching into a `LowLevelOpList`. The fresh
+    /// `LowLevelOpList(None)` mirrors upstream — no parent graph is
+    /// recorded for the helper ops, so `record_extra_call` stays inert.
+    pub fn generate_exception_match(
+        &self,
+        rtyper: Rc<RPythonTyper>,
+        oplist: &mut Vec<SpaceOperation>,
+        var_etype: Hlvalue,
+        const_etype: Hlvalue,
+    ) -> Result<Hlvalue, TyperError> {
+        // upstream `const_etype.value.subclassrange_{min,max}` —
+        // `const_etype` is a `Constant(_ptr, Ptr(OBJECT_VTABLE))` and
+        // `.value` is the underlying `_ptr` to a vtable struct.
+        let Hlvalue::Constant(const_etype_c) = &const_etype else {
+            return Err(TyperError::message(
+                "generate_exception_match: const_etype must be a Constant",
+            ));
+        };
+        let ConstValue::LLPtr(c_ptr) = &const_etype_c.value else {
+            return Err(TyperError::message(format!(
+                "generate_exception_match: const_etype.value must be _ptr, got {:?}",
+                const_etype_c.value,
+            )));
+        };
+        let min_val = c_ptr
+            .getattr("subclassrange_min")
+            .map_err(TyperError::message)?;
+        let max_val = c_ptr
+            .getattr("subclassrange_max")
+            .map_err(TyperError::message)?;
+        let LowLevelValue::Signed(min_n) = min_val else {
+            return Err(TyperError::message(format!(
+                "generate_exception_match: subclassrange_min must be Signed, got {min_val:?}",
+            )));
+        };
+        let LowLevelValue::Signed(max_n) = max_val else {
+            return Err(TyperError::message(format!(
+                "generate_exception_match: subclassrange_max must be Signed, got {max_val:?}",
+            )));
+        };
+
+        // upstream `LowLevelOpList(None)` — a temporary buffer with no
+        // originalblock, accumulating helper ops before the
+        // `oplist.extend(llops)` flush.
+        let mut llops = LowLevelOpList::new(rtyper, None);
+
+        // upstream `field = llops.genop('getfield',
+        //     [var_etype, llops.genvoidconst('subclassrange_min')], Signed)`.
+        let void_field = Constant::with_concretetype(
+            ConstValue::Str("subclassrange_min".to_string()),
+            LowLevelType::Void,
+        );
+        let v_field = llops
+            .genop(
+                "getfield",
+                vec![var_etype, Hlvalue::Constant(void_field)],
+                GenopResult::LLType(LowLevelType::Signed),
+            )
+            .expect("getfield with Signed result returns a value");
+
+        // upstream `res = llops.genop('int_between', [genconst(min),
+        // field, genconst(max)], Bool)`.
+        let c_min = Constant::with_concretetype(ConstValue::Int(min_n), LowLevelType::Signed);
+        let c_max = Constant::with_concretetype(ConstValue::Int(max_n), LowLevelType::Signed);
+        let v_res = llops
+            .genop(
+                "int_between",
+                vec![
+                    Hlvalue::Constant(c_min),
+                    Hlvalue::Variable(v_field),
+                    Hlvalue::Constant(c_max),
+                ],
+                GenopResult::LLType(LowLevelType::Bool),
+            )
+            .expect("int_between with Bool result returns a value");
+
+        // upstream `oplist.extend(llops)` — flush helper ops onto the
+        // caller-provided block.operations buffer.
+        oplist.extend(llops.ops);
+        Ok(Hlvalue::Variable(v_res))
     }
 }
 
@@ -197,6 +415,12 @@ pub struct RPythonTyper {
     /// [`crate::translator::rtyper::rpbc::MultipleUnrelatedFrozenPBCRepr`]
     /// (and future `MultipleFrozenPBCRepr`).
     pub pbc_reprs: RefCell<HashMap<PbcReprKey, Arc<dyn Repr>>>,
+    /// RPython `self.annmixlevel = None` (rtyper.py:204) lazily filled
+    /// by [`RPythonTyper::getannmixlevel`] (rtyper.py:191-196). Reset to
+    /// `None` at the start of every `specialize_more_blocks()` pass so
+    /// helper-annotator state from a prior pass is not reused.
+    pub annmixlevel:
+        RefCell<Option<Rc<crate::translator::rtyper::annlowlevel::MixLevelHelperAnnotator>>>,
     /// RPython low-level helper graphs are cached by
     /// `FunctionDesc.cachedgraph()` under `annlowlevel.py`'s
     /// `LowLevelAnnotatorPolicy.lowlevelspecialize`. The Rust port has
@@ -243,6 +467,7 @@ impl RPythonTyper {
             seen_reprs_must_call_setup: RefCell::new(Vec::new()),
             primitive_to_repr: RefCell::new(HashMap::new()),
             pbc_reprs: RefCell::new(HashMap::new()),
+            annmixlevel: RefCell::new(None),
             lowlevel_helper_graphs: RefCell::new(HashMap::new()),
         }
     }
@@ -271,7 +496,7 @@ impl RPythonTyper {
         // live handle even before `rootclass_repr` is installed.
         *self.self_weak.borrow_mut() = Rc::downgrade(self);
         // rtyper.py:57 — `self.rootclass_repr = RootClassRepr(self)`.
-        let root = Arc::new(RootClassRepr::new());
+        let root = Arc::new(RootClassRepr::new(self));
         // rtyper.py:58 — `self.rootclass_repr.setup()`.
         Repr::setup(root.as_ref())?;
         *self.rootclass_repr.borrow_mut() = Some(root.clone());
@@ -1334,12 +1559,16 @@ impl RPythonTyper {
     /// - No `seed`-based shuffle (pyre lacks the translator-level seed
     ///   knob; block ordering falls out of HashMap iteration).
     /// - No progress-bar log events.
-    /// - `self.annmixlevel` finish step (rtyper.py:238-241) is skipped
-    ///   until `getannmixlevel` / `MixLevelHelperAnnotator` are ported.
     /// - `BlockKey → BlockRef` materialisation reads from
     ///   `annotator.all_blocks`, the Rust-side reverse index that keeps
     ///   Python's "dict keys ARE Block objects" iteration shape.
     pub fn specialize_more_blocks(self: &Rc<Self>) -> Result<(), TyperError> {
+        // upstream rtyper.py:204 — `self.annmixlevel = None`. Resets
+        // the helper-annotator cache at every pass so each pass that
+        // needs `getannmixlevel` constructs a fresh
+        // `MixLevelHelperAnnotator` whose `pending` queue is drained on
+        // the matching `finish` call at the bottom of this method.
+        *self.annmixlevel.borrow_mut() = None;
         loop {
             self.call_all_setups()?;
             let pending: Vec<BlockRef> = {
@@ -1364,7 +1593,44 @@ impl RPythonTyper {
                 self.mark_already_seen(&block);
             }
         }
+        // upstream rtyper.py:238-241 — `annmixlevel = self.annmixlevel;
+        // del self.annmixlevel; if annmixlevel is not None:
+        // annmixlevel.finish()`. The take-then-finish drains any helper
+        // graphs queued via `getannmixlevel().getgraph(...)` during this
+        // pass. Skipped silently when no caller invoked `getannmixlevel`.
+        let helper = self.annmixlevel.borrow_mut().take();
+        if let Some(helper) = helper {
+            helper.finish()?;
+        }
         Ok(())
+    }
+
+    /// RPython `RPythonTyper.getannmixlevel(self)` (rtyper.py:191-196).
+    ///
+    /// ```python
+    /// def getannmixlevel(self):
+    ///     if self.annmixlevel is not None:
+    ///         return self.annmixlevel
+    ///     from rpython.rtyper.annlowlevel import MixLevelHelperAnnotator
+    ///     self.annmixlevel = MixLevelHelperAnnotator(self)
+    ///     return self.annmixlevel
+    /// ```
+    ///
+    /// Lazy-singleton getter for the per-pass
+    /// [`MixLevelHelperAnnotator`]. The cache is cleared at every
+    /// [`Self::specialize_more_blocks`] entry, so callers within the
+    /// same pass share one helper instance and `finish_annotate` in
+    /// `specialize` (rtyper.py:188) drains a deterministic queue.
+    pub fn getannmixlevel(
+        self: &Rc<Self>,
+    ) -> Rc<crate::translator::rtyper::annlowlevel::MixLevelHelperAnnotator> {
+        if let Some(annmixlevel) = self.annmixlevel.borrow().clone() {
+            return annmixlevel;
+        }
+        let helper =
+            Rc::new(crate::translator::rtyper::annlowlevel::MixLevelHelperAnnotator::new(self));
+        *self.annmixlevel.borrow_mut() = Some(helper.clone());
+        helper
     }
 
     /// RPython `RPythonTyper.setup_block_entry(self, block)`
@@ -1584,6 +1850,10 @@ impl RPythonTyper {
             }
             "cmp" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_cmp),
             "coerce" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_coerce),
+            // rtyper.py:547-549 — `translate_op_newtuple` calls the
+            // free function `rtuple.rtype_newtuple(hop)` which routes
+            // to `TupleRepr._rtype_newtuple`. No per-Repr dispatch.
+            "newtuple" => super::rtuple::TupleRepr::rtype_newtuple(hop),
             _ => self.default_translate_operation(hop),
         }
     }
@@ -4376,6 +4646,235 @@ mod tests {
             .finish_exceptiondata()
             .expect_err("finish without initialize must error");
         assert!(err.to_string().contains("ExceptionData not initialised"));
+    }
+
+    /// Allocate a vtable container and pre-populate the
+    /// `subclassrange_min` / `subclassrange_max` head fields. Mirrors the
+    /// upstream `init_vtable` writes (`rclass.py:296-330`) at the granularity
+    /// `generate_exception_match` consumes — no rclass machinery needed.
+    fn make_const_etype(min: i64, max: i64) -> Hlvalue {
+        use crate::translator::rtyper::lltypesystem::lltype::{
+            LowLevelValue, MallocFlavor, malloc,
+        };
+        // OBJECT_VTABLE is a `ForwardReference(Struct(...))` for
+        // self-reference parity (rclass.py:159); `malloc` only accepts
+        // container types, so resolve through the forward-ref before
+        // allocating.
+        let vtable_lltype = match crate::translator::rtyper::rclass::OBJECT_VTABLE.clone() {
+            LowLevelType::ForwardReference(fwd) => fwd
+                .resolved()
+                .expect("OBJECT_VTABLE forward-reference must be resolved"),
+            other => other,
+        };
+        let mut vtable_ptr =
+            malloc(vtable_lltype, None, MallocFlavor::Raw, true).expect("malloc OBJECT_VTABLE");
+        vtable_ptr
+            .setattr("subclassrange_min", LowLevelValue::Signed(min))
+            .expect("setattr subclassrange_min");
+        vtable_ptr
+            .setattr("subclassrange_max", LowLevelValue::Signed(max))
+            .expect("setattr subclassrange_max");
+        let const_etype = Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(vtable_ptr)),
+            crate::translator::rtyper::rclass::CLASSTYPE.clone(),
+        );
+        Hlvalue::Constant(const_etype)
+    }
+
+    #[test]
+    fn getannmixlevel_returns_cached_instance_within_one_pass() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        // Initially the cache is empty.
+        assert!(rtyper.annmixlevel.borrow().is_none());
+
+        let first = rtyper.getannmixlevel();
+        let second = rtyper.getannmixlevel();
+        // Two consecutive calls within the same pass must reuse the
+        // same `MixLevelHelperAnnotator` instance (upstream identity
+        // check via `self.annmixlevel is not None`).
+        assert!(Rc::ptr_eq(&first, &second));
+        assert!(rtyper.annmixlevel.borrow().is_some());
+    }
+
+    #[test]
+    fn specialize_more_blocks_resets_annmixlevel_per_pass() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+
+        // Seed the cache so we can observe the reset at pass entry.
+        let _seeded = rtyper.getannmixlevel();
+        assert!(rtyper.annmixlevel.borrow().is_some());
+
+        // No annotated blocks → loop terminates immediately, but the
+        // annmixlevel reset and post-loop finish-take still execute.
+        rtyper
+            .specialize_more_blocks()
+            .expect("specialize_more_blocks on empty annotated");
+        assert!(
+            rtyper.annmixlevel.borrow().is_none(),
+            "specialize_more_blocks must clear annmixlevel after finish",
+        );
+    }
+
+    #[test]
+    fn get_standard_ll_exc_instance_returns_objectptr_constant_for_root_classdef() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let ed = rtyper.exceptiondata().expect("exceptiondata");
+
+        // None classdef → root InstanceRepr; create_instance allocates
+        // an OBJECT struct (no super chain), and ll_cast_to_object is
+        // identity for OBJECTPTR.
+        let out = ed
+            .get_standard_ll_exc_instance(&rtyper, None)
+            .expect("get_standard_ll_exc_instance(None) on root");
+        let crate::flowspace::model::ConstValue::LLPtr(p) = &out.value else {
+            panic!("expected LLPtr, got {:?}", out.value);
+        };
+        assert!(p.nonzero(), "prebuilt root instance must be live");
+        assert_eq!(
+            out.concretetype.as_ref(),
+            Some(&crate::translator::rtyper::rclass::OBJECTPTR.clone())
+        );
+    }
+
+    #[test]
+    fn get_standard_ll_exc_instance_by_class_unknown_raises_typererror() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let ed = rtyper.exceptiondata().expect("exceptiondata");
+        let bogus = crate::flowspace::model::HostObject::new_class("NotAStandardException", vec![]);
+        let err = ed
+            .get_standard_ll_exc_instance_by_class(&rtyper, &bogus)
+            .expect_err("unknown class must error (UnknownException parity)");
+        assert!(err.to_string().contains("UnknownException"), "{err}");
+    }
+
+    #[test]
+    fn get_standard_ll_exc_instance_by_class_known_returns_live_objectptr() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        rtyper.finish_exceptiondata().expect("finish_exceptiondata");
+        // `fill_vtable_root` requires `classdef.minid/maxid`, which
+        // `assign_inheritance_ids` populates. Upstream
+        // `RPythonTyper.specialize` runs that pass via
+        // `perform_normalizations` before any vtable materialisation.
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+        let ed = rtyper.exceptiondata().expect("exceptiondata");
+
+        // OverflowError is a known standard exception (verified by
+        // standard_exception_classes_have_expected_names test). The
+        // by-class wrapper resolves the classdef and forwards to the
+        // live get_standard_ll_exc_instance body. Look up the
+        // canonical HostObject from the standard set so identity
+        // matches what `initialize_exceptiondata` registered.
+        let overflow = crate::annotator::exception::standard_exception_classes()
+            .into_iter()
+            .find(|cls| cls.qualname() == "OverflowError")
+            .expect("OverflowError must be a standard exception");
+        let out = ed
+            .get_standard_ll_exc_instance_by_class(&rtyper, &overflow)
+            .expect("standard exception class must produce a live prebuilt instance");
+        let crate::flowspace::model::ConstValue::LLPtr(p) = &out.value else {
+            panic!("expected LLPtr, got {:?}", out.value);
+        };
+        assert!(p.nonzero());
+    }
+
+    #[test]
+    fn generate_exception_match_emits_getfield_then_int_between() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let ed = rtyper.exceptiondata().expect("exceptiondata");
+
+        let mut var_etype = Variable::new();
+        var_etype.set_concretetype(Some(crate::translator::rtyper::rclass::CLASSTYPE.clone()));
+        let var_etype_h = Hlvalue::Variable(var_etype);
+
+        let const_etype = make_const_etype(7, 11);
+
+        let mut oplist: Vec<SpaceOperation> = Vec::new();
+        let res = ed
+            .generate_exception_match(rtyper.clone(), &mut oplist, var_etype_h, const_etype)
+            .expect("generate_exception_match");
+
+        // upstream emits exactly two ops: getfield + int_between.
+        assert_eq!(oplist.len(), 2, "expected two helper ops, got {oplist:?}");
+        assert_eq!(oplist[0].opname, "getfield");
+        assert_eq!(oplist[1].opname, "int_between");
+
+        // getfield arg[1] is `genvoidconst('subclassrange_min')`.
+        let Hlvalue::Constant(field_const) = &oplist[0].args[1] else {
+            panic!("getfield arg[1] must be a Constant");
+        };
+        assert_eq!(
+            field_const.value,
+            ConstValue::Str("subclassrange_min".to_string())
+        );
+        assert_eq!(field_const.concretetype.as_ref(), Some(&LowLevelType::Void));
+
+        // int_between args[0]/args[2] are `genconst(min)` / `genconst(max)`.
+        let Hlvalue::Constant(c_min) = &oplist[1].args[0] else {
+            panic!("int_between arg[0] must be a Constant");
+        };
+        let Hlvalue::Constant(c_max) = &oplist[1].args[2] else {
+            panic!("int_between arg[2] must be a Constant");
+        };
+        assert_eq!(c_min.value, ConstValue::Int(7));
+        assert_eq!(c_max.value, ConstValue::Int(11));
+        assert_eq!(c_min.concretetype.as_ref(), Some(&LowLevelType::Signed));
+        assert_eq!(c_max.concretetype.as_ref(), Some(&LowLevelType::Signed));
+
+        // Returned res variable carries Bool concretetype.
+        let Hlvalue::Variable(res_var) = res else {
+            panic!("generate_exception_match must return a Variable");
+        };
+        assert_eq!(res_var.concretetype().as_ref(), Some(&LowLevelType::Bool));
+    }
+
+    #[test]
+    fn generate_exception_match_rejects_non_constant_etype() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata");
+        let ed = rtyper.exceptiondata().expect("exceptiondata");
+
+        let mut var_etype = Variable::new();
+        var_etype.set_concretetype(Some(crate::translator::rtyper::rclass::CLASSTYPE.clone()));
+        let var_etype_h = Hlvalue::Variable(var_etype);
+        // Pass a Variable as `const_etype` to violate the upstream
+        // contract that it must carry a concrete `_ptr`.
+        let mut bad_const = Variable::new();
+        bad_const.set_concretetype(Some(crate::translator::rtyper::rclass::CLASSTYPE.clone()));
+        let bad_const_h = Hlvalue::Variable(bad_const);
+
+        let mut oplist: Vec<SpaceOperation> = Vec::new();
+        let err = ed
+            .generate_exception_match(rtyper.clone(), &mut oplist, var_etype_h, bad_const_h)
+            .expect_err("non-constant const_etype must error");
+        assert!(
+            err.to_string().contains("const_etype must be a Constant"),
+            "{err}",
+        );
+        assert!(oplist.is_empty(), "no ops should leak when input invalid");
     }
 
     #[test]

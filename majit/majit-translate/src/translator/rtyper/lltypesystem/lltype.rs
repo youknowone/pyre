@@ -227,13 +227,10 @@ impl LowLevelType {
             // downstream via _enforce on malformed constants).
             LowLevelType::Char => matches!(value, ConstValue::Str(_)),
             LowLevelType::UniChar => matches!(value, ConstValue::Str(_)),
-            // Address is a Primitive with `_defl = NULL`. No ConstValue
-            // variant models a fakeaddress yet; until the llmemory
-            // cast helpers land, only Placeholder (handled above) is
-            // accepted. Downstream TyperError surfaces fakeaddress
-            // constants through the same Placeholder path upstream uses
-            // for `NODEFAULT`.
-            LowLevelType::Address => false,
+            // Address is a Primitive with `_defl = NULL`. Concrete
+            // values are llmemory.fakeaddress instances; pyre carries
+            // them as `ConstValue::LLAddress`.
+            LowLevelType::Address => matches!(value, ConstValue::LLAddress(_)),
             // upstream `Ptr(FuncType)` accepts `_ptr` instances — pyre's
             // `ConstValue::LLPtr` is the direct equivalent.
             LowLevelType::Ptr(_) => matches!(value, ConstValue::LLPtr(_)),
@@ -325,13 +322,26 @@ pub enum LowLevelValue {
 ///
 /// Upstream carries the underlying `_ptr` (or `None` for NULL) and
 /// exposes `_cast_to_ptr` / `_cast_to_int` / dereference helpers.
-/// Pyre lands only the NULL sentinel in this commit — the `Fake(_ptr)`
-/// arm will extend when the first consumer (MultipleUnrelatedFrozenPBCRepr
-/// `convert_pbc`) hits it.
-#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+/// Pyre carries the two arms consumers actually hit today — the NULL
+/// sentinel + a `Fake(_ptr)` wrapper produced by
+/// [`MultipleUnrelatedFrozenPBCRepr.convert_pbc`] via
+/// `llmemory.fakeaddress(pbcptr)`. Cast / dereference helpers extend
+/// `_address` later as further consumers land.
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum _address {
     /// `NULL = fakeaddress(None)` (`llmemory.py:649`).
     Null,
+    /// `fakeaddress(ptr)` — wraps a live `_ptr` so it can flow
+    /// through `Address`-typed slots (e.g. `MUFrozenPBCRepr` whose
+    /// lowleveltype is `llmemory.Address`). Upstream stores this on
+    /// the dict-by-identity `converted_pbc_cache`; pyre keys the same
+    /// cache by `DescKey` and stores the [`_address::Fake`] payload
+    /// directly.
+    ///
+    /// `_address` no longer derives `Hash` because `_ptr` does not
+    /// have a stable structural hash; the `Fake` arm carries a Box
+    /// to keep the variant fixed-size.
+    Fake(Box<_ptr>),
 }
 
 #[derive(Clone, Debug)]
@@ -856,6 +866,30 @@ impl _struct {
         *slot = value;
         true
     }
+
+    /// Recursively descend through nested Struct fields named by `path`
+    /// and `_setattr(field, value)` at the bottom. Returns `false` when
+    /// any path step is not a Struct field. Used by
+    /// [`_ptr::setattr_at_path`] to mutate vtable substructs in place
+    /// without going through `_ptr.getattr` (which returns a detached
+    /// copy for non-Gc Struct fields).
+    pub fn _setattr_descending(
+        &mut self,
+        path: &[&str],
+        field: &str,
+        value: LowLevelValue,
+    ) -> bool {
+        if path.is_empty() {
+            return self._setattr(field, value);
+        }
+        let Some((_, slot)) = self._fields.iter_mut().find(|(name, _)| name == path[0]) else {
+            return false;
+        };
+        let LowLevelValue::Struct(inner) = slot else {
+            return false;
+        };
+        inner._setattr_descending(&path[1..], field, value)
+    }
 }
 
 impl _array {
@@ -1074,6 +1108,81 @@ impl _ptr {
             Ok(None) => false,
             Err(DelayedPointer) => true,
         }
+    }
+
+    /// RPython `_ptr._cast_to(self, PTRTYPE)` (`lltype.py:1421-1451`).
+    ///
+    /// Walks the struct super-chain to produce a re-typed pointer that
+    /// aliases the same underlying allocation. Down-casts (positive
+    /// `castable` depth) walk via the first field name (`super`);
+    /// up-casts via `_parentstructure()`.
+    ///
+    /// Pyre-port scope: down-casts and identity casts are supported.
+    /// Null casts return `Ptr(target)._defl()`. Up-casts surface a
+    /// structured error pending a `_parent_link` port — exception
+    /// classes only ever down-cast for `ll_cast_to_object`, which is
+    /// the immediate consumer.
+    pub fn _cast_to(&self, ptrtype: &Ptr) -> Result<_ptr, String> {
+        let down_or_up = castable(ptrtype, &self._TYPE)?;
+        if down_or_up == 0 {
+            return Ok(self.clone());
+        }
+        // upstream: `if not self: return PTRTYPE._defl()`.
+        if !self.nonzero() {
+            return Ok(ptrtype._defl());
+        }
+        if down_or_up < 0 {
+            return Err(format!(
+                "_ptr._cast_to: up-cast (depth={down_or_up}) requires \
+                 _parentstructure() — not yet ported",
+            ));
+        }
+        // upstream: `while down_or_up: p = getattr(p, typeOf(p).TO._names[0])`.
+        // The first field of a Struct in our port is the leading entry
+        // of `_flds`; for the instance/class hierarchy that is
+        // `("super", parent_struct)`. Walk by repeated `_obj.getattr`
+        // re-pointing through the chain.
+        let mut current = self.clone();
+        let mut steps = down_or_up;
+        while steps > 0 {
+            let to_struct = match &current._TYPE.TO {
+                PtrTarget::Struct(s) => s.clone(),
+                PtrTarget::ForwardReference(fwd) => match fwd.resolved() {
+                    Some(LowLevelType::Struct(s)) => *s,
+                    _ => {
+                        return Err(format!(
+                            "_ptr._cast_to: ForwardReference {fwd:?} did not \
+                             resolve to a Struct"
+                        ));
+                    }
+                },
+                _ => {
+                    return Err(format!(
+                        "_ptr._cast_to: cast walk requires Struct target, got {:?}",
+                        current._TYPE
+                    ));
+                }
+            };
+            let first_name = to_struct._names.first().ok_or_else(|| {
+                format!(
+                    "_ptr._cast_to: struct {:?} has no fields to walk",
+                    to_struct._name
+                )
+            })?;
+            let lv = current.getattr(first_name)?;
+            let LowLevelValue::Ptr(next) = lv else {
+                return Err(format!(
+                    "_ptr._cast_to: vtable.{first_name} did not yield a Ptr value"
+                ));
+            };
+            current = *next;
+            steps -= 1;
+        }
+        // Re-wrap with the target Ptr type while preserving the
+        // underlying object and solid bit. Upstream `_ptr(PTRTYPE,
+        // p._obj, solid=self._solid)`.
+        let obj0 = current._obj0.clone();
+        Ok(_ptr::new_with_solid(ptrtype.clone(), obj0, self._solid))
     }
 
     pub fn _identityhash(&self) -> i64 {
@@ -1296,6 +1405,45 @@ impl _ptr {
             return Ok(());
         }
         Err(self._TYPE._nofield(field_name))
+    }
+
+    /// Variant of [`Self::setattr`] that descends through nested Struct
+    /// fields named by `path` before writing `field`. The pointer
+    /// continues to alias the same underlying allocation (unlike
+    /// `_ptr.getattr("super")` which returns a detached copy of the
+    /// substruct). Required by `ClassRepr.init_vtable` to write
+    /// `subclassrange_min/max` / `rtti` on the OBJECT_VTABLE substruct
+    /// nested inside a per-class vtable allocation.
+    pub fn setattr_at_path(
+        &mut self,
+        path: &[&str],
+        field: &str,
+        val: LowLevelValue,
+    ) -> Result<(), String> {
+        let obj = self
+            ._obj0
+            .as_mut()
+            .map_err(|_| {
+                format!(
+                    "delayed pointer {:?} has no nested field {:?}",
+                    self._TYPE, field
+                )
+            })?
+            .as_mut()
+            .expect("non-null struct pointer must expose an underlying object");
+        let _ptr_obj::Struct(obj) = obj else {
+            return Err(format!(
+                "setattr_at_path: pointer {:?} does not target a Struct",
+                self._TYPE
+            ));
+        };
+        if !obj._setattr_descending(path, field, val) {
+            return Err(format!(
+                "setattr_at_path: nested write at path={:?} field={:?} failed",
+                path, field
+            ));
+        }
+        Ok(())
     }
 
     pub fn setitem(&mut self, index: usize, val: LowLevelValue) -> Result<(), String> {
@@ -1845,6 +1993,29 @@ impl StructType {
         Some((first_name.clone(), first_struct.as_ref()))
     }
 
+    /// Owned variant of [`Self::_first_struct`] that resolves a
+    /// leading `ForwardReference` field by cloning out the resolved
+    /// struct body. Required by `castdepth` to walk the inheritance
+    /// chain produced by `InstanceRepr._setup_repr` (where the
+    /// immediate parent is wrapped in `ForwardReference` to support
+    /// `_become`-style late resolution).
+    pub fn _first_struct_owned(&self) -> Option<(String, StructType)> {
+        let first_name = self._names.first()?.clone();
+        let first_type = self._flds.get(&first_name)?.clone();
+        let first_struct: StructType = match first_type {
+            LowLevelType::Struct(boxed) => *boxed,
+            LowLevelType::ForwardReference(fwd) => match fwd.resolved()? {
+                LowLevelType::Struct(boxed) => *boxed,
+                _ => return None,
+            },
+            _ => return None,
+        };
+        if self._gckind != first_struct._gckind {
+            return None;
+        }
+        Some((first_name, first_struct))
+    }
+
     /// RPython `Struct._is_atomic` (`lltype.py:314-318`). All fields must
     /// themselves be atomic (primitive or opaque-with-no-gc-children).
     pub fn _is_atomic(&self) -> bool {
@@ -2189,18 +2360,30 @@ fn castdepth(outside: &StructType, inside: &StructType) -> i32 {
         return 0;
     }
     let mut dwn = 0;
-    let mut current = outside;
+    // Walk an owned chain so we can resolve `ForwardReference` parents
+    // produced by `_setup_repr` for the inheritance hierarchy.
+    let mut current_owned = outside.clone();
     loop {
-        let Some((_, first_type)) = current._first_struct() else {
+        let Some((_, first_type)) = current_owned._first_struct_owned() else {
             break;
         };
         dwn += 1;
-        if first_type == inside {
+        if &first_type == inside {
             return dwn;
         }
-        current = first_type;
+        current_owned = first_type;
     }
     -1
+}
+
+/// RPython `castable(PTRTYPE, CURTYPE)` (`lltype.py:944-961`). Returns
+/// the signed depth distance between two `Ptr` types: positive when
+/// `PTRTYPE` is reached by walking inward (through `_first_struct`),
+/// negative when reached outward (parent), zero when identical. Errors
+/// when the types are not castable (gc-status mismatch / non-Struct
+/// targets / no chain).
+pub fn castable(ptrtype: &Ptr, curtype: &Ptr) -> Result<i32, String> {
+    castable_ptr_types(ptrtype, curtype)
 }
 
 fn castable_ptr_types(ptrtype: &Ptr, curtype: &Ptr) -> Result<i32, String> {
@@ -2601,6 +2784,23 @@ pub fn nullptr(T: LowLevelType) -> Result<_ptr, String> {
     Ok(Ptr::from_container_type(T)?._defl())
 }
 
+/// RPython `cast_pointer(PTRTYPE, ptr)` (`lltype.py:964-968`):
+///
+/// ```python
+/// def cast_pointer(PTRTYPE, ptr):
+///     CURTYPE = typeOf(ptr)
+///     if not isinstance(CURTYPE, Ptr) or not isinstance(PTRTYPE, Ptr):
+///         raise TypeError("can only cast pointers to other pointers")
+///     return ptr._cast_to(PTRTYPE)
+/// ```
+///
+/// Ports the entry point used by `ll_cast_to_object` (`rclass.py:1126-1127`)
+/// and other repr-side static-cast call sites. The actual chain walk
+/// lives on [`_ptr::_cast_to`].
+pub fn cast_pointer(ptrtype: &Ptr, ptr: &_ptr) -> Result<_ptr, String> {
+    ptr._cast_to(ptrtype)
+}
+
 /// RPython `getRuntimeTypeInfo(GCSTRUCT)` (`lltype.py:2391-2397`):
 ///
 /// ```python
@@ -2763,14 +2963,12 @@ pub enum MallocFlavor {
 ///     return _ptr(Ptr(T), o, solid)
 /// ```
 ///
-/// This port covers only the subset R3 (`ClassRepr::init_vtable`) needs:
-/// `flavor='gc'` or `'raw'` × `immortal=True/False` × `n=None` × non-varsize
-/// Struct / Array / OpaqueType. Varsize `n`, `zero`, `track_allocation`,
-/// `add_memory_pressure`, `nonmovable` upstream kwargs are not accepted —
-/// upstream's `_uninitialized` abstraction is the prerequisite for them
-/// and remains unported, so keeping a narrow surface matches parity rule
-/// #1 (no API expansion without its matching semantics). The `solid`
-/// kwarg threaded through upstream `_ptr(Ptr(T), o, solid)` is still
+/// This port covers the subset R3/RString needs: `flavor='gc'` or
+/// `'raw'` × `immortal=True/False` × Struct / Array / OpaqueType,
+/// including varsize Structs whose trailing field is an `Array`.
+/// `zero`, `track_allocation`, `add_memory_pressure`, and
+/// `nonmovable` upstream kwargs are still not accepted. The `solid`
+/// kwarg threaded through upstream `_ptr(Ptr(T), o, solid)` is
 /// tracked on `_ptr._solid` (upstream lltype.py:2221 `immortal or
 /// flavor == 'raw'`).
 pub fn malloc(
@@ -2779,23 +2977,67 @@ pub fn malloc(
     flavor: MallocFlavor,
     immortal: bool,
 ) -> Result<_ptr, String> {
-    if n.is_some() {
-        return Err(format!(
-            "malloc: varsize n={n:?} not yet ported (R3 subset)"
-        ));
-    }
     let obj: _ptr_obj = match &T {
         LowLevelType::Struct(struct_t) => {
             if struct_t._arrayfld.is_some() {
-                return Err(format!(
-                    "malloc: varsize struct {:?} requires n (not yet ported)",
-                    struct_t._name
-                ));
+                let n = n.ok_or_else(|| {
+                    format!("malloc: varsize struct {:?} requires n", struct_t._name)
+                })?;
+                let fields = struct_t
+                    ._names
+                    .iter()
+                    .map(|name| {
+                        let typ = struct_t
+                            ._flds
+                            .get(name)
+                            .expect("StructType._names entry must exist in _flds");
+                        if Some(name) == struct_t._arrayfld.as_ref() {
+                            let LowLevelType::Array(array_t) = typ else {
+                                panic!("StructType._arrayfld must name an Array field");
+                            };
+                            let arr = _array {
+                                _identity: fresh_low_level_container_identity(),
+                                TYPE: ArrayContainer::Array((**array_t).clone()),
+                                items: (0..n).map(|_| array_t.OF._defl()).collect(),
+                            };
+                            (name.clone(), LowLevelValue::Array(Box::new(arr)))
+                        } else {
+                            (name.clone(), typ._defl())
+                        }
+                    })
+                    .collect();
+                _ptr_obj::Struct(_struct {
+                    _identity: fresh_low_level_container_identity(),
+                    TYPE: (**struct_t).clone(),
+                    _fields: fields,
+                })
+            } else {
+                if n.is_some() {
+                    return Err(format!(
+                        "malloc: non-varsize struct {:?} got n={n:?}",
+                        struct_t._name
+                    ));
+                }
+                _ptr_obj::Struct(struct_t._container_example())
             }
-            _ptr_obj::Struct(struct_t._container_example())
         }
-        LowLevelType::Array(array_t) => _ptr_obj::Array(array_t._container_example()),
-        LowLevelType::Opaque(opaque_t) => _ptr_obj::Opaque(opaque_t._container_example()),
+        LowLevelType::Array(array_t) => {
+            let items = match n {
+                Some(n) => (0..n).map(|_| array_t.OF._defl()).collect(),
+                None => array_t._container_example().items,
+            };
+            _ptr_obj::Array(_array {
+                _identity: fresh_low_level_container_identity(),
+                TYPE: ArrayContainer::Array((**array_t).clone()),
+                items,
+            })
+        }
+        LowLevelType::Opaque(opaque_t) => {
+            if n.is_some() {
+                return Err("malloc: OpaqueType does not accept n".to_string());
+            }
+            _ptr_obj::Opaque(opaque_t._container_example())
+        }
         other => {
             return Err(format!("malloc: unmallocable type {other:?}"));
         }
@@ -3059,6 +3301,61 @@ mod tests {
     }
 
     #[test]
+    fn cast_pointer_identity_returns_same_pointer_value() {
+        let s = StructType::_build(
+            "vtable",
+            vec![("super".into(), LowLevelType::Signed)],
+            GcKind::Gc,
+            vec![],
+            vec![],
+        );
+        let T = LowLevelType::Struct(Box::new(s));
+        let p = malloc(T.clone(), None, MallocFlavor::Gc, true).unwrap();
+        let ptr_T = Ptr::from_container_type(T).unwrap();
+        let q = cast_pointer(&ptr_T, &p).unwrap();
+        // Identity cast preserves both _identity (same allocation) and
+        // _TYPE.
+        assert_eq!(p._hashable_identity(), q._hashable_identity());
+    }
+
+    #[test]
+    fn cast_pointer_downcast_walks_first_field_super_chain() {
+        // Build a parent gc struct (rtti=true by `gc_rtti`) and a
+        // sub-struct whose first field is `("super", parent)`. cast
+        // from sub→parent should yield a pointer whose _TYPE matches
+        // parent and which aliases the same allocation.
+        let parent = StructType::gc_rtti("parent", vec![("typeptr".into(), LowLevelType::Signed)]);
+        let parent_T = LowLevelType::Struct(Box::new(parent.clone()));
+        let sub = StructType::gc_rtti(
+            "sub",
+            vec![
+                ("super".into(), parent_T.clone()),
+                ("data".into(), LowLevelType::Signed),
+            ],
+        );
+        let sub_T = LowLevelType::Struct(Box::new(sub));
+        let sub_ptr = malloc(sub_T, None, MallocFlavor::Gc, true).unwrap();
+
+        let parent_ptr_T = Ptr::from_container_type(parent_T).unwrap();
+        let cast = cast_pointer(&parent_ptr_T, &sub_ptr).unwrap();
+        // The cast result's `_TYPE` is `Ptr(parent)`.
+        let PtrTarget::Struct(s) = &cast._TYPE.TO else {
+            panic!("cast result must be Ptr(Struct)");
+        };
+        assert_eq!(s._name, "parent");
+    }
+
+    #[test]
+    fn cast_pointer_null_yields_null_of_target_type() {
+        let parent = StructType::gc_rtti("parent_n", vec![]);
+        let parent_T = LowLevelType::Struct(Box::new(parent));
+        let parent_ptr_T = Ptr::from_container_type(parent_T.clone()).unwrap();
+        let null = nullptr(parent_T).unwrap();
+        let cast = cast_pointer(&parent_ptr_T, &null).unwrap();
+        assert!(!cast.nonzero(), "null cast must remain null");
+    }
+
+    #[test]
     fn malloc_immortal_gc_struct_produces_live_struct_container() {
         let s = StructType::_build(
             "vtable",
@@ -3091,22 +3388,36 @@ mod tests {
     }
 
     #[test]
-    fn malloc_rejects_varsize_n_kwarg_as_unported() {
+    fn malloc_varsize_struct_initialises_trailing_array_to_requested_length() {
         let s = StructType::_build(
             "S",
-            vec![("x".into(), LowLevelType::Signed)],
+            vec![
+                ("x".into(), LowLevelType::Signed),
+                (
+                    "items".into(),
+                    LowLevelType::Array(Box::new(ArrayType::new(LowLevelType::Char))),
+                ),
+            ],
             GcKind::Gc,
             vec![],
             vec![],
         );
-        let err = malloc(
+        let p = malloc(
             LowLevelType::Struct(Box::new(s)),
             Some(3),
             MallocFlavor::Gc,
             true,
         )
-        .unwrap_err();
-        assert!(err.contains("not yet ported"), "unexpected error: {err}");
+        .unwrap();
+        let Some(_ptr_obj::Struct(s)) = p._obj0.as_ref().unwrap().as_ref() else {
+            panic!("malloc should return a live Struct pointer");
+        };
+        let Some((_, LowLevelValue::Array(items))) =
+            s._fields.iter().find(|(field, _)| field == "items")
+        else {
+            panic!("varsize array field should be initialised as an Array");
+        };
+        assert_eq!(items.getlength(), 3);
     }
 
     #[test]
@@ -3503,13 +3814,14 @@ mod tests {
     }
 
     #[test]
-    fn lowleveltype_address_contains_value_rejects_constants_until_fakeaddress_lands() {
+    fn lowleveltype_address_contains_value_accepts_fakeaddress_constants() {
         use crate::flowspace::model::ConstValue;
-        // No ConstValue variant models fakeaddress yet. Until the
-        // llmemory cast helpers land, Address rejects everything
-        // except the universal Placeholder sentinel.
         assert!(!LowLevelType::Address.contains_value(&ConstValue::Int(0)));
         assert!(!LowLevelType::Address.contains_value(&ConstValue::None));
+        assert!(
+            LowLevelType::Address.contains_value(&ConstValue::LLAddress(_address::Null)),
+            "Address must accept llmemory.NULL fakeaddress"
+        );
         assert!(LowLevelType::Address.contains_value(&ConstValue::Placeholder));
     }
 

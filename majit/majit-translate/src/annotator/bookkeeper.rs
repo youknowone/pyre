@@ -1735,6 +1735,7 @@ impl Bookkeeper {
             ConstValue::Code(_)
             | ConstValue::Graphs(_)
             | ConstValue::LowLevelType(_)
+            | ConstValue::LLAddress(_)
             | ConstValue::SpecTag(_)
             | ConstValue::Atom(_)
             | ConstValue::Placeholder => {

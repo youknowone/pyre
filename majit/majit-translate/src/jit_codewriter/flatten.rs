@@ -629,7 +629,10 @@ pub(crate) fn linkarg_kind(arg: &LinkArg, regallocs: &HashMap<RegKind, RegAllocR
 /// are gcref-bearing (kind `'r'`), `SpecTag` is a Signed wrapper.
 pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
     match cv {
-        ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::SpecTag(_) => 'i',
+        ConstValue::Int(_)
+        | ConstValue::Bool(_)
+        | ConstValue::SpecTag(_)
+        | ConstValue::LLAddress(_) => 'i',
         ConstValue::Float(_) => 'f',
         ConstValue::None
         | ConstValue::Str(_)

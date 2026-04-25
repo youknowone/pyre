@@ -158,7 +158,10 @@ fn merge_value_type(state: &mut AnnotationState, dst: ValueId, src_ty: ValueType
 
 fn const_value_type(value: &ConstValue) -> ValueType {
     match value {
-        ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::SpecTag(_) => ValueType::Int,
+        ConstValue::Int(_)
+        | ConstValue::Bool(_)
+        | ConstValue::SpecTag(_)
+        | ConstValue::LLAddress(_) => ValueType::Int,
         ConstValue::Float(_) => ValueType::Float,
         ConstValue::Placeholder => ValueType::Unknown,
         ConstValue::Atom(_)

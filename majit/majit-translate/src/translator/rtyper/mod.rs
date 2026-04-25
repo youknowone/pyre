@@ -23,4 +23,5 @@ pub mod rint;
 pub mod rmodel;
 pub mod rnone;
 pub mod rpbc;
+pub mod rtuple;
 pub mod rtyper;

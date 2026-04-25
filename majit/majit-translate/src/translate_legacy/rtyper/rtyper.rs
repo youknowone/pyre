@@ -243,7 +243,10 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
 
 fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
     match value {
-        ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::SpecTag(_) => ConcreteType::Signed,
+        ConstValue::Int(_)
+        | ConstValue::Bool(_)
+        | ConstValue::SpecTag(_)
+        | ConstValue::LLAddress(_) => ConcreteType::Signed,
         ConstValue::Float(_) => ConcreteType::Float,
         ConstValue::Placeholder => ConcreteType::Unknown,
         ConstValue::Atom(_)

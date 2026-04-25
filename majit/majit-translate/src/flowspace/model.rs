@@ -1739,6 +1739,11 @@ pub enum ConstValue {
     LowLevelType(Box<ConcretetypePlaceholder>),
     /// RPython `lltype._ptr` function pointer constant.
     LLPtr(Box<_ptr>),
+    /// RPython `llmemory._fakeaddress` Address-typed constant —
+    /// either NULL or a `Fake(_ptr)` wrapping a live pointer. Surfaces
+    /// at the `Address` lowleveltype slot used by
+    /// `MultipleUnrelatedFrozenPBCRepr`.
+    LLAddress(crate::translator::rtyper::lltypesystem::lltype::_address),
     /// Arbitrary host-level Python object (class, module, builtin
     /// callable, instance). upstream `Constant.value` 에 담기는 임의
     /// object 를 흉내내는 일반 carrier — `HostObject` 참조.
@@ -1780,6 +1785,7 @@ impl PartialEq for ConstValue {
             (ConstValue::LLPtr(a), ConstValue::LLPtr(b)) => {
                 a._hashable_identity() == b._hashable_identity()
             }
+            (ConstValue::LLAddress(a), ConstValue::LLAddress(b)) => a == b,
             (ConstValue::HostObject(a), ConstValue::HostObject(b)) => a == b,
             (ConstValue::SpecTag(a), ConstValue::SpecTag(b)) => a == b,
             _ => false,
@@ -1811,6 +1817,7 @@ impl std::fmt::Display for ConstValue {
             | ConstValue::Graphs(_)
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)
+            | ConstValue::LLAddress(_)
             | ConstValue::Function(_) => write!(f, "{self:?}"),
         }
     }
@@ -1852,6 +1859,13 @@ impl Hash for ConstValue {
             ConstValue::Graphs(graphs) => graphs.hash(state),
             ConstValue::LowLevelType(lltype) => lltype.hash(state),
             ConstValue::LLPtr(ptr) => ptr._hashable_identity().hash(state),
+            ConstValue::LLAddress(addr) => match addr {
+                crate::translator::rtyper::lltypesystem::lltype::_address::Null => 0u8.hash(state),
+                crate::translator::rtyper::lltypesystem::lltype::_address::Fake(p) => {
+                    1u8.hash(state);
+                    p._hashable_identity().hash(state);
+                }
+            },
             ConstValue::HostObject(obj) => obj.hash(state),
             ConstValue::SpecTag(id) => id.hash(state),
         }
@@ -2360,6 +2374,10 @@ impl ConstValue {
             ConstValue::Graphs(graphs) => Some(!graphs.is_empty()),
             ConstValue::LowLevelType(_) => Some(true),
             ConstValue::LLPtr(ptr) => Some(ptr.nonzero()),
+            ConstValue::LLAddress(addr) => Some(matches!(
+                addr,
+                crate::translator::rtyper::lltypesystem::lltype::_address::Fake(_)
+            )),
             ConstValue::Function(_) => Some(true),
             ConstValue::HostObject(_) => Some(true),
             ConstValue::Atom(_) => Some(true),
@@ -2440,6 +2458,7 @@ impl ConstValue {
             | ConstValue::Graphs(_)
             | ConstValue::LowLevelType(_)
             | ConstValue::LLPtr(_)
+            | ConstValue::LLAddress(_)
             | ConstValue::SpecTag(_) => None,
         }
     }
