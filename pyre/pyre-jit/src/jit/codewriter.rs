@@ -1720,8 +1720,6 @@ struct RegisterLayout {
     obj_tmp1: u16,
     /// First ref register reserved for portal red-arg shuffling.
     arg_regs_start: u16,
-    /// Ref register holding the `NULL` sentinel value.
-    null_ref_reg: u16,
     /// `interp_jit.py:64` portal red `frame` register.
     portal_frame_reg: u16,
     /// `interp_jit.py:64` portal red `ec` register.
@@ -1747,9 +1745,12 @@ impl RegisterLayout {
         let obj_tmp0 = (nlocals + max_stackdepth) as u16;
         let obj_tmp1 = (nlocals + max_stackdepth + 1) as u16;
         let arg_regs_start = (nlocals + max_stackdepth + 2) as u16;
-        let null_ref_reg = (nlocals + max_stackdepth + 10) as u16;
-        let portal_frame_reg = null_ref_reg + 1;
-        let portal_ec_reg = null_ref_reg + 2;
+        // Slot `+10` was the dedicated `null_ref_reg` PY_NULL holder
+        // before Tier 4 Epic A retired the slot. portal red regs keep
+        // their numerical positions so layout-sensitive tests stay
+        // stable.
+        let portal_frame_reg = (nlocals + max_stackdepth + 11) as u16;
+        let portal_ec_reg = (nlocals + max_stackdepth + 12) as u16;
         Self {
             nlocals,
             ncells,
@@ -1759,7 +1760,6 @@ impl RegisterLayout {
             obj_tmp0,
             obj_tmp1,
             arg_regs_start,
-            null_ref_reg,
             portal_frame_reg,
             portal_ec_reg,
             int_tmp0: 0,
@@ -2020,8 +2020,11 @@ fn filter_liveness_in_place(
         // frame slots (`0..nlocals` + `stack_base..stack_base+depth`)
         // with scratch Ref tmps allocated at fixed offsets beyond
         // `nlocals + max_stackdepth` (`obj_tmp0` / `arg_regs_start` /
-        // `null_ref_reg` / `portal_{frame,ec}_reg` — see
-        // `RegisterLayout::compute` at codewriter.rs:1670-1692). Those
+        // `portal_{frame,ec}_reg` — see `RegisterLayout::compute` at
+        // codewriter.rs:1670-1692; the `null_ref_reg` slot was retired
+        // in Tier 4 Epic A by routing `setarrayitem_vable_r(..,
+        // ConstPtr.NULL)` through the existing bytecode's unified-
+        // register-space const slots). Those
         // scratch registers appear in `compute_liveness`'s alive set
         // but are NOT Python boxes; leaking them into live_r causes
         // the blackhole consumer at `call_jit.rs:876-881` to call
@@ -2513,7 +2516,6 @@ impl CodeWriter {
             obj_tmp0,
             obj_tmp1,
             arg_regs_start,
-            null_ref_reg,
             portal_frame_reg,
             portal_ec_reg,
             int_tmp0,
@@ -2758,14 +2760,49 @@ impl CodeWriter {
         // every current_depth mutation so the frame's valuestackdepth
         // stays in sync at every guard/call point — matching RPython's
         // per-push/per-pop semantics.
+        //
+        // Task #229 Session 1 slice: record a matching graph op pair
+        // (`int_const` producing a fresh Int Variable + `setfield_vable_i`
+        // consuming it) alongside the SSA emission. The SSA bytecode is
+        // unchanged (`int_tmp0` still used), but graph regalloc now sees
+        // the short-lived depth Variable, lifting `graph_num` toward
+        // `ssa_num` as Task #227 Phase 4 prepares to flip
+        // `flatten_graph(graph, regallocs)` as the source of truth.
         macro_rules! emit_vsd {
             ($depth:expr) => {
                 if is_portal {
-                    emit_load_const_i!(
-                        ssarepr,
-                        int_tmp0,
-                        (stack_base_absolute + $depth as usize) as i64
+                    let depth_value = (stack_base_absolute + $depth as usize) as i64;
+                    // Graph-side shadow: produce a fresh Int Variable
+                    // from a `int_const` op and consume it in a matching
+                    // `setfield_vable_i` op. Mirrors jtransform.py:844 +
+                    // jtransform.py:925 so graph regalloc observes the
+                    // liverange of the VSD-sync scratch.
+                    // Graph offsets for these synthetic shadow ops use -1
+                    // — they're emission-time bookkeeping, not tied to a
+                    // Python bytecode PC. `SpaceOperation.offset` is
+                    // advisory in regalloc (`regalloc.rs::make_dependencies`
+                    // doesn't read it); -1 simply distinguishes them from
+                    // real py_pc-anchored ops.
+                    let v_depth = emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "int_const",
+                        vec![super::flow::Constant::signed(depth_value).into()],
+                        Kind::Int,
+                        -1,
                     );
+                    record_graph_op(
+                        &current_block.block(),
+                        "setfield_vable_i",
+                        vec![
+                            super::flow::Constant::signed(VABLE_VALUESTACKDEPTH_FIELD_IDX as i64)
+                                .into(),
+                            v_depth.into(),
+                        ],
+                        None,
+                        -1,
+                    );
+                    emit_load_const_i!(ssarepr, int_tmp0, depth_value);
                     emit_vable_setfield_int!(ssarepr, VABLE_VALUESTACKDEPTH_FIELD_IDX, int_tmp0);
                 }
             };
@@ -3274,25 +3311,29 @@ impl CodeWriter {
         }
 
         // B6 Phase 3b dual emission for the `*_vable_*` field/array
-        // accessors. RPython parity: `jtransform.py:844`
-        // `SpaceOperation('getfield_vable_%s' % kind, ...)` and
-        // `jtransform.py:923` `SpaceOperation('setfield_vable_%s' % kind,
-        // ...)` use the FULL kind name (`int` / `ref` / `float`);
-        // `jtransform.py` `SpaceOperation('getarrayitem_vable_%s' %
-        // kind[0], ...)` / `SpaceOperation('setarrayitem_vable_%s' %
-        // kind[0], ...)` use the SHORT form (`i` / `r` / `f`).
+        // accessors. RPython parity: `jtransform.py:844-846` and
+        // `jtransform.py:923-927` both compute `kind = getkind(...)[0]`
+        // and emit `getfield_vable_%s` / `setfield_vable_%s` with the
+        // single-char suffix (`i` / `r` / `f`). The array variants
+        // (`getarrayitem_vable_%s` / `setarrayitem_vable_%s`) use the
+        // same short form. SSA emission below mirrors the upstream
+        // opnames verbatim; assembler dispatch matches the same keys
+        // (`assembler.rs:903-980`).
         //
-        // The runtime dispatch arms in `assembler.rs:486-524` were
-        // already written against short-form field names; the SSA
-        // emission here uses the RPython-parity full-form names and
-        // relies on the Phase 3c dispatch aliases (added alongside)
-        // to route the full-form opnames to the same builder methods.
+        // Graph-side shadow intentionally absent: jtransform.py:919-922
+        // `do_fixed_list_getitem` lowers `getfield_vable_r` to a fresh
+        // Variable result that subsequent ops consume as an input. Pyre
+        // does not yet thread that result through downstream graph ops
+        // (Phase A6 — `emit_residual_call` arg shadow), so emitting an
+        // unused Variable here would introduce a dangling shadow with
+        // no upstream backing. Per RPython parity, the graph mirror
+        // returns once a real consumer exists.
         macro_rules! emit_vable_getfield_ref {
             ($ssarepr:expr, $dst:expr, $field_idx:expr) => {{
                 let dst = $dst;
                 let field_idx = $field_idx;
                 let insn = Insn::op_with_result(
-                    "getfield_vable_ref",
+                    "getfield_vable_r",
                     vec![Operand::ConstInt(field_idx as i64)],
                     Register::new(Kind::Ref, dst),
                 );
@@ -3304,7 +3345,7 @@ impl CodeWriter {
                 let field_idx = $field_idx;
                 let src = $src;
                 let insn = Insn::op(
-                    "setfield_vable_int",
+                    "setfield_vable_i",
                     vec![
                         Operand::ConstInt(field_idx as i64),
                         Operand::reg(Kind::Int, src),
@@ -3340,6 +3381,31 @@ impl CodeWriter {
                         Operand::ConstInt(field_idx as i64),
                         Operand::reg(Kind::Int, index),
                         Operand::reg(Kind::Ref, src),
+                    ],
+                );
+                $ssarepr.insns.push(insn.clone());
+            }};
+        }
+
+        // `setarrayitem_vable_r(vable, idx, ConstPtr(value))` — the
+        // ConstPtr-source variant produced by jtransform.py:1898 when
+        // the value operand is a Const. Carries `Operand::ConstRef`
+        // through to the assembler dispatch, which routes it to
+        // `JitCodeBuilder::vable_setarrayitem_ref_const_value`. No
+        // separate bytecode: the existing `BC_SETARRAYITEM_VABLE_R`
+        // already supports unified-register-space const sources via
+        // the `const_patches` / `init_register_file_from_i64s` path.
+        macro_rules! emit_vable_setarrayitem_ref_const {
+            ($ssarepr:expr, $field_idx:expr, $index:expr, $value:expr) => {{
+                let field_idx = $field_idx;
+                let index = $index;
+                let value: i64 = $value;
+                let insn = Insn::op(
+                    "setarrayitem_vable_r",
+                    vec![
+                        Operand::ConstInt(field_idx as i64),
+                        Operand::reg(Kind::Int, index),
+                        Operand::ConstRef(value),
                     ],
                 );
                 $ssarepr.insns.push(insn.clone());
@@ -3394,15 +3460,40 @@ impl CodeWriter {
         // reconstruction and the per-push cost is recovered only as the
         // optimizer port progresses.
         macro_rules! emit_pushvalue_ref {
-            ($ssarepr:expr, $depth:ident, $src:expr) => {{
+            ($ssarepr:expr, $depth:ident, $src:expr, $src_value:expr) => {{
                 let src_reg = $src;
+                let src_value: super::flow::FlowValue = $src_value;
                 emit_ref_copy!($ssarepr, stack_base + $depth, src_reg);
                 if is_portal {
-                    emit_load_const_i!(
-                        $ssarepr,
-                        int_tmp0,
-                        (stack_base_absolute + $depth as usize) as i64
+                    let depth_value = (stack_base_absolute + $depth as usize) as i64;
+                    // Task #229 Session 3 slice: pyframe.py:389
+                    // `pushvalue` lowers to
+                    // `setarrayitem_vable_r(locals_cells_stack_w, depth,
+                    // w_object)` via jtransform.py:1898. The graph mirror
+                    // now carries the same source FlowValue as the shadow
+                    // stack, instead of the Session 2 `Constant::none()`
+                    // placeholder. Graph offset -1 matches the emit_vsd
+                    // shadow convention.
+                    let v_idx = emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "int_const",
+                        vec![super::flow::Constant::signed(depth_value).into()],
+                        Kind::Int,
+                        -1,
                     );
+                    record_graph_op(
+                        &current_block.block(),
+                        "setarrayitem_vable_r",
+                        vec![
+                            super::flow::Constant::signed(0).into(),
+                            v_idx.into(),
+                            src_value.into(),
+                        ],
+                        None,
+                        -1,
+                    );
+                    emit_load_const_i!($ssarepr, int_tmp0, depth_value);
                     emit_vable_setarrayitem_ref!($ssarepr, 0_u16, int_tmp0, src_reg);
                 }
                 $depth += 1;
@@ -3410,23 +3501,109 @@ impl CodeWriter {
             }};
         }
 
+        // Tier 4 Epic A — null_ref_reg → ConstRef(PY_NULL) migration.
+        // pyframe.py:389 `pushvalue(w_object)` lowers, when w_object is a
+        // compile-time `ConstPtr.NULL`, to `setarrayitem_vable_r(
+        // locals_cells_stack_w, depth, ConstPtr(NULL))` via
+        // jtransform.py:1898. Pyre's bytecode does not yet expose a
+        // const-source variant of `setarrayitem_vable_r`, so we lazily
+        // materialize the constant into the caller-supplied scratch ref
+        // register and emit the regular reg-source path. The graph
+        // shadow's third operand is the canonical null ref constant —
+        // `Constant::none()` (`ConstantValue::None` + `Kind::Ref`),
+        // matching pyframe.py:411 (`None`) and assembler.py:109's null
+        // ref handling. flatten.rs:1163 lowers it to `ConstRef(0)`,
+        // which is the same sentinel `PY_NULL` (a null pointer) that
+        // the SSA emit writes via `emit_vable_setarrayitem_ref_const`.
+        // All current callers pass `PY_NULL`; the parameter is retained
+        // for surface symmetry with `emit_pushvalue_ref!`.
+        macro_rules! emit_pushvalue_ref_const {
+            ($ssarepr:expr, $depth:ident, $value:expr) => {{
+                let value: i64 = $value;
+                debug_assert_eq!(
+                    value,
+                    pyre_object::PY_NULL as i64,
+                    "emit_pushvalue_ref_const: only PY_NULL is supported today; \
+                     graph shadow uses Constant::none() per assembler.py:109",
+                );
+                emit_ref_const_copy!($ssarepr, stack_base + $depth, value);
+                if is_portal {
+                    let depth_value = (stack_base_absolute + $depth as usize) as i64;
+                    let v_idx = emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "int_const",
+                        vec![super::flow::Constant::signed(depth_value).into()],
+                        Kind::Int,
+                        -1,
+                    );
+                    record_graph_op(
+                        &current_block.block(),
+                        "setarrayitem_vable_r",
+                        vec![
+                            super::flow::Constant::signed(0).into(),
+                            v_idx.into(),
+                            super::flow::Constant::none().into(),
+                        ],
+                        None,
+                        -1,
+                    );
+                    emit_load_const_i!($ssarepr, int_tmp0, depth_value);
+                    emit_vable_setarrayitem_ref_const!($ssarepr, 0_u16, int_tmp0, value);
+                }
+                $depth += 1;
+                emit_vsd!($depth);
+            }};
+        }
+
         // pyframe.py:411-417 `popvalue_maybe_none` lowers to
-        // `setarrayitem_vable_r(locals_cells_stack_w, depth, None)` +
-        // `setfield_vable_i(valuestackdepth, depth)`. Mirror the None
-        // clear by writing `null_ref_reg` (already initialized to
-        // `pyre_object::PY_NULL`) at the freshly-vacated slot. The
-        // popped SSA register stays available for downstream uses.
+        // `setarrayitem_vable_r(locals_cells_stack_w, depth, ConstPtr.NULL)`
+        // + `setfield_vable_i(valuestackdepth, depth)` via
+        // jtransform.py:1898 / :927. The SSA op carries `ConstRef(0)`
+        // as the value operand — at assembler time the dispatch routes
+        // it to `vable_setarrayitem_ref_const_value`, which reuses the
+        // existing `BC_SETARRAYITEM_VABLE_R` bytecode with its src u16
+        // patched to the constants suffix of the unified register
+        // space. Single bytecode op per pop, matching upstream's
+        // `iric` argcode lowering. The popped SSA register stays
+        // available for downstream uses. The graph shadow's third
+        // operand is `Constant::none()` (`ConstantValue::None` +
+        // `Kind::Ref`), the canonical null ref representation upstream
+        // uses for stack-slot clears (pyframe.py:411 `None`,
+        // assembler.py:109 null ref handling). flatten.rs:1163 lowers
+        // it to `ConstRef(0)`.
         macro_rules! emit_popvalue_ref {
             ($ssarepr:expr, $depth:ident) => {{
                 $depth -= 1;
                 let popped_reg = stack_base + $depth;
                 if is_portal {
-                    emit_load_const_i!(
-                        $ssarepr,
-                        int_tmp0,
-                        (stack_base_absolute + $depth as usize) as i64
+                    let depth_value = (stack_base_absolute + $depth as usize) as i64;
+                    let v_idx = emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "int_const",
+                        vec![super::flow::Constant::signed(depth_value).into()],
+                        Kind::Int,
+                        -1,
                     );
-                    emit_vable_setarrayitem_ref!($ssarepr, 0_u16, int_tmp0, null_ref_reg);
+                    record_graph_op(
+                        &current_block.block(),
+                        "setarrayitem_vable_r",
+                        vec![
+                            super::flow::Constant::signed(0).into(),
+                            v_idx.into(),
+                            super::flow::Constant::none().into(),
+                        ],
+                        None,
+                        -1,
+                    );
+                    emit_load_const_i!($ssarepr, int_tmp0, depth_value);
+                    emit_vable_setarrayitem_ref_const!(
+                        $ssarepr,
+                        0_u16,
+                        int_tmp0,
+                        pyre_object::PY_NULL as i64
+                    );
                 }
                 emit_vsd!($depth);
                 popped_reg
@@ -3470,8 +3647,8 @@ impl CodeWriter {
                         .get(reg as usize)
                         .and_then(|value| value.clone())
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                    current_state.stack.push(loaded);
-                    emit_pushvalue_ref!($ssarepr, $depth, reg);
+                    current_state.stack.push(loaded.clone());
+                    emit_pushvalue_ref!($ssarepr, $depth, reg, loaded);
                 }
             }};
         }
@@ -3506,12 +3683,6 @@ impl CodeWriter {
                 $ssarepr.insns.push(insn.clone());
             }};
         }
-
-        // Materialize the dedicated NULL sentinel register once so
-        // bytecodes that need a literal null ref (`push_null`,
-        // `RAISE_VARARGS argc=1`, call-site NULL sentinels) do not read
-        // an uninitialized temp.
-        emit_ref_const_copy!(ssarepr, null_ref_reg, pyre_object::PY_NULL as i64);
 
         // Seed the outer walker queue.  Matches
         // `flowcontext.py:401` `pendingblocks = deque([startblock])`.
@@ -3796,23 +3967,29 @@ impl CodeWriter {
 
                     Instruction::LoadConst { consti } => {
                         let idx = consti.get(op_arg).as_usize();
+                        let dst_slot = stack_base + current_depth;
                         // jtransform.py: getfield_vable_r for pycode (field 1)
-                        emit_vable_getfield_ref!(ssarepr, obj_tmp0, VABLE_CODE_FIELD_IDX);
+                        // — write straight to the target stack slot. The slot
+                        // is the next push destination (currently free); the
+                        // call below reads it as input and overwrites it with
+                        // the load_const result. SSA-wise: write1 (getfield)
+                        // → read (call input) → write2 (call result) — same
+                        // input-output share pattern as Sessions 1-3.
+                        // Portal vable sync at this slot relies on the next
+                        // opcode's pushvalue (LoadConst's existing A-slice 2
+                        // elision documented at LoadGlobal's caveat).
+                        emit_vable_getfield_ref!(ssarepr, dst_slot, VABLE_CODE_FIELD_IDX);
                         emit_load_const_i!(ssarepr, int_tmp0, idx as i64);
-                        // A-slice 2: write result directly to the target
-                        // stack slot.  Call reads obj_tmp0 / int_tmp0 inputs
-                        // before writing its output per blackhole/backend ABI,
-                        // so retiring the obj_tmp0 → stack ref_copy is safe.
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::Plain,
                             load_const_fn_idx,
                             &[
-                                majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
+                                majit_metainterp::jitcode::JitCallArg::reference(dst_slot),
                                 majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                             ],
                             ResKind::Ref,
-                            Some(stack_base + current_depth),
+                            Some(dst_slot),
                         );
                         let value = code
                             .constants
@@ -3936,8 +4113,8 @@ impl CodeWriter {
                                 .get(load_reg as usize)
                                 .and_then(|value| value.clone())
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            current_state.stack.push(loaded);
-                            emit_pushvalue_ref!(ssarepr, current_depth, load_reg);
+                            current_state.stack.push(loaded.clone());
+                            emit_pushvalue_ref!(ssarepr, current_depth, load_reg, loaded);
                         }
                     }
 
@@ -4000,7 +4177,11 @@ impl CodeWriter {
 
                     Instruction::PushNull => {
                         current_state.stack.push(null_stack_sentinel());
-                        emit_pushvalue_ref!(ssarepr, current_depth, null_ref_reg);
+                        emit_pushvalue_ref_const!(
+                            ssarepr,
+                            current_depth,
+                            pyre_object::PY_NULL as i64
+                        );
                     }
 
                     // jtransform.py: rewrite_op_int_add etc.
@@ -4264,13 +4445,22 @@ impl CodeWriter {
                             ResKind::Ref,
                             Some(obj_tmp0),
                         );
-                        // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first
+                        // LOAD_GLOBAL with (namei >> 1) & 1: push NULL first.
+                        // const-source pushvalue writes the constant directly to
+                        // the stack TOS register and (in portal case) to the
+                        // vable slot via setarrayitem_vable_r_const, leaving
+                        // obj_tmp0/obj_tmp1 untouched for the trailing
+                        // `emit_pushvalue_ref!(obj_tmp0)`.
                         if raw_namei & 1 != 0 {
                             current_state.stack.push(null_stack_sentinel());
-                            emit_pushvalue_ref!(ssarepr, current_depth, null_ref_reg);
+                            emit_pushvalue_ref_const!(
+                                ssarepr,
+                                current_depth,
+                                pyre_object::PY_NULL as i64
+                            );
                         }
-                        current_state.stack.push(result_value);
-                        emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                        current_state.stack.push(result_value.clone());
+                        emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0, result_value);
                     }
 
                     // RPython jtransform.py: rewrite_op_direct_call →
@@ -4299,7 +4489,6 @@ impl CodeWriter {
                             );
                         }
                         let callable_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                        emit_ref_copy!(ssarepr, obj_tmp1, callable_reg);
                         let callable_value = current_state
                             .stack
                             .pop()
@@ -4313,8 +4502,9 @@ impl CodeWriter {
                         // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
                         // call_fn(callable, arg0, ...) → result
                         // Parent frame accessed via BH_VABLE_PTR thread-local.
-                        let mut call_args =
-                            vec![majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1)];
+                        let mut call_args = vec![majit_metainterp::jitcode::JitCallArg::reference(
+                            callable_reg,
+                        )];
                         for i in 0..nargs {
                             call_args.push(majit_metainterp::jitcode::JitCallArg::reference(
                                 arg_regs_start + i as u16,
@@ -4374,8 +4564,7 @@ impl CodeWriter {
 
                     // RPython bhimpl_int_neg: -obj via binary_op(0, obj, NB_SUBTRACT)
                     Instruction::UnaryNegative => {
-                        let value_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                        emit_ref_copy!(ssarepr, obj_tmp0, value_reg);
+                        let operand_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let operand_value = current_state
                             .stack
                             .pop()
@@ -4386,10 +4575,6 @@ impl CodeWriter {
                             operand_value,
                             py_pc as i64,
                         );
-                        // A-slice 5: use stack slot directly for the operand
-                        // instead of staging in obj_tmp0.  binary_op call
-                        // reads inputs into ABI regs before writing result.
-                        let operand_reg = stack_base + current_depth;
                         emit_load_const_i!(ssarepr, int_tmp0, 0);
                         let subtract_tag =
                             binary_op_tag(pyre_interpreter::bytecode::BinaryOperator::Subtract)
@@ -4521,10 +4706,17 @@ impl CodeWriter {
                                     .pop()
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                                 let cause_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                                emit_ref_copy!(ssarepr, obj_tmp1, cause_reg);
-                                majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1)
+                                majit_metainterp::jitcode::JitCallArg::reference(cause_reg)
                             } else {
-                                majit_metainterp::jitcode::JitCallArg::reference(null_ref_reg)
+                                // Tier 4 Epic A: lazy-materialize PY_NULL
+                                // into obj_tmp1 (free here) instead of
+                                // reading the dropped null_ref_reg slot.
+                                emit_ref_const_copy!(
+                                    ssarepr,
+                                    obj_tmp1,
+                                    pyre_object::PY_NULL as i64
+                                );
+                                majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1)
                             };
                             // Drop the pre-normalization exception operand from
                             // the shadow stack. The residual call below may
@@ -4536,22 +4728,28 @@ impl CodeWriter {
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             let exc_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                            emit_ref_copy!(ssarepr, obj_tmp0, exc_reg);
                             // pyopcode.py:711 `exception_is_valid_obj_as_class_w`
-                            // normalization + `set_cause` attachment.
+                            // normalization + `set_cause` attachment.  Call ABI
+                            // reads inputs before writing the result; the
+                            // popped stack slot is the natural result
+                            // destination, so the call writes the normalized
+                            // exception directly into `exc_reg` and
+                            // `emit_raise!` reads the same register as its
+                            // source. Pattern matches Sessions 1-3 retirements
+                            // (Call/UnaryNegative/CheckExcMatch input-side).
                             emit_residual_call(
                                 &mut ssarepr,
                                 CallFlavor::Plain,
                                 normalize_raise_varargs_fn_idx,
                                 &[
-                                    majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
+                                    majit_metainterp::jitcode::JitCallArg::reference(exc_reg),
                                     cause,
                                 ],
                                 ResKind::Ref,
-                                Some(obj_tmp0),
+                                Some(exc_reg),
                             );
                             let normalized_exc_fv = fresh_ref_value(&mut graph);
-                            emit_raise!(ssarepr, obj_tmp0, normalized_exc_fv, py_pc as i64);
+                            emit_raise!(ssarepr, exc_reg, normalized_exc_fv, py_pc as i64);
                         } else {
                             // reraise: re-raise exception_last_value
                             emit_reraise!(ssarepr);
@@ -4576,7 +4774,13 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        emit_ref_copy!(ssarepr, obj_tmp0, exc_reg);
+                        // D2-1: input-side staging retire — exc_reg's SSA
+                        // register slot still holds the popped value (the
+                        // popvalue macro only NULL-clears the portal vable
+                        // mirror), so set_current_exception can read it
+                        // directly and the trailing push can use it as the
+                        // src register. Pattern matches Sessions 1-3
+                        // input-side retirements.
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::Plain,
@@ -4589,15 +4793,15 @@ impl CodeWriter {
                             &mut ssarepr,
                             CallFlavor::Plain,
                             set_current_exception_fn_idx,
-                            &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
+                            &[majit_metainterp::jitcode::JitCallArg::reference(exc_reg)],
                             ResKind::Void,
                             None,
                         );
                         let prev_value = fresh_ref_value(&mut graph);
-                        current_state.stack.push(prev_value);
-                        emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp1);
-                        current_state.stack.push(exc_value);
-                        emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                        current_state.stack.push(prev_value.clone());
+                        emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp1, prev_value);
+                        current_state.stack.push(exc_value.clone());
+                        emit_pushvalue_ref!(ssarepr, current_depth, exc_reg, exc_value);
                     }
 
                     Instruction::CheckExcMatch => {
@@ -4613,23 +4817,23 @@ impl CodeWriter {
                         // the check.
                         let match_type_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let _ = current_state.stack.pop();
-                        emit_ref_copy!(ssarepr, obj_tmp1, match_type_reg);
-                        emit_ref_copy!(ssarepr, obj_tmp0, stack_base + current_depth - 1);
+                        let exc_reg = stack_base + current_depth - 1;
                         emit_load_const_i!(ssarepr, int_tmp0, 10);
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::MayForce,
                             compare_fn_idx,
                             &[
-                                majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0),
-                                majit_metainterp::jitcode::JitCallArg::reference(obj_tmp1),
+                                majit_metainterp::jitcode::JitCallArg::reference(exc_reg),
+                                majit_metainterp::jitcode::JitCallArg::reference(match_type_reg),
                                 majit_metainterp::jitcode::JitCallArg::int(int_tmp0),
                             ],
                             ResKind::Ref,
                             Some(obj_tmp0),
                         );
-                        current_state.stack.push(fresh_ref_value(&mut graph));
-                        emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0);
+                        let result_value = fresh_ref_value(&mut graph);
+                        current_state.stack.push(result_value.clone());
+                        emit_pushvalue_ref!(ssarepr, current_depth, obj_tmp0, result_value);
                     }
 
                     Instruction::PopExcept => {
@@ -4644,12 +4848,11 @@ impl CodeWriter {
                         // re-propagates it.
                         let prev_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let _ = current_state.stack.pop();
-                        emit_ref_copy!(ssarepr, obj_tmp0, prev_reg);
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::Plain,
                             set_current_exception_fn_idx,
-                            &[majit_metainterp::jitcode::JitCallArg::reference(obj_tmp0)],
+                            &[majit_metainterp::jitcode::JitCallArg::reference(prev_reg)],
                             ResKind::Void,
                             None,
                         );
@@ -4676,11 +4879,12 @@ impl CodeWriter {
                     Instruction::Copy { i } => {
                         let d = i.get(op_arg) as usize;
                         if d == 1 {
-                            let _ = duplicate_shadow_tos(&mut graph, &mut current_state);
+                            let duplicated = duplicate_shadow_tos(&mut graph, &mut current_state);
                             emit_pushvalue_ref!(
                                 ssarepr,
                                 current_depth,
-                                stack_base + current_depth - 1
+                                stack_base + current_depth - 1,
+                                duplicated
                             );
                         } else {
                             // COPY(d>1): exception handler pattern only.
@@ -4928,7 +5132,12 @@ impl CodeWriter {
                         int_tmp0,
                         (stack_base_absolute + unwind_depth as usize) as i64,
                     );
-                    emit_vable_setarrayitem_ref!(ssarepr, 0_u16, int_tmp0, null_ref_reg);
+                    emit_vable_setarrayitem_ref_const!(
+                        ssarepr,
+                        0_u16,
+                        int_tmp0,
+                        pyre_object::PY_NULL as i64
+                    );
                 }
             }
             // pyframe.py:378-387 `pushvalue` semantics — each push writes

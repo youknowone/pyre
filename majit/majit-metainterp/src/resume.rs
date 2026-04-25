@@ -242,7 +242,14 @@ impl Snapshot {
         }
     }
 
-    /// Create a multi-frame snapshot from (jitcode_index, pc, boxes) tuples.
+    /// Create a multi-frame snapshot from per-frame (jitcode_index, pc,
+    /// boxes) tuples. Read-side ordering matches upstream: after
+    /// `SnapshotIterator.__init__` calls `self.framestack.reverse()`
+    /// (`opencoder.py:217`), `framestack[0]` is the outermost/caller
+    /// frame and the last element is the innermost/callee — as asserted
+    /// by `test_opencoder.py:123-130` (jc_index=2 at `framestack[0]`,
+    /// jc_index=4 at `framestack[1]`). Input tuples for this factory
+    /// follow the same caller-first order.
     pub fn multi_frame(frames: Vec<(i32, i32, Vec<majit_ir::OpRef>)>) -> Self {
         Snapshot {
             vable_array: Vec::new(),

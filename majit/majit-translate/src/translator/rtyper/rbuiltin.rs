@@ -29,8 +29,14 @@
 //!   land.
 //! * `extregistry.specialize_call` (rbuiltin.py:78-81) — the
 //!   [`crate::translator::rtyper::extregistry::ExtRegistryEntry`] type
-//!   has `is_registered` / `lookup` wired for the `_ptr` entry only,
-//!   and the `specialize_call` method is not ported yet.
+//!   has `is_registered` / `lookup` wired for the `_ptr` entry only
+//!   (via `_ptrEntry` at lltype.py:1513-1518, which does not override
+//!   `specialize_call`, matching upstream `AttributeError` when this
+//!   path is hit). The dispatch to `entry.specialize_call` for entry
+//!   types whose upstream subclasses do override it (e.g. `llhelper`,
+//!   `llmemory.*` family, `objectmodel.*` hints) is not ported yet;
+//!   those entry types must first be added as new `ExtRegistryEntry`
+//!   enum variants before `findbltintyper` can route them.
 
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -216,20 +222,24 @@ impl BuiltinFunctionRepr {
     /// ```
     ///
     /// Upstream accepts `rtyper` as a parameter but never reads it —
-    /// the Rust port drops the arg. The `extregistry.specialize_call`
-    /// path surfaces as a `MissingRTypeOperation` TyperError until
-    /// `ExtRegistryEntry.specialize_call` (rbuiltin.py:79-81) is
-    /// ported; this matches upstream's `NotImplementedError` default
-    /// on the `ExtRegistryEntry` base class.
+    /// the Rust port drops the arg. The `entry.specialize_call`
+    /// attribute lookup is delegated to
+    /// [`ExtRegistryEntry::specialize_call`], which mirrors upstream's
+    /// per-subclass override pattern: subclasses that define
+    /// `specialize_call` add an arm returning `Ok(typer_fn)`; subclasses
+    /// that do not (e.g. `_ptrEntry` in `lltype.py:1513-1518`, the only
+    /// registered variant today) yield the upstream `AttributeError`
+    /// surface as a `TyperError`. `ExtRegistryEntry` (extregistry.py:33-72)
+    /// defines no base `specialize_call`, so this is a per-arm decision.
     pub fn findbltintyper(&self) -> Result<BuiltinTyperFn, TyperError> {
         if let Some(f) = lookup_typer(&self.builtinfunc) {
             return Ok(f);
         }
         let as_const = ConstValue::HostObject(self.builtinfunc.clone());
         if extregistry::is_registered(&as_const) {
-            return Err(TyperError::missing_rtype_operation(
-                "BuiltinFunctionRepr.findbltintyper: ExtRegistryEntry.specialize_call (rbuiltin.py:79-81) port pending",
-            ));
+            let entry = extregistry::lookup(&as_const)
+                .expect("extregistry::is_registered returned true but lookup returned None");
+            return entry.specialize_call();
         }
         Err(TyperError::message(format!(
             "don't know about built-in function {:?}",

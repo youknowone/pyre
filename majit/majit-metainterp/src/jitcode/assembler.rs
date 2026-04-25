@@ -311,6 +311,35 @@ impl JitCodeBuilder {
         self.push_u16(src);
     }
 
+    /// Const-source variant of `vable_setarrayitem_ref`. Lowers a
+    /// `setarrayitem_vable_r(vable, idx, ConstPtr(value))` SSA op
+    /// (jtransform.py:1898 produces this when the value operand is a
+    /// `Const`) by reusing the same `BC_SETARRAYITEM_VABLE_R` opcode
+    /// with the src u16 deferred to the const-patch table — at finish
+    /// time it is patched to `num_regs_r + const_idx`, addressing into
+    /// the constants suffix of the unified register space (see
+    /// `Frame::copy_constants` and `init_register_file_from_i64s`,
+    /// matching upstream `assembler.py:80-138 emit_const` register-
+    /// space convention). No new bytecode is required: blackhole
+    /// (`registers_r[src]`) and tracer (`read_ref_reg(src)`) both read
+    /// the pre-populated constant slot.
+    pub fn vable_setarrayitem_ref_const_value(
+        &mut self,
+        array_idx: u16,
+        index_reg: u16,
+        value: i64,
+    ) {
+        let const_idx = self.add_const_r(value);
+        self.touch_reg(index_reg);
+        self.push_u8(jitcode::BC_SETARRAYITEM_VABLE_R);
+        self.push_u16(array_idx);
+        self.push_u16(index_reg);
+        let src_offset = self.code.len();
+        self.push_u16(0);
+        self.const_patches
+            .push((src_offset, ConstKind::Ref, const_idx));
+    }
+
     pub fn vable_setarrayitem_float(&mut self, array_idx: u16, index_reg: u16, src: u16) {
         self.touch_reg(index_reg);
         self.touch_float_reg(src);

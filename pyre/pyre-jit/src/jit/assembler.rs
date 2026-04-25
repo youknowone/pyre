@@ -894,41 +894,37 @@ fn dispatch_op(
                 expect_reg(&args[2], Kind::Int),
             );
         }
-        // RPython opname parity (jtransform.py:765-927, blackhole.py:1374-1493):
-        // SpaceOperation names use `*_vable_*` infix. pyre's JitCodeBuilder
-        // methods retain `vable_*` prefix as a PRE-EXISTING-ADAPTATION so
-        // the rename is scoped to the Insn::Op key.
-        // `rpython/jit/codewriter/jtransform.py:844,923` emits field
-        // accessors with the FULL kind name (`getfield_vable_int`,
-        // `setfield_vable_ref`, etc.). The short-form aliases
-        // (`getfield_vable_i`, …) are pre-existing pyre-side dispatch
-        // arms kept here for backwards compatibility with any caller
-        // that has not yet migrated to the RPython-parity names.
-        "getfield_vable_int" | "getfield_vable_i" => {
+        // RPython opname parity (jtransform.py:844-927, blackhole.py:1446-1493):
+        // `kind = getkind(...)[0]` in jtransform.py forces single-char
+        // suffix everywhere — `getfield_vable_i` / `_r` / `_f` and
+        // `setfield_vable_i` / `_r` / `_f`. pyre's JitCodeBuilder methods
+        // retain the `vable_*` prefix as a PRE-EXISTING-ADAPTATION so the
+        // rename is scoped to the Insn::Op key.
+        "getfield_vable_i" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
             state
                 .builder
                 .vable_getfield_int(dst, expect_small_u16(&args[0]));
         }
-        "getfield_vable_ref" | "getfield_vable_r" => {
+        "getfield_vable_r" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
             state
                 .builder
                 .vable_getfield_ref(dst, expect_small_u16(&args[0]));
         }
-        "getfield_vable_float" | "getfield_vable_f" => {
+        "getfield_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
             state
                 .builder
                 .vable_getfield_float(dst, expect_small_u16(&args[0]));
         }
-        "setfield_vable_int" | "setfield_vable_i" => state
+        "setfield_vable_i" => state
             .builder
             .vable_setfield_int(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Int)),
-        "setfield_vable_ref" | "setfield_vable_r" => state
+        "setfield_vable_r" => state
             .builder
             .vable_setfield_ref(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Ref)),
-        "setfield_vable_float" | "setfield_vable_f" => state.builder.vable_setfield_float(
+        "setfield_vable_f" => state.builder.vable_setfield_float(
             expect_small_u16(&args[0]),
             expect_reg(&args[1], Kind::Float),
         ),
@@ -961,11 +957,32 @@ fn dispatch_op(
             expect_reg(&args[1], Kind::Int),
             expect_reg(&args[2], Kind::Int),
         ),
-        "setarrayitem_vable_r" => state.builder.vable_setarrayitem_ref(
-            expect_small_u16(&args[0]),
-            expect_reg(&args[1], Kind::Int),
-            expect_reg(&args[2], Kind::Ref),
-        ),
+        "setarrayitem_vable_r" => {
+            let array_idx = expect_small_u16(&args[0]);
+            let index_reg = expect_reg(&args[1], Kind::Int);
+            match &args[2] {
+                Operand::Register(r) if r.kind == Kind::Ref => {
+                    state
+                        .builder
+                        .vable_setarrayitem_ref(array_idx, index_reg, r.index);
+                }
+                // `setarrayitem_vable_r(vable, idx, ConstPtr(value))` —
+                // jtransform.py:1898 lowers ConstPtr value operands as
+                // SSA constants. The builder side reuses the same
+                // BC_SETARRAYITEM_VABLE_R bytecode and points its src
+                // u16 at the constants suffix of the unified register
+                // space (matching upstream `assembler.py:80-138 emit_const`).
+                Operand::ConstRef(value) => {
+                    state
+                        .builder
+                        .vable_setarrayitem_ref_const_value(array_idx, index_reg, *value);
+                }
+                other => panic!(
+                    "setarrayitem_vable_r expects Register(Ref) or ConstRef, got {:?}",
+                    other,
+                ),
+            }
+        }
         "setarrayitem_vable_f" => state.builder.vable_setarrayitem_float(
             expect_small_u16(&args[0]),
             expect_reg(&args[1], Kind::Int),
