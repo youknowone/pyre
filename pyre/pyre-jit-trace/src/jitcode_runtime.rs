@@ -912,21 +912,19 @@ mod tests {
         assert_eq!(id_a, id_b, "Or-grouped variants must share an arm_id");
     }
 
-    // Ignored pending root-cause fix for `int_ge/ir>i`: the assembler
-    // emits an `int_ge` op whose operand kinds are `(ref, int)` for
-    // some registered graph, so the insns table contains
-    // `int_ge/ir>i` with no matching `bhimpl_*` handler.  The
-    // previous pragmatic "add a bhhandler_ir_i! alias" workaround
-    // (commit 72d2710eb1) was removed per reviewer directive —
-    // adding a bhhandler alias papers over a real type-flow bug
-    // upstream of the assembler (Expr::Path creating a new
-    // `Input { ty: Unknown }` instead of reusing an existing local
-    // binding, rtyper backfilling an int as ref, or codewriter
-    // emitting the wrong kind suffix).  Task #85 tracks locating
-    // and fixing the origin so `int_ge/ii>i` emerges naturally,
-    // after which these tests re-enable.
+    // `int_ge/ir>i` (the original blocker for these tests) is now
+    // resolved at the source — `front/ast.rs` populates `result_ty`
+    // for both Call and MethodCall ops from `ctx.fn_return_types`,
+    // so the rtyper sees `Signed` kinds for `usize`/`bool`/`i64`
+    // returns instead of defaulting to GcRef.  The remaining
+    // unwired opnames (`int_neg/f>i`, `int_add/ff>i`, etc.) are a
+    // separate parity gap — `jtransform` does not yet rewrite
+    // arithmetic ops on float operands to the `float_*` family
+    // (RPython `jtransform.py:rewrite_op_neg` / `rewrite_op_add`
+    // dispatches on operand `concretetype`).  Tests stay ignored
+    // until that broader rewrite lands.
     #[test]
-    #[ignore = "task #85: int_ge/ir>i root cause — assembler emits mixed (ref,int) ge kinds"]
+    #[ignore = "broader parity gap: jtransform does not rewrite int_* on float operands to float_*"]
     fn build_default_bh_builder_matches_insns_table() {
         // Slice 3a: the runtime-side `BlackholeInterpBuilder` is reachable
         // from pyre-jit-trace. After `setup_insns + wire_bhimpl_handlers`
@@ -948,7 +946,7 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "task #85: int_ge/ir>i root cause — assembler emits mixed (ref,int) ge kinds"]
+    #[ignore = "broader parity gap: jtransform does not rewrite int_* on float operands to float_*"]
     fn default_bh_builder_handler_coverage_report() {
         // Diagnostic: surface the opnames in the real insns table that
         // `wire_bhimpl_handlers` did NOT override. These fall back to

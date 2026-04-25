@@ -1448,13 +1448,39 @@ fn lower_expr(
                 args.push(v);
             }
             let target = canonical_call_target(&call.func, &ctx.module_prefix);
+            // RPython parity: same rationale as the MethodCall arm above
+            // — `op.result.concretetype` is set from the registered
+            // FuncDesc.  Look up the qualified function path in
+            // `ctx.fn_return_types` (populated in pass 1) so calls to
+            // free functions returning `usize` / `bool` / `i64` propagate
+            // a `Signed` result kind through rtyper instead of defaulting
+            // to GcRef.
+            let result_ty = if let syn::Expr::Path(p) = &*call.func {
+                let segments: Vec<String> = p
+                    .path
+                    .segments
+                    .iter()
+                    .map(|s| s.ident.to_string())
+                    .collect();
+                let key = if segments.len() == 1 && !ctx.module_prefix.is_empty() {
+                    format!("{}::{}", ctx.module_prefix, segments[0])
+                } else {
+                    segments.join("::")
+                };
+                ctx.fn_return_types
+                    .get(&key)
+                    .map(|s| type_string_to_value_type(s))
+                    .unwrap_or(ValueType::Unknown)
+            } else {
+                ValueType::Unknown
+            };
             Ok(Lowered {
                 value: graph.push_op(
                     *block,
                     OpKind::Call {
                         target,
                         args,
-                        result_ty: ValueType::Unknown,
+                        result_ty,
                     },
                     true,
                 ),
@@ -1476,18 +1502,36 @@ fn lower_expr(
             // Detect via the collected local_dyn_trait_roots map so
             // locals / params / Box<dyn> receivers all participate
             // (Issue 3 coverage).
+            let receiver_root = receiver_type_root(&mc.receiver, ctx);
             let target = if let Some(trait_root) = dyn_trait_root_for_receiver(&mc.receiver, ctx) {
                 CallTarget::indirect(trait_root, mc.method.to_string())
             } else {
-                CallTarget::method(mc.method.to_string(), receiver_type_root(&mc.receiver, ctx))
+                CallTarget::method(mc.method.to_string(), receiver_root.clone())
             };
+            // RPython parity: `op.result.concretetype` is set from the
+            // callee graph's return signature at flowspace time
+            // (`flowspace/objspace.py` consults the registered FuncDesc).
+            // Pyre's pass 1 collected method return types into
+            // `ctx.fn_return_types` keyed by `Type::method`; resolving
+            // here lets the rtyper produce `Signed` operands for pure
+            // integer ops (otherwise `value_type_to_kind` defaults to
+            // `'r'` and the result reaches the assembler as a Ref-kind
+            // operand, surfacing as `int_ge/ir>i` etc.).
+            let result_ty = receiver_root
+                .as_ref()
+                .and_then(|root| {
+                    let key = format!("{}::{}", root, mc.method);
+                    ctx.fn_return_types.get(&key)
+                })
+                .map(|s| type_string_to_value_type(s))
+                .unwrap_or(ValueType::Unknown);
             Ok(Lowered {
                 value: graph.push_op(
                     *block,
                     OpKind::Call {
                         target,
                         args,
-                        result_ty: ValueType::Unknown,
+                        result_ty,
                     },
                     true,
                 ),
