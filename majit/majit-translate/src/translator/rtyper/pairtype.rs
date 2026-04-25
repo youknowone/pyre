@@ -102,16 +102,8 @@ pub enum ReprClassId {
     SingleFrozenPBCRepr,
     /// `rpbc.py:675 MultipleUnrelatedFrozenPBCRepr`.
     MultipleUnrelatedFrozenPBCRepr,
-    /// `rpbc.py:728 MultipleFrozenPBCRepr`.
-    MultipleFrozenPBCRepr,
     /// `rpbc.py:920 ClassesPBCRepr`.
     ClassesPBCRepr,
-    /// `rpbc.py:393 SmallFunctionSetPBCRepr(FunctionReprBase)`.
-    SmallFunctionSetPBCRepr,
-    /// `rpbc.py:844 MethodOfFrozenPBCRepr`.
-    MethodOfFrozenPBCRepr,
-    /// `rpbc.py:1126 MethodsPBCRepr`.
-    MethodsPBCRepr,
 }
 
 impl ReprClassId {
@@ -148,15 +140,7 @@ impl ReprClassId {
             BuiltinMethodRepr => &[BuiltinMethodRepr, Repr],
             SingleFrozenPBCRepr => &[SingleFrozenPBCRepr, Repr],
             MultipleUnrelatedFrozenPBCRepr => &[MultipleUnrelatedFrozenPBCRepr, Repr],
-            MultipleFrozenPBCRepr => &[MultipleFrozenPBCRepr, Repr],
             ClassesPBCRepr => &[ClassesPBCRepr, Repr],
-            // upstream `class SmallFunctionSetPBCRepr(FunctionReprBase)`
-            // (rpbc.py:393) — `FunctionReprBase` is a virtual base that
-            // pyre folds into `Repr`, so the MRO mirrors the
-            // non-virtual chain.
-            SmallFunctionSetPBCRepr => &[SmallFunctionSetPBCRepr, Repr],
-            MethodOfFrozenPBCRepr => &[MethodOfFrozenPBCRepr, Repr],
-            MethodsPBCRepr => &[MethodsPBCRepr, Repr],
         }
     }
 }
@@ -267,15 +251,6 @@ fn dispatch_convert_from_to(
         // ends are Void-typed so the Variable can be passed through
         // unmodified — no need to emit any operation.
         (FunctionRepr, FunctionRepr) => Ok(Some(v.clone())),
-        // rpbc.py:377-379 — pairtype(FunctionRepr,
-        // FunctionsPBCRepr).convert_from_to: upstream
-        // `return inputconst(r_fpbc2, r_fpbc1.s_pbc.const)`. The source
-        // `FunctionRepr` always comes from a single-desc SomePBC that
-        // had a pyobj populate `const_box`, so the destination's
-        // `convert_const` resolves to the concrete row pointer.
-        (FunctionRepr, FunctionsPBCRepr) => {
-            super::rpbc::pair_function_repr_functions_pbc_repr_convert_from_to(r_from, r_to)
-        }
         // rpbc.py:381-383 — pairtype(FunctionsPBCRepr,
         // FunctionRepr).convert_from_to: upstream
         // `return inputconst(Void, None)`. FunctionRepr is Void-typed,
@@ -291,44 +266,6 @@ fn dispatch_convert_from_to(
         // `NotImplemented`. The rtyper distinguishes different spec-func
         // Struct pointer types even within the same Repr subclass.
         (FunctionsPBCRepr, FunctionsPBCRepr) => same_lowleveltype_convert_from_to(r_from, r_to, v),
-        // rpbc.py:802-805 — pairtype(MultipleFrozenPBCRepr,
-        // MultipleUnrelatedFrozenPBCRepr): `cast_ptr_to_adr` lowers
-        // the pointer to a raw address before the MU comparison path
-        // consumes it.
-        (MultipleFrozenPBCRepr, MultipleUnrelatedFrozenPBCRepr) => {
-            super::rpbc::pair_mfpbc_mufpbc_convert_from_to(r_from, r_to, v, llops)
-        }
-        // rpbc.py:807-811 — pairtype(MultipleFrozenPBCRepr,
-        // MultipleFrozenPBCRepr): identity when the two reprs share an
-        // access_set, `NotImplemented` otherwise.
-        (MultipleFrozenPBCRepr, MultipleFrozenPBCRepr) => {
-            super::rpbc::pair_mfpbc_mfpbc_convert_from_to(r_from, r_to, v)
-        }
-        // rpbc.py:813-821 — pairtype(SingleFrozenPBCRepr,
-        // MultipleFrozenPBCRepr): converts only when source's
-        // queryattrfamily matches dest's access_set; materialises the
-        // struct pointer via `convert_desc`.
-        (SingleFrozenPBCRepr, MultipleFrozenPBCRepr) => {
-            super::rpbc::pair_sfpbc_mfpbc_convert_from_to(r_from, r_to)
-        }
-        // rpbc.py:823-826 — pairtype(MultipleFrozenPBCReprBase,
-        // SingleFrozenPBCRepr): returns `inputconst(Void, r_pbc2.
-        // frozendesc)`. Covers both `MultipleFrozenPBCRepr` and
-        // `MultipleUnrelatedFrozenPBCRepr` as source.
-        (MultipleFrozenPBCRepr, SingleFrozenPBCRepr)
-        | (MultipleUnrelatedFrozenPBCRepr, SingleFrozenPBCRepr) => {
-            super::rpbc::pair_mfpbc_base_sfpbc_convert_from_to(r_from, r_to)
-        }
-        // rpbc.py:828-834 — pairtype(FunctionRepr,
-        // MultipleFrozenPBCRepr).
-        (FunctionRepr, MultipleFrozenPBCRepr) => {
-            super::rpbc::pair_function_repr_mfpbc_convert_from_to(r_from, r_to)
-        }
-        // rpbc.py:836-841 — pairtype(MultipleFrozenPBCRepr,
-        // FunctionRepr).
-        (MultipleFrozenPBCRepr, FunctionRepr) => {
-            super::rpbc::pair_mfpbc_function_repr_convert_from_to(r_from, r_to)
-        }
         // rmodel.py:361-363 — `pairtype(Repr, VoidRepr).convert_from_to`
         // returns `inputconst(Void, None)`.
         (Repr, VoidRepr) => Ok(Some(Hlvalue::Constant(inputconst_from_lltype(
@@ -1482,110 +1419,5 @@ mod tests {
         let converted = pair_convert_from_to(r.as_ref(), r.as_ref(), &v_in, &mut llops).unwrap();
         assert_eq!(converted, Some(v_in));
         assert!(llops.ops.is_empty());
-    }
-
-    #[test]
-    fn pair_function_repr_to_functions_pbc_materialises_llptr_constant() {
-        // rpbc.py:377-379 — `inputconst(r_fpbc2, r_fpbc1.s_pbc.const)`.
-        // The FunctionRepr source wraps a single-desc SomePBC whose
-        // `const_box` is populated by the pyobj on the description.
-        // FunctionsPBCRepr.convert_const routes that host object
-        // through bookkeeper.getdesc → convert_desc, yielding an LLPtr
-        // constant pointing at the row's llfn.
-        use crate::annotator::annrpython::RPythonAnnotator;
-        use crate::annotator::bookkeeper::Bookkeeper;
-        use crate::annotator::description::{DescEntry, FunctionDesc, GraphCacheKey};
-        use crate::annotator::model::{SomeInteger, SomePBC, SomeValue};
-        use crate::flowspace::argument::Signature;
-        use crate::flowspace::model::{ConstValue, GraphFunc, HostObject, Variable};
-        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
-        use crate::translator::rtyper::rpbc::{FunctionRepr, FunctionsPBCRepr};
-        use crate::translator::rtyper::rtyper::{LowLevelOpList, RPythonTyper};
-        use std::cell::RefCell as StdRefCell;
-        use std::rc::Rc;
-
-        fn f_entry(bk: &Rc<Bookkeeper>, name: &str) -> DescEntry {
-            DescEntry::Function(Rc::new(StdRefCell::new(FunctionDesc::new(
-                bk.clone(),
-                None,
-                name,
-                Signature::new(vec!["x".to_string()], None, None),
-                None,
-                None,
-            ))))
-        }
-
-        let ann = RPythonAnnotator::new(None, None, None, false);
-        let rtyper = Rc::new(RPythonTyper::new(&ann));
-        let mut llops = LowLevelOpList::new(rtyper.clone(), None);
-
-        let fd_f = match f_entry(&ann.bookkeeper, "f") {
-            DescEntry::Function(rc) => rc,
-            _ => unreachable!(),
-        };
-        let fd_g = match f_entry(&ann.bookkeeper, "g") {
-            DescEntry::Function(rc) => rc,
-            _ => unreachable!(),
-        };
-        for (desc, name) in [(&fd_f, "f_graph"), (&fd_g, "g_graph")] {
-            desc.borrow().cache.borrow_mut().insert(
-                GraphCacheKey::None,
-                crate::translator::rtyper::rpbc::tests::make_pygraph(name),
-            );
-        }
-        let args = crate::annotator::argument::ArgumentsForTranslation::new(
-            vec![SomeValue::Integer(SomeInteger::default())],
-            None,
-            None,
-        );
-        FunctionDesc::consider_call_site(
-            &[fd_f.clone(), fd_g.clone()],
-            &args,
-            &SomeValue::Impossible,
-            None,
-        )
-        .unwrap();
-
-        // Build a host user-function, prime bookkeeper.descs so getdesc
-        // routes to fd_f without running newfuncdesc, and populate the
-        // FunctionRepr source's SomePBC const_box with that host object.
-        let host_f = HostObject::new_user_function(GraphFunc::new(
-            "f",
-            crate::flowspace::model::Constant::new(ConstValue::Dict(Default::default())),
-        ));
-        ann.bookkeeper
-            .descs
-            .borrow_mut()
-            .insert(host_f.clone(), DescEntry::Function(fd_f.clone()));
-        let mut s_from = SomePBC::new(vec![DescEntry::Function(fd_f.clone())], false);
-        s_from.base.const_box = Some(crate::flowspace::model::Constant::new(
-            ConstValue::HostObject(host_f),
-        ));
-
-        let r_from: Arc<dyn Repr> = Arc::new(FunctionRepr::new(&rtyper, s_from).unwrap());
-        let r_to: Arc<dyn Repr> = Arc::new(
-            FunctionsPBCRepr::new(
-                &rtyper,
-                SomePBC::new(
-                    vec![DescEntry::Function(fd_f), DescEntry::Function(fd_g)],
-                    false,
-                ),
-            )
-            .unwrap(),
-        );
-
-        let input_var = Variable::new();
-        input_var.set_concretetype(Some(LowLevelType::Void));
-        let v_in = Hlvalue::Variable(input_var);
-        let converted =
-            pair_convert_from_to(r_from.as_ref(), r_to.as_ref(), &v_in, &mut llops).unwrap();
-        match converted {
-            Some(Hlvalue::Constant(c)) => {
-                assert!(matches!(c.value, ConstValue::LLPtr(_)));
-                assert_eq!(c.concretetype.as_ref(), Some(r_to.lowleveltype()));
-            }
-            other => panic!("expected LLPtr constant, got {other:?}"),
-        }
-        assert!(llops.ops.is_empty(), "conversion is a pure constant fold");
     }
 }

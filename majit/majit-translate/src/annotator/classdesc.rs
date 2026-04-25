@@ -585,14 +585,6 @@ impl Attribute {
 /// and exception-class predicates.
 #[derive(Debug)]
 pub struct ClassDesc {
-    /// Upstream `id(self)` handle — unified with
-    /// [`crate::annotator::description::Desc::identity`] so family
-    /// storage keys (ClassAttrFamily.descs, CallFamily.descs,
-    /// SomePBC.descriptions) all agree regardless of whether the desc
-    /// is a ClassDesc or a FunctionDesc/FrozenDesc/etc. Allocated via
-    /// the same counter so every `DescEntry::desc_key()` route is
-    /// observationally identical to the family-side key.
-    pub identity: super::description::DescKey,
     /// RPython `self.pyobj` — the live Python class object.
     pub pyobj: HostObject,
     /// RPython `self.name` — upstream `cls.__module__ + '.' + cls.__name__`.
@@ -634,7 +626,6 @@ impl ClassDesc {
     /// callers use [`Self::new`].
     pub fn new_shell(bookkeeper: &Rc<Bookkeeper>, pyobj: HostObject, name: String) -> Self {
         ClassDesc {
-            identity: super::description::alloc_desc_key(),
             pyobj,
             name,
             basedesc: None,
@@ -806,7 +797,6 @@ impl ClassDesc {
 
         // Build `self` — subsequent mutation flows through interior mutability.
         let me = Rc::new(RefCell::new(ClassDesc {
-            identity: super::description::alloc_desc_key(),
             pyobj: cls.clone(),
             name,
             basedesc,
@@ -1432,7 +1422,8 @@ impl ClassDesc {
         this: &Rc<RefCell<Self>>,
         attrname: &str,
     ) -> Option<Rc<RefCell<super::description::ClassAttrFamily>>> {
-        let key = this.borrow().identity;
+        use super::description::DescKey;
+        let key = DescKey::from_rc(this);
         let bk = this.borrow().bookkeeper.upgrade()?;
         Some(bk.with_classpbc_attr_families(attrname, |uf| {
             let rep = uf.find_rep(key);
@@ -1457,7 +1448,8 @@ impl ClassDesc {
         this: &Rc<RefCell<Self>>,
         attrname: &str,
     ) -> Option<Rc<RefCell<super::description::ClassAttrFamily>>> {
-        let key = this.borrow().identity;
+        use super::description::DescKey;
+        let key = DescKey::from_rc(this);
         let bk = this.borrow().bookkeeper.upgrade()?;
         bk.with_classpbc_attr_families(attrname, |uf| {
             if !uf.contains(&key) {
@@ -1484,15 +1476,16 @@ impl ClassDesc {
         others: &[Rc<RefCell<Self>>],
         attrname: &str,
     ) -> bool {
+        use super::description::DescKey;
         let Some(bk) = this.borrow().bookkeeper.upgrade() else {
             return false;
         };
-        let head_key = this.borrow().identity;
+        let head_key = DescKey::from_rc(this);
         bk.with_classpbc_attr_families(attrname, |uf| {
             let mut rep = uf.find_rep(head_key);
             let mut changed = false;
             for desc in others {
-                let other_key = desc.borrow().identity;
+                let other_key = DescKey::from_rc(desc);
                 let (c, new_rep) = uf.union(rep, other_key);
                 changed |= c;
                 rep = new_rep;
@@ -1752,6 +1745,7 @@ impl ClassDesc {
         s_result: &super::model::SomeValue,
         op_key: Option<super::bookkeeper::PositionKey>,
     ) -> Result<(), super::model::AnnotatorError> {
+        use super::description::DescKey;
         use super::model::SomeValue;
         if descs.is_empty() {
             return Ok(());
@@ -1760,14 +1754,12 @@ impl ClassDesc {
         // `class ClassDesc(Desc)` inheritance collapses into a bare
         // struct here), so `getcallfamily` / `mergecallfamilies` are
         // re-derived against the bookkeeper's pbc_maximal_call_families
-        // UnionFind. The identity key is `ClassDesc.identity`, which
-        // shares its counter allocator with `Desc::identity` — every
-        // family lookup (Function/Method/Frozen/Class) keys on the
-        // same identity space that `DescEntry::desc_key()` returns.
+        // UnionFind keyed by `DescKey::from_rc(&classdesc)` — the same
+        // pointer identity upstream `id(desc)` provides.
         let Some(bk) = descs[0].borrow().bookkeeper.upgrade() else {
             return Ok(());
         };
-        let head_key = descs[0].borrow().identity;
+        let head_key = DescKey::from_rc(&descs[0]);
         // upstream: `descs[0].getcallfamily()` — force the family slot
         // to exist so merge has a representative.
         {
@@ -1779,7 +1771,7 @@ impl ClassDesc {
             let mut families = bk.pbc_maximal_call_families.borrow_mut();
             let mut rep = families.find_rep(head_key);
             for other in descs.iter().skip(1) {
-                let other_key = other.borrow().identity;
+                let other_key = DescKey::from_rc(other);
                 let (_changed, new_rep) = families.union(rep, other_key);
                 rep = new_rep;
             }
@@ -3598,6 +3590,7 @@ mod tests {
     #[test]
     fn classdesc_consider_call_site_merges_call_families() {
         use super::super::argument::simple_args;
+        use super::super::description::DescKey;
         use super::super::model::SomeValue;
         let bk = make_bk();
         // Phase 2 requires a common base — upstream classdesc.py:912
@@ -3611,8 +3604,8 @@ mod tests {
         a.borrow_mut().basedesc = Some(common.clone());
         let b = make_classdesc(&bk, "pkg.B");
         b.borrow_mut().basedesc = Some(common.clone());
-        let a_key = a.borrow().identity;
-        let b_key = b.borrow().identity;
+        let a_key = DescKey::from_rc(&a);
+        let b_key = DescKey::from_rc(&b);
         // Pre-condition: A and B belong to distinct CallFamilies.
         {
             let mut families = bk.pbc_maximal_call_families.borrow_mut();

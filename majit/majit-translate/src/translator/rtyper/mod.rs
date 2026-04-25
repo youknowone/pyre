@@ -9,7 +9,6 @@
 //! there as a temporary wiring bridge.
 
 pub mod annlowlevel;
-pub mod callparse;
 pub mod error;
 pub mod extregistry;
 pub mod llannotation;

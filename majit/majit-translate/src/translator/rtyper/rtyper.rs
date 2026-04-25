@@ -593,7 +593,6 @@ impl RPythonTyper {
     /// (`specialize_block`) iterates it fully.
     pub fn highlevelops(
         self: &Rc<Self>,
-        graph: Option<&GraphRef>,
         block: &BlockRef,
         llops: Rc<RefCell<LowLevelOpList>>,
     ) -> Vec<HighLevelOp> {
@@ -603,29 +602,25 @@ impl RPythonTyper {
             return result;
         }
         let last_idx = b.operations.len() - 1;
-        for (op_index, op) in b.operations[..last_idx].iter().enumerate() {
-            let position_key = graph
-                .map(|g| crate::annotator::bookkeeper::PositionKey::from_refs(g, block, op_index));
-            let mut hop =
-                HighLevelOp::new(Rc::clone(self), op.clone(), Vec::new(), Rc::clone(&llops));
-            hop.position_key = position_key;
-            result.push(hop);
+        for op in &b.operations[..last_idx] {
+            result.push(HighLevelOp::new(
+                Rc::clone(self),
+                op.clone(),
+                Vec::new(),
+                Rc::clone(&llops),
+            ));
         }
         let exclinks: Vec<LinkRef> = if b.canraise() {
             b.exits.iter().skip(1).cloned().collect()
         } else {
             Vec::new()
         };
-        let position_key =
-            graph.map(|g| crate::annotator::bookkeeper::PositionKey::from_refs(g, block, last_idx));
-        let mut last_hop = HighLevelOp::new(
+        result.push(HighLevelOp::new(
             Rc::clone(self),
             b.operations[last_idx].clone(),
             exclinks,
             llops,
-        );
-        last_hop.position_key = position_key;
-        result.push(last_hop);
+        ));
         result
     }
 
@@ -1218,7 +1213,7 @@ impl RPythonTyper {
             varmapping.insert(v.clone(), Hlvalue::Variable(v));
         }
 
-        let hops = self.highlevelops(Some(&graph), block, newops.clone());
+        let hops = self.highlevelops(block, newops.clone());
         for hop in hops {
             if let Err(e) = hop.setup() {
                 return Err(self.gottypererror(e, block, &hop.spaceop));
@@ -1722,14 +1717,6 @@ pub struct HighLevelOp {
     pub rtyper: Rc<RPythonTyper>,
     /// RPython `self.spaceop = spaceop` (rtyper.py:621).
     pub spaceop: SpaceOperation,
-    /// Real `(graph, block, op_index)` position key, populated by
-    /// [`RPythonTyper::highlevelops`]. Upstream `FunctionReprBase.call`
-    /// passes `hop.spaceop` as `id(position_key)` to
-    /// `callfamily.find_row`; pyre threads the already-constructed
-    /// triple so `FunctionDesc::specialize`'s op-key cache agrees with
-    /// the annotator side. `None` for test-only hops built without an
-    /// enclosing graph context.
-    pub position_key: Option<crate::annotator::bookkeeper::PositionKey>,
     /// RPython `self.exceptionlinks = exceptionlinks` (rtyper.py:622).
     /// Set of exceptional successor links collected by
     /// `highlevelops(...)` when a block raises
@@ -1774,7 +1761,6 @@ impl HighLevelOp {
         HighLevelOp {
             rtyper,
             spaceop,
-            position_key: None,
             exceptionlinks,
             llops,
             args_v: RefCell::new(Vec::new()),
@@ -1785,21 +1771,6 @@ impl HighLevelOp {
         }
     }
 
-    /// Construct a HighLevelOp carrying the `(graph, block, op_index)`
-    /// triple its `FunctionReprBase.call` dispatchers need for
-    /// call-site-specific graph specialization caching.
-    pub fn with_position(
-        rtyper: Rc<RPythonTyper>,
-        spaceop: SpaceOperation,
-        exceptionlinks: Vec<LinkRef>,
-        llops: Rc<RefCell<LowLevelOpList>>,
-        position_key: crate::annotator::bookkeeper::PositionKey,
-    ) -> Self {
-        let mut hop = Self::new(rtyper, spaceop, exceptionlinks, llops);
-        hop.position_key = Some(position_key);
-        hop
-    }
-
     /// RPython `HighLevelOp.nb_args` property (rtyper.py:636-637).
     pub fn nb_args(&self) -> usize {
         self.args_v.borrow().len()
@@ -1807,13 +1778,12 @@ impl HighLevelOp {
 
     /// RPython `HighLevelOp.copy(self)` (`rtyper.py:639-646`).
     pub fn copy(&self) -> Self {
-        let mut result = HighLevelOp::new(
+        let result = HighLevelOp::new(
             self.rtyper.clone(),
             self.spaceop.clone(),
             self.exceptionlinks.clone(),
             self.llops.clone(),
         );
-        result.position_key = self.position_key.clone();
         *result.args_v.borrow_mut() = self.args_v.borrow().clone();
         *result.args_s.borrow_mut() = self.args_s.borrow().clone();
         *result.s_result.borrow_mut() = self.s_result.borrow().clone();
@@ -5140,7 +5110,7 @@ mod tests {
         let rtyper = Rc::new(RPythonTyper::new(&ann));
         let block = Block::shared(vec![]);
         let llops = Rc::new(RefCell::new(rtyper.make_new_lloplist(block.clone())));
-        let hops = rtyper.highlevelops(None, &block, llops);
+        let hops = rtyper.highlevelops(&block, llops);
         assert!(hops.is_empty());
     }
 
@@ -5156,7 +5126,7 @@ mod tests {
         block.borrow_mut().operations.push(op1);
         block.borrow_mut().operations.push(op2);
         let llops = Rc::new(RefCell::new(rtyper.make_new_lloplist(block.clone())));
-        let hops = rtyper.highlevelops(None, &block, llops);
+        let hops = rtyper.highlevelops(&block, llops);
         assert_eq!(hops.len(), 2);
         assert_eq!(hops[0].spaceop.opname, "op1");
         assert_eq!(hops[1].spaceop.opname, "op2");

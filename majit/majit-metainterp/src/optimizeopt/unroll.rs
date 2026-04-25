@@ -2321,39 +2321,32 @@ impl OptUnroll {
                     continue;
                 }
             };
-            // unroll.py:336: `guard.rd_resume_position =
-            // patchguardop.rd_resume_position` — in RPython every preamble
-            // finish that reaches jump_to_existing_trace has already run
-            // `optimize_GUARD_FUTURE_CONDITION`, so `patchguardop` is
-            // always populated. Any extra guard reaching store_final_boxes
-            // without `patchguardop` would panic at `resume.py:397 assert
-            // resume_position >= 0` during numbering, so bail out of this
-            // target_token and let the caller fall through to the
-            // preamble JUMP instead of crashing mid-synthesis.
-            let patch_rd_resume_position =
-                match ctx.patchguardop.as_ref().map(|p| p.rd_resume_position) {
-                    Some(pos) if pos >= 0 => pos,
-                    _ => {
-                        if !extra_guards.is_empty() && std::env::var_os("MAJIT_LOG_JTET").is_some()
-                        {
-                            eprintln!(
-                                "[jit][jte] target_token #{tt_idx} skipped: \
-                                 {} extra guard(s) without patchguardop \
-                                 (force_boxes={force_boxes})",
-                                extra_guards.len(),
-                            );
-                        }
-                        if extra_guards.is_empty() {
-                            -1
-                        } else {
-                            continue;
-                        }
-                    }
-                };
+            // unroll.py:333-338 parity: read patchguardop.rd_resume_position
+            // and stamp it onto every extra guard. RPython has no fallback —
+            // `optimize_GUARD_FUTURE_CONDITION` (rewrite.py / simplify.py) runs
+            // unconditionally on the GUARD_FUTURE_CONDITION emitted at
+            // `reached_loop_header` (pyjitpl.py:2969), so by the time
+            // `_jump_to_existing_trace` runs `self.optimizer.patchguardop` is
+            // always populated. pyre mirrors this: `close_loop_args_at`
+            // (trace_opcode.rs:1863) emits the same GFC, and Phase 1 captures
+            // it into `patchguardop` (rewrite.rs:2737), which Phase 2 inherits
+            // (unroll.rs:513). Skip the read when `extra_guards` is empty —
+            // RPython's `for guard in extra_guards.extra_guards` loop body is
+            // also skipped in that case.
             for guard_req in &extra_guards {
                 if let Some(mut guard_op) = guard_req.to_op(&args, ctx) {
+                    let patch = ctx.patchguardop.as_ref().unwrap_or_else(|| {
+                        panic!(
+                            "unroll.py:333 invariant: patchguardop must be set \
+                             when extra_guards is non-empty (target_token #{}, \
+                             {} extra guard(s), force_boxes={})",
+                            tt_idx,
+                            extra_guards.len(),
+                            force_boxes,
+                        )
+                    });
                     // unroll.py:336: guard.rd_resume_position = patchguardop.rd_resume_position
-                    guard_op.rd_resume_position = patch_rd_resume_position;
+                    guard_op.rd_resume_position = patch.rd_resume_position;
                     guard_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
                     optimizer.send_extra_operation(&guard_op, ctx);
                 }

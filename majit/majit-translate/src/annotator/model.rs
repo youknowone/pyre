@@ -1206,10 +1206,8 @@ pub struct SomePBC {
     pub base: SomeObjectBase,
     /// RPython `self.descriptions` (model.py:522): a Python set of
     /// [`DescEntry`] objects. The Rust port uses
-    /// `BTreeMap<DescKey, DescEntry>` — keyed by
-    /// [`DescEntry::desc_key()`] (the counter-allocated identity
-    /// shared with family-side storage) to mirror
-    /// `set(descriptions)` membership while keeping iteration
+    /// `BTreeMap<DescKey, DescEntry>` — keyed by pointer identity to
+    /// mirror `set(descriptions)` membership while keeping iteration
     /// deterministic.
     pub descriptions:
         std::collections::BTreeMap<super::description::DescKey, super::description::DescEntry>,
@@ -1296,7 +1294,9 @@ impl SomePBC {
                         > = std::collections::BTreeSet::new();
                         for entry in pbc.descriptions.values() {
                             if let Some(mof) = entry.as_method_of_frozen() {
-                                funcdesc_keys.insert(mof.borrow().funcdesc.borrow().base.identity);
+                                funcdesc_keys.insert(super::description::DescKey::from_rc(
+                                    &mof.borrow().funcdesc,
+                                ));
                             }
                         }
                         if funcdesc_keys.len() > 1 {
