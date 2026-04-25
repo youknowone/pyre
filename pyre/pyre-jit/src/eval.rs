@@ -1184,11 +1184,13 @@ pub(crate) fn portal_runner_result(frame: &mut PyFrame) -> PyResult {
     // opcode of the recursive portal frame, which breaks parity for
     // bhimpl_recursive_call_* paths.
     frame.fix_array_ptrs();
-    if let Some(result) = try_function_entry_jit(frame) {
+    let _frame_guard = pyre_interpreter::eval::install_current_frame(frame);
+    let result = if let Some(result) = try_function_entry_jit(frame) {
         result
     } else {
         handle_jitexception(frame)
-    }
+    };
+    result
 }
 
 pub fn portal_runner(frame: &mut PyFrame) -> pyre_object::PyObjectRef {

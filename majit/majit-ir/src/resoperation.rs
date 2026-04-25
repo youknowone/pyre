@@ -19,6 +19,10 @@ impl OpRef {
     /// opencoder.py: TAGINT/TAGCONSTPTR/TAGCONSTOTHER/TAGBOX use 2-bit tags;
     /// here a single high bit suffices (op vs const).
     const CONST_BIT: u32 = 1 << 31;
+    /// Top of the u32 range reserved for sentinel OpRefs used by the
+    /// regalloc backend (temp register placeholders); kept disjoint from
+    /// the constant namespace so `is_constant()` returns false for them.
+    const SENTINEL_BASE: u32 = u32::MAX - 16;
 
     pub fn is_none(self) -> bool {
         self.0 == u32::MAX
@@ -31,7 +35,13 @@ impl OpRef {
             "const index too large: {}",
             index
         );
-        OpRef(index | Self::CONST_BIT)
+        let raw = index | Self::CONST_BIT;
+        debug_assert!(
+            raw < Self::SENTINEL_BASE,
+            "const index collides with regalloc sentinel range: {}",
+            index
+        );
+        OpRef(raw)
     }
 
     /// Extract the zero-based constant index (masks off high bit).
@@ -42,7 +52,7 @@ impl OpRef {
 
     /// resoperation.py: is_constant() — Const subclass check.
     pub fn is_constant(self) -> bool {
-        self.0 & Self::CONST_BIT != 0 && self.0 != u32::MAX
+        self.0 & Self::CONST_BIT != 0 && self.0 < Self::SENTINEL_BASE
     }
 }
 

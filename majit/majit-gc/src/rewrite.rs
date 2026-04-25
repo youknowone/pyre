@@ -169,11 +169,11 @@ pub struct JitFrameDescrs {
     pub jf_savedata_ofs: i32,
     pub jf_guard_exc_ofs: i32,
     pub jf_forward_ofs: i32,
-    /// Offset from JitFrame start to jf_frame array.
+    /// Offset from JitFrame start to jf_frame length field.
     pub jf_frame_ofs: usize,
-    /// BASEITEMOFS: offset of first item within the jf_frame array.
+    /// unpack_arraydescr(arraydescr): basesize, measured from JitFrame start.
     pub jf_frame_baseitemofs: usize,
-    /// LENGTHOFS: offset of length field within the jf_frame array.
+    /// descrs.arraydescr.lendescr.offset, measured from JitFrame start.
     pub jf_frame_lengthofs: usize,
     /// SIGN_SIZE: size of one jf_frame slot.
     pub sign_size: usize,

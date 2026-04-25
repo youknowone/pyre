@@ -206,6 +206,56 @@ impl JitState for BadLiveState {
     }
 }
 
+struct ExtraLiveState {
+    frame: usize,
+    stack: i64,
+    extra: i64,
+}
+
+impl JitState for ExtraLiveState {
+    type Meta = TestMeta;
+    type Sym = Vec<OpRef>;
+    type Env = ();
+
+    fn build_meta(&self, header_pc: usize, _env: &Self::Env) -> Self::Meta {
+        TestMeta { header_pc }
+    }
+
+    fn extract_live(&self, _meta: &Self::Meta) -> Vec<i64> {
+        vec![self.frame as i64, self.stack, self.extra]
+    }
+
+    fn extract_live_values(&self, _meta: &Self::Meta) -> Vec<Value> {
+        vec![
+            Value::Ref(GcRef(self.frame)),
+            Value::Int(self.stack),
+            Value::Int(self.extra),
+        ]
+    }
+
+    fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
+        vec![OpRef(0), OpRef(1), OpRef(2)]
+    }
+
+    fn is_compatible(&self, _meta: &Self::Meta) -> bool {
+        true
+    }
+
+    fn restore(&mut self, _meta: &Self::Meta, values: &[i64]) {
+        self.frame = values[0] as usize;
+        self.stack = values[1];
+        self.extra = values[2];
+    }
+
+    fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
+        sym.clone()
+    }
+
+    fn validate_close(_sym: &Self::Sym, _meta: &Self::Meta) -> bool {
+        true
+    }
+}
+
 struct TypedState {
     frame: usize,
     acc: f64,
@@ -1529,6 +1579,35 @@ fn declarative_driver_rejects_live_value_count_mismatch() {
     )
     .expect("declarative driver should build runtime descriptor");
     let mut state = BadLiveState { frame: 9 };
+
+    assert!(
+        driver
+            .back_edge_declarative::<DeclarativeDriver>(&[1, 2], 1, &mut state, &(), || {})
+            .expect("green key should build")
+            .is_none()
+    );
+    assert!(
+        driver
+            .back_edge_declarative::<DeclarativeDriver>(&[1, 2], 1, &mut state, &(), || {})
+            .expect("green key should build")
+            .is_none()
+    );
+    assert!(!driver.is_tracing());
+}
+
+#[test]
+fn declarative_driver_rejects_extra_live_values_beyond_descriptor_reds() {
+    let mut driver = JitDriver::<ExtraLiveState>::with_declarative::<DeclarativeDriver>(
+        2,
+        &[Type::Int, Type::Int],
+        &[Type::Ref, Type::Int],
+    )
+    .expect("declarative driver should build runtime descriptor");
+    let mut state = ExtraLiveState {
+        frame: 9,
+        stack: 4,
+        extra: 17,
+    };
 
     assert!(
         driver

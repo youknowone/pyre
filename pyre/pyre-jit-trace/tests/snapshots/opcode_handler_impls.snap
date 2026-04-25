@@ -485,16 +485,17 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
             let live_args =
                 crate::state::MIFrame::close_loop_args_at(this, ctx, Some(target));
             let live_types = {
-                let s = this.sym();
-                let mut types = crate::virtualizable_gen::virt_live_value_types(0);
-                types.extend(s.symbolic_local_types.iter().copied());
-                let stack_only = s.stack_only_depth();
-                types.extend(
-                    s.symbolic_stack_types[..stack_only.min(s.symbolic_stack_types.len())]
-                        .iter()
-                        .copied(),
-                );
-                types
+                live_args
+                    .iter()
+                    .map(|opref| {
+                        ctx.get_opref_type(*opref).unwrap_or_else(|| {
+                            panic!(
+                                "live_arg {opref:?} has no type in OptContext; \
+                                 RPython Box always carries its type"
+                            )
+                        })
+                    })
+                    .collect()
             };
 
             // pyjitpl.py:2978-2983 compile_trace attempt.

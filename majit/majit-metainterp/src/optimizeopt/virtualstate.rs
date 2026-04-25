@@ -1717,13 +1717,15 @@ impl GuardRequirement {
                 } else {
                     *args.get(*arg_index)?
                 };
-                // virtualstate.py:401: ResOperation(GUARD_VALUE, [box, self.constbox])
-                let val_const = ctx.make_constant_int(match expected_value {
-                    Value::Int(v) => *v,
-                    Value::Float(f) => f.to_bits() as i64,
-                    Value::Ref(r) => r.0 as i64,
-                    Value::Void => 0,
-                });
+                // virtualstate.py:401: ResOperation(GUARD_VALUE,
+                // [box, self.constbox]). Preserve the Const object's type:
+                // ConstPtr must not be represented as ConstInt.
+                let val_const = match expected_value {
+                    Value::Int(v) => ctx.make_constant_int(*v),
+                    Value::Float(f) => ctx.make_constant_float(*f),
+                    Value::Ref(r) => ctx.make_constant_ref(*r),
+                    Value::Void => ctx.make_constant_int(0),
+                };
                 let mut op = Op::new(OpCode::GuardValue, &[arg, val_const]);
                 op.fail_args = Some(Default::default());
                 Some(op)

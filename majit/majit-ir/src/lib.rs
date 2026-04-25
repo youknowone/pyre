@@ -9,9 +9,9 @@ pub mod value;
 pub use descr::{
     AccumInfo, ArrayDescr, ArrayFlag, CallDescr, DebugMergePointDescr, DebugMergePointInfo, Descr,
     DescrRef, FailDescr, FieldDescr, GcCache, InteriorFieldDescr, LLType, LoopTargetDescr,
-    SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr, TargetArgLoc, UnpackAtExitInfo,
-    VableExpansion, descr_identity, make_array_descr, make_field_descr, make_loop_target_descr,
-    make_memcpy_calldescr, make_raw_malloc_calldescr, make_size_descr_full,
+    LoopTokenDescr, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr, TargetArgLoc,
+    UnpackAtExitInfo, VableExpansion, descr_identity, make_array_descr, make_field_descr,
+    make_loop_target_descr, make_memcpy_calldescr, make_raw_malloc_calldescr, make_size_descr_full,
     make_size_descr_with_vtable, unpack_fielddescr,
 };
 pub use effectinfo::{
