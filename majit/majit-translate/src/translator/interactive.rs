@@ -33,19 +33,21 @@
 //!    26's `_prebuilt_graphs[entry_point] = graph` seed is performed
 //!    verbatim after.
 //!
-//! 2. **Driver-backed methods** (DEFERRED). Upstream line 15 creates
-//!    `TranslationDriver(overrides=DEFAULTS)`. Nearly every method on
+//! 2. **Driver-backed methods** (PARITY). Upstream line 15 creates
+//!    `TranslationDriver(overrides=DEFAULTS)`. Every method on
 //!    `Translation` outside `__init__` / `view` / `viewcg` forwards to
 //!    `self.driver.*` (`annotate`, `rtype`, `backendopt`, `source`,
 //!    `source_c`, `source_cl`, `compile`, `compile_c`, `disable`,
 //!    `set_backend_extra_options`, `ensure_opt`, `ensure_type_system`,
-//!    `ensure_backend`). Those require porting
-//!    `rpython/translator/driver.py` (631 LOC) first — out of scope
-//!    for M2.5 / M3.
-//!    *Convergence path*: once `translator::driver` lands, a single
-//!    `pub driver: Rc<TranslationDriver>` field plus the 13 forwarding
-//!    methods will make this wrapper byte-for-byte equivalent with
-//!    upstream.
+//!    `ensure_backend`). The Rust port wires every one through
+//!    [`TranslationDriver::proceed`] / [`TranslationDriver::disable`] /
+//!    [`TranslationDriver::set_backend_extra_options`] in the same body
+//!    shape upstream uses (`update_options(kwds) → ensure_backend →
+//!    driver.proceed("<task>_<backend>")`); the only `getattr`-style
+//!    indirection upstream uses to dispatch `rtype_lltype` /
+//!    `compile_c` etc. is folded into `format!("rtype_{}", ts)` etc.
+//!    on the Rust side because [`ProceedGoals::One`] takes the goal
+//!    name as a string.
 //!
 //! The `export_symbol(entry_point)` call at upstream line 18 is
 //! ported in-place via [`crate::rlib::entrypoint::export_symbol`] —
@@ -53,12 +55,11 @@
 //! `HostObject` is stored in `self.entry_point`, matching upstream
 //! `entrypoint.py:10-12`.
 //!
-//! Fields ported here match upstream line-for-line except for
-//! `driver`:
+//! Fields ported here match upstream line-for-line:
 //!
 //! | upstream field                             | local              |
 //! |--------------------------------------------|--------------------|
-//! | `self.driver`                              | DEFERRED           |
+//! | `self.driver`                              | `self.driver`      |
 //! | `self.config`                              | `self.config()`    |
 //! | `self.entry_point = export_symbol(…)`      | `self.entry_point` |
 //! | `self.context = TranslationContext(…)`    | `self.context`     |
@@ -67,6 +68,7 @@
 
 use std::cell::RefCell;
 use std::collections::HashMap;
+use std::path::PathBuf;
 use std::rc::Rc;
 
 use quote::ToTokens;
@@ -74,12 +76,13 @@ use syn::ItemFn;
 
 use crate::annotator::policy::AnnotatorPolicy;
 use crate::annotator::signature::AnnotationSpec;
-use crate::config::config::{Config, ConfigError, OptionValue};
+use crate::config::config::{Config, ConfigError, ConfigValue, OptionValue};
 use crate::flowspace::model::HostObject;
 use crate::flowspace::rust_source::{AdapterError, build_host_function_from_rust};
 use crate::rlib::entrypoint::export_symbol;
-use crate::translator::driver::TranslationDriver;
+use crate::translator::driver::{ProceedGoals, TranslationDriver};
 use crate::translator::simplify;
+use crate::translator::tool::taskengine::{TaskError, TaskOutput};
 use crate::translator::translator::{FlowingFlags, TranslationConfig, TranslationContext};
 
 /// Top-level construction error for [`Translation::from_rust_item_fn`]
@@ -298,6 +301,338 @@ impl Translation {
         Ok(())
     }
 
+    /// Port of upstream `Translation.ensure_opt()` at
+    /// `interactive.py:46-57`.
+    ///
+    /// ```python
+    /// def ensure_opt(self, name, value=None, fallback=None):
+    ///     if value is not None:
+    ///         self.update_options({name: value})
+    ///         return value
+    ///     val = getattr(self.config.translation, name, None)
+    ///     if fallback is not None and val is None:
+    ///         self.update_options({name: fallback})
+    ///         return fallback
+    ///     if val is not None:
+    ///         return val
+    ///     raise Exception(
+    ///                 "the %r option should have been specified at this point" % name)
+    /// ```
+    ///
+    /// Upstream `getattr(self.config.translation, name, None)` reads the
+    /// `translation.<name>` slot via Python's `__getattr__`. The Rust
+    /// port routes through [`Config::get`] on `translation.<name>` and
+    /// peels the inner [`OptionValue`] back to a `String`. The two
+    /// upstream call sites — `ensure_type_system` and `ensure_backend`
+    /// — both read `ChoiceOption` slots (`backend` / `type_system`) so
+    /// only `Choice` / `Str` / `None` arms are exercised here; other
+    /// `OptionValue` variants (`Bool`, `Int`, `Float`, `Arbitrary`)
+    /// would be a caller bug.
+    pub fn ensure_opt(
+        &self,
+        name: &str,
+        value: Option<&str>,
+        fallback: Option<&str>,
+    ) -> Result<String, ConfigError> {
+        // Upstream `:47-49`: `if value is not None: self.update_options(
+        // {name: value}); return value`.
+        if let Some(v) = value {
+            let mut kwds = HashMap::new();
+            kwds.insert(name.to_string(), v.to_string());
+            self.update_options(&kwds)?;
+            return Ok(v.to_string());
+        }
+        // Upstream `:50`: `val = getattr(self.config.translation, name,
+        // None)`. `Config::get` returns `Err(UnknownOption)` on a
+        // missing slot — Python's `getattr(_, _, None)` swallows it, so
+        // map every error here back to the `None` arm.
+        let path = format!("translation.{}", name);
+        let val = self.driver.config.get(&path).ok();
+        let val_str = val.and_then(|cv| match cv {
+            ConfigValue::Value(OptionValue::Choice(s)) => Some(s),
+            ConfigValue::Value(OptionValue::Str(s)) => Some(s),
+            // Upstream `None` sentinel ⇒ Python `None`.
+            ConfigValue::Value(OptionValue::None) => None,
+            _ => None,
+        });
+        // Upstream `:51-53`: `if fallback is not None and val is None:
+        // self.update_options({name: fallback}); return fallback`.
+        if let Some(f) = fallback {
+            if val_str.is_none() {
+                let mut kwds = HashMap::new();
+                kwds.insert(name.to_string(), f.to_string());
+                self.update_options(&kwds)?;
+                return Ok(f.to_string());
+            }
+        }
+        // Upstream `:54-55`: `if val is not None: return val`.
+        if let Some(v) = val_str {
+            return Ok(v);
+        }
+        // Upstream `:56-57`: `raise Exception("the %r option should
+        // have been specified at this point" % name)`.
+        Err(ConfigError::Generic(format!(
+            "the {:?} option should have been specified at this point",
+            name
+        )))
+    }
+
+    /// Port of upstream `Translation.ensure_type_system()` at
+    /// `interactive.py:59-62`.
+    ///
+    /// ```python
+    /// def ensure_type_system(self, type_system=None):
+    ///     if self.config.translation.backend is not None:
+    ///         return self.ensure_opt('type_system')
+    ///     return self.ensure_opt('type_system', type_system, 'lltype')
+    /// ```
+    ///
+    /// `self.config.translation.backend is not None` tests the
+    /// `ChoiceOption` slot for a non-None value. The Rust port reads
+    /// the slot through [`Config::get`] and treats `OptionValue::None`
+    /// (and any read error) as the `None` arm.
+    pub fn ensure_type_system(&self, type_system: Option<&str>) -> Result<String, ConfigError> {
+        // Upstream `:60`: `if self.config.translation.backend is not None`.
+        let backend_set = match self.driver.config.get("translation.backend").ok() {
+            Some(ConfigValue::Value(OptionValue::None)) => false,
+            Some(ConfigValue::Value(_)) => true,
+            _ => false,
+        };
+        if backend_set {
+            // Upstream `:61`: `return self.ensure_opt('type_system')`.
+            return self.ensure_opt("type_system", None, None);
+        }
+        // Upstream `:62`: `return self.ensure_opt('type_system',
+        // type_system, 'lltype')`.
+        self.ensure_opt("type_system", type_system, Some("lltype"))
+    }
+
+    /// Port of upstream `Translation.ensure_backend()` at
+    /// `interactive.py:64-67`.
+    ///
+    /// ```python
+    /// def ensure_backend(self, backend=None):
+    ///     backend = self.ensure_opt('backend', backend)
+    ///     self.ensure_type_system()
+    ///     return backend
+    /// ```
+    pub fn ensure_backend(&self, backend: Option<&str>) -> Result<String, ConfigError> {
+        // Upstream `:65`: `backend = self.ensure_opt('backend', backend)`.
+        let backend_str = self.ensure_opt("backend", backend, None)?;
+        // Upstream `:66`: `self.ensure_type_system()`.
+        self.ensure_type_system(None)?;
+        // Upstream `:67`: `return backend`.
+        Ok(backend_str)
+    }
+
+    /// Port of upstream `Translation.disable()` at `interactive.py:69-71`.
+    ///
+    /// ```python
+    /// def disable(self, to_disable):
+    ///     self.driver.disable(to_disable)
+    /// ```
+    pub fn disable(&self, to_disable: Vec<String>) {
+        self.driver.disable(to_disable);
+    }
+
+    /// Port of upstream `Translation.set_backend_extra_options()` at
+    /// `interactive.py:73-77`.
+    ///
+    /// ```python
+    /// def set_backend_extra_options(self, **extra_options):
+    ///     for name in extra_options:
+    ///         backend, option = name.split('_', 1)
+    ///         self.ensure_backend(backend)
+    ///     self.driver.set_backend_extra_options(extra_options)
+    /// ```
+    ///
+    /// Upstream `name.split('_', 1)` raises `ValueError` if the name
+    /// has no `_` (the Python tuple-unpack at `:75` requires exactly
+    /// two parts). The Rust port returns
+    /// [`ConfigError::Generic`] on the same condition so the surface
+    /// is observable; PyPy's exception at this point would also be
+    /// caught by the same `try/except` callers wrap around
+    /// `set_backend_extra_options` in the C-backend path.
+    pub fn set_backend_extra_options(
+        &self,
+        extra_options: HashMap<String, OptionValue>,
+    ) -> Result<(), ConfigError> {
+        // Upstream `:74-76`: split each name on first `_` and ensure
+        // the corresponding backend.
+        for name in extra_options.keys() {
+            let (backend, _option) = name.split_once('_').ok_or_else(|| {
+                ConfigError::Generic(format!(
+                    "extra option {:?} must be of the form <backend>_<option>",
+                    name
+                ))
+            })?;
+            self.ensure_backend(Some(backend))?;
+        }
+        // Upstream `:77`: forward the dict to the driver.
+        self.driver.set_backend_extra_options(extra_options);
+        Ok(())
+    }
+
+    /// Port of upstream `Translation.annotate()` at
+    /// `interactive.py:81-83`.
+    ///
+    /// ```python
+    /// def annotate(self, **kwds):
+    ///     self.update_options(kwds)
+    ///     return self.driver.annotate()
+    /// ```
+    ///
+    /// `self.driver.annotate()` upstream is the `expose_task`-generated
+    /// proc that calls `self.proceed("annotate")`
+    /// (`driver.py:104-110`). The Rust port routes through
+    /// [`TranslationDriver::proceed`] with `ProceedGoals::One("annotate")`,
+    /// which performs the same engine planning + execution.
+    pub fn annotate(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+        // Upstream `:82`: `self.update_options(kwds)`.
+        self.update_options(kwds).map_err(cfg_to_task)?;
+        // Upstream `:83`: `return self.driver.annotate()` ⇒
+        // `self.proceed("annotate")` per `driver.py:104-110`.
+        self.driver
+            .proceed(ProceedGoals::One("annotate".to_string()))
+    }
+
+    /// Port of upstream `Translation.rtype()` at `interactive.py:87-90`.
+    ///
+    /// ```python
+    /// def rtype(self, **kwds):
+    ///     self.update_options(kwds)
+    ///     ts = self.ensure_type_system()
+    ///     return getattr(self.driver, 'rtype_' + ts)()
+    /// ```
+    ///
+    /// `getattr(self.driver, 'rtype_' + ts)()` upstream resolves to the
+    /// `expose_task`-generated proc whose body calls
+    /// `self.proceed('rtype_<ts>')`. The Rust port short-circuits the
+    /// `getattr` round-trip and proceeds directly.
+    pub fn rtype(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+        self.update_options(kwds).map_err(cfg_to_task)?;
+        let ts = self.ensure_type_system(None).map_err(cfg_to_task)?;
+        self.driver
+            .proceed(ProceedGoals::One(format!("rtype_{}", ts)))
+    }
+
+    /// Port of upstream `Translation.backendopt()` at
+    /// `interactive.py:92-95`.
+    ///
+    /// ```python
+    /// def backendopt(self, **kwds):
+    ///     self.update_options(kwds)
+    ///     ts = self.ensure_type_system('lltype')
+    ///     return getattr(self.driver, 'backendopt_' + ts)()
+    /// ```
+    ///
+    /// Note the explicit `'lltype'` fallback at upstream `:94`: this
+    /// method forces `type_system=lltype` when the slot is unset,
+    /// while `rtype()` at `:90` only resolves the existing default.
+    pub fn backendopt(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+        self.update_options(kwds).map_err(cfg_to_task)?;
+        let ts = self
+            .ensure_type_system(Some("lltype"))
+            .map_err(cfg_to_task)?;
+        self.driver
+            .proceed(ProceedGoals::One(format!("backendopt_{}", ts)))
+    }
+
+    /// Port of upstream `Translation.source()` at
+    /// `interactive.py:99-102`.
+    ///
+    /// ```python
+    /// def source(self, **kwds):
+    ///     self.update_options(kwds)
+    ///     backend = self.ensure_backend()
+    ///     getattr(self.driver, 'source_' + backend)()
+    /// ```
+    pub fn source(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+        self.update_options(kwds).map_err(cfg_to_task)?;
+        let backend = self.ensure_backend(None).map_err(cfg_to_task)?;
+        self.driver
+            .proceed(ProceedGoals::One(format!("source_{}", backend)))
+    }
+
+    /// Port of upstream `Translation.source_c()` at
+    /// `interactive.py:104-107`.
+    ///
+    /// ```python
+    /// def source_c(self, **kwds):
+    ///     self.update_options(kwds)
+    ///     self.ensure_backend('c')
+    ///     self.driver.source_c()
+    /// ```
+    pub fn source_c(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+        self.update_options(kwds).map_err(cfg_to_task)?;
+        self.ensure_backend(Some("c")).map_err(cfg_to_task)?;
+        self.driver
+            .proceed(ProceedGoals::One("source_c".to_string()))
+    }
+
+    /// Port of upstream `Translation.source_cl()` at
+    /// `interactive.py:109-112`.
+    ///
+    /// ```python
+    /// def source_cl(self, **kwds):
+    ///     self.update_options(kwds)
+    ///     self.ensure_backend('cl')
+    ///     self.driver.source_cl()
+    /// ```
+    ///
+    /// "cl" is not in the upstream `backend` choices either
+    /// (`translationoption.py:51-56` lists only `"c"`); the method is
+    /// preserved for surface parity but always errors out at
+    /// `ensure_backend('cl')` with `ConfigError::ValidationFailed`.
+    pub fn source_cl(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+        self.update_options(kwds).map_err(cfg_to_task)?;
+        self.ensure_backend(Some("cl")).map_err(cfg_to_task)?;
+        self.driver
+            .proceed(ProceedGoals::One("source_cl".to_string()))
+    }
+
+    /// Port of upstream `Translation.compile()` at
+    /// `interactive.py:114-118`.
+    ///
+    /// ```python
+    /// def compile(self, **kwds):
+    ///     self.update_options(kwds)
+    ///     backend = self.ensure_backend()
+    ///     getattr(self.driver, 'compile_' + backend)()
+    ///     return self.driver.c_entryp
+    /// ```
+    ///
+    /// Returns `self.driver.c_entryp` after the proceed call. Upstream
+    /// reads the attribute directly even when it is `None` — the Rust
+    /// port mirrors that with `Option<PathBuf>` so callers can observe
+    /// the same shape (the C-backend leaf populates the slot through
+    /// `task_compile_c` at upstream `:524`).
+    pub fn compile(&self, kwds: &HashMap<String, String>) -> Result<Option<PathBuf>, TaskError> {
+        self.update_options(kwds).map_err(cfg_to_task)?;
+        let backend = self.ensure_backend(None).map_err(cfg_to_task)?;
+        self.driver
+            .proceed(ProceedGoals::One(format!("compile_{}", backend)))?;
+        Ok(self.driver.c_entryp.borrow().clone())
+    }
+
+    /// Port of upstream `Translation.compile_c()` at
+    /// `interactive.py:120-124`.
+    ///
+    /// ```python
+    /// def compile_c(self, **kwds):
+    ///     self.update_options(kwds)
+    ///     self.ensure_backend('c')
+    ///     self.driver.compile_c()
+    ///     return self.driver.c_entryp
+    /// ```
+    pub fn compile_c(&self, kwds: &HashMap<String, String>) -> Result<Option<PathBuf>, TaskError> {
+        self.update_options(kwds).map_err(cfg_to_task)?;
+        self.ensure_backend(Some("c")).map_err(cfg_to_task)?;
+        self.driver
+            .proceed(ProceedGoals::One("compile_c".to_string()))?;
+        Ok(self.driver.c_entryp.borrow().clone())
+    }
+
     /// Port of upstream `Translation.__init__` specialized for a
     /// Rust-source entry. Mirrors the `buildflowgraph(entry_point)` +
     /// `_prebuilt_graphs[entry_point] = graph` pair at
@@ -461,25 +796,14 @@ impl Translation {
 
         // `self.entry_point = export_symbol(entry_point)` —
         // upstream `interactive.py:18`. Upstream mutates the Python
-        // function in place and returns the same object; the Rust
-        // port emits a new `HostObject` wrapper carrying a flagged
-        // `GraphFunc` (see `rlib/entrypoint.rs`). The flag applies
-        // before `_prebuilt_graphs[entry_point] = graph` seeds the
-        // cache so the map key is the post-flag `HostObject`, exactly
-        // what the caller later looks up through `buildflowgraph(entry_point)`.
-        //
-        // Side-effect caveat (PRE-EXISTING-ADAPTATION): upstream's
-        // in-place mutation also reaches the GraphFunc referenced by
-        // `pygraph.func` and `pygraph.graph.func` (Python: same
-        // object). The Rust port builds those two slots as
-        // independent `Clone` copies inside
-        // `build_host_function_from_rust` (`register.rs:155,:165,:171`),
-        // so flipping the flag on `flagged_host`'s GraphFunc does
-        // not propagate there. Observable divergence is zero under
-        // every currently-ported consumer — the flag is C-backend-
-        // only per `rpython/translator/c/database.py`. When the C
-        // backend or `register.rs`'s GraphFunc-sharing surface is
-        // ported, flag those slots too so parity is complete.
+        // function in place and returns the same object. The Rust
+        // port routes through `rlib::entrypoint::export_symbol` which
+        // flips `GraphFunc.exported_symbol` (an `Arc<AtomicBool>`)
+        // through interior mutability, so the input HostObject and
+        // the returned one are `Arc::ptr_eq` (same identity), and
+        // every adapter-built `pygraph.func` / `pygraph.graph.func`
+        // clone shares the same flag cell — matching upstream's
+        // single-Python-object semantics.
         let flagged_host = export_symbol(host);
         context
             ._prebuilt_graphs
@@ -504,6 +828,20 @@ impl Translation {
             .map_err(|e| TranslationConstructError::Config(ConfigError::Generic(e.message)))?;
 
         Ok((translation, flagged_host))
+    }
+}
+
+/// Converts a [`ConfigError`] (raised by `Config::set` / `Config::get`
+/// surfaces inside `update_options` / `ensure_*`) into a [`TaskError`]
+/// so the forwarding methods (`annotate`, `rtype`, `compile`, …) can
+/// expose a single error type to callers. Upstream Python uses one
+/// shared `raise` channel, so this fold-down preserves the
+/// observable behaviour: a config-time problem before the proceed
+/// call surfaces with the same urgency as a task-time error during
+/// it.
+fn cfg_to_task(e: ConfigError) -> TaskError {
+    TaskError {
+        message: format!("{:?}", e),
     }
 }
 
@@ -981,7 +1319,8 @@ mod tests {
         // `self.entry_point` carries the flag.
         let gf = t.entry_point.user_function().expect("user function");
         assert!(
-            gf.exported_symbol,
+            gf.exported_symbol
+                .load(std::sync::atomic::Ordering::Relaxed),
             "interactive.py:18 export_symbol(entry_point) must set exported_symbol=true"
         );
 
@@ -1052,6 +1391,212 @@ mod tests {
         assert!(
             Rc::ptr_eq(&t.context, &ann.translator),
             "Translation.context and annotator.translator must be Rc-identical"
+        );
+    }
+
+    // ---- forwarding API parity tests (interactive.py:46-124) -------------
+
+    /// Helper: build a Translation around `fn main() -> i64 { ... }` with
+    /// `argtypes=Some(vec![])` so `setup` records `standalone=False`.
+    /// `task_annotate`'s `entry_point and standalone and s.knowntype != int`
+    /// check at upstream `:321-324` is therefore skipped, matching the
+    /// shape used by `task_annotate_runs_end_to_end_for_constant_return`.
+    fn translation_for(src: &str) -> Translation {
+        let item = parse_item_fn(src);
+        let (t, _host) = Translation::from_rust_item_fn_with_options(
+            &item,
+            Some(Vec::new()),
+            None,
+            &HashMap::new(),
+        )
+        .expect("translation");
+        t
+    }
+
+    #[test]
+    fn ensure_opt_returns_explicit_value_when_provided() {
+        // Upstream `interactive.py:47-49`: `if value is not None:
+        // self.update_options({name: value}); return value`.
+        let t = translation_for("fn main() -> i64 { 1 }");
+        let got = t
+            .ensure_opt("type_system", Some("lltype"), None)
+            .expect("ensure_opt explicit");
+        assert_eq!(got, "lltype");
+        // Side effect: `update_options` lands `lltype` on the live config.
+        let read = match t.driver.config.get("translation.type_system").unwrap() {
+            ConfigValue::Value(OptionValue::Choice(s)) => s,
+            other => panic!("expected Choice, got {other:?}"),
+        };
+        assert_eq!(read, "lltype");
+    }
+
+    #[test]
+    fn ensure_opt_returns_fallback_when_unset() {
+        // Upstream `:51-53`: `if fallback is not None and val is None:
+        // self.update_options({name: fallback}); return fallback`. The
+        // driver default for `translation.type_system` is `None`, so
+        // `ensure_opt('type_system', None, 'lltype')` lands `lltype` via
+        // the fallback branch.
+        let t = translation_for("fn main() -> i64 { 1 }");
+        let got = t
+            .ensure_opt("type_system", None, Some("lltype"))
+            .expect("ensure_opt fallback");
+        assert_eq!(got, "lltype");
+    }
+
+    #[test]
+    fn ensure_backend_explicit_c_lands_lltype_via_requires() {
+        // Upstream `interactive.py:6-10 DEFAULTS` sets
+        // `translation.backend = None` (overriding the schema default
+        // of `"c"` from `translationoption.py:51-56`). So
+        // `ensure_backend(None)` raises — see the test below — but
+        // `ensure_backend("c")` lands the value via the `value is not
+        // None` branch and the `requires={"c": [("type_system",
+        // "lltype")]}` chain triggers `type_system=lltype` as a side
+        // effect.
+        let t = translation_for("fn main() -> i64 { 1 }");
+        let backend = t.ensure_backend(Some("c")).expect("ensure_backend(c)");
+        assert_eq!(backend, "c");
+        let ts = match t.driver.config.get("translation.type_system").unwrap() {
+            ConfigValue::Value(OptionValue::Choice(s)) => s,
+            other => panic!("expected Choice, got {other:?}"),
+        };
+        assert_eq!(ts, "lltype");
+    }
+
+    #[test]
+    fn ensure_backend_none_raises_when_defaults_zero_backend() {
+        // Upstream parity with `interactive.py:6 DEFAULTS = {'backend':
+        // None, ...}`: with backend=None the unset slot has no
+        // fallback, so `ensure_opt('backend', None, None)` raises
+        // `"the 'backend' option should have been specified at this
+        // point"` per upstream `:56-57`. The Rust port surfaces the
+        // same message via `ConfigError::Generic`.
+        let t = translation_for("fn main() -> i64 { 1 }");
+        let err = t.ensure_backend(None).unwrap_err();
+        match err {
+            ConfigError::Generic(msg) => {
+                assert!(msg.contains("\"backend\""), "msg: {msg}");
+                assert!(msg.contains("should have been specified"), "msg: {msg}");
+            }
+            other => panic!("expected Generic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn disable_forwards_to_driver_underscore_disabled() {
+        // Upstream `interactive.py:69-71`: `def disable(self,
+        // to_disable): self.driver.disable(to_disable)`. Forwards into
+        // `driver.py:166-167` which writes `_disabled = to_disable`.
+        let t = translation_for("fn main() -> i64 { 1 }");
+        t.disable(vec!["compile_c".to_string(), "source_c".to_string()]);
+        let stored = t.driver._disabled.borrow();
+        assert_eq!(
+            *stored,
+            vec!["compile_c".to_string(), "source_c".to_string()]
+        );
+    }
+
+    #[test]
+    fn set_backend_extra_options_runs_ensure_backend_per_key() {
+        // Upstream `interactive.py:73-77`: each name splits on `_` and
+        // ensures the backend, then the dict is forwarded to
+        // `driver.set_backend_extra_options`. Single-key fixture using
+        // `c_compiler_path` exercises the `c` path (the only valid
+        // choice) without triggering the `cl` rejection.
+        let t = translation_for("fn main() -> i64 { 1 }");
+        let mut extras = HashMap::new();
+        extras.insert(
+            "c_compiler_path".to_string(),
+            OptionValue::Str("/usr/bin/clang".to_string()),
+        );
+        t.set_backend_extra_options(extras.clone())
+            .expect("set_backend_extra_options");
+        // Forwarded dict is on the driver.
+        let stored = t.driver._backend_extra_options.borrow();
+        assert!(stored.contains_key("c_compiler_path"));
+        // Backend slot remains `c` (was the default already, but the
+        // ensure_backend call must not break it).
+        let backend = match t.driver.config.get("translation.backend").unwrap() {
+            ConfigValue::Value(OptionValue::Choice(s)) => s,
+            other => panic!("expected Choice, got {other:?}"),
+        };
+        assert_eq!(backend, "c");
+    }
+
+    #[test]
+    fn set_backend_extra_options_rejects_name_without_underscore() {
+        // Upstream `:75 backend, option = name.split('_', 1)` raises
+        // `ValueError: not enough values to unpack` on a name without
+        // `_`. The Rust port surfaces the same rejection as
+        // `ConfigError::Generic`.
+        let t = translation_for("fn main() -> i64 { 1 }");
+        let mut extras = HashMap::new();
+        extras.insert("nounderscore".to_string(), OptionValue::Bool(true));
+        let err = t.set_backend_extra_options(extras).unwrap_err();
+        match err {
+            ConfigError::Generic(msg) => {
+                assert!(msg.contains("nounderscore"), "msg: {msg}");
+            }
+            other => panic!("expected Generic, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn annotate_runs_proceed_through_engine() {
+        // Upstream `interactive.py:81-83`:
+        //
+        //     def annotate(self, **kwds):
+        //         self.update_options(kwds)
+        //         return self.driver.annotate()
+        //
+        // The Rust port routes `driver.annotate()` through
+        // `driver.proceed("annotate")`, which executes
+        // `task_annotate` end-to-end (driver.py:297-327). Verify
+        // completion + `done` bookkeeping via DriverHooks::_do.
+        let t = translation_for("fn main() -> i64 { 42 }");
+        t.annotate(&HashMap::new()).expect("annotate");
+        assert!(
+            t.driver.done.borrow().contains_key("annotate"),
+            "DriverHooks::_do must record annotate as done"
+        );
+    }
+
+    #[test]
+    fn rtype_runs_proceed_for_rtype_lltype_goal() {
+        // Upstream `interactive.py:87-90`: `getattr(self.driver,
+        // 'rtype_' + ts)()` resolves the `expose_task`-generated
+        // proc whose body is `proceed('rtype_<ts>')`. With the
+        // schema default `type_system=None`, `ensure_type_system`
+        // lands `lltype` first, so the proceed goal is `rtype_lltype`.
+        let t = translation_for("fn main() -> i64 { 7 }");
+        t.rtype(&HashMap::new()).expect("rtype");
+        let done = t.driver.done.borrow();
+        assert!(done.contains_key("annotate"));
+        assert!(done.contains_key("rtype_lltype"));
+    }
+
+    #[test]
+    fn compile_c_propagates_missing_task_leaf_error() {
+        // Upstream `interactive.py:120-124`: `compile_c` runs
+        // `proceed('compile_c')` then returns `self.driver.c_entryp`.
+        // The `task_compile_c` body at upstream `:533-541` is DEFERRED
+        // in the Rust port — `task_database_c` raises a
+        // `missing_task_leaf` before the chain reaches `compile_c`. The
+        // forwarding method must propagate that error rather than
+        // silently dropping it.
+        let t = translation_for("fn main() -> i64 { 1 }");
+        let err = t.compile_c(&HashMap::new()).unwrap_err();
+        // Error message must cite the deferred leaf so a reviewer can
+        // grep the exact upstream line. Accept both `not ported` and
+        // `not yet ported` wordings — different shells along the chain
+        // (driver.py / genc.py / all.py / unixcheckpoint.py) phrase the
+        // deferred-leaf marker slightly differently.
+        let msg = &err.message;
+        let cites_upstream = msg.contains(".py:") || msg.contains("not ported");
+        assert!(
+            cites_upstream,
+            "compile_c must surface the missing_task_leaf message: {msg}"
         );
     }
 }

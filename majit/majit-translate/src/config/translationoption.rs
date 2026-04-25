@@ -799,20 +799,14 @@ pub fn get_combined_translation_config(
             // Upstream `:313`:
             // `config._cfgimpl_values[child._name] = value`.
             //
-            // For leaf options the value is a single `OptionValue`;
-            // for subgroups the value is itself a nested `Config`.
-            // Both shapes are handled by the dict write upstream;
-            // [`Config::set_subconfig`] is the named local helper for
-            // the subgroup case (see its docstring for the
-            // `_cfgimpl_parent` non-fix-up parity note).
-            match value {
-                crate::config::config::ConfigValue::Value(v) => {
-                    config.set_value(name, v)?;
-                }
-                crate::config::config::ConfigValue::SubConfig(sub) => {
-                    config.set_subconfig(name, sub)?;
-                }
-            }
+            // Routed through [`Config::_cfgimpl_set_raw`] which
+            // mirrors PyPy's bare dict write line-by-line: no owner
+            // change, no validation, no requires/suggests cascade.
+            // `setoption(_, _, Owner::User)` would diverge by promoting
+            // the slot's owner to `User`, which downstream owner-
+            // aware readers (`config.py:553` / `:572`) would then see
+            // as a user-set value rather than an inherited default.
+            config._cfgimpl_set_raw(name, value)?;
         }
     }
 

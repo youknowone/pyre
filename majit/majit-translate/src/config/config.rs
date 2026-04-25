@@ -93,8 +93,23 @@ impl std::error::Error for NoMatchingOptionFound {}
 #[derive(Debug, Clone)]
 pub enum ConfigError {
     /// Generic config error (upstream's `ConfigError` base class raise
-    /// sites at `:232`, `:367`, `:388`, `:405`).
+    /// sites at `:232`, `:367`, `:388`, `:405`). Upstream catches
+    /// `TypeError` inside `IntOption.setoption` / `FloatOption.setoption`
+    /// / `StrOption.setoption` and re-wraps as `ConfigError(*e.args)` —
+    /// those raise sites land here.
     Generic(String),
+    /// Upstream's uncaught `ValueError` propagated out of
+    /// `IntOption.setoption` / `FloatOption.setoption` when the value
+    /// is a non-numeric string. Upstream's `int("abc")` /
+    /// `float("abc")` raises `ValueError`, NOT `TypeError`, so the
+    /// `except TypeError` block at `:366-367` / `:387-388` does not
+    /// catch it — the exception propagates to the caller as a
+    /// distinct type. The Rust port mirrors that distinction with a
+    /// dedicated variant so callers that want to discriminate can
+    /// `match` on it (for example, command-line option parsing
+    /// surfaces a different message for "expected an int" vs "option
+    /// not found").
+    ValueError(String),
     /// Upstream `config.py:17 ConflictConfigError(ConfigError)`.
     /// Raised by [`Config::setoption`] when a user mutation would
     /// overwrite a non-default-non-suggested value.
@@ -112,6 +127,7 @@ impl fmt::Display for ConfigError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             ConfigError::Generic(m)
+            | ConfigError::ValueError(m)
             | ConfigError::Conflict(m)
             | ConfigError::Ambigous(m)
             | ConfigError::NoMatch(m)
@@ -560,6 +576,24 @@ impl Option for IntOption {
     /// Upstream `IntOption.setoption` at `:363-367`: coerces via
     /// `int(value)` before delegating to the base `setoption`. Keeps
     /// storage normalised at `OptionValue::Int`.
+    ///
+    /// Error-type parity (PyPy `:364-367`):
+    ///
+    /// ```python
+    /// try:
+    ///     super().setoption(config, int(value), who)
+    /// except TypeError as e:
+    ///     raise ConfigError(*e.args)
+    /// ```
+    ///
+    /// `int("abc")` raises `ValueError`, NOT `TypeError`, so the
+    /// `except TypeError` block does NOT catch it — the
+    /// `ValueError` propagates uncaught to the caller. The Rust port
+    /// mirrors this with [`ConfigError::ValueError`] for the
+    /// non-numeric `Str` parse-failure path; the `TypeError`-
+    /// equivalent arms (an `Arbitrary` or unsupported variant) keep
+    /// using [`ConfigError::Generic`] to mirror the
+    /// `raise ConfigError(*e.args)` lift.
     fn setoption(
         &self,
         config: &Rc<Config>,
@@ -573,16 +607,19 @@ impl Option for IntOption {
             OptionValue::Str(s) => match s.trim().parse::<i64>() {
                 Ok(v) => OptionValue::Int(v),
                 Err(_) => {
-                    return Err(ConfigError::Generic(format!(
-                        "invalid value {:?}, expected integer",
-                        value
+                    // PyPy `int("abc")` raises ValueError uncaught.
+                    return Err(ConfigError::ValueError(format!(
+                        "invalid literal for int() with base 10: {:?}",
+                        s
                     )));
                 }
             },
             OptionValue::None if who == Owner::Default => OptionValue::None,
             _ => {
+                // PyPy `int(<unsupported>)` raises TypeError caught and
+                // re-wrapped as `ConfigError(*e.args)`.
                 return Err(ConfigError::Generic(format!(
-                    "invalid value {:?}, expected integer",
+                    "int() argument must be a string or a number, not {:?}",
                     value
                 )));
             }
@@ -653,6 +690,10 @@ impl Option for FloatOption {
 
     /// Upstream `FloatOption.setoption` at `:384-388`: coerces via
     /// `float(value)` before delegating to the base `setoption`.
+    ///
+    /// Error-type parity: same `ValueError` vs `TypeError` distinction
+    /// as [`IntOption::setoption`] — `float("abc")` raises `ValueError`
+    /// uncaught (the `except TypeError` block doesn't catch it).
     fn setoption(
         &self,
         config: &Rc<Config>,
@@ -666,16 +707,19 @@ impl Option for FloatOption {
             OptionValue::Str(s) => match s.trim().parse::<f64>() {
                 Ok(v) => OptionValue::Float(v),
                 Err(_) => {
-                    return Err(ConfigError::Generic(format!(
-                        "invalid value {:?}, expected float",
-                        value
+                    // PyPy `float("abc")` raises ValueError uncaught.
+                    return Err(ConfigError::ValueError(format!(
+                        "could not convert string to float: {:?}",
+                        s
                     )));
                 }
             },
             OptionValue::None if who == Owner::Default => OptionValue::None,
             _ => {
+                // PyPy `float(<unsupported>)` raises TypeError caught
+                // and re-wrapped as `ConfigError(*e.args)`.
                 return Err(ConfigError::Generic(format!(
-                    "invalid value {:?}, expected float",
+                    "float() argument must be a string or a number, not {:?}",
                     value
                 )));
             }
@@ -1450,29 +1494,66 @@ impl Config {
         self.setoption(name, value, Owner::User)
     }
 
-    /// Upstream `config._cfgimpl_values[child._name] = subgroup`
-    /// at `translationoption.py:313` for the case where `subgroup`
-    /// is itself a nested `Config`. Rebinds the slot to the supplied
-    /// sub-config. Upstream's bare dict write does NOT update
-    /// `subgroup._cfgimpl_parent` either — the grafted sub-Config
-    /// keeps its original parent weak-ref, which only matters for
-    /// `_cfgimpl_get_toplevel` (warnings routing). The Rust port
-    /// reproduces the same shape: insert into the values map without
-    /// touching `_cfgimpl_parent` (which is by-value, not RefCell —
-    /// matching upstream's "no fix-up" semantics structurally).
-    /// Owner is set to `Owner::User` because the upstream caller
-    /// (`translationoption.py:308-313`) is splicing in a config value
-    /// that came from outside the schema's defaults.
-    pub fn set_subconfig(self: &Rc<Self>, name: &str, sub: Rc<Config>) -> Result<(), ConfigError> {
+    /// Port of upstream's bare dict write
+    /// `config._cfgimpl_values[name] = value` at
+    /// `translationoption.py:313` (and any other site that needs to
+    /// graft a value/subgroup into a freshly-constructed Config
+    /// without paying the `setoption` validation / owner / requires
+    /// cascade). PyPy's body is literally one line:
+    ///
+    /// ```python
+    /// config._cfgimpl_values[child._name] = value
+    /// ```
+    ///
+    /// Which means:
+    /// - **No owner update.** `_cfgimpl_value_owners[name]` stays at
+    ///   whatever the schema initialized it to (`'default'` per
+    ///   `config.py:35`). The grafted slot looks like an unmodified
+    ///   default to every downstream owner-aware reader.
+    /// - **No validation.** The `Option.validate(value)` step that
+    ///   `setoption` runs at `:107-111` is skipped.
+    /// - **No requires / suggests cascade.** ChoiceOption /
+    ///   BoolOption side effects from `Option.setoption(:548-589)`
+    ///   never fire.
+    /// - **No `_cfgimpl_parent` fix-up** for the SubConfig variant —
+    ///   the grafted sub-config keeps its original parent weak-ref.
+    ///
+    /// Refuses on a frozen Config to keep symmetry with `set_value`,
+    /// since upstream `__setattr__` at `:64-70` (the only public
+    /// surface that exercises the frozen-check) is also bypassed by
+    /// the raw dict write — but a frozen Config is a documented
+    /// caller bug regardless of the path taken.
+    pub fn _cfgimpl_set_raw(
+        self: &Rc<Self>,
+        name: &str,
+        value: ConfigValue,
+    ) -> Result<(), ConfigError> {
         if self._cfgimpl_frozen.get() {
             return Err(ConfigError::Generic(
                 "trying to change a frozen option object".to_string(),
             ));
         }
-        // Refuse if the slot doesn't exist or is a leaf option —
-        // upstream's dict write would silently corrupt the schema in
-        // the same scenario, so the Rust port surfaces it as an
-        // error instead of papering over a structural mismatch.
+        let entry = match value {
+            ConfigValue::Value(v) => ValueOrSubConfig::Value(v),
+            ConfigValue::SubConfig(sub) => ValueOrSubConfig::SubConfig(sub),
+        };
+        self._cfgimpl_values
+            .borrow_mut()
+            .insert(name.to_string(), entry);
+        Ok(())
+    }
+
+    /// Backwards-compatible wrapper around [`Self::_cfgimpl_set_raw`]
+    /// for the SubConfig graft case. The method name remains for the
+    /// `translationoption.rs` callsite that pre-dates the
+    /// raw-graft helper; new callers should prefer
+    /// [`Self::_cfgimpl_set_raw`] directly.
+    ///
+    /// Refuses if the slot doesn't exist or is a leaf option —
+    /// upstream's dict write would silently corrupt the schema in
+    /// the same scenario, so the Rust port surfaces it as an
+    /// error instead of papering over a structural mismatch.
+    pub fn set_subconfig(self: &Rc<Self>, name: &str, sub: Rc<Config>) -> Result<(), ConfigError> {
         let already_subgroup = matches!(
             self._cfgimpl_values.borrow().get(name),
             Some(ValueOrSubConfig::SubConfig(_))
@@ -1483,13 +1564,7 @@ impl Config {
                 name
             )));
         }
-        self._cfgimpl_values
-            .borrow_mut()
-            .insert(name.to_string(), ValueOrSubConfig::SubConfig(sub));
-        self._cfgimpl_value_owners
-            .borrow_mut()
-            .insert(name.to_string(), Owner::User);
-        Ok(())
+        self._cfgimpl_set_raw(name, ConfigValue::SubConfig(sub))
     }
 
     /// Internal helper — read the raw `OptionValue` stored for `name`.
@@ -1867,5 +1942,100 @@ mod tests {
         let opt =
             ArbitraryOption::new("data", "arbitrary").with_defaultfactory(|| OptionValue::Int(7));
         assert!(matches!(opt.getdefault(), OptionValue::Int(7)));
+    }
+
+    #[test]
+    fn int_option_setoption_value_error_on_non_numeric_string() {
+        // Upstream `config.py:363-367` — `int("abc")` raises
+        // `ValueError`, NOT `TypeError`, so the `except TypeError`
+        // block does not catch it. The Rust port surfaces the same
+        // distinction with `ConfigError::ValueError`.
+        let opt = IntOption::new("count", "row count").with_default(0);
+        let root = Rc::new(OptionDescription::new(
+            "root",
+            "",
+            vec![Child::Option(Rc::new(opt))],
+        ));
+        let c = Config::new(root, HashMap::new()).expect("config");
+        let err = c
+            .set_value("count", OptionValue::Str("abc".to_string()))
+            .unwrap_err();
+        match err {
+            ConfigError::ValueError(msg) => {
+                assert!(
+                    msg.contains("\"abc\""),
+                    "ValueError message should quote the offending string: {msg}"
+                );
+            }
+            other => panic!("expected ValueError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float_option_setoption_value_error_on_non_numeric_string() {
+        // Upstream `config.py:384-388` — same `ValueError` vs
+        // `TypeError` distinction as `IntOption`.
+        let opt = FloatOption::new("rate", "rate").with_default(0.0);
+        let root = Rc::new(OptionDescription::new(
+            "root",
+            "",
+            vec![Child::Option(Rc::new(opt))],
+        ));
+        let c = Config::new(root, HashMap::new()).expect("config");
+        let err = c
+            .set_value("rate", OptionValue::Str("not-a-number".to_string()))
+            .unwrap_err();
+        match err {
+            ConfigError::ValueError(msg) => {
+                assert!(
+                    msg.contains("\"not-a-number\""),
+                    "ValueError message should quote the offending string: {msg}"
+                );
+            }
+            other => panic!("expected ValueError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cfgimpl_set_raw_does_not_change_owner() {
+        // Upstream `translationoption.py:308-313` — the `_cfgimpl_values
+        // [child._name] = value` raw write does NOT touch
+        // `_cfgimpl_value_owners`. The slot stays at whatever the
+        // schema initialized it to (`'default'` per `config.py:35`).
+        let c = Config::new(translation_descr(), HashMap::new()).expect("config");
+        // Confirm baseline owner is Default.
+        let before = c
+            ._cfgimpl_value_owners
+            .borrow()
+            .get("translation")
+            .copied()
+            .unwrap_or(Owner::Default);
+        // `translation` is a SubConfig slot; build a fresh sub-config
+        // and graft it through the raw helper.
+        let child_descr = match c
+            ._cfgimpl_descr
+            ._children
+            .iter()
+            .find(|ch| ch.name() == "translation")
+            .expect("translation child")
+        {
+            Child::Description(d) => Rc::clone(d),
+            _ => panic!("expected SubGroup"),
+        };
+        let sub = Config::new(child_descr, HashMap::new()).expect("sub config");
+        c._cfgimpl_set_raw("translation", ConfigValue::SubConfig(sub))
+            .expect("raw graft");
+        let after = c
+            ._cfgimpl_value_owners
+            .borrow()
+            .get("translation")
+            .copied()
+            .unwrap_or(Owner::Default);
+        // Owner stays the same — the raw write did NOT promote it to
+        // Owner::User as `set_value` would have.
+        assert_eq!(
+            after, before,
+            "_cfgimpl_set_raw must NOT change the slot's owner"
+        );
     }
 }

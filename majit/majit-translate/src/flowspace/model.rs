@@ -25,7 +25,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, Mutex, OnceLock};
 
 use super::bytecode::HostCode;
@@ -3066,7 +3066,16 @@ pub struct GraphFunc {
     /// ported; the flag still rides along on `GraphFunc` so line-by-
     /// line surface with `interactive.py:18 export_symbol(entry_point)`
     /// stays intact.
-    pub exported_symbol: bool,
+    ///
+    /// Wrapped in `Arc<AtomicBool>` so every `Clone`-produced copy of
+    /// the GraphFunc shares the same flag cell — upstream Python's
+    /// in-place mutation `func.exported_symbol = True` is observable
+    /// through every reference because Python objects share identity.
+    /// The Rust port mirrors that by Arc-cloning the AtomicBool so a
+    /// `store(true)` on any clone is observable on every other.
+    /// `Relaxed` ordering is sufficient — there is no other shared
+    /// memory whose visibility this flag synchronizes with.
+    pub exported_symbol: Arc<AtomicBool>,
     /// Upstream `func._llfnobjattrs_` consumed by
     /// `lltype.getfunctionptr()`. It can force `_name`, `_callable`, or
     /// arbitrary fields on the low-level function object.
@@ -3103,7 +3112,7 @@ impl GraphFunc {
             _generator_next_method_of_: None,
             _jit_look_inside_: None,
             relax_sig_check: None,
-            exported_symbol: false,
+            exported_symbol: Arc::new(AtomicBool::new(false)),
             _llfnobjattrs_: HashMap::new(),
             globals,
             closure: Vec::new(),

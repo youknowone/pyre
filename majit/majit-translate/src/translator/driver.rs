@@ -187,79 +187,38 @@ impl ProfInstrument {
 /// downcast to its own argtype shape when it lands.
 pub type EntryPointSpec = (Rc<dyn Any>, Vec<Rc<dyn Any>>);
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum CBuilderKind {
-    Standalone,
-    Library,
+/// Carrier for the `libdef` argument upstream `setup_library(self,
+/// libdef, …)` reads at `driver.py:212-216`. Upstream's `libdef` is a
+/// duck-typed object supplied by carbonpython (the only consumer per
+/// the upstream `# Used by carbon python only.` comment at `:213`); it
+/// carries a `.functions` attribute that the driver assigns to
+/// `self.secondary_entrypoints` at `:216`.
+///
+/// The Rust port keeps `setup_library`'s `libdef: Rc<dyn Any>` opaque
+/// so any wrapper (e.g. the C-backend's `CLibraryBuilder`) can pass
+/// through; this struct is the minimal shape that downcast at `:216`
+/// recognises so the assignment can be performed without dragging
+/// carbonpython types into the port.
+#[derive(Debug, Clone)]
+pub struct LibDef {
+    pub functions: Vec<EntryPointSpec>,
 }
 
-#[derive(Clone, Debug)]
-pub struct DatabaseState;
-
-#[derive(Clone, Debug)]
-pub struct CBuilderState {
-    pub kind: CBuilderKind,
-    pub modulename: Option<String>,
-    pub targetdir: PathBuf,
-    pub executable_name: PathBuf,
-    pub shared_library_name: Option<PathBuf>,
-    pub executable_name_w: Option<PathBuf>,
-}
-
-impl CBuilderState {
-    fn standalone() -> Self {
-        Self {
-            kind: CBuilderKind::Standalone,
-            modulename: None,
-            targetdir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            executable_name: PathBuf::from("pypy-c"),
-            shared_library_name: None,
-            executable_name_w: None,
-        }
-    }
-
-    fn library(name: Option<String>) -> Self {
-        let modulename = name.clone();
-        Self {
-            kind: CBuilderKind::Library,
-            modulename,
-            targetdir: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
-            executable_name: PathBuf::from(name.unwrap_or_else(|| "libtesting".to_string())),
-            shared_library_name: None,
-            executable_name_w: None,
-        }
-    }
-
-    fn missing_leaf(&self, leaf: &str) -> TaskError {
-        TaskError {
-            message: format!(
-                "driver.py C backend leaf not ported for {:?}: {leaf}",
-                self.kind
-            ),
-        }
-    }
-
-    pub fn build_database(&self) -> Result<DatabaseState, TaskError> {
-        Err(self.missing_leaf("cbuilder.build_database()"))
-    }
-
-    pub fn generate_source(
-        &self,
-        _database: &DatabaseState,
-        _defines: &HashMap<String, String>,
-        _exe_name: Option<String>,
-    ) -> Result<PathBuf, TaskError> {
-        Err(self.missing_leaf("cbuilder.generate_source(database, defines, exe_name=...)"))
-    }
-
-    pub fn compile(&self, _exe_name: Option<String>) -> Result<(), TaskError> {
-        Err(self.missing_leaf("cbuilder.compile(**kwds)"))
-    }
-
-    pub fn get_entry_point(&self) -> Result<PathBuf, TaskError> {
-        Err(self.missing_leaf("cbuilder.get_entry_point()"))
+impl LibDef {
+    /// Constructor matching upstream's `LibDef(functions=...)` shape.
+    pub fn new(functions: Vec<EntryPointSpec>) -> Self {
+        Self { functions }
     }
 }
+
+// Upstream `CStandaloneBuilder` / `CLibraryBuilder` / `LowLevelDatabase`
+// types live in `crate::translator::c::{genc, dlltool}` matching upstream
+// module paths (`rpython/translator/c/genc.py` /
+// `rpython/translator/c/dlltool.py`). The `CBuilderRef` sum type below
+// stitches the two subclasses into the single `self.cbuilder` slot the
+// driver tasks read at `:435`, `:444`, `:531-541`.
+pub use crate::translator::c::CBuilderRef;
+pub use crate::translator::c::genc::LowLevelDatabase as DatabaseState;
 
 // Upstream `entrypoint.py:1`: `secondary_entrypoints = {"main": []}`.
 // Stored thread-local because `Rc<dyn Any>` is not `Sync`.
@@ -278,6 +237,36 @@ pub fn secondary_entrypoints_get(key: &str) -> Option<Vec<EntryPointSpec>> {
     SECONDARY_ENTRYPOINTS.with(|s| s.borrow().get(key).cloned())
 }
 
+/// Typed registration helper mirroring upstream
+/// `secondary_entrypoints.setdefault(key, []).append((func, argtypes))`
+/// at `entrypoint.py:1` (the only mutator in upstream's import path).
+///
+/// `func` is a [`HostObject`] — the only callable shape `task_annotate`
+/// at `:308-312` knows how to feed to `annotator.build_types`. Each
+/// element of `inputtypes` is an [`AnnotationSpec`] carried through
+/// `Rc::new` so the storage slot's `Rc<dyn Any>` shape downcasts back
+/// at task time. An empty `inputtypes` list means a 0-arg function,
+/// matching upstream's `[]` literal at the call site (NOT upstream's
+/// `Ellipsis` sentinel — Ellipsis support is currently DEFERRED, no
+/// in-tree caller has requested it).
+pub fn secondary_entrypoints_register(
+    key: &str,
+    func: crate::flowspace::model::HostObject,
+    inputtypes: Vec<crate::annotator::signature::AnnotationSpec>,
+) {
+    let func_any: Rc<dyn Any> = Rc::new(func);
+    let inputs_any: Vec<Rc<dyn Any>> = inputtypes
+        .into_iter()
+        .map(|s| Rc::new(s) as Rc<dyn Any>)
+        .collect();
+    SECONDARY_ENTRYPOINTS.with(|s| {
+        s.borrow_mut()
+            .entry(key.to_string())
+            .or_default()
+            .push((func_any, inputs_any));
+    });
+}
+
 /// All registered keys (used by upstream's `secondary_entrypoints.keys()`
 /// at `:207` for the missing-key error message).
 pub fn secondary_entrypoints_keys() -> Vec<String> {
@@ -293,6 +282,22 @@ thread_local! {
 /// Read-only view of upstream `entrypoint.py:8 annotated_jit_entrypoints`.
 pub fn annotated_jit_entrypoints_get() -> Vec<EntryPointSpec> {
     ANNOTATED_JIT_ENTRYPOINTS.with(|s| s.borrow().clone())
+}
+
+/// Typed registration helper for upstream
+/// `entrypoint.py:8 annotated_jit_entrypoints.append((func, argtypes))`.
+/// Same shape as [`secondary_entrypoints_register`] — see that helper's
+/// doc for the typed → opaque-slot conversion rationale.
+pub fn annotated_jit_entrypoints_register(
+    func: crate::flowspace::model::HostObject,
+    inputtypes: Vec<crate::annotator::signature::AnnotationSpec>,
+) {
+    let func_any: Rc<dyn Any> = Rc::new(func);
+    let inputs_any: Vec<Rc<dyn Any>> = inputtypes
+        .into_iter()
+        .map(|s| Rc::new(s) as Rc<dyn Any>)
+        .collect();
+    ANNOTATED_JIT_ENTRYPOINTS.with(|s| s.borrow_mut().push((func_any, inputs_any)));
 }
 
 // ---------------------------------------------------------------------
@@ -485,8 +490,10 @@ pub struct TranslationDriver {
     /// before calling `warmspot.apply_jit`.
     pub jitpolicy: RefCell<Option<Rc<dyn Any>>>,
 
-    /// Upstream `self.cbuilder`, written by `task_database_c`.
-    pub cbuilder: RefCell<Option<CBuilderState>>,
+    /// Upstream `self.cbuilder`, written by `task_database_c`. Holds
+    /// either a `CStandaloneBuilder` or a `CLibraryBuilder` per the
+    /// `if standalone:` branch at `:419-432`.
+    pub cbuilder: RefCell<Option<CBuilderRef>>,
 
     /// Upstream `self.database`, written by `task_database_c`.
     pub database: RefCell<Option<DatabaseState>>,
@@ -813,15 +820,10 @@ impl TranslationDriver {
 
         // Upstream `:113`: `for task in self.tasks:` — iteration order
         // is the dict order upstream, which since Python 3.7 is
-        // insertion order. Rust's `HashMap` doesn't preserve insertion
-        // order; sort task names so the resulting `self.exposed`
-        // ordering is deterministic across runs (the test reads it as
-        // a set, but determinism aids debugging).
-        let task_names: Vec<String> = {
-            let mut names: Vec<String> = self.engine.tasks().keys().cloned().collect();
-            names.sort();
-            names
-        };
+        // insertion order. Engine's `task_order` sidecar mirrors that
+        // trail so the resulting `self.exposed` ordering matches
+        // upstream's verbatim.
+        let task_names: Vec<String> = self.engine.task_names_in_registration_order();
 
         for task_name in task_names {
             let explicit_task = task_name.clone();
@@ -1126,9 +1128,15 @@ impl TranslationDriver {
         // Upstream `:215`: `self.libdef = libdef`.
         *self.libdef.borrow_mut() = Some(libdef.clone());
         // Upstream `:216`: `self.secondary_entrypoints = libdef.functions`.
-        // DEFERRED — `libdef.functions` shape lives in the C-backend
-        // (`rpython/translator/c/dlltool.py`) port, not yet ported.
-        let _ = libdef;
+        // RPython attribute access raises `AttributeError` when the
+        // object does not expose `.functions`. The Rust port surfaces a
+        // [`TaskError`] on the equivalent downcast failure so non-
+        // [`LibDef`] carriers cannot silently end up with empty
+        // `secondary_entrypoints`.
+        let ld = libdef.downcast_ref::<LibDef>().ok_or_else(|| TaskError {
+            message: "driver.py:216 setup_library: libdef has no `.functions` attribute (downcast to LibDef failed)".to_string(),
+        })?;
+        *self.secondary_entrypoints.borrow_mut() = ld.functions.clone();
         Ok(())
     }
 
@@ -1138,12 +1146,17 @@ impl TranslationDriver {
     /// `self.config.translation.instrument*` for the child, drives
     /// `self.proceed('compile')`, then reads `_instrument_counters` out
     /// of `udir`. None of those are ported here (`os.fork` /
-    /// `udir` / C-backend `compile` task / `array.array` reading). The
-    /// signature stays so callers compile.
-    pub fn instrument_result(&self, _args: &[Rc<dyn Any>]) -> ! {
-        unimplemented!(
-            "driver.py:218 instrument_result — leaves os.fork + udir + C-backend compile not yet ported"
-        );
+    /// `udir` / C-backend `compile` task / `array.array` reading).
+    ///
+    /// Upstream returns the `counters` array (`array.array('L')`,
+    /// unsigned long); the local port returns `Vec<u64>` matching the
+    /// `'L'` typecode on a 64-bit host. Until the leaf lands, the
+    /// function surfaces a [`TaskError`] citing `:218` so callers see
+    /// the missing leaf rather than a panic.
+    pub fn instrument_result(&self, _args: &[Rc<dyn Any>]) -> Result<Vec<u64>, TaskError> {
+        Err(TaskError {
+            message: "driver.py:218 instrument_result — leaves os.fork + udir + C-backend compile not yet ported".to_string(),
+        })
     }
 
     /// Upstream `info(self, msg)` at `:250-251`.
@@ -1155,12 +1168,24 @@ impl TranslationDriver {
 
     /// Upstream `_profile(self, goal, func)` at `:253-260`. DEFERRED —
     /// requires `cProfile.Profile` + `KCacheGrind`, neither ported.
+    ///
+    /// Upstream's body ends with `return d['res']` where `d['res']`
+    /// captures the value of `func()` ran inside `prof.runctx`. The
+    /// Rust port preserves that contract by returning the `func`
+    /// closure's `Result<TaskOutput, TaskError>` shape — but since
+    /// neither cProfile nor KCacheGrind is ported, the function
+    /// surfaces a [`TaskError`] citing `:253` instead of running the
+    /// callable. Callers (the `_do` PROFILE branch at `:275-278`) treat
+    /// the error as a translation failure, which matches upstream's
+    /// fail-loud semantics when profiling is requested but unavailable.
     pub fn _profile(
         &self,
         _goal: &str,
         _func: &Rc<dyn Fn() -> Result<TaskOutput, TaskError>>,
-    ) -> ! {
-        unimplemented!("driver.py:253 _profile — leaf cProfile.Profile not ported");
+    ) -> Result<TaskOutput, TaskError> {
+        Err(TaskError {
+            message: "driver.py:253 _profile — leaf cProfile.Profile not ported".to_string(),
+        })
     }
 
     // -----------------------------------------------------------------
@@ -1233,19 +1258,59 @@ impl TranslationDriver {
         // [`Self::annotator`] for the Rust-port adaptation rationale.
         *self.annotator.borrow_mut() = Some(Rc::clone(&annotator));
 
-        // Upstream `:308-312`: secondary entrypoints loop. The local
-        // `EntryPointSpec` carries `(Rc<dyn Any>, Vec<Rc<dyn Any>>)` —
-        // the upstream `(func, inputtypes)` shape isn't downcastable
-        // to a typed `(HostObject, Vec<AnnotationSpec>)` pair without
-        // an Any-narrowing step. Once
-        // `rlib::entrypoint::secondary_entrypoints` ports the typed
-        // shape, this loop becomes the upstream `for func, inputtypes
-        // in self.secondary_entrypoints:` straight-port.
-        // DEFERRED — body is currently a no-op; the empty-registry
-        // shape matches upstream's "no secondary entrypoints" path.
-        for (_func_any, _inputtypes_any) in self.secondary_entrypoints.borrow().iter() {
-            // upstream: `if inputtypes == Ellipsis: continue;
-            // annotator.build_types(func, inputtypes, False)`.
+        // Upstream `:308-312`:
+        //
+        //     if self.secondary_entrypoints is not None:
+        //         for func, inputtypes in self.secondary_entrypoints:
+        //             if inputtypes == Ellipsis:
+        //                 continue
+        //             annotator.build_types(func, inputtypes, False)
+        //
+        // The local `EntryPointSpec` carries `(Rc<dyn Any>,
+        // Vec<Rc<dyn Any>>)` — registrants seed the slots through
+        // [`secondary_entrypoints_register`], which wraps a typed
+        // `HostObject` + `Vec<AnnotationSpec>` pair. The loop
+        // downcasts back at consume time. Ellipsis support is DEFERRED
+        // (no in-tree caller registers an Ellipsis sentinel yet — see
+        // the `secondary_entrypoints_register` doc); empty inputtypes
+        // are treated as upstream's `[]` "0-arg call", matching the
+        // typed-helper contract.
+        let entries: Vec<EntryPointSpec> = self.secondary_entrypoints.borrow().clone();
+        for (func_any, inputtypes_any) in entries.into_iter() {
+            // upstream: `for func, inputtypes in self.secondary_entrypoints:`
+            let host = match func_any.downcast_ref::<HostObject>() {
+                Some(h) => h.clone(),
+                None => {
+                    // Untyped carriers (raw `Rc<dyn Any>` slots) cannot
+                    // be fed to `build_types`. Skip silently — matches
+                    // the registry's pre-typed-helper era contract.
+                    continue;
+                }
+            };
+            let mut specs: Vec<crate::annotator::signature::AnnotationSpec> =
+                Vec::with_capacity(inputtypes_any.len());
+            let mut typed = true;
+            for it in inputtypes_any.iter() {
+                match it.downcast_ref::<crate::annotator::signature::AnnotationSpec>() {
+                    Some(s) => specs.push(s.clone()),
+                    None => {
+                        typed = false;
+                        break;
+                    }
+                }
+            }
+            if !typed {
+                continue;
+            }
+            // upstream: `annotator.build_types(func, inputtypes, False)`.
+            // The trailing `False` is `complete_now`; upstream's
+            // `main_entry_point` defaults to False here too — only the
+            // `:314-316` call uses `main_entry_point=True`.
+            annotator
+                .build_types(&host, &specs, false, false)
+                .map_err(|e| TaskError {
+                    message: format!("annotator.build_types (secondary): {e}"),
+                })?;
         }
 
         // Upstream `:314-318`: optional `s = annotator.build_types(
@@ -1388,10 +1453,26 @@ impl TranslationDriver {
     }
 
     /// Upstream `task_pyjitpl_lltype(self)` at `:347-363`.
+    ///
+    /// Cross-crate boundary note (PRE-EXISTING-ADAPTATION):
+    /// upstream `:359-360` calls
+    /// `rpython.jit.metainterp.warmspot.apply_jit`, which would map to
+    /// `majit_metainterp::warmspot::apply_jit`. `majit-translate` does
+    /// **not** depend on `majit-metainterp` (the dependency runs the
+    /// other way per `majit-metainterp/Cargo.toml`), so the call has no
+    /// in-crate path. Convergence: register the apply-jit hook from
+    /// `majit-metainterp` via a thread-local (similar to
+    /// [`set_compile_jitcode_fn`](crate::jit_codewriter)) once
+    /// `warmspot.rs` lands. Until then the body assembles every
+    /// upstream-shaped argument it can (`policy`, `backend_name`,
+    /// `inline=True`) and surfaces a TaskError citing `:358`.
     pub fn task_pyjitpl_lltype(&self) -> Result<TaskOutput, TaskError> {
         let translator = self.translator.borrow().clone().ok_or_else(|| TaskError {
             message: "task_pyjitpl_lltype: translator slot is unset".to_string(),
         })?;
+        // Upstream `:351-357`: `get_policy = self.extra.get('jitpolicy',
+        // None); if get_policy is None: self.jitpolicy = JitPolicy()
+        // else: self.jitpolicy = get_policy(self)`.
         let get_policy = self.extra.borrow().get("jitpolicy").cloned();
         if get_policy.is_none() {
             *self.jitpolicy.borrow_mut() = Some(Rc::new(
@@ -1403,23 +1484,32 @@ impl TranslationDriver {
                 "calling extra['jitpolicy'](self) to build the JIT policy",
             ));
         }
+        // Upstream `:360-361`: `apply_jit(self.translator,
+        // policy=self.jitpolicy,
+        // backend_name=self.config.translation.jit_backend, inline=True)`.
         let backend_name = self
             .read_choice("translation.jit_backend")
             .unwrap_or_else(|| "auto".to_string());
         let _ = (translator, backend_name);
         Err(self.missing_task_leaf(
             358,
-            "rpython.jit.metainterp.warmspot.apply_jit(translator, policy=..., backend_name=..., inline=True)",
+            "rpython.jit.metainterp.warmspot.apply_jit(translator, policy=..., backend_name=..., inline=True) — cross-crate dependency on majit-metainterp not yet wired",
         ))
     }
 
     /// Upstream `task_jittest_lltype(self)` at `:365-376`.
     pub fn task_jittest_lltype(&self) -> Result<TaskOutput, TaskError> {
-        // Upstream first creates a restartable checkpoint:
-        // `unixcheckpoint.restartable_point(auto='run')`. The
-        // checkpoint leaf is not ported; keep the call site as a
-        // no-op until `unixcheckpoint` lands, then continue to the
-        // actual test leaf.
+        // Upstream `:371-372`: `from rpython.translator.goal import
+        // unixcheckpoint; unixcheckpoint.restartable_point(auto='run')`.
+        crate::translator::goal::unixcheckpoint::restartable_point(Some("run"))?;
+        // Upstream `:374-376`: `from rpython.jit.tl import jittest;
+        // jittest.jittest(self)`. The `jittest.jittest` body lives at
+        // `rpython/jit/tl/jittest.py:26-38` and itself calls
+        // `LLInterpreter(driver.translator.rtyper)` +
+        // `apply_jit(jitpolicy, interp, graph, LLGraphCPU)` from
+        // `warmspot`. Both `apply_jit` (cross-crate to majit-metainterp)
+        // and `LLGraphCPU` (rpython/jit/backend/llgraph) are not yet
+        // ported; surface a TaskError citing upstream `:375`.
         Err(self.missing_task_leaf(375, "rpython.jit.tl.jittest.jittest(self)"))
     }
 
@@ -1428,11 +1518,15 @@ impl TranslationDriver {
         let translator = self.translator.borrow().clone().ok_or_else(|| TaskError {
             message: "task_backendopt_lltype: translator slot is unset".to_string(),
         })?;
-        let _ = translator;
-        Err(self.missing_task_leaf(
-            383,
-            "rpython.translator.backendopt.all.backend_optimizations(self.translator, replace_we_are_jitted=True)",
-        ))
+        // Upstream `:383`: `from rpython.translator.backendopt.all import
+        // backend_optimizations` → `backend_optimizations(self.translator,
+        // replace_we_are_jitted=True)`.
+        let mut kwds = HashMap::new();
+        kwds.insert("replace_we_are_jitted".to_string(), OptionValue::Bool(true));
+        crate::translator::backendopt::all::backend_optimizations(
+            translator, None, false, false, kwds,
+        )?;
+        Ok(None)
     }
 
     /// Upstream `task_stackcheckinsertion_lltype(self)` at `:388-392`.
@@ -1448,8 +1542,31 @@ impl TranslationDriver {
     }
 
     /// Upstream `possibly_check_for_boehm(self)` at `:395-403`.
-    /// DEFERRED — requires `rpython.rtyper.tool.rffi_platform.configure_boehm`
-    /// and `rpython.translator.platform.CompilationError`.
+    ///
+    /// ```python
+    /// def possibly_check_for_boehm(self):
+    ///     if self.config.translation.gc == "boehm":
+    ///         from rpython.rtyper.tool.rffi_platform import configure_boehm
+    ///         from rpython.translator.platform import CompilationError
+    ///         try:
+    ///             configure_boehm(self.translator.platform)
+    ///         except CompilationError as e:
+    ///             i = 'Boehm GC not installed.  Try e.g. "translate.py --gc=minimark"'
+    ///             raise Exception(str(e) + '\n' + i)
+    /// ```
+    ///
+    /// **PRE-EXISTING-ADAPTATION** — `rpython.rtyper.tool.rffi_platform`
+    /// (`pypy/rpython/rtyper/tool/rffi_platform.py`) and
+    /// `rpython.translator.platform` (`pypy/rpython/translator/platform/__init__.py`)
+    /// are not ported. The configure_boehm probe links a tiny C
+    /// program against `libgc-dev` to verify the headers + lib are
+    /// installed; without those ports we cannot run the probe, so the
+    /// branch returns `Ok(())` even when `gc=boehm`. Convergence path:
+    /// once `translator.platform` ports, the body becomes the
+    /// upstream try/except shape verbatim — until then, callers that
+    /// set `gc=boehm` skip the verification step at runtime (matching
+    /// upstream behaviour on hosts where Boehm is installed; mismatch
+    /// only on hosts where it is *not*, where upstream raises).
     pub fn possibly_check_for_boehm(&self) -> Result<(), TaskError> {
         // Upstream `:396`: `if self.config.translation.gc == "boehm":`.
         let gc = match self.config.get("translation.gc") {
@@ -1458,51 +1575,99 @@ impl TranslationDriver {
         };
         if gc == "boehm" {
             // Upstream `:397-403`: probe the platform for libgc-dev.
-            // DEFERRED — until rffi_platform ports, just succeed; this
-            // matches the runtime behaviour on any host where Boehm is
-            // installed.
+            // PRE-EXISTING-ADAPTATION — see the doc-comment above for
+            // the convergence path.
         }
         Ok(())
     }
 
     /// Upstream `task_database_c(self)` at `:408-438`.
     pub fn task_database_c(&self) -> Result<TaskOutput, TaskError> {
+        // Upstream `:411`: `translator = self.translator`.
         let translator = self.translator.borrow().clone().ok_or_else(|| TaskError {
             message: "task_database_c: translator slot is unset".to_string(),
         })?;
+        // Upstream `:412-413`: `if translator.annotator is not None:
+        // translator.frozen = True`.
         if translator.annotator().is_some() {
             translator.frozen.set(true);
         }
 
+        // Upstream `:415`: `standalone = self.standalone`.
         let standalone = self.standalone.get();
+        // Upstream `:416-417`: `get_gchooks = self.extra.get('get_gchooks',
+        // lambda: None); gchooks = get_gchooks()`.
         let get_gchooks = self.extra.borrow().get("get_gchooks").cloned();
         if get_gchooks.is_some() {
-            return Err(self.missing_task_leaf(414, "calling extra['get_gchooks']()"));
+            return Err(self.missing_task_leaf(417, "calling extra['get_gchooks']()"));
         }
+        let gchooks: Option<Rc<dyn Any>> = None;
 
-        let cbuilder = if standalone {
-            let _ = (
+        // Upstream `:419-432`: `if standalone:` constructs
+        // `CStandaloneBuilder` else `CLibraryBuilder` with the same
+        // (translator, entry_point, config, gchooks=gchooks,
+        // secondary_entrypoints=secondary + annotated_jit) shape.
+        let secondary = self.secondary_entrypoints.borrow().clone();
+        let annotated = annotated_jit_entrypoints_get();
+        let mut secondary_combined: Vec<EntryPointSpec> = secondary.clone();
+        secondary_combined.extend(annotated.clone());
+        let entry_point = self.entry_point.borrow().clone();
+        let config = self.config.clone();
+        let cbuilder: CBuilderRef = if standalone {
+            // Upstream `:420-424`:
+            //     cbuilder = CStandaloneBuilder(self.translator,
+            //         self.entry_point, config=self.config, gchooks=gchooks,
+            //         secondary_entrypoints=
+            //             self.secondary_entrypoints +
+            //             annotated_jit_entrypoints)
+            CBuilderRef::Standalone(crate::translator::c::genc::CStandaloneBuilder::new(
                 translator,
-                self.entry_point.borrow().clone(),
-                self.config.clone(),
-                self.secondary_entrypoints.borrow().clone(),
-                annotated_jit_entrypoints_get(),
-            );
-            CBuilderState::standalone()
+                entry_point,
+                config,
+                None,
+                gchooks,
+                secondary_combined,
+            ))
         } else {
-            let _functions = {
-                let mut functions = Vec::new();
-                if let Some(entry) = self.entry_point.borrow().clone() {
-                    functions.push((Rc::new(entry) as Rc<dyn Any>, Vec::new()));
-                }
-                functions.extend(self.secondary_entrypoints.borrow().clone());
-                functions.extend(annotated_jit_entrypoints_get());
-                functions
-            };
-            CBuilderState::library(self.extmod_name.borrow().clone())
+            // Upstream `:426-432`: build the `functions` list and
+            // construct `CLibraryBuilder(translator, entry_point,
+            // functions=functions, name='libtesting', config=config,
+            // gchooks=gchooks)`.
+            let mut functions: Vec<EntryPointSpec> = Vec::new();
+            if let Some(entry) = entry_point.clone() {
+                functions.push((Rc::new(entry) as Rc<dyn Any>, Vec::new()));
+            }
+            functions.extend(secondary);
+            functions.extend(annotated);
+            // Upstream `:430`: `name='libtesting'` — overridden in
+            // `:434` if `not standalone:` by `cbuilder.modulename =
+            // self.extmod_name`. The local port keeps the upstream
+            // default and lets the `extmod_name` override happen
+            // post-construction.
+            let name = self
+                .extmod_name
+                .borrow()
+                .clone()
+                .unwrap_or_else(|| "libtesting".to_string());
+            CBuilderRef::Library(crate::translator::c::dlltool::CLibraryBuilder::new(
+                translator,
+                entry_point,
+                config,
+                functions,
+                name,
+                None,
+                gchooks,
+                Vec::new(),
+            ))
         };
+        // Upstream `:433-434`: `if not standalone: cbuilder.modulename =
+        // self.extmod_name`. The local port already wires
+        // `extmod_name` into the `CLibraryBuilder.name` slot above.
+        // Upstream `:435`: `database = cbuilder.build_database()`.
         let database = cbuilder.build_database()?;
+        // Upstream `:436`: `self.log.info("...")`.
         self.info("database for generating C source was created");
+        // Upstream `:437-438`: `self.cbuilder = cbuilder; self.database = database`.
         *self.cbuilder.borrow_mut() = Some(cbuilder);
         *self.database.borrow_mut() = Some(database);
         Ok(None)
@@ -1536,7 +1701,7 @@ impl TranslationDriver {
         let c_source_filename = cbuilder.generate_source(&database, &defines, exe_name)?;
         self.info(&format!("written: {}", c_source_filename.display()));
         if self.read_bool("translation.dump_static_data_info") {
-            let _targetdir = cbuilder.targetdir.clone();
+            let _targetdir = cbuilder.targetdir();
             return Err(self.missing_task_leaf(
                 456,
                 "rpython.translator.tool.staticsizereport.dump_static_data_info(...)",
@@ -1596,7 +1761,7 @@ impl TranslationDriver {
                 newexename.display()
             ));
             if let Some(cbuilder) = self.cbuilder.borrow().clone() {
-                if let Some(soname) = cbuilder.shared_library_name {
+                if let Some(soname) = cbuilder.shared_library_name() {
                     let newsoname =
                         newexename.with_file_name(soname.file_name().ok_or_else(|| TaskError {
                             message: "create_exe: shared_library_name has no basename".to_string(),
@@ -1613,7 +1778,7 @@ impl TranslationDriver {
                         soname.display(),
                         newsoname.display()
                     ));
-                    if cbuilder.executable_name_w.is_some() {
+                    if cbuilder.executable_name_w().is_some() {
                         return Err(self.missing_task_leaf(
                             490,
                             "Windows pypyw/import-library/pdb/libffi copy block",
@@ -1654,9 +1819,16 @@ impl TranslationDriver {
         };
         cbuilder.compile(exe_name)?;
         if self.standalone.get() {
-            *self.c_entryp.borrow_mut() = Some(cbuilder.executable_name.clone());
+            // Upstream `:537-539`: `self.c_entryp =
+            // cbuilder.executable_name; self.create_exe()`.
+            let executable = cbuilder.executable_name().ok_or_else(|| TaskError {
+                message: "task_compile_c: cbuilder.executable_name is None after compile()"
+                    .to_string(),
+            })?;
+            *self.c_entryp.borrow_mut() = Some(executable);
             self.create_exe()?;
         } else {
+            // Upstream `:540-541`: `self.c_entryp = cbuilder.get_entry_point()`.
             *self.c_entryp.borrow_mut() = Some(cbuilder.get_entry_point()?);
         }
         Ok(None)
@@ -1664,20 +1836,45 @@ impl TranslationDriver {
 
     /// Upstream `task_llinterpret_lltype(self)` at `:544-555`.
     pub fn task_llinterpret_lltype(&self) -> Result<TaskOutput, TaskError> {
+        // Upstream `:545`: `from rpython.rtyper.llinterp import LLInterpreter`.
+        use crate::translator::rtyper::llinterp::LLInterpreter;
+        // Upstream `:547`: `translator = self.translator`.
         let translator = self.translator.borrow().clone().ok_or_else(|| TaskError {
             message: "task_llinterpret_lltype: translator slot is unset".to_string(),
         })?;
+        // Upstream `:548`: `interp = LLInterpreter(translator.rtyper)`.
         let rtyper = translator.rtyper().ok_or_else(|| TaskError {
             message: "task_llinterpret_lltype: translator.rtyper slot is unset".to_string(),
         })?;
-        let annotator = translator.annotator().ok_or_else(|| TaskError {
+        let interp = LLInterpreter::new(rtyper, true, None);
+        // Upstream `:549-550`: `bk = translator.annotator.bookkeeper`,
+        // `graph = bk.getdesc(self.entry_point).getuniquegraph()`.
+        // `bookkeeper.getdesc(...).getuniquegraph()` is not yet ported
+        // — once it lands, this becomes the concrete graph fed into
+        // `eval_graph`.
+        let _annotator = translator.annotator().ok_or_else(|| TaskError {
             message: "task_llinterpret_lltype: translator.annotator slot is unset".to_string(),
         })?;
-        let _ = (rtyper, annotator, self.entry_point.borrow().clone());
-        Err(self.missing_task_leaf(
-            546,
-            "rpython.rtyper.llinterp.LLInterpreter(translator.rtyper).eval_graph(...)",
-        ))
+        let _entry = self.entry_point.borrow().clone().ok_or_else(|| TaskError {
+            message: "task_llinterpret_lltype: entry_point slot is unset".to_string(),
+        })?;
+        // Upstream `:551-553`: `v = interp.eval_graph(graph, get_llinterp_args())`.
+        // Use a placeholder graph until `getuniquegraph` lands; the
+        // shell still surfaces the leaf-level TaskError citing
+        // `llinterp.py:84`.
+        let placeholder_graph: Rc<dyn Any> = Rc::new(());
+        let get_args = self
+            .extra
+            .borrow()
+            .get("get_llinterp_args")
+            .cloned()
+            .map(|_| ())
+            .unwrap_or(());
+        let _ = get_args;
+        let v = interp.eval_graph(placeholder_graph, Vec::new(), false)?;
+        // Upstream `:555`: `log.llinterpret("result -> %s" % v)`.
+        self.info(&format!("llinterpret result -> {:?}", v.type_id()));
+        Ok(None)
     }
 
     /// Upstream `proceed(self, goals)` at `:557-570`.
@@ -1734,7 +1931,7 @@ impl TranslationDriver {
         _empty_translator: Option<Rc<super::translator::TranslationContext>>,
         _disable: Vec<String>,
         _default_goal: Option<String>,
-    ) -> Result<Rc<Self>, ConfigError> {
+    ) -> Result<Rc<Self>, TaskError> {
         // The upstream body at `:577-602` is:
         //
         //     if args is None: args = []
@@ -1761,12 +1958,13 @@ impl TranslationDriver {
         // the timer would leave the driver in a half-setup state
         // (no entry_point, no policy, no translator) that any
         // downstream `proceed()` would crash inside
-        // [`Self::task_annotate`] for. Fail fast instead so callers
-        // see the missing leaf rather than a misleading silent OK.
-        unimplemented!(
-            "driver.py:573 from_targetspec — target(driver, args) leaf is c-backend (rpython/translator/goal/targetstandalone.py); \
-             driver.setup tuple-unpack at :587-595 cannot run without it"
-        );
+        // [`Self::task_annotate`] for. Surface a [`TaskError`] citing
+        // the upstream line instead so callers see the missing leaf
+        // (the construction-side counterpart of the per-task
+        // `:218 instrument_result` / `:253 _profile` shells).
+        Err(TaskError {
+            message: "driver.py:573 from_targetspec — target(driver, args) leaf is c-backend (rpython/translator/goal/targetstandalone.py); driver.setup tuple-unpack at :587-595 cannot run without it".to_string(),
+        })
     }
 
     /// Upstream `prereq_checkpt_rtype(self)` at `:604-606`. DEFERRED —
@@ -1785,11 +1983,19 @@ impl TranslationDriver {
         self.prereq_checkpt_rtype()
     }
 
-    /// Upstream `_event(self, kind, goal, func)` at `:610-622`. The
-    /// `fork_before` / `unixcheckpoint.restartable_point` path is
-    /// DEFERRED — it forks the process to support resumable
-    /// translation, which the Rust port has no direct equivalent for.
-    /// The earlycheck branch (`:611-612`) is preserved verbatim.
+    /// Upstream `_event(self, kind, goal, func)` at `:610-622`.
+    ///
+    /// Earlycheck branch (`:611-612`) ports verbatim. The fork-before
+    /// checkpoint at `:613-622` reads
+    /// `config.translation.fork_before`, resolves it through
+    /// `backend_select_goals`, gates on `not done && match goal`, runs
+    /// the optional `prereq_checkpt_<goal>` hook, and dispatches
+    /// `unixcheckpoint.restartable_point(auto='run')`. The Rust port
+    /// mirrors that chain end-to-end; the leaf
+    /// [`super::goal::unixcheckpoint::restartable_point`] currently
+    /// surfaces a [`TaskError`] until the fork / `os.waitpid` / prompt
+    /// loop ports — that error propagates out of `_event_with_func`,
+    /// matching upstream's "fork checkpoint failed" semantics.
     pub fn _event_with_func(
         &self,
         kind: &str,
@@ -1802,10 +2008,7 @@ impl TranslationDriver {
             }
         }
         if kind == "pre" {
-            // Upstream `:614-622`: fork_before checkpoint. DEFERRED —
-            // requires `unixcheckpoint`. The structural read of
-            // `config.translation.fork_before` is preserved so the
-            // shape is grep-detectable.
+            // Upstream `:614`: `fork_before = self.config.translation.fork_before`.
             //
             // `fork_before` is declared as a `ChoiceOption` in
             // `translationoption.rs:400` (upstream `translationoption.py:146-150`),
@@ -1817,9 +2020,39 @@ impl TranslationDriver {
                 Ok(ConfigValue::Value(OptionValue::Choice(s))) => Some(s),
                 _ => None,
             };
-            if let Some(_fb) = fork_before {
-                // DEFERRED: backend_select_goals + done check +
-                // prereq_checkpt + unixcheckpoint.restartable_point.
+            if let Some(fb) = fork_before {
+                // Upstream `:616`: `fork_before, = self.backend_select_goals([fork_before])`.
+                let resolved = self
+                    .backend_select_goals(&[fb.clone()])
+                    .map_err(|e| TaskError {
+                        message: format!("fork_before backend_select_goals({fb:?}): {e}"),
+                    })?;
+                let resolved_fb = match resolved.into_iter().next() {
+                    Some(s) => s,
+                    None => {
+                        return Err(TaskError {
+                            message: format!(
+                                "fork_before backend_select_goals({fb:?}): empty result"
+                            ),
+                        });
+                    }
+                };
+                // Upstream `:617`: `if not fork_before in self.done and fork_before == goal:`.
+                if !self.done.borrow().contains_key(&resolved_fb) && resolved_fb == goal {
+                    // Upstream `:618-620`: optional `prereq_checkpt_<goal>` hook.
+                    // Only `prereq_checkpt_rtype` (and its alias
+                    // `prereq_checkpt_rtype_lltype` at `:607`) are
+                    // declared in the local port — both are no-ops
+                    // matching upstream's "best-effort" intent.
+                    match goal {
+                        "rtype" => self.prereq_checkpt_rtype()?,
+                        "rtype_lltype" => self.prereq_checkpt_rtype_lltype()?,
+                        _ => {}
+                    }
+                    // Upstream `:621-622`: `from rpython.translator.goal import
+                    // unixcheckpoint; unixcheckpoint.restartable_point(auto='run')`.
+                    super::goal::unixcheckpoint::restartable_point(Some("run"))?;
+                }
             }
         }
         let _ = idempotent;
@@ -1909,15 +2142,13 @@ impl TaskEngineHooks for DriverHooks {
         let mut instrument = false;
         let mut res: TaskOutput = None;
         // Upstream `:275-278`: PROFILE branch. DEFERRED — `_profile`
-        // panics when reached; the `PROFILE` set is empty by default
-        // so the branch is unreachable in practice.
+        // surfaces a TaskError citing `driver.py:253` when reached; the
+        // `PROFILE` set is empty by default so the branch is
+        // unreachable in practice.
         let in_profile = profile_contains(goal);
         let result = if in_profile {
             // Upstream `:276`: `res = self._profile(goal, func)`.
-            // DEFERRED.
-            return Err(TaskError {
-                message: format!("driver.py:276 PROFILE — _profile not ported (goal={goal})"),
-            });
+            driver._profile(goal, callable)
         } else {
             callable()
         };
@@ -2391,6 +2622,92 @@ mod tests {
     }
 
     #[test]
+    fn task_backendopt_lltype_dispatches_to_translator_backendopt_all() {
+        // Upstream `:380-384`: the leaf calls
+        // `rpython.translator.backendopt.all.backend_optimizations(
+        // self.translator, replace_we_are_jitted=True)`. The local port
+        // dispatches into `crate::translator::backendopt::all`; verify
+        // the surfaced error cites `all.py:35` so future leaf landings
+        // can stay structurally honest about where the work actually
+        // lives.
+        let td = TranslationDriver::new_default().expect("driver");
+        td.setup(None, None, None, HashMap::new(), None)
+            .expect("setup");
+        let err = td
+            .task_backendopt_lltype()
+            .expect_err("backendopt leaf is still missing");
+        assert!(
+            err.message.contains("all.py:35"),
+            "task_backendopt_lltype must dispatch to `all.py:35 backend_optimizations`, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn task_jittest_lltype_calls_unixcheckpoint_first() {
+        // Upstream `:371-372`: `unixcheckpoint.restartable_point(auto='run')`
+        // runs *before* the jittest module is imported. The local port
+        // dispatches `restartable_point` first and surfaces *its*
+        // TaskError before reaching the cross-crate jittest stub.
+        let td = TranslationDriver::new_default().expect("driver");
+        td.setup(None, None, None, HashMap::new(), None)
+            .expect("setup");
+        let err = td
+            .task_jittest_lltype()
+            .expect_err("jittest leaf is still missing");
+        // The unixcheckpoint shell at `unixcheckpoint.py:7` runs first
+        // — assert that the surfaced error cites the checkpoint, not
+        // the (later) jittest dispatch site.
+        assert!(
+            err.message.contains("unixcheckpoint.py:7"),
+            "task_jittest_lltype must dispatch unixcheckpoint first, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn task_llinterpret_lltype_dispatches_to_translator_rtyper_llinterp() {
+        // Upstream `:545-553`: the leaf imports `LLInterpreter` from
+        // `rpython.rtyper.llinterp` and runs `eval_graph`. The local
+        // port routes through `crate::translator::rtyper::llinterp`
+        // and surfaces `llinterp.py:84` once the entry-point /
+        // annotator slots are populated.
+        use crate::flowspace::rust_source::build_host_function_from_rust;
+        use crate::translator::translator::TranslationContext;
+
+        let item: syn::ItemFn = syn::parse_str("fn main() -> i64 { 0 }").expect("parse");
+        let (host, pygraph) =
+            build_host_function_from_rust(&item, None, None).expect("rust-source adapter");
+
+        let td = TranslationDriver::new_default().expect("driver");
+        let translator = Rc::new(TranslationContext::new());
+        translator.graphs.borrow_mut().push(pygraph.graph.clone());
+        translator
+            ._prebuilt_graphs
+            .borrow_mut()
+            .insert(host.clone(), pygraph);
+
+        td.setup(
+            Some(host),
+            Some(Vec::new()),
+            None,
+            HashMap::new(),
+            Some(translator),
+        )
+        .expect("setup");
+        td.task_annotate().expect("annotate");
+        td.task_rtype_lltype().expect("rtype_lltype");
+        let err = td
+            .task_llinterpret_lltype()
+            .expect_err("llinterpret leaf is still missing");
+        assert!(
+            err.message.contains("llinterp.py:84"),
+            "task_llinterpret_lltype must dispatch to `llinterp.py:84 LLInterpreter.eval_graph`, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn task_database_c_sets_translator_frozen_before_c_backend_leaf() {
         let td = TranslationDriver::new_default().expect("driver");
         td.setup(None, None, None, HashMap::new(), None)
@@ -2407,7 +2724,15 @@ mod tests {
         let err = td
             .task_database_c()
             .expect_err("C backend builder is still a missing leaf");
-        assert!(err.message.contains("cbuilder.build_database"));
+        // Upstream `:435 cbuilder.build_database()` lives in
+        // `genc.py:87 CBuilder.build_database`. The local port routes
+        // the leaf-level TaskError there, so the surfaced message
+        // cites the upstream module.
+        assert!(
+            err.message.contains("genc.py:87"),
+            "expected genc.py:87 citation, got: {}",
+            err.message
+        );
         assert!(
             translator.frozen.get(),
             "task_database_c must mirror driver.py:411 before building the database"
@@ -2432,5 +2757,187 @@ mod tests {
         assert_eq!(read, "hello");
         std::fs::remove_file(&a).ok();
         std::fs::remove_file(&b).ok();
+    }
+
+    /// Upstream `instrument_result(self, args)` at `:218-248` is
+    /// DEFERRED — the Rust port surfaces a [`TaskError`] citing the
+    /// upstream line instead of panicking, so callers see the missing
+    /// leaf. Pinned here so the panic→Result flip cannot regress.
+    #[test]
+    fn instrument_result_returns_task_error_citing_line_218() {
+        let td = TranslationDriver::new_default().expect("driver");
+        let err = td.instrument_result(&[]).expect_err("must be DEFERRED");
+        assert!(
+            err.message.contains("driver.py:218"),
+            "expected `driver.py:218` citation, got: {}",
+            err.message
+        );
+    }
+
+    /// Upstream `_profile(self, goal, func)` at `:253-260` is DEFERRED.
+    /// The Rust port returns a [`TaskError`] citing `:253` so the
+    /// `_do` PROFILE branch (`:275-278`) propagates instead of
+    /// crashing the host.
+    #[test]
+    fn _profile_returns_task_error_citing_line_253() {
+        let td = TranslationDriver::new_default().expect("driver");
+        let callable: Rc<dyn Fn() -> Result<TaskOutput, TaskError>> = Rc::new(|| Ok(None));
+        let err = td
+            ._profile("annotate", &callable)
+            .expect_err("must be DEFERRED");
+        assert!(
+            err.message.contains("driver.py:253"),
+            "expected `driver.py:253` citation, got: {}",
+            err.message
+        );
+    }
+
+    /// Upstream `from_targetspec(cls, targetspec_dic, ...)` at
+    /// `:573-602` is DEFERRED until `targetstandalone.py:target` ports.
+    /// The Rust port returns a [`TaskError`] citing `:573` so callers
+    /// fail fast with a grep-discoverable message.
+    /// `secondary_entrypoints_register` mirrors upstream
+    /// `entrypoint.py:1 secondary_entrypoints.setdefault(key,
+    /// []).append(...)`. The typed (HostObject, Vec<AnnotationSpec>)
+    /// shape downcasts back at `task_annotate :308-312` consume time.
+    #[test]
+    fn secondary_entrypoints_register_round_trips_through_typed_helper() {
+        use crate::annotator::signature::AnnotationSpec;
+        use crate::flowspace::model::{ConstValue, Constant, GraphFunc, HostObject};
+
+        let key = "test_secondary_register_round_trip";
+        let globals = Constant::new(ConstValue::Dict(Default::default()));
+        let gf = GraphFunc::new("demo_secondary", globals);
+        let host = HostObject::new_user_function(gf);
+        secondary_entrypoints_register(key, host.clone(), vec![AnnotationSpec::Int]);
+
+        let entries = secondary_entrypoints_get(key).expect("registered key");
+        assert_eq!(entries.len(), 1);
+        let (func_any, inputs_any) = &entries[0];
+        let func = func_any
+            .downcast_ref::<HostObject>()
+            .expect("HostObject downcast");
+        assert_eq!(func.qualname(), host.qualname());
+        assert_eq!(inputs_any.len(), 1);
+        let spec = inputs_any[0]
+            .downcast_ref::<AnnotationSpec>()
+            .expect("AnnotationSpec downcast");
+        assert!(matches!(spec, AnnotationSpec::Int));
+    }
+
+    /// Upstream `_event(self, "pre", goal, ...)` at `:613-622`: when
+    /// `config.translation.fork_before` is unset (the default), the
+    /// body skips the checkpoint silently. Pinned so the activation
+    /// added in this commit doesn't regress the default-OK path.
+    #[test]
+    fn event_pre_no_fork_before_returns_ok() {
+        let td = TranslationDriver::new_default().expect("driver");
+        td._event_with_func("pre", "rtype_lltype", false)
+            .expect("default fork_before=None must skip body");
+    }
+
+    /// Upstream `_event(self, "pre", goal, ...)` at `:613-622`: when
+    /// `fork_before` matches the resolved goal, the body dispatches
+    /// `unixcheckpoint.restartable_point(auto='run')`. The Rust port's
+    /// `restartable_point` is currently a structural shell citing
+    /// `unixcheckpoint.py:7` — pin that citation propagates out.
+    #[test]
+    fn event_pre_fork_before_matching_goal_propagates_unixcheckpoint_error() {
+        // `fork_before` is a `ChoiceOption` per `translationoption.rs:399-414`
+        // (upstream `translationoption.py:146-150`); the raw value is
+        // one of `["annotate", "rtype", "backendopt", "database",
+        // "source", "pyjitpl"]`. After `backend_select_goals`,
+        // `'rtype'` resolves to `'rtype_lltype'`.
+        let mut setopts: HashMap<String, OptionValue> = HashMap::new();
+        setopts.insert(
+            "fork_before".to_string(),
+            OptionValue::Choice("rtype".to_string()),
+        );
+        let td = TranslationDriver::new(Some(setopts), None, Vec::new(), None, None, None, None)
+            .expect("driver");
+        let err = td
+            ._event_with_func("pre", "rtype_lltype", false)
+            .expect_err("must surface DEFERRED");
+        assert!(
+            err.message.contains("unixcheckpoint.py:7"),
+            "expected unixcheckpoint citation, got: {}",
+            err.message
+        );
+    }
+
+    /// Upstream `_event(self, "pre", goal, ...)` at `:617`: when
+    /// `fork_before` is set but doesn't match the resolved goal
+    /// (e.g. fork_before='rtype' but goal='annotate'), the body skips.
+    /// Pinned so the goal-mismatch path stays observable.
+    #[test]
+    fn event_pre_fork_before_non_matching_goal_returns_ok() {
+        let mut setopts: HashMap<String, OptionValue> = HashMap::new();
+        setopts.insert(
+            "fork_before".to_string(),
+            OptionValue::Choice("rtype".to_string()),
+        );
+        let td = TranslationDriver::new(Some(setopts), None, Vec::new(), None, None, None, None)
+            .expect("driver");
+        // `fork_before='rtype'` resolves to `'rtype_lltype'`; the goal
+        // arg is `'annotate'`, which does not match — body skips.
+        td._event_with_func("pre", "annotate", false)
+            .expect("non-matching goal must skip checkpoint");
+    }
+
+    /// Upstream `setup_library` at `:212-216` ends with
+    /// `self.secondary_entrypoints = libdef.functions`. Pin the
+    /// downcast → assignment chain so the Rust port matches upstream
+    /// for typed [`LibDef`] carriers.
+    #[test]
+    fn setup_library_assigns_libdef_functions_to_secondary_entrypoints() {
+        let td = TranslationDriver::new_default().expect("driver");
+        // Upstream `LibDef(functions=[(func, argtypes)])`. Use the
+        // simplest opaque func / argtypes shape so the assignment is
+        // observable without exercising the annotator.
+        let func: Rc<dyn Any> = Rc::new("the-func".to_string());
+        let libdef = Rc::new(LibDef::new(vec![(func.clone(), Vec::new())])) as Rc<dyn Any>;
+        td.setup_library(libdef, None, HashMap::new(), None)
+            .expect("setup_library");
+        let secondary = td.secondary_entrypoints.borrow().clone();
+        assert_eq!(secondary.len(), 1, "must mirror libdef.functions length");
+        // Verify the inner reference is preserved (Rc::ptr_eq).
+        assert!(
+            Rc::ptr_eq(&secondary[0].0, &func),
+            "must preserve func Rc identity"
+        );
+    }
+
+    /// Untyped `libdef` carriers (e.g. `Rc::new(())`) hit the
+    /// AttributeError-equivalent path: upstream `:216
+    /// libdef.functions` raises on a missing attribute, so the Rust
+    /// port surfaces a [`TaskError`] rather than silently leaving the
+    /// slot empty.
+    #[test]
+    fn setup_library_errors_on_libdef_without_functions_attribute() {
+        let td = TranslationDriver::new_default().expect("driver");
+        let untyped: Rc<dyn Any> = Rc::new(());
+        let err = td
+            .setup_library(untyped, None, HashMap::new(), None)
+            .expect_err("untyped libdef must surface AttributeError-equivalent");
+        assert!(
+            err.message.contains("driver.py:216"),
+            "expected `driver.py:216` citation, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn from_targetspec_returns_task_error_citing_line_573() {
+        let result =
+            TranslationDriver::from_targetspec(HashMap::new(), None, None, None, Vec::new(), None);
+        let err = match result {
+            Ok(_) => panic!("must be DEFERRED"),
+            Err(e) => e,
+        };
+        assert!(
+            err.message.contains("driver.py:573"),
+            "expected `driver.py:573` citation, got: {}",
+            err.message
+        );
     }
 }

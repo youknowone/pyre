@@ -13,3 +13,4 @@
 //! deferred to the corresponding upstream-leaf-driven ports.
 
 pub mod query;
+pub mod unixcheckpoint;

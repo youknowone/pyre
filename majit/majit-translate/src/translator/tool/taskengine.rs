@@ -89,6 +89,89 @@ pub struct TaskRegistration {
 /// `self._plan_cache` at `taskengine.py:19`.
 type PlanKey = (Vec<String>, Vec<String>);
 
+/// Port of upstream's nested `consider(subgoal)` inside `_plan`
+/// (`taskengine.py:41-50`):
+///
+/// ```python
+/// def consider(subgoal):
+///     if subgoal in seen:
+///         return
+///     else:
+///         seen[subgoal] = True
+///     constraints.append([subgoal])
+///     deps = subgoals(subgoal)
+///     for dep in deps:
+///         constraints.append([subgoal, dep])
+///         consider(dep)
+/// ```
+///
+/// Free-function form because Rust closures cannot recurse without
+/// extra plumbing, and `consider` shares mutable state
+/// (`seen` / `constraints`) across calls. `tasks` / `goal_set` /
+/// `skip` are `&` borrows — they don't change inside `_plan`.
+///
+/// The matching upstream `subgoals(task_name)` (`taskengine.py:26-37`)
+/// — the `??` / `?` sigil resolver — is inlined here as the
+/// `resolved_deps` filter, matching the same per-dep emission order.
+fn consider(
+    subgoal: &str,
+    tasks: &HashMap<String, TaskRegistration>,
+    goal_set: &HashSet<&String>,
+    skip: &[String],
+    seen: &mut HashSet<String>,
+    constraints: &mut Vec<Vec<String>>,
+) -> Result<(), TaskError> {
+    // Upstream `:42-43`: `if subgoal in seen: return`.
+    if seen.contains(subgoal) {
+        return Ok(());
+    }
+    // Upstream `:44-45`: `seen[subgoal] = True`.
+    seen.insert(subgoal.to_string());
+    // Upstream `:46`: `constraints.append([subgoal])`.
+    constraints.push(vec![subgoal.to_string()]);
+
+    let reg = tasks.get(subgoal).ok_or_else(|| TaskError {
+        message: format!("SimpleTaskEngine._plan: unknown goal {:?}", subgoal),
+    })?;
+
+    // Upstream nested `subgoals(task_name)` at `:26-37` — apply the
+    // `??` (optional) / `?` (suggested) sigils.
+    let resolved_deps: Vec<String> = reg
+        .deps
+        .iter()
+        .filter_map(|dep| {
+            if let Some(rest) = dep.strip_prefix("??") {
+                // Upstream `:29-32`: optional, only if already in goals.
+                if goal_set.contains(&rest.to_string()) {
+                    Some(rest.to_string())
+                } else {
+                    None
+                }
+            } else if let Some(rest) = dep.strip_prefix('?') {
+                // Upstream `:33-36`: suggested, included unless skipped.
+                if skip.iter().any(|s| s == rest) {
+                    None
+                } else {
+                    Some(rest.to_string())
+                }
+            } else {
+                // Upstream `:37 yield dep` — bare requirement.
+                Some(dep.clone())
+            }
+        })
+        .collect();
+
+    // Upstream `:48-50`: `for dep in deps: constraints.append([subgoal,
+    // dep]); consider(dep)`. The append-then-recurse interleave is the
+    // ordering PyPy's topo picker breaks ties on; preserve it
+    // line-for-line.
+    for dep in &resolved_deps {
+        constraints.push(vec![subgoal.to_string(), dep.clone()]);
+        consider(dep, tasks, goal_set, skip, seen, constraints)?;
+    }
+    Ok(())
+}
+
 /// Port of `rpython/translator/tool/taskengine.py:1-14
 /// SimpleTaskEngine` state.
 ///
@@ -107,6 +190,16 @@ pub struct SimpleTaskEngine {
     /// stores; the Rust port carries the full [`TaskRegistration`] to
     /// preserve `task_title` / `task_idempotent` for subclass hooks.
     tasks: RefCell<HashMap<String, TaskRegistration>>,
+    /// Sidecar to [`tasks`] tracking registration order. Upstream's
+    /// `self.tasks` is a Python dict whose iteration order is the
+    /// insertion order (Python 3.7+); callers like
+    /// `driver.py:113 for task in self.tasks:` observe that order.
+    /// Rust's `HashMap` has no ordering guarantee, so the port mirrors
+    /// the dict-insertion-order trail in this auxiliary `Vec`.
+    /// Re-registering an existing task name preserves the position
+    /// upstream's dict assignment would (`d['k'] = v` keeps `'k'`'s
+    /// position).
+    task_order: RefCell<Vec<String>>,
 }
 
 impl Default for SimpleTaskEngine {
@@ -125,6 +218,7 @@ impl SimpleTaskEngine {
         SimpleTaskEngine {
             _plan_cache: RefCell::new(HashMap::new()),
             tasks: RefCell::new(HashMap::new()),
+            task_order: RefCell::new(Vec::new()),
         }
     }
 
@@ -135,10 +229,11 @@ impl SimpleTaskEngine {
     /// declared deps, and the title / idempotency attributes that
     /// upstream reads via `getattr(task, 'task_deps', [])`.
     ///
-    /// Re-registering under an existing name panics to surface bugs
-    /// early; upstream silently overwrites via dict assignment but the
-    /// strict behaviour flags structural errors (a task defined twice
-    /// is always a subclass mistake).
+    /// Re-registering under an existing name overwrites the entry,
+    /// matching upstream `taskengine.py:14 tasks[task_name] = task,
+    /// task_deps` dict-assignment semantics. The order recorded in
+    /// `task_order` is preserved on overwrite (Python dict assignment
+    /// keeps the existing key's position).
     pub fn register_task(
         &self,
         name: impl Into<String>,
@@ -150,11 +245,9 @@ impl SimpleTaskEngine {
         let name = name.into();
         let title = title.into();
         let mut tasks = self.tasks.borrow_mut();
-        if tasks.contains_key(&name) {
-            panic!(
-                "SimpleTaskEngine::register_task: task {:?} already registered",
-                name
-            );
+        let mut order = self.task_order.borrow_mut();
+        if !tasks.contains_key(&name) {
+            order.push(name.clone());
         }
         tasks.insert(
             name,
@@ -206,57 +299,17 @@ impl SimpleTaskEngine {
         let mut constraints: Vec<Vec<String>> = Vec::new();
         let mut seen: HashSet<String> = HashSet::new();
 
-        // Upstream inner closures `subgoals(task_name)` + `consider(subgoal)`.
-        // Rust has no stable way to express mutual recursion over
-        // closures sharing state; write the same logic iteratively
-        // with an explicit worklist that mirrors the recursion order.
-        let mut worklist: Vec<String> = goals.iter().cloned().collect();
-        while let Some(subgoal) = worklist.pop() {
-            if seen.contains(&subgoal) {
-                continue;
-            }
-            seen.insert(subgoal.clone());
-            constraints.push(vec![subgoal.clone()]);
-
-            let reg = tasks.get(&subgoal).ok_or_else(|| TaskError {
-                message: format!("SimpleTaskEngine._plan: unknown goal {:?}", subgoal),
-            })?;
-
-            // Collect resolved deps (apply `??` / `?` sigils). Upstream
-            // `subgoals(task_name)` iterator at lines 26-37.
-            let mut resolved_deps: Vec<String> = Vec::new();
-            for dep in &reg.deps {
-                let resolved = if let Some(rest) = dep.strip_prefix("??") {
-                    // Optional: only included if already in `goals`.
-                    if goal_set.contains(&rest.to_string()) {
-                        Some(rest.to_string())
-                    } else {
-                        None
-                    }
-                } else if let Some(rest) = dep.strip_prefix('?') {
-                    // Suggested: included unless in `skip`.
-                    if skip.iter().any(|s| s == rest) {
-                        None
-                    } else {
-                        Some(rest.to_string())
-                    }
-                } else {
-                    Some(dep.clone())
-                };
-                if let Some(d) = resolved {
-                    resolved_deps.push(d);
-                }
-            }
-
-            for dep in &resolved_deps {
-                constraints.push(vec![subgoal.clone(), dep.clone()]);
-            }
-            // Upstream recurses into `consider(dep)`. Mirror with push.
-            // Pop order (LIFO) doesn't change the final plan because
-            // the explicit constraint-driven loop below re-sorts.
-            for dep in resolved_deps.into_iter().rev() {
-                worklist.push(dep);
-            }
+        // Upstream `for goal in goals: consider(goal)` at
+        // `taskengine.py:52-53`. Drives `consider` in goal order so
+        // independent goals' constraints are emitted in the same order
+        // PyPy's recursion produces — the topo picker at `:64-69`
+        // breaks ties on this ordering, so a LIFO worklist would
+        // shuffle independent goals' constraints and yield a
+        // *different* plan after the final `plan.reverse()`. The
+        // explicit-recursion `consider` helper below mirrors PyPy's
+        // call-stack recursion verbatim.
+        for goal in goals {
+            consider(goal, &tasks, &goal_set, &skip, &mut seen, &mut constraints)?;
         }
 
         // Upstream `while True: …` at lines 59-76. Repeatedly pick a
@@ -356,6 +409,14 @@ impl SimpleTaskEngine {
     /// `driver.py:113 for task in self.tasks:`.
     pub fn tasks(&self) -> std::cell::Ref<'_, HashMap<String, TaskRegistration>> {
         self.tasks.borrow()
+    }
+
+    /// Task names in registration (== upstream dict-insertion) order.
+    /// Use this when iterating `self.tasks` matters, e.g. in
+    /// `driver.py:113 for task in self.tasks:` whose loop order is
+    /// observable through `self.exposed`.
+    pub fn task_names_in_registration_order(&self) -> Vec<String> {
+        self.task_order.borrow().clone()
     }
 }
 
@@ -504,11 +565,48 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "already registered")]
-    fn register_task_panics_on_duplicate() {
+    fn register_task_overwrites_on_duplicate_preserving_order_position() {
+        // Upstream `taskengine.py:14 tasks[task_name] = task, task_deps`
+        // is dict assignment. Re-registering must overwrite the
+        // callable/deps/title/idempotent and preserve the existing key's
+        // position in the iteration order (Python dict-assignment
+        // semantics).
         let e = SimpleTaskEngine::new();
-        e.register_task("annotate", noop_callable(), vec![], "first", false);
-        e.register_task("annotate", noop_callable(), vec![], "second", false);
+        e.register_task("a", noop_callable(), vec![], "alpha", false);
+        e.register_task("b", noop_callable(), vec![], "bravo", true);
+        e.register_task("a", noop_callable(), vec!["b".to_string()], "alpha2", true);
+
+        let tasks = e.tasks.borrow();
+        let reg_a = tasks.get("a").expect("a is registered");
+        assert_eq!(reg_a.title, "alpha2");
+        assert_eq!(reg_a.deps, vec!["b".to_string()]);
+        assert!(reg_a.idempotent);
+        drop(tasks);
+
+        // Position of "a" stays at index 0 — Python dict assignment
+        // does not re-order existing keys.
+        assert_eq!(
+            e.task_names_in_registration_order(),
+            vec!["a".to_string(), "b".to_string()]
+        );
+    }
+
+    #[test]
+    fn task_names_follow_registration_order() {
+        // Upstream `driver.py:113 for task in self.tasks:` iterates dict
+        // insertion order. Pin the trail.
+        let e = SimpleTaskEngine::new();
+        e.register_task("annotate", noop_callable(), vec![], "a", false);
+        e.register_task("rtype_lltype", noop_callable(), vec![], "r", false);
+        e.register_task("backendopt_lltype", noop_callable(), vec![], "b", false);
+        assert_eq!(
+            e.task_names_in_registration_order(),
+            vec![
+                "annotate".to_string(),
+                "rtype_lltype".to_string(),
+                "backendopt_lltype".to_string(),
+            ]
+        );
     }
 
     #[test]
@@ -526,6 +624,30 @@ mod tests {
         e.register_task("annotate", noop_callable(), vec![], "a", false);
         let plan = e._plan(&["annotate".to_string()], &[]).expect("plan");
         assert_eq!(plan, vec!["annotate".to_string()]);
+    }
+
+    #[test]
+    fn plan_iterates_goals_in_forward_order_after_reverse() {
+        // Upstream `taskengine.py:52-53` — `for goal in goals:
+        // consider(goal)` drives `consider` in goal order.
+        // Constraints land in forward order, then `plan.reverse()` at
+        // `:78` flips the final plan so the LATEST goal lands first.
+        // Fixture: two independent leaves with no deps.
+        //
+        // The pre-fix port used a LIFO worklist
+        // (`worklist.pop()`), which iterated goals in reverse —
+        // producing constraints `[[b], [a]]` instead of `[[a], [b]]`,
+        // and a final plan `[a, b]` instead of `[b, a]`. This test
+        // pins the fix.
+        let e = SimpleTaskEngine::new();
+        e.register_task("a", noop_callable(), vec![], "a", false);
+        e.register_task("b", noop_callable(), vec![], "b", false);
+        let plan = e
+            ._plan(&["a".to_string(), "b".to_string()], &[])
+            .expect("plan");
+        // PyPy trace: consider("a") → [[a]]; consider("b") → [[a],[b]];
+        // topo picks a then b → plan [a,b]; reverse → [b,a].
+        assert_eq!(plan, vec!["b".to_string(), "a".to_string()]);
     }
 
     #[test]

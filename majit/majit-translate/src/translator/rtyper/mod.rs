@@ -12,6 +12,7 @@ pub mod annlowlevel;
 pub mod error;
 pub mod extregistry;
 pub mod llannotation;
+pub mod llinterp;
 pub mod lltypesystem;
 pub mod normalizecalls;
 pub mod pairtype;

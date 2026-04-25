@@ -11,6 +11,7 @@
 //! belongs in `translator_legacy/` instead.
 
 pub mod backendopt;
+pub mod c;
 pub mod driver;
 pub mod goal;
 pub mod interactive;
