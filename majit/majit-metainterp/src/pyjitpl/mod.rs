@@ -655,6 +655,26 @@ pub struct MetaInterp<M: Clone> {
     /// reads it to fire the trace-too-long hook.
     pub aborted_tracing_jitdriver: Option<usize>,
 
+    /// pyjitpl.py:3291 `self.jitdriver_sd` parity — index into
+    /// `staticdata.jitdrivers_sd` of the driver that owns the
+    /// in-flight trace.
+    ///
+    /// Upstream MetaInterp is constructed once per
+    /// `_compile_and_run_once` and binds `self.jitdriver_sd =
+    /// jitdriver_sd` at construction (warmspot.py
+    /// `WarmEnterState._compile_and_run_once`).  pyre reuses a
+    /// single MetaInterp across traces, so the active driver is
+    /// installed at every trace-start path
+    /// (`setup_tracing` / `force_start_tracing` /
+    /// `start_retrace_from_guard`) and cleared once the trace
+    /// session ends.  Single-portal pyre still has only the shell
+    /// driver, so this is always 0 in practice; reads
+    /// (`initialize_virtualizable` / `virtualizable_info` /
+    /// `set_virtualizable_info`) prefer this slot and fall back to
+    /// scanning `jitdrivers_sd` when it has not yet been set
+    /// (init-time broadcast, test paths).
+    pub active_jitdriver_sd: Option<usize>,
+
     /// pyjitpl.py:2406 `self.aborted_tracing_greenkey = None`.  See
     /// `aborted_tracing_jitdriver`.
     pub aborted_tracing_greenkey: Option<u64>,
@@ -1210,6 +1230,7 @@ impl<M: Clone> MetaInterp<M> {
             portal_trace_positions: Some(Vec::new()),
             last_exc_value: 0,
             aborted_tracing_jitdriver: None,
+            active_jitdriver_sd: None,
             aborted_tracing_greenkey: None,
             pending_abort_green_key: None,
             pending_abort_permanent: false,
@@ -1433,18 +1454,17 @@ impl<M: Clone> MetaInterp<M> {
     /// pyre's single-portal discipline).
     fn initialize_virtualizable(&self, ctx: &mut TraceCtx, live_values: &[Value]) {
         // pyjitpl.py:3291: vinfo = self.jitdriver_sd.virtualizable_info
-        let jd_sd = self
-            .staticdata
-            .jitdrivers_sd
-            .iter()
-            .find(|jd| jd.virtualizable_info.is_some());
-        let Some(jd_sd) = jd_sd else {
+        // Prefer the trace-bound `active_jitdriver_sd` (RPython
+        // `self.jitdriver_sd`); fall back to scanning when an
+        // init-time / test caller has not yet elected one.
+        let Some(idx) = self.resolve_active_jitdriver_sd_with_vinfo() else {
             return;
         };
+        let jd_sd = &self.staticdata.jitdrivers_sd[idx];
         let info = jd_sd
             .virtualizable_info
             .as_ref()
-            .expect("jitdriver with vinfo was just matched");
+            .expect("resolve_active_jitdriver_sd_with_vinfo returned a slot without vinfo");
         // pyjitpl.py:3293-3295:
         //     index = (self.jitdriver_sd.num_green_args +
         //              self.jitdriver_sd.index_of_virtualizable)
@@ -1699,9 +1719,17 @@ impl<M: Clone> MetaInterp<M> {
     /// (`_do_jit_force_virtual`, `vable_*_residual_call`) see the info.
     pub fn set_virtualizable_info(&mut self, info: std::sync::Arc<VirtualizableInfo>) {
         self.ensure_default_driver_sd();
+        let active = self.active_jitdriver_sd;
         let sd = std::sync::Arc::get_mut(&mut self.staticdata)
             .expect("set_virtualizable_info: staticdata has other owners");
-        for jd in sd.jitdrivers_sd.iter_mut() {
+        // warmspot.py:545 `jd.virtualizable_info = vinfos[VTYPEPTR]`:
+        // upstream binds `virtualizable_info` to a single driver. pyre
+        // reuses the same call for both init-time setup (no active
+        // driver yet) and per-trace updates; route to the elected
+        // `active_jitdriver_sd` when available, otherwise broadcast
+        // so the single-portal default still receives the info before
+        // `setup_tracing` runs.
+        let assign = |jd: &mut crate::jitdriver::JitDriverStaticData| {
             jd.virtualizable_info = Some(info.clone());
             // warmspot.py:529/538 parity: pyre's shell driver
             // (`ensure_default_driver_sd`) is constructed with empty
@@ -1716,21 +1744,97 @@ impl<M: Clone> MetaInterp<M> {
             if jd.index_of_virtualizable < 0 && jd.reds().is_empty() {
                 jd.index_of_virtualizable = 0;
             }
+        };
+        if let Some(idx) = active.filter(|&i| i < sd.jitdrivers_sd.len()) {
+            assign(&mut sd.jitdrivers_sd[idx]);
+        } else {
+            for jd in sd.jitdrivers_sd.iter_mut() {
+                assign(jd);
+            }
         }
     }
 
     /// Get the active virtualizable info.
     ///
-    /// jitdriver.py:16 parity — reads the first registered
-    /// `jitdrivers_sd` entry whose `virtualizable_info` slot is
-    /// populated.  `set_virtualizable_info` lazy-creates
-    /// `jitdrivers_sd[0]`, so production callers see the info as soon
-    /// as the host installs it at JIT init.
+    /// pyjitpl.py:3291 `vinfo = self.jitdriver_sd.virtualizable_info`.
+    /// Prefers the trace-bound `active_jitdriver_sd`; falls back to
+    /// scanning `jitdrivers_sd` for callers that read this before any
+    /// trace has started (warmspot init, host-side queries).
     pub fn virtualizable_info(&self) -> Option<&std::sync::Arc<VirtualizableInfo>> {
+        if let Some(idx) = self.active_jitdriver_sd {
+            if let Some(jd) = self.staticdata.jitdrivers_sd.get(idx) {
+                if jd.virtualizable_info.is_some() {
+                    return jd.virtualizable_info.as_ref();
+                }
+            }
+        }
         self.staticdata
             .jitdrivers_sd
             .iter()
             .find_map(|jd| jd.virtualizable_info.as_ref())
+    }
+
+    /// pyjitpl.py:3291 `self.jitdriver_sd = jitdriver_sd` parity —
+    /// pick the slot inside `staticdata.jitdrivers_sd` that owns the
+    /// next trace.
+    ///
+    /// Single-portal pyre still tracks one driver, so the search is
+    /// trivial.  The argument is kept so future multi-portal hosts
+    /// can hook the descriptor's identity (e.g. `JitDriverStaticData::index`
+    /// once `register_jitdriver_sd` populates it) without rewriting the
+    /// trace-start callers.
+    fn elect_active_jitdriver_sd(
+        &self,
+        driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
+    ) -> Option<usize> {
+        // warmspot.py:537 each registered driver keeps its slot index;
+        // honour it when the descriptor still carries one.
+        if let Some(descriptor) = driver_descriptor {
+            if let Some(idx) = descriptor.index {
+                if idx < self.staticdata.jitdrivers_sd.len() {
+                    return Some(idx);
+                }
+            }
+        }
+        // Fall back to the vinfo-bearing slot — pyre's portal driver
+        // always has `virtualizable_info` set by the time tracing
+        // starts. If no driver carries vinfo (test-only paths), fall
+        // through to slot 0 so reads that don't need vinfo still work.
+        self.staticdata
+            .jitdrivers_sd
+            .iter()
+            .position(|jd| jd.virtualizable_info.is_some())
+            .or_else(|| {
+                if self.staticdata.jitdrivers_sd.is_empty() {
+                    None
+                } else {
+                    Some(0)
+                }
+            })
+    }
+
+    /// Resolve the slot index of the JitDriver that should be treated
+    /// as `self.jitdriver_sd` (pyjitpl.py:3291) for callers that need
+    /// `virtualizable_info` and the related metadata together.
+    ///
+    /// Prefers the trace-bound `active_jitdriver_sd` and validates it
+    /// carries `virtualizable_info`; otherwise scans for the first
+    /// registered slot with `virtualizable_info` populated. Returns
+    /// `None` when no driver carries `virtualizable_info` yet (the
+    /// caller should bail out — RPython would have early-returned
+    /// from the `vinfo is None` branch in `initialize_virtualizable`).
+    fn resolve_active_jitdriver_sd_with_vinfo(&self) -> Option<usize> {
+        if let Some(idx) = self.active_jitdriver_sd {
+            if let Some(jd) = self.staticdata.jitdrivers_sd.get(idx) {
+                if jd.virtualizable_info.is_some() {
+                    return Some(idx);
+                }
+            }
+        }
+        self.staticdata
+            .jitdrivers_sd
+            .iter()
+            .position(|jd| jd.virtualizable_info.is_some())
     }
 
     /// warmspot.py:519-525 `jd.greenfield_info = GreenFieldInfo(cpu, jd)`.
@@ -1954,6 +2058,11 @@ impl<M: Clone> MetaInterp<M> {
                 if let Some(descriptor) = driver_descriptor {
                     ctx.set_driver_descriptor(descriptor);
                 }
+                // pyjitpl.py:3291 `self.jitdriver_sd = jitdriver_sd`: see
+                // `setup_tracing` for the rationale; `force_start_tracing`
+                // is the parallel trace-start entry point and must keep the
+                // same invariant.
+                self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
                 // pyjitpl.py:3290 initialize_virtualizable parity.
                 self.initialize_virtualizable(&mut ctx, live_values);
                 self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
@@ -2102,6 +2211,12 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(descriptor) = driver_descriptor {
             ctx.set_driver_descriptor(descriptor);
         }
+        // pyjitpl.py:3291 `self.jitdriver_sd = jitdriver_sd`: bind the
+        // active driver before reads (`initialize_virtualizable`) consult
+        // it. `elect_active_jitdriver_sd` mirrors RPython by picking the
+        // driver matching the descriptor; with the single-portal pyre
+        // shell driver this collapses to slot 0.
+        self.active_jitdriver_sd = self.elect_active_jitdriver_sd(ctx.driver_descriptor());
         // pyjitpl.py:3290 initialize_virtualizable parity.
         self.initialize_virtualizable(&mut ctx, live_values);
 
@@ -7113,6 +7228,12 @@ impl<M: Clone> MetaInterp<M> {
         ctx.set_trace_limit(self.warm_state.trace_limit() as usize);
         ctx.callinfocollection = self.callinfocollection.clone();
         self.tracing = Some(ctx);
+        // pyjitpl.py:3291 `self.jitdriver_sd = jitdriver_sd`: bridges
+        // inherit the parent's driver. The bridge entry path does not
+        // thread `driver_descriptor`, so fall back to scanning for the
+        // vinfo-bearing slot — a no-op for single-portal pyre and the
+        // same shape `virtualizable_info()` already used.
+        self.active_jitdriver_sd = self.elect_active_jitdriver_sd(None);
 
         // RPython uses global ConstInt/ConstPtr boxes, so a bridge that
         // references a parent-loop constant and a bridge that allocates
