@@ -328,10 +328,20 @@ impl MetaInterpStaticData {
     /// `JitCode(name, fnaddr, calldescr, ...)` (call.py:168) before
     /// `assembler.assemble(ssarepr, jitcode, num_regs)`
     /// (codewriter.py:67) has run.
+    ///
+    /// A portal-bridged install (G.3a `install_portal_for`) is also
+    /// "usable cache" — its `jitcode.code` carries the portal canonical
+    /// bytecode even though `metadata.pc_map` is empty (portal mode
+    /// dispatches on `pycode.instructions[pc]` at runtime, not via a
+    /// per-CodeObject pc_map). The OR clause below admits both populated
+    /// per-CodeObject installs and portal-bridge installs so a
+    /// `PYRE_PORTAL_REDIRECT=1` short-circuit at the top-level
+    /// `jitcode_for` produces a stable cached `*const JitCode`
+    /// pointer across calls.
     fn compiled_jitcode_lookup(&self, code: *const ()) -> Option<*const JitCode> {
         let idx = *self.by_code.get(&Self::canonical_code_key(code))?;
         let jitcode = &self.jitcodes[idx];
-        if !jitcode.payload.is_populated() {
+        if !jitcode.payload.is_populated() && !jitcode.payload.is_portal_bridge() {
             return None;
         }
         Some(&**jitcode as *const JitCode)
@@ -547,6 +557,62 @@ pub fn set_compile_jitcode_fn(f: CompileJitcodeFn) {
     COMPILE_JITCODE_FN.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
 }
 
+/// G.4.3a-fix Issue 1 callback: hand a freshly-installed portal-bridge
+/// `Arc<PyJitCode>` to `pyre-jit::CallControl` so its `.jitcodes`
+/// dictionary holds the SAME allocation as `MetaInterpStaticData
+/// .jitcodes`.  Mirrors the upstream `call.py:147` `jd.mainjitcode =
+/// self.get_jitcode(jd.portal_graph)` invariant where the two stores
+/// share Python `JitCode` objects via refcount semantics; pyre's
+/// `find_jitcode_arc` (`pyre-jit/src/jit/call.rs:246`) is the Rust
+/// analog and the comment there explicitly pins this shared-Arc
+/// expectation.
+///
+/// Why a callback instead of direct call: `pyre-jit-trace` cannot
+/// depend on `pyre-jit` (the dependency runs the other way), so the
+/// CallControl insert lives on the pyre-jit side and is wired through
+/// a fn-pointer hook the same way `COMPILE_JITCODE_FN` is.
+///
+/// The arguments mirror the per-CodeObject path's call shape: the
+/// `*const ()` is the `W_CodeObject` wrapper pointer used as the dict
+/// key (`compile_jitcode_via_w_code` → `compile_jitcode_for_callee`
+/// derives `raw_code` and inserts at `raw_code as usize`); the `Arc`
+/// is the install_portal_for output that should be cloned into both
+/// stores.
+pub type RegisterPortalBridgeFn = fn(*const (), std::sync::Arc<crate::PyJitCode>);
+
+static REGISTER_PORTAL_BRIDGE_FN: std::sync::atomic::AtomicPtr<()> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+
+pub fn set_register_portal_bridge_fn(f: RegisterPortalBridgeFn) {
+    REGISTER_PORTAL_BRIDGE_FN.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// G.3c — `PYRE_PORTAL_REDIRECT` opt-in switch. Read once on first
+/// call and cached in a `OnceLock` so subsequent `jitcode_for` lookups
+/// pay no env-var cost.
+///
+/// When the variable is set to a non-empty value, `jitcode_for(code)`
+/// short-circuits the COMPILE_JITCODE_FN callback path and installs a
+/// portal-bridged `Arc<PyJitCode>` (G.3a `install_portal_for`)
+/// instead. The flag is the controlled probe surface that lets G.3d
+/// collect empirical reader-failure data per benchmark without
+/// destabilizing the default baseline.
+///
+/// RPython parity note: upstream has no equivalent flag because every
+/// user CodeObject is the portal's `pycode` input — there is no
+/// per-CodeObject jitcode to short-circuit *to*. The flag exists as
+/// a transitional probe so pyre can A/B compare its per-CodeObject
+/// path against the orthodox single-portal path during the G.3
+/// migration. Removed when G.4 (per-CodeObject emit no-op) lands.
+fn portal_redirect_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var_os("PYRE_PORTAL_REDIRECT")
+            .map(|s| !s.is_empty() && s != "0")
+            .unwrap_or(false)
+    })
+}
+
 /// pyjitpl.py:74: frame.jitcode — get or create JitCode for CodeObject.
 /// RPython: MetaInterp.staticdata.jitcodes[idx]; pyre: METAINTERP_SD.
 ///
@@ -559,19 +625,57 @@ pub fn set_compile_jitcode_fn(f: CompileJitcodeFn) {
 /// drain populate `MetaInterpStaticData.jitcodes` — both holding the
 /// same Python object. Pyre's lazy split runs that pipeline for one
 /// code object per trace-side reference; see `set_compile_jitcode_fn`.
+///
+/// G.3c — when `PYRE_PORTAL_REDIRECT` env is set, the callback path is
+/// replaced by `canonical_bridge::install_portal_for(...)`. Existing
+/// cached entries (per-CodeObject or portal-bridge) are still served
+/// by `compiled_jitcode_lookup`. The flag is OFF by default — flag-OFF
+/// behavior is byte-for-byte identical to pre-G.3c.
 pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     ensure_finish_setup();
     if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code)) {
         return existing;
     }
-    let cb = COMPILE_JITCODE_FN.load(std::sync::atomic::Ordering::Relaxed);
-    let supplied = if cb.is_null() {
-        None
+    let supplied = if portal_redirect_enabled() {
+        // G.3c short-circuit: skip the per-CodeObject codewriter
+        // callback entirely; install a portal-bridged Arc<PyJitCode>
+        // whose `jitcode.code` is the portal canonical bytecode and
+        // whose `metadata` is empty. Readers that follow this path
+        // observe `PyJitCode::is_portal_bridge() == true`.
+        //
+        // KNOWN-INCOMPLETE Issue 1 (G.4.3a parity audit, 2026-04-26):
+        // upstream `call.py:147` requires
+        // `MetaInterpStaticData.jitcodes` ⇄ `CallControl.jitcodes` to
+        // hold the same Python `JitCode` objects via refcount semantics,
+        // but the redirect-ON path here installs into the SD only.
+        // Empirically (G.4.3a parity-fix probe) routing the
+        // freshly-installed `Arc<PyJitCode>` into CallControl via the
+        // `set_register_portal_bridge_fn` callback regressed
+        // `PYRE_PORTAL_REDIRECT=1` from 12/14 to 8/14 with 5 simple
+        // benches timing out (>5s) — every CallControl reader still
+        // expects a per-CodeObject `is_populated()` entry and falls
+        // into compile loops on portal-bridge skeletons.  The proper
+        // closure is co-evolving every CallControl reader to handle
+        // portal-bridge entries (Phase G.4.4+ multi-session), the same
+        // direction as install_portal_for itself.  The
+        // `RegisterPortalBridgeFn` API and `set_register_portal_bridge_fn`
+        // hook are kept in `state.rs` so the eventual G.4.4 land can
+        // wire it without re-inventing the callback shape.
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject
+        };
+        Some(crate::canonical_bridge::install_portal_for(raw_code, code))
     } else {
-        // SAFETY: only `set_compile_jitcode_fn` writes to this slot,
-        // and it stores a `CompileJitcodeFn` cast through `as *mut ()`.
-        let f: CompileJitcodeFn = unsafe { std::mem::transmute(cb) };
-        f(code)
+        let cb = COMPILE_JITCODE_FN.load(std::sync::atomic::Ordering::Relaxed);
+        if cb.is_null() {
+            None
+        } else {
+            // SAFETY: only `set_compile_jitcode_fn` writes to this slot,
+            // and it stores a `CompileJitcodeFn` cast through `as *mut ()`.
+            let f: CompileJitcodeFn = unsafe { std::mem::transmute(cb) };
+            f(code)
+        }
     };
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, supplied))
 }
@@ -713,6 +817,40 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
                 let length_f = all_liveness[off + 2] as usize;
                 return length_i + length_r + length_f;
             }
+        }
+        // G.4.3 portal-bridge decoder count: read the per-PC depth from
+        // the metadata `LiveVars` derivation that
+        // `canonical_bridge::install_portal_for` populates (G.4.2).
+        // The encoder side (`trace_opcode.rs::get_list_of_active_boxes`)
+        // emits exactly `stack_base + depth_at_py_pc[pc]` Ref-typed
+        // boxes for portal-bridge frames; this count must agree so the
+        // rd_numb cursor advances symmetrically through
+        // `_prepare_next_section`.
+        //
+        // RPython parity: upstream `pyjitpl.py:177
+        // get_list_of_active_boxes` and `resume.py:1017-1026
+        // _prepare_next_section` share a single packed-liveness
+        // definition per (jitcode, pc).  Pyre's portal-bridge wrapper
+        // routes both sides through `metadata.depth_at_py_pc` instead
+        // of canonical's `all_liveness` (which encodes the dispatch
+        // loop's registers, not user PyFrame state) so the same
+        // symmetry holds.  All portal-bridge live values are Ref-typed
+        // (PyObjectRef stack), so `length_i = length_f = 0` and the
+        // total count is a single `length_r`.
+        //
+        // (Pre-G.4.3a-fix used `payload.nlocals_from_code()` which
+        // dropped `ncells`, breaking encoder/decoder count agreement
+        // for closure-bearing functions.  `metadata.stack_base` matches
+        // upstream's `pyframe.py:111 valuestackdepth = co_nlocals +
+        // ncellvars + nfreevars`.)
+        if payload.is_portal_bridge() {
+            let depth = payload
+                .metadata
+                .depth_at_py_pc
+                .get(pc as usize)
+                .copied()
+                .unwrap_or(0) as usize;
+            return payload.metadata.stack_base + depth;
         }
         // `CallControl.get_jitcode` drain fills pc_map + liveness
         // before any guard capture (pyjitpl.py:199 parity). Phase X-0
@@ -4515,6 +4653,49 @@ impl JitState for PyreJitState {
             }
             let jc = unsafe { &*jc_ptr };
             let payload = &jc.payload;
+            // G.4.3 portal-bridge writeback: positional iteration over
+            // `0..stack_base + depth_at_py_pc[live_pc]`, paired with the
+            // encoder's positional emit in
+            // `trace_opcode.rs::get_list_of_active_boxes` and the
+            // count check in `frame_value_count_at`.  Skips the canonical
+            // `all_liveness` path (whose register indices are for the
+            // dispatch loop, not the user PyFrame) and routes each
+            // consumed value to `set_local_at` / `set_stack_at` by the
+            // same `reg < stack_base` split the canonical path uses
+            // below.
+            //
+            // `metadata.stack_base = nlocals + ncells` (G.3h), the same
+            // value `local_count()` derives from `concrete_nlocals(frame)`
+            // — but reading from metadata makes the encoder/decoder
+            // symmetric source explicit (G.4.3a-fix: pre-fix code mixed
+            // `local_count() = stack_base` here with `nlocals_from_code()
+            // = varnames.len()` in the count callback, breaking parity
+            // for closure-bearing functions).
+            if payload.is_portal_bridge() {
+                let stack_base = payload.metadata.stack_base;
+                let depth = payload
+                    .metadata
+                    .depth_at_py_pc
+                    .get(live_pc)
+                    .copied()
+                    .unwrap_or(0) as usize;
+                let target_count = stack_base + depth;
+                for reg in 0..target_count {
+                    if let Some(value) = values.get(idx) {
+                        let boxed = virtualizable_box_value(value);
+                        if reg < stack_base {
+                            let _ = self.set_local_at(reg, boxed);
+                        } else {
+                            let stack_idx = reg - stack_base;
+                            if stack_idx < stack_only {
+                                let _ = self.set_stack_at(stack_idx, boxed);
+                            }
+                        }
+                    }
+                    idx += 1;
+                }
+                return true;
+            }
             let Some(&jit_pc) = payload.metadata.pc_map.get(live_pc) else {
                 return false;
             };

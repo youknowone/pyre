@@ -93,6 +93,31 @@ impl PyJitCode {
         !self.metadata.pc_map.is_empty()
     }
 
+    /// Is this `PyJitCode` a portal-bridged install (G.3a
+    /// `canonical_bridge::install_portal_for`)?
+    ///
+    /// Discriminator:
+    ///   * `jitcode.code` non-empty (rules out `PyJitCode::skeleton`,
+    ///     which clones `Arc::new(RuntimeJitCode::default())` whose
+    ///     `code` is empty).
+    ///   * `metadata.pc_map` empty (rules out per-CodeObject installs
+    ///     produced by `compile_jitcode_for_callee`, whose drain
+    ///     populates `pc_map` to `code.instructions.len()`).
+    ///
+    /// Used by readers that have to branch on portal-mode semantics —
+    /// portal entry has no per-Python-PC `pc_map` because the portal
+    /// jitcode dispatches on `pycode.instructions[pc]` at runtime via
+    /// its own dispatch arms.  See
+    /// `canonical_bridge::install_portal_for` for the full reader
+    /// audit (G.3a).
+    ///
+    /// G.3b commit lands this discriminator only.  No production
+    /// reader currently calls it — readers will pick it up site-by-site
+    /// in G.3c when concrete callers flip onto `install_portal_for`.
+    pub fn is_portal_bridge(&self) -> bool {
+        !self.jitcode.code.is_empty() && self.metadata.pc_map.is_empty()
+    }
+
     /// Empty `PyJitCode` slot inserted by `CallControl::get_jitcode`
     /// (call.py:168 `jitcode = JitCode(graph.name, fnaddr, calldescr, ...)`).
     ///

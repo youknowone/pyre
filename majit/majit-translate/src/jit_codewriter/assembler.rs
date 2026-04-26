@@ -1216,32 +1216,15 @@ impl Assembler {
             // byte register index (argcodes `i`). The bhimpl signature
             // (`blackhole.py:1062 @arguments("i")`) looks the byte up in
             // `registers_i`. The canonical runtime key is `loop_header/i`
-            // (`majit-metainterp/src/jitcode/mod.rs:293`), and the payload is
-            // 1 byte. Emitting via the generic fallback would push zero
-            // operand bytes (because `op_value_refs(LoopHeader)` is empty),
-            // misaligning the dispatch cursor.
-            //
-            // PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): pyre's runtime
-            // shortcuts the `/i` register-file lookup and reads the byte as
-            // the jdindex value directly (see `blackhole.rs:2079-2083` and
-            // `pyjitpl/dispatch.rs:1097-1108`). portals have a single
-            // jitdriver so jdindex is always 0 and the two models collide
-            // on the same byte value, but structurally this diverges from
-            // upstream `@arguments("i")`. majit-translate mirrors the
-            // runtime shortcut to stay consistent with the legacy emitter
-            // (`majit-metainterp/src/jitcode/assembler.rs:639,705`) which
-            // also pushes the raw value — migrating only one side would
-            // desynchronise the two emitters. Migration target: Phase G/H
-            // of the `codewriter graph-keyed parity` plan
-            // (`~/.claude/plans/lucky-growing-puzzle.md`) removes the
-            // legacy emitter; at that point introduce `emit_const_i(jdindex)`
-            // here and switch runtime to `registers_i[next_u8()]`.
+            // (`majit-metainterp/src/jitcode/mod.rs:293`); `emit_const_i`
+            // returns `num_regs_i + pool_idx` which the runtime resolves
+            // back to the constant via `registers_i[byte]`. Emitting via
+            // the generic fallback would push zero operand bytes (because
+            // `op_value_refs(LoopHeader)` is empty), misaligning the
+            // dispatch cursor.
             OpKind::LoopHeader { jitdriver_index } => {
-                assert!(
-                    *jitdriver_index <= u8::MAX as usize,
-                    "loop_header jitdriver_index {jitdriver_index} does not fit in one byte"
-                );
-                state.code.push(*jitdriver_index as u8);
+                let reg_byte = self.emit_const_i(*jitdriver_index as i64, state);
+                state.code.push(reg_byte);
                 argcodes.push('i');
                 let opnum = self.get_opnum("loop_header/i");
                 state.code[startposition] = opnum;
@@ -1261,16 +1244,11 @@ impl Assembler {
             // used greens_i / greens_r / reds_r), but the payload matches
             // the full six-list shape per
             // `majit-metainterp/src/jitcode/assembler.rs:706-729`. The
+            // jdindex byte is `emit_const_i`-routed (`@arguments("i")` =
+            // register-file pool slot, same as OpKind::LoopHeader). The
             // generic fallback would flatten SSA register bytes without the
             // length prefix and without the jdindex byte, corrupting the
             // stream.
-            //
-            // PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): jdindex is
-            // emitted as a raw byte value instead of a `registers_i`
-            // register index (upstream `@arguments("i")`). Same rationale
-            // as OpKind::LoopHeader above — see that arm for the migration
-            // plan pinned to Phase G/H of the codewriter graph-keyed
-            // parity epic.
             OpKind::JitMergePoint {
                 jitdriver_index,
                 greens_i,
@@ -1280,11 +1258,8 @@ impl Assembler {
                 reds_r,
                 reds_f,
             } => {
-                assert!(
-                    *jitdriver_index <= u8::MAX as usize,
-                    "jit_merge_point jitdriver_index {jitdriver_index} does not fit in one byte"
-                );
-                state.code.push(*jitdriver_index as u8);
+                let jdindex_byte = self.emit_const_i(*jitdriver_index as i64, state);
+                state.code.push(jdindex_byte);
                 self.emit_list_of_kind(greens_i, RegKind::Int, regallocs, state);
                 self.emit_list_of_kind(greens_r, RegKind::Ref, regallocs, state);
                 self.emit_list_of_kind(greens_f, RegKind::Float, regallocs, state);

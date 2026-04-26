@@ -1047,22 +1047,16 @@ where
                 // Payload shape mirrors upstream `@arguments("self", "i",
                 // "I", "R", "F", "I", "R", "F")` (blackhole.py:1066) and
                 // pyre's own `majit-metainterp/src/jitcode/assembler.rs:692`
-                // — 1-byte jdindex + six typed register lists
+                // — 1-byte jdindex (an `int_values` register index, with
+                // the constant pool slot resolved by `MIFrame::copy_constants`
+                // at frame setup) + six typed register lists
                 // (`[len:u8][reg:u8 * N]`). Metainterp dispatch doesn't use
-                // the values yet (trace-level opimpl_jit_merge_point 는
+                // jdindex yet (trace-level opimpl_jit_merge_point 는
                 // pyjitpl.py:1538 참조), but the cursor must advance past the
                 // operands so the following opcode byte is read at the
                 // correct offset.
-                //
-                // PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): jdindex
-                // byte is read as a raw value instead of an `int_values`
-                // register-file index. See `blackhole.rs:2012`,
-                // `majit-translate/src/jit_codewriter/assembler.rs`
-                // JitMergePoint arm for the matching emitter shortcut.
-                // Migration target: Phase G/H of the codewriter graph-keyed
-                // parity plan (`~/.claude/plans/lucky-growing-puzzle.md`).
                 let frame = self.frames.current_mut();
-                let _jdindex = frame.next_u8();
+                let _jdindex_reg = frame.next_u8();
                 for _ in 0..6 {
                     let count = frame.next_u8() as usize;
                     for _ in 0..count {
@@ -1075,17 +1069,15 @@ where
                 }
             }
             jitcode::BC_LOOP_HEADER => {
-                // pyjitpl.py:1527-1573 opimpl_loop_header. The 1-byte jdindex
-                // operand is the jitdriver index; pyre has a single jitdriver
-                // so we read and ignore it. Non-portal loop header marker
-                // (helper jitcodes only) — portal merge points go through
+                // pyjitpl.py:1527-1573 opimpl_loop_header. The 1-byte
+                // jdindex operand is an `int_values` register index — the
+                // jitdriver index constant lives in the pool (upstream
+                // `@arguments("i")`). pyre has a single jitdriver so the
+                // value is ignored; the byte is consumed only to advance
+                // the cursor. Non-portal loop header marker (helper
+                // jitcodes only) — portal merge points go through
                 // BC_JIT_MERGE_POINT above.
-                //
-                // PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): see the
-                // matching note on `BC_JIT_MERGE_POINT` above. Migration
-                // deferred to Phase G/H of the codewriter graph-keyed
-                // parity plan.
-                let _jdindex = self.frames.current_mut().next_u8();
+                let _jdindex_reg = self.frames.current_mut().next_u8();
                 let pc = self.frames.current_mut().pc;
                 if runtime.label_at(pc) == sym.loop_header_pc() {
                     return TraceAction::CloseLoop;

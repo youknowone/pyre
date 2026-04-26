@@ -33,6 +33,37 @@
 //! convenience for downstream consumers that already import
 //! `crate::generated`.
 //!
+//! ## Audience: TEST FIXTURE (not production)
+//!
+//! As of 2026-04-25, `all_jitcodes()` is consumed **only** by
+//! majit-translate's own integration tests
+//! (`test_phase_f_all_jitcodes.rs`,
+//! `test_make_jitcodes_produces_graph_keyed_output.rs`,
+//! `tests` mod below). The pyre runtime never imports this function.
+//!
+//! Production builds run a parallel pipeline at `pyre-jit-trace/build.rs`
+//! that calls `analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings`
+//! with `pyre_interpreter::jit_trace_fnaddrs()` and then bincode-embeds
+//! the resulting `pipeline.jitcodes` into the `pyre-jit-trace` binary
+//! (`$OUT_DIR/opcode_jitcodes.bin`). That separate path is what supplies
+//! real `JitCode.fnaddr` values to the metainterp / blackhole runtime;
+//! `all_jitcodes()` here intentionally retains the **symbolic fnaddr
+//! fallback** because exercising the pipeline without `&fnaddr_bindings`
+//! is what the unit tests need to assert (graph discovery, alloc-order
+//! invariants, by-path keying).
+//!
+//! The historical Task #100 description ("route generated::all_jitcodes
+//! through fnaddr_bindings instead of symbolic fallback") was written
+//! before the build-time bincode path landed in `pyre-jit-trace/build.rs`;
+//! production-side fnaddr resolution is therefore already done by that
+//! script, and `generated::all_jitcodes` keeps its symbolic-fallback
+//! contract as the deliberate test surface. **Do not rewire this module
+//! to thread `&fnaddr_bindings` — doing so would either (1) introduce a
+//! `majit-translate` ⇒ `pyre-interpreter` dependency that breaks the
+//! `majit/* ⊥ pyre/*` invariant, or (2) require parameterising the
+//! `OnceLock` (forfeiting memoisation). Both are wrong shapes for what
+//! is, in practice, a test fixture.**
+//!
 //! ## Why this wraps the full pipeline
 //!
 //! An earlier draft of this module ran its own narrow pipeline

@@ -84,6 +84,69 @@ pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
     ALL_JITCODES.get(index).cloned()
 }
 
+/// Cached index of the build-time portal jitcode within `ALL_JITCODES`.
+///
+/// RPython `warmspot.py:281-282` + `call.py:147-148`:
+/// `jd.mainjitcode = self.get_jitcode(jd.portal_graph)` followed by
+/// `jd.mainjitcode.jitdriver_sd = jd`. The single jitcode whose
+/// `jitdriver_sd` is set is the portal — every other entry in
+/// `metainterp_sd.jitcodes` is either an inlined callee or an indirect
+/// call target. Pyre's bincode preserves that flag through
+/// `oncelock_usize_serde`, so the scan below identifies the same
+/// jitcode the codewriter side stored in
+/// `JitDriverStaticData.mainjitcode`.
+///
+/// Production identity (Phase D snapshot 2026-04-25): the portal name
+/// is currently `execute_opcode_step` because `pyre-jit-trace/build.rs`
+/// only walks `pyre-object/src` + `pyre-interpreter/src`. Once that
+/// build script is widened to include `pyre/pyre-jit/src/eval.rs`
+/// (Phase G follow-up), the portal flips to `eval_loop_jit` and this
+/// accessor returns that JitCode without code change.
+static PORTAL_JITCODE_INDEX: LazyLock<Option<usize>> = LazyLock::new(|| {
+    let mut hits = ALL_JITCODES
+        .iter()
+        .enumerate()
+        .filter(|(_, jc)| jc.jitdriver_sd().is_some())
+        .map(|(i, _)| i);
+    let first = hits.next();
+    // RPython `call.py:147` `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`
+    // assigns once per JitDriverStaticData; pyre runs a single jitdriver
+    // (PyJitDriver) so at most one `jitdriver_sd` flag should be set in
+    // the build-time pipeline. A second hit signals a structural
+    // regression in `setup_jitdriver` and must surface immediately.
+    if hits.next().is_some() {
+        panic!(
+            "pyre-jit-trace: build-time pipeline has more than one portal \
+             jitcode (jitdriver_sd populated). RPython `call.py:147` allows \
+             exactly one per `JitDriverStaticData`."
+        );
+    }
+    first
+});
+
+/// RPython: `metainterp_sd.jitcodes[jitdriver_sd.mainjitcode.index]`
+/// (warmspot.py:281-282 + call.py:147-148) — the single portal jitcode
+/// that `find_all_graphs(portal, policy)` seeds the jitcode closure
+/// from. Returns `None` only when the build-time pipeline has no
+/// jitdriver registered (e.g. compact test inputs).
+///
+/// Phase G consumers route trace-side user-function calls
+/// (`callee_frame_helper`, `jit_create_callee_frame_*`,
+/// `jit_force_callee_frame`) through this accessor instead of emitting
+/// per-CodeObject jitcodes via `state::jitcode_for(code)` +
+/// `compile_jitcode_for_callee` callback. The orthodox model treats
+/// every user CodeObject as the portal's `pycode` input argument and
+/// reuses the single portal JitCode for every call — see RPython
+/// `pypy/module/pypyjit/interp_jit.py portal_runner` and
+/// `rpython/jit/codewriter/jtransform.py:473` `inline_call_*` emit.
+///
+/// G.2 introduces this accessor as the surface that G.3 will plug
+/// callee dispatch into; G.2 itself does not redirect any caller.
+pub fn portal_jitcode() -> Option<Arc<JitCode>> {
+    let idx = (*PORTAL_JITCODE_INDEX)?;
+    ALL_JITCODES.get(idx).cloned()
+}
+
 /// RPython: opcode dispatch arm table (analogue of PyPy's per-opcode
 /// Python methods). One `PipelineOpcodeArm` per Rust `match` arm.
 pub fn all_opcode_arms() -> &'static [PipelineOpcodeArm] {
@@ -631,6 +694,32 @@ mod tests {
     fn deserializes_arms_without_error() {
         let arms = all_opcode_arms();
         assert!(!arms.is_empty(), "expected at least one opcode arm");
+    }
+
+    #[test]
+    fn portal_jitcode_resolves_to_unique_jitdriver_entry() {
+        // Phase G G.2 — verify the portal accessor returns the single
+        // build-time JitCode whose `jitdriver_sd` is set (RPython
+        // call.py:147 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`).
+        // Production identity is currently `execute_opcode_step` because
+        // `pyre-jit-trace/build.rs` does not yet include
+        // `pyre/pyre-jit/src/eval.rs` in its source manifest. The
+        // assertion is on uniqueness + jitdriver flag, not name, so the
+        // test stays green when the manifest later widens to make
+        // `eval_loop_jit` the portal.
+        let portal = portal_jitcode().expect("build-time pipeline must register a portal jitcode");
+        assert!(
+            portal.jitdriver_sd().is_some(),
+            "portal jitcode must carry a populated `jitdriver_sd` (call.py:148)"
+        );
+        let jitdriver_count = all_jitcodes()
+            .iter()
+            .filter(|jc| jc.jitdriver_sd().is_some())
+            .count();
+        assert_eq!(
+            jitdriver_count, 1,
+            "RPython call.py:147 invariant: exactly one portal jitcode per JitDriverStaticData"
+        );
     }
 
     #[test]

@@ -39,6 +39,14 @@ pub struct JitCodeBuilder {
     /// `finish()` pass rewrites each placeholder to
     /// `num_regs_X + pool_idx` once the per-kind register count is final.
     const_patches: Vec<(usize, ConstKind, u16)>,
+    /// Same role as `const_patches`, but for 1-byte placeholder slots.
+    /// Used by `loop_header` / `jit_merge_point` jdindex emission, where
+    /// the operand byte must hold a single `num_regs_X + pool_idx`
+    /// register-file index (upstream `@arguments("i")` —
+    /// `blackhole.py:1062,1066`). `patch_const_u8_refs()` rewrites each
+    /// placeholder once `num_regs_X` is final and asserts the slot fits
+    /// in u8.
+    const_patches_u8: Vec<(usize, ConstKind, u16)>,
     /// Runtime descriptor pool emitted into `JitCodeExecState.descrs`
     /// on `finish()`. Every `BC_INLINE_CALL` / `BC_CALL_*` /
     /// `BC_RESIDUAL_CALL_*` operand is a 2-byte index into this pool
@@ -666,29 +674,18 @@ impl JitCodeBuilder {
     /// bhimpl_loop_header(jdindex) is a no-op; pyjitpl.py:1527
     /// opimpl_loop_header records the jitdriver index for the trace.
     ///
-    /// PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): upstream encodes the
-    /// jdindex Constant through `emit_const(allow_short=False)` which
-    /// registers it in `constants_i` and emits `num_regs_i + pool_idx` as
-    /// a single register-index byte (argcodes `i`); the runtime looks the
-    /// byte up in `registers_i` (blackhole.py:1062 `@arguments("i")`).
-    /// pyre pushes the raw jdindex byte and pairs it with a runtime that
-    /// reads the byte as the value directly (blackhole.rs:2082,
-    /// pyjitpl/dispatch.rs:1115). The shortcut coincidentally works
-    /// because portals have a single jitdriver, so jdindex is always 0.
-    /// A proper pool routing here is blocked on a u8 const-patch pass —
-    /// this emitter's `num_regs_i` grows monotonically during emission,
-    /// so `num_regs_i + pool_idx` computed at call time is wrong once a
-    /// later `touch_reg` widens the register file. The existing
-    /// `patch_const_refs()` (line 1846) only rewrites u16 operands;
-    /// extending it to u8 plus auditing every `add_const_i` site is
-    /// multi-session scope. Migration target: Phase G/H of the
-    /// `codewriter graph-keyed parity` plan
-    /// (`~/.claude/plans/lucky-growing-puzzle.md`) removes this forked
-    /// emitter entirely, at which point the pool-bypass vanishes with
-    /// the file and only the majit-translate assembler needs updating.
+    /// `@arguments("i")` (blackhole.py:1062) parity: jdindex is encoded
+    /// as a single register-index byte pointing into the post-regs
+    /// constants suffix of `registers_i`. `add_const_i` registers the
+    /// value; the placeholder is patched at `finish()` once `num_regs_i`
+    /// is final.
     pub fn loop_header(&mut self, jdindex: u8) {
         self.write_insn("loop_header/i");
-        self.push_u8(jdindex);
+        let const_idx = self.add_const_i(jdindex as i64);
+        let offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((offset, ConstKind::Int, const_idx));
     }
 
     /// RPython assembler.py: emit `live/` followed by a 2-byte offset into
@@ -753,14 +750,19 @@ impl JitCodeBuilder {
     /// `greens_r` = [pycode_reg] (constant slot)
     /// `reds_r`   = [frame_reg, ec_reg] (dedicated portal registers)
     ///
-    /// PRE-EXISTING-ADAPTATION (jdindex-pool-bypass): jdindex is pushed as
-    /// a raw byte value (hard-coded 0 for pyre's single-portal case)
-    /// instead of a `registers_i` register index via `add_const_i`. See
-    /// the matching note on `loop_header` above for rationale and the
-    /// Phase G/H migration path that removes this emitter.
+    /// jdindex is emitted as a `registers_i` register index via
+    /// `add_const_i` (upstream `@arguments("i")` — blackhole.py:1066),
+    /// matching `loop_header` above. The hard-coded `0` here reflects
+    /// pyre's single-portal invariant — once multiple jitdrivers are
+    /// supported the caller passes the index, but the encoding stays
+    /// pool-routed.
     pub fn jit_merge_point(&mut self, greens_i: &[u8], greens_r: &[u8], reds_r: &[u8]) {
         self.write_insn("jit_merge_point/IRR");
-        self.push_u8(0); // jdindex
+        let jdindex_const = self.add_const_i(0); // single jitdriver
+        let jdindex_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((jdindex_offset, ConstKind::Int, jdindex_const));
         // gi: green int registers (next_instr, is_being_profiled)
         self.push_u8(greens_i.len() as u8);
         for &idx in greens_i {
@@ -1684,6 +1686,7 @@ impl JitCodeBuilder {
     pub fn finish(mut self) -> JitCode {
         self.patch_labels();
         self.patch_const_refs();
+        self.patch_const_u8_refs();
         JitCode {
             name: self.name,
             code: self.code,
@@ -1910,6 +1913,28 @@ impl JitCodeBuilder {
             let bytes = slot.to_le_bytes();
             self.code[offset] = bytes[0];
             self.code[offset + 1] = bytes[1];
+        }
+    }
+
+    /// 1-byte counterpart of `patch_const_refs`. `loop_header/i` and
+    /// `jit_merge_point/IRR` jdindex bytes (`@arguments("i")`,
+    /// blackhole.py:1062,1066) carry a single register-index byte.
+    /// Asserts the resolved slot fits in u8 — overflow means the portal
+    /// has more than 255 int registers + constants combined, which
+    /// would also break the broader 1-byte register encoding.
+    fn patch_const_u8_refs(&mut self) {
+        for &(offset, kind, pool_idx) in &self.const_patches_u8 {
+            let base = match kind {
+                ConstKind::Int => self.num_regs_i,
+                ConstKind::Ref => self.num_regs_r,
+                ConstKind::Float => self.num_regs_f,
+            };
+            let slot = base + pool_idx;
+            assert!(
+                slot <= u8::MAX as u16,
+                "patch_const_u8_refs: slot {slot} (base={base} + pool_idx={pool_idx}) overflows u8"
+            );
+            self.code[offset] = slot as u8;
         }
     }
 }

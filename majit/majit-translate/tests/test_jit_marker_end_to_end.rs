@@ -222,6 +222,29 @@ fn jit_marker_emissions_reach_ssarepr_through_full_pipeline() {
         .expect("assembler must populate ssarepr.insns_pos");
     let code = &body.code;
 
+    // Helper: resolve a `/i`-encoded byte (register-file index, upstream
+    // `@arguments("i")`) to the constant value it points at — same model
+    // as `init_register_files_from_runtime_jitcode` (`blackhole.rs:1054`)
+    // and `MIFrame::copy_constants` (`pyjitpl/frame.rs:196`). Used to
+    // validate the pool-routed jdindex byte without running the runtime.
+    let num_regs_i = body.c_num_regs_i as usize;
+    let resolve_int_const = |reg_byte: u8| -> i64 {
+        let idx = reg_byte as usize;
+        assert!(
+            idx >= num_regs_i,
+            "jdindex byte {idx} points at a real register, not the constants pool \
+             (num_regs_i={num_regs_i})"
+        );
+        let pool_idx = idx - num_regs_i;
+        assert!(
+            pool_idx < body.constants_i.len(),
+            "jdindex byte {idx} points past constants_i pool \
+             (pool_idx={pool_idx}, len={})",
+            body.constants_i.len()
+        );
+        body.constants_i[pool_idx]
+    };
+
     let mut canonical_merge_points = 0usize;
     let mut canonical_loop_headers = 0usize;
     for (idx, insn) in ssarepr.insns.iter().enumerate() {
@@ -243,9 +266,10 @@ fn jit_marker_emissions_reach_ssarepr_through_full_pipeline() {
                     "jit_merge_point at {pos} truncated before jdindex"
                 );
                 assert_eq!(
-                    code[pos + 1] as usize,
+                    resolve_int_const(code[pos + 1]) as usize,
                     *jitdriver_index,
-                    "jit_merge_point jdindex byte must match OpKind.jitdriver_index"
+                    "jit_merge_point jdindex byte (pool index) must resolve \
+                     to OpKind.jitdriver_index"
                 );
                 let mut cursor = pos + 2;
                 let expected_counts = [
@@ -281,9 +305,10 @@ fn jit_marker_emissions_reach_ssarepr_through_full_pipeline() {
                     "loop_header at {pos} truncated before jdindex"
                 );
                 assert_eq!(
-                    code[pos + 1] as usize,
+                    resolve_int_const(code[pos + 1]) as usize,
                     *jitdriver_index,
-                    "loop_header jdindex byte must match OpKind.jitdriver_index"
+                    "loop_header jdindex byte (pool index) must resolve \
+                     to OpKind.jitdriver_index"
                 );
                 canonical_loop_headers += 1;
             }

@@ -2387,6 +2387,18 @@ impl CodeWriter {
         static INIT_COMPILE_CALLBACK: std::sync::Once = std::sync::Once::new();
         INIT_COMPILE_CALLBACK.call_once(|| {
             pyre_jit_trace::set_compile_jitcode_fn(compile_jitcode_via_w_code);
+            // G.4.3a-fix Issue 1 KNOWN-INCOMPLETE: the matching
+            // `set_register_portal_bridge_fn` registration is
+            // intentionally NOT wired here. Empirically a
+            // direct CallControl insert of the portal-bridge Arc
+            // breaks `PYRE_PORTAL_REDIRECT=1` (5 benches timeout —
+            // CallControl readers expect `is_populated()` and loop
+            // on portal-bridge skeletons). Closing this requires
+            // co-evolving every CallControl reader to handle
+            // portal-bridge entries (Phase G.4.4 territory).  The
+            // helper `register_portal_bridge_in_callcontrol` below
+            // stays in place as the wire-up function the eventual
+            // landing will register.
         });
         Self {
             assembler: RefCell::new(Assembler::new()),
@@ -5754,6 +5766,58 @@ fn compile_jitcode_via_w_code(w_code: *const ()) -> Option<std::sync::Arc<PyJitC
     CodeWriter::instance()
         .callcontrol()
         .find_compiled_jitcode_arc(code as *const _)
+}
+
+/// G.4.3a-fix Issue 1 callback (KNOWN-INCOMPLETE — currently NOT
+/// registered): insert a freshly-installed portal-bridge `Arc<PyJitCode>`
+/// into `CallControl.jitcodes` so blackhole resume's
+/// `CallControl::find_jitcode` / `find_compiled_jitcode_arc` lookups
+/// (`pyre/pyre-jit/src/jit/call.rs:236,266`) find the same entry the
+/// trace-side `MetaInterpStaticData.jitcodes` stores.
+///
+/// Designed to wire through `pyre_jit_trace::set_register_portal_bridge_fn`
+/// from `CodeWriter::new()` once per process — same lazy-init pattern as
+/// `set_compile_jitcode_fn` for `compile_jitcode_via_w_code`.
+///
+/// **Why not registered**: empirically (G.4.3a parity-fix probe,
+/// 2026-04-26) wiring this callback regressed
+/// `PYRE_PORTAL_REDIRECT=1` from 12/14 to 8/14 with 5 simple benches
+/// timing out (>5s).  Every CallControl reader downstream of
+/// `find_jitcode` (`call_jit.rs:794,1670`,
+/// `compile_jitcode_via_w_code:5745`) still expects an
+/// `is_populated()` per-CodeObject entry and falls into compile loops
+/// on portal-bridge skeletons.
+///
+/// **Convergence path**: Phase G.4.4 (per-CodeObject jitcode emit
+/// no-op) co-evolves every CallControl reader to handle portal-bridge
+/// entries, the same direction `install_portal_for` itself moves.  At
+/// that point this callback is enabled and the upstream
+/// `call.py:147` `mainjitcode = self.get_jitcode(jd.portal_graph)` ⇄
+/// `metainterp_sd.jitcodes[]` shared-identity invariant is restored.
+///
+/// `w_code` is the `W_CodeObject` wrapper pointer; the wrapper's
+/// underlying `CodeObject` raw pointer is the dict key used by
+/// `compile_jitcode_for_callee` and matches what `find_jitcode(code)`
+/// resolves at resume time.
+#[allow(dead_code)]
+fn register_portal_bridge_in_callcontrol(
+    w_code: *const (),
+    pyjit: std::sync::Arc<pyre_jit_trace::PyJitCode>,
+) {
+    if w_code.is_null() {
+        return;
+    }
+    let raw_code = unsafe {
+        pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+            as *const pyre_interpreter::CodeObject
+    };
+    if raw_code.is_null() {
+        return;
+    }
+    CodeWriter::instance()
+        .callcontrol()
+        .jitcodes
+        .insert(raw_code as usize, pyjit);
 }
 
 /// Scan `code` for JUMP_BACKWARD targets — the PCs where

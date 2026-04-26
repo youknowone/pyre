@@ -624,6 +624,48 @@ impl MIFrame {
         // reach final code emission.
         let jc = unsafe { &*jitcode_ptr };
         if jc.payload.metadata.pc_map.is_empty() {
+            // G.4.3 portal-bridge encoder: emit a positional Ref-typed
+            // box list of length `stack_base + depth_at_py_pc[live_pc]`,
+            // covering locals + cells + the live operand stack tail.
+            // `metadata.stack_base = code.varnames.len() + ncells(code)`
+            // (G.3h derivation) is the absolute boundary in
+            // `PyFrame.locals_cells_stack_w` between the "always live"
+            // slots and the depth-dependent operand stack — the same
+            // boundary `set_stack_at` (state.rs:2762) uses on the
+            // decoder writeback side.
+            //
+            // Encoder/decoder symmetry (G.4.3): both
+            // `state::frame_value_count_at` and
+            // `restore_guard_failure_values` source their counts from
+            // `metadata.stack_base + depth_at_py_pc[pc]` so the upstream
+            // `pyjitpl.py:177` / `resume.py:1017-1026` packed-liveness
+            // invariant is preserved.  Slots beyond
+            // `registers_r_view.len()` collapse to `OpRef::NONE`,
+            // matching the snapshot helper's missing-slot convention —
+            // the decoder skips writes for NONE values without raising.
+            //
+            // (Pre-G.4.3a-fix used `s.nlocals = code.varnames.len()`
+            // which dropped `ncells` — symmetric with
+            // `nlocals_from_code()` on the count side, but both wrong
+            // for closure-bearing functions.  `metadata.stack_base`
+            // matches upstream's `pypy/interpreter/pyframe.py:111
+            // valuestackdepth = co_nlocals + ncellvars + nfreevars`.)
+            if jc.payload.is_portal_bridge() {
+                let stack_base = jc.payload.metadata.stack_base;
+                let depth = jc
+                    .payload
+                    .metadata
+                    .depth_at_py_pc
+                    .get(live_pc)
+                    .copied()
+                    .unwrap_or(0) as usize;
+                let target_count = stack_base + depth;
+                let mut boxes = Vec::with_capacity(target_count);
+                for reg in 0..target_count {
+                    boxes.push(registers_r_view.get(reg).copied().unwrap_or(OpRef::NONE));
+                }
+                return boxes;
+            }
             // `CallControl.get_jitcode` drain fills pc_map before any
             // guard capture (pyjitpl.py:199 parity). Phase X-0 eliminated
             // the out-of-range-pc source. Phase X-1(a) migrated the
@@ -1246,7 +1288,16 @@ impl MIFrame {
             (0, 0, 0)
         };
         let ns_ptr = self.sym().concrete_namespace as i64;
-        let vsd = self.sym().valuestackdepth as i64;
+        // G.4.3a: portal-bridge frames trace eval_loop_jit, so each user
+        // opcode is a residual call to execute_opcode_step whose
+        // valuestackdepth side-effects do NOT advance `sym.valuestackdepth`.
+        // The stale symbolic value would encode `vable_valuestackdepth =
+        // stack_base`, leaving the resumed PyFrame with vsd ≤ stack_base
+        // and crashing the next pop. Recompute from the per-PC user-side
+        // depth metadata derived in `install_portal_for` (G.4.2).
+        let vsd = self
+            .portal_bridge_vable_vsd(resume_pc)
+            .unwrap_or_else(|| self.sym().valuestackdepth as i64);
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
         let s = self.sym_mut();
         s.vable_last_instr = ctx.const_int(resume_pc as i64 - 1);
@@ -1255,6 +1306,45 @@ impl MIFrame {
         s.vable_debugdata = ctx.const_ref(debugdata as i64);
         s.vable_lastblock = ctx.const_ref(lastblock as i64);
         s.vable_w_globals = ctx.const_ref(ns_ptr);
+    }
+
+    /// G.4.3a: For portal-bridge frames, derive the absolute
+    /// valuestackdepth from `metadata.stack_base + depth_at_py_pc[pc]`
+    /// (both populated by `install_portal_for` G.3h + G.4.2).  Returns
+    /// `None` for non-portal-bridge or null-jitcode states so the caller
+    /// can fall back to the stale `sym.valuestackdepth` /
+    /// `pre_opcode_registers_r.len()` heuristic that the per-CodeObject
+    /// path relies on.
+    ///
+    /// Why this is needed: portal-bridge tracing records each user opcode
+    /// as a residual call to `execute_opcode_step`.  The symbolic
+    /// `sym.valuestackdepth` only advances through `push_typed_value` /
+    /// `pop_value` (`trace_opcode.rs:808/872`), neither of which fires
+    /// for residual-call paths.  As a result the symbolic value stays at
+    /// its initial seed (`= stack_base`) for the lifetime of the trace,
+    /// and the encoded `vable_valuestackdepth` is too low.  Restoring
+    /// that value into PyFrame.valuestackdepth crashes the next pop with
+    /// `assertion failed: self.valuestackdepth > self.stack_base()`
+    /// (`pyframe.rs:862`).  The metadata-driven computation matches the
+    /// runtime PyFrame state for the same `(jitcode, py_pc)` pair, just
+    /// like the per-CodeObject path's stack-effect walk does inside
+    /// `pre_opcode_registers_r`.
+    fn portal_bridge_vable_vsd(&self, pc: usize) -> Option<i64> {
+        let s = self.sym();
+        if s.jitcode.is_null() {
+            return None;
+        }
+        let payload = unsafe { &(*s.jitcode).payload };
+        if !payload.is_portal_bridge() {
+            return None;
+        }
+        let depth = payload
+            .metadata
+            .depth_at_py_pc
+            .get(pc)
+            .copied()
+            .unwrap_or(0) as usize;
+        Some((payload.metadata.stack_base + depth) as i64)
     }
 
     /// capture_resumedata(resumepc=orgpc) parity: flush vable fields for guards.
@@ -1284,13 +1374,13 @@ impl MIFrame {
             (0, 0, 0)
         };
         let ns_ptr = self.sym().concrete_namespace as i64;
-        let vsd = {
+        let vsd = self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
             let s = self.sym();
             self.pre_opcode_registers_r
                 .as_ref()
                 .map(|pre_r| pre_r.len())
                 .unwrap_or(s.valuestackdepth) as i64
-        };
+        });
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
         let s = self.sym_mut();
         s.vable_last_instr = ctx.const_int(resume_pc as i64 - 1);
