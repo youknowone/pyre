@@ -104,6 +104,8 @@ pub enum ReprClassId {
     MultipleUnrelatedFrozenPBCRepr,
     /// `rpbc.py:728 MultipleFrozenPBCRepr`.
     MultipleFrozenPBCRepr,
+    /// `rpbc.py:844 MethodOfFrozenPBCRepr`.
+    MethodOfFrozenPBCRepr,
     /// `rpbc.py:920 ClassesPBCRepr`.
     ClassesPBCRepr,
     /// `rtuple.py:129 TupleRepr`.
@@ -151,6 +153,7 @@ impl ReprClassId {
             SingleFrozenPBCRepr => &[SingleFrozenPBCRepr, Repr],
             MultipleUnrelatedFrozenPBCRepr => &[MultipleUnrelatedFrozenPBCRepr, Repr],
             MultipleFrozenPBCRepr => &[MultipleFrozenPBCRepr, Repr],
+            MethodOfFrozenPBCRepr => &[MethodOfFrozenPBCRepr, Repr],
             ClassesPBCRepr => &[ClassesPBCRepr, Repr],
             TupleRepr => &[TupleRepr, Repr],
             CharRepr => &[CharRepr, Repr],

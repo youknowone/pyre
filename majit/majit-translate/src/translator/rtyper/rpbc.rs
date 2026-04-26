@@ -2837,6 +2837,379 @@ impl Repr for MultipleFrozenPBCRepr {
     }
 }
 
+/// RPython `adjust_shape(hop2, s_shape)` (rpbc.py:1120-1124):
+///
+/// ```python
+/// def adjust_shape(hop2, s_shape):
+///     new_shape = (s_shape.const[0]+1,) + s_shape.const[1:]
+///     c_shape = Constant(new_shape)
+///     s_shape = hop2.rtyper.annotator.bookkeeper.immutablevalue(new_shape)
+///     hop2.v_s_insertfirstarg(c_shape, s_shape) # reinsert adjusted shape
+/// ```
+///
+/// `s_shape.const` is a `(shape_cnt, shape_keys, shape_star)` tuple
+/// constant carried by `call_args` ops; the helper bumps `shape_cnt`
+/// by 1 to account for the bound-self arg that
+/// [`MethodOfFrozenPBCRepr::redispatch_call`] /
+/// [`MethodsPBCRepr::redispatch_call`] (rpbc.py:894, :1195) prepend.
+pub(super) fn adjust_shape(
+    hop2: &crate::translator::rtyper::rtyper::HighLevelOp,
+    s_shape: &crate::annotator::model::SomeValue,
+) -> Result<(), TyperError> {
+    use crate::annotator::model::SomeValue;
+    use crate::flowspace::model::Constant as FlowConstant;
+
+    // upstream: `s_shape.const` — pull the underlying tuple ConstValue.
+    let shape_const = s_shape
+        .const_()
+        .cloned()
+        .ok_or_else(|| TyperError::message("adjust_shape: s_shape is not a Constant"))?;
+    let items = match &shape_const {
+        ConstValue::Tuple(items) => items,
+        other => {
+            return Err(TyperError::message(format!(
+                "adjust_shape: s_shape.const is not a Tuple: {other:?}"
+            )));
+        }
+    };
+    if items.len() != 3 {
+        return Err(TyperError::message(
+            "adjust_shape: shape tuple must have 3 elements",
+        ));
+    }
+    // upstream: `(s_shape.const[0]+1,) + s_shape.const[1:]`.
+    let bumped_cnt = match &items[0] {
+        ConstValue::Int(n) => ConstValue::Int(n + 1),
+        other => {
+            return Err(TyperError::message(format!(
+                "adjust_shape: shape_cnt is not Int: {other:?}"
+            )));
+        }
+    };
+    let new_shape = ConstValue::Tuple(vec![bumped_cnt, items[1].clone(), items[2].clone()]);
+    // upstream: `c_shape = Constant(new_shape)` — Void-typed constant
+    // (matches the encoding `bookkeeper::call_shape_from_const` reads).
+    let c_shape = Hlvalue::Constant(FlowConstant::with_concretetype(
+        new_shape.clone(),
+        LowLevelType::Void,
+    ));
+    // upstream: `s_shape = hop2.rtyper.annotator.bookkeeper.immutablevalue(new_shape)`.
+    let bookkeeper = hop2
+        .rtyper
+        .annotator
+        .upgrade()
+        .ok_or_else(|| TyperError::message("adjust_shape: annotator weak ref dropped"))?
+        .bookkeeper
+        .clone();
+    let s_new_shape = bookkeeper
+        .immutablevalue(&new_shape)
+        .map_err(|e| TyperError::message(e.to_string()))?;
+    // upstream: `hop2.v_s_insertfirstarg(c_shape, s_shape)`.
+    hop2.v_s_insertfirstarg(c_shape, s_new_shape)?;
+    // Suppress unused-import warning for SomeValue when only used in
+    // the parameter type.
+    let _ = SomeValue::Impossible;
+    Ok(())
+}
+
+/// RPython `class MethodOfFrozenPBCRepr(Repr)` (rpbc.py:844-911).
+///
+/// ```python
+/// class MethodOfFrozenPBCRepr(Repr):
+///     """Representation selected for a PBC of method object(s) of frozen PBCs.
+///     It assumes that all methods are the same function bound to different PBCs.
+///     The low-level representation can then be a pointer to that PBC."""
+///
+///     def __init__(self, rtyper, s_pbc):
+///         self.rtyper = rtyper
+///         funcdescs = set([desc.funcdesc for desc in s_pbc.descriptions])
+///         assert len(funcdescs) == 1
+///         self.funcdesc = funcdescs.pop()
+///         if s_pbc.can_be_none():
+///             raise TyperError(...)
+///         im_selves = [desc.frozendesc for desc in s_pbc.descriptions]
+///         self.s_im_self = annmodel.SomePBC(im_selves)
+///         self.r_im_self = rtyper.getrepr(self.s_im_self)
+///         self.lowleveltype = self.r_im_self.lowleveltype
+/// ```
+#[derive(Debug)]
+pub struct MethodOfFrozenPBCRepr {
+    /// RPython `self.rtyper = rtyper` (rpbc.py:850).
+    pub rtyper: Weak<RPythonTyper>,
+    /// RPython `self.funcdesc = funcdescs.pop()` (rpbc.py:853) — the
+    /// single shared underlying `FunctionDesc` across all bound
+    /// methods in `s_pbc`.
+    pub funcdesc: Rc<RefCell<crate::annotator::description::FunctionDesc>>,
+    /// RPython `self.s_im_self = SomePBC(im_selves)` (rpbc.py:867) —
+    /// the PBC of the bound `frozendesc`s.
+    pub s_im_self: SomePBC,
+    /// RPython `self.r_im_self = rtyper.getrepr(self.s_im_self)`
+    /// (rpbc.py:868).
+    pub r_im_self: std::sync::Arc<dyn Repr>,
+    /// RPython `self.lowleveltype = self.r_im_self.lowleveltype`
+    /// (rpbc.py:869) — pointer-to-bound-PBC. Stored explicitly because
+    /// `Repr::lowleveltype` returns `&LowLevelType` and we cannot
+    /// borrow through `r_im_self`.
+    lltype: LowLevelType,
+    state: ReprState,
+}
+
+impl MethodOfFrozenPBCRepr {
+    /// RPython `MethodOfFrozenPBCRepr.__init__(self, rtyper, s_pbc)`
+    /// (rpbc.py:849-869).
+    pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Self, TyperError> {
+        // upstream: `funcdescs = set([desc.funcdesc for desc in
+        //                              s_pbc.descriptions]); assert
+        //            len(funcdescs) == 1; self.funcdesc =
+        //            funcdescs.pop()`.
+        let mut funcdesc_set: std::collections::BTreeMap<
+            crate::annotator::description::DescKey,
+            Rc<RefCell<crate::annotator::description::FunctionDesc>>,
+        > = std::collections::BTreeMap::new();
+        let mut frozendescs: Vec<crate::annotator::description::DescEntry> = Vec::new();
+        for entry in s_pbc.descriptions.values() {
+            let mof = entry.as_method_of_frozen().ok_or_else(|| {
+                TyperError::message(
+                    "MethodOfFrozenPBCRepr: every description must be a MethodOfFrozenDesc",
+                )
+            })?;
+            let mof_b = mof.borrow();
+            let fd = mof_b.funcdesc.clone();
+            let fd_key = crate::annotator::description::DescKey::from_rc(&fd);
+            funcdesc_set.entry(fd_key).or_insert(fd);
+            frozendescs.push(crate::annotator::description::DescEntry::Frozen(
+                mof_b.frozendesc.clone(),
+            ));
+        }
+        if funcdesc_set.len() != 1 {
+            return Err(TyperError::message(
+                "MethodOfFrozenPBCRepr: all bound methods must share a single FunctionDesc",
+            ));
+        }
+        let funcdesc = funcdesc_set.into_iter().next().expect("len checked").1;
+
+        // upstream: `if s_pbc.can_be_none(): raise TyperError(...)`.
+        if s_pbc.can_be_none {
+            return Err(TyperError::message(
+                "unsupported: variable of type method-of-frozen-PBC or None",
+            ));
+        }
+
+        // upstream: `im_selves = [desc.frozendesc for desc in
+        //                          s_pbc.descriptions];
+        //            self.s_im_self = SomePBC(im_selves);
+        //            self.r_im_self = rtyper.getrepr(self.s_im_self);
+        //            self.lowleveltype = self.r_im_self.lowleveltype`.
+        let s_im_self = SomePBC::new(frozendescs, false);
+        let r_im_self =
+            rtyper.getrepr(&crate::annotator::model::SomeValue::PBC(s_im_self.clone()))?;
+        let lltype = r_im_self.lowleveltype().clone();
+
+        Ok(MethodOfFrozenPBCRepr {
+            rtyper: Rc::downgrade(rtyper),
+            funcdesc,
+            s_im_self,
+            r_im_self,
+            lltype,
+            state: ReprState::new(),
+        })
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.convert_desc(self, mdesc)`
+    /// (rpbc.py:878-882):
+    ///
+    /// ```python
+    /// def convert_desc(self, mdesc):
+    ///     if mdesc.funcdesc is not self.funcdesc:
+    ///         raise TyperError("not a method bound on %r: %r" % ...)
+    ///     return self.r_im_self.convert_desc(mdesc.frozendesc)
+    /// ```
+    pub fn convert_desc(
+        &self,
+        desc: &crate::annotator::description::DescEntry,
+    ) -> Result<Constant, TyperError> {
+        let mof = desc.as_method_of_frozen().ok_or_else(|| {
+            TyperError::message(
+                "MethodOfFrozenPBCRepr.convert_desc: desc is not a MethodOfFrozenDesc",
+            )
+        })?;
+        let mof_b = mof.borrow();
+        // upstream: `if mdesc.funcdesc is not self.funcdesc: raise`.
+        if !Rc::ptr_eq(&mof_b.funcdesc, &self.funcdesc) {
+            return Err(TyperError::message(format!(
+                "not a method bound on {:?}: {:?}",
+                self.funcdesc.borrow().name,
+                mof_b.funcdesc.borrow().name,
+            )));
+        }
+        // upstream: `return self.r_im_self.convert_desc(mdesc.frozendesc)`.
+        let frozen_entry =
+            crate::annotator::description::DescEntry::Frozen(mof_b.frozendesc.clone());
+        self.r_im_self.convert_desc(&frozen_entry)
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.redispatch_call(self, hop,
+    /// call_args)` (rpbc.py:894-911).
+    ///
+    /// ```python
+    /// def redispatch_call(self, hop, call_args):
+    ///     s_function = annmodel.SomePBC([self.funcdesc])
+    ///     hop2 = hop.copy()
+    ///     hop2.args_s[0] = self.s_im_self
+    ///     hop2.args_r[0] = self.r_im_self
+    ///     if isinstance(hop2.args_v[0], Constant):
+    ///         boundmethod = hop2.args_v[0].value
+    ///         hop2.args_v[0] = Constant(boundmethod.im_self)
+    ///     if call_args:
+    ///         hop2.swap_fst_snd_args()
+    ///         _, s_shape = hop2.r_s_popfirstarg()
+    ///         adjust_shape(hop2, s_shape)
+    ///     c = Constant("obscure-don't-use-me")
+    ///     hop2.v_s_insertfirstarg(c, s_function)
+    ///     return hop2.dispatch()
+    /// ```
+    pub fn redispatch_call(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+        call_args: bool,
+    ) -> Result<Option<Hlvalue>, TyperError> {
+        use crate::annotator::description::DescEntry;
+        use crate::annotator::model::SomeValue;
+        use crate::flowspace::model::Constant as FlowConstant;
+
+        // upstream: `s_function = SomePBC([self.funcdesc])`.
+        let s_function = SomeValue::PBC(SomePBC::new(
+            vec![DescEntry::Function(self.funcdesc.clone())],
+            false,
+        ));
+        // upstream: `hop2 = hop.copy()`.
+        let hop2 = hop.copy();
+        // upstream: `hop2.args_s[0] = self.s_im_self;
+        //            hop2.args_r[0] = self.r_im_self`.
+        hop2.args_s.borrow_mut()[0] = SomeValue::PBC(self.s_im_self.clone());
+        hop2.args_r.borrow_mut()[0] = Some(self.r_im_self.clone());
+
+        // upstream:
+        //     if isinstance(hop2.args_v[0], Constant):
+        //         boundmethod = hop2.args_v[0].value
+        //         hop2.args_v[0] = Constant(boundmethod.im_self)
+        //
+        // PRE-EXISTING-ADAPTATION: pyre's `ConstValue` does not yet
+        // carry a "bound method" host-object variant from which
+        // `boundmethod.im_self` can be extracted. The Constant arm of
+        // upstream is a compile-time short-circuit that re-bases the
+        // hop's first arg on the frozen instance's host-side
+        // representation; pyre defers it until the bookkeeper carries
+        // a `BoundMethod` Constant kind. The Variable arm runs
+        // unmodified — `convertvar` will do the type adjustment under
+        // `args_r[0] = self.r_im_self`.
+        if matches!(hop2.args_v.borrow().get(0), Some(Hlvalue::Constant(_))) {
+            return Err(TyperError::missing_rtype_operation(
+                "MethodOfFrozenPBCRepr.redispatch_call (rpbc.py:900-902) \
+                 Constant boundmethod.im_self extraction port pending",
+            ));
+        }
+
+        // upstream: `if call_args: swap_fst_snd_args(); _, s_shape =
+        //                          r_s_popfirstarg(); adjust_shape(hop2, s_shape)`.
+        if call_args {
+            hop2.swap_fst_snd_args();
+            let (_r, s_shape) = hop2.r_s_popfirstarg();
+            adjust_shape(&hop2, &s_shape)?;
+        }
+
+        // upstream: `c = Constant("obscure-don't-use-me")`. Void-typed
+        // sentinel — the hop2 path never dereferences it, but the
+        // dispatcher needs *some* args_v[0] to feed
+        // `hop.inputarg(self_repr, 0)`. Upstream stores no
+        // concretetype on this Constant; pyre tags Void to satisfy
+        // genop's concretetype assertion downstream.
+        let c = Hlvalue::Constant(FlowConstant::with_concretetype(
+            ConstValue::Str("obscure-don't-use-me".to_string()),
+            LowLevelType::Void,
+        ));
+        // upstream: `hop2.v_s_insertfirstarg(c, s_function)`.
+        hop2.v_s_insertfirstarg(c, s_function)?;
+        // upstream: `return hop2.dispatch()`.
+        hop2.dispatch()
+    }
+}
+
+impl Repr for MethodOfFrozenPBCRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "MethodOfFrozenPBCRepr"
+    }
+
+    fn repr_class_id(&self) -> ReprClassId {
+        ReprClassId::MethodOfFrozenPBCRepr
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.get_r_implfunc(self)`
+    /// (rpbc.py:874-876).
+    fn get_r_implfunc(&self) -> Result<(&dyn Repr, usize), TyperError> {
+        // upstream: `r_func = self.rtyper.getrepr(self.get_s_callable());
+        //            return r_func, 1`.
+        // We cannot return a `&dyn Repr` to a temporary Arc, so the
+        // implfunc accessor is unsupported until callers route through
+        // an owned-Arc API. Surface as a typed error so the missing
+        // dependency is explicit.
+        Err(TyperError::missing_rtype_operation(
+            "MethodOfFrozenPBCRepr.get_r_implfunc (rpbc.py:874-876) \
+             requires &dyn Repr from a freshly-built FunctionRepr",
+        ))
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.convert_desc` (rpbc.py:878-882) —
+    /// thin Repr-trait forwarder; the body lives on the inherent impl.
+    fn convert_desc(
+        &self,
+        desc: &crate::annotator::description::DescEntry,
+    ) -> Result<Constant, TyperError> {
+        MethodOfFrozenPBCRepr::convert_desc(self, desc)
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.convert_const(self, method)`
+    /// (rpbc.py:884-886).
+    ///
+    /// PRE-EXISTING-ADAPTATION: upstream calls `bookkeeper.getdesc(method)`
+    /// on a host-side Python bound method. Pyre's bookkeeper accepts
+    /// `HostObject` only; bound-method `HostObject`s are not yet
+    /// produced anywhere in the pipeline. Defers to convert_desc by
+    /// way of `getdesc` once that bridge lands.
+    fn convert_const(&self, _value: &ConstValue) -> Result<Constant, TyperError> {
+        Err(TyperError::missing_rtype_operation(
+            "MethodOfFrozenPBCRepr.convert_const (rpbc.py:884-886) \
+             requires bookkeeper.getdesc on a HostObject(BoundMethod)",
+        ))
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.rtype_simple_call(self, hop)`
+    /// (rpbc.py:888-889) — `return self.redispatch_call(hop, call_args=False)`.
+    fn rtype_simple_call(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        self.redispatch_call(hop, false)
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.rtype_call_args(self, hop)`
+    /// (rpbc.py:891-892) — `return self.redispatch_call(hop, call_args=True)`.
+    fn rtype_call_args(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        self.redispatch_call(hop, true)
+    }
+}
+
 /// RPython `class ClassesPBCRepr(Repr)` (rpbc.py:920-968).
 ///
 /// PBC repr for a `SomePBC` whose kind is `DescKind::Class`. Upstream:
@@ -3567,9 +3940,13 @@ pub fn somepbc_rtyper_makerepr(
             "SomePBC.rtyper_makerepr: MethodsPBCRepr (rpbc.py:53-54) port pending",
         )),
         DescKind::Frozen => get_frozen_pbc_repr(rtyper, s_pbc),
-        DescKind::MethodOfFrozen => Err(TyperError::missing_rtype_operation(
-            "SomePBC.rtyper_makerepr: MethodOfFrozenPBCRepr (rpbc.py:57-58) port pending",
-        )),
+        DescKind::MethodOfFrozen => {
+            // rpbc.py:57-58 — `getRepr = MethodOfFrozenPBCRepr`.
+            Ok(
+                std::sync::Arc::new(MethodOfFrozenPBCRepr::new(rtyper, s_pbc.clone())?)
+                    as std::sync::Arc<dyn Repr>,
+            )
+        }
     }
 }
 
@@ -3764,6 +4141,115 @@ mod pbc_repr_tests {
         DescEntry::Frozen(Rc::new(StdRefCell::new(
             FrozenDesc::new(bk.clone(), pyobj).expect("FrozenDesc::new"),
         )))
+    }
+
+    fn method_of_frozen_entry(
+        bk: &Rc<Bookkeeper>,
+        funcdesc: &Rc<StdRefCell<crate::annotator::description::FunctionDesc>>,
+        frozen_name: &str,
+    ) -> DescEntry {
+        use crate::annotator::description::{FrozenDesc, MethodOfFrozenDesc};
+        use crate::flowspace::model::HostObject;
+        let pyobj = HostObject::new_module(frozen_name);
+        let frozendesc = Rc::new(StdRefCell::new(FrozenDesc::new(bk.clone(), pyobj).unwrap()));
+        DescEntry::MethodOfFrozen(Rc::new(StdRefCell::new(MethodOfFrozenDesc::new(
+            bk.clone(),
+            funcdesc.clone(),
+            frozendesc,
+        ))))
+    }
+
+    #[test]
+    fn method_of_frozen_pbc_repr_new_succeeds_for_single_methodoffrozen_pbc() {
+        // rpbc.py:849-869 — shared FunctionDesc + can_be_None=False
+        // builds the repr; lowleveltype = r_im_self.lowleveltype.
+        // Single-MethodOfFrozenDesc PBC routes r_im_self through
+        // SingleFrozenPBCRepr (Void-typed).
+        let (ann, rtyper) = make_rtyper();
+        let DescEntry::Function(fd) = function_entry(&ann.bookkeeper, "f") else {
+            unreachable!()
+        };
+        let mof = method_of_frozen_entry(&ann.bookkeeper, &fd, "frozen0");
+        let s_pbc = SomePBC::new(vec![mof], false);
+        let r = MethodOfFrozenPBCRepr::new(&rtyper, s_pbc).unwrap();
+        assert_eq!(r.class_name(), "MethodOfFrozenPBCRepr");
+        assert_eq!(r.repr_class_id(), ReprClassId::MethodOfFrozenPBCRepr);
+        // r_im_self is `SingleFrozenPBCRepr` → Void.
+        assert_eq!(r.lowleveltype(), &LowLevelType::Void);
+        assert_eq!(r.lowleveltype(), r.r_im_self.lowleveltype());
+        // The shared FunctionDesc on the repr is the same Rc as the
+        // one bound on the MethodOfFrozenDesc.
+        assert!(Rc::ptr_eq(&r.funcdesc, &fd));
+    }
+
+    // The "mixed funcdescs" rejection branch (rpbc.py:851-853 `assert
+    // len(funcdescs) == 1`) is enforced one layer up: `SomePBC::new`
+    // (annotator/model.rs:1302-1306) panics with "AnnotatorError: You
+    // can't mix a set of methods on a frozen PBC in RPython that are
+    // different underlying functions" before the rtyper repr ever
+    // sees the SomePBC. The redundant `funcdesc_set.len() != 1`
+    // guard inside `MethodOfFrozenPBCRepr::new` is defensive only —
+    // the upstream `assert` is the load-bearing check. No separate
+    // test is added here because the SomePBC-level enforcement is
+    // already exercised by `annotator/model::tests`.
+
+    #[test]
+    fn method_of_frozen_pbc_repr_convert_desc_routes_through_r_im_self() {
+        // rpbc.py:878-882 — `if mdesc.funcdesc is not self.funcdesc:
+        // raise; return self.r_im_self.convert_desc(mdesc.frozendesc)`.
+        // The success path returns the Constant produced by the
+        // bound-frozendesc's repr (single-frozen → Void None sentinel).
+        use crate::flowspace::model::ConstValue;
+        let (ann, rtyper) = make_rtyper();
+        let DescEntry::Function(fd) = function_entry(&ann.bookkeeper, "f") else {
+            unreachable!()
+        };
+        let mof = method_of_frozen_entry(&ann.bookkeeper, &fd, "frozen0");
+        let s_pbc = SomePBC::new(vec![mof.clone()], false);
+        let r = MethodOfFrozenPBCRepr::new(&rtyper, s_pbc).unwrap();
+        let c = r.convert_desc(&mof).unwrap();
+        // Single-frozen `r_im_self` → Void-typed `None` sentinel
+        // matches `SingleFrozenPBCRepr.convert_desc` parity.
+        assert_eq!(c.concretetype, Some(LowLevelType::Void));
+        assert!(matches!(c.value, ConstValue::None));
+    }
+
+    #[test]
+    fn method_of_frozen_pbc_repr_convert_desc_rejects_foreign_funcdesc() {
+        // rpbc.py:879-880 — "not a method bound on %r". Build the
+        // repr around `f`, then call convert_desc with a MethodOf-
+        // FrozenDesc whose funcdesc is `g`.
+        let (ann, rtyper) = make_rtyper();
+        let DescEntry::Function(fd_f) = function_entry(&ann.bookkeeper, "f") else {
+            unreachable!()
+        };
+        let DescEntry::Function(fd_g) = function_entry(&ann.bookkeeper, "g") else {
+            unreachable!()
+        };
+        let mof_f = method_of_frozen_entry(&ann.bookkeeper, &fd_f, "frozen0");
+        let mof_g = method_of_frozen_entry(&ann.bookkeeper, &fd_g, "frozen0");
+        let s_pbc = SomePBC::new(vec![mof_f], false);
+        let r = MethodOfFrozenPBCRepr::new(&rtyper, s_pbc).unwrap();
+        let err = r.convert_desc(&mof_g).unwrap_err();
+        assert!(
+            err.to_string().contains("not a method bound on"),
+            "unexpected: {err}"
+        );
+    }
+
+    #[test]
+    fn somepbc_rtyper_makerepr_method_of_frozen_kind_routes_to_method_of_frozen_pbc_repr() {
+        // rpbc.py:57-58 — `elif issubclass(kind, MethodOfFrozenDesc):
+        //                  getRepr = MethodOfFrozenPBCRepr`.
+        use crate::annotator::model::SomeValue;
+        let (ann, rtyper) = make_rtyper();
+        let DescEntry::Function(fd) = function_entry(&ann.bookkeeper, "f") else {
+            unreachable!()
+        };
+        let mof = method_of_frozen_entry(&ann.bookkeeper, &fd, "frozen0");
+        let s_pbc = SomePBC::new(vec![mof], false);
+        let r = rtyper.getrepr(&SomeValue::PBC(s_pbc)).unwrap();
+        assert_eq!(r.repr_class_id(), ReprClassId::MethodOfFrozenPBCRepr);
     }
 
     #[test]
