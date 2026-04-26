@@ -17,20 +17,6 @@ use majit_ir::resoperation::{Op, OpCode, OpRef};
 
 use crate::{GcRewriter, WriteBarrierDescr};
 
-unsafe extern "C" {
-    // rpython/jit/backend/llsupport/memcpy.py:3-5 — the `memcpy` host
-    // symbol that `gc.py:39 memcpy_fn` binds via `rffi.llexternal`.
-    // Used by `rewrite_copy_str_content` as the CALL_N target.
-    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
-}
-
-/// Raw address of `memcpy`, embedded as a ConstInt into the lowered
-/// CALL_N emitted by `rewrite_copy_str_content`.  Mirrors
-/// `rewrite.py:1046-1047 cast_ptr_to_adr(memcpy_fn) / cast_adr_to_int`.
-fn memcpy_fn_addr() -> i64 {
-    memcpy as *const () as i64
-}
-
 /// Alignment for nursery allocations (8 bytes).
 const NURSERY_ALIGN: usize = 8;
 
@@ -151,6 +137,58 @@ pub struct GcRewriterImpl {
     /// explicit NULL-pointer stores at flush time
     /// (rewrite.py:761-766).
     pub malloc_zero_filled: bool,
+    /// llsupport/gc.py:39 `self.memcpy_fn = memcpy_fn` cast to a Signed
+    /// integer via `cast_ptr_to_adr` + `cast_adr_to_int`
+    /// (rewrite.py:1046-1047). Embedded as a ConstInt into the lowered
+    /// `CALL_N(memcpy_fn, dst, src, n)` emitted by
+    /// `rewrite_copy_str_content` for COPYSTRCONTENT / COPYUNICODECONTENT.
+    pub memcpy_fn: i64,
+    /// llsupport/gc.py:40-43 `self.memcpy_descr = get_call_descr(...)`.
+    /// CallDescr stamped onto the lowered `CALL_N(memcpy_fn, ...)` —
+    /// `[Signed, Signed, Signed] -> Void`, `EF_CANNOT_RAISE`,
+    /// `can_collect=False`. Single instance shared across rewrites
+    /// (`make_memcpy_calldescr` singleton, descr.rs).
+    pub memcpy_descr: DescrRef,
+    /// llsupport/gc.py:46 `self.str_descr = get_array_descr(self, rstr.STR)`.
+    /// Provides `basesize` / `itemsize=1` for `rewrite_copy_str_content`
+    /// COPYSTRCONTENT lowering — basesize is offset by `-1` at use to
+    /// skip the `extra_item_after_alloc=True` null terminator
+    /// (rstr.py:1226; rewrite.py:1051-1053).
+    pub str_descr: DescrRef,
+    /// llsupport/gc.py:47 `self.unicode_descr = get_array_descr(self, rstr.UNICODE)`.
+    /// Provides `basesize` / `itemsize` (2 or 4 bytes per UCS) for
+    /// `rewrite_copy_str_content` COPYUNICODECONTENT lowering;
+    /// `itemscale = log2(itemsize)` (rewrite.py:1057-1063).
+    pub unicode_descr: DescrRef,
+    /// llsupport/gc.py:48 `self.str_hash_descr = get_field_descr(self, rstr.STR, 'hash')`.
+    /// FieldDescr for the `hash` field of `rstr.STR`. Consumed by
+    /// `clear_varsize_gc_fields` at NEWSTR allocation when
+    /// `malloc_zero_filled=false` (rewrite.py:529-530), where upstream
+    /// emits `emit_setfield(result, ConstInt(0), descr=hash_descr)`.
+    pub str_hash_descr: DescrRef,
+    /// llsupport/gc.py:49 `self.unicode_hash_descr = get_field_descr(self, rstr.UNICODE, 'hash')`.
+    /// Same role as `str_hash_descr` for NEWUNICODE
+    /// (rewrite.py:531-535).
+    pub unicode_hash_descr: DescrRef,
+    /// llsupport/gc.py:33-37 `self.fielddescr_vtable = get_field_descr(
+    /// self, rclass.OBJECT, 'typeptr')` or `None` under
+    /// `gcremovetypeptr=True`.  Consumed by `handle_new`'s
+    /// NEW_WITH_VTABLE branch (rewrite.py:482-484) to stamp the vtable
+    /// onto the freshly-allocated object's typeptr slot.  `None`
+    /// disables the vtable store entirely (matching upstream's
+    /// `gcremovetypeptr` build configuration).
+    pub fielddescr_vtable: Option<DescrRef>,
+    /// llsupport/gc.py:157 `fielddescr_tid = None` (Boehm) /
+    /// llsupport/gc.py:394 `self.fielddescr_tid = get_field_descr(self,
+    /// self.GCClass.HDR, 'tid')` (framework GC).  Consumed by
+    /// `rewrite.py:914-918` `gen_initialize_tid` to stamp the type id
+    /// onto the freshly-allocated object's header word.  `None` makes
+    /// `gen_initialize_tid` a no-op (Boehm path).
+    ///
+    /// pyre's HDR sits *before* the object pointer (vs RPython's HDR at
+    /// the object pointer); `gen_initialize_tid` translates the descr's
+    /// offset by `-HDR_SIZE` so the GC_STORE addresses the header word.
+    pub fielddescr_tid: Option<DescrRef>,
 }
 
 /// JitFrame field descriptors for handle_call_assembler.
@@ -820,9 +858,16 @@ impl GcRewriterImpl {
         // ob_type=NULL eventually crashed the blackhole's binary_op_fn
         // path (memory: phase5_super_lift_bisect_2026_04_17.md).
         if op.opcode == OpCode::NewWithVtable {
-            let vtable = descr.vtable();
-            if vtable != 0 {
-                self.gen_initialize_vtable(obj_ref, vtable, st);
+            // rewrite.py:482 `if self.gc_ll_descr.fielddescr_vtable is not None`.
+            if let Some(vtable_fd_ref) = self.fielddescr_vtable.as_ref() {
+                let vtable = descr.vtable();
+                // Defensive — pyre's NEW_WITH_VTABLE descrs in production
+                // always carry a non-zero vtable; some test fixtures
+                // synthesize 0, in which case skip the store rather than
+                // emit a NULL typeptr.
+                if vtable != 0 {
+                    self.gen_initialize_vtable(obj_ref, vtable, vtable_fd_ref, st);
+                }
             }
         }
 
@@ -861,51 +906,107 @@ impl GcRewriterImpl {
     ///
     /// kind: FLAG_ARRAY=0, FLAG_STR=1, FLAG_UNICODE=2.
     ///
-    /// TODO(rewrite.py:546-584 four-path port): upstream splits this
-    /// into (a) constant total_size nursery fast path
-    /// (`gen_malloc_nursery`), (b) varsize nursery fast path with
-    /// early return (`gen_malloc_nursery_varsize`), (c) boehm path
-    /// (`gen_boehm_malloc_array`), and (d) the generic slow path
-    /// (`gen_malloc_array` / `gen_malloc_str` / `gen_malloc_unicode`).
-    /// Pyre currently collapses all four into a single
-    /// `CALL_MALLOC_NURSERY_VARSIZE` IR op and defers the path
-    /// distinction to the backend runner where the nursery bump
-    /// allocator state actually lives. Converging on upstream needs
-    /// `nursery_free`/`nursery_top` state and the malloc-external
-    /// helpers surfaced into the rewriter so each branch can emit its
-    /// upstream-shaped op set.
-    fn handle_new_array(&self, op: &Op, st: &mut RewriteState, kind: i64) {
-        let descr_ref = op
-            .descr
-            .as_ref()
-            .expect("NEW_ARRAY must have an ArrayDescr");
+    /// `descr_ref` is the ArrayDescr to use for size / length-field /
+    /// per-item layout queries.  Upstream rewrite.py:489-494 passes
+    /// `self.gc_ll_descr.{str,unicode}_descr` for NEWSTR/NEWUNICODE and
+    /// `op.getdescr()` for NEW_ARRAY; the dispatcher in
+    /// `rewrite_for_gc_with_constants` is what threads the right
+    /// instance through this signature.
+    ///
+    /// TODO(rewrite.py:546-584 four-path port): paths (a) constant
+    /// total_size nursery fast path (`gen_malloc_nursery`) and
+    /// (b) varsize nursery fast path (`gen_malloc_nursery_varsize`) are
+    /// in place below; (c) boehm path (`gen_boehm_malloc_array`) and
+    /// (d) generic slow path (`gen_malloc_array` / `gen_malloc_str` /
+    /// `gen_malloc_unicode`) are still deferred to the backend runner.
+    /// Surfacing those needs the `malloc_array_descr` /
+    /// `malloc_str_descr` / `malloc_unicode_descr` mirrors plus
+    /// `gc_ll_descr.kind == 'boehm'` discrimination on
+    /// `GcRewriterImpl`.
+    fn handle_new_array(&self, descr_ref: DescrRef, op: &Op, st: &mut RewriteState, kind: i64) {
         let descr = descr_ref
             .as_array_descr()
-            .expect("NEW_ARRAY descr must be ArrayDescr");
+            .expect("handle_new_array descr must be ArrayDescr");
 
         let item_size = descr.item_size();
         let v_length = st.resolve(op.arg(0)); // the length operand
+        let length_const = st.resolve_constant(v_length.0);
 
-        // rewrite.py:857-860: CALL_MALLOC_NURSERY_VARSIZE([ConstInt(kind), ConstInt(itemsize), v_length])
-        st.emitting_an_operation_that_can_collect();
-
-        let kind_ref = st.const_int(kind);
-        let itemsize_ref = st.const_int(item_size as i64);
-        let mut varsize_op = Op::new(
-            OpCode::CallMallocNurseryVarsize,
-            &[kind_ref, itemsize_ref, v_length],
-        );
-        varsize_op.descr = op.descr.clone();
-        let result = st.emit_result(varsize_op, op.pos);
-        st.record_result_mapping(op.pos, result);
-
-        // rewrite.py:565 / rewrite.py:572 gen_initialize_len.
-        if let Some(len_descr) = descr.len_descr() {
-            self.gen_initialize_len(result, v_length, descr_ref.clone(), len_descr, st);
+        // rewrite.py:548-558 — total_size for the constant-size /
+        // zero-itemsize fast path.  Stays at -1 when v_length is a
+        // ConstInt that overflows `basesize + itemsize * num_elem`,
+        // matching upstream's `OverflowError: pass`.
+        let mut total_size: i64 = -1;
+        if let Some(num_elem) = length_const {
+            if num_elem >= 0 {
+                if let Some(var_size) = (item_size as i64).checked_mul(num_elem) {
+                    if let Some(t) = (descr.base_size() as i64).checked_add(var_size) {
+                        total_size = t;
+                    }
+                }
+            }
+        } else if item_size == 0 {
+            // rewrite.py:557-558 — non-const length but zero itemsize
+            // means no variable payload; fold to fixed-size basesize.
+            total_size = descr.base_size() as i64;
         }
 
-        // rewrite.py:566-567 / rewrite.py:585-586 clear_varsize_gc_fields.
-        // Emits ZERO_ARRAY for NEW_ARRAY_CLEAR and a hash-field zeroing
+        let result = if total_size >= 0 {
+            // rewrite.py:569-572 path #2 — constant-size nursery.
+            //
+            // pyre layout note: gen_malloc_nursery expects HDR + payload
+            // bytes (handle_new_fixedsize line 836); upstream's basesize
+            // already includes the header offset.  Add HDR_SIZE here so
+            // the bump-pointer alloc covers the same span.
+            let alloc_size = crate::header::GcHeader::SIZE + total_size as usize;
+            let r = self.gen_malloc_nursery(alloc_size, op.pos, st);
+            st.record_result_mapping(op.pos, r);
+            // rewrite.py:571 — gen_initialize_tid(op, arraydescr.tid).
+            self.gen_initialize_tid(r, descr.type_id(), st);
+            // rewrite.py:572 — gen_initialize_len(op, v_length, lendescr).
+            if let Some(len_descr) = descr.len_descr() {
+                self.gen_initialize_len(r, v_length, descr_ref.clone(), len_descr, st);
+            }
+            r
+        } else {
+            // rewrite.py:559-567 path #1 — varsize nursery fast path
+            // (with rewrite.py:863-865 "don't record into wb_applied"
+            // comment because large young arrays may need card marking).
+            //
+            // PRE-EXISTING-ADAPTATION (rewrite.py:573-584): when path #1
+            // gen_malloc_nursery_varsize would return False upstream
+            // (e.g. non-standard array shape), upstream branches into
+            // Boehm / slow paths.  Pyre keeps the descr-bearing
+            // CALL_MALLOC_NURSERY_VARSIZE here and defers that
+            // discrimination to the backend runner, which still owns
+            // the nursery_free / nursery_top state.
+            st.emitting_an_operation_that_can_collect();
+            let kind_ref = st.const_int(kind);
+            let itemsize_ref = st.const_int(item_size as i64);
+            let mut varsize_op = Op::new(
+                OpCode::CallMallocNurseryVarsize,
+                &[kind_ref, itemsize_ref, v_length],
+            );
+            // rewrite.py:858-860 — `arraydescr` is the descr passed
+            // into handle_new_array (gc_ll_descr.{str,unicode}_descr
+            // for NEWSTR/NEWUNICODE; op.getdescr() for NEW_ARRAY).
+            varsize_op.descr = Some(descr_ref.clone());
+            let r = st.emit_result(varsize_op, op.pos);
+            st.record_result_mapping(op.pos, r);
+            // rewrite.py:565 — gen_initialize_len(op, v_length, lendescr).
+            // Note: NO gen_initialize_tid here — upstream comment
+            // (rewrite.py:562-564) is that the array might end up being
+            // allocated by malloc_external, which initializes the GC
+            // header fields differently.
+            if let Some(len_descr) = descr.len_descr() {
+                self.gen_initialize_len(r, v_length, descr_ref.clone(), len_descr, st);
+            }
+            r
+        };
+
+        // rewrite.py:566-567 (path #1 inline) / rewrite.py:585-586
+        // (paths #2/#3/#4 tail) clear_varsize_gc_fields.  Emits
+        // ZERO_ARRAY for NEW_ARRAY_CLEAR and a hash-field zeroing
         // store for NEWSTR / NEWUNICODE, gated on !malloc_zero_filled.
         self.clear_varsize_gc_fields(
             kind,
@@ -919,12 +1020,12 @@ impl GcRewriterImpl {
 
         // rewrite.py:551: if isinstance(v_length, ConstInt):
         //     self.remember_known_length(op, v_length.getint())
-        if let Some(num_elem) = st.resolve_constant(v_length.0) {
+        // Upstream calls this BEFORE total_size computation, but the key
+        // is the OpRef of the alloc result, so the call is safely
+        // hoisted to here without changing the semantic outcome.
+        if let Some(num_elem) = length_const {
             st.remember_known_length(result, num_elem as usize);
         }
-
-        // Don't add to wb_applied: large young arrays may need card
-        // marking, so the GC still relies on write barriers.
     }
 
     /// rewrite.py:520-535 `clear_varsize_gc_fields`.
@@ -964,13 +1065,24 @@ impl GcRewriterImpl {
             return;
         }
         // rewrite.py:529-535 FLAG_STR / FLAG_UNICODE: zero the hash
-        // field at offset 0 with WORD size (hash is `Signed`).
+        // field via emit_setfield(result, ConstInt(0), descr=hash_descr).
+        // Offset / size come from gc_ll_descr.{str,unicode}_hash_descr
+        // (gc.py:48-49) — both rstr.STR and rstr.UNICODE keep `hash` at
+        // offset 0 with `Signed` size, but reading it through the
+        // descr keeps the layout assumption explicit.
         if kind == 1 || kind == 2 {
-            let word = std::mem::size_of::<usize>() as i64;
-            let ofs_ref = st.const_int(0);
+            let hash_descr_ref = if kind == 1 {
+                &self.str_hash_descr
+            } else {
+                &self.unicode_hash_descr
+            };
+            let hash_fd = hash_descr_ref
+                .as_field_descr()
+                .expect("gc_ll_descr.{str,unicode}_hash_descr must be a FieldDescr");
+            let ofs_ref = st.const_int(hash_fd.offset() as i64);
             let zero_ref = st.const_int(0);
-            let word_ref = st.const_int(word);
-            let store = Op::new(OpCode::GcStore, &[result, ofs_ref, zero_ref, word_ref]);
+            let size_ref = st.const_int(hash_fd.field_size() as i64);
+            let store = Op::new(OpCode::GcStore, &[result, ofs_ref, zero_ref, size_ref]);
             st.emit(store);
         }
     }
@@ -1065,36 +1177,49 @@ impl GcRewriterImpl {
     /// `extra_item_after_alloc` null terminator (rewrite.py:1051-1053;
     /// rstr.py:1226 `extra_item_after_alloc=True`).
     fn rewrite_copy_str_content(&self, op: &Op, st: &mut RewriteState) {
-        let descr = op
-            .descr
-            .as_ref()
-            .expect("COPY{STR,UNICODE}CONTENT must carry an ArrayDescr");
-        let ad = descr
-            .as_array_descr()
-            .expect("COPY{STR,UNICODE}CONTENT descr must be an ArrayDescr");
+        // rewrite.py:1046-1048 — pull memcpy_fn / memcpy_descr off the
+        // gc_ll_descr instance fields (gc.py:39-43).
+        let memcpy_fn = self.memcpy_fn;
+        let memcpy_descr = self.memcpy_descr.clone();
 
-        // rewrite.py:1049-1064 — pick basesize/itemscale per op kind.
-        let mut basesize = ad.base_size() as i64;
-        let itemscale: i64 = if op.opcode == OpCode::Copystrcontent {
-            // rewrite.py:1051-1053 — one extra null after the string buffer,
-            // so the `chars` array starts at `str_descr.basesize - 1`.
+        // rewrite.py:1049-1064 — basesize/itemscale come from the
+        // canonical str_descr / unicode_descr held on gc_ll_descr
+        // (gc.py:46-47), NOT from the op itself; upstream's
+        // COPY{STR,UNICODE}CONTENT carries no arraydescr.
+        let (mut basesize, itemscale) = if op.opcode == OpCode::Copystrcontent {
+            let ad = self
+                .str_descr
+                .as_array_descr()
+                .expect("gc_ll_descr.str_descr must be an ArrayDescr");
+            // rewrite.py:1054 `assert self.gc_ll_descr.str_descr.itemsize == 1`.
             assert_eq!(
                 ad.item_size(),
                 1,
-                "rewrite.py:1054 COPYSTRCONTENT itemsize must be 1"
+                "rewrite.py:1054 str_descr.itemsize must be 1"
             );
-            basesize -= 1;
-            0
+            (ad.base_size() as i64, 0i64)
         } else {
+            let ad = self
+                .unicode_descr
+                .as_array_descr()
+                .expect("gc_ll_descr.unicode_descr must be an ArrayDescr");
             let itemsize = ad.item_size() as i64;
-            match itemsize {
+            // rewrite.py:1059-1063 — itemscale = log2(itemsize) for 2/4.
+            let itemscale = match itemsize {
                 2 => 1,
                 4 => 2,
                 _ => {
-                    panic!("rewrite.py:1063 unknown unicode itemsize {itemsize} — expected 2 or 4")
+                    panic!("rewrite.py:1064 unknown unicode itemsize {itemsize} — expected 2 or 4")
                 }
-            }
+            };
+            (ad.base_size() as i64, itemscale)
         };
+        if op.opcode == OpCode::Copystrcontent {
+            // rewrite.py:1051-1053 — one extra item after the string buffer
+            // (rstr.py:1226 `extra_item_after_alloc=True`), so the `chars`
+            // array starts at `str_descr.basesize - 1`.
+            basesize -= 1;
+        }
 
         // rewrite.py:1065-1068 — effective source / destination addresses.
         let src_gcptr = st.resolve(op.arg(0));
@@ -1125,9 +1250,9 @@ impl GcRewriterImpl {
         };
 
         // rewrite.py:1079-1080 — CALL_N(memcpy_fn, i2, i1, arg, descr=memcpy_descr).
-        let memcpy_fn_const = st.const_int(memcpy_fn_addr());
+        let memcpy_fn_const = st.const_int(memcpy_fn);
         let mut call_op = Op::new(OpCode::CallN, &[memcpy_fn_const, i2, i1, arg]);
-        call_op.descr = Some(majit_ir::make_memcpy_calldescr());
+        call_op.descr = Some(memcpy_descr);
         st.emit(call_op);
     }
 
@@ -1908,16 +2033,31 @@ impl GcRewriterImpl {
 
     /// rewrite.py:914-918 gen_initialize_tid parity.
     ///
-    /// RPython: emit_setfield(obj, ConstInt(tid), descr=fielddescr_tid)
-    ///   → emit_gc_store_or_indexed(ptr, ConstInt(0), ConstInt(tid), size=WORD, factor=1, ofs=tid_ofs)
-    ///   → GC_STORE(ptr, ConstInt(tid_ofs), ConstInt(tid), ConstInt(WORD))
+    /// RPython:
+    /// ```python
+    /// def gen_initialize_tid(self, v_newgcobj, tid):
+    ///     if self.gc_ll_descr.fielddescr_tid is not None:
+    ///         self.emit_setfield(v_newgcobj, ConstInt(tid),
+    ///                            descr=self.gc_ll_descr.fielddescr_tid)
+    /// ```
+    /// `emit_setfield` lowers to `GC_STORE(ptr, ConstInt(offset),
+    /// ConstInt(tid), ConstInt(size))` via `emit_gc_store_or_indexed`.
     ///
-    /// The tid field is in the GcHeader which sits before the object pointer.
-    /// offset = -(GcHeader::SIZE) from the object pointer.
+    /// pyre layout note: HDR sits at `obj_ptr - HDR_SIZE` (vs RPython's
+    /// HDR at `obj_ptr + 0`).  `fielddescr_tid.offset` is the offset of
+    /// `tid` within the header struct (0 for pyre's single-word HDR);
+    /// the actual store address is `obj_ptr + (-HDR_SIZE +
+    /// descr.offset())`.  None disables the store (Boehm parity).
     fn gen_initialize_tid(&self, obj: OpRef, tid: u32, st: &mut RewriteState) {
-        let ofs = st.const_int(-(crate::header::GcHeader::SIZE as i64));
+        let Some(tid_fd_ref) = self.fielddescr_tid.as_ref() else {
+            return;
+        };
+        let tid_fd = tid_fd_ref
+            .as_field_descr()
+            .expect("gc_ll_descr.fielddescr_tid must be a FieldDescr");
+        let ofs = st.const_int(-(crate::header::GcHeader::SIZE as i64) + tid_fd.offset() as i64);
         let tid_val = st.const_int(tid as i64);
-        let size = st.const_int(std::mem::size_of::<usize>() as i64);
+        let size = st.const_int(tid_fd.field_size() as i64);
         let store = Op::new(OpCode::GcStore, &[obj, ofs, tid_val, size]);
         st.emit(store);
     }
@@ -1925,11 +2065,23 @@ impl GcRewriterImpl {
     /// rewrite.py:479-484 gen_initialize_vtable parity.
     ///
     /// RPython: emit_setfield(obj, ConstInt(vtable), descr=fielddescr_vtable)
-    /// The vtable pointer is at offset 0 from the object pointer.
-    fn gen_initialize_vtable(&self, obj: OpRef, vtable: usize, st: &mut RewriteState) {
-        let ofs = st.const_int(0);
+    /// — the typeptr field of `rclass.OBJECT`. Offset / size come from
+    /// the supplied `fielddescr_vtable` (gc.py:36 `get_field_descr(self,
+    /// rclass.OBJECT, 'typeptr')`); for the canonical layout the
+    /// vtable pointer sits at offset 0 with `Signed` size.
+    fn gen_initialize_vtable(
+        &self,
+        obj: OpRef,
+        vtable: usize,
+        vtable_fd_ref: &DescrRef,
+        st: &mut RewriteState,
+    ) {
+        let vtable_fd = vtable_fd_ref
+            .as_field_descr()
+            .expect("gc_ll_descr.fielddescr_vtable must be a FieldDescr");
+        let ofs = st.const_int(vtable_fd.offset() as i64);
         let vtable_ref = st.const_int(vtable as i64);
-        let size = st.const_int(std::mem::size_of::<usize>() as i64);
+        let size = st.const_int(vtable_fd.field_size() as i64);
         let store = Op::new(OpCode::GcStore, &[obj, ofs, vtable_ref, size]);
         st.emit(store);
     }
@@ -2198,15 +2350,23 @@ impl GcRewriter for GcRewriterImpl {
                 OpCode::New | OpCode::NewWithVtable => {
                     self.handle_new(op, &mut st);
                 }
-                // rewrite.py:485-494
+                // rewrite.py:485-494 — descr source per opcode mirrors
+                // upstream: NEW_ARRAY threads op.getdescr(); NEWSTR /
+                // NEWUNICODE thread self.gc_ll_descr.{str,unicode}_descr.
                 OpCode::NewArray | OpCode::NewArrayClear => {
-                    self.handle_new_array(op, &mut st, 0); // FLAG_ARRAY
+                    let descr_ref = op
+                        .descr
+                        .clone()
+                        .expect("NEW_ARRAY must carry an ArrayDescr");
+                    self.handle_new_array(descr_ref, op, &mut st, 0); // FLAG_ARRAY
                 }
                 OpCode::Newstr => {
-                    self.handle_new_array(op, &mut st, 1); // FLAG_STR
+                    // rewrite.py:489-491 `handle_new_array(self.gc_ll_descr.str_descr, op, FLAG_STR)`.
+                    self.handle_new_array(self.str_descr.clone(), op, &mut st, 1);
                 }
                 OpCode::Newunicode => {
-                    self.handle_new_array(op, &mut st, 2); // FLAG_UNICODE
+                    // rewrite.py:492-494 `handle_new_array(self.gc_ll_descr.unicode_descr, op, FLAG_UNICODE)`.
+                    self.handle_new_array(self.unicode_descr.clone(), op, &mut st, 2);
                 }
 
                 // ── COPYSTRCONTENT / COPYUNICODECONTENT → memcpy CALL_N ──
@@ -2471,6 +2631,21 @@ mod tests {
             // `clear_gc_fields` / `_delayed_zero_setfields` tests flip
             // this to `false` per-test.
             malloc_zero_filled: true,
+            // gc.py:39-43, gc.py:46-49 fields.
+            memcpy_fn: majit_ir::memcpy_fn_addr(),
+            memcpy_descr: majit_ir::make_memcpy_calldescr(),
+            str_descr: str_array_descr(),
+            unicode_descr: unicode_array_descr(),
+            str_hash_descr: hash_field_descr(),
+            unicode_hash_descr: hash_field_descr(),
+            // gc.py:33-37 `fielddescr_vtable`. Test fixtures always
+            // install a Some so the existing test_new_with_vtable
+            // continues to exercise the typeptr stamping path.
+            fielddescr_vtable: Some(majit_ir::make_vtable_field_descr()),
+            // gc.py:394 `fielddescr_tid`. Test fixtures always install a
+            // Some so existing handle_new tests continue to exercise the
+            // tid header stamping path (matches framework-GC mode).
+            fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
         }
     }
 
@@ -3492,73 +3667,69 @@ mod tests {
             call_assembler_callee_locs: None,
             load_supported_factors: &[1],
             malloc_zero_filled: true,
+            memcpy_fn: majit_ir::memcpy_fn_addr(),
+            memcpy_descr: majit_ir::make_memcpy_calldescr(),
+            str_descr: str_array_descr(),
+            unicode_descr: unicode_array_descr(),
+            str_hash_descr: hash_field_descr(),
+            unicode_hash_descr: hash_field_descr(),
+            // gc.py:33-37 `fielddescr_vtable`. Test fixtures always
+            // install a Some so the existing test_new_with_vtable
+            // continues to exercise the typeptr stamping path.
+            fielddescr_vtable: Some(majit_ir::make_vtable_field_descr()),
+            // gc.py:394 `fielddescr_tid`. Test fixtures install a Some
+            // (framework-GC mode) so handle_new tests exercise the tid
+            // header stamping path.
+            fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
         }
     }
 
     #[test]
-    fn test_setarrayitem_gc_small_array_uses_regular_wb() {
-        // rewrite.py:961-964: known length < LARGE → regular WB.
-        let rw = make_rewriter_with_cards();
-        // NEW_ARRAY with const length 10 (< 130).
-        // Use a constant-pool OpRef for the length.
-        let len_ref = OpRef(10_000); // constant key
-        let mut constants = HashMap::new();
-        constants.insert(10_000, 10_i64);
-        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_ref());
-        new_array.pos = OpRef(0);
-        let ops = vec![
-            new_array,
-            Op::with_descr(
-                OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(1), OpRef(2)],
-                array_descr_ref(),
-            ),
-            Op::new(OpCode::Finish, &[]),
-        ];
-        let (result, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
-        // Small array → regular COND_CALL_GC_WB, not WB_ARRAY.
-        let wb = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::CondCallGcWb)
-            .count();
-        let wb_arr = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::CondCallGcWbArray)
-            .count();
-        assert_eq!(wb, 1, "small array should get regular WB");
-        assert_eq!(wb_arr, 0, "small array should NOT get WB_ARRAY");
-    }
-
-    #[test]
-    fn test_setarrayitem_gc_large_array_uses_wb_array() {
-        // rewrite.py:965-970: known length >= LARGE → WB_ARRAY.
-        let rw = make_rewriter_with_cards();
-        // NEW_ARRAY with const length 200 (>= 130).
-        let len_ref = OpRef(10_000);
-        let mut constants = HashMap::new();
-        constants.insert(10_000, 200_i64);
-        let mut new_array = Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_ref());
-        new_array.pos = OpRef(0);
-        let ops = vec![
-            new_array,
-            Op::with_descr(
-                OpCode::SetarrayitemGc,
-                &[OpRef(0), OpRef(1), OpRef(2)],
-                array_descr_ref(),
-            ),
-            Op::new(OpCode::Finish, &[]),
-        ];
-        let (result, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
-        let wb = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::CondCallGcWb)
-            .count();
-        let wb_arr = result
-            .iter()
-            .filter(|o| o.opcode == OpCode::CondCallGcWbArray)
-            .count();
-        assert_eq!(wb, 0, "large array should NOT get regular WB");
-        assert_eq!(wb_arr, 1, "large array should get WB_ARRAY");
+    fn test_setarrayitem_gc_after_const_alloc_no_wb() {
+        // rewrite.py:910-911 — gen_malloc_nursery's tail
+        // `remember_write_barrier(op)` records the fresh nursery alloc
+        // in wb_applied; rewrite.py:937-938 `if not write_barrier_applied
+        // (val): ...` then short-circuits the WB on the immediate
+        // SETARRAYITEM_GC.  Both length=10 (< LARGE) and length=200
+        // (>= LARGE) take handle_new_array path #2 (constant-size
+        // nursery), so neither gen_write_barrier_array branch fires
+        // (LARGE threshold logic stays gated behind path #4 fallback,
+        // not yet ported in pyre).
+        for &num_elem in &[10_i64, 200_i64] {
+            let rw = make_rewriter_with_cards();
+            let len_ref = OpRef(10_000);
+            let mut constants = HashMap::new();
+            constants.insert(10_000, num_elem);
+            let mut new_array =
+                Op::with_descr(OpCode::NewArrayClear, &[len_ref], array_descr_ref());
+            new_array.pos = OpRef(0);
+            let ops = vec![
+                new_array,
+                Op::with_descr(
+                    OpCode::SetarrayitemGc,
+                    &[OpRef(0), OpRef(1), OpRef(2)],
+                    array_descr_ref(),
+                ),
+                Op::new(OpCode::Finish, &[]),
+            ];
+            let (result, _) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+            let wb = result
+                .iter()
+                .filter(|o| o.opcode == OpCode::CondCallGcWb)
+                .count();
+            let wb_arr = result
+                .iter()
+                .filter(|o| o.opcode == OpCode::CondCallGcWbArray)
+                .count();
+            assert_eq!(
+                wb, 0,
+                "fresh alloc is wb_applied → no regular WB (num_elem={num_elem})"
+            );
+            assert_eq!(
+                wb_arr, 0,
+                "fresh alloc is wb_applied → no WB_ARRAY (num_elem={num_elem})"
+            );
+        }
     }
 
     #[test]
@@ -3620,6 +3791,17 @@ mod tests {
             item_size: 4,
             type_id: 8,
             item_type: Type::Int,
+        })
+    }
+
+    /// Test stand-in for `gc_ll_descr.{str,unicode}_hash_descr`
+    /// (gc.py:48-49): the `hash` field of rstr.STR / rstr.UNICODE
+    /// lives at offset 0 with `Signed` size.
+    fn hash_field_descr() -> DescrRef {
+        Arc::new(TestFieldDescr {
+            offset: 0,
+            field_size: std::mem::size_of::<usize>(),
+            field_type: Type::Int,
         })
     }
 

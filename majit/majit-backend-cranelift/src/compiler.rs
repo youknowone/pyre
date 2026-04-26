@@ -6014,6 +6014,35 @@ impl CraneliftBackend {
             // always zero-filled at allocation time; `clear_gc_fields`
             // thus short-circuits per rewrite.py:499-500.
             malloc_zero_filled: true,
+            // gc.py:39 `self.memcpy_fn = memcpy_fn` cast through
+            // `cast_ptr_to_adr` + `cast_adr_to_int` (rewrite.py:1046-1047).
+            memcpy_fn: majit_ir::memcpy_fn_addr(),
+            // gc.py:40-43 `self.memcpy_descr = get_call_descr(...)`.
+            memcpy_descr: majit_ir::make_memcpy_calldescr(),
+            // gc.py:46 `self.str_descr = get_array_descr(self, rstr.STR)`.
+            str_descr: builtin_string_array_descr(OpCode::Newstr)
+                .expect("Newstr must produce a str ArrayDescr"),
+            // gc.py:47 `self.unicode_descr = get_array_descr(self, rstr.UNICODE)`.
+            unicode_descr: builtin_string_array_descr(OpCode::Newunicode)
+                .expect("Newunicode must produce a unicode ArrayDescr"),
+            // gc.py:48 `self.str_hash_descr = get_field_descr(self, rstr.STR, 'hash')`.
+            str_hash_descr: builtin_string_hash_field_descr(OpCode::Strhash)
+                .expect("Strhash must produce a str hash FieldDescr"),
+            // gc.py:49 `self.unicode_hash_descr = get_field_descr(self, rstr.UNICODE, 'hash')`.
+            unicode_hash_descr: builtin_string_hash_field_descr(OpCode::Unicodehash)
+                .expect("Unicodehash must produce a unicode hash FieldDescr"),
+            // gc.py:33-37 `self.fielddescr_vtable = get_field_descr(
+            // self, rclass.OBJECT, 'typeptr')`.  pyre always emits a
+            // typeptr slot (no `gcremovetypeptr` build), so we install
+            // Some unconditionally.
+            fielddescr_vtable: Some(majit_ir::make_vtable_field_descr()),
+            // gc.py:394 `self.fielddescr_tid = get_field_descr(self,
+            // self.GCClass.HDR, 'tid')` — framework GC.  pyre's GC is
+            // always framework-style (incminimark-shaped), so install
+            // Some unconditionally; the helper translates the descr's
+            // offset by `-HDR_SIZE` because pyre's HDR sits before the
+            // object pointer.
+            fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
             // rewrite.py:673 — read compiled_loop_token._ll_initial_locs and
             // rewrite.py:669 — ptr2int(compiled_loop_token.frame_info),
             // both sourced directly from the CLT Arc on the target

@@ -12,7 +12,8 @@ pub use descr::{
     LoopTokenDescr, SimpleCallDescr, SimpleFailDescr, SimpleFieldDescr, SizeDescr, TargetArgLoc,
     UnpackAtExitInfo, VableExpansion, descr_identity, make_array_descr, make_field_descr,
     make_loop_target_descr, make_memcpy_calldescr, make_raw_malloc_calldescr, make_size_descr_full,
-    make_size_descr_with_vtable, unpack_fielddescr,
+    make_size_descr_with_vtable, make_tid_field_descr, make_vtable_field_descr, memcpy_fn_addr,
+    unpack_fielddescr,
 };
 pub use effectinfo::{
     CallInfoCollection, EffectInfo, ExtraEffect, OopSpecIndex, QuasiImmutAnalyzer,

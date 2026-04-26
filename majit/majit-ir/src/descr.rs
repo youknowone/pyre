@@ -2214,6 +2214,23 @@ pub fn make_raw_malloc_calldescr() -> DescrRef {
     ))
 }
 
+unsafe extern "C" {
+    // llsupport/memcpy.py:3-5 — the host `memcpy` symbol that
+    // `gc.py:39 self.memcpy_fn = memcpy_fn` binds via `rffi.llexternal`.
+    fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8;
+}
+
+/// llsupport/gc.py:39 `GcLLDescr_framework.memcpy_fn` cast to a Signed
+/// via `cast_ptr_to_adr` + `cast_adr_to_int` (rewrite.py:1046-1047).
+///
+/// Returns the same address on every call so the lowered
+/// `CALL_N(memcpy_fn, …)` emitted by `rewrite_copy_str_content` carries
+/// a stable ConstInt argument across rewrites — matching upstream where
+/// the address is read once into `self.memcpy_fn` per CPU.
+pub fn memcpy_fn_addr() -> i64 {
+    memcpy as *const () as i64
+}
+
 /// llsupport/gc.py:40-43 `GcLLDescr_framework.memcpy_descr`.
 ///
 /// CallDescr used by `rewrite_copy_str_content` for the lowered
@@ -2226,28 +2243,104 @@ pub fn make_raw_malloc_calldescr() -> DescrRef {
 ///     EffectInfo([], [], [], [], [], [], EffectInfo.EF_CANNOT_RAISE,
 ///         can_collect=False))
 /// ```
+///
+/// gc.py:40-43 builds a single instance per `GcLLDescription`; pyre keeps
+/// the same identity invariant by returning a `OnceLock`-cached `Arc`,
+/// so every caller (`GcRewriterImpl::new` per-backend, optimizer
+/// virtualstate import, …) sees the same `DescrRef`.
+
+/// llsupport/gc.py:33-37 `self.fielddescr_vtable = get_field_descr(
+/// self, rclass.OBJECT, 'typeptr')`. FieldDescr describing the
+/// `typeptr` slot at the head of every `rclass.OBJECT` (offset 0,
+/// `Signed` size). Consumed by `rewrite.py:482-484` to stamp the
+/// vtable onto a freshly-allocated NEW_WITH_VTABLE result. None when
+/// the translator was built with `gcremovetypeptr=True`; pyre's
+/// production backends always emit a typeptr slot, so they install
+/// a Some value.
+///
+/// Cached as a process-wide singleton via `OnceLock` to mirror the
+/// "single instance per CPU" semantic; identity stability matters
+/// when downstream optimizer caches key on `descr_identity`.
+pub fn make_vtable_field_descr() -> DescrRef {
+    use std::sync::{Arc, OnceLock};
+    static VTABLE_FIELD_DESCR: OnceLock<DescrRef> = OnceLock::new();
+    VTABLE_FIELD_DESCR
+        .get_or_init(|| {
+            // rclass.py / objectmodel.py: typeptr lives at object head
+            // with `Signed`-sized vtable pointer; is_immutable=true
+            // because the class identity does not change after malloc.
+            Arc::new(SimpleFieldDescr::new(
+                0x6000_0000,
+                0,                            // offset
+                std::mem::size_of::<usize>(), // field_size = WORD
+                crate::Type::Int,
+                true, // is_immutable — typeptr never reassigned
+            ))
+        })
+        .clone()
+}
+
+/// llsupport/gc.py:394 `self.fielddescr_tid = get_field_descr(self,
+/// self.GCClass.HDR, 'tid')`. FieldDescr describing the `tid` slot
+/// inside the GC header.  Consumed by `rewrite.py:914-918`
+/// `gen_initialize_tid` to stamp the type id onto every freshly-allocated
+/// framework-GC object's header.  None on Boehm builds (gc.py:157), where
+/// `gen_initialize_tid` is a no-op.
+///
+/// pyre's `GcHeader` is a single u64 word (`tid_and_flags`) with the type
+/// id occupying the lower 32 bits — `offset = 0` within the header,
+/// `field_size = WORD`.  The header sits *before* the object pointer
+/// (rather than at it, as in RPython); `gen_initialize_tid` translates
+/// the descr's offset by `-HDR_SIZE` to point at the header word.
+///
+/// Cached as a process-wide singleton via `OnceLock` to mirror gc.py's
+/// "single instance per CPU" semantic.
+pub fn make_tid_field_descr() -> DescrRef {
+    use std::sync::{Arc, OnceLock};
+    static TID_FIELD_DESCR: OnceLock<DescrRef> = OnceLock::new();
+    TID_FIELD_DESCR
+        .get_or_init(|| {
+            // header.rs `GcHeader.tid_and_flags: u64` — the tid bits live
+            // at offset 0 within the header struct; we emit the full
+            // u64 store on every initialize so size = WORD.
+            // is_immutable=false: incminimark mutates flag bits on mark
+            // and rewrites the whole word on forwarding.
+            Arc::new(SimpleFieldDescr::new(
+                0x7000_0000,
+                0,                            // offset within HDR
+                std::mem::size_of::<usize>(), // field_size = WORD
+                crate::Type::Int,
+                false, // is_immutable — flags / forwarding marker mutate
+            ))
+        })
+        .clone()
+}
+
 pub fn make_memcpy_calldescr() -> DescrRef {
-    use std::sync::Arc;
-    static NEXT_IDX: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0x5000_0000);
-    let idx = NEXT_IDX.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    let effect = EffectInfo {
-        // EF_CANNOT_RAISE — memcpy is leaf; does not raise.
-        extraeffect: ExtraEffect::CannotRaise,
-        // can_collect=False — regalloc can skip saving GC-ref regs across
-        // the call (rewrite.rs `SAVE_DEFAULT_REGS` path).
-        can_collect: false,
-        ..EffectInfo::default()
-    };
-    // memcpy returns void.  `result_size=0` / `result_signed=false` are the
-    // SimpleCallDescr defaults for a Void return.
-    Arc::new(SimpleCallDescr::new(
-        idx,
-        vec![crate::Type::Int, crate::Type::Int, crate::Type::Int],
-        crate::Type::Void,
-        false,
-        0,
-        effect,
-    ))
+    use std::sync::{Arc, OnceLock};
+    static MEMCPY_DESCR: OnceLock<DescrRef> = OnceLock::new();
+    MEMCPY_DESCR
+        .get_or_init(|| {
+            let effect = EffectInfo {
+                // EF_CANNOT_RAISE — memcpy is leaf; does not raise.
+                extraeffect: ExtraEffect::CannotRaise,
+                // can_collect=False — regalloc can skip saving GC-ref regs across
+                // the call (rewrite.rs `SAVE_DEFAULT_REGS` path).
+                can_collect: false,
+                ..EffectInfo::default()
+            };
+            // memcpy returns void.  `result_size=0` / `result_signed=false`
+            // are the SimpleCallDescr defaults for a Void return.
+            Arc::new(SimpleCallDescr::new(
+                0x5000_0000,
+                vec![crate::Type::Int, crate::Type::Int, crate::Type::Int],
+                crate::Type::Void,
+                false,
+                0,
+                effect,
+            ))
+        })
+        .clone()
 }
 
 /// Simple concrete FailDescr for guard failure descriptors.
