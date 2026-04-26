@@ -1801,49 +1801,9 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
     if let Some(result) = try_function_entry_jit(frame) {
-        if majit_metainterp::majit_log_enabled() {
-            log_named_global_result(frame, "eval_with_jit_inner.try_function_entry_jit");
-        }
         return result;
     }
-    let result = handle_jitexception(frame);
-    if majit_metainterp::majit_log_enabled() {
-        log_named_global_result(frame, "eval_with_jit_inner.handle_jitexception");
-    }
-    result
-}
-
-fn log_named_global_result(frame: &PyFrame, label: &str) {
-    unsafe {
-        if frame.w_globals.is_null() {
-            return;
-        }
-        let Some(&value) = (*frame.w_globals).get("result") else {
-            return;
-        };
-        if value.is_null() {
-            eprintln!("[jit][{label}] result=NULL");
-            return;
-        }
-        // pyobject.rs:308 `is_int` returns true for both INT_TYPE and
-        // BOOL_TYPE, but W_BoolObject's layout differs from W_IntObject —
-        // calling w_int_get_value on a bool reads the wrong field. Match
-        // INT_TYPE strictly so the int payload read stays sound.
-        if pyre_object::pyobject::py_type_check(value, &pyre_object::pyobject::INT_TYPE) {
-            eprintln!(
-                "[jit][{label}] result_ptr=0x{:x} kind=int intval={}",
-                value as usize,
-                pyre_object::intobject::w_int_get_value(value),
-            );
-        } else if pyre_object::pyobject::is_bool(value) {
-            eprintln!("[jit][{label}] result_ptr=0x{:x} kind=bool", value as usize,);
-        } else {
-            eprintln!(
-                "[jit][{label}] result_ptr=0x{:x} kind=other",
-                value as usize,
-            );
-        }
-    }
+    handle_jitexception(frame)
 }
 
 /// warmspot.py:970-983 ContinueRunningNormally → portal_ptr(*args) parity.
@@ -2961,9 +2921,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // warmstate.py:503-511: procedure_token → enter unconditionally.
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][func-entry] run compiled frame=0x{:x} locals=0x{:x} key={} arg0={:?} depth={} raw_finish_known={}",
-                frame as *mut PyFrame as usize,
-                frame.locals_cells_stack_w as usize,
+                "[jit][func-entry] run compiled key={} arg0={:?} depth={} raw_finish_known={}",
                 green_key,
                 debug_first_arg_int(frame),
                 call_depth(),
@@ -2998,9 +2956,7 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 DetailedDriverRunOutcome::GuardFailure { .. } => "guard-failure",
             };
             eprintln!(
-                "[jit][func-entry] compiled outcome frame=0x{:x} locals=0x{:x} key={} arg0={:?} kind={}",
-                frame as *mut PyFrame as usize,
-                frame.locals_cells_stack_w as usize,
+                "[jit][func-entry] compiled outcome key={} arg0={:?} kind={}",
                 green_key,
                 debug_first_arg_int(frame),
                 kind

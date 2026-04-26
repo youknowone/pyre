@@ -2928,14 +2928,6 @@ impl Optimizer {
         }
 
         // unroll.py:214-218: retrace check
-        if crate::optimizeopt::majit_log_enabled() {
-            eprintln!(
-                "[jit][bridge-retrace-check] retraced_count={} retrace_limit={} jump_args={} force_boxes=false",
-                retraced_count,
-                retrace_limit,
-                jump_args.len(),
-            );
-        }
         if retraced_count < retrace_limit {
             if crate::optimizeopt::majit_log_enabled() {
                 eprintln!("[jit] Retracing ({}/{})", retraced_count + 1, retrace_limit);
@@ -2973,10 +2965,7 @@ impl Optimizer {
         // RPython sends the JUMP through the full optimization chain so that
         // force_box materializes virtuals and potential_extra_ops are consumed.
         if crate::optimizeopt::majit_log_enabled() {
-            eprintln!(
-                "[jit] Retrace count reached, jumping to preamble (retraced_count={} retrace_limit={})",
-                retraced_count, retrace_limit,
-            );
+            eprintln!("[jit] Retrace count reached, jumping to preamble");
         }
         if let Some(preamble_token) = front_target_tokens.first() {
             ctx.clear_newoperations();

@@ -909,12 +909,6 @@ impl DynasmBackend {
     }
 
     fn register_call_assembler_target(token_number: u64, code_addr: usize) {
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!(
-                "[dynasm][ca-target] register token={} addr=0x{:x}",
-                token_number, code_addr
-            );
-        }
         CALL_ASSEMBLER_TARGETS
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
@@ -922,12 +916,6 @@ impl DynasmBackend {
     }
 
     fn redirect_call_assembler_target(old_number: u64, new_addr: usize) {
-        if std::env::var_os("MAJIT_LOG").is_some() {
-            eprintln!(
-                "[dynasm][ca-target] redirect token={} addr=0x{:x}",
-                old_number, new_addr
-            );
-        }
         CALL_ASSEMBLER_TARGETS
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
