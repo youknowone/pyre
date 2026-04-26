@@ -27,10 +27,24 @@ pub struct VirtualizableConfig {
     pub static_field_offsets: Vec<usize>,
     /// Types of static (scalar) frame fields, parallel to `static_field_offsets`.
     pub static_field_types: Vec<Type>,
+    /// virtualizable.py:71-72 `static_field_descrs`.
+    ///
+    /// Standard virtualizable traces must keep using the real cached
+    /// field descriptors built by `VirtualizableInfo`, not synthetic
+    /// slot-only placeholders. `OptVirtualize::init_virtualizable`
+    /// copies these into `VirtualizableFieldState.field_descrs` so the
+    /// force path later emits upstream-shaped SetfieldRaw ops whose
+    /// FieldDescr carries `parent_descr`.
+    pub static_field_descrs: Vec<DescrRef>,
     /// Byte offsets of array pointer frame fields (e.g. locals_w, value_stack_w).
     pub array_field_offsets: Vec<usize>,
     /// Item types of array fields, parallel to `array_field_offsets`.
     pub array_item_types: Vec<Type>,
+    /// virtualizable.py:73-74 `array_field_descrs`.
+    ///
+    /// Same role as `static_field_descrs`, but for the array-pointer
+    /// fields on the virtualizable object.
+    pub array_field_descrs: Vec<DescrRef>,
     /// Trace-entry lengths of array fields, parallel to `array_field_offsets`.
     ///
     /// Standard virtualizable traces carry array elements in the input box
@@ -72,10 +86,11 @@ pub struct OptVirtualize {
     last_emitted_was_removed: bool,
     /// virtualize.py:48 OptVirtualize.__init__: self._last_guard_not_forced_2 = None
     /// virtualize.py:77-78 optimize_GUARD_NOT_FORCED_2 stashes the op here.
-    /// virtualize.py:80-90 optimize_FINISH / postprocess_FINISH consumes it
-    /// and re-inserts it just before the FINISH op in `_newoperations`
-    /// (after `store_final_boxes_in_guard`).
     last_guard_not_forced_2: Option<Op>,
+    /// virtualize.py:81 / 84: self._finish_guard_op.
+    /// Set by optimize_FINISH and consumed by postprocess_FINISH after the
+    /// FINISH result has already been forced and emitted.
+    finish_guard_op: Option<Op>,
 }
 
 impl OptVirtualize {
@@ -87,6 +102,7 @@ impl OptVirtualize {
             needs_vable_setup: false,
             last_emitted_was_removed: false,
             last_guard_not_forced_2: None,
+            finish_guard_op: None,
         }
     }
 
@@ -99,6 +115,7 @@ impl OptVirtualize {
             needs_vable_setup: false,
             last_emitted_was_removed: false,
             last_guard_not_forced_2: None,
+            finish_guard_op: None,
         }
     }
 
@@ -160,7 +177,7 @@ impl OptVirtualize {
         };
         let mut flat_input_idx = 1usize;
 
-        for &offset in &config.static_field_offsets {
+        for (field_idx_in_vinfo, &offset) in config.static_field_offsets.iter().enumerate() {
             if flat_input_idx >= ctx.num_inputs() {
                 break;
             }
@@ -170,7 +187,11 @@ impl OptVirtualize {
             set_field_descr(
                 &mut state.field_descrs,
                 field_idx,
-                make_field_index_descr(field_idx),
+                config
+                    .static_field_descrs
+                    .get(field_idx_in_vinfo)
+                    .cloned()
+                    .unwrap_or_else(|| make_field_index_descr(field_idx)),
             );
             flat_input_idx += 1;
         }
@@ -185,7 +206,11 @@ impl OptVirtualize {
             set_field_descr(
                 &mut state.field_descrs,
                 field_idx,
-                make_field_index_descr(field_idx),
+                config
+                    .array_field_descrs
+                    .get(array_idx)
+                    .cloned()
+                    .unwrap_or_else(|| make_field_index_descr(field_idx)),
             );
 
             let mut elements = Vec::with_capacity(length);
@@ -1351,12 +1376,7 @@ impl Optimization for OptVirtualize {
             // The actual arg forcing belongs later in Optimizer._emit_operation,
             // after the queued guard has been flushed ahead of FINISH.
             OpCode::Finish => {
-                // Force all virtual args (same as escaping op).
-                let result = self.optimize_escaping_op(op, ctx);
-                if let Some(stashed) = self.last_guard_not_forced_2.take() {
-                    let after = ctx.current_pass_idx;
-                    ctx.emit_extra(after, stashed);
-                }
+                self.finish_guard_op = self.last_guard_not_forced_2.take();
                 OptimizationResult::PassOn
             }
 
@@ -1516,10 +1536,30 @@ impl Optimization for OptVirtualize {
     }
 
     fn setup(&mut self) {
+        self.last_emitted_was_removed = false;
+        self.last_guard_not_forced_2 = None;
         self.vable_initialized = false;
         // Defer virtualizable PtrInfo init to first propagate_forward
         // (setup() doesn't have access to OptContext).
         self.needs_vable_setup = self.vable_config.is_some();
+        self.finish_guard_op = None;
+    }
+
+    fn have_postprocess_op(&self, opcode: OpCode) -> bool {
+        matches!(opcode, OpCode::Finish)
+    }
+
+    fn propagate_postprocess(&mut self, op: &Op, ctx: &mut OptContext) {
+        if op.opcode != OpCode::Finish {
+            return;
+        }
+        if let Some(guard_op) = self.finish_guard_op.take() {
+            debug_assert!(
+                ctx.pending_finish_guard_postprocess.is_none(),
+                "postprocess_FINISH queued multiple guards"
+            );
+            ctx.pending_finish_guard_postprocess = Some(guard_op);
+        }
     }
 
     fn name(&self) -> &'static str {
@@ -2144,8 +2184,10 @@ mod tests {
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
             static_field_types: vec![],
+            static_field_descrs: vec![],
             array_field_offsets: vec![8],
             array_item_types: vec![Type::Ref],
+            array_field_descrs: vec![],
             array_lengths: vec![1],
         });
         pass.setup();
@@ -2173,8 +2215,10 @@ mod tests {
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
             static_field_types: vec![],
+            static_field_descrs: vec![],
             array_field_offsets: vec![8],
             array_item_types: vec![Type::Int],
+            array_field_descrs: vec![],
             array_lengths: vec![1],
         });
         pass.setup();
@@ -2235,8 +2279,10 @@ mod tests {
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![8, 16],
             static_field_types: vec![Type::Int, Type::Int],
+            static_field_descrs: vec![],
             array_field_offsets: vec![],
             array_item_types: vec![],
+            array_field_descrs: vec![],
             array_lengths: vec![],
         });
         pass.setup();
@@ -2267,8 +2313,10 @@ mod tests {
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![8],
             static_field_types: vec![Type::Int],
+            static_field_descrs: vec![],
             array_field_offsets: vec![],
             array_item_types: vec![],
+            array_field_descrs: vec![],
             array_lengths: vec![],
         });
         pass.setup();
@@ -2287,8 +2335,10 @@ mod tests {
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![8],
             static_field_types: vec![Type::Int],
+            static_field_descrs: vec![],
             array_field_offsets: vec![],
             array_item_types: vec![],
+            array_field_descrs: vec![],
             array_lengths: vec![],
         });
         pass.setup();
@@ -2298,6 +2348,38 @@ mod tests {
 
         let result = pass.propagate_forward(&set, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
+    }
+
+    #[test]
+    fn test_standard_virtualizable_init_uses_parent_backed_field_descrs() {
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        let parent = majit_ir::make_size_descr_full(900, 16, 1);
+        info.set_parent_descr(parent);
+        let config = info.to_optimizer_config();
+        let real_descr = info.static_field_descr(0);
+
+        let mut ctx = OptContext::with_num_inputs(8, 2);
+        let mut pass = OptVirtualize::with_virtualizable(config);
+        pass.setup();
+        pass.ensure_vable_setup(&mut ctx);
+
+        let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info(OpRef(0)) else {
+            panic!("expected standard virtualizable ptr info on OpRef(0)");
+        };
+        let seeded = get_field_descr(&vstate.field_descrs, virtualizable_field_index(8))
+            .expect("virtualizable init should seed field descr");
+        assert_eq!(
+            majit_ir::descr::descr_identity(&seeded),
+            majit_ir::descr::descr_identity(&real_descr)
+        );
+        assert!(
+            seeded
+                .as_field_descr()
+                .and_then(|fd| fd.get_parent_descr())
+                .is_some(),
+            "standard virtualizable config must carry real fielddescr.parent_descr",
+        );
     }
 
     #[test]
@@ -2336,8 +2418,10 @@ mod tests {
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
             static_field_types: vec![],
+            static_field_descrs: vec![],
             array_field_offsets: vec![24],
             array_item_types: vec![Type::Int],
+            array_field_descrs: vec![],
             array_lengths: vec![1],
         });
         pass.setup();
@@ -2363,8 +2447,10 @@ mod tests {
         let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![],
             static_field_types: vec![],
+            static_field_descrs: vec![],
             array_field_offsets: vec![24],
             array_item_types: vec![Type::Int],
+            array_field_descrs: vec![],
             array_lengths: vec![1],
         });
         pass.setup();
@@ -2385,12 +2471,51 @@ mod tests {
     }
 
     #[test]
+    fn test_standard_virtualizable_raw_setarrayitem_updates_vable_state_without_side_table() {
+        let mut ctx = OptContext::with_num_inputs(3, 2);
+        ctx.seed_constant(OpRef(50), Value::Int(0));
+        let mut pass = OptVirtualize::with_virtualizable(VirtualizableConfig {
+            static_field_offsets: vec![],
+            static_field_types: vec![],
+            static_field_descrs: vec![],
+            array_field_offsets: vec![24],
+            array_item_types: vec![Type::Int],
+            array_field_descrs: vec![],
+            array_lengths: vec![1],
+        });
+        pass.setup();
+
+        let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef(0)]);
+        get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
+        get_field.pos = OpRef(10);
+        assert!(matches!(
+            pass.propagate_forward(&get_field, &mut ctx),
+            OptimizationResult::PassOn
+        ));
+        ctx.emit(get_field);
+
+        let mut set_item = Op::new(OpCode::SetarrayitemRaw, &[OpRef(10), OpRef(50), OpRef(2)]);
+        set_item.descr = Some(array_descr(24));
+        assert!(matches!(
+            pass.propagate_forward(&set_item, &mut ctx),
+            OptimizationResult::PassOn
+        ));
+
+        let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info(OpRef(0)) else {
+            panic!("expected standard virtualizable ptr info on OpRef(0)");
+        };
+        assert_eq!(get_array_element(&vstate.arrays, 0, 0), Some(OpRef(2)));
+    }
+
+    #[test]
     fn test_standard_virtualizable_loop_keeps_original_input_arity() {
         let mut opt = Optimizer::default_pipeline_with_virtualizable(VirtualizableConfig {
             static_field_offsets: vec![8],
             static_field_types: vec![Type::Int],
+            static_field_descrs: vec![],
             array_field_offsets: vec![24],
             array_item_types: vec![Type::Int],
+            array_field_descrs: vec![],
             array_lengths: vec![1],
         });
         let mut constants = HashMap::new();

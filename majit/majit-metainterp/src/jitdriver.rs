@@ -1841,15 +1841,9 @@ impl<S: JitState> JitDriver<S> {
             }
         }
 
-        // Always refresh the cached trace-entry vable layout when MetaInterp
-        // has a registered VirtualizableInfo.  Historically this block sat
-        // inside the `descriptor.virtualizable()` branch above, but pyre's
-        // `driver_descriptor` returns None until the CA-emission refactor
-        // lands (see `pyre-jit-trace/src/state.rs::driver_descriptor`).
-        // Without this fallback, `trace_entry_vable_lengths` is forced to
-        // return `[]`, `initialize_virtualizable` exits early, and
-        // `virtualizable_boxes` is never populated for the trace.
-        //
+        // Refresh the trace-entry vable heap pointer so `initialize_virtualizable`
+        // reads array lengths directly from the concrete virtualizable object
+        // (pyjitpl.py:3302 `vinfo.read_boxes(cpu, virtualizable, startindex)`).
         // `VirtualizableInfo.name` is the canonical identifier declared via
         // `virtualizable!(name = "...")`, so we can feed it straight to the
         // interpreter hooks without going through the descriptor.
@@ -1861,6 +1855,11 @@ impl<S: JitState> JitDriver<S> {
             if let Some(ptr) = state.virtualizable_heap_ptr(meta, &vable_name, info) {
                 self.meta.set_vable_ptr(ptr.cast_const());
             }
+            // Fallback cache for layouts that cannot expose array length on
+            // the heap object alone (header-less embedded arrays). Unused in
+            // production since PyFrame's `locals_cells_stack_w` is embedded
+            // with a length_offset; retained so tests that don't stage a
+            // fake heap object still reach `initialize_virtualizable`.
             let fallback_lengths = state
                 .virtualizable_array_lengths(meta, &vable_name, info)
                 .unwrap_or_default();

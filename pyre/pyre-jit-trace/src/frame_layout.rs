@@ -89,3 +89,24 @@ pub fn build_pyframe_virtualizable_info() -> std::sync::Arc<VirtualizableInfo> {
     info.clear_vable_descr = Some(VirtualizableInfo::make_clear_vable_descr());
     info.finalize_arc(crate::state::pyframe_size_descr())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::build_pyframe_virtualizable_info;
+
+    #[test]
+    fn pyframe_token_descr_parent_survives_vinfo_drop() {
+        let info = build_pyframe_virtualizable_info();
+        let token_descr = info.token_field_descr();
+        drop(info);
+
+        let parent = token_descr
+            .as_field_descr()
+            .and_then(|fd| fd.get_parent_descr());
+        assert!(
+            parent.is_some(),
+            "PyFrame token field descr must keep a live parent SizeDescr \
+             like GcCache.get_size_descr()"
+        );
+    }
+}

@@ -6144,6 +6144,9 @@ pub fn force_from_resumedata<'a>(
     all_liveness: &'a [u8],
     deadframe: &'a [i64],
     deadframe_types: Option<&'a [majit_ir::Type]>,
+    rd_virtuals: Option<&'a [VirtualInfo]>,
+    rd_pendingfields: Option<&[PendingFieldInfo]>,
+    rd_guard_pendingfields: Option<&[majit_ir::GuardPendingFieldEntry]>,
     vrefinfo: Option<&dyn VRefInfo>,
     vinfo: Option<&dyn VirtualizableInfo>,
     ginfo: Option<&dyn GreenfieldInfo>,
@@ -6159,6 +6162,9 @@ pub fn force_from_resumedata<'a>(
         None,
         allocator,
     );
+    // resume.py:1371 common-case __init__ calls self._prepare(storage)
+    // before handling_async_forcing() flips the GUARD_NOT_FORCED state.
+    resumereader.prepare(rd_virtuals, rd_pendingfields, rd_guard_pendingfields);
     resumereader.handling_async_forcing();
     // resume.py:1350
     resumereader.consume_vref_and_vable(vrefinfo, vinfo, ginfo);

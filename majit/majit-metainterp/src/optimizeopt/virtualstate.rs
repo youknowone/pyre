@@ -1194,6 +1194,7 @@ impl VirtualState {
         other: &VirtualState,
         boxes: &[OpRef],
         runtime_boxes: Option<&[OpRef]>,
+        ctx: &OptContext,
         force_boxes: bool,
     ) -> Result<Vec<GuardRequirement>, ()> {
         if self.state.len() != other.state.len() {
@@ -1204,15 +1205,25 @@ impl VirtualState {
         for (i, (expected, incoming)) in self.state.iter().zip(other.state.iter()).enumerate() {
             let box_opref = boxes.get(i).copied().unwrap_or(OpRef::NONE);
             let runtime_box = runtime_boxes.and_then(|rb| rb.get(i).copied());
-            Self::generate_guards_for_entry(
+            if let Err(()) = Self::generate_guards_for_entry(
                 i,
                 expected,
                 incoming,
                 box_opref,
                 runtime_box,
+                ctx,
                 force_boxes,
                 &mut guards,
-            )?;
+            ) {
+                if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                    let runtime_value =
+                        runtime_box.and_then(|runtime_box| ctx.get_constant(runtime_box).cloned());
+                    eprintln!(
+                        "[jit][jte] virtualstate mismatch index={i} box={box_opref:?} runtime={runtime_box:?} runtime_value={runtime_value:?} expected={expected:?} incoming={incoming:?}"
+                    );
+                }
+                return Err(());
+            }
         }
 
         Ok(guards)
@@ -1238,6 +1249,7 @@ impl VirtualState {
         incoming: &VirtualStateInfo,
         box_opref: OpRef,
         runtime_box: Option<OpRef>,
+        ctx: &OptContext,
         force_boxes: bool,
         guards: &mut Vec<GuardRequirement>,
     ) -> Result<(), ()> {
@@ -1313,8 +1325,14 @@ impl VirtualState {
             // ── Constant target ── (virtualstate.py:396-405)
             (VirtualStateInfo::Constant(a), VirtualStateInfo::Constant(b)) if a == b => Ok(()),
             (VirtualStateInfo::Constant(val), _) => {
-                // virtualstate.py:400-405: runtime_box check for guard_value.
-                if runtime_box.is_some() {
+                // virtualstate.py:400-405: emit GUARD_VALUE only when the
+                // concrete runtime box already equals the target constant.
+                // Merely having a runtime box is not enough; RPython checks
+                // `self.constbox.same_constant(runtime_box.constbox())`.
+                if runtime_box
+                    .and_then(|runtime_box| ctx.get_constant(runtime_box))
+                    .is_some_and(|runtime_value| runtime_value == val)
+                {
                     guards.push(GuardRequirement::GuardValue {
                         arg_index: arg_idx,
                         box_opref,
@@ -2345,10 +2363,11 @@ mod tests {
         ]);
 
         let boxes = vec![OpRef(100), OpRef(101)];
+        let ctx = OptContext::new(128);
         // runtime_boxes=Some enables non-permanent guard emission (RPython
         // _jump_to_existing_trace path). With None, Unknown incoming → Err.
         let guards = s1
-            .generate_guards(&s2, &boxes, Some(&boxes), false)
+            .generate_guards(&s2, &boxes, Some(&boxes), &ctx, false)
             .unwrap();
         assert_eq!(guards.len(), 2);
         assert!(matches!(
@@ -2359,6 +2378,43 @@ mod tests {
             &guards[1],
             GuardRequirement::GuardNonnull { arg_index: 1, box_opref } if *box_opref == OpRef(101)
         ));
+    }
+
+    #[test]
+    fn test_constant_guard_requires_matching_runtime_box() {
+        let expected = VirtualState::new(vec![VirtualStateInfo::Constant(Value::Int(7))]);
+        let incoming = VirtualState::new(vec![VirtualStateInfo::Unknown(Type::Int)]);
+        let boxes = vec![OpRef(10)];
+
+        let mut ctx = OptContext::new(128);
+        let matching_runtime = ctx.make_constant_int(7);
+        let guards = expected
+            .generate_guards(&incoming, &boxes, Some(&[matching_runtime]), &ctx, false)
+            .unwrap();
+        assert_eq!(guards.len(), 1);
+
+        let mismatching_runtime = ctx.make_constant_int(8);
+        assert!(
+            expected
+                .generate_guards(&incoming, &boxes, Some(&[mismatching_runtime]), &ctx, false)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn test_guard_value_preserves_ref_constant_type() {
+        let mut ctx = OptContext::new(128);
+        let expected = GcRef(0x1234);
+        let guard = GuardRequirement::GuardValue {
+            arg_index: 0,
+            box_opref: OpRef(10),
+            expected_value: Value::Ref(expected),
+        }
+        .to_op(&[OpRef(10)], &mut ctx)
+        .unwrap();
+
+        assert_eq!(guard.opcode, OpCode::GuardValue);
+        assert_eq!(ctx.get_constant(guard.arg(1)), Some(&Value::Ref(expected)));
     }
 
     // ── Export/Import tests ──

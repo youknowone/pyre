@@ -355,6 +355,11 @@ impl UnrollOptimizer {
                 p1_ops_in.push(op);
             }
             let p1_iter_fresh_hw = p1_iter._fresh;
+            opt_p1.runtime_boxes = ops
+                .iter()
+                .rfind(|op| op.opcode == OpCode::Jump)
+                .map(|op| op.args.to_vec())
+                .unwrap_or_default();
             let p1_ops =
                 opt_p1.optimize_with_constants_and_inputs(&p1_ops_in, &mut consts_p1, num_inputs);
             // RPython parity: Phase 1 optimizer may discover new constants
@@ -373,8 +378,14 @@ impl UnrollOptimizer {
 
             match opt_p1.exported_loop_state.take() {
                 Some(mut state) => {
-                    // unroll.py:454 end_args carry type via Box; export_state
-                    // already populated `state.end_arg_types` from ctx.
+                    // end_arg_types is already populated by
+                    // `Optimizer::optimize_with_constants_and_inputs_at`
+                    // using the optimizer-visible `ctx.opref_type()` (see
+                    // optimizer.rs:2405-2416). Overwriting it here with
+                    // `opcode.result_type()` + `Type::Ref` default would
+                    // retype Phase 1 inputarg OpRefs (absent from `p1_ops`)
+                    // as `Ref`, which later feeds the cross-type forward
+                    // assertion in `OptContext::replace_op`.
                     // RPython Phase 1 → Phase 2 heap cache transfer:
                     // RPython does NOT serialize heap cache in ExportedState.
                     // HeapOps in the short preamble are replayed during Phase 2's
@@ -431,7 +442,9 @@ impl UnrollOptimizer {
                         renamed_inputargs: state.renamed_inputargs.clone(),
                         renamed_inputarg_types: state.renamed_inputarg_types.clone(),
                         short_inputargs: Vec::new(),
+                        runtime_boxes: Vec::new(),
                         patchguardop: None,
+                        phase1_value_types: HashMap::new(),
                         rooted_refs: Vec::new(),
                         shadow_stack_base: 0,
                     });
@@ -643,13 +656,25 @@ impl UnrollOptimizer {
         // reference these via `imported_label_args`. They are NOT in the
         // `p2_cache` (only raw trace positions are), so leave
         // `phase1_value_types` untranslated.
-        let p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
+        let mut p2_ops = opt_p2.optimize_with_constants_and_inputs_at(
             &p2_ops_in,
             &mut consts_p2,
             body_num_inputs,
             phase2_inputarg_base, // inputarg_base — Phase 2 inputargs at [phase2_inputarg_base..)
             p2_high_water,
         );
+        // RPython parity: by the time Phase 2 reaches the assembly path,
+        // body op args have already been canonicalized through
+        // `get_box_replacement` (optimizer.rs:2932-2940).  The flat OpRef
+        // port keeps Phase 2 source slots in a disjoint namespace
+        // `[phase2_inputarg_base..)` during optimization; re-resolve the
+        // finalized body ops here so no raw Phase 2 inputarg slot leaks into
+        // `assemble_peeled_trace_with_jump_args`.
+        if let Some(final_ctx) = opt_p2.final_ctx.as_ref() {
+            for op in &mut p2_ops {
+                apply_box_replacements(op, final_ctx);
+            }
+        }
         // Post-translate Phase 2 output back to the shared-inputarg
         // layout expected by `assemble_peeled_trace_with_jump_args`.
         //
@@ -983,6 +1008,16 @@ impl UnrollOptimizer {
                             .downcast_ref::<crate::optimize::InvalidLoop>()
                             .is_some()
                         {
+                            if let Some(reason) =
+                                payload.downcast_ref::<crate::optimize::InvalidLoop>()
+                            {
+                                if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                                    eprintln!(
+                                        "[jit][jte] InvalidLoop during force_boxes=false: {}",
+                                        reason.0
+                                    );
+                                }
+                            }
                             // unroll.py:154-158: except InvalidLoop →
                             // jump_to_preamble, skip retry
                             invalid_loop = true;
@@ -1032,6 +1067,16 @@ impl UnrollOptimizer {
                                 .downcast_ref::<crate::optimize::InvalidLoop>()
                                 .is_some()
                             {
+                                if let Some(reason) =
+                                    payload.downcast_ref::<crate::optimize::InvalidLoop>()
+                                {
+                                    if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                                        eprintln!(
+                                            "[jit][jte] InvalidLoop during force_boxes=true retrace: {}",
+                                            reason.0
+                                        );
+                                    }
+                                }
                                 false // unroll.py:167-168: except InvalidLoop: pass
                             } else {
                                 std::panic::resume_unwind(payload);
@@ -1060,6 +1105,16 @@ impl UnrollOptimizer {
                                 .downcast_ref::<crate::optimize::InvalidLoop>()
                                 .is_some()
                             {
+                                if let Some(reason) =
+                                    payload.downcast_ref::<crate::optimize::InvalidLoop>()
+                                {
+                                    if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                                        eprintln!(
+                                            "[jit][jte] InvalidLoop during force_boxes=true limit: {}",
+                                            reason.0
+                                        );
+                                    }
+                                }
                                 false // unroll.py:224-225: except InvalidLoop: pass
                             } else {
                                 std::panic::resume_unwind(payload);
@@ -1360,10 +1415,28 @@ pub struct ExportedState {
     pub renamed_inputarg_types: Vec<Type>,
     /// Short inputargs for the short preamble.
     pub short_inputargs: Vec<OpRef>,
+    /// unroll.py: runtime_boxes — live values at the original jump point.
+    /// Threaded into Phase 2 import as `runtime_boxes` for guard generation.
+    /// Default `Vec::new()` until the export site populates it; callers
+    /// that need it write the field directly after `ExportedState::new`.
+    pub runtime_boxes: Vec<OpRef>,
     /// RPython parity: patchguardop from Phase 1's GuardFutureCondition.
     /// Phase 2's extra_guards (from virtualstate) need rd_resume_position
     /// from this patchguardop (unroll.py:333-336).
     pub patchguardop: Option<majit_ir::Op>,
+    /// Complete Phase 1 `value_types` map (OpRef position → result type).
+    ///
+    /// RPython's `Box` carries its type intrinsically (InputArgInt /
+    /// InputArgRef / ResOp with typed opcode), so a retrace inherits the
+    /// type automatically through the shared Box object. Pyre's `OpRef(u32)`
+    /// is untyped, so Phase 1 types must be serialized here and re-seeded
+    /// into Phase 2's `prev_phase_value_types` on the retrace path where
+    /// Phase 1 is skipped (see `compile_retrace` in unroll.rs).
+    ///
+    /// Default `HashMap::new()` — populated by the export site once the
+    /// retrace path starts reading it; consumers without Phase 1 types
+    /// continue to fall back to `OptContext.value_types` lookups.
+    pub phase1_value_types: HashMap<u32, Type>,
     /// Shadow stack rooting for GcRef values in exported_infos.
     /// (OpRef key, field kind, shadow stack index).
     rooted_refs: Vec<(OpRef, ExportedGcRefField, usize)>,
@@ -1479,7 +1552,9 @@ impl ExportedState {
             renamed_inputargs,
             renamed_inputarg_types,
             short_inputargs,
+            runtime_boxes: Vec::new(),
             patchguardop: None,
+            phase1_value_types: HashMap::new(),
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -1489,6 +1564,154 @@ impl ExportedState {
         // order (longer-lived copy rooted first → lower shadow stack depth).
         // new() does NOT auto-root because the LIFO ordering depends on
         // the caller's storage pattern.
+    }
+
+    /// Smallest fresh OpRef that is guaranteed not to collide with any Box
+    /// identity stored in this exported preamble state.
+    ///
+    /// RPython keeps these as object identities in `partial_trace` /
+    /// `ExportedState`. Majit uses integer OpRefs, so compile_retrace must
+    /// reconstruct this high-water mark before creating the fresh Phase 2
+    /// TraceIterator namespace.
+    #[allow(dead_code)]
+    fn opref_high_water(&self) -> u32 {
+        let mut high = 0_u32;
+        let mut visit = |opref: OpRef| {
+            if !opref.is_none() && !opref.is_constant() {
+                high = high.max(opref.0.saturating_add(1));
+            }
+        };
+        let visit_op = |op: &Op, visit: &mut dyn FnMut(OpRef)| {
+            visit(op.pos);
+            for &arg in &op.args {
+                visit(arg);
+            }
+            if let Some(ref fail_args) = op.fail_args {
+                for &arg in fail_args {
+                    visit(arg);
+                }
+            }
+        };
+        let visit_short_arg = |arg: &ExportedShortArg, visit: &mut dyn FnMut(OpRef)| {
+            if let ExportedShortArg::Const { source, .. } = arg {
+                visit(*source);
+            }
+        };
+
+        for &opref in &self.end_args {
+            visit(opref);
+        }
+        for &opref in &self.next_iteration_args {
+            visit(opref);
+        }
+        for &opref in &self.renamed_inputargs {
+            visit(opref);
+        }
+        for &opref in &self.short_inputargs {
+            visit(opref);
+        }
+        for &opref in &self.runtime_boxes {
+            visit(opref);
+        }
+
+        for (&opref, info) in &self.exported_infos {
+            visit(opref);
+            if let crate::optimizeopt::info::OpInfo::Ptr(ptr_info) = info {
+                for child in ptr_info.visitor_walk_recursive() {
+                    visit(child);
+                }
+            }
+        }
+
+        for exported in &self.exported_short_ops {
+            match exported {
+                ExportedShortOp::Pure {
+                    source,
+                    args,
+                    same_as_source,
+                    ..
+                } => {
+                    visit(*source);
+                    for arg in args {
+                        visit_short_arg(arg, &mut visit);
+                    }
+                    if let Some(source) = same_as_source {
+                        visit(*source);
+                    }
+                }
+                ExportedShortOp::HeapField {
+                    source,
+                    object,
+                    same_as_source,
+                    ..
+                }
+                | ExportedShortOp::HeapArrayItem {
+                    source,
+                    object,
+                    same_as_source,
+                    ..
+                } => {
+                    visit(*source);
+                    visit_short_arg(object, &mut visit);
+                    if let Some(source) = same_as_source {
+                        visit(*source);
+                    }
+                }
+                ExportedShortOp::LoopInvariant {
+                    source,
+                    same_as_source,
+                    ..
+                } => {
+                    visit(*source);
+                    if let Some(source) = same_as_source {
+                        visit(*source);
+                    }
+                }
+            }
+        }
+
+        for preamble_op in &self.exported_short_boxes {
+            visit_op(&preamble_op.op, &mut visit);
+            if let Some(source) = preamble_op.same_as_source {
+                visit(source);
+            }
+        }
+
+        if let Some(short_preamble) = &self.short_preamble {
+            for opref in short_preamble
+                .inputargs
+                .iter()
+                .chain(short_preamble.used_boxes.iter())
+                .chain(short_preamble.jump_args.iter())
+            {
+                visit(*opref);
+            }
+            if let Some(phase1_inputargs) = &short_preamble.phase1_inputargs {
+                for &opref in phase1_inputargs {
+                    visit(opref);
+                }
+            }
+            for short_op in &short_preamble.ops {
+                visit_op(&short_op.op, &mut visit);
+            }
+            for ptr_info in short_preamble.inputarg_infos.iter().flatten() {
+                for child in ptr_info.visitor_walk_recursive() {
+                    visit(child);
+                }
+            }
+        }
+
+        // phase1_value_types carries the full Phase 1 value_types map, which
+        // can include positions that are not reachable via any of the
+        // structure-stored OpRef fields above (e.g. intermediate ops that
+        // were forwarded and never survive as an end_arg / short_op source).
+        // Retrace must keep its Phase 2 namespace disjoint from every one
+        // of those, so factor their max position into the high water too.
+        if let Some(&max) = self.phase1_value_types.keys().max() {
+            visit(OpRef(max));
+        }
+
+        high
     }
 
     /// Push all GcRef values from exported_infos and virtual_state to
@@ -1717,7 +1940,9 @@ impl Clone for ExportedState {
             renamed_inputargs: self.renamed_inputargs.clone(),
             renamed_inputarg_types: self.renamed_inputarg_types.clone(),
             short_inputargs: self.short_inputargs.clone(),
+            runtime_boxes: self.runtime_boxes.clone(),
             patchguardop: self.patchguardop.clone(),
+            phase1_value_types: self.phase1_value_types.clone(),
             rooted_refs: Vec::new(),
             shadow_stack_base: majit_gc::shadow_stack::depth(),
         }
@@ -2072,9 +2297,34 @@ impl OptUnroll {
         // unroll.py:454 `end_args` are typed Boxes — port reads each arg's
         // authoritative type from `ctx` at export time so downstream consumers
         // never have to reconstruct types from op result shape.
-        let end_arg_types: Vec<Type> = end_args
+        // RPython Box type parity: `renamed_inputargs` are the fresh per-iteration
+        // InputArg Boxes (unroll.py `trace.get_iter()` inputargs). Their types
+        // are intrinsic on RPython Boxes; pyre reconstructs them via
+        // `ctx.opref_type` for each renamed OpRef directly. Using
+        // `end_arg_types` (computed over `end_args`) here would be wrong:
+        // `end_args` are the post-force JUMP operands, which may be distinct
+        // OpRefs from the renamed inputargs (and can have different types
+        // when forcing virtuals replaces an InputArg slot with a fresh
+        // NewWithVtable / SameAs alias).
+        let renamed_inputarg_types: Vec<Type> = renamed_inputargs
             .iter()
-            .map(|&arg| ctx.opref_type(arg).unwrap_or(Type::Ref))
+            .map(|&opref| {
+                ctx.opref_type(opref).unwrap_or_else(|| {
+                    // unroll.py ExportedState has no parity for this missing-type
+                    // case because RPython Boxes always carry `.type`. In pyre
+                    // a renamed inputarg OpRef may not have a value_types entry
+                    // when the corresponding inputarg slot was never referenced
+                    // by any emitted op — return Ref as a conservative default
+                    // (matches the pre-fix `end_arg_types` fallback shape).
+                    if crate::optimizeopt::majit_log_enabled() {
+                        eprintln!(
+                            "[jit][renamed_inputarg_types] missing type for {:?}; falling back to Ref",
+                            opref
+                        );
+                    }
+                    Type::Ref
+                })
+            })
             .collect();
         ExportedState::new(
             label_args.clone(),
@@ -2084,7 +2334,7 @@ impl OptUnroll {
             exported_short_ops,
             exported_short_boxes,
             renamed_inputargs.to_vec(),
-            end_arg_types,
+            renamed_inputarg_types,
             short_args,
         )
     }
@@ -2309,6 +2559,7 @@ impl OptUnroll {
                 &virtual_state,
                 &args,
                 runtime_boxes,
+                ctx,
                 force_boxes,
             ) {
                 Ok(guards) => guards,
@@ -2345,6 +2596,17 @@ impl OptUnroll {
                             force_boxes,
                         )
                     });
+                    if std::env::var_os("MAJIT_LOG_JTET").is_some() {
+                        let arg_values: Vec<_> = guard_op
+                            .args
+                            .iter()
+                            .map(|&arg| (arg, ctx.get_constant(arg).cloned()))
+                            .collect();
+                        eprintln!(
+                            "[jit][jte] target_token #{tt_idx} emit guard {:?} from {:?} args={:?}",
+                            guard_op.opcode, guard_req, arg_values
+                        );
+                    }
                     // unroll.py:336: guard.rd_resume_position = patchguardop.rd_resume_position
                     guard_op.rd_resume_position = patch.rd_resume_position;
                     guard_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
@@ -2824,6 +3086,9 @@ impl OptUnroll {
             debug_assert!(source != *target, "import_state: source is target");
             // source.set_forwarded(target)
             ctx.replace_op(source, *target);
+            if crate::optimizeopt::majit_log_enabled() {
+                eprintln!("[jit] import_state_map[{i}]: source={source:?} target={target:?}");
+            }
             // info = exported_state.exported_infos.get(target, None)
             // if info is not None:
             if let Some(info) = exported_state.exported_infos.get(target) {
@@ -2834,10 +3099,17 @@ impl OptUnroll {
         }
         // label_args = exported_state.virtual_state.make_inputargs(
         //     targetargs, self.optimizer)
-        let label_args = exported_state
+        let label_args = match exported_state
             .virtual_state
             .make_inputargs(targetargs, optimizer, ctx, false)
-            .expect("import_state make_inputargs failed (VirtualStatesCantMatch)");
+        {
+            Ok(args) => args,
+            Err(()) => {
+                std::panic::panic_any(crate::optimize::InvalidLoop(
+                    "Cannot import state, virtual states don't match",
+                ));
+            }
+        };
         // self.short_preamble_producer = ShortPreambleBuilder(
         //     label_args, exported_state.short_boxes,
         //     exported_state.short_inputargs, exported_state.exported_infos,
@@ -3523,6 +3795,7 @@ impl OptUnroll {
                     ) else {
                         continue;
                     };
+                    ctx.register_value_type(value, result_type);
                     ctx.replace_op(source, value);
                     ctx.imported_loop_invariant_results.insert(func_ptr, value);
                     ctx.imported_short_sources
@@ -4025,6 +4298,15 @@ fn assemble_peeled_trace_with_jump_args(
     {
         let mut seen_body_defs = std::collections::HashSet::new();
         for op in p2_ops {
+            // compile.py assembles the loop LABEL from `label_op` plus
+            // short-preamble `used_boxes`; the terminal JUMP's target-local
+            // payload is not part of that contract. In particular,
+            // jump_to_preamble retargets the body JUMP to the preamble start
+            // label, so carrying its extra args into the loop LABEL mutates
+            // the body arity in a way upstream never does.
+            if op.opcode == OpCode::Jump {
+                continue;
+            }
             let all_refs = op
                 .args
                 .iter()
@@ -4304,7 +4586,12 @@ fn assemble_peeled_trace_with_jump_args(
                     .enumerate()
                     .map(|(i, &arg)| (OpRef(i as u32), arg))
                     .collect();
-                original_args
+                // unroll.py:238-242 jump_to_preamble sends the live JUMP
+                // after force_box / send_extra_operation rewrites. Use the
+                // already-remapped args here; falling back to original_args
+                // resurrects virtual/raw pre-force refs.
+                new_op
+                    .args
                     .iter()
                     .map(|arg| start_remap.get(arg).copied().unwrap_or(*arg))
                     .collect()
@@ -6054,6 +6341,54 @@ mod tests {
         let jump = combined.last().expect("assembled jump");
         assert_eq!(jump.opcode, OpCode::Jump);
         assert_eq!(jump.args.as_slice(), &[OpRef(100), OpRef(101)]);
+    }
+
+    #[test]
+    fn test_assemble_peeled_trace_does_not_extend_body_label_with_preamble_jump_only_args() {
+        let start_descr = TargetToken::new_preamble(0).as_jump_target_descr();
+        let loop_descr = TargetToken::new_loop(1).as_jump_target_descr();
+        let p2_ops = vec![
+            {
+                let mut op = Op::new(OpCode::IntAdd, &[OpRef(10), OpRef::from_const(0)]);
+                op.pos = OpRef(20);
+                op
+            },
+            {
+                let mut jump = Op::new(OpCode::Jump, &[OpRef(10), OpRef(50), OpRef(60)]);
+                jump.descr = Some(start_descr.clone());
+                jump
+            },
+        ];
+        let constants = std::collections::HashMap::from([(OpRef::from_const(0).0, 1_i64)]);
+
+        let combined = assemble_peeled_trace(
+            &[],
+            &p2_ops,
+            &[OpRef(10)],
+            &[OpRef(100), OpRef(101), OpRef(102)],
+            &[],
+            1,
+            false,
+            &[],
+            &[],
+            &constants,
+            Some(start_descr),
+            Some(loop_descr),
+        );
+
+        let body_label = combined
+            .iter()
+            .find(|op| {
+                op.opcode == OpCode::Label
+                    && op.descr.as_ref().map(|descr| descr.repr())
+                        == Some("LoopTargetDescr(1)".to_string())
+            })
+            .expect("body label");
+        assert_eq!(body_label.args.as_slice(), &[OpRef(10)]);
+
+        let jump = combined.last().expect("assembled jump");
+        assert_eq!(jump.opcode, OpCode::Jump);
+        assert_eq!(jump.args.as_slice(), &[OpRef(10), OpRef(50), OpRef(60)]);
     }
 
     #[test]

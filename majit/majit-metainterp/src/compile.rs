@@ -217,24 +217,41 @@ pub(crate) fn build_guard_metadata(
                 .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
                 .collect()
         } else if let Some(ref fail_args) = op.fail_args {
-            // Derive exit_types from value_types (post-unbox) first,
-            // falling back to fail_arg_types then fail_arg_type.
+            // `store_final_boxes_in_guard` (resume.py:397) writes the
+            // reduced liveboxes' types authoritatively; prefer them
+            // verbatim when available and matching arity. Otherwise
+            // fall back to reconstructing per-arg via `value_types`
+            // (which may be stale for OpRefs the optimizer retyped).
             let fa_types = op.fail_arg_types.as_ref();
-            fail_args
-                .iter()
-                .enumerate()
-                .map(|(i, opref)| {
-                    if let Some(&tp) = value_types.get(&opref.0) {
-                        return tp;
-                    }
-                    if let Some(types) = fa_types {
-                        if let Some(&tp) = types.get(i) {
+            if let Some(types) = fa_types {
+                if types.len() == fail_args.len() {
+                    types.clone()
+                } else {
+                    fail_args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, opref)| {
+                            if let Some(&tp) = value_types.get(&opref.0) {
+                                return tp;
+                            }
+                            if let Some(&tp) = types.get(i) {
+                                return tp;
+                            }
+                            fail_arg_type(opref, &value_types, constant_types)
+                        })
+                        .collect()
+                }
+            } else {
+                fail_args
+                    .iter()
+                    .map(|opref| {
+                        if let Some(&tp) = value_types.get(&opref.0) {
                             return tp;
                         }
-                    }
-                    fail_arg_type(opref, &value_types, constant_types)
-                })
-                .collect()
+                        fail_arg_type(opref, &value_types, constant_types)
+                    })
+                    .collect()
+            }
         } else if let Some(ref types) = op.fail_arg_types {
             types.clone()
         } else {
@@ -2330,6 +2347,29 @@ mod tests {
         assert_eq!(
             recovery.frames[0].slot_types.as_ref().unwrap(),
             &vec![Type::Int]
+        );
+    }
+
+    #[test]
+    fn test_build_guard_metadata_prefers_explicit_fail_arg_types_over_stale_inputarg_types() {
+        let inputargs = vec![
+            InputArg::new_ref(0),
+            InputArg::new_ref(1),
+            InputArg::new_ref(2),
+            InputArg::new_ref(3),
+        ];
+        let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(0)]);
+        guard.descr = Some(make_fail_descr_with_index(0, 4));
+        guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2), OpRef(3)]);
+        guard.fail_arg_types = Some(vec![Type::Ref, Type::Ref, Type::Int, Type::Int]);
+
+        let (_resume_data, _guard_indices, exit_layouts) =
+            build_guard_metadata(&inputargs, &[guard], 0, &HashMap::new(), None);
+        let exit = exit_layouts.get(&0).expect("guard exit layout");
+
+        assert_eq!(
+            exit.exit_types,
+            vec![Type::Ref, Type::Ref, Type::Int, Type::Int]
         );
     }
 }

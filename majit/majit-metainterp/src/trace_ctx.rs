@@ -1044,13 +1044,19 @@ impl TraceCtx {
         self.recorder.num_inputargs()
     }
 
+    fn infer_arg_types(&self, args: &[OpRef]) -> Vec<Type> {
+        args.iter()
+            .map(|&arg| self.get_opref_type(arg).unwrap_or(Type::Int))
+            .collect()
+    }
+
     /// Record a void-returning function call (CallN).
     ///
     /// Automatically registers the function pointer as a constant and
     /// creates a CallDescr. The interpreter doesn't need to manage
     /// function pointer constants or CallDescr implementations.
     pub fn call_void(&mut self, func_ptr: *const (), args: &[OpRef]) {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_void_typed(func_ptr, args, &arg_types);
     }
 
@@ -1058,7 +1064,7 @@ impl TraceCtx {
     ///
     /// Same convenience as `call_void` but returns an OpRef for the result.
     pub fn call_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_int_typed(func_ptr, args, &arg_types)
     }
 
@@ -1224,7 +1230,7 @@ impl TraceCtx {
     /// This records a CALL_PURE_I (or CALL_PURE_R/CALL_PURE_N) which the
     /// optimizer's pure pass can eliminate.
     pub fn call_elidable_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_elidable_int_typed(func_ptr, args, &arg_types)
     }
 
@@ -1234,7 +1240,7 @@ impl TraceCtx {
     /// In RPython this is `call_may_force` — a call that may force virtualizable
     /// frames or raise exceptions. Must be followed by `GUARD_NOT_FORCED`.
     pub fn call_may_force_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_may_force_int_typed(func_ptr, args, &arg_types)
     }
 
@@ -2498,13 +2504,13 @@ impl TraceCtx {
 
     /// Record a ref-returning call to a may-force function.
     pub fn call_may_force_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_may_force_ref_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a void-returning call to a may-force function.
     pub fn call_may_force_void(&mut self, func_ptr: *const (), args: &[OpRef]) {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_may_force_void_typed(func_ptr, args, &arg_types);
     }
 
@@ -2513,7 +2519,7 @@ impl TraceCtx {
     /// In RPython this is `call_release_gil`. The GIL is released before the
     /// call and reacquired after. Used for long-running C functions.
     pub fn call_release_gil_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_release_gil_int_typed(func_ptr, args, &arg_types)
     }
 
@@ -2522,7 +2528,7 @@ impl TraceCtx {
     /// The result is cached for the duration of one loop iteration.
     /// In RPython, `@jit.loop_invariant` marks such functions.
     pub fn call_loopinvariant_int(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_loopinvariant_int_typed(func_ptr, args, &arg_types)
     }
 
@@ -2825,25 +2831,25 @@ impl TraceCtx {
 
     /// Record a ref-returning function call (CallR).
     pub fn call_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_ref_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a float-returning function call (CallF).
     pub fn call_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_float_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a ref-returning elidable (pure) call (CallPureR).
     pub fn call_elidable_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_elidable_ref_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a float-returning elidable (pure) call (CallPureF).
     pub fn call_elidable_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_elidable_float_typed(func_ptr, args, &arg_types)
     }
 
@@ -2953,7 +2959,7 @@ impl TraceCtx {
 
     /// Record a float-returning may-force call (CallMayForceF).
     pub fn call_may_force_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_may_force_float_typed(func_ptr, args, &arg_types)
     }
 
@@ -2974,31 +2980,31 @@ impl TraceCtx {
 
     /// Record a void-returning GIL-release call (CallReleaseGilN).
     pub fn call_release_gil_void(&mut self, func_ptr: *const (), args: &[OpRef]) {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_release_gil_void_typed(func_ptr, args, &arg_types);
     }
 
     /// Record a ref-returning GIL-release call (CallReleaseGilR).
     pub fn call_release_gil_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_release_gil_ref_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a float-returning GIL-release call (CallReleaseGilF).
     pub fn call_release_gil_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_release_gil_float_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a ref-returning loop-invariant call (CallLoopinvariantR).
     pub fn call_loopinvariant_ref(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_loopinvariant_ref_typed(func_ptr, args, &arg_types)
     }
 
     /// Record a float-returning loop-invariant call (CallLoopinvariantF).
     pub fn call_loopinvariant_float(&mut self, func_ptr: *const (), args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_loopinvariant_float_typed(func_ptr, args, &arg_types)
     }
 
@@ -3158,7 +3164,7 @@ impl TraceCtx {
     /// Assumes all args are `Type::Int`. For mixed-type args, use
     /// `call_assembler_int_by_number_typed` instead.
     pub fn call_assembler_int_by_number(&mut self, target_number: u64, args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         let descr = make_call_assembler_descr(
             target_number,
             &arg_types,
@@ -3249,31 +3255,58 @@ impl TraceCtx {
         self.record_op_with_descr(opcode, args, descr)
     }
 
-    /// Emit CALL_ASSEMBLER_N (void). Assumes all args are `Type::Int`.
-    /// For mixed-type args, use `call_assembler_void_typed`.
+    /// RPython `direct_assembler_call` red-args-only emission
+    /// (pyjitpl.py:3589-3609). Takes the JitDriver reds directly and emits
+    /// a CALL_ASSEMBLER with no `VableExpansion` — the callee's compiled
+    /// loop reconstructs each virtualizable field via its GETFIELD_GC /
+    /// GETARRAYITEM_GC preamble emitted by
+    /// `patch_new_loop_to_load_virtualizable_fields` (compile.py:425-461).
+    ///
+    /// `virtualizable_arg_index` of the emitted descriptor comes from the
+    /// active `JitDriverStaticData`, matching RPython's
+    /// `rewrite.py:684 jd.index_of_virtualizable` lookup.
+    #[allow(dead_code)]
+    pub fn call_assembler_red_only_ref(
+        &mut self,
+        target_number: u64,
+        args: &[OpRef],
+        arg_types: &[Type],
+    ) -> OpRef {
+        let descr = make_call_assembler_descr(
+            target_number,
+            arg_types,
+            Type::Ref,
+            self.driver_descriptor
+                .as_ref()
+                .and_then(JitDriverStaticData::virtualizable_arg_index),
+        );
+        self.record_op_with_descr(OpCode::CallAssemblerR, args, descr)
+    }
+
+    /// Emit CALL_ASSEMBLER_N (void), inferring arg types from the current boxes.
     pub fn call_assembler_void(&mut self, target: &JitCellToken, args: &[OpRef]) {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_assembler_void_typed(target, args, &arg_types);
     }
 
     /// Emit CALL_ASSEMBLER_I. Assumes all args are `Type::Int`.
     /// For mixed-type args, use `call_assembler_int_typed`.
     pub fn call_assembler_int(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_assembler_int_typed(target, args, &arg_types)
     }
 
     /// Emit CALL_ASSEMBLER_R. Assumes all args are `Type::Int`.
     /// For mixed-type args, use `call_assembler_ref_typed`.
     pub fn call_assembler_ref(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_assembler_ref_typed(target, args, &arg_types)
     }
 
     /// Emit CALL_ASSEMBLER_F. Assumes all args are `Type::Int`.
     /// For mixed-type args, use `call_assembler_float_typed`.
     pub fn call_assembler_float(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
-        let arg_types: Vec<Type> = args.iter().map(|_| Type::Int).collect();
+        let arg_types = self.infer_arg_types(args);
         self.call_assembler_float_typed(target, args, &arg_types)
     }
 
@@ -3688,6 +3721,24 @@ mod tests {
     }
 
     #[test]
+    fn call_void_infers_mixed_arg_types_from_boxes() {
+        let (mut ctx, args) = make_ctx_with_mixed_inputs();
+        ctx.call_void(dummy_call_target as *const (), &args);
+        let (arg_types, opcode) = take_single_call_descr(ctx, &args);
+        assert_eq!(opcode, OpCode::CallN);
+        assert_eq!(arg_types, &[Type::Ref, Type::Float, Type::Int]);
+    }
+
+    #[test]
+    fn call_ref_infers_mixed_arg_types_from_boxes() {
+        let (mut ctx, args) = make_ctx_with_mixed_inputs();
+        let _ = ctx.call_ref(dummy_call_target as *const (), &args);
+        let (arg_types, opcode) = take_single_call_descr(ctx, &args);
+        assert_eq!(opcode, OpCode::CallR);
+        assert_eq!(arg_types, &[Type::Ref, Type::Float, Type::Int]);
+    }
+
+    #[test]
     fn call_release_gil_typed_preserves_mixed_arg_types() {
         let (mut ctx, args) = make_ctx_with_mixed_inputs();
         let _ = ctx.call_release_gil_float_typed(
@@ -3737,6 +3788,35 @@ mod tests {
         assert_eq!(call_descr.call_virtualizable_index(), Some(1));
         assert_eq!(loop_token.loop_token_number(), 777);
         assert_eq!(loop_token.call_virtualizable_index(), Some(1));
+    }
+
+    #[test]
+    fn call_assembler_red_only_ref_emits_no_vable_expansion() {
+        let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
+        let frame = OpRef(0);
+        ctx.set_driver_descriptor(JitDriverStaticData::with_virtualizable(
+            Vec::new(),
+            vec![("frame", Type::Ref)],
+            Some("frame"),
+        ));
+
+        let _ = ctx.call_assembler_red_only_ref(999, &[frame], &[Type::Ref]);
+
+        let op = take_single_call_op(ctx, &[frame]);
+        assert_eq!(op.opcode, OpCode::CallAssemblerR);
+        assert_eq!(op.args.as_slice(), &[frame]);
+        let call_descr = op
+            .descr
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+            .expect("red-only CA should still carry a CallDescr");
+        assert_eq!(call_descr.arg_types(), &[Type::Ref]);
+        assert_eq!(call_descr.call_target_token(), Some(999));
+        assert_eq!(call_descr.call_virtualizable_index(), Some(0));
+        assert!(
+            call_descr.vable_expansion().is_none(),
+            "red-only emission must not attach a VableExpansion",
+        );
     }
 
     fn take_all_ops(ctx: TraceCtx) -> Vec<majit_ir::Op> {

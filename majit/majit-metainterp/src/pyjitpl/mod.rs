@@ -12,7 +12,7 @@ pub use frame::{MIFrame, MIFrameStack};
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use crate::optimizeopt::optimizer::Optimizer;
+use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};
 use majit_backend::{Backend, ExitRecoveryLayout, JitCellToken};
 #[cfg(feature = "cranelift")]
 pub(crate) use majit_backend_cranelift::CraneliftBackend as BackendImpl;
@@ -315,6 +315,96 @@ fn snapshot_map_from_trace_snapshots(
     (box_map, size_map, vable_map, pc_map)
 }
 
+#[allow(dead_code)]
+struct PreparedBridgeTrace {
+    ops: Vec<Op>,
+    inputargs: Vec<InputArg>,
+    snapshot_boxes: HashMap<i32, Vec<OpRef>>,
+    snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
+    snapshot_vable_boxes: HashMap<i32, Vec<OpRef>>,
+    snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
+    pending_bridge_rd: Option<PendingBridgeRd>,
+}
+
+#[allow(dead_code)]
+fn translate_trace_iter_opref(opref: OpRef, cache: &[Option<OpRef>]) -> OpRef {
+    if opref.is_none() || opref.is_constant() {
+        return opref;
+    }
+    cache
+        .get(opref.0 as usize)
+        .copied()
+        .flatten()
+        .unwrap_or(opref)
+}
+
+#[allow(dead_code)]
+fn translate_trace_iter_box_map(
+    mut box_map: HashMap<i32, Vec<OpRef>>,
+    cache: &[Option<OpRef>],
+) -> HashMap<i32, Vec<OpRef>> {
+    for boxes in box_map.values_mut() {
+        for opref in boxes.iter_mut() {
+            *opref = translate_trace_iter_opref(*opref, cache);
+        }
+    }
+    box_map
+}
+
+#[allow(dead_code)]
+fn prepare_bridge_trace_for_optimizer(
+    bridge_ops: &[Op],
+    bridge_inputargs: &[InputArg],
+    snapshot_boxes: HashMap<i32, Vec<OpRef>>,
+    snapshot_frame_sizes: HashMap<i32, Vec<usize>>,
+    snapshot_vable_boxes: HashMap<i32, Vec<OpRef>>,
+    snapshot_frame_pcs: HashMap<i32, Vec<(i32, i32)>>,
+    pending_bridge_rd: Option<PendingBridgeRd>,
+    bridge_inputarg_base: u32,
+) -> PreparedBridgeTrace {
+    // unroll.py:187 `trace = trace.get_iter()` parity for bridge traces.
+    // RPython allocates fresh InputArg / ResOperation objects before
+    // optimize_bridge() consumes the trace; majit's analogue is a fresh
+    // TraceIterator walk with `start_fresh = bridge_inputarg_base`.
+    let mut iter = crate::opencoder::TraceIterator::new(
+        bridge_ops,
+        0,
+        bridge_ops.len(),
+        None,
+        bridge_inputargs.len(),
+        bridge_inputarg_base,
+    );
+    let mut ops = Vec::with_capacity(bridge_ops.len());
+    while let Some(op) = iter.next() {
+        ops.push(op);
+    }
+    let inputargs = bridge_inputargs
+        .iter()
+        .zip(iter.inputargs.iter().copied())
+        .map(|(arg, opref)| InputArg::from_type(arg.tp, opref.0))
+        .collect();
+    let cache = iter._cache;
+    let snapshot_boxes = translate_trace_iter_box_map(snapshot_boxes, &cache);
+    let snapshot_vable_boxes = translate_trace_iter_box_map(snapshot_vable_boxes, &cache);
+    let pending_bridge_rd = pending_bridge_rd.map(|mut prd| {
+        prd.liveboxes = prd
+            .liveboxes
+            .into_iter()
+            .map(|opref| translate_trace_iter_opref(opref, &cache))
+            .collect();
+        prd
+    });
+    PreparedBridgeTrace {
+        ops,
+        inputargs,
+        snapshot_boxes,
+        snapshot_frame_sizes,
+        snapshot_vable_boxes,
+        snapshot_frame_pcs,
+        pending_bridge_rd,
+    }
+}
+
 fn normalize_root_loop_entry_contract(
     mut inputargs: Vec<InputArg>,
     mut optimized_ops: Vec<Op>,
@@ -377,6 +467,22 @@ pub(crate) struct CompiledEntry<M> {
     /// previous functions are kept here so external target_token JUMPs
     /// can redirect to them via runtime trampoline.
     pub(crate) previous_tokens: Vec<JitCellToken>,
+    /// Box identity plan Phase E Step 1 (dormant): high-water OpRef at
+    /// which a future bridge compilation should start allocating.
+    ///
+    /// RPython `opencoder.py:249-273 TraceIterator.__init__` allocates
+    /// fresh `InputArg` Python objects every iteration, so bridge
+    /// inputargs are automatically disjoint from the parent loop's boxes
+    /// by Python `is` identity. In pyre `OpRef(u32)` IS the identity, so
+    /// a bridge that re-uses the `[0..num_inputs)` range collides with
+    /// the parent loop's OpRefs. `next_global_opref` records the first
+    /// OpRef Phase 2 did *not* allocate, so a bridge can start at
+    /// `max(next_global_opref, bridge_inputargs.len())` and stay disjoint.
+    ///
+    /// Dormant until Step 2 wires `compile_bridge` / `optimize_bridge`
+    /// to consume the value — for now Phase 2 records it so the contract
+    /// is honest when the wiring lands.
+    pub(crate) next_global_opref: u32,
 }
 
 /// compile.py compile_trace return parity.
@@ -1014,6 +1120,52 @@ impl<M: Clone> MetaInterp<M> {
         })
     }
 
+    #[allow(dead_code)]
+    fn backend_fail_descr_layout(
+        &self,
+        compiled: &CompiledEntry<M>,
+        trace_id: u64,
+        fail_index: u32,
+    ) -> Option<majit_backend::FailDescrLayout> {
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        let lookup = |token: &JitCellToken| {
+            if token.compiled.is_none() {
+                return None;
+            }
+            self.backend
+                .compiled_trace_fail_descr_layouts(token, trace_id)
+                .and_then(|layouts| {
+                    layouts
+                        .into_iter()
+                        .find(|layout| layout.fail_index == fail_index)
+                })
+        };
+        lookup(&compiled.token).or_else(|| compiled.previous_tokens.iter().find_map(lookup))
+    }
+
+    #[allow(dead_code)]
+    fn backend_terminal_exit_layout(
+        &self,
+        compiled: &CompiledEntry<M>,
+        trace_id: u64,
+        op_index: usize,
+    ) -> Option<majit_backend::TerminalExitLayout> {
+        let trace_id = Self::normalize_trace_id(compiled, trace_id);
+        let lookup = |token: &JitCellToken| {
+            if token.compiled.is_none() {
+                return None;
+            }
+            self.backend
+                .compiled_trace_terminal_exit_layouts(token, trace_id)
+                .and_then(|layouts| {
+                    layouts
+                        .into_iter()
+                        .find(|layout| layout.op_index == op_index)
+                })
+        };
+        lookup(&compiled.token).or_else(|| compiled.previous_tokens.iter().find_map(lookup))
+    }
+
     fn compiled_exit_layout_from_backend(
         &self,
         compiled: &CompiledEntry<M>,
@@ -1404,20 +1556,23 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     fn trace_entry_vable_lengths(&self, info: &VirtualizableInfo) -> Vec<usize> {
-        // RPython initialize_virtualizable() seeds virtualizable_boxes from the
-        // current trace entry boxes, not by re-reading a potentially larger
-        // heap layout.  When the interpreter provides explicit trace-entry
-        // lengths, prefer them because they describe the live input box prefix
-        // that was actually recorded for this trace.
-        if !self.vable_array_lengths.is_empty() {
-            return self.vable_array_lengths.clone();
-        }
+        // pyjitpl.py:3302 `vinfo.read_boxes(self.cpu, virtualizable, startindex)`
+        // reads field/array values directly from the concrete virtualizable
+        // heap object; RPython does not consult any interpreter-supplied
+        // "trace-entry cache" for lengths. Match that here when the layout
+        // exposes a readable header (the common case).
         if !self.vable_ptr.is_null() && info.can_read_all_array_lengths_from_heap() {
             // Safety: vable_ptr is cached from JitState::virtualizable_heap_ptr()
             // for the currently active interpreter state.
             return unsafe { info.read_array_lengths_from_heap(self.vable_ptr) };
         }
-        Vec::new()
+        // Fallback for layouts that cannot expose array length on the heap
+        // object alone (header-less embedded arrays) and for unit tests that
+        // do not stage a real heap object. RPython has no such layout in
+        // the PyPy tree; this branch is a documented pyre adaptation until
+        // header-less layouts are either dropped or taught to report their
+        // length directly on the heap object.
+        self.vable_array_lengths.clone()
     }
 
     /// pyjitpl.py:3290 `initialize_virtualizable(self, original_boxes)`.
@@ -2055,8 +2210,8 @@ impl<M: Clone> MetaInterp<M> {
                         ctx.constants.get_or_insert_typed(bits, tp)
                     })
                     .collect();
-                if let Some(descriptor) = driver_descriptor {
-                    ctx.set_driver_descriptor(descriptor);
+                if let Some(ref descriptor) = driver_descriptor {
+                    ctx.set_driver_descriptor(descriptor.clone());
                 }
                 // pyjitpl.py:3291 `self.jitdriver_sd = jitdriver_sd`: see
                 // `setup_tracing` for the rationale; `force_start_tracing`
@@ -2067,8 +2222,17 @@ impl<M: Clone> MetaInterp<M> {
                 self.initialize_virtualizable(&mut ctx, live_values);
                 self.force_finish_trace = self.warm_state.take_force_finish_tracing(green_key);
                 ctx.set_force_finish(self.force_finish_trace);
-                let num_inputs = ctx.num_inputargs();
-                let input_types = ctx.inputarg_types();
+                // compile_tmp_callback parity: pending CALL_ASSEMBLER targets
+                // must expose the same red-args-only entry contract that
+                // `patch_new_loop_to_load_virtualizable_fields()` later hands
+                // to `backend.compile_loop(...)`. Mirror the `setup_tracing`
+                // path so both trace-start entry points register the same
+                // pending-token shape.
+                let input_types = Self::pending_target_input_types(
+                    ctx.inputarg_types(),
+                    driver_descriptor.as_ref(),
+                );
+                let num_inputs = input_types.len();
                 // warmspot.py:527-538 — jd.index_of_virtualizable is -1 when
                 // no virtualizables, else jitdriver.reds.index(vname).
                 let index_of_virtualizable: i32 = ctx
@@ -2158,6 +2322,34 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    #[allow(dead_code)]
+    fn pending_target_input_types(
+        input_types: Vec<Type>,
+        driver_descriptor: Option<&crate::jitdriver::JitDriverStaticData>,
+    ) -> Vec<Type> {
+        let Some(driver) = driver_descriptor else {
+            return input_types;
+        };
+        let Some(_) = driver.virtualizable_arg_index() else {
+            return input_types;
+        };
+        // `patch_new_loop_to_load_virtualizable_fields()` (compile.py:425-461)
+        // collapses the loop's inputargs to the JitDriver reds. Pyre's
+        // `extract_live_values()` still emits the expanded
+        // `[frame, last_instr, pycode, valuestackdepth, debugdata, lastblock,
+        //  w_globals, locals..., stack...]` shape, so the trace's inputarg
+        // types do NOT carry the reds in the leading `num_reds` slots —
+        // truncating to `num_reds` here would register a bogus
+        // `[Ref(frame), Int(last_instr)]` ABI when reds is `[frame, ec]`.
+        // Synthesise the reds-only shape directly from the JitDriver var
+        // table (`JitDriverVar.tp` matches RPython's `Box.type` parity).
+        let red_types: Vec<Type> = driver.reds().iter().map(|red| red.tp).collect();
+        if input_types.len() <= red_types.len() {
+            return input_types;
+        }
+        red_types
+    }
+
     fn setup_tracing(
         &mut self,
         green_key: u64,
@@ -2208,8 +2400,8 @@ impl<M: Clone> MetaInterp<M> {
                 ctx.constants.get_or_insert_typed(bits, tp)
             })
             .collect();
-        if let Some(descriptor) = driver_descriptor {
-            ctx.set_driver_descriptor(descriptor);
+        if let Some(ref descriptor) = driver_descriptor {
+            ctx.set_driver_descriptor(descriptor.clone());
         }
         // pyjitpl.py:3291 `self.jitdriver_sd = jitdriver_sd`: bind the
         // active driver before reads (`initialize_virtualizable`) consult
@@ -2224,9 +2416,28 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2411: propagate force_finish_trace to TraceCtx
         // so the proc-macro merge_fn closure can read it.
         ctx.set_force_finish(self.force_finish_trace);
+        // compile_tmp_callback parity: pending CALL_ASSEMBLER targets must
+        // expose the same red-args-only entry contract that
+        // `patch_new_loop_to_load_virtualizable_fields()` later hands to
+        // `backend.compile_loop(...)`.
+        let input_types =
+            Self::pending_target_input_types(ctx.inputarg_types(), driver_descriptor.as_ref());
+        let num_inputs = input_types.len();
+        let index_of_virtualizable: i32 = ctx
+            .driver_descriptor()
+            .and_then(|jd| jd.virtualizable_arg_index())
+            .map(|i| i as i32)
+            .unwrap_or(-1);
         self.tracing = Some(ctx);
         let pending_num = self.warm_state.alloc_token_number();
         self.pending_token = Some((green_key, pending_num));
+        self.backend.register_pending_target(
+            pending_num,
+            input_types,
+            num_inputs,
+            self.num_scalar_inputargs,
+            index_of_virtualizable,
+        );
         if let Some(ref hook) = self.hooks.on_trace_start {
             hook(green_key);
         }
@@ -2972,6 +3183,13 @@ impl<M: Clone> MetaInterp<M> {
                         self.clear_trace_session();
                         return CompileOutcome::Aborted;
                     }
+                    if self.tracing.is_none() {
+                        // compile.py has no "late cancel after draining the
+                        // tracer" state. If compile_retrace consumed the
+                        // tracing ctx, it was a hard backend failure and the
+                        // caller must abort instead of continuing to trace.
+                        return CompileOutcome::Aborted;
+                    }
                     // Not too many — clear retrace state and fall through
                     // to normal compile_loop path.
                     self.exported_state = None;
@@ -3614,6 +3832,13 @@ impl<M: Clone> MetaInterp<M> {
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
+                        // Box Identity Phase E Step 1: record Phase 2's final
+                        // OpRef high-water so later bridges can allocate in a
+                        // disjoint namespace. RPython gets disjointness for
+                        // free via fresh `InputArg` Python identities per
+                        // TraceIterator (opencoder.py:249-273); pyre flat u32
+                        // OpRefs need this explicit baseline.
+                        next_global_opref: unroll_opt.next_global_opref.max(inputargs.len() as u32),
                     },
                 );
                 // RPython warmstate.py:342: attach_procedure_to_interp(greenkey, token)
@@ -4302,6 +4527,8 @@ impl<M: Clone> MetaInterp<M> {
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
+                        // Box Identity Phase E Step 1: see main compile site.
+                        next_global_opref: unroll_opt.next_global_opref.max(inputargs.len() as u32),
                     },
                 );
                 let install_num = self.warm_state.alloc_token_number();
@@ -4760,6 +4987,7 @@ impl<M: Clone> MetaInterp<M> {
                             root_trace_id: trace_id,
                             traces,
                             previous_tokens,
+                            next_global_opref: 0,
                         },
                     );
                 }
@@ -5042,6 +5270,7 @@ impl<M: Clone> MetaInterp<M> {
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
+                        next_global_opref: 0,
                     },
                 );
                 self.stats.loops_compiled += 1;
@@ -6518,11 +6747,20 @@ impl<M: Clone> MetaInterp<M> {
         // constant pool merge. Const objects flow via rd_consts + fresh
         // decode (resume.py:1245-1282). Typed seeding comes from
         // inject_bridge_constants + decoded_box_to_opref.
-        let (retraced_count, loop_num_inputs) = {
+        let (retraced_count, loop_num_inputs, parent_next_global_opref) = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
-            (compiled.retraced_count, compiled.num_inputs)
+            (
+                compiled.retraced_count,
+                compiled.num_inputs,
+                compiled.next_global_opref,
+            )
         };
         let retrace_limit = self.warm_state.retrace_limit();
+        // Box Identity Phase E Step 2a: stage bridge_inputarg_base based
+        // on the parent loop's recorded next_global_opref. See
+        // Optimizer::optimize_bridge docstring for the RPython identity
+        // model this mirrors (opencoder.py:249-273).
+        let bridge_inputarg_base = parent_next_global_opref.max(bridge_inputargs.len() as u32);
         let bridge_optimize_result = {
             let compiled = self.compiled_loops.get_mut(&green_key).unwrap();
             std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -6536,6 +6774,7 @@ impl<M: Clone> MetaInterp<M> {
                     retrace_limit,
                     None,
                     Some(loop_num_inputs),
+                    bridge_inputarg_base,
                 )
             }))
         };
@@ -6735,6 +6974,7 @@ impl<M: Clone> MetaInterp<M> {
                         root_trace_id: trace_id,
                         traces,
                         previous_tokens,
+                        next_global_opref: 0,
                     },
                 );
                 let install_num = self.warm_state.alloc_token_number();
@@ -6878,6 +7118,11 @@ impl<M: Clone> MetaInterp<M> {
         // classes that were known at the guard point are restored —
         // runtime class inspection is NOT used here.
         let loop_num_inputs = compiled.num_inputs;
+        // Box Identity Phase E Step 2a: see other compile_bridge site
+        // and optimize_bridge's docstring for the identity model.
+        let bridge_inputarg_base = compiled
+            .next_global_opref
+            .max(bridge_inputargs.len() as u32);
         if crate::majit_log_enabled() {
             eprintln!(
                 "--- bridge trace (before opt) ninputs={} ---",
@@ -6902,6 +7147,7 @@ impl<M: Clone> MetaInterp<M> {
                 retrace_limit,
                 pending_bridge_rd,
                 Some(loop_num_inputs),
+                bridge_inputarg_base,
             )
         }));
         let (optimized_ops, retrace_requested) = match bridge_optimize_result {
@@ -7343,6 +7589,9 @@ impl<M: Clone> MetaInterp<M> {
             all_liveness,
             fail_values,
             None, // deadframe_types
+            None, // rd_virtuals — populated via descr-driven path
+            None, // rd_pendingfields
+            None, // rd_guard_pendingfields
             Some(&self.virtualref_info as &dyn crate::resume::VRefInfo),
             vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
             None, // ginfo — pyre has no greenfield mechanism
@@ -14108,6 +14357,7 @@ mod tests {
                 root_trace_id: trace_id,
                 traces,
                 previous_tokens: Vec::new(),
+                next_global_opref: 0,
             },
         );
     }
@@ -14244,7 +14494,11 @@ mod tests {
     }
 
     #[test]
-    fn trace_entry_vable_lengths_prefers_cached_fallback_over_heap_lengths() {
+    fn trace_entry_vable_lengths_reads_from_heap_first() {
+        // pyjitpl.py:3302 `vinfo.read_boxes(...)` always reads from the
+        // concrete heap object. The interpreter-supplied cache is a pyre
+        // fallback used only when `info.can_read_all_array_lengths_from_heap`
+        // is false; otherwise the heap-read wins.
         let mut info = VirtualizableInfo::new(0);
         {
             let items_offset = std::mem::size_of::<usize>();
@@ -14268,9 +14522,11 @@ mod tests {
         let mut meta = MetaInterp::<()>::new(10);
         meta.set_virtualizable_info(std::sync::Arc::new(info.clone()));
         meta.set_vable_ptr((&obj as *const TraceEntryObj).cast());
+        // Even if the interpreter cache claims a different length, the heap
+        // object's `len=4` wins — matching RPython semantics.
         meta.set_vable_array_lengths(vec![1]);
 
-        assert_eq!(meta.trace_entry_vable_lengths(&info), vec![1]);
+        assert_eq!(meta.trace_entry_vable_lengths(&info), vec![4]);
     }
 
     #[test]
@@ -14557,6 +14813,7 @@ mod tests {
                 root_trace_id: 0,
                 traces: HashMap::new(),
                 previous_tokens: Vec::new(),
+                next_global_opref: 0,
             },
         );
         let action = meta.force_start_tracing(777, (0, 0), None, &[]);
@@ -15221,5 +15478,58 @@ mod tests {
         assert!(hooks.on_trace_start.is_none());
         assert!(hooks.on_trace_abort.is_none());
         assert!(hooks.on_compile_error.is_none());
+    }
+
+    #[test]
+    fn test_pending_target_input_types_passes_through_when_no_descriptor() {
+        // No descriptor → expanded form survives untouched.
+        let expanded = vec![Type::Ref, Type::Int, Type::Ref, Type::Int, Type::Ref];
+        let result = MetaInterp::<()>::pending_target_input_types(expanded.clone(), None);
+        assert_eq!(result, expanded);
+    }
+
+    #[test]
+    fn test_pending_target_input_types_passes_through_when_no_virtualizable() {
+        let descriptor = JitDriverStaticData::new(
+            vec![("pc", Type::Int)],
+            vec![("a", Type::Int), ("b", Type::Int)],
+        );
+        let expanded = vec![Type::Int, Type::Int];
+        let result =
+            MetaInterp::<()>::pending_target_input_types(expanded.clone(), Some(&descriptor));
+        assert_eq!(result, expanded);
+    }
+
+    #[test]
+    fn test_pending_target_input_types_uses_driver_red_types_not_expanded_prefix() {
+        // PyPy `interp_jit.py:67`: reds=[frame, ec], virtualizable=frame.
+        // The trace's expanded inputarg shape is
+        // `[Ref(frame), Int(last_instr), Ref(pycode), Int(valuestackdepth),
+        //   Ref(debugdata), Ref(lastblock), Ref(w_globals), ...locals/stack]`.
+        // Truncating the leading two slots would yield `[Ref, Int]` — wrong.
+        // The descriptor's `reds` is the source of truth, so the result
+        // must be `[Ref, Ref]`.
+        let descriptor = JitDriverStaticData::with_virtualizable(
+            vec![
+                ("next_instr", Type::Int),
+                ("is_being_profiled", Type::Int),
+                ("pycode", Type::Ref),
+            ],
+            vec![("frame", Type::Ref), ("ec", Type::Ref)],
+            Some("frame"),
+        );
+        let expanded = vec![
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+            Type::Int,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+            Type::Ref,
+        ];
+        let result = MetaInterp::<()>::pending_target_input_types(expanded, Some(&descriptor));
+        assert_eq!(result, vec![Type::Ref, Type::Ref]);
     }
 }

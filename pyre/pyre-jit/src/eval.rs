@@ -4920,6 +4920,8 @@ mod tests {
             num_locals: 4,
             ns_len: 0,
             valuestackdepth: 4,
+            array_capacity: 4,
+            trace_extra_reds: 0,
             has_virtualizable: true,
             // Trace-entry slot types can be stale; guard failure must still
             // respect the runtime Value tags recovered from resume data.

@@ -78,6 +78,10 @@ pub struct Optimizer {
     /// RPython Boxes carry type intrinsically; we store it here so
     /// export_state can propagate to ExportedState.renamed_inputarg_types.
     pub trace_inputarg_types: Vec<majit_ir::Type>,
+    /// unroll.py / compile.py parity: original live values at the jump
+    /// point, threaded into export_state as `runtime_boxes`. Dormant
+    /// until the export/import pair starts reading it.
+    pub runtime_boxes: Vec<OpRef>,
     /// RPython unroll.py: export_state — exported optimizer facts at the end
     /// of the preamble, adapted to majit's slot-based inputarg model.
     pub exported_loop_state: Option<crate::optimizeopt::unroll::ExportedState>,
@@ -1007,6 +1011,7 @@ impl Optimizer {
             numbering_type_overrides: std::collections::HashMap::new(),
             imported_virtuals: Vec::new(),
             trace_inputarg_types: Vec::new(),
+            runtime_boxes: Vec::new(),
             exported_loop_state: None,
             imported_loop_state: None,
             imported_short_sources: Vec::new(),
@@ -1700,6 +1705,8 @@ impl Optimizer {
         }
         self.imported_label_args = None;
         self.terminal_op = None;
+        let _export_runtime_boxes = self.runtime_boxes.clone();
+        self.runtime_boxes.clear();
         // RPython parity: each optimizer run is a fresh Optimizer instance.
         // In pyre we reuse the same Optimizer, so clear per-run state.
         self.last_guard_op = None;
@@ -1873,6 +1880,15 @@ impl Optimizer {
         // is restored at the end of the block.
         let imported_loop_state_taken = self.imported_loop_state.take();
         if let Some(ref exported_state) = imported_loop_state_taken {
+            for (&opref, &tp) in exported_state
+                .end_args
+                .iter()
+                .zip(exported_state.end_arg_types.iter())
+            {
+                if tp != majit_ir::Type::Void {
+                    ctx.value_types.insert(opref.0, tp);
+                }
+            }
             // opencoder.py:259 + unroll.py:479-504 parity: RPython's
             // TraceIterator allocates fresh InputArg Box objects for
             // each iteration, and `import_state` asserts
@@ -1943,6 +1959,16 @@ impl Optimizer {
 
         if !self.imported_virtuals.is_empty() {
             self.install_imported_virtuals(&mut ctx);
+            if crate::optimizeopt::majit_log_enabled() {
+                let upper = ctx.inputarg_base + ctx.num_inputs;
+                for raw in ctx.inputarg_base..upper {
+                    let raw = OpRef(raw);
+                    eprintln!(
+                        "[jit] import_state_resolved: raw={raw:?} resolved={:?}",
+                        ctx.get_box_replacement(raw)
+                    );
+                }
+            }
         }
 
         // RPython shortpreamble.py: PureOp.produce_op stores PreambleOp
@@ -2302,7 +2328,11 @@ impl Optimizer {
                 // `value_types` (maintained per op result type by emit()).
                 let raw_type = ctx
                     .opref_type(arg)
-                    .expect("preview short arg missing box.type");
+                    .unwrap_or_else(|| {
+                        panic!(
+                            "preview short arg missing box.type: arg={arg:?} preview_short_args={preview_short_args:?}"
+                        )
+                    });
                 if raw_type == majit_ir::Type::Void {
                     // Upstream collision: a previously-virtual OpRef whose
                     // position was reused as a Phase 2 constant slot — its
@@ -2760,6 +2790,21 @@ impl Optimizer {
         retrace_limit: u32,
         pending_bridge_rd: Option<PendingBridgeRd>,
         _loop_num_inputs: Option<usize>,
+        // Box Identity plan Phase E Step 2a (dormant): disjoint OpRef
+        // namespace for bridge inputargs. RPython opencoder.py:249-273
+        // TraceIterator allocates fresh InputArg Python objects, which
+        // carry Python `is` identity distinct from the parent loop's
+        // boxes. Pyre's flat `OpRef(u32)` must encode this explicitly:
+        // a bridge whose `inputarg_base == 0` reuses the parent loop's
+        // `[0..num_inputs)` identities. Passing the parent loop's
+        // recorded `next_global_opref` (from `CompiledEntry`) here
+        // lets Step 2b hoist the bridge's inputargs into
+        // `[bridge_inputarg_base..bridge_inputarg_base+num_inputs)`.
+        //
+        // Currently unused — Step 2b (internal switch to
+        // `optimize_with_constants_and_inputs_at`) lands in a follow-up
+        // commit.
+        #[allow(unused_variables)] bridge_inputarg_base: u32,
     ) -> (Vec<Op>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge
         // Store as pending — setup() inside optimize_with_constants_and_inputs

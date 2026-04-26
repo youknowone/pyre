@@ -1089,6 +1089,16 @@ pub struct PyreMeta {
     pub ns_len: usize,
     #[vable(valuestackdepth)]
     pub valuestackdepth: usize,
+    /// Full `locals_cells_stack_w` length on the heap object
+    /// (`co_nlocals + ncellvars + nfreevars + co_stacksize`).
+    /// This stays separate from `valuestackdepth`, which is the live depth
+    /// (`pyframe.py:111`) in the RPython model.
+    pub array_capacity: usize,
+    /// Temporary staging count for extra portal reds that sit between the
+    /// frame red and the expanded virtualizable payload. Root portal traces
+    /// now carry `ec` here; guard-resume bridge traces still use 0 until the
+    /// resumedata path is migrated to the same contract.
+    pub trace_extra_reds: usize,
     pub has_virtualizable: bool,
     #[vable(slot_types)]
     pub slot_types: Vec<Type>,
@@ -1105,6 +1115,12 @@ pub struct PyreSym {
     /// OpRef for the owning PyFrame pointer.
     #[vable(frame)]
     pub frame: OpRef,
+    /// PyPy portal second red: `ec` from `interp_jit.py:67`.
+    ///
+    /// This is not part of the virtualizable payload; it lives between the
+    /// frame red and the virtualizable expansion when running under the
+    /// canonical PyPy driver descriptor.
+    pub(crate) execution_context: OpRef,
     // ── Persistent symbolic frame field tracking ──
     // Stage 3.4 Phase C: the Python stack (`locals_cells_stack_w[nlocals..]`)
     // lives in the tail of `registers_r`. The macro's `collect_stack`
@@ -1410,7 +1426,7 @@ pub(crate) fn array_descr_for_kind(kind: u8, _descr_index: u32) -> DescrRef {
 /// `VirtualizableInfo::set_parent_descr` so virtualizable field
 /// descriptors share the same parent.
 pub fn pyframe_size_descr() -> DescrRef {
-    make_size_descr(std::mem::size_of::<pyre_interpreter::pyframe::PyFrame>())
+    crate::descr::pyframe_size_descr()
 }
 
 pub(crate) fn frame_locals_cells_stack_descr() -> DescrRef {
@@ -2016,6 +2032,14 @@ pub(crate) fn concrete_slot_types(
     types
 }
 
+impl PyreMeta {
+    /// Heap capacity of `locals_cells_stack_w`, distinct from the live
+    /// `valuestackdepth`.
+    pub fn array_stack_only_depth(&self) -> usize {
+        self.array_capacity.saturating_sub(self.num_locals)
+    }
+}
+
 pub(crate) fn boxed_slot_i64_for_type(slot_type: Type, raw: i64) -> PyObjectRef {
     match slot_type {
         Type::Int => w_int_new(raw),
@@ -2125,6 +2149,7 @@ impl PyreSym {
     pub(crate) fn new_uninit(frame: OpRef) -> Self {
         Self {
             frame,
+            execution_context: OpRef::NONE,
             symbolic_local_types: Vec::new(),
             symbolic_stack_types: Vec::new(),
             pending_next_instr: None,
@@ -2199,6 +2224,27 @@ impl PyreSym {
         sym.vable_lastblock = state.vable_lastblock;
         sym.vable_w_globals = state.vable_w_globals;
         sym
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn shift_virtualizable_input_indices(&mut self, extra_reds: u32) {
+        if extra_reds == 0 {
+            return;
+        }
+        let shift = |opref: &mut OpRef| {
+            if !opref.is_none() {
+                *opref = OpRef(opref.0 + extra_reds);
+            }
+        };
+        shift(&mut self.vable_last_instr);
+        shift(&mut self.vable_pycode);
+        shift(&mut self.vable_valuestackdepth);
+        shift(&mut self.vable_debugdata);
+        shift(&mut self.vable_lastblock);
+        shift(&mut self.vable_w_globals);
+        if let Some(base) = self.vable_array_base.as_mut() {
+            *base += extra_reds;
+        }
     }
 
     /// Initialize symbolic tracking state. Called once when the owning
@@ -2515,6 +2561,195 @@ pub(crate) fn opimpl_virtual_ref_finish(ctx: &mut TraceCtx, sym: &mut PyreSym, v
 }
 
 impl PyreJitState {
+    /// Canonical PyPy portal driver layout from `interp_jit.py:67-74`.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn pypyjit_driver_descriptor() -> JitDriverStaticData {
+        let mut descriptor = JitDriverStaticData::with_virtualizable(
+            vec![
+                ("next_instr", Type::Int),
+                ("is_being_profiled", Type::Int),
+                ("pycode", Type::Ref),
+            ],
+            vec![("frame", Type::Ref), ("ec", Type::Ref)],
+            Some("frame"),
+        );
+        descriptor.is_recursive = true;
+        descriptor
+    }
+
+    #[allow(dead_code)]
+    fn execution_context_as_usize(&self) -> usize {
+        let Some(frame_ptr) = self.frame_ptr() else {
+            return 0;
+        };
+        unsafe { (*(frame_ptr as *const PyFrame)).execution_context as usize }
+    }
+
+    #[allow(dead_code)]
+    fn expanded_virtualizable_live_values_with_extra_reds(
+        &self,
+        meta: &PyreMeta,
+        extra_reds: &[Value],
+    ) -> Vec<Value> {
+        let base = crate::virtualizable_gen::virt_extract_live_values(
+            self.frame,
+            self.last_instr_as_usize(),
+            self.pycode_as_usize(),
+            self.valuestackdepth(),
+            self.debugdata_as_usize(),
+            self.lastblock_as_usize(),
+            self.w_globals_as_usize(),
+            meta.num_locals,
+            meta.array_capacity,
+            |i| self.local_at(i).unwrap_or(PY_NULL) as usize,
+            |i| self.stack_at(i).unwrap_or(PY_NULL) as usize,
+        );
+        let Some((&frame, tail)) = base.split_first() else {
+            return extra_reds.to_vec();
+        };
+        let mut values = Vec::with_capacity(base.len() + extra_reds.len());
+        values.push(frame);
+        values.extend_from_slice(extra_reds);
+        values.extend_from_slice(tail);
+        values
+    }
+
+    #[allow(dead_code)]
+    fn expanded_virtualizable_live_value_types_with_extra_reds(
+        meta: &PyreMeta,
+        extra_red_types: &[Type],
+    ) -> Vec<Type> {
+        let base = crate::virtualizable_gen::virt_live_value_types(meta.slot_types.len());
+        let Some((&frame_tp, tail)) = base.split_first() else {
+            return extra_red_types.to_vec();
+        };
+        let mut types = Vec::with_capacity(base.len() + extra_red_types.len());
+        types.push(frame_tp);
+        types.extend_from_slice(extra_red_types);
+        types.extend_from_slice(tail);
+        types
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn pypyjit_live_values_with_ec(&self, meta: &PyreMeta) -> Vec<Value> {
+        let _ = meta;
+        vec![
+            Value::Ref(majit_ir::GcRef(self.frame)),
+            Value::Ref(majit_ir::GcRef(self.execution_context_as_usize())),
+        ]
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn pypyjit_live_value_types_with_ec(meta: &PyreMeta) -> Vec<Type> {
+        let _ = meta;
+        vec![Type::Ref, Type::Ref]
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn pypyjit_collect_jump_args(sym: &PyreSym) -> Vec<OpRef> {
+        let base = sym.vable_collect_jump_args();
+        let Some((&frame, tail)) = base.split_first() else {
+            return vec![sym.execution_context];
+        };
+        let mut args = Vec::with_capacity(base.len() + 1);
+        args.push(frame);
+        args.push(sym.execution_context);
+        args.extend_from_slice(tail);
+        args
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn pypyjit_collect_typed_jump_args(sym: &PyreSym) -> Vec<(OpRef, Type)> {
+        let base = sym.vable_collect_typed_jump_args();
+        let Some(&(frame, frame_tp)) = base.first() else {
+            return vec![(sym.execution_context, Type::Ref)];
+        };
+        let mut args = Vec::with_capacity(base.len() + 1);
+        args.push((frame, frame_tp));
+        args.push((sym.execution_context, Type::Ref));
+        args.extend_from_slice(&base[1..]);
+        args
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn pypyjit_create_sym(meta: &PyreMeta, _header_pc: usize) -> PyreSym {
+        let mut sym = PyreSym::new_uninit(OpRef(0));
+        sym.execution_context = OpRef(1);
+        sym.init_vable_indices();
+        sym.shift_virtualizable_input_indices(1);
+        sym.nlocals = meta.num_locals;
+        sym.valuestackdepth = meta.valuestackdepth;
+        sym.symbolic_local_types = vec![Type::Ref; meta.num_locals];
+        sym.symbolic_stack_types = vec![Type::Ref; meta.vable_stack_only_depth()];
+        let stack_only = meta.vable_stack_only_depth();
+        sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
+        sym
+    }
+
+    #[allow(dead_code)]
+    fn restore_expanded_virtualizable_values_with_extra_reds(
+        &mut self,
+        meta: &PyreMeta,
+        values: &[Value],
+        extra_reds: usize,
+    ) {
+        let Some(frame) = values.first() else {
+            return;
+        };
+        self.frame = value_to_usize(frame);
+        if values.len() <= 1 + extra_reds {
+            return;
+        }
+
+        if meta.has_virtualizable {
+            self.set_valuestackdepth(meta.valuestackdepth);
+            let nlocals = self.local_count();
+            let stack_only = meta.valuestackdepth.saturating_sub(nlocals);
+            let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + extra_reds;
+            for local_idx in 0..nlocals {
+                if let Some(value) = values.get(idx) {
+                    let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
+                    let _ =
+                        self.set_local_at(local_idx, boxed_slot_value_for_type(slot_type, value));
+                }
+                idx += 1;
+            }
+            for i in 0..stack_only {
+                if let Some(value) = values.get(idx) {
+                    let slot_type = meta
+                        .slot_types
+                        .get(nlocals + i)
+                        .copied()
+                        .unwrap_or(Type::Ref);
+                    let _ = self.set_stack_at(i, boxed_slot_value_for_type(slot_type, value));
+                }
+                idx += 1;
+            }
+        } else {
+            let nlocals = self.local_count();
+            let stack_only_depth = meta.valuestackdepth.saturating_sub(nlocals);
+            let mut idx = 1 + extra_reds;
+            for local_idx in 0..nlocals {
+                let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
+                let _ = self.set_local_at(
+                    local_idx,
+                    boxed_slot_value_for_type(slot_type, &values[idx]),
+                );
+                idx += 1;
+            }
+            for i in 0..stack_only_depth {
+                let slot_type = meta
+                    .slot_types
+                    .get(nlocals + i)
+                    .copied()
+                    .unwrap_or(Type::Ref);
+                let _ = self.set_stack_at(i, boxed_slot_value_for_type(slot_type, &values[idx]));
+                idx += 1;
+            }
+            self.set_valuestackdepth(meta.valuestackdepth);
+        }
+    }
+
     /// virtualizable.py:126-137 write_from_resume_data_partial parity.
     ///
     /// Restore virtualizable frame state from raw output buffer values.
@@ -3544,6 +3779,8 @@ impl JitState for PyreJitState {
             num_locals,
             ns_len: self.namespace_len(),
             valuestackdepth: vsd,
+            array_capacity: self.array_capacity(),
+            trace_extra_reds: 0,
             has_virtualizable: self.has_virtualizable_info(),
             slot_types,
         }
@@ -4044,6 +4281,8 @@ impl JitState for PyreJitState {
             num_locals: provisional.num_locals,
             ns_len: provisional.ns_len,
             valuestackdepth: vsd,
+            array_capacity: provisional.array_capacity,
+            trace_extra_reds: provisional.trace_extra_reds,
             has_virtualizable: provisional.has_virtualizable,
             slot_types,
         }
@@ -4503,11 +4742,19 @@ impl JitState for PyreJitState {
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
-        sym.vable_collect_jump_args()
+        if sym.execution_context.is_none() {
+            sym.vable_collect_jump_args()
+        } else {
+            Self::pypyjit_collect_jump_args(sym)
+        }
     }
 
     fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {
-        sym.vable_collect_typed_jump_args()
+        if sym.execution_context.is_none() {
+            sym.vable_collect_typed_jump_args()
+        } else {
+            Self::pypyjit_collect_typed_jump_args(sym)
+        }
     }
 
     fn validate_close(sym: &Self::Sym, meta: &Self::Meta) -> bool {
@@ -4562,6 +4809,63 @@ impl JitState for PyreJitState {
 }
 
 impl PyreJitState {
+    /// Portal trace entry values in RPython red-only shape (Task #11 target).
+    ///
+    /// warmstate.py:387 `execute_assembler(*args)` is called with exactly the
+    /// JitDriver reds. For pypy that is `[frame, ec]`, but this helper
+    /// currently models the `[frame]`-only single-red shim (interp_jit.py:67
+    /// activation still pending the `ec` red plumbing in Task #11 Phase B).
+    ///
+    /// Unused in production today — `extract_live_values` still returns the
+    /// expanded `[frame, last_instr, pycode, ..., locals..., stack...]`
+    /// vector until the CALL_ASSEMBLER VableExpansion path is collapsed.
+    /// Covered by `test_portal_red_only_live_values_returns_just_frame` so
+    /// the shape stays verified while the legacy contract is retired.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn portal_red_only_live_values(&self) -> Vec<Value> {
+        vec![Value::Ref(majit_ir::GcRef(self.frame))]
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn portal_red_only_live_value_types() -> Vec<Type> {
+        vec![Type::Ref]
+    }
+
+    /// Red-only JUMP args: the loop carries a single `frame` OpRef through
+    /// back-edges. The virtualizable's scalar/array slots live as preamble
+    /// GETFIELD_GC / GETARRAYITEM_GC ops emitted by
+    /// `patch_new_loop_to_load_virtualizable_fields` (compile.py:425-461)
+    /// rather than as trailing JUMP operands.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn portal_red_only_jump_args(sym: &PyreSym) -> Vec<OpRef> {
+        vec![sym.frame]
+    }
+
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn portal_red_only_typed_jump_args(sym: &PyreSym) -> Vec<(OpRef, Type)> {
+        vec![(sym.frame, Type::Ref)]
+    }
+
+    /// Red-only `create_sym`: the trace has a single `frame` inputarg at
+    /// `OpRef(0)`. The symbolic virtualizable fields are not pre-seeded
+    /// here — they come in via the compiled preamble's GETFIELD_GC /
+    /// GETARRAYITEM_GC ops. Tracer-side reads still use the symbolic
+    /// `vable_last_instr` / `vable_pycode` / ... indices once those point
+    /// at the preamble-produced OpRefs; wiring that is part of the atomic
+    /// flip in Task #11 Phase A.
+    #[cfg_attr(not(test), allow(dead_code))]
+    fn portal_red_only_create_sym(meta: &PyreMeta, _header_pc: usize) -> PyreSym {
+        let mut sym = PyreSym::new_uninit(OpRef(0));
+        sym.init_vable_indices();
+        sym.nlocals = meta.num_locals;
+        sym.valuestackdepth = meta.valuestackdepth;
+        sym.symbolic_local_types = vec![Type::Ref; meta.num_locals];
+        sym.symbolic_stack_types = vec![Type::Ref; meta.vable_stack_only_depth()];
+        let stack_only = meta.vable_stack_only_depth();
+        sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
+        sym
+    }
+
     fn materialize_virtual_ref_from_layout(
         &mut self,
         materialized: &majit_metainterp::resume::MaterializedVirtual,
@@ -4886,6 +5190,8 @@ mod tests {
             num_locals: 0,
             ns_len: 0,
             valuestackdepth: 0,
+            array_capacity: 0,
+            trace_extra_reds: 0,
             slot_types: Vec::new(),
             has_virtualizable: false,
         }
@@ -5587,6 +5893,31 @@ mod tests {
         assert_eq!(field.field_type(), Type::Int);
         assert!(descr.is_always_pure());
         assert!(field.is_immutable());
+    }
+
+    #[test]
+    fn test_pypyjit_driver_descriptor_matches_interp_jit_layout() {
+        let descriptor = PyreJitState::pypyjit_driver_descriptor();
+
+        assert!(descriptor.is_recursive);
+        assert_eq!(descriptor.num_greens(), 3);
+        assert_eq!(descriptor.num_reds(), 2);
+        assert_eq!(descriptor.virtualizable.as_deref(), Some("frame"));
+        assert_eq!(descriptor.index_of_virtualizable, 0);
+
+        let greens = descriptor.greens();
+        assert_eq!(greens[0].name, "next_instr");
+        assert_eq!(greens[0].tp, Type::Int);
+        assert_eq!(greens[1].name, "is_being_profiled");
+        assert_eq!(greens[1].tp, Type::Int);
+        assert_eq!(greens[2].name, "pycode");
+        assert_eq!(greens[2].tp, Type::Ref);
+
+        let reds = descriptor.reds();
+        assert_eq!(reds[0].name, "frame");
+        assert_eq!(reds[0].tp, Type::Ref);
+        assert_eq!(reds[1].name, "ec");
+        assert_eq!(reds[1].tp, Type::Ref);
     }
 
     #[test]

@@ -13,6 +13,8 @@
 ///
 /// arch.rs, codebuf.rs, guard.rs, regloc.rs are from llsupport/.
 // ── Shared modules (llsupport/ parity) ──
+use std::cell::RefCell;
+
 pub mod arch;
 pub mod callbuilder;
 pub mod codebuf;
@@ -37,10 +39,20 @@ pub mod x86;
 // Cranelift uses JIT_EXC_VALUE / JIT_EXC_TYPE atomics (compiler.rs:515-517).
 // Dynasm uses the same pattern for structural equivalence.
 
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
 static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
+static JITFRAME_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
+static DUMMY_THREADLOCAL_SLOT: i64 = 0;
+
+thread_local! {
+    /// llmodel.py:317-323 `threadlocalref_addr` parity: compiled entries
+    /// take the thread-local slot-array base as their second argument.
+    /// Dynasm's aarch64 CALL_ASSEMBLER path preserves and forwards that
+    /// entry ABI even before THREADLOCALREF_GET lowering exists.
+    static JIT_THREADLOCAL_SLOTS: RefCell<Vec<i64>> = const { RefCell::new(Vec::new()) };
+}
 
 /// llmodel.py:194-199 _store_exception parity: set JIT exception state.
 /// `value` is a valid OBJECTPTR (or 0). Exception class derived from
@@ -76,6 +88,48 @@ pub fn jit_exc_clear() {
     JIT_EXC_TYPE.store(0, Ordering::Relaxed);
 }
 
+/// Override the JITFRAME type id used by dynasm nursery slow paths.
+///
+/// The frontend registers `jitframe_type_info()` on its active GC before
+/// running JIT code; dynasm must allocate recursive callee jitframes with
+/// that same type so the collector traces them with `jitframe_trace`.
+pub fn set_jitframe_gc_type_id(id: u32) {
+    JITFRAME_GC_TYPE_ID.store(id, Ordering::Release);
+}
+
+#[allow(dead_code)]
+pub(crate) fn jitframe_gc_type_id() -> Option<u32> {
+    match JITFRAME_GC_TYPE_ID.load(Ordering::Acquire) {
+        u32::MAX => None,
+        id => Some(id),
+    }
+}
+
+/// Write a thread-local slot that compiled entrypoints may read back.
+pub fn jit_threadlocalref_set(offset: i64, value: i64) {
+    JIT_THREADLOCAL_SLOTS.with(|slots| {
+        let mut slots = slots.borrow_mut();
+        let idx = (offset / 8) as usize;
+        if idx >= slots.len() {
+            slots.resize(idx + 1, 0);
+        }
+        slots[idx] = value;
+    });
+}
+
+/// Return the base pointer passed to compiled entrypoints as x1.
+#[allow(dead_code)]
+pub(crate) fn jit_threadlocalref_base() -> *const i64 {
+    JIT_THREADLOCAL_SLOTS.with(|slots| {
+        let slots = slots.borrow();
+        if slots.is_empty() {
+            &raw const DUMMY_THREADLOCAL_SLOT
+        } else {
+            slots.as_ptr()
+        }
+    })
+}
+
 // ── CALL_ASSEMBLER helper infrastructure ──
 // assembler.py:345-350: jd.assembler_helper_adr — the slow path runtime
 // entry point for CALL_ASSEMBLER when callee doesn't finish normally.
@@ -104,6 +158,49 @@ static CA_BLACKHOLE_FN: OnceLock<BlackholeFn> = OnceLock::new();
 static CA_BRIDGE_FN: OnceLock<BridgeFn> = OnceLock::new();
 static CA_FORCE_FN: OnceLock<ForceFn> = OnceLock::new();
 static CA_UNBOX_INT_FN: OnceLock<UnboxIntFn> = OnceLock::new();
+
+/// JitFrame field descriptors supplied by the interpreter crate so the
+/// GC rewriter's `handle_call_assembler` pass (rewrite.py:665-695) can
+/// emit the correct GC_LOAD / GC_STORE sequence for callee jitframes.
+#[derive(Clone)]
+pub struct JitFrameLayoutInfo {
+    pub jitframe_descrs: Option<majit_gc::rewrite::JitFrameDescrs>,
+}
+
+static JITFRAME_LAYOUT: OnceLock<JitFrameLayoutInfo> = OnceLock::new();
+
+pub fn register_jitframe_layout(info: JitFrameLayoutInfo) {
+    let _ = JITFRAME_LAYOUT.set(info);
+}
+
+#[allow(dead_code)]
+pub(crate) fn jitframe_layout() -> Option<JitFrameLayoutInfo> {
+    JITFRAME_LAYOUT.get().cloned()
+}
+
+/// Pyre dynasm extension: CALL_ASSEMBLER builds some callee jitframes via
+/// `libc::calloc`, so the GC needs an explicit registration hook before the
+/// callee pushes that frame on the jitframe shadow stack.
+pub extern "C" fn dynasm_register_libc_jitframe(addr: i64) {
+    if addr != 0 {
+        majit_gc::shadow_stack::register_libc_jitframe(addr as usize);
+    }
+}
+
+/// Remove a libc-jitframe from the registry immediately before freeing it.
+pub extern "C" fn dynasm_unregister_libc_jitframe(addr: i64) {
+    if addr != 0 {
+        majit_gc::shadow_stack::unregister_libc_jitframe(addr as usize);
+    }
+}
+
+pub fn register_libc_jitframe_helper_addr() -> usize {
+    dynasm_register_libc_jitframe as usize
+}
+
+pub fn unregister_libc_jitframe_helper_addr() -> usize {
+    dynasm_unregister_libc_jitframe as usize
+}
 
 /// Register blackhole resume handler (same API as Cranelift).
 pub fn register_call_assembler_blackhole(f: BlackholeFn) {
