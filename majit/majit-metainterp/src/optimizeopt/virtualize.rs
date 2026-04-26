@@ -734,6 +734,12 @@ impl OptVirtualize {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
         let value_ref = ctx.get_box_replacement(op.arg(2));
+        // Phase 0 probe (Tasks #158/#159/#122 epic): when
+        // MAJIT_PROBE_LIVENESS env is set, log every setarrayitem_gc
+        // resolution path (Virtual elide / Vable mirror / passthrough).
+        // Goal P0-Q2: identify which array-write path is the source of
+        // vable mirror staleness for fannkuch's LoadFastLoadFast read.
+        let probe = std::env::var_os("MAJIT_PROBE_LIVENESS").is_some();
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
             if let Some(info) = ctx.get_ptr_info_mut(array_ref) {
@@ -741,6 +747,12 @@ impl OptVirtualize {
                     let idx = index as usize;
                     if idx < vinfo.items.len() {
                         vinfo.items[idx] = value_ref;
+                        if probe {
+                            eprintln!(
+                                "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → VirtualArray.items[{}] = value (REMOVE)",
+                                op.pos.0, array_ref, idx, value_ref, idx,
+                            );
+                        }
                         return OptimizationResult::Remove;
                     }
                 }
@@ -752,10 +764,26 @@ impl OptVirtualize {
                 self.resolve_virtualizable_array_source(array_ref, ctx)
             {
                 let elem_idx = index as usize;
+                if probe {
+                    eprintln!(
+                        "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → Vable[{}].arrays[{}].elem[{}] = value (mirror, PASS)",
+                        op.pos.0, array_ref, elem_idx, value_ref, frame_ref.0, array_idx, elem_idx,
+                    );
+                }
                 if let Some(PtrInfo::Virtualizable(vstate)) = ctx.get_ptr_info_mut(frame_ref) {
                     set_array_element(&mut vstate.arrays, array_idx, elem_idx, value_ref);
                 }
+            } else if probe {
+                eprintln!(
+                    "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} idx={} value_ref={:?} → no vable mirror (passthrough)",
+                    op.pos.0, array_ref, index as usize, value_ref,
+                );
             }
+        } else if probe {
+            eprintln!(
+                "[probe-B][setarrayitem_gc] op_pos={} array_ref={:?} non-const-idx index_ref={:?} value_ref={:?} (passthrough)",
+                op.pos.0, array_ref, index_ref, value_ref,
+            );
         }
         // virtualize.py:307: self.make_nonnull(op.getarg(0))
         // Virtual value-arg is NOT forced here; _emit_operation
@@ -770,6 +798,11 @@ impl OptVirtualize {
     fn optimize_getarrayitem_gc(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let array_ref = ctx.get_box_replacement(op.arg(0));
         let index_ref = op.arg(1);
+        // Phase 0 probe (Tasks #158/#159/#122 epic): symmetric to the
+        // setarrayitem_gc probe — log every read resolution. P0-Q2 needs
+        // BOTH sides to confirm whether the read sees the fresh value
+        // written by a recent setarrayitem or a stale slot from before.
+        let probe = std::env::var_os("MAJIT_PROBE_LIVENESS").is_some();
 
         if let Some(index) = ctx.get_constant_int(index_ref) {
             if let Some(info) = ctx.get_ptr_info(array_ref).cloned() {
@@ -778,12 +811,29 @@ impl OptVirtualize {
                     if idx < vinfo.items.len() {
                         let item_ref = vinfo.items[idx];
                         if !item_ref.is_none() {
+                            if probe {
+                                eprintln!(
+                                    "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} idx={} → VirtualArray.items[{}] = {:?} (REMOVE → fold)",
+                                    op.pos.0, array_ref, idx, idx, item_ref,
+                                );
+                            }
                             ctx.replace_op(op.pos, item_ref);
                             return OptimizationResult::Remove;
                         }
                     }
                 }
             }
+            if probe {
+                eprintln!(
+                    "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} idx={} → no fold (PASS, runtime read)",
+                    op.pos.0, array_ref, index as usize,
+                );
+            }
+        } else if probe {
+            eprintln!(
+                "[probe-B][getarrayitem_gc] op_pos={} array_ref={:?} non-const-idx index_ref={:?} (PASS)",
+                op.pos.0, array_ref, index_ref,
+            );
         }
         OptimizationResult::PassOn
     }

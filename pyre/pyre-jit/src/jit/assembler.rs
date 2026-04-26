@@ -853,6 +853,17 @@ fn dispatch_op(
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
             state.builder.pop_f(dst);
         }
+        // PRE-EXISTING-ADAPTATION: `load_state_*` / `store_state_*` are
+        // pyre-specific opnames produced by `JitCodeBuilder::load_state_*` /
+        // `store_state_*` (majit/majit-metainterp/src/jitcode/assembler.rs:188+)
+        // via `write_insn("load_state_field/di")` etc.  The proc-macro
+        // `jit_interp/jitcode_lower.rs` (line 533, 567, 2022, 2055) generates
+        // builder calls into these methods from `#[jit_interp]` opcode bodies
+        // that read or write virtualizable fields/arrays.  RPython has no
+        // direct counterpart — its analogue is the field/array `getfield_gc_*`
+        // path through `optimizer.py` virtualizable info — but pyre routes
+        // these through SSARepr dispatch as a kept-stable adaptation, so the
+        // arms below MUST stay until the proc-macro lowering migrates.
         "load_state_field" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
             state
@@ -894,6 +905,10 @@ fn dispatch_op(
                 expect_reg(&args[2], Kind::Int),
             );
         }
+        // `load_const_{i,r,f}` are pyre-specific opnames that no SSARepr
+        // emitter produces — the RPython-canonical shape for constant loads
+        // is `%s_copy` with a Constant source (`flatten.py:333`, handled by
+        // the `int_copy` / `ref_copy` / `float_copy` arms above).
         // `rpython/jit/codewriter/jtransform.py:844,923` uses
         // `kind = getkind(...)[0]`, so RPython only emits the short-form
         // opnames `getfield_vable_i` / `_r` / `_f` and `setfield_vable_i`

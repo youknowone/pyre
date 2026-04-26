@@ -1359,7 +1359,8 @@ impl Backend for DynasmBackend {
         // `jf_gcmap`-marked Ref slots get traced during
         // CallMallocNursery-triggered collections. Without this the
         // inner-loop jitframe's live Refs go un-updated and later guard
-        // deadframes read stale (freed-nursery) pointers.
+        // deadframes read stale (freed-nursery) pointers. The matching
+        // `unregister_libc_jitframe` below balances this registration.
         majit_gc::shadow_stack::register_libc_jitframe(jf_ptr as usize);
 
         for (i, &val) in args.iter().enumerate() {

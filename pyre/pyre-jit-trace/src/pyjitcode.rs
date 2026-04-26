@@ -47,6 +47,19 @@ pub struct PyJitCodeMetadata {
     pub portal_ec_reg: u16,
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,
+    /// Phase 2 commit 2.1 (Tasks #158/#159/#122 epic, plan
+    /// `~/.claude/plans/staged-sauteeing-koala.md`): post-regalloc
+    /// color of each Python-semantic stack slot.
+    /// `stack_slot_color_map[d]` = `apply_rename(Kind::Ref, stack_base + d)`
+    /// for `d in 0..max_stackdepth`. Populated in `finalize_jitcode`
+    /// after `apply_rename` runs.
+    ///
+    /// Currently with stack-slot input-arg pinning (regalloc.rs:455-466),
+    /// this is identical to `[stack_base, stack_base+1, ..., stack_base+max-1]`
+    /// — i.e. `stack_slot_color_map[d] == nlocals + d`. The map exists as
+    /// a side channel so the decoder can stop assuming this invariant
+    /// before commit 2.1 step C removes the pinning.
+    pub stack_slot_color_map: Vec<u16>,
 }
 
 /// Compiled JitCode plus pyre-only metadata.
@@ -176,6 +189,7 @@ impl PyJitCode {
                 portal_frame_reg: 0,
                 portal_ec_reg: 0,
                 stack_base: 0,
+                stack_slot_color_map: Vec::new(),
             },
             code_ptr,
             w_code,

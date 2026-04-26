@@ -903,6 +903,26 @@ pub fn resume_in_blackhole(
                 section.values.len(),
             );
         }
+        // Phase 0 probe (Tasks #158/#159/#122 epic, plan
+        // ~/.claude/plans/staged-sauteeing-koala.md): when
+        // MAJIT_PROBE_LIVENESS env is set, log the per-ref-bank
+        // (reg_idx → section.values[k]) mapping plus null/concrete
+        // status. Goal P0-Q1: distinguish "trace export missing this
+        // value" (section.values short / NULL entry) from "BH dispatch
+        // can't find it" (later read-side issue). Default: off.
+        let probe_liveness = std::env::var_os("MAJIT_PROBE_LIVENESS").is_some();
+        if probe_liveness {
+            eprintln!(
+                "[probe-A][consume_one_section] jitcode={} py_pc={} jit_pc={} live_i={:?} live_r={:?} live_f={:?} section.values.len={}",
+                pyjitcode.jitcode.name,
+                section.py_pc,
+                bh.position,
+                live_i,
+                live_r,
+                live_f,
+                section.values.len(),
+            );
+        }
         // resume.py:1017-1026 _prepare_next_section callbacks:
         // _callback_i → next_int() → write_an_int(register_index, value)
         // _callback_r → next_ref() → write_a_ref(register_index, value)
@@ -914,9 +934,34 @@ pub fn resume_in_blackhole(
             }
             val_idx += 1;
         }
+        let probe_bh_startup = std::env::var("PYRE_PROBE_BH_STARTUP").ok().as_deref() == Some("1");
         for &reg_idx in &live_r {
             if let Some(val) = section.values.get(val_idx) {
-                bh.setarg_r(reg_idx as usize, materialize_virtual(val));
+                let materialized = materialize_virtual(val);
+                if probe_liveness {
+                    eprintln!(
+                        "[probe-A][ref] reg_idx={} val_idx={} raw={:?} materialized=0x{:x} is_null={}",
+                        reg_idx,
+                        val_idx,
+                        val,
+                        materialized as usize,
+                        materialized == 0,
+                    );
+                }
+                if probe_bh_startup && (reg_idx as usize) < nlocals {
+                    eprintln!(
+                        "[PROBE-BH-START][setarg_r] sec={} py_pc={} reg_idx={} (LOCAL) val_idx={} materialized=0x{:x}",
+                        sec_idx, py_pc, reg_idx, val_idx, materialized as usize
+                    );
+                }
+                bh.setarg_r(reg_idx as usize, materialized);
+            } else if probe_liveness {
+                eprintln!(
+                    "[probe-A][ref] reg_idx={} val_idx={} OUT-OF-BOUNDS section.values.len={}",
+                    reg_idx,
+                    val_idx,
+                    section.values.len(),
+                );
             }
             val_idx += 1;
         }
@@ -944,6 +989,42 @@ pub fn resume_in_blackhole(
         // invokes this at resume.rs:5824; the pyre-local chain builder sits
         // on a parallel code path and must replay the same step.
         bh.handle_rvmprof_enter();
+
+        // PHASE 1.4 candidate D probe (BH startup): immediately after
+        // bh.registers_r is populated and before any BH op runs, compare
+        // per-local `bh.registers_r[i]` to heap PyFrame.locals_w[i] (==
+        // `vable.values[i]`). The two SHOULD be identical — they both
+        // represent the same logical local at the guard PC. Divergence
+        // here means the JIT-compiled trace's dual-write (heap +
+        // register-file) was broken by the optimizer/backend, OR the
+        // build_resumed_frames materialization picked a stale dead_frame
+        // slot for a register that the heap had moved past.
+        if std::env::var("PYRE_PROBE_BH_STARTUP").ok().as_deref() == Some("1") {
+            let vinfo_ptr = bh.virtualizable_info;
+            if !vinfo_ptr.is_null() && bh.virtualizable_ptr != 0 {
+                let vinfo = unsafe { &*vinfo_ptr };
+                if !vinfo.array_fields.is_empty() {
+                    let ainfo = &vinfo.array_fields[0];
+                    let scan_len = nlocals.min(bh.registers_r.len());
+                    for i in 0..scan_len {
+                        let reg_val = bh.registers_r[i];
+                        let vable_val = unsafe {
+                            majit_metainterp::virtualizable::vable_read_array_item(
+                                bh.virtualizable_ptr as *const u8,
+                                ainfo,
+                                i,
+                            )
+                        };
+                        if reg_val != vable_val {
+                            eprintln!(
+                                "[PROBE-BH-START] sec={} py_pc={} local={} reg=0x{:x} vable=0x{:x} MISMATCH",
+                                sec_idx, py_pc, i, reg_val, vable_val
+                            );
+                        }
+                    }
+                }
+            }
+        }
 
         // RPython: nextbh.nextblackholeinterp = curbh
         bh.nextblackholeinterp = prev_bh.map(Box::new);
@@ -1075,7 +1156,9 @@ pub fn resume_in_blackhole(
                 // lives in the BH side: clear exception_last_value on
                 // handle_exception_in_frame + reset the caller
                 // BH_LAST_EXC_VALUE thread-local once the exception is
-                // consumed. Until that lands, Failed is load-bearing.
+                // consumed. Tracked by Task #122 (rd_numb resume
+                // unification), blocked by Task #158 (register-layout
+                // refactor) + Task #159 (liveness pipeline rework).
                 return BlackholeResult::Failed;
             };
 

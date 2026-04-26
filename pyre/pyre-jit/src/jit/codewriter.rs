@@ -1983,10 +1983,10 @@ fn filter_liveness_in_place(
     ssarepr: &mut super::flatten::SSARepr,
     code: &CodeObject,
     nlocals: usize,
-    stack_base: u16,
+    stack_slot_color_map: &[u16],
     depth_at_pc: &[u16],
 ) {
-    use super::flatten::{Insn, Kind as SsaKind, Operand as SsaOperand};
+    use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     super::liveness::compute_liveness(ssarepr);
     let live_vars = pyre_jit_trace::state::liveness_for(code as *const _);
     let live_markers = live_marker_indices_by_pc(ssarepr, code.instructions.len());
@@ -2016,8 +2016,9 @@ fn filter_liveness_in_place(
             continue;
         }
 
-        let depth = depth_at_pc[py_pc];
-        let stack_limit = stack_base as usize + depth as usize;
+        let depth = depth_at_pc[py_pc] as usize;
+        let live_stack_colors: std::collections::BTreeSet<u16> =
+            stack_slot_color_map.iter().copied().take(depth).collect();
         let mut seen_r: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
         let mut seen_i: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
         let mut seen_f: std::collections::BTreeSet<u16> = std::collections::BTreeSet::new();
@@ -2048,12 +2049,14 @@ fn filter_liveness_in_place(
         // `setarg_r` with scratch contents, crashing on nbody /
         // fannkuch / spectral_norm.
         //
-        // Until pyre's register layout is refactored to a
-        // post-regalloc-color-only space matching RPython (Task #62
-        // scope, multi-session), constrain live_r to the Python-frame
-        // range and force-add in-depth stack slots so the "all stack
-        // slots up to current depth hold a live box" runtime contract
-        // holds at every `-live-` marker.
+        // Task #158 (register-layout refactor): until pyre's register
+        // layout is refactored to a post-regalloc-color-only space
+        // matching RPython, constrain live_r to the Python-frame
+        // range and force-add the LIVE stack-slot colors from
+        // `metadata.stack_slot_color_map` so the "all stack slots up
+        // to current depth hold a live box" runtime contract still
+        // holds at every `-live-` marker after stack-slot pinning
+        // removal.
         for op in existing.iter() {
             let SsaOperand::Register(reg) = op else {
                 continue;
@@ -2062,7 +2065,7 @@ fn filter_liveness_in_place(
                 SsaKind::Ref => {
                     let idx = reg.index as usize;
                     let in_locals = idx < nlocals;
-                    let in_stack = idx >= stack_base as usize && idx < stack_limit;
+                    let in_stack = live_stack_colors.contains(&reg.index);
                     if (in_locals || in_stack) && seen_r.insert(reg.index) {
                         live_r.push(reg.index);
                     }
@@ -2077,11 +2080,9 @@ fn filter_liveness_in_place(
                         live_f.push(reg.index);
                     }
                 }
-                _ => {}
             }
         }
-        for d in 0..depth {
-            let idx = stack_base + d;
+        for &idx in &live_stack_colors {
             if seen_r.insert(idx) {
                 live_r.push(idx);
             }
@@ -2098,9 +2099,7 @@ fn filter_liveness_in_place(
                 .filter(|&idx| live_vars.is_local_live(py_pc, idx))
                 .map(|idx| idx as u16)
                 .collect();
-            for d in 0..depth {
-                s.insert(stack_base + d);
-            }
+            s.extend(live_stack_colors.iter().copied());
             s
         };
         live_r.retain(|idx| lv_live.contains(idx));
@@ -3687,6 +3686,33 @@ impl CodeWriter {
             }};
         }
 
+        // jtransform.py:1898 `do_fixed_list_setitem` vable case +
+        // post-store reg_N mirror. STORE_FAST and its super-inst
+        // relatives (StoreFastLoadFast, StoreFastStoreFast) all
+        // perform the same dual-write pair: when the frame is
+        // portal-virtualizable, write `stored_reg` into the vable
+        // array slot for the local; in every case, `ref_copy` it
+        // into reg_N so super-inst consumers reading reg_N directly
+        // (LoadFastLoadFast / LoadFastBorrowLoadFastBorrow) see the
+        // post-store value. The reg==vable invariant established
+        // here is the foundation for the LFLF vable flip — see
+        // memo super_inst_candidate1_probe_scope_2026_04_23.
+        macro_rules! emit_store_local_with_mirror {
+            ($ssarepr:expr, $reg:expr, $stored_reg:expr) => {{
+                let reg = $reg;
+                let stored_reg = $stored_reg;
+                if is_portal {
+                    emit_load_const_i!(
+                        $ssarepr,
+                        int_tmp0,
+                        local_to_vable_slot(reg as usize) as i64
+                    );
+                    emit_vable_setarrayitem_ref!($ssarepr, 0_u16, int_tmp0, stored_reg);
+                }
+                emit_ref_copy!($ssarepr, reg, stored_reg);
+            }};
+        }
+
         // B6 Phase 3b dual emission for `jit_merge_point`. RPython parity:
         // `jtransform.py:rewrite_op_jit_merge_point` emits
         // `SpaceOperation('jit_merge_point', args, None)` with
@@ -3952,24 +3978,7 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if is_portal {
-                            emit_load_const_i!(
-                                ssarepr,
-                                int_tmp0,
-                                local_to_vable_slot(reg as usize) as i64
-                            );
-                            emit_vable_setarrayitem_ref!(ssarepr, 0_u16, int_tmp0, stored_reg);
-                        }
-                        // D.vable Phase 1 (2026-04-23): mirror the stored value
-                        // into reg_N so super-inst consumers
-                        // (LoadFastLoadFast / LoadFastBorrowLoadFastBorrow)
-                        // which read reg_N directly see the post-STORE_FAST
-                        // value. Portal frames previously skipped this step,
-                        // leaving reg_N stale after vable_setarrayitem_ref.
-                        // Establishing the reg==vable invariant here is the
-                        // foundation for the eventual LFLF vable flip — see
-                        // memo super_inst_candidate1_probe_scope_2026_04_23.
-                        emit_ref_copy!(ssarepr, reg, stored_reg);
+                        emit_store_local_with_mirror!(ssarepr, reg, stored_reg);
                         if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                             *slot = Some(stored);
                         }
@@ -4091,17 +4100,14 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        // STORE_FAST half: same dual-write as Instruction::StoreFast.
+                        // Non-portal popvalue places `stored_reg` at
+                        // `stack_base + current_depth` post-decrement, so the
+                        // macro's `ref_copy(store_reg, stored_reg)` is
+                        // equivalent to the prior explicit
+                        // `ref_copy(store_reg, stack_base + current_depth)`.
+                        emit_store_local_with_mirror!(ssarepr, store_reg, stored_reg);
                         if is_portal {
-                            // STORE_FAST half: popvalue + locals_cells_stack_w[local_slot] = w
-                            emit_load_const_i!(
-                                ssarepr,
-                                int_tmp0,
-                                local_to_vable_slot(store_reg as usize) as i64
-                            );
-                            emit_vable_setarrayitem_ref!(ssarepr, 0_u16, int_tmp0, stored_reg);
-                            // D.vable Phase 1: mirror STORE half into reg_N for
-                            // LFLF consumers. See Instruction::StoreFast arm.
-                            emit_ref_copy!(ssarepr, store_reg, stored_reg);
                             // LOAD_FAST half: read local, then pyframe.py:378-381
                             // pushvalue parity — mirror to the value-stack slot.
                             emit_load_const_i!(
@@ -4138,7 +4144,6 @@ impl CodeWriter {
                             current_depth += 1;
                             emit_vsd!(current_depth);
                         } else {
-                            emit_ref_copy!(ssarepr, store_reg, stack_base + current_depth);
                             if let Some(slot) = current_state.locals_w.get_mut(store_reg as usize) {
                                 *slot = Some(stored);
                             }
@@ -5020,17 +5025,7 @@ impl CodeWriter {
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            if is_portal {
-                                emit_load_const_i!(
-                                    ssarepr,
-                                    int_tmp0,
-                                    local_to_vable_slot(reg as usize) as i64,
-                                );
-                                emit_vable_setarrayitem_ref!(ssarepr, 0_u16, int_tmp0, stored_reg);
-                            }
-                            // D.vable Phase 1: mirror each store into reg_N for
-                            // LFLF consumers. See Instruction::StoreFast arm.
-                            emit_ref_copy!(ssarepr, reg, stored_reg);
+                            emit_store_local_with_mirror!(ssarepr, reg, stored_reg);
                             if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                                 *slot = Some(stored);
                             }
@@ -5345,6 +5340,37 @@ impl CodeWriter {
             .copied()
             .unwrap_or(portal_ec_reg);
 
+        // Phase 2 commit 2.1 step A (Tasks #158/#159/#122 epic, plan
+        // `~/.claude/plans/staged-sauteeing-koala.md`): record each
+        // Python-semantic stack slot's post-regalloc color so the
+        // decoder can drop the assumption `color = stack_base + d`
+        // before step C removes the input-arg pinning.
+        //
+        // Currently with stack-slot pinning still in place (regalloc.rs
+        // :455-466), `enforce_input_args` rotates the stack pre-colors
+        // `stack_base + d` to `nlocals + d` — an identity rotation in
+        // the typical case. Step A populates the side channel without
+        // changing decoder behaviour.
+        let mut stack_slot_color_map: Vec<u16> =
+            Vec::with_capacity(max_stack_depth_observed as usize);
+        for d in 0..max_stack_depth_observed {
+            let pre = stack_base + d;
+            let post = alloc_result
+                .rename
+                .get(&(Kind::Ref, pre))
+                .copied()
+                .unwrap_or(pre);
+            stack_slot_color_map.push(post);
+        }
+        // After step C the chordal coloring is free to coalesce
+        // disjointly-live stack slots into the same color, so the full
+        // map may legitimately repeat colors (e.g. `[1, 1, 2, 3, 4, 0,
+        // 5]`). The runtime decoder bounds its `iter().position()`
+        // lookup to the slots that are LIVE at the resume PC
+        // (`stack_only` in `state.rs::write_from_resume_data_partial`),
+        // and chordal coloring guarantees uniqueness within any
+        // simultaneously-live subset.
+
         // codewriter.py:55-56 parity: `compute_liveness(ssarepr)` runs
         // AFTER regalloc + flatten, so the live-register indices the
         // pass writes into each `-live-` marker are already the
@@ -5352,7 +5378,13 @@ impl CodeWriter {
         // them into live_i/live_r/live_f per assembler.py:150-152,
         // with a PRE-EXISTING-ADAPTATION narrowing live_r to Python
         // boxes (see that function's header comment).
-        filter_liveness_in_place(&mut ssarepr, code, nlocals, stack_base, &depth_at_pc);
+        filter_liveness_in_place(
+            &mut ssarepr,
+            code,
+            nlocals,
+            &stack_slot_color_map,
+            &depth_at_pc,
+        );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
@@ -5398,6 +5430,7 @@ impl CodeWriter {
             has_abort,
             merge_point_pc,
             num_regs,
+            stack_slot_color_map,
         )
     }
 
@@ -5434,6 +5467,7 @@ impl CodeWriter {
         has_abort: bool,
         merge_point_pc: Option<usize>,
         num_regs: super::assembler::NumRegs,
+        stack_slot_color_map: Vec<u16>,
     ) -> PyJitCode {
         // pc_map[py_pc] currently holds SSARepr insn indices (returned by
         // SSAReprEmitter::current_pos()). Translate them to JitCode byte
@@ -5481,6 +5515,7 @@ impl CodeWriter {
             portal_frame_reg,
             portal_ec_reg,
             stack_base: frame_stack_base,
+            stack_slot_color_map,
         };
 
         PyJitCode {

@@ -10,6 +10,35 @@ use majit_ir::{Op, OpCode, OpRef, Value};
 use crate::optimizeopt::intutils::IntBound;
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
 
+/// autogenintrules.py:14-18 `_eq(box1, bound1, box2, bound2)` helper.
+/// RPython's rule matcher tests identity OR constant-bound equality so
+/// two different boxes with the same known constant value are treated
+/// as `x is x`.
+fn autogen_eq(box1: OpRef, bound1: &IntBound, box2: OpRef, bound2: &IntBound) -> bool {
+    if box1 == box2 {
+        return true;
+    }
+    if bound1.is_constant()
+        && bound2.is_constant()
+        && bound1.get_constant() == bound2.get_constant()
+    {
+        return true;
+    }
+    false
+}
+
+/// autogenintrules.py rewrite helper: `self.replace_op_with(op, opcode,
+/// args=[...])`. Builds a fresh `Op` that reuses the original `op.pos`
+/// (preserving Box identity) and returns `OptimizationResult::Replace`
+/// so the dispatch loop continues with the new op from the next pass.
+/// Mirrors RPython's `replace_op_with` + `send_extra_operation(newop)`
+/// pattern for the portion of the pipeline that comes after OptIntBounds.
+fn replace_with(original: &Op, opcode: OpCode, args: &[OpRef]) -> OptimizationResult {
+    let mut new_op = Op::new(opcode, args);
+    new_op.pos = original.pos;
+    OptimizationResult::Replace(new_op)
+}
+
 /// Integer bounds optimization pass.
 ///
 /// Keeps track of the bounds placed on integers by guards and removes
@@ -27,17 +56,11 @@ pub struct OptIntBounds {
     last_emitted_args: Vec<OpRef>,
     /// intbounds.py: last_emitted_operation — OpRef result.
     last_emitted_ref: OpRef,
-    /// intbounds.py: pure_from_args synthesis cache.
-    /// Records equivalent pure operations discovered through bounds analysis
-    /// (e.g., INT_OR with non-overlapping ranges = INT_ADD).
-    /// Key: (opcode, arg0, arg1), Value: result OpRef.
-    pure_from_args_cache: Vec<(OpCode, OpRef, OpRef, OpRef)>,
 }
 
 impl OptIntBounds {
     pub fn new() -> Self {
         OptIntBounds {
-            pure_from_args_cache: Vec::new(),
             last_emitted_opcode: None,
             last_emitted_args: Vec::new(),
             last_emitted_ref: OpRef::NONE,
@@ -73,12 +96,6 @@ impl OptIntBounds {
         ctx.make_constant(opref, Value::Int(value));
     }
 
-    /// Record a pure_from_args entry for CSE.
-    /// intbounds.py: self.optimizer.pure_from_args(opnum, args, result)
-    fn record_pure_from_args(&mut self, opcode: OpCode, arg0: OpRef, arg1: OpRef, result: OpRef) {
-        self.pure_from_args_cache.push((opcode, arg0, arg1, result));
-    }
-
     /// Get or create a constant OpRef for the given value.
     fn get_or_make_const(&self, value: i64, ctx: &mut OptContext) -> OpRef {
         // Search existing constants
@@ -94,11 +111,6 @@ impl OptIntBounds {
         let opref = ctx.emit(op);
         ctx.make_constant(opref, Value::Int(value));
         opref
-    }
-
-    /// Get the pure_from_args synthesis cache (for integration with OptPure).
-    pub fn get_pure_from_args_cache(&self) -> &[(OpCode, OpRef, OpRef, OpRef)] {
-        &self.pure_from_args_cache
     }
 
     // ── Comparison optimizations ──
@@ -167,36 +179,131 @@ impl OptIntBounds {
         }
     }
 
+    /// autogenintrules.py:1220-1320 optimize_INT_EQ — rules:
+    /// eq_different_knownbits / eq_same / eq_one / eq_zero / eq_sub_eq.
     fn optimize_int_eq(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
-        if arg0 == arg1 {
-            self.make_constant_int(op, 1, ctx);
-            OptimizationResult::Remove
-        } else if b0.known_ne(&b1) {
-            self.make_constant_int(op, 0, ctx);
-            OptimizationResult::Remove
-        } else {
-            OptimizationResult::PassOn
+        // eq_sub_eq: int_eq(int_sub(x, int_eq(x, a)), a) => 0 (4 forms)
+        if let Some(arg0_sub) = self.as_operation(arg0, OpCode::IntSub, ctx) {
+            let arg0_0 = ctx.get_box_replacement(arg0_sub.arg(0));
+            let arg0_1 = ctx.get_box_replacement(arg0_sub.arg(1));
+            let b_arg0_0 = self.getintbound(arg0_0, ctx);
+            if let Some(inner_eq) = self.as_operation(arg0_1, OpCode::IntEq, ctx) {
+                let inner_0 = ctx.get_box_replacement(inner_eq.arg(0));
+                let inner_1 = ctx.get_box_replacement(inner_eq.arg(1));
+                let b_inner_0 = self.getintbound(inner_0, ctx);
+                let b_inner_1 = self.getintbound(inner_1, ctx);
+                // eq_sub_eq: int_eq(int_sub(x, int_eq(x, a)), a) => 0
+                if autogen_eq(inner_0, &b_inner_0, arg0_0, &b_arg0_0)
+                    && autogen_eq(arg1, &b1, inner_1, &b_inner_1)
+                {
+                    self.make_constant_int(op, 0, ctx);
+                    return OptimizationResult::Remove;
+                }
+                // eq_sub_eq: int_eq(int_sub(x, int_eq(a, x)), a) => 0
+                if autogen_eq(inner_1, &b_inner_1, arg0_0, &b_arg0_0)
+                    && autogen_eq(arg1, &b1, inner_0, &b_inner_0)
+                {
+                    self.make_constant_int(op, 0, ctx);
+                    return OptimizationResult::Remove;
+                }
+            }
         }
+        if let Some(arg1_sub) = self.as_operation(arg1, OpCode::IntSub, ctx) {
+            let arg1_0 = ctx.get_box_replacement(arg1_sub.arg(0));
+            let arg1_1 = ctx.get_box_replacement(arg1_sub.arg(1));
+            let b_arg1_0 = self.getintbound(arg1_0, ctx);
+            if let Some(inner_eq) = self.as_operation(arg1_1, OpCode::IntEq, ctx) {
+                let inner_0 = ctx.get_box_replacement(inner_eq.arg(0));
+                let inner_1 = ctx.get_box_replacement(inner_eq.arg(1));
+                let b_inner_0 = self.getintbound(inner_0, ctx);
+                let b_inner_1 = self.getintbound(inner_1, ctx);
+                // eq_sub_eq: int_eq(a, int_sub(x, int_eq(x, a))) => 0
+                if autogen_eq(inner_0, &b_inner_0, arg1_0, &b_arg1_0)
+                    && autogen_eq(inner_1, &b_inner_1, arg0, &b0)
+                {
+                    self.make_constant_int(op, 0, ctx);
+                    return OptimizationResult::Remove;
+                }
+                // eq_sub_eq: int_eq(a, int_sub(x, int_eq(a, x))) => 0
+                if autogen_eq(inner_0, &b_inner_0, arg0, &b0)
+                    && autogen_eq(inner_1, &b_inner_1, arg1_0, &b_arg1_0)
+                {
+                    self.make_constant_int(op, 0, ctx);
+                    return OptimizationResult::Remove;
+                }
+            }
+        }
+        // eq_same: int_eq(x, x) => 1
+        if autogen_eq(arg1, &b1, arg0, &b0) {
+            self.make_constant_int(op, 1, ctx);
+            return OptimizationResult::Remove;
+        }
+        // eq_different_knownbits: int_eq(x, y) => 0
+        if b0.known_ne(&b1) {
+            self.make_constant_int(op, 0, ctx);
+            return OptimizationResult::Remove;
+        }
+        // eq_different_knownbits: int_eq(y, x) => 0
+        if b1.known_ne(&b0) {
+            self.make_constant_int(op, 0, ctx);
+            return OptimizationResult::Remove;
+        }
+        // eq_one: int_eq(1, x) => x  (when x is bool)
+        if b0.is_constant() && b0.get_constant() == 1 && b1.is_bool() {
+            ctx.make_equal_to(op.pos, arg1);
+            return OptimizationResult::Remove;
+        }
+        // eq_one: int_eq(x, 1) => x  (when x is bool)
+        if b1.is_constant() && b1.get_constant() == 1 && b0.is_bool() {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        // eq_zero: int_eq(0, x) => int_is_zero(x)
+        if b0.is_constant() && b0.get_constant() == 0 {
+            return replace_with(op, OpCode::IntIsZero, &[arg1]);
+        }
+        // eq_zero: int_eq(x, 0) => int_is_zero(x)
+        if b1.is_constant() && b1.get_constant() == 0 {
+            return replace_with(op, OpCode::IntIsZero, &[arg0]);
+        }
+        OptimizationResult::PassOn
     }
 
+    /// autogenintrules.py:1324-1360 optimize_INT_NE — rules:
+    /// ne_different_knownbits / ne_same / ne_zero.
     fn optimize_int_ne(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let arg0 = ctx.get_box_replacement(op.arg(0));
         let arg1 = ctx.get_box_replacement(op.arg(1));
         let b0 = self.getintbound(arg0, ctx);
         let b1 = self.getintbound(arg1, ctx);
-        if arg0 == arg1 {
+        // ne_same: int_ne(x, x) => 0
+        if autogen_eq(arg1, &b1, arg0, &b0) {
             self.make_constant_int(op, 0, ctx);
-            OptimizationResult::Remove
-        } else if b0.known_ne(&b1) {
-            self.make_constant_int(op, 1, ctx);
-            OptimizationResult::Remove
-        } else {
-            OptimizationResult::PassOn
+            return OptimizationResult::Remove;
         }
+        // ne_different_knownbits: int_ne(x, y) => 1
+        if b0.known_ne(&b1) {
+            self.make_constant_int(op, 1, ctx);
+            return OptimizationResult::Remove;
+        }
+        // ne_different_knownbits: int_ne(y, x) => 1
+        if b1.known_ne(&b0) {
+            self.make_constant_int(op, 1, ctx);
+            return OptimizationResult::Remove;
+        }
+        // ne_zero: int_ne(0, x) => int_is_true(x)
+        if b0.is_constant() && b0.get_constant() == 0 {
+            return replace_with(op, OpCode::IntIsTrue, &[arg1]);
+        }
+        // ne_zero: int_ne(x, 0) => int_is_true(x)
+        if b1.is_constant() && b1.get_constant() == 0 {
+            return replace_with(op, OpCode::IntIsTrue, &[arg0]);
+        }
+        OptimizationResult::PassOn
     }
 
     // ── Unsigned comparison optimizations ──
@@ -265,6 +372,1127 @@ impl OptIntBounds {
         }
     }
 
+    // ── autogenintrules.py ports ──
+    //
+    // rpython/jit/metainterp/optimizeopt/autogenintrules.py is machine-
+    // generated by ruleopt/generate.py and mixed into OptIntBounds via
+    // `objectmodel.import_from_mixin(autogenintrules.OptIntAutoGenerated)`
+    // at intbounds.py:806. Each optimize_* method below is a direct port
+    // of the corresponding `def optimize_INT_*` block.
+
+    /// autogenintrules.py:23-143 optimize_INT_ADD — rules:
+    /// add_zero / add_reassoc_consts / add_sub_x_c_c / add_sub_c_x_c.
+    fn optimize_int_add(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
+        // add_zero: int_add(0, x) => x
+        if b0.is_constant() && b0.get_constant() == 0 {
+            ctx.make_equal_to(op.pos, arg1);
+            return OptimizationResult::Remove;
+        }
+        // add_zero: int_add(x, 0) => x
+        if b1.is_constant() && b1.get_constant() == 0 {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        // autogenintrules.py:42-88 — outer const on arg0, inner producer on arg1.
+        if b0.is_constant() {
+            let c_outer = b0.get_constant();
+            if let Some(arg1_add) = self.as_operation(arg1, OpCode::IntAdd, ctx) {
+                let inner_0 = ctx.get_box_replacement(arg1_add.arg(0));
+                let inner_1 = ctx.get_box_replacement(arg1_add.arg(1));
+                let b_inner_0 = self.getintbound(inner_0, ctx);
+                let b_inner_1 = self.getintbound(inner_1, ctx);
+                // add_reassoc_consts: int_add(C2, int_add(C1, x)) => int_add(x, C1+C2)
+                if b_inner_0.is_constant() {
+                    let folded = c_outer.wrapping_add(b_inner_0.get_constant());
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntAdd, &[inner_1, const_ref]);
+                }
+                // add_reassoc_consts: int_add(C2, int_add(x, C1)) => int_add(x, C1+C2)
+                if b_inner_1.is_constant() {
+                    let folded = c_outer.wrapping_add(b_inner_1.get_constant());
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntAdd, &[inner_0, const_ref]);
+                }
+            } else if let Some(arg1_sub) = self.as_operation(arg1, OpCode::IntSub, ctx) {
+                let inner_0 = ctx.get_box_replacement(arg1_sub.arg(0));
+                let inner_1 = ctx.get_box_replacement(arg1_sub.arg(1));
+                let b_inner_0 = self.getintbound(inner_0, ctx);
+                let b_inner_1 = self.getintbound(inner_1, ctx);
+                // add_sub_c_x_c: int_add(C2, int_sub(C1, x)) => int_sub(C1+C2, x)
+                if b_inner_0.is_constant() {
+                    let folded = c_outer.wrapping_add(b_inner_0.get_constant());
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntSub, &[const_ref, inner_1]);
+                }
+                // add_sub_x_c_c: int_add(C2, int_sub(x, C1)) => int_add(x, C2-C1)
+                if b_inner_1.is_constant() {
+                    let folded = c_outer.wrapping_sub(b_inner_1.get_constant());
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntAdd, &[inner_0, const_ref]);
+                }
+            }
+        } else {
+            // autogenintrules.py:89-142 — inner producer on arg0, outer const on arg1.
+            if let Some(arg0_add) = self.as_operation(arg0, OpCode::IntAdd, ctx) {
+                let inner_0 = ctx.get_box_replacement(arg0_add.arg(0));
+                let inner_1 = ctx.get_box_replacement(arg0_add.arg(1));
+                let b_inner_0 = self.getintbound(inner_0, ctx);
+                let b_inner_1 = self.getintbound(inner_1, ctx);
+                if b1.is_constant() {
+                    let c_outer = b1.get_constant();
+                    // add_reassoc_consts: int_add(int_add(C1, x), C2) => int_add(x, C1+C2)
+                    if b_inner_0.is_constant() {
+                        let folded = b_inner_0.get_constant().wrapping_add(c_outer);
+                        let const_ref = ctx.make_constant_int(folded);
+                        return replace_with(op, OpCode::IntAdd, &[inner_1, const_ref]);
+                    }
+                    // add_reassoc_consts: int_add(int_add(x, C1), C2) => int_add(x, C1+C2)
+                    if b_inner_1.is_constant() {
+                        let folded = b_inner_1.get_constant().wrapping_add(c_outer);
+                        let const_ref = ctx.make_constant_int(folded);
+                        return replace_with(op, OpCode::IntAdd, &[inner_0, const_ref]);
+                    }
+                }
+            } else if let Some(arg0_sub) = self.as_operation(arg0, OpCode::IntSub, ctx) {
+                let inner_0 = ctx.get_box_replacement(arg0_sub.arg(0));
+                let inner_1 = ctx.get_box_replacement(arg0_sub.arg(1));
+                let b_inner_0 = self.getintbound(inner_0, ctx);
+                let b_inner_1 = self.getintbound(inner_1, ctx);
+                if b1.is_constant() {
+                    let c_outer = b1.get_constant();
+                    // add_sub_c_x_c: int_add(int_sub(C1, x), C2) => int_sub(C1+C2, x)
+                    if b_inner_0.is_constant() {
+                        let folded = b_inner_0.get_constant().wrapping_add(c_outer);
+                        let const_ref = ctx.make_constant_int(folded);
+                        return replace_with(op, OpCode::IntSub, &[const_ref, inner_1]);
+                    }
+                    // add_sub_x_c_c: int_add(int_sub(x, C1), C2) => int_add(x, C2-C1)
+                    if b_inner_1.is_constant() {
+                        let folded = c_outer.wrapping_sub(b_inner_1.get_constant());
+                        let const_ref = ctx.make_constant_int(folded);
+                        return replace_with(op, OpCode::IntAdd, &[inner_0, const_ref]);
+                    }
+                }
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:147-311 optimize_INT_SUB — rules:
+    /// sub_zero / sub_from_zero / sub_x_x / sub_add_consts / sub_add /
+    /// sub_add_neg / sub_sub_left_x_c_c / sub_sub_left_c_x_c /
+    /// sub_xor_x_y_y / sub_or_x_y_y / sub_invert_one.
+    fn optimize_int_sub(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
+        // sub_x_x: int_sub(x, x) => 0
+        if autogen_eq(arg1, &b1, arg0, &b0) {
+            self.make_constant_int(op, 0, ctx);
+            return OptimizationResult::Remove;
+        }
+        // sub_add: int_sub(int_add(x, y), y) => x / int_sub(int_add(y, x), y) => x
+        if let Some(arg0_int_add) = self.as_operation(arg0, OpCode::IntAdd, ctx) {
+            let arg0_0 = ctx.get_box_replacement(arg0_int_add.arg(0));
+            let arg0_1 = ctx.get_box_replacement(arg0_int_add.arg(1));
+            let b0_0 = self.getintbound(arg0_0, ctx);
+            let b0_1 = self.getintbound(arg0_1, ctx);
+            if autogen_eq(arg1, &b1, arg0_1, &b0_1) {
+                ctx.make_equal_to(op.pos, arg0_0);
+                return OptimizationResult::Remove;
+            }
+            if autogen_eq(arg1, &b1, arg0_0, &b0_0) {
+                ctx.make_equal_to(op.pos, arg0_1);
+                return OptimizationResult::Remove;
+            }
+        } else if let Some(arg0_int_or) = self.as_operation(arg0, OpCode::IntOr, ctx) {
+            // sub_or_x_y_y: int_sub(int_or(x, y), y) => x  (when x & y == 0)
+            let arg0_0 = ctx.get_box_replacement(arg0_int_or.arg(0));
+            let arg0_1 = ctx.get_box_replacement(arg0_int_or.arg(1));
+            let b0_0 = self.getintbound(arg0_0, ctx);
+            let b0_1 = self.getintbound(arg0_1, ctx);
+            if autogen_eq(arg1, &b1, arg0_1, &b0_1) && b0_0.and_bound(&b0_1).known_eq_const(0) {
+                ctx.make_equal_to(op.pos, arg0_0);
+                return OptimizationResult::Remove;
+            }
+            if autogen_eq(arg1, &b1, arg0_0, &b0_0) && b0_1.and_bound(&b0_0).known_eq_const(0) {
+                ctx.make_equal_to(op.pos, arg0_1);
+                return OptimizationResult::Remove;
+            }
+        } else if let Some(arg0_int_xor) = self.as_operation(arg0, OpCode::IntXor, ctx) {
+            // sub_xor_x_y_y: int_sub(int_xor(x, y), y) => x  (when x & y == 0)
+            let arg0_0 = ctx.get_box_replacement(arg0_int_xor.arg(0));
+            let arg0_1 = ctx.get_box_replacement(arg0_int_xor.arg(1));
+            let b0_0 = self.getintbound(arg0_0, ctx);
+            let b0_1 = self.getintbound(arg0_1, ctx);
+            if autogen_eq(arg1, &b1, arg0_1, &b0_1) && b0_0.and_bound(&b0_1).known_eq_const(0) {
+                ctx.make_equal_to(op.pos, arg0_0);
+                return OptimizationResult::Remove;
+            }
+            if autogen_eq(arg1, &b1, arg0_0, &b0_0) && b0_1.and_bound(&b0_0).known_eq_const(0) {
+                ctx.make_equal_to(op.pos, arg0_1);
+                return OptimizationResult::Remove;
+            }
+        }
+        // sub_zero: int_sub(x, 0) => x
+        if b1.is_constant() && b1.get_constant() == 0 {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        // sub_from_zero: int_sub(0, x) => int_neg(x)
+        if b0.is_constant() && b0.get_constant() == 0 {
+            return replace_with(op, OpCode::IntNeg, &[arg1]);
+        }
+        if let Some(arg0_int_invert) = self.as_operation(arg0, OpCode::IntInvert, ctx) {
+            let arg0_0 = ctx.get_box_replacement(arg0_int_invert.arg(0));
+            // sub_invert_one: int_sub(int_invert(x), -1) => int_neg(x)
+            if b1.is_constant() && b1.get_constant() == -1 {
+                return replace_with(op, OpCode::IntNeg, &[arg0_0]);
+            }
+        } else if let Some(arg0_int_add) = self.as_operation(arg0, OpCode::IntAdd, ctx) {
+            let arg0_0 = ctx.get_box_replacement(arg0_int_add.arg(0));
+            let arg0_1 = ctx.get_box_replacement(arg0_int_add.arg(1));
+            let b0_0 = self.getintbound(arg0_0, ctx);
+            let b0_1 = self.getintbound(arg0_1, ctx);
+            if b1.is_constant() {
+                let c_outer = b1.get_constant();
+                // sub_add_consts: int_sub(int_add(C1, x), C2) => int_sub(x, C-C1)
+                if b0_0.is_constant() {
+                    let folded = c_outer.wrapping_sub(b0_0.get_constant());
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntSub, &[arg0_1, const_ref]);
+                }
+                // sub_add_consts: int_sub(int_add(x, C1), C2) => int_sub(x, C-C1)
+                if b0_1.is_constant() {
+                    let folded = c_outer.wrapping_sub(b0_1.get_constant());
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntSub, &[arg0_0, const_ref]);
+                }
+            }
+        } else if let Some(arg0_int_sub) = self.as_operation(arg0, OpCode::IntSub, ctx) {
+            let arg0_0 = ctx.get_box_replacement(arg0_int_sub.arg(0));
+            let arg0_1 = ctx.get_box_replacement(arg0_int_sub.arg(1));
+            let b0_0 = self.getintbound(arg0_0, ctx);
+            let b0_1 = self.getintbound(arg0_1, ctx);
+            if b1.is_constant() {
+                let c_outer = b1.get_constant();
+                // sub_sub_left_c_x_c: int_sub(int_sub(C1, x), C2) => int_sub(C1-C2, x)
+                if b0_0.is_constant() {
+                    let folded = b0_0.get_constant().wrapping_sub(c_outer);
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntSub, &[const_ref, arg0_1]);
+                }
+                // sub_sub_left_x_c_c: int_sub(int_sub(x, C1), C2) => int_sub(x, C1+C2)
+                if b0_1.is_constant() {
+                    let folded = b0_1.get_constant().wrapping_add(c_outer);
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntSub, &[arg0_0, const_ref]);
+                }
+            }
+        }
+        if let Some(arg1_int_add) = self.as_operation(arg1, OpCode::IntAdd, ctx) {
+            let arg1_0 = ctx.get_box_replacement(arg1_int_add.arg(0));
+            let arg1_1 = ctx.get_box_replacement(arg1_int_add.arg(1));
+            let b1_0 = self.getintbound(arg1_0, ctx);
+            let b1_1 = self.getintbound(arg1_1, ctx);
+            // sub_add_neg: int_sub(y, int_add(x, y)) => int_neg(x)
+            if autogen_eq(arg1_1, &b1_1, arg0, &b0) {
+                return replace_with(op, OpCode::IntNeg, &[arg1_0]);
+            }
+            // sub_add_neg: int_sub(y, int_add(y, x)) => int_neg(x)
+            if autogen_eq(arg1_0, &b1_0, arg0, &b0) {
+                return replace_with(op, OpCode::IntNeg, &[arg1_1]);
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:315-410 optimize_INT_MUL — rules:
+    /// mul_zero / mul_one / mul_minus_one / mul_pow2_const / mul_lshift.
+    fn optimize_int_mul(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
+        // mul_zero: int_mul(0, x) => 0
+        if b0.is_constant() && b0.get_constant() == 0 {
+            self.make_constant_int(op, 0, ctx);
+            return OptimizationResult::Remove;
+        }
+        // mul_zero: int_mul(x, 0) => 0
+        if b1.is_constant() && b1.get_constant() == 0 {
+            self.make_constant_int(op, 0, ctx);
+            return OptimizationResult::Remove;
+        }
+        // mul_one: int_mul(1, x) => x
+        if b0.is_constant() && b0.get_constant() == 1 {
+            ctx.make_equal_to(op.pos, arg1);
+            return OptimizationResult::Remove;
+        }
+        // mul_one: int_mul(x, 1) => x
+        if b1.is_constant() && b1.get_constant() == 1 {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        // Outer const on arg0: mul_minus_one / mul_pow2_const
+        if b0.is_constant() {
+            let c = b0.get_constant();
+            // mul_minus_one: int_mul(-1, x) => int_neg(x)
+            if c == -1 {
+                return replace_with(op, OpCode::IntNeg, &[arg1]);
+            }
+            // mul_pow2_const: int_mul(C, x) where C > 0 && (C & (C-1)) == 0
+            // => int_lshift(x, highest_bit(C))
+            if c > 0 && (c & c.wrapping_sub(1)) == 0 {
+                let shift = c.trailing_zeros() as i64;
+                let shift_ref = ctx.make_constant_int(shift);
+                return replace_with(op, OpCode::IntLshift, &[arg1, shift_ref]);
+            }
+        } else if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
+            // mul_lshift: int_mul(int_lshift(1, y), x) => int_lshift(x, y)
+            let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            if b_inner_0.is_constant()
+                && b_inner_0.get_constant() == 1
+                && b_inner_1.known_ge_const(0)
+                && b_inner_1.known_le_const(64)
+            {
+                return replace_with(op, OpCode::IntLshift, &[arg1, inner_1]);
+            }
+        }
+        // Outer const on arg1: mul_minus_one / mul_pow2_const
+        if b1.is_constant() {
+            let c = b1.get_constant();
+            // mul_minus_one: int_mul(x, -1) => int_neg(x)
+            if c == -1 {
+                return replace_with(op, OpCode::IntNeg, &[arg0]);
+            }
+            // mul_pow2_const: int_mul(x, C) where C > 0 && pow2
+            if c > 0 && (c & c.wrapping_sub(1)) == 0 {
+                let shift = c.trailing_zeros() as i64;
+                let shift_ref = ctx.make_constant_int(shift);
+                return replace_with(op, OpCode::IntLshift, &[arg0, shift_ref]);
+            }
+        } else if let Some(arg1_lshift) = self.as_operation(arg1, OpCode::IntLshift, ctx) {
+            // mul_lshift: int_mul(x, int_lshift(1, y)) => int_lshift(x, y)
+            let inner_0 = ctx.get_box_replacement(arg1_lshift.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg1_lshift.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            if b_inner_0.is_constant()
+                && b_inner_0.get_constant() == 1
+                && b_inner_1.known_ge_const(0)
+                && b_inner_1.known_le_const(64)
+            {
+                return replace_with(op, OpCode::IntLshift, &[arg0, inner_1]);
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:414-581 optimize_INT_AND — rules:
+    /// and_known_result / and_x_c_in_range / and_x_x / and_idempotent /
+    /// and_reassoc_consts / and_absorb / and_or.
+    fn optimize_int_and(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
+        // and_known_result: int_and(a, b) bound is constant => ConstInt(C)
+        let bound = b0.and_bound(&b1);
+        if bound.is_constant() {
+            self.make_constant_int(op, bound.get_constant(), ctx);
+            return OptimizationResult::Remove;
+        }
+        let bound = b1.and_bound(&b0);
+        if bound.is_constant() {
+            self.make_constant_int(op, bound.get_constant(), ctx);
+            return OptimizationResult::Remove;
+        }
+        // and_x_c_in_range: int_and(C, x) => x  (when 0 <= x.lower &&
+        //                                      x.upper <= C & ~(C+1))
+        if b0.is_constant() {
+            let c = b0.get_constant();
+            let mask = !((c as u64).wrapping_add(1)) as i64;
+            if b1.lower >= 0 && b1.upper <= c & mask {
+                ctx.make_equal_to(op.pos, arg1);
+                return OptimizationResult::Remove;
+            }
+        }
+        // and_x_c_in_range: int_and(x, C) => x
+        if b1.is_constant() {
+            let c = b1.get_constant();
+            let mask = !((c as u64).wrapping_add(1)) as i64;
+            if b0.lower >= 0 && b0.upper <= c & mask {
+                ctx.make_equal_to(op.pos, arg0);
+                return OptimizationResult::Remove;
+            }
+        }
+        // and_x_x: int_and(a, a) => a
+        if autogen_eq(arg1, &b1, arg0, &b0) {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        // and_idempotent: int_and(x, y) => x
+        // when b1.tvalue | ~(b0.tvalue | b0.tmask) == all-ones
+        if b1.tvalue | !(b0.tvalue | b0.tmask) == u64::MAX {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        // and_idempotent: int_and(y, x) => x
+        if b0.tvalue | !(b1.tvalue | b1.tmask) == u64::MAX {
+            ctx.make_equal_to(op.pos, arg1);
+            return OptimizationResult::Remove;
+        }
+        if b0.is_constant() {
+            let c_outer = b0.get_constant();
+            if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
+                let inner_0 = ctx.get_box_replacement(arg1_and.arg(0));
+                let inner_1 = ctx.get_box_replacement(arg1_and.arg(1));
+                let b_inner_0 = self.getintbound(inner_0, ctx);
+                let b_inner_1 = self.getintbound(inner_1, ctx);
+                // and_reassoc_consts: int_and(C2, int_and(C1, x)) => int_and(x, C1&C2)
+                if b_inner_0.is_constant() {
+                    let folded = b_inner_0.get_constant() & c_outer;
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntAnd, &[inner_1, const_ref]);
+                }
+                // and_reassoc_consts: int_and(C2, int_and(x, C1)) => int_and(x, C1&C2)
+                if b_inner_1.is_constant() {
+                    let folded = b_inner_1.get_constant() & c_outer;
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntAnd, &[inner_0, const_ref]);
+                }
+            }
+        } else if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_and.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_and.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            if b_inner_0.is_constant() {
+                if b1.is_constant() {
+                    // and_reassoc_consts: int_and(int_and(C1, x), C2) => int_and(x, C1&C2)
+                    let folded = b_inner_0.get_constant() & b1.get_constant();
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntAnd, &[inner_1, const_ref]);
+                }
+            }
+            if b_inner_1.is_constant() {
+                if b1.is_constant() {
+                    // and_reassoc_consts: int_and(int_and(x, C1), C2) => int_and(x, C1&C2)
+                    let folded = b_inner_1.get_constant() & b1.get_constant();
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntAnd, &[inner_0, const_ref]);
+                }
+            }
+            // and_absorb: int_and(int_and(a, b), a) => int_and(a, b)
+            if autogen_eq(arg1, &b1, inner_0, &b_inner_0) {
+                return replace_with(op, OpCode::IntAnd, &[inner_0, inner_1]);
+            }
+            // and_absorb: int_and(int_and(b, a), a) => int_and(a, b)
+            if autogen_eq(arg1, &b1, inner_1, &b_inner_1) {
+                return replace_with(op, OpCode::IntAnd, &[inner_1, inner_0]);
+            }
+        } else if let Some(arg0_or) = self.as_operation(arg0, OpCode::IntOr, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_or.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_or.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            // and_or: int_and(int_or(x, y), z) => int_and(x, z)
+            if b_inner_1.and_bound(&b1).known_eq_const(0) {
+                return replace_with(op, OpCode::IntAnd, &[inner_0, arg1]);
+            }
+            // and_or: int_and(int_or(y, x), z) => int_and(x, z)
+            if b_inner_0.and_bound(&b1).known_eq_const(0) {
+                return replace_with(op, OpCode::IntAnd, &[inner_1, arg1]);
+            }
+        }
+        // Symmetric arm: producer on arg1.
+        if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg1_and.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg1_and.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            // and_absorb: int_and(a, int_and(a, b)) => int_and(a, b)
+            if autogen_eq(inner_0, &b_inner_0, arg0, &b0) {
+                return replace_with(op, OpCode::IntAnd, &[arg0, inner_1]);
+            }
+            // and_absorb: int_and(a, int_and(b, a)) => int_and(a, b)
+            if autogen_eq(inner_1, &b_inner_1, arg0, &b0) {
+                return replace_with(op, OpCode::IntAnd, &[arg0, inner_0]);
+            }
+        } else if let Some(arg1_or) = self.as_operation(arg1, OpCode::IntOr, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg1_or.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg1_or.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            // and_or: int_and(z, int_or(x, y)) => int_and(x, z)
+            if b_inner_1.and_bound(&b0).known_eq_const(0) {
+                return replace_with(op, OpCode::IntAnd, &[inner_0, arg0]);
+            }
+            // and_or: int_and(z, int_or(y, x)) => int_and(x, z)
+            if b_inner_0.and_bound(&b0).known_eq_const(0) {
+                return replace_with(op, OpCode::IntAnd, &[inner_1, arg0]);
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:585-787 optimize_INT_OR — rules:
+    /// or_known_result / or_x_x / or_idempotent / or_reassoc_consts /
+    /// or_and_two_parts / or_absorb.
+    ///
+    /// Note on RPython parity: the auto-generated source includes
+    /// pairs of `or_and_two_parts` arms with identical `_eq` predicates
+    /// (autogenintrules.py:661/668, 677/684, 701/708, 717/724); the
+    /// second of each pair is dead because the first always returns
+    /// when its predicate holds. Preserved here to mirror upstream's
+    /// auto-generated output line for line.
+    fn optimize_int_or(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
+        // or_known_result: int_or(a, b) bound is constant => ConstInt(C)
+        let bound = b0.or_bound(&b1);
+        if bound.is_constant() {
+            self.make_constant_int(op, bound.get_constant(), ctx);
+            return OptimizationResult::Remove;
+        }
+        let bound = b1.or_bound(&b0);
+        if bound.is_constant() {
+            self.make_constant_int(op, bound.get_constant(), ctx);
+            return OptimizationResult::Remove;
+        }
+        // or_x_x: int_or(a, a) => a
+        if autogen_eq(arg1, &b1, arg0, &b0) {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        // or_idempotent: int_or(x, y) => x
+        // when b0.tvalue | ~(b1.tvalue | b1.tmask) == all-ones
+        if b0.tvalue | !(b1.tvalue | b1.tmask) == u64::MAX {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        // or_idempotent: int_or(y, x) => x
+        if b1.tvalue | !(b0.tvalue | b0.tmask) == u64::MAX {
+            ctx.make_equal_to(op.pos, arg1);
+            return OptimizationResult::Remove;
+        }
+        if b0.is_constant() {
+            let c_outer = b0.get_constant();
+            if let Some(arg1_or) = self.as_operation(arg1, OpCode::IntOr, ctx) {
+                let inner_0 = ctx.get_box_replacement(arg1_or.arg(0));
+                let inner_1 = ctx.get_box_replacement(arg1_or.arg(1));
+                let b_inner_0 = self.getintbound(inner_0, ctx);
+                let b_inner_1 = self.getintbound(inner_1, ctx);
+                // or_reassoc_consts: int_or(C2, int_or(C1, x)) => int_or(x, C1|C2)
+                if b_inner_0.is_constant() {
+                    let folded = b_inner_0.get_constant() | c_outer;
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntOr, &[inner_1, const_ref]);
+                }
+                // or_reassoc_consts: int_or(C2, int_or(x, C1)) => int_or(x, C1|C2)
+                if b_inner_1.is_constant() {
+                    let folded = b_inner_1.get_constant() | c_outer;
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntOr, &[inner_0, const_ref]);
+                }
+            }
+        } else if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
+            let arg0_0 = ctx.get_box_replacement(arg0_and.arg(0));
+            let arg0_1 = ctx.get_box_replacement(arg0_and.arg(1));
+            let b_arg0_0 = self.getintbound(arg0_0, ctx);
+            let b_arg0_1 = self.getintbound(arg0_1, ctx);
+            // or_and_two_parts shapes when outer = int_and(C, x):
+            if b_arg0_0.is_constant() {
+                let c_arg0_0 = b_arg0_0.get_constant();
+                if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
+                    let arg1_0 = ctx.get_box_replacement(arg1_and.arg(0));
+                    let arg1_1 = ctx.get_box_replacement(arg1_and.arg(1));
+                    let b_arg1_0 = self.getintbound(arg1_0, ctx);
+                    let b_arg1_1 = self.getintbound(arg1_1, ctx);
+                    if b_arg1_0.is_constant() {
+                        // int_or(int_and(C1, x), int_and(C2, x)) => int_and(x, C1|C2)
+                        if autogen_eq(arg1_1, &b_arg1_1, arg0_1, &b_arg0_1) {
+                            let folded = c_arg0_0 | b_arg1_0.get_constant();
+                            let const_ref = ctx.make_constant_int(folded);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_1, const_ref]);
+                        }
+                        // dead twin per autogenintrules.py:668-673
+                        if autogen_eq(arg1_1, &b_arg1_1, arg0_1, &b_arg0_1) {
+                            let folded = b_arg1_0.get_constant() | c_arg0_0;
+                            let const_ref = ctx.make_constant_int(folded);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_1, const_ref]);
+                        }
+                    }
+                    if b_arg1_1.is_constant() {
+                        // int_or(int_and(C, x), int_and(x, C1)) => int_and(x, C|C1)
+                        if autogen_eq(arg1_0, &b_arg1_0, arg0_1, &b_arg0_1) {
+                            let folded = b_arg1_1.get_constant() | c_arg0_0;
+                            let const_ref = ctx.make_constant_int(folded);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_1, const_ref]);
+                        }
+                        // dead twin per autogenintrules.py:684-689
+                        if autogen_eq(arg1_0, &b_arg1_0, arg0_1, &b_arg0_1) {
+                            let folded = c_arg0_0 | b_arg1_1.get_constant();
+                            let const_ref = ctx.make_constant_int(folded);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_1, const_ref]);
+                        }
+                    }
+                }
+            }
+            if b_arg0_1.is_constant() {
+                let c_arg0_1 = b_arg0_1.get_constant();
+                if let Some(arg1_and) = self.as_operation(arg1, OpCode::IntAnd, ctx) {
+                    let arg1_0 = ctx.get_box_replacement(arg1_and.arg(0));
+                    let arg1_1 = ctx.get_box_replacement(arg1_and.arg(1));
+                    let b_arg1_0 = self.getintbound(arg1_0, ctx);
+                    let b_arg1_1 = self.getintbound(arg1_1, ctx);
+                    if b_arg1_0.is_constant() {
+                        // int_or(int_and(x, C1), int_and(C2, x)) => int_and(x, C)
+                        if autogen_eq(arg1_1, &b_arg1_1, arg0_0, &b_arg0_0) {
+                            let folded = c_arg0_1 | b_arg1_0.get_constant();
+                            let const_ref = ctx.make_constant_int(folded);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_0, const_ref]);
+                        }
+                        // dead twin per autogenintrules.py:708-713
+                        if autogen_eq(arg1_1, &b_arg1_1, arg0_0, &b_arg0_0) {
+                            let folded = b_arg1_0.get_constant() | c_arg0_1;
+                            let const_ref = ctx.make_constant_int(folded);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_0, const_ref]);
+                        }
+                    }
+                    if b_arg1_1.is_constant() {
+                        // int_or(int_and(x, C1), int_and(x, C2)) => int_and(x, C)
+                        if autogen_eq(arg1_0, &b_arg1_0, arg0_0, &b_arg0_0) {
+                            let folded = c_arg0_1 | b_arg1_1.get_constant();
+                            let const_ref = ctx.make_constant_int(folded);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_0, const_ref]);
+                        }
+                        // dead twin per autogenintrules.py:724-729
+                        if autogen_eq(arg1_0, &b_arg1_0, arg0_0, &b_arg0_0) {
+                            let folded = b_arg1_1.get_constant() | c_arg0_1;
+                            let const_ref = ctx.make_constant_int(folded);
+                            return replace_with(op, OpCode::IntAnd, &[arg0_0, const_ref]);
+                        }
+                    }
+                }
+            }
+        } else if let Some(arg0_or) = self.as_operation(arg0, OpCode::IntOr, ctx) {
+            let arg0_0 = ctx.get_box_replacement(arg0_or.arg(0));
+            let arg0_1 = ctx.get_box_replacement(arg0_or.arg(1));
+            let b_arg0_0 = self.getintbound(arg0_0, ctx);
+            let b_arg0_1 = self.getintbound(arg0_1, ctx);
+            if b_arg0_0.is_constant() && b1.is_constant() {
+                // or_reassoc_consts: int_or(int_or(C1, x), C2) => int_or(x, C1|C2)
+                let folded = b_arg0_0.get_constant() | b1.get_constant();
+                let const_ref = ctx.make_constant_int(folded);
+                return replace_with(op, OpCode::IntOr, &[arg0_1, const_ref]);
+            }
+            if b_arg0_1.is_constant() && b1.is_constant() {
+                // or_reassoc_consts: int_or(int_or(x, C1), C2) => int_or(x, C1|C2)
+                let folded = b_arg0_1.get_constant() | b1.get_constant();
+                let const_ref = ctx.make_constant_int(folded);
+                return replace_with(op, OpCode::IntOr, &[arg0_0, const_ref]);
+            }
+            // or_absorb: int_or(int_or(a, b), a) => int_or(a, b)
+            if autogen_eq(arg1, &b1, arg0_0, &b_arg0_0) {
+                return replace_with(op, OpCode::IntOr, &[arg0_0, arg0_1]);
+            }
+            // or_absorb: int_or(int_or(b, a), a) => int_or(a, b)
+            if autogen_eq(arg1, &b1, arg0_1, &b_arg0_1) {
+                return replace_with(op, OpCode::IntOr, &[arg0_1, arg0_0]);
+            }
+        }
+        // Symmetric arm: producer on arg1.
+        if let Some(arg1_or) = self.as_operation(arg1, OpCode::IntOr, ctx) {
+            let arg1_0 = ctx.get_box_replacement(arg1_or.arg(0));
+            let arg1_1 = ctx.get_box_replacement(arg1_or.arg(1));
+            let b_arg1_0 = self.getintbound(arg1_0, ctx);
+            let b_arg1_1 = self.getintbound(arg1_1, ctx);
+            // or_absorb: int_or(a, int_or(a, b)) => int_or(a, b)
+            if autogen_eq(arg1_0, &b_arg1_0, arg0, &b0) {
+                return replace_with(op, OpCode::IntOr, &[arg0, arg1_1]);
+            }
+            // or_absorb: int_or(a, int_or(b, a)) => int_or(a, b)
+            if autogen_eq(arg1_1, &b_arg1_1, arg0, &b0) {
+                return replace_with(op, OpCode::IntOr, &[arg0, arg1_0]);
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:791-942 optimize_INT_XOR — rules:
+    /// xor_x_x / xor_reassoc_consts / xor_absorb / xor_zero /
+    /// xor_minus_1 / xor_known_result / xor_is_not.
+    fn optimize_int_xor(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
+        // xor_known_result: int_xor(a, b) bound is constant => ConstInt(C)
+        let bound = b0.xor_bound(&b1);
+        if bound.is_constant() {
+            self.make_constant_int(op, bound.get_constant(), ctx);
+            return OptimizationResult::Remove;
+        }
+        let bound = b1.xor_bound(&b0);
+        if bound.is_constant() {
+            self.make_constant_int(op, bound.get_constant(), ctx);
+            return OptimizationResult::Remove;
+        }
+        // xor_x_x: int_xor(a, a) => 0
+        if autogen_eq(arg1, &b1, arg0, &b0) {
+            self.make_constant_int(op, 0, ctx);
+            return OptimizationResult::Remove;
+        }
+        // xor_zero: int_xor(0, a) => a   (else: producer-xor absorbs)
+        if b0.is_constant() {
+            if b0.get_constant() == 0 {
+                ctx.make_equal_to(op.pos, arg1);
+                return OptimizationResult::Remove;
+            }
+        } else if let Some(arg0_xor) = self.as_operation(arg0, OpCode::IntXor, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_xor.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_xor.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            // xor_absorb: int_xor(int_xor(a, b), b) => a
+            if autogen_eq(arg1, &b1, inner_1, &b_inner_1) {
+                ctx.make_equal_to(op.pos, inner_0);
+                return OptimizationResult::Remove;
+            }
+            // xor_absorb: int_xor(int_xor(b, a), b) => a
+            if autogen_eq(arg1, &b1, inner_0, &b_inner_0) {
+                ctx.make_equal_to(op.pos, inner_1);
+                return OptimizationResult::Remove;
+            }
+        }
+        // xor_zero: int_xor(a, 0) => a   (else: producer-xor absorbs)
+        if b1.is_constant() {
+            if b1.get_constant() == 0 {
+                ctx.make_equal_to(op.pos, arg0);
+                return OptimizationResult::Remove;
+            }
+        } else if let Some(arg1_xor) = self.as_operation(arg1, OpCode::IntXor, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg1_xor.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg1_xor.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            // xor_absorb: int_xor(b, int_xor(a, b)) => a
+            if autogen_eq(inner_1, &b_inner_1, arg0, &b0) {
+                ctx.make_equal_to(op.pos, inner_0);
+                return OptimizationResult::Remove;
+            }
+            // xor_absorb: int_xor(b, int_xor(b, a)) => a
+            if autogen_eq(inner_0, &b_inner_0, arg0, &b0) {
+                ctx.make_equal_to(op.pos, inner_1);
+                return OptimizationResult::Remove;
+            }
+        }
+        // Constant-on-left arm (b_arg_0 constant): reassoc_consts/minus_1/is_not
+        if b0.is_constant() {
+            let c_outer = b0.get_constant();
+            if let Some(arg1_xor) = self.as_operation(arg1, OpCode::IntXor, ctx) {
+                let inner_0 = ctx.get_box_replacement(arg1_xor.arg(0));
+                let inner_1 = ctx.get_box_replacement(arg1_xor.arg(1));
+                let b_inner_0 = self.getintbound(inner_0, ctx);
+                let b_inner_1 = self.getintbound(inner_1, ctx);
+                // xor_reassoc_consts: int_xor(C2, int_xor(C1, x)) => int_xor(x, C1^C2)
+                if b_inner_0.is_constant() {
+                    let folded = b_inner_0.get_constant() ^ c_outer;
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntXor, &[inner_1, const_ref]);
+                }
+                // xor_reassoc_consts: int_xor(C2, int_xor(x, C1)) => int_xor(x, C1^C2)
+                if b_inner_1.is_constant() {
+                    let folded = b_inner_1.get_constant() ^ c_outer;
+                    let const_ref = ctx.make_constant_int(folded);
+                    return replace_with(op, OpCode::IntXor, &[inner_0, const_ref]);
+                }
+            }
+            // xor_minus_1: int_xor(-1, x) => int_invert(x)
+            if c_outer == -1 {
+                return replace_with(op, OpCode::IntInvert, &[arg1]);
+            }
+            // xor_is_not: int_xor(1, x) => int_is_zero(x)  (when x is bool)
+            if c_outer == 1 && b1.is_bool() {
+                return replace_with(op, OpCode::IntIsZero, &[arg1]);
+            }
+        } else if let Some(arg0_xor) = self.as_operation(arg0, OpCode::IntXor, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_xor.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_xor.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            if b_inner_0.is_constant() && b1.is_constant() {
+                // xor_reassoc_consts: int_xor(int_xor(C1, x), C2) => int_xor(x, C1^C2)
+                let folded = b_inner_0.get_constant() ^ b1.get_constant();
+                let const_ref = ctx.make_constant_int(folded);
+                return replace_with(op, OpCode::IntXor, &[inner_1, const_ref]);
+            }
+            if b_inner_1.is_constant() && b1.is_constant() {
+                // xor_reassoc_consts: int_xor(int_xor(x, C1), C2) => int_xor(x, C1^C2)
+                let folded = b_inner_1.get_constant() ^ b1.get_constant();
+                let const_ref = ctx.make_constant_int(folded);
+                return replace_with(op, OpCode::IntXor, &[inner_0, const_ref]);
+            }
+        }
+        // Constant-on-right arm (b_arg_1 constant): minus_1/is_not
+        if b1.is_constant() {
+            let c = b1.get_constant();
+            // xor_minus_1: int_xor(x, -1) => int_invert(x)
+            if c == -1 {
+                return replace_with(op, OpCode::IntInvert, &[arg0]);
+            }
+            // xor_is_not: int_xor(x, 1) => int_is_zero(x)  (when x is bool)
+            if c == 1 && b0.is_bool() {
+                return replace_with(op, OpCode::IntIsZero, &[arg0]);
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:1432-1443 optimize_INT_INVERT — rules: invert_invert.
+    fn optimize_int_invert(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        // invert_invert: int_invert(int_invert(x)) => x
+        if let Some(inner) = self.as_operation(arg0, OpCode::IntInvert, ctx) {
+            let inner_0 = ctx.get_box_replacement(inner.arg(0));
+            ctx.make_equal_to(op.pos, inner_0);
+            return OptimizationResult::Remove;
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:1447-1458 optimize_INT_NEG — rules: neg_neg.
+    fn optimize_int_neg(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        // neg_neg: int_neg(int_neg(x)) => x
+        if let Some(inner) = self.as_operation(arg0, OpCode::IntNeg, ctx) {
+            let inner_0 = ctx.get_box_replacement(inner.arg(0));
+            ctx.make_equal_to(op.pos, inner_0);
+            return OptimizationResult::Remove;
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:946-1109 optimize_INT_LSHIFT — rules:
+    /// lshift_zero_x / lshift_x_zero / lshift_rshift_c_c / lshift_and_rshift /
+    /// lshift_urshift_c_c / lshift_and_urshift / lshift_lshift_c_c.
+    /// LONG_BIT inlined as 64 (pyre is 64-bit only).
+    fn optimize_int_lshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
+        // lshift_zero_x: int_lshift(0, x) => 0
+        if b0.is_constant() && b0.get_constant() == 0 {
+            self.make_constant_int(op, 0, ctx);
+            return OptimizationResult::Remove;
+        }
+        // lshift_x_zero: int_lshift(x, 0) => x
+        if b1.is_constant() && b1.get_constant() == 0 {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_and.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_and.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            if b_inner_0.is_constant() {
+                let c_arg0_0 = b_inner_0.get_constant();
+                if let Some(rshift) = self.as_operation(inner_1, OpCode::IntRshift, ctx) {
+                    let r0 = ctx.get_box_replacement(rshift.arg(0));
+                    let r1 = ctx.get_box_replacement(rshift.arg(1));
+                    let b_r1 = self.getintbound(r1, ctx);
+                    if b_r1.is_constant() && b1.is_constant() {
+                        let c_r1 = b_r1.get_constant();
+                        let c_arg1 = b1.get_constant();
+                        // lshift_and_rshift: int_lshift(int_and(C2, int_rshift(x, C1)), C1) => int_and(x, C)
+                        if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
+                            let folded = c_arg0_0.wrapping_shl(c_r1 as u32);
+                            let const_ref = ctx.make_constant_int(folded);
+                            return replace_with(op, OpCode::IntAnd, &[r0, const_ref]);
+                        }
+                    }
+                } else if let Some(urshift) = self.as_operation(inner_1, OpCode::UintRshift, ctx) {
+                    let r0 = ctx.get_box_replacement(urshift.arg(0));
+                    let r1 = ctx.get_box_replacement(urshift.arg(1));
+                    let b_r1 = self.getintbound(r1, ctx);
+                    if b_r1.is_constant() && b1.is_constant() {
+                        let c_r1 = b_r1.get_constant();
+                        let c_arg1 = b1.get_constant();
+                        // lshift_and_urshift: int_lshift(int_and(C2, uint_rshift(x, C1)), C1) => int_and(x, C)
+                        if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
+                            let folded = c_arg0_0.wrapping_shl(c_r1 as u32);
+                            let const_ref = ctx.make_constant_int(folded);
+                            return replace_with(op, OpCode::IntAnd, &[r0, const_ref]);
+                        }
+                    }
+                }
+            } else if let Some(rshift) = self.as_operation(inner_0, OpCode::IntRshift, ctx) {
+                let r0 = ctx.get_box_replacement(rshift.arg(0));
+                let r1 = ctx.get_box_replacement(rshift.arg(1));
+                let b_r1 = self.getintbound(r1, ctx);
+                if b_r1.is_constant() && b_inner_1.is_constant() && b1.is_constant() {
+                    let c_r1 = b_r1.get_constant();
+                    let c_arg0_1 = b_inner_1.get_constant();
+                    let c_arg1 = b1.get_constant();
+                    // lshift_and_rshift: int_lshift(int_and(int_rshift(x, C1), C2), C1) => int_and(x, C)
+                    if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
+                        let folded = c_arg0_1.wrapping_shl(c_r1 as u32);
+                        let const_ref = ctx.make_constant_int(folded);
+                        return replace_with(op, OpCode::IntAnd, &[r0, const_ref]);
+                    }
+                }
+            } else if let Some(urshift) = self.as_operation(inner_0, OpCode::UintRshift, ctx) {
+                let r0 = ctx.get_box_replacement(urshift.arg(0));
+                let r1 = ctx.get_box_replacement(urshift.arg(1));
+                let b_r1 = self.getintbound(r1, ctx);
+                if b_r1.is_constant() && b_inner_1.is_constant() && b1.is_constant() {
+                    let c_r1 = b_r1.get_constant();
+                    let c_arg0_1 = b_inner_1.get_constant();
+                    let c_arg1 = b1.get_constant();
+                    // lshift_and_urshift: int_lshift(int_and(uint_rshift(x, C1), C2), C1) => int_and(x, C)
+                    if c_arg1 == c_r1 && (0..64).contains(&c_r1) {
+                        let folded = c_arg0_1.wrapping_shl(c_r1 as u32);
+                        let const_ref = ctx.make_constant_int(folded);
+                        return replace_with(op, OpCode::IntAnd, &[r0, const_ref]);
+                    }
+                }
+            }
+        } else if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1));
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            if b_inner_1.is_constant() && b1.is_constant() {
+                let c1 = b_inner_1.get_constant();
+                let c2 = b1.get_constant();
+                // lshift_lshift_c_c: int_lshift(int_lshift(x, C1), C2) => int_lshift(x, C)
+                if (0..64).contains(&c1) && (0..64).contains(&c2) {
+                    let folded = c1.wrapping_add(c2);
+                    if folded < 64 {
+                        let const_ref = ctx.make_constant_int(folded);
+                        return replace_with(op, OpCode::IntLshift, &[inner_0, const_ref]);
+                    }
+                }
+            }
+        } else if let Some(arg0_rshift) = self.as_operation(arg0, OpCode::IntRshift, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_rshift.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_rshift.arg(1));
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            if b_inner_1.is_constant() && b1.is_constant() {
+                let c1 = b_inner_1.get_constant();
+                let c2 = b1.get_constant();
+                // lshift_rshift_c_c: int_lshift(int_rshift(x, C1), C1) => int_and(x, -1 << C1)
+                if c2 == c1 && (0..64).contains(&c1) {
+                    let mask = (-1i64).wrapping_shl(c1 as u32);
+                    let const_ref = ctx.make_constant_int(mask);
+                    return replace_with(op, OpCode::IntAnd, &[inner_0, const_ref]);
+                }
+            }
+        } else if let Some(arg0_urshift) = self.as_operation(arg0, OpCode::UintRshift, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_urshift.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_urshift.arg(1));
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            if b_inner_1.is_constant() && b1.is_constant() {
+                let c1 = b_inner_1.get_constant();
+                let c2 = b1.get_constant();
+                // lshift_urshift_c_c: int_lshift(uint_rshift(x, C1), C1) => int_and(x, -1 << C1)
+                if c2 == c1 && (0..64).contains(&c1) {
+                    let mask = (-1i64).wrapping_shl(c1 as u32);
+                    let const_ref = ctx.make_constant_int(mask);
+                    return replace_with(op, OpCode::IntAnd, &[inner_0, const_ref]);
+                }
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:1113-1169 optimize_INT_RSHIFT — rules:
+    /// rshift_zero_x / rshift_x_zero / rshift_known_result / rshift_lshift /
+    /// rshift_rshift_c_c. LONG_BIT inlined as 64.
+    fn optimize_int_rshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
+        // rshift_zero_x: int_rshift(0, x) => 0
+        if b0.is_constant() && b0.get_constant() == 0 {
+            self.make_constant_int(op, 0, ctx);
+            return OptimizationResult::Remove;
+        }
+        // rshift_known_result: int_rshift(a, b) bound is constant => ConstInt(C)
+        let bound = b0.rshift_bound(&b1);
+        if bound.is_constant() {
+            self.make_constant_int(op, bound.get_constant(), ctx);
+            return OptimizationResult::Remove;
+        }
+        if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            // rshift_lshift: int_rshift(int_lshift(x, y), y) => x
+            if autogen_eq(arg1, &b1, inner_1, &b_inner_1)
+                && b_inner_0.lshift_bound_cannot_overflow(&b_inner_1)
+            {
+                ctx.make_equal_to(op.pos, inner_0);
+                return OptimizationResult::Remove;
+            }
+        }
+        // rshift_x_zero: int_rshift(x, 0) => x
+        if b1.is_constant() && b1.get_constant() == 0 {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        if let Some(arg0_rshift) = self.as_operation(arg0, OpCode::IntRshift, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_rshift.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_rshift.arg(1));
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            if b_inner_1.is_constant() && b1.is_constant() {
+                let c1 = b_inner_1.get_constant();
+                let c2 = b1.get_constant();
+                // rshift_rshift_c_c: int_rshift(int_rshift(x, C1), C2) => int_rshift(x, min(C1+C2, 63))
+                if (0..64).contains(&c1) && (0..64).contains(&c2) {
+                    let folded = c1.wrapping_add(c2).min(63);
+                    if (0..64).contains(&folded) {
+                        let const_ref = ctx.make_constant_int(folded);
+                        return replace_with(op, OpCode::IntRshift, &[inner_0, const_ref]);
+                    }
+                }
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:1364-1399 optimize_INT_IS_TRUE — rules:
+    /// is_true_bool / is_true_true / is_true_and_minint.
+    fn optimize_int_is_true(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let b0 = self.getintbound(arg0, ctx);
+        // is_true_true: int_is_true(x) => 1
+        // when bound excludes 0: lower > 0, or upper < 0, or any tvalue bit set.
+        if b0.lower > 0 || b0.upper < 0 || b0.tvalue != 0 {
+            self.make_constant_int(op, 1, ctx);
+            return OptimizationResult::Remove;
+        }
+        // is_true_bool: int_is_true(x) => x  (when x is bool)
+        if b0.is_bool() {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        if let Some(arg0_and) = self.as_operation(arg0, OpCode::IntAnd, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_and.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_and.arg(1));
+            let b_inner_0 = self.getintbound(inner_0, ctx);
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            // is_true_and_minint: int_is_true(int_and(MININT, x)) => int_lt(x, 0)
+            if b_inner_0.is_constant() && b_inner_0.get_constant() == i64::MIN {
+                let zero_ref = ctx.make_constant_int(0);
+                return replace_with(op, OpCode::IntLt, &[inner_1, zero_ref]);
+            }
+            // is_true_and_minint: int_is_true(int_and(x, MININT)) => int_lt(x, 0)
+            if b_inner_1.is_constant() && b_inner_1.get_constant() == i64::MIN {
+                let zero_ref = ctx.make_constant_int(0);
+                return replace_with(op, OpCode::IntLt, &[inner_0, zero_ref]);
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:1403-1411 optimize_INT_IS_ZERO — rules: is_zero_true.
+    fn optimize_int_is_zero(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let b0 = self.getintbound(arg0, ctx);
+        // is_zero_true: int_is_zero(x) => 0
+        // when bound excludes 0: lower > 0, or upper < 0, or any tvalue bit set.
+        if b0.lower > 0 || b0.upper < 0 || b0.tvalue != 0 {
+            self.make_constant_int(op, 0, ctx);
+            return OptimizationResult::Remove;
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:1415-1428 optimize_INT_FORCE_GE_ZERO — rules:
+    /// force_ge_zero_pos / force_ge_zero_neg.
+    fn optimize_int_force_ge_zero(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let b0 = self.getintbound(arg0, ctx);
+        // force_ge_zero_neg: int_force_ge_zero(x) => 0  (when x < 0)
+        if b0.known_lt_const(0) {
+            self.make_constant_int(op, 0, ctx);
+            return OptimizationResult::Remove;
+        }
+        // force_ge_zero_pos: int_force_ge_zero(x) => x  (when x >= 0)
+        if b0.known_nonnegative() {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py:1173-1216 optimize_UINT_RSHIFT — rules:
+    /// urshift_zero_x / urshift_x_zero / urshift_known_result /
+    /// urshift_lshift_x_c_c.
+    fn optimize_uint_rshift(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+        let arg0 = ctx.get_box_replacement(op.arg(0));
+        let arg1 = ctx.get_box_replacement(op.arg(1));
+        let b0 = self.getintbound(arg0, ctx);
+        let b1 = self.getintbound(arg1, ctx);
+        // urshift_zero_x: uint_rshift(0, x) => 0
+        if b0.is_constant() && b0.get_constant() == 0 {
+            self.make_constant_int(op, 0, ctx);
+            return OptimizationResult::Remove;
+        }
+        // urshift_known_result: uint_rshift(a, b) bound is constant => ConstInt(C)
+        let bound = b0.urshift_bound(&b1);
+        if bound.is_constant() {
+            self.make_constant_int(op, bound.get_constant(), ctx);
+            return OptimizationResult::Remove;
+        }
+        // urshift_x_zero: uint_rshift(x, 0) => x
+        if b1.is_constant() && b1.get_constant() == 0 {
+            ctx.make_equal_to(op.pos, arg0);
+            return OptimizationResult::Remove;
+        }
+        if let Some(arg0_lshift) = self.as_operation(arg0, OpCode::IntLshift, ctx) {
+            let inner_0 = ctx.get_box_replacement(arg0_lshift.arg(0));
+            let inner_1 = ctx.get_box_replacement(arg0_lshift.arg(1));
+            let b_inner_1 = self.getintbound(inner_1, ctx);
+            if b_inner_1.is_constant() && b1.is_constant() {
+                let c1 = b_inner_1.get_constant();
+                let c2 = b1.get_constant();
+                // urshift_lshift_x_c_c: uint_rshift(int_lshift(x, C), C) => int_and(x, mask)
+                // mask = intmask(r_uint(-1 << C) >> r_uint(C))
+                if c2 == c1 && (0..64).contains(&c1) {
+                    let mask = ((((-1i64) as u64) << c1) >> c1) as i64;
+                    let const_ref = ctx.make_constant_int(mask);
+                    return replace_with(op, OpCode::IntAnd, &[inner_0, const_ref]);
+                }
+            }
+        }
+        OptimizationResult::PassOn
+    }
+
+    /// autogenintrules.py helper used for pattern matching:
+    /// `as_operation(box, opnum)` returns the producing op iff its opcode
+    /// matches, else None.
+    fn as_operation(&self, opref: OpRef, opcode: OpCode, ctx: &OptContext) -> Option<Op> {
+        let op = ctx.get_producing_op(opref)?;
+        if op.opcode == opcode { Some(op) } else { None }
+    }
+
     // ── Arithmetic postprocessing ──
 
     /// intbounds.py:114-146 postprocess_INT_ADD
@@ -283,8 +1511,8 @@ impl OptIntBounds {
         // intbounds.py:125-127:
         //   self.optimizer.pure_from_args2(rop.INT_SUB, op, arg1, arg0)
         //   self.optimizer.pure_from_args2(rop.INT_SUB, op, arg0, arg1)
-        self.record_pure_from_args(OpCode::IntSub, op.pos, arg1, arg0);
-        self.record_pure_from_args(OpCode::IntSub, op.pos, arg0, arg1);
+        ctx.register_pure_from_args2(OpCode::IntSub, arg0, op.pos, arg1);
+        ctx.register_pure_from_args2(OpCode::IntSub, arg1, op.pos, arg0);
         // intbounds.py:128-142: pick the constant arg, fall back to commutative
         // swap so `arg1` ends up holding the non-const operand.
         let (inv_const, other) = if let Some(c) = ctx.get_constant_int(arg0) {
@@ -306,10 +1534,10 @@ impl OptIntBounds {
         //   self.optimizer.pure_from_args2(rop.INT_SUB, arg1, op, inv_arg0)
         //   self.optimizer.pure_from_args2(rop.INT_ADD, op, inv_arg0, arg1)
         //   self.optimizer.pure_from_args2(rop.INT_ADD, inv_arg0, op, arg1)
-        self.record_pure_from_args(OpCode::IntSub, other, neg_ref, op.pos);
-        self.record_pure_from_args(OpCode::IntSub, other, op.pos, neg_ref);
-        self.record_pure_from_args(OpCode::IntAdd, op.pos, neg_ref, other);
-        self.record_pure_from_args(OpCode::IntAdd, neg_ref, op.pos, other);
+        ctx.register_pure_from_args2(OpCode::IntSub, op.pos, other, neg_ref);
+        ctx.register_pure_from_args2(OpCode::IntSub, neg_ref, other, op.pos);
+        ctx.register_pure_from_args2(OpCode::IntAdd, other, op.pos, neg_ref);
+        ctx.register_pure_from_args2(OpCode::IntAdd, other, neg_ref, op.pos);
     }
 
     /// intbounds.py: INT_SUB postprocess with constant inversion synthesis.
@@ -321,16 +1549,16 @@ impl OptIntBounds {
         let b = b0.sub_bound(&b1);
         self.intersect_bound(op.pos, &b, ctx);
         // Synthesis: INT_SUB(a,b)=res → INT_ADD(res,b)=a, INT_SUB(a,res)=b
-        self.record_pure_from_args(OpCode::IntAdd, op.pos, arg1, arg0);
-        self.record_pure_from_args(OpCode::IntSub, arg0, op.pos, arg1);
+        ctx.register_pure_from_args2(OpCode::IntAdd, arg0, op.pos, arg1);
+        ctx.register_pure_from_args2(OpCode::IntSub, arg1, arg0, op.pos);
         // intbounds.py: constant inversion for INT_SUB
         if let Some(c1) = ctx.get_constant_int(arg1) {
             if c1 != i64::MIN {
                 let neg_ref = self.get_or_make_const(-c1, ctx);
-                self.record_pure_from_args(OpCode::IntAdd, arg0, neg_ref, op.pos);
-                self.record_pure_from_args(OpCode::IntAdd, neg_ref, arg0, op.pos);
-                self.record_pure_from_args(OpCode::IntSub, op.pos, neg_ref, arg0);
-                self.record_pure_from_args(OpCode::IntSub, op.pos, arg0, neg_ref);
+                ctx.register_pure_from_args2(OpCode::IntAdd, op.pos, arg0, neg_ref);
+                ctx.register_pure_from_args2(OpCode::IntAdd, op.pos, neg_ref, arg0);
+                ctx.register_pure_from_args2(OpCode::IntSub, arg0, op.pos, neg_ref);
+                ctx.register_pure_from_args2(OpCode::IntSub, neg_ref, op.pos, arg0);
             }
         }
     }
@@ -360,8 +1588,8 @@ impl OptIntBounds {
             // intbounds.py:66-69:
             //   pure_from_args2(rop.INT_ADD, arg0, arg1, op)
             //   pure_from_args2(rop.INT_XOR, arg0, arg1, op)
-            self.record_pure_from_args(OpCode::IntAdd, arg0, arg1, op.pos);
-            self.record_pure_from_args(OpCode::IntXor, arg0, arg1, op.pos);
+            ctx.register_pure_from_args2(OpCode::IntAdd, op.pos, arg0, arg1);
+            ctx.register_pure_from_args2(OpCode::IntXor, op.pos, arg0, arg1);
         }
         let b = b0.or_bound(&b1);
         self.intersect_bound(op.pos, &b, ctx);
@@ -378,8 +1606,8 @@ impl OptIntBounds {
             // intbounds.py:79-82:
             //   pure_from_args2(rop.INT_ADD, arg0, arg1, op)
             //   pure_from_args2(rop.INT_OR, arg0, arg1, op)
-            self.record_pure_from_args(OpCode::IntAdd, arg0, arg1, op.pos);
-            self.record_pure_from_args(OpCode::IntOr, arg0, arg1, op.pos);
+            ctx.register_pure_from_args2(OpCode::IntAdd, op.pos, arg0, arg1);
+            ctx.register_pure_from_args2(OpCode::IntOr, op.pos, arg0, arg1);
         }
         let b = b0.xor_bound(&b1);
         self.intersect_bound(op.pos, &b, ctx);
@@ -396,7 +1624,7 @@ impl OptIntBounds {
         self.intersect_bound(op.pos, &b, ctx);
         // intbounds.py:185: only synthesize reverse if lshift cannot overflow
         if b0.lshift_bound_cannot_overflow(&b1) {
-            self.record_pure_from_args(OpCode::IntRshift, op.pos, arg1, arg0);
+            ctx.register_pure_from_args2(OpCode::IntRshift, arg0, op.pos, arg1);
         }
     }
 
@@ -617,37 +1845,40 @@ impl OptIntBounds {
     }
 
     /// intbounds.py:209-229 optimize_GUARD_NO_OVERFLOW
-    fn optimize_guard_no_overflow(&mut self, op: &Op) -> OptimizationResult {
+    fn optimize_guard_no_overflow(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
         let _ = op;
-        // intbounds.py:210-219:
+        // intbounds.py:210-220:
         //   lastop = self.last_emitted_operation
         //   if lastop is not None:
         //     opnum = lastop.getopnum()
         //     if opnum not in (INT_ADD_OVF, INT_SUB_OVF, INT_MUL_OVF):
         //       return   # guard killed
-        if let Some(opcode) = self.last_emitted_opcode {
-            if !matches!(
-                opcode,
-                OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
-            ) {
-                return OptimizationResult::Remove;
-            }
-            // intbounds.py:222-228: synthesize the non-overflowing inverse
-            let result = self.last_emitted_ref;
-            if self.last_emitted_args.len() >= 2 && !result.is_none() {
-                let arg0 = self.last_emitted_args[0];
-                let arg1 = self.last_emitted_args[1];
-                match opcode {
-                    OpCode::IntAddOvf => {
-                        self.record_pure_from_args(OpCode::IntSub, result, arg1, arg0);
-                        self.record_pure_from_args(OpCode::IntSub, result, arg0, arg1);
-                    }
-                    OpCode::IntSubOvf => {
-                        self.record_pure_from_args(OpCode::IntAdd, result, arg1, arg0);
-                        self.record_pure_from_args(OpCode::IntSub, arg0, result, arg1);
-                    }
-                    _ => {}
+        //   else:
+        //     return   # falls out of `if`, no emit, guard killed
+        let Some(opcode) = self.last_emitted_opcode else {
+            return OptimizationResult::Remove;
+        };
+        if !matches!(
+            opcode,
+            OpCode::IntAddOvf | OpCode::IntSubOvf | OpCode::IntMulOvf
+        ) {
+            return OptimizationResult::Remove;
+        }
+        // intbounds.py:222-228: synthesize the non-overflowing inverse
+        let result = self.last_emitted_ref;
+        if self.last_emitted_args.len() >= 2 && !result.is_none() {
+            let arg0 = self.last_emitted_args[0];
+            let arg1 = self.last_emitted_args[1];
+            match opcode {
+                OpCode::IntAddOvf => {
+                    ctx.register_pure_from_args2(OpCode::IntSub, arg0, result, arg1);
+                    ctx.register_pure_from_args2(OpCode::IntSub, arg1, result, arg0);
                 }
+                OpCode::IntSubOvf => {
+                    ctx.register_pure_from_args2(OpCode::IntAdd, arg0, result, arg1);
+                    ctx.register_pure_from_args2(OpCode::IntSub, arg1, arg0, result);
+                }
+                _ => {}
             }
         }
         // intbounds.py:229: return self.emit(op)
@@ -1356,6 +2587,22 @@ impl Optimization for OptIntBounds {
             OpCode::UintGt => self.optimize_uint_gt(op, ctx),
             OpCode::UintGe => self.optimize_uint_ge(op, ctx),
 
+            // ── Arithmetic folds (autogenintrules.py) ──
+            OpCode::IntAdd => self.optimize_int_add(op, ctx),
+            OpCode::IntSub => self.optimize_int_sub(op, ctx),
+            OpCode::IntMul => self.optimize_int_mul(op, ctx),
+            OpCode::IntAnd => self.optimize_int_and(op, ctx),
+            OpCode::IntOr => self.optimize_int_or(op, ctx),
+            OpCode::IntXor => self.optimize_int_xor(op, ctx),
+            OpCode::IntNeg => self.optimize_int_neg(op, ctx),
+            OpCode::IntInvert => self.optimize_int_invert(op, ctx),
+            OpCode::IntLshift => self.optimize_int_lshift(op, ctx),
+            OpCode::IntRshift => self.optimize_int_rshift(op, ctx),
+            OpCode::UintRshift => self.optimize_uint_rshift(op, ctx),
+            OpCode::IntIsTrue => self.optimize_int_is_true(op, ctx),
+            OpCode::IntIsZero => self.optimize_int_is_zero(op, ctx),
+            OpCode::IntForceGeZero => self.optimize_int_force_ge_zero(op, ctx),
+
             // ── Signext ──
             OpCode::IntSignext => self.optimize_int_signext(op, ctx),
 
@@ -1365,7 +2612,7 @@ impl Optimization for OptIntBounds {
             OpCode::IntMulOvf => self.optimize_int_mul_ovf(op, ctx),
 
             // ── Overflow guards ──
-            OpCode::GuardNoOverflow => self.optimize_guard_no_overflow(op),
+            OpCode::GuardNoOverflow => self.optimize_guard_no_overflow(op, ctx),
             OpCode::GuardOverflow => self.optimize_guard_overflow(op),
 
             // ── Guards on conditions ──
@@ -2173,6 +3420,112 @@ mod tests {
         assert!(b.upper <= 15);
     }
 
+    /// autogenintrules.py rule and_known_result: int_and(a, b) where the
+    /// AND of bounds is a single constant => fold to that constant.
+    #[test]
+    fn test_int_and_known_result_both_const() {
+        let initial_bounds = vec![
+            (OpRef(0), IntBound::from_constant(0xff)),
+            (OpRef(1), IntBound::from_constant(0x0f)),
+        ];
+        let ops = vec![make_op(OpCode::IntAnd, &[OpRef(0), OpRef(1)], 2)];
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        assert!(
+            result.iter().all(|op| op.opcode != OpCode::IntAnd),
+            "INT_AND of constants should be folded out, got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+        let b = ctx.getintbound(OpRef(2));
+        assert!(b.is_constant(), "result should be constant");
+        assert_eq!(b.get_constant(), 0x0f);
+    }
+
+    /// autogenintrules.py rule and_x_x: int_and(a, a) => a.
+    #[test]
+    fn test_int_and_x_x() {
+        let ops = vec![make_op(OpCode::IntAnd, &[OpRef(0), OpRef(0)], 1)];
+        let result = run_pass(&ops);
+        assert!(
+            result.iter().all(|op| op.opcode != OpCode::IntAnd),
+            "INT_AND(a, a) should be removed via and_x_x, got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    /// autogenintrules.py rule and_x_c_in_range: int_and(C, x) => x when x
+    /// is a non-negative bounded value already inside the C low-bit mask.
+    #[test]
+    fn test_int_and_x_c_in_range() {
+        // Mask = 0xff (low-byte mask). x = bounded(0, 100). 100 < 256 and
+        // 100 < 0xff & ~0x100 == 0xff so the rule fires.
+        let initial_bounds = vec![
+            (OpRef(0), IntBound::from_constant(0xff)),
+            (OpRef(1), IntBound::bounded(0, 100)),
+        ];
+        let ops = vec![make_op(OpCode::IntAnd, &[OpRef(0), OpRef(1)], 2)];
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        assert!(
+            result.iter().all(|op| op.opcode != OpCode::IntAnd),
+            "INT_AND(0xff, [0,100]) should fold via and_x_c_in_range, got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    /// autogenintrules.py rule or_known_result: int_or(a, b) where the OR
+    /// of bounds is a single constant => fold to that constant.
+    #[test]
+    fn test_int_or_known_result_both_const() {
+        let initial_bounds = vec![
+            (OpRef(0), IntBound::from_constant(0xf0)),
+            (OpRef(1), IntBound::from_constant(0x0f)),
+        ];
+        let ops = vec![make_op(OpCode::IntOr, &[OpRef(0), OpRef(1)], 2)];
+        let (result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        assert!(
+            result.iter().all(|op| op.opcode != OpCode::IntOr),
+            "INT_OR of constants should be folded out, got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+        let b = ctx.getintbound(OpRef(2));
+        assert!(b.is_constant(), "result should be constant");
+        assert_eq!(b.get_constant(), 0xff);
+    }
+
+    /// autogenintrules.py rule or_x_x: int_or(a, a) => a.
+    #[test]
+    fn test_int_or_x_x() {
+        let ops = vec![make_op(OpCode::IntOr, &[OpRef(0), OpRef(0)], 1)];
+        let result = run_pass(&ops);
+        assert!(
+            result.iter().all(|op| op.opcode != OpCode::IntOr),
+            "INT_OR(a, a) should be removed via or_x_x, got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
+    /// autogenintrules.py rule or_idempotent: int_or(x, y) => x when y's
+    /// known bits are a subset of x's known bits (knownbits absorption).
+    #[test]
+    fn test_int_or_idempotent_subset() {
+        // arg0 = constant 0xff (tvalue=0xff, tmask=0).
+        // arg1 = constant 0x0f (tvalue=0x0f, tmask=0).
+        // 0x0f's set bits are a subset of 0xff's set bits, so
+        // int_or(0xff, 0x0f) collapses; this is also covered by
+        // or_known_result as a fold to 0xff. Either rule satisfies the
+        // assertion.
+        let initial_bounds = vec![
+            (OpRef(0), IntBound::from_constant(0xff)),
+            (OpRef(1), IntBound::from_constant(0x0f)),
+        ];
+        let ops = vec![make_op(OpCode::IntOr, &[OpRef(0), OpRef(1)], 2)];
+        let (result, _ctx) = run_pass_with_bounds(&ops, &initial_bounds);
+        assert!(
+            result.iter().all(|op| op.opcode != OpCode::IntOr),
+            "INT_OR(0xff, 0x0f) should be folded, got {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+    }
+
     #[test]
     fn test_int_force_ge_zero() {
         let initial_bounds = vec![(OpRef(0), IntBound::bounded(-10, 20))];
@@ -2469,7 +3822,7 @@ mod tests {
 
         let (_result, mut ctx) = run_pass_with_bounds(&ops, &initial_bounds);
         // Manually tighten the result and trigger backward prop. The
-        // OptIntBounds pass is stateless beyond `pure_from_args_cache`
+        // OptIntBounds pass is stateless except for `last_emitted_*`
         // (everything else lives on `ctx.forwarded`), so we can spin up a
         // fresh one to drive the backward propagation step.
         let mut pass = OptIntBounds::new();

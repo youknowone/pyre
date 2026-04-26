@@ -995,6 +995,33 @@ pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
     })
 }
 
+/// Map a post-regalloc Ref-bank color back to the semantic
+/// `locals_cells_stack_w` slot it denotes at the current PC.
+///
+/// After stack-slot pinning removal, stack slots are no longer forced to
+/// occupy colors `nlocals + d`; the reverse lookup must consult
+/// `metadata.stack_slot_color_map` first, bounded to the LIVE stack
+/// prefix at the current PC. Only if no live stack slot owns the color
+/// can the color fall back to a local inputarg slot in `0..nlocals`.
+pub(crate) fn semantic_ref_slot_for_reg_color(
+    nlocals: usize,
+    stack_only: usize,
+    stack_color_map: &[u16],
+    reg: usize,
+) -> Option<usize> {
+    let live_len = stack_color_map.len().min(stack_only);
+    if let Some(stack_idx) = stack_color_map[..live_len]
+        .iter()
+        .position(|&color| color as usize == reg)
+    {
+        return Some(nlocals + stack_idx);
+    }
+    if reg < nlocals {
+        return Some(reg);
+    }
+    None
+}
+
 /// Sentinel null JitCode for uninitialized PyreSym.
 ///
 /// Cannot be `static` because `Arc::new` is not const; use a thread_local
@@ -4211,6 +4238,13 @@ impl JitState for PyreJitState {
         let reg_indices =
             crate::state::frame_liveness_reg_indices_at(frame0.jitcode_index, frame0.pc);
         let stack_only = sym.valuestackdepth.saturating_sub(sym.nlocals);
+        let stack_color_map = METAINTERP_SD.with(|r| {
+            let sd = r.borrow();
+            sd.jitcodes
+                .get(frame0.jitcode_index as usize)
+                .map(|jc| jc.payload.metadata.stack_slot_color_map.clone())
+                .unwrap_or_default()
+        });
         let bridge_reg_len = nlocals + stack_only;
         let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
         // RPython parity: after A.1 the guard-recovery path calls
@@ -4232,7 +4266,14 @@ impl JitState for PyreJitState {
         );
         for (value, &reg_idx) in frame0.values.iter().zip(reg_indices.iter()) {
             let resolved = resolve(ctx, &mut virtuals_cache, value);
-            let idx = reg_idx as usize;
+            let Some(idx) = semantic_ref_slot_for_reg_color(
+                nlocals,
+                stack_only,
+                &stack_color_map,
+                reg_idx as usize,
+            ) else {
+                continue;
+            };
             if idx < bridge_registers_r.len() {
                 bridge_registers_r[idx] = resolved;
             }
@@ -4660,12 +4701,10 @@ impl JitState for PyreJitState {
         // resume.py:1077 consume_boxes parity — iterate the SAME
         // `all_liveness` BC_LIVE data the encoder used in
         // `trace_opcode.rs::get_list_of_active_boxes`. For every live
-        // reg idx, consume one tagged `values[idx]` and route to the
-        // PyFrame slot:
-        //   - `reg < nlocals` → `set_local_at(reg, …)`
-        //   - `nlocals <= reg < nlocals + stack_only` → `set_stack_at`
-        // This keeps the encoder/decoder contract aligned on jitcode
-        // SSA liveness rather than the LiveVars approximation.
+        // reg color, reverse-map through the current jitcode's live
+        // stack-slot colors before falling back to the local inputarg
+        // prefix. This keeps the encoder/decoder contract aligned on
+        // jitcode SSA liveness rather than the LiveVars approximation.
         //
         // Falls back to the LiveVars path below only when the frame's
         // code is not (yet) registered or has no pc_map entry — i.e.
@@ -4736,6 +4775,16 @@ impl JitState for PyreJitState {
             let length_f = all_liveness[off + 2] as u32;
             let mut cursor = off + 3;
             use majit_translate::liveness::LivenessIterator;
+            // Phase 2 commit 2.1 step B: route Ref-bank live-register
+            // colors through `metadata.stack_slot_color_map` (forward
+            // map: stack slot d → post-rename color). Currently with
+            // input-arg pinning the map is `[nlocals, nlocals+1, ...]`
+            // so the lookup is identity; once step C removes the
+            // pinning, stack colors may differ from `nlocals + d` and
+            // the map is the single source of truth for the
+            // `color → stack-slot-index` reverse lookup the heap
+            // writeback needs.
+            let stack_color_map: &[u16] = &payload.metadata.stack_slot_color_map;
             for length in [length_i, length_r, length_f] {
                 if length == 0 {
                     continue;
@@ -4745,12 +4794,16 @@ impl JitState for PyreJitState {
                     let reg = reg_idx as usize;
                     if let Some(value) = values.get(idx) {
                         let boxed = virtualizable_box_value(value);
-                        if reg < nlocals {
-                            let _ = self.set_local_at(reg, boxed);
-                        } else {
-                            let stack_idx = reg - nlocals;
-                            if stack_idx < stack_only {
-                                let _ = self.set_stack_at(stack_idx, boxed);
+                        if let Some(slot_idx) = semantic_ref_slot_for_reg_color(
+                            nlocals,
+                            stack_only,
+                            stack_color_map,
+                            reg,
+                        ) {
+                            if slot_idx < nlocals {
+                                let _ = self.set_local_at(slot_idx, boxed);
+                            } else {
+                                let _ = self.set_stack_at(slot_idx - nlocals, boxed);
                             }
                         }
                     }
@@ -5391,6 +5444,16 @@ mod tests {
             }));
             crate::callbacks::init(cb);
         });
+    }
+
+    #[test]
+    fn semantic_ref_slot_prefers_live_stack_color_reuse() {
+        assert_eq!(semantic_ref_slot_for_reg_color(2, 1, &[0], 0), Some(2),);
+    }
+
+    #[test]
+    fn semantic_ref_slot_falls_back_to_local_prefix() {
+        assert_eq!(semantic_ref_slot_for_reg_color(2, 1, &[3], 1), Some(1),);
     }
 
     fn empty_meta() -> PyreMeta {

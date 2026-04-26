@@ -448,11 +448,11 @@ pub(super) fn allocate_registers(
             for i in 0..nlocals as u16 {
                 external.push(i);
             }
-            // Pyre-only: stack regs are Python-semantic pinned slots
-            // (see `ExternalInputs::stack_base` docstring). Pin them
-            // before portal red args so `enforce_input_args` assigns
-            // them colors `nlocals..nlocals+max_stack_depth`, matching
-            // the trace-side `stack_values[idx - nlocals]` decode.
+            // Pin stack slots to colors `stack_base..stack_base + max_stack_depth`.
+            // The trace-side decoder reads `register_idx >= nlocals` as
+            // "register holds stack slot `idx - nlocals`", so post-regalloc
+            // stack colors must equal `stack_base + slot_index`. See
+            // `ExternalInputs::stack_base` PRE-EXISTING-ADAPTATION docstring.
             for d in 0..inputs.max_stack_depth {
                 external.push(inputs.stack_base + d);
             }

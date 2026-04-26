@@ -1449,18 +1449,29 @@ impl TraceCtx {
     /// `BC_GETARRAYITEM_VABLE_R` read will decode 0 via `value_as_ref_bits`.
     /// That null is a pyre-upstream parity gap, not a shadow bug — the
     /// shadow faithfully reflects the caller's Box.
-    pub fn set_virtualizable_entry_at(&mut self, index: usize, opref: OpRef, value: Value) -> bool {
-        let have_boxes = self
-            .virtualizable_boxes
+    pub fn set_virtualizable_entry_at(&mut self, index: usize, opref: OpRef, value: Value) {
+        let (boxes_opt, values_opt) = (
+            &mut self.virtualizable_boxes,
+            &mut self.virtualizable_values,
+        );
+        let boxes = boxes_opt
             .as_mut()
-            .and_then(|boxes| boxes.get_mut(index).map(|slot| *slot = opref))
-            .is_some();
-        let have_values = self
-            .virtualizable_values
+            .expect("set_virtualizable_entry_at: virtualizable_boxes missing");
+        let values = values_opt
             .as_mut()
-            .and_then(|vals| vals.get_mut(index).map(|slot| *slot = value))
-            .is_some();
-        have_boxes && have_values
+            .expect("set_virtualizable_entry_at: virtualizable_values missing");
+        assert_eq!(
+            boxes.len(),
+            values.len(),
+            "set_virtualizable_entry_at: boxes/values length mismatch",
+        );
+        assert!(
+            index < boxes.len(),
+            "set_virtualizable_entry_at: index {index} out of range for {} slots",
+            boxes.len(),
+        );
+        boxes[index] = opref;
+        values[index] = value;
     }
 
     /// Return the standard virtualizable identity (`virtualizable_boxes[-1]`).
@@ -2052,17 +2063,13 @@ impl TraceCtx {
         let index = self
             .virtualizable_info
             .as_ref()
-            .and_then(|info| info.static_field_by_descr(&fielddescr));
-        if let Some(idx) = index {
-            if self.set_virtualizable_entry_at(idx, value, concrete) {
-                // pyjitpl.py:3446 write_boxes parity: mirror the updated
-                // shadow slot back into the live virtualizable.
-                self.synchronize_virtualizable();
-                return;
-            }
-        }
-        // Fallback: emit the heap op when the layout is unavailable.
-        self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], fielddescr);
+            .expect("vable_setfield: virtualizable_info missing")
+            .static_field_by_descr(&fielddescr)
+            .expect("vable_setfield: standard virtualizable field descr missing");
+        self.set_virtualizable_entry_at(index, value, concrete);
+        // pyjitpl.py:3446 write_boxes parity: mirror the updated
+        // shadow slot back into the live virtualizable.
+        self.synchronize_virtualizable();
     }
 
     /// Record a virtualizable field write with an explicit field descriptor.
@@ -2346,26 +2353,20 @@ impl TraceCtx {
         }
     }
 
-    /// Standard virtualizable array item write.
-    /// `array_field_offset` identifies which array field, `item_index` is the element index.
-    /// If standard boxes are active, writes to the flat box array directly.
+    /// Standard virtualizable array item write at a known flat slot index.
+    /// `item_index` is the element index within the array described by `fdescr`.
     pub fn vable_setarrayitem_vable(
         &mut self,
-        array_opref: OpRef,
         fdescr: &DescrRef,
         item_index: usize,
         value: OpRef,
         concrete: Value,
     ) {
-        let flat_idx = self.vable_array_flat_index(fdescr, item_index);
-        if let Some(idx) = flat_idx {
-            if self.set_virtualizable_entry_at(idx, value, concrete) {
-                return;
-            }
-        }
-        let index = self.const_int(item_index as i64);
-        let zero = self.const_int(0);
-        self.record_op(OpCode::SetarrayitemGc, &[array_opref, index, value, zero]);
+        let flat_idx = self
+            .vable_array_flat_index(fdescr, item_index)
+            .expect("vable_setarrayitem_vable: standard virtualizable array slot missing");
+        self.set_virtualizable_entry_at(flat_idx, value, concrete);
+        self.synchronize_virtualizable();
     }
 
     /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable(box, indexbox, valuebox, fdescr, adescr, pc)`.
@@ -2385,22 +2386,14 @@ impl TraceCtx {
             self.vable_setarrayitem(array_opref, index, value);
             return;
         }
-        if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
-        {
-            if self.set_virtualizable_entry_at(flat_idx, value, concrete) {
-                // pyjitpl.py:3446 write_boxes parity: mirror the updated
-                // shadow slot back into the live virtualizable.
-                self.synchronize_virtualizable();
-                return;
-            }
-        }
-        let array_opref =
-            self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr.clone());
-        if let Ok(item_index) = usize::try_from(index_runtime_value) {
-            self.vable_setarrayitem_vable(array_opref, &fdescr, item_index, value, concrete);
-        } else {
-            self.vable_setarrayitem(array_opref, index, value);
-        }
+        // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
+        // self.metainterp.virtualizable_boxes[index] = valuebox
+        // self.metainterp.synchronize_virtualizable()
+        let flat_idx = self
+            .get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
+            .expect("vable_setarrayitem_indexed: virtualizable array slot missing");
+        self.set_virtualizable_entry_at(flat_idx, value, concrete);
+        self.synchronize_virtualizable();
     }
 
     /// pyjitpl.py:1253-1263 `opimpl_arraylen_vable(box, fdescr, adescr, pc)`.
@@ -4786,7 +4779,7 @@ mod tests {
         );
 
         // Write to array[1]
-        ctx.vable_setarrayitem_vable(vable, &fd24, 1, new_val, ph(Type::Int));
+        ctx.vable_setarrayitem_vable(&fd24, 1, new_val, ph(Type::Int));
 
         // Read back: array[0] unchanged, array[1] updated
         let (r0, _) = ctx.vable_getarrayitem_int_vable(vable, &fd24, 0);

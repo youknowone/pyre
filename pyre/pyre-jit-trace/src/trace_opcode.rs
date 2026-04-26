@@ -538,27 +538,50 @@ impl MIFrame {
                 }
             }
         };
+        let (nlocals, valid_stack_only, jitcode_ptr, stack_slot_color_map) = {
+            let s = self.sym();
+            let valid_stack_only = if let Some(ref pre_r) = self.pre_opcode_registers_r {
+                pre_r.len().saturating_sub(s.nlocals)
+            } else {
+                s.valuestackdepth.saturating_sub(s.nlocals)
+            };
+            let stack_slot_color_map = if s.jitcode.is_null() {
+                Vec::new()
+            } else {
+                unsafe { (&*s.jitcode).payload.metadata.stack_slot_color_map.clone() }
+            };
+            (s.nlocals, valid_stack_only, s.jitcode, stack_slot_color_map)
+        };
         for idx in live_reg_idxs {
-            // `load_local_value` errors when `idx >= registers_r.len()`;
-            // a live stack slot beyond the current register-file growth
-            // needs resizing before the mirror read can land the value.
+            let Some(slot_idx) = crate::state::semantic_ref_slot_for_reg_color(
+                nlocals,
+                valid_stack_only,
+                &stack_slot_color_map,
+                idx,
+            ) else {
+                continue;
+            };
+            // `load_local_value` errors when `slot_idx >= registers_r.len()`;
+            // a live semantic slot beyond the current register-file
+            // growth needs resizing before the mirror read can land the
+            // value.
             {
                 let s = self.sym_mut();
-                if idx >= s.registers_r.len() {
-                    s.registers_r.resize(idx + 1, OpRef::NONE);
+                if slot_idx >= s.registers_r.len() {
+                    s.registers_r.resize(slot_idx + 1, OpRef::NONE);
                 }
             }
             let cur = self
                 .sym()
                 .registers_r
-                .get(idx)
+                .get(slot_idx)
                 .copied()
                 .unwrap_or(OpRef::NONE);
             if cur == OpRef::NONE {
-                let _ = MIFrame::load_local_value(self, ctx, idx);
+                let _ = MIFrame::load_local_value(self, ctx, slot_idx);
             }
         }
-        let (nlocals, registers_r, stack_values, jitcode_ptr) = {
+        let registers_r = {
             let s = self.sym();
             // Stage 3.4 Phase B: unified abstract register file view.
             // When a guard is being captured mid-opcode, read from
@@ -577,16 +600,11 @@ impl MIFrame {
             // surface as active OpRefs. This matches the OLD
             // `stack_values.len()` bound on the
             // `stack_values[idx - nlocals]` read path.
-            let (valid_stack_only, source_len) =
-                if let Some(ref pre_r) = self.pre_opcode_registers_r {
-                    let pre_stack_only = pre_r.len().saturating_sub(s.nlocals);
-                    (pre_stack_only, pre_r.len())
-                } else {
-                    (
-                        s.valuestackdepth.saturating_sub(s.nlocals),
-                        s.registers_r.len(),
-                    )
-                };
+            let source_len = if let Some(ref pre_r) = self.pre_opcode_registers_r {
+                pre_r.len()
+            } else {
+                s.registers_r.len()
+            };
             let valid_len = (s.nlocals + valid_stack_only).min(source_len);
             let mut registers_r: Vec<OpRef> = if let Some(ref pre_r) = self.pre_opcode_registers_r {
                 pre_r[..valid_len.min(pre_r.len())].to_vec()
@@ -601,16 +619,7 @@ impl MIFrame {
                     }
                 }
             }
-            // Skeleton path's `is_stack_live` query still needs a stack
-            // slice in per-slot kind shape; slice the tail of the
-            // register-file view.
-            let nlocals = s.nlocals;
-            let stack_values: Vec<OpRef> = if registers_r.len() > nlocals {
-                registers_r[nlocals..].to_vec()
-            } else {
-                Vec::new()
-            };
-            (nlocals, registers_r, stack_values, s.jitcode)
+            registers_r
         };
         // pyjitpl.py:202-203: read the 2-byte offset from JitCode.code
         // (upstream uses `decode_offset(self.jitcode.code, pc + 1)`) and
@@ -768,12 +777,21 @@ impl MIFrame {
         let length_f = all_liveness[off + 2] as u32;
         let mut cursor = off + 3;
         let mut boxes = Vec::with_capacity((length_i + length_r + length_f) as usize);
-        // Stage 3.4 Phase B: unified register-file lookup. Bank
-        // indices live in `stack_base=nlocals` register space, so any
-        // `idx` in [0, nlocals+stack_depth) resolves to a single slot
-        // in `registers_r`. Out-of-range reads return NULL.
-        let snapshot =
-            |idx: usize| -> OpRef { registers_r.get(idx).copied().unwrap_or(OpRef::NONE) };
+        // Stage 3.4 Phase B/C: liveness now stores post-regalloc colors,
+        // not Python-semantic stack-slot indices. Reverse-map each live
+        // color through the current jitcode's live stack prefix first,
+        // then fall back to the local inputarg prefix.
+        let snapshot = |reg: usize| -> OpRef {
+            let Some(slot_idx) = crate::state::semantic_ref_slot_for_reg_color(
+                nlocals,
+                valid_stack_only,
+                &stack_slot_color_map,
+                reg,
+            ) else {
+                return OpRef::NONE;
+            };
+            registers_r.get(slot_idx).copied().unwrap_or(OpRef::NONE)
+        };
         use majit_translate::liveness::LivenessIterator;
         for length in [length_i, length_r, length_f] {
             if length == 0 {
@@ -2362,6 +2380,49 @@ impl MIFrame {
         }
         let vable_boxes = self.list_of_boxes_virtualizable(ctx);
         let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
+        // PHASE 1.4 candidate D probe: detect snapshot-time divergence
+        // between vable_boxes (heap mirror) and registers_r (machine
+        // register source). Both should be populated by store_local_value's
+        // dual-write. Any divergence here means a code path updated one
+        // shadow without the other — most likely load_local_value's lazy
+        // fallback (trace_opcode.rs:1041-1063) which writes registers_r
+        // but does NOT call set_virtualizable_box_at. See
+        // memory/phase_1_4_cand_a_landed_raise_catch_diagnostic_2026_04_26.md.
+        if std::env::var("PYRE_PROBE_SNAPSHOT").ok().as_deref() == Some("1") {
+            let num_static = ctx
+                .virtualizable_info()
+                .map(|info| info.num_static_extra_boxes)
+                .unwrap_or(0);
+            let nlocals = self.sym().nlocals;
+            let registers_r_src: Vec<OpRef> = if let Some(ref pre_r) = self.pre_opcode_registers_r {
+                pre_r[..pre_r.len().min(nlocals)].to_vec()
+            } else {
+                let s = self.sym();
+                s.registers_r[..s.registers_r.len().min(nlocals)].to_vec()
+            };
+            let mut diverge = 0usize;
+            for i in 0..registers_r_src.len() {
+                let reg_op = registers_r_src[i];
+                let vable_op = ctx
+                    .virtualizable_box_at(num_static + i)
+                    .unwrap_or(OpRef::NONE);
+                if !reg_op.is_none() && reg_op != vable_op {
+                    eprintln!(
+                        "[PROBE-D] vable/reg divergence top_pc={} local={} reg_opref={:?} vable_opref={:?}",
+                        top_pc, i, reg_op, vable_op
+                    );
+                    diverge += 1;
+                }
+            }
+            eprintln!(
+                "[PROBE-D] ENTER top_pc={} nlocals={} reg_len={} num_static={} diverge_count={}",
+                top_pc,
+                nlocals,
+                registers_r_src.len(),
+                num_static,
+                diverge
+            );
+        }
         majit_metainterp::recorder::Snapshot {
             frames,
             vable_boxes,
