@@ -32,7 +32,10 @@ use crate::model::{
     BlockId, CallTarget, FunctionGraph as JitFunctionGraph, OpKind, SpaceOperation,
 };
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::lltypesystem::lltype::{_ptr, FuncType, PtrTarget};
+use crate::translator::rtyper::lltypesystem::lltype::{
+    _ptr, DelayedPointer, FuncType, MallocFlavor, Ptr as LLPtr, PtrTarget, StructType,
+    malloc as ll_malloc, nullptr as ll_nullptr,
+};
 use crate::translator::rtyper::rclass;
 use crate::translator::rtyper::rtyper::RPythonTyper;
 // `TypeResolutionState` lives at `jit_codewriter/type_state.rs` — see the
@@ -1084,7 +1087,7 @@ impl FunctionRepr {
         v: &crate::flowspace::model::Hlvalue,
         shape: &CallShape,
         index: usize,
-        _llop: &crate::translator::rtyper::rtyper::LowLevelOpList,
+        _llops: &Rc<RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>>,
     ) -> Result<crate::flowspace::model::Hlvalue, TyperError> {
         // upstream: `assert v.concretetype == Void`.
         let v_ty = match v {
@@ -1359,7 +1362,7 @@ where
         &Hlvalue,
         &CallShape,
         usize,
-        &crate::translator::rtyper::rtyper::LowLevelOpList,
+        &Rc<RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>>,
     ) -> Result<Hlvalue, TyperError>,
 {
     use crate::annotator::bookkeeper::build_args_for_op;
@@ -1431,12 +1434,11 @@ where
 
     // upstream: `vlist = [self.convert_to_concrete_llfn(vfn, shape, index, hop.llops)]`.
     //
-    // The borrow is released before the later `borrow_mut()` for
-    // `convertvar` so the closure cannot deadlock the RefCell.
-    let vlist0 = {
-        let llops = hop.llops.borrow();
-        convert_to_concrete_llfn(&vfn, &row.shape, row.index, &llops)?
-    };
+    // Pass the `Rc<RefCell<LowLevelOpList>>` directly so the multi-row
+    // `FunctionsPBCRepr` branch can `borrow_mut()` to emit the `getfield`
+    // op (rpbc.py:308-312). Single-row paths take a no-op pass-through
+    // and never touch the inner buffer.
+    let vlist0 = convert_to_concrete_llfn(&vfn, &row.shape, row.index, &hop.llops)?;
     let mut vlist: Vec<Hlvalue> = vec![vlist0];
 
     // upstream: `vlist += callparse.callparse(self.rtyper, anygraph, hop)`.
@@ -1673,10 +1675,6 @@ pub struct FunctionsPBCRepr {
 
 impl FunctionsPBCRepr {
     /// RPython `FunctionsPBCRepr(rtyper, s_pbc)` (rpbc.py:227-240).
-    ///
-    /// Handles the single-row `len(uniquerows) == 1` path; multi-row
-    /// `setup_specfunc` surfaces as `MissingRTypeOperation` until the
-    /// `Ptr(Struct('specfunc', *fields))` construction machinery lands.
     pub fn new(rtyper: &Rc<RPythonTyper>, s_pbc: SomePBC) -> Result<Self, TyperError> {
         let base = FunctionReprBase::new(rtyper, s_pbc)?;
         let callfamily = base.callfamily.clone().ok_or_else(|| {
@@ -1685,20 +1683,19 @@ impl FunctionsPBCRepr {
         // upstream: `llct = get_concrete_calltable(self.rtyper, self.callfamily)`.
         let llct = get_concrete_calltable(rtyper, &callfamily)
             .map_err(|e| TyperError::message(e.to_string()))?;
-        // upstream rpbc.py:232-239 — single-row case → `row.fntype`
-        // (wrapped in `Ptr`); multi-row defers.
+        // upstream rpbc.py:232-239:
+        //     if len(llct.uniquerows) == 1:
+        //         row = llct.uniquerows[0]
+        //         self.lowleveltype = row.fntype
+        //     else:
+        //         self.lowleveltype = self.setup_specfunc()
         let lltype = if llct.uniquerows.len() == 1 {
             let row = llct.uniquerows[0].borrow();
-            LowLevelType::Ptr(Box::new(
-                crate::translator::rtyper::lltypesystem::lltype::Ptr {
-                    TO: PtrTarget::Func(row.fntype.clone()),
-                },
-            ))
+            LowLevelType::Ptr(Box::new(LLPtr {
+                TO: PtrTarget::Func(row.fntype.clone()),
+            }))
         } else {
-            return Err(TyperError::missing_rtype_operation(
-                "FunctionsPBCRepr.setup_specfunc (rpbc.py:242-247) \
-                 multi-row spec-func struct port pending",
-            ));
+            Self::setup_specfunc(&llct.uniquerows)?
         };
         Ok(FunctionsPBCRepr {
             base,
@@ -1708,6 +1705,77 @@ impl FunctionsPBCRepr {
             funccache: RefCell::new(HashMap::new()),
             state: ReprState::new(),
         })
+    }
+
+    /// RPython `FunctionsPBCRepr.setup_specfunc(self)` (rpbc.py:242-247):
+    ///
+    /// ```python
+    /// def setup_specfunc(self):
+    ///     fields = []
+    ///     for row in self.uniquerows:
+    ///         fields.append((row.attrname, row.fntype))
+    ///     kwds = {'hints': {'immutable': True, 'static_immutable': True}}
+    ///     return Ptr(Struct('specfunc', *fields, **kwds))
+    /// ```
+    ///
+    /// Each multi-row `uniquerow` carries a unique `variant{N}` attrname
+    /// stamped in [`get_concrete_calltable`] (rpbc.rs:174-176); we
+    /// surface a `TyperError::message` if attrname is `None` to catch
+    /// the impossible single-row-leaks-into-multi-row case.
+    fn setup_specfunc(uniquerows: &[ConcreteCallTableRowRef]) -> Result<LowLevelType, TyperError> {
+        let mut fields: Vec<(String, LowLevelType)> = Vec::with_capacity(uniquerows.len());
+        for row_ref in uniquerows {
+            let row = row_ref.borrow();
+            let attrname = row.attrname.clone().ok_or_else(|| {
+                TyperError::message(
+                    "FunctionsPBCRepr.setup_specfunc: multi-row uniquerow has no \
+                     attrname (get_concrete_calltable should have stamped variant{N})",
+                )
+            })?;
+            let fnptr_ty = LowLevelType::Ptr(Box::new(LLPtr {
+                TO: PtrTarget::Func(row.fntype.clone()),
+            }));
+            fields.push((attrname, fnptr_ty));
+        }
+        // upstream `kwds = {'hints': {'immutable': True, 'static_immutable': True}}`
+        let hints = vec![
+            ("immutable".to_string(), ConstValue::Bool(true)),
+            ("static_immutable".to_string(), ConstValue::Bool(true)),
+        ];
+        let struct_t = StructType::with_hints("specfunc", fields, hints);
+        Ok(LowLevelType::Ptr(Box::new(LLPtr {
+            TO: PtrTarget::Struct(struct_t),
+        })))
+    }
+
+    /// RPython `FunctionsPBCRepr.get_specfunc_row(self, llop, v, c_rowname,
+    /// resulttype)` (rpbc.py:252-253):
+    ///
+    /// ```python
+    /// def get_specfunc_row(self, llop, v, c_rowname, resulttype):
+    ///     return llop.genop('getfield', [v, c_rowname], resulttype=resulttype)
+    /// ```
+    fn get_specfunc_row(
+        &self,
+        llop: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+        v: &Hlvalue,
+        attrname: &str,
+        resulttype: LowLevelType,
+    ) -> Result<Hlvalue, TyperError> {
+        let cname = Constant::with_concretetype(ConstValue::byte_str(attrname), LowLevelType::Void);
+        let var = llop
+            .genop(
+                "getfield",
+                vec![v.clone(), Hlvalue::Constant(cname)],
+                crate::translator::rtyper::rtyper::GenopResult::LLType(resulttype),
+            )
+            .ok_or_else(|| {
+                TyperError::message(
+                    "FunctionsPBCRepr.get_specfunc_row: genop(getfield) returned None \
+                     despite typed resulttype",
+                )
+            })?;
+        Ok(Hlvalue::Variable(var))
     }
 
     /// RPython `FunctionsPBCRepr.convert_to_concrete_llfn(self, v,
@@ -1731,9 +1799,9 @@ impl FunctionsPBCRepr {
     pub fn convert_to_concrete_llfn(
         &self,
         v: &Hlvalue,
-        _shape: &CallShape,
-        _index: usize,
-        _llop: &crate::translator::rtyper::rtyper::LowLevelOpList,
+        shape: &CallShape,
+        index: usize,
+        llops: &Rc<RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>>,
     ) -> Result<Hlvalue, TyperError> {
         // upstream: `assert v.concretetype == self.lowleveltype`.
         let v_ty = match v {
@@ -1749,16 +1817,34 @@ impl FunctionsPBCRepr {
         }
         if self.uniquerows.len() == 1 {
             // upstream: `return v`.
-            Ok(v.clone())
-        } else {
-            // upstream rpbc.py:308-312 — multi-row Struct field load
-            // via `get_specfunc_row` (`getfield`). Deferred in tandem
-            // with `setup_specfunc` (rpbc.py:242-247).
-            Err(TyperError::missing_rtype_operation(
-                "FunctionsPBCRepr.convert_to_concrete_llfn (rpbc.py:308-312) \
-                 multi-row specfunc getfield port pending",
-            ))
+            return Ok(v.clone());
         }
+        // upstream rpbc.py:308-312:
+        //     row = self.concretetable[shape, index]
+        //     cname = inputconst(Void, row.attrname)
+        //     return self.get_specfunc_row(llop, v, cname, row.fntype)
+        let row_ref = self
+            .concretetable
+            .get(&(shape.clone(), index))
+            .cloned()
+            .ok_or_else(|| {
+                TyperError::message(format!(
+                    "FunctionsPBCRepr.convert_to_concrete_llfn: \
+                     concretetable has no row for (shape={shape:?}, index={index})"
+                ))
+            })?;
+        let row = row_ref.borrow();
+        let attrname = row.attrname.clone().ok_or_else(|| {
+            TyperError::message(
+                "FunctionsPBCRepr.convert_to_concrete_llfn: \
+                 multi-row concretetable entry has no attrname",
+            )
+        })?;
+        let resulttype = LowLevelType::Ptr(Box::new(LLPtr {
+            TO: PtrTarget::Func(row.fntype.clone()),
+        }));
+        let mut llop = llops.borrow_mut();
+        self.get_specfunc_row(&mut llop, v, &attrname, resulttype)
     }
 
     /// RPython `FunctionReprBase.call(self, hop)` (rpbc.py:199-221).
@@ -1821,28 +1907,121 @@ impl Repr for FunctionsPBCRepr {
             return Ok(cached.clone());
         }
 
-        if self.uniquerows.len() != 1 {
-            return Err(TyperError::missing_rtype_operation(
-                "FunctionsPBCRepr.convert_desc (rpbc.py:281-285) \
-                 multi-row specfunc Struct build port pending",
-            ));
+        // upstream rpbc.py:261-271:
+        //     llfns = {}
+        //     found_anything = False
+        //     for row in self.uniquerows:
+        //         if funcdesc in row:
+        //             llfn = row[funcdesc]
+        //             found_anything = True
+        //         else:
+        //             llfn = nullptr(row.fntype.TO)
+        //         llfns[row.attrname] = llfn
+        let mut llfns: Vec<(Option<String>, _ptr)> = Vec::with_capacity(self.uniquerows.len());
+        let mut last_llfn: Option<_ptr> = None;
+        let mut found_anything = false;
+        for row_ref in &self.uniquerows {
+            let row = row_ref.borrow();
+            let llfn = match row.row.get(&desc_rowkey) {
+                Some(ptr) => {
+                    found_anything = true;
+                    ptr.clone()
+                }
+                None => ll_nullptr(LowLevelType::Func(Box::new(row.fntype.clone())))
+                    .map_err(TyperError::message)?,
+            };
+            last_llfn = Some(llfn.clone());
+            llfns.push((row.attrname.clone(), llfn));
         }
-        let row_ref = self.uniquerows[0].clone();
-        let row = row_ref.borrow();
 
-        let llfn = match row.row.get(&desc_rowkey) {
-            Some(ptr) => ptr.clone(),
-            None => {
-                return Err(TyperError::missing_rtype_operation(
-                    "FunctionsPBCRepr.convert_desc (rpbc.py:275-280) \
-                     funcdesc-missing rffi.cast fallback port pending",
-                ));
+        // upstream rpbc.py:272-285:
+        //     if len(self.uniquerows) == 1:
+        //         if found_anything:
+        //             result = llfn
+        //         else:
+        //             # extremely rare case
+        //             result = rffi.cast(self.lowleveltype, ~len(self.funccache))
+        //     else:
+        //         result = self.create_specfunc()
+        //         for attrname, llfn in llfns.items():
+        //             setattr(result, attrname, llfn)
+        let result_ptr: _ptr = if self.uniquerows.len() == 1 {
+            if found_anything {
+                last_llfn.expect("single-row loop must populate last_llfn when found_anything")
+            } else {
+                // upstream rpbc.py:275-280:
+                //     # extremely rare case, shown only sometimes by
+                //     # test_bug_callfamily: don't emit NULL, because
+                //     # that would be interpreted as equal to None...
+                //     # It should never be called anyway.
+                //     result = rffi.cast(self.lowleveltype, ~len(self.funccache))
+                //
+                // Upstream's `~len(funccache)` casts an integer to a
+                // function pointer; the value is unique per call, so
+                // any two missing-from-row descs get distinct
+                // non-NULL sentinels (so equality checks against None
+                // and against each other resolve correctly).
+                //
+                // pyre's parity equivalent: a fresh `_ptr` carrying
+                // [`DelayedPointer`] as the `_obj0` slot. `_ptr`'s
+                // PartialEq (lltype.rs:1048-1051) falls back to
+                // `_identity` for any non-Ok(Some) `_obj0`, and each
+                // `_ptr::new` allocation gets a fresh identity. The
+                // result: never-NULL, distinct-per-call, never
+                // dereferenceable — same observable semantics as
+                // upstream's int-encoded cast without needing the
+                // llmemory/rffi int-to-ptr machinery.
+                let LowLevelType::Ptr(boxed) = &self.lltype else {
+                    return Err(TyperError::message(
+                        "FunctionsPBCRepr.convert_desc: single-row lltype is not Ptr",
+                    ));
+                };
+                _ptr::new_with_solid(
+                    (**boxed).clone(),
+                    Err(DelayedPointer),
+                    /* _solid = */ true,
+                )
             }
+        } else {
+            // upstream `self.create_specfunc()` ≡ `malloc(self.lowleveltype.TO,
+            // immortal=True)` (rpbc.py:249-250). Here `self.lltype` is
+            // `Ptr(Struct('specfunc', ...))`, so the `.TO` peels back to
+            // the Struct.
+            let LowLevelType::Ptr(struct_ptr) = &self.lltype else {
+                return Err(TyperError::message(
+                    "FunctionsPBCRepr.convert_desc: multi-row lltype is not Ptr(Struct)",
+                ));
+            };
+            let PtrTarget::Struct(struct_t) = &struct_ptr.TO else {
+                return Err(TyperError::message(
+                    "FunctionsPBCRepr.convert_desc: multi-row lltype.TO is not Struct",
+                ));
+            };
+            let struct_lltype = LowLevelType::Struct(Box::new(struct_t.clone()));
+            let mut specfunc_ptr = ll_malloc(struct_lltype, None, MallocFlavor::Raw, true)
+                .map_err(TyperError::message)?;
+            // upstream `for attrname, llfn in llfns.items(): setattr(result, attrname, llfn)`.
+            for (attrname_opt, llfn) in &llfns {
+                let attrname = attrname_opt.as_deref().ok_or_else(|| {
+                    TyperError::message(
+                        "FunctionsPBCRepr.convert_desc: multi-row uniquerow has no attrname",
+                    )
+                })?;
+                let llfn_value =
+                    crate::translator::rtyper::lltypesystem::lltype::LowLevelValue::Ptr(Box::new(
+                        llfn.clone(),
+                    ));
+                specfunc_ptr
+                    .setattr(attrname, llfn_value)
+                    .map_err(TyperError::message)?;
+            }
+            specfunc_ptr
         };
 
+        // upstream `self.funccache[funcdesc] = result; return result`.
         let c = crate::translator::rtyper::rmodel::inputconst_from_lltype(
             &self.lltype,
-            &ConstValue::LLPtr(Box::new(llfn)),
+            &ConstValue::LLPtr(Box::new(result_ptr)),
         )?;
         self.funccache.borrow_mut().insert(desc_rowkey, c.clone());
         Ok(c)
@@ -5280,8 +5459,10 @@ mod pbc_repr_tests {
 
     fn empty_lloplist(
         rtyper: &Rc<RPythonTyper>,
-    ) -> crate::translator::rtyper::rtyper::LowLevelOpList {
-        crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None)
+    ) -> Rc<RefCell<crate::translator::rtyper::rtyper::LowLevelOpList>> {
+        Rc::new(RefCell::new(
+            crate::translator::rtyper::rtyper::LowLevelOpList::new(rtyper.clone(), None),
+        ))
     }
 
     /// Verifies that a `Hlvalue::Constant(LLPtr(Func(...)))` names the
