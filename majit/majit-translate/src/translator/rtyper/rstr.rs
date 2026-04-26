@@ -87,11 +87,10 @@ use crate::translator::rtyper::rtyper::{
 /// The `basetype` / `base` / `CACHE` attributes only matter for
 /// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`)
 /// which lands in a follow-up slice. Today the struct just carries
-/// `lowleveltype = Ptr(STR)`. Until `convert_const` plus the abstract
-/// `rtype_*` method surface (`rstr.py:119-449`) land,
-/// [`super::rmodel::rtyper_makerepr`] keeps the boundary anchor and
-/// returns `MissingRTypeOperation` for `SomeString` rather than
-/// dispatching through this partial repr.
+/// `lowleveltype = Ptr(STR)` so [`super::rmodel::rtyper_makerepr`]
+/// can return the singleton when `SomeString` shows up. Per-method
+/// `rtype_*` calls fall through `Repr`'s default `MissingRTypeOperation`
+/// stubs until each slice 4-12 method body lands.
 #[derive(Debug)]
 pub struct StringRepr {
     state: ReprState,

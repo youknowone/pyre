@@ -687,13 +687,26 @@ pub trait Repr: Debug + std::any::Any {
         ))
     }
 
-    /// RPython `Repr.rtype_getattr(self, hop)` (`rmodel.py:182-193`).
+    /// RPython `Repr.rtype_getattr(self, hop)` (`rmodel.py:182-193`):
+    ///
+    /// ```python
+    /// if s_attr.is_constant() and isinstance(s_attr.const, str):
+    ///     attr = s_attr.const
+    ///     ...
+    /// else:
+    ///     raise TyperError("getattr() with a non-constant attribute name")
+    /// ```
+    ///
+    /// `isinstance(s_attr.const, str)` is Python 2 bytes-only — narrow
+    /// with [`ConstValue::as_pystr`] so a unicode attribute literal
+    /// surfaces the upstream `non-constant attribute name` error
+    /// instead of dispatching as if it were a Python 2 `str`.
     fn rtype_getattr(&self, hop: &HighLevelOp) -> RTypeResult {
         let args_s = hop.args_s.borrow();
         let s_attr = args_s
             .get(1)
             .ok_or_else(|| TyperError::message("getattr() missing attribute argument"))?;
-        if let Some(attr) = s_attr.const_().and_then(ConstValue::as_text) {
+        if let Some(attr) = s_attr.const_().and_then(ConstValue::as_pystr) {
             let s_obj = args_s
                 .first()
                 .ok_or_else(|| TyperError::message("getattr() missing object argument"))?;
@@ -2322,29 +2335,21 @@ pub fn rtyper_makerepr(
         SomeValue::UnicodeCodePoint(_) => {
             Ok(crate::translator::rtyper::rstr::unichar_repr() as std::sync::Arc<dyn Repr>)
         }
-        // rstr.py:569-571 / 577-579 — `SomeString.rtyper_makerepr` /
+        // rstr.py:567-579 — `SomeString.rtyper_makerepr` /
         // `SomeUnicodeString.rtyper_makerepr` return the module-global
         // `string_repr` / `unicode_repr` (`lltypesystem/rstr.py:1255` /
-        // `:1260`). Pyre defines the singletons today (Item 3 epic
-        // Slice 3) but `BaseLLStringRepr.convert_const`
-        // (`lltypesystem/rstr.py:191-206`) plus the abstract method
-        // surface (`rstr.py:119-449` — `rtype_len` / `rtype_bool` /
-        // `rtype_add` / `rtype_eq` / `rtype_getitem` / `rtype_method_*`
-        // / `get_ll_eq_function` / `get_ll_hash_function`) only land in
-        // slices 4-12. Returning the partial repr here is a regression:
-        // callers downstream observe an `Arc<dyn Repr>` whose method
-        // calls dispatch to the default-`MissingRTypeOperation` paths,
-        // which is silently weaker than the upstream behaviour where
-        // `SomeString` would surface the missing port at the
-        // `rtyper_makerepr` boundary. Keep the anchor pinned at the
-        // boundary until the slice 4+ method bodies (the helpers in
-        // `lltypesystem/rstr.rs`) are wired through.
-        SomeValue::String(_) => Err(TyperError::missing_rtype_operation(
-            "SomeString.rtyper_makerepr — port rpython/rtyper/rstr.py + lltypesystem/rstr.py BaseLLStringRepr.convert_const + StringRepr method surface",
-        )),
-        SomeValue::UnicodeString(_) => Err(TyperError::missing_rtype_operation(
-            "SomeUnicodeString.rtyper_makerepr — port rpython/rtyper/rstr.py + lltypesystem/rstr.py BaseLLStringRepr.convert_const + UnicodeRepr method surface",
-        )),
+        // `:1260`) unconditionally. Pyre's per-method `rtype_*` /
+        // `convert_const` overrides land slice-by-slice in the Item 3
+        // epic (`memory/item3_abstractstringrepr_epic_plan.md`). Until
+        // each one lands, `Repr`'s default impls surface a typed
+        // `TyperError` from the per-method dispatch — same upstream
+        // surface as `AbstractStringRepr` not yet defining the method.
+        SomeValue::String(_) => {
+            Ok(crate::translator::rtyper::rstr::string_repr() as std::sync::Arc<dyn Repr>)
+        }
+        SomeValue::UnicodeString(_) => {
+            Ok(crate::translator::rtyper::rstr::unicode_repr() as std::sync::Arc<dyn Repr>)
+        }
         // rbytearray.py:6-23 — `SomeByteArray.rtyper_makerepr` returns
         // a `ByteArrayRepr`. Pyre defers the dedicated rbytearray.rs
         // port to a separate epic; surface the missing-rtype anchor.
@@ -3370,44 +3375,50 @@ mod tests {
         assert_eq!(repr.class_name(), "RootClassRepr");
     }
 
-    /// rstr.py:569-571 — `SomeString.rtyper_makerepr` defers to
-    /// `lltypesystem/rstr.py:1255` `string_repr`. The singleton is
-    /// constructed today (Item 3 epic Slice 3) but
-    /// `BaseLLStringRepr.convert_const` and the method surface
-    /// (`rtype_len` / `rtype_bool` / `rtype_add` / `rtype_eq` /
-    /// `rtype_getitem` / `rtype_method_*`) land in slices 4-12.
-    /// Until then `rtyper_makerepr` keeps the anchor pinned so the
-    /// missing port surfaces at the `rtyper.getrepr` boundary instead
-    /// of silently dispatching the default `MissingRTypeOperation`
-    /// paths from inside a partial repr.
+    /// rstr.py:569-571 — `SomeString.rtyper_makerepr` returns the
+    /// module-global `string_repr` (`lltypesystem/rstr.py:1255`).
     #[test]
-    fn rtyper_makerepr_somestring_surfaces_missing_rtype_to_rstr() {
+    fn rtyper_makerepr_somestring_returns_string_repr_singleton() {
         use crate::annotator::model::SomeString;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
 
         let sv = SomeValue::String(SomeString::new(false, false));
-        let err =
-            rtyper_makerepr(&sv, &rtyper).expect_err("StringRepr method surface not yet ported");
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("rstr.py"));
+        let repr = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr");
+        assert_eq!(repr.class_name(), "StringRepr");
+        assert_eq!(
+            repr.repr_class_id(),
+            crate::translator::rtyper::pairtype::ReprClassId::StringRepr
+        );
+
+        let again = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr");
+        assert!(std::sync::Arc::ptr_eq(
+            &(repr as std::sync::Arc<dyn Repr>),
+            &(again as std::sync::Arc<dyn Repr>),
+        ));
     }
 
-    /// rstr.py:577-579 — `SomeUnicodeString.rtyper_makerepr` defers to
-    /// `lltypesystem/rstr.py:1260` `unicode_repr`. Same gating as
-    /// `SomeString` above — the singleton exists, but the method
-    /// surface waits on slices 4-12.
+    /// rstr.py:577-579 — `SomeUnicodeString.rtyper_makerepr` returns
+    /// the module-global `unicode_repr` (`lltypesystem/rstr.py:1260`).
     #[test]
-    fn rtyper_makerepr_someunicodestring_surfaces_missing_rtype_to_rstr() {
+    fn rtyper_makerepr_someunicodestring_returns_unicode_repr_singleton() {
         use crate::annotator::model::SomeUnicodeString;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann));
 
         let sv = SomeValue::UnicodeString(SomeUnicodeString::new(false, false));
-        let err =
-            rtyper_makerepr(&sv, &rtyper).expect_err("UnicodeRepr method surface not yet ported");
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("rstr.py"));
+        let repr = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr");
+        assert_eq!(repr.class_name(), "UnicodeRepr");
+        assert_eq!(
+            repr.repr_class_id(),
+            crate::translator::rtyper::pairtype::ReprClassId::UnicodeRepr
+        );
+
+        let again = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr");
+        assert!(std::sync::Arc::ptr_eq(
+            &(repr as std::sync::Arc<dyn Repr>),
+            &(again as std::sync::Arc<dyn Repr>),
+        ));
     }
 
     /// `SomeByteArray` remains parked behind a missing-rtype anchor —

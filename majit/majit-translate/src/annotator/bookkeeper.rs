@@ -1298,13 +1298,13 @@ impl Bookkeeper {
             ))
             .into());
         };
-        // bookkeeper.py:543-556 `pbc_getattr(self, pbc, s_attr)` —
-        // upstream uses `attr = s_attr.const` directly without an
-        // explicit isinstance gate, but every caller passes a Python 2
-        // `str` (bytes) attribute name. Use [`as_pystr`] to keep the
-        // pyre boundary symmetric with `unaryop.py` getattr handlers
-        // and reject stray unicode literals here.
-        let Some(attr_name) = attr_const.as_pystr().map(str::to_owned) else {
+        // bookkeeper.py:458-466 `pbc_getattr(self, pbc, s_attr)` —
+        // upstream `attr = s_attr.const` with no `isinstance(...,
+        // str)` gate. Use [`as_text`] so both `ByteStr` and `UniStr`
+        // pass through, mirroring the upstream constant-only check
+        // (string equality and the s_read_attribute lookup work
+        // across Python 2's bytes/unicode boundary).
+        let Some(attr_name) = attr_const.as_text().map(str::to_owned) else {
             return Err(AnnotatorError::new(format!(
                 "pbc_getattr: attr must be a string, got {attr_const:?}"
             ))

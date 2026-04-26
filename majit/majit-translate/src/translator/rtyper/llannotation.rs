@@ -216,11 +216,14 @@ impl SomePtr {
                 self.ll_ptrtype
             )));
         }
-        // lltype.py:1531-1548 `SomePtr.getattr` — field-name lookups
-        // against the example struct expect Python 2 `str` (bytes)
-        // identifiers. Narrow with [`ConstValue::as_pystr`] so a
-        // unicode literal doesn't reach `_lookup_adtmeth`.
-        let Some(attr) = s_attr.const_().and_then(ConstValue::as_pystr) else {
+        // lltype.py:1531-1548 `SomePtr.getattr` — upstream guards on
+        // `s_attr.is_constant()` only and forwards `s_attr.const`
+        // straight into `_lookup_adtmeth` / `getattr(example, ...)`
+        // with no `isinstance(..., str)` gate. Use [`ConstValue::as_text`]
+        // for the same `ByteStr`-or-`UniStr` acceptance as the
+        // sibling `setattr` / `bool` / `len` arms below at lines 273 /
+        // 340 / 388 — keeps the four ll field-name paths consistent.
+        let Some(attr) = s_attr.const_().and_then(ConstValue::as_text) else {
             panic!(
                 "SomePtr.getattr expects a constant string field-name, got {:?}",
                 s_attr.const_()

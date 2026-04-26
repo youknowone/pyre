@@ -5651,14 +5651,11 @@ mod tests {
         // the upstream module name in the error message.
         //
         // `SomeWeakRef` is the still-unported witness variant
-        // (rweakref.py port not landed). `SomeString` /
-        // `SomeUnicodeString` also still surface
-        // `MissingRTypeOperation` — Item 3 epic Slice 3 wires the
-        // `string_repr` / `unicode_repr` singletons but defers the
-        // `BaseLLStringRepr.convert_const` + abstract method surface,
-        // so `rtyper_makerepr` keeps the boundary anchor. Either
-        // witness works; the test stays on `SomeWeakRef` because it
-        // is the variant least coupled to the rstr.py slice churn.
+        // (rweakref.py port not landed). Earlier this test exercised
+        // `SomeString`; the Item 3 epic (Slice 3) ported `string_repr`
+        // / `unicode_repr`, so rotated onto another unported variant
+        // (robject.py / rproperty.py / rweakref.py — pick whichever
+        // remains unported next).
         use crate::annotator::model::SomeWeakRef;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
@@ -5846,11 +5843,9 @@ mod tests {
         // TyperError so callers know which upstream module to land.
         //
         // `SomeWeakRef` is the still-unported witness variant
-        // (rweakref.py). `SomeString` would also work — Item 3 Slice 3
-        // wires the singletons but
-        // `rtyper_makerepr` still anchors at the boundary until the
-        // method surface lands in slices 4-12 — but the test stays on
-        // `SomeWeakRef` to decouple it from the rstr.py slice churn.
+        // (rweakref.py). Earlier this test used `SomeString`; that
+        // landed in Slice 3 of the Item 3 epic, so rotated to
+        // `SomeWeakRef`.
         use crate::annotator::model::SomeWeakRef;
         let ann_rc = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann_rc));

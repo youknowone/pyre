@@ -476,12 +476,16 @@ fn init_someobject_defaults(
                     unreachable!("PBC-tag dispatch must carry SomePBC, got {s_self:?}");
                 };
                 // unaryop.py:972-980 — `SomePBC.getattr(self, s_attr)`.
-                // Upstream `assert s_attr.is_constant()` plus the
-                // downstream `s_attr.const == '__name__'` comparison
-                // both presume a Python 2 `str` (bytes) attribute name.
+                // Upstream only asserts `s_attr.is_constant()` and
+                // uses `s_attr.const` directly — no `isinstance(...,
+                // str)` gate. Python 2 string equality crosses the
+                // bytes/unicode boundary (`'__name__' == u'__name__'`
+                // is True), so accept both `ByteStr` and `UniStr` via
+                // [`ConstValue::as_text`] to keep parity with the
+                // upstream constant-only check.
                 let Some(attr) = s_attr
                     .const_()
-                    .and_then(ConstValue::as_pystr)
+                    .and_then(ConstValue::as_text)
                     .map(str::to_owned)
                 else {
                     panic!(
@@ -3795,7 +3799,14 @@ fn init_instance_attr_transform(
             }
         }),
     );
-    // unaryop.py:924-936 — setattr
+    // unaryop.py:924-936 — setattr_SomeInstance.
+    //
+    //   if not s_attr.is_constant() or not isinstance(s_attr.const, str): return
+    //
+    // Mirror getter's `isinstance(value, str)` Python 2 bytes-only
+    // gate via [`ConstValue::as_pystr`] so a unicode literal short-
+    // circuits the same way it does on the getattr side, instead of
+    // dispatching against `_find_property_meth(..., 'fset')`.
     register_transform(
         reg,
         OpKind::SetAttr,
@@ -3806,7 +3817,7 @@ fn init_instance_attr_transform(
             let v_value = args[2].clone();
             let s_attr = ann.annotation(v_attr)?;
             let attr = match s_attr.const_() {
-                Some(value) => value.as_text().map(str::to_owned)?,
+                Some(value) => value.as_pystr().map(str::to_owned)?,
                 _ => return None,
             };
             let s_obj = ann.annotation(&v_obj)?;
