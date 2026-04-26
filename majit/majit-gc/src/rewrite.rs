@@ -2367,6 +2367,16 @@ impl GcRewriterImpl {
         // any CALL_ASSEMBLER op referencing this token.
         let callee_locs = lookup(token)
             .expect("pending CALL_ASSEMBLER target must be registered before rewriter runs");
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[gc-rewrite][call-assembler] token={} frame_info_ptr=0x{:x} ll_initial_locs={:?} frame_depth={} index_of_virtualizable={}",
+                token,
+                callee_locs.frame_info_ptr,
+                callee_locs._ll_initial_locs,
+                callee_locs.frame_depth,
+                callee_locs.index_of_virtualizable,
+            );
+        }
 
         // rewrite.py:627-653 — gen_malloc_frame(llfi)
         // RPython reads jfi_frame_size from frame_info AT RUNTIME so

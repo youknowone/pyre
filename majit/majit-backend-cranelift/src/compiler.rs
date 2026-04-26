@@ -11587,6 +11587,16 @@ fn collect_guards(
         descr.rd_virtuals = op.rd_virtuals.clone();
         descr.rd_pendingfields = op.rd_pendingfields.clone();
         let descr = Arc::new(descr);
+        if std::env::var_os("MAJIT_LOG").is_some() && !is_finish && !is_external_jump {
+            eprintln!(
+                "[cl-guard-token] fail_index={} op_index={} opcode={:?} fail_args={:?} fail_arg_types={:?}",
+                fail_index,
+                op_idx,
+                op.opcode,
+                op.fail_args.as_ref(),
+                descr.fail_arg_types,
+            );
+        }
         // store_hash is called after compile_loop by pyjitpl.rs using
         // jitcounter.fetch_next_hash() (compile.py:826-830 parity).
         //
