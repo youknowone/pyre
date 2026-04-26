@@ -1,5 +1,7 @@
-def main():
-    n = 100000
+MOD = 1000000007
+
+
+def fib(n):
     a = 0
     b = 1
     i = 0
@@ -8,6 +10,11 @@ def main():
         a = b
         b = t
         i = i + 1
-    print(b % 1000000007)
+    return b
+
+
+def main():
+    for n in [20000, 40000, 60000, 80000, 100000]:
+        print(fib(n) % MOD)
 
 main()

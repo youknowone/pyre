@@ -3,5 +3,5 @@ def fib(n):
         return n
     return fib(n - 1) + fib(n - 2)
 
-print(fib(32))
-print(fib(35))
+for i in range(35):
+    print(fib(i))
