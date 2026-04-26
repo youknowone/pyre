@@ -116,6 +116,12 @@ pub enum ReprClassId {
     /// `rstr.py:758 AbstractUniCharRepr` (`UniCharRepr` lltypesystem
     /// realisation, `lowleveltype = UniChar`).
     UniCharRepr,
+    /// `rstr.py:95 AbstractStringRepr` (`lltypesystem.rstr.StringRepr`
+    /// realisation, `lowleveltype = Ptr(STR)`).
+    StringRepr,
+    /// `rstr.py:450 AbstractUnicodeRepr` (`lltypesystem.rstr.UnicodeRepr`
+    /// realisation, `lowleveltype = Ptr(UNICODE)`).
+    UnicodeRepr,
 }
 
 impl ReprClassId {
@@ -158,6 +164,8 @@ impl ReprClassId {
             TupleRepr => &[TupleRepr, Repr],
             CharRepr => &[CharRepr, Repr],
             UniCharRepr => &[UniCharRepr, Repr],
+            StringRepr => &[StringRepr, Repr],
+            UnicodeRepr => &[UnicodeRepr, Repr],
         }
     }
 }

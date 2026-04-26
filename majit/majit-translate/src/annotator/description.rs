@@ -908,7 +908,8 @@ impl FunctionDesc {
                     "False".to_string()
                 }
             }
-            ConstValue::Str(s) => s.clone(),
+            ConstValue::ByteStr(s) => String::from_utf8_lossy(s).into_owned(),
+            ConstValue::UniStr(s) => s.clone(),
             ConstValue::HostObject(obj) => obj
                 .qualname()
                 .rsplit('.')
@@ -3795,11 +3796,11 @@ mod tests {
         // authoritative path.
         let bk = bk();
         let cls = HostObject::new_class("Cls", vec![]);
-        cls.class_set("TAG", ConstValue::Str("tag".into()));
+        cls.class_set("TAG", ConstValue::byte_str("tag"));
         let instance = HostObject::new_instance(cls, vec![]);
         let fd = FrozenDesc::new(bk, instance).unwrap();
         let v = fd.read_attribute("TAG").unwrap();
-        assert!(matches!(v, ConstValue::Str(ref s) if s == "tag"));
+        assert!(v.string_eq("tag"));
     }
 
     #[test]

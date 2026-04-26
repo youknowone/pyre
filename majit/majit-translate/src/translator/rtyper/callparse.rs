@@ -780,10 +780,10 @@ fn call_shape_from_const(cv: &ConstValue) -> Result<CallShape, TyperError> {
     let shape_keys: Vec<String> = match &items[1] {
         ConstValue::Tuple(keys) => keys
             .iter()
-            .map(|k| match k {
-                ConstValue::Str(s) => Ok(s.clone()),
-                other => Err(TyperError::message(format!(
-                    "call_shape_from_const: shape_keys element is not Str: {other:?}"
+            .map(|k| match k.as_text() {
+                Some(s) => Ok(s.to_string()),
+                None => Err(TyperError::message(format!(
+                    "call_shape_from_const: shape_keys element is not Str: {k:?}"
                 ))),
             })
             .collect::<Result<Vec<_>, _>>()?,
@@ -1094,7 +1094,7 @@ mod tests {
     fn call_shape_from_const_decodes_star_present() {
         let c = ConstValue::Tuple(vec![
             ConstValue::Int(1),
-            ConstValue::Tuple(vec![ConstValue::Str("kw".into())]),
+            ConstValue::Tuple(vec![ConstValue::byte_str("kw")]),
             ConstValue::Bool(true),
         ]);
         let shape = call_shape_from_const(&c).expect("shape decode");

@@ -37,7 +37,7 @@ use super::dictdef::DictDef;
 use super::listdef::ListDef;
 use super::model::{
     AnnotatorError, SomeBool, SomeBuiltin, SomeChar, SomeDict, SomeFloat, SomeInteger, SomeList,
-    SomePBC, SomeString, SomeTuple, SomeValue, s_none,
+    SomePBC, SomeString, SomeTuple, SomeUnicodeCodePoint, SomeUnicodeString, SomeValue, s_none,
 };
 use super::policy::AnnotatorPolicy;
 use crate::flowspace::argument::CallShape;
@@ -1298,14 +1298,17 @@ impl Bookkeeper {
             ))
             .into());
         };
-        let attr_name = match attr_const {
-            ConstValue::Str(s) => s.clone(),
-            other => {
-                return Err(AnnotatorError::new(format!(
-                    "pbc_getattr: attr must be a string, got {other:?}"
-                ))
-                .into());
-            }
+        // bookkeeper.py:543-556 `pbc_getattr(self, pbc, s_attr)` —
+        // upstream uses `attr = s_attr.const` directly without an
+        // explicit isinstance gate, but every caller passes a Python 2
+        // `str` (bytes) attribute name. Use [`as_pystr`] to keep the
+        // pyre boundary symmetric with `unaryop.py` getattr handlers
+        // and reject stray unicode literals here.
+        let Some(attr_name) = attr_const.as_pystr().map(str::to_owned) else {
+            return Err(AnnotatorError::new(format!(
+                "pbc_getattr: attr must be a string, got {attr_const:?}"
+            ))
+            .into());
         };
 
         // upstream: `descs = list(pbc.descriptions); first = descs[0]`.
@@ -1395,9 +1398,9 @@ impl Bookkeeper {
                 };
                 let contains = match &c.value {
                     // upstream `_attrs_` is typically a tuple of strings.
-                    ConstValue::Tuple(vs) | ConstValue::List(vs) => vs
-                        .iter()
-                        .any(|v| matches!(v, ConstValue::Str(s) if *s == attr_name)),
+                    ConstValue::Tuple(vs) | ConstValue::List(vs) => {
+                        vs.iter().any(|v| v.as_text() == Some(attr_name.as_str()))
+                    }
                     _ => false,
                 };
                 if contains {
@@ -1681,9 +1684,9 @@ impl Bookkeeper {
                 s.base.const_box = Some(Constant::new(x.clone()));
                 Ok(SomeValue::Float(s))
             }
-            ConstValue::Str(s) => {
-                let no_nul = !s.contains('\x00');
-                let result = if s.chars().count() == 1 {
+            ConstValue::ByteStr(s) => {
+                let no_nul = !s.contains(&0);
+                let result = if s.len() == 1 {
                     // upstream: `result = SomeChar(no_nul=no_nul)`.
                     let mut ch = SomeChar::new(no_nul);
                     ch.inner.base.const_box = Some(Constant::new(x.clone()));
@@ -1693,6 +1696,19 @@ impl Bookkeeper {
                     let mut st = SomeString::new(false, no_nul);
                     st.inner.base.const_box = Some(Constant::new(x.clone()));
                     SomeValue::String(st)
+                };
+                Ok(result)
+            }
+            ConstValue::UniStr(s) => {
+                let no_nul = !s.contains('\x00');
+                let result = if s.chars().count() == 1 {
+                    let mut ch = SomeUnicodeCodePoint::new(no_nul);
+                    ch.inner.base.const_box = Some(Constant::new(x.clone()));
+                    SomeValue::UnicodeCodePoint(ch)
+                } else {
+                    let mut st = SomeUnicodeString::new(false, no_nul);
+                    st.inner.base.const_box = Some(Constant::new(x.clone()));
+                    SomeValue::UnicodeString(st)
                 };
                 Ok(result)
             }
@@ -1810,10 +1826,8 @@ impl Bookkeeper {
         // in BUILTIN_ANALYZERS: result = SomeBuiltin(...)`.
         if super::builtin::is_registered(obj.qualname()) {
             let module_name = match crate::flowspace::model::host_getattr(obj, "__module__") {
-                Ok(ConstValue::Str(s)) => s,
-                Ok(_) | Err(crate::flowspace::model::HostGetAttrError::Missing) => {
-                    "unknown".to_string()
-                }
+                Ok(value) => value.into_text().unwrap_or_else(|| "unknown".to_string()),
+                Err(crate::flowspace::model::HostGetAttrError::Missing) => "unknown".to_string(),
                 Err(crate::flowspace::model::HostGetAttrError::Unsupported) => {
                     return Err(AnnotatorError::new(format!(
                         "Bookkeeper.immutablevalue(SomeBuiltin): getattr({:?}, '__module__') unsupported",
@@ -1822,13 +1836,12 @@ impl Bookkeeper {
                 }
             };
             let name = match crate::flowspace::model::host_getattr(obj, "__name__") {
-                Ok(ConstValue::Str(s)) => s,
-                Ok(other) => {
-                    return Err(AnnotatorError::new(format!(
-                        "Bookkeeper.immutablevalue(SomeBuiltin): {:?}.__name__ is not a string: {other:?}",
+                Ok(value) => value.as_text().map(str::to_owned).ok_or_else(|| {
+                    AnnotatorError::new(format!(
+                        "Bookkeeper.immutablevalue(SomeBuiltin): {:?}.__name__ is not a string: {value:?}",
                         obj.qualname()
-                    )));
-                }
+                    ))
+                })?,
                 Err(err) => {
                     return Err(AnnotatorError::new(format!(
                         "Bookkeeper.immutablevalue(SomeBuiltin): getattr({:?}, '__name__') failed: {err:?}",
@@ -2167,13 +2180,12 @@ fn call_shape_from_const(cv: &ConstValue) -> Result<CallShape, AnnotatorError> {
     };
     let mut shape_keys = Vec::with_capacity(keys_tuple.len());
     for k in keys_tuple {
-        match k {
-            ConstValue::Str(s) => shape_keys.push(s.clone()),
-            _ => {
-                return Err(AnnotatorError::new(
-                    "call_shape_from_const: shape_keys element is not Str",
-                ));
-            }
+        if let Some(s) = k.as_text() {
+            shape_keys.push(s.to_string());
+        } else {
+            return Err(AnnotatorError::new(
+                "call_shape_from_const: shape_keys element is not Str",
+            ));
         }
     }
     let shape_star = match &items[2] {
@@ -2340,21 +2352,21 @@ mod tests {
     #[test]
     fn immutablevalue_single_char_str_is_somechar() {
         let bk = bk();
-        let s = bk.immutablevalue(&ConstValue::Str("a".into())).unwrap();
+        let s = bk.immutablevalue(&ConstValue::byte_str("a")).unwrap();
         assert!(matches!(s, SomeValue::Char(_)));
     }
 
     #[test]
     fn immutablevalue_multichar_str_is_somestring() {
         let bk = bk();
-        let s = bk.immutablevalue(&ConstValue::Str("hello".into())).unwrap();
+        let s = bk.immutablevalue(&ConstValue::byte_str("hello")).unwrap();
         assert!(matches!(s, SomeValue::String(_)));
     }
 
     #[test]
     fn immutablevalue_str_with_nul_clears_no_nul() {
         let bk = bk();
-        let with_nul = ConstValue::Str("a\x00b".into());
+        let with_nul = ConstValue::byte_str("a\x00b");
         let s = bk.immutablevalue(&with_nul).unwrap();
         match s {
             SomeValue::String(st) => assert!(!st.inner.no_nul),
@@ -3051,14 +3063,12 @@ mod tests {
     }
 
     #[test]
-    fn unicode_through_const_str() {
-        // ConstValue::Str carries both str and unicode upstream; the
-        // byte-level no-nul check lands identically.
+    fn unicode_through_const_unistr() {
         let bk = bk();
-        let s = bk.immutablevalue(&ConstValue::Str("abc".into())).unwrap();
+        let s = bk.immutablevalue(&ConstValue::uni_str("abc")).unwrap();
         match s {
-            SomeValue::String(st) => assert!(st.inner.no_nul),
-            other => panic!("expected SomeString, got {other:?}"),
+            SomeValue::UnicodeString(st) => assert!(st.inner.no_nul),
+            other => panic!("expected SomeUnicodeString, got {other:?}"),
         }
     }
 
@@ -3074,7 +3084,7 @@ mod tests {
     #[test]
     fn char_has_no_nul() {
         let bk = bk();
-        let s = bk.immutablevalue(&ConstValue::Str("x".into())).unwrap();
+        let s = bk.immutablevalue(&ConstValue::byte_str("x")).unwrap();
         match s {
             SomeValue::Char(_) => {
                 let c = SomeChar::new(true);

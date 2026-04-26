@@ -3906,7 +3906,7 @@ mod tests {
             }),
         });
         let mut s_attr = SomeString::new(false, false);
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("missing".into())));
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("missing")));
         let err = s_ptr
             .getattr(&SomeValue::String(s_attr))
             .expect_err("function-pointer subset has no low-level fields");
@@ -3926,7 +3926,7 @@ mod tests {
             }),
         });
         let mut s_attr = SomeString::new(false, false);
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("missing".into())));
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("missing")));
         let err = s_ptr
             .setattr(
                 &SomeValue::String(s_attr),
@@ -3949,7 +3949,7 @@ mod tests {
             )),
         });
         let mut s_attr = SomeString::new(false, false);
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("x".into())));
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("x")));
 
         let result = s_ptr
             .getattr(&SomeValue::String(s_attr))
@@ -3970,7 +3970,7 @@ mod tests {
             )),
         });
         let mut s_attr = SomeString::new(false, false);
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("x".into())));
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("x")));
 
         let result = s_ptr
             .setattr(
@@ -3999,7 +3999,7 @@ mod tests {
             )),
         });
         let mut s_attr = SomeString::new(false, false);
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("f".into())));
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("f")));
 
         let result = s_ptr
             .getattr(&SomeValue::String(s_attr))
@@ -4021,7 +4021,7 @@ mod tests {
             )),
         });
         let mut s_attr = SomeString::new(false, false);
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("x".into())));
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("x")));
 
         let result = s_ptr
             .getattr(&SomeValue::String(s_attr))

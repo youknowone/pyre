@@ -650,7 +650,9 @@ fn lower_literal(lit: &Lit) -> Result<Hlvalue, AdapterError> {
             Ok(Hlvalue::Constant(Constant::new(ConstValue::Int(value))))
         }
         Lit::Bool(bl) => Ok(Hlvalue::Constant(Constant::new(ConstValue::Bool(bl.value)))),
-        Lit::Str(s) => Ok(Hlvalue::Constant(Constant::new(ConstValue::Str(s.value())))),
+        Lit::Str(s) => Ok(Hlvalue::Constant(Constant::new(ConstValue::uni_str(
+            s.value(),
+        )))),
         Lit::Float(f) => {
             // `ConstValue::Float` stores `f64::to_bits()` so the
             // enum keeps `Eq + Hash` — see model.rs:1696-1701. The
@@ -668,19 +670,19 @@ fn lower_literal(lit: &Lit) -> Result<Hlvalue, AdapterError> {
         // the role (`model.py:658` switch-exitcase admits
         // `isinstance(n, (str, unicode)) and len(n) == 1`; general
         // `operation.py` string ops accept len==1 the same as any
-        // other str). Emit as `ConstValue::Str(c.to_string())` so
+        // other unicode). Emit as `ConstValue::UniStr(c.to_string())` so
         // expression-position `'a'` and match-arm `'a' =>` carry the
         // identical constant — see `classify_pattern` for the
         // match-arm side.
-        Lit::Char(ch) => Ok(Hlvalue::Constant(Constant::new(ConstValue::Str(
+        Lit::Char(ch) => Ok(Hlvalue::Constant(Constant::new(ConstValue::uni_str(
             ch.value().to_string(),
         )))),
-        Lit::ByteStr(_) | Lit::Byte(_) => Err(AdapterError::Unsupported {
-            reason: "byte / bytestring literal — upstream has no direct analogue \
-                (Python 2.7 collapses bytes into `str`, modern `bytes` is not in \
-                the flowspace vocabulary)"
-                .into(),
-        }),
+        Lit::ByteStr(bs) => Ok(Hlvalue::Constant(Constant::new(ConstValue::ByteStr(
+            bs.value(),
+        )))),
+        Lit::Byte(b) => Ok(Hlvalue::Constant(Constant::new(ConstValue::ByteStr(vec![
+            b.value(),
+        ])))),
         _ => Err(AdapterError::Unsupported {
             reason: "unrecognised literal kind".into(),
         }),
@@ -1310,8 +1312,8 @@ fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<BlockExit, Ada
         for exitcase in arm_ex {
             let link_exitcase = match exitcase {
                 Some(v) => Some(v.clone()),
-                None => Some(Hlvalue::Constant(Constant::new(ConstValue::Str(
-                    "default".into(),
+                None => Some(Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                    "default",
                 )))),
             };
             let link = Rc::new(RefCell::new(Link::new(
@@ -1852,7 +1854,7 @@ fn lower_for(b: &mut Builder, for_expr: &ExprForLoop) -> Result<(), AdapterError
     let assertion_msg = "implicit RuntimeError shouldn't occur".to_string();
     let assertion_instance = crate::flowspace::model::HostObject::new_instance(
         assertion_cls,
-        vec![ConstValue::Str(assertion_msg)],
+        vec![ConstValue::byte_str(assertion_msg)],
     );
     let assertion_instance_const =
         Hlvalue::Constant(Constant::new(ConstValue::HostObject(assertion_instance)));
@@ -2234,14 +2236,14 @@ fn lower_method_call(
     let receiver = lower_expr(b, &method_call.receiver)?;
 
     // `getattr(receiver, "method")` — the method name is a Python
-    // string constant (upstream `ConstValue::Str`).
+    // byte-string constant, matching Python 2 method names.
     let method_name = method_call.method.to_string();
     let bound = Hlvalue::Variable(Variable::new());
     b.emit_op(SpaceOperation::new(
         "getattr",
         vec![
             receiver,
-            Hlvalue::Constant(Constant::new(ConstValue::Str(method_name))),
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str(method_name))),
         ],
         bound.clone(),
     ));
@@ -2414,7 +2416,7 @@ fn lower_field(b: &mut Builder, f: &ExprField) -> Result<Hlvalue, AdapterError> 
         "getattr",
         vec![
             base,
-            Hlvalue::Constant(Constant::new(ConstValue::Str(attr_name))),
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str(attr_name))),
         ],
         result.clone(),
     ));
@@ -2538,15 +2540,15 @@ fn classify_pattern(pat: &Pat, is_last: bool) -> Result<Option<Hlvalue>, Adapter
             // switch exitcases (`isinstance(n, (str, unicode)) and
             // len(n) == 1`). Rust's `char` literal is the direct
             // analogue — RPython has no `char` type; it uses one-char
-            // `str`. Emit `ConstValue::Str(c.to_string())` so the
+            // unicode. Emit `ConstValue::UniStr(c.to_string())` so the
             // resulting exitcase passes `checkgraph`'s len==1 check.
-            Lit::Char(ch) => Ok(Some(Hlvalue::Constant(Constant::new(ConstValue::Str(
+            Lit::Char(ch) => Ok(Some(Hlvalue::Constant(Constant::new(ConstValue::uni_str(
                 ch.value().to_string(),
             ))))),
             // Upstream `model.py:658` admits `isinstance(n, (str,
             // unicode)) and len(n) == 1` as a valid switch exitcase,
             // so single-character string patterns are legal. `char`
-            // literals lower to the same `ConstValue::Str(c.to_string())`
+            // literals lower to the same `ConstValue::UniStr(c.to_string())`
             // shape (see the `Lit::Char` arm above), making
             // `match x { "a" => … }` and `match x { 'a' => … }`
             // structurally interchangeable. Multi-character strings
@@ -2564,11 +2566,17 @@ fn classify_pattern(pat: &Pat, is_last: bool) -> Result<Option<Hlvalue>, Adapter
                             .into(),
                     });
                 }
-                Ok(Some(Hlvalue::Constant(Constant::new(ConstValue::Str(
+                Ok(Some(Hlvalue::Constant(Constant::new(ConstValue::uni_str(
                     value,
                 )))))
             }
-            Lit::ByteStr(_) | Lit::Byte(_) | Lit::Float(_) | _ => Err(AdapterError::Unsupported {
+            Lit::ByteStr(bs) if bs.value().len() == 1 => Ok(Some(Hlvalue::Constant(
+                Constant::new(ConstValue::ByteStr(bs.value())),
+            ))),
+            Lit::Byte(b) => Ok(Some(Hlvalue::Constant(Constant::new(ConstValue::ByteStr(
+                vec![b.value()],
+            ))))),
+            Lit::ByteStr(_) | Lit::Float(_) | _ => Err(AdapterError::Unsupported {
                 reason: "match arm non-integer/bool/char literal pattern \
                         (byte/bytestring/float patterns have no upstream analogue)"
                     .into(),
@@ -2925,7 +2933,7 @@ mod tests {
         assert_eq!(ec1, Hlvalue::Constant(Constant::new(ConstValue::Int(1))));
         assert_eq!(
             ec2,
-            Hlvalue::Constant(Constant::new(ConstValue::Str("default".into())))
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str("default")))
         );
     }
 
@@ -3024,7 +3032,7 @@ mod tests {
         let ec = start.exits[0].borrow().exitcase.clone().unwrap();
         assert_eq!(
             ec,
-            Hlvalue::Constant(Constant::new(ConstValue::Str("default".into())))
+            Hlvalue::Constant(Constant::new(ConstValue::byte_str("default")))
         );
     }
 
@@ -3396,7 +3404,7 @@ mod tests {
         assert!(
             matches!(
                 ec_2,
-                Hlvalue::Constant(ref c) if matches!(&c.value, ConstValue::Str(s) if s == "default")
+                Hlvalue::Constant(ref c) if c.value.string_eq("default")
             ),
             "default arm should carry Str(\"default\")"
         );
@@ -3454,7 +3462,7 @@ mod tests {
         // and len(n) == 1` as a switch exitcase. Rust's `char` literal
         // (`'a'`) is the direct analogue — RPython has no `char` type,
         // so single-char strings fill the role. The arm exitcase
-        // should be `ConstValue::Str("a")` (len==1), passing
+        // should be `ConstValue::UniStr("a")` (len==1), passing
         // `checkgraph`.
         let g = lower("fn f(c: char) -> i64 { match c { 'a' => 1, 'b' => 2, _ => 0 } }").unwrap();
         checkgraph(&g);
@@ -3466,21 +3474,21 @@ mod tests {
         assert!(
             matches!(
                 ec_a,
-                Hlvalue::Constant(ref c) if matches!(&c.value, ConstValue::Str(s) if s == "a")
+                Hlvalue::Constant(ref c) if c.value.string_eq("a")
             ),
             "first char arm should carry Str(\"a\") — got {ec_a:?}"
         );
         assert!(
             matches!(
                 ec_b,
-                Hlvalue::Constant(ref c) if matches!(&c.value, ConstValue::Str(s) if s == "b")
+                Hlvalue::Constant(ref c) if c.value.string_eq("b")
             ),
             "second char arm should carry Str(\"b\") — got {ec_b:?}"
         );
         assert!(
             matches!(
                 ec_d,
-                Hlvalue::Constant(ref c) if matches!(&c.value, ConstValue::Str(s) if s == "default")
+                Hlvalue::Constant(ref c) if c.value.string_eq("default")
             ),
             "wildcard arm should carry Str(\"default\") — got {ec_d:?}"
         );
@@ -3512,7 +3520,7 @@ mod tests {
         // Upstream `model.py:658` admits single-character strings as
         // valid switch exitcases; the adapter should accept `"a"` in
         // a match arm the same way it accepts `'a'`. Both produce a
-        // `ConstValue::Str("a".into())` exitcase — structurally
+        // `ConstValue::UniStr("a".into())` exitcase — structurally
         // interchangeable at the graph layer.
         let g = lower(
             "fn f(s: &str) -> i64 {
@@ -3530,7 +3538,7 @@ mod tests {
         assert!(
             matches!(
                 ec,
-                Hlvalue::Constant(ref c) if matches!(&c.value, ConstValue::Str(s) if s == "a")
+                Hlvalue::Constant(ref c) if c.value.string_eq("a")
             ),
             "single-char string pattern should carry Str(\"a\") — got {ec:?}"
         );
@@ -3539,7 +3547,7 @@ mod tests {
     #[test]
     fn match_single_char_str_and_char_pattern_produce_identical_exitcase() {
         // `match x { "a" => … }` and `match x { 'a' => … }` must
-        // produce the same `ConstValue::Str("a")` exitcase. This
+        // produce the same `ConstValue::UniStr("a")` exitcase. This
         // pins `lower_literal` / `classify_pattern`'s symmetry
         // between the two syntactic forms.
         let g_str = lower("fn f(s: &str) -> i64 { match s { \"a\" => 1, _ => 0 } }").unwrap();
@@ -4293,7 +4301,7 @@ mod tests {
         assert_eq!(start.operations[0].opname, "getattr");
         match &start.operations[0].args[1] {
             Hlvalue::Constant(c) => match &c.value {
-                ConstValue::Str(s) => assert_eq!(s, "abs"),
+                value if value.string_eq("abs") => {}
                 other => panic!("expected Str method name, got {other:?}"),
             },
             other => panic!("expected Constant method name, got {other:?}"),
@@ -4469,7 +4477,7 @@ mod tests {
     #[test]
     fn string_literal_lowers_to_constant_str() {
         // `fn f() -> i64 { let _s = "hello"; 0 }` — the string is
-        // stored as a ConstValue::Str attached to a let binding,
+        // stored as a ConstValue string attached to a let binding,
         // then the tail emits 0. No op emitted for the literal
         // itself (it's a Constant, not a SpaceOperation result).
         let g = lower(r#"fn f() -> i64 { let _s = "hello"; 0 }"#).unwrap();
@@ -4555,7 +4563,7 @@ mod tests {
 
     #[test]
     fn char_literal_lowers_to_single_char_str() {
-        // Rust `char` → `ConstValue::Str(len==1)`. Matches the
+        // Rust `char` → `ConstValue::UniStr(len==1)`. Matches the
         // match-arm side (`classify_pattern`) so scrutinee and
         // exitcase share the identical Constant for an end-to-end
         // char match. No operations emitted — a bare `let _c = 'a'`
@@ -4571,15 +4579,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_byte_literal() {
-        // `b'a'` parses as `Lit::Byte` and stays rejected — upstream
-        // Python 2.7 doesn't have a distinct byte vocabulary in
-        // flowspace.
-        match lower("fn f() -> i64 { let _b = b'a'; 0 }").unwrap_err() {
-            AdapterError::Unsupported { reason } => {
-                assert!(reason.contains("byte"), "reason: {reason}");
+    fn byte_literal_lowers_to_bytestr() {
+        let g = lower("fn f() -> u8 { b'a' }").unwrap();
+        checkgraph(&g);
+        let link = g.startblock.borrow().exits[0].clone();
+        match link.borrow().args[0].as_ref() {
+            Some(Hlvalue::Constant(c)) => {
+                assert_eq!(c.value, ConstValue::byte_str(b"a"));
             }
-            other => panic!("expected Unsupported(byte), got {other:?}"),
+            other => panic!("expected ByteStr return constant, got {other:?}"),
         }
     }
 
@@ -4600,10 +4608,7 @@ mod tests {
         let link = start.exits[0].borrow();
         match link.args[0].as_ref().unwrap() {
             Hlvalue::Constant(c) => match &c.value {
-                ConstValue::Str(s) => {
-                    assert_eq!(s, "a");
-                    assert_eq!(s.chars().count(), 1, "model.py:658 requires len==1");
-                }
+                value if value.string_eq("a") => {}
                 other => panic!("expected Str, got {other:?}"),
             },
             other => panic!("expected Constant, got {other:?}"),
@@ -4652,7 +4657,7 @@ mod tests {
         assert_eq!(start.operations[0].opname, "getattr");
         match &start.operations[0].args[1] {
             Hlvalue::Constant(c) => match &c.value {
-                ConstValue::Str(s) => assert_eq!(s, "x"),
+                value if value.string_eq("x") => {}
                 other => panic!("expected Str, got {other:?}"),
             },
             other => panic!("expected Constant, got {other:?}"),

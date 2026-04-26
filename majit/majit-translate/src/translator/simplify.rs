@@ -220,7 +220,7 @@ pub fn replace_exitswitch_by_constant(block: &BlockRef, const_: &Constant) -> Ve
     let default_case = |link: &LinkRef| {
         matches!(
             &link.borrow().exitcase,
-            Some(Hlvalue::Constant(c)) if matches!(&c.value, ConstValue::Str(s) if s == "default")
+            Some(Hlvalue::Constant(c)) if c.value.string_eq("default")
         )
     };
 
@@ -2312,14 +2312,11 @@ impl<'a> ListComprehensionDetector<'a> {
         };
         let mut hint_items = HashMap::new();
         hint_items.insert(
-            ConstValue::Str(
-                if exactlength {
-                    "maxlength"
-                } else {
-                    "maxlength_inexact"
-                }
-                .to_string(),
-            ),
+            ConstValue::byte_str(if exactlength {
+                "maxlength"
+            } else {
+                "maxlength_inexact"
+            }),
             ConstValue::Bool(true),
         );
         let hint_result = match &vlist {
@@ -2358,17 +2355,14 @@ impl<'a> ListComprehensionDetector<'a> {
                     continue;
                 };
                 let mut hints =
-                    HashMap::from([(ConstValue::Str("fence".to_string()), ConstValue::Bool(true))]);
+                    HashMap::from([(ConstValue::byte_str("fence"), ConstValue::Bool(true))]);
                 if exactlength
                     && BlockKey::of(block) == BlockKey::of(&loopnextblock)
                     && stopblocks
                         .iter()
                         .any(|stopblock| BlockKey::of(stopblock) == BlockKey::of(&target))
                 {
-                    hints.insert(
-                        ConstValue::Str("exactlength".to_string()),
-                        ConstValue::Bool(true),
-                    );
+                    hints.insert(ConstValue::byte_str("exactlength"), ConstValue::Bool(true));
                 }
                 let newblock = crate::translator::unsimplify::insert_empty_block(&link, vec![]);
                 let index = link
@@ -2401,7 +2395,7 @@ impl<'a> ListComprehensionDetector<'a> {
 /// RPython `detect_list_comprehension(graph)` (simplify.py:703-780).
 pub fn detect_list_comprehension(graph: &FunctionGraph) {
     let mut variable_families = DataFlowFamilyBuilder::new(graph).into_variable_families();
-    let c_append = Constant::new(ConstValue::Str("append".to_string()));
+    let c_append = Constant::new(ConstValue::byte_str("append"));
     let mut newlist_v: HashMap<Hlvalue, BlockRef> = HashMap::new();
     let mut iter_v: HashMap<Hlvalue, BlockRef> = HashMap::new();
     let mut append_v: Vec<(Hlvalue, Hlvalue, BlockRef)> = Vec::new();
@@ -3053,7 +3047,7 @@ mod tests {
             "getattr",
             vec![
                 list_in_append.clone(),
-                Hlvalue::Constant(Constant::new(ConstValue::Str("append".to_string()))),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("append"))),
             ],
             Hlvalue::Variable(vmeth.clone()),
         ));
@@ -3180,7 +3174,7 @@ mod tests {
             "getattr",
             vec![
                 list_in_append.clone(),
-                Hlvalue::Constant(Constant::new(ConstValue::Str("append".to_string()))),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("append"))),
             ],
             Hlvalue::Variable(vmeth.clone()),
         ));

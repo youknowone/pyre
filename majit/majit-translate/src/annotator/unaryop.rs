@@ -400,7 +400,16 @@ fn init_someobject_defaults(
             apply: Box::new(|ann, hl| {
                 let s_self = ann.annotation(&hl.args[0]).expect("getattr: self unbound");
                 let s_attr = ann.annotation(&hl.args[1]).expect("getattr: attr unbound");
-                let Some(ConstValue::Str(attr)) = s_attr.const_().cloned() else {
+                // unaryop.py:280-285 `_getattr_(s_obj, s_attr)` — `if
+                // s_attr.is_constant() and isinstance(s_attr.const, str)`.
+                // Upstream Python 2 `str` is bytes; pyre uses
+                // [`ConstValue::as_pystr`] so a unicode literal does not
+                // sneak through.
+                let Some(attr) = s_attr
+                    .const_()
+                    .and_then(ConstValue::as_pystr)
+                    .map(str::to_owned)
+                else {
                     panic!(
                         "AnnotatorError: getattr({:?}, {:?}) has non-constant argument",
                         s_self, s_attr
@@ -466,7 +475,15 @@ fn init_someobject_defaults(
                 let SomeValue::PBC(pbc) = &s_self else {
                     unreachable!("PBC-tag dispatch must carry SomePBC, got {s_self:?}");
                 };
-                let Some(ConstValue::Str(attr)) = s_attr.const_().cloned() else {
+                // unaryop.py:972-980 — `SomePBC.getattr(self, s_attr)`.
+                // Upstream `assert s_attr.is_constant()` plus the
+                // downstream `s_attr.const == '__name__'` comparison
+                // both presume a Python 2 `str` (bytes) attribute name.
+                let Some(attr) = s_attr
+                    .const_()
+                    .and_then(ConstValue::as_pystr)
+                    .map(str::to_owned)
+                else {
                     panic!(
                         "AnnotatorError: pbc getattr({:?}, {:?}) has non-constant argument",
                         s_self, s_attr
@@ -1696,10 +1713,9 @@ fn init_somestring_overrides(
                 };
                 if s.is_constant() {
                     if let Some(c) = &s.inner.base.const_box {
-                        if let ConstValue::Str(v) = &c.value {
+                        if let ConstValue::ByteStr(v) = &c.value {
                             let mut i = SomeInteger::new(true, false);
-                            i.base.const_box =
-                                Some(Constant::new(ConstValue::Int(v.chars().count() as i64)));
+                            i.base.const_box = Some(Constant::new(ConstValue::Int(v.len() as i64)));
                             return SomeValue::Integer(i);
                         }
                     }
@@ -1940,7 +1956,8 @@ fn const_str_of(sv: &SomeValue) -> Option<String> {
         _ => return None,
     };
     cb.as_ref().and_then(|c| match &c.value {
-        ConstValue::Str(v) => Some(v.clone()),
+        ConstValue::ByteStr(v) => String::from_utf8(v.clone()).ok(),
+        ConstValue::UniStr(v) => Some(v.clone()),
         _ => None,
     })
 }
@@ -2068,12 +2085,10 @@ pub fn str_method_join(
         //     return immutablevalue("")
         // The SomeString branch routes through bookkeeper.immutablevalue
         // so no_nul / const_box carry the same invariants as any other
-        // empty-string constant. The Rust port has no ConstValue::UStr
-        // yet, so the SomeUnicodeString branch mirrors the same shape
-        // inline until unicode-const support lands.
+        // empty-string constant.
         let s_empty = ann
             .bookkeeper
-            .immutablevalue(&ConstValue::Str(String::new()))
+            .immutablevalue(&ConstValue::byte_str(""))
             .expect("immutablevalue(\"\") must succeed");
         return match s_self {
             SomeValue::UnicodeString(_) => {
@@ -3490,8 +3505,7 @@ pub(crate) fn decode_call_shape(
         ConstValue::Tuple(keys) => keys
             .iter()
             .map(|k| match k {
-                ConstValue::Str(s) => Some(s.clone()),
-                _ => None,
+                value => value.as_text().map(str::to_owned),
             })
             .collect::<Option<Vec<_>>>()?,
         _ => return None,
@@ -3512,14 +3526,7 @@ pub(crate) fn decode_call_shape(
 fn encode_call_shape(shape: &super::super::flowspace::argument::CallShape) -> ConstValue {
     ConstValue::Tuple(vec![
         ConstValue::Int(shape.shape_cnt as i64),
-        ConstValue::Tuple(
-            shape
-                .shape_keys
-                .iter()
-                .cloned()
-                .map(ConstValue::Str)
-                .collect(),
-        ),
+        ConstValue::Tuple(shape.shape_keys.iter().map(ConstValue::byte_str).collect()),
         ConstValue::Bool(shape.shape_star),
     ])
 }
@@ -3607,7 +3614,7 @@ fn init_instance_single_transform(
                 OpKind::GetAttr,
                 vec![
                     v_arg,
-                    Hlvalue::Constant(Constant::new(ConstValue::Str("__len__".into()))),
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__len__"))),
                 ],
             );
             let getattr_result = Hlvalue::Variable(get_len.result.clone());
@@ -3626,7 +3633,7 @@ fn init_instance_single_transform(
                 OpKind::GetAttr,
                 vec![
                     v_arg,
-                    Hlvalue::Constant(Constant::new(ConstValue::Str("__iter__".into()))),
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__iter__"))),
                 ],
             );
             let getattr_result = Hlvalue::Variable(get_iter.result.clone());
@@ -3645,7 +3652,7 @@ fn init_instance_single_transform(
                 OpKind::GetAttr,
                 vec![
                     v_arg,
-                    Hlvalue::Constant(Constant::new(ConstValue::Str("next".into()))),
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("next"))),
                 ],
             );
             let getattr_result = Hlvalue::Variable(get_next.result.clone());
@@ -3666,7 +3673,7 @@ fn init_instance_single_transform(
                 OpKind::GetAttr,
                 vec![
                     v_obj,
-                    Hlvalue::Constant(Constant::new(ConstValue::Str("__getslice__".into()))),
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__getslice__"))),
                 ],
             );
             let getattr_result = Hlvalue::Variable(get_getslice.result.clone());
@@ -3688,7 +3695,7 @@ fn init_instance_single_transform(
                 OpKind::GetAttr,
                 vec![
                     v_obj,
-                    Hlvalue::Constant(Constant::new(ConstValue::Str("__setslice__".into()))),
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__setslice__"))),
                 ],
             );
             let getattr_result = Hlvalue::Variable(get_setslice.result.clone());
@@ -3714,7 +3721,7 @@ fn init_instance_single_transform(
                 OpKind::GetAttr,
                 vec![
                     v_ins,
-                    Hlvalue::Constant(Constant::new(ConstValue::Str("__contains__".into()))),
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__contains__"))),
                 ],
             );
             let getattr_result = Hlvalue::Variable(get_contains.result.clone());
@@ -3755,8 +3762,11 @@ fn init_instance_attr_transform(
             // upstream: `s_attr = annotator.annotation(v_attr)`.
             let s_attr = ann.annotation(v_attr)?;
             // upstream: `if not s_attr.is_constant() or not isinstance(s_attr.const, str): return`.
+            // `isinstance(x, str)` is Python 2 bytes-only — narrow with
+            // [`ConstValue::as_pystr`] to keep parity with the upstream
+            // short-circuit on unicode constants.
             let attr = match s_attr.const_() {
-                Some(ConstValue::Str(s)) => s.clone(),
+                Some(value) => value.as_pystr().map(str::to_owned)?,
                 _ => return None,
             };
             // upstream: `getters = _find_property_meth(annotator.annotation(v_obj), attr, 'fget')`.
@@ -3772,7 +3782,7 @@ fn init_instance_attr_transform(
                     OpKind::GetAttr,
                     vec![
                         v_obj,
-                        Hlvalue::Constant(Constant::new(ConstValue::Str(getter_name))),
+                        Hlvalue::Constant(Constant::new(ConstValue::byte_str(getter_name))),
                     ],
                 );
                 let getter_result = Hlvalue::Variable(get_getter.result.clone());
@@ -3796,7 +3806,7 @@ fn init_instance_attr_transform(
             let v_value = args[2].clone();
             let s_attr = ann.annotation(v_attr)?;
             let attr = match s_attr.const_() {
-                Some(ConstValue::Str(s)) => s.clone(),
+                Some(value) => value.as_text().map(str::to_owned)?,
                 _ => return None,
             };
             let s_obj = ann.annotation(&v_obj)?;
@@ -3810,7 +3820,7 @@ fn init_instance_attr_transform(
                     OpKind::GetAttr,
                     vec![
                         v_obj,
-                        Hlvalue::Constant(Constant::new(ConstValue::Str(setter_name))),
+                        Hlvalue::Constant(Constant::new(ConstValue::byte_str(setter_name))),
                     ],
                 );
                 let setter_result = Hlvalue::Variable(get_setter.result.clone());
@@ -3868,7 +3878,7 @@ mod tests {
             OpKind::GetAttr,
             vec![
                 Hlvalue::Variable(v),
-                Hlvalue::Constant(Constant::new(ConstValue::Str("append".into()))),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("append"))),
             ],
         );
 
@@ -3989,7 +3999,7 @@ mod tests {
                 std::collections::BTreeMap::new(),
             )),
         );
-        let v_attr_const = Hlvalue::Constant(Constant::new(ConstValue::Str("prop".into())));
+        let v_attr_const = Hlvalue::Constant(Constant::new(ConstValue::byte_str("prop")));
         let hl = HLOperation::new(
             OpKind::GetAttr,
             vec![Hlvalue::Variable(v_obj), v_attr_const],
@@ -4018,7 +4028,7 @@ mod tests {
         );
         let mut v_value = Variable::named("val");
         ann.setbinding(&mut v_value, SomeValue::Integer(SomeInteger::default()));
-        let v_attr_const = Hlvalue::Constant(Constant::new(ConstValue::Str("prop".into())));
+        let v_attr_const = Hlvalue::Constant(Constant::new(ConstValue::byte_str("prop")));
         let hl = HLOperation::new(
             OpKind::SetAttr,
             vec![
@@ -4075,7 +4085,7 @@ mod tests {
                 std::collections::BTreeMap::new(),
             )),
         );
-        let v_attr_const = Hlvalue::Constant(Constant::new(ConstValue::Str("prop".into())));
+        let v_attr_const = Hlvalue::Constant(Constant::new(ConstValue::byte_str("prop")));
         let hl = HLOperation::new(
             OpKind::GetAttr,
             vec![Hlvalue::Variable(v_obj), v_attr_const],
@@ -4089,7 +4099,7 @@ mod tests {
         let target_attr = &new_ops[0].args[1];
         match target_attr {
             Hlvalue::Constant(c) => match &c.value {
-                ConstValue::Str(s) => assert_eq!(s, "prop__getter__"),
+                value if value.string_eq("prop__getter__") => {}
                 other => panic!("expected Str, got {other:?}"),
             },
             other => panic!("expected Constant attr, got {other:?}"),
@@ -4496,7 +4506,7 @@ mod tests {
     fn consider_somestring_len_const_returns_const_int() {
         // unaryop.py:720-725 — len(const "abc") → SomeInteger(const=3).
         let mut s = SomeString::new(false, false);
-        s.inner.base.const_box = Some(Constant::new(ConstValue::Str("abc".into())));
+        s.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("abc")));
         let (hl, ann) = hl1(OpKind::Len, SomeValue::String(s));
         let r = hl.consider(&ann).unwrap();
         match r {
@@ -4658,7 +4668,7 @@ mod tests {
             OpKind::GetAttr,
             vec![
                 Hlvalue::Variable(v_cls),
-                Hlvalue::Constant(Constant::new(ConstValue::Str("__name__".into()))),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("__name__"))),
             ],
         );
         let r = hl.consider(&ann).expect("class __name__ getattr");
@@ -4684,7 +4694,7 @@ mod tests {
             OpKind::GetAttr,
             vec![
                 Hlvalue::Variable(v_cls),
-                Hlvalue::Constant(Constant::new(ConstValue::Str("N".into()))),
+                Hlvalue::Constant(Constant::new(ConstValue::byte_str("N"))),
             ],
         );
         let r = hl.consider(&ann).expect("class const attr getattr");
@@ -4724,7 +4734,7 @@ mod tests {
             SomeValue::String(SomeString::new(false, false)),
         );
         let mut nul_char = super::super::model::SomeChar::new(false);
-        nul_char.inner.base.const_box = Some(Constant::new(ConstValue::Str("\0".into())));
+        nul_char.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("\0")));
         let mut v_char = Variable::named("c");
         ann.setbinding(&mut v_char, SomeValue::Char(nul_char));
         let hl = HLOperation::new(
@@ -4758,7 +4768,7 @@ mod tests {
             SomeValue::UnicodeString(SomeUnicodeString::new(false, false)),
         );
         let mut nul_cp = super::super::model::SomeUnicodeCodePoint::new(false);
-        nul_cp.inner.base.const_box = Some(Constant::new(ConstValue::Str("\0".into())));
+        nul_cp.inner.base.const_box = Some(Constant::new(ConstValue::uni_str("\0")));
         let mut v_char = Variable::named("c");
         ann.setbinding(&mut v_char, SomeValue::UnicodeCodePoint(nul_cp));
         let hl = HLOperation::new(

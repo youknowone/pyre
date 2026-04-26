@@ -365,11 +365,15 @@ impl InstanceSource {
                 continue;
             }
             match slots {
-                ConstValue::Str(slot) => result.push(slot),
+                value if value.as_text().is_some() => {
+                    result.push(value.as_text().unwrap().to_string())
+                }
                 ConstValue::Tuple(items) | ConstValue::List(items) => {
                     for item in items {
                         match item {
-                            ConstValue::Str(slot) => result.push(slot),
+                            value if value.as_text().is_some() => {
+                                result.push(value.as_text().unwrap().to_string())
+                            }
                             _ => {
                                 return Err(AnnotatorError::new(
                                     "__slots__ must be a sequence of strings",
@@ -722,7 +726,8 @@ impl ClassDesc {
         // classdesc.py:507-510 — _annspecialcase_ is unsupported.
         if let Some(tag) = cls.class_get("_annspecialcase_") {
             let truthy = match &tag {
-                ConstValue::Str(s) => !s.is_empty(),
+                ConstValue::ByteStr(s) => !s.is_empty(),
+                ConstValue::UniStr(s) => !s.is_empty(),
                 ConstValue::Bool(b) => *b,
                 ConstValue::None => false,
                 _ => true,
@@ -1908,7 +1913,7 @@ impl ClassDesc {
             Some(v) => v,
             None => return Ok(HashSet::new()),
         };
-        if let ConstValue::Str(_) = &v {
+        if v.as_text().is_some() {
             return Err(AnnotatorError::new(format!(
                 "In class {:?}, '_immutable_fields_' must be a sequence of \
                  attribute names, not a string.",
@@ -1929,7 +1934,9 @@ impl ClassDesc {
     ) -> Result<Vec<String>, AnnotatorError> {
         let items: &[ConstValue] = match v {
             ConstValue::Tuple(items) | ConstValue::List(items) => items,
-            ConstValue::Str(s) => return Ok(vec![s.clone()]),
+            value if value.as_text().is_some() => {
+                return Ok(vec![value.as_text().unwrap().to_string()]);
+            }
             _ => {
                 return Err(AnnotatorError::new(format!(
                     "{:?} must be a sequence of names",
@@ -1940,7 +1947,7 @@ impl ClassDesc {
         items
             .iter()
             .map(|item| match item {
-                ConstValue::Str(s) => Ok(s.clone()),
+                value if value.as_text().is_some() => Ok(value.as_text().unwrap().to_string()),
                 _ => Err(AnnotatorError::new(format!(
                     "{:?} must be a sequence of strings",
                     decl_name
@@ -2974,11 +2981,11 @@ mod tests {
     fn instance_source_all_instance_attributes_collects_instance_dict_and_slots() {
         let bk = make_bk();
         let base = HostObject::new_class("pkg.Base", vec![]);
-        base.class_set("__slots__", ConstValue::Str("base_slot".into()));
+        base.class_set("__slots__", ConstValue::byte_str("base_slot"));
         let cls = HostObject::new_class("pkg.X", vec![base]);
         cls.class_set(
             "__slots__",
-            ConstValue::Tuple(vec![ConstValue::Str("slot_a".into())]),
+            ConstValue::Tuple(vec![ConstValue::byte_str("slot_a")]),
         );
         let obj = HostObject::new_instance(cls, vec![]);
         obj.instance_set("dyn", ConstValue::Int(1));
@@ -3120,7 +3127,7 @@ mod tests {
     fn classdesc_new_rejects_annspecialcase() {
         let bk = make_bk();
         let cls = HostObject::new_class("pkg.OldSpec", vec![]);
-        cls.class_set("_annspecialcase_", ConstValue::Str("memo".into()));
+        cls.class_set("_annspecialcase_", ConstValue::byte_str("memo"));
         let err = ClassDesc::new(&bk, cls, None, None, None).unwrap_err();
         assert!(err.msg.as_deref().unwrap().contains("_annspecialcase_"));
     }
@@ -3159,10 +3166,7 @@ mod tests {
         let cls = HostObject::new_class("pkg.Immut", vec![]);
         cls.class_set(
             "_immutable_fields_",
-            ConstValue::Tuple(vec![
-                ConstValue::Str("a".into()),
-                ConstValue::Str("b".into()),
-            ]),
+            ConstValue::Tuple(vec![ConstValue::byte_str("a"), ConstValue::byte_str("b")]),
         );
         let desc_rc = ClassDesc::new(&bk, cls, None, None, None).unwrap();
         let cd = desc_rc.borrow();
@@ -3174,7 +3178,7 @@ mod tests {
     fn classdesc_new_rejects_str_immutable_fields() {
         let bk = make_bk();
         let cls = HostObject::new_class("pkg.ImmutStr", vec![]);
-        cls.class_set("_immutable_fields_", ConstValue::Str("justone".into()));
+        cls.class_set("_immutable_fields_", ConstValue::byte_str("justone"));
         let err = ClassDesc::new(&bk, cls, None, None, None).unwrap_err();
         assert!(err.msg.as_deref().unwrap().contains("not a string"));
     }
@@ -3212,10 +3216,7 @@ mod tests {
         let cls = HostObject::new_class("pkg.Slotted", vec![]);
         cls.class_set(
             "__slots__",
-            ConstValue::Tuple(vec![
-                ConstValue::Str("x".into()),
-                ConstValue::Str("y".into()),
-            ]),
+            ConstValue::Tuple(vec![ConstValue::byte_str("x"), ConstValue::byte_str("y")]),
         );
         let desc_rc = ClassDesc::new(&bk, cls, None, None, None).unwrap();
         let cd = desc_rc.borrow();
@@ -3446,7 +3447,7 @@ mod tests {
         let cls = HostObject::new_class("pkg.C", vec![]);
         cls.class_set(
             "_immutable_fields_",
-            ConstValue::Tuple(vec![ConstValue::Str("lst[*]".to_string())]),
+            ConstValue::Tuple(vec![ConstValue::byte_str("lst[*]")]),
         );
         let desc = ClassDesc::new(&bk, cls, None, None, None).unwrap();
         let s_list = SomeValue::List(SomeList::new(ListDef::new(

@@ -1123,7 +1123,7 @@ mod tests {
             ConstValue::Tuple(
                 shape_keys
                     .iter()
-                    .map(|k| ConstValue::Str((*k).to_string()))
+                    .map(|k| ConstValue::byte_str(*k))
                     .collect(),
             ),
             ConstValue::Bool(shape_star),

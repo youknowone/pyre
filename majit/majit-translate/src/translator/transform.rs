@@ -375,7 +375,7 @@ pub fn cutoff_alwaysraising_block(ann: &RPythonAnnotator, block: &BlockRef) {
         assert_err_class.clone(),
     )));
     let err_instance =
-        HostObject::new_instance(assert_err_class.clone(), vec![ConstValue::Str(msg.clone())]);
+        HostObject::new_instance(assert_err_class.clone(), vec![ConstValue::byte_str(msg)]);
     let c2 = Hlvalue::Constant(Constant::new(ConstValue::HostObject(err_instance)));
 
     // upstream: `errlink = Link([c1, c2], graph.exceptblock)`.
@@ -869,7 +869,8 @@ fn is_valid_contains_key(cv: &ConstValue) -> bool {
         ConstValue::Bool(_)
         | ConstValue::Int(_)
         | ConstValue::Float(_)
-        | ConstValue::Str(_)
+        | ConstValue::ByteStr(_)
+        | ConstValue::UniStr(_)
         | ConstValue::None
         | ConstValue::HostObject(_)
         | ConstValue::Function(_) => true,

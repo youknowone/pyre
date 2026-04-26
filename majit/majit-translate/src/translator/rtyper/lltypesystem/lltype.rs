@@ -220,18 +220,9 @@ impl LowLevelType {
             LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
                 matches!(value, ConstValue::Float(_))
             }
-            // upstream `typeOf(value)` asserts `len(value) == 1` for
-            // both `str` (`Char`, `lltype.py:837-839`) and `unicode`
-            // (`UniChar`, `lltype.py:840-842`). `_contains_value` then
-            // routes through `isCompatibleType(typeOf(value), self)`
-            // (`lltype.py:194-197`), so multi-char strings are
-            // rejected at this layer upstream. Pyre's `ConstValue::Str`
-            // does not yet distinguish byte from unicode (cross-crate
-            // infrastructure gap, see `rstr.rs` module doc), so the
-            // Char vs UniChar boundary stays loose in this slice; the
-            // length invariant is enforced.
-            LowLevelType::Char | LowLevelType::UniChar => {
-                matches!(value, ConstValue::Str(s) if s.chars().count() == 1)
+            LowLevelType::Char => matches!(value, ConstValue::ByteStr(s) if s.len() == 1),
+            LowLevelType::UniChar => {
+                matches!(value, ConstValue::UniStr(s) if s.chars().count() == 1)
             }
             // Address is a Primitive with `_defl = NULL`. Concrete
             // values are llmemory.fakeaddress instances; pyre carries
@@ -2123,7 +2114,7 @@ impl StructType {
             return true;
         }
         if let Some(ConstValue::Dict(fields)) = self._hints.get("immutable_fields")
-            && fields.contains_key(&ConstValue::Str(field.to_string()))
+            && fields.contains_key(&ConstValue::byte_str(field))
         {
             return true;
         }
@@ -3290,12 +3281,15 @@ where
     let mut attrs = HashMap::new();
     if let Some(func) = &graph_b.func {
         attrs = func._llfnobjattrs_.clone();
-        if let Some(ConstValue::Str(forced_name)) = attrs.remove("_name") {
+        if let Some(forced_name) = attrs.remove("_name").and_then(ConstValue::into_text) {
             name = forced_name;
         }
         if let Some(forced_callable) = attrs.remove("_callable") {
             callable = Some(match forced_callable {
-                ConstValue::Str(name) => name,
+                ConstValue::ByteStr(name) => {
+                    String::from_utf8(name).unwrap_or_else(|err| format!("{:?}", err.into_bytes()))
+                }
+                ConstValue::UniStr(name) => name,
                 ConstValue::Function(func) => func.name,
                 ConstValue::HostObject(obj) => obj.qualname().to_string(),
                 other => format!("{other:?}"),
@@ -3784,13 +3778,11 @@ mod tests {
             Hlvalue::Variable(ret),
         )));
         let mut func = GraphFunc::new("py_func", Constant::new(ConstValue::Dict(HashMap::new())));
-        func._llfnobjattrs_.insert(
-            "_name".to_string(),
-            ConstValue::Str("forced_name".to_string()),
-        );
+        func._llfnobjattrs_
+            .insert("_name".to_string(), ConstValue::byte_str("forced_name"));
         func._llfnobjattrs_.insert(
             "_callable".to_string(),
-            ConstValue::Str("forced_callable".to_string()),
+            ConstValue::byte_str("forced_callable"),
         );
         func._llfnobjattrs_
             .insert("extra".to_string(), ConstValue::Int(7));
@@ -3837,23 +3829,20 @@ mod tests {
     }
 
     #[test]
-    fn lowleveltype_char_unichar_contains_value_enforces_single_char_length() {
+    fn lowleveltype_char_unichar_contains_value_enforces_type_and_single_char_length() {
         use crate::flowspace::model::ConstValue;
-        // upstream typeOf (`lltype.py:837-842`) asserts `len(value) == 1`
-        // on str/unicode before returning Char/UniChar. _contains_value
-        // routes through isCompatibleType(typeOf(value), self), so
-        // multi-char strings fail at this layer upstream.
-        assert!(LowLevelType::Char.contains_value(&ConstValue::Str("a".to_string())));
-        assert!(LowLevelType::Char.contains_value(&ConstValue::Str("π".to_string())));
-        assert!(!LowLevelType::Char.contains_value(&ConstValue::Str("ab".to_string())));
-        assert!(!LowLevelType::Char.contains_value(&ConstValue::Str(String::new())));
+        assert!(LowLevelType::Char.contains_value(&ConstValue::byte_str(b"a")));
+        assert!(!LowLevelType::Char.contains_value(&ConstValue::byte_str(b"ab")));
+        assert!(!LowLevelType::Char.contains_value(&ConstValue::byte_str(b"")));
+        assert!(!LowLevelType::Char.contains_value(&ConstValue::uni_str("a")));
 
-        assert!(LowLevelType::UniChar.contains_value(&ConstValue::Str("a".to_string())));
-        assert!(LowLevelType::UniChar.contains_value(&ConstValue::Str("π".to_string())));
-        assert!(!LowLevelType::UniChar.contains_value(&ConstValue::Str("ab".to_string())));
-        assert!(!LowLevelType::UniChar.contains_value(&ConstValue::Str(String::new())));
+        assert!(LowLevelType::UniChar.contains_value(&ConstValue::uni_str("a")));
+        assert!(LowLevelType::UniChar.contains_value(&ConstValue::uni_str("π")));
+        assert!(!LowLevelType::UniChar.contains_value(&ConstValue::uni_str("πi")));
+        assert!(!LowLevelType::UniChar.contains_value(&ConstValue::uni_str("")));
+        assert!(!LowLevelType::UniChar.contains_value(&ConstValue::byte_str(b"a")));
 
-        // Non-Str variants stay rejected.
+        // Non-string variants stay rejected.
         assert!(!LowLevelType::Char.contains_value(&ConstValue::Int(0)));
         assert!(!LowLevelType::UniChar.contains_value(&ConstValue::Bool(false)));
     }

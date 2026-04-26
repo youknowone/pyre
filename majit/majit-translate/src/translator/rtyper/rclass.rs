@@ -323,7 +323,8 @@ fn const_truthy(value: &ConstValue) -> bool {
         ConstValue::Bool(flag) => *flag,
         ConstValue::Int(value) => *value != 0,
         ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
-        ConstValue::Str(text) => !text.is_empty(),
+        ConstValue::ByteStr(text) => !text.is_empty(),
+        ConstValue::UniStr(text) => !text.is_empty(),
         ConstValue::Tuple(items) => !items.is_empty(),
         ConstValue::List(items) => !items.is_empty(),
         ConstValue::Dict(items) => !items.is_empty(),
@@ -372,13 +373,9 @@ fn classdesc_get_param(
 }
 
 pub(super) fn getgcflavor(classdef: &Rc<RefCell<ClassDef>>) -> Result<Flavor, TyperError> {
-    let alloc_flavor = classdesc_get_param(
-        classdef,
-        "_alloc_flavor_",
-        ConstValue::Str("gc".to_string()),
-        true,
-    );
-    let ConstValue::Str(alloc_flavor) = alloc_flavor else {
+    let alloc_flavor =
+        classdesc_get_param(classdef, "_alloc_flavor_", ConstValue::byte_str("gc"), true);
+    let Some(alloc_flavor) = alloc_flavor.as_text() else {
         return Err(TyperError::message(
             "classdesc.get_param('_alloc_flavor_') must return a string",
         ));
@@ -1096,10 +1093,8 @@ impl ClassRepr {
     ) -> Result<Variable, TyperError> {
         if let Some((mangled_name, r)) = self.clsfields.borrow().get(attr).cloned() {
             let v_vtable = self.fromtypeptr(vcls, llops)?;
-            let cname = Constant::with_concretetype(
-                ConstValue::Str(mangled_name.clone()),
-                LowLevelType::Void,
-            );
+            let cname =
+                Constant::with_concretetype(ConstValue::byte_str(mangled_name), LowLevelType::Void);
             return Ok(llops
                 .genop(
                     "getfield",
@@ -1143,10 +1138,8 @@ impl ClassRepr {
     ) -> Result<(), TyperError> {
         if let Some((mangled_name, _r)) = self.clsfields.borrow().get(attr).cloned() {
             let v_vtable = self.fromtypeptr(vcls, llops)?;
-            let cname = Constant::with_concretetype(
-                ConstValue::Str(mangled_name.clone()),
-                LowLevelType::Void,
-            );
+            let cname =
+                Constant::with_concretetype(ConstValue::byte_str(mangled_name), LowLevelType::Void);
             llops.genop(
                 "setfield",
                 vec![
@@ -1203,7 +1196,7 @@ impl ClassRepr {
             })?;
         let v_vtable = self.fromtypeptr(vcls, llops)?;
         let cname =
-            Constant::with_concretetype(ConstValue::Str(mangled_name.clone()), LowLevelType::Void);
+            Constant::with_concretetype(ConstValue::byte_str(mangled_name), LowLevelType::Void);
         Ok(llops
             .genop(
                 "getfield",
@@ -3892,7 +3885,7 @@ mod tests {
             .classdesc
             .borrow()
             .pyobj
-            .class_set("_alloc_flavor_", ConstValue::Str("raw".to_string()));
+            .class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
         let repr =
             getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr raw");
         assert_eq!(repr.gcflavor(), Flavor::Raw);
@@ -3925,7 +3918,7 @@ mod tests {
             .classdesc
             .borrow()
             .pyobj
-            .class_set("_alloc_flavor_", ConstValue::Str("raw".to_string()));
+            .class_set("_alloc_flavor_", ConstValue::byte_str("raw"));
 
         let repr = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("raw repr");
         assert_eq!(repr.gcflavor(), Flavor::Raw);

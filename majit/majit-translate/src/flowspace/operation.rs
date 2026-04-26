@@ -1059,7 +1059,7 @@ impl HLOperation {
         let (Hlvalue::Constant(w_obj), Hlvalue::Constant(w_name)) = (w_obj_hl, w_name_hl) else {
             return Ok(None);
         };
-        let ConstValue::Str(name) = &w_name.value else {
+        let Some(name) = w_name.value.as_text() else {
             return Ok(None);
         };
         let name_str = name.to_string();
@@ -1193,7 +1193,9 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         //     helper that resolves bound methods via
         //     `HOST_ENV.lookup_builtin`.
         (OpKind::GetAttr, 2) => {
-            if let [ConstValue::HostObject(obj), ConstValue::Str(name)] = args {
+            if let [ConstValue::HostObject(obj), name] = args
+                && let Some(name) = name.as_text()
+            {
                 if let Some(value) = obj.module_get(name) {
                     return Some(ConstValue::HostObject(value));
                 }
@@ -1243,10 +1245,14 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
             Some(ConstValue::float(if *b { 1.0 } else { 0.0 }))
         }
         (OpKind::Long, [ConstValue::Int(n)]) => Some(ConstValue::Int(*n)),
-        (OpKind::Ord, [ConstValue::Str(s)]) if s.chars().count() == 1 => {
+        (OpKind::Ord, [ConstValue::ByteStr(s)]) if s.len() == 1 => {
+            Some(ConstValue::Int(s[0] as i64))
+        }
+        (OpKind::Ord, [ConstValue::UniStr(s)]) if s.chars().count() == 1 => {
             s.chars().next().map(|c| ConstValue::Int(c as i64))
         }
-        (OpKind::Len, [ConstValue::Str(s)]) => Some(ConstValue::Int(s.chars().count() as i64)),
+        (OpKind::Len, [ConstValue::ByteStr(s)]) => Some(ConstValue::Int(s.len() as i64)),
+        (OpKind::Len, [ConstValue::UniStr(s)]) => Some(ConstValue::Int(s.chars().count() as i64)),
         (OpKind::Len, [ConstValue::Tuple(items) | ConstValue::List(items)]) => {
             Some(ConstValue::Int(items.len() as i64))
         }
@@ -1339,8 +1345,13 @@ pub(crate) fn pyfunc(kind: OpKind, args: &[&ConstValue]) -> Option<ConstValue> {
         }
 
         // --- binary concat (str / tuple / list) ---
-        (OpKind::Add, [ConstValue::Str(a), ConstValue::Str(b)]) => {
-            Some(ConstValue::Str(format!("{a}{b}")))
+        (OpKind::Add, [ConstValue::ByteStr(a), ConstValue::ByteStr(b)]) => {
+            let mut out = a.clone();
+            out.extend_from_slice(b);
+            Some(ConstValue::ByteStr(out))
+        }
+        (OpKind::Add, [ConstValue::UniStr(a), ConstValue::UniStr(b)]) => {
+            Some(ConstValue::uni_str(format!("{a}{b}")))
         }
         (OpKind::Add, [ConstValue::Tuple(a), ConstValue::Tuple(b)]) => {
             let mut out = a.clone();
@@ -1377,7 +1388,8 @@ fn cmp_fold(a: &ConstValue, b: &ConstValue) -> Option<std::cmp::Ordering> {
         (ConstValue::Float(x), ConstValue::Float(y)) => {
             f64::from_bits(*x).partial_cmp(&f64::from_bits(*y))
         }
-        (ConstValue::Str(x), ConstValue::Str(y)) => Some(x.cmp(y)),
+        (ConstValue::ByteStr(x), ConstValue::ByteStr(y)) => Some(x.cmp(y)),
+        (ConstValue::UniStr(x), ConstValue::UniStr(y)) => Some(x.cmp(y)),
         (ConstValue::Bool(x), ConstValue::Bool(y)) => Some(x.cmp(y)),
         _ => None,
     }
@@ -1998,7 +2010,7 @@ mod tests {
     }
 
     fn cs(s: &str) -> Hlvalue {
-        c(ConstValue::Str(s.to_string()))
+        c(ConstValue::byte_str(s))
     }
 
     fn fold(kind: OpKind, args: Vec<Hlvalue>) -> Option<ConstValue> {
@@ -2266,7 +2278,7 @@ mod tests {
         let Some(Hlvalue::Constant(constant)) = folded else {
             panic!("expected Constant result");
         };
-        assert_eq!(constant.value, ConstValue::Str("user_fn".to_string()));
+        assert_eq!(constant.value, ConstValue::byte_str("user_fn"));
     }
 
     #[test]
@@ -2302,7 +2314,7 @@ mod tests {
         let Some(Hlvalue::Constant(name_constant)) = folded2 else {
             panic!("expected Constant result");
         };
-        assert_eq!(name_constant.value, ConstValue::Str("int".to_string()));
+        assert_eq!(name_constant.value, ConstValue::byte_str("int"));
     }
 
     #[test]
@@ -2325,10 +2337,7 @@ mod tests {
         let Some(Hlvalue::Constant(module_constant)) = folded2 else {
             panic!("expected Constant result");
         };
-        assert_eq!(
-            module_constant.value,
-            ConstValue::Str("__builtin__".to_string())
-        );
+        assert_eq!(module_constant.value, ConstValue::byte_str("__builtin__"));
     }
 
     #[test]
@@ -2343,7 +2352,7 @@ mod tests {
         let Some(Hlvalue::Constant(name_constant)) = folded else {
             panic!("expected Constant result");
         };
-        assert_eq!(name_constant.value, ConstValue::Str("user_fn".to_string()));
+        assert_eq!(name_constant.value, ConstValue::byte_str("user_fn"));
     }
 
     #[test]
@@ -2358,10 +2367,7 @@ mod tests {
         let Some(Hlvalue::Constant(module_constant)) = folded else {
             panic!("expected Constant result");
         };
-        assert_eq!(
-            module_constant.value,
-            ConstValue::Str("pkg.demo".to_string())
-        );
+        assert_eq!(module_constant.value, ConstValue::byte_str("pkg.demo"));
     }
 
     #[test]
@@ -2414,7 +2420,7 @@ mod tests {
         let globals = Constant::new(ConstValue::Dict(HashMap::new()));
         let mut graph_func = crate::flowspace::model::GraphFunc::new("pkg.demo.user_fn", globals);
         graph_func.defaults = vec![Constant::new(ConstValue::Int(7))];
-        graph_func.closure = vec![Constant::new(ConstValue::Str("cell".to_string()))];
+        graph_func.closure = vec![Constant::new(ConstValue::byte_str("cell"))];
         let func = ConstValue::Function(Box::new(graph_func));
 
         let op_defaults =
@@ -2439,7 +2445,7 @@ mod tests {
         };
         assert_eq!(
             closure_constant.value,
-            ConstValue::Tuple(vec![ConstValue::Str("cell".to_string())])
+            ConstValue::Tuple(vec![ConstValue::byte_str("cell")])
         );
     }
 
@@ -2589,7 +2595,7 @@ mod tests {
     fn constfold_string_and_tuple_concat() {
         assert_eq!(
             fold(OpKind::Add, vec![cs("hi"), cs(" there")]),
-            Some(ConstValue::Str("hi there".into()))
+            Some(ConstValue::byte_str("hi there"))
         );
         assert_eq!(
             fold(
@@ -2654,7 +2660,7 @@ mod tests {
             Some(ConstValue::Tuple(vec![
                 ConstValue::Int(1),
                 ConstValue::Int(2),
-                ConstValue::Str("x".into()),
+                ConstValue::byte_str("x"),
             ]))
         );
         // empty tuple.

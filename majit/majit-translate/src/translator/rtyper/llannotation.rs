@@ -216,7 +216,11 @@ impl SomePtr {
                 self.ll_ptrtype
             )));
         }
-        let Some(ConstValue::Str(attr)) = s_attr.const_() else {
+        // lltype.py:1531-1548 `SomePtr.getattr` — field-name lookups
+        // against the example struct expect Python 2 `str` (bytes)
+        // identifiers. Narrow with [`ConstValue::as_pystr`] so a
+        // unicode literal doesn't reach `_lookup_adtmeth`.
+        let Some(attr) = s_attr.const_().and_then(ConstValue::as_pystr) else {
             panic!(
                 "SomePtr.getattr expects a constant string field-name, got {:?}",
                 s_attr.const_()
@@ -266,7 +270,7 @@ impl SomePtr {
                 self.ll_ptrtype
             )));
         }
-        let Some(ConstValue::Str(attr)) = s_attr.const_() else {
+        let Some(attr) = s_attr.const_().and_then(ConstValue::as_text) else {
             panic!(
                 "SomePtr.setattr expects a constant string field-name, got {:?}",
                 s_attr.const_()
@@ -333,7 +337,7 @@ impl SomeInteriorPtr {
                 self.ll_ptrtype
             )));
         }
-        let Some(ConstValue::Str(attr)) = s_attr.const_() else {
+        let Some(attr) = s_attr.const_().and_then(ConstValue::as_text) else {
             panic!(
                 "SomeInteriorPtr.getattr expects a constant string field-name, got {:?}",
                 s_attr.const_()
@@ -381,7 +385,7 @@ impl SomeInteriorPtr {
                 self.ll_ptrtype
             )));
         }
-        let Some(ConstValue::Str(attr)) = s_attr.const_() else {
+        let Some(attr) = s_attr.const_().and_then(ConstValue::as_text) else {
             panic!(
                 "SomeInteriorPtr.setattr expects a constant string field-name, got {:?}",
                 s_attr.const_()

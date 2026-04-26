@@ -1330,9 +1330,10 @@ fn string_string_add(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     //              result.const = str1.const + str2.const`
     if s1.is_immutable_constant() && s2.is_immutable_constant() {
         if let (Some(c1), Some(c2)) = (&s1.inner.base.const_box, &s2.inner.base.const_box) {
-            if let (ConstValue::Str(a), ConstValue::Str(b)) = (&c1.value, &c2.value) {
-                let combined = format!("{a}{b}");
-                result.inner.base.const_box = Some(Constant::new(ConstValue::Str(combined)));
+            if let (ConstValue::ByteStr(a), ConstValue::ByteStr(b)) = (&c1.value, &c2.value) {
+                let mut combined = a.clone();
+                combined.extend_from_slice(b);
+                result.inner.base.const_box = Some(Constant::new(ConstValue::ByteStr(combined)));
             }
         }
     }
@@ -2226,7 +2227,7 @@ fn unicode_family_add(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
                     .const_box
                     .as_ref()
                     .and_then(|c| match &c.value {
-                        ConstValue::Str(v) => Some(v.clone()),
+                        ConstValue::UniStr(v) => Some(v.clone()),
                         _ => None,
                     });
                 (s.inner.no_nul, c)
@@ -2238,7 +2239,7 @@ fn unicode_family_add(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
                     .const_box
                     .as_ref()
                     .and_then(|c| match &c.value {
-                        ConstValue::Str(v) => Some(v.clone()),
+                        ConstValue::UniStr(v) => Some(v.clone()),
                         _ => None,
                     });
                 (s.inner.no_nul, c)
@@ -2257,7 +2258,7 @@ fn unicode_family_add(ann: &RPythonAnnotator, hl: &HLOperation) -> SomeValue {
     let mut result = SomeUnicodeString::new(false, n1 && n2);
     if let (Some(a), Some(b)) = (c1, c2) {
         let combined = format!("{a}{b}");
-        result.inner.base.const_box = Some(Constant::new(ConstValue::Str(combined)));
+        result.inner.base.const_box = Some(Constant::new(ConstValue::uni_str(combined)));
     }
     SomeValue::UnicodeString(result)
 }
@@ -2855,7 +2856,7 @@ fn init_instance_object_transform(
                 OpKind::GetAttr,
                 vec![
                     v_ins,
-                    Hlvalue::Constant(Constant::new(ConstValue::Str("__getitem__".into()))),
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__getitem__"))),
                 ],
             );
             let getattr_result = Hlvalue::Variable(get_getitem.result.clone());
@@ -2877,7 +2878,7 @@ fn init_instance_object_transform(
                 OpKind::GetAttr,
                 vec![
                     v_ins,
-                    Hlvalue::Constant(Constant::new(ConstValue::Str("__setitem__".into()))),
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__setitem__"))),
                 ],
             );
             let getattr_result = Hlvalue::Variable(get_setitem.result.clone());
@@ -2898,7 +2899,7 @@ fn init_instance_object_transform(
                 OpKind::GetAttr,
                 vec![
                     v_ins,
-                    Hlvalue::Constant(Constant::new(ConstValue::Str("__delitem__".into()))),
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("__delitem__"))),
                 ],
             );
             let getattr_result = Hlvalue::Variable(get_delitem.result.clone());
@@ -3124,9 +3125,9 @@ mod tests {
         let mut v0 = Variable::named("s0");
         let mut v1 = Variable::named("s1");
         let mut s0 = SomeString::new(false, true);
-        s0.inner.base.const_box = Some(Constant::new(ConstValue::Str(c1.to_owned())));
+        s0.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(c1)));
         let mut s1 = SomeString::new(false, true);
-        s1.inner.base.const_box = Some(Constant::new(ConstValue::Str(c2.to_owned())));
+        s1.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(c2)));
         ann.setbinding(&mut v0, SomeValue::String(s0));
         ann.setbinding(&mut v1, SomeValue::String(s1));
         let hl = HLOperation::new(
@@ -3144,7 +3145,7 @@ mod tests {
         match r {
             SomeValue::String(s) => {
                 let c = s.inner.base.const_box.expect("const not propagated");
-                assert_eq!(c.value, ConstValue::Str("foobar".into()));
+                assert_eq!(c.value, ConstValue::byte_str("foobar"));
             }
             other => panic!("got {:?}", other),
         }

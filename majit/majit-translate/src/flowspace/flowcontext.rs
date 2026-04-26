@@ -227,13 +227,13 @@ fn exception_class_value(name: &str) -> Hlvalue {
 
 /// upstream `const(SomeException("msg"))` — instance HostObject 를
 /// 만들어 `Hlvalue` 로 감싼다. `message` 가 Some 이면
-/// `HostObject.instance_args()` 의 0번째가 `ConstValue::Str(message)`.
+/// `HostObject.instance_args()` 의 0번째가 byte-string message.
 fn exception_instance_value(name: &str, message: Option<String>) -> Hlvalue {
     let cls = HOST_ENV
         .lookup_builtin(name)
         .unwrap_or_else(|| panic!("HOST_ENV missing exception class {name}"));
     let args = message
-        .map(|m| vec![ConstValue::Str(m)])
+        .map(|m| vec![ConstValue::byte_str(m)])
         .unwrap_or_default();
     let inst = HostObject::new_instance(cls, args);
     Hlvalue::Constant(Constant::new(ConstValue::HostObject(inst)))
@@ -250,17 +250,15 @@ fn exception_message(w_exc_value: &Hlvalue) -> String {
     }) = w_exc_value
     {
         if let Some(args) = obj.instance_args() {
-            if let Some(ConstValue::Str(m)) = args.first() {
-                return m.clone();
+            if let Some(m) = args.first().and_then(ConstValue::as_text) {
+                return m.to_string();
             }
         }
     }
-    if let Hlvalue::Constant(Constant {
-        value: ConstValue::Str(message),
-        ..
-    }) = w_exc_value
+    if let Hlvalue::Constant(Constant { value, .. }) = w_exc_value
+        && let Some(message) = value.as_text()
     {
-        return message.clone();
+        return message.to_string();
     }
     "<not a constant message>".to_owned()
 }
@@ -366,14 +364,7 @@ fn load_attr_name_index(oparg: u32) -> usize {
 fn build_call_shape_constant(shape: &CallShape) -> Hlvalue {
     Hlvalue::Constant(Constant::new(ConstValue::Tuple(vec![
         ConstValue::Int(shape.shape_cnt as i64),
-        ConstValue::Tuple(
-            shape
-                .shape_keys
-                .iter()
-                .cloned()
-                .map(ConstValue::Str)
-                .collect(),
-        ),
+        ConstValue::Tuple(shape.shape_keys.iter().map(ConstValue::byte_str).collect()),
         ConstValue::Bool(shape.shape_star),
     ])))
 }
@@ -1095,7 +1086,11 @@ impl FlowContext {
     pub(crate) fn import_name(&mut self, args: &[ConstValue]) -> Result<Hlvalue, FlowContextError> {
         // upstream 시그니처 `(name, glob=None, loc=None, frm=None, level=-1)`.
         let name = match args.first() {
-            Some(ConstValue::Str(s)) => s.clone(),
+            Some(value) => value.as_text().map(str::to_owned).ok_or_else(|| {
+                FlowContextError::Flowing(FlowingError::new(
+                    "import_name: first argument must be a constant string",
+                ))
+            })?,
             _ => {
                 return Err(FlowContextError::Flowing(FlowingError::new(
                     "import_name: first argument must be a constant string",
@@ -1159,10 +1154,11 @@ impl FlowContext {
             }
         };
         let name = match &w_name {
-            Hlvalue::Constant(Constant {
-                value: ConstValue::Str(s),
-                ..
-            }) => s.clone(),
+            Hlvalue::Constant(c) => c.value.as_text().map(str::to_owned).ok_or_else(|| {
+                FlowContextError::Flowing(FlowingError::new(
+                    "import_from: w_name must be a constant string",
+                ))
+            })?,
             _ => {
                 return Err(FlowContextError::Flowing(FlowingError::new(
                     "import_from: w_name must be a constant string",
@@ -1651,8 +1647,8 @@ impl FlowContext {
     }
 
     pub fn getname_w(&self, index: usize) -> Result<Hlvalue, FlowContextError> {
-        Ok(Hlvalue::Constant(Constant::new(ConstValue::Str(
-            self.getname_u(index)?.to_owned(),
+        Ok(Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+            self.getname_u(index)?,
         ))))
     }
 
@@ -1663,11 +1659,12 @@ impl FlowContext {
                 ..
             }) => items
                 .into_iter()
-                .map(|item| match item {
-                    ConstValue::Str(name) => Ok(name),
-                    other => Err(FlowContextError::Flowing(FlowingError::new(format!(
-                        "CALL_KW expected tuple[str], got {other:?}"
-                    )))),
+                .map(|item| {
+                    item.as_text().map(str::to_owned).ok_or_else(|| {
+                        FlowContextError::Flowing(FlowingError::new(format!(
+                            "CALL_KW expected tuple[str], got {item:?}"
+                        )))
+                    })
                 })
                 .collect(),
             other => Err(FlowContextError::Flowing(FlowingError::new(format!(
@@ -1689,7 +1686,7 @@ impl FlowContext {
             }
             ConstantData::Float { value } => Ok(ConstValue::float(*value)),
             ConstantData::None => Ok(ConstValue::None),
-            ConstantData::Str { value } => Ok(ConstValue::Str(value.to_string())),
+            ConstantData::Str { value } => Ok(ConstValue::uni_str(value.to_string())),
             ConstantData::Tuple { elements } => {
                 let mut out = Vec::with_capacity(elements.len());
                 for element in elements {
@@ -1717,7 +1714,7 @@ impl FlowContext {
 
     fn find_global(&self, varname: &str) -> Result<Hlvalue, FlowContextError> {
         if let Some(globals) = self.w_globals.value.dict_items() {
-            if let Some(value) = globals.get(&ConstValue::Str(varname.to_string())) {
+            if let Some(value) = globals.get(&ConstValue::byte_str(varname)) {
                 return Ok(Hlvalue::Constant(Constant::new(value.clone())));
             }
         } else {
@@ -2573,23 +2570,22 @@ impl FlowContext {
                         matches!(
                             item,
                             Hlvalue::Constant(Constant {
-                                value: ConstValue::Str(_),
+                                value: ConstValue::ByteStr(_) | ConstValue::UniStr(_),
                                 ..
                             })
                         )
                     }) {
                         let mut out = String::new();
                         for item in items {
-                            let Hlvalue::Constant(Constant {
-                                value: ConstValue::Str(value),
-                                ..
-                            }) = item
-                            else {
+                            let Hlvalue::Constant(Constant { value, .. }) = item else {
                                 unreachable!();
                             };
-                            out.push_str(&value);
+                            let Some(value) = value.as_text() else {
+                                unreachable!();
+                            };
+                            out.push_str(value);
                         }
-                        Hlvalue::Constant(Constant::new(ConstValue::Str(out)))
+                        Hlvalue::Constant(Constant::new(ConstValue::uni_str(out)))
                     } else {
                         self.record_pure_op("buildstr", items)?
                     };
@@ -2748,10 +2744,13 @@ impl FlowContext {
                     let w_level = self.pop_hlvalue()?;
                     let w_modulename = self.getname_w(oparg as usize)?;
                     let modulename = match &w_modulename {
-                        Hlvalue::Constant(Constant {
-                            value: ConstValue::Str(s),
-                            ..
-                        }) => s.clone(),
+                        Hlvalue::Constant(Constant { value, .. }) => {
+                            value.as_text().map(str::to_owned).ok_or_else(|| {
+                                FlowContextError::Flowing(FlowingError::new(format!(
+                                    "IMPORT_NAME: expected str name, got {w_modulename:?}"
+                                )))
+                            })?
+                        }
                         other => {
                             return Err(FlowContextError::Flowing(FlowingError::new(format!(
                                 "IMPORT_NAME: expected str name, got {other:?}"
@@ -2768,7 +2767,7 @@ impl FlowContext {
                         _ => ConstValue::Int(-1),
                     };
                     let w_module = self.import_name(&[
-                        ConstValue::Str(modulename),
+                        ConstValue::byte_str(modulename),
                         glob,
                         ConstValue::None,
                         fromlist,
@@ -3155,7 +3154,7 @@ impl FlowContext {
                         }
                     };
                     let w_obj = self.pop_hlvalue()?;
-                    let w_name = Hlvalue::Constant(Constant::new(ConstValue::Str(name.to_owned())));
+                    let w_name = Hlvalue::Constant(Constant::new(ConstValue::byte_str(name)));
                     let w_method = self.record_maybe_raise_op(
                         "getattr",
                         vec![w_obj, w_name],
@@ -3604,9 +3603,7 @@ mod test {
                 assert!(obj.is_instance());
                 assert_eq!(obj.instance_class().unwrap().qualname(), "AssertionError");
                 match obj.instance_args().unwrap().first() {
-                    Some(ConstValue::Str(s)) => {
-                        assert_eq!(s, "implicit ValueError shouldn't occur");
-                    }
+                    Some(value) if value.string_eq("implicit ValueError shouldn't occur") => {}
                     other => panic!("expected Str arg, got {other:?}"),
                 }
             }
@@ -3639,10 +3636,8 @@ mod test {
         assert!(ctx.guessbool(iconst(1)).unwrap());
         assert!(!ctx.guessbool(iconst(0)).unwrap());
         assert!(
-            ctx.guessbool(Hlvalue::Constant(Constant::new(ConstValue::Str(
-                "x".to_owned()
-            ))))
-            .unwrap()
+            ctx.guessbool(Hlvalue::Constant(Constant::new(ConstValue::byte_str("x"))))
+                .unwrap()
         );
         assert!(
             !ctx.guessbool(Hlvalue::Constant(Constant::new(ConstValue::Tuple(vec![]))))
@@ -3653,7 +3648,7 @@ mod test {
     #[test]
     fn find_global_reads_function_globals_before_builtins() {
         let mut globals = HashMap::new();
-        globals.insert(ConstValue::Str("sentinel".to_owned()), ConstValue::Int(42));
+        globals.insert(ConstValue::byte_str("sentinel"), ConstValue::Int(42));
         let ctx = flow_context_with_globals("def f():\n    return sentinel\n", globals);
         assert_eq!(ctx.find_global("sentinel").unwrap(), iconst(42));
         let print_obj = HOST_ENV.lookup_builtin("print").unwrap();
@@ -4132,7 +4127,7 @@ mod test {
         // separate value").
         let mut ctx = flow_context("def f():\n    return 1\n");
         let w_non_type = Hlvalue::Constant(Constant::new(ConstValue::Int(42)));
-        let w_value = Hlvalue::Constant(Constant::new(ConstValue::Str("junk".into())));
+        let w_value = Hlvalue::Constant(Constant::new(ConstValue::byte_str("junk")));
         let err = ctx.exc_from_raise(w_non_type, w_value).unwrap_err();
         match err {
             FlowContextError::Signal(FlowSignal::Raise { w_exc }) => match &w_exc.w_type {
@@ -4197,7 +4192,7 @@ mod test {
                 OpKind::GetAttr,
                 vec![
                     Hlvalue::Constant(Constant::new(ConstValue::HostObject(module))),
-                    Hlvalue::Constant(Constant::new(ConstValue::Str("create_file".to_string()))),
+                    Hlvalue::Constant(Constant::new(ConstValue::byte_str("create_file"))),
                 ],
             )
             .expect("constant module getattr should fold");
@@ -4250,17 +4245,17 @@ mod test {
         // w_stararg.value` over any iterable. A Str stararg yields
         // per-char Constants.
         use super::super::argument::CallSpec;
-        let star = Hlvalue::Constant(Constant::new(ConstValue::Str("ab".into())));
+        let star = Hlvalue::Constant(Constant::new(ConstValue::byte_str("ab")));
         let args = CallSpec::new(Vec::new(), None, Some(star));
         let expanded = args.as_list();
         assert_eq!(expanded.len(), 2);
         assert!(matches!(
             &expanded[0],
-            Hlvalue::Constant(Constant { value: ConstValue::Str(s), .. }) if s == "a"
+            Hlvalue::Constant(Constant { value, .. }) if value.string_eq("a")
         ));
         assert!(matches!(
             &expanded[1],
-            Hlvalue::Constant(Constant { value: ConstValue::Str(s), .. }) if s == "b"
+            Hlvalue::Constant(Constant { value, .. }) if value.string_eq("b")
         ));
     }
 

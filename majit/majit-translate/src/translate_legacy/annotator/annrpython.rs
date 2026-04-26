@@ -166,7 +166,8 @@ fn const_value_type(value: &ConstValue) -> ValueType {
         ConstValue::Placeholder => ValueType::Unknown,
         ConstValue::Atom(_)
         | ConstValue::Dict(_)
-        | ConstValue::Str(_)
+        | ConstValue::ByteStr(_)
+        | ConstValue::UniStr(_)
         | ConstValue::Tuple(_)
         | ConstValue::List(_)
         | ConstValue::Graphs(_)

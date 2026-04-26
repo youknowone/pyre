@@ -24,17 +24,19 @@
 //!   non-trivial usages and have no caller on the tuple eq/hash path.
 //! * `AbstractCharRepr.ll_str` / `AbstractUniCharRepr.ll_str`
 //!   (rstr.py:554-562) — chr→str conversion (allocates GC string).
-//! * Full `AbstractStringRepr` / `AbstractUnicodeRepr` (rstr.py:67-481,
-//!   543-737) — string types are GC-managed Ptr structs; their hash
-//!   helper `ll_strhash` mirrors CPython's algorithm. Larger porting
-//!   epic.
-//! * `ConstValue::Str` byte/unicode tag — pyre's `ConstValue::Str(_)`
-//!   does not distinguish Python 2 byte strings from unicode, so
-//!   [`CharRepr::convert_const`] / [`UniCharRepr::convert_const`]
-//!   currently both accept any `len() == 1` `ConstValue::Str`.
-//!   Mirroring rstr.py:491-494 / 757-762 byte/unicode discrimination
-//!   requires a separate `ConstValue::ByteStr` / `ConstValue::UniStr`
-//!   split (cross-crate infrastructure).
+//! * `AbstractStringRepr` / `AbstractUnicodeRepr` method bodies
+//!   (`rtype_len`, `rtype_bool`, `rtype_method_*`, pairtype `rtype_eq`
+//!   / `rtype_add` / `rtype_getitem`, `rtype_int` / `rtype_float`,
+//!   etc., rstr.py:119-449 + 651-737). The struct skeletons and
+//!   module-global singletons land here today; method bodies arrive
+//!   slice-by-slice — see the epic plan in
+//!   `~/.claude/projects/.../memory/item3_abstractstringrepr_epic_plan.md`.
+//! * `LLHelpers.ll_*` helper graphs (`ll_strhash`, `ll_streq`,
+//!   `ll_strconcat`, `ll_strlen` family, `ll_str2int` / `ll_str2float`,
+//!   `ll_startswith` / `ll_endswith` / `ll_find` / `ll_strip` /
+//!   `ll_lower` / `ll_upper` / `ll_split` / `ll_join` / `ll_replace`)
+//!   live in `lltypesystem/rstr.rs`; only `ll_strlen` / `ll_unilen`
+//!   exist today.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -46,11 +48,169 @@ use crate::flowspace::model::{
 use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+use crate::translator::rtyper::lltypesystem::rstr::{STRPTR, UNICODEPTR};
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
     ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
     helper_pygraph_from_graph, variable_with_lltype,
 };
+
+// ____________________________________________________________
+// StringRepr / UnicodeRepr — `rpython/rtyper/lltypesystem/rstr.py:229`
+// + `:247`. The upstream class hierarchy splits over two files:
+// `rstr.py:95` `class AbstractStringRepr(Repr)` carries the abstract
+// method surface (`rtype_len`, `rtype_bool`, `rtype_method_startswith`
+// / `endswith` / `find` / `count` / `strip` / `lower` / `upper` /
+// `split` / `join` / `replace` / `format`, `rtype_int` / `rtype_float`,
+// pairtype `rtype_eq` / `rtype_add` / `rtype_getitem`); the
+// lltypesystem subclasses bind `lowleveltype = Ptr(STR)` / `Ptr(UNICODE)`
+// and dispatch to `LLHelpers.ll_*` graphs.
+//
+// Pyre lands the **struct skeleton + module-global singletons** today
+// (`Slice 3` of the Item 3 epic — `item3_abstractstringrepr_epic_plan.md`).
+// Method bodies arrive in slices 4-12 alongside the `LLHelpers.ll_*`
+// helper graphs in `lltypesystem/rstr.rs`. Until then the trait
+// methods inherit `Repr`'s default `rtype_*` impls, which surface
+// `MissingRTypeOperation` errors with the upstream method name.
+
+/// RPython `class StringRepr(BaseLLStringRepr, AbstractStringRepr)`
+/// (`lltypesystem/rstr.py:229-238`):
+///
+/// ```python
+/// class StringRepr(BaseLLStringRepr, AbstractStringRepr):
+///     lowleveltype = Ptr(STR)
+///     basetype = str
+///     base = Char
+///     CACHE = CONST_STR_CACHE
+/// ```
+///
+/// The `basetype` / `base` / `CACHE` attributes only matter for
+/// `BaseLLStringRepr.convert_const` (`lltypesystem/rstr.py:191-206`)
+/// which lands in a follow-up slice. Today the struct just carries
+/// `lowleveltype = Ptr(STR)`. Until `convert_const` plus the abstract
+/// `rtype_*` method surface (`rstr.py:119-449`) land,
+/// [`super::rmodel::rtyper_makerepr`] keeps the boundary anchor and
+/// returns `MissingRTypeOperation` for `SomeString` rather than
+/// dispatching through this partial repr.
+#[derive(Debug)]
+pub struct StringRepr {
+    state: ReprState,
+    lltype: LowLevelType,
+}
+
+impl StringRepr {
+    pub fn new() -> Self {
+        StringRepr {
+            state: ReprState::new(),
+            lltype: STRPTR.clone(),
+        }
+    }
+
+    /// RPython `StringRepr.char_repr = char_repr` (`lltypesystem/rstr.py:1268`)
+    /// class-level attribute. Pyre exposes the link as a method that
+    /// returns the module-global [`char_repr`] singleton.
+    pub fn char_repr(&self) -> Arc<CharRepr> {
+        char_repr()
+    }
+}
+
+impl Default for StringRepr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Repr for StringRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "StringRepr"
+    }
+
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::StringRepr
+    }
+}
+
+/// RPython `class UnicodeRepr(BaseLLStringRepr, AbstractUnicodeRepr)`
+/// (`lltypesystem/rstr.py:247-256`):
+///
+/// ```python
+/// class UnicodeRepr(BaseLLStringRepr, AbstractUnicodeRepr):
+///     lowleveltype = Ptr(UNICODE)
+///     basetype = basestring
+///     base = UniChar
+///     CACHE = CONST_UNICODE_CACHE
+/// ```
+///
+/// Mirror of [`StringRepr`] swapping `Ptr(STR)` → `Ptr(UNICODE)` and
+/// the char-side backlink to `unichar_repr`.
+#[derive(Debug)]
+pub struct UnicodeRepr {
+    state: ReprState,
+    lltype: LowLevelType,
+}
+
+impl UnicodeRepr {
+    pub fn new() -> Self {
+        UnicodeRepr {
+            state: ReprState::new(),
+            lltype: UNICODEPTR.clone(),
+        }
+    }
+
+    /// RPython `UnicodeRepr.char_repr = unichar_repr`
+    /// (`lltypesystem/rstr.py:1266`).
+    pub fn char_repr(&self) -> Arc<UniCharRepr> {
+        unichar_repr()
+    }
+}
+
+impl Default for UnicodeRepr {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Repr for UnicodeRepr {
+    fn lowleveltype(&self) -> &LowLevelType {
+        &self.lltype
+    }
+
+    fn state(&self) -> &ReprState {
+        &self.state
+    }
+
+    fn class_name(&self) -> &'static str {
+        "UnicodeRepr"
+    }
+
+    fn repr_class_id(&self) -> super::pairtype::ReprClassId {
+        super::pairtype::ReprClassId::UnicodeRepr
+    }
+}
+
+/// RPython `string_repr = StringRepr()` (`lltypesystem/rstr.py:1255`)
+/// module-global. Pyre mirrors the upstream singleton via [`OnceLock`]
+/// so every `SomeString.rtyper_makerepr(rtyper)` call returns the same
+/// `Arc`.
+pub fn string_repr() -> Arc<StringRepr> {
+    static REPR: OnceLock<Arc<StringRepr>> = OnceLock::new();
+    REPR.get_or_init(|| Arc::new(StringRepr::new())).clone()
+}
+
+/// RPython `unicode_repr = UnicodeRepr()` (`lltypesystem/rstr.py:1260`)
+/// module-global.
+pub fn unicode_repr() -> Arc<UnicodeRepr> {
+    static REPR: OnceLock<Arc<UnicodeRepr>> = OnceLock::new();
+    REPR.get_or_init(|| Arc::new(UnicodeRepr::new())).clone()
+}
 
 // ____________________________________________________________
 // CharRepr — `rstr.py:483-541` (lltypesystem-bound `AbstractCharRepr`).
@@ -74,6 +234,23 @@ impl CharRepr {
             state: ReprState::new(),
             lltype: LowLevelType::Char,
         }
+    }
+
+    /// RPython `CharRepr.char_repr = char_repr`
+    /// (`lltypesystem/rstr.py:1267`) class-level attribute — char-side
+    /// backlink so the shared `BaseCharReprMixin._rtype_method_isxxx`
+    /// helper (`rstr.py:516-520`) can read `hop.args_r[0].char_repr`.
+    pub fn char_repr(&self) -> Arc<CharRepr> {
+        char_repr()
+    }
+
+    /// RPython `class CharRepr(AbstractCharRepr, StringRepr)`
+    /// (`lltypesystem/rstr.py:291-292`) — `CharRepr` MRO inherits
+    /// `StringRepr.repr = string_repr` (`lltypesystem/rstr.py:1262`).
+    /// Method form so callers (`rstr.py:120` `string_repr = self.repr`)
+    /// reach the parent string repr through `char_repr.repr()`.
+    pub fn repr(&self) -> Arc<StringRepr> {
+        string_repr()
     }
 }
 
@@ -110,12 +287,12 @@ impl Repr for CharRepr {
     ///     return value
     /// ```
     ///
-    /// Pyre maps `Char` lltype to a `ConstValue::Str` of length 1.
-    /// Other ConstValue variants and non-1-len strings are rejected.
+    /// Pyre maps `Char` lltype to a one-byte
+    /// [`ConstValue::ByteStr`]. Unicode constants are rejected here.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         match value {
-            ConstValue::Str(s) if s.chars().count() == 1 => Ok(Constant::with_concretetype(
-                ConstValue::Str(s.clone()),
+            ConstValue::ByteStr(s) if s.len() == 1 => Ok(Constant::with_concretetype(
+                ConstValue::ByteStr(s.clone()),
                 LowLevelType::Char,
             )),
             other => Err(TyperError::message(format!("not a character: {other:?}"))),
@@ -281,6 +458,21 @@ pub struct UniCharRepr {
 }
 
 impl UniCharRepr {
+    /// RPython `UniCharRepr.char_repr = unichar_repr`
+    /// (`lltypesystem/rstr.py:1265`) — UniCharRepr's char-side backlink
+    /// is itself; mirrors `CharRepr.char_repr = char_repr`
+    /// (`lltypesystem/rstr.py:1267`).
+    pub fn char_repr(&self) -> Arc<UniCharRepr> {
+        unichar_repr()
+    }
+
+    /// RPython `class UniCharRepr(AbstractUniCharRepr, UnicodeRepr)`
+    /// (`lltypesystem/rstr.py:294-295`) — `UniCharRepr` MRO inherits
+    /// `UniCharRepr.repr = unicode_repr` (`lltypesystem/rstr.py:1264`).
+    pub fn repr(&self) -> Arc<UnicodeRepr> {
+        unicode_repr()
+    }
+
     pub fn new() -> Self {
         UniCharRepr {
             state: ReprState::new(),
@@ -312,24 +504,36 @@ impl Repr for UniCharRepr {
         super::pairtype::ReprClassId::UniCharRepr
     }
 
-    /// RPython `AbstractUniCharRepr.convert_const` (`rstr.py:759-762`):
+    /// RPython `AbstractUniCharRepr.convert_const` (`rstr.py:759-766`):
     ///
     /// ```python
     /// def convert_const(self, value):
+    ///     if isinstance(value, str):
+    ///         value = unicode(value)
     ///     if not isinstance(value, unicode) or len(value) != 1:
     ///         raise TyperError("not a unicode character: %r" % (value,))
     ///     return value
     /// ```
     ///
-    /// Pyre maps `UniChar` lltype to a `ConstValue::Str` containing a
-    /// single Unicode scalar value (Python 3 collapses `str` and
-    /// `unicode`; the distinguisher is the target lltype).
+    /// Python2's `unicode(value)` for a `str` runs the default codec
+    /// (ASCII) — non-ASCII bytes raise `UnicodeDecodeError`. Pyre
+    /// mirrors that: a one-byte ASCII [`ConstValue::ByteStr`] is
+    /// promoted to a [`ConstValue::UniStr`] holding the same scalar
+    /// (codepoint < 0x80, so byte value == codepoint), while non-ASCII
+    /// or multi-byte byte strings are rejected. Native `UniStr` of
+    /// length 1 passes through unchanged.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         match value {
-            ConstValue::Str(s) if s.chars().count() == 1 => Ok(Constant::with_concretetype(
-                ConstValue::Str(s.clone()),
+            ConstValue::UniStr(s) if s.chars().count() == 1 => Ok(Constant::with_concretetype(
+                ConstValue::UniStr(s.clone()),
                 LowLevelType::UniChar,
             )),
+            ConstValue::ByteStr(b) if b.len() == 1 && b[0] < 0x80 => {
+                Ok(Constant::with_concretetype(
+                    ConstValue::UniStr((b[0] as char).to_string()),
+                    LowLevelType::UniChar,
+                ))
+            }
             other => Err(TyperError::message(format!(
                 "not a unicode character: {other:?}"
             ))),
@@ -1158,19 +1362,16 @@ mod tests {
         assert_eq!(opnames, vec!["cast_unichar_to_int"]);
     }
 
-    /// rstr.py:491-494 / 759-762 — `convert_const` accepts only
-    /// 1-character `ConstValue::Str`. Other variants and longer
-    /// strings raise TyperError.
+    /// rstr.py:491-494 / 759-762 — `convert_const` accepts only the
+    /// matching byte/unicode one-character constant.
     #[test]
     fn char_repr_convert_const_accepts_single_char_only() {
         let r = char_repr();
-        let c = r.convert_const(&ConstValue::Str("a".to_string())).unwrap();
-        assert_eq!(c.value, ConstValue::Str("a".to_string()));
+        let c = r.convert_const(&ConstValue::byte_str(b"a")).unwrap();
+        assert_eq!(c.value, ConstValue::byte_str(b"a"));
         assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Char));
 
-        let err = r
-            .convert_const(&ConstValue::Str("ab".to_string()))
-            .unwrap_err();
+        let err = r.convert_const(&ConstValue::byte_str(b"ab")).unwrap_err();
         assert!(err.to_string().contains("not a character"));
 
         let err = r.convert_const(&ConstValue::Int(1)).unwrap_err();
@@ -1178,14 +1379,51 @@ mod tests {
     }
 
     #[test]
+    fn char_convert_const_rejects_unistr() {
+        let r = char_repr();
+        let err = r.convert_const(&ConstValue::uni_str("a")).unwrap_err();
+        assert!(err.to_string().contains("not a character"));
+    }
+
+    #[test]
     fn unichar_repr_convert_const_accepts_single_unicode_only() {
         let r = unichar_repr();
-        let c = r.convert_const(&ConstValue::Str("π".to_string())).unwrap();
+        let c = r.convert_const(&ConstValue::uni_str("π")).unwrap();
+        assert_eq!(c.value, ConstValue::uni_str("π"));
         assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::UniChar));
 
-        let err = r
-            .convert_const(&ConstValue::Str("πi".to_string()))
-            .unwrap_err();
+        let err = r.convert_const(&ConstValue::uni_str("πi")).unwrap_err();
+        assert!(err.to_string().contains("not a unicode character"));
+    }
+
+    /// RPython `AbstractUniCharRepr.convert_const` (`rstr.py:759-766`)
+    /// promotes a Python2 `str` of length 1 to `unicode(value)` —
+    /// implicit ASCII decode. Pyre mirrors that for an ASCII-byte
+    /// `ConstValue::ByteStr` of length 1.
+    #[test]
+    fn unichar_convert_const_promotes_ascii_byte_str_to_unistr() {
+        let r = unichar_repr();
+        let c = r.convert_const(&ConstValue::byte_str(b"a")).unwrap();
+        assert_eq!(c.value, ConstValue::uni_str("a"));
+        assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::UniChar));
+    }
+
+    /// Non-ASCII bytes raise `UnicodeDecodeError` under Python2's
+    /// default codec — pyre rejects the `ByteStr` outright.
+    #[test]
+    fn unichar_convert_const_rejects_non_ascii_byte_str() {
+        let r = unichar_repr();
+        let err = r.convert_const(&ConstValue::byte_str(&[0xff])).unwrap_err();
+        assert!(err.to_string().contains("not a unicode character"));
+    }
+
+    /// `len(value) != 1` filter still applies to byte input — RPython
+    /// promotes first then length-checks; pyre short-circuits on
+    /// length since ASCII bytes preserve length 1:1 in unicode.
+    #[test]
+    fn unichar_convert_const_rejects_multibyte_byte_str() {
+        let r = unichar_repr();
+        let err = r.convert_const(&ConstValue::byte_str(b"ab")).unwrap_err();
         assert!(err.to_string().contains("not a unicode character"));
     }
 
@@ -1198,6 +1436,84 @@ mod tests {
         let u1 = unichar_repr();
         let u2 = unichar_repr();
         assert!(Arc::ptr_eq(&u1, &u2));
+    }
+
+    /// `lltypesystem/rstr.py:1255` — `string_repr = StringRepr()`
+    /// module-global. Lowleveltype is `Ptr(STR)`; `class_name` /
+    /// `repr_class_id` mirror the `StringRepr` upstream class.
+    #[test]
+    fn string_repr_singleton_lowleveltype_is_strptr() {
+        let r = string_repr();
+        assert_eq!(r.lowleveltype(), &*STRPTR);
+        assert_eq!(r.class_name(), "StringRepr");
+        assert_eq!(
+            r.repr_class_id(),
+            super::super::pairtype::ReprClassId::StringRepr
+        );
+        let r2 = string_repr();
+        assert!(Arc::ptr_eq(&r, &r2));
+    }
+
+    /// `lltypesystem/rstr.py:1260` — `unicode_repr = UnicodeRepr()`
+    /// module-global with `Ptr(UNICODE)` lowleveltype.
+    #[test]
+    fn unicode_repr_singleton_lowleveltype_is_unicodeptr() {
+        let r = unicode_repr();
+        assert_eq!(r.lowleveltype(), &*UNICODEPTR);
+        assert_eq!(r.class_name(), "UnicodeRepr");
+        assert_eq!(
+            r.repr_class_id(),
+            super::super::pairtype::ReprClassId::UnicodeRepr
+        );
+        let r2 = unicode_repr();
+        assert!(Arc::ptr_eq(&r, &r2));
+    }
+
+    /// `lltypesystem/rstr.py:1267` — `CharRepr.char_repr = char_repr`;
+    /// `lltypesystem/rstr.py:1268` — `StringRepr.char_repr = char_repr`
+    /// — both class-level attributes alias to the same singleton.
+    #[test]
+    fn string_repr_and_char_repr_char_repr_method_returns_char_repr() {
+        let s = string_repr();
+        let c_via_string = s.char_repr();
+        assert!(Arc::ptr_eq(&c_via_string, &char_repr()));
+
+        let c = char_repr();
+        let c_via_char = c.char_repr();
+        assert!(Arc::ptr_eq(&c_via_char, &char_repr()));
+    }
+
+    /// `lltypesystem/rstr.py:1265` — `UniCharRepr.char_repr = unichar_repr`;
+    /// `lltypesystem/rstr.py:1266` — `UnicodeRepr.char_repr = unichar_repr`.
+    #[test]
+    fn unicode_repr_and_unichar_repr_char_repr_method_returns_unichar_repr() {
+        let u = unicode_repr();
+        let c_via_unicode = u.char_repr();
+        assert!(Arc::ptr_eq(&c_via_unicode, &unichar_repr()));
+
+        let uc = unichar_repr();
+        let c_via_unichar = uc.char_repr();
+        assert!(Arc::ptr_eq(&c_via_unichar, &unichar_repr()));
+    }
+
+    /// `lltypesystem/rstr.py:1262` — `StringRepr.repr = string_repr`;
+    /// `class CharRepr(AbstractCharRepr, StringRepr)` (`:291-292`)
+    /// inherits the attribute. Pyre exposes both via `.repr()`.
+    #[test]
+    fn char_repr_repr_method_returns_string_repr() {
+        let c = char_repr();
+        let s_via_char = c.repr();
+        assert!(Arc::ptr_eq(&s_via_char, &string_repr()));
+    }
+
+    /// `lltypesystem/rstr.py:1264` — `UniCharRepr.repr = unicode_repr`;
+    /// `class UniCharRepr(AbstractUniCharRepr, UnicodeRepr)` (`:294-295`)
+    /// inherits the attribute.
+    #[test]
+    fn unichar_repr_repr_method_returns_unicode_repr() {
+        let uc = unichar_repr();
+        let u_via_unichar = uc.repr();
+        assert!(Arc::ptr_eq(&u_via_unichar, &unicode_repr()));
     }
 
     fn build_pair_compare_hop(

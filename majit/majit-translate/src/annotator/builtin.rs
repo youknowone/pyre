@@ -570,7 +570,8 @@ pub fn builtin_bool(
             ConstValue::Bool(b) => *b,
             ConstValue::Int(n) => *n != 0,
             ConstValue::Float(bits) => f64::from_bits(*bits) != 0.0,
-            ConstValue::Str(s) => !s.is_empty(),
+            ConstValue::ByteStr(s) => !s.is_empty(),
+            ConstValue::UniStr(s) => !s.is_empty(),
             ConstValue::None => false,
             ConstValue::Tuple(items) | ConstValue::List(items) => !items.is_empty(),
             ConstValue::Graphs(graphs) => !graphs.is_empty(),
@@ -657,7 +658,10 @@ pub fn builtin_int(
     constpropagate(bk, &prop_args, s_result, |consts| match consts {
         [ConstValue::Int(n)] => Some(ConstValue::Int(*n)),
         [ConstValue::Bool(b)] => Some(ConstValue::Int(if *b { 1 } else { 0 })),
-        [ConstValue::Str(s)] => s.parse::<i64>().ok().map(ConstValue::Int),
+        [s] if s.as_text().is_some() => s
+            .as_text()
+            .and_then(|text| text.parse::<i64>().ok())
+            .map(ConstValue::Int),
         [ConstValue::Float(bits)] => {
             // upstream `int(float_const)` raises OverflowError when the
             // truncated value does not fit, which `constpropagate`
@@ -675,9 +679,9 @@ pub fn builtin_int(
             }
             Some(ConstValue::Int(truncated as i64))
         }
-        [ConstValue::Str(s), ConstValue::Int(base)] => {
+        [s, ConstValue::Int(base)] if s.as_text().is_some() => {
             if *base >= 2 && *base <= 36 {
-                i64::from_str_radix(s.trim(), *base as u32)
+                i64::from_str_radix(s.as_text().unwrap().trim(), *base as u32)
                     .ok()
                     .map(ConstValue::Int)
             } else {
@@ -705,7 +709,10 @@ pub fn builtin_float(
             [ConstValue::Int(n)] => Some(ConstValue::float(*n as f64)),
             [ConstValue::Bool(b)] => Some(ConstValue::float(if *b { 1.0 } else { 0.0 })),
             [ConstValue::Float(bits)] => Some(ConstValue::Float(*bits)),
-            [ConstValue::Str(s)] => s.trim().parse::<f64>().ok().map(ConstValue::float),
+            [s] if s.as_text().is_some() => s
+                .as_text()
+                .and_then(|text| text.trim().parse::<f64>().ok())
+                .map(ConstValue::float),
             _ => None,
         },
     )
@@ -727,7 +734,7 @@ pub fn builtin_chr(
         |consts| match consts {
             [ConstValue::Int(n)] => {
                 if (0..=0xff).contains(n) {
-                    Some(ConstValue::Str(char::from(*n as u8).to_string()))
+                    Some(ConstValue::ByteStr(vec![*n as u8]))
                 } else {
                     None
                 }
@@ -739,13 +746,9 @@ pub fn builtin_chr(
 
 /// Upstream `builtin_unichr(s_int)` (builtin.py:123-124).
 ///
-/// `constpropagate` cannot handle the unicode path: the Rust `ConstValue`
-/// enum does not distinguish `str` from `unicode`, so
-/// `bk.immutablevalue(ConstValue::Str(...))` returns `SomeChar` /
-/// `SomeString`, which then fails the `s_result.contains(s_realresult)`
-/// check against `SomeUnicodeCodePoint`. Fold the constant case
-/// directly, mirroring upstream `constpropagate(unichr, ...)` semantics
-/// while pinning the result's `const_box` ourselves.
+/// Fold the constant case directly, mirroring upstream
+/// `constpropagate(unichr, ...)` semantics while pinning the result's
+/// `const_box` ourselves.
 pub fn builtin_unichr(
     _bk: &Rc<Bookkeeper>,
     args_s: &[SomeValue],
@@ -761,7 +764,7 @@ pub fn builtin_unichr(
         && let Some(ch) = u32::try_from(*n).ok().and_then(char::from_u32)
     {
         result.inner.base.const_box = Some(super::super::flowspace::model::Constant::new(
-            ConstValue::Str(ch.to_string()),
+            ConstValue::uni_str(ch.to_string()),
         ));
     }
     Ok(SomeValue::UnicodeCodePoint(result))
@@ -769,9 +772,8 @@ pub fn builtin_unichr(
 
 /// Upstream `builtin_unicode(s_unicode)` (builtin.py:126-127).
 ///
-/// See [`builtin_unichr`] for the constpropagate carve-out rationale —
-/// the Rust `ConstValue::Str` carrier cannot round-trip through
-/// `immutablevalue` without collapsing to `SomeString`.
+/// Mirrors upstream `unicode(x)` while preserving the explicit
+/// `ConstValue::UniStr` type tag.
 pub fn builtin_unicode(
     _bk: &Rc<Bookkeeper>,
     args_s: &[SomeValue],
@@ -782,10 +784,10 @@ pub fn builtin_unicode(
     };
     let mut result = SomeUnicodeString::new(false, false);
     if is_immutable_constant(s_unicode)
-        && let Some(ConstValue::Str(s)) = s_unicode.const_()
+        && let Some(s) = s_unicode.const_().and_then(ConstValue::as_text)
     {
         result.inner.base.const_box = Some(super::super::flowspace::model::Constant::new(
-            ConstValue::Str(s.clone()),
+            ConstValue::uni_str(s),
         ));
     }
     Ok(SomeValue::UnicodeString(result))
@@ -811,16 +813,18 @@ pub fn builtin_hasattr(
     let [s_obj, s_attr] = args_s else {
         return Err(AnnotatorError::new("hasattr() takes exactly two arguments"));
     };
-    let attr_is_const_str = matches!(s_attr.const_(), Some(ConstValue::Str(_)));
+    // builtin.py:133-136 — `if not s_attr.is_constant() or not
+    // isinstance(s_attr.const, str): bookkeeper.warning("hasattr is not
+    // RPythonic enough") ; return SomeBool()`. Upstream's `isinstance(x,
+    // str)` is Python 2 bytes-only; pyre uses [`as_pystr`] so a unicode
+    // attribute literal short-circuits to the non-constant SomeBool
+    // path the same way upstream does. (We skip the warning because
+    // the Rust bookkeeper has no warning channel yet.)
+    let attr_is_const_str = s_attr.const_().and_then(ConstValue::as_pystr).is_some();
     if !s_attr.is_constant() || !attr_is_const_str {
-        // upstream emits a bookkeeper.warning and falls through to the
-        // non-constant SomeBool result. We skip the warning because the
-        // Rust bookkeeper does not yet have a warning channel — record
-        // the upstream guidance here so the port stays auditable.
-        // (builtin.py:135-136: "hasattr is not RPythonic enough".)
         return Ok(SomeValue::Bool(SomeBool::new()));
     }
-    let Some(ConstValue::Str(attr_name)) = s_attr.const_() else {
+    let Some(attr_name) = s_attr.const_().and_then(ConstValue::as_pystr) else {
         return Ok(SomeValue::Bool(SomeBool::new()));
     };
 
@@ -1500,9 +1504,7 @@ mod tests {
     #[test]
     fn builtin_int_const_string_returns_constant_integer() {
         let bk = bk();
-        let s_str = bk
-            .immutablevalue(&ConstValue::Str("42".to_string()))
-            .unwrap();
+        let s_str = bk.immutablevalue(&ConstValue::byte_str("42")).unwrap();
         let result = builtin_int(&bk, &[s_str], &no_kwds()).unwrap();
         match result {
             SomeValue::Integer(i) => {
@@ -1532,9 +1534,10 @@ mod tests {
         match result {
             SomeValue::Char(ch) => {
                 assert!(ch.inner.base.const_box.is_some());
-                if let Some(ConstValue::Str(s)) = ch.inner.base.const_box.as_ref().map(|c| &c.value)
+                if let Some(ConstValue::ByteStr(s)) =
+                    ch.inner.base.const_box.as_ref().map(|c| &c.value)
                 {
-                    assert_eq!(s, "A");
+                    assert_eq!(s.as_slice(), b"A");
                 }
             }
             other => panic!("expected constant SomeChar, got {other:?}"),
@@ -1747,15 +1750,14 @@ mod tests {
     fn builtin_unichr_const_integer_returns_constant_unicode_cp() {
         // Codex P2: `unichr(65)` must keep the constant via the
         // UnicodeCodePoint variant; constpropagate's re-annotation
-        // through immutablevalue does NOT because ConstValue::Str
-        // collapses to SomeChar/SomeString.
+        // through immutablevalue needs the explicit unicode tag.
         let bk = bk();
         let s_int = bk.immutablevalue(&ConstValue::Int(65)).unwrap();
         let out = builtin_unichr(&bk, &[s_int], &no_kwds()).unwrap();
         match out {
             SomeValue::UnicodeCodePoint(cp) => {
                 match cp.inner.base.const_box.as_ref().map(|c| &c.value) {
-                    Some(ConstValue::Str(s)) => assert_eq!(s, "A"),
+                    Some(ConstValue::UniStr(s)) => assert_eq!(s, "A"),
                     other => panic!("expected constant unicode 'A', got {other:?}"),
                 }
             }
@@ -1768,12 +1770,12 @@ mod tests {
         // Codex P2: `unicode("abc")` must return a constant
         // SomeUnicodeString, not raise AnnotatorError.
         let bk = bk();
-        let s_str = bk.immutablevalue(&ConstValue::Str("abc".into())).unwrap();
+        let s_str = bk.immutablevalue(&ConstValue::byte_str("abc")).unwrap();
         let out = builtin_unicode(&bk, &[s_str], &no_kwds()).unwrap();
         match out {
             SomeValue::UnicodeString(us) => {
                 match us.inner.base.const_box.as_ref().map(|c| &c.value) {
-                    Some(ConstValue::Str(s)) => assert_eq!(s, "abc"),
+                    Some(ConstValue::UniStr(s)) => assert_eq!(s, "abc"),
                     other => panic!("expected constant unicode 'abc', got {other:?}"),
                 }
             }
@@ -1793,7 +1795,7 @@ mod tests {
         let obj = HOST_ENV.lookup_builtin("range").unwrap();
         let s_obj = bk.immutablevalue(&ConstValue::HostObject(obj)).unwrap();
         let s_attr = bk
-            .immutablevalue(&ConstValue::Str("no_such_attr".into()))
+            .immutablevalue(&ConstValue::byte_str("no_such_attr"))
             .unwrap();
         let out = builtin_hasattr(&bk, &[s_obj, s_attr], &no_kwds()).unwrap();
         match out {
@@ -1862,7 +1864,7 @@ mod tests {
         // `int(s, base=16)` is the positive path — `base` is declared
         // allowed for `int` in the allow-list.
         let bk = bk();
-        let s_str = bk.immutablevalue(&ConstValue::Str("1a".into())).unwrap();
+        let s_str = bk.immutablevalue(&ConstValue::byte_str("1a")).unwrap();
         let s_base = bk.immutablevalue(&ConstValue::Int(16)).unwrap();
         let mut kwds: HashMap<String, SomeValue> = HashMap::new();
         kwds.insert("s_base".into(), s_base);
@@ -1881,7 +1883,7 @@ mod tests {
         // Codex P2: `int(x, 10, base=16)` must raise the duplicate-arg
         // error that upstream's Python dispatch produces.
         let bk = bk();
-        let s_str = bk.immutablevalue(&ConstValue::Str("1a".into())).unwrap();
+        let s_str = bk.immutablevalue(&ConstValue::byte_str("1a")).unwrap();
         let s_base_pos = bk.immutablevalue(&ConstValue::Int(10)).unwrap();
         let s_base_kw = bk.immutablevalue(&ConstValue::Int(16)).unwrap();
         let mut kwds: HashMap<String, SomeValue> = HashMap::new();
@@ -1997,7 +1999,7 @@ mod tests {
         base.class_set("m", ConstValue::Int(0));
         let sub = HostObject::new_class("pkg.Sub", vec![base]);
         let s_obj = bk.immutablevalue(&ConstValue::HostObject(sub)).unwrap();
-        let s_attr = bk.immutablevalue(&ConstValue::Str("m".into())).unwrap();
+        let s_attr = bk.immutablevalue(&ConstValue::byte_str("m")).unwrap();
         let out = builtin_hasattr(&bk, &[s_obj, s_attr], &no_kwds()).unwrap();
         match out {
             SomeValue::Bool(b) => match b.base.const_box.as_ref().map(|c| &c.value) {

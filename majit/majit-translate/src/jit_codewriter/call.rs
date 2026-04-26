@@ -3202,7 +3202,8 @@ fn resolve_array_identity(
         match value {
             crate::flowspace::model::ConstValue::List(_) => Some("list".to_string()),
             crate::flowspace::model::ConstValue::Tuple(_) => Some("tuple".to_string()),
-            crate::flowspace::model::ConstValue::Str(_) => Some("str".to_string()),
+            crate::flowspace::model::ConstValue::ByteStr(_) => Some("str".to_string()),
+            crate::flowspace::model::ConstValue::UniStr(_) => Some("unicode".to_string()),
             crate::flowspace::model::ConstValue::HostObject(obj) => {
                 Some(obj.instance_class().unwrap_or(obj).qualname().to_string())
             }

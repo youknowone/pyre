@@ -40,7 +40,7 @@ fn const_host(obj: HostObject) -> Hlvalue {
 }
 
 fn const_str(value: &str) -> Hlvalue {
-    Hlvalue::Constant(Constant::new(ConstValue::Str(value.to_string())))
+    Hlvalue::Constant(Constant::new(ConstValue::byte_str(value)))
 }
 
 fn get_variable_names_from_hlvalues(
@@ -60,12 +60,7 @@ fn get_variable_names_from_hlvalues(
 }
 
 fn tuple_of_strings(items: &[String]) -> ConstValue {
-    ConstValue::Tuple(
-        items
-            .iter()
-            .map(|item| ConstValue::Str(item.clone()))
-            .collect(),
-    )
+    ConstValue::Tuple(items.iter().map(ConstValue::byte_str).collect())
 }
 
 fn make_generatoriterator_class(func: &GraphFunc, var_names: &[String]) -> HostObject {
@@ -95,7 +90,7 @@ fn entry_varnames(entry: &HostObject) -> Result<Vec<String>, FlowContextError> {
         Some(ConstValue::Tuple(items)) => {
             let mut out = Vec::with_capacity(items.len());
             for item in items {
-                let ConstValue::Str(value) = item else {
+                let Some(value) = item.as_text().map(str::to_owned) else {
                     return Err(FlowContextError::Flowing(FlowingError::new(
                         "generator Entry.varnames must be a tuple of strings",
                     )));
@@ -532,7 +527,7 @@ fn tweak_generator_body_graph(
             Hlvalue::Constant(Constant::new(ConstValue::HostObject(
                 HostObject::new_instance(
                     err_cls,
-                    vec![ConstValue::Str("bad generator class".into())],
+                    vec![ConstValue::byte_str("bad generator class")],
                 ),
             ))),
         ],

@@ -347,7 +347,8 @@ fn const_value_to_concrete(value: &ConstValue) -> ConcreteType {
         ConstValue::Placeholder => ConcreteType::Unknown,
         ConstValue::Atom(_)
         | ConstValue::Dict(_)
-        | ConstValue::Str(_)
+        | ConstValue::ByteStr(_)
+        | ConstValue::UniStr(_)
         | ConstValue::Tuple(_)
         | ConstValue::List(_)
         | ConstValue::Graphs(_)

@@ -1286,7 +1286,7 @@ impl TupleRepr {
             ))
         })?;
         let llresult = self.lltypes[index].clone();
-        let cname = Constant::with_concretetype(ConstValue::Str(name.clone()), LowLevelType::Void);
+        let cname = Constant::with_concretetype(ConstValue::byte_str(name), LowLevelType::Void);
         Ok(llops
             .genop(
                 "getfield",
@@ -1420,10 +1420,8 @@ impl TupleRepr {
         // surface the flavor via a Void-typed Str sentinel matching
         // how other malloc emitters in pyre encode it; the lowering
         // pass reads the type from `c1` and the flavor from `cflags`.
-        let cflags = Constant::with_concretetype(
-            ConstValue::Str("flavor=gc".to_string()),
-            LowLevelType::Void,
-        );
+        let cflags =
+            Constant::with_concretetype(ConstValue::byte_str("flavor=gc"), LowLevelType::Void);
         let v_result = llops
             .genop(
                 "malloc",
@@ -1434,7 +1432,7 @@ impl TupleRepr {
         let v_result_h = Hlvalue::Variable(v_result);
         for (i, v_item) in items_v.into_iter().enumerate() {
             let cname = Constant::with_concretetype(
-                ConstValue::Str(r_tuple.fieldnames[i].clone()),
+                ConstValue::byte_str(&r_tuple.fieldnames[i]),
                 LowLevelType::Void,
             );
             llops.genop(
@@ -2098,7 +2096,7 @@ mod tests {
         let Hlvalue::Constant(field_const) = &llops.ops[0].args[1] else {
             panic!("getfield arg[1] must be a Constant");
         };
-        assert_eq!(field_const.value, ConstValue::Str("item1".to_string()));
+        assert_eq!(field_const.value, ConstValue::byte_str("item1"));
         assert_eq!(v.concretetype().as_ref(), Some(&LowLevelType::Signed));
     }
 
@@ -2261,7 +2259,7 @@ mod tests {
         let Hlvalue::Constant(c) = &getfield.args[1] else {
             panic!("getfield arg[1] must be a Constant");
         };
-        assert_eq!(c.value, ConstValue::Str("item2".to_string()));
+        assert_eq!(c.value, ConstValue::byte_str("item2"));
     }
 
     #[test]

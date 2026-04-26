@@ -298,7 +298,7 @@ impl ExceptionData {
         // upstream `field = llops.genop('getfield',
         //     [var_etype, llops.genvoidconst('subclassrange_min')], Signed)`.
         let void_field = Constant::with_concretetype(
-            ConstValue::Str("subclassrange_min".to_string()),
+            ConstValue::byte_str("subclassrange_min"),
             LowLevelType::Void,
         );
         let v_field = llops
@@ -1185,7 +1185,7 @@ impl RPythonTyper {
         let exitcase = link.borrow().exitcase.clone();
         let needs_convert = match exitcase.as_ref() {
             None => false,
-            Some(Hlvalue::Constant(c)) => !matches!(&c.value, ConstValue::Str(s) if s == "default"),
+            Some(Hlvalue::Constant(c)) => !c.value.string_eq("default"),
             Some(Hlvalue::Variable(_)) => {
                 // Upstream Python's `exitcase != 'default'` compares
                 // concrete values; a Variable exitcase is not an
@@ -2700,7 +2700,7 @@ pub(crate) fn helper_pygraph_from_graph(
 }
 
 pub(crate) fn void_field_const(name: &str) -> Hlvalue {
-    constant_with_lltype(ConstValue::Str(name.to_string()), LowLevelType::Void)
+    constant_with_lltype(ConstValue::byte_str(name), LowLevelType::Void)
 }
 
 fn lowlevel_issubclass_helper_graph(
@@ -3171,7 +3171,7 @@ fn lowlevel_int_py_div_helper_graph(
             vec![
                 Hlvalue::Variable(ok),
                 constant_with_lltype(
-                    ConstValue::Str("int_py_div_nonnegargs(): one arg is negative".to_string()),
+                    ConstValue::byte_str("int_py_div_nonnegargs(): one arg is negative"),
                     LowLevelType::Void,
                 ),
             ],
@@ -3372,7 +3372,7 @@ fn lowlevel_int_py_mod_helper_graph(
             vec![
                 Hlvalue::Variable(ok),
                 constant_with_lltype(
-                    ConstValue::Str("int_py_mod_nonnegargs(): one arg is negative".to_string()),
+                    ConstValue::byte_str("int_py_mod_nonnegargs(): one arg is negative"),
                     LowLevelType::Void,
                 ),
             ],
@@ -4875,10 +4875,7 @@ mod tests {
         let Hlvalue::Constant(field_const) = &oplist[0].args[1] else {
             panic!("getfield arg[1] must be a Constant");
         };
-        assert_eq!(
-            field_const.value,
-            ConstValue::Str("subclassrange_min".to_string())
-        );
+        assert_eq!(field_const.value, ConstValue::byte_str("subclassrange_min"));
         assert_eq!(field_const.concretetype.as_ref(), Some(&LowLevelType::Void));
 
         // int_between args[0]/args[2] are `genconst(min)` / `genconst(max)`.
@@ -5653,18 +5650,23 @@ mod tests {
         // `MissingRTypeOperation` so cascading callers can anchor on
         // the upstream module name in the error message.
         //
-        // `SomeString` is used here as a still-unported variant; when
-        // `rstr.py` lands, rotate to another unported variant
-        // (robject.py / rproperty.py / rweakref.py) so this test keeps
-        // guarding the error path.
-        use crate::annotator::model::SomeString;
+        // `SomeWeakRef` is the still-unported witness variant
+        // (rweakref.py port not landed). `SomeString` /
+        // `SomeUnicodeString` also still surface
+        // `MissingRTypeOperation` — Item 3 epic Slice 3 wires the
+        // `string_repr` / `unicode_repr` singletons but defers the
+        // `BaseLLStringRepr.convert_const` + abstract method surface,
+        // so `rtyper_makerepr` keeps the boundary anchor. Either
+        // witness works; the test stays on `SomeWeakRef` because it
+        // is the variant least coupled to the rstr.py slice churn.
+        use crate::annotator::model::SomeWeakRef;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = RPythonTyper::new(&ann);
         let err = rtyper
-            .getrepr(&SomeValue::String(SomeString::new(false, false)))
+            .getrepr(&SomeValue::WeakRef(SomeWeakRef::new(None)))
             .unwrap_err();
         assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("rstr.py"));
+        assert!(err.to_string().contains("rweakref.py"));
     }
 
     #[test]
@@ -5843,17 +5845,19 @@ mod tests {
         // silently fail, the setup path returns the structured
         // TyperError so callers know which upstream module to land.
         //
-        // `SomeString` is the still-unported witness variant; when
-        // `rstr.py` lands, rotate to another unported variant.
-        use crate::annotator::model::SomeString;
+        // `SomeWeakRef` is the still-unported witness variant
+        // (rweakref.py). `SomeString` would also work — Item 3 Slice 3
+        // wires the singletons but
+        // `rtyper_makerepr` still anchors at the boundary until the
+        // method surface lands in slices 4-12 — but the test stays on
+        // `SomeWeakRef` to decouple it from the rstr.py slice churn.
+        use crate::annotator::model::SomeWeakRef;
         let ann_rc = RPythonAnnotator::new(None, None, None, false);
         let rtyper = Rc::new(RPythonTyper::new(&ann_rc));
         let mut arg_var = Variable::new();
         arg_var
             .annotation
-            .replace(Some(Rc::new(SomeValue::String(SomeString::new(
-                false, false,
-            )))));
+            .replace(Some(Rc::new(SomeValue::WeakRef(SomeWeakRef::new(None)))));
         let mut result_var = Variable::new();
         result_var
             .annotation
@@ -6035,8 +6039,8 @@ mod tests {
         let rtyper = RPythonTyper::new(&ann);
         let block = Block::shared(vec![]);
         let target = Block::shared(vec![]);
-        let exitcase = Some(Hlvalue::Constant(Constant::new(ConstValue::Str(
-            "default".to_string(),
+        let exitcase = Some(Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+            "default",
         ))));
         let link = Link::new(vec![], Some(target), exitcase).into_ref();
         link.borrow_mut().llexitcase =
@@ -6083,8 +6087,8 @@ mod tests {
         block.borrow_mut().exitswitch = Some(Hlvalue::Constant(c_last_exception()));
         assert!(block.borrow().canraise());
         let target = Block::shared(vec![]);
-        let exitcase = Some(Hlvalue::Constant(Constant::new(ConstValue::Str(
-            "ValueError".to_string(),
+        let exitcase = Some(Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+            "ValueError",
         ))));
         let link = Link::new(vec![], Some(target), exitcase).into_ref();
         let err = rtyper._convert_link(&block, &link).unwrap_err();

@@ -2528,7 +2528,8 @@ impl MultipleFrozenPBCRepr {
                     "MultipleFrozenPBCRepr.getfield: attr {attr:?} not in fieldmap"
                 ))
             })?;
-        let cname = Constant::with_concretetype(ConstValue::Str(mangled_name), LowLevelType::Void);
+        let cname =
+            Constant::with_concretetype(ConstValue::byte_str(mangled_name), LowLevelType::Void);
         Ok(llops
             .genop(
                 "getfield",
@@ -2792,7 +2793,7 @@ impl Repr for MultipleFrozenPBCRepr {
                 TyperError::message("MultipleFrozenPBCRepr.rtype_getattr: missing args_s[1]")
             })?;
             match s_attr.const_().cloned() {
-                Some(ConstValue::Str(s)) => s,
+                Some(value) => value.as_text().unwrap_or("<non-string>").to_string(),
                 other => {
                     return Err(TyperError::message(format!(
                         "MultipleFrozenPBCRepr.rtype_getattr: non-constant attribute name (got {other:?})"
@@ -3125,7 +3126,7 @@ impl MethodOfFrozenPBCRepr {
         // concretetype on this Constant; pyre tags Void to satisfy
         // genop's concretetype assertion downstream.
         let c = Hlvalue::Constant(FlowConstant::with_concretetype(
-            ConstValue::Str("obscure-don't-use-me".to_string()),
+            ConstValue::byte_str("obscure-don't-use-me"),
             LowLevelType::Void,
         ));
         // upstream: `hop2.v_s_insertfirstarg(c, s_function)`.
@@ -3536,7 +3537,7 @@ impl Repr for ClassesPBCRepr {
                 )
             })?;
             match s_attr.const_().cloned() {
-                Some(ConstValue::Str(s)) => s,
+                Some(value) => value.as_text().unwrap_or("<non-string>").to_string(),
                 other => {
                     return Err(TyperError::message(format!(
                         "ClassesPBCRepr.rtype_getattr: non-constant attribute name \
@@ -3569,10 +3570,8 @@ impl Repr for ClassesPBCRepr {
                 ConvertedTo::LowLevelType(&LowLevelType::Void),
             ])?;
             let vcls = v_args[0].clone();
-            let cname = Constant::with_concretetype(
-                ConstValue::Str("name".to_string()),
-                LowLevelType::Void,
-            );
+            let cname =
+                Constant::with_concretetype(ConstValue::byte_str("name"), LowLevelType::Void);
             let strptr = crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone();
             let v_res = {
                 let mut llops = hop.llops.borrow_mut();
@@ -5101,11 +5100,11 @@ mod pbc_repr_tests {
         hop.args_s.borrow_mut().push(SomeValue::Impossible);
         hop.args_r.borrow_mut().push(Some(root_repr_arc.clone()));
         let mut s_attr = SomeString::default();
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str("__name__".to_string())));
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str("__name__")));
         hop.args_v
             .borrow_mut()
             .push(Hlvalue::Constant(Constant::with_concretetype(
-                ConstValue::Str("__name__".to_string()),
+                ConstValue::byte_str("__name__"),
                 LowLevelType::Void,
             )));
         hop.args_s.borrow_mut().push(SomeValue::String(s_attr));
@@ -5128,7 +5127,7 @@ mod pbc_repr_tests {
         let Hlvalue::Constant(field_const) = &getfield.args[1] else {
             panic!("getfield arg[1] must be a Constant");
         };
-        assert_eq!(field_const.value, ConstValue::Str("name".to_string()));
+        assert_eq!(field_const.value, ConstValue::byte_str("name"));
         assert_eq!(field_const.concretetype, Some(LowLevelType::Void));
     }
 

@@ -891,13 +891,11 @@ fn host_object_own_getattr(pyobj: &HostObject, name: &str) -> Option<ConstValue>
             | HostObjectKind::UserFunction { .. }
             | HostObjectKind::BoundMethod { .. }
             | HostObjectKind::NativeCallable { .. } => {
-                Some(ConstValue::Str(pyobj.simple_name().to_string()))
+                Some(ConstValue::byte_str(pyobj.simple_name()))
             }
-            HostObjectKind::Property { .. } => {
-                Some(ConstValue::Str(pyobj.simple_name().to_string()))
-            }
+            HostObjectKind::Property { .. } => Some(ConstValue::byte_str(pyobj.simple_name())),
             HostObjectKind::StaticMethod { func } | HostObjectKind::ClassMethod { func } => {
-                Some(ConstValue::Str(func.simple_name().to_string()))
+                Some(ConstValue::byte_str(func.simple_name()))
             }
             _ => None,
         },
@@ -909,9 +907,9 @@ fn host_object_own_getattr(pyobj: &HostObject, name: &str) -> Option<ConstValue>
             | HostObjectKind::BoundMethod { .. }
             | HostObjectKind::StaticMethod { .. }
             | HostObjectKind::ClassMethod { .. }
-            | HostObjectKind::NativeCallable { .. } => pyobj
-                .module_name()
-                .map(|module| ConstValue::Str(module.to_string())),
+            | HostObjectKind::NativeCallable { .. } => {
+                pyobj.module_name().map(ConstValue::byte_str)
+            }
             _ => None,
         },
         "__globals__" => match &pyobj.inner.kind {
@@ -1202,11 +1200,11 @@ pub fn const_runtime_getattr(obj: &ConstValue, name: &str) -> Result<Option<Cons
         ConstValue::Function(func) => match name {
             "__name__" => {
                 let (simple_name, _) = split_attr_name_module(&func.name);
-                Ok(Some(ConstValue::Str(simple_name)))
+                Ok(Some(ConstValue::byte_str(simple_name)))
             }
             "__module__" => {
                 let (_, module_name) = split_attr_name_module(&func.name);
-                Ok(module_name.map(ConstValue::Str))
+                Ok(module_name.map(ConstValue::byte_str))
             }
             "__globals__" => Ok(Some(func.globals.value.clone())),
             "__defaults__" => {
@@ -1465,6 +1463,7 @@ impl HostEnv {
             "method",
             "builtin_function_or_method",
             "str",
+            "unicode",
             "int",
             "float",
             "bool",
@@ -1703,9 +1702,15 @@ pub enum ConstValue {
     /// used both for `func.__globals__` and optimizer rewrites like
     /// `transform_list_contains`.
     Dict(HashMap<ConstValue, ConstValue>),
-    /// Python string constant. Used by `checkgraph()` to validate
-    /// single-character switch exitcases and `"default"` ordering.
-    Str(String),
+    /// Python 2 byte string constant (`str`).
+    ///
+    /// RPython keeps the byte/unicode distinction in the concrete
+    /// Python object stored on `Constant.value`; the Rust port makes
+    /// that type tag explicit so low-level `Char` and `UniChar`
+    /// constants cannot be confused.
+    ByteStr(Vec<u8>),
+    /// Python 2 unicode constant (`unicode`).
+    UniStr(String),
     /// Python tuple constant. Used by `CallSpec.as_list()` to unpack
     /// `*args` exactly like upstream's `w_stararg.value`.
     Tuple(Vec<ConstValue>),
@@ -1769,7 +1774,8 @@ impl PartialEq for ConstValue {
             (ConstValue::Int(a), ConstValue::Int(b)) => a == b,
             (ConstValue::Float(a), ConstValue::Float(b)) => a == b,
             (ConstValue::Dict(a), ConstValue::Dict(b)) => a == b,
-            (ConstValue::Str(a), ConstValue::Str(b)) => a == b,
+            (ConstValue::ByteStr(a), ConstValue::ByteStr(b)) => a == b,
+            (ConstValue::UniStr(a), ConstValue::UniStr(b)) => a == b,
             (ConstValue::Tuple(a), ConstValue::Tuple(b)) => a == b,
             (ConstValue::List(a), ConstValue::List(b)) => a == b,
             (ConstValue::Bool(a), ConstValue::Bool(b)) => a == b,
@@ -1805,7 +1811,8 @@ impl std::fmt::Display for ConstValue {
             ConstValue::Placeholder => f.write_str("<placeholder>"),
             ConstValue::Int(value) => write!(f, "{value}"),
             ConstValue::Float(bits) => write!(f, "{}", f64::from_bits(*bits)),
-            ConstValue::Str(value) => write!(f, "{value:?}"),
+            ConstValue::ByteStr(value) => write!(f, "b{:?}", String::from_utf8_lossy(value)),
+            ConstValue::UniStr(value) => write!(f, "u{value:?}"),
             ConstValue::Bool(value) => write!(f, "{value}"),
             ConstValue::None => f.write_str("None"),
             ConstValue::SpecTag(id) => write!(f, "<spec-tag {id}>"),
@@ -1850,7 +1857,8 @@ impl Hash for ConstValue {
                     entry_hash.hash(state);
                 }
             }
-            ConstValue::Str(value) => value.hash(state),
+            ConstValue::ByteStr(value) => value.hash(state),
+            ConstValue::UniStr(value) => value.hash(state),
             ConstValue::Tuple(items) | ConstValue::List(items) => items.hash(state),
             ConstValue::Bool(value) => value.hash(state),
             ConstValue::None => {}
@@ -2347,6 +2355,69 @@ impl ConstValue {
         ConstValue::Float(value.to_bits())
     }
 
+    /// Construct a Python 2 byte string (`str`) constant.
+    pub fn byte_str(value: impl AsRef<[u8]>) -> Self {
+        ConstValue::ByteStr(value.as_ref().to_vec())
+    }
+
+    /// Construct a Python 2 unicode constant.
+    pub fn uni_str(value: impl AsRef<str>) -> Self {
+        ConstValue::UniStr(value.as_ref().to_string())
+    }
+
+    /// Return the raw bytes for a Python 2 byte string constant.
+    pub fn as_byte_str(&self) -> Option<&[u8]> {
+        match self {
+            ConstValue::ByteStr(value) => Some(value.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Return the text for a Python 2 unicode constant.
+    pub fn as_uni_str(&self) -> Option<&str> {
+        match self {
+            ConstValue::UniStr(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Return a Rust `str` view for string constants used as host
+    /// names/attributes. Python 2 byte strings are accepted only when
+    /// they are valid UTF-8, which covers identifiers and metadata.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            ConstValue::ByteStr(value) => std::str::from_utf8(value).ok(),
+            ConstValue::UniStr(value) => Some(value.as_str()),
+            _ => None,
+        }
+    }
+
+    /// Mirror RPython's `isinstance(value, str)` (Python 2 bytes-only)
+    /// check on string constants. Use this where the upstream call
+    /// site explicitly demands `str` rather than the generic
+    /// `bytes`-or-`unicode` text view returned by [`as_text`]. Returns
+    /// the byte-string interpreted as UTF-8 text — ASCII identifiers /
+    /// attribute names always succeed, while a `unicode` constant or a
+    /// non-UTF-8 byte string yields `None`.
+    pub fn as_pystr(&self) -> Option<&str> {
+        match self {
+            ConstValue::ByteStr(value) => std::str::from_utf8(value).ok(),
+            _ => None,
+        }
+    }
+
+    pub fn into_text(self) -> Option<String> {
+        match self {
+            ConstValue::ByteStr(value) => String::from_utf8(value).ok(),
+            ConstValue::UniStr(value) => Some(value),
+            _ => None,
+        }
+    }
+
+    pub fn string_eq(&self, expected: &str) -> bool {
+        self.as_text() == Some(expected)
+    }
+
     /// Unwrap a `Float` variant back to `f64`. Returns `None` for
     /// other variants.
     pub fn as_float(&self) -> Option<f64> {
@@ -2366,7 +2437,8 @@ impl ConstValue {
             // which equals 0.0 under IEEE 754).
             ConstValue::Float(bits) => Some(f64::from_bits(*bits) != 0.0),
             ConstValue::Dict(items) => Some(!items.is_empty()),
-            ConstValue::Str(s) => Some(!s.is_empty()),
+            ConstValue::ByteStr(s) => Some(!s.is_empty()),
+            ConstValue::UniStr(s) => Some(!s.is_empty()),
             ConstValue::Tuple(items) | ConstValue::List(items) => Some(!items.is_empty()),
             ConstValue::Bool(value) => Some(*value),
             ConstValue::None => Some(false),
@@ -2410,15 +2482,22 @@ impl ConstValue {
     /// (`argument.py:113`) — upstream consumes any Python iterable.
     /// Line-by-line port for the `ConstValue` variants that can appear
     /// as `w_stararg.value` in practice: tuple/list (flow-space's
-    /// BUILD_TUPLE/BUILD_LIST output), str (per-char iteration matches
-    /// Python semantics), dict (iteration over keys).
+    /// BUILD_TUPLE/BUILD_LIST output), str/unicode (per-item
+    /// iteration matches Python semantics), dict (iteration over keys).
     pub fn iter_items(&self) -> Option<Vec<ConstValue>> {
         match self {
             ConstValue::Tuple(items) | ConstValue::List(items) => Some(items.clone()),
-            ConstValue::Str(value) => Some(
+            ConstValue::ByteStr(value) => Some(
+                value
+                    .iter()
+                    .copied()
+                    .map(|b| ConstValue::ByteStr(vec![b]))
+                    .collect(),
+            ),
+            ConstValue::UniStr(value) => Some(
                 value
                     .chars()
-                    .map(|c| ConstValue::Str(c.to_string()))
+                    .map(|c| ConstValue::uni_str(c.to_string()))
                     .collect(),
             ),
             ConstValue::Dict(items) => Some(items.keys().cloned().collect()),
@@ -2445,7 +2524,8 @@ impl ConstValue {
             ConstValue::Int(_) => HOST_ENV.lookup_builtin("int"),
             ConstValue::Float(_) => HOST_ENV.lookup_builtin("float"),
             ConstValue::Bool(_) => HOST_ENV.lookup_builtin("bool"),
-            ConstValue::Str(_) => HOST_ENV.lookup_builtin("str"),
+            ConstValue::ByteStr(_) => HOST_ENV.lookup_builtin("str"),
+            ConstValue::UniStr(_) => HOST_ENV.lookup_builtin("unicode"),
             ConstValue::Tuple(_) => HOST_ENV.lookup_builtin("tuple"),
             ConstValue::List(_) => HOST_ENV.lookup_builtin("list"),
             ConstValue::Dict(_) => HOST_ENV.lookup_builtin("dict"),
@@ -3635,13 +3715,17 @@ fn is_valid_switch_exitcase(exitcase: &Hlvalue) -> bool {
             value: ConstValue::Int(_) | ConstValue::Bool(_) | ConstValue::None,
             ..
         })
-    ) || matches!(
-        exitcase,
+    ) || match exitcase {
         Hlvalue::Constant(Constant {
-            value: ConstValue::Str(s),
+            value: ConstValue::ByteStr(s),
             ..
-        }) if s == "default" || s.chars().count() == 1
-    )
+        }) => s == b"default" || s.len() == 1,
+        Hlvalue::Constant(Constant {
+            value: ConstValue::UniStr(s),
+            ..
+        }) => s == "default" || s.chars().count() == 1,
+        _ => false,
+    }
 }
 
 /// RPython `flowspace/model.py:568-700` — `checkgraph(graph)`.
@@ -3804,12 +3888,8 @@ pub fn checkgraph(graph: &FunctionGraph) {
                             is_valid_switch_exitcase(&exitcase),
                             "switch on a non-primitive value {exitcase:?}"
                         );
-                        if let Hlvalue::Constant(Constant {
-                            value: ConstValue::Str(s),
-                            ..
-                        }) = &exitcase
-                        {
-                            if s == "default" {
+                        if let Hlvalue::Constant(c) = &exitcase {
+                            if c.value.string_eq("default") {
                                 assert!(
                                     idx + 1 == b.exits.len(),
                                     "'default' branch of a switch is not the last exit"
@@ -3949,6 +4029,23 @@ mod tests {
         a.hash(&mut ha);
         b.hash(&mut hb);
         assert_eq!(ha.finish(), hb.finish());
+    }
+
+    /// `ConstValue::as_pystr` mirrors RPython `isinstance(value, str)`
+    /// (Python 2 bytes-only). UniStr / non-string variants must yield
+    /// `None`; ByteStr returns the UTF-8 view (ASCII identifiers /
+    /// attribute names always succeed).
+    #[test]
+    fn as_pystr_matches_python2_str_isinstance_only() {
+        // ByteStr → UTF-8 view (ASCII identifier).
+        assert_eq!(ConstValue::byte_str(b"name").as_pystr(), Some("name"));
+        // UniStr is `unicode` upstream, NOT `str`. Reject.
+        assert_eq!(ConstValue::uni_str("name").as_pystr(), None);
+        // Non-UTF-8 bytes — also reject (ASCII identifiers never
+        // produce these; defensive).
+        assert_eq!(ConstValue::byte_str(&[0xff, 0xfe]).as_pystr(), None);
+        // Non-string variants reject as well.
+        assert_eq!(ConstValue::Int(1).as_pystr(), None);
     }
 
     #[test]
@@ -4832,7 +4929,7 @@ mod tests {
         );
         let prop = HostObject::new_property("pkg.Box.value", Some(fget.clone()), None, None);
         let out = host_getattr(&prop, "__name__").expect("property.__name__");
-        assert_eq!(out, ConstValue::Str("value".to_string()));
+        assert_eq!(out, ConstValue::byte_str("value"));
         let out = host_getattr(&prop, "fget").expect("property.fget");
         assert_eq!(out, ConstValue::HostObject(fget));
         let out = host_getattr(&prop, "fset").expect("property.fset");
@@ -4887,9 +4984,9 @@ mod tests {
             Constant::new(ConstValue::Dict(HashMap::new())),
         ));
         let out = host_getattr(&func, "__name__").expect("function.__name__");
-        assert_eq!(out, ConstValue::Str("demo".to_string()));
+        assert_eq!(out, ConstValue::byte_str("demo"));
         let out = host_getattr(&func, "__module__").expect("function.__module__");
-        assert_eq!(out, ConstValue::Str("pkg.module".to_string()));
+        assert_eq!(out, ConstValue::byte_str("pkg.module"));
     }
 
     #[test]
@@ -4921,7 +5018,7 @@ mod tests {
         let globals = Constant::new(ConstValue::Dict(HashMap::new()));
         let mut graph_func = GraphFunc::new("pkg.module.demo", globals);
         graph_func.defaults = vec![Constant::new(ConstValue::Int(7))];
-        graph_func.closure = vec![Constant::new(ConstValue::Str("cell".to_string()))];
+        graph_func.closure = vec![Constant::new(ConstValue::byte_str("cell"))];
         let func = HostObject::new_user_function(graph_func);
 
         let defaults = host_getattr(&func, "__defaults__").expect("function.__defaults__");
@@ -4930,7 +5027,7 @@ mod tests {
         let closure = host_getattr(&func, "__closure__").expect("function.__closure__");
         assert_eq!(
             closure,
-            ConstValue::Tuple(vec![ConstValue::Str("cell".to_string())])
+            ConstValue::Tuple(vec![ConstValue::byte_str("cell")])
         );
     }
 
@@ -4938,7 +5035,7 @@ mod tests {
     fn host_getattr_module_and_class_dunder_name_follow_python_surface() {
         let module = HostObject::new_module("pkg.demo");
         let out = host_getattr(&module, "__name__").expect("module.__name__");
-        assert_eq!(out, ConstValue::Str("pkg.demo".to_string()));
+        assert_eq!(out, ConstValue::byte_str("pkg.demo"));
         assert_eq!(
             host_getattr(&module, "__module__"),
             Err(HostGetAttrError::Missing)
@@ -4946,9 +5043,9 @@ mod tests {
 
         let cls = HostObject::new_class("pkg.demo.Box", vec![]);
         let out = host_getattr(&cls, "__name__").expect("class.__name__");
-        assert_eq!(out, ConstValue::Str("Box".to_string()));
+        assert_eq!(out, ConstValue::byte_str("Box"));
         let out = host_getattr(&cls, "__module__").expect("class.__module__");
-        assert_eq!(out, ConstValue::Str("pkg.demo".to_string()));
+        assert_eq!(out, ConstValue::byte_str("pkg.demo"));
     }
 
     #[test]
@@ -4961,14 +5058,14 @@ mod tests {
         let cm = HostObject::new_classmethod("pkg.demo.value", func);
 
         let out = host_getattr(&sm, "__name__").expect("staticmethod.__name__");
-        assert_eq!(out, ConstValue::Str("value".to_string()));
+        assert_eq!(out, ConstValue::byte_str("value"));
         let out = host_getattr(&sm, "__module__").expect("staticmethod.__module__");
-        assert_eq!(out, ConstValue::Str("pkg.demo".to_string()));
+        assert_eq!(out, ConstValue::byte_str("pkg.demo"));
 
         let out = host_getattr(&cm, "__name__").expect("classmethod.__name__");
-        assert_eq!(out, ConstValue::Str("value".to_string()));
+        assert_eq!(out, ConstValue::byte_str("value"));
         let out = host_getattr(&cm, "__module__").expect("classmethod.__module__");
-        assert_eq!(out, ConstValue::Str("pkg.demo".to_string()));
+        assert_eq!(out, ConstValue::byte_str("pkg.demo"));
     }
 
     #[test]

@@ -1039,9 +1039,7 @@ mod tests {
     fn integer_repr_convert_const_rejects_non_integer() {
         // rint.py:37 — `raise TyperError("not an integer: %r" % ...)`.
         let r = signed_repr();
-        let err = r
-            .convert_const(&ConstValue::Str("x".to_string()))
-            .unwrap_err();
+        let err = r.convert_const(&ConstValue::byte_str("x")).unwrap_err();
         assert!(err.to_string().contains("not an integer"));
     }
 

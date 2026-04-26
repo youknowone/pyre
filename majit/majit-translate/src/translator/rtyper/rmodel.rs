@@ -102,17 +102,17 @@ fn hop_arg_const_string(hop: &HighLevelOp, index: usize) -> Result<String, Typer
         .get(index)
         .and_then(|s| s.const_())
         .ok_or_else(|| TyperError::message("expected constant string annotation"))?;
-    let ConstValue::Str(attr) = value else {
+    let Some(attr) = value.as_text() else {
         return Err(TyperError::message(format!(
             "expected constant string annotation, got {value:?}"
         )));
     };
-    Ok(attr.clone())
+    Ok(attr.to_string())
 }
 
 fn void_field_const(name: &str) -> Hlvalue {
     Hlvalue::Constant(Constant::with_concretetype(
-        ConstValue::Str(name.to_string()),
+        ConstValue::byte_str(name),
         LowLevelType::Void,
     ))
 }
@@ -218,10 +218,7 @@ fn lowlevel_type_const(lltype: LowLevelType) -> Hlvalue {
 }
 
 fn gc_flavor_const() -> Result<Hlvalue, TyperError> {
-    let flags = HashMap::from([(
-        ConstValue::Str("flavor".to_string()),
-        ConstValue::Str("gc".to_string()),
-    )]);
+    let flags = HashMap::from([(ConstValue::byte_str("flavor"), ConstValue::byte_str("gc"))]);
     HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags)).map(Hlvalue::Constant)
 }
 
@@ -696,7 +693,7 @@ pub trait Repr: Debug + std::any::Any {
         let s_attr = args_s
             .get(1)
             .ok_or_else(|| TyperError::message("getattr() missing attribute argument"))?;
-        if let Some(ConstValue::Str(attr)) = s_attr.const_() {
+        if let Some(attr) = s_attr.const_().and_then(ConstValue::as_text) {
             let s_obj = args_s
                 .first()
                 .ok_or_else(|| TyperError::message("getattr() missing object argument"))?;
@@ -1560,7 +1557,7 @@ impl InteriorPtrRepr {
                 }
                 crate::translator::rtyper::lltypesystem::lltype::InteriorOffset::Field(name) => {
                     v_offsets.push(Some(Constant::with_concretetype(
-                        ConstValue::Str(name.clone()),
+                        ConstValue::byte_str(name),
                         LowLevelType::Void,
                     )));
                 }
@@ -2325,11 +2322,35 @@ pub fn rtyper_makerepr(
         SomeValue::UnicodeCodePoint(_) => {
             Ok(crate::translator::rtyper::rstr::unichar_repr() as std::sync::Arc<dyn Repr>)
         }
-        SomeValue::String(_) | SomeValue::UnicodeString(_) | SomeValue::ByteArray(_) => {
-            Err(TyperError::missing_rtype_operation(
-                "SomeString/ByteArray.rtyper_makerepr — port rpython/rtyper/rstr.py string Repr",
-            ))
-        }
+        // rstr.py:569-571 / 577-579 — `SomeString.rtyper_makerepr` /
+        // `SomeUnicodeString.rtyper_makerepr` return the module-global
+        // `string_repr` / `unicode_repr` (`lltypesystem/rstr.py:1255` /
+        // `:1260`). Pyre defines the singletons today (Item 3 epic
+        // Slice 3) but `BaseLLStringRepr.convert_const`
+        // (`lltypesystem/rstr.py:191-206`) plus the abstract method
+        // surface (`rstr.py:119-449` — `rtype_len` / `rtype_bool` /
+        // `rtype_add` / `rtype_eq` / `rtype_getitem` / `rtype_method_*`
+        // / `get_ll_eq_function` / `get_ll_hash_function`) only land in
+        // slices 4-12. Returning the partial repr here is a regression:
+        // callers downstream observe an `Arc<dyn Repr>` whose method
+        // calls dispatch to the default-`MissingRTypeOperation` paths,
+        // which is silently weaker than the upstream behaviour where
+        // `SomeString` would surface the missing port at the
+        // `rtyper_makerepr` boundary. Keep the anchor pinned at the
+        // boundary until the slice 4+ method bodies (the helpers in
+        // `lltypesystem/rstr.rs`) are wired through.
+        SomeValue::String(_) => Err(TyperError::missing_rtype_operation(
+            "SomeString.rtyper_makerepr — port rpython/rtyper/rstr.py + lltypesystem/rstr.py BaseLLStringRepr.convert_const + StringRepr method surface",
+        )),
+        SomeValue::UnicodeString(_) => Err(TyperError::missing_rtype_operation(
+            "SomeUnicodeString.rtyper_makerepr — port rpython/rtyper/rstr.py + lltypesystem/rstr.py BaseLLStringRepr.convert_const + UnicodeRepr method surface",
+        )),
+        // rbytearray.py:6-23 — `SomeByteArray.rtyper_makerepr` returns
+        // a `ByteArrayRepr`. Pyre defers the dedicated rbytearray.rs
+        // port to a separate epic; surface the missing-rtype anchor.
+        SomeValue::ByteArray(_) => Err(TyperError::missing_rtype_operation(
+            "SomeByteArray.rtyper_makerepr — port rpython/rtyper/rbytearray.py ByteArrayRepr",
+        )),
         // rclass.py:445-447 — SomeInstance.rtyper_makerepr.
         SomeValue::Instance(s) => {
             let rtyper_rc = rtyper.self_rc()?;
@@ -2493,7 +2514,7 @@ mod tests {
 
     fn const_string_annotation(value: &str) -> SomeValue {
         let mut s_attr = SomeString::new(false, false);
-        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::Str(value.to_string())));
+        s_attr.inner.base.const_box = Some(Constant::new(ConstValue::byte_str(value)));
         SomeValue::String(s_attr)
     }
 
@@ -3131,7 +3152,7 @@ mod tests {
         let Some(c_offset) = &repr.v_offsets[0] else {
             panic!("field offset should be stored as a Void constant");
         };
-        assert_eq!(c_offset.value, ConstValue::Str("x".into()));
+        assert_eq!(c_offset.value, ConstValue::byte_str("x"));
         assert_eq!(c_offset.concretetype, Some(LowLevelType::Void));
         assert!(matches!(repr.parentptrtype.TO, PtrTarget::Struct(_)));
     }
@@ -3347,6 +3368,59 @@ mod tests {
         let sv = SomeValue::Type(SomeType::new());
         let repr = rtyper_makerepr(&sv, &rtyper).expect("rtyper_makerepr");
         assert_eq!(repr.class_name(), "RootClassRepr");
+    }
+
+    /// rstr.py:569-571 — `SomeString.rtyper_makerepr` defers to
+    /// `lltypesystem/rstr.py:1255` `string_repr`. The singleton is
+    /// constructed today (Item 3 epic Slice 3) but
+    /// `BaseLLStringRepr.convert_const` and the method surface
+    /// (`rtype_len` / `rtype_bool` / `rtype_add` / `rtype_eq` /
+    /// `rtype_getitem` / `rtype_method_*`) land in slices 4-12.
+    /// Until then `rtyper_makerepr` keeps the anchor pinned so the
+    /// missing port surfaces at the `rtyper.getrepr` boundary instead
+    /// of silently dispatching the default `MissingRTypeOperation`
+    /// paths from inside a partial repr.
+    #[test]
+    fn rtyper_makerepr_somestring_surfaces_missing_rtype_to_rstr() {
+        use crate::annotator::model::SomeString;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+
+        let sv = SomeValue::String(SomeString::new(false, false));
+        let err =
+            rtyper_makerepr(&sv, &rtyper).expect_err("StringRepr method surface not yet ported");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("rstr.py"));
+    }
+
+    /// rstr.py:577-579 — `SomeUnicodeString.rtyper_makerepr` defers to
+    /// `lltypesystem/rstr.py:1260` `unicode_repr`. Same gating as
+    /// `SomeString` above — the singleton exists, but the method
+    /// surface waits on slices 4-12.
+    #[test]
+    fn rtyper_makerepr_someunicodestring_surfaces_missing_rtype_to_rstr() {
+        use crate::annotator::model::SomeUnicodeString;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+
+        let sv = SomeValue::UnicodeString(SomeUnicodeString::new(false, false));
+        let err =
+            rtyper_makerepr(&sv, &rtyper).expect_err("UnicodeRepr method surface not yet ported");
+        assert!(err.is_missing_rtype_operation());
+        assert!(err.to_string().contains("rstr.py"));
+    }
+
+    /// `SomeByteArray` remains parked behind a missing-rtype anchor —
+    /// `rbytearray.py:6-23` `ByteArrayRepr` is its own port.
+    #[test]
+    fn rtyper_makerepr_somebytearray_surfaces_missing_rtype_to_rbytearray() {
+        use crate::annotator::model::SomeByteArray;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+
+        let sv = SomeValue::ByteArray(SomeByteArray::new(false));
+        let err = rtyper_makerepr(&sv, &rtyper).expect_err("ByteArray repr not yet ported");
+        assert!(err.to_string().contains("rbytearray.py"));
     }
 
     // -----------------------------------------------------------------

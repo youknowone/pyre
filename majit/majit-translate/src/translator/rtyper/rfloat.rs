@@ -1204,9 +1204,7 @@ mod tests {
     fn convert_const_rejects_non_numeric() {
         // rfloat.py:15-16 — `raise TyperError("not a float: %r" % ...)`.
         let r = FloatRepr::new();
-        let err = r
-            .convert_const(&ConstValue::Str("pi".to_string()))
-            .unwrap_err();
+        let err = r.convert_const(&ConstValue::byte_str("pi")).unwrap_err();
         assert!(err.to_string().contains("not a float"));
     }
 

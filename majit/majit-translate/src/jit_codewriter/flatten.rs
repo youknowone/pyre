@@ -635,7 +635,8 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
         | ConstValue::LLAddress(_) => 'i',
         ConstValue::Float(_) => 'f',
         ConstValue::None
-        | ConstValue::Str(_)
+        | ConstValue::ByteStr(_)
+        | ConstValue::UniStr(_)
         | ConstValue::HostObject(_)
         | ConstValue::Tuple(_)
         | ConstValue::List(_)
