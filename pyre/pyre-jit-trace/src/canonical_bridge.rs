@@ -543,46 +543,28 @@ pub fn install_portal_for(
     // would find duplicates).
     let runtime = build_runtime_jitcode(&canonical, JitCodeExecState::default(), None);
 
-    // G.4.4 prereq #2 step 2 sub-step 1 (2026-04-26): canonical-name-
-    // gated portal-register derivation.  History:
+    // RPython `JitDriverStaticData` derives the portal frame/ec
+    // register slots from the jitdriver's `greens` / `reds`
+    // declarations (`rpython/jit/metainterp/warmspot.py` setup_jit
+    // chain), not from the canonical's name.  pyre lacks the
+    // jitdriver greens/reds → register-slot mapping infrastructure;
+    // until that lands, both registers stay sentinel-skipped with
+    // `u16::MAX` so `fill_portal_registers`
+    // (`majit-metainterp/src/blackhole.rs:1163`) becomes a no-op
+    // for portal-bridge installs.
     //
-    //   * Pre-G.4.3a Cat C derivation set `portal_frame_reg = 0`
-    //     unconditionally, assuming `eval_loop_jit`'s single Ref
-    //     inputarg.  When the build-time canonical was actually
-    //     `pyopcode.rs::execute_opcode_step` (5 mixed-kind inputargs:
-    //     `executor: &mut E`, `code: &CodeObject`, `instruction:
-    //     Instruction`, `op_arg: OpArg`, `next_instr: usize`) the
-    //     monomorphized frame inputarg lived in a different Ref slot
-    //     and writing `virtualizable_ptr` to register 0 corrupted
-    //     whatever that canonical had there.
-    //   * G.4.3a-fix sentinel-skipped both registers with `u16::MAX`
-    //     so `fill_portal_registers` (`majit-metainterp/src/blackhole.
-    //     rs:1163`) became a no-op — wrong but localised.
-    //   * Phase G follow-up (`pyre-jit-trace/build.rs` commit
-    //     `ea6fc097816`) added `pyre/pyre-jit/src/eval.rs` to the
-    //     analyse pipeline, which flips the build-time canonical to
-    //     `eval_loop_jit(frame: &mut PyFrame) -> LoopResult` — a
-    //     single Ref inputarg.  The derivation `portal_frame_reg = 0`
-    //     is now correct for that canonical; legacy
-    //     `execute_opcode_step` (still produced by builds that omit
-    //     eval.rs from the source list — e.g. minimal unit-test
-    //     scaffolding) keeps the conservative `u16::MAX` sentinel.
-    //
-    // `eval_loop_jit` has no execution-context inputarg — ec is loaded
-    // from frame on demand via `(*frame).execution_context`, so
-    // `portal_ec_reg` stays sentinel-skipped regardless of canonical.
-    //
-    // Foundational change: at this commit no `find_jitcode` reader
-    // returns portal-bridge entries (Issue 1 callback
-    // `register_portal_bridge_in_callcontrol` is `#[allow(dead_code)]`
-    // — `pyre-jit/src/jit/codewriter.rs:5854`), so the new derivation
-    // is byte-for-byte runtime no-op until G.4.4 prereq #2 steps 2-4
-    // wire the BH chain walk + reader changes + callback activation.
-    let portal_frame_reg = if canonical.name == "eval_loop_jit" {
-        0
-    } else {
-        u16::MAX
-    };
+    // PRE-EXISTING-ADAPTATION: the conservative sentinel is
+    // localised-wrong-but-harmless.  An earlier patch
+    // (`054fdc69865`) gated `portal_frame_reg = 0` on
+    // `canonical.name == "eval_loop_jit"` — name-based register
+    // inference has no RPython precedent (RPython resolves the slot
+    // from the actual inputarg layout) and could actively corrupt
+    // ref reg 0 if the canonical layout shifts or the callback
+    // activates downstream of the no-op window
+    // (`register_portal_bridge_in_callcontrol` is currently
+    // `#[allow(dead_code)]` at `pyre-jit/src/jit/codewriter.rs:5854`).
+    // Revert to the sentinel pending the proper derivation port.
+    let portal_frame_reg = u16::MAX;
     let portal_ec_reg = u16::MAX;
 
     // `stack_base` is the absolute index of the operand stack within
@@ -961,24 +943,12 @@ mod tests {
         // callers always pass a non-null wrapper; that path is exercised
         // by `install_portal_for_populates_depth_at_py_pc_for_user_code`.
         assert!(pyjit.metadata.depth_at_py_pc.is_empty());
-        // G.4.4 prereq #2 step 2 sub-step 1: canonical-name-gated
-        // derivation.  After Phase G follow-up
-        // (`pyre-jit-trace/build.rs` commit `ea6fc097816`) included
-        // `pyre/pyre-jit/src/eval.rs` in the analyse pipeline, the
-        // build-time canonical is `eval_loop_jit(frame: &mut PyFrame)`
-        // — single Ref inputarg at register 0.  Test environment uses
-        // the same build.rs so this assertion pins the production
-        // canonical's derivation; the legacy-canonical fallback
-        // (`u16::MAX` sentinel) only fires when the source list omits
-        // eval.rs (no production caller does).  `portal_ec_reg` stays
-        // sentinel-skipped regardless of canonical because
-        // `eval_loop_jit` has no execution-context inputarg.
-        let canonical = portal_jitcode().expect("build-time portal canonical jitcode must exist");
-        if canonical.name == "eval_loop_jit" {
-            assert_eq!(pyjit.metadata.portal_frame_reg, 0);
-        } else {
-            assert_eq!(pyjit.metadata.portal_frame_reg, u16::MAX);
-        }
+        // RPython-orthodox revert: `portal_frame_reg` /
+        // `portal_ec_reg` are sentinel-skipped pending the proper
+        // greens/reds → register-slot derivation port.  See
+        // `install_portal_for` for the rationale.
+        let _canonical = portal_jitcode().expect("build-time portal canonical jitcode must exist");
+        assert_eq!(pyjit.metadata.portal_frame_reg, u16::MAX);
         assert_eq!(pyjit.metadata.portal_ec_reg, u16::MAX);
         // Test fixture passes null code_ptr; install_portal_for falls
         // back to stack_base = 0 (production callers always pass a

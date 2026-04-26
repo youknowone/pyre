@@ -43,17 +43,20 @@
 //! `_match_signature` body in this file collapses into a single shared
 //! implementation. Tracking item: cascade R1 follow-up after R1.m.
 //!
-//! ## PRE-EXISTING-ADAPTATION: `_emit` cache deferred
+//! ## PRE-EXISTING-ADAPTATION: `Holder::Item` parent sharing
 //!
-//! Upstream `Holder.emit` (callparse.py:78-88) caches emit results per
-//! `repr` so a Holder reused under the same Repr emits one IR op
-//! instead of N. Rust port omits the cache for the first slice — every
-//! `emit` call re-emits the underlying op. Functional equivalence
-//! preserved (callparse outputs the same low-level argument list); IR
-//! size grows linearly with reuse. Caching can be added later by
-//! wrapping each Holder variant in `RefCell<HashMap<*const dyn Repr,
-//! Hlvalue>>` once profiling justifies the complexity.
+//! Upstream `VarHolder.items()` (callparse.py:100-103) builds
+//! `ItemHolder(self, i)` so every sibling `ItemHolder` shares the
+//! `self` parent (Python reference semantics). Pyre's [`Holder::item`]
+//! wraps a `Box<Holder>` whose construction at [`Holder::items`]
+//! (line 423) clones the parent — sibling `ItemHolder`s therefore each
+//! own a private parent copy. The per-Holder `_emit` cache below still
+//! avoids re-emitting under the same Holder, but cross-sibling parent
+//! sharing is lost relative to upstream. Switching `Box<Holder>` →
+//! `Rc<Holder>` would restore parity; deferred until a consumer
+//! actually needs cross-sibling cache hits.
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
@@ -343,6 +346,14 @@ impl ArgumentsForRtype {
 /// (callparse.py:73-164). Rust collapses the inheritance into a single
 /// `enum` because Holder leaves are dispatched via concrete-class
 /// branches (no virtual override beyond the four listed variants).
+///
+/// Each variant carries a per-instance `_cache` that mirrors upstream
+/// `Holder.emit`'s `cache = self._cache = {}` lazy-init pattern
+/// (callparse.py:78-88). Key is the data-pointer identity of the
+/// requested target [`Repr`] (Python's `dict[repr]` defaults to
+/// `id(repr)` because `Repr` doesn't override `__hash__`/`__eq__`),
+/// matching pyre's singleton-Arc Repr layout where the same logical
+/// repr is the same allocation.
 #[derive(Clone, Debug)]
 pub enum Holder {
     /// RPython `class VarHolder(Holder)` (callparse.py:91-110).
@@ -352,18 +363,21 @@ pub enum Holder {
         /// RPython `VarHolder.s_obj` — annotation copy from
         /// `hop.args_s[num]`.
         s_obj: SomeValue,
+        cache: RefCell<HashMap<usize, Hlvalue>>,
     },
     /// RPython `class ConstHolder(Holder)` (callparse.py:112-124).
     Const {
         /// RPython `ConstHolder.value` — the untyped Python value;
         /// pyre carries it as a [`ConstValue`].
         value: ConstValue,
+        cache: RefCell<HashMap<usize, Hlvalue>>,
     },
     /// RPython `class NewTupleHolder(Holder)` (callparse.py:127-152).
     NewTuple {
         /// RPython `NewTupleHolder.holders` — items of the synthetic
         /// tuple.
         holders: Vec<Holder>,
+        cache: RefCell<HashMap<usize, Hlvalue>>,
     },
     /// RPython `class ItemHolder(Holder)` (callparse.py:155-164).
     Item {
@@ -371,10 +385,37 @@ pub enum Holder {
         holder: Box<Holder>,
         /// RPython `ItemHolder.index`.
         index: usize,
+        cache: RefCell<HashMap<usize, Hlvalue>>,
     },
 }
 
 impl Holder {
+    /// RPython `VarHolder(num, s_obj)` (callparse.py:91-95).
+    pub fn var(num: usize, s_obj: SomeValue) -> Self {
+        Holder::Var {
+            num,
+            s_obj,
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// RPython `ConstHolder(value)` (callparse.py:112-114).
+    pub fn const_(value: ConstValue) -> Self {
+        Holder::Const {
+            value,
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// RPython `ItemHolder(holder, index)` (callparse.py:155-158).
+    pub fn item(holder: Holder, index: usize) -> Self {
+        Holder::Item {
+            holder: Box::new(holder),
+            index,
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
     /// RPython `NewTupleHolder.__new__(cls, holders)` (callparse.py:127-137).
     ///
     /// Upstream short-circuits when every input is an `ItemHolder` over
@@ -383,10 +424,30 @@ impl Holder {
     /// (avoiding a needless wrap-and-unwrap).
     ///
     /// PRE-EXISTING-ADAPTATION: collapse optimisation deferred. The
-    /// first port slice always wraps into [`Holder::NewTuple`].
-    /// Functional equivalence preserved; only IR size differs.
+    /// upstream Python check `h.holder == holders[0].holder` defaults
+    /// to object-identity (`is`); porting it requires either
+    /// `PartialEq` on `Holder` (which transitively requires
+    /// `PartialEq` on `ConstValue`, currently `Clone + Debug` only) or
+    /// a hashable identity wrapper threaded through every `Holder::Item`
+    /// constructor.  Both are larger than the scope of a single
+    /// collapse-port slice.  The non-collapsed path always wraps into
+    /// [`Holder::NewTuple`]; functional equivalence preserved, only IR
+    /// size differs.
     pub fn new_tuple(holders: Vec<Holder>) -> Self {
-        Holder::NewTuple { holders }
+        Holder::NewTuple {
+            holders,
+            cache: RefCell::new(HashMap::new()),
+        }
+    }
+
+    /// Per-instance `_cache` accessor (callparse.py:78-82).
+    fn cache(&self) -> &RefCell<HashMap<usize, Hlvalue>> {
+        match self {
+            Holder::Var { cache, .. }
+            | Holder::Const { cache, .. }
+            | Holder::NewTuple { cache, .. }
+            | Holder::Item { cache, .. } => cache,
+        }
     }
 
     /// RPython `Holder.is_tuple()` (callparse.py:75-76 → `False`,
@@ -394,7 +455,7 @@ impl Holder {
     pub fn is_tuple(&self) -> bool {
         match self {
             Holder::Var { s_obj, .. } => s_obj.tag() == SomeValueTag::Tuple,
-            Holder::Const { value } => matches!(value, ConstValue::Tuple(_)),
+            Holder::Const { value, .. } => matches!(value, ConstValue::Tuple(_)),
             Holder::NewTuple { .. } => true,
             Holder::Item { .. } => false,
         }
@@ -412,35 +473,50 @@ impl Holder {
                     SomeValue::Tuple(st) => st.items.len(),
                     other => panic!("Holder::Var::items called on non-tuple s_obj: {other:?}"),
                 };
-                (0..n)
-                    .map(|i| Holder::Item {
-                        holder: Box::new(self.clone()),
-                        index: i,
-                    })
-                    .collect()
+                (0..n).map(|i| Holder::item(self.clone(), i)).collect()
             }
-            Holder::Const { value } => {
+            Holder::Const { value, .. } => {
                 // upstream callparse.py:119-121 — `return self.value`
                 // (because the value is a Python tuple already).
                 let items = match value {
                     ConstValue::Tuple(items) => items.clone(),
                     other => panic!("Holder::Const::items called on non-tuple value: {other:?}"),
                 };
-                items
-                    .into_iter()
-                    .map(|cv| Holder::Const { value: cv })
-                    .collect()
+                items.into_iter().map(Holder::const_).collect()
             }
-            Holder::NewTuple { holders } => holders.clone(),
+            Holder::NewTuple { holders, .. } => holders.clone(),
             other => panic!("Holder::items called on non-tuple holder: {other:?}"),
         }
     }
 
     /// RPython `Holder.emit(self, repr, hop)` (callparse.py:78-88).
-    /// The `_emit` cache layer is documented as deferred — see module
-    /// PRE-EXISTING-ADAPTATION note.
+    ///
+    /// ```python
+    /// def emit(self, repr, hop):
+    ///     try:
+    ///         cache = self._cache
+    ///     except AttributeError:
+    ///         cache = self._cache = {}
+    ///     try:
+    ///         return cache[repr]
+    ///     except KeyError:
+    ///         v = self._emit(repr, hop)
+    ///         cache[repr] = v
+    ///         return v
+    /// ```
+    ///
+    /// Pyre keys the cache by `Arc::as_ptr` of the requested repr.
+    /// Singleton-Arc Repr layout means the same logical repr is the
+    /// same allocation, so pointer identity matches Python's default
+    /// `id(repr)` hash.
     pub fn emit(&self, repr: &Arc<dyn Repr>, hop: &HighLevelOp) -> Result<Hlvalue, TyperError> {
-        self._emit(repr, hop)
+        let key = Arc::as_ptr(repr) as *const () as usize;
+        if let Some(cached) = self.cache().borrow().get(&key) {
+            return Ok(cached.clone());
+        }
+        let v = self._emit(repr, hop)?;
+        self.cache().borrow_mut().insert(key, v.clone());
+        Ok(v)
     }
 
     /// RPython `_emit(self, repr, hop)` per-subclass body
@@ -452,13 +528,13 @@ impl Holder {
             Holder::Var { num, .. } => hop.inputarg(repr.as_ref(), *num),
             // upstream callparse.py:123-124 — `ConstHolder._emit`:
             // `return hop.inputconst(repr, self.value)`.
-            Holder::Const { value } => inputconst(repr.as_ref(), value).map(Hlvalue::Constant),
+            Holder::Const { value, .. } => inputconst(repr.as_ref(), value).map(Hlvalue::Constant),
             // upstream callparse.py:145-152 — `NewTupleHolder._emit`:
             // verifies repr is a TupleRepr, recursively emits each
             // sub-holder under the matching `items_r` repr, then
             // builds the tuple via `repr.newtuple(hop.llops, repr,
             // tupleitems_v)`.
-            Holder::NewTuple { holders } => {
+            Holder::NewTuple { holders, .. } => {
                 let r_tup = (repr.as_ref() as &dyn std::any::Any)
                     .downcast_ref::<TupleRepr>()
                     .ok_or_else(|| {
@@ -478,7 +554,7 @@ impl Holder {
             // `v = r_tup.getitem_internal(hop, v_tuple, index)`; then
             // `return hop.llops.convertvar(v, r_tup.items_r[index],
             //                              repr)`.
-            Holder::Item { holder, index } => {
+            Holder::Item { holder, index, .. } => {
                 let (r_tup_arc, v_tuple) = holder.access(hop)?;
                 let r_tup = (r_tup_arc.as_ref() as &dyn std::any::Any)
                     .downcast_ref::<TupleRepr>()
@@ -674,10 +750,7 @@ pub fn callparse(
     let arguments = match opname {
         "simple_call" => {
             let args_h: Vec<Holder> = (start..hop.nb_args())
-                .map(|i| Holder::Var {
-                    num: i,
-                    s_obj: hop.args_s.borrow()[i].clone(),
-                })
+                .map(|i| Holder::var(i, hop.args_s.borrow()[i].clone()))
                 .collect();
             ArgumentsForRtype::new(args_h)
         }
@@ -692,10 +765,7 @@ pub fn callparse(
                 })?;
             let shape = call_shape_from_const(&shape_value)?;
             let args_h: Vec<Holder> = (start + 1..hop.nb_args())
-                .map(|i| Holder::Var {
-                    num: i,
-                    s_obj: hop.args_s.borrow()[i].clone(),
-                })
+                .map(|i| Holder::var(i, hop.args_s.borrow()[i].clone()))
                 .collect();
             ArgumentsForRtype::fromshape(&shape, args_h)
         }
@@ -713,9 +783,7 @@ pub fn callparse(
         .as_ref()
         .map(|defs| {
             defs.iter()
-                .map(|c| Holder::Const {
-                    value: c.value.clone(),
-                })
+                .map(|c| Holder::const_(c.value.clone()))
                 .collect()
         })
         .unwrap_or_default();
@@ -835,13 +903,11 @@ mod tests {
     }
 
     fn h_var(num: usize, s_obj: SomeValue) -> Holder {
-        Holder::Var { num, s_obj }
+        Holder::var(num, s_obj)
     }
 
     fn h_const_int(n: i64) -> Holder {
-        Holder::Const {
-            value: ConstValue::Int(n),
-        }
+        Holder::const_(ConstValue::Int(n))
     }
 
     fn sig(argnames: &[&str]) -> Signature {
@@ -872,9 +938,10 @@ mod tests {
 
     #[test]
     fn const_holder_is_tuple_recognises_constvalue_tuple() {
-        let h = Holder::Const {
-            value: ConstValue::Tuple(vec![ConstValue::Int(1), ConstValue::Int(2)]),
-        };
+        let h = Holder::const_(ConstValue::Tuple(vec![
+            ConstValue::Int(1),
+            ConstValue::Int(2),
+        ]));
         assert!(h.is_tuple());
     }
 
@@ -887,10 +954,7 @@ mod tests {
     #[test]
     fn item_holder_is_not_tuple_by_default() {
         let parent = h_var(0, s_tuple_of(vec![s_int(), s_int()]));
-        let item = Holder::Item {
-            holder: Box::new(parent),
-            index: 0,
-        };
+        let item = Holder::item(parent, 0);
         assert!(!item.is_tuple());
     }
 
@@ -901,7 +965,7 @@ mod tests {
         assert_eq!(items.len(), 3);
         for (i, item) in items.iter().enumerate() {
             match item {
-                Holder::Item { holder, index } => {
+                Holder::Item { holder, index, .. } => {
                     assert_eq!(*index, i);
                     match holder.as_ref() {
                         Holder::Var { num, .. } => assert_eq!(*num, 7),
@@ -915,13 +979,14 @@ mod tests {
 
     #[test]
     fn const_holder_items_returns_per_element_const_holders() {
-        let h = Holder::Const {
-            value: ConstValue::Tuple(vec![ConstValue::Int(1), ConstValue::Int(2)]),
-        };
+        let h = Holder::const_(ConstValue::Tuple(vec![
+            ConstValue::Int(1),
+            ConstValue::Int(2),
+        ]));
         let items = h.items();
         assert_eq!(items.len(), 2);
         match &items[0] {
-            Holder::Const { value } => assert_eq!(*value, ConstValue::Int(1)),
+            Holder::Const { value, .. } => assert_eq!(*value, ConstValue::Int(1)),
             other => panic!("expected Const, got {other:?}"),
         }
     }
@@ -964,7 +1029,7 @@ mod tests {
             .expect("default should fill missing arg");
         assert_eq!(scope.len(), 2);
         match &scope[1] {
-            Holder::Const { value } => assert_eq!(*value, ConstValue::Int(42)),
+            Holder::Const { value, .. } => assert_eq!(*value, ConstValue::Int(42)),
             other => panic!("expected Const fill, got {other:?}"),
         }
     }
@@ -1002,7 +1067,7 @@ mod tests {
             .expect("vararg should accept extras");
         assert_eq!(scope.len(), 2);
         match &scope[1] {
-            Holder::NewTuple { holders } => assert_eq!(holders.len(), 2),
+            Holder::NewTuple { holders, .. } => assert_eq!(holders.len(), 2),
             other => panic!("expected NewTupleHolder, got {other:?}"),
         }
     }
@@ -1052,9 +1117,10 @@ mod tests {
     #[test]
     fn match_signature_stararg_unpacks_into_positional() {
         // 1 positional + stararg holding tuple-of-2 → 3 positional total.
-        let stararg = Holder::Const {
-            value: ConstValue::Tuple(vec![ConstValue::Int(2), ConstValue::Int(3)]),
-        };
+        let stararg = Holder::const_(ConstValue::Tuple(vec![
+            ConstValue::Int(2),
+            ConstValue::Int(3),
+        ]));
         let args = ArgumentsForRtype::with_keywords_and_stararg(
             vec![h_var(0, s_int())],
             HashMap::new(),
@@ -1066,11 +1132,11 @@ mod tests {
             .expect("stararg should unpack into positional slots");
         assert_eq!(scope.len(), 3);
         match &scope[1] {
-            Holder::Const { value } => assert_eq!(*value, ConstValue::Int(2)),
+            Holder::Const { value, .. } => assert_eq!(*value, ConstValue::Int(2)),
             other => panic!("expected Const at slot 1, got {other:?}"),
         }
         match &scope[2] {
-            Holder::Const { value } => assert_eq!(*value, ConstValue::Int(3)),
+            Holder::Const { value, .. } => assert_eq!(*value, ConstValue::Int(3)),
             other => panic!("expected Const at slot 2, got {other:?}"),
         }
     }

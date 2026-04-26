@@ -903,7 +903,7 @@ pub(crate) mod tests {
 // surface as `MissingRTypeOperation` from `rtyper_makerepr`.
 // =====================================================================
 
-use crate::flowspace::model::{ConstValue, Constant, Hlvalue};
+use crate::flowspace::model::{ConstValue, Constant, GraphKey, Hlvalue};
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{Repr, ReprState};
@@ -1416,7 +1416,14 @@ where
         .callfamily
         .as_ref()
         .ok_or_else(|| TyperError::message("FunctionReprBase.call: callfamily not available"))?;
-    let row = select_call_family_row(&bookkeeper, callfamily, &s_pbc, &args, None)
+    // upstream `rpbc.py:204` passes `hop.spaceop` to `find_row`; pyre
+    // carries the equivalent (graph + block + op_index identity) on
+    // [`HighLevelOp::position_key`], stamped by `highlevelops_with_graph`
+    // during `specialize_block`. Falls back to `None` for test-only
+    // hops constructed via the bare [`HighLevelOp::new`] ctor — those
+    // never reach a real callfamily lookup.
+    let op_key = hop.position_key.borrow().clone();
+    let row = select_call_family_row(&bookkeeper, callfamily, &s_pbc, &args, op_key)
         .map_err(|e| TyperError::message(e.to_string()))?;
 
     // upstream: `vfn = hop.inputarg(self, arg=0)`.
@@ -1457,18 +1464,28 @@ where
     let v = if matches!(&vlist[0], Hlvalue::Constant(_)) {
         hop.genop("direct_call", vlist, resulttype)
     } else {
-        // PRE-EXISTING-ADAPTATION: upstream appends a Void-typed
-        // `Constant` carrying the Python list of candidate graphs
-        // (`row_of_graphs.values()`); pyre's `ConstValue` lacks a
-        // graph-list variant at the Hlvalue layer. The candidate
-        // graphs are recovered later by `lower_indirect_calls`
-        // (rpbc.rs:319) directly from the
-        // `OpKind::Call { CallTarget::Indirect, .. }` site, so a
-        // `ConstValue::None` placeholder is sufficient.
+        // upstream `rpbc.py:216`:
+        //     vlist.append(hop.inputconst(Void, row_of_graphs.values()))
+        // pyre carries the candidate graphs as a `ConstValue::Graphs`
+        // (graph identities via `GraphKey::as_usize`) since `Constant`
+        // cannot hold raw `Rc<RefCell<FunctionGraph>>` without breaking
+        // the wider `Sync`/`Hash` invariants (see `ConstValue::Graphs`
+        // doc on `flowspace/model.rs`). Sorted so the constant is
+        // deterministic across HashMap iteration orders — order has no
+        // semantic meaning at the indirect_call protocol level
+        // (`lower_indirect_calls` at rpbc.rs:319 still recovers the
+        // graphs from `OpKind::Call { CallTarget::Indirect, .. }`,
+        // which is the authoritative channel).
+        let mut graph_ids: Vec<usize> = row
+            .row_of_graphs
+            .values()
+            .map(|g| GraphKey::of(&g.graph).as_usize())
+            .collect();
+        graph_ids.sort_unstable();
         vlist.push(Hlvalue::Constant(
             crate::translator::rtyper::rtyper::HighLevelOp::inputconst(
                 &LowLevelType::Void,
-                &ConstValue::None,
+                &ConstValue::Graphs(graph_ids),
             )?,
         ));
         hop.genop("indirect_call", vlist, resulttype)

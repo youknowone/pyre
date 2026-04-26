@@ -11,16 +11,12 @@
 //! | `class SingleFloatRepr(Repr)` (`rfloat.py:150-158`) | [`SingleFloatRepr`] |
 //! | `class LongFloatRepr(Repr)` (`rfloat.py:166-174`) | [`LongFloatRepr`] |
 //! | `SomeFloat/SomeSingleFloat/SomeLongFloat rtyper_make*` (`rfloat.py:67-72,144-148,160-164`) | wired in [`super::rmodel::rtyper_makerepr`] + [`super::rmodel::rtyper_makekey`] |
+//! | `pairtype(FloatRepr, FloatRepr).rtype_add/sub/mul/truediv` (`rfloat.py:75-93`) | dispatched via [`super::pairtype::pair_rtype_add`] etc. → [`rtype_template`] |
+//! | `pairtype(FloatRepr, FloatRepr).rtype_eq/ne/lt/le/gt/ge/is_` (`rfloat.py:103-130`) | dispatched via [`super::pairtype::pair_rtype_eq`] etc. → [`rtype_compare_template`] |
+//! | `_rtype_template(hop, func)` / `_rtype_compare_template(hop, func)` helpers (`rfloat.py:75-135`) | [`rtype_template`] / [`rtype_compare_template`] |
 //!
 //! ## Deferred to follow-up commits
 //!
-//! * `pairtype(FloatRepr, FloatRepr)` binary ops + comparisons
-//!   (`rfloat.py:75-135`) — `rtype_add/sub/mul/truediv/eq/ne/lt/le/gt/ge`
-//!   live on the pairtype, not on `FloatRepr` itself. Upstream
-//!   `translate_op_add` (`rtyper.py`) resolves through the pairtype
-//!   dispatcher (`tool/pairtype.py`), which is not yet ported; the
-//!   binary-op helpers `_rtype_template` / `_rtype_compare_template`
-//!   land with the pairtype bridge.
 //! * `get_ll_{gt,lt,ge,le}_function` (`rfloat.py:21-25`) — require
 //!   trait slots for ordering helpers. Used by `rdict.py` /
 //!   `rordereddict.py` when those land; no current consumer. (`get_ll_eq`

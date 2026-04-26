@@ -249,11 +249,10 @@ impl CallControl {
             .map(std::sync::Arc::clone)
     }
 
-    /// Dispatchable-entry variant used by the trace-side callback: return
-    /// the shared `Arc<PyJitCode>` only when the entry is ready to
-    /// dispatch (`PyJitCode::is_dispatchable` — either per-CodeObject
-    /// populated by the codewriter drain or portal-bridged by
-    /// `canonical_bridge::install_portal_for`).
+    /// Compiled-entry variant used by the trace-side callback: return
+    /// the shared `Arc<PyJitCode>` only when the entry is fully
+    /// populated by the codewriter drain (`PyJitCode::is_populated`
+    /// — `pc_map` non-empty).
     ///
     /// PRE-EXISTING-ADAPTATION: RPython has no equivalent gate because
     /// `make_jitcodes` (codewriter.py:74-89) drains every unfinished
@@ -265,27 +264,12 @@ impl CallControl {
     /// fnaddr, calldescr, ...)` (call.py:168) waiting for the drain.
     /// Returning `None` on a skeleton routes the caller through the
     /// compile path first.
-    ///
-    /// G.4.4 prereq #2 step 1: gate widened from the narrow
-    /// `is_populated()` (per-CodeObject only — `pc_map` non-empty) to
-    /// `is_dispatchable()` (per-CodeObject ∪ portal-bridge — `pc_map`
-    /// non-empty *or* `jitcode.code` non-empty with empty `pc_map`).
-    /// Skeleton (`pc_map` empty *and* `jitcode.code` empty) still
-    /// returns `None`, preserving the lazy-drain routing.  Byte-for-byte
-    /// no-op until `register_portal_bridge_in_callcontrol`
-    /// (`pyre-jit/src/jit/codewriter.rs:5854`) lands a portal-bridge
-    /// entry into `self.jitcodes` — the prior probe (G.4.3a parity-fix,
-    /// 2026-04-26) showed wiring that callback alone regressed
-    /// `PYRE_PORTAL_REDIRECT=1` from 12/14 to 8/14 because the narrow
-    /// gate forced compile loops on portal-bridge entries; this widening
-    /// removes that hazard so the callback can be safely activated by a
-    /// follow-up step.
     pub fn find_compiled_jitcode_arc(
         &self,
         code: *const CodeObject,
     ) -> Option<std::sync::Arc<PyJitCode>> {
         let arc = self.jitcodes.get(&(code as usize))?;
-        if !arc.is_dispatchable() {
+        if !arc.is_populated() {
             return None;
         }
         Some(std::sync::Arc::clone(arc))

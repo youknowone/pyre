@@ -23,6 +23,7 @@ use std::rc::{Rc, Weak};
 use std::sync::Arc;
 
 use crate::annotator::annrpython::RPythonAnnotator;
+use crate::annotator::bookkeeper::PositionKey;
 use crate::annotator::model::{SomeObjectTrait, SomeValue};
 use crate::flowspace::argument::Signature;
 use crate::flowspace::model::{
@@ -888,6 +889,27 @@ impl RPythonTyper {
         result
     }
 
+    /// Like [`Self::highlevelops`] but also stamps each emitted hop's
+    /// [`HighLevelOp::position_key`] with the graph + block + op_index
+    /// triple. Required for production callers (`specialize_block`)
+    /// because downstream `find_row` / `desc.specialize` lookups rely
+    /// on the position key — `highlevelops` alone leaves `position_key
+    /// = None`, which is fine for tests but causes
+    /// `desc.specialize(_, None)` to fall back to the bookkeeper's
+    /// (cleared) ambient position and pick the wrong calltable row.
+    pub fn highlevelops_with_graph(
+        self: &Rc<Self>,
+        graph: &GraphRef,
+        block: &BlockRef,
+        llops: Rc<RefCell<LowLevelOpList>>,
+    ) -> Vec<HighLevelOp> {
+        let hops = self.highlevelops(block, llops);
+        for (idx, hop) in hops.iter().enumerate() {
+            hop.set_position_key(Some(PositionKey::from_refs(graph, block, idx)));
+        }
+        hops
+    }
+
     /// RPython `RPythonTyper.translate_hl_to_ll(self, hop, varmapping)`
     /// (rtyper.py:434-481).
     ///
@@ -1477,7 +1499,7 @@ impl RPythonTyper {
             varmapping.insert(v.clone(), Hlvalue::Variable(v));
         }
 
-        let hops = self.highlevelops(block, newops.clone());
+        let hops = self.highlevelops_with_graph(&graph, block, newops.clone());
         for hop in hops {
             if let Err(e) = hop.setup() {
                 return Err(self.gottypererror(e, block, &hop.spaceop));
@@ -2058,6 +2080,18 @@ pub struct HighLevelOp {
     /// RPython `self.r_result = rtyper.getrepr(self.s_result)`
     /// (rtyper.py:632).
     pub r_result: RefCell<Option<Arc<dyn Repr>>>,
+    /// Position key for this op site (graph + block + op_index identity).
+    ///
+    /// Upstream `find_row(bookkeeper, descs, args, op)` (rpbc.py:204,
+    /// description.py:54-59) passes `hop.spaceop` to
+    /// `desc.specialize(inputs, op)`; specialize then derives a
+    /// position key from the op's enclosing context. Pyre cannot recover
+    /// graph/block identity from a bare [`SpaceOperation`], so the
+    /// callsite that constructs the [`HighLevelOp`] populates this field
+    /// directly via [`Self::set_position_key`]. `None` is the
+    /// test-fixture default; production [`RPythonTyper::specialize_block`]
+    /// fills it via [`RPythonTyper::highlevelops_with_graph`].
+    pub position_key: RefCell<Option<PositionKey>>,
 }
 
 impl HighLevelOp {
@@ -2079,7 +2113,15 @@ impl HighLevelOp {
             s_result: RefCell::new(None),
             args_r: RefCell::new(Vec::new()),
             r_result: RefCell::new(None),
+            position_key: RefCell::new(None),
         }
+    }
+
+    /// Stamp the (graph, block, op_index) position key onto this hop.
+    /// Mirrors upstream's reliance on `hop.spaceop` to recover the
+    /// op-site identity for `desc.specialize(inputs, op)` lookups.
+    pub fn set_position_key(&self, position_key: Option<PositionKey>) {
+        *self.position_key.borrow_mut() = position_key;
     }
 
     /// RPython `HighLevelOp.nb_args` property (rtyper.py:636-637).
@@ -2100,6 +2142,7 @@ impl HighLevelOp {
         *result.s_result.borrow_mut() = self.s_result.borrow().clone();
         *result.args_r.borrow_mut() = self.args_r.borrow().clone();
         *result.r_result.borrow_mut() = self.r_result.borrow().clone();
+        *result.position_key.borrow_mut() = self.position_key.borrow().clone();
         result
     }
 

@@ -24,6 +24,43 @@
 //! `JitCode` Python objects via Python's reference semantics; pyre
 //! mirrors the shared-identity part with `Arc<PyJitCode>`, but still
 //! keeps the extra runtime adapter split described above.
+//!
+//! ## Discriminator: 3-state mode mapping
+//!
+//! A `PyJitCode` is one of three modes, encoded across two flags:
+//!
+//! | mode             | `jitcode.code` | `metadata.pc_map` | predicate                |
+//! |------------------|----------------|--------------------|--------------------------|
+//! | Skeleton         | empty          | empty              | [`PyJitCode::is_skeleton`]       |
+//! | PortalBridge     | non-empty      | empty              | [`PyJitCode::is_portal_bridge`]  |
+//! | PerCodeObject    | non-empty      | non-empty          | [`PyJitCode::is_populated`]      |
+//!
+//! `code` and `pc_map` are independent because the portal-bridged
+//! install ([`crate::canonical_bridge::install_portal_for`]) reuses
+//! the canonical portal `JitCode.code` byte stream but skips the
+//! per-Python-PC mapping (the portal dispatches via its own arms on
+//! `pycode.instructions[pc]`). Per-CodeObject installs
+//! ([`crate::canonical_bridge::compile_jitcode_for_callee`]) do both:
+//! drain real instructions into `code` and stamp `pc_map` to
+//! `code.instructions.len()`. Skeletons have neither because they are
+//! placeholder slots inserted by `CallControl::get_jitcode` before the
+//! assembler drain runs.
+//!
+//! The fourth combination (`code` empty, `pc_map` non-empty) is not
+//! produced by any production path; the predicates classify it as
+//! neither Skeleton nor PortalBridge nor PerCodeObject. Test fixtures
+//! that fabricate this combination (e.g. by calling [`PyJitCode::skeleton`]
+//! and then pushing into `metadata.pc_map`) flow as PerCodeObject for
+//! [`PyJitCode::is_populated`] purposes (the historical predicate
+//! looks at `pc_map` only).
+//!
+//! Convergence path: RPython's single `JitCode` class has neither flag
+//! to consult — `assembler.assemble` populates `code` in place and
+//! per-PC mapping is implicit in the bytecode stream. pyre will lose
+//! the dual-mode discrimination once the codewriter routes Python
+//! bytecode through the canonical RPython codewriter pipeline (Phase
+//! G.4.4+). Until then, the mode mapping above is the source of truth
+//! for every reader that branches on install style.
 
 use majit_metainterp::jitcode::JitCode as RuntimeJitCode;
 
@@ -102,8 +139,24 @@ impl PyJitCode {
     /// `assembler.assemble(ssarepr, jitcode, num_regs)`
     /// (codewriter.py:67); pyre's split wrapper uses `pc_map.is_empty()`
     /// as the same "still a shell" test.
+    ///
+    /// PerCodeObject mode in the discriminator table on the module
+    /// doc.
     pub fn is_populated(&self) -> bool {
         !self.metadata.pc_map.is_empty()
+    }
+
+    /// Skeleton slot inserted by [`Self::skeleton`] — neither `code`
+    /// nor `pc_map` populated yet. See the discriminator table on
+    /// the module doc.
+    ///
+    /// Strictly equivalent to `!is_populated() && !is_portal_bridge()`
+    /// (DeMorgan-expanded: `pc_map.is_empty() && (code.is_empty() ||
+    /// !pc_map.is_empty())` reduces to the conjunction below).
+    /// Callers prefer this name over the negated-pair form because it
+    /// names the third mode in the discriminator table directly.
+    pub fn is_skeleton(&self) -> bool {
+        self.jitcode.code.is_empty() && self.metadata.pc_map.is_empty()
     }
 
     /// Is this `PyJitCode` a portal-bridged install (G.3a
@@ -129,37 +182,6 @@ impl PyJitCode {
     /// in G.3c when concrete callers flip onto `install_portal_for`.
     pub fn is_portal_bridge(&self) -> bool {
         !self.jitcode.code.is_empty() && self.metadata.pc_map.is_empty()
-    }
-
-    /// True when the entry is "ready to dispatch" — either fully
-    /// compiled (per-CodeObject install via the codewriter drain) or
-    /// portal-bridged (`canonical_bridge::install_portal_for` clone of
-    /// the portal canonical jitcode).  Both have non-empty
-    /// `jitcode.code`; the discriminator between them is whether
-    /// `metadata.pc_map` carries a per-PC mapping (per-CodeObject) or
-    /// stays empty (portal-bridge dispatches on `pycode.instructions[pc]`
-    /// at runtime via its own arms — no per-PC mapping needed).
-    ///
-    /// The mutually-exclusive `is_populated()` / `is_portal_bridge()`
-    /// pair is preserved as the structural discriminator; this method
-    /// is the union and exists so CallControl readers can ask "is this
-    /// entry usable?" without needing to know which install kind it
-    /// is.  `PyJitCode::skeleton()` (call.py:168 — fresh shell awaiting
-    /// the drain) returns false for both predicates and therefore
-    /// `is_dispatchable() == false`, preserving the skeleton-filter
-    /// invariant `find_compiled_jitcode_arc` relies on
-    /// (`PRE-EXISTING-ADAPTATION` doc on
-    /// `pyre/pyre-jit/src/jit/call.rs:256-265`).
-    ///
-    /// G.4.4 prereq #2 step 1: introduced as the gate
-    /// `find_compiled_jitcode_arc` switches to so that future
-    /// `register_portal_bridge_in_callcontrol` activation
-    /// (`pyre-jit/src/jit/codewriter.rs:5854`) can route portal-bridge
-    /// entries through CallControl without the readers triggering
-    /// compile loops on what the narrow `is_populated()` gate would
-    /// otherwise classify as "not yet compiled".
-    pub fn is_dispatchable(&self) -> bool {
-        self.is_populated() || self.is_portal_bridge()
     }
 
     /// Empty `PyJitCode` slot inserted by `CallControl::get_jitcode`

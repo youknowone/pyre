@@ -341,7 +341,12 @@ impl MetaInterpStaticData {
     fn compiled_jitcode_lookup(&self, code: *const ()) -> Option<*const JitCode> {
         let idx = *self.by_code.get(&Self::canonical_code_key(code))?;
         let jitcode = &self.jitcodes[idx];
-        if !jitcode.payload.is_populated() && !jitcode.payload.is_portal_bridge() {
+        // Skeletons are placeholder slots inserted by `get_jitcode`
+        // before the assembler drain populates `code`. They satisfy
+        // neither `is_populated()` (per-CodeObject) nor
+        // `is_portal_bridge()` — see the 3-state discriminator table
+        // on `pyjitcode.rs` module doc.
+        if jitcode.payload.is_skeleton() {
             return None;
         }
         Some(&**jitcode as *const JitCode)

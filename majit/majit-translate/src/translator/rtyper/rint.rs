@@ -20,6 +20,12 @@
 //! | `getintegerrepr(lltype, prefix=None)` (`rint.py:177-182`) | [`getintegerrepr`] |
 //! | Standard integer singletons `signed_repr` / `unsigned_repr` / `signedlonglong_repr` / `unsignedlonglong_repr` (`rint.py:193-198`) | [`signed_repr`] / [`unsigned_repr`] / [`signedlonglong_repr`] / [`unsignedlonglong_repr`] |
 //! | `SomeInteger.rtyper_makerepr` / `rtyper_makekey` (`rint.py:185-191`) | wired in [`super::rmodel::rtyper_makerepr`] / [`super::rmodel::rtyper_makekey`] |
+//! | `pairtype(IntegerRepr, IntegerRepr).rtype_add/sub/mul/floordiv/mod/and_/or_/xor/lshift/rshift` + `_ovf` siblings (`rint.py:217-288`) | dispatched via [`super::pairtype::pair_rtype_add`] etc. → [`rtype_template`] / [`rtype_call_helper`] |
+//! | `pairtype(IntegerRepr, IntegerRepr).rtype_eq/ne/lt/le/gt/ge/is_` (`rint.py:292-310`) | dispatched via [`super::pairtype::pair_rtype_eq`] etc. → [`rtype_compare_template`] |
+//! | `pairtype(IntegerRepr, IntegerRepr).convert_from_to` (`rint.py:202-213`) | [`pair_integer_integer_convert_from_to`] |
+//! | `pairtype(IntegerRepr, FloatRepr).convert_from_to` (`rint.py:645-655`) | [`pair_integer_float_convert_from_to`] |
+//! | `pairtype(FloatRepr, IntegerRepr).convert_from_to` (`rint.py:657-665`) | [`pair_float_integer_convert_from_to`] |
+//! | `_rtype_template` / `_rtype_compare_template` / `_rtype_call_helper` + `rtype_add_ovf` (`rint.py:314-388`) | [`rtype_template`] / [`rtype_compare_template`] / [`rtype_call_helper`] / [`rtype_add_ovf`] |
 //!
 //! ## Deferred to follow-up commits
 //!
@@ -38,9 +44,6 @@
 //!   `get_ll_{eq,hash}_function`) + `annlowlevel.llstr`.
 //! * `get_ll_{eq,ge,gt,lt,le,hash,fasthash,dummyval}_function`
 //!   (`rint.py:39-64`) — require trait slots absent from pyre's `Repr`.
-//! * `pairtype(IntegerRepr, FloatRepr)` / `pairtype(FloatRepr,
-//!   IntegerRepr)` cast conversions (`rint.py:645-665`) — pairtype
-//!   dispatcher dependency (shared deferral).
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
