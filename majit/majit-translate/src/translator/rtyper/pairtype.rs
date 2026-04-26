@@ -94,6 +94,8 @@ pub enum ReprClassId {
     FunctionRepr,
     /// `rpbc.py:224 FunctionsPBCRepr`.
     FunctionsPBCRepr,
+    /// `rpbc.py:393 SmallFunctionSetPBCRepr`.
+    SmallFunctionSetPBCRepr,
     /// `rbuiltin.py:67 BuiltinFunctionRepr`.
     BuiltinFunctionRepr,
     /// `rbuiltin.py:113 BuiltinMethodRepr`.
@@ -106,6 +108,8 @@ pub enum ReprClassId {
     MultipleFrozenPBCRepr,
     /// `rpbc.py:844 MethodOfFrozenPBCRepr`.
     MethodOfFrozenPBCRepr,
+    /// `rpbc.py:1126 MethodsPBCRepr`.
+    MethodsPBCRepr,
     /// `rpbc.py:920 ClassesPBCRepr`.
     ClassesPBCRepr,
     /// `rtuple.py:129 TupleRepr`.
@@ -154,12 +158,14 @@ impl ReprClassId {
             LLADTMethRepr => &[LLADTMethRepr, Repr],
             FunctionRepr => &[FunctionRepr, Repr],
             FunctionsPBCRepr => &[FunctionsPBCRepr, Repr],
+            SmallFunctionSetPBCRepr => &[SmallFunctionSetPBCRepr, Repr],
             BuiltinFunctionRepr => &[BuiltinFunctionRepr, Repr],
             BuiltinMethodRepr => &[BuiltinMethodRepr, Repr],
             SingleFrozenPBCRepr => &[SingleFrozenPBCRepr, Repr],
             MultipleUnrelatedFrozenPBCRepr => &[MultipleUnrelatedFrozenPBCRepr, Repr],
             MultipleFrozenPBCRepr => &[MultipleFrozenPBCRepr, Repr],
             MethodOfFrozenPBCRepr => &[MethodOfFrozenPBCRepr, Repr],
+            MethodsPBCRepr => &[MethodsPBCRepr, Repr],
             ClassesPBCRepr => &[ClassesPBCRepr, Repr],
             TupleRepr => &[TupleRepr, Repr],
             CharRepr => &[CharRepr, Repr],
@@ -285,12 +291,72 @@ fn dispatch_convert_from_to(
             &LowLevelType::Void,
             &ConstValue::None,
         )?))),
+        // rpbc.py:377-379 — pairtype(FunctionRepr,
+        // FunctionsPBCRepr).convert_from_to: upstream
+        // `return inputconst(r_fpbc2, r_fpbc1.s_pbc.const)`.
+        //   FunctionRepr always carries a single-FunctionDesc PBC whose
+        //   `s_pbc.const` is the host-side function pyobj. Re-input the
+        //   constant against r_fpbc2's lowleveltype, which routes
+        //   through `FunctionsPBCRepr.convert_const(pyobj)`.
+        (FunctionRepr, FunctionsPBCRepr) => {
+            super::rpbc::pair_function_repr_functions_pbc_convert_from_to(r_from, r_to, v, llops)
+        }
         // rpbc.py:385-390 — pairtype(FunctionsPBCRepr,
         // FunctionsPBCRepr).convert_from_to: upstream identity if
         // `r_fpbc1.lowleveltype == r_fpbc2.lowleveltype`, else
         // `NotImplemented`. The rtyper distinguishes different spec-func
         // Struct pointer types even within the same Repr subclass.
         (FunctionsPBCRepr, FunctionsPBCRepr) => same_lowleveltype_convert_from_to(r_from, r_to, v),
+        // rpbc.py:517-519 — pairtype(SmallFunctionSetPBCRepr,
+        // FunctionRepr).convert_from_to: `return inputconst(Void, None)`.
+        //   FunctionRepr is Void-typed; the Char source variable is
+        //   discarded.
+        (SmallFunctionSetPBCRepr, FunctionRepr) => Ok(Some(Hlvalue::Constant(
+            inputconst_from_lltype(&LowLevelType::Void, &ConstValue::None)?,
+        ))),
+        // rpbc.py:521-526 — pairtype(SmallFunctionSetPBCRepr,
+        // FunctionsPBCRepr).convert_from_to:
+        //   `assert v.concretetype is Char;
+        //    v_int = llops.genop('cast_char_to_int', [v], resulttype=Signed);
+        //    return llops.genop('getarrayitem',
+        //                        [r_set.c_pointer_table, v_int],
+        //                        resulttype=r_ptr.lowleveltype)`.
+        (SmallFunctionSetPBCRepr, FunctionsPBCRepr) => {
+            super::rpbc::pair_small_function_set_functions_pbc_convert_from_to(
+                r_from, r_to, v, llops,
+            )
+        }
+        // rpbc.py:548-551 — pairtype(FunctionRepr,
+        // SmallFunctionSetPBCRepr).convert_from_to: pulls the unique
+        // FunctionDesc out of `r_ptr.s_pbc.descriptions` and returns
+        // `inputconst(Char, r_set.convert_desc(desc))`.
+        (FunctionRepr, SmallFunctionSetPBCRepr) => {
+            super::rpbc::pair_function_repr_small_function_set_convert_from_to(
+                r_from, r_to, v, llops,
+            )
+        }
+        // rpbc.py:553-556 — pairtype(FunctionsPBCRepr,
+        // SmallFunctionSetPBCRepr).convert_from_to:
+        //   `ll_compress = compression_function(r_set);
+        //    return llops.gendirectcall(ll_compress, v)`.
+        (FunctionsPBCRepr, SmallFunctionSetPBCRepr) => {
+            super::rpbc::pair_functions_pbc_small_function_set_convert_from_to(
+                r_from, r_to, v, llops,
+            )
+        }
+        // rpbc.py:597-607 — pairtype(SmallFunctionSetPBCRepr,
+        // SmallFunctionSetPBCRepr).convert_from_to:
+        //   `c_table = conversion_table(r_from, r_to);
+        //    if c_table:
+        //        v_int = genop('cast_char_to_int', [v], Signed)
+        //        return genop('getarrayitem', [c_table, v_int], Char)
+        //    else:
+        //        return v  # identity`.
+        (SmallFunctionSetPBCRepr, SmallFunctionSetPBCRepr) => {
+            super::rpbc::pair_small_function_set_small_function_set_convert_from_to(
+                r_from, r_to, v, llops,
+            )
+        }
         // rtuple.py:340-353 — `pairtype(TupleRepr, TupleRepr).convert_from_to`.
         // Same-arity tuple-to-tuple: identity if lltypes match, else
         // per-item getitem_internal + convertvar + newtuple.
@@ -713,6 +779,24 @@ fn dispatch_rtype_is_(
         // (Repr, Repr) dispatcher below.
         (MultipleUnrelatedFrozenPBCRepr, MultipleUnrelatedFrozenPBCRepr) => {
             super::rpbc::pair_mu_mu_rtype_is_(r1, r2, hop).map(Some)
+        }
+        // rpbc.py:558-571 — `pairtype(FunctionReprBase,
+        // FunctionReprBase).rtype_is_`: union the two SomePBCs,
+        // resolve the merged repr, convert both sides to it, then
+        // emit `char_eq` (Char-typed Small set) or `ptr_eq` (Ptr-typed
+        // Functions / Function set). Pyre's FunctionReprBase analogues
+        // are `FunctionRepr`, `FunctionsPBCRepr`, and
+        // `SmallFunctionSetPBCRepr` — all three pairwise.
+        (FunctionRepr, FunctionRepr)
+        | (FunctionRepr, FunctionsPBCRepr)
+        | (FunctionRepr, SmallFunctionSetPBCRepr)
+        | (FunctionsPBCRepr, FunctionRepr)
+        | (FunctionsPBCRepr, FunctionsPBCRepr)
+        | (FunctionsPBCRepr, SmallFunctionSetPBCRepr)
+        | (SmallFunctionSetPBCRepr, FunctionRepr)
+        | (SmallFunctionSetPBCRepr, FunctionsPBCRepr)
+        | (SmallFunctionSetPBCRepr, SmallFunctionSetPBCRepr) => {
+            super::rpbc::pair_function_repr_base_rtype_is_(r1, r2, hop).map(Some)
         }
         // rtuple.py:355-356 — `pairtype(TupleRepr, TupleRepr).rtype_is_`
         // raises `TyperError("cannot compare tuples with 'is'")`. The

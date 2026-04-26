@@ -29,6 +29,14 @@
 
 use std::cell::RefCell;
 use std::collections::{BTreeMap, HashMap, HashSet};
+
+/// RPython `flags={}` keyword argument threaded through
+/// `InstanceRepr.{getfield,setfield}` (rclass.py:987 / :1002) and the
+/// `hook_access_field` / `hook_setfield` virtualizable hooks
+/// (rclass.py:712-715). Default empty maps to upstream's `{}` literal;
+/// `_jit_virtualizable_2_` instance reprs read keys like `'access_directly'`
+/// and `'fresh_virtualizable'` from this dict.
+pub type Flags = HashMap<String, ConstValue>;
 use std::rc::{Rc, Weak};
 use std::sync::{Arc, LazyLock};
 
@@ -2074,6 +2082,182 @@ impl InstanceRepr {
         self.allinstancefields.borrow()
     }
 
+    /// RPython `InstanceRepr.rclass` (rclass.py:494) — the
+    /// [`ClassRepr`] / [`RootClassRepr`] handle for this instance's
+    /// class. Populated lazily by [`InstanceRepr::_setup_repr`]; callers
+    /// must `Repr::setup` first or be invoked from a context where
+    /// setup has run.
+    pub fn rclass(&self) -> Option<ClassReprArc> {
+        self.rclass.borrow().clone()
+    }
+
+    /// RPython `InstanceRepr.getfieldrepr(self, attr)` (rclass.py:977-985):
+    ///
+    /// ```python
+    /// def getfieldrepr(self, attr):
+    ///     """Return the repr used for the given attribute."""
+    ///     if attr in self.fields:
+    ///         mangled_name, r = self.fields[attr]
+    ///         return r
+    ///     else:
+    ///         if self.classdef is None:
+    ///             raise MissingRTypeAttribute(attr)
+    ///         return self.rbase.getfieldrepr(attr)
+    /// ```
+    pub fn getfieldrepr(self: &Arc<Self>, attr: &str) -> Result<Arc<dyn Repr>, TyperError> {
+        if let Some((_mangled, r)) = self.fields.borrow().get(attr).cloned() {
+            return Ok(r);
+        }
+        // upstream: `if self.classdef is None: raise MissingRTypeAttribute(attr)`.
+        if self.classdef.is_none() {
+            return Err(TyperError::message(format!(
+                "InstanceRepr.getfieldrepr: MissingRTypeAttribute({attr:?})"
+            )));
+        }
+        let rbase = self.rbase.borrow().clone().ok_or_else(|| {
+            TyperError::message("InstanceRepr.getfieldrepr: rbase missing — call setup() first")
+        })?;
+        rbase.getfieldrepr(attr)
+    }
+
+    /// RPython `InstanceRepr.hook_access_field(self, vinst, cname,
+    /// llops, flags)` (rclass.py:712-713):
+    ///
+    /// ```python
+    /// def hook_access_field(self, vinst, cname, llops, flags):
+    ///     pass # for virtualizables; see rvirtualizable.py
+    /// ```
+    ///
+    /// Default no-op. Subclasses (e.g. virtualizable instance reprs)
+    /// override to emit `promote_virtualizable` op before the getfield.
+    pub fn hook_access_field(
+        &self,
+        _vinst: &Hlvalue,
+        _cname: &Hlvalue,
+        _llops: &mut LowLevelOpList,
+        _flags: &Flags,
+    ) {
+        // upstream: `pass`.
+    }
+
+    /// RPython `InstanceRepr.getfield(self, vinst, attr, llops,
+    /// force_cast=False, flags={})` (rclass.py:987-1000):
+    ///
+    /// ```python
+    /// def getfield(self, vinst, attr, llops, force_cast=False, flags={}):
+    ///     """Read the given attribute (or __class__ for the type) of 'vinst'."""
+    ///     if attr in self.fields:
+    ///         mangled_name, r = self.fields[attr]
+    ///         cname = inputconst(Void, mangled_name)
+    ///         if force_cast:
+    ///             vinst = llops.genop('cast_pointer', [vinst], resulttype=self)
+    ///         self.hook_access_field(vinst, cname, llops, flags)
+    ///         return llops.genop('getfield', [vinst, cname], resulttype=r)
+    ///     else:
+    ///         if self.classdef is None:
+    ///             raise MissingRTypeAttribute(attr)
+    ///         return self.rbase.getfield(vinst, attr, llops, force_cast=True,
+    ///                                    flags=flags)
+    /// ```
+    pub fn getfield(
+        self: &Arc<Self>,
+        vinst: Hlvalue,
+        attr: &str,
+        llops: &mut LowLevelOpList,
+        force_cast: bool,
+        flags: &Flags,
+    ) -> Result<Variable, TyperError> {
+        if let Some((mangled_name, r)) = self.fields.borrow().get(attr).cloned() {
+            // upstream: `cname = inputconst(Void, mangled_name)`.
+            let cname = Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str(mangled_name.clone()),
+                LowLevelType::Void,
+            ));
+            // upstream: `if force_cast: vinst = llops.genop('cast_pointer',
+            //                                              [vinst], resulttype=self)`.
+            let vinst = if force_cast {
+                let v_cast = llops
+                    .genop(
+                        "cast_pointer",
+                        vec![vinst],
+                        GenopResult::LLType(self.lowleveltype.clone()),
+                    )
+                    .expect("cast_pointer with non-Void resulttype yields a Variable");
+                Hlvalue::Variable(v_cast)
+            } else {
+                vinst
+            };
+            // upstream: `self.hook_access_field(vinst, cname, llops, flags)`.
+            self.hook_access_field(&vinst, &cname, llops, flags);
+            // upstream: `return llops.genop('getfield', [vinst, cname],
+            //                              resulttype=r)`.
+            return Ok(llops
+                .genop(
+                    "getfield",
+                    vec![vinst, cname],
+                    GenopResult::LLType(r.lowleveltype().clone()),
+                )
+                .expect("getfield with non-Void resulttype yields a Variable"));
+        }
+        // upstream: `if self.classdef is None: raise MissingRTypeAttribute(attr)`.
+        if self.classdef.is_none() {
+            return Err(TyperError::message(format!(
+                "InstanceRepr.getfield: MissingRTypeAttribute({attr:?})"
+            )));
+        }
+        let rbase = self.rbase.borrow().clone().ok_or_else(|| {
+            TyperError::message("InstanceRepr.getfield: rbase missing — call setup() first")
+        })?;
+        // upstream: `return self.rbase.getfield(vinst, attr, llops,
+        //                                      force_cast=True, flags=flags)`.
+        rbase.getfield(vinst, attr, llops, true, flags)
+    }
+
+    /// RPython `InstanceRepr.null_instance(self)` (rclass.py:938-939):
+    ///
+    /// ```python
+    /// def null_instance(self):
+    ///     return nullptr(self.object_type)
+    /// ```
+    ///
+    /// Returns a null `_ptr` to the same container as `self.lowleveltype`,
+    /// suitable for embedding into `Constant(value=LLPtr(...),
+    /// concretetype=self.lowleveltype)` (the upstream `convert_const`
+    /// `value is None` branch).
+    pub fn null_instance(&self) -> Result<_ptr, TyperError> {
+        let object_lltype = match self.object_type.clone() {
+            LowLevelType::ForwardReference(fwd) => fwd.resolved().ok_or_else(|| {
+                TyperError::message(
+                    "InstanceRepr.null_instance: object_type ForwardReference not \
+                     resolved (call setup() first)",
+                )
+            })?,
+            other => other,
+        };
+        lltype::nullptr(object_lltype).map_err(TyperError::message)
+    }
+
+    /// RPython `InstanceRepr.upcast(self, result)` (rclass.py:941-942):
+    ///
+    /// ```python
+    /// def upcast(self, result):
+    ///     return cast_pointer(self.lowleveltype, result)
+    /// ```
+    ///
+    /// Used by `convert_const` when delegating to a subclass `InstanceRepr`
+    /// (rclass.py:788-790): the subclass produces a pointer typed at the
+    /// subclass's `lowleveltype`; this helper casts it back up to the
+    /// owning `InstanceRepr`'s `lowleveltype`.
+    pub fn upcast(&self, result: &_ptr) -> Result<_ptr, TyperError> {
+        let LowLevelType::Ptr(ptrtype) = &self.lowleveltype else {
+            return Err(TyperError::message(format!(
+                "InstanceRepr.upcast: self.lowleveltype is not a Ptr: {:?}",
+                self.lowleveltype
+            )));
+        };
+        lltype::cast_pointer(ptrtype, result).map_err(TyperError::message)
+    }
+
     /// RPython `InstanceRepr.create_instance(self)` (rclass.py:944-945):
     ///
     /// ```python
@@ -2286,6 +2470,155 @@ impl Repr for InstanceRepr {
 
     fn repr_class_id(&self) -> ReprClassId {
         ReprClassId::Repr
+    }
+
+    /// RPython `InstanceRepr.convert_const(self, value)` (rclass.py:772-792):
+    ///
+    /// ```python
+    /// def convert_const(self, value):
+    ///     if value is None:
+    ///         return self.null_instance()
+    ///     if isinstance(value, types.MethodType):
+    ///         value = value.im_self   # bound method -> instance
+    ///     bk = self.rtyper.annotator.bookkeeper
+    ///     try:
+    ///         classdef = bk.getuniqueclassdef(value.__class__)
+    ///     except KeyError:
+    ///         raise TyperError("no classdef: %r" % (value.__class__,))
+    ///     if classdef != self.classdef:
+    ///         if classdef.commonbase(self.classdef) != self.classdef:
+    ///             raise TyperError("not an instance of %r: %r" % (
+    ///                 self.classdef.name, value))
+    ///         rinstance = getinstancerepr(self.rtyper, classdef)
+    ///         result = rinstance.convert_const(value)
+    ///         return self.upcast(result)
+    ///     # common case
+    ///     return self.convert_const_exact(value)
+    /// ```
+    ///
+    /// The `convert_const_exact` (rclass.py:794-802) tail is gated on
+    /// the `iprebuiltinstances` cache + the full `initialize_prebuilt_data`
+    /// body for `classdef != None` (rclass.py:951-971), neither of
+    /// which has been ported yet — surfaces as `MissingRTypeOperation`
+    /// for the exact-match arm.
+    fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        use crate::annotator::classdesc::ClassDef;
+
+        // upstream: `if value is None: return self.null_instance()`.
+        if matches!(value, ConstValue::None) {
+            let null = self.null_instance()?;
+            return Ok(Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(null)),
+                self.lowleveltype.clone(),
+            ));
+        }
+
+        // upstream: `isinstance(value, types.MethodType)` —
+        //   bound method redirect to its `im_self`.
+        let host_obj = match value {
+            ConstValue::HostObject(h) => h.clone(),
+            other => {
+                return Err(TyperError::message(format!(
+                    "InstanceRepr.convert_const: expected HostObject or None, \
+                     got {other:?}"
+                )));
+            }
+        };
+        let host_obj = if host_obj.is_bound_method() {
+            host_obj.bound_method_self().cloned().ok_or_else(|| {
+                TyperError::message("InstanceRepr.convert_const: bound method has no self_obj")
+            })?
+        } else {
+            host_obj
+        };
+
+        // upstream: `classdef = bk.getuniqueclassdef(value.__class__)`.
+        let host_cls = host_obj.class_of().ok_or_else(|| {
+            TyperError::message(format!(
+                "InstanceRepr.convert_const: no class_of() for {:?}",
+                host_obj.qualname()
+            ))
+        })?;
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("InstanceRepr.convert_const: rtyper weak ref dropped")
+        })?;
+        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+            TyperError::message("InstanceRepr.convert_const: annotator weak ref dropped")
+        })?;
+        let classdef = annotator
+            .bookkeeper
+            .getuniqueclassdef(&host_cls)
+            .map_err(|e| {
+                TyperError::message(format!("no classdef: {} ({})", host_cls.qualname(), e))
+            })?;
+
+        // upstream: `if classdef != self.classdef`.
+        let exact_match = match self.classdef.as_ref() {
+            Some(self_cd) => Rc::ptr_eq(self_cd, &classdef),
+            None => false,
+        };
+        if !exact_match {
+            // upstream: `if classdef.commonbase(self.classdef) !=
+            //              self.classdef: raise TyperError(...)`.
+            //   Subclass-relationship check; self must be a base of the
+            //   value's class.
+            let self_cd = self.classdef.as_ref().ok_or_else(|| {
+                TyperError::message(format!(
+                    "InstanceRepr.convert_const: cannot delegate via root \
+                     InstanceRepr (classdef=None) to {:?}",
+                    classdef.borrow().name
+                ))
+            })?;
+            let common = ClassDef::commonbase(&classdef, self_cd).ok_or_else(|| {
+                TyperError::message(format!(
+                    "not an instance of {:?}: {:?}",
+                    self_cd.borrow().name,
+                    host_obj.qualname()
+                ))
+            })?;
+            if !Rc::ptr_eq(&common, self_cd) {
+                return Err(TyperError::message(format!(
+                    "not an instance of {:?}: {:?}",
+                    self_cd.borrow().name,
+                    host_obj.qualname()
+                )));
+            }
+            // upstream: `rinstance = getinstancerepr(rtyper, classdef);
+            //            result = rinstance.convert_const(value);
+            //            return self.upcast(result)`.
+            let rinstance = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc)?;
+            let sub_result = (rinstance.as_ref() as &dyn Repr).convert_const(value)?;
+            let ConstValue::LLPtr(sub_ptr) = &sub_result.value else {
+                return Err(TyperError::message(format!(
+                    "InstanceRepr.convert_const: subclass result is not LLPtr: \
+                     {:?}",
+                    sub_result.value
+                )));
+            };
+            let upcast_ptr = self.upcast(sub_ptr)?;
+            return Ok(Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(upcast_ptr)),
+                self.lowleveltype.clone(),
+            ));
+        }
+
+        // upstream: `return self.convert_const_exact(value)`.
+        //
+        // PRE-EXISTING-ADAPTATION: `convert_const_exact` (rclass.py:794-802)
+        // requires the `iprebuiltinstances` value-keyed identity cache
+        // plus the full `initialize_prebuilt_data` field-init body
+        // (rclass.py:947-975) for `classdef != None`. Pyre's
+        // [`InstanceRepr::initialize_prebuilt_data`] only handles the
+        // empty-fields case today (used by exception-class shells in
+        // [`get_standard_ll_exc_instance`]). Restoring the exact-match
+        // arm is gated on porting both the cache and the per-field
+        // `getattr` probe + per-field `convert_const` / `convert_desc`
+        // pipeline.
+        Err(TyperError::missing_rtype_operation(
+            "InstanceRepr.convert_const_exact (rclass.py:794-802) port pending — \
+             requires iprebuiltinstances cache + initialize_prebuilt_data \
+             field-init body for classdef!=None",
+        ))
     }
 
     /// RPython `InstanceRepr._setup_repr` (rclass.py:487-558).
@@ -3524,6 +3857,56 @@ mod tests {
         Repr::setup(inst.as_ref() as &dyn Repr).unwrap();
         let p = inst.create_instance().expect("create_instance");
         assert!(p.nonzero());
+    }
+
+    #[test]
+    fn instance_repr_convert_const_none_returns_null_instance_constant() {
+        // rclass.py:773-774 — `if value is None: return self.null_instance()`.
+        // null_instance returns `nullptr(self.object_type)` wrapped as
+        // ConstValue::LLPtr; concretetype tracks `self.lowleveltype`.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("init exceptiondata");
+        let host = HostObject::new_class("Bare2", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let DescEntry::Class(rc) = &entry else {
+            unreachable!()
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        let inst = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(inst.as_ref() as &dyn Repr).expect("setup InstanceRepr");
+
+        let c = (inst.as_ref() as &dyn Repr)
+            .convert_const(&ConstValue::None)
+            .expect("convert_const(None)");
+        assert_eq!(c.concretetype.as_ref(), Some(inst.lowleveltype()));
+        let ConstValue::LLPtr(ptr) = &c.value else {
+            panic!("convert_const(None) must produce LLPtr, got {:?}", c.value);
+        };
+        assert!(!ptr.nonzero(), "null_instance must be a null pointer");
+    }
+
+    #[test]
+    fn instance_repr_convert_const_non_hostobject_rejected() {
+        // rclass.py:778-781 (`bk.getuniqueclassdef(value.__class__)`) —
+        // pyre's `getuniqueclassdef` only accepts HostObject inputs, so
+        // the convert_const port rejects non-HostObject ConstValues
+        // before reaching the bookkeeper.
+        let rtyper = fresh_rtyper();
+        let classdef = ClassDef::new_standalone("pkg.RejectShape", None);
+        let inst = getinstancerepr(&rtyper, Some(&classdef), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(inst.as_ref() as &dyn Repr).expect("setup InstanceRepr");
+        let err = (inst.as_ref() as &dyn Repr)
+            .convert_const(&ConstValue::Int(7))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("expected HostObject or None"),
+            "unexpected: {err}"
+        );
     }
 
     #[test]

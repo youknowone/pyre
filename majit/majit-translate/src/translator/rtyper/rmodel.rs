@@ -546,6 +546,48 @@ pub trait Repr: Debug + std::any::Any {
         )))
     }
 
+    /// RPython `Repr.get_r_implfunc(self)` (rpbc.py:1165-1168) —
+    /// owned-`Arc<dyn Repr>` variant.
+    ///
+    /// `MethodsPBCRepr.get_r_implfunc` (rpbc.py:1165) returns a
+    /// `r_func` borrowed from `r_class.clsfields[methodname]`. The
+    /// upstream borrow is a Python attribute lookup whose result
+    /// outlives the call; Rust's `&dyn Repr` cannot escape the
+    /// short-lived `RefCell::borrow()` guard, so this sibling method
+    /// returns the `Arc<dyn Repr>` instead. Default delegates to the
+    /// `&dyn Repr` variant for impls (FunctionRepr, FunctionsPBCRepr,
+    /// SmallFunctionSetPBCRepr) that return `(self, 0)` — those want
+    /// `Arc::new` of `self`, which is impossible from `&self` alone, so
+    /// callers that need the Arc must invoke the impl-specific helper
+    /// directly.
+    fn get_r_implfunc_arc(&self) -> Result<(std::sync::Arc<dyn Repr>, usize), TyperError> {
+        Err(TyperError::message(format!(
+            "{} has no corresponding implementation function representation \
+             (Arc form)",
+            self.repr_string()
+        )))
+    }
+
+    /// RPython `FunctionReprBase.s_pbc` (`rpbc.py:180`) read accessor.
+    ///
+    /// In upstream Python `r_func.s_pbc` is a plain attribute access on
+    /// `FunctionRepr` / `FunctionsPBCRepr` / `SmallFunctionSetPBCRepr`
+    /// (each subclasses `FunctionReprBase`). Rust composes rather than
+    /// inherits (see [`super::rpbc::FunctionReprBase`]'s module doc), so
+    /// the polymorphic field access becomes a `Repr` trait method.
+    ///
+    /// Used by callers that need a callable PBC's shape — notably
+    /// `MethodsPBCRepr.redispatch_call` (rpbc.py:1202) — to read
+    /// `r_func.s_pbc` for the `subset_of=` argument when narrowing the
+    /// per-call `SomePBC`.
+    ///
+    /// Default `None` matches upstream's `AttributeError`-raising
+    /// behaviour for non-FunctionReprBase subclasses; concrete
+    /// FunctionReprBase impls override to return `Some(&self.base.s_pbc)`.
+    fn pbc_s_pbc(&self) -> Option<&crate::annotator::model::SomePBC> {
+        None
+    }
+
     /// RPython `Repr.convert_const(self, value)` (`rmodel.py:120-125`).
     ///
     /// ```python

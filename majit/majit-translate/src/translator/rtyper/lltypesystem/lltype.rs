@@ -2174,6 +2174,24 @@ impl ArrayType {
         Self::_build(of, GcKind::Gc, vec![])
     }
 
+    /// Raw `Array(OF, hints={...})`. Upstream
+    /// `rpython/rtyper/lltypesystem/lltype.py:428-439 Array.__init__`
+    /// + `_install_extras` forwards the `hints` kwarg to
+    /// `self._hints`. Used by
+    /// `SmallFunctionSetPBCRepr._setup_repr` (rpbc.py:416-418) which
+    /// builds `Array(self.pointer_repr.lowleveltype,
+    ///                hints={'nolength': True, 'immutable': True,
+    ///                       'static_immutable': True})`.
+    pub fn with_hints(of: ConcretetypePlaceholder, hints: Vec<(String, ConstValue)>) -> Self {
+        Self::_build(of, GcKind::Raw, hints)
+    }
+
+    /// `GcArray(OF, hints={...})`. Same as [`ArrayType::gc`] plus a
+    /// `hints` dict mirrored from upstream `_install_extras`.
+    pub fn gc_with_hints(of: ConcretetypePlaceholder, hints: Vec<(String, ConstValue)>) -> Self {
+        Self::_build(of, GcKind::Gc, hints)
+    }
+
     /// Unified constructor mirroring `Array.__init__` / `_install_extras`
     /// (`lltype.py:428-439`). Rejects any non-raw container as the item
     /// type (`lltype.py:434-436`) — a gc array-of-gc-containers would

@@ -31,8 +31,10 @@
 //!   `lltype.Address` + `adr_eq` + `robj1.null_instance()` which have no
 //!   Rust counterpart (`rpython/rtyper/lltypesystem/llmemory.py` is
 //!   unported). Marked with a structured TyperError placeholder.
-//! * `SmallFunctionSetPBCRepr` branch (rnone.py:76-82) — defers to the
-//!   `rpbc.py SmallFunctionSetPBCRepr` port.
+//! * The `SmallFunctionSetPBCRepr` branch (rnone.py:76-82) is wired
+//!   through [`super::pairtype::ReprClassId::SmallFunctionSetPBCRepr`]
+//!   plus [`Repr::pbc_s_pbc`] — `can_be_None` true emits
+//!   `char_eq(v1, '\000')`, false folds to `inputconst(Bool, False)`.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
@@ -302,16 +304,37 @@ pub fn rtype_is_none(
         return HighLevelOp::inputconst(&LowLevelType::Bool, &ConstValue::Bool(true))
             .map(|c| Some(Hlvalue::Constant(c)));
     }
-    // upstream: `elif isinstance(robj1, SmallFunctionSetPBCRepr)`. The
-    // SmallFunctionSetPBCRepr port lives in `rpbc.py:SmallFunctionSetPBCRepr`
-    // and has not yet been ported. Upstream semantics: emit a
-    // `char_eq(v1, '\000')` when `s_pbc.can_be_None` is true, otherwise
-    // fold to `inputconst(Bool, False)`. Left as a parity-marker
-    // TyperError so the callsite surfaces the missing dependency with
-    // the expected context.
-    //
-    // TODO (cascading port): flip this arm when rpbc.rs lands
-    // SmallFunctionSetPBCRepr.
+    // upstream rnone.py:76-82:
+    //   elif isinstance(robj1, SmallFunctionSetPBCRepr):
+    //       if robj1.s_pbc.can_be_None:
+    //           v1 = hop.inputarg(robj1, pos)
+    //           return hop.genop('char_eq', [v1, inputconst(Char, '\000')],
+    //                            resulttype=Bool)
+    //       else:
+    //           return inputconst(Bool, False)
+    if matches!(
+        robj1.repr_class_id(),
+        super::pairtype::ReprClassId::SmallFunctionSetPBCRepr
+    ) {
+        let s_pbc = robj1.pbc_s_pbc().ok_or_else(|| {
+            TyperError::message("rtype_is_none: SmallFunctionSetPBCRepr missing pbc_s_pbc accessor")
+        })?;
+        if s_pbc.can_be_none {
+            let v1 = hop.inputarg(robj1, pos)?;
+            let c_zero = Hlvalue::Constant(Constant::with_concretetype(
+                ConstValue::byte_str(vec![0u8]),
+                LowLevelType::Char,
+            ));
+            return Ok(hop.genop(
+                "char_eq",
+                vec![v1, c_zero],
+                GenopResult::LLType(LowLevelType::Bool),
+            ));
+        } else {
+            return HighLevelOp::inputconst(&LowLevelType::Bool, &ConstValue::Bool(false))
+                .map(|c| Some(Hlvalue::Constant(c)));
+        }
+    }
 
     // upstream: `else: raise TyperError('rtype_is_none of %r' % (robj1))`.
     Err(TyperError::message(format!(
