@@ -5,4 +5,6 @@
 //! Each file name matches upstream (e.g. `ssa.py` → `ssa.rs`).
 
 pub mod all;
+pub mod constfold;
+pub mod removenoops;
 pub mod ssa;

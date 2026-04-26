@@ -278,11 +278,13 @@ impl Translation {
     /// through `Result::Err`.
     pub fn update_options(
         &self,
-        kwds: &HashMap<String, String>,
+        kwds: &[(String, String)],
     ) -> Result<(), crate::config::config::ConfigError> {
         // Upstream `:41-43`: pop `gc` and special-case it as
-        // `translation.gc`.
-        let mut remaining: HashMap<String, OptionValue> = HashMap::with_capacity(kwds.len());
+        // `translation.gc`. `kwds` is an ordered slice so the
+        // downstream `Config.set` walk preserves caller order
+        // (`config.py:131 for key, value in kwargs.iteritems():`).
+        let mut remaining: Vec<(String, OptionValue)> = Vec::with_capacity(kwds.len());
         for (k, v) in kwds.iter() {
             if k == "gc" {
                 self.driver
@@ -290,7 +292,7 @@ impl Translation {
                     .set_value("translation.gc", OptionValue::Choice(v.clone()))?;
                 continue;
             }
-            remaining.insert(k.clone(), OptionValue::Str(v.clone()));
+            remaining.push((k.clone(), OptionValue::Str(v.clone())));
         }
         // Upstream `:44`: `self.config.translation.set(**kwds)`.
         // `Config::set` at `config.rs` walks the option tree by name,
@@ -337,8 +339,7 @@ impl Translation {
         // Upstream `:47-49`: `if value is not None: self.update_options(
         // {name: value}); return value`.
         if let Some(v) = value {
-            let mut kwds = HashMap::new();
-            kwds.insert(name.to_string(), v.to_string());
+            let kwds = vec![(name.to_string(), v.to_string())];
             self.update_options(&kwds)?;
             return Ok(v.to_string());
         }
@@ -359,8 +360,7 @@ impl Translation {
         // self.update_options({name: fallback}); return fallback`.
         if let Some(f) = fallback {
             if val_str.is_none() {
-                let mut kwds = HashMap::new();
-                kwds.insert(name.to_string(), f.to_string());
+                let kwds = vec![(name.to_string(), f.to_string())];
                 self.update_options(&kwds)?;
                 return Ok(f.to_string());
             }
@@ -487,7 +487,7 @@ impl Translation {
     /// (`driver.py:104-110`). The Rust port routes through
     /// [`TranslationDriver::proceed`] with `ProceedGoals::One("annotate")`,
     /// which performs the same engine planning + execution.
-    pub fn annotate(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+    pub fn annotate(&self, kwds: &[(String, String)]) -> Result<TaskOutput, TaskError> {
         // Upstream `:82`: `self.update_options(kwds)`.
         self.update_options(kwds).map_err(cfg_to_task)?;
         // Upstream `:83`: `return self.driver.annotate()` ⇒
@@ -509,7 +509,7 @@ impl Translation {
     /// `expose_task`-generated proc whose body calls
     /// `self.proceed('rtype_<ts>')`. The Rust port short-circuits the
     /// `getattr` round-trip and proceeds directly.
-    pub fn rtype(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+    pub fn rtype(&self, kwds: &[(String, String)]) -> Result<TaskOutput, TaskError> {
         self.update_options(kwds).map_err(cfg_to_task)?;
         let ts = self.ensure_type_system(None).map_err(cfg_to_task)?;
         self.driver
@@ -529,7 +529,7 @@ impl Translation {
     /// Note the explicit `'lltype'` fallback at upstream `:94`: this
     /// method forces `type_system=lltype` when the slot is unset,
     /// while `rtype()` at `:90` only resolves the existing default.
-    pub fn backendopt(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+    pub fn backendopt(&self, kwds: &[(String, String)]) -> Result<TaskOutput, TaskError> {
         self.update_options(kwds).map_err(cfg_to_task)?;
         let ts = self
             .ensure_type_system(Some("lltype"))
@@ -547,7 +547,7 @@ impl Translation {
     ///     backend = self.ensure_backend()
     ///     getattr(self.driver, 'source_' + backend)()
     /// ```
-    pub fn source(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+    pub fn source(&self, kwds: &[(String, String)]) -> Result<TaskOutput, TaskError> {
         self.update_options(kwds).map_err(cfg_to_task)?;
         let backend = self.ensure_backend(None).map_err(cfg_to_task)?;
         self.driver
@@ -563,7 +563,7 @@ impl Translation {
     ///     self.ensure_backend('c')
     ///     self.driver.source_c()
     /// ```
-    pub fn source_c(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+    pub fn source_c(&self, kwds: &[(String, String)]) -> Result<TaskOutput, TaskError> {
         self.update_options(kwds).map_err(cfg_to_task)?;
         self.ensure_backend(Some("c")).map_err(cfg_to_task)?;
         self.driver
@@ -584,7 +584,7 @@ impl Translation {
     /// (`translationoption.py:51-56` lists only `"c"`); the method is
     /// preserved for surface parity but always errors out at
     /// `ensure_backend('cl')` with `ConfigError::ValidationFailed`.
-    pub fn source_cl(&self, kwds: &HashMap<String, String>) -> Result<TaskOutput, TaskError> {
+    pub fn source_cl(&self, kwds: &[(String, String)]) -> Result<TaskOutput, TaskError> {
         self.update_options(kwds).map_err(cfg_to_task)?;
         self.ensure_backend(Some("cl")).map_err(cfg_to_task)?;
         self.driver
@@ -607,7 +607,7 @@ impl Translation {
     /// port mirrors that with `Option<PathBuf>` so callers can observe
     /// the same shape (the C-backend leaf populates the slot through
     /// `task_compile_c` at upstream `:524`).
-    pub fn compile(&self, kwds: &HashMap<String, String>) -> Result<Option<PathBuf>, TaskError> {
+    pub fn compile(&self, kwds: &[(String, String)]) -> Result<Option<PathBuf>, TaskError> {
         self.update_options(kwds).map_err(cfg_to_task)?;
         let backend = self.ensure_backend(None).map_err(cfg_to_task)?;
         self.driver
@@ -625,7 +625,7 @@ impl Translation {
     ///     self.driver.compile_c()
     ///     return self.driver.c_entryp
     /// ```
-    pub fn compile_c(&self, kwds: &HashMap<String, String>) -> Result<Option<PathBuf>, TaskError> {
+    pub fn compile_c(&self, kwds: &[(String, String)]) -> Result<Option<PathBuf>, TaskError> {
         self.update_options(kwds).map_err(cfg_to_task)?;
         self.ensure_backend(Some("c")).map_err(cfg_to_task)?;
         self.driver
@@ -679,7 +679,7 @@ impl Translation {
         item: &ItemFn,
         argtypes: Option<Vec<AnnotationSpec>>,
         policy: Option<AnnotatorPolicy>,
-        kwds: &HashMap<String, String>,
+        kwds: &[(String, String)],
     ) -> Result<(Self, HostObject), TranslationConstructError> {
         let source_text = item.to_token_stream().to_string();
         Self::from_rust_item_fn_with_source_and_options(
@@ -710,7 +710,7 @@ impl Translation {
             source_text,
             None,
             None,
-            &HashMap::new(),
+            &[],
         )
     }
 
@@ -734,7 +734,7 @@ impl Translation {
         source_text: Option<&str>,
         argtypes: Option<Vec<AnnotationSpec>>,
         policy: Option<AnnotatorPolicy>,
-        kwds: &HashMap<String, String>,
+        kwds: &[(String, String)],
     ) -> Result<(Self, HostObject), TranslationConstructError> {
         // Upstream `interactive.py:15`:
         // `self.driver = driver.TranslationDriver(overrides=DEFAULTS)`.
@@ -851,9 +851,11 @@ fn cfg_to_task(e: ConfigError) -> TaskError {
 /// context). Logic stays identical to the public method.
 fn update_options_via_driver(
     driver: &TranslationDriver,
-    kwds: &HashMap<String, String>,
+    kwds: &[(String, String)],
 ) -> Result<(), ConfigError> {
-    let mut remaining: HashMap<String, OptionValue> = HashMap::with_capacity(kwds.len());
+    // `kwds` is an ordered slice mirroring upstream's `**kwds` dict;
+    // `Config::set` walks them in caller order.
+    let mut remaining: Vec<(String, OptionValue)> = Vec::with_capacity(kwds.len());
     for (k, v) in kwds.iter() {
         if k == "gc" {
             driver
@@ -861,7 +863,7 @@ fn update_options_via_driver(
                 .set_value("translation.gc", OptionValue::Choice(v.clone()))?;
             continue;
         }
-        remaining.insert(k.clone(), OptionValue::Str(v.clone()));
+        remaining.push((k.clone(), OptionValue::Str(v.clone())));
     }
     if !remaining.is_empty() {
         driver.config.set(remaining)?;
@@ -1194,8 +1196,7 @@ mod tests {
         // before returning. Confirm the constructor variant that
         // accepts these parameters drives the same chain end-to-end.
         let item = parse_item_fn("fn one() -> i64 { 1 }");
-        let mut kwds = HashMap::new();
-        kwds.insert("gc".to_string(), "boehm".to_string());
+        let kwds = vec![("gc".to_string(), "boehm".to_string())];
         let argtypes: Vec<AnnotationSpec> = Vec::new();
         let policy = AnnotatorPolicy::default();
         let (t, _host) =
@@ -1272,7 +1273,7 @@ mod tests {
         let item = parse_item_fn("fn one() -> i64 { 1 }");
         let (t, _host) = Translation::from_rust_item_fn(&item).expect("translation");
         // Empty: no error, config unchanged.
-        t.update_options(&HashMap::new()).expect("empty update");
+        t.update_options(&[]).expect("empty update");
         let verbose = match t
             .driver
             .config
@@ -1288,8 +1289,7 @@ mod tests {
         );
 
         // `gc` short-circuit lands as ChoiceOption.
-        let mut kwds = HashMap::new();
-        kwds.insert("gc".to_string(), "boehm".to_string());
+        let kwds = vec![("gc".to_string(), "boehm".to_string())];
         t.update_options(&kwds).expect("gc update");
         let gc = match t
             .driver
@@ -1403,13 +1403,9 @@ mod tests {
     /// shape used by `task_annotate_runs_end_to_end_for_constant_return`.
     fn translation_for(src: &str) -> Translation {
         let item = parse_item_fn(src);
-        let (t, _host) = Translation::from_rust_item_fn_with_options(
-            &item,
-            Some(Vec::new()),
-            None,
-            &HashMap::new(),
-        )
-        .expect("translation");
+        let (t, _host) =
+            Translation::from_rust_item_fn_with_options(&item, Some(Vec::new()), None, &[])
+                .expect("translation");
         t
     }
 
@@ -1555,7 +1551,7 @@ mod tests {
         // `task_annotate` end-to-end (driver.py:297-327). Verify
         // completion + `done` bookkeeping via DriverHooks::_do.
         let t = translation_for("fn main() -> i64 { 42 }");
-        t.annotate(&HashMap::new()).expect("annotate");
+        t.annotate(&[]).expect("annotate");
         assert!(
             t.driver.done.borrow().contains_key("annotate"),
             "DriverHooks::_do must record annotate as done"
@@ -1570,7 +1566,7 @@ mod tests {
         // schema default `type_system=None`, `ensure_type_system`
         // lands `lltype` first, so the proceed goal is `rtype_lltype`.
         let t = translation_for("fn main() -> i64 { 7 }");
-        t.rtype(&HashMap::new()).expect("rtype");
+        t.rtype(&[]).expect("rtype");
         let done = t.driver.done.borrow();
         assert!(done.contains_key("annotate"));
         assert!(done.contains_key("rtype_lltype"));
@@ -1586,7 +1582,7 @@ mod tests {
         // forwarding method must propagate that error rather than
         // silently dropping it.
         let t = translation_for("fn main() -> i64 { 1 }");
-        let err = t.compile_c(&HashMap::new()).unwrap_err();
+        let err = t.compile_c(&[]).unwrap_err();
         // Error message must cite the deferred leaf so a reviewer can
         // grep the exact upstream line. Accept both `not ported` and
         // `not yet ported` wordings — different shells along the chain

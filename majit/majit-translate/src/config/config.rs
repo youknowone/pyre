@@ -1326,7 +1326,19 @@ impl Config {
     /// Upstream `Config.set(self, **kwargs)` at `config.py:129-143`.
     /// Resolves short names by matching the suffix against the full
     /// dotted paths returned by `getpaths()`.
-    pub fn set(self: &Rc<Self>, kwargs: HashMap<String, OptionValue>) -> Result<(), ConfigError> {
+    ///
+    /// `kwargs` is a `Vec<(String, OptionValue)>` rather than a
+    /// `HashMap` so the caller's `**kwargs` order is preserved during
+    /// the `for key, value in kwargs.iteritems():` walk at
+    /// `config.py:131`. Upstream RPython runs on Python 2 where `dict`
+    /// has no defined iteration order; matching upstream's *behaviour*
+    /// (callers that depend on a specific order pass an
+    /// `OrderedDict`-equivalent or rely on the alphabetical-by-luck
+    /// reality of CPython 2 hashing) is impossible without additional
+    /// signal, so the local port preserves the caller's *literal*
+    /// argument order via the explicit Vec — no semantic loss versus
+    /// what upstream callers actually relied on.
+    pub fn set(self: &Rc<Self>, kwargs: Vec<(String, OptionValue)>) -> Result<(), ConfigError> {
         let all_paths: Vec<Vec<String>> = self
             .getpaths(false)
             .into_iter()
@@ -1726,8 +1738,7 @@ mod tests {
         // the full path `translation.gc` (the only path ending with
         // `gc`).
         let c = Config::new(translation_descr(), HashMap::new()).expect("config");
-        let mut kwargs = HashMap::new();
-        kwargs.insert("gc".to_string(), OptionValue::Choice("boehm".to_string()));
+        let kwargs = vec![("gc".to_string(), OptionValue::Choice("boehm".to_string()))];
         c.set(kwargs).expect("set");
         let gc = c.get("translation.gc").expect("path");
         assert!(matches!(
@@ -1919,8 +1930,7 @@ mod tests {
             ],
         ));
         let c = Config::new(root, HashMap::new()).expect("config");
-        let mut kwargs = HashMap::new();
-        kwargs.insert("gc".to_string(), OptionValue::Choice("x".to_string()));
+        let kwargs = vec![("gc".to_string(), OptionValue::Choice("x".to_string()))];
         let err = c.set(kwargs).unwrap_err();
         assert!(matches!(err, ConfigError::Ambigous(_)));
     }
@@ -1929,8 +1939,7 @@ mod tests {
     fn config_set_no_match_on_unknown_suffix() {
         // Upstream `:141-143 NoMatchingOptionFound`.
         let c = Config::new(translation_descr(), HashMap::new()).expect("config");
-        let mut kwargs = HashMap::new();
-        kwargs.insert("nosuch".to_string(), OptionValue::Bool(true));
+        let kwargs = vec![("nosuch".to_string(), OptionValue::Bool(true))];
         let err = c.set(kwargs).unwrap_err();
         assert!(matches!(err, ConfigError::NoMatch(_)));
     }

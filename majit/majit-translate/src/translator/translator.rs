@@ -377,14 +377,76 @@ impl TranslationContext {
         self.rtyper.borrow().as_ref().cloned()
     }
 
-    // `getexceptiontransformer()` (translator.py:86-92) lands
-    // alongside the `rpython/translator/exceptiontransform.py` port.
-
     /// RPython `TranslationContext.checkgraphs()` (translator.py:94-96).
     pub fn checkgraphs(&self) {
         for graph in self.graphs.borrow().iter() {
             checkgraph(&graph.borrow());
         }
+    }
+
+    /// RPython `translator.getexceptiontransformer()` at
+    /// `rpython/translator/translator.py:86-93`.
+    ///
+    /// Upstream:
+    /// ```python
+    /// def getexceptiontransformer(self):
+    ///     if self.rtyper is None:
+    ///         raise ValueError("no rtyper")
+    ///     if self.exceptiontransformer is not None:
+    ///         return self.exceptiontransformer
+    ///     from rpython.translator.exceptiontransform import ExceptionTransformer
+    ///     self.exceptiontransformer = ExceptionTransformer(self)
+    ///     return self.exceptiontransformer
+    /// ```
+    ///
+    /// The `rtyper is None` guard at `:87-88` is mirrored exactly. The
+    /// lazy creation at `:91-92` (`ExceptionTransformer(self)`) is
+    /// PRE-EXISTING-ADAPTATION pending the
+    /// `rpython/translator/exceptiontransform.py` port — for now the
+    /// method returns `Ok(None)` so callers see the
+    /// "rtyper-present-but-no-transformer-yet" shape and route the
+    /// `None` through to downstream consumers (`genc.py:92` already
+    /// stores the value verbatim).
+    pub fn getexceptiontransformer(
+        &self,
+    ) -> Result<
+        Option<std::rc::Rc<dyn std::any::Any>>,
+        crate::translator::tool::taskengine::TaskError,
+    > {
+        if self.rtyper.borrow().is_none() {
+            return Err(crate::translator::tool::taskengine::TaskError {
+                message: "translator.py:88 ValueError: no rtyper".to_string(),
+            });
+        }
+        Ok(None)
+    }
+
+    /// Upstream `genc.py:128 for obj in exports.EXPORTS_obj2name.keys():
+    /// db.getcontainernode(obj)`.
+    ///
+    /// `rpython/rlib/exports.py` is not yet ported; the local stub
+    /// returns an empty iterator so the upstream loop body matches
+    /// line-by-line and runs zero times. Convergence path = port
+    /// `rlib/exports.py` and have its `EXPORTS_obj2name` populated by
+    /// the same `@export` decorator the upstream uses.
+    pub fn exports_obj2name_keys(&self) -> Vec<std::rc::Rc<dyn std::any::Any>> {
+        Vec::new()
+    }
+
+    /// Upstream `genc.py:130 exports.clear()`. Stub no-op until
+    /// `rlib/exports.py` lands locally.
+    pub fn clear_exports(&self) {}
+
+    /// Upstream `genc.py:132 for ll_func in db.translator._call_at_startup`.
+    ///
+    /// `_call_at_startup` is registered upstream by code paths that
+    /// have not yet been ported (rffi tooling, GC startup hooks).
+    /// Returns an empty Vec so the loop body matches upstream and
+    /// degrades to zero iterations. Convergence path = land the
+    /// `_call_at_startup` slot on `TranslationContext` once those
+    /// upstream code paths land locally.
+    pub fn call_at_startup(&self) -> Vec<std::rc::Rc<dyn std::any::Any>> {
+        Vec::new()
     }
 
     /// RPython `TranslationContext.update_call_graph(caller_graph,

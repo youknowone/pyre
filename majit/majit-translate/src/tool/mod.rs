@@ -11,8 +11,10 @@
 //! | `error`               | `error.py`                    |
 //! | `flattenrec`          | `flattenrec.py`               |
 //! | `pairtype`            | `pairtype.py`                 |
+//! | `udir`                | `udir.py`                     |
 
 pub mod algo;
 pub mod error;
 pub mod flattenrec;
 pub mod pairtype;
+pub mod udir;

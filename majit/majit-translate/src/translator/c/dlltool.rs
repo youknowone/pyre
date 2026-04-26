@@ -92,6 +92,8 @@ impl CLibraryBuilder {
         );
         // Upstream `:9`: `split = True`.
         base.split = true;
+        // Upstream `:8`: `standalone = False`.
+        base.standalone = false;
         Self {
             base,
             functions,
@@ -105,9 +107,14 @@ impl CLibraryBuilder {
 
     /// Upstream `getentrypointptr(self)` at `:16-22`.
     pub fn getentrypointptr(&self) -> Result<Vec<Rc<dyn Any>>, TaskError> {
-        Err(TaskError {
-            message: "dlltool.py:16 CLibraryBuilder.getentrypointptr — leaf bookkeeper.getdesc / getuniquegraph / getfunctionptr not yet ported".to_string(),
-        })
+        let mut entrypoints = Vec::new();
+        for (func, _) in &self.functions {
+            entrypoints.push(
+                self.base
+                    .functionptr_for_any(func, "dlltool.py:16 CLibraryBuilder.getentrypointptr")?,
+            );
+        }
+        Ok(entrypoints)
     }
 
     /// Upstream `gen_makefile(self, targetdir, exe_name=None,
@@ -202,6 +209,26 @@ mod tests {
         );
         let ok = lb.gen_makefile(PathBuf::from("/tmp"), None, Vec::new());
         assert!(ok.is_ok(), "gen_makefile must mirror upstream `pass`");
+    }
+
+    #[test]
+    fn getentrypointptr_empty_functions_returns_empty_list() {
+        // Upstream `dlltool.py:16-22`: starts with `entrypoints = []`
+        // and appends once per `(f, _)`; an empty `functions` list returns
+        // an empty list without touching the bookkeeper.
+        let (translator, config) = fixture_translator_and_config();
+        let lb = CLibraryBuilder::new(
+            translator,
+            None,
+            config,
+            Vec::new(),
+            "x".to_string(),
+            None,
+            None,
+            Vec::new(),
+        );
+        let entrypoints = lb.getentrypointptr().expect("empty loop succeeds");
+        assert!(entrypoints.is_empty());
     }
 
     #[test]

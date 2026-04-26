@@ -16,6 +16,7 @@
 //! body can be written against the upstream call shape and only the leaf
 //! body remains to land on a per-method basis.
 
+pub mod database;
 pub mod dlltool;
 pub mod genc;
 
@@ -36,10 +37,22 @@ pub enum CBuilderRef {
 
 impl CBuilderRef {
     /// Upstream `cbuilder.build_database()` (driver.py:435).
-    pub fn build_database(&self) -> Result<genc::LowLevelDatabase, TaskError> {
+    ///
+    /// Threads the subclass `getentrypointptr()` callback into
+    /// [`genc::CBuilder::build_database_with`] so the dispatch lands at
+    /// the upstream `genc.py:110` position — after gcpolicy /
+    /// exctransformer / DB construction / gc_startup_code, before
+    /// secondary entry points and exports/startup walks.
+    pub fn build_database(&self) -> Result<database::LowLevelDatabase, TaskError> {
         match self {
-            CBuilderRef::Standalone(b) => b.base.build_database(),
-            CBuilderRef::Library(b) => b.base.build_database(),
+            CBuilderRef::Standalone(b) => b.base.build_database_with(&|| {
+                let pf = b.getentrypointptr()?;
+                Ok(genc::EntryPointPtr::One(pf))
+            }),
+            CBuilderRef::Library(b) => b.base.build_database_with(&|| {
+                let pfs = b.getentrypointptr()?;
+                Ok(genc::EntryPointPtr::Many(pfs))
+            }),
         }
     }
 
@@ -47,7 +60,7 @@ impl CBuilderRef {
     /// at `driver.py:454-455`.
     pub fn generate_source(
         &self,
-        db: &genc::LowLevelDatabase,
+        db: &database::LowLevelDatabase,
         defines: &std::collections::HashMap<String, String>,
         exe_name: Option<String>,
     ) -> Result<PathBuf, TaskError> {

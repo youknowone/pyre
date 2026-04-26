@@ -3260,6 +3260,14 @@ pub struct FunctionGraph {
     pub func: Option<GraphFunc>,
     /// RPython `FunctionGraph._source`.
     pub _source: Option<String>,
+    /// RPython `FunctionGraph._seen_by_the_backend` — set by the C
+    /// backend after a graph has been processed (see
+    /// `rpython/translator/c/funcgen.py`). The
+    /// `backend_optimizations` entry asserts it is `False`
+    /// (`all.py:48`); the local port carries the same flag so the
+    /// assert can be enforced even though the C backend write site
+    /// has not landed yet.
+    pub _seen_by_the_backend: std::cell::Cell<bool>,
 }
 
 impl FunctionGraph {
@@ -3284,6 +3292,7 @@ impl FunctionGraph {
             tag: None,
             func: None,
             _source: None,
+            _seen_by_the_backend: std::cell::Cell::new(false),
         }
     }
 
@@ -3309,6 +3318,7 @@ impl FunctionGraph {
             tag: None,
             func: None,
             _source: None,
+            _seen_by_the_backend: std::cell::Cell::new(false),
         }
     }
 

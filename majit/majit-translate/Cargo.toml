@@ -18,6 +18,7 @@ proc-macro2 = { version = "1", features = ["span-locations"] }
 serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 majit-ir = { workspace = true }
+libc = "0.2"
 # PRE-EXISTING-ADAPTATION, parity rule #1.
 #
 # RPython's `rpython/flowspace/bytecode.py` does `from opcode import

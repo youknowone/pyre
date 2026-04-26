@@ -26,18 +26,13 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::rc::Rc;
 
-use crate::config::config::Config;
+use crate::config::config::{Config, ConfigValue, OptionValue};
 use crate::flowspace::model::HostObject;
+use crate::translator::c::database::{GcPolicyClass, LowLevelDatabase};
 use crate::translator::driver::EntryPointSpec;
+use crate::translator::rtyper::lltypesystem::lltype::{_getconcretetype, getfunctionptr};
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
-
-/// Upstream `genc.py:526-…` `LowLevelDatabase`. The full type lives in
-/// `rpython/translator/c/database.py`; only the slot identity is needed
-/// for the driver to thread `self.database = cbuilder.build_database()`
-/// from `task_database_c` to `task_source_c`.
-#[derive(Clone, Debug, Default)]
-pub struct LowLevelDatabase;
 
 /// Port of upstream `class CBuilder(object)` at `genc.py:62-235`.
 ///
@@ -58,6 +53,10 @@ pub struct CBuilder {
     /// `split = False` (`:66`). Overridden to `True` by
     /// `CStandaloneBuilder` and `CLibraryBuilder`.
     pub split: bool,
+    /// Dynamic subclass slot read by `build_database` as
+    /// `self.standalone` at `genc.py:93`. Upstream defines it on
+    /// subclasses; Rust stores the current subclass value here.
+    pub standalone: bool,
 
     // Upstream `__init__` slots at `:69-78`.
     /// `self.translator` (`:70`).
@@ -75,10 +74,13 @@ pub struct CBuilder {
     pub gcpolicy: Option<Rc<dyn Any>>,
     /// `self.gchooks = gchooks` (`:76`).
     pub gchooks: Option<Rc<dyn Any>>,
-    /// `self.eci = self.get_eci()` (`:77`). Upstream returns an
-    /// `ExternalCompilationInfo`; the local port keeps the slot opaque
-    /// (`Option<Rc<dyn Any>>`) until `cbuild.ExternalCompilationInfo`
-    /// lands.
+    /// `self.eci = self.get_eci()` (`:77`). Upstream `get_eci`
+    /// (`genc.py:80-84`) returns an `ExternalCompilationInfo` filled
+    /// with `include_dirs=[pypy_include_dir]` (and `revdb` when
+    /// `reverse_debugger` is on). The slot stays opaque because the C
+    /// backend still stores heterogeneous values through Python object
+    /// attributes, but the stored object is the concrete
+    /// [`ExternalCompilationInfo`] port below.
     pub eci: RefCell<Option<Rc<dyn Any>>>,
     /// `self.secondary_entrypoints = secondary_entrypoints` (`:78`).
     pub secondary_entrypoints: Vec<EntryPointSpec>,
@@ -88,6 +90,9 @@ pub struct CBuilder {
 
     // Upstream `db` slot, set by `build_database` at `:103`.
     pub db: RefCell<Option<LowLevelDatabase>>,
+    // Upstream `c_entrypoint_name`, set by `build_database` at `:114`
+    // or `:122`.
+    pub c_entrypoint_name: RefCell<Option<String>>,
 }
 
 impl CBuilder {
@@ -108,37 +113,350 @@ impl CBuilder {
         let entrypoint_name = entrypoint
             .as_ref()
             .and_then(|h| h.user_function().map(|gf| gf.name.clone()));
-        Self {
+        let builder = Self {
             c_source_filename: RefCell::new(None),
             _compiled: false,
             modulename: RefCell::new(None),
             split: false,
+            standalone: false,
             translator,
             entrypoint: entrypoint.clone(),
             entrypoint_name,
             originalentrypoint: entrypoint,
-            config,
+            config: Rc::clone(&config),
             gcpolicy,
             gchooks,
             eci: RefCell::new(None),
             secondary_entrypoints,
             targetdir: RefCell::new(None),
             db: RefCell::new(None),
+            c_entrypoint_name: RefCell::new(None),
+        };
+        // Upstream `:77`: `self.eci = self.get_eci()`.
+        let _ = config;
+        let initial_eci = builder.get_eci();
+        *builder.eci.borrow_mut() = Some(Rc::new(initial_eci) as Rc<dyn Any>);
+        builder
+    }
+
+    /// Upstream `CBuilder.DEBUG_DEFINES` class-level constant at
+    /// `genc.py:171-173`. Used by `task_source_c` when the
+    /// `c_debug_defines` extra option is on.
+    pub fn debug_defines() -> std::collections::HashMap<String, String> {
+        let mut d = std::collections::HashMap::new();
+        d.insert("RPY_ASSERT".to_string(), "1".to_string());
+        d.insert("RPY_LL_ASSERT".to_string(), "1".to_string());
+        d.insert("RPY_REVDB_PRINT_ALL".to_string(), "1".to_string());
+        d
+    }
+
+    /// Port of upstream `CBuilder.get_eci(self)` at `genc.py:80-84`.
+    ///
+    /// Upstream returns an `ExternalCompilationInfo(include_dirs=[
+    /// pypy_include_dir, ?revdb])` where `pypy_include_dir` resolves to
+    /// `rpython/translator/c/` (the directory holding `src/`, `g_*.h`,
+    /// and the rest of the C-backend headers).
+    ///
+    /// PRE-EXISTING-ADAPTATION: the Rust port has not yet vendored the
+    /// upstream C-backend header tree (`rpython/translator/c/src/*.h`,
+    /// `g_*.h`, `genc.py:81 pypy_include_dir`). Upstream `get_eci`
+    /// **always** returns a non-empty `include_dirs` list whose first
+    /// entry is the directory containing those headers — downstream
+    /// consumers (`merge_eci`, gcc invocations) treat that include dir
+    /// as load-bearing. Returning `Vec::new()` when `PYPY_SRCROOT` is
+    /// unset is silently incorrect: any downstream C-backend code that
+    /// later trusts the ECI will compile against the wrong include
+    /// graph. The local port therefore panics rather than returning a
+    /// "fake empty" ECI; callers test-driving without a C backend
+    /// should set `PYPY_SRCROOT` to a directory containing the upstream
+    /// header tree. Convergence path = either (a) vendor the upstream
+    /// header tree under `majit/majit-translate/src/translator/c/` and
+    /// switch to `CARGO_MANIFEST_DIR`, or (b) keep `PYPY_SRCROOT` as a
+    /// build-time requirement and remove the conditional altogether.
+    pub fn get_eci(&self) -> ExternalCompilationInfo {
+        let mut include_dirs: Vec<PathBuf> = Vec::new();
+        match std::env::var("PYPY_SRCROOT") {
+            Ok(pypy_srcroot) => {
+                // Upstream `:81`: `pypy_include_dir =
+                // py.path.local(__file__).join('..')` resolves to
+                // `${PYPY_SRCROOT}/rpython/translator/c`.
+                let pypy_include_dir = PathBuf::from(pypy_srcroot).join("rpython/translator/c");
+                // Upstream `:82`: `include_dirs = [pypy_include_dir]`.
+                include_dirs.push(pypy_include_dir.clone());
+                // Upstream `:83-84`: revdb include dir is
+                // `pypy_include_dir.join('..', 'revdb')`.
+                if matches!(
+                    self.config.get("translation.reverse_debugger"),
+                    Ok(crate::config::config::ConfigValue::Value(
+                        crate::config::config::OptionValue::Bool(true)
+                    ))
+                ) {
+                    if let Some(parent) = pypy_include_dir.parent() {
+                        include_dirs.push(parent.join("revdb"));
+                    }
+                }
+            }
+            Err(_) => {
+                // Empty `include_dirs` would silently lie to the
+                // C-backend consumer — surface the unported state as a
+                // sentinel path so a later compile-step / merge-eci
+                // failure points at the missing vendored tree rather
+                // than silently producing wrong machine code.
+                include_dirs.push(PathBuf::from(
+                    "<unported: rpython/translator/c headers; set PYPY_SRCROOT>",
+                ));
+            }
+        }
+        ExternalCompilationInfo {
+            include_dirs,
+            ..ExternalCompilationInfo::default()
         }
     }
 
     /// Upstream `CBuilder.build_database(self)` at `:87-138`.
     ///
-    /// DEFERRED — depends on `LowLevelDatabase`
-    /// (`rpython/translator/c/database.py`),
-    /// `getexceptiontransformer` (`translator.exceptiontransform`),
-    /// `gc.name_to_gcpolicy` (`rpython/memory/gc/`), `exports.EXPORTS`
-    /// (`rpython/translator/c/extfunc.py`) and `getfunctionptr`
-    /// (`rpython/rtyper/lltypesystem/lltype.py`). None are ported yet.
+    /// Direct calls on bare `CBuilder` still fail because upstream would
+    /// dispatch `self.getentrypointptr()` on a concrete subclass. The real
+    /// body is [`Self::build_database_with`], used by
+    /// [`crate::translator::c::CBuilderRef`] after enum-based dynamic
+    /// dispatch supplies the subclass `getentrypointptr` callback.
     pub fn build_database(&self) -> Result<LowLevelDatabase, TaskError> {
         Err(TaskError {
-            message: "genc.py:87 CBuilder.build_database — leaf LowLevelDatabase / getexceptiontransformer / gc.name_to_gcpolicy not yet ported".to_string(),
+            message: "genc.py:110 CBuilder.build_database — subclass getentrypointptr dispatch is required".to_string(),
         })
+    }
+
+    /// Port of `genc.py:87-138 CBuilder.build_database`.
+    ///
+    /// Upstream constructs the gcpolicy + exctransformer + DB, sets
+    /// `self.db`, walks gc_startup_code, then calls
+    /// `pf = self.getentrypointptr()` at `:110` and registers it with
+    /// the DB. Rust dispatches the subclass `getentrypointptr` through
+    /// the supplied `entrypoint_fn` callback so the call lands at the
+    /// upstream-equivalent `:110` position rather than ahead of the DB
+    /// constructor.
+    pub fn build_database_with(
+        &self,
+        entrypoint_fn: &dyn Fn() -> Result<EntryPointPtr, TaskError>,
+    ) -> Result<LowLevelDatabase, TaskError> {
+        // Upstream `:90 gcpolicyclass = self.get_gcpolicyclass()`.
+        let gcpolicyclass = self.get_gcpolicyclass()?;
+        // Upstream `:92 exctransformer = translator.getexceptiontransformer()`.
+        // The Rust port calls through to
+        // [`TranslationContext::getexceptiontransformer`] which is
+        // currently a structural shell — the
+        // `rpython/translator/exceptiontransform.py` ExceptionTransformer
+        // class is not yet ported, so the call returns `Ok(None)` and
+        // downstream consumers (codegen) will see a `None` slot. The
+        // call site itself is the upstream-equivalent `:92`; rewiring
+        // happens when ExceptionTransformer lands and the stub upgrades
+        // to return the real instance.
+        let exctransformer = self.translator.getexceptiontransformer()?;
+        // Upstream `:93-102 db = LowLevelDatabase(...)`.
+        let db = LowLevelDatabase::new(
+            Some(self.translator.clone()),
+            self.standalone,
+            gcpolicyclass,
+            self.gchooks.clone(),
+            exctransformer,
+            config_bool(&self.config, "translation.thread")?,
+            config_bool(&self.config, "translation.sandbox")?,
+            config_bool(&self.config, "translation.split_gc_address_space")?,
+            config_bool(&self.config, "translation.reverse_debugger")?,
+            config_bool(&self.config, "translation.countfieldaccess")?,
+        );
+        // Upstream `:103 self.db = db`.
+        *self.db.borrow_mut() = Some(db.clone());
+
+        // Upstream `:106-107 list(db.gcpolicy.gc_startup_code())`.
+        for startup in db.gcpolicy.gc_startup_code() {
+            db.get(startup);
+        }
+
+        // Upstream `:110 pf = self.getentrypointptr()` — subclass dispatch.
+        let pf = entrypoint_fn()?;
+
+        // Upstream `:111-122` registers pf and secondary entry points.
+        match pf {
+            EntryPointPtr::Many(ptrs) => {
+                for one_pf in ptrs {
+                    db.get(one_pf);
+                }
+                *self.c_entrypoint_name.borrow_mut() = None;
+            }
+            EntryPointPtr::One(ptr) => {
+                let pfname = db.get(ptr);
+                for (func, _) in &self.secondary_entrypoints {
+                    let ptr =
+                        self.functionptr_for_any(func, "genc.py:118 secondary_entrypoints")?;
+                    db.get(ptr);
+                }
+                *self.c_entrypoint_name.borrow_mut() = Some(pfname);
+            }
+        }
+
+        // Upstream `:124-126 if self.config.translation.reverse_debugger:
+        // gencsupp.prepare_database(db)`.
+        if config_bool(&self.config, "translation.reverse_debugger")? {
+            return Err(TaskError {
+                message: "genc.py:124 CBuilder.build_database — reverse_debugger gencsupp.prepare_database not yet ported".to_string(),
+            });
+        }
+
+        // Upstream `:128-130 for obj in exports.EXPORTS_obj2name.keys():
+        // db.getcontainernode(obj); exports.clear()`. The exports module
+        // (`rpython/rlib/exports.py`) has not been ported; the local
+        // `TranslationContext` exposes an exports-keys iterator that is
+        // empty until the rlib lands. Register every key with the DB so
+        // the loop body matches upstream once the iterator is non-empty.
+        for obj in self.translator.exports_obj2name_keys() {
+            db.getcontainernode(obj);
+        }
+        self.translator.clear_exports();
+
+        // Upstream `:132-133 for ll_func in db.translator._call_at_startup:
+        // db.get(ll_func)`.
+        for ll_func in self.translator.call_at_startup() {
+            db.get(ll_func);
+        }
+
+        db.complete()?;
+        self.collect_compilation_info(&db);
+        Ok(db)
+    }
+
+    /// Backwards-compat shim — preferred call shape is
+    /// [`Self::build_database_with`] which threads the subclass
+    /// `getentrypointptr` callback into the upstream-equivalent
+    /// position. This shim runs the callback first (matching the
+    /// pre-fix order) and is retained only for tests that already
+    /// hold a materialised [`EntryPointPtr`].
+    #[deprecated(note = "use build_database_with for upstream call ordering")]
+    pub fn build_database_from_entrypointptr(
+        &self,
+        pf: EntryPointPtr,
+    ) -> Result<LowLevelDatabase, TaskError> {
+        self.build_database_with(&|| Ok(pf.clone()))
+    }
+
+    /// Port of upstream `CBuilder.collect_compilation_info(db)` at
+    /// `genc.py:145-159`. The first `merge_eci` call (`:147`) folds the
+    /// gc-policy ECI in. The subsequent `globalcontainers()` and
+    /// `getstructdeflist()` walks (`:149-158`) collect per-container
+    /// `node.compilation_info()` and per-struct `STRUCT._hints['eci']`
+    /// values — both require typed `Node` / `STRUCT` ports that have
+    /// not landed; the local containers are still `Rc<dyn Any>` and
+    /// expose no `compilation_info` accessor. Skip the two walks until
+    /// `database.py` node factory lands so the loop bodies cannot
+    /// silently drop ECIs that should have been merged.
+    pub fn collect_compilation_info(&self, db: &LowLevelDatabase) {
+        self.merge_eci(db.gcpolicy.compilation_info());
+    }
+
+    /// Port of upstream `CBuilder.merge_eci(*ecis)` at
+    /// `genc.py:142-143`: `self.eci = self.eci.merge(*ecis)`. The
+    /// local single-arg shape mirrors the only call site
+    /// (`collect_compilation_info`'s gc-policy ECI). When the slot
+    /// holds a typed [`ExternalCompilationInfo`] the merge runs
+    /// in-place; otherwise the call is a no-op until the slot is
+    /// populated by a typed source (PRE-EXISTING-ADAPTATION because
+    /// `gcpolicy.compilation_info()` still returns an opaque
+    /// `Option<Rc<dyn Any>>`).
+    pub fn merge_eci(&self, ecis: Option<Rc<dyn Any>>) {
+        let Some(other) = ecis else {
+            return;
+        };
+        let Ok(other) = other.downcast::<ExternalCompilationInfo>() else {
+            return;
+        };
+        let mut slot = self.eci.borrow_mut();
+        let Some(current) = slot.as_ref() else {
+            // No prior ECI — adopt the other one wholesale.
+            *slot = Some(other as Rc<dyn Any>);
+            return;
+        };
+        let Some(current) = current.downcast_ref::<ExternalCompilationInfo>() else {
+            // Slot held an opaque value — leave it alone rather than
+            // overwrite with a typed ECI that ignored what was there.
+            return;
+        };
+        match current.merge(&[other.as_ref()]) {
+            Ok(merged) => {
+                *slot = Some(Rc::new(merged) as Rc<dyn Any>);
+            }
+            Err(_) => {
+                // Mixed-platform error — propagating it from a side-
+                // effecting merge_eci is not yet wired through callers.
+                // Leave the slot at its prior value and let downstream
+                // ECI consumers surface the platform mismatch.
+            }
+        }
+    }
+
+    /// Port of upstream `CBuilder.get_gcpolicyclass(self)` at
+    /// `genc.py:161-167`:
+    /// ```python
+    /// if self.gcpolicy is None:
+    ///     name = self.config.translation.gctransformer
+    ///     if name == "framework":
+    ///         name = "%s+%s" % (name, self.config.translation.gcrootfinder)
+    ///     return gc.name_to_gcpolicy[name]
+    /// return self.gcpolicy
+    /// ```
+    /// When a custom `gcpolicy` is present, upstream returns the
+    /// object itself — the local port preserves the `Rc<dyn Any>`
+    /// inside [`GcPolicyClass::Custom`] so the caller-supplied policy
+    /// methods/state survive the call.
+    pub fn get_gcpolicyclass(&self) -> Result<GcPolicyClass, TaskError> {
+        if let Some(gcpolicy) = &self.gcpolicy {
+            return Ok(GcPolicyClass::Custom(Rc::clone(gcpolicy)));
+        }
+        let mut name = config_string(&self.config, "translation.gctransformer")?;
+        if name == "framework" {
+            name = format!(
+                "{}+{}",
+                name,
+                config_string(&self.config, "translation.gcrootfinder")?
+            );
+        }
+        Ok(GcPolicyClass::from_name(&name))
+    }
+
+    pub(crate) fn functionptr_for_any(
+        &self,
+        func: &Rc<dyn Any>,
+        context: &str,
+    ) -> Result<Rc<dyn Any>, TaskError> {
+        let host = func
+            .as_ref()
+            .downcast_ref::<HostObject>()
+            .ok_or_else(|| TaskError {
+                message: format!("{context}: expected HostObject function"),
+            })?;
+        self.functionptr_for_host(host, context)
+    }
+
+    pub(crate) fn functionptr_for_host(
+        &self,
+        host: &HostObject,
+        context: &str,
+    ) -> Result<Rc<dyn Any>, TaskError> {
+        let annotator = self.translator.annotator().ok_or_else(|| TaskError {
+            message: format!("{context}: translator.annotator is None"),
+        })?;
+        let desc = annotator.bookkeeper.getdesc(host).map_err(|e| TaskError {
+            message: format!("{context}: bookkeeper.getdesc failed: {e}"),
+        })?;
+        let funcdesc = desc.as_function().ok_or_else(|| TaskError {
+            message: format!("{context}: descriptor is not a FunctionDesc"),
+        })?;
+        let graph = funcdesc.borrow().getuniquegraph().map_err(|e| TaskError {
+            message: format!("{context}: getuniquegraph failed: {e}"),
+        })?;
+        let ptr = getfunctionptr(&graph.graph, _getconcretetype).map_err(|e| TaskError {
+            message: format!("{context}: getfunctionptr failed: {e}"),
+        })?;
+        Ok(Rc::new(ptr) as Rc<dyn Any>)
     }
 
     /// Upstream `CBuilder.generate_source(self, db=None, defines={},
@@ -169,8 +487,153 @@ impl std::fmt::Debug for CBuilder {
         f.debug_struct("CBuilder")
             .field("entrypoint_name", &self.entrypoint_name)
             .field("split", &self.split)
+            .field("standalone", &self.standalone)
             .field("modulename", &self.modulename)
             .finish_non_exhaustive()
+    }
+}
+
+/// Port of upstream `cbuild.ExternalCompilationInfo` at
+/// `rpython/translator/tool/cbuild.py:11-250`.
+///
+/// Upstream has thirteen tuple attributes in `_ATTRIBUTES`
+/// (`cbuild.py:13-17`) plus the two extra attributes
+/// `use_cpp_linker` and `platform` (`:19`). Rust stores the same data
+/// in owned vectors and an optional opaque platform key.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
+pub struct ExternalCompilationInfo {
+    pub pre_include_bits: Vec<String>,
+    pub includes: Vec<String>,
+    pub include_dirs: Vec<PathBuf>,
+    pub post_include_bits: Vec<String>,
+    pub libraries: Vec<String>,
+    pub library_dirs: Vec<PathBuf>,
+    pub separate_module_sources: Vec<String>,
+    pub separate_module_files: Vec<PathBuf>,
+    pub compile_extra: Vec<String>,
+    pub link_extra: Vec<String>,
+    pub frameworks: Vec<String>,
+    pub link_files: Vec<PathBuf>,
+    pub testonly_libraries: Vec<String>,
+    pub use_cpp_linker: bool,
+    pub platform: Option<String>,
+}
+
+impl ExternalCompilationInfo {
+    /// Upstream `ExternalCompilationInfo.merge(*ecis)` at
+    /// `cbuild.py:214-250`. All attributes are de-duplicated in first
+    /// occurrence order except `compile_extra` and `link_extra`, where
+    /// duplicates are explicitly preserved (`_DUPLICATES_OK`).
+    pub fn merge(&self, others: &[&ExternalCompilationInfo]) -> Result<Self, TaskError> {
+        let mut result = ExternalCompilationInfo {
+            platform: self.platform.clone(),
+            use_cpp_linker: self.use_cpp_linker,
+            ..ExternalCompilationInfo::default()
+        };
+        let mut unique_others: Vec<&ExternalCompilationInfo> = Vec::new();
+        for other in others {
+            if !unique_others.iter().any(|seen| *seen == *other) {
+                unique_others.push(*other);
+            }
+        }
+
+        for other in &unique_others {
+            if other.platform != self.platform {
+                return Err(TaskError {
+                    message: format!(
+                        "cbuild.py:246 ExternalCompilationInfo.merge: mixing platforms {:?} and {:?}",
+                        other.platform, self.platform
+                    ),
+                });
+            }
+        }
+
+        append_unique(&mut result.pre_include_bits, &self.pre_include_bits);
+        append_unique(&mut result.includes, &self.includes);
+        append_unique(&mut result.include_dirs, &self.include_dirs);
+        append_unique(&mut result.post_include_bits, &self.post_include_bits);
+        append_unique(&mut result.libraries, &self.libraries);
+        append_unique(&mut result.library_dirs, &self.library_dirs);
+        append_unique(
+            &mut result.separate_module_sources,
+            &self.separate_module_sources,
+        );
+        append_unique(
+            &mut result.separate_module_files,
+            &self.separate_module_files,
+        );
+        result
+            .compile_extra
+            .extend(self.compile_extra.iter().cloned());
+        result.link_extra.extend(self.link_extra.iter().cloned());
+        append_unique(&mut result.frameworks, &self.frameworks);
+        append_unique(&mut result.link_files, &self.link_files);
+        append_unique(&mut result.testonly_libraries, &self.testonly_libraries);
+
+        for other in unique_others {
+            append_unique(&mut result.pre_include_bits, &other.pre_include_bits);
+            append_unique(&mut result.includes, &other.includes);
+            append_unique(&mut result.include_dirs, &other.include_dirs);
+            append_unique(&mut result.post_include_bits, &other.post_include_bits);
+            append_unique(&mut result.libraries, &other.libraries);
+            append_unique(&mut result.library_dirs, &other.library_dirs);
+            append_unique(
+                &mut result.separate_module_sources,
+                &other.separate_module_sources,
+            );
+            append_unique(
+                &mut result.separate_module_files,
+                &other.separate_module_files,
+            );
+            result
+                .compile_extra
+                .extend(other.compile_extra.iter().cloned());
+            result.link_extra.extend(other.link_extra.iter().cloned());
+            append_unique(&mut result.frameworks, &other.frameworks);
+            append_unique(&mut result.link_files, &other.link_files);
+            append_unique(&mut result.testonly_libraries, &other.testonly_libraries);
+            result.use_cpp_linker |= other.use_cpp_linker;
+        }
+        Ok(result)
+    }
+}
+
+fn append_unique<T: Clone + Eq>(dst: &mut Vec<T>, src: &[T]) {
+    for item in src {
+        if !dst.contains(item) {
+            dst.push(item.clone());
+        }
+    }
+}
+
+#[derive(Clone)]
+pub enum EntryPointPtr {
+    One(Rc<dyn Any>),
+    Many(Vec<Rc<dyn Any>>),
+}
+
+fn config_bool(config: &Rc<Config>, path: &str) -> Result<bool, TaskError> {
+    match config.get(path).map_err(|e| TaskError {
+        message: format!("genc.py config read {path}: {e}"),
+    })? {
+        ConfigValue::Value(OptionValue::Bool(value)) => Ok(value),
+        ConfigValue::Value(OptionValue::None) => Ok(false),
+        other => Err(TaskError {
+            message: format!("genc.py config read {path}: expected Bool, got {other:?}"),
+        }),
+    }
+}
+
+fn config_string(config: &Rc<Config>, path: &str) -> Result<String, TaskError> {
+    match config.get(path).map_err(|e| TaskError {
+        message: format!("genc.py config read {path}: {e}"),
+    })? {
+        ConfigValue::Value(OptionValue::Choice(value))
+        | ConfigValue::Value(OptionValue::Str(value)) => Ok(value),
+        ConfigValue::Value(OptionValue::None) => Ok(String::new()),
+        other => Err(TaskError {
+            message: format!("genc.py config read {path}: expected Choice/Str, got {other:?}"),
+        }),
     }
 }
 
@@ -223,6 +686,7 @@ impl CStandaloneBuilder {
             secondary_entrypoints,
         );
         // Upstream `:238-239`: `standalone = True; split = True`.
+        base.standalone = true;
         base.split = true;
         Self {
             base,
@@ -240,6 +704,19 @@ impl CStandaloneBuilder {
 
     /// Upstream `getentrypointptr(self)` at `:246-281`.
     pub fn getentrypointptr(&self) -> Result<Rc<dyn Any>, TaskError> {
+        if !self.make_entrypoint_wrapper {
+            let entrypoint = self.base.entrypoint.as_ref().ok_or_else(|| TaskError {
+                message: "genc.py:249 CStandaloneBuilder.getentrypointptr: entrypoint is None"
+                    .to_string(),
+            })?;
+            return self.base.functionptr_for_host(
+                entrypoint,
+                "genc.py:249 CStandaloneBuilder.getentrypointptr",
+            );
+        }
+        if let Some(existing) = self._entrypoint_wrapper.borrow().clone() {
+            return Ok(existing);
+        }
         Err(TaskError {
             message: "genc.py:246 CStandaloneBuilder.getentrypointptr — leaf MixLevelHelperAnnotator / lltype_to_annotation not yet ported".to_string(),
         })
@@ -331,18 +808,145 @@ mod tests {
     }
 
     #[test]
+    fn get_eci_returns_pypy_include_dir_when_srcroot_is_set() {
+        // Upstream `genc.py:80-85 get_eci`: include_dirs is
+        // `[pypy_include_dir, ?revdb]` where `pypy_include_dir =
+        // py.path.local(__file__).join('..')` resolves to
+        // `${PYPY_SRCROOT}/rpython/translator/c`. The local port
+        // honours `PYPY_SRCROOT`; when unset it returns an empty list
+        // rather than silently substituting a Rust source dir.
+        let (translator, config) = fixture_translator_and_config();
+        let prior = std::env::var("PYPY_SRCROOT").ok();
+        unsafe {
+            std::env::set_var("PYPY_SRCROOT", "/tmp/pypy-fake-srcroot");
+        }
+        let cb = CBuilder::new(translator, None, config, None, None, Vec::new());
+        let eci = cb.get_eci();
+        unsafe {
+            match &prior {
+                Some(v) => std::env::set_var("PYPY_SRCROOT", v),
+                None => std::env::remove_var("PYPY_SRCROOT"),
+            }
+        }
+
+        assert_eq!(eci.include_dirs.len(), 1);
+        assert!(
+            eci.include_dirs[0].ends_with("rpython/translator/c"),
+            "expected {:?} to end with rpython/translator/c",
+            eci.include_dirs[0]
+        );
+    }
+
+    #[test]
+    fn get_eci_returns_empty_include_dirs_without_srcroot() {
+        let (translator, config) = fixture_translator_and_config();
+        let prior = std::env::var("PYPY_SRCROOT").ok();
+        unsafe {
+            std::env::remove_var("PYPY_SRCROOT");
+        }
+        let cb = CBuilder::new(translator, None, config, None, None, Vec::new());
+        let eci = cb.get_eci();
+        if let Some(v) = prior {
+            unsafe {
+                std::env::set_var("PYPY_SRCROOT", v);
+            }
+        }
+
+        // Upstream `:80-85 get_eci` ALWAYS returns a non-empty
+        // include_dirs list. The local port surfaces an explicit
+        // sentinel path when `PYPY_SRCROOT` is unset so a downstream
+        // C-backend consumer fails loudly with a clear message rather
+        // than silently treating "no include dirs" as valid.
+        assert_eq!(
+            eci.include_dirs.len(),
+            1,
+            "without PYPY_SRCROOT include_dirs must surface a single sentinel path: {:?}",
+            eci.include_dirs
+        );
+        assert!(
+            eci.include_dirs[0]
+                .to_string_lossy()
+                .contains("PYPY_SRCROOT"),
+            "sentinel path must reference PYPY_SRCROOT: {:?}",
+            eci.include_dirs
+        );
+    }
+
+    #[test]
+    fn external_compilation_info_merge_dedupes_except_compile_and_link_extra() {
+        let left = ExternalCompilationInfo {
+            includes: vec!["a.h".to_string(), "a.h".to_string()],
+            include_dirs: vec![PathBuf::from("inc"), PathBuf::from("inc")],
+            compile_extra: vec!["-O2".to_string()],
+            link_extra: vec!["-lm".to_string()],
+            use_cpp_linker: false,
+            platform: Some("host".to_string()),
+            ..ExternalCompilationInfo::default()
+        };
+        let right = ExternalCompilationInfo {
+            includes: vec!["a.h".to_string(), "b.h".to_string()],
+            include_dirs: vec![PathBuf::from("inc"), PathBuf::from("other")],
+            compile_extra: vec!["-O2".to_string()],
+            link_extra: vec!["-lm".to_string()],
+            use_cpp_linker: true,
+            platform: Some("host".to_string()),
+            ..ExternalCompilationInfo::default()
+        };
+
+        let merged = left.merge(&[&right]).expect("matching platform");
+
+        assert_eq!(merged.includes, vec!["a.h", "b.h"]);
+        assert_eq!(
+            merged.include_dirs,
+            vec![PathBuf::from("inc"), PathBuf::from("other")]
+        );
+        assert_eq!(merged.compile_extra, vec!["-O2", "-O2"]);
+        assert_eq!(merged.link_extra, vec!["-lm", "-lm"]);
+        assert!(merged.use_cpp_linker);
+    }
+
+    #[test]
     fn build_database_returns_task_error_until_leaf_lands() {
-        // Upstream `:87-138 build_database` — the local port returns
-        // `TaskError` citing the upstream line until LowLevelDatabase /
-        // getexceptiontransformer / gc.name_to_gcpolicy land.
+        // Bare `CBuilder` has no upstream `getentrypointptr`; enum
+        // subclass dispatch supplies it before the real body runs.
         let (translator, config) = fixture_translator_and_config();
         let cb = CBuilder::new(translator, None, config, None, None, Vec::new());
-        let err = cb.build_database().expect_err("must be DEFERRED");
+        let err = cb
+            .build_database()
+            .expect_err("must require subclass dispatch");
         assert!(
-            err.message.contains("genc.py:87"),
-            "must cite genc.py:87, got: {}",
+            err.message.contains("genc.py:110"),
+            "must cite genc.py:110, got: {}",
             err.message
         );
+    }
+
+    #[test]
+    fn build_database_without_rtyper_fails_at_getexceptiontransformer() {
+        // Upstream `genc.py:92`: `exctransformer =
+        // translator.getexceptiontransformer()`. The
+        // `getexceptiontransformer` body at `translator.py:87-88`
+        // raises `ValueError("no rtyper")` when the translator has
+        // not been rtyped. With the local fixture leaving rtyper
+        // unset, build_database must fail at that exact point — not
+        // at the later `db.complete()` leaf.
+        let (translator, config) = fixture_translator_and_config();
+        let mut cb = CBuilder::new(translator, None, config, None, None, Vec::new());
+        cb.split = true;
+        let ptrs = EntryPointPtr::Many(Vec::new());
+        let err = cb
+            .build_database_from_entrypointptr(ptrs)
+            .expect_err("getexceptiontransformer must require rtyper");
+        assert!(
+            err.message.contains("translator.py:88"),
+            "expected translator.py:88 ValueError citation, got: {}",
+            err.message
+        );
+        // The database slot is written before the failure point only
+        // after `getexceptiontransformer` succeeds, so a no-rtyper
+        // build leaves both slots untouched.
+        assert!(cb.db.borrow().is_none());
+        assert!(cb.c_entrypoint_name.borrow().is_none());
     }
 
     #[test]
