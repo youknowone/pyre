@@ -3403,8 +3403,14 @@ fn raw_varsize_alloc_typed_and_set_len(
     let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
         return 0;
     };
-    let layout = std::alloc::Layout::from_size_align(total_size, 8)
-        .unwrap_or(std::alloc::Layout::new::<u8>());
+    // gc.py:51 contract: malloc helper returns NULL on OOM or invalid
+    // layout; the caller's CHECK_MEMORY_ERROR converts NULL into a
+    // MemoryError.  Falling back to a 1-byte layout would silently
+    // succeed-with-a-bogus-allocation and then corrupt the caller's
+    // header/length store.
+    let Ok(layout) = std::alloc::Layout::from_size_align(total_size, 8) else {
+        return 0;
+    };
     let raw = unsafe { std::alloc::alloc_zeroed(layout) };
     if raw.is_null() {
         return 0;
@@ -3471,9 +3477,14 @@ extern "C" fn gc_malloc_array_nonstandard_helper(
     )
 }
 
-extern "C" fn gc_malloc_str_helper(length: u64) -> u64 {
+/// gc.py:460 `malloc_str(length)` — but the upstream closure captures
+/// `str_type_id` from `self.str_descr.tid` at generate-time.  `extern
+/// "C" fn` cannot capture, so the type id is threaded through the
+/// CALL_R as an explicit Signed arg and the calldescr's first param is
+/// it (see `make_malloc_str_calldescr`).
+extern "C" fn gc_malloc_str_helper(type_id: u64, length: u64) -> u64 {
     active_runtime_alloc_varsize_typed_and_set_len(
-        0,
+        type_id as u32,
         BUILTIN_STR_TOKEN_BASE_SIZE,
         1,
         BUILTIN_STRING_LEN_OFFSET,
@@ -3481,9 +3492,11 @@ extern "C" fn gc_malloc_str_helper(length: u64) -> u64 {
     )
 }
 
-extern "C" fn gc_malloc_unicode_helper(length: u64) -> u64 {
+/// gc.py:469 `malloc_unicode(length)` — see `gc_malloc_str_helper` for
+/// the closure-vs-extern type-id threading rationale.
+extern "C" fn gc_malloc_unicode_helper(type_id: u64, length: u64) -> u64 {
     active_runtime_alloc_varsize_typed_and_set_len(
-        0,
+        type_id as u32,
         BUILTIN_UNICODE_TOKEN_BASE_SIZE,
         4,
         BUILTIN_STRING_LEN_OFFSET,

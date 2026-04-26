@@ -2401,8 +2401,17 @@ pub fn make_malloc_array_nonstandard_calldescr() -> DescrRef {
         .clone()
 }
 
-/// gc.py:45 + gc.py:453-458 generate_function('malloc_str', ...).
-/// CallDescr for CALL_R(malloc_str_fn, length) -> Ref.
+/// gc.py:45 + gc.py:460-467 generate_function('malloc_str', ...).
+/// CallDescr for CALL_R(malloc_str_fn, type_id, length) -> Ref.
+///
+/// PRE-EXISTING-ADAPTATION: upstream `malloc_str` is generated as
+/// `[lltype.Signed]` (length only) and captures `str_type_id` via Python
+/// closure scope (gc.py:451 `str_type_id = self.str_descr.tid`).  Rust
+/// `extern "C" fn` cannot lexically capture, so the type id is threaded
+/// through the call as an explicit Signed arg — same pattern pyre
+/// already uses for `malloc_array_nonstandard` (rewrite.py:825-832 +
+/// `make_malloc_array_nonstandard_calldescr` below).  The descr's first
+/// param is the type id, the second is the requested length.
 pub fn make_malloc_str_calldescr() -> DescrRef {
     use std::sync::{Arc, OnceLock};
     static MALLOC_STR_DESCR: OnceLock<DescrRef> = OnceLock::new();
@@ -2410,7 +2419,7 @@ pub fn make_malloc_str_calldescr() -> DescrRef {
         .get_or_init(|| {
             Arc::new(SimpleCallDescr::new(
                 0x5000_0003,
-                vec![crate::Type::Int],
+                vec![crate::Type::Int, crate::Type::Int],
                 crate::Type::Ref,
                 false,
                 std::mem::size_of::<usize>(),
@@ -2420,8 +2429,14 @@ pub fn make_malloc_str_calldescr() -> DescrRef {
         .clone()
 }
 
-/// gc.py:45 + gc.py:460-465 generate_function('malloc_unicode', ...).
-/// CallDescr for CALL_R(malloc_unicode_fn, length) -> Ref.
+/// gc.py:45 + gc.py:469-476 generate_function('malloc_unicode', ...).
+/// CallDescr for CALL_R(malloc_unicode_fn, type_id, length) -> Ref.
+///
+/// PRE-EXISTING-ADAPTATION: see `make_malloc_str_calldescr` — the type
+/// id is threaded as an explicit arg because `extern "C" fn` cannot
+/// lexically capture `unicode_type_id` the way upstream's
+/// `malloc_unicode` closure does (gc.py:455 `unicode_type_id =
+/// self.unicode_descr.tid`).
 pub fn make_malloc_unicode_calldescr() -> DescrRef {
     use std::sync::{Arc, OnceLock};
     static MALLOC_UNICODE_DESCR: OnceLock<DescrRef> = OnceLock::new();
@@ -2429,7 +2444,7 @@ pub fn make_malloc_unicode_calldescr() -> DescrRef {
         .get_or_init(|| {
             Arc::new(SimpleCallDescr::new(
                 0x5000_0004,
-                vec![crate::Type::Int],
+                vec![crate::Type::Int, crate::Type::Int],
                 crate::Type::Ref,
                 false,
                 std::mem::size_of::<usize>(),

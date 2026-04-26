@@ -301,9 +301,14 @@ pub extern "C" fn dynasm_malloc_array_nonstandard(
     )
 }
 
-pub extern "C" fn dynasm_malloc_str(length: u64) -> u64 {
+/// gc.py:460 `malloc_str(length)` — but the upstream closure captures
+/// `str_type_id` from `self.str_descr.tid` at generate-time.  `extern
+/// "C" fn` cannot capture, so the type id is threaded through the
+/// CALL_R as an explicit Signed arg and the calldescr's first param is
+/// it (see `make_malloc_str_calldescr`).
+pub extern "C" fn dynasm_malloc_str(type_id: u64, length: u64) -> u64 {
     dynasm_alloc_varsize_typed_and_set_len(
-        0,
+        type_id as u32,
         BUILTIN_STR_TOKEN_BASE_SIZE,
         1,
         BUILTIN_STRING_LEN_OFFSET,
@@ -311,9 +316,11 @@ pub extern "C" fn dynasm_malloc_str(length: u64) -> u64 {
     )
 }
 
-pub extern "C" fn dynasm_malloc_unicode(length: u64) -> u64 {
+/// gc.py:469 `malloc_unicode(length)` — see `dynasm_malloc_str` for the
+/// closure-vs-extern type-id threading rationale.
+pub extern "C" fn dynasm_malloc_unicode(type_id: u64, length: u64) -> u64 {
     dynasm_alloc_varsize_typed_and_set_len(
-        0,
+        type_id as u32,
         BUILTIN_UNICODE_TOKEN_BASE_SIZE,
         4,
         BUILTIN_STRING_LEN_OFFSET,

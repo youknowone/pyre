@@ -2270,6 +2270,19 @@ impl Assembler386 {
                     self.store_rax_to_result(op.pos);
                 }
             }
+            // x86/assembler.py:1630 `genop_discard_check_memory_error` —
+            // upstream emits `TEST reg, reg` + `JZ propagate_exception_path`
+            // so a NULL return from a malloc helper propagates as a
+            // MemoryError via `self.cpu.propagate_exception_descr`.
+            //
+            // PRE-EXISTING-ADAPTATION: pyre's dynasm backend does not yet
+            // expose a `propagate_exception_path` recovery stub.  Until
+            // that exists, this op is a no-op — a NULL result register
+            // will fault when the next op dereferences it.  The fix is to
+            // wire `attached_descrs.propagate_exception_descr` into a
+            // recovery stub identical in shape to the
+            // `exit_frame_with_exception_descr` path and emit a
+            // conditional jump here.
             OpCode::CheckMemoryError => {}
             // x86/assembler.py:2438 genop_discard_cond_call_gc_wb
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {

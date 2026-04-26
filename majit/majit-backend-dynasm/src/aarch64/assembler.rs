@@ -2492,6 +2492,16 @@ impl AssemblerARM64 {
                     self.store_rax_to_result(op.pos);
                 }
             }
+            // aarch64/opassembler.py:258 `emit_op_check_memory_error` —
+            // upstream calls `propagate_memoryerror_if_reg_is_null` so a
+            // NULL return from a malloc helper raises a MemoryError via
+            // `self.cpu.propagate_exception_descr`.
+            //
+            // PRE-EXISTING-ADAPTATION: pyre's dynasm aarch64 backend has
+            // no `propagate_memoryerror_if_reg_is_null` analog yet — see
+            // the matching note in `x86/assembler.rs`.  Until the
+            // recovery stub is wired, this op is a no-op and a NULL
+            // result faults on its first dereference.
             OpCode::CheckMemoryError => {}
             // aarch64/opassembler.py:912 _write_barrier_fastpath parity.
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {

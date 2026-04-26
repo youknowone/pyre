@@ -989,22 +989,28 @@ impl GcRewriterImpl {
             // means no variable payload; fold to fixed-size basesize.
             total_size = descr.base_size() as i64;
         } else if self.can_use_nursery(1) {
-            // rewrite.py:559-567 path #1 — varsize nursery fast path.
-            let r = self.gen_malloc_nursery_varsize(descr_ref.clone(), kind, v_length, op.pos, st);
-            st.record_result_mapping(op.pos, r);
-            if let Some(len_descr) = descr.len_descr() {
-                self.gen_initialize_len(r, v_length, descr_ref.clone(), len_descr, st);
+            // rewrite.py:559-568 path #1 — varsize nursery fast path.
+            // Returns None when the descr is non-standard FLAG_ARRAY,
+            // in which case we fall through to path #4
+            // (`gen_malloc_array_nonstandard`) per rewrite.py:853-856.
+            if let Some(r) =
+                self.gen_malloc_nursery_varsize(descr_ref.clone(), kind, v_length, op.pos, st)
+            {
+                st.record_result_mapping(op.pos, r);
+                if let Some(len_descr) = descr.len_descr() {
+                    self.gen_initialize_len(r, v_length, descr_ref.clone(), len_descr, st);
+                }
+                self.clear_varsize_gc_fields(
+                    kind,
+                    descr_ref.clone(),
+                    item_size as i64,
+                    r,
+                    v_length,
+                    op.opcode,
+                    st,
+                );
+                return;
             }
-            self.clear_varsize_gc_fields(
-                kind,
-                descr_ref.clone(),
-                item_size as i64,
-                r,
-                v_length,
-                op.opcode,
-                st,
-            );
-            return;
         }
 
         // rewrite.py:569-584 paths #2 / #4.
@@ -1207,11 +1213,12 @@ impl GcRewriterImpl {
 
     /// rewrite.py:848-866 `gen_malloc_nursery_varsize`.
     ///
-    /// PRE-EXISTING-ADAPTATION: unlike upstream's framework-GC port,
-    /// pyre's CALL_MALLOC_NURSERY_VARSIZE lowering accepts the full
-    /// ArrayDescr and writes the length via a follow-up
-    /// `gen_initialize_len`, so the helper does not reject
-    /// non-standard array shapes here.
+    /// Returns `Some(opref)` when the nursery fast path emits the
+    /// CALL_MALLOC_NURSERY_VARSIZE op, `None` when the upstream
+    /// `kind == FLAG_ARRAY` non-standard-shape guard
+    /// (rewrite.py:853-856) rejects the descr — in that case the
+    /// caller falls through to `gen_malloc_array` /
+    /// `gen_boehm_malloc_array` like upstream's path #4.
     fn gen_malloc_nursery_varsize(
         &self,
         arraydescr: DescrRef,
@@ -1219,10 +1226,26 @@ impl GcRewriterImpl {
         v_length: OpRef,
         result_pos: OpRef,
         st: &mut RewriteState,
-    ) -> OpRef {
+    ) -> Option<OpRef> {
         let ad = arraydescr
             .as_array_descr()
             .expect("gen_malloc_nursery_varsize descr must be ArrayDescr");
+        // rewrite.py:853-856 — standard-shape gate: only `FLAG_ARRAY`
+        // (kind == 0) is constrained; `FLAG_STR` (1) / `FLAG_UNICODE`
+        // (2) always proceed because their descrs are by definition
+        // non-standard-shaped but the nursery layout still accepts
+        // them.
+        const FLAG_ARRAY: i64 = 0;
+        if kind == FLAG_ARRAY {
+            let length_ofs = ad
+                .len_descr()
+                .map_or(self.standard_array_length_ofs, |fd| fd.offset());
+            if ad.base_size() != self.standard_array_basesize
+                || length_ofs != self.standard_array_length_ofs
+            {
+                return None;
+            }
+        }
         st.emitting_an_operation_that_can_collect();
         let kind_ref = st.const_int(kind);
         let itemsize_ref = st.const_int(ad.item_size() as i64);
@@ -1231,7 +1254,7 @@ impl GcRewriterImpl {
             &[kind_ref, itemsize_ref, v_length],
         );
         varsize_op.descr = Some(arraydescr);
-        st.emit_result(varsize_op, result_pos)
+        Some(st.emit_result(varsize_op, result_pos))
     }
 
     /// rewrite.py:768-776 `_gen_call_malloc_gc`.
@@ -1298,10 +1321,23 @@ impl GcRewriterImpl {
     }
 
     /// rewrite.py:836-840 `gen_malloc_str`.
+    ///
+    /// PRE-EXISTING-ADAPTATION: upstream's `malloc_str` helper closure
+    /// captures `str_type_id = self.str_descr.tid` (gc.py:451) at
+    /// generate-time.  Rust `extern "C" fn` can't lexically capture, so
+    /// the type id is threaded as an explicit CALL arg sourced from
+    /// `gc_ll_descr.str_descr.type_id()`.  Matches the
+    /// `malloc_str_calldescr` Signed/Signed signature documented there.
     fn gen_malloc_str(&self, v_num_elem: OpRef, result_pos: OpRef, st: &mut RewriteState) -> OpRef {
         let fn_ref = st.const_int(self.malloc_str_fn);
+        let type_id = self
+            .str_descr
+            .as_array_descr()
+            .expect("gc_ll_descr.str_descr must be an ArrayDescr")
+            .type_id();
+        let type_id_ref = st.const_int(type_id as i64);
         self.gen_call_malloc_gc(
-            &[fn_ref, v_num_elem],
+            &[fn_ref, type_id_ref, v_num_elem],
             result_pos,
             self.malloc_str_descr.clone(),
             st,
@@ -1309,6 +1345,10 @@ impl GcRewriterImpl {
     }
 
     /// rewrite.py:842-846 `gen_malloc_unicode`.
+    ///
+    /// PRE-EXISTING-ADAPTATION: see `gen_malloc_str`.  Type id sourced
+    /// from `gc_ll_descr.unicode_descr.type_id()` (gc.py:455
+    /// `unicode_type_id = self.unicode_descr.tid`).
     fn gen_malloc_unicode(
         &self,
         v_num_elem: OpRef,
@@ -1316,8 +1356,14 @@ impl GcRewriterImpl {
         st: &mut RewriteState,
     ) -> OpRef {
         let fn_ref = st.const_int(self.malloc_unicode_fn);
+        let type_id = self
+            .unicode_descr
+            .as_array_descr()
+            .expect("gc_ll_descr.unicode_descr must be an ArrayDescr")
+            .type_id();
+        let type_id_ref = st.const_int(type_id as i64);
         self.gen_call_malloc_gc(
-            &[fn_ref, v_num_elem],
+            &[fn_ref, type_id_ref, v_num_elem],
             result_pos,
             self.malloc_unicode_descr.clone(),
             st,
