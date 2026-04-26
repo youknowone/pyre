@@ -109,6 +109,61 @@ pub trait JitCodeSym {
     fn state_varray_len(&self, _array_idx: usize) -> Option<OpRef> {
         None
     }
+
+    /// Bridge state-field JIT's `__JitSym` storage onto
+    /// `MIFrame.int_regs` / `int_values` ahead of guard capture.
+    ///
+    /// PRE-EXISTING-ADAPTATION (state-field JIT divergence):
+    /// RPython stores live state in `MIFrame.{int,ref,float}_regs`
+    /// directly via `setfield_*` opimpls during dispatch
+    /// (`pyjitpl.py:74-95 MIFrame.setup` + per-opcode register
+    /// assignments).  pyre's state-field JIT instead stores OpRefs +
+    /// concrete values in `__JitSym.<field>` / `<field>_value` etc.
+    /// because the macro emits per-opcode jitcodes that read state
+    /// directly from the symbolic side-channel.  At guard-capture
+    /// time `MIFrame::get_list_of_active_boxes`
+    /// (`pyjitpl/frame.rs:430-440`) still expects live state in
+    /// `int_regs` / `int_values`, so this hook copies the
+    /// `__JitSym` slots into the frame's banks at the canonical
+    /// liveness indices defined by `live_slots_for_state_field_jit`
+    /// (Task #89 orth-6): scalars at `0..num_scalars`, then
+    /// flattened arrays, then virt-array (ptr, len) pairs.  Virt-
+    /// array value mirrors are cached at `JitState::initialize_sym`
+    /// time from the user state's `<varr>.as_ptr() as i64` /
+    /// `<varr>.len() as i64` (Task #89 framestack-lift Session 3b-1)
+    /// — accurate iff the Vec does not reallocate during tracing
+    /// (true for the 6 macro examples that use fixed-capacity
+    /// `vec![0i64; program.len()]`).
+    ///
+    /// Convergence path: when the macro switches to RPython
+    /// MIFrame-regs storage (Task #89 orth-9 step 4 reshape), this
+    /// method's default no-op impl matches RPython's "regs already
+    /// populated by dispatch" semantics and the macro override drops
+    /// out.  Until then, callers with a state-field JIT pass
+    /// `&__JitSym` here right before invoking
+    /// `TraceRecordBuffer::capture_resumedata` so the framestack-walk
+    /// snapshot has matching slot data.
+    ///
+    /// Codex review (2026-04-26): this is a NEW-DEVIATION bridge
+    /// hook with no RPython counterpart.  RPython's dispatch
+    /// (`pyjitpl.py:opimpl_setfield_gc_*`,
+    /// `opimpl_int_add` etc.) writes directly into
+    /// `MIFrame.{int,ref,float}_regs[i]` while interpreting the
+    /// jitcode bytestream — by the time `MetaInterp.generate_guard`
+    /// calls `capture_resumedata`, every register bank is already
+    /// up-to-date and `MIFrame::get_list_of_active_boxes` reads them
+    /// without any side-channel sync.  pyre's macro instead routes
+    /// the same data through `__JitSym.<field>` for ergonomic reasons
+    /// (the proc-macro can derive symbolic state-field accesses
+    /// statically), and this trait method is the back-door that
+    /// re-establishes the RPython invariant just before the snapshot
+    /// is captured.  Convergence path: Task #72 (codegen.rs / macro
+    /// → register-machine jitcode) eliminates `__JitSym` as a
+    /// distinct storage; macro-emitted opimpls then write directly to
+    /// `MIFrame.regs`, and this method (along with its `__JitSym`
+    /// value-mirror seeding from `JitState::initialize_sym`) is
+    /// removed.
+    fn populate_frame_int_regs(&self, _frame: &mut MIFrame) {}
 }
 
 pub trait JitCodeRuntime {
@@ -246,24 +301,78 @@ where
         }
     }
 
+    /// Record a state-field-JIT guard.  Records the guard with no
+    /// inline `op.fail_args` and attaches a snapshot built from the
+    /// current `MIFrame`'s `int_regs` (populated from `__JitSym` via
+    /// `JitCodeSym::populate_frame_int_regs`).  The optimizer's
+    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:3200`) then
+    /// derives `op.fail_args` from the snapshot via `_number_boxes`,
+    /// matching RPython's `pyjitpl.MetaInterp.generate_guard`
+    /// (`pyjitpl.py:2558-2602`) +
+    /// `capture_resumedata` (`opencoder.py:819`) +
+    /// `store_final_boxes_in_guard` (`resume.py:396-397`)
+    /// snapshot-as-source-of-truth invariant.
+    ///
+    /// `resume_pc` is the bytecode position blackhole resumes at on
+    /// guard fail.  Mirrors RPython
+    /// `MetaInterp.capture_resumedata(resumepc)` (`pyjitpl.py:2591-2602`)
+    /// which temporarily swaps `frame.pc = resumepc`, captures the
+    /// framestack snapshot, then restores the original `frame.pc` —
+    /// keeping the snapshot's PC field aligned with the guard's
+    /// resumepc independent of where the dispatcher's `frame.pc`
+    /// currently points (typically past the just-decoded instruction
+    /// args).
     fn record_state_guard(
+        &mut self,
         ctx: &mut TraceCtx,
         sym: &mut S,
         opcode: OpCode,
         args: &[OpRef],
-        extra_fail_args: &[OpRef],
+        resume_pc: usize,
     ) {
-        if let Some(mut fail_args) = sym.fail_args_with_ctx(ctx) {
-            let mut fail_types = sym.fail_args_types();
-            fail_args.extend_from_slice(extra_fail_args);
-            if let Some(ref mut types) = fail_types {
-                types.extend(std::iter::repeat(majit_ir::Type::Int).take(extra_fail_args.len()));
-            }
+        if let Some(fail_args) = sym.fail_args_with_ctx(ctx) {
+            let fail_types = sym.fail_args_types();
+            // Task #91 slice 3a: snapshot is the source of truth — the
+            // optimizer's `store_final_boxes_in_guard`
+            // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args` from
+            // the snapshot built below, so the inline `fail_args` copy
+            // that the legacy
+            // `record_guard_typed_with_fail_args` /
+            // `record_guard_with_fail_args` paths used to write is
+            // redundant.  Mirrors RPython's
+            // `pyjitpl.MetaInterp.generate_guard`
+            // (`pyjitpl.py:2558-2602`) which records the guard with no
+            // inline fail_args and lets `capture_resumedata` +
+            // `_number_boxes` populate them from the snapshot chain.
             if let Some(types) = fail_types {
-                ctx.record_guard_typed_with_fail_args(opcode, args, types, &fail_args);
+                ctx.record_guard_typed(opcode, args, types);
             } else {
-                ctx.record_guard_with_fail_args(opcode, args, fail_args.len(), &fail_args);
+                ctx.record_guard(opcode, args, fail_args.len());
             }
+            // Task #89 framestack-lift Session 3b-3b: capture a
+            // matching snapshot and patch the guard's
+            // rd_resume_position so the optimizer's
+            // store_final_boxes_in_guard derives fail_args from the
+            // snapshot (RPython parity, opencoder.py:819 +
+            // resume.py:396-397).
+            //
+            // RPython `pyjitpl.py:2591-2602 capture_resumedata`
+            // temporarily swaps `frame.pc = resumepc` ahead of the
+            // framestack walk, then restores the original `frame.pc`.
+            // `build_state_field_snapshot` reads `frame.pc` directly
+            // (`pyjitpl/dispatch.rs:2596`), so the swap pins the
+            // snapshot's `SnapshotFrame.pc` to the guard's resumepc
+            // independent of the dispatcher's post-decode `frame.pc`.
+            let total_slots = sym.total_slots();
+            let frame = self.frames.current_mut();
+            let saved_pc = frame.pc;
+            frame.pc = resume_pc;
+            sym.populate_frame_int_regs(frame);
+            let snapshot = build_state_field_snapshot(frame, total_slots);
+            let frame = self.frames.current_mut();
+            frame.pc = saved_pc;
+            let snapshot_id = ctx.capture_resumedata(snapshot);
+            ctx.set_last_guard_resume_position(snapshot_id);
         } else {
             ctx.record_guard(opcode, args, sym.total_slots());
         }
@@ -518,6 +627,16 @@ where
 
         let bytecode = self.frames.current_mut().next_u8();
         match bytecode {
+            // RPython `blackhole.py:950 bhimpl_live` — no-op marker
+            // emitted by the codewriter ahead of every guard-bearing
+            // instruction.  The two operand bytes are the offset into
+            // `MetaInterpStaticData.liveness_info`; consumed by
+            // `MIFrame::get_list_of_active_boxes` at guard time, not
+            // here.  (See also the same skip in
+            // `unwind_to_exception_handler` above.)
+            jitcode::BC_LIVE => {
+                let _liveness_offset = self.frames.current_mut().next_u16();
+            }
             // -- State field access (register/tape machines) --
             jitcode::BC_LOAD_STATE_FIELD => {
                 let field_idx = self.frames.current_mut().next_u16() as usize;
@@ -847,8 +966,8 @@ where
                 } else {
                     OpCode::GuardTrue
                 };
-                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
-                Self::record_state_guard(ctx, sym, opcode, &[cond], &[resume_pc]);
+                let resume_pc = self.frames.current_mut().pc;
+                self.record_state_guard(ctx, sym, opcode, &[cond], resume_pc);
                 if branch_taken {
                     self.frames.current_mut().code_cursor = target;
                 }
@@ -871,8 +990,8 @@ where
                 } else {
                     OpCode::GuardTrue
                 };
-                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
-                Self::record_state_guard(ctx, sym, guard, &[cond], &[resume_pc]);
+                let resume_pc = self.frames.current_mut().pc;
+                self.record_state_guard(ctx, sym, guard, &[cond], resume_pc);
                 if cond_value == 0 {
                     self.frames.current_mut().code_cursor = target;
                 }
@@ -909,8 +1028,8 @@ where
                 } else {
                     OpCode::GuardTrue
                 };
-                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
-                Self::record_state_guard(ctx, sym, guard, &[cond], &[resume_pc]);
+                let resume_pc = self.frames.current_mut().pc;
+                self.record_state_guard(ctx, sym, guard, &[cond], resume_pc);
                 if cond_value == 0 {
                     self.frames.current_mut().code_cursor = target;
                 }
@@ -948,8 +1067,8 @@ where
                 } else {
                     OpCode::GuardFalse
                 };
-                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
-                Self::record_state_guard(ctx, sym, guard, &[cond], &[resume_pc]);
+                let resume_pc = self.frames.current_mut().pc;
+                self.record_state_guard(ctx, sym, guard, &[cond], resume_pc);
                 if !taken {
                     self.frames.current_mut().code_cursor = target;
                 }
@@ -976,8 +1095,8 @@ where
                 } else {
                     OpCode::GuardFalse
                 };
-                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
-                Self::record_state_guard(ctx, sym, guard, &[cond], &[resume_pc]);
+                let resume_pc = self.frames.current_mut().pc;
+                self.record_state_guard(ctx, sym, guard, &[cond], resume_pc);
                 if !taken {
                     self.frames.current_mut().code_cursor = target;
                 }
@@ -1000,8 +1119,8 @@ where
                 } else {
                     OpCode::GuardTrue
                 };
-                let resume_pc = ctx.const_int(self.frames.current_mut().pc as i64);
-                Self::record_state_guard(ctx, sym, guard, &[cond], &[resume_pc]);
+                let resume_pc = self.frames.current_mut().pc;
+                self.record_state_guard(ctx, sym, guard, &[cond], resume_pc);
                 if cond_value == 0 {
                     self.frames.current_mut().code_cursor = target;
                 }
@@ -2458,6 +2577,60 @@ pub(crate) fn call_void_function(func_ptr: *const (), args: &[i64]) {
     }
 }
 
+/// Build a single-frame `recorder::Snapshot` over
+/// `frame.int_regs[0..num_slots]` for a state-field-JIT guard.
+///
+/// PRE-EXISTING-ADAPTATION (state-field JIT divergence — Task #89
+/// framestack-lift Session 3b-3a):  RPython captures snapshots by
+/// walking `MetaInterp.framestack` and reading per-frame liveness via
+/// `MIFrame.get_list_of_active_boxes`
+/// (`opencoder.py:819 capture_resumedata`); pyre's state-field JIT
+/// instead has the macro-generated `JitCodeSym::populate_frame_int_regs`
+/// (Session 3a-prep) copy `__JitSym` slots into
+/// `frame.int_regs` / `int_values` at the canonical liveness indices
+/// declared by `live_slots_for_state_field_jit` (Task #89 orth-6).
+/// This helper is the matching consumer side: it takes the populated
+/// frame and produces a `recorder::Snapshot` ready for
+/// `TraceCtx::capture_resumedata` + `set_last_guard_resume_position`.
+///
+/// Each `frame.int_regs[i]` is encoded as
+/// `SnapshotTagged::Box(opref.0, Type::Int)`; `OpRef.0` already
+/// distinguishes constants (CONST_BIT high bit) from live boxes, so the
+/// downstream consumer (`tagged_to_opref` in
+/// `pyjitpl/mod.rs:263 finish_trace_for_parity`) decodes both cases via
+/// `OpRef::is_constant` (matching opencoder.py:603 `_encode`'s TAGBOX vs
+/// TAGCONST split).  `None` slots map to `OpRef::NONE.0` — same fallback
+/// `history.rs:425` emits for unmapped post-cut Boxes.
+///
+/// `pc` and `jitcode_index` are read from the frame as-is; the caller is
+/// responsible for ensuring `frame.pc` points just past the
+/// `live/<offset>` op so the snapshot consumer can re-derive liveness if
+/// needed.
+///
+/// Convergence path: when state-field JIT migrates to RPython
+/// MIFrame-regs storage (Task #89 orth-9 step 4 reshape), the
+/// `populate_frame_int_regs` override drops out and this helper is
+/// replaced by the standard `MIFrame::get_list_of_active_boxes` walk.
+pub fn build_state_field_snapshot(frame: &MIFrame, num_slots: usize) -> crate::recorder::Snapshot {
+    use std::sync::atomic::Ordering;
+    let n = num_slots.min(frame.int_regs.len());
+    let boxes: Vec<crate::recorder::SnapshotTagged> = (0..n)
+        .map(|i| {
+            let opref = frame.int_regs[i].unwrap_or(majit_ir::OpRef::NONE);
+            crate::recorder::SnapshotTagged::Box(opref.0, majit_ir::Type::Int)
+        })
+        .collect();
+    crate::recorder::Snapshot {
+        frames: vec![crate::recorder::SnapshotFrame {
+            jitcode_index: frame.jitcode.index.load(Ordering::Relaxed) as u32,
+            pc: frame.pc as u32,
+            boxes,
+        }],
+        vable_boxes: Vec::new(),
+        vref_boxes: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2921,5 +3094,360 @@ mod tests {
         assert_eq!(finish_arg_types, vec![majit_ir::Type::Ref]);
         assert_eq!(finish_args.len(), 1);
         assert!(exit_with_exception);
+    }
+
+    #[test]
+    fn live_op_is_no_op_in_dispatch() {
+        // RPython `blackhole.py:950 bhimpl_live` is a no-op that the
+        // codewriter emits before every guard-bearing instruction.
+        // pyre's `JitCodeMachine::run_one_step` must consume the opcode
+        // byte and the 2-byte offset operand without panicking, exactly
+        // mirroring the existing skip already in place at
+        // `unwind_to_exception_handler`.
+        let mut builder = JitCodeBuilder::new();
+        // `live_placeholder()` emits `BC_LIVE` + 2 zero offset bytes —
+        // the orth-8 macro-side caller will patch the offset; the
+        // dispatcher consumes it as opaque data either way.
+        let _patch = builder.live_placeholder();
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default();
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        assert!(matches!(action, TraceAction::Continue));
+
+        let recorder = ctx.into_recorder();
+        assert_eq!(
+            recorder.num_ops(),
+            0,
+            "BC_LIVE must not record any op into the trace buffer",
+        );
+    }
+
+    #[test]
+    fn populate_frame_int_regs_default_is_no_op() {
+        // Trait method is a default no-op when not overridden.  Existing
+        // `JitCodeSym` impls (e.g. `DummySym`, `NoopSym`, the `()` unit
+        // bridge) inherit this default — they must not silently
+        // overwrite frame banks during the framestack-lift wiring
+        // (Session 3a-prep guarantee for non-state-field JIT users).
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        builder.load_const_i_value(1, 0);
+        builder.load_const_i_value(2, 0);
+        builder.load_const_i_value(3, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+
+        let mut frame = MIFrame::new(jitcode, 0);
+        // Pre-fill regs with sentinels so a stray write would surface.
+        for slot in &mut frame.int_regs {
+            *slot = Some(majit_ir::OpRef(99));
+        }
+        for slot in &mut frame.int_values {
+            *slot = Some(0xDEAD);
+        }
+        let saved_regs = frame.int_regs.clone();
+        let saved_values = frame.int_values.clone();
+
+        let sym = DummySym;
+        sym.populate_frame_int_regs(&mut frame);
+
+        assert_eq!(frame.int_regs, saved_regs);
+        assert_eq!(frame.int_values, saved_values);
+    }
+
+    #[test]
+    fn populate_frame_int_regs_writes_scalars_and_arrays() {
+        // Hand-rolled override that mirrors the macro emit
+        // (`majit-macros/src/jit_interp/codegen_state.rs`):
+        //   - 2 scalar slots (idx 0, 1) → `(OpRef(10), 100)`,
+        //     `(OpRef(11), 101)`.
+        //   - 1 array slot of length 3 (idx 2..5) →
+        //     `(OpRef(20+i), 200+i)` for `i in 0..3`.
+        // Asserts the canonical liveness slot layout from
+        // `live_slots_for_state_field_jit(num_scalars=2,
+        // array_lens=&[3], num_virt_arrays=0)` is honored.
+        struct StateFieldLikeSym;
+        impl JitCodeSym for StateFieldLikeSym {
+            fn total_slots(&self) -> usize {
+                5
+            }
+            fn loop_header_pc(&self) -> usize {
+                0
+            }
+            fn fail_args(&self) -> Option<Vec<OpRef>> {
+                None
+            }
+            fn populate_frame_int_regs(&self, frame: &mut MIFrame) {
+                let mut slot = 0;
+                // scalars
+                frame.int_regs[slot] = Some(majit_ir::OpRef(10));
+                frame.int_values[slot] = Some(100);
+                slot += 1;
+                frame.int_regs[slot] = Some(majit_ir::OpRef(11));
+                frame.int_values[slot] = Some(101);
+                slot += 1;
+                // array (len 3)
+                for i in 0..3 {
+                    frame.int_regs[slot + i] = Some(majit_ir::OpRef(20 + i as u32));
+                    frame.int_values[slot + i] = Some(200 + i as i64);
+                }
+            }
+        }
+
+        let mut builder = JitCodeBuilder::new();
+        for i in 0..5 {
+            builder.load_const_i_value(i, 0);
+        }
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let mut frame = MIFrame::new(jitcode, 0);
+
+        let sym = StateFieldLikeSym;
+        sym.populate_frame_int_regs(&mut frame);
+
+        assert_eq!(frame.int_regs[0], Some(majit_ir::OpRef(10)));
+        assert_eq!(frame.int_values[0], Some(100));
+        assert_eq!(frame.int_regs[1], Some(majit_ir::OpRef(11)));
+        assert_eq!(frame.int_values[1], Some(101));
+        for i in 0..3 {
+            assert_eq!(frame.int_regs[2 + i], Some(majit_ir::OpRef(20 + i as u32)));
+            assert_eq!(frame.int_values[2 + i], Some(200 + i as i64));
+        }
+    }
+
+    #[test]
+    fn record_state_guard_attaches_snapshot_when_sym_supplies_fail_args() {
+        // Task #89 framestack-lift Session 3b-3c contract:
+        // when a JitCodeSym implementation returns `Some(_)` from
+        // `fail_args_with_ctx` and overrides `populate_frame_int_regs`
+        // (the macro-emitted state-field-JIT shape), every guard
+        // recorded via `record_state_guard` must
+        //   (a) push a snapshot through `TraceCtx::capture_resumedata`,
+        //   (b) patch the just-recorded guard's `rd_resume_position`
+        //       to that snapshot's id (matching
+        //       `recorder.rs:228 set_last_op_resume_position`),
+        //   (c) populate the snapshot's frame.boxes from the same
+        //       slots `populate_frame_int_regs` writes.
+        // This locks Session 3b-3b's wire-up so a future regression
+        // (e.g. accidentally dropping the `set_last_guard_resume_position`
+        // call) is caught at the unit level rather than only via the
+        // macro-example end-to-end suites.
+        struct StateFieldLikeSym {
+            fail_args: Vec<OpRef>,
+            populated: Vec<(usize, OpRef, i64)>,
+        }
+        impl JitCodeSym for StateFieldLikeSym {
+            fn total_slots(&self) -> usize {
+                self.populated.len()
+            }
+            fn loop_header_pc(&self) -> usize {
+                0
+            }
+            fn fail_args(&self) -> Option<Vec<OpRef>> {
+                Some(self.fail_args.clone())
+            }
+            fn populate_frame_int_regs(&self, frame: &mut MIFrame) {
+                for &(slot, opref, value) in &self.populated {
+                    frame.int_regs[slot] = Some(opref);
+                    frame.int_values[slot] = Some(value);
+                }
+            }
+        }
+
+        // Mirrors `goto_if_not_int_lt_records_compare_and_guard_false`:
+        // 5 < 3 is false, so the guard records `IntLt` + `GuardFalse`.
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.load_const_i_value(0, 5);
+        builder.load_const_i_value(1, 3);
+        builder.goto_if_not_int_lt(0, 1, target);
+        builder.mark_label(target);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        // Pre-populate three plausible state-field OpRefs (50, 51, 52)
+        // — the actual values are arbitrary; the snapshot must mirror
+        // them slot-for-slot post-`populate_frame_int_regs`.
+        let mut sym = StateFieldLikeSym {
+            fail_args: vec![OpRef(50), OpRef(51), OpRef(52)],
+            populated: vec![
+                (0, OpRef(50), 500),
+                (1, OpRef(51), 510),
+                (2, OpRef(52), 520),
+            ],
+        };
+
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        assert!(matches!(action, TraceAction::Continue));
+
+        // (a): exactly one snapshot was published.
+        let snapshots = ctx.snapshots().to_vec();
+        assert_eq!(
+            snapshots.len(),
+            1,
+            "record_state_guard must publish exactly one snapshot per guard",
+        );
+        // (c): snapshot's single frame mirrors populate_frame_int_regs.
+        let snap = &snapshots[0];
+        assert_eq!(snap.frames.len(), 1);
+        assert_eq!(
+            snap.frames[0].boxes,
+            vec![
+                crate::recorder::SnapshotTagged::Box(50, Type::Int),
+                crate::recorder::SnapshotTagged::Box(51, Type::Int),
+                crate::recorder::SnapshotTagged::Box(52, Type::Int),
+            ],
+            "snapshot boxes must match populate_frame_int_regs output",
+        );
+
+        // (b): the recorded guard op carries the matching resume_position.
+        let recorder = ctx.into_recorder();
+        let guard = recorder
+            .ops()
+            .iter()
+            .rev()
+            .find(|op| op.opcode == OpCode::GuardFalse)
+            .expect("BC_GOTO_IF_NOT_INT_LT must record a GuardFalse op");
+        assert_eq!(
+            guard.rd_resume_position, 0,
+            "guard's rd_resume_position must point at the captured snapshot",
+        );
+    }
+
+    #[test]
+    fn record_state_guard_skips_snapshot_when_sym_returns_none_fail_args() {
+        // Inverse of the above: when a JitCodeSym returns `None` from
+        // `fail_args_with_ctx` (legacy / non-state-field path), the
+        // else branch of `record_state_guard` keeps the original
+        // `record_guard` semantics — no snapshot capture, no
+        // `set_last_guard_resume_position` patch.  Locks the negative
+        // contract so the wire-up does not bleed into call sites that
+        // did not opt in.
+        let mut builder = JitCodeBuilder::new();
+        let target = builder.new_label();
+        builder.load_const_i_value(0, 5);
+        builder.load_const_i_value(1, 3);
+        builder.goto_if_not_int_lt(0, 1, target);
+        builder.mark_label(target);
+        let jitcode = builder.finish();
+
+        let mut ctx = TraceCtx::for_test(0);
+        let mut sym = DummySym::default(); // fail_args() = None
+        let action = trace_jitcode(&mut ctx, &mut sym, &jitcode, 0, |_pc| 0);
+        assert!(matches!(action, TraceAction::Continue));
+
+        assert_eq!(
+            ctx.snapshots().len(),
+            0,
+            "DummySym fail_args() = None must skip the snapshot wire-up",
+        );
+        let recorder = ctx.into_recorder();
+        let guard = recorder
+            .ops()
+            .iter()
+            .rev()
+            .find(|op| op.opcode == OpCode::GuardFalse)
+            .expect("guard recorded");
+        assert_eq!(
+            guard.rd_resume_position, -1,
+            "non-state-field guard keeps the -1 sentinel",
+        );
+    }
+
+    #[test]
+    fn build_state_field_snapshot_emits_box_tags_for_populated_slots() {
+        // Mirror the canonical layout
+        // (`live_slots_for_state_field_jit(num_scalars=2, array_lens=&[3],
+        // num_virt_arrays=0)`): scalars at slot 0..2, then a 3-element
+        // array at slot 2..5. Helper must encode each as
+        // `SnapshotTagged::Box(opref.0, Type::Int)`.
+        let mut builder = JitCodeBuilder::new();
+        for i in 0..5 {
+            builder.load_const_i_value(i, 0);
+        }
+        let jitcode = std::sync::Arc::new(builder.finish());
+        jitcode.index.store(7, std::sync::atomic::Ordering::Relaxed);
+        let mut frame = MIFrame::new(jitcode, 3);
+        frame.int_regs[0] = Some(majit_ir::OpRef(10));
+        frame.int_regs[1] = Some(majit_ir::OpRef(11));
+        for i in 0..3 {
+            frame.int_regs[2 + i] = Some(majit_ir::OpRef(20 + i as u32));
+        }
+
+        let snapshot = build_state_field_snapshot(&frame, 5);
+
+        assert_eq!(snapshot.frames.len(), 1);
+        assert!(snapshot.vable_boxes.is_empty());
+        assert!(snapshot.vref_boxes.is_empty());
+        let f = &snapshot.frames[0];
+        assert_eq!(f.jitcode_index, 7);
+        assert_eq!(f.pc, 3);
+        assert_eq!(
+            f.boxes,
+            vec![
+                crate::recorder::SnapshotTagged::Box(10, majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(11, majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(20, majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(21, majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(22, majit_ir::Type::Int),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_state_field_snapshot_uses_none_for_empty_slots() {
+        // history.rs:425 fallback parity: an unpopulated `int_regs[i]`
+        // must emit `OpRef::NONE.0` rather than panic, so a snapshot
+        // captured while only some scalars have been bound by the
+        // macro-generated `populate_frame_int_regs` still round-trips.
+        let mut builder = JitCodeBuilder::new();
+        for i in 0..3 {
+            builder.load_const_i_value(i, 0);
+        }
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.int_regs[1] = Some(majit_ir::OpRef(42));
+        // slot 0 + slot 2 left as `None`.
+
+        let snapshot = build_state_field_snapshot(&frame, 3);
+
+        let f = &snapshot.frames[0];
+        assert_eq!(
+            f.boxes,
+            vec![
+                crate::recorder::SnapshotTagged::Box(majit_ir::OpRef::NONE.0, majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(42, majit_ir::Type::Int),
+                crate::recorder::SnapshotTagged::Box(majit_ir::OpRef::NONE.0, majit_ir::Type::Int),
+            ]
+        );
+    }
+
+    #[test]
+    fn build_state_field_snapshot_clamps_num_slots_to_int_regs_len() {
+        // A caller passing a `num_slots` larger than the frame's
+        // `int_regs.len()` must not panic — emit only as many slots as
+        // the frame can supply. This guards the wire-up path against
+        // accidental over-reads when a state's canonical liveness layout
+        // overflows the frame's allocated register window.
+        let mut builder = JitCodeBuilder::new();
+        builder.load_const_i_value(0, 0);
+        builder.load_const_i_value(1, 0);
+        let jitcode = std::sync::Arc::new(builder.finish());
+        let mut frame = MIFrame::new(jitcode, 0);
+        frame.int_regs[0] = Some(majit_ir::OpRef(5));
+        frame.int_regs[1] = Some(majit_ir::OpRef(6));
+
+        let snapshot = build_state_field_snapshot(&frame, 99);
+
+        let f = &snapshot.frames[0];
+        assert_eq!(f.boxes.len(), frame.int_regs.len());
+        assert_eq!(
+            f.boxes[0],
+            crate::recorder::SnapshotTagged::Box(5, majit_ir::Type::Int)
+        );
+        assert_eq!(
+            f.boxes[1],
+            crate::recorder::SnapshotTagged::Box(6, majit_ir::Type::Int)
+        );
     }
 }

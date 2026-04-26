@@ -138,9 +138,13 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         .map(|(_, f)| {
             let ptr_name = quote::format_ident!("{}_ptr", f.name);
             let len_name = quote::format_ident!("{}_len", f.name);
+            let ptr_value_name = quote::format_ident!("{}_ptr_value", f.name);
+            let len_value_name = quote::format_ident!("{}_len_value", f.name);
             quote! {
                 #ptr_name: majit_ir::OpRef,
                 #len_name: majit_ir::OpRef,
+                #ptr_value_name: i64,
+                #len_value_name: i64,
             }
         })
         .collect();
@@ -288,6 +292,71 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         })
         .collect();
 
+    // ── populate_frame_int_regs: scalars + flattened arrays ──
+    // Matches `live_slots_for_state_field_jit` slot order so a
+    // `MIFrame::get_list_of_active_boxes` walk against the canonical
+    // liveness entry decodes back the same OpRefs / values that
+    // `__JitSym` and the macro-emitted `live/<offset>` placeholder
+    // refer to.  Virt-array populate is deferred (Session 3b) — see
+    // the trait-method docstring.
+    let populate_scalar_parts: Vec<TokenStream> = scalars
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_value", f.name);
+            quote! {
+                if __slot < frame.int_regs.len() {
+                    frame.int_regs[__slot] = Some(self.#fname);
+                    frame.int_values[__slot] = Some(self.#value_name);
+                }
+                __slot += 1;
+            }
+        })
+        .collect();
+    let populate_array_parts: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let value_name = quote::format_ident!("{}_values", f.name);
+            quote! {
+                for __i in 0..self.#fname.len() {
+                    if __slot + __i < frame.int_regs.len() {
+                        frame.int_regs[__slot + __i] = Some(self.#fname[__i]);
+                        frame.int_values[__slot + __i] = Some(self.#value_name[__i]);
+                    }
+                }
+                __slot += self.#fname.len();
+            }
+        })
+        .collect();
+    // Virt-array populate (Session 3b-1): two consecutive slots per
+    // varray — `<varr>_ptr` (data pointer OpRef) at offset N, then
+    // `<varr>_len` at N+1.  Value mirrors come from
+    // `<varr>_ptr_value` / `<varr>_len_value` cached at
+    // `JitState::initialize_sym` from the user state's
+    // `<varr>.as_ptr() as i64` / `<varr>.len() as i64`.
+    let populate_virt_array_parts: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|(_, f)| {
+            let ptr_name = quote::format_ident!("{}_ptr", f.name);
+            let len_name = quote::format_ident!("{}_len", f.name);
+            let ptr_value_name = quote::format_ident!("{}_ptr_value", f.name);
+            let len_value_name = quote::format_ident!("{}_len_value", f.name);
+            quote! {
+                if __slot < frame.int_regs.len() {
+                    frame.int_regs[__slot] = Some(self.#ptr_name);
+                    frame.int_values[__slot] = Some(self.#ptr_value_name);
+                }
+                __slot += 1;
+                if __slot < frame.int_regs.len() {
+                    frame.int_regs[__slot] = Some(self.#len_name);
+                    frame.int_values[__slot] = Some(self.#len_value_name);
+                }
+                __slot += 1;
+            }
+        })
+        .collect();
+
     // ── fail_args ──
     let fail_scalar_parts: Vec<TokenStream> = scalars
         .iter()
@@ -322,6 +391,21 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             let fname = &f.name;
             let len_name = quote::format_ident!("{}_len", f.name);
             quote! { #len_name: self.#fname.len(), }
+        })
+        .collect();
+
+    // ── canonical_liveness_slots: array_lens slice expression ──
+    // RPython `assembler.py:218-231 get_liveness_info` extracts per-kind
+    // liveness for each `-live-` marker.  In flat-state JIT every slot
+    // is permanently live, so the canonical entry is just
+    // `[0..total_slots]` of int slots.  The `array_lens` slice fed to
+    // `live_slots_for_state_field_jit` enumerates the runtime lengths
+    // captured in `__JitMeta::<arr>_len` (one per flattened array).
+    let canonical_liveness_array_len_refs: Vec<TokenStream> = arrays
+        .iter()
+        .map(|(_, f)| {
+            let len_name = quote::format_ident!("{}_len", f.name);
+            quote! { self.#len_name }
         })
         .collect();
 
@@ -391,11 +475,15 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         .map(|(_, f)| {
             let ptr_name = quote::format_ident!("{}_ptr", f.name);
             let len_name = quote::format_ident!("{}_len", f.name);
+            let ptr_value_name = quote::format_ident!("{}_ptr_value", f.name);
+            let len_value_name = quote::format_ident!("{}_len_value", f.name);
             quote! {
                 let #ptr_name = majit_ir::OpRef(__offset as u32);
                 __offset += 1;
                 let #len_name = majit_ir::OpRef(__offset as u32);
                 __offset += 1;
+                let #ptr_value_name = 0i64;
+                let #len_value_name = 0i64;
             }
         })
         .collect();
@@ -416,6 +504,14 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
     let create_sym_virt_array_len_names: Vec<syn::Ident> = virt_arrays
         .iter()
         .map(|(_, f)| quote::format_ident!("{}_len", f.name))
+        .collect();
+    let create_sym_virt_array_ptr_value_names: Vec<syn::Ident> = virt_arrays
+        .iter()
+        .map(|(_, f)| quote::format_ident!("{}_ptr_value", f.name))
+        .collect();
+    let create_sym_virt_array_len_value_names: Vec<syn::Ident> = virt_arrays
+        .iter()
+        .map(|(_, f)| quote::format_ident!("{}_len_value", f.name))
         .collect();
 
     // ── is_compatible: check flattened array lengths match meta ──
@@ -488,6 +584,27 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             }
         })
         .collect();
+    // Virt-array `<varr>_ptr_value` / `<varr>_len_value` mirror the
+    // current `<state>.<varr>` ptr/len so `populate_frame_int_regs`
+    // can fill the corresponding `MIFrame.int_values` slots without
+    // re-reading the live state at guard time
+    // (Task #89 framestack-lift Session 3b-1).  PRE-EXISTING-ADAPTATION:
+    // accurate iff the user's varray Vec does not reallocate during
+    // tracing — true for the 6 macro examples
+    // (`vec![0i64; program.len()]` is fixed-capacity).  Dynamic
+    // varrays would need per-mutation refresh hooks.
+    let initialize_sym_virt_array_parts: Vec<TokenStream> = virt_arrays
+        .iter()
+        .map(|(_, f)| {
+            let fname = &f.name;
+            let ptr_value_name = quote::format_ident!("{}_ptr_value", f.name);
+            let len_value_name = quote::format_ident!("{}_len_value", f.name);
+            quote! {
+                sym.#ptr_value_name = self.#fname.as_ptr() as i64;
+                sym.#len_value_name = self.#fname.len() as i64;
+            }
+        })
+        .collect();
 
     // ── validate_close: flattened array lengths in sym match meta ──
     // Virt arrays always validate (ptr+len are just OpRefs, not sized).
@@ -506,6 +623,95 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
         #[allow(non_camel_case_types)]
         struct __JitMeta {
             #(#meta_fields)*
+        }
+
+        impl __JitMeta {
+            /// RPython `assembler.py:218-231 get_liveness_info(insn, kind)`
+            /// adapted for flat-state JIT: every state_field slot is
+            /// permanently live, so the canonical
+            /// `(live_i, live_r, live_f)` triple is just `0..total_slots`
+            /// in the int bank.  state-field JIT enforces `Type::Int` on
+            /// every slot at macro expansion (`codegen_state.rs:30-43`),
+            /// so `live_r` and `live_f` are empty.  Used by
+            /// `JitCodeBuilder::live` (`assembler.py:148+158`) to
+            /// register the canonical entry once per process and emit
+            /// a `live/<offset>` prefix on each per-opcode jitcode.
+            #[allow(dead_code)]
+            fn canonical_liveness_slots(
+                &self,
+            ) -> (::std::vec::Vec<u8>, ::std::vec::Vec<u8>, ::std::vec::Vec<u8>) {
+                let __array_lens: &[usize] = &[#(#canonical_liveness_array_len_refs),*];
+                majit_metainterp::live_slots_for_state_field_jit(
+                    #num_scalars,
+                    __array_lens,
+                    #num_virt_arrays,
+                )
+            }
+
+            /// RPython `warmspot.py:281-289`'s `make_jitcodes() →
+            /// finish_setup(codewriter)` lifecycle reduced to the
+            /// canonical-entry slice for state-field JIT
+            /// (`pyjitpl.py:2264 self.liveness_info = "".join(
+            /// asm.all_liveness)`).  Builds a fresh `Assembler`,
+            /// registers the canonical
+            /// `(live_i, live_r, live_f)` triple via
+            /// `Assembler::_encode_liveness` (`assembler.py:235-248`),
+            /// then publishes the resulting `all_liveness` payload
+            /// through `JitDriver::install_canonical_liveness`.
+            ///
+            /// Caller pattern:
+            /// ```ignore
+            /// let meta = state.build_meta(0, &program);
+            /// meta.install_canonical_liveness(&mut driver);
+            /// ```
+            /// Must run before the first trace — the
+            /// `Arc::get_mut` invariant on `MetaInterp::staticdata`
+            /// (`pyjitpl/mod.rs::install_canonical_liveness`) panics
+            /// once any tracing setup has cloned the Arc.
+            #[allow(dead_code)]
+            fn install_canonical_liveness(
+                &self,
+                driver: &mut majit_metainterp::JitDriver<#state_type>,
+            ) {
+                let mut __asm = majit_metainterp::Assembler::new();
+                let (__live_i, __live_r, __live_f) = self.canonical_liveness_slots();
+                let mut __code_buf: ::std::vec::Vec<u8> = ::std::vec::Vec::new();
+                __asm._encode_liveness(
+                    &__live_i,
+                    &__live_r,
+                    &__live_f,
+                    &mut __code_buf,
+                );
+                // RPython `assembler.py:222 self.insns[key] = opnum`
+                // records every opcode the assembler emits during
+                // `assemble()`.  pyre's macro path skips
+                // `assembler.assemble()` (the per-arm `JitCodeBuilder`
+                // emits BC_* directly), so the canonical state-field
+                // JIT entries are registered explicitly here.  The
+                // downstream `MetaInterpStaticData::
+                // install_canonical_liveness` then calls
+                // `setup_insns(asm.insns())` (`pyjitpl.py:2227-2243`)
+                // to dynamically resolve `op_live` /
+                // `op_catch_exception` / `op_*_return` instead of a
+                // parallel hardcoded `BC_*` seeding block.
+                __asm.register_insn("live/", majit_metainterp::BC_LIVE);
+                __asm.register_insn(
+                    "catch_exception/L",
+                    majit_metainterp::BC_CATCH_EXCEPTION,
+                );
+                __asm.register_insn(
+                    "rvmprof_code/ii",
+                    majit_metainterp::BC_RVMPROF_CODE,
+                );
+                __asm.register_insn("int_return/i", majit_metainterp::BC_INT_RETURN);
+                __asm.register_insn("ref_return/r", majit_metainterp::BC_REF_RETURN);
+                __asm.register_insn(
+                    "float_return/f",
+                    majit_metainterp::BC_FLOAT_RETURN,
+                );
+                __asm.register_insn("void_return/", majit_metainterp::BC_VOID_RETURN);
+                driver.install_canonical_liveness(&__asm);
+            }
         }
 
         /// Symbolic state during tracing: per-field OpRefs.
@@ -606,6 +812,27 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
                 #(#fail_virt_array_parts)*
                 Some(args)
             }
+
+            #[allow(unused_assignments, unused_variables)]
+            fn populate_frame_int_regs(
+                &self,
+                frame: &mut majit_metainterp::MIFrame,
+            ) {
+                // Slot layout matches `live_slots_for_state_field_jit`
+                // (Task #89 orth-6): scalars at `0..num_scalars`,
+                // then flattened arrays, then virt-array (ptr, len)
+                // pairs.  Virt-array value mirrors are cached at
+                // `JitState::initialize_sym` time
+                // (Task #89 framestack-lift Session 3b-1) from the
+                // user state's `<varr>.as_ptr()` / `<varr>.len()`,
+                // accurate iff the Vec does not reallocate during
+                // tracing.
+                let mut __slot: usize = 0;
+                #(#populate_scalar_parts)*
+                #(#populate_array_parts)*
+                #(#populate_virt_array_parts)*
+                let _ = __slot;
+            }
         }
 
         impl majit_metainterp::JitState for #state_type {
@@ -643,6 +870,8 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
                     #(#create_sym_array_value_names,)*
                     #(#create_sym_virt_array_ptr_names,)*
                     #(#create_sym_virt_array_len_names,)*
+                    #(#create_sym_virt_array_ptr_value_names,)*
+                    #(#create_sym_virt_array_len_value_names,)*
                     loop_header_pc: header_pc,
                     trace_started: false,
                 }
@@ -651,6 +880,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             fn initialize_sym(&self, sym: &mut __JitSym, _meta: &__JitMeta) {
                 #(#initialize_sym_scalar_parts)*
                 #(#initialize_sym_array_parts)*
+                #(#initialize_sym_virt_array_parts)*
             }
 
             fn is_compatible(&self, meta: &__JitMeta) -> bool {
@@ -674,6 +904,27 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn validate_close(sym: &__JitSym, meta: &__JitMeta) -> bool {
                 true #(#validate_array_checks)*
+            }
+
+            // Task #89 framestack-lift Session 4: state-field JIT
+            // override of `JitState::populate_frame_for_guard` so
+            // jitdriver-level guard sites (e.g. `force_finish_trace`'s
+            // GuardAlwaysFails fallback) get the same snapshot wire-up
+            // as the dispatch-level `record_state_guard`
+            // (`pyjitpl/dispatch.rs:284`).  Calls the macro-emitted
+            // `JitCodeSym::populate_frame_int_regs` to bridge
+            // `__JitSym` slots onto `MIFrame.int_regs`, then builds a
+            // single-frame snapshot via the canonical helper.
+            fn populate_frame_for_guard(
+                sym: &__JitSym,
+                frame: &mut majit_metainterp::MIFrame,
+            ) -> Option<majit_metainterp::recorder::Snapshot> {
+                use majit_metainterp::JitCodeSym as _;
+                sym.populate_frame_int_regs(frame);
+                Some(majit_metainterp::build_state_field_snapshot(
+                    frame,
+                    sym.total_slots(),
+                ))
             }
         }
     }

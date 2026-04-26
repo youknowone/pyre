@@ -1387,18 +1387,6 @@ pub struct TraceRecordBuffer {
     /// `Arc<MetaInterpStaticData>` so the Trace can outlive its
     /// creating MetaInterp frame without reshuffling the reference.
     pub metainterp_sd: std::sync::Arc<crate::MetaInterpStaticData>,
-
-    /// Pyre-only side table: guard-op position → FailDescr recorded at
-    /// guard time.  RPython has no direct counterpart — RPython routes
-    /// guard descrs through resume-data capture — but pyre callers
-    /// migrating off `recorder::Trace.record_guard` expect the descr
-    /// to survive to the materialization/backend stage.  `ByteTraceIter`
-    /// continues to emit `op.descr = None` for guards; consumers that
-    /// need the stored descr call `guard_descr(pos)` explicitly.
-    pub _guard_descrs: HashMap<u32, majit_ir::DescrRef>,
-    /// Pyre-only side table: guard-op position → fail_args recorded at
-    /// guard time.  Same rationale as `_guard_descrs` above.
-    pub _guard_fail_args: HashMap<u32, smallvec::SmallVec<[OpRef; 4]>>,
 }
 
 impl TraceRecordBuffer {
@@ -1443,8 +1431,6 @@ impl TraceRecordBuffer {
             _consts_ptr_nodict: 0,
             _deadranges: None,
             metainterp_sd,
-            _guard_descrs: HashMap::new(),
-            _guard_fail_args: HashMap::new(),
         };
         // opencoder.py:489 — `append_snapshot_array_data_int(0)` so all
         // zero-length arrays share index 0.
@@ -2560,69 +2546,11 @@ impl TraceRecordBuffer {
         pos
     }
 
-    // ── M2 Step 2d · guard / close_loop / finish helpers ──────────────
+    // ── M2 Step 2d · close_loop / finish helpers ──────────────────────
     //
     // Thin wrappers over `record_op_oprefs` that mirror the
-    // `recorder::Trace` surface (`record_guard`, `record_guard_with_fail_args`,
-    // `close_loop`, `close_loop_with_descr`, `finish`).  Guards emit the
-    // 2-byte descr=0 placeholder at wire level (opencoder.py:664-670
-    // `descr=None`); the placeholder is later patched by
-    // `patch_last_guard_descr_slot` when `capture_resumedata` runs.
-    // Guard FailDescr + fail_args are parked in `_guard_descrs` /
-    // `_guard_fail_args` side tables (pyre-only, documented on the
-    // fields themselves).
-
-    /// Record a guard operation with a FailDescr.  Wire-level: writes
-    /// opnum + args + 2-byte descr=0 placeholder (matches
-    /// `record_op_oprefs(..., None, pool)`).  The FailDescr is stashed
-    /// in `_guard_descrs` keyed by the returned position so callers
-    /// that previously relied on `op.descr` after record can still
-    /// retrieve it via `guard_descr(pos)`.
-    pub fn record_guard_oprefs(
-        &mut self,
-        opcode: OpCode,
-        argrefs: &[OpRef],
-        descr: &majit_ir::DescrRef,
-        pool: &ConstantPool,
-    ) -> u32 {
-        debug_assert!(
-            opcode.is_guard(),
-            "record_guard_oprefs: opcode {:?} is not a guard",
-            opcode
-        );
-        let pos = self.record_op_oprefs(opcode, argrefs, None, pool);
-        self._guard_descrs.insert(pos, descr.clone());
-        pos
-    }
-
-    /// Record a guard with explicit fail_args.  Same wire layout as
-    /// `record_guard_oprefs`; additionally parks `fail_args` in
-    /// `_guard_fail_args`.  No RPython counterpart for the side table —
-    /// RPython routes fail args through the snapshot chain.
-    pub fn record_guard_oprefs_with_fail_args(
-        &mut self,
-        opcode: OpCode,
-        argrefs: &[OpRef],
-        descr: &majit_ir::DescrRef,
-        fail_args: &[OpRef],
-        pool: &ConstantPool,
-    ) -> u32 {
-        let pos = self.record_guard_oprefs(opcode, argrefs, descr, pool);
-        self._guard_fail_args
-            .insert(pos, smallvec::SmallVec::from_slice(fail_args));
-        pos
-    }
-
-    /// Retrieve a previously recorded guard's FailDescr.  Returns
-    /// `None` if the position is not a guard or was never recorded.
-    pub fn guard_descr(&self, pos: u32) -> Option<&majit_ir::DescrRef> {
-        self._guard_descrs.get(&pos)
-    }
-
-    /// Retrieve a previously recorded guard's fail_args slice.
-    pub fn guard_fail_args(&self, pos: u32) -> Option<&[OpRef]> {
-        self._guard_fail_args.get(&pos).map(|v| v.as_slice())
-    }
+    // `recorder::Trace` surface (`close_loop`, `close_loop_with_descr`,
+    // `finish`).
 
     /// Close the loop: append a JUMP op with no descr.  Mirrors
     /// `recorder::Trace::close_loop`.
@@ -4053,60 +3981,6 @@ mod tests {
             }
         }
         Arc::new(D)
-    }
-
-    /// Step 2d: `record_guard_oprefs` writes opnum + args + 2-byte
-    /// descr=0 placeholder — same wire bytes as
-    /// `record_op1(guard, arg, None)`.  The FailDescr is parked in the
-    /// side table, retrievable via `guard_descr(pos)`.
-    #[test]
-    fn test_record_guard_oprefs_2d() {
-        let pool = crate::constant_pool::ConstantPool::new();
-        let descr = dummy_descr();
-        let mut expected = TraceRecordBuffer::new(1, empty_sd());
-        let mut actual = TraceRecordBuffer::new(1, empty_sd());
-        expected.record_input_arg(Type::Int);
-        actual.record_input_arg(Type::Int);
-        let pos_e = expected.record_op1(OpCode::GuardTrue, Box::ResOp(0), None);
-        let pos_a = actual.record_guard_oprefs(OpCode::GuardTrue, &[OpRef(0)], &descr, &pool);
-        assert_eq!(pos_e, pos_a);
-        assert_eq!(expected._ops[..expected._pos], actual._ops[..actual._pos]);
-        // Side-table must carry the FailDescr.
-        let stored = actual.guard_descr(pos_a).expect("descr parked");
-        assert_eq!(stored.get_descr_index(), descr.get_descr_index());
-    }
-
-    /// Step 2d: `record_guard_oprefs_with_fail_args` additionally
-    /// parks fail_args in `_guard_fail_args`.
-    #[test]
-    fn test_record_guard_oprefs_with_fail_args_2d() {
-        let pool = crate::constant_pool::ConstantPool::new();
-        let descr = dummy_descr();
-        let mut buf = TraceRecordBuffer::new(2, empty_sd());
-        buf.record_input_arg(Type::Int);
-        buf.record_input_arg(Type::Int);
-        let pos = buf.record_guard_oprefs_with_fail_args(
-            OpCode::GuardTrue,
-            &[OpRef(0)],
-            &descr,
-            &[OpRef(0), OpRef(1)],
-            &pool,
-        );
-        let fail_args = buf.guard_fail_args(pos).expect("fail_args parked");
-        assert_eq!(fail_args, &[OpRef(0), OpRef(1)][..]);
-        // Guard descr also parked on the same key.
-        assert!(buf.guard_descr(pos).is_some());
-    }
-
-    /// Step 2d: a non-guard opcode must panic the guard recorder.
-    #[test]
-    #[should_panic(expected = "is not a guard")]
-    fn test_record_guard_oprefs_rejects_non_guard_2d() {
-        let pool = crate::constant_pool::ConstantPool::new();
-        let descr = dummy_descr();
-        let mut buf = TraceRecordBuffer::new(1, empty_sd());
-        buf.record_input_arg(Type::Int);
-        buf.record_guard_oprefs(OpCode::IntAdd, &[OpRef(0)], &descr, &pool);
     }
 
     /// Step 2d: `close_loop_oprefs` records a JUMP with no descr.

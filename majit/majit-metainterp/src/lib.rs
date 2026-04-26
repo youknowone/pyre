@@ -59,16 +59,27 @@ pub use jit_state::{
     DeoptMaterializationCache, JitState, PendingFieldWriteLayout, ResidualVirtualizableSync,
     ResumeDataResult,
 };
-pub use jitcode::{JitArgKind, JitCallArg, JitCode, JitCodeBuilder, LivenessInfo};
+pub use jitcode::{
+    BC_CATCH_EXCEPTION, BC_FLOAT_RETURN, BC_INT_RETURN, BC_LIVE, BC_REF_RETURN, BC_RVMPROF_CODE,
+    BC_VOID_RETURN, JitArgKind, JitCallArg, JitCode, JitCodeBuilder, LivenessInfo,
+    live_slots_for_state_field_jit,
+};
 pub use jitdriver::{DeclarativeJitDriver, JitDriver, JitDriverStaticData};
 pub use majit_backend::CompiledTraceInfo;
+// Re-export the canonical translate-side Assembler so macro-emitted
+// state-field JIT setup (e.g. `__JitMeta::install_canonical_liveness`)
+// can build a fresh Assembler without forcing each user crate to
+// declare a `majit-translate` dependency.  The same pattern is used
+// for `JitCode` / `BhDescr` re-exports above (`jitcode/mod.rs:4`).
+pub use majit_translate::jit_codewriter::assembler::Assembler;
 pub use parity::{TraceParityCase, assert_trace_parity, normalize_ops, normalize_trace};
 pub use pyjitpl::{
     BackEdgeAction, BlackholeRunResult, BridgeRetraceResult, ClosureRuntime, CompileOutcome,
     CompiledExitLayout, CompiledTerminalExitLayout, CompiledTraceLayout, DeadFrameArtifacts,
     DetailedDriverRunOutcome, DriverRunOutcome, InlineDecision, JitCodeMachine, JitCodeRuntime,
     JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, MetaInterpGlobalData,
-    MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, trace_jitcode,
+    MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, build_state_field_snapshot,
+    trace_jitcode,
 };
 pub use quasiimmut::QuasiImmut;
 pub use trace_ctx::{MergePoint, TraceCtx};

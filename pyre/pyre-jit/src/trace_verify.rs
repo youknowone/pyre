@@ -57,7 +57,6 @@ mod tests {
             FAKE_INT_TYPE,
             ob_type_descr(),
             intval_descr(),
-            &[obj],
         );
         let ops = get_ops(ctx);
         // GUARD_CLASS(box, cls): backend loads typeptr from obj at offset 0
@@ -98,7 +97,6 @@ mod tests {
             ob_type_descr(),
             intval_descr(),
             w_int_size_descr(),
-            &[OpRef(0), OpRef(1)],
         );
         let ops = get_ops(ctx);
         assert_eq!(
@@ -127,7 +125,6 @@ mod tests {
             FAKE_FLOAT_TYPE,
             ob_type_descr(),
             floatval_descr(),
-            &[obj],
         );
         let ops = get_ops(ctx);
         assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcF]);
@@ -144,7 +141,6 @@ mod tests {
             FAKE_INT_TYPE,
             immutable_ob_type_descr(),
             immutable_intval_descr(),
-            &[obj],
         );
         let ops = get_ops(ctx);
         // Immutable intval descr → GetfieldGcPureI for the value read.
@@ -162,7 +158,6 @@ mod tests {
             FAKE_FLOAT_TYPE,
             immutable_ob_type_descr(),
             immutable_floatval_descr(),
-            &[obj],
         );
         let ops = get_ops(ctx);
         assert_eq!(ops, vec![OpCode::GuardClass, OpCode::GetfieldGcPureF]);
@@ -196,7 +191,6 @@ mod tests {
             ob_type_descr(),
             floatval_descr(),
             w_float_size_descr(),
-            &[OpRef(0), OpRef(1)],
         );
         let ops = get_ops(ctx);
         assert_eq!(

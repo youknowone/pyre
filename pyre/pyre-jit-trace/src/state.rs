@@ -1811,7 +1811,6 @@ pub(crate) fn trace_unbox_int_with_resume_descr(
         type_addr,
         crate::descr::ob_type_descr(),
         intval_descr,
-        &[],
     )
 }
 
@@ -1834,7 +1833,6 @@ pub(crate) fn trace_unbox_float_with_resume(
         float_type_addr,
         crate::descr::ob_type_descr(),
         crate::descr::float_floatval_descr(),
-        &[],
     )
 }
 

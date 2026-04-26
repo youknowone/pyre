@@ -1801,9 +1801,49 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     // portal_ptr = eval_loop_jit at depth 0 (has jit_merge_point +
     // can_enter_jit back-edge), plain interpreter at depth > 0.
     if let Some(result) = try_function_entry_jit(frame) {
+        if majit_metainterp::majit_log_enabled() {
+            log_named_global_result(frame, "eval_with_jit_inner.try_function_entry_jit");
+        }
         return result;
     }
-    handle_jitexception(frame)
+    let result = handle_jitexception(frame);
+    if majit_metainterp::majit_log_enabled() {
+        log_named_global_result(frame, "eval_with_jit_inner.handle_jitexception");
+    }
+    result
+}
+
+fn log_named_global_result(frame: &PyFrame, label: &str) {
+    unsafe {
+        if frame.w_globals.is_null() {
+            return;
+        }
+        let Some(&value) = (*frame.w_globals).get("result") else {
+            return;
+        };
+        if value.is_null() {
+            eprintln!("[jit][{label}] result=NULL");
+            return;
+        }
+        // pyobject.rs:308 `is_int` returns true for both INT_TYPE and
+        // BOOL_TYPE, but W_BoolObject's layout differs from W_IntObject —
+        // calling w_int_get_value on a bool reads the wrong field. Match
+        // INT_TYPE strictly so the int payload read stays sound.
+        if pyre_object::pyobject::py_type_check(value, &pyre_object::pyobject::INT_TYPE) {
+            eprintln!(
+                "[jit][{label}] result_ptr=0x{:x} kind=int intval={}",
+                value as usize,
+                pyre_object::intobject::w_int_get_value(value),
+            );
+        } else if pyre_object::pyobject::is_bool(value) {
+            eprintln!("[jit][{label}] result_ptr=0x{:x} kind=bool", value as usize,);
+        } else {
+            eprintln!(
+                "[jit][{label}] result_ptr=0x{:x} kind=other",
+                value as usize,
+            );
+        }
+    }
 }
 
 /// warmspot.py:970-983 ContinueRunningNormally → portal_ptr(*args) parity.
@@ -2921,7 +2961,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
         // warmstate.py:503-511: procedure_token → enter unconditionally.
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit][func-entry] run compiled key={} arg0={:?} depth={} raw_finish_known={}",
+                "[jit][func-entry] run compiled frame=0x{:x} locals=0x{:x} key={} arg0={:?} depth={} raw_finish_known={}",
+                frame as *mut PyFrame as usize,
+                frame.locals_cells_stack_w as usize,
                 green_key,
                 debug_first_arg_int(frame),
                 call_depth(),
@@ -2956,7 +2998,9 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                 DetailedDriverRunOutcome::GuardFailure { .. } => "guard-failure",
             };
             eprintln!(
-                "[jit][func-entry] compiled outcome key={} arg0={:?} kind={}",
+                "[jit][func-entry] compiled outcome frame=0x{:x} locals=0x{:x} key={} arg0={:?} kind={}",
+                frame as *mut PyFrame as usize,
+                frame.locals_cells_stack_w as usize,
                 green_key,
                 debug_first_arg_int(frame),
                 kind
@@ -5841,6 +5885,7 @@ mod tests {
     fn test_branch_guard_preserves_pre_pop_stack_shape_with_compiled_trace_jitcode() {
         use majit_ir::{OpCode, OpRef, Type};
         use majit_metainterp::TraceCtx;
+        use majit_metainterp::recorder::SnapshotTagged;
         use pyre_interpreter::compile_exec;
         use pyre_interpreter::pyframe::PyFrame;
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
@@ -5897,24 +5942,55 @@ mod tests {
                 state.capture_generate_guard(OpCode::GuardTrue, &[truth]);
             }
 
-            let recorder = ctx.into_recorder();
-            let guard = recorder
+            // Task #91 slice 4a: production guard recording goes through
+            // `record_guard_typed` + `capture_resumedata` —
+            // `op.fail_args` stays None until the optimizer's
+            // `store_final_boxes_in_guard` writes it back from the
+            // snapshot.  Inspect the snapshot directly (the canonical
+            // RPython resume oracle) instead of the raw recorder buffer.
+            //
+            // Snapshot layout (opencoder.py:806 / build_framestack_snapshot):
+            //  - `vable_boxes` = full virtualizable image
+            //    `[frame_ptr, scalar_fields..., array_items...]`
+            //    (NUM_SCALAR_INPUTARGS scalars + locals/stack array slots).
+            //  - `frames[0].boxes` = top frame's active boxes (one per
+            //    live register at the resume PC).
+            let guard = ctx
                 .ops()
                 .last()
-                .expect("branch guard should be recorded");
-            let fail_args = guard
-                .fail_args
-                .as_ref()
-                .expect("branch guard should carry explicit fail args");
-            let n = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-            let active_boxes = &fail_args[n..];
+                .expect("branch guard should be recorded")
+                .clone();
             assert_eq!(guard.opcode, OpCode::GuardTrue);
-            assert_eq!(fail_args.len(), n + live_regs.len());
-            assert_eq!(fail_args[0], frame_ref);
+            let snapshot_id = guard.rd_resume_position;
             assert!(
-                active_boxes
-                    .windows(2)
-                    .any(|pair| pair == [lower_stack, truth]),
+                snapshot_id >= 0,
+                "branch guard must carry rd_resume_position pointing at its captured snapshot",
+            );
+            let snapshot = &ctx.snapshots()[snapshot_id as usize];
+            let n = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            assert!(
+                snapshot.vable_boxes.len() >= n,
+                "vable_boxes must contain at least the scalar virtualizable header: {:?}",
+                snapshot.vable_boxes
+            );
+            // vable_boxes[0] = frame_ptr — the encoded form of `frame_ref`,
+            // which the test seeded as `ctx.const_ref(frame_ptr as i64)`.
+            assert_eq!(
+                snapshot.vable_boxes[0],
+                SnapshotTagged::Const(frame_ptr as i64, Type::Ref)
+            );
+            let active_boxes = snapshot
+                .frames
+                .first()
+                .map(|f| f.boxes.as_slice())
+                .unwrap_or(&[]);
+            assert_eq!(active_boxes.len(), live_regs.len());
+            assert!(
+                active_boxes.windows(2).any(|pair| matches!(
+                    pair,
+                    [SnapshotTagged::Box(li, _), SnapshotTagged::Box(ti, _)]
+                        if *li == lower_stack.0 && *ti == truth.0
+                )),
                 "pre-pop stack order should preserve lower stack slot before truth: {:?}",
                 active_boxes
             );
@@ -5928,6 +6004,7 @@ mod tests {
     fn test_branch_truth_uses_concrete_parameter_with_compiled_trace_jitcode() {
         use majit_ir::{OpCode, OpRef, Type};
         use majit_metainterp::TraceCtx;
+        use majit_metainterp::recorder::SnapshotTagged;
         use pyre_interpreter::pyframe::PyFrame;
         use pyre_interpreter::{BranchOpcodeHandler, compile_exec};
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
@@ -5987,20 +6064,39 @@ mod tests {
         );
         <MIFrame as BranchOpcodeHandler>::leave_branch_truth(&mut state).unwrap();
 
-        let recorder = ctx.into_recorder();
-        let guard = recorder.ops().last().expect("guard op should be present");
-        let fail_args = guard
-            .fail_args
-            .as_ref()
-            .expect("mixed-bank guard should carry fail args");
-        let n = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        let active_boxes = &fail_args[n..];
+        // Task #91 slice 4a: snapshot is the resume-data oracle, not
+        // `op.fail_args` (None until the optimizer's
+        // `store_final_boxes_in_guard` writes it back).
+        let guard = ctx
+            .ops()
+            .last()
+            .expect("guard op should be present")
+            .clone();
         assert_eq!(guard.opcode, OpCode::GuardTrue);
-        assert_eq!(fail_args.len(), n + live_regs.len());
+        let snapshot_id = guard.rd_resume_position;
         assert!(
-            active_boxes
-                .windows(2)
-                .any(|pair| pair == [lower_stack, truth]),
+            snapshot_id >= 0,
+            "guard must carry rd_resume_position pointing at its captured snapshot",
+        );
+        let snapshot = &ctx.snapshots()[snapshot_id as usize];
+        let n = pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+        assert!(
+            snapshot.vable_boxes.len() >= n,
+            "vable_boxes must contain at least the scalar virtualizable header: {:?}",
+            snapshot.vable_boxes
+        );
+        let active_boxes = snapshot
+            .frames
+            .first()
+            .map(|f| f.boxes.as_slice())
+            .unwrap_or(&[]);
+        assert_eq!(active_boxes.len(), live_regs.len());
+        assert!(
+            active_boxes.windows(2).any(|pair| matches!(
+                pair,
+                [SnapshotTagged::Box(li, _), SnapshotTagged::Box(ti, _)]
+                    if *li == lower_stack.0 && *ti == truth.0
+            )),
             "mixed-bank guard should preserve the Ref+Int stack pair order: {:?}",
             active_boxes
         );

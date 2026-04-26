@@ -1,6 +1,6 @@
 mod assembler;
 
-pub use assembler::JitCodeBuilder;
+pub use assembler::{JitCodeBuilder, live_slots_for_state_field_jit};
 pub use majit_translate::jitcode::{
     BhCallDescr as CanonicalBhCallDescr, BhDescr as CanonicalBhDescr, JitCode as CanonicalJitCode,
 };
@@ -68,7 +68,7 @@ pub(crate) const BC_SETARRAYITEM_VABLE_F: u8 = 73;
 pub(crate) const BC_ARRAYLEN_VABLE: u8 = 74;
 pub(crate) const BC_HINT_FORCE_VIRTUALIZABLE: u8 = 75;
 /// RPython bhimpl_ref_return: callee returns a ref value.
-pub(crate) const BC_REF_RETURN: u8 = 76;
+pub const BC_REF_RETURN: u8 = 76;
 /// blackhole.py bhimpl_raise: raise an exception from a ref register.
 pub(crate) const BC_RAISE: u8 = 77;
 /// blackhole.py bhimpl_reraise: re-raise exception_last_value.
@@ -90,14 +90,14 @@ pub(crate) const BC_FLOAT_GUARD_VALUE: u8 = 86;
 /// blackhole.py:1066 bhimpl_jit_merge_point: portal merge point marker.
 pub(crate) const BC_JIT_MERGE_POINT: u8 = 87;
 pub const BC_LIVE: u8 = 88;
-pub(crate) const BC_CATCH_EXCEPTION: u8 = 89;
+pub const BC_CATCH_EXCEPTION: u8 = 89;
 pub(crate) const BC_LAST_EXC_VALUE: u8 = 90;
 /// RPython blackhole.py:987 `last_exception/>i`.
 pub(crate) const BC_LAST_EXCEPTION: u8 = 129;
 /// RPython blackhole.py:976-985 `goto_if_exception_mismatch/iL`.
 pub(crate) const BC_GOTO_IF_EXCEPTION_MISMATCH: u8 = 130;
 /// blackhole.py bhimpl_rvmprof_code: rvmprof enter/leave marker.
-pub(crate) const BC_RVMPROF_CODE: u8 = 91;
+pub const BC_RVMPROF_CODE: u8 = 91;
 
 // RPython jtransform.py:196 `optimize_goto_if_not` fuses
 // `v = int_lt(x, y); exitswitch = v` into
@@ -187,9 +187,9 @@ pub(crate) const BC_GOTO_IF_NOT_PTR_NONZERO: u8 = 158;
 // still needs every upstream return flavour so
 // `pyjitpl.py:2240-2243` `setup_insns` fields do not fall back to
 // `u8::MAX` sentinels.
-pub(crate) const BC_INT_RETURN: u8 = 148;
-pub(crate) const BC_FLOAT_RETURN: u8 = 149;
-pub(crate) const BC_VOID_RETURN: u8 = 150;
+pub const BC_INT_RETURN: u8 = 148;
+pub const BC_FLOAT_RETURN: u8 = 149;
+pub const BC_VOID_RETURN: u8 = 150;
 
 pub(crate) const MAX_HOST_CALL_ARITY: usize = 16;
 

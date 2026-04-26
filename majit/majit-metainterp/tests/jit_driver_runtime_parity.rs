@@ -11,22 +11,18 @@ macro_rules! close_loop_with_increment_guard_failure {
     ($ctx:expr, $sym:expr) => {{
         let null = $ctx.const_null();
         let frame_is_null = $ctx.record_op(OpCode::PtrEq, &[$sym[0], null]);
-        $ctx.record_guard_typed_with_fail_args(
+        let g1 = $ctx.record_guard_typed(
             OpCode::GuardFalse,
             &[frame_is_null],
             vec![Type::Ref, Type::Int],
-            &[$sym[0], $sym[1]],
         );
+        $ctx.set_fail_args(g1, &[$sym[0], $sym[1]]);
         let one = $ctx.const_int(1);
         let incremented = $ctx.record_op(OpCode::IntAdd, &[$sym[1], one]);
         let two = $ctx.const_int(2);
         let reached_second_guard = $ctx.record_op(OpCode::IntEq, &[incremented, two]);
-        $ctx.record_guard_with_fail_args(
-            OpCode::GuardFalse,
-            &[reached_second_guard],
-            1,
-            &[incremented],
-        );
+        let g2 = $ctx.record_guard(OpCode::GuardFalse, &[reached_second_guard], 1);
+        $ctx.set_fail_args(g2, &[incremented]);
         let finish_args = $sym.clone();
         let finish_arg_types = finish_args
             .iter()

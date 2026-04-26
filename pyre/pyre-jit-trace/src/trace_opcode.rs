@@ -2154,35 +2154,34 @@ impl MIFrame {
                 &callee_active_boxes,
                 &callee_snapshot_types_full,
             );
-            // pyjitpl.py:2558-2585 generate_guard parity: record guard with
-            // a raw fail_args "hint" (header + active_boxes). The optimizer's
-            // store_final_boxes_in_guard (mod.rs:finalize_guard_resume_data)
-            // calls ResumeDataLoopMemo::finish() which rebuilds fail_args
-            // from the snapshot via _number_boxes — Consts are dropped from
-            // liveboxes during numbering (resume.py:202-207 getconst path),
-            // so the post-optimizer fail_args naturally satisfy regalloc.py:1203.
-            let callee_fail_args: Vec<OpRef> = {
-                let s = self.sym();
-                let mut fa = vec![
-                    s.frame,
-                    s.vable_last_instr,
-                    s.vable_pycode,
-                    s.vable_valuestackdepth,
-                    s.vable_debugdata,
-                    s.vable_lastblock,
-                    s.vable_w_globals,
-                ];
-                fa.extend_from_slice(&callee_active_boxes);
-                fa
-            };
-            let (fail_args, types) = self.extend_fail_args_and_types_with_parents(
+            // Task #91 slice 4a: snapshot is the source of truth — the
+            // optimizer's `store_final_boxes_in_guard`
+            // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args` from
+            // the snapshot via `op.store_final_boxes(liveboxes)`
+            // (mod.rs:3392), so the inline `fail_args` copy that the
+            // legacy `record_guard_typed_with_fail_args` path used to
+            // write was redundant.  Mirrors RPython
+            // `pyjitpl.MetaInterp.generate_guard` (pyjitpl.py:2558-2602)
+            // which records the guard with no inline fail_args and lets
+            // `capture_resumedata` + `_number_boxes` populate them from
+            // the snapshot chain.
+            //
+            // The state-fields header `[s.frame, s.vable_*]` that fed
+            // the inline fail_args is now dead and removed; the
+            // snapshot's `vable_boxes` already encodes the same
+            // information via `build_virtualizable_boxes`. Parent-frame
+            // types are still collected via
+            // `extend_fail_args_and_types_with_parents` (the discarded
+            // `_fail_args` is the residual of the legacy path; the
+            // parent-types-only refactor is a separate cleanup).
+            let (_fail_args, types) = self.extend_fail_args_and_types_with_parents(
                 ctx,
-                callee_fail_args,
+                Vec::new(),
                 callee_snapshot_types_full,
             );
             let snapshot_id = ctx.capture_resumedata(snapshot);
 
-            ctx.record_guard_typed_with_fail_args(opcode, args, types, &fail_args);
+            ctx.record_guard_typed(opcode, args, types);
             ctx.set_last_guard_resume_position(snapshot_id);
             return;
         }
@@ -2219,22 +2218,19 @@ impl MIFrame {
         let active_boxes = self.get_list_of_active_boxes(ctx, false, after_residual_call);
         let snapshot_full_types = self.build_fail_arg_types_for_active_boxes(&active_boxes);
         let fail_arg_types = snapshot_full_types.clone();
-        let fail_args: Vec<OpRef> = {
-            let s = self.sym();
-            let mut fa = vec![
-                s.frame,
-                s.vable_last_instr,
-                s.vable_pycode,
-                s.vable_valuestackdepth,
-                s.vable_debugdata,
-                s.vable_lastblock,
-                s.vable_w_globals,
-            ];
-            fa.extend_from_slice(&active_boxes);
-            fa
-        };
 
-        ctx.record_guard_typed_with_fail_args(opcode, args, fail_arg_types, &fail_args);
+        // Task #91 slice 4a: snapshot is the source of truth — the
+        // optimizer's `store_final_boxes_in_guard`
+        // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args` from the
+        // snapshot built below via `op.store_final_boxes(liveboxes)`
+        // (mod.rs:3392), so the inline `fail_args` copy that the legacy
+        // `record_guard_typed_with_fail_args` path used to write was
+        // redundant.  Mirrors RPython
+        // `pyjitpl.MetaInterp.generate_guard` (pyjitpl.py:2558-2602)
+        // which records the guard with no inline fail_args and lets
+        // `capture_resumedata` + `_number_boxes` populate them from the
+        // snapshot chain.
+        ctx.record_guard_typed(opcode, args, fail_arg_types);
 
         // pyjitpl.py:2579: self.capture_resumedata(resumepc, after_residual_call)
         self.capture_resumedata(
@@ -2816,28 +2812,8 @@ impl MIFrame {
         self.flush_to_frame_for_guard(ctx);
         // pyjitpl.py:177: get_list_of_active_boxes uses frame.pc for liveness
         let callee_active_boxes = self.get_list_of_active_boxes(ctx, false, false);
-        // pyjitpl.py:2558-2585 generate_guard parity: record a raw fail_args
-        // "hint". store_final_boxes_in_guard rebuilds the real fail_args from
-        // the snapshot via _number_boxes (Consts go to TAGCONST, not liveboxes).
         let callee_snapshot_types_full =
             self.build_fail_arg_types_for_active_boxes(&callee_active_boxes);
-
-        let callee_fail_args: Vec<OpRef> = {
-            let s = self.sym();
-            // interp_jit.py:25-31 scalar field order.
-            // NUM_SCALAR_INPUTARGS = 7: frame + 6 static fields.
-            let mut fa = vec![
-                s.frame,
-                s.vable_last_instr,
-                s.vable_pycode,
-                s.vable_valuestackdepth,
-                s.vable_debugdata,
-                s.vable_lastblock,
-                s.vable_w_globals,
-            ];
-            fa.extend_from_slice(&callee_active_boxes);
-            fa
-        };
 
         // opencoder.py:819 capture_resumedata(framestack) parity:
         // Encode the full framestack [callee (top) with resume_pc=other_target,
@@ -2851,14 +2827,25 @@ impl MIFrame {
             &callee_active_boxes,
             &callee_snapshot_types_full,
         );
-        let (fail_args, types) = self.extend_fail_args_and_types_with_parents(
+        // Task #91 slice 4a: snapshot is the source of truth — the
+        // optimizer's `store_final_boxes_in_guard`
+        // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args` from
+        // the snapshot via `op.store_final_boxes(liveboxes)`
+        // (mod.rs:3392), so the inline `fail_args` copy that the legacy
+        // `record_guard_typed_with_fail_args` path used to write was
+        // redundant.  Mirrors RPython
+        // `pyjitpl.MetaInterp.generate_guard` (pyjitpl.py:2558-2602)
+        // which records the guard with no inline fail_args and lets
+        // `capture_resumedata` + `_number_boxes` populate them from the
+        // snapshot chain.
+        let (_fail_args, types) = self.extend_fail_args_and_types_with_parents(
             ctx,
-            callee_fail_args,
+            Vec::new(),
             callee_snapshot_types_full,
         );
         let snapshot_id = ctx.capture_resumedata(snapshot);
 
-        ctx.record_guard_typed_with_fail_args(opcode, &[truth], types, &fail_args);
+        ctx.record_guard_typed(opcode, &[truth], types);
         ctx.set_last_guard_resume_position(snapshot_id);
 
         // pyjitpl.py:2602: frame.pc = saved_pc (restore all, generate_guard_core parity)
@@ -4878,38 +4865,32 @@ impl MIFrame {
                 this.flush_to_frame_for_guard(ctx);
                 let active_boxes = this.get_list_of_active_boxes(ctx, false, after_residual_call);
                 let fail_arg_types = this.build_fail_arg_types_for_active_boxes(&active_boxes);
-                let callee_fail_args = {
-                    let s = this.sym();
-                    let mut fa = vec![
-                        s.frame,
-                        s.vable_last_instr,
-                        s.vable_pycode,
-                        s.vable_valuestackdepth,
-                        s.vable_debugdata,
-                        s.vable_lastblock,
-                        s.vable_w_globals,
-                    ];
-                    fa.extend_from_slice(&active_boxes);
-                    fa
-                };
 
                 // capture_resumedata parity: full framestack snapshot.
                 // pyjitpl.py:2597: capture_resumedata(self.framestack, ...)
                 let snapshot =
                     this.build_framestack_snapshot(ctx, resume_pc, &active_boxes, &fail_arg_types);
-                let (all_fail_args, all_types) = this.extend_fail_args_and_types_with_parents(
-                    ctx,
-                    callee_fail_args,
-                    fail_arg_types,
-                );
+                // Task #91 slice 4a: snapshot is the source of truth —
+                // the optimizer's `store_final_boxes_in_guard`
+                // (`optimizeopt/mod.rs:3200`) overwrites `op.fail_args`
+                // from the snapshot via
+                // `op.store_final_boxes(liveboxes)` (mod.rs:3392), so
+                // the inline `record_guard_typed_with_fail_args` copy
+                // was redundant.  Mirrors RPython
+                // `pyjitpl.MetaInterp.generate_guard`
+                // (pyjitpl.py:2558-2602) which records the guard with
+                // no inline fail_args and lets `capture_resumedata` +
+                // `_number_boxes` populate them from the snapshot
+                // chain.
+                let (_all_fail_args, all_types) =
+                    this.extend_fail_args_and_types_with_parents(ctx, Vec::new(), fail_arg_types);
                 let snapshot_id = ctx.capture_resumedata(snapshot);
 
                 let exc_type_const = ctx.const_int(exc_type_ptr);
-                let op = ctx.record_guard_typed_with_fail_args(
+                let op = ctx.record_guard_typed(
                     majit_ir::OpCode::GuardException,
                     &[exc_type_const],
                     all_types,
-                    &all_fail_args,
                 );
                 ctx.set_last_guard_resume_position(snapshot_id);
 

@@ -259,22 +259,25 @@ pub fn decode_offset(jitcode: &[u8], pc: usize) -> usize {
 
 /// RPython liveness.py:147-166 `encode_liveness(live)`.
 ///
-/// Encodes a single register-kind bitset: `live` is a sorted list of
-/// register indices (each `< 256`). Returns the packed bitset bytes
-/// (no length header — the caller is responsible for emitting the
-/// three `len_i/len_r/len_f` header bytes).
+/// Encodes a single register-kind bitset: `live` is a list of register
+/// indices (each `< 256`). Returns the packed bitset bytes (no length
+/// header — the caller is responsible for emitting the three
+/// `len_i/len_r/len_f` header bytes).
+///
+/// Mirrors RPython's `live = sorted(live)` (liveness.py:148): the input
+/// is sorted internally so callers can pass arbitrary-order or
+/// duplicated slices without normalization.
 pub fn encode_liveness(live: &[u8]) -> Vec<u8> {
-    // RPython liveness.py:148 `live = sorted(live)` — enforce sorted input.
-    debug_assert!(
-        live.windows(2).all(|w| w[0] <= w[1]),
-        "encode_liveness: input must be sorted"
-    );
+    // RPython liveness.py:148 `live = sorted(live)`.
+    let mut sorted: Vec<u8> = live.to_vec();
+    sorted.sort_unstable();
+    sorted.dedup();
     let mut liveness: Vec<u8> = Vec::new();
     let mut offset: u32 = 0;
     let mut char_: u32 = 0;
     let mut i = 0;
-    while i < live.len() {
-        let x = live[i] as u32;
+    while i < sorted.len() {
+        let x = sorted[i] as u32;
         let x = x.wrapping_sub(offset);
         if x >= 8 {
             liveness.push(char_ as u8);

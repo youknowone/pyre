@@ -592,19 +592,20 @@ pub fn trace_unbox_int(
     int_type_addr: i64,
     ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
-    fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
     // GUARD_CLASS(box, cls): guard takes object box directly,
     // backend loads typeptr at offset 0 (llgraph/runner.py:1245).
+    // Production callers (`trace_unbox_int_with_resume_descr`,
+    // `trace_unbox_float_with_resume`) already emit the GuardClass via
+    // `frame.generate_guard` — by the time control reaches here,
+    // `is_class_known(obj)` returns true and this branch is dead.  In
+    // unit tests (`pyre/pyre-jit/src/trace_verify.rs`) the GuardClass is
+    // recorded with no resume context; the test asserts only on the
+    // emitted opcode shape.
     if !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(int_type_addr);
-        ctx.record_guard_typed_with_fail_args(
-            OpCode::GuardClass,
-            &[obj, type_const],
-            vec![majit_ir::Type::Ref; fail_args.len()],
-            fail_args,
-        );
+        ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const], Vec::new());
         ctx.heap_cache_mut()
             .class_now_known(obj, majit_ir::GcRef(int_type_addr as usize));
     }
@@ -651,16 +652,18 @@ pub fn trace_int_binop_ovf(
     ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
     size_descr: majit_ir::DescrRef,
-    fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
-    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
-    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
+    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
+    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
     let result = ctx.record_op(opcode, &[a_val, b_val]);
-    ctx.record_guard_typed_with_fail_args(
-        OpCode::GuardNoOverflow, &[],
-        vec![majit_ir::Type::Ref; fail_args.len()], fail_args,
-    );
+    // No production caller of this AST→trace helper: pyre-jit-trace
+    // routes overflow guards through `frame.generate_guard` in
+    // `generated_binary_int_value` instead.  The bare
+    // `record_guard_typed` keeps the guard shape correct in unit tests
+    // (`trace_verify.rs`) without a synthetic snapshot — convergence
+    // path is Task #72 (codegen.rs → register-machine jitcode).
+    ctx.record_guard_typed(OpCode::GuardNoOverflow, &[], Vec::new());
     trace_box_int(ctx, result, size_descr, ob_type_descr, intval_descr, int_type_addr)
 }
 
@@ -674,10 +677,9 @@ pub fn trace_int_binop(
     ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
     size_descr: majit_ir::DescrRef,
-    fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
-    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
+    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
+    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     trace_box_int(ctx, result, size_descr, ob_type_descr, intval_descr, int_type_addr)
 }
@@ -691,10 +693,9 @@ pub fn trace_int_compare(
     int_type_addr: i64,
     ob_type_descr: majit_ir::DescrRef,
     intval_descr: majit_ir::DescrRef,
-    fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
-    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone(), fail_args);
+    let a_val = trace_unbox_int(ctx, a, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
+    let b_val = trace_unbox_int(ctx, b, int_type_addr, ob_type_descr.clone(), intval_descr.clone());
     ctx.record_op(opcode, &[a_val, b_val])
 }
 
@@ -727,17 +728,11 @@ pub fn trace_unbox_float(
     float_type_addr: i64,
     ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
-    fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
     use majit_ir::OpCode;
     if !ctx.heap_cache().is_class_known(obj) {
         let type_const = ctx.const_int(float_type_addr);
-        ctx.record_guard_typed_with_fail_args(
-            OpCode::GuardClass,
-            &[obj, type_const],
-            vec![majit_ir::Type::Ref; fail_args.len()],
-            fail_args,
-        );
+        ctx.record_guard_typed(OpCode::GuardClass, &[obj, type_const], Vec::new());
         ctx.heap_cache_mut()
             .class_now_known(obj, majit_ir::GcRef(float_type_addr as usize));
     }
@@ -774,10 +769,9 @@ pub fn trace_float_binop(
     ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
     size_descr: majit_ir::DescrRef,
-    fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_float(ctx, a, float_type_addr, ob_type_descr.clone(), floatval_descr.clone(), fail_args);
-    let b_val = trace_unbox_float(ctx, b, float_type_addr, ob_type_descr.clone(), floatval_descr.clone(), fail_args);
+    let a_val = trace_unbox_float(ctx, a, float_type_addr, ob_type_descr.clone(), floatval_descr.clone());
+    let b_val = trace_unbox_float(ctx, b, float_type_addr, ob_type_descr.clone(), floatval_descr.clone());
     let result = ctx.record_op(opcode, &[a_val, b_val]);
     trace_box_float(ctx, result, size_descr, ob_type_descr, floatval_descr, float_type_addr)
 }
@@ -791,10 +785,9 @@ pub fn trace_float_compare(
     float_type_addr: i64,
     ob_type_descr: majit_ir::DescrRef,
     floatval_descr: majit_ir::DescrRef,
-    fail_args: &[majit_ir::OpRef],
 ) -> majit_ir::OpRef {
-    let a_val = trace_unbox_float(ctx, a, float_type_addr, ob_type_descr.clone(), floatval_descr.clone(), fail_args);
-    let b_val = trace_unbox_float(ctx, b, float_type_addr, ob_type_descr.clone(), floatval_descr.clone(), fail_args);
+    let a_val = trace_unbox_float(ctx, a, float_type_addr, ob_type_descr.clone(), floatval_descr.clone());
+    let b_val = trace_unbox_float(ctx, b, float_type_addr, ob_type_descr.clone(), floatval_descr.clone());
     ctx.record_op(opcode, &[a_val, b_val])
 }
 "#);

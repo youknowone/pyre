@@ -237,14 +237,15 @@ impl Assembler {
                 state.label_positions.insert(*label, state.code.len());
             }
 
-            // RPython assembler.py:146-158: -live- → encode liveness
-            // Separates live registers by kind (int/ref/float) and encodes
-            // as offset into shared liveness table.
+            // RPython assembler.py:146-158 `Register('-live-', ...)`
+            // case in `write_insn`: emit the `live/` opcode followed
+            // by the 2-byte offset returned from `_encode_liveness`.
             FlatOp::Live { live_values } => {
                 self.num_liveness_ops += 1;
                 let key = state.code.len();
                 state.startpoints.insert(key);
-                // Separate live values by kind
+                // assembler.py:151-156 `live_i, live_r, live_f` —
+                // partition live values by kind via the regalloc result.
                 let mut live_i = Vec::new();
                 let mut live_r = Vec::new();
                 let mut live_f = Vec::new();
@@ -256,37 +257,19 @@ impl Assembler {
                         RegKind::Float => live_f.push(color),
                     }
                 }
-                let opnum = self.get_opnum("live/");
-                state.code.push(opnum);
-                // RPython assembler.py:234-248: _encode_liveness
-                // Deduplicate liveness data in shared table. Bytecode
-                // gets a 2-byte offset into all_liveness.
+                // assembler.py:236 `key = (frozenset(live_i), …)` — pyre
+                // deduplicates with sorted `Vec<u8>` keys; sort each kind
+                // so equal sets compare equal under the `Vec<u8>` Eq impl.
                 live_i.sort();
                 live_r.sort();
                 live_f.sort();
-                let liveness_key = (live_i.clone(), live_r.clone(), live_f.clone());
-                let offset = if let Some(&pos) = self.all_liveness_positions.get(&liveness_key) {
-                    pos
-                } else {
-                    let pos = self.all_liveness.len();
-                    self.all_liveness_positions.insert(liveness_key, pos);
-                    // RPython assembler.py:241: 3 count bytes
-                    self.all_liveness.push(live_i.len() as u8);
-                    self.all_liveness.push(live_r.len() as u8);
-                    self.all_liveness.push(live_f.len() as u8);
-                    // RPython assembler.py:243-247: encode_liveness per kind
-                    // liveness.py:147-166: bitset encoding — each byte is an
-                    // 8-bit bitmap of register indices (bit N = reg N is live).
-                    for live in [&live_i, &live_r, &live_f] {
-                        let encoded = encode_liveness(live);
-                        self.all_liveness.extend_from_slice(&encoded);
-                    }
-                    self.all_liveness_length = self.all_liveness.len();
-                    pos
-                };
-                // RPython liveness.py:127-131: encode_offset — 2-byte LE
-                state.code.push((offset & 0xFF) as u8);
-                state.code.push((offset >> 8) as u8);
+                // assembler.py:148 `self.code.append(chr(self.insns['live/']))`
+                let opnum = self.get_opnum("live/");
+                state.code.push(opnum);
+                // assembler.py:158 `self._encode_liveness(live_i, live_r, live_f)`
+                // — appends the 2-byte offset into `state.code` after
+                // registering or reusing the canonical entry.
+                self._encode_liveness(&live_i, &live_r, &live_f, &mut state.code);
             }
 
             // RPython assembler.py:141-142: '---' → skip
@@ -535,6 +518,67 @@ impl Assembler {
                 state.code.push(reg);
             }
         }
+    }
+
+    /// RPython `assembler.py:234-248` `_encode_liveness(live_i, live_r,
+    /// live_f)` — register a `(live_i, live_r, live_f)` triple in the
+    /// shared `all_liveness` table (deduplicating against
+    /// `all_liveness_positions`) and append the 2-byte offset of the
+    /// canonical entry into `code`.
+    ///
+    /// Mirrors RPython `assembler.py:235`
+    /// `key = (frozenset(live_i), frozenset(live_r), frozenset(live_f))`:
+    /// the cache key is set-valued, so callers may pass arbitrary-order
+    /// or duplicated slices.  Each kind's effective payload is the
+    /// sorted, deduplicated set, exactly as `liveness.py:148` `live =
+    /// sorted(live)` produces during inner encoding.
+    ///
+    /// On a cache miss we append three header bytes
+    /// (`len(live_i)`, `len(live_r)`, `len(live_f)`) followed by
+    /// `encode_liveness` of each kind, exactly mirroring upstream
+    /// `assembler.py:241-247` byte order.  The returned offset is
+    /// finally written via `liveness::encode_offset` (parity with
+    /// `liveness.py:127-131`).
+    pub fn _encode_liveness(
+        &mut self,
+        live_i: &[u8],
+        live_r: &[u8],
+        live_f: &[u8],
+        code: &mut Vec<u8>,
+    ) {
+        // assembler.py:235 `key = (frozenset(live_i), frozenset(live_r),
+        // frozenset(live_f))`.  Pyre normalises by sort+dedup so the
+        // `Vec<u8>` cache key matches across equivalent sets.
+        let normalize = |slice: &[u8]| -> Vec<u8> {
+            let mut v = slice.to_vec();
+            v.sort_unstable();
+            v.dedup();
+            v
+        };
+        let live_i = normalize(live_i);
+        let live_r = normalize(live_r);
+        let live_f = normalize(live_f);
+        let key = (live_i.clone(), live_r.clone(), live_f.clone());
+        let pos = if let Some(&cached) = self.all_liveness_positions.get(&key) {
+            cached
+        } else {
+            let pos = self.all_liveness.len();
+            self.all_liveness_positions.insert(key, pos);
+            // assembler.py:241 `chr(len(live_i)) + chr(len(live_r)) + chr(len(live_f))`
+            self.all_liveness.push(live_i.len() as u8);
+            self.all_liveness.push(live_r.len() as u8);
+            self.all_liveness.push(live_f.len() as u8);
+            // assembler.py:243-247 `for live in live_i, live_r, live_f:
+            // liveness = encode_liveness(live); …`
+            for live in [live_i.as_slice(), live_r.as_slice(), live_f.as_slice()] {
+                let encoded = crate::jit_codewriter::liveness::encode_liveness(live);
+                self.all_liveness.extend_from_slice(&encoded);
+            }
+            self.all_liveness_length = self.all_liveness.len();
+            pos
+        };
+        // assembler.py:248 `encode_offset(pos, self.code)`.
+        crate::jit_codewriter::liveness::encode_offset(pos, code);
     }
 
     /// Encode a [`LinkArg`] source operand for `{kind}_copy` /
@@ -1788,34 +1832,6 @@ fn extract_element_type_from_str(type_str: &str) -> Option<String> {
     None
 }
 
-/// RPython liveness.py:147-166: encode_liveness.
-///
-/// Encodes a sorted set of register indices as a bitset. Each byte
-/// represents 8 consecutive register indices: bit N = register (offset+N)
-/// is live. The output is a compact bitmap.
-fn encode_liveness(live: &[u8]) -> Vec<u8> {
-    let mut result = Vec::new();
-    let mut offset: u16 = 0;
-    let mut byte: u8 = 0;
-    let mut i = 0;
-    while i < live.len() {
-        let x = live[i] as u16;
-        let rel = x - offset;
-        if rel >= 8 {
-            result.push(byte);
-            byte = 0;
-            offset += 8;
-            continue;
-        }
-        byte |= 1 << rel;
-        i += 1;
-    }
-    if byte != 0 {
-        result.push(byte);
-    }
-    result
-}
-
 /// Convert OpKind to an opname string for the assembler's instruction table.
 /// RPython: the opname comes from SpaceOperation.opname.
 /// Convert OpKind to a typed opname matching RPython's jtransform output.
@@ -1968,6 +1984,31 @@ impl Assembler {
     /// BlackholeInterpBuilder::setup_insns() to build the dispatch table.
     pub fn insns(&self) -> &HashMap<String, u8> {
         &self.insns
+    }
+
+    /// Register an `(opname/argcodes, opnum)` pair into `self.insns`.
+    ///
+    /// RPython `assembler.py:222 self.insns[key] = opnum` records every
+    /// opcode the assembler emits during `assemble()`.  Pyre's
+    /// state-field-JIT macro path skips `assemble()` entirely (the
+    /// `JitCodeBuilder` emits BC_* directly), so the canonical entries
+    /// — `live/`, `catch_exception/L`, `*_return/*` — are populated
+    /// here at install time so `MetaInterpStaticData::setup_insns`
+    /// (`pyjitpl.py:2227-2243`) can do the dynamic
+    /// `insns.get(name)` lookup instead of a parallel hardcoded
+    /// `BC_*` seeding block.
+    pub fn register_insn(&mut self, name: &str, opnum: u8) {
+        self.insns.insert(name.to_string(), opnum);
+    }
+
+    /// RPython `assembler.py:29 self.all_liveness = []` — the shared
+    /// liveness byte stream populated by `_encode_liveness`.  Returned
+    /// as a contiguous `&[u8]` view so consumers (notably
+    /// `MetaInterpStaticData::finish_setup` per `pyjitpl.py:2264`) can
+    /// take a snapshot without depending on the dedup cache or
+    /// position table.
+    pub fn all_liveness(&self) -> &[u8] {
+        &self.all_liveness
     }
 
     /// Snapshot the descriptor table after all jitcodes have been fully

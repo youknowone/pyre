@@ -121,8 +121,19 @@ fn generate_jitcode_arm(
                     .or_else(|| jitcode_lower::try_generate_jitcode_body(&arm.original_body));
 
             match code {
+                // RPython `assembler.py:146-158` emits a `live/<offset>`
+                // marker ahead of every guard-bearing instruction during
+                // codewriter assemble.  The placeholder offset (0) is
+                // canonical-entry-unaware here; the orth-9 wiring will
+                // register the per-`__JitMeta` canonical liveness entry
+                // and patch the offset.  Until then, the dispatcher's
+                // `BC_LIVE` arm (`dispatch.rs`) no-ops the marker per
+                // `blackhole.py:950 bhimpl_live`, and no
+                // `MIFrame::get_list_of_active_boxes` consumer reads
+                // this offset yet.
                 Some(code) => quote! {
                     let mut __builder = majit_metainterp::JitCodeBuilder::new();
+                    let _live_offset_patch = __builder.live_placeholder();
                     #promote_preamble
                     #code
                     Some(__builder.finish())

@@ -688,6 +688,41 @@ impl JitCodeBuilder {
             .push((offset, ConstKind::Int, const_idx));
     }
 
+    /// RPython `assembler.py:146-158` `Register('-live-', ...)` arm in
+    /// `write_insn` — emit the `live/` opcode followed by the 2-byte
+    /// offset returned from `Assembler._encode_liveness`.
+    ///
+    /// ```python
+    /// elif insn[i].is_live():
+    ///     self.code.append(chr(self.insns['live/']))   # 148
+    ///     live_i = self.get_liveness_info(insn[i:], 'int')
+    ///     live_r = self.get_liveness_info(insn[i:], 'ref')
+    ///     live_f = self.get_liveness_info(insn[i:], 'float')
+    ///     self._encode_liveness(live_i, live_r, live_f)  # 158
+    /// ```
+    ///
+    /// Mirrors `Assembler::_encode_liveness` (assembler.py:235): the
+    /// cache key is built from the set-equivalent (sorted, deduplicated)
+    /// view of each `live_*` slice, so callers may pass arbitrary order.
+    ///
+    /// Pyre keeps `live_placeholder` + `patch_live_offset` below for
+    /// deferred-patch callers that must emit the LIVE op before the
+    /// canonical liveness entry is known (e.g., the macro state-field
+    /// jitcode build registers its canonical entry once per process,
+    /// long after individual jitcode bytes are written).
+    pub fn live(
+        &mut self,
+        asm: &mut majit_translate::jit_codewriter::assembler::Assembler,
+        live_i: &[u8],
+        live_r: &[u8],
+        live_f: &[u8],
+    ) {
+        // assembler.py:148 `self.code.append(chr(self.insns['live/']))`
+        self.write_insn("live/");
+        // assembler.py:158 `self._encode_liveness(live_i, live_r, live_f)`
+        asm._encode_liveness(live_i, live_r, live_f, &mut self.code);
+    }
+
     /// RPython assembler.py: emit `live/` followed by a 2-byte offset into
     /// the shared all_liveness byte string. Returns the operand offset so the
     /// caller can patch it after computing liveness.
@@ -1936,5 +1971,155 @@ impl JitCodeBuilder {
             );
             self.code[offset] = slot as u8;
         }
+    }
+}
+
+/// RPython `assembler.py:218-231 get_liveness_info(insn, kind)` adapted
+/// for the flat-state JIT: every state_field slot is permanently live,
+/// so the canonical `(live_i, live_r, live_f)` triple just enumerates
+/// the int register file from `0..total_slots`.
+///
+/// state-field JIT enforces `Type::Int` on every slot at macro
+/// expansion (`codegen_state.rs:30-43`), so `live_r` and `live_f` are
+/// empty.  `total_slots` matches `JitCodeSym::total_slots`:
+/// `num_scalars + sum(array_lens) + 2 * num_virt_arrays`.
+///
+/// The returned `Vec<u8>`s are caller-owned and can be passed directly
+/// into `JitCodeBuilder::live` / `Assembler::_encode_liveness`.
+///
+/// # Panics
+///
+/// Panics if `total_slots > 255`.  RPython jitcode register indices are
+/// `chr(...)`-encoded `u8`s (`assembler.py:241`,
+/// `liveness.py:148-159`); a state-field JIT with more than 256 live
+/// slots would overflow that encoding.
+pub fn live_slots_for_state_field_jit(
+    num_scalars: usize,
+    array_lens: &[usize],
+    num_virt_arrays: usize,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    let total_slots: usize = num_scalars + array_lens.iter().sum::<usize>() + 2 * num_virt_arrays;
+    assert!(
+        total_slots <= u8::MAX as usize + 1 - 1, // i.e. < 256
+        "live_slots_for_state_field_jit: total_slots={total_slots} exceeds RPython jitcode \
+         u8 register-index limit (assembler.py:241, liveness.py:148-159)",
+    );
+    let live_i: Vec<u8> = (0..total_slots as u32).map(|i| i as u8).collect();
+    (live_i, Vec::new(), Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use majit_translate::jit_codewriter::assembler::Assembler;
+
+    #[test]
+    fn live_writes_opcode_byte_then_two_offset_bytes() {
+        // RPython assembler.py:146-158 — `live/` opcode followed by the
+        // 2-byte offset returned by `_encode_liveness`.  The first call
+        // for a never-seen liveness key must produce offset 0; the next
+        // call with the same key must reuse offset 0 (dedup).
+        let mut asm = Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+
+        builder.live(&mut asm, &[0, 1], &[2], &[]);
+        assert_eq!(builder.code.len(), 1 + 2, "opcode + u16 offset");
+        // u16-LE 0 means the canonical entry for this key sits at the
+        // start of `Assembler::all_liveness`.
+        assert_eq!(builder.code[1], 0);
+        assert_eq!(builder.code[2], 0);
+
+        builder.live(&mut asm, &[0, 1], &[2], &[]);
+        assert_eq!(
+            builder.code.len(),
+            (1 + 2) * 2,
+            "second call appends another opcode + offset, no all_liveness growth"
+        );
+        // assembler.py:236-238 dedup: identical key reuses the same
+        // 0-offset entry, so the second pair of offset bytes is also 0.
+        assert_eq!(builder.code[4], 0);
+        assert_eq!(builder.code[5], 0);
+
+        // assembler.py:30 `self.all_liveness = []` — only one canonical
+        // payload exists despite two LIVE op emissions.
+        let three_header_bytes = 3;
+        let live_i_payload = 1; // [0, 1] fits in one bitset byte
+        let live_r_payload = 1; // [2] fits in one bitset byte
+        let live_f_payload = 0; // empty bitset → 0 bytes
+        assert_eq!(
+            asm.all_liveness().len(),
+            three_header_bytes + live_i_payload + live_r_payload + live_f_payload,
+        );
+    }
+
+    #[test]
+    fn live_distinct_keys_advance_offset() {
+        let mut asm = Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+
+        builder.live(&mut asm, &[0], &[], &[]);
+        let first_offset = u16::from_le_bytes([builder.code[1], builder.code[2]]);
+        assert_eq!(first_offset, 0);
+
+        builder.live(&mut asm, &[5], &[], &[]);
+        let second_offset = u16::from_le_bytes([builder.code[4], builder.code[5]]);
+        assert!(
+            second_offset > 0,
+            "distinct live_i key must advance into a fresh `all_liveness` entry"
+        );
+        assert_eq!(
+            second_offset as usize,
+            3 + 1,
+            "first entry occupies 3 header + 1 payload byte"
+        );
+    }
+
+    #[test]
+    fn state_field_canonical_slots_empty_state() {
+        // No scalars, no arrays, no virt arrays — empty triple.
+        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(0, &[], 0);
+        assert!(live_i.is_empty());
+        assert!(live_r.is_empty());
+        assert!(live_f.is_empty());
+    }
+
+    #[test]
+    fn state_field_canonical_slots_mixed_layout() {
+        // Mirrors the `tlc` example shape: 1 scalar (`stackpos`) + 1
+        // virt array (`stack`, ptr+len) plus a synthetic 3-element
+        // flattened array.  total_slots = 1 + 3 + 2 = 6, so
+        // live_i = [0, 1, 2, 3, 4, 5] and ref/float banks are empty.
+        let (live_i, live_r, live_f) = super::live_slots_for_state_field_jit(1, &[3], 1);
+        assert_eq!(live_i, vec![0u8, 1, 2, 3, 4, 5]);
+        assert!(live_r.is_empty());
+        assert!(live_f.is_empty());
+    }
+
+    #[test]
+    fn state_field_canonical_slots_feeds_assembler_encode() {
+        // The triple plumbs straight into `Assembler::_encode_liveness`
+        // / `JitCodeBuilder::live` without further reshaping.  Two
+        // distinct shapes must dedup or advance through `all_liveness`
+        // exactly as `live_writes_opcode_byte_then_two_offset_bytes`
+        // / `live_distinct_keys_advance_offset` cover for hand-built
+        // triples.
+        let mut asm = Assembler::new();
+        let mut builder = JitCodeBuilder::new();
+        let (li, lr, lf) = super::live_slots_for_state_field_jit(2, &[1], 0);
+        builder.live(&mut asm, &li, &lr, &lf);
+        // Header bytes = 3 (len_i, len_r, len_f).  live_i has 3 indices
+        // (0, 1, 2) all in the first bitset byte.  live_r/live_f empty.
+        assert_eq!(asm.all_liveness().len(), 3 + 1);
+        assert_eq!(asm.all_liveness()[0], 3, "len(live_i) header byte");
+        assert_eq!(asm.all_liveness()[1], 0, "len(live_r) header byte");
+        assert_eq!(asm.all_liveness()[2], 0, "len(live_f) header byte");
+    }
+
+    #[test]
+    #[should_panic(expected = "exceeds RPython jitcode u8 register-index limit")]
+    fn state_field_canonical_slots_panics_on_overflow() {
+        // 256 slots overflows the u8 register-index encoding upstream
+        // jitcode bytes are written through (assembler.py:241).
+        let _ = super::live_slots_for_state_field_jit(256, &[], 0);
     }
 }

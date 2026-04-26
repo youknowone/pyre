@@ -109,7 +109,6 @@ mod tests {
             i64,
             majit_ir::DescrRef,
             majit_ir::DescrRef,
-            &[majit_ir::OpRef],
         ) -> majit_ir::OpRef = trace_unbox_int;
 
         let _: fn(
@@ -130,7 +129,6 @@ mod tests {
             majit_ir::DescrRef,
             majit_ir::DescrRef,
             majit_ir::DescrRef,
-            &[majit_ir::OpRef],
         ) -> majit_ir::OpRef = trace_int_binop_ovf;
 
         eprintln!("trace_unbox_int, trace_box_int, trace_int_binop_ovf: ✓");

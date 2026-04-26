@@ -231,6 +231,26 @@ impl Trace {
         }
     }
 
+    /// Set fail_args on a recorded op identified by `opref`.
+    ///
+    /// Mirrors RPython's `Op.setfailargs([...])` (`resoperation.py`)
+    /// — the post-record mutation API used by tests and any path that
+    /// constructs a synthetic guard shape outside the standard
+    /// `capture_resumedata` flow.  Production guard recording uses the
+    /// snapshot path (`record_guard_typed` + `capture_resumedata` +
+    /// `set_last_op_resume_position`); `op.fail_args` is then derived
+    /// from the snapshot via `op.store_final_boxes(liveboxes)` in the
+    /// optimizer's `store_final_boxes_in_guard`.
+    pub fn set_op_fail_args(&mut self, opref: OpRef, fail_args: &[OpRef]) {
+        let op = self
+            .ops
+            .iter_mut()
+            .rev()
+            .find(|op| op.pos == opref)
+            .unwrap_or_else(|| panic!("set_op_fail_args: no op with pos {:?}", opref));
+        op.fail_args = Some(smallvec::SmallVec::from_slice(fail_args));
+    }
+
     /// Close the loop: add a JUMP operation back to the start.
     /// `jump_args` are the values of the input arguments at the end of the loop.
     pub fn close_loop(&mut self, jump_args: &[OpRef]) {

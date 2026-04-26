@@ -112,6 +112,14 @@ fn mainloop(program: &Bytecode, num_args: usize, threshold: u32) -> i64 {
         stack: vec![0i64; program.len()],
     };
 
+    // RPython warmspot.py:281-289 canonical-liveness install hook.
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+
     while pc < program.len() {
         jit_merge_point!();
         let opcode = program[pc];

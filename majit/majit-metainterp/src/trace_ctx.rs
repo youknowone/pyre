@@ -844,6 +844,24 @@ impl TraceCtx {
         self.recorder.set_last_op_resume_position(snapshot_id);
     }
 
+    /// Mutate `op.fail_args` on a recorded op identified by `opref`.
+    ///
+    /// 1:1 port of RPython's `Op.setfailargs([...])`
+    /// (`resoperation.py`).  Production guard recording goes through
+    /// the snapshot path (`record_guard_typed` + `capture_resumedata`
+    /// + `set_last_guard_resume_position`); the optimizer's
+    /// `store_final_boxes_in_guard` (`optimizeopt/mod.rs:3200`) then
+    /// derives `op.fail_args` from the snapshot via
+    /// `op.store_final_boxes(liveboxes)` (`mod.rs:3392`).  This setter
+    /// is for tests and other callers that construct synthetic guard
+    /// shapes outside the standard `capture_resumedata` flow —
+    /// matching how RPython's `test_resume.py` /
+    /// `test_optimizeopt.py` build `ResOperation`s with `setfailargs`
+    /// directly rather than through `history.record_default_val`.
+    pub fn set_fail_args(&mut self, opref: OpRef, fail_args: &[OpRef]) {
+        self.recorder.set_op_fail_args(opref, fail_args);
+    }
+
     /// Look up a constant value by its OpRef (>= 10_000).
     pub fn constant_value(&self, opref: OpRef) -> Option<i64> {
         self.constants.as_ref().get(&opref.0).copied()
@@ -854,42 +872,24 @@ impl TraceCtx {
         Self::do_record_guard(&mut self.recorder, &self.constants, opcode, args, descr)
     }
 
-    /// Record a guard with explicit fail_args.
-    pub fn record_guard_with_fail_args(
-        &mut self,
-        opcode: OpCode,
-        args: &[OpRef],
-        num_live: usize,
-        fail_args: &[OpRef],
-    ) -> OpRef {
-        let descr = make_fail_descr(num_live);
-        Self::do_record_guard_with_fail_args(
-            &mut self.recorder,
-            &self.constants,
-            opcode,
-            args,
-            descr,
-            fail_args,
-        )
-    }
-
-    /// Record a guard with explicit typed fail_args.
-    pub fn record_guard_typed_with_fail_args(
+    /// Record a guard with a typed FailDescr but **no** inline
+    /// `op.fail_args` — the caller must attach a snapshot via
+    /// `capture_resumedata` + `set_last_guard_resume_position` before
+    /// the guard reaches the optimizer's `store_final_boxes_in_guard`
+    /// (`optimizeopt/mod.rs:3200`).  Mirrors RPython's
+    /// `pyjitpl.MetaInterp.generate_guard` (pyjitpl.py:2558-2602) where
+    /// the resume context lives entirely in the snapshot chain — not in
+    /// a parallel `op.fail_args` field — so the snapshot's frame boxes
+    /// supply the eventual `liveboxes` written back into `op.fail_args`
+    /// by `op.store_final_boxes(liveboxes)`.
+    pub fn record_guard_typed(
         &mut self,
         opcode: OpCode,
         args: &[OpRef],
         fail_arg_types: Vec<Type>,
-        fail_args: &[OpRef],
     ) -> OpRef {
         let descr = make_fail_descr_typed(fail_arg_types);
-        Self::do_record_guard_with_fail_args(
-            &mut self.recorder,
-            &self.constants,
-            opcode,
-            args,
-            descr,
-            fail_args,
-        )
+        Self::do_record_guard(&mut self.recorder, &self.constants, opcode, args, descr)
     }
 
     // ── Step 2e.2a: split-borrow helpers ──────────────────────────────
@@ -951,17 +951,6 @@ impl TraceCtx {
         descr: DescrRef,
     ) -> OpRef {
         recorder.record_guard(opcode, args, descr)
-    }
-
-    fn do_record_guard_with_fail_args(
-        recorder: &mut Trace,
-        _constants: &ConstantPool,
-        opcode: OpCode,
-        args: &[OpRef],
-        descr: DescrRef,
-        fail_args: &[OpRef],
-    ) -> OpRef {
-        recorder.record_guard_with_fail_args(opcode, args, descr, fail_args)
     }
 
     fn do_close_loop(recorder: &mut Trace, _constants: &ConstantPool, jump_args: &[OpRef]) {

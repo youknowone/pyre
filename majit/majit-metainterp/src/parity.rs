@@ -171,7 +171,8 @@ mod tests {
         );
         let zero = ctx.const_int(0);
         let cond = ctx.record_op(OpCode::IntGt, &[i0, zero]);
-        ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[cond], 1, &[i0]);
+        let g = ctx.record_guard(OpCode::GuardTrue, &[cond], 1);
+        ctx.set_fail_args(g, &[i0]);
         let (trace, constants) = finish_trace_ctx(ctx, &[i0]);
 
         let case = TraceParityCase {
@@ -203,7 +204,8 @@ mod tests {
         let zero = ctx.const_int(0);
         let xored = ctx.record_op(OpCode::IntXor, &[anded, seven]);
         let cond = ctx.record_op(OpCode::IntGe, &[xored, zero]);
-        ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[cond], 2, &[i0, i1]);
+        let g = ctx.record_guard(OpCode::GuardTrue, &[cond], 2);
+        ctx.set_fail_args(g, &[i0, i1]);
         let (trace, constants) = finish_trace_ctx(ctx, &[xored]);
 
         let case = TraceParityCase {

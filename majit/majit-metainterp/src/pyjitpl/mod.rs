@@ -1,6 +1,7 @@
 mod dispatch;
 mod frame;
 
+pub use dispatch::build_state_field_snapshot;
 pub use dispatch::{
     ClosureRuntime, JitCodeMachine, JitCodeRuntime, JitCodeSym, StandaloneFrameStack, trace_jitcode,
 };
@@ -1406,6 +1407,60 @@ impl<M: Clone> MetaInterp<M> {
         } = this;
         staticdata.attach_descrs_to_cpu(backend);
         this
+    }
+
+    /// `warmspot.py:289` `self.metainterp_sd.finish_setup(self.codewriter)`
+    /// — drive `MetaInterpStaticData::finish_setup(asm)` against the
+    /// canonical staticdata while it still has a single owner, mirroring
+    /// the upstream lifecycle in which `make_jitcodes` populates the
+    /// codewriter's assembler before this call.
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre stores `staticdata: Arc<…>` on
+    /// `MetaInterp` (see field doc) so callers downstream can clone the
+    /// Arc into per-session structures.  RPython holds an unwrapped
+    /// reference instead.  Routing through `Arc::get_mut` recovers the
+    /// upstream `&mut` access only while the refcount is still 1, which
+    /// is true between `MetaInterp::new` and the first Arc clone (e.g.
+    /// the bridge-resume / tracing setup paths).  Callers that need the
+    /// orthodox `finish_setup(codewriter)` step must invoke this method
+    /// before any clone of `self.staticdata` is taken; otherwise the
+    /// `unwrap` panics with a clear message and the convergence failure
+    /// is visible at the call site.
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre's `CodeWriter` does not own
+    /// `callcontrol` (see `MetaInterpStaticData::finish_setup` doc);
+    /// the call site threads both as siblings to keep the upstream
+    /// `codewriter.callcontrol.<field>` reads literal in the inner
+    /// staticdata method.
+    pub fn finish_setup(
+        &mut self,
+        codewriter: &majit_translate::jit_codewriter::codewriter::CodeWriter,
+        callcontrol: &majit_translate::jit_codewriter::call::CallControl,
+    ) {
+        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+            "MetaInterp::finish_setup called after `staticdata` was cloned; \
+             RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
+        );
+        staticdata.finish_setup(codewriter, callcontrol);
+    }
+
+    /// Narrow lifecycle hook for state-field JIT: install the canonical
+    /// liveness payload from a pre-populated `Assembler` without
+    /// requiring a full `CodeWriter` / `CallControl`.
+    ///
+    /// See `MetaInterpStaticData::install_canonical_liveness` for the
+    /// RPython parity citation.  The same single-owner `Arc::get_mut`
+    /// invariant as `finish_setup` (RPython `warmspot.py:289`) applies
+    /// — call before any tracing path clones `staticdata`.
+    pub fn install_canonical_liveness(
+        &mut self,
+        asm: &majit_translate::jit_codewriter::assembler::Assembler,
+    ) {
+        let staticdata = std::sync::Arc::get_mut(&mut self.staticdata).expect(
+            "MetaInterp::install_canonical_liveness called after `staticdata` was cloned; \
+             RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
+        );
+        staticdata.install_canonical_liveness(asm);
     }
 
     /// Install a fresh [`ActiveTraceSession`] seeded with the frontend
@@ -7591,7 +7646,7 @@ impl<M: Clone> MetaInterp<M> {
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
         let allocator = crate::resume::NullAllocator;
-        let all_liveness = self.staticdata.liveness_info.as_bytes();
+        let all_liveness = self.staticdata.liveness_info.as_slice();
         let (all_virtuals_ptr, all_virtuals_int) = crate::resume::force_from_resumedata(
             rd_numb,
             rd_consts,
@@ -11608,9 +11663,20 @@ pub struct MetaInterpStaticData {
     pub op_float_return: i32,
     /// pyjitpl.py:2243 `op_void_return = insns.get('void_return/', -1)`.
     pub op_void_return: i32,
-    /// pyjitpl.py:2264 `liveness_info` — string of liveness data
-    /// concatenated by `assembler.all_liveness`.
-    pub liveness_info: String,
+    /// pyjitpl.py:2264 `self.liveness_info = "".join(asm.all_liveness)` —
+    /// the concatenated byte stream produced by
+    /// `assembler.py:241-247` `all_liveness.append(...)`.  RPython freezes
+    /// it once at `finish_setup` and never mutates it again; the runtime
+    /// reads the bytes through `pyjitpl.py:203 all_liveness =
+    /// self.metainterp.staticdata.liveness_info` and decodes via
+    /// `LivenessIterator`.
+    ///
+    /// Stored as raw `Vec<u8>` because the upstream string is bytes-like
+    /// (Python 2 `str`) and the packed liveness encoding is not valid
+    /// UTF-8 in general.  Filled exactly once by
+    /// `MetaInterpStaticData::finish_setup(asm)` (parity with
+    /// `pyjitpl.py:2255-2264`).
+    pub liveness_info: Vec<u8>,
     /// pyjitpl.py:2255-2285 `finish_setup(...)` populates this from
     /// `codewriter.callcontrol.callinfocollection`.
     pub callinfocollection: majit_ir::effectinfo::CallInfoCollection,
@@ -11833,6 +11899,208 @@ impl MetaInterpStaticData {
         }
     }
 
+    /// `pyjitpl.py:2255-2285` `MetaInterpStaticData.finish_setup(self,
+    /// codewriter, optimizer=None)`.
+    ///
+    /// ```python
+    /// def finish_setup(self, codewriter, optimizer=None):
+    ///     from rpython.jit.metainterp.blackhole import BlackholeInterpBuilder
+    ///     self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)
+    ///     #
+    ///     asm = codewriter.assembler
+    ///     self.setup_insns(asm.insns)
+    ///     self.setup_descrs(asm.descrs)
+    ///     self.setup_indirectcalltargets(asm.indirectcalltargets)
+    ///     self.setup_list_of_addr2name(asm.list_of_addr2name)
+    ///     self.liveness_info = "".join(asm.all_liveness)
+    ///     #
+    ///     self.jitdrivers_sd = codewriter.callcontrol.jitdrivers_sd
+    ///     self.virtualref_info = codewriter.callcontrol.virtualref_info
+    ///     self.callinfocollection = codewriter.callcontrol.callinfocollection
+    ///     self.has_libffi_call = codewriter.callcontrol.has_libffi_call
+    ///     #
+    ///     # store this information for fastpath of call_assembler
+    ///     # (only the paths that can actually be taken)
+    ///     exc_descr = compile.PropagateExceptionDescr()
+    ///     for jd in self.jitdrivers_sd:
+    ///         name = {history.INT: 'int', history.REF: 'ref',
+    ///                 history.FLOAT: 'float', history.VOID: 'void'}[jd.result_type]
+    ///         token = getattr(self, 'done_with_this_frame_descr_%s' % name)
+    ///         jd.portal_finishtoken = token
+    ///         jd.propagate_exc_descr = exc_descr
+    ///     #
+    ///     self.cpu.propagate_exception_descr = exc_descr
+    ///     self.globaldata = MetaInterpGlobalData(self)
+    /// ```
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre's `CodeWriter`
+    /// (`majit-translate/src/jit_codewriter/codewriter.rs:64-77`) does
+    /// **not** own `callcontrol` — RPython's does
+    /// (`codewriter.py:CodeWriter.__init__` keeps both).  The Rust
+    /// borrow-checker constraint is documented at the CodeWriter
+    /// declaration; pyre threads `callcontrol` as a sibling parameter
+    /// at this call site so the upstream
+    /// `codewriter.callcontrol.{jitdrivers_sd, virtualref_info,
+    /// callinfocollection, has_libffi_call}` reads remain literal
+    /// ports of the source line, just spelt
+    /// `callcontrol.<field>` instead of
+    /// `codewriter.callcontrol.<field>`.
+    ///
+    /// Each upstream line below is either ported in place or annotated
+    /// with a cited blocker so that downstream callers see the full
+    /// `pyjitpl.py:2255-2285` lifecycle surface even when individual
+    /// payload types still diverge.
+    pub fn finish_setup(
+        &mut self,
+        codewriter: &majit_translate::jit_codewriter::codewriter::CodeWriter,
+        callcontrol: &majit_translate::jit_codewriter::call::CallControl,
+    ) {
+        // pyjitpl.py:2257-2258
+        //     self.blackholeinterpbuilder = BlackholeInterpBuilder(codewriter, self)
+        // PRE-EXISTING-ADAPTATION: pyre's `BlackholeInterpBuilder`
+        // (`blackhole.rs:3088 setup_insns`) is wired piecewise from
+        // per-jitdriver bring-up rather than a single constructor call
+        // — bringing the constructor-form back here cascades into a
+        // refactor of `BlackholeInterpBuilder`'s allocator and
+        // exceeds Task #89 session scope.
+
+        let asm = &codewriter.assembler;
+        // pyjitpl.py:2260 `self.setup_insns(asm.insns)`
+        self.setup_insns(asm.insns());
+        // pyjitpl.py:2261 `self.setup_descrs(asm.descrs)`
+        // PRE-EXISTING-ADAPTATION: payload mismatch.  Translate-side
+        // `Assembler.descrs` is a `Vec<DescrRef>` (object refs); pyre's
+        // `setup_descrs(Vec<u64>)` keys by opcode id.  The conversion
+        // is `descrs[i] = asm.descrs[i].as_int_id()`, but pyre's
+        // runtime Descr surface (DescrRef) does not yet expose a
+        // stable u64 id — that bridging is a separate audit slice.
+
+        // pyjitpl.py:2262 `self.setup_indirectcalltargets(asm.indirectcalltargets)`
+        // PRE-EXISTING-ADAPTATION: payload mismatch.  Translate-side
+        // `Assembler.indirectcalltargets` is a JitCode set; pyre
+        // stores `Vec<Arc<JitCode>>` already keyed in alloc-order on
+        // `MetaInterpStaticData`.  Bridging requires
+        // `CallControl::jitcodes_in_alloc_order` (call.py:87-88) to
+        // commit the same shape.
+
+        // pyjitpl.py:2263 `self.setup_list_of_addr2name(asm.list_of_addr2name)`
+        // PRE-EXISTING-ADAPTATION: payload mismatch.  Translate-side
+        // carries `Vec<(String, String)>` (modname, funcname); pyre's
+        // `setup_list_of_addr2name((usize, String))` wants
+        // `(address, full_name)` — bridging requires
+        // `getfunctionptr(graph)`, an unported codewriter helper.
+
+        // pyjitpl.py:2264 `self.liveness_info = "".join(asm.all_liveness)`
+        self.liveness_info = asm.all_liveness().to_vec();
+
+        // pyjitpl.py:2266 `self.jitdrivers_sd = codewriter.callcontrol.jitdrivers_sd`
+        // PRE-EXISTING-ADAPTATION: pyre populates `jitdrivers_sd`
+        // incrementally via `register_jitdriver_sd`
+        // (`mod.rs:11576-11589`).  Wholesale assignment here would
+        // clobber the incremental work; the convergence path is to
+        // flip `register_jitdriver_sd` from "owner" to "validator"
+        // once the codewriter pre-builds the full list at
+        // `make_jitcodes` time.
+
+        // pyjitpl.py:2267 `self.virtualref_info = codewriter.callcontrol.virtualref_info`
+        // PRE-EXISTING-ADAPTATION: pyre's `CallControl` does not yet
+        // carry `virtualref_info`.
+
+        // pyjitpl.py:2268 `self.callinfocollection = codewriter.callcontrol.callinfocollection`
+        self.callinfocollection = callcontrol.callinfocollection.clone();
+
+        // pyjitpl.py:2269 `self.has_libffi_call = codewriter.callcontrol.has_libffi_call`
+        // PRE-EXISTING-ADAPTATION: pyre's `CallControl` has no
+        // `has_libffi_call` field; libffi handling is currently not
+        // implemented.
+
+        // pyjitpl.py:2273-2284
+        //     exc_descr = compile.PropagateExceptionDescr()
+        //     for jd in self.jitdrivers_sd: jd.portal_finishtoken = ...
+        //     self.cpu.propagate_exception_descr = exc_descr
+        // PRE-EXISTING-ADAPTATION: pyre runs the equivalent reattach
+        // through `finish_setup_descrs_for_jitdrivers` from
+        // `register_jitdriver_sd` (`mod.rs:11588`).  Repeating the
+        // loop here would double-attach.
+
+        // pyjitpl.py:2285 `self.globaldata = MetaInterpGlobalData(self)`
+        // PRE-EXISTING-ADAPTATION: pyre constructs `globaldata` in
+        // `MetaInterpStaticData::new()` because `MetaInterpGlobalData`
+        // is required by other init sites that run before
+        // `finish_setup`.  Replacing here would require an ownership
+        // reshuffle.
+    }
+
+    /// Narrow `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`
+    /// slice intended for state-field JIT.  Copies the
+    /// already-populated `Assembler::all_liveness` byte stream into
+    /// `self.liveness_info` and seeds the cached opcode-id fields
+    /// (`op_live` etc.) that `setup_insns(asm.insns)` would otherwise
+    /// populate, without otherwise running `finish_setup`'s
+    /// `setup_descrs / setup_indirectcalltargets / ...` payload-
+    /// mismatched adaptations.
+    ///
+    /// State-field JIT's `__JitMeta` shape produces exactly one
+    /// canonical liveness entry per JitDriver
+    /// (`live_slots_for_state_field_jit`), so a fully-fledged
+    /// `CodeWriter` + `CallControl` is overkill — only the liveness
+    /// receptacle (`pyjitpl.py:2264`) and the cached opcode ids
+    /// (`pyjitpl.py:2236-2243`) need settling before the macro-emitted
+    /// `live/<offset>` placeholders become readable through
+    /// `MIFrame::get_list_of_active_boxes` (whose
+    /// `code[pc - SIZE_LIVE_OP] == op_live` assert is the dominant
+    /// downstream consumer).
+    ///
+    /// Both `finish_setup` and `install_canonical_liveness` share the
+    /// same write target and the same `pyjitpl.py:2264`
+    /// `self.liveness_info` semantics; downstream sessions will
+    /// migrate state-field callers to the full `finish_setup` once
+    /// `CodeWriter::with_assembler_only` (Task #89 orth-9 plan
+    /// step 4) lands.
+    ///
+    /// Codex review (2026-04-26): this hook is a NEW-DEVIATION vs
+    /// RPython.  RPython has no `install_canonical_liveness`
+    /// equivalent — `warmspot.py:281-289` calls a single
+    /// `metainterp_sd.finish_setup(codewriter)` after
+    /// `make_jitcodes()`, and `pyjitpl.py:2255-2285 finish_setup`
+    /// reads `asm.insns` / `asm.all_liveness` / `asm.descrs` /
+    /// `callcontrol.jitdrivers_sd` etc. via the single
+    /// `codewriter.assembler` reference.  The current pyre lifecycle
+    /// fragmentation arises because `majit-translate::CodeWriter`
+    /// does not own `CallControl` or `Assembler` like RPython's
+    /// `codewriter.CodeWriter` does (pre-existing structural gap),
+    /// and because the state-field JIT macro path produces canonical
+    /// liveness eagerly per JitState rather than going through the
+    /// shared codewriter pipeline.  Convergence path: when CodeWriter
+    /// owns its Assembler (`with_assembler_only`) and CallControl
+    /// merges in (Task #89 orth-9 step 4 + Task #72 sub-thread),
+    /// this method dissolves into the canonical
+    /// `finish_setup(codewriter)` and the macro-side examples drop
+    /// their `state.build_meta(...).install_canonical_liveness(...)`
+    /// calls in favor of the unified `make_jitcodes()
+    /// → finish_setup(codewriter)` warmspot lifecycle.
+    pub fn install_canonical_liveness(
+        &mut self,
+        asm: &majit_translate::jit_codewriter::assembler::Assembler,
+    ) {
+        // Mirrors the asm-derived parts of `finish_setup(codewriter,
+        // callcontrol)` (this file, `pyjitpl.py:2255-2285`):
+        // `setup_insns(asm.insns)` (line 2260) and
+        // `liveness_info = "".join(asm.all_liveness)` (line 2264).
+        //
+        // The macro caller (`majit-macros::codegen_state.rs::
+        // install_canonical_liveness`) populates `asm.insns` via
+        // `Assembler::register_insn` before invoking this hook so the
+        // `setup_insns(asm.insns())` lookup resolves the canonical
+        // pyre-static `BC_*` opcode ids dynamically — same data flow
+        // as RPython `make_jitcodes() → finish_setup(codewriter)`,
+        // where `codewriter.assembler.insns` is already populated by
+        // the time `setup_insns` runs.  No parallel hardcoded `BC_*`
+        // seeding block lives in this method any more.
+        self.setup_insns(asm.insns());
+        self.liveness_info = asm.all_liveness().to_vec();
+    }
+
     /// pyjitpl.py:2227-2243 `setup_insns(insns)`.
     ///
     /// Stores the opcode-id → name table and the cached opcode-id
@@ -11845,17 +12113,28 @@ impl MetaInterpStaticData {
     /// `crate::blackhole::BlackholeInterpBuilder::setup_insns`.
     pub fn setup_insns(&mut self, insns: &std::collections::HashMap<String, u8>) {
         // pyjitpl.py:2228-2229: opcode_names/opcode_implementations init.
-        let mut names = vec![String::from("?"); insns.len()];
+        // RPython sizes by `len(insns)` because its assembler assigns
+        // opnums sequentially from 0, so `len(insns) == max(opnum) + 1`.
+        // pyre's static-pyre `BC_*` constants are sparse over `0..=255`
+        // (some opnums are reserved for unimplemented opcodes), so
+        // size by `max(opnum) + 1` to keep `names[opnum] = key` in
+        // bounds for state-field-JIT macro paths whose `insns` carries
+        // only the opnums that actually fire.  Empty `insns` → empty
+        // tables (matches `len(insns) == 0` in upstream).
+        let table_len = insns
+            .values()
+            .copied()
+            .max()
+            .map(|m| m as usize + 1)
+            .unwrap_or(0);
+        let mut names = vec![String::from("?"); table_len];
         // pyjitpl.py:2230-2235: opcode_implementations[value] = opimpl.
         // PRE-EXISTING-ADAPTATION: pyre dispatches by BC_* match, so
         // the slot is left as None — the table only carries the size
         // for parity with `opcode_names`.
-        let implementations = vec![None; insns.len()];
+        let implementations = vec![None; table_len];
         for (key, &value) in insns.iter() {
-            let idx = value as usize;
-            if idx < names.len() {
-                names[idx] = key.clone();
-            }
+            names[value as usize] = key.clone();
         }
         self.opcode_names = names;
         self.opcode_implementations = implementations;
@@ -14147,6 +14426,171 @@ mod metainterp_static_data_tests {
         assert_eq!(sd.op_float_return, -1);
         assert_eq!(sd.op_void_return, -1);
     }
+
+    #[test]
+    fn finish_setup_copies_assembler_liveness_and_insns() {
+        // pyjitpl.py:2255-2285 — MetaInterpStaticData.finish_setup(codewriter)
+        // pulls `asm.insns` and `asm.all_liveness` into the staticdata
+        // mirror.  Build a small CodeWriter, register two liveness
+        // entries on its assembler, and make sure finish_setup mirrors
+        // both halves.
+        use majit_translate::jit_codewriter::call::CallControl;
+        use majit_translate::jit_codewriter::codewriter::CodeWriter;
+
+        let mut codewriter = CodeWriter::new();
+        let mut scratch = Vec::<u8>::new();
+        // assembler.py:236-247 _encode_liveness — first entry pos = 0.
+        codewriter
+            .assembler
+            ._encode_liveness(&[0, 1], &[2], &[], &mut scratch);
+        // Second call with the same key should reuse pos = 0 (dedup).
+        codewriter
+            .assembler
+            ._encode_liveness(&[0, 1], &[2], &[], &mut scratch);
+        // Third call with a different key advances pos.
+        codewriter
+            .assembler
+            ._encode_liveness(&[3], &[], &[5], &mut scratch);
+        let expected_liveness = codewriter.assembler.all_liveness().to_vec();
+        let expected_liveness_len = expected_liveness.len();
+        assert!(
+            expected_liveness_len > 0,
+            "scaffolding sanity: assembler must have emitted liveness bytes"
+        );
+
+        let callcontrol = CallControl::new();
+        let mut sd = MetaInterpStaticData::new();
+        sd.finish_setup(&codewriter, &callcontrol);
+
+        // pyjitpl.py:2264 `self.liveness_info = "".join(asm.all_liveness)`
+        assert_eq!(sd.liveness_info, expected_liveness);
+        // pyjitpl.py:2260 `self.setup_insns(asm.insns)` — the assembler
+        // was driven only through `_encode_liveness`, so no opcode
+        // names were registered yet; the staticdata mirror must reflect
+        // that empty state.
+        assert!(sd.opcode_names.is_empty());
+    }
+
+    #[test]
+    fn metainterp_finish_setup_publishes_canonical_liveness() {
+        // warmspot.py:289 `self.metainterp_sd.finish_setup(self.codewriter)`
+        // — the orthodox lifecycle ports as `Arc::get_mut` while the
+        // staticdata Arc still has refcount 1 (immediately after
+        // `MetaInterp::new`).  Verify the wrapper drives the bytes all
+        // the way to `staticdata.liveness_info` without panicking.
+        use majit_translate::jit_codewriter::call::CallControl;
+        use majit_translate::jit_codewriter::codewriter::CodeWriter;
+
+        let mut codewriter = CodeWriter::new();
+        let mut scratch = Vec::<u8>::new();
+        codewriter
+            .assembler
+            ._encode_liveness(&[0, 1, 2], &[3], &[], &mut scratch);
+        let expected = codewriter.assembler.all_liveness().to_vec();
+
+        let callcontrol = CallControl::new();
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.finish_setup(&codewriter, &callcontrol);
+
+        assert_eq!(meta.staticdata.liveness_info, expected);
+    }
+
+    #[test]
+    #[should_panic(expected = "called after `staticdata` was cloned")]
+    fn metainterp_finish_setup_panics_after_staticdata_clone() {
+        // The Rust `Arc::get_mut` adaptation only matches RPython's
+        // single-owner invariant while the refcount is 1; once
+        // anything has cloned `self.staticdata`, the wrapper must fail
+        // loudly so the convergence violation surfaces at the call
+        // site.
+        use majit_translate::jit_codewriter::call::CallControl;
+        use majit_translate::jit_codewriter::codewriter::CodeWriter;
+
+        let mut meta = MetaInterp::<()>::new(0);
+        let _share: std::sync::Arc<MetaInterpStaticData> = meta.staticdata.clone();
+        meta.finish_setup(&CodeWriter::new(), &CallControl::new());
+    }
+
+    #[test]
+    fn metainterp_install_canonical_liveness_publishes_asm_bytes() {
+        // Narrow analogue of `metainterp_finish_setup_publishes_canonical_liveness`
+        // that exercises the `install_canonical_liveness` lifecycle hook.
+        // pyjitpl.py:2264 `self.liveness_info = "".join(asm.all_liveness)`
+        // — the hook must drive an already-populated `Assembler`'s
+        // `all_liveness()` straight into `staticdata.liveness_info`,
+        // without going through `CodeWriter` / `CallControl`.
+        // pyjitpl.py:2236-2243 — also seed the cached opcode-id fields
+        // (`op_live` etc.) from pyre's static `BC_*` constants.
+        use majit_translate::jit_codewriter::assembler::Assembler;
+
+        let mut asm = Assembler::new();
+        let mut scratch = Vec::<u8>::new();
+        // State-field JIT canonical entry shape: live_i = 0..total_slots,
+        // live_r / live_f empty.  Matches `live_slots_for_state_field_jit`
+        // for `(num_scalars=2, array_lens=&[1], num_virt_arrays=0)` →
+        // total_slots = 3.
+        asm._encode_liveness(&[0, 1, 2], &[], &[], &mut scratch);
+        // Mirror the macro's `__JitMeta::install_canonical_liveness`
+        // (`majit-macros::codegen_state.rs`) which pre-populates
+        // `asm.insns` so `setup_insns(asm.insns())` resolves the
+        // pyre-static `BC_*` opnums dynamically (RPython parity:
+        // `assembler.py:222 self.insns[key] = opnum`).
+        asm.register_insn("live/", crate::jitcode::BC_LIVE);
+        asm.register_insn("catch_exception/L", crate::jitcode::BC_CATCH_EXCEPTION);
+        asm.register_insn("rvmprof_code/ii", crate::jitcode::BC_RVMPROF_CODE);
+        asm.register_insn("int_return/i", crate::jitcode::BC_INT_RETURN);
+        asm.register_insn("ref_return/r", crate::jitcode::BC_REF_RETURN);
+        asm.register_insn("float_return/f", crate::jitcode::BC_FLOAT_RETURN);
+        asm.register_insn("void_return/", crate::jitcode::BC_VOID_RETURN);
+        let expected = asm.all_liveness().to_vec();
+
+        let mut meta = MetaInterp::<()>::new(0);
+        meta.install_canonical_liveness(&asm);
+
+        assert_eq!(meta.staticdata.liveness_info, expected);
+        assert_eq!(
+            meta.staticdata.op_live,
+            crate::jitcode::BC_LIVE as i32,
+            "install_canonical_liveness must seed op_live to pyre-static BC_LIVE",
+        );
+        assert_eq!(
+            meta.staticdata.op_catch_exception,
+            crate::jitcode::BC_CATCH_EXCEPTION as i32,
+        );
+        assert_eq!(
+            meta.staticdata.op_rvmprof_code,
+            crate::jitcode::BC_RVMPROF_CODE as i32,
+        );
+        assert_eq!(
+            meta.staticdata.op_int_return,
+            crate::jitcode::BC_INT_RETURN as i32,
+        );
+        assert_eq!(
+            meta.staticdata.op_ref_return,
+            crate::jitcode::BC_REF_RETURN as i32,
+        );
+        assert_eq!(
+            meta.staticdata.op_float_return,
+            crate::jitcode::BC_FLOAT_RETURN as i32,
+        );
+        assert_eq!(
+            meta.staticdata.op_void_return,
+            crate::jitcode::BC_VOID_RETURN as i32,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "called after `staticdata` was cloned")]
+    fn metainterp_install_canonical_liveness_panics_after_staticdata_clone() {
+        // Same single-owner invariant as `finish_setup`: once
+        // `staticdata` is shared, the hook must fail loudly rather
+        // than silently no-op or clobber a shared snapshot.
+        use majit_translate::jit_codewriter::assembler::Assembler;
+
+        let mut meta = MetaInterp::<()>::new(0);
+        let _share: std::sync::Arc<MetaInterpStaticData> = meta.staticdata.clone();
+        meta.install_canonical_liveness(&Assembler::new());
+    }
 }
 
 #[cfg(test)]
@@ -15025,12 +15469,8 @@ mod tests {
         };
         let (item, _) = meta.opimpl_getarrayitem_vable_int(OpRef(0), index, 1, fd24);
         if let Some(ctx) = meta.trace_ctx() {
-            ctx.record_guard_with_fail_args(
-                OpCode::GuardTrue,
-                &[item],
-                0,
-                &[OpRef(0), OpRef(1), OpRef(2)],
-            );
+            let g = ctx.record_guard(OpCode::GuardTrue, &[item], 0);
+            ctx.set_fail_args(g, &[OpRef(0), OpRef(1), OpRef(2)]);
         }
         meta.compile_loop(&[OpRef(0), OpRef(1), OpRef(2)], ());
 
@@ -15139,7 +15579,8 @@ mod tests {
             let i0 = OpRef(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
-            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.set_fail_args(g, &[sum]);
         }
         meta.compile_loop(&[OpRef(0)], ());
 
@@ -15233,7 +15674,8 @@ mod tests {
             let i0 = OpRef(0);
             let const_one = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, const_one]);
-            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.set_fail_args(g, &[sum]);
         }
         meta.compile_loop(&[OpRef(0)], ());
         assert_eq!(
@@ -15270,7 +15712,8 @@ mod tests {
                 let const_one = ctx.const_int(1);
                 let sum = ctx.record_op(OpCode::IntAdd, &[i0, i1]);
                 let sum2 = ctx.record_op(OpCode::IntAdd, &[sum, const_one]);
-                ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum2, i1]);
+                let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+                ctx.set_fail_args(g, &[sum2, i1]);
             }
             meta.compile_loop(&[OpRef(0), OpRef(1)], ());
         }

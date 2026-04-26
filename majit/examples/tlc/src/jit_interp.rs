@@ -126,6 +126,19 @@ pub fn mainloop(program: &Bytecode, inputarg: i64, threshold: u32) -> i64 {
         stack: vec![0i64; program.len()],
     };
 
+    // RPython warmspot.py:281-289 — `make_jitcodes(); finish_setup(codewriter)`
+    // surface for state-field JIT.  Publishes the canonical
+    // `(live_i, live_r, live_f)` triple into `staticdata.liveness_info`
+    // before the first `jit_merge_point!()` so that
+    // `MIFrame::get_list_of_active_boxes` can decode the
+    // macro-emitted `live/<offset>` placeholders (Task #89 orth-8).
+    {
+        use majit_metainterp::JitState as _;
+        state
+            .build_meta(0, program)
+            .install_canonical_liveness(&mut driver);
+    }
+
     while pc < program.len() {
         jit_merge_point!();
         let opcode = program[pc];

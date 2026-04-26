@@ -421,6 +421,31 @@ pub trait JitState: Sized {
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef>;
 
+    /// Bridge `Sym`'s state slots onto the current `MIFrame.int_regs`
+    /// and return a single-frame `recorder::Snapshot` for the guard
+    /// about to be (or just-) recorded.  Default no-op returns `None`,
+    /// preserving the legacy side-vec-only path; state-field JIT (the
+    /// macro emit at `majit-macros::jit_interp::codegen_state`) and
+    /// any other consumer that wants its `record_*_with_fail_args`
+    /// guards to also carry an `rd_resume_position` overrides this
+    /// hook.
+    ///
+    /// PRE-EXISTING-ADAPTATION (Task #89 framestack-lift Session 4):
+    /// this is the JitState-level entry point for the framestack-lift
+    /// epic.  It mirrors `JitCodeSym::populate_frame_int_regs`
+    /// (`pyjitpl/dispatch.rs:113-146`) but is reachable from
+    /// `merge_point` / `force_finish_trace` where the generic `S::Sym`
+    /// is not constrained to implement `JitCodeSym`.  Once
+    /// `JitState::Sym: JitCodeSym` becomes the universal contract
+    /// (Task #89 orth-9 step 4 reshape), this hook collapses into the
+    /// `JitCodeSym` method directly.
+    fn populate_frame_for_guard(
+        _sym: &Self::Sym,
+        _frame: &mut crate::pyjitpl::MIFrame,
+    ) -> Option<crate::recorder::Snapshot> {
+        None
+    }
+
     fn collect_typed_jump_args(sym: &Self::Sym) -> Vec<(OpRef, Type)> {
         Self::collect_jump_args(sym)
             .into_iter()

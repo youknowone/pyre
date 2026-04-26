@@ -424,6 +424,28 @@ impl<S: JitState> JitDriver<S> {
         }
     }
 
+    /// Install the state-field JIT canonical liveness payload before
+    /// any tracing path runs.  Mirrors RPython `warmspot.py:281-289`'s
+    /// `make_jitcodes() → finish_setup(codewriter)` for the narrow
+    /// `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`
+    /// slice — full `finish_setup` requires `CodeWriter` /
+    /// `CallControl` construction (Task #89 orth-9 plan step 4) which
+    /// is not yet wired.
+    ///
+    /// Caller responsibility: build a fresh
+    /// `majit_translate::jit_codewriter::assembler::Assembler`,
+    /// register the canonical
+    /// `__JitMeta::canonical_liveness_slots()` triple via
+    /// `Assembler::_encode_liveness`, then pass `&asm` here.  The
+    /// single-owner `Arc::get_mut` invariant (`MetaInterp::finish_setup`)
+    /// applies — call before the first trace.
+    pub fn install_canonical_liveness(
+        &mut self,
+        asm: &majit_translate::jit_codewriter::assembler::Assembler,
+    ) {
+        self.meta.install_canonical_liveness(asm);
+    }
+
     /// Register a portal runner callback for blackhole ContinueRunningNormally.
     ///
     /// warmspot.py:1039 handle_jitexception_from_blackhole parity:
@@ -814,26 +836,69 @@ impl<S: JitState> JitDriver<S> {
                 .map(|ctx| ctx.num_ops() > ctx.trace_limit() * 4 / 5)
                 .unwrap_or(false);
             if should_segment {
+                // RPython `pyjitpl.py:2558-2602 MetaInterp.generate_guard`
+                // pairs every guard recording with `capture_resumedata`,
+                // and segmenting itself is independent of whether the
+                // sym-side framestack-lift override is wired:
+                // `_create_segmented_trace_and_blackhole`
+                // (`pyjitpl.py:1622`) always emits
+                // `generate_guard(GUARD_ALWAYS_FAILS) + Finish +
+                // SwitchToBlackhole`.  When
+                // `JitState::populate_frame_for_guard` is overridden
+                // (state-field-JIT macro consumers), pair the guard with
+                // the bridge snapshot.  When the default no-op returns
+                // `None`, still emit the segment without a snapshot —
+                // the optimizer's `store_final_boxes_in_guard`
+                // (`optimizeopt/mod.rs:3200`) drops the resume data and
+                // emits a sentinel descr that triggers loop
+                // invalidation on guard fail, mirroring the
+                // SwitchToBlackhole bailout.  PRE-EXISTING-ADAPTATION:
+                // the snapshot-less path is bounded; convergence is
+                // Task #89 (lift `S::Sym` into MIFrame framestack
+                // populate) so every consumer captures uniformly via
+                // the standard `MIFrame::get_list_of_active_boxes`
+                // walk.
+                let pre_snapshot = self.sym.as_ref().and_then(|sym| {
+                    let frame = self.meta.framestack.current_mut();
+                    S::populate_frame_for_guard(sym, frame)
+                });
                 let mut current_live = self
                     .sym
                     .as_ref()
                     .map(|sym| S::collect_jump_args(sym))
                     .unwrap_or_default();
                 if let Some(ctx) = self.meta.trace_ctx() {
-                    // pyjitpl.py:2594: use last_traced_pc (= frame.pc at
-                    // the guard point), not header_pc.
+                    // pyjitpl.py:2594: use last_traced_pc
+                    // (= frame.pc at the guard point), not header_pc.
                     let pc_opref = ctx.const_int(ctx.last_traced_pc as i64);
                     current_live.push(pc_opref);
                     let live_types: Vec<majit_ir::Type> = current_live
                         .iter()
                         .map(|opref| ctx.get_opref_type(*opref).unwrap_or(majit_ir::Type::Int))
                         .collect();
-                    ctx.record_guard_typed_with_fail_args(
-                        majit_ir::OpCode::GuardAlwaysFails,
-                        &[],
-                        live_types,
-                        &current_live,
-                    );
+                    let guard_opref =
+                        ctx.record_guard_typed(majit_ir::OpCode::GuardAlwaysFails, &[], live_types);
+                    if let Some(snapshot) = pre_snapshot {
+                        let snapshot_id = ctx.capture_resumedata(snapshot);
+                        ctx.set_last_guard_resume_position(snapshot_id);
+                    } else {
+                        // No framestack-lift override: pre_snapshot is
+                        // None, so the optimizer's
+                        // `store_final_boxes_in_guard`
+                        // (`optimizeopt/mod.rs:3200`) cannot derive
+                        // `op.fail_args` from a snapshot.  Fall back to
+                        // setting fail_args inline via
+                        // `Op.setfailargs([...])` (RPython
+                        // `resoperation.py`) — the production path used
+                        // for guards constructed outside the standard
+                        // `capture_resumedata` flow (`trace_ctx.rs:861`
+                        // `set_fail_args` doc).  Mirrors main's pre-Task
+                        // #91 inline fail_args data flow until Task #89
+                        // lifts `S::Sym` into MIFrame framestack
+                        // populate, after which this branch dissolves
+                        // and the `pre_snapshot` arm is unconditional.
+                        ctx.set_fail_args(guard_opref, &current_live);
+                    }
                     let dummy = ctx.const_int(0);
                     ctx.record_finish(dummy, majit_ir::Type::Int);
                     if crate::majit_log_enabled() {
@@ -1534,7 +1599,7 @@ impl<S: JitState> JitDriver<S> {
                     self.meta_interp().staticdata.op_catch_exception,
                     self.meta_interp().staticdata.op_rvmprof_code,
                 );
-                let all_liveness = self.meta_interp().staticdata.liveness_info.as_bytes();
+                let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     &resolve_jitcode,
@@ -3192,7 +3257,7 @@ impl<S: JitState> JitDriver<S> {
                     self.meta_interp().staticdata.op_catch_exception,
                     self.meta_interp().staticdata.op_rvmprof_code,
                 );
-                let all_liveness = self.meta_interp().staticdata.liveness_info.as_bytes();
+                let all_liveness = self.meta_interp().staticdata.liveness_info.as_slice();
                 let bh = crate::resume::blackhole_from_resumedata(
                     &mut bh_builder,
                     &resolve_jitcode,
@@ -3491,7 +3556,8 @@ mod tests {
         {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
             let i0 = OpRef(0); // input arg
-            ctx.record_guard_with_fail_args(OpCode::GuardFalse, &[i0], 0, &[i0]);
+            let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            ctx.set_fail_args(g, &[i0]);
         };
         driver.meta.compile_loop(&[OpRef(0)], ());
         assert!(driver.has_compiled_loop(key));
@@ -3543,12 +3609,8 @@ mod tests {
         {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
             let i0 = OpRef(0);
-            ctx.record_guard_with_fail_args(
-                OpCode::GuardFalse,
-                &[i0],
-                0,
-                &[OpRef(0), OpRef(1), OpRef(2)],
-            );
+            let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            ctx.set_fail_args(g, &[OpRef(0), OpRef(1), OpRef(2)]);
         };
         driver
             .meta
@@ -3598,12 +3660,8 @@ mod tests {
         {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
             let i0 = OpRef(0);
-            ctx.record_guard_with_fail_args(
-                OpCode::GuardFalse,
-                &[i0],
-                0,
-                &[OpRef(0), OpRef(1), OpRef(2)],
-            );
+            let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            ctx.set_fail_args(g, &[OpRef(0), OpRef(1), OpRef(2)]);
         };
         driver
             .meta
@@ -3703,7 +3761,8 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef(0);
             ctx.const_int(42);
-            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[i0]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.set_fail_args(g, &[i0]);
         }
         driver.meta.compile_loop(&[OpRef(0)], ());
         assert!(driver.has_compiled_loop(key));
@@ -3818,7 +3877,8 @@ mod tests {
             let i0 = OpRef(0); // input arg from on_back_edge
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.set_fail_args(g, &[sum]);
             sum
         };
 
@@ -3857,7 +3917,8 @@ mod tests {
                 let i0 = OpRef(0);
                 let c1 = ctx.const_int(1);
                 let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-                ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
+                let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+                ctx.set_fail_args(g, &[sum]);
             }
             driver.meta.compile_loop(&[OpRef(0)], ());
             assert!(driver.has_compiled_loop(key));
@@ -3896,7 +3957,8 @@ mod tests {
             let i0 = OpRef(0); // input arg (non-constant = won't be folded)
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.set_fail_args(g, &[sum]);
             sum
         };
         driver.meta.compile_loop(&[sum], ());
@@ -3959,7 +4021,8 @@ mod tests {
             // at runtime → GuardTrue fails.
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef(0);
-            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.set_fail_args(g, &[]);
         }
         driver.meta.compile_loop(&[OpRef(0)], ());
         assert!(driver.has_compiled_loop(green_key));
@@ -4047,7 +4110,8 @@ mod tests {
             let i0 = OpRef(0);
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
-            ctx.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], 0, &[sum]);
+            let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.set_fail_args(g, &[sum]);
             sum
         };
         driver.meta.compile_loop(&[sum], ());
@@ -4071,5 +4135,54 @@ mod tests {
         // The driver stats reflect exactly one compiled loop.
         let stats = driver.get_stats();
         assert_eq!(stats.loops_compiled, 1);
+    }
+
+    #[test]
+    fn jitdriver_install_canonical_liveness_publishes_macro_emit_composition() {
+        // Mirrors the body of the macro-emitted
+        // `__JitMeta::install_canonical_liveness`
+        // (`majit-macros/src/jit_interp/codegen_state.rs`):
+        //   1. Build a fresh `Assembler`.
+        //   2. Encode the canonical
+        //      `live_slots_for_state_field_jit(num_scalars, &lens, num_virt)`
+        //      triple via `_encode_liveness`.
+        //   3. Forward to `JitDriver::install_canonical_liveness`.
+        //
+        // RPython parity: `warmspot.py:281-289` →
+        // `pyjitpl.py:2264 self.liveness_info = "".join(asm.all_liveness)`
+        // — the metainterp-side test
+        // (`pyjitpl/mod.rs::metainterp_install_canonical_liveness_publishes_asm_bytes`)
+        // exercises the inner layer; this driver-level test guards the
+        // pass-through wrapper the macro actually targets.
+        use majit_translate::jit_codewriter::assembler::Assembler;
+
+        // Build the canonical liveness exactly the way the macro expansion
+        // does (orth-6 helper + orth-2 _encode_liveness + insns
+        // registration mirroring `assembler.py:222 self.insns[key] = opnum`).
+        let (live_i, live_r, live_f) = crate::live_slots_for_state_field_jit(2, &[1], 0);
+        let mut asm = Assembler::new();
+        let mut scratch = Vec::<u8>::new();
+        asm._encode_liveness(&live_i, &live_r, &live_f, &mut scratch);
+        asm.register_insn("live/", crate::jitcode::BC_LIVE);
+        asm.register_insn("catch_exception/L", crate::jitcode::BC_CATCH_EXCEPTION);
+        asm.register_insn("rvmprof_code/ii", crate::jitcode::BC_RVMPROF_CODE);
+        asm.register_insn("int_return/i", crate::jitcode::BC_INT_RETURN);
+        asm.register_insn("ref_return/r", crate::jitcode::BC_REF_RETURN);
+        asm.register_insn("float_return/f", crate::jitcode::BC_FLOAT_RETURN);
+        asm.register_insn("void_return/", crate::jitcode::BC_VOID_RETURN);
+        let expected = asm.all_liveness().to_vec();
+
+        let mut driver = JitDriver::<TypedRestoreState>::new(0);
+        driver.install_canonical_liveness(&asm);
+
+        assert_eq!(driver.meta.staticdata.liveness_info, expected);
+        // `setup_insns(asm.insns())` (`pyjitpl.py:2236-2243`) resolves
+        // `op_live` from the `live/` entry the macro registers above
+        // — same data flow as RPython where `make_jitcodes()`
+        // populates `asm.insns` before `finish_setup(codewriter)`.
+        assert_eq!(
+            driver.meta.staticdata.op_live,
+            crate::jitcode::BC_LIVE as i32,
+        );
     }
 }
