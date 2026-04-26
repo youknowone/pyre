@@ -26,6 +26,17 @@ pub struct W_SetObject {
     pub len: usize,
 }
 
+/// GC type id assigned to `W_SetObject` at JitDriver init time.
+pub const W_SET_GC_TYPE_ID: u32 = 30;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_SET_OBJECT_SIZE: usize = std::mem::size_of::<W_SetObject>();
+
+impl crate::lltype::GcType for W_SetObject {
+    const TYPE_ID: u32 = W_SET_GC_TYPE_ID;
+    const SIZE: usize = W_SET_OBJECT_SIZE;
+}
+
 #[inline]
 pub unsafe fn is_set(obj: PyObjectRef) -> bool {
     unsafe { py_type_check(obj, &SET_TYPE) }
@@ -49,15 +60,15 @@ unsafe fn set_keys_equal(a: PyObjectRef, b: PyObjectRef) -> bool {
 }
 
 fn alloc_set_with_type(tp: &'static PyType) -> PyObjectRef {
-    let obj = Box::new(W_SetObject {
+    let items = crate::lltype::malloc_raw(Vec::new());
+    crate::lltype::malloc_typed(W_SetObject {
         ob_header: PyObject {
             ob_type: tp as *const PyType,
             w_class: get_instantiate(tp),
         },
-        items: Box::into_raw(Box::new(Vec::new())),
+        items,
         len: 0,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Allocate an empty `set`.
@@ -189,5 +200,18 @@ mod tests {
             assert!(is_frozenset(fs));
             assert!(!is_set(fs));
         }
+    }
+
+    #[test]
+    fn w_set_gc_type_id_matches_descr() {
+        assert_eq!(W_SET_GC_TYPE_ID, 30);
+        assert_eq!(
+            <W_SetObject as crate::lltype::GcType>::TYPE_ID,
+            W_SET_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_SetObject as crate::lltype::GcType>::SIZE,
+            W_SET_OBJECT_SIZE
+        );
     }
 }

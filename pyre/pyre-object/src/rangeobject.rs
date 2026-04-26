@@ -31,9 +31,19 @@ pub const RANGE_ITER_STOP_OFFSET: usize = std::mem::offset_of!(W_RangeIterator, 
 /// Field offset of `step` within `W_RangeIterator`.
 pub const RANGE_ITER_STEP_OFFSET: usize = std::mem::offset_of!(W_RangeIterator, step);
 
+/// Fixed payload size (`framework.py:811`).
+pub const W_RANGE_ITER_OBJECT_SIZE: usize = std::mem::size_of::<W_RangeIterator>();
+
+impl crate::lltype::GcType for W_RangeIterator {
+    /// Mirrors `pyre_jit_trace::descr::RANGE_ITER_GC_TYPE_ID`. The JIT
+    /// init's `debug_assert_eq!` cross-checks any drift.
+    const TYPE_ID: u32 = 6;
+    const SIZE: usize = W_RANGE_ITER_OBJECT_SIZE;
+}
+
 /// Allocate a new `W_RangeIterator` on the heap.
 pub fn w_range_iter_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
-    let obj = Box::new(W_RangeIterator {
+    crate::lltype::malloc_typed(W_RangeIterator {
         ob: PyObject {
             ob_type: &RANGE_ITER_TYPE as *const PyType,
             w_class: get_instantiate(&RANGE_ITER_TYPE),
@@ -41,8 +51,7 @@ pub fn w_range_iter_new(start: i64, stop: i64, step: i64) -> PyObjectRef {
         current: start,
         stop,
         step,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 #[majit_macros::dont_look_inside]
@@ -194,8 +203,29 @@ pub struct W_SeqIterator {
     pub length: i64,
 }
 
+/// Field offset of `seq` within `W_SeqIterator`.
+pub const SEQ_ITER_SEQ_OFFSET: usize = std::mem::offset_of!(W_SeqIterator, seq);
+
+/// GC type id assigned to `W_SeqIterator` at JitDriver init time.
+pub const W_SEQ_ITER_GC_TYPE_ID: u32 = 23;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_SEQ_ITER_OBJECT_SIZE: usize = std::mem::size_of::<W_SeqIterator>();
+
+/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
+pub const W_SEQ_ITER_GC_PTR_OFFSETS: [usize; 1] = [SEQ_ITER_SEQ_OFFSET];
+
+impl crate::lltype::GcType for W_SeqIterator {
+    const TYPE_ID: u32 = W_SEQ_ITER_GC_TYPE_ID;
+    const SIZE: usize = W_SEQ_ITER_OBJECT_SIZE;
+}
+
 pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
-    let obj = Box::new(W_SeqIterator {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(seq);
+
+    crate::lltype::malloc_typed(W_SeqIterator {
         ob: PyObject {
             ob_type: &SEQ_ITER_TYPE as *const PyType,
             w_class: get_instantiate(&SEQ_ITER_TYPE),
@@ -203,10 +233,27 @@ pub fn w_seq_iter_new(seq: PyObjectRef, length: usize) -> PyObjectRef {
         seq,
         index: 0,
         length: length as i64,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 pub unsafe fn is_seq_iter(obj: PyObjectRef) -> bool {
     !obj.is_null() && unsafe { (*obj).ob_type == &SEQ_ITER_TYPE as *const PyType }
+}
+
+#[cfg(test)]
+mod seq_iter_tests {
+    use super::*;
+
+    #[test]
+    fn w_seq_iter_gc_type_id_matches_descr() {
+        assert_eq!(W_SEQ_ITER_GC_TYPE_ID, 23);
+        assert_eq!(
+            <W_SeqIterator as crate::lltype::GcType>::TYPE_ID,
+            W_SEQ_ITER_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_SeqIterator as crate::lltype::GcType>::SIZE,
+            W_SEQ_ITER_OBJECT_SIZE
+        );
+    }
 }

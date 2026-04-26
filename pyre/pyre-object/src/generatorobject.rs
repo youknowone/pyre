@@ -28,8 +28,19 @@ pub struct W_GeneratorObject {
     pub running: bool,
 }
 
+/// GC type id assigned to `W_GeneratorObject` at JitDriver init time.
+pub const W_GENERATOR_GC_TYPE_ID: u32 = 32;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_GENERATOR_OBJECT_SIZE: usize = std::mem::size_of::<W_GeneratorObject>();
+
+impl crate::lltype::GcType for W_GeneratorObject {
+    const TYPE_ID: u32 = W_GENERATOR_GC_TYPE_ID;
+    const SIZE: usize = W_GENERATOR_OBJECT_SIZE;
+}
+
 pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
-    let obj = Box::new(W_GeneratorObject {
+    crate::lltype::malloc_typed(W_GeneratorObject {
         ob: PyObject {
             ob_type: &GENERATOR_TYPE as *const PyType,
             w_class: get_instantiate(&GENERATOR_TYPE),
@@ -38,8 +49,7 @@ pub fn w_generator_new(frame_ptr: *mut u8) -> PyObjectRef {
         started: false,
         exhausted: false,
         running: false,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 #[inline]
@@ -78,5 +88,23 @@ pub unsafe fn w_generator_is_running(obj: PyObjectRef) -> bool {
 pub unsafe fn w_generator_set_running(obj: PyObjectRef, val: bool) {
     unsafe {
         (*(obj as *mut W_GeneratorObject)).running = val;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w_generator_gc_type_id_matches_descr() {
+        assert_eq!(W_GENERATOR_GC_TYPE_ID, 32);
+        assert_eq!(
+            <W_GeneratorObject as crate::lltype::GcType>::TYPE_ID,
+            W_GENERATOR_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_GeneratorObject as crate::lltype::GcType>::SIZE,
+            W_GENERATOR_OBJECT_SIZE
+        );
     }
 }

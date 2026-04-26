@@ -20,19 +20,42 @@ pub const FLOAT_FLOATVAL_OFFSET: usize = std::mem::offset_of!(W_FloatObject, flo
 /// allocation hook can reach it without a back-channel.
 pub const W_FLOAT_GC_TYPE_ID: u32 = 2;
 
+/// Fixed payload size for `W_FloatObject`, mirroring `info.fixedsize`
+/// in `framework.py:811`.
+pub const W_FLOAT_OBJECT_SIZE: usize = std::mem::size_of::<W_FloatObject>();
+
+impl crate::lltype::GcType for W_FloatObject {
+    const TYPE_ID: u32 = W_FLOAT_GC_TYPE_ID;
+    const SIZE: usize = W_FLOAT_OBJECT_SIZE;
+}
+
 /// Allocate a new W_FloatObject on the heap.
 ///
-/// Phase 1: uses `Box::leak` for simplicity (objects are never freed).
-/// A proper GC will replace this allocation strategy.
+/// Routes through [`crate::lltype::malloc_typed`] (Task #145), the
+/// typed unified allocation lowering that mirrors RPython's
+/// `lltype.malloc(W_FloatObject)`
+/// (`rpython/rtyper/lltypesystem/lltype.py:2192`). PyPy's
+/// `pypy/objspace/std/floatobject.py:299 newfloat` produces the
+/// same shape: a single allocation call that the GC transform stage
+/// eventually rewrites into managed alloc + push/pop_roots
+/// (`rpython/memory/gctransform/framework.py:803-853`). The typed
+/// variant carries `W_FLOAT_GC_TYPE_ID` and `W_FLOAT_OBJECT_SIZE`
+/// via the [`crate::lltype::GcType`] impl so the future managed
+/// allocator can read them without a runtime registry lookup,
+/// matching `gct_fv_gc_malloc`'s `c_type_id` / `c_size` constants
+/// (`framework.py:807-811`).
+///
+/// Phase 1: `lltype::malloc_typed` is `Box::into_raw`. Future GC
+/// integration replaces only that body; this constructor stays
+/// unchanged.
 pub fn w_float_new(value: f64) -> PyObjectRef {
-    let obj = Box::new(W_FloatObject {
+    crate::lltype::malloc_typed(W_FloatObject {
         ob_header: PyObject {
             ob_type: &FLOAT_TYPE as *const PyType,
             w_class: get_instantiate(&FLOAT_TYPE),
         },
         floatval: value,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Box a float constant into a heap Python float object.
@@ -59,6 +82,10 @@ pub extern "C" fn jit_w_float_new(value_bits: i64) -> i64 {
 mod tests {
     use super::*;
 
+    // GC-flavored allocations (`malloc_typed`) are leaked in these
+    // tests; `Box::from_raw` is unsound once Phase 2 routes
+    // `malloc_typed` through the managed allocator.
+
     #[test]
     fn test_float_create_and_read() {
         let obj = w_float_new(3.14);
@@ -66,7 +93,6 @@ mod tests {
             assert!(is_float(obj));
             assert!(!is_int(obj));
             assert_eq!(w_float_get_value(obj), 3.14);
-            drop(Box::from_raw(obj as *mut W_FloatObject));
         }
     }
 
@@ -75,7 +101,6 @@ mod tests {
         let obj = w_float_new(-2.5);
         unsafe {
             assert_eq!(w_float_get_value(obj), -2.5);
-            drop(Box::from_raw(obj as *mut W_FloatObject));
         }
     }
 
@@ -84,7 +109,6 @@ mod tests {
         let obj = box_float_constant(6.25);
         unsafe {
             assert_eq!(w_float_get_value(obj), 6.25);
-            drop(Box::from_raw(obj as *mut W_FloatObject));
         }
     }
 

@@ -65,6 +65,61 @@ pub const FUNCTION_NAME_OFFSET: usize = std::mem::offset_of!(Function, name);
 pub const FUNCTION_GLOBALS_OFFSET: usize = std::mem::offset_of!(Function, w_func_globals);
 /// Field offset of `closure` within `Function`.
 pub const FUNCTION_CLOSURE_OFFSET: usize = std::mem::offset_of!(Function, closure);
+/// Field offset of `defs_w` within `Function`.
+pub const FUNCTION_DEFS_W_OFFSET: usize = std::mem::offset_of!(Function, defs_w);
+/// Field offset of `w_kw_defs` within `Function`.
+pub const FUNCTION_W_KW_DEFS_OFFSET: usize = std::mem::offset_of!(Function, w_kw_defs);
+/// Field offset of `w_module` within `Function`.
+pub const FUNCTION_W_MODULE_OFFSET: usize = std::mem::offset_of!(Function, w_module);
+
+/// GC type id assigned to `Function` at JitDriver init time. Held as
+/// a constant alongside the struct (rather than runtime-queried) so
+/// the allocation hook can reach it without a back-channel, mirroring
+/// `W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID` / `BUILTIN_CODE_GC_TYPE_ID`.
+/// `pyre/pyre-jit/src/eval.rs` asserts the same id is returned by
+/// `gc.register_type(...)` so any drift panics on startup.
+///
+/// `BuiltinFunction` (gateway.py module-level builtins) and
+/// `FunctionWithFixedCode` are Rust type aliases of `Function`, so
+/// instances of those PyTypes share this tid via the
+/// `register_vtable_for_type` mapping.
+pub const FUNCTION_GC_TYPE_ID: u32 = 14;
+
+/// Fixed payload size used by `gct_fv_gc_malloc`'s `c_size`
+/// (`framework.py:811`).
+pub const FUNCTION_OBJECT_SIZE: usize = std::mem::size_of::<Function>();
+
+/// Byte offsets of the inline `PyObjectRef`-shaped fields the GC must
+/// trace during minor collection. `code` is included because
+/// `BuiltinCode` is now allocated through `malloc_typed`
+/// (`gateway.rs:298`) and therefore lives in the GC heap; the W_CodeObject
+/// path remains raw/immortal and the walker's `is_in_nursery` check
+/// (`majit-gc/src/collector.rs:764`) leaves those entries alone.
+/// `function.py:47 _immutable_fields_ = ['code?', ...]` matches PyPy's
+/// W_Function.code? — an immutable GC reference traced as part of the
+/// closure / defs_w / w_kw_defs / w_module set.
+///
+/// The remaining fields are non-GC: `can_change_code` is a `bool`,
+/// `name` is a manually-managed `*const String`, `w_func_globals` is a
+/// `*mut DictStorage` (manually-managed pointer to non-GC storage —
+/// see Task #145 follow-up for DictStorage GC migration).
+///
+/// `ob.w_class` is intentionally absent, mirroring how W_IntObject /
+/// W_FloatObject leave the typeptr-shaped header field out of their
+/// `gc_ptr_offsets`. W_TypeObject instances are static-region and
+/// not subject to nursery relocation.
+pub const FUNCTION_GC_PTR_OFFSETS: [usize; 5] = [
+    FUNCTION_CODE_OFFSET,
+    FUNCTION_CLOSURE_OFFSET,
+    FUNCTION_DEFS_W_OFFSET,
+    FUNCTION_W_KW_DEFS_OFFSET,
+    FUNCTION_W_MODULE_OFFSET,
+];
+
+impl pyre_object::lltype::GcType for Function {
+    const TYPE_ID: u32 = FUNCTION_GC_TYPE_ID;
+    const SIZE: usize = FUNCTION_OBJECT_SIZE;
+}
 
 /// Allocate a new `Function`.
 ///
@@ -99,8 +154,23 @@ fn function_new_impl(
     closure: PyObjectRef,
     can_change_code: bool,
 ) -> PyObjectRef {
-    let name_ptr = Box::into_raw(Box::new(name)) as *const String;
-    let obj = Box::new(Function {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`) for
+    // the `lltype::malloc_typed` call below. `closure` and `code` are
+    // PyObjectRef-shaped GC roots across the alloc — `BuiltinCode`
+    // lives in the GC heap (`gateway.rs:298 malloc_typed`) and
+    // `W_CodeObject` is currently raw/immortal; the walker's
+    // `is_in_nursery` filter (`majit-gc/src/collector.rs:764`) is what
+    // makes the heterogeneous case safe. `w_func_globals` is a
+    // host-allocated DictStorage (raw), and `name_ptr` is allocated
+    // below via `malloc_raw` (non-GC) and stored into the struct as
+    // part of the same `malloc_typed` call, so it never spans a
+    // collection point.
+    let _roots = pyre_object::gc_roots::push_roots();
+    pyre_object::gc_roots::pin_root(closure);
+    pyre_object::gc_roots::pin_root(code as PyObjectRef);
+
+    let name_ptr = pyre_object::lltype::malloc_raw(name) as *const String;
+    pyre_object::lltype::malloc_typed(Function {
         ob: PyObject {
             ob_type: ob_type as *const PyType,
             w_class: pyre_object::pyobject::get_instantiate(ob_type),
@@ -113,8 +183,7 @@ fn function_new_impl(
         defs_w: PY_NULL,
         w_kw_defs: PY_NULL,
         w_module: PY_NULL,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// function.py:703 — `class FunctionWithFixedCode(Function): can_change_code = False`
@@ -516,7 +585,7 @@ pub unsafe fn function_set_func_name(obj: PyObjectRef, name: PyObjectRef) {
             return;
         }
         let name = pyre_object::w_str_get_value(name);
-        let name = Box::into_raw(Box::new(name.to_string())) as *const String;
+        let name = pyre_object::lltype::malloc_raw(name.to_string()) as *const String;
         let old = (*(obj as *mut Function)).name;
         if !old.is_null() {
             drop(Box::from_raw(old as *mut String));
@@ -1038,5 +1107,44 @@ mod tests {
         assert_eq!(FUNCTION_NAME_OFFSET, 32); // after code(8) + can_change_code(1) + padding(7)
         assert_eq!(FUNCTION_GLOBALS_OFFSET, 40); // after name
         assert_eq!(FUNCTION_CLOSURE_OFFSET, 48); // after w_func_globals
+    }
+
+    /// Guard against drift between the constant colocated with
+    /// `Function` and the id that `pyre-jit/src/eval.rs` asserts at
+    /// JitDriver init. Mirror of the W_INT/W_FLOAT/BuiltinCode
+    /// trip-wire tests.
+    #[test]
+    fn function_gc_type_id_matches_descr() {
+        assert_eq!(FUNCTION_GC_TYPE_ID, 14);
+        assert_eq!(
+            <Function as pyre_object::lltype::GcType>::TYPE_ID,
+            FUNCTION_GC_TYPE_ID
+        );
+        assert_eq!(
+            <Function as pyre_object::lltype::GcType>::SIZE,
+            std::mem::size_of::<Function>()
+        );
+    }
+
+    /// `FUNCTION_GC_PTR_OFFSETS` must list the five inline
+    /// `PyObjectRef`-shaped fields the GC traces (the four
+    /// `PyObjectRef` payload fields plus `code`, which is `*const ()`
+    /// but points at a `[ob: PyObject, ...]`-prefixed Code object so
+    /// the walker can interpret it as a typed reference). If a new GC
+    /// field is added to `Function` (or one of these fields is removed)
+    /// the array has to follow — this test makes the change a
+    /// compile-time failure rather than a silent traversal gap.
+    #[test]
+    fn function_gc_ptr_offsets_cover_inline_pyobjectref_fields() {
+        assert_eq!(
+            FUNCTION_GC_PTR_OFFSETS,
+            [
+                std::mem::offset_of!(Function, code),
+                std::mem::offset_of!(Function, closure),
+                std::mem::offset_of!(Function, defs_w),
+                std::mem::offset_of!(Function, w_kw_defs),
+                std::mem::offset_of!(Function, w_module),
+            ]
+        );
     }
 }

@@ -31,33 +31,44 @@ pub struct W_DictObject {
 /// Field offset of `len` within `W_DictObject`, for JIT field access.
 pub const DICT_LEN_OFFSET: usize = std::mem::offset_of!(W_DictObject, len);
 
+/// GC type id assigned to `W_DictObject` at JitDriver init time.
+pub const W_DICT_GC_TYPE_ID: u32 = 29;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_DICT_OBJECT_SIZE: usize = std::mem::size_of::<W_DictObject>();
+
+impl crate::lltype::GcType for W_DictObject {
+    const TYPE_ID: u32 = W_DICT_GC_TYPE_ID;
+    const SIZE: usize = W_DICT_OBJECT_SIZE;
+}
+
 /// Allocate a new empty dict.
 pub fn w_dict_new() -> PyObjectRef {
-    let obj = Box::new(W_DictObject {
+    let entries = crate::lltype::malloc_raw(Vec::new());
+    crate::lltype::malloc_typed(W_DictObject {
         ob_header: PyObject {
             ob_type: &DICT_TYPE as *const PyType,
             w_class: get_instantiate(&DICT_TYPE),
         },
-        entries: Box::into_raw(Box::new(Vec::new())),
+        entries,
         len: 0,
         dict_storage_proxy: std::ptr::null_mut(),
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Allocate a dict backed by a `DictStorage` (for `globals()` and similar
 /// live dict views). Mutations to this dict also update the backing storage.
 pub fn w_dict_new_with_dict_storage(ns: *mut u8) -> PyObjectRef {
-    let obj = Box::new(W_DictObject {
+    let entries = crate::lltype::malloc_raw(Vec::new());
+    crate::lltype::malloc_typed(W_DictObject {
         ob_header: PyObject {
             ob_type: &DICT_TYPE as *const PyType,
             w_class: get_instantiate(&DICT_TYPE),
         },
-        entries: Box::into_raw(Box::new(Vec::new())),
+        entries,
         len: 0,
         dict_storage_proxy: ns,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Compare two dict keys for equality.
@@ -194,8 +205,9 @@ impl AtomicHookPtr {
     fn store(&self, hook: NamespaceStoreHook) {
         // Leak a boxed function pointer so the pointer lives for the entire
         // process lifetime; this matches PyPy's one-time interp init.
-        let boxed: Box<NamespaceStoreHook> = Box::new(hook);
-        let raw = Box::into_raw(boxed);
+        // `flavor='raw'` because this is host-side dispatch state, not a
+        // GC-managed Python object.
+        let raw = crate::lltype::malloc_raw(hook);
         self.0.store(raw, std::sync::atomic::Ordering::Release);
     }
 
@@ -335,5 +347,18 @@ mod tests {
             w_dict_setitem(dict, 1, w_int_new(20));
             assert_eq!(w_dict_len(dict), 1);
         }
+    }
+
+    #[test]
+    fn w_dict_gc_type_id_matches_descr() {
+        assert_eq!(W_DICT_GC_TYPE_ID, 29);
+        assert_eq!(
+            <W_DictObject as crate::lltype::GcType>::TYPE_ID,
+            W_DICT_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_DictObject as crate::lltype::GcType>::SIZE,
+            W_DICT_OBJECT_SIZE
+        );
     }
 }

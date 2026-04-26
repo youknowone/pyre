@@ -15,28 +15,39 @@ pub struct W_BytearrayObject {
     pub data: *mut Vec<u8>,
 }
 
+/// GC type id assigned to `W_BytearrayObject` at JitDriver init time.
+pub const W_BYTEARRAY_GC_TYPE_ID: u32 = 28;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_BYTEARRAY_OBJECT_SIZE: usize = std::mem::size_of::<W_BytearrayObject>();
+
+impl crate::lltype::GcType for W_BytearrayObject {
+    const TYPE_ID: u32 = W_BYTEARRAY_GC_TYPE_ID;
+    const SIZE: usize = W_BYTEARRAY_OBJECT_SIZE;
+}
+
 /// Allocate a new bytearray filled with zeros.
 pub fn w_bytearray_new(size: usize) -> PyObjectRef {
-    let obj = Box::new(W_BytearrayObject {
+    let data = crate::lltype::malloc_raw(vec![0u8; size]);
+    crate::lltype::malloc_typed(W_BytearrayObject {
         ob_header: PyObject {
             ob_type: &BYTEARRAY_TYPE as *const PyType,
             w_class: get_instantiate(&BYTEARRAY_TYPE),
         },
-        data: Box::into_raw(Box::new(vec![0u8; size])),
-    });
-    Box::into_raw(obj) as PyObjectRef
+        data,
+    }) as PyObjectRef
 }
 
 /// Allocate a new bytearray from a byte slice.
 pub fn w_bytearray_from_bytes(bytes: &[u8]) -> PyObjectRef {
-    let obj = Box::new(W_BytearrayObject {
+    let data = crate::lltype::malloc_raw(bytes.to_vec());
+    crate::lltype::malloc_typed(W_BytearrayObject {
         ob_header: PyObject {
             ob_type: &BYTEARRAY_TYPE as *const PyType,
             w_class: get_instantiate(&BYTEARRAY_TYPE),
         },
-        data: Box::into_raw(Box::new(bytes.to_vec())),
-    });
-    Box::into_raw(obj) as PyObjectRef
+        data,
+    }) as PyObjectRef
 }
 
 pub unsafe fn is_bytearray(obj: PyObjectRef) -> bool {
@@ -110,5 +121,18 @@ mod tests {
             assert_eq!(w_bytearray_find(ba, 1, 0), 3);
             assert_eq!(w_bytearray_find(ba, 1, 4), -1);
         }
+    }
+
+    #[test]
+    fn w_bytearray_gc_type_id_matches_descr() {
+        assert_eq!(W_BYTEARRAY_GC_TYPE_ID, 28);
+        assert_eq!(
+            <W_BytearrayObject as crate::lltype::GcType>::TYPE_ID,
+            W_BYTEARRAY_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_BytearrayObject as crate::lltype::GcType>::SIZE,
+            W_BYTEARRAY_OBJECT_SIZE
+        );
     }
 }

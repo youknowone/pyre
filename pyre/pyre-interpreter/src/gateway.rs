@@ -240,6 +240,14 @@ impl UnwrapSpec_EmitShortcut {
 /// PyPy typedef.py: BuiltinCode.typedef = TypeDef('builtin-code', ...)
 pub static BUILTIN_CODE_TYPE: PyType = pyre_object::pyobject::new_pytype("builtin-code");
 
+/// GC type id assigned to `BuiltinCode` at JitDriver init time. Held
+/// as a constant alongside the struct (rather than runtime-queried) so
+/// the allocation hook can reach it without a back-channel, mirroring
+/// `W_INT_GC_TYPE_ID` / `W_FLOAT_GC_TYPE_ID`. `pyre/pyre-jit/src/eval.rs`
+/// asserts the same id is returned by `gc.register_type(...)` so any
+/// drift panics on startup.
+pub const BUILTIN_CODE_GC_TYPE_ID: u32 = 13;
+
 /// Signature of a built-in function.
 ///
 /// PyPy: all interp-level functions can raise OperationError.
@@ -260,6 +268,18 @@ pub struct BuiltinCode {
     pub docstring: Option<&'static str>,
 }
 
+/// Fixed payload size used by `gct_fv_gc_malloc`'s `c_size`
+/// (`framework.py:811`). The payload has no inline GC pointers (`name`
+/// / `docstring` are `'static` slices, `func` is a function pointer,
+/// `ob.w_class` follows the existing W_IntObject / W_FloatObject
+/// convention of leaving typeptr fixups out of `gc_ptr_offsets`).
+pub const BUILTIN_CODE_OBJECT_SIZE: usize = std::mem::size_of::<BuiltinCode>();
+
+impl pyre_object::lltype::GcType for BuiltinCode {
+    const TYPE_ID: u32 = BUILTIN_CODE_GC_TYPE_ID;
+    const SIZE: usize = BUILTIN_CODE_OBJECT_SIZE;
+}
+
 /// Allocate a new `BuiltinCode` with no docstring.
 pub fn builtin_code_new(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
     builtin_code_new_with_doc(name, func, None)
@@ -275,7 +295,7 @@ pub fn builtin_code_new_with_doc(
     func: BuiltinCodeFn,
     docstring: Option<&'static str>,
 ) -> PyObjectRef {
-    let obj = Box::new(BuiltinCode {
+    pyre_object::lltype::malloc_typed(BuiltinCode {
         ob: PyObject {
             ob_type: &BUILTIN_CODE_TYPE,
             w_class: pyre_object::pyobject::get_instantiate(&BUILTIN_CODE_TYPE),
@@ -283,8 +303,7 @@ pub fn builtin_code_new_with_doc(
         name,
         func,
         docstring,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Check if an object is a built-in function.
@@ -347,4 +366,25 @@ pub fn make_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjec
 pub fn make_module_builtin_function(name: &'static str, func: BuiltinCodeFn) -> PyObjectRef {
     let code = builtin_code_new(name, func);
     crate::function_new_builtin(code as *const (), name.to_string(), std::ptr::null_mut())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Guard against drift between the constant colocated with
+    /// `BuiltinCode` and the id that `pyre-jit/src/eval.rs` asserts at
+    /// JitDriver init. Mirror of the W_INT/W_FLOAT trip-wire tests.
+    #[test]
+    fn builtin_code_gc_type_id_matches_descr() {
+        assert_eq!(BUILTIN_CODE_GC_TYPE_ID, 13);
+        assert_eq!(
+            <BuiltinCode as pyre_object::lltype::GcType>::TYPE_ID,
+            BUILTIN_CODE_GC_TYPE_ID
+        );
+        assert_eq!(
+            <BuiltinCode as pyre_object::lltype::GcType>::SIZE,
+            std::mem::size_of::<BuiltinCode>()
+        );
+    }
 }

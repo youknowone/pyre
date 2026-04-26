@@ -357,6 +357,93 @@ pub use pyre_object::specialisedtupleobject::{
     SPECIALISED_TUPLE_FF_GC_TYPE_ID, SPECIALISED_TUPLE_II_GC_TYPE_ID,
     SPECIALISED_TUPLE_OO_GC_TYPE_ID,
 };
+// `BUILTIN_CODE_GC_TYPE_ID` lives in `pyre-interpreter::gateway`
+// alongside the `BuiltinCode` struct it describes. `FUNCTION_GC_TYPE_ID`
+// lives in `pyre-interpreter::function` for the same reason and covers
+// `Function`, `BuiltinFunction`, and `FunctionWithFixedCode` (the
+// latter two are Rust type aliases of `Function`). Re-exported here
+// for the JIT registration site (`pyre-jit/src/eval.rs`).
+pub use pyre_interpreter::function::FUNCTION_GC_TYPE_ID;
+pub use pyre_interpreter::gateway::BUILTIN_CODE_GC_TYPE_ID;
+// `W_CELL_GC_TYPE_ID` lives in `pyre-object::cellobject` alongside the
+// `W_CellObject` struct it describes. Re-exported for the JIT
+// registration site.
+pub use pyre_object::cellobject::W_CELL_GC_TYPE_ID;
+// `W_METHOD_GC_TYPE_ID` lives in `pyre-object::methodobject` alongside
+// the `W_MethodObject` struct it describes. Re-exported for the JIT
+// registration site.
+pub use pyre_object::methodobject::W_METHOD_GC_TYPE_ID;
+// `W_SLICE_GC_TYPE_ID` lives in `pyre-object::sliceobject` alongside
+// the `W_SliceObject` struct it describes. Re-exported for the JIT
+// registration site.
+pub use pyre_object::sliceobject::W_SLICE_GC_TYPE_ID;
+// `W_SUPER_GC_TYPE_ID` lives in `pyre-object::superobject` alongside
+// the `W_SuperObject` struct it describes. Re-exported for the JIT
+// registration site.
+pub use pyre_object::superobject::W_SUPER_GC_TYPE_ID;
+// `W_PROPERTY_GC_TYPE_ID` / `W_STATICMETHOD_GC_TYPE_ID` /
+// `W_CLASSMETHOD_GC_TYPE_ID` live in `pyre-object::propertyobject`
+// alongside their structs. Re-exported for the JIT registration site.
+pub use pyre_object::propertyobject::{
+    W_CLASSMETHOD_GC_TYPE_ID, W_PROPERTY_GC_TYPE_ID, W_STATICMETHOD_GC_TYPE_ID,
+};
+// `W_UNION_GC_TYPE_ID` lives in `pyre-object::unionobject` alongside
+// the `W_UnionType` struct it describes. Re-exported for the JIT
+// registration site.
+pub use pyre_object::unionobject::W_UNION_GC_TYPE_ID;
+// `W_SEQ_ITER_GC_TYPE_ID` lives in `pyre-object::rangeobject`
+// alongside the `W_SeqIterator` struct it describes. Re-exported for
+// the JIT registration site.
+pub use pyre_object::rangeobject::W_SEQ_ITER_GC_TYPE_ID;
+// `W_COUNT_GC_TYPE_ID` / `W_REPEAT_GC_TYPE_ID` live in
+// `pyre-object::itertoolsmodule` alongside the `W_Count` /
+// `W_Repeat` structs they describe. Re-exported for the JIT
+// registration site.
+pub use pyre_object::itertoolsmodule::{W_COUNT_GC_TYPE_ID, W_REPEAT_GC_TYPE_ID};
+// `W_MEMBER_GC_TYPE_ID` lives in `pyre-object::memberobject`
+// alongside the `W_MemberDescr` struct it describes. Re-exported for
+// the JIT registration site.
+pub use pyre_object::memberobject::W_MEMBER_GC_TYPE_ID;
+// `W_BYTES_GC_TYPE_ID` lives in `pyre-object::bytesobject` alongside
+// the `W_BytesObject` struct it describes. Re-exported for the JIT
+// registration site.
+pub use pyre_object::bytesobject::W_BYTES_GC_TYPE_ID;
+// `W_BYTEARRAY_GC_TYPE_ID` lives in `pyre-object::bytearrayobject`
+// alongside the `W_BytearrayObject` struct it describes. Re-exported
+// for the JIT registration site.
+pub use pyre_object::bytearrayobject::W_BYTEARRAY_GC_TYPE_ID;
+// `W_DICT_GC_TYPE_ID` lives in `pyre-object::dictobject` alongside
+// the `W_DictObject` struct it describes. Re-exported for the JIT
+// registration site.
+pub use pyre_object::dictobject::W_DICT_GC_TYPE_ID;
+// `W_SET_GC_TYPE_ID` lives in `pyre-object::setobject` alongside the
+// `W_SetObject` struct it describes (covers both `set` and
+// `frozenset` PyTypes — same Rust struct). Re-exported for the JIT
+// registration site.
+pub use pyre_object::setobject::W_SET_GC_TYPE_ID;
+// `W_EXCEPTION_GC_TYPE_ID` lives in `pyre-object::excobject`
+// alongside the `W_ExceptionObject` struct it describes. Re-exported
+// for the JIT registration site.
+pub use pyre_object::excobject::W_EXCEPTION_GC_TYPE_ID;
+// `W_GENERATOR_GC_TYPE_ID` lives in `pyre-object::generatorobject`
+// alongside the `W_GeneratorObject` struct it describes. Re-exported
+// for the JIT registration site.
+pub use pyre_object::generatorobject::W_GENERATOR_GC_TYPE_ID;
+// `W_TYPE_GC_TYPE_ID` lives in `pyre-object::typeobject` alongside
+// the `W_TypeObject` struct it describes. Re-exported for the JIT
+// registration site. (`TYPE_TYPE` is in `all_foreign_pytypes()` but
+// the foreign-pytype loop's `sizeof(PyObject)` approximation would
+// drastically under-count the W_TypeObject payload.)
+pub use pyre_object::typeobject::W_TYPE_GC_TYPE_ID;
+// `W_STR_GC_TYPE_ID` / `W_LONG_GC_TYPE_ID` / `W_MODULE_GC_TYPE_ID`
+// live alongside their structs in
+// `pyre-object::{strobject, longobject, moduleobject}`. Re-exported
+// for the JIT registration site. `W_InstanceObject` shares
+// `OBJECT_GC_TYPE_ID` with the `object` root (see comment on the
+// struct) so it has no separate id.
+pub use pyre_object::longobject::W_LONG_GC_TYPE_ID;
+pub use pyre_object::moduleobject::W_MODULE_GC_TYPE_ID;
+pub use pyre_object::strobject::W_STR_GC_TYPE_ID;
 
 fn field_descr_from_group(group: &PyreObjectDescrGroup, index: usize) -> DescrRef {
     let field_descr = group

@@ -88,6 +88,20 @@ pub fn w_tuple_new(items: Vec<PyObjectRef>) -> PyObjectRef {
 /// `is_managed_heap_object` guard (collector.rs:991/1008) keeps that
 /// stepping-stone correctness-safe.
 pub fn w_tuple_new_array_backed(items: Vec<PyObjectRef>) -> PyObjectRef {
+    // First Phase 2 caller of the `gct_fv_gc_malloc` bracket pattern
+    // (`framework.py:853-856`):
+    //   livevars = self.push_roots(hop)
+    //   v_alloc = hop.genop("direct_call", [malloc_fast_ptr, ...])
+    //   self.pop_roots(hop, livevars)
+    // Each `items[i]` is a live GC pointer that must survive the
+    // potential collection triggered inside `try_gc_alloc_stable`
+    // below; the `RootScope` guard truncates the shadow stack on
+    // function return mirroring `pop_roots`.
+    let _roots = crate::gc_roots::push_roots();
+    for &item in &items {
+        crate::gc_roots::pin_root(item);
+    }
+
     let items_block = unsafe { alloc_tuple_items_block(&items) };
     let header = PyObject {
         ob_type: &TUPLE_TYPE as *const PyType,

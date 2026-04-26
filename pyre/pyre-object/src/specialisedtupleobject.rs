@@ -173,6 +173,14 @@ pub fn w_specialised_tuple_ff_new(value0: f64, value1: f64) -> PyObjectRef {
 /// walker's `is_managed_heap_object` guard (collector.rs:991/1008)
 /// keeps that case correctness-safe.
 pub fn w_specialised_tuple_oo_new(value0: PyObjectRef, value1: PyObjectRef) -> PyObjectRef {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
+    // both inputs are live PyObjectRef roots that must survive the
+    // potential collection inside `try_gc_alloc_stable`. The ii/ff
+    // variants take unboxed i64/f64 and need no bracket here.
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(value0);
+    crate::gc_roots::pin_root(value1);
+
     let header = PyObject {
         ob_type: &SPECIALISED_TUPLE_OO_TYPE as *const PyType,
         w_class: get_instantiate(&TUPLE_TYPE),
@@ -269,6 +277,10 @@ mod tests {
     use crate::intobject::w_int_new;
 
     #[test]
+    // GC-flavored allocations are leaked in these tests; calling
+    // `Box::from_raw` on `malloc_typed` output becomes unsound once
+    // Phase 2 routes typed mallocs through the managed allocator.
+
     fn test_ii_layout_and_access() {
         let t = w_specialised_tuple_ii_new(7, 11);
         unsafe {
@@ -278,7 +290,6 @@ mod tests {
             assert!(!is_specialised_tuple_oo(t));
             assert_eq!(w_specialised_tuple_ii_getvalue(t, 0), 7);
             assert_eq!(w_specialised_tuple_ii_getvalue(t, 1), 11);
-            drop(Box::from_raw(t as *mut W_SpecialisedTupleObject_ii));
         }
     }
 
@@ -289,7 +300,6 @@ mod tests {
             assert!(is_specialised_tuple_ff(t));
             assert_eq!(w_specialised_tuple_ff_getvalue(t, 0), 1.5);
             assert_eq!(w_specialised_tuple_ff_getvalue(t, 1), 2.25);
-            drop(Box::from_raw(t as *mut W_SpecialisedTupleObject_ff));
         }
     }
 
@@ -302,7 +312,6 @@ mod tests {
             assert!(is_specialised_tuple_oo(t));
             assert_eq!(w_specialised_tuple_oo_getvalue(t, 0), a);
             assert_eq!(w_specialised_tuple_oo_getvalue(t, 1), b);
-            drop(Box::from_raw(t as *mut W_SpecialisedTupleObject_oo));
         }
     }
 

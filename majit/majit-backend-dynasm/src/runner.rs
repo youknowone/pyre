@@ -547,12 +547,6 @@ impl DynasmBackend {
     // below so `compile_tmp_callback` and other backend-agnostic
     // consumers can reach them through `&mut dyn Backend`.
 
-    /// Stub — dynasm doesn't need GC runtime ID.
-    pub fn gc_runtime_id(&self) -> Option<u64> {
-        None
-    }
-    pub fn set_gc_runtime_id(&mut self, _id: u64) {}
-
     /// gc.py:525-531 parity: build a GcRewriterImpl from the active GC.
     fn gc_rewriter(
         &self,

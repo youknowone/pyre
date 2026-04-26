@@ -25,20 +25,31 @@ pub struct W_ModuleObject {
     pub dict: *mut u8,
 }
 
+/// GC type id assigned to `W_ModuleObject` at JitDriver init time.
+pub const W_MODULE_GC_TYPE_ID: u32 = 36;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_MODULE_OBJECT_SIZE: usize = std::mem::size_of::<W_ModuleObject>();
+
+impl crate::lltype::GcType for W_ModuleObject {
+    const TYPE_ID: u32 = W_MODULE_GC_TYPE_ID;
+    const SIZE: usize = W_MODULE_OBJECT_SIZE;
+}
+
 /// Allocate a new W_ModuleObject.
 ///
 /// `name` — the module name (e.g. "math", "os.path")
 /// `dict_ptr` — raw pointer to the module's backing dict storage
 pub fn w_module_new(name: &str, dict_ptr: *mut u8) -> PyObjectRef {
-    let obj = Box::new(W_ModuleObject {
+    let name = crate::lltype::malloc_raw(name.to_string());
+    crate::lltype::malloc_typed(W_ModuleObject {
         ob_header: PyObject {
             ob_type: &MODULE_TYPE as *const PyType,
             w_class: get_instantiate(&MODULE_TYPE),
         },
-        name: Box::into_raw(Box::new(name.to_string())),
+        name,
         dict: dict_ptr,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Get the module name.

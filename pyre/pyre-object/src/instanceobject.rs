@@ -24,17 +24,39 @@ pub struct W_InstanceObject {
     pub ob_header: PyObject,
 }
 
+/// `W_InstanceObject` is the bare `[ob_header]` instance for user-
+/// defined classes. Its size matches `size_of::<PyObject>()` and it
+/// shares the GC type id of `INSTANCE_TYPE` (the `object` root —
+/// `OBJECT_GC_TYPE_ID = 0`). Registering it as a separate id would
+/// duplicate the root of the inheritance hierarchy and break the
+/// preorder-range invariants in `subclass_range`. Allocation goes
+/// through the untyped [`malloc`] for now; a future pass that
+/// teaches `malloc_typed` about parent-id aliasing can re-enable a
+/// typed entry point.
+///
+/// Fixed payload size (`framework.py:811`).
+pub const W_INSTANCE_OBJECT_SIZE: usize = std::mem::size_of::<W_InstanceObject>();
+
 /// Allocate a new instance of a user-defined class.
 ///
 /// PyPy equivalent: object.__new__(space, w_type) → allocate_instance
 pub fn w_instance_new(w_type: PyObjectRef) -> PyObjectRef {
-    let obj = Box::new(W_InstanceObject {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`) for
+    // the `lltype::malloc` call below. `w_type` is a `W_TypeObject`
+    // (`pyre-object::typeobject` GC type id 33) — user-defined types
+    // are allocated through `malloc_typed`, so the typeptr is a live
+    // GC reference across the instance allocation. The `is_in_nursery`
+    // filter in the walker (`majit-gc/src/collector.rs:764`) keeps the
+    // built-in static `PyType` case (e.g. `INT_TYPE`) untouched.
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_type);
+
+    crate::lltype::malloc(W_InstanceObject {
         ob_header: PyObject {
             ob_type: &INSTANCE_TYPE as *const PyType,
             w_class: w_type,
         },
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Get the class (W_TypeObject) of an instance.

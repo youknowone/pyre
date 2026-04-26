@@ -101,9 +101,29 @@ pub struct W_TypeObject {
     pub weakrefable: bool,
 }
 
+/// Field offset of `bases` within `W_TypeObject`.
+pub const TYPE_BASES_OFFSET: usize = std::mem::offset_of!(W_TypeObject, bases);
+
+/// GC type id assigned to `W_TypeObject` at JitDriver init time.
+pub const W_TYPE_GC_TYPE_ID: u32 = 33;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_TYPE_OBJECT_SIZE: usize = std::mem::size_of::<W_TypeObject>();
+
+/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
+/// Only `bases` is a `PyObjectRef` — `name` (`*mut String`),
+/// `dict` (`*mut u8`), `mro_w` (`*mut Vec<PyObjectRef>`), and `layout`
+/// (`*const Layout`) are non-PyObject heap allocations.
+pub const W_TYPE_GC_PTR_OFFSETS: [usize; 1] = [TYPE_BASES_OFFSET];
+
+impl crate::lltype::GcType for W_TypeObject {
+    const TYPE_ID: u32 = W_TYPE_GC_TYPE_ID;
+    const SIZE: usize = W_TYPE_OBJECT_SIZE;
+}
+
 /// Leak a Layout to get a 'static pointer for sharing.
 pub fn leak_layout(layout: Layout) -> *const Layout {
-    Box::into_raw(Box::new(layout))
+    crate::lltype::malloc_raw(layout)
 }
 
 /// Allocate a new W_TypeObject with `flag_heaptype = true`.
@@ -112,21 +132,25 @@ pub fn leak_layout(layout: Layout) -> *const Layout {
 /// Layout is set to null initially; caller must set it via set_layout
 /// after running create_all_slots / setup_builtin_type.
 pub fn w_type_new(name: &str, bases: PyObjectRef, dict_ptr: *mut u8) -> PyObjectRef {
-    let obj = Box::new(W_TypeObject {
+    let name = crate::lltype::malloc_raw(name.to_string());
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(bases);
+
+    crate::lltype::malloc_typed(W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
             w_class: std::ptr::null_mut(),
         },
         mro_w: std::ptr::null_mut(),
-        name: Box::into_raw(Box::new(name.to_string())),
+        name,
         bases,
         dict: dict_ptr,
         flag_heaptype: true,
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Allocate a new W_TypeObject with `flag_heaptype = false`.
@@ -138,21 +162,25 @@ pub fn w_type_new_builtin(
     dict_ptr: *mut u8,
     _layout_pytype: *const PyType,
 ) -> PyObjectRef {
-    let obj = Box::new(W_TypeObject {
+    let name = crate::lltype::malloc_raw(name.to_string());
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(bases);
+
+    crate::lltype::malloc_typed(W_TypeObject {
         ob_header: PyObject {
             ob_type: &TYPE_TYPE as *const PyType,
             w_class: std::ptr::null_mut(),
         },
         mro_w: std::ptr::null_mut(),
-        name: Box::into_raw(Box::new(name.to_string())),
+        name,
         bases,
         dict: dict_ptr,
         flag_heaptype: false,
         layout: std::ptr::null(),
         hasdict: false,
         weakrefable: false,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 // ── Layout accessors ─────────────────────────────────────────────────
@@ -260,7 +288,7 @@ pub unsafe fn w_type_get_mro(obj: PyObjectRef) -> *mut Vec<PyObjectRef> {
 
 /// Set the cached MRO.
 pub unsafe fn w_type_set_mro(obj: PyObjectRef, mro: Vec<PyObjectRef>) {
-    (*(obj as *mut W_TypeObject)).mro_w = Box::into_raw(Box::new(mro));
+    (*(obj as *mut W_TypeObject)).mro_w = crate::lltype::malloc_raw(mro);
 }
 
 /// Check if an object is a type (user-defined class).
@@ -363,5 +391,18 @@ mod tests {
         assert!(Layout::expands_equal(root, true, true, root, true, true));
         // Different hasdict → not equal
         assert!(!Layout::expands_equal(root, true, true, root, false, true));
+    }
+
+    #[test]
+    fn w_type_gc_type_id_matches_descr() {
+        assert_eq!(W_TYPE_GC_TYPE_ID, 33);
+        assert_eq!(
+            <W_TypeObject as crate::lltype::GcType>::TYPE_ID,
+            W_TYPE_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_TypeObject as crate::lltype::GcType>::SIZE,
+            W_TYPE_OBJECT_SIZE
+        );
     }
 }

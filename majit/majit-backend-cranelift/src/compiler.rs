@@ -451,7 +451,6 @@ struct RegisteredLoopTarget {
     caller_prefix_layout: Option<ExitRecoveryLayout>,
     code_ptr: *const u8,
     fail_descrs: Vec<Arc<CraneliftFailDescr>>,
-    gc_runtime_id: Option<u64>,
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
@@ -495,7 +494,6 @@ unsafe impl Sync for RegisteredLoopTarget {}
 struct LoopTargetEntry {
     code_ptr: *const u8,
     fail_descrs: Vec<Arc<CraneliftFailDescr>>,
-    gc_runtime_id: Option<u64>,
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
@@ -1057,77 +1055,61 @@ fn cranelift_type_for(tp: &Type) -> cranelift_codegen::ir::Type {
     }
 }
 
-static NEXT_GC_RUNTIME_ID: AtomicU64 = AtomicU64::new(1);
 thread_local! {
-    /// GC allocator registry — single-threaded, no lock needed.
-    /// RPython's GC has no lock on allocator lookup (GIL-protected).
-    static GC_RUNTIMES: RefCell<HashMap<u64, Box<dyn GcAllocator>>> =
-        RefCell::new(HashMap::new());
-    /// Runtime-local JITFRAME type ids. Lazy registration is per allocator,
-    /// so a stale type id from a previous MiniMarkGC must not leak into a
-    /// later runtime.
-    static GC_RUNTIME_JITFRAME_TYPE_IDS: RefCell<HashMap<u64, u32>> =
-        RefCell::new(HashMap::new());
-    /// Currently active GC runtime for virtual materialization during guard failure.
-    /// Set by compiled code exit handler, read by materialize_virtual_recursive.
-    static ACTIVE_GC_RUNTIME_ID: Cell<Option<u64>> = const { Cell::new(None) };
+    /// `llmodel.py:58` `self.gc_ll_descr = get_ll_description(...)` — owned
+    /// by the active cranelift backend on this thread. Stored as a
+    /// thread-local so the backend-agnostic `majit_gc::ActiveGcGuardHooks`
+    /// shims and trampoline-baked C addresses can reach the live allocator
+    /// without taking a cranelift dependency. Mirrors
+    /// `majit-backend-dynasm/src/runner.rs:46 DYNASM_ACTIVE_GC`.
+    static CRANELIFT_ACTIVE_GC: RefCell<Option<Box<dyn GcAllocator>>> =
+        const { RefCell::new(None) };
+    /// JITFRAME `Type` id of the active GC runtime. Lazy-registered when
+    /// the GC sees its first JITFRAME, cleared when the active GC is
+    /// replaced or torn down.
+    static CRANELIFT_JITFRAME_TYPE_ID: Cell<Option<u32>> = const { Cell::new(None) };
 }
 
-fn register_gc_runtime(gc: Box<dyn GcAllocator>) -> u64 {
-    let id = NEXT_GC_RUNTIME_ID.fetch_add(1, Ordering::Relaxed);
-    GC_RUNTIMES.with(|r| r.borrow_mut().insert(id, gc));
-    id
-}
-
-fn replace_gc_runtime(id: u64, gc: Box<dyn GcAllocator>) {
-    GC_RUNTIMES.with(|r| r.borrow_mut().insert(id, gc));
-}
-
-fn unregister_gc_runtime(id: u64) {
-    GC_RUNTIMES.with(|r| r.borrow_mut().remove(&id));
-}
-
-fn set_runtime_jitframe_type_id(runtime_id: u64, type_id: u32) {
-    GC_RUNTIME_JITFRAME_TYPE_IDS.with(|r| {
-        r.borrow_mut().insert(runtime_id, type_id);
-    });
-}
-
-fn runtime_jitframe_type_id(runtime_id: u64) -> Option<u32> {
-    GC_RUNTIME_JITFRAME_TYPE_IDS.with(|r| r.borrow().get(&runtime_id).copied())
-}
-
-fn clear_runtime_jitframe_type_id(runtime_id: u64) {
-    GC_RUNTIME_JITFRAME_TYPE_IDS.with(|r| {
-        r.borrow_mut().remove(&runtime_id);
-    });
-}
-
-fn with_gc_runtime<R>(id: u64, f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
-    GC_RUNTIMES.with(|r| {
-        let mut guard = r.borrow_mut();
-        let runtime = guard
-            .get_mut(&id)
-            .unwrap_or_else(|| panic!("missing GC runtime {id}"));
-        f(runtime.as_mut())
+fn with_cranelift_gc<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> Option<R> {
+    CRANELIFT_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        match guard.as_deref_mut() {
+            Some(gc) => Some(f(gc)),
+            None => None,
+        }
     })
+}
+
+fn with_cranelift_gc_required<R>(f: impl FnOnce(&mut dyn GcAllocator) -> R) -> R {
+    CRANELIFT_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        let gc = guard.as_deref_mut().expect("missing active GC runtime");
+        f(gc)
+    })
+}
+
+fn set_cranelift_active_gc(gc: Option<Box<dyn GcAllocator>>) {
+    CRANELIFT_ACTIVE_GC.with(|cell| *cell.borrow_mut() = gc);
+}
+
+fn cranelift_jitframe_type_id() -> Option<u32> {
+    CRANELIFT_JITFRAME_TYPE_ID.with(|c| c.get())
+}
+
+fn set_cranelift_jitframe_type_id(type_id: Option<u32>) {
+    CRANELIFT_JITFRAME_TYPE_ID.with(|c| c.set(type_id));
+}
+
+fn cranelift_gc_active() -> bool {
+    CRANELIFT_ACTIVE_GC.with(|cell| cell.borrow().is_some())
 }
 
 /// `majit_gc::CheckIsObjectFn` installed by `set_gc_allocator`. Dispatches
 /// `gc.py:631-642 check_is_object` through the thread-local
-/// `ACTIVE_GC_RUNTIME_ID` so backend-agnostic callers (optimizer) can
+/// `CRANELIFT_ACTIVE_GC` so backend-agnostic callers (optimizer) can
 /// reach the live GC allocator without taking a cranelift dependency.
 fn check_is_object_via_active_runtime(gcref: GcRef) -> bool {
-    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
-        return false;
-    };
-    GC_RUNTIMES.with(|r| {
-        let guard = r.borrow();
-        match guard.get(&id) {
-            Some(runtime) => runtime.check_is_object(gcref),
-            None => false,
-        }
-    })
+    with_cranelift_gc(|gc| gc.check_is_object(gcref)).unwrap_or(false)
 }
 
 /// `majit_gc::GetActualTypeidFn` installed by `set_gc_allocator`.
@@ -1136,13 +1118,7 @@ fn check_is_object_via_active_runtime(gcref: GcRef) -> bool {
 /// `vtable_to_type_id` table populated via `register_vtable_for_type`
 /// for pyre's foreign PyObject layout.
 fn get_actual_typeid_via_active_runtime(gcref: GcRef) -> Option<u32> {
-    let id = ACTIVE_GC_RUNTIME_ID.with(|c| c.get())?;
-    GC_RUNTIMES.with(|r| {
-        let guard = r.borrow();
-        guard
-            .get(&id)
-            .and_then(|runtime| runtime.get_actual_typeid(gcref))
-    })
+    with_cranelift_gc(|gc| gc.get_actual_typeid(gcref)).flatten()
 }
 
 /// `majit_gc::SubclassRangeFn` installed by `set_gc_allocator`.
@@ -1150,13 +1126,7 @@ fn get_actual_typeid_via_active_runtime(gcref: GcRef) -> Option<u32> {
 /// lookup from x86/assembler.py:1971-1974 through the GC's
 /// vtable→typeid table.
 fn subclass_range_via_active_runtime(classptr: usize) -> Option<(i64, i64)> {
-    let id = ACTIVE_GC_RUNTIME_ID.with(|c| c.get())?;
-    GC_RUNTIMES.with(|r| {
-        let guard = r.borrow();
-        guard
-            .get(&id)
-            .and_then(|runtime| runtime.subclass_range(classptr))
-    })
+    with_cranelift_gc(|gc| gc.subclass_range(classptr)).flatten()
 }
 
 /// `majit_gc::TypeidSubclassRangeFn` installed by `set_gc_allocator`.
@@ -1164,26 +1134,14 @@ fn subclass_range_via_active_runtime(classptr: usize) -> Option<(i64, i64)> {
 /// it to recover `value.typeptr.subclassrange_min` after extracting
 /// the typeid via `get_actual_typeid`.
 fn typeid_subclass_range_via_active_runtime(typeid: u32) -> Option<(i64, i64)> {
-    let id = ACTIVE_GC_RUNTIME_ID.with(|c| c.get())?;
-    GC_RUNTIMES.with(|r| {
-        let guard = r.borrow();
-        guard
-            .get(&id)
-            .and_then(|runtime| runtime.typeid_subclass_range(typeid))
-    })
+    with_cranelift_gc(|gc| gc.typeid_subclass_range(typeid)).flatten()
 }
 
 /// `majit_gc::TypeidIsObjectFn` installed by `set_gc_allocator`.
 /// Answers "does this typeid have `T_IS_RPYTHON_INSTANCE` set in its
 /// TYPE_INFO entry" for the executor's `GuardIsObject` arm.
 fn typeid_is_object_via_active_runtime(typeid: u32) -> Option<bool> {
-    let id = ACTIVE_GC_RUNTIME_ID.with(|c| c.get())?;
-    GC_RUNTIMES.with(|r| {
-        let guard = r.borrow();
-        guard
-            .get(&id)
-            .and_then(|runtime| runtime.typeid_is_object(typeid))
-    })
+    with_cranelift_gc(|gc| gc.typeid_is_object(typeid)).flatten()
 }
 
 /// `majit_gc::AllocNurseryTypedFn` installed by `set_gc_allocator`.
@@ -1197,16 +1155,7 @@ fn typeid_is_object_via_active_runtime(typeid: u32) -> Option<bool> {
 /// we just returned, leaving the caller dangling. `no_collect` falls
 /// back to old-gen on nursery full instead.
 fn alloc_nursery_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
-    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
-        return GcRef(0);
-    };
-    GC_RUNTIMES.with(|r| {
-        let mut guard = r.borrow_mut();
-        match guard.get_mut(&id) {
-            Some(runtime) => runtime.alloc_nursery_no_collect_typed(type_id, size),
-            None => GcRef(0),
-        }
-    })
+    with_cranelift_gc(|gc| gc.alloc_nursery_no_collect_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
 /// `majit_gc::AllocOldgenTypedFn` installed by `set_gc_allocator`.
@@ -1217,16 +1166,7 @@ fn alloc_nursery_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
 /// stack across subsequent allocations. Returns `GcRef(0)` when no
 /// active runtime is set on this thread.
 fn alloc_oldgen_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
-    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
-        return GcRef(0);
-    };
-    GC_RUNTIMES.with(|r| {
-        let mut guard = r.borrow_mut();
-        match guard.get_mut(&id) {
-            Some(runtime) => runtime.alloc_oldgen_typed(type_id, size),
-            None => GcRef(0),
-        }
-    })
+    with_cranelift_gc(|gc| gc.alloc_oldgen_typed(type_id, size)).unwrap_or(GcRef(0))
 }
 
 /// Host-side root-register trampoline (Task #141 option a). Bridges
@@ -1237,28 +1177,12 @@ fn alloc_oldgen_typed_via_active_runtime(type_id: u32, size: usize) -> GcRef {
 /// Caller must keep `slot` valid until [`gc_remove_root_via_active_runtime`]
 /// is called with the same pointer.
 unsafe fn gc_add_root_via_active_runtime(slot: *mut GcRef) {
-    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
-        return;
-    };
-    GC_RUNTIMES.with(|r| {
-        let mut guard = r.borrow_mut();
-        if let Some(runtime) = guard.get_mut(&id) {
-            unsafe { runtime.add_root(slot) };
-        }
-    });
+    with_cranelift_gc(|gc| unsafe { gc.add_root(slot) });
 }
 
 /// Companion to [`gc_add_root_via_active_runtime`].
 fn gc_remove_root_via_active_runtime(slot: *mut GcRef) {
-    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
-        return;
-    };
-    GC_RUNTIMES.with(|r| {
-        let mut guard = r.borrow_mut();
-        if let Some(runtime) = guard.get_mut(&id) {
-            runtime.remove_root(slot);
-        }
-    });
+    with_cranelift_gc(|gc| gc.remove_root(slot));
 }
 
 /// Host-side `is_managed_heap_object` trampoline. Lets host-side
@@ -1266,41 +1190,33 @@ fn gc_remove_root_via_active_runtime(slot: *mut GcRef) {
 /// `try_gc_alloc_stable`-allocated blocks from `std::alloc`-backed
 /// fallback blocks during the L1/L2 stepping-stone window.
 fn gc_owns_object_via_active_runtime(addr: usize) -> bool {
-    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
-        return false;
-    };
-    GC_RUNTIMES.with(|r| {
-        let guard = r.borrow();
-        match guard.get(&id) {
-            Some(runtime) => runtime.is_managed_heap_object(addr),
-            None => false,
-        }
-    })
+    with_cranelift_gc(|gc| gc.is_managed_heap_object(addr)).unwrap_or(false)
 }
 
-pub(crate) fn register_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
+/// Returns true when the active GC was present and roots were
+/// registered; false when no GC is active and registration was a
+/// no-op. Callers pair the bool with `unregister_gc_roots` on Drop.
+pub(crate) fn register_gc_roots(roots: &mut [GcRef]) -> bool {
     if roots.is_empty() {
-        return;
+        return false;
     }
-    with_gc_runtime(runtime_id, |gc| {
+    with_cranelift_gc(|gc| {
         for root in roots.iter_mut() {
             unsafe {
                 gc.add_root(root as *mut GcRef);
             }
         }
-    });
+    })
+    .is_some()
 }
 
-pub(crate) fn unregister_gc_roots(runtime_id: u64, roots: &mut [GcRef]) {
+pub(crate) fn unregister_gc_roots(roots: &mut [GcRef]) {
     if roots.is_empty() {
         return;
     }
-    GC_RUNTIMES.with(|r| {
-        let mut guard = r.borrow_mut();
-        if let Some(runtime) = guard.get_mut(&runtime_id) {
-            for root in roots.iter_mut() {
-                runtime.remove_root(root as *mut GcRef);
-            }
+    with_cranelift_gc(|gc| {
+        for root in roots.iter_mut() {
+            gc.remove_root(root as *mut GcRef);
         }
     });
 }
@@ -1340,14 +1256,12 @@ fn rebuild_state_after_failure(
             // Keep materialized pointers indexed by vidx for pending fields.
             let mut materialized: Vec<Option<i64>> = vec![None; recovery.virtual_layouts.len()];
             // resume.py:951 getvirtual_ptr parity: recursive materialization.
-            let gc_rt = ACTIVE_GC_RUNTIME_ID.with(|c| c.get());
             let materialize = |vidx: usize, materialized: &mut Vec<Option<i64>>| -> i64 {
                 materialize_virtual_recursive(
                     vidx,
                     &recovery.virtual_layouts,
                     outputs,
                     materialized,
-                    gc_rt,
                 )
             };
 
@@ -1439,7 +1353,6 @@ fn materialize_virtual_recursive(
     virtual_layouts: &[majit_backend::ExitVirtualLayout],
     outputs: &[i64],
     materialized: &mut Vec<Option<i64>>,
-    gc_runtime_id: Option<u64>,
 ) -> i64 {
     if let Some(ptr) = materialized.get(vidx).copied().flatten() {
         return ptr;
@@ -1498,10 +1411,9 @@ fn materialize_virtual_recursive(
             }
             let size = if alloc_size > 0 { alloc_size } else { 16 };
             let ptr = if ob_type != 0 {
-                if let Some(rt_id) = gc_runtime_id {
-                    let p = with_gc_runtime(rt_id, |gc| {
-                        gc.alloc_nursery_typed(alloc_tid, size).0 as i64
-                    });
+                if let Some(p) =
+                    with_cranelift_gc(|gc| gc.alloc_nursery_typed(alloc_tid, size).0 as i64)
+                {
                     if p != 0 {
                         unsafe { *(p as *mut i64) = ob_type };
                     }
@@ -1549,8 +1461,10 @@ fn materialize_virtual_recursive(
                 return 0;
             }
             let size = if alloc_size > 0 { alloc_size } else { 16 };
-            if let Some(rt_id) = gc_runtime_id {
-                with_gc_runtime(rt_id, |gc| gc.alloc_nursery_typed(alloc_tid, size).0 as i64)
+            if let Some(p) =
+                with_cranelift_gc(|gc| gc.alloc_nursery_typed(alloc_tid, size).0 as i64)
+            {
+                p
             } else {
                 let layout = match std::alloc::Layout::from_size_align(size, 8) {
                     Ok(l) => l,
@@ -1682,7 +1596,6 @@ fn materialize_virtual_recursive(
                                     virtual_layouts,
                                     outputs,
                                     materialized,
-                                    gc_runtime_id,
                                 )
                             } else {
                                 0
@@ -2433,7 +2346,6 @@ fn register_call_assembler_target(
         caller_prefix_layout: compiled.caller_prefix_layout.clone(),
         code_ptr: compiled.code_ptr,
         fail_descrs: compiled.fail_descrs.clone(),
-        gc_runtime_id: compiled.gc_runtime_id,
         num_inputs: compiled.num_inputs,
         num_ref_roots: compiled.num_ref_roots,
         max_output_slots: compiled.max_output_slots,
@@ -2521,7 +2433,6 @@ pub(crate) fn register_pending_call_assembler_target(
         caller_prefix_layout: None,
         code_ptr: std::ptr::null(),
         fail_descrs: Vec::new(),
-        gc_runtime_id: None,
         num_inputs,
         num_ref_roots: 0,
         max_output_slots: 1,
@@ -2681,22 +2592,16 @@ pub fn force_token_to_dead_frame(force_token: GcRef) -> DeadFrame {
     // Register jf_gcref as GC root so moving GC can update the
     // pointer. Shadow stack keeps the object alive, but does NOT
     // update this separate copy of jf_gcref.
-    let gc_runtime_id = fail_descr.gc_runtime_id;
-    deadframe_from_jitframe(jf_gcref, fail_descr, gc_runtime_id, None)
+    deadframe_from_jitframe(jf_gcref, fail_descr, None)
 }
 
 fn deadframe_from_jitframe(
     jf_gcref: GcRef,
     fail_descr: Arc<CraneliftFailDescr>,
-    gc_runtime_id: Option<u64>,
     heap_owner: Option<Vec<i64>>,
 ) -> DeadFrame {
     let mut frame = Box::new(JitFrameDeadFrame::new(
-        jf_gcref,
-        fail_descr,
-        None,
-        gc_runtime_id,
-        heap_owner,
+        jf_gcref, fail_descr, None, heap_owner,
     ));
     frame.register_roots();
     DeadFrame { data: frame }
@@ -2767,7 +2672,6 @@ pub fn grab_exc_value_from_deadframe(frame: &DeadFrame) -> Result<GcRef, Backend
 fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64]) -> DeadFrame {
     let mut cur_code_ptr = target.code_ptr;
     let mut cur_fail_descrs = target.fail_descrs.clone();
-    let mut cur_gc_runtime_id = target.gc_runtime_id;
     let mut cur_num_ref_roots = target.num_ref_roots;
     let mut cur_max_output_slots = target.max_output_slots;
     let mut current_inputs = inputs.to_vec();
@@ -2784,7 +2688,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         let exec = run_compiled_code(
             cur_code_ptr,
             &cur_fail_descrs,
-            cur_gc_runtime_id,
             cur_num_ref_roots,
             cur_max_output_slots,
             &current_inputs,
@@ -2814,7 +2717,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             direct_descr.unwrap_or_else(|| cur_fail_descrs[fail_index as usize].clone());
         let fail_descr = &fail_descr_arc;
         fail_descr.increment_fail_count();
-        ACTIVE_GC_RUNTIME_ID.with(|c| c.set(cur_gc_runtime_id));
         let bridge_guard = fail_descr.bridge_ref();
         if let Some(ref bridge) = *bridge_guard {
             if bridge.loop_reentry {
@@ -2848,7 +2750,6 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                     });
                     cur_code_ptr = target_entry.code_ptr;
                     cur_fail_descrs = target_entry.fail_descrs;
-                    cur_gc_runtime_id = target_entry.gc_runtime_id;
                     cur_num_ref_roots = target_entry.num_ref_roots;
                     cur_max_output_slots = target_entry.max_output_slots;
                     continue;
@@ -2879,12 +2780,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
         // jf_guard_exc already written by emit_guard_exit
         // (_build_failure_recovery parity).
 
-        return deadframe_from_jitframe(
-            exec.jf_gcref,
-            fail_descr.clone(),
-            target.gc_runtime_id,
-            exec.heap_owner,
-        );
+        return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
     } // end loop
 }
 
@@ -3201,7 +3097,6 @@ fn call_assembler_fast_path_heap(
     let exec = run_compiled_code(
         target.code_ptr,
         &target.fail_descrs,
-        target.gc_runtime_id,
         target.num_ref_roots,
         target.max_output_slots,
         inputs,
@@ -3461,14 +3356,14 @@ fn call_assembler_shim_inner(
     0
 }
 
-/// RPython parity: alloc shims receive (runtime_id, ...args).
-/// Roots are persistently registered by run_compiled_code via add_root
-/// on jf_frame ref slot addresses (_call_header_shadowstack parity).
-extern "C" fn gc_alloc_nursery_shim(runtime_id: u64, size: u64) -> u64 {
-    with_gc_runtime(runtime_id, |gc| {
-        let obj = gc.alloc_nursery(size as usize);
-        obj.0 as u64
-    })
+/// RPython parity: alloc shims dispatch through the active
+/// `cpu.gc_ll_descr` (`llmodel.py:58`). pyre publishes that slot in
+/// the thread-local `CRANELIFT_ACTIVE_GC`, mirroring dynasm's
+/// `DYNASM_ACTIVE_GC`. Roots are persistently registered by
+/// `run_compiled_code` via `add_root` on jf_frame ref slot addresses
+/// (`_call_header_shadowstack` parity).
+extern "C" fn gc_alloc_nursery_shim(size: u64) -> u64 {
+    with_cranelift_gc_required(|gc| gc.alloc_nursery(size as usize).0 as u64)
 }
 
 /// Plain malloc fallback for New() when no GC runtime is configured.
@@ -3478,25 +3373,17 @@ extern "C" fn plain_malloc_zeroed_shim(size: u64) -> u64 {
     unsafe { std::alloc::alloc_zeroed(layout) as u64 }
 }
 
-extern "C" fn gc_alloc_typed_nursery_shim(runtime_id: u64, _type_id: u64, size: u64) -> u64 {
+extern "C" fn gc_alloc_typed_nursery_shim(_type_id: u64, size: u64) -> u64 {
     // RPython rewrite.py: CALL_MALLOC_NURSERY fallback path.
     // Use no-collect allocation to avoid triggering GC during compiled code
     // execution. When nursery is full, falls back to old-gen allocation.
-    with_gc_runtime(runtime_id, |gc| {
-        let obj = gc.alloc_nursery_no_collect(size as usize);
-        obj.0 as u64
-    })
+    with_cranelift_gc_required(|gc| gc.alloc_nursery_no_collect(size as usize).0 as u64)
 }
 
-extern "C" fn gc_alloc_varsize_shim(
-    runtime_id: u64,
-    base_size: u64,
-    item_size: u64,
-    length: u64,
-) -> u64 {
-    with_gc_runtime(runtime_id, |gc| {
-        let obj = gc.alloc_varsize(base_size as usize, item_size as usize, length as usize);
-        obj.0 as u64
+extern "C" fn gc_alloc_varsize_shim(base_size: u64, item_size: u64, length: u64) -> u64 {
+    with_cranelift_gc_required(|gc| {
+        gc.alloc_varsize(base_size as usize, item_size as usize, length as usize)
+            .0 as u64
     })
 }
 
@@ -3539,30 +3426,23 @@ fn active_runtime_alloc_varsize_typed_and_set_len(
     length_ofs: usize,
     length: usize,
 ) -> u64 {
-    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
-        return raw_varsize_alloc_typed_and_set_len(
-            type_id, base_size, item_size, length_ofs, length,
-        );
-    };
-    GC_RUNTIMES.with(|r| {
-        let mut guard = r.borrow_mut();
-        match guard.get_mut(&id) {
-            Some(runtime) => {
-                let obj = runtime.alloc_varsize_typed(type_id, base_size, item_size, length);
-                if obj.is_null() {
-                    0
-                } else {
-                    unsafe {
-                        *((obj.0 as *mut u8).add(length_ofs) as *mut usize) = length;
-                    }
-                    obj.0 as u64
-                }
+    let result = with_cranelift_gc(|gc| {
+        let obj = gc.alloc_varsize_typed(type_id, base_size, item_size, length);
+        if obj.is_null() {
+            0
+        } else {
+            unsafe {
+                *((obj.0 as *mut u8).add(length_ofs) as *mut usize) = length;
             }
-            None => raw_varsize_alloc_typed_and_set_len(
-                type_id, base_size, item_size, length_ofs, length,
-            ),
+            obj.0 as u64
         }
-    })
+    });
+    match result {
+        Some(v) => v,
+        None => {
+            raw_varsize_alloc_typed_and_set_len(type_id, base_size, item_size, length_ofs, length)
+        }
+    }
 }
 
 extern "C" fn gc_malloc_array_helper(item_size: u64, type_id: u64, num_elem: u64) -> u64 {
@@ -3613,14 +3493,14 @@ extern "C" fn gc_malloc_unicode_helper(length: u64) -> u64 {
 
 /// aarch64/assembler.py:342 get_write_barrier_fn()
 /// → incminimark.py:1569 jit_remember_young_pointer
-extern "C" fn gc_write_barrier_shim(runtime_id: u64, obj: u64) {
-    with_gc_runtime(runtime_id, |gc| gc.write_barrier(GcRef(obj as usize)));
+extern "C" fn gc_write_barrier_shim(obj: u64) {
+    with_cranelift_gc_required(|gc| gc.write_barrier(GcRef(obj as usize)));
 }
 
 /// aarch64/assembler.py:352 get_write_barrier_from_array_fn()
 /// → incminimark.py:1606 jit_remember_young_pointer_from_array
-extern "C" fn gc_jit_remember_young_pointer_from_array_shim(runtime_id: u64, obj: u64) {
-    with_gc_runtime(runtime_id, |gc| {
+extern "C" fn gc_jit_remember_young_pointer_from_array_shim(obj: u64) {
+    with_cranelift_gc_required(|gc| {
         gc.jit_remember_young_pointer_from_array(GcRef(obj as usize));
     });
 }
@@ -4840,7 +4720,6 @@ fn emit_collecting_gc_call(
     defined_ref_vars: &HashSet<u32>,
     ref_root_base_ofs: i32,
     per_call_gcmap: i64,
-    runtime_id: CValue,
     func_ptr: usize,
     extra_args: &[CValue],
     return_type: Option<cranelift_codegen::ir::Type>,
@@ -4854,11 +4733,14 @@ fn emit_collecting_gc_call(
     );
     emit_push_gcmap(builder, jf_ptr, per_call_gcmap);
 
-    let mut args = Vec::with_capacity(extra_args.len() + 1);
-    args.push(runtime_id);
-    args.extend_from_slice(extra_args);
-
-    let result = emit_host_call(builder, ptr_type, call_conv, func_ptr, &args, return_type);
+    let result = emit_host_call(
+        builder,
+        ptr_type,
+        call_conv,
+        func_ptr,
+        extra_args,
+        return_type,
+    );
 
     // _reload_frame_if_necessary (assembler.py:405-412)
     let new_jf_ptr = emit_reload_frame_if_necessary(builder, ptr_type, call_conv);
@@ -4881,7 +4763,6 @@ fn emit_indirect_call_from_parts(
     call_descr: &dyn CallDescr,
     call_conv: cranelift_codegen::isa::CallConv,
     ptr_type: cranelift_codegen::ir::Type,
-    _gc_runtime_id: Option<u64>,
     jf_ptr: CValue,
     ref_root_slots: &[(u32, usize)],
     defined_ref_vars: &HashSet<u32>,
@@ -5181,7 +5062,6 @@ struct CompiledLoop {
     code_size: usize,
     fail_descrs: Vec<Arc<CraneliftFailDescr>>,
     terminal_exit_layouts: UnsafeCell<Vec<TerminalExitLayout>>,
-    gc_runtime_id: Option<u64>,
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
@@ -5307,7 +5187,6 @@ struct JitExecResult {
     heap_owner: Option<Vec<i64>>,
     fail_index: u32,
     direct_descr: Option<Arc<CraneliftFailDescr>>,
-    gc_runtime_id: Option<u64>,
 }
 
 impl JitExecResult {
@@ -5328,7 +5207,6 @@ impl JitExecResult {
 fn run_compiled_code(
     code_ptr: *const u8,
     fail_descrs: &[Arc<CraneliftFailDescr>],
-    gc_runtime_id: Option<u64>,
     num_ref_roots: usize,
     max_output_slots: usize,
     inputs: &[i64],
@@ -5343,7 +5221,6 @@ fn run_compiled_code(
     run_compiled_code_inner(
         code_ptr,
         fail_descrs,
-        gc_runtime_id,
         num_ref_roots,
         max_output_slots,
         inputs,
@@ -5354,7 +5231,6 @@ fn run_compiled_code(
 fn run_compiled_code_inner(
     code_ptr: *const u8,
     fail_descrs: &[Arc<CraneliftFailDescr>],
-    gc_runtime_id: Option<u64>,
     num_ref_roots: usize,
     max_output_slots: usize,
     inputs: &[i64],
@@ -5395,19 +5271,18 @@ fn run_compiled_code_inner(
     // are spilled/reloaded around collecting calls. Input slots are read
     // once at entry (before any GC point) and their values live in
     // SSA/ref_root_slots afterward.
-    let runtime_jitframe_tid = gc_runtime_id.and_then(runtime_jitframe_type_id);
+    let runtime_jitframe_tid = cranelift_jitframe_type_id();
     let use_gc_alloc = runtime_jitframe_tid.is_some();
     let (jf_gcref, heap_owner): (GcRef, Option<Vec<i64>>) = if use_gc_alloc {
-        let runtime_id = gc_runtime_id.unwrap();
         let type_id = runtime_jitframe_tid.unwrap();
         assert_ne!(
             type_id,
             u32::MAX,
-            "JITFRAME GC type id not registered for runtime {runtime_id} — frontend must call \
+            "JITFRAME GC type id not registered — frontend must call \
              set_jitframe_gc_type_id() or ensure_jitframe_type_registered() \
              before running compiled code"
         );
-        let gcref = with_gc_runtime(runtime_id, |gc| {
+        let gcref = with_cranelift_gc_required(|gc| {
             gc.alloc_nursery_no_collect_typed(type_id, payload_bytes)
         });
         unsafe {
@@ -5444,8 +5319,7 @@ fn run_compiled_code_inner(
 
     // llmodel.py:322: llop.gc_writebarrier(ll_frame)
     if use_gc_alloc {
-        let runtime_id = gc_runtime_id.unwrap();
-        with_gc_runtime(runtime_id, |gc| gc.write_barrier(jf_gcref));
+        with_cranelift_gc_required(|gc| gc.write_barrier(jf_gcref));
     }
 
     // llmodel.py:323 parity: ll_frame = func(ll_frame)
@@ -5551,7 +5425,6 @@ fn run_compiled_code_inner(
         heap_owner,
         fail_index,
         direct_descr,
-        gc_runtime_id,
     }
 }
 
@@ -5779,7 +5652,6 @@ pub struct CraneliftBackend {
     /// lookups (resume.py:1143-1188).
     callinfocollection: Option<Arc<majit_ir::CallInfoCollection>>,
     func_counter: u32,
-    gc_runtime_id: Option<u64>,
     trace_counter: u64,
     next_trace_id: Option<u64>,
     next_header_pc: Option<u64>,
@@ -5899,7 +5771,6 @@ impl CraneliftBackend {
                                         caller_prefix_layout: b.caller_prefix_layout.clone(),
                                         code_ptr: b.code_ptr,
                                         fail_descrs: b.fail_descrs.clone(),
-                                        gc_runtime_id: b.gc_runtime_id,
                                         num_inputs: b.num_inputs,
                                         num_ref_roots: b.num_ref_roots,
                                         max_output_slots: b.max_output_slots,
@@ -5938,7 +5809,6 @@ impl CraneliftBackend {
             constant_types: HashMap::new(),
             callinfocollection: None,
             func_counter: 0,
-            gc_runtime_id: None,
             trace_counter: 1,
             next_trace_id: None,
             next_header_pc: None,
@@ -6027,10 +5897,7 @@ impl CraneliftBackend {
     /// typeid through `cpu.gc_ll_descr`; in majit the gc_ll_descr role
     /// is filled by the active GC runtime registered via set_gc_allocator.
     fn lookup_typeid_from_classptr(&self, classptr: usize) -> Option<u32> {
-        let runtime_id = self.gc_runtime_id?;
-        with_gc_runtime(runtime_id, |gc| {
-            gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)
-        })
+        with_cranelift_gc(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)).flatten()
     }
 
     pub fn with_gc_allocator(gc: Box<dyn GcAllocator>) -> Self {
@@ -6048,25 +5915,17 @@ impl CraneliftBackend {
         // in by the preorder walk in assign_inheritance_ids.
         gc.freeze_types();
         let supports_guard_gc_type = gc.supports_guard_gc_type();
-        let runtime_id = if let Some(runtime_id) = self.gc_runtime_id {
-            replace_gc_runtime(runtime_id, gc);
-            runtime_id
-        } else {
-            let runtime_id = register_gc_runtime(gc);
-            self.gc_runtime_id = Some(runtime_id);
-            runtime_id
-        };
-        if let Some(type_id) = jitframe_type_id {
-            set_runtime_jitframe_type_id(runtime_id, type_id);
-        } else {
-            clear_runtime_jitframe_type_id(runtime_id);
-        }
-        // Publish the backend's GC-guard seam on a thread-local so
-        // the backend-agnostic optimizer (majit-metainterp) and
-        // blackhole executor can reach the live allocator without
+        // `llmodel.py:58` `self.gc_ll_descr = get_ll_description(...)` —
+        // single owning slot per CPU. Replaces any prior allocator on
+        // this thread; the implicit drop of the old `Box` is the
+        // RPython `cpu.gc_ll_descr = …` assignment's parity.
+        set_cranelift_active_gc(Some(gc));
+        set_cranelift_jitframe_type_id(jitframe_type_id);
+        // Publish the backend's GC-guard seam through the
+        // backend-agnostic shims so the optimizer (majit-metainterp)
+        // and blackhole executor can reach the live allocator without
         // taking a cranelift dependency. Mirrors RPython's
         // `self.optimizer.cpu.check_is_object(...)` access path.
-        ACTIVE_GC_RUNTIME_ID.with(|c| c.set(self.gc_runtime_id));
         majit_gc::set_active_gc_guard_hooks(majit_gc::ActiveGcGuardHooks {
             check_is_object: Some(check_is_object_via_active_runtime),
             get_actual_typeid: Some(get_actual_typeid_via_active_runtime),
@@ -6090,9 +5949,8 @@ impl CraneliftBackend {
     // consumers can reach them through `&mut dyn Backend`.
 
     fn gc_rewriter(&self, constant_types: &HashMap<u32, majit_ir::Type>) -> Option<GcRewriterImpl> {
-        let runtime_id = self.gc_runtime_id?;
         let ct = constant_types.clone();
-        Some(with_gc_runtime(runtime_id, |gc| GcRewriterImpl {
+        with_cranelift_gc(|gc| GcRewriterImpl {
             nursery_free_addr: gc.nursery_free_addr(),
             nursery_top_addr: gc.nursery_top_addr(),
             max_nursery_size: gc.max_nursery_object_size(),
@@ -6193,7 +6051,7 @@ impl CraneliftBackend {
                     }
                 })
             })),
-        }))
+        })
     }
 
     fn prepare_ops_for_compile(
@@ -6230,7 +6088,6 @@ impl CraneliftBackend {
         // Current trace state (equivalent to LLFrame.lltrace)
         let mut cur_code_ptr = compiled.code_ptr;
         let mut cur_fail_descrs: Vec<Arc<CraneliftFailDescr>> = compiled.fail_descrs.clone();
-        let mut cur_gc_runtime_id = compiled.gc_runtime_id;
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = inputs.to_vec();
@@ -6246,7 +6103,6 @@ impl CraneliftBackend {
             let exec = run_compiled_code(
                 cur_code_ptr,
                 &cur_fail_descrs,
-                cur_gc_runtime_id,
                 cur_num_ref_roots,
                 cur_max_output_slots,
                 &cur_inputs,
@@ -6306,7 +6162,6 @@ impl CraneliftBackend {
                     .expect("external JUMP target must be a registered LoopTargetDescr");
                 cur_code_ptr = target_entry.code_ptr;
                 cur_fail_descrs = target_entry.fail_descrs;
-                cur_gc_runtime_id = target_entry.gc_runtime_id;
                 cur_num_ref_roots = target_entry.num_ref_roots;
                 cur_max_output_slots = target_entry.max_output_slots;
                 cur_inputs = outputs;
@@ -6317,16 +6172,10 @@ impl CraneliftBackend {
                 // Real FINISH — function completed.
                 // jf_savedata already correct in jf_frame memory.
                 // jf_guard_exc already written by emit_guard_exit.
-                return deadframe_from_jitframe(
-                    exec.jf_gcref,
-                    fail_descr.clone(),
-                    compiled.gc_runtime_id,
-                    exec.heap_owner,
-                );
+                return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
             }
 
             fail_descr.increment_fail_count();
-            ACTIVE_GC_RUNTIME_ID.with(|c| c.set(compiled.gc_runtime_id));
 
             // llgraph/runner.py:1184-1191 fail_guard: if bridge attached,
             // raise Jump(target, values).
@@ -6346,7 +6195,6 @@ impl CraneliftBackend {
                 }
                 cur_code_ptr = bridge.code_ptr;
                 cur_fail_descrs = bridge.fail_descrs.clone();
-                cur_gc_runtime_id = bridge.gc_runtime_id;
                 cur_num_ref_roots = bridge.num_ref_roots;
                 cur_max_output_slots = bridge.max_output_slots;
 
@@ -6358,12 +6206,7 @@ impl CraneliftBackend {
 
             // llgraph/runner.py:1192-1194 fail_guard without bridge →
             // ExecutionFinished(LLDeadFrame).
-            return deadframe_from_jitframe(
-                exec.jf_gcref,
-                fail_descr.clone(),
-                compiled.gc_runtime_id,
-                exec.heap_owner,
-            );
+            return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
         } // end loop
     }
 
@@ -6382,7 +6225,6 @@ impl CraneliftBackend {
         let exec = run_compiled_code(
             bridge.code_ptr,
             &bridge.fail_descrs,
-            bridge.gc_runtime_id,
             bridge.num_ref_roots,
             bridge.max_output_slots,
             bridge_inputs,
@@ -6413,12 +6255,7 @@ impl CraneliftBackend {
         // bridge's exit is misinterpreted as a guard failure.
         if fail_descr.is_finish {
             // jf_guard_exc already written by emit_guard_exit.
-            return deadframe_from_jitframe(
-                exec.jf_gcref,
-                fail_descr.clone(),
-                bridge.gc_runtime_id,
-                exec.heap_owner,
-            );
+            return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
         }
 
         fail_descr.increment_fail_count();
@@ -6435,12 +6272,7 @@ impl CraneliftBackend {
         let _ = bridge_guard;
 
         // jf_guard_exc already written by emit_guard_exit.
-        deadframe_from_jitframe(
-            exec.jf_gcref,
-            fail_descr.clone(),
-            bridge.gc_runtime_id,
-            exec.heap_owner,
-        )
+        deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner)
     }
 
     fn do_compile(
@@ -6517,7 +6349,6 @@ impl CraneliftBackend {
             source_guard,
             caller_layout,
             &self.constants,
-            self.gc_runtime_id,
             self.callinfocollection.as_deref(),
             attached_descrs,
         )?;
@@ -6541,27 +6372,21 @@ impl CraneliftBackend {
         let known_values = build_known_values_set(inputargs, ops);
         let value_types = build_value_type_map_simple(inputargs, ops);
         let ref_root_slots = build_ref_root_slots(inputargs, ops, &force_tokens)?;
-        let gc_runtime_id = self.gc_runtime_id;
-        let gc_nursery_addrs = gc_runtime_id.map(|runtime_id| {
-            with_gc_runtime(runtime_id, |gc| {
-                (gc.nursery_free_addr(), gc.nursery_top_addr())
-            })
-        });
+        let gc_nursery_addrs =
+            with_cranelift_gc(|gc| (gc.nursery_free_addr(), gc.nursery_top_addr()));
         // llmodel.py:64-69 self.vtable_offset — backend property used by
         // bh_new_with_vtable. Capture for use in NEW_WITH_VTABLE codegen.
         let vtable_offset = self.vtable_offset;
         // llsupport/gc.py:563 GcLLDescr_framework
         //   .get_typeid_from_classptr_if_gcremovetypeptr — used by
-        // _cmp_guard_class when vtable_offset is None. Capture the
-        // active runtime id so the closure can resolve typeids without
-        // owning a reference to `self` (avoids borrow conflicts with
-        // func_ctx).
-        let gc_runtime_for_typeid = self.gc_runtime_id;
+        // _cmp_guard_class when vtable_offset is None. Reads through the
+        // thread-local `CRANELIFT_ACTIVE_GC` (`llmodel.py:58`
+        // `cpu.gc_ll_descr` parity), so the closure does not need a
+        // reference to `self` and can be moved freely past borrow
+        // conflicts with `func_ctx`.
         let gc_typeid_lookup = move |classptr: usize| -> Option<u32> {
-            let runtime_id = gc_runtime_for_typeid?;
-            with_gc_runtime(runtime_id, |gc| {
-                gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)
-            })
+            with_cranelift_gc(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr))
+                .flatten()
         };
         let mut defined_ref_vars: HashSet<u32> = inputargs
             .iter()
@@ -7830,10 +7655,12 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    if !cranelift_gc_active() {
+                        return Err(missing_gc_runtime(op.opcode));
+                    }
                     // assembler.py:1925 assert self.cpu.supports_guard_gc_type
                     assert!(
-                        with_gc_runtime(runtime_id, |gc| gc.supports_guard_gc_type()),
+                        with_cranelift_gc_required(|gc| gc.supports_guard_gc_type()),
                         "x86/assembler.py:1925: assert self.cpu.\
                          supports_guard_gc_type (GcAllocator has not \
                          installed a TYPE_INFO layout)"
@@ -7854,8 +7681,8 @@ impl CraneliftBackend {
 
                     // assembler.py:1934-1937 gc_ll_descr lookups.
                     let (base_type_info, shift_by, _sizeof_ti) =
-                        with_gc_runtime(runtime_id, |gc| gc.get_translated_info_for_typeinfo());
-                    let (infobits_offset, is_object_flag) = with_gc_runtime(runtime_id, |gc| {
+                        with_cranelift_gc_required(|gc| gc.get_translated_info_for_typeinfo());
+                    let (infobits_offset, is_object_flag) = with_cranelift_gc_required(|gc| {
                         gc.get_translated_info_for_guard_is_object()
                     });
 
@@ -7931,10 +7758,12 @@ impl CraneliftBackend {
                     let info = &guard_infos[guard_idx];
                     guard_idx += 1;
 
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    if !cranelift_gc_active() {
+                        return Err(missing_gc_runtime(op.opcode));
+                    }
                     // assembler.py:1946 assert self.cpu.supports_guard_gc_type
                     assert!(
-                        with_gc_runtime(runtime_id, |gc| gc.supports_guard_gc_type()),
+                        with_cranelift_gc_required(|gc| gc.supports_guard_gc_type()),
                         "x86/assembler.py:1946: assert self.cpu.\
                          supports_guard_gc_type (GcAllocator has not \
                          installed a TYPE_INFO / rclass.CLASSTYPE layout)"
@@ -7957,7 +7786,7 @@ impl CraneliftBackend {
                     // assembler.py:1950-1951: cpu.vtable_offset /
                     // cpu.subclassrange_min_offset.
                     let offset_vtable = vtable_offset;
-                    let offset2 = with_gc_runtime(runtime_id, |gc| gc.subclassrange_min_offset());
+                    let offset2 = with_cranelift_gc_required(|gc| gc.subclassrange_min_offset());
 
                     // loc_tmp: majit uses a cranelift value as the temp;
                     // x86 allocates a register.
@@ -7992,7 +7821,7 @@ impl CraneliftBackend {
                         let tid_mask = builder.ins().iconst(cl_types::I64, TYPE_ID_MASK as i64);
                         let typeid = builder.ins().band(hdr_word, tid_mask);
                         let (base_type_info, shift_by, sizeof_ti) =
-                            with_gc_runtime(runtime_id, |gc| gc.get_translated_info_for_typeinfo());
+                            with_cranelift_gc_required(|gc| gc.get_translated_info_for_typeinfo());
                         let shifted = if shift_by > 0 {
                             builder.ins().ishl_imm(typeid, shift_by as i64)
                         } else {
@@ -8010,7 +7839,7 @@ impl CraneliftBackend {
 
                     // assembler.py:1971-1974 read the bounds from the
                     // expected class pointer at codegen time.
-                    let (check_min, check_max) = with_gc_runtime(runtime_id, |gc| {
+                    let (check_min, check_max) = with_cranelift_gc_required(|gc| {
                         gc.subclass_range(loc_check_against_class as usize)
                     })
                     .unwrap_or_else(|| {
@@ -8153,7 +7982,6 @@ impl CraneliftBackend {
                         call_descr,
                         call_conv,
                         ptr_type,
-                        gc_runtime_id,
                         jf_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
@@ -8721,7 +8549,6 @@ impl CraneliftBackend {
                         call_descr,
                         call_conv,
                         ptr_type,
-                        gc_runtime_id,
                         jf_ptr,
                         &ref_root_slots,
                         &defined_ref_vars,
@@ -8903,7 +8730,6 @@ impl CraneliftBackend {
                                 call_descr,
                                 call_conv,
                                 ptr_type,
-                                gc_runtime_id,
                                 jf_ptr,
                                 &ref_root_slots,
                                 &defined_ref_vars,
@@ -8958,7 +8784,6 @@ impl CraneliftBackend {
                                 call_descr,
                                 call_conv,
                                 ptr_type,
-                                gc_runtime_id,
                                 jf_ptr,
                                 &ref_root_slots,
                                 &defined_ref_vars,
@@ -8995,7 +8820,7 @@ impl CraneliftBackend {
                     // Cranelift equivalent: spill ref roots BEFORE brif,
                     // reload AFTER merge. No SSA variable redefinitions
                     // inside fast_block or slow_block — avoids phi issues.
-                    let use_inline = gc_runtime_id.is_some();
+                    let use_inline = cranelift_gc_active();
 
                     if use_inline {
                         // x86/assembler.py:2556-2565 malloc_cond parity:
@@ -9083,15 +8908,13 @@ impl CraneliftBackend {
                             ref_root_base_ofs,
                         );
                         emit_push_gcmap(&mut builder, jf_ptr, per_call_gcmap);
-                        let rid = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                        let rid_v = builder.ins().iconst(cl_types::I64, rid as i64);
                         let ps = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
                         let slow_r = emit_host_call(
                             &mut builder,
                             ptr_type,
                             call_conv,
                             gc_alloc_nursery_shim as *const () as usize,
-                            &[rid_v, ps],
+                            &[ps],
                             Some(cl_types::I64),
                         )
                         .expect("alloc");
@@ -9126,34 +8949,16 @@ impl CraneliftBackend {
                         }
                         builder.def_var(var(vi), result);
                     } else {
-                        // no GC runtime — host call fallback (test-only path)
-                        let runtime_id =
-                            gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
-                        let size_total = builder.ins().iconst(cl_types::I64, op.arg(0).0 as i64);
-                        let size = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
-                        let result = emit_collecting_gc_call(
-                            &mut builder,
-                            ptr_type,
-                            call_conv,
-                            jf_ptr,
-                            &ref_root_slots,
-                            &defined_ref_vars,
-                            ref_root_base_ofs,
-                            per_call_gcmap,
-                            runtime_id,
-                            gc_alloc_nursery_shim as *const () as usize,
-                            &[size],
-                            Some(cl_types::I64),
-                        )
-                        .expect("alloc");
-                        jf_ptr = emit_reload_frame_if_necessary(&mut builder, ptr_type, call_conv);
-                        builder.def_var(jf_ptr_var, jf_ptr);
-                        builder.def_var(var(vi), result);
+                        // No active GC — refuse compile, matching the
+                        // pre-existing contract that CallMallocNursery
+                        // requires a configured `cpu.gc_ll_descr`.
+                        return Err(missing_gc_runtime(op.opcode));
                     }
                 }
                 OpCode::CallMallocNurseryVarsize => {
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    if !cranelift_gc_active() {
+                        return Err(missing_gc_runtime(op.opcode));
+                    }
                     let descr = op
                         .descr
                         .as_ref()
@@ -9161,7 +8966,6 @@ impl CraneliftBackend {
                     let ad = descr
                         .as_array_descr()
                         .expect("CallMallocNurseryVarsize descr must be an ArrayDescr");
-                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
                     let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
                     let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
                     // rewrite.py:858: args = [ConstInt(kind), ConstInt(itemsize), v_length]
@@ -9176,7 +8980,6 @@ impl CraneliftBackend {
                         &defined_ref_vars,
                         ref_root_base_ofs,
                         per_call_gcmap,
-                        runtime_id,
                         gc_alloc_varsize_shim as *const () as usize,
                         &[base_size, item_size, length],
                         Some(cl_types::I64),
@@ -9252,15 +9055,16 @@ impl CraneliftBackend {
                     builder.switch_to_block(slow_block);
                     builder.seal_block(slow_block);
                     builder.set_cold_block(slow_block);
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let runtime_id_val = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                    if !cranelift_gc_active() {
+                        return Err(missing_gc_runtime(op.opcode));
+                    }
                     let size = builder.ins().iadd_imm(size_total, -(GcHeader::SIZE as i64));
                     let slow_result = emit_host_call(
                         &mut builder,
                         ptr_type,
                         call_conv,
                         gc_alloc_nursery_shim as *const () as usize,
-                        &[runtime_id_val, size],
+                        &[size],
                         Some(cl_types::I64),
                     )
                     .expect("GC frame allocation helper must return a value");
@@ -9297,8 +9101,9 @@ impl CraneliftBackend {
                 // Inline flag check → skip if flag not set → slow path call.
                 // CondCallGcWbArray: card marking + post-helper re-test.
                 OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
-                    let runtime_id_val =
-                        gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
+                    if !cranelift_gc_active() {
+                        return Err(missing_gc_runtime(op.opcode));
+                    }
                     let obj = resolve_opref(&mut builder, &constants, op.arg(0));
                     let is_array = op.opcode == OpCode::CondCallGcWbArray;
 
@@ -9370,13 +9175,12 @@ impl CraneliftBackend {
                         // opassembler.py:953-980: array-specific helper call.
                         builder.switch_to_block(helper_call_block);
                         builder.seal_block(helper_call_block);
-                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id_val as i64);
                         let _ = emit_host_call(
                             &mut builder,
                             ptr_type,
                             call_conv,
                             gc_jit_remember_young_pointer_from_array_shim as *const () as usize,
-                            &[runtime_id, obj],
+                            &[obj],
                             None,
                         );
 
@@ -9418,13 +9222,12 @@ impl CraneliftBackend {
                         builder.ins().jump(cont_block, &[]);
                     } else {
                         // Simple write barrier (no card marking).
-                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id_val as i64);
                         let _ = emit_host_call(
                             &mut builder,
                             ptr_type,
                             call_conv,
                             gc_write_barrier_shim as *const () as usize,
-                            &[runtime_id, obj],
+                            &[obj],
                             None,
                         );
                         builder.ins().jump(cont_block, &[]);
@@ -10851,8 +10654,7 @@ impl CraneliftBackend {
                         && vtable != 0
                         && vtable_offset.is_some();
                     let vtable_off_i32 = vtable_offset.unwrap_or(0) as i32;
-                    if let Some(runtime_id) = gc_runtime_id {
-                        let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                    if cranelift_gc_active() {
                         let cur_jf = builder.use_var(jf_ptr_var);
                         let result = emit_collecting_gc_call(
                             &mut builder,
@@ -10863,7 +10665,6 @@ impl CraneliftBackend {
                             &defined_ref_vars,
                             ref_root_base_ofs,
                             per_call_gcmap,
-                            runtime_id,
                             gc_alloc_typed_nursery_shim as *const () as usize,
                             &[type_id_val, size_val],
                             Some(cl_types::I64),
@@ -10912,8 +10713,9 @@ impl CraneliftBackend {
                     }
                 }
                 OpCode::NewArray | OpCode::NewArrayClear => {
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                    if !cranelift_gc_active() {
+                        return Err(missing_gc_runtime(op.opcode));
+                    }
                     let length =
                         resolve_opref_or_imm(&mut builder, &constants, &known_values, op.arg(0));
                     let (base_size, item_size) =
@@ -10937,7 +10739,6 @@ impl CraneliftBackend {
                         &defined_ref_vars,
                         ref_root_base_ofs,
                         per_call_gcmap,
-                        runtime_id,
                         gc_alloc_varsize_shim as *const () as usize,
                         &[base_size, item_size, length],
                         Some(cl_types::I64),
@@ -11065,8 +10866,9 @@ impl CraneliftBackend {
                     let ad = descr
                         .as_array_descr()
                         .expect("newstr/newunicode descriptor must be an ArrayDescr");
-                    let runtime_id = gc_runtime_id.ok_or_else(|| missing_gc_runtime(op.opcode))?;
-                    let runtime_id = builder.ins().iconst(cl_types::I64, runtime_id as i64);
+                    if !cranelift_gc_active() {
+                        return Err(missing_gc_runtime(op.opcode));
+                    }
                     let len = resolve_opref(&mut builder, &constants, op.arg(0));
                     let base_size = builder.ins().iconst(cl_types::I64, ad.base_size() as i64);
                     let item_size = builder.ins().iconst(cl_types::I64, ad.item_size() as i64);
@@ -11079,7 +10881,6 @@ impl CraneliftBackend {
                         &defined_ref_vars,
                         ref_root_base_ofs,
                         per_call_gcmap,
-                        runtime_id,
                         gc_alloc_varsize_shim as *const () as usize,
                         &[base_size, item_size, len],
                         Some(cl_types::I64),
@@ -11170,7 +10971,6 @@ impl CraneliftBackend {
         let entry: LoopTargetEntry = LoopTargetEntry {
             code_ptr,
             fail_descrs: fail_descrs.clone(),
-            gc_runtime_id,
             num_inputs: inputargs.len(),
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
@@ -11197,7 +10997,6 @@ impl CraneliftBackend {
             code_size: 0,
             fail_descrs,
             terminal_exit_layouts: UnsafeCell::new(terminal_exit_layouts),
-            gc_runtime_id,
             num_inputs: inputargs.len(),
             num_ref_roots: ref_root_slots.len(),
             max_output_slots,
@@ -11216,10 +11015,14 @@ impl Drop for CraneliftBackend {
         }
         let _ = CALL_ASSEMBLER_DEADFRAMES.try_with(|map| map.borrow_mut().clear());
         let _ = NEXT_CALL_ASSEMBLER_DEADFRAME_HANDLE.try_with(|cell| cell.set(1));
-        if let Some(runtime_id) = self.gc_runtime_id.take() {
-            unregister_gc_runtime(runtime_id);
-            clear_runtime_jitframe_type_id(runtime_id);
-        }
+        // `llmodel.py:58` `cpu.gc_ll_descr` ownership ends here. Drop the
+        // active allocator so a subsequent backend is free to install
+        // its own; matching dynasm's
+        // `runner.rs DYNASM_ACTIVE_GC` reset on backend teardown.
+        let _ = CRANELIFT_ACTIVE_GC.try_with(|cell| {
+            *cell.borrow_mut() = None;
+        });
+        let _ = CRANELIFT_JITFRAME_TYPE_ID.try_with(|c| c.set(None));
     }
 }
 
@@ -11235,7 +11038,6 @@ fn collect_guards(
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
     constants: &HashMap<u32, i64>,
-    gc_runtime_id: Option<u64>,
     callinfocollection: Option<&majit_ir::CallInfoCollection>,
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
@@ -11763,7 +11565,6 @@ fn collect_guards(
         };
         descr.set_source_op_index(op_idx);
         descr.green_key = header_pc;
-        descr.gc_runtime_id = gc_runtime_id;
         // resume.py:450-488 parity: propagate rd_* from op to descr so
         // `compiled_exit_layout_from_backend` (pyjitpl/mod.rs:817-845) can
         // reconstruct the blackhole chain even after the frontend's
@@ -12136,7 +11937,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 code_ptr: compiled.code_ptr,
                 fail_descrs: compiled.fail_descrs,
                 terminal_exit_layouts: compiled.terminal_exit_layouts,
-                gc_runtime_id: compiled.gc_runtime_id,
                 loop_reentry,
                 num_inputs: bridge_num_inputs,
                 num_ref_roots: compiled.num_ref_roots,
@@ -12173,7 +11973,6 @@ impl majit_backend::Backend for CraneliftBackend {
                                     caller_prefix_layout: b.caller_prefix_layout.clone(),
                                     code_ptr: b.code_ptr,
                                     fail_descrs: b.fail_descrs.clone(),
-                                    gc_runtime_id: b.gc_runtime_id,
                                     num_inputs: b.num_inputs,
                                     num_ref_roots: b.num_ref_roots,
                                     max_output_slots: b.max_output_slots,
@@ -12337,7 +12136,6 @@ impl majit_backend::Backend for CraneliftBackend {
                         caller_prefix_layout: b.caller_prefix_layout.clone(),
                         code_ptr: b.code_ptr,
                         fail_descrs: b.fail_descrs.clone(),
-                        gc_runtime_id: b.gc_runtime_id,
                         num_inputs: b.num_inputs,
                         num_ref_roots: b.num_ref_roots,
                         max_output_slots: b.max_output_slots,
@@ -12400,7 +12198,6 @@ impl majit_backend::Backend for CraneliftBackend {
         let exec = run_compiled_code(
             compiled.code_ptr,
             &compiled.fail_descrs,
-            compiled.gc_runtime_id,
             compiled.num_ref_roots,
             compiled.max_output_slots,
             args,
@@ -12841,14 +12638,15 @@ impl majit_backend::Backend for CraneliftBackend {
     /// llmodel.py:775 bh_new(sizedescr) → gc_ll_descr.gc_malloc(sizedescr).
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
-        let Some(runtime_id) = self.gc_runtime_id else {
-            let layout = std::alloc::Layout::from_size_align(size, 8)
-                .unwrap_or(std::alloc::Layout::new::<u8>());
-            return unsafe { std::alloc::alloc_zeroed(layout) as i64 };
-        };
-        with_gc_runtime(runtime_id, |gc| {
-            gc.alloc_nursery_typed(sizedescr.get_type_id(), size).0 as i64
-        })
+        match with_cranelift_gc(|gc| gc.alloc_nursery_typed(sizedescr.get_type_id(), size).0 as i64)
+        {
+            Some(ptr) => ptr,
+            None => {
+                let layout = std::alloc::Layout::from_size_align(size, 8)
+                    .unwrap_or(std::alloc::Layout::new::<u8>());
+                unsafe { std::alloc::alloc_zeroed(layout) as i64 }
+            }
+        }
     }
 
     /// llmodel.py:778-782 bh_new_with_vtable(sizedescr).
@@ -12856,14 +12654,15 @@ impl majit_backend::Backend for CraneliftBackend {
     fn bh_new_with_vtable(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
         let size = sizedescr.as_size();
         let vtable = sizedescr.get_vtable();
-        let ptr = if let Some(runtime_id) = self.gc_runtime_id {
-            with_gc_runtime(runtime_id, |gc| {
-                gc.alloc_nursery_typed(sizedescr.get_type_id(), size).0 as i64
-            })
-        } else {
-            let layout = std::alloc::Layout::from_size_align(size, 8)
-                .unwrap_or(std::alloc::Layout::new::<u8>());
-            unsafe { std::alloc::alloc_zeroed(layout) as i64 }
+        let ptr = match with_cranelift_gc(|gc| {
+            gc.alloc_nursery_typed(sizedescr.get_type_id(), size).0 as i64
+        }) {
+            Some(p) => p,
+            None => {
+                let layout = std::alloc::Layout::from_size_align(size, 8)
+                    .unwrap_or(std::alloc::Layout::new::<u8>());
+                unsafe { std::alloc::alloc_zeroed(layout) as i64 }
+            }
         };
         // llmodel.py:780-782: if self.vtable_offset is not None:
         //   self.write_int_at_mem(res, self.vtable_offset, WORD, sizedescr.get_vtable())
@@ -12987,10 +12786,7 @@ impl majit_backend::Backend for CraneliftBackend {
     /// Resolves the typeid via the active GC runtime, mirroring how
     /// RPython looks the value up in `cpu.gc_ll_descr`.
     fn get_typeid_from_classptr_if_gcremovetypeptr(&self, classptr: usize) -> Option<u32> {
-        let runtime_id = self.gc_runtime_id?;
-        with_gc_runtime(runtime_id, |gc| {
-            gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)
-        })
+        with_cranelift_gc(|gc| gc.get_typeid_from_classptr_if_gcremovetypeptr(classptr)).flatten()
     }
 }
 
@@ -13258,13 +13054,13 @@ mod tests {
         Arc::new(TestLabelDescr { idx })
     }
 
-    extern "C" fn collect_nursery_via_runtime(runtime_id: i64) -> i64 {
-        with_gc_runtime(runtime_id as u64, |gc| gc.collect_nursery());
+    extern "C" fn collect_nursery_via_runtime(_runtime_id: i64) -> i64 {
+        with_cranelift_gc_required(|gc| gc.collect_nursery());
         123
     }
 
-    extern "C" fn collect_nursery_via_runtime_void(runtime_id: i64) {
-        with_gc_runtime(runtime_id as u64, |gc| gc.collect_nursery());
+    extern "C" fn collect_nursery_via_runtime_void(_runtime_id: i64) {
+        with_cranelift_gc_required(|gc| gc.collect_nursery());
     }
 
     fn may_force_void_values() -> &'static Mutex<Vec<i64>> {
@@ -13406,14 +13202,14 @@ mod tests {
     extern "C" fn maybe_force_and_return_ref(
         force_token: i64,
         flag: i64,
-        runtime_id: i64,
+        _runtime_id: i64,
         return_ref: i64,
     ) -> i64 {
         if flag != 0 {
             let mut deadframe = force_token_to_dead_frame(GcRef(force_token as usize));
             let preview_live = get_ref_from_deadframe(&deadframe, 2).unwrap();
             set_savedata_ref_on_deadframe(&mut deadframe, preview_live).unwrap();
-            with_gc_runtime(runtime_id as u64, |gc| gc.collect_nursery());
+            with_cranelift_gc_required(|gc| gc.collect_nursery());
             let preview_result = get_ref_from_deadframe(&deadframe, 1).unwrap();
             let preview_live = get_ref_from_deadframe(&deadframe, 2).unwrap();
             let preview_return = get_ref_from_deadframe(&deadframe, 3).unwrap();
@@ -15062,9 +14858,6 @@ mod tests {
         clear_test_exception_call_log();
 
         let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
-        let runtime_id = backend
-            .gc_runtime_id
-            .expect("GC runtime must be configured");
         let descr = make_call_descr(vec![Type::Int], Type::Void);
 
         let inputargs = vec![InputArg::new_int(0)];
@@ -15085,7 +14878,7 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(1)]);
-        with_gc_runtime(runtime_id, |gc| gc.collect_nursery());
+        with_cranelift_gc_required(|gc| gc.collect_nursery());
 
         assert_eq!(exc_class_of(&backend, &frame), 0x4444);
         let moved = backend.grab_exc_value(&frame);
@@ -17910,8 +17703,7 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         // Snapshot nursery free pointer before execution.
-        let gc_id = backend.gc_runtime_id.unwrap();
-        let nf_before = with_gc_runtime(gc_id, |gc| gc.nursery_free() as usize);
+        let nf_before = with_cranelift_gc_required(|gc| gc.nursery_free() as usize);
 
         let frame = backend.execute_token(&token, &[]);
 
@@ -17919,7 +17711,7 @@ mod tests {
         // resets, so nursery_free is near the start (only p2 allocated
         // post-collection). Without collection nursery_free would advance
         // by jf + 3*alloc = jf + 72 past nf_before.
-        let nf_after = with_gc_runtime(gc_id, |gc| gc.nursery_free() as usize);
+        let nf_after = with_cranelift_gc_required(|gc| gc.nursery_free() as usize);
         assert!(
             nf_after < nf_before + 3 * alloc_size,
             "nursery should have been collected (free before={nf_before:#x}, \
@@ -18238,9 +18030,6 @@ mod tests {
         }
 
         let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
-        let runtime_id = backend
-            .gc_runtime_id
-            .expect("GC runtime must be configured");
 
         let descr = make_call_descr(vec![Type::Int], Type::Int);
         let inputargs = vec![InputArg::new_ref(0)];
@@ -18255,7 +18044,9 @@ mod tests {
             100,
             collect_nursery_via_runtime as *const () as usize as i64,
         );
-        constants.insert(101, runtime_id as i64);
+        // Vestigial runtime_id arg ignored by the trampoline since the
+        // active GC is now routed through `CRANELIFT_ACTIVE_GC` directly.
+        constants.insert(101, 0);
         backend.set_constants(constants);
 
         let mut token = JitCellToken::new(1506);
@@ -18287,9 +18078,6 @@ mod tests {
         }
 
         let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
-        let runtime_id = backend
-            .gc_runtime_id
-            .expect("GC runtime must be configured");
 
         let descr = make_call_descr(vec![Type::Int], Type::Void);
         let inputargs = vec![InputArg::new_ref(0)];
@@ -18309,7 +18097,8 @@ mod tests {
             100,
             collect_nursery_via_runtime_void as *const () as usize as i64,
         );
-        constants.insert(101, runtime_id as i64);
+        // Vestigial runtime_id arg, see comment on the previous test.
+        constants.insert(101, 0);
         constants.insert(102, 1);
         backend.set_constants(constants);
 
@@ -18340,9 +18129,6 @@ mod tests {
         }
 
         let mut backend = CraneliftBackend::with_gc_allocator(Box::new(gc));
-        let runtime_id = backend
-            .gc_runtime_id
-            .expect("GC runtime must be configured");
 
         let inputargs = vec![InputArg::new_ref(0)];
         let ops = vec![
@@ -18354,7 +18140,7 @@ mod tests {
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Ref(root)]);
-        with_gc_runtime(runtime_id, |gc| gc.collect_nursery());
+        with_cranelift_gc_required(|gc| gc.collect_nursery());
 
         let moved_root = backend.get_ref_value(&frame, 0);
         assert!(!moved_root.is_null());

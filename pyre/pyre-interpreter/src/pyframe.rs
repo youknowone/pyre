@@ -218,7 +218,7 @@ unsafe fn clone_debugdata_ptr(ptr: *mut FrameDebugData) -> *mut FrameDebugData {
         if ptr.is_null() {
             std::ptr::null_mut()
         } else {
-            Box::into_raw(Box::new((*ptr).clone()))
+            pyre_object::lltype::malloc_raw((*ptr).clone())
         }
     }
 }
@@ -237,11 +237,11 @@ unsafe fn clone_block_chain(ptr: *mut FrameBlock) -> *mut FrameBlock {
         if ptr.is_null() {
             std::ptr::null_mut()
         } else {
-            Box::into_raw(Box::new(FrameBlock {
+            pyre_object::lltype::malloc_raw(FrameBlock {
                 handlerposition: (*ptr).handlerposition,
                 valuestackdepth: (*ptr).valuestackdepth,
                 previous: clone_block_chain((*ptr).previous),
-            }))
+            })
         }
     }
 }
@@ -469,7 +469,8 @@ impl PyFrame {
     #[inline]
     fn getorcreate_debug_data(&mut self, init_lineno: isize) -> &mut FrameDebugData {
         if self.debugdata.is_null() {
-            self.debugdata = Box::into_raw(Box::new(FrameDebugData::new(self.pycode, init_lineno)));
+            self.debugdata =
+                pyre_object::lltype::malloc_raw(FrameDebugData::new(self.pycode, init_lineno));
         }
         unsafe { &mut *self.debugdata }
     }
@@ -625,7 +626,7 @@ impl PyFrame {
         let flags = code.flags;
         if !flags.contains(CodeFlags::OPTIMIZED) {
             let w_locals = if flags.contains(CodeFlags::NEWLOCALS) {
-                Box::into_raw(Box::new(DictStorage::new()))
+                pyre_object::lltype::malloc_raw(DictStorage::new())
             } else {
                 self.get_w_globals()
             };
@@ -1050,7 +1051,7 @@ impl PyFrame {
     #[inline]
     pub fn append_block(&mut self, mut block: FrameBlock) {
         block.previous = self.lastblock;
-        self.lastblock = Box::into_raw(Box::new(block));
+        self.lastblock = pyre_object::lltype::malloc_raw(block);
     }
 
     /// pyframe.py:190 pop_block
@@ -1449,7 +1450,7 @@ impl PyFrame {
         let mut w_locals = d.w_locals;
         let mut write = false;
         if w_locals.is_null() {
-            w_locals = Box::into_raw(Box::new(DictStorage::new()));
+            w_locals = pyre_object::lltype::malloc_raw(DictStorage::new());
             write = true;
         }
         let w_locals_ref = unsafe { &mut *w_locals };

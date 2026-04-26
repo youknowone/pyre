@@ -26,24 +26,34 @@ unsafe impl Sync for W_LongObject {}
 /// Field offset of `value` within `W_LongObject`, for potential JIT field access.
 pub const LONG_VALUE_OFFSET: usize = std::mem::offset_of!(W_LongObject, value);
 
+/// GC type id assigned to `W_LongObject` at JitDriver init time.
+pub const W_LONG_GC_TYPE_ID: u32 = 35;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_LONG_OBJECT_SIZE: usize = std::mem::size_of::<W_LongObject>();
+
+impl crate::lltype::GcType for W_LongObject {
+    const TYPE_ID: u32 = W_LONG_GC_TYPE_ID;
+    const SIZE: usize = W_LONG_OBJECT_SIZE;
+}
+
 /// Allocate a new W_LongObject on the heap.
 ///
 /// Phase 1: uses `Box::leak` (objects are never freed).
 pub fn w_long_new(value: BigInt) -> PyObjectRef {
-    let inner = Box::into_raw(Box::new(value));
     // W_LongObject shares the `int` type with W_IntObject — the two only
     // differ in their storage layout, not their Python-level identity
     // (PyPy does the same via W_AbstractIntObject's typedef). Wire
     // `w_class` to INT_TYPE.instantiate so `type(x) is int` and
     // `isinstance(x, int)` both hold for long integers.
-    let obj = Box::new(W_LongObject {
+    let value = crate::lltype::malloc_raw(value);
+    crate::lltype::malloc_typed(W_LongObject {
         ob_header: PyObject {
             ob_type: &LONG_TYPE as *const PyType,
             w_class: get_instantiate(&INT_TYPE),
         },
-        value: inner,
-    });
-    Box::into_raw(obj) as PyObjectRef
+        value,
+    }) as PyObjectRef
 }
 
 /// Create a W_LongObject from an i64 value.

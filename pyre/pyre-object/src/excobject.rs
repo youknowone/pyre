@@ -59,18 +59,28 @@ pub struct W_ExceptionObject {
 pub const EXC_KIND_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, kind);
 pub const EXC_MESSAGE_OFFSET: usize = std::mem::offset_of!(W_ExceptionObject, message);
 
+/// GC type id assigned to `W_ExceptionObject` at JitDriver init time.
+pub const W_EXCEPTION_GC_TYPE_ID: u32 = 31;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_EXCEPTION_OBJECT_SIZE: usize = std::mem::size_of::<W_ExceptionObject>();
+
+impl crate::lltype::GcType for W_ExceptionObject {
+    const TYPE_ID: u32 = W_EXCEPTION_GC_TYPE_ID;
+    const SIZE: usize = W_EXCEPTION_OBJECT_SIZE;
+}
+
 /// Allocate a new exception object on the heap.
 pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
-    let msg = Box::into_raw(Box::new(message.to_string()));
-    let obj = Box::new(W_ExceptionObject {
+    let message = crate::lltype::malloc_raw(message.to_string());
+    crate::lltype::malloc_typed(W_ExceptionObject {
         ob_header: PyObject {
             ob_type: &EXCEPTION_TYPE as *const PyType,
             w_class: get_instantiate(&EXCEPTION_TYPE),
         },
         kind,
-        message: msg,
-    });
-    Box::into_raw(obj) as PyObjectRef
+        message,
+    }) as PyObjectRef
 }
 
 /// Check if an object is an exception instance.
@@ -240,5 +250,18 @@ mod tests {
             let name = exc_kind_name(kind);
             assert_eq!(exc_kind_from_name(name), Some(kind));
         }
+    }
+
+    #[test]
+    fn w_exception_gc_type_id_matches_descr() {
+        assert_eq!(W_EXCEPTION_GC_TYPE_ID, 31);
+        assert_eq!(
+            <W_ExceptionObject as crate::lltype::GcType>::TYPE_ID,
+            W_EXCEPTION_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_ExceptionObject as crate::lltype::GcType>::SIZE,
+            W_EXCEPTION_OBJECT_SIZE
+        );
     }
 }

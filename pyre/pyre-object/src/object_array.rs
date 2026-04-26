@@ -343,17 +343,47 @@ impl IndexMut<usize> for FixedObjectArray {
 // In pyre, GcArray is a boxed PyObjectArray on the heap. The returned
 // pointer is a raw `*mut PyObjectArray` cast to usize for GcRef.
 
-// ─── GcTypedArray: RPython typed GC array ────────────────────────────
+// ─── GcTypedArray: typed array helper for resume / blackhole ─────────
 //
 // llmodel.py:788-789: bh_new_array / bh_new_array_clear
 // llmodel.py:607-619: bh_setarrayitem_gc_r/i/f, bh_getarrayitem_gc_r/i/f
 // resume.py:1444-1537: ResumeDataDirectReader allocate_array + setarrayitem_*
 //
 // RPython GC arrays are typed: ref[], int[], float[]. Each slot stores
-// a raw value of the corresponding type. pyre's GcTypedArray preserves
-// this distinction.
+// a raw value of the corresponding type. pyre's `GcTypedArray` keeps
+// the typed distinction at the API level but DOES NOT match upstream's
+// memory shape:
+//
+// **NON-PARITY (PRE-EXISTING-ADAPTATION).** Upstream `gc_malloc_array`
+// (`framework.py:837-849 gct_fv_gc_malloc_varsize`) is a *varsize*
+// allocation parameterised by `(length, basesize, itemsize,
+// length_offset)`, producing a single flat block:
+//
+//     [length: WORD] [item_0] [item_1] ... [item_(length-1)]
+//
+// `GcTypedArray` instead heap-boxes a fixed-size Rust enum that wraps
+// a `Vec<T>`, giving a double indirection
+// (`*mut GcTypedArray -> Vec.ptr -> items`). The Vec storage lives on
+// `std::alloc`'s heap, completely outside any GC nursery, so the GC
+// walker has no path to the inline `PyObjectRef`s in `Ref(_)` /
+// `Struct { data, .. }`.
+//
+// Convergence target: replace each variant with a flat varsize struct
+// matching upstream — see [`ItemsBlock`] above for the exact shape
+// (`rpython/rtyper/lltypesystem/rlist.py:84 GcArray(OBJECTPTR)`) and
+// register through `TypeInfo::varsize(basesize, itemsize,
+// length_offset, items_have_gc_ptrs, gc_ptr_offsets)` matching
+// `framework.py:839`. Allocation site (`allocate_array` /
+// `allocate_array_struct`) routes through `malloc_raw` rather than
+// `malloc` to avoid claiming GC-managed semantics it does not yet
+// honour. The Vec contents are reachable only through the resume /
+// blackhole walker holding `*mut GcTypedArray` directly as a root
+// (resume.py:1444-1537 reader pattern).
 
-/// RPython typed GC array — descr.py:273 ArrayDescr.flag parity.
+/// Typed array helper used by the resume / blackhole readers.
+/// `descr.py:273 ArrayDescr.flag` parity at the API level only —
+/// the memory shape is NOT upstream-equivalent (see module-level
+/// comment).
 pub enum GcTypedArray {
     /// FLAG_POINTER: each slot is a PyObjectRef (GCREF).
     Ref(Vec<PyObjectRef>),
@@ -382,11 +412,16 @@ pub enum ArrayKind {
     Struct,
 }
 
-/// resume.py:1444-1447, llmodel.py:788-790 parity.
+/// resume.py:1444-1447, llmodel.py:788-790 — API alias.
 /// RPython: `bh_new_array_clear = bh_new_array` (llmodel.py:790).
-/// Both call `gc_malloc_array` which allocates from the GC nursery
-/// (always zero-filled). The `clear` parameter preserves the API
-/// distinction from resume.py:1444 but has no behavioral difference.
+/// Upstream both call `gc_malloc_array` which allocates a varsize
+/// block from the GC nursery (always zero-filled).
+///
+/// **NON-PARITY** at the storage level: pyre boxes a fixed-size
+/// `GcTypedArray` enum (`malloc_raw`) whose `Vec` payload lives on
+/// `std::alloc`'s heap. The result is invisible to the GC walker
+/// — see the module-level comment for the convergence path through
+/// flat varsize blocks à la [`ItemsBlock`].
 pub fn allocate_array(length: usize, kind: ArrayKind, _clear: bool) -> *mut GcTypedArray {
     // llmodel.py:790: bh_new_array_clear = bh_new_array.
     // Both allocate from gc_malloc_array (always zero-filled).
@@ -400,13 +435,21 @@ pub fn allocate_array(length: usize, kind: ArrayKind, _clear: bool) -> *mut GcTy
             data: Vec::new(),
         },
     };
-    Box::into_raw(Box::new(arr))
+    crate::lltype::malloc_raw(arr)
 }
 
-/// resume.py:749 VArrayStructInfo.allocate parity.
+/// resume.py:749 VArrayStructInfo.allocate — API alias.
 /// Allocate a flat byte buffer for Array(Struct(...)).
 /// Layout: num_elems elements × item_size bytes, zero-filled.
-/// llmodel.py: gc_malloc_array(basesize + num_elems * itemsize).
+/// llmodel.py: `gc_malloc_array(basesize + num_elems * itemsize)`.
+///
+/// **NON-PARITY** at the storage level: same caveat as
+/// [`allocate_array`] above. The byte buffer lives on `std::alloc`,
+/// not in the GC nursery, so reads/writes through
+/// [`setinteriorfield`] do not engage write-barriers. Until the
+/// flat-varsize port lands, callers must hold `*mut GcTypedArray` as
+/// an explicit root for any contained PyObjectRefs to survive a
+/// collection.
 pub fn allocate_array_struct(num_elems: usize, item_size: usize) -> *mut GcTypedArray {
     let total_bytes = num_elems * item_size;
     let arr = GcTypedArray::Struct {
@@ -414,7 +457,7 @@ pub fn allocate_array_struct(num_elems: usize, item_size: usize) -> *mut GcTyped
         num_elems,
         data: vec![0u8; total_bytes],
     };
-    Box::into_raw(Box::new(arr))
+    crate::lltype::malloc_raw(arr)
 }
 
 /// llmodel.py:607-609 bh_setarrayitem_gc_r parity.

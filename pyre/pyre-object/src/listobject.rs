@@ -325,6 +325,19 @@ unsafe fn switch_to_correct_strategy(list: &mut W_ListObject, w_item: PyObjectRe
 
 /// Allocate a new W_ListObject from a Vec of items.
 pub fn w_list_new(items: Vec<PyObjectRef>) -> PyObjectRef {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`):
+    // pin every PyObjectRef in `items` before the GC malloc paths
+    // below (`alloc_list_items_block`, `try_gc_alloc_stable`) so the
+    // shadow stack walker sees them if a collection fires inside the
+    // allocator. The Empty / Integer / Float strategies still hold
+    // PyObjectRef pointers in `items` until each element is unboxed
+    // (`plain_int_w`, `w_float_get_value`); pinning all of them at
+    // function entry covers every strategy uniformly.
+    let _roots = crate::gc_roots::push_roots();
+    for &item in &items {
+        crate::gc_roots::pin_root(item);
+    }
+
     // listobject.py:1092 EmptyListStrategy: a freshly created list with no
     // items uses Empty until first append picks a typed strategy.
     let strategy = if items.is_empty() {

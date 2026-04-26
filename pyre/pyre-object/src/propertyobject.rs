@@ -22,11 +22,40 @@ pub struct W_PropertyObject {
 
 pub static PROPERTY_TYPE: PyType = crate::pyobject::new_pytype("property");
 
+/// Field offsets of inline `PyObjectRef` slots within `W_PropertyObject`.
+pub const PROPERTY_FGET_OFFSET: usize = std::mem::offset_of!(W_PropertyObject, fget);
+pub const PROPERTY_FSET_OFFSET: usize = std::mem::offset_of!(W_PropertyObject, fset);
+pub const PROPERTY_FDEL_OFFSET: usize = std::mem::offset_of!(W_PropertyObject, fdel);
+
+/// GC type id assigned to `W_PropertyObject` at JitDriver init time.
+pub const W_PROPERTY_GC_TYPE_ID: u32 = 19;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_PROPERTY_OBJECT_SIZE: usize = std::mem::size_of::<W_PropertyObject>();
+
+/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
+pub const W_PROPERTY_GC_PTR_OFFSETS: [usize; 3] = [
+    PROPERTY_FGET_OFFSET,
+    PROPERTY_FSET_OFFSET,
+    PROPERTY_FDEL_OFFSET,
+];
+
+impl crate::lltype::GcType for W_PropertyObject {
+    const TYPE_ID: u32 = W_PROPERTY_GC_TYPE_ID;
+    const SIZE: usize = W_PROPERTY_OBJECT_SIZE;
+}
+
 /// Allocate a new property object.
 ///
 /// PyPy: W_Property.__init__(space, w_fget, w_fset, w_fdel, w_doc)
 pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -> PyObjectRef {
-    let obj = Box::new(W_PropertyObject {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(fget);
+    crate::gc_roots::pin_root(fset);
+    crate::gc_roots::pin_root(fdel);
+
+    crate::lltype::malloc_typed(W_PropertyObject {
         ob_header: PyObject {
             ob_type: &PROPERTY_TYPE as *const PyType,
             w_class: get_instantiate(&PROPERTY_TYPE),
@@ -34,8 +63,7 @@ pub fn w_property_new(fget: PyObjectRef, fset: PyObjectRef, fdel: PyObjectRef) -
         fget,
         fset,
         fdel,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 pub unsafe fn w_property_get_fget(obj: PyObjectRef) -> PyObjectRef {
@@ -69,15 +97,36 @@ pub struct W_StaticMethodObject {
 
 pub static STATICMETHOD_TYPE: PyType = crate::pyobject::new_pytype("staticmethod");
 
+/// Field offset of `w_function` within `W_StaticMethodObject`.
+pub const STATICMETHOD_W_FUNCTION_OFFSET: usize =
+    std::mem::offset_of!(W_StaticMethodObject, w_function);
+
+/// GC type id assigned to `W_StaticMethodObject` at JitDriver init time.
+pub const W_STATICMETHOD_GC_TYPE_ID: u32 = 20;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_STATICMETHOD_OBJECT_SIZE: usize = std::mem::size_of::<W_StaticMethodObject>();
+
+/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
+pub const W_STATICMETHOD_GC_PTR_OFFSETS: [usize; 1] = [STATICMETHOD_W_FUNCTION_OFFSET];
+
+impl crate::lltype::GcType for W_StaticMethodObject {
+    const TYPE_ID: u32 = W_STATICMETHOD_GC_TYPE_ID;
+    const SIZE: usize = W_STATICMETHOD_OBJECT_SIZE;
+}
+
 pub fn w_staticmethod_new(func: PyObjectRef) -> PyObjectRef {
-    let obj = Box::new(W_StaticMethodObject {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(func);
+
+    crate::lltype::malloc_typed(W_StaticMethodObject {
         ob_header: PyObject {
             ob_type: &STATICMETHOD_TYPE as *const PyType,
             w_class: get_instantiate(&STATICMETHOD_TYPE),
         },
         w_function: func,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 pub unsafe fn w_staticmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
@@ -103,15 +152,36 @@ pub struct W_ClassMethodObject {
 
 pub static CLASSMETHOD_TYPE: PyType = crate::pyobject::new_pytype("classmethod");
 
+/// Field offset of `w_function` within `W_ClassMethodObject`.
+pub const CLASSMETHOD_W_FUNCTION_OFFSET: usize =
+    std::mem::offset_of!(W_ClassMethodObject, w_function);
+
+/// GC type id assigned to `W_ClassMethodObject` at JitDriver init time.
+pub const W_CLASSMETHOD_GC_TYPE_ID: u32 = 21;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_CLASSMETHOD_OBJECT_SIZE: usize = std::mem::size_of::<W_ClassMethodObject>();
+
+/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
+pub const W_CLASSMETHOD_GC_PTR_OFFSETS: [usize; 1] = [CLASSMETHOD_W_FUNCTION_OFFSET];
+
+impl crate::lltype::GcType for W_ClassMethodObject {
+    const TYPE_ID: u32 = W_CLASSMETHOD_GC_TYPE_ID;
+    const SIZE: usize = W_CLASSMETHOD_OBJECT_SIZE;
+}
+
 pub fn w_classmethod_new(func: PyObjectRef) -> PyObjectRef {
-    let obj = Box::new(W_ClassMethodObject {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(func);
+
+    crate::lltype::malloc_typed(W_ClassMethodObject {
         ob_header: PyObject {
             ob_type: &CLASSMETHOD_TYPE as *const PyType,
             w_class: get_instantiate(&CLASSMETHOD_TYPE),
         },
         w_function: func,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 pub unsafe fn w_classmethod_get_func(obj: PyObjectRef) -> PyObjectRef {
@@ -134,5 +204,44 @@ mod tests {
             assert!(is_property(obj));
             assert!(!is_int(obj));
         }
+    }
+
+    #[test]
+    fn w_property_gc_type_id_matches_descr() {
+        assert_eq!(W_PROPERTY_GC_TYPE_ID, 19);
+        assert_eq!(
+            <W_PropertyObject as crate::lltype::GcType>::TYPE_ID,
+            W_PROPERTY_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_PropertyObject as crate::lltype::GcType>::SIZE,
+            W_PROPERTY_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_staticmethod_gc_type_id_matches_descr() {
+        assert_eq!(W_STATICMETHOD_GC_TYPE_ID, 20);
+        assert_eq!(
+            <W_StaticMethodObject as crate::lltype::GcType>::TYPE_ID,
+            W_STATICMETHOD_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_StaticMethodObject as crate::lltype::GcType>::SIZE,
+            W_STATICMETHOD_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_classmethod_gc_type_id_matches_descr() {
+        assert_eq!(W_CLASSMETHOD_GC_TYPE_ID, 21);
+        assert_eq!(
+            <W_ClassMethodObject as crate::lltype::GcType>::TYPE_ID,
+            W_CLASSMETHOD_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_ClassMethodObject as crate::lltype::GcType>::SIZE,
+            W_CLASSMETHOD_OBJECT_SIZE
+        );
     }
 }

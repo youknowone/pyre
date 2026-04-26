@@ -39,6 +39,11 @@ pub const SMALL_INT_MIN: i64 = -5;
 pub const SMALL_INT_MAX: i64 = 256;
 pub const W_INT_OBJECT_SIZE: usize = std::mem::size_of::<W_IntObject>();
 
+impl crate::lltype::GcType for W_IntObject {
+    const TYPE_ID: u32 = W_INT_GC_TYPE_ID;
+    const SIZE: usize = W_INT_OBJECT_SIZE;
+}
+
 static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| {
     (SMALL_INT_MIN..=SMALL_INT_MAX)
         .map(|v| W_IntObject {
@@ -54,30 +59,33 @@ static SMALL_INTS: LazyLock<Vec<W_IntObject>> = LazyLock::new(|| {
 /// Create or retrieve a W_IntObject for the given value.
 ///
 /// Values in -5..=256 are returned from a pre-allocated cache (no heap
-/// allocation). Values outside this range are heap-allocated via
-/// `Box::into_raw` (Phase 1 leak). A future phase routes the
-/// non-cached path through `crate::gc_hook::try_gc_alloc`, but a
-/// direct substitution is unsafe today: the caller holds the returned
-/// `PyObjectRef` on the Rust stack without registering it as a GC
-/// root, so a minor-collection-driven nursery copy between
-/// `w_int_new` returning and the caller writing into a tracked slot
-/// leaves a dangling pointer. See Task #140 memory for the
-/// SIGSEGV reproduced when attempting the migration.
+/// allocation). Non-cached values are allocated through
+/// [`crate::lltype::malloc_typed`] (Task #145 Step 2), which carries
+/// `W_INT_GC_TYPE_ID` + `W_INT_OBJECT_SIZE` via the
+/// [`crate::lltype::GcType`] impl below — the Rust analog of
+/// `gct_fv_gc_malloc`'s compile-time `c_type_id` / `c_size`
+/// (`rpython/memory/gctransform/framework.py:807-811`). PyPy's
+/// `pypy/objspace/std/intobject.py:883 wrapint` produces the same
+/// shape: a single allocation call that the GC transform stage
+/// eventually rewrites into managed alloc + push/pop_roots
+/// (`framework.py:803-853`).
+///
+/// Phase 1: `lltype::malloc_typed` is `Box::into_raw`. Future GC
+/// integration replaces only that body; this constructor stays
+/// unchanged.
 #[inline]
 pub fn w_int_new(value: i64) -> PyObjectRef {
     if value >= SMALL_INT_MIN && value <= SMALL_INT_MAX {
         let idx = (value - SMALL_INT_MIN) as usize;
-        (&SMALL_INTS[idx] as *const W_IntObject).cast_mut() as PyObjectRef
-    } else {
-        let obj = Box::new(W_IntObject {
-            ob_header: PyObject {
-                ob_type: &INT_TYPE as *const PyType,
-                w_class: get_instantiate(&INT_TYPE),
-            },
-            intval: value,
-        });
-        Box::into_raw(obj) as PyObjectRef
+        return (&SMALL_INTS[idx] as *const W_IntObject).cast_mut() as PyObjectRef;
     }
+    crate::lltype::malloc_typed(W_IntObject {
+        ob_header: PyObject {
+            ob_type: &INT_TYPE as *const PyType,
+            w_class: get_instantiate(&INT_TYPE),
+        },
+        intval: value,
+    }) as PyObjectRef
 }
 
 /// Create a W_IntObject bypassing the small-int cache.
@@ -85,14 +93,13 @@ pub fn w_int_new(value: i64) -> PyObjectRef {
 /// Used for int subclass instances that need unique object identity
 /// (so per-object attributes in ATTR_TABLE don't collide).
 pub fn w_int_new_unique(value: i64) -> PyObjectRef {
-    let obj = Box::new(W_IntObject {
+    crate::lltype::malloc_typed(W_IntObject {
         ob_header: PyObject {
             ob_type: &INT_TYPE as *const PyType,
             w_class: get_instantiate(&INT_TYPE),
         },
         intval: value,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Return the address of INT_TYPE for JIT type-id validation.
@@ -181,9 +188,10 @@ mod tests {
         unsafe {
             assert_eq!(w_int_get_value(a), 1000);
             assert_eq!(w_int_get_value(b), 1000);
-            drop(Box::from_raw(a as *mut W_IntObject));
-            drop(Box::from_raw(b as *mut W_IntObject));
         }
+        // GC-flavored allocation: leak in tests. `Box::from_raw` is
+        // unsound once `malloc_typed` routes through the Phase 2
+        // managed allocator.
     }
 
     #[test]

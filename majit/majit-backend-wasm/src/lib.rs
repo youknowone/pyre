@@ -24,10 +24,9 @@ thread_local! {
     /// backend on this thread. Stored as a thread-local so the
     /// backend-agnostic `majit_gc::ActiveGcGuardHooks` shims can
     /// reach the live allocator without taking a wasm dependency.
-    /// Mirrors `cranelift::compiler::GC_RUNTIMES` /
-    /// `ACTIVE_GC_RUNTIME_ID`; cranelift carries an id because it
-    /// supports multiple registered GCs across compile sessions,
-    /// while wasm only has one active backend at a time.
+    /// Mirrors `cranelift::compiler::CRANELIFT_ACTIVE_GC` and
+    /// `dynasm::runner::DYNASM_ACTIVE_GC` — RPython's
+    /// `cpu.gc_ll_descr` parity, single-slot per thread.
     static WASM_ACTIVE_GC: RefCell<Option<Box<dyn GcAllocator>>> = const { RefCell::new(None) };
 }
 

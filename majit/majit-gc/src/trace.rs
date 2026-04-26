@@ -425,6 +425,38 @@ impl TypeInfo {
         }
     }
 
+    /// `object_subclass` variant for instances whose payload contains
+    /// inline `GcRef`-typed fields. `offsets` lists their byte offsets
+    /// within the struct (after `ob_type` at offset 0). The collector
+    /// walks these during minor collection so the parent-chain
+    /// inheritance information is preserved alongside the trace
+    /// metadata.
+    ///
+    /// Use this when an `rclass.OBJECT`-shaped class has fields whose
+    /// rtyped form is `Ptr(rclass.OBJECT)` — for example
+    /// `pypy/interpreter/function.py:47-86 W_Function`'s `closure`,
+    /// `defs_w`, `w_kw_defs`, `w_module`.
+    pub fn object_subclass_with_gc_ptrs(
+        size: usize,
+        parent_typeid: u32,
+        offsets: Vec<usize>,
+    ) -> Self {
+        let has_gc_ptrs = !offsets.is_empty();
+        TypeInfo {
+            size,
+            has_gc_ptrs,
+            gc_ptr_offsets: offsets,
+            item_size: 0,
+            length_offset: 0,
+            items_have_gc_ptrs: false,
+            custom_trace: None,
+            is_object: true,
+            parent: Some(parent_typeid),
+            subclassrange_min: 0,
+            subclassrange_max: 0,
+        }
+    }
+
     /// Create a type info for a fixed-size object with GC pointer fields.
     /// `offsets` lists byte offsets of GcRef fields within the payload.
     pub fn with_gc_ptrs(size: usize, offsets: Vec<usize>) -> Self {

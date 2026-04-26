@@ -25,6 +25,23 @@ pub struct W_UnionType {
 
 pub static UNION_TYPE: PyType = crate::pyobject::new_pytype("types.UnionType");
 
+/// Field offset of `args` within `W_UnionType`.
+pub const UNION_ARGS_OFFSET: usize = std::mem::offset_of!(W_UnionType, args);
+
+/// GC type id assigned to `W_UnionType` at JitDriver init time.
+pub const W_UNION_GC_TYPE_ID: u32 = 22;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_UNION_OBJECT_SIZE: usize = std::mem::size_of::<W_UnionType>();
+
+/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
+pub const W_UNION_GC_PTR_OFFSETS: [usize; 1] = [UNION_ARGS_OFFSET];
+
+impl crate::lltype::GcType for W_UnionType {
+    const TYPE_ID: u32 = W_UNION_GC_TYPE_ID;
+    const SIZE: usize = W_UNION_OBJECT_SIZE;
+}
+
 /// Check if an object is a UnionType.
 #[inline]
 pub unsafe fn is_union(obj: PyObjectRef) -> bool {
@@ -43,14 +60,17 @@ pub fn w_union_new(a: PyObjectRef, b: PyObjectRef) -> PyObjectRef {
     dedup_members(&mut members);
 
     let args = crate::w_tuple_new(members);
-    let obj = Box::new(W_UnionType {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(args);
+
+    crate::lltype::malloc_typed(W_UnionType {
         ob_header: PyObject {
             ob_type: &UNION_TYPE as *const PyType,
             w_class: get_instantiate(&UNION_TYPE),
         },
         args,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Flatten nested UnionType args, or add a single type.
@@ -165,5 +185,18 @@ mod tests {
             let args = w_union_get_args(outer);
             assert_eq!(crate::w_tuple_len(args), 3);
         }
+    }
+
+    #[test]
+    fn w_union_gc_type_id_matches_descr() {
+        assert_eq!(W_UNION_GC_TYPE_ID, 22);
+        assert_eq!(
+            <W_UnionType as crate::lltype::GcType>::TYPE_ID,
+            W_UNION_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_UnionType as crate::lltype::GcType>::SIZE,
+            W_UNION_OBJECT_SIZE
+        );
     }
 }

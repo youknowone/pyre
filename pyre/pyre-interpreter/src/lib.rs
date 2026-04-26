@@ -74,6 +74,15 @@ pub use shared_opcode::*;
 ///
 /// These live here rather than in `pyre_object::pyobject` because
 /// `pyre-object` cannot depend on `pyre-interpreter`.
+///
+/// `BUILTIN_CODE_TYPE`, `FUNCTION_TYPE`, `BUILTIN_FUNCTION_TYPE` are
+/// intentionally absent: they get their own ids
+/// (`BUILTIN_CODE_GC_TYPE_ID`, `FUNCTION_GC_TYPE_ID`) because the GC
+/// needs the actual payload size and inline `PyObjectRef` field
+/// offsets, neither of which the foreign-pytype loop can derive from
+/// `sizeof(PyObject)`. Future types whose instances reach the GC
+/// nursery should follow the same pre-registration pattern (see
+/// `eval.rs` BuiltinCode / Function blocks).
 pub fn all_foreign_pytypes() -> &'static [(
     &'static pyre_object::pyobject::PyType,
     &'static pyre_object::pyobject::PyType,
@@ -81,18 +90,7 @@ pub fn all_foreign_pytypes() -> &'static [(
     static PYTYPES: &[(
         &pyre_object::pyobject::PyType,
         &pyre_object::pyobject::PyType,
-    )] = &[
-        (&crate::pycode::CODE_TYPE, &pyre_object::INSTANCE_TYPE),
-        (&crate::function::FUNCTION_TYPE, &pyre_object::INSTANCE_TYPE),
-        (
-            &crate::function::BUILTIN_FUNCTION_TYPE,
-            &pyre_object::INSTANCE_TYPE,
-        ),
-        (
-            &crate::gateway::BUILTIN_CODE_TYPE,
-            &pyre_object::INSTANCE_TYPE,
-        ),
-    ];
+    )] = &[(&crate::pycode::CODE_TYPE, &pyre_object::INSTANCE_TYPE)];
     PYTYPES
 }
 

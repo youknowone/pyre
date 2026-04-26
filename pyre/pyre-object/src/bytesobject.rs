@@ -21,18 +21,32 @@ pub struct W_BytesObject {
     pub len: usize,
 }
 
+/// GC type id assigned to `W_BytesObject` at JitDriver init time.
+pub const W_BYTES_GC_TYPE_ID: u32 = 27;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_BYTES_OBJECT_SIZE: usize = std::mem::size_of::<W_BytesObject>();
+
+impl crate::lltype::GcType for W_BytesObject {
+    const TYPE_ID: u32 = W_BYTES_GC_TYPE_ID;
+    const SIZE: usize = W_BYTES_OBJECT_SIZE;
+}
+
 /// Allocate a new bytes object from a byte slice.
 pub fn w_bytes_from_bytes(bytes: &[u8]) -> PyObjectRef {
     let len = bytes.len();
-    let obj = Box::new(W_BytesObject {
+    // The `data` Vec lives on the raw heap (manually freed elsewhere),
+    // so it is allocated through `malloc_raw`. The W_BytesObject itself
+    // is GC-managed via `malloc_typed`.
+    let data = crate::lltype::malloc_raw(bytes.to_vec());
+    crate::lltype::malloc_typed(W_BytesObject {
         ob_header: PyObject {
             ob_type: &BYTES_TYPE as *const PyType,
             w_class: get_instantiate(&BYTES_TYPE),
         },
-        data: Box::into_raw(Box::new(bytes.to_vec())),
+        data,
         len,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Allocate an empty bytes object.
@@ -149,5 +163,18 @@ mod tests {
             assert!(is_bytes(b));
             assert_eq!(w_bytes_len(b), 0);
         }
+    }
+
+    #[test]
+    fn w_bytes_gc_type_id_matches_descr() {
+        assert_eq!(W_BYTES_GC_TYPE_ID, 27);
+        assert_eq!(
+            <W_BytesObject as crate::lltype::GcType>::TYPE_ID,
+            W_BYTES_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_BytesObject as crate::lltype::GcType>::SIZE,
+            W_BYTES_OBJECT_SIZE
+        );
     }
 }

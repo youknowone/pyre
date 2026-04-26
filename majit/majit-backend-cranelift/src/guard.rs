@@ -37,8 +37,6 @@ pub struct BridgeData {
     pub code_ptr: *const u8,
     /// Fail descriptors within the bridge (guards + finish).
     pub fail_descrs: Vec<Arc<CraneliftFailDescr>>,
-    /// GC runtime used by the compiled bridge, if any.
-    pub gc_runtime_id: Option<u64>,
     /// Number of input arguments the bridge expects.
     /// Set to parent guard's fail_arg count (not optimizer-reduced count)
     /// so execute_bridge passes all parent outputs and indices align.
@@ -86,7 +84,6 @@ impl std::fmt::Debug for BridgeData {
             .field("source_guard", &self.source_guard)
             .field("caller_prefix_layout", &self.caller_prefix_layout)
             .field("code_ptr", &self.code_ptr)
-            .field("gc_runtime_id", &self.gc_runtime_id)
             .field("num_inputs", &self.num_inputs)
             .field("num_ref_roots", &self.num_ref_roots)
             .field("terminal_exit_layouts", unsafe {
@@ -154,10 +151,6 @@ pub struct CraneliftFailDescr {
     pub bridge: UnsafeCell<Option<BridgeData>>,
     /// Atomic cache of bridge code_ptr for lock-free dispatch.
     pub bridge_code_ptr_cache: std::sync::atomic::AtomicUsize,
-    /// GC runtime that owns the compiled loop this guard belongs to.
-    /// Used by force() to register the JitFrame as a GC root without
-    /// relying on thread-local ACTIVE_GC_RUNTIME_ID.
-    pub gc_runtime_id: Option<u64>,
     /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
     /// Populated at compile time from the frontend's `StoredExitLayout` so
     /// `compiled_exit_layout_from_backend` can reconstruct the blackhole
@@ -288,7 +281,6 @@ impl CraneliftFailDescr {
             vector_info: Vec::new(),
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
-            gc_runtime_id: None,
             rd_numb: None,
             rd_consts: None,
             rd_virtuals: None,
@@ -331,7 +323,6 @@ impl CraneliftFailDescr {
             vector_info: Vec::new(),
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
-            gc_runtime_id: None,
             rd_numb: None,
             rd_consts: None,
             rd_virtuals: None,
@@ -601,8 +592,12 @@ pub struct JitFrameDeadFrame {
     /// Original attached `jf_descr` identity for finish exits emitted by
     /// the metainterp (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
     pub latest_descr: Option<DescrRef>,
-    /// GC runtime id for root cleanup on Drop.
-    pub gc_runtime_id: Option<u64>,
+    /// True when `register_roots` has registered `jf_gcref` with the
+    /// active cranelift GC, so `Drop` knows to remove it. Replaces the
+    /// pre-removal `gc_runtime_id` field that paired registration with
+    /// a per-trace runtime id; the active GC is now a single thread-local
+    /// (`compiler.rs CRANELIFT_ACTIVE_GC`, mirroring `llmodel.py:58`).
+    pub roots_registered: bool,
     /// Keeps the frame memory alive for non-GC allocations.
     pub _heap_owner: Option<Vec<i64>>,
 }
@@ -619,22 +614,19 @@ impl JitFrameDeadFrame {
         jf_gcref: GcRef,
         fail_descr: Arc<CraneliftFailDescr>,
         latest_descr: Option<DescrRef>,
-        gc_runtime_id: Option<u64>,
         heap_owner: Option<Vec<i64>>,
     ) -> Self {
         JitFrameDeadFrame {
             jf_gcref,
             fail_descr,
             latest_descr,
-            gc_runtime_id,
+            roots_registered: false,
             _heap_owner: heap_owner,
         }
     }
 
     pub fn register_roots(&mut self) {
-        if let Some(runtime_id) = self.gc_runtime_id {
-            register_gc_roots(runtime_id, std::slice::from_mut(&mut self.jf_gcref));
-        }
+        self.roots_registered = register_gc_roots(std::slice::from_mut(&mut self.jf_gcref));
     }
 
     #[inline]
@@ -680,8 +672,8 @@ impl JitFrameDeadFrame {
 
 impl Drop for JitFrameDeadFrame {
     fn drop(&mut self) {
-        if let Some(runtime_id) = self.gc_runtime_id {
-            unregister_gc_roots(runtime_id, std::slice::from_mut(&mut self.jf_gcref));
+        if self.roots_registered {
+            unregister_gc_roots(std::slice::from_mut(&mut self.jf_gcref));
         }
     }
 }

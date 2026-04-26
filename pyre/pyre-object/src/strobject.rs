@@ -25,21 +25,31 @@ pub const STR_VALUE_OFFSET: usize = std::mem::offset_of!(W_StrObject, value);
 /// Field offset of `len` within `W_StrObject`, for JIT field access.
 pub const STR_LEN_OFFSET: usize = std::mem::offset_of!(W_StrObject, len);
 
+/// GC type id assigned to `W_StrObject` at JitDriver init time.
+pub const W_STR_GC_TYPE_ID: u32 = 34;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_STR_OBJECT_SIZE: usize = std::mem::size_of::<W_StrObject>();
+
+impl crate::lltype::GcType for W_StrObject {
+    const TYPE_ID: u32 = W_STR_GC_TYPE_ID;
+    const SIZE: usize = W_STR_OBJECT_SIZE;
+}
+
 /// Allocate a new W_StrObject on the heap.
 ///
 /// Phase 1: uses `Box::leak` for simplicity (objects are never freed).
 /// The inner `String` is also `Box::into_raw`'d so it can be recovered.
 pub fn w_str_new(s: &str) -> PyObjectRef {
-    let inner = Box::into_raw(Box::new(s.to_string()));
-    let obj = Box::new(W_StrObject {
+    let value = crate::lltype::malloc_raw(s.to_string());
+    crate::lltype::malloc_typed(W_StrObject {
         ob_header: PyObject {
             ob_type: &STR_TYPE as *const PyType,
             w_class: get_instantiate(&STR_TYPE),
         },
-        value: inner,
+        value,
         len: s.chars().count(),
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 thread_local! {

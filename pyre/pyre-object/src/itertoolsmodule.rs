@@ -37,16 +37,38 @@ pub struct W_Count {
     pub w_step: PyObjectRef,
 }
 
+/// Field offsets of inline `PyObjectRef` slots within `W_Count`.
+pub const COUNT_W_C_OFFSET: usize = std::mem::offset_of!(W_Count, w_c);
+pub const COUNT_W_STEP_OFFSET: usize = std::mem::offset_of!(W_Count, w_step);
+
+/// GC type id assigned to `W_Count` at JitDriver init time.
+pub const W_COUNT_GC_TYPE_ID: u32 = 24;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_COUNT_OBJECT_SIZE: usize = std::mem::size_of::<W_Count>();
+
+/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
+pub const W_COUNT_GC_PTR_OFFSETS: [usize; 2] = [COUNT_W_C_OFFSET, COUNT_W_STEP_OFFSET];
+
+impl crate::lltype::GcType for W_Count {
+    const TYPE_ID: u32 = W_COUNT_GC_TYPE_ID;
+    const SIZE: usize = W_COUNT_OBJECT_SIZE;
+}
+
 pub fn w_count_new(w_firstval: PyObjectRef, w_step: PyObjectRef) -> PyObjectRef {
-    let obj = Box::new(W_Count {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_firstval);
+    crate::gc_roots::pin_root(w_step);
+
+    crate::lltype::malloc_typed(W_Count {
         ob: PyObject {
             ob_type: &COUNT_TYPE as *const PyType,
             w_class: get_instantiate(&COUNT_TYPE),
         },
         w_c: w_firstval,
         w_step,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Check if an object is a `W_Count`.
@@ -116,12 +138,33 @@ pub struct W_Repeat {
     pub count: i64,
 }
 
+/// Field offset of `w_obj` within `W_Repeat`.
+pub const REPEAT_W_OBJ_OFFSET: usize = std::mem::offset_of!(W_Repeat, w_obj);
+
+/// GC type id assigned to `W_Repeat` at JitDriver init time.
+pub const W_REPEAT_GC_TYPE_ID: u32 = 25;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_REPEAT_OBJECT_SIZE: usize = std::mem::size_of::<W_Repeat>();
+
+/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
+pub const W_REPEAT_GC_PTR_OFFSETS: [usize; 1] = [REPEAT_W_OBJ_OFFSET];
+
+impl crate::lltype::GcType for W_Repeat {
+    const TYPE_ID: u32 = W_REPEAT_GC_TYPE_ID;
+    const SIZE: usize = W_REPEAT_OBJECT_SIZE;
+}
+
 pub fn w_repeat_new(w_obj: PyObjectRef, w_times: Option<i64>) -> PyObjectRef {
     let (counting, count) = match w_times {
         None => (false, 0),
         Some(n) => (true, n.max(0)),
     };
-    let obj = Box::new(W_Repeat {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(w_obj);
+
+    crate::lltype::malloc_typed(W_Repeat {
         ob: PyObject {
             ob_type: &REPEAT_TYPE as *const PyType,
             w_class: get_instantiate(&REPEAT_TYPE),
@@ -129,8 +172,7 @@ pub fn w_repeat_new(w_obj: PyObjectRef, w_times: Option<i64>) -> PyObjectRef {
         w_obj,
         counting,
         count,
-    });
-    Box::into_raw(obj) as PyObjectRef
+    }) as PyObjectRef
 }
 
 /// Check if an object is a `W_Repeat`.
@@ -173,5 +215,36 @@ pub unsafe fn w_repeat_get_count(obj: PyObjectRef) -> i64 {
 pub unsafe fn w_repeat_dec_count(obj: PyObjectRef) {
     unsafe {
         (*(obj as *mut W_Repeat)).count -= 1;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w_count_gc_type_id_matches_descr() {
+        assert_eq!(W_COUNT_GC_TYPE_ID, 24);
+        assert_eq!(
+            <W_Count as crate::lltype::GcType>::TYPE_ID,
+            W_COUNT_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_Count as crate::lltype::GcType>::SIZE,
+            W_COUNT_OBJECT_SIZE
+        );
+    }
+
+    #[test]
+    fn w_repeat_gc_type_id_matches_descr() {
+        assert_eq!(W_REPEAT_GC_TYPE_ID, 25);
+        assert_eq!(
+            <W_Repeat as crate::lltype::GcType>::TYPE_ID,
+            W_REPEAT_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_Repeat as crate::lltype::GcType>::SIZE,
+            W_REPEAT_OBJECT_SIZE
+        );
     }
 }

@@ -19,17 +19,39 @@ pub struct W_SuperObject {
     pub obj: PyObjectRef,
 }
 
+/// Field offsets of inline `PyObjectRef` slots.
+pub const SUPER_SUPER_TYPE_OFFSET: usize = std::mem::offset_of!(W_SuperObject, super_type);
+pub const SUPER_OBJ_OFFSET: usize = std::mem::offset_of!(W_SuperObject, obj);
+
+/// GC type id assigned to `W_SuperObject` at JitDriver init time.
+pub const W_SUPER_GC_TYPE_ID: u32 = 18;
+
+/// Fixed payload size (`framework.py:811`).
+pub const W_SUPER_OBJECT_SIZE: usize = std::mem::size_of::<W_SuperObject>();
+
+/// Byte offsets of the inline `PyObjectRef` fields the GC must trace.
+pub const W_SUPER_GC_PTR_OFFSETS: [usize; 2] = [SUPER_SUPER_TYPE_OFFSET, SUPER_OBJ_OFFSET];
+
+impl crate::lltype::GcType for W_SuperObject {
+    const TYPE_ID: u32 = W_SUPER_GC_TYPE_ID;
+    const SIZE: usize = W_SUPER_OBJECT_SIZE;
+}
+
 /// Create a new super proxy.
 pub fn w_super_new(super_type: PyObjectRef, obj: PyObjectRef) -> PyObjectRef {
-    let s = Box::new(W_SuperObject {
+    // `gct_fv_gc_malloc` bracket pattern (`framework.py:853-856`).
+    let _roots = crate::gc_roots::push_roots();
+    crate::gc_roots::pin_root(super_type);
+    crate::gc_roots::pin_root(obj);
+
+    crate::lltype::malloc_typed(W_SuperObject {
         ob: PyObject {
             ob_type: &SUPER_TYPE as *const PyType,
             w_class: get_instantiate(&SUPER_TYPE),
         },
         super_type,
         obj,
-    });
-    Box::into_raw(s) as PyObjectRef
+    }) as PyObjectRef
 }
 
 #[inline]
@@ -47,4 +69,22 @@ pub unsafe fn w_super_get_type(obj: PyObjectRef) -> PyObjectRef {
 #[inline]
 pub unsafe fn w_super_get_obj(obj: PyObjectRef) -> PyObjectRef {
     unsafe { (*(obj as *const W_SuperObject)).obj }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn w_super_gc_type_id_matches_descr() {
+        assert_eq!(W_SUPER_GC_TYPE_ID, 18);
+        assert_eq!(
+            <W_SuperObject as crate::lltype::GcType>::TYPE_ID,
+            W_SUPER_GC_TYPE_ID
+        );
+        assert_eq!(
+            <W_SuperObject as crate::lltype::GcType>::SIZE,
+            W_SUPER_OBJECT_SIZE
+        );
+    }
 }
