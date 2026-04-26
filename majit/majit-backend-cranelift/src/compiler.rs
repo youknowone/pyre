@@ -3500,6 +3500,117 @@ extern "C" fn gc_alloc_varsize_shim(
     })
 }
 
+fn raw_varsize_alloc_typed_and_set_len(
+    type_id: u32,
+    base_size: usize,
+    item_size: usize,
+    length_ofs: usize,
+    length: usize,
+) -> u64 {
+    let Some(var_bytes) = item_size.checked_mul(length) else {
+        return 0;
+    };
+    let Some(payload_size) = base_size.checked_add(var_bytes) else {
+        return 0;
+    };
+    let Some(total_size) = GcHeader::SIZE.checked_add(payload_size) else {
+        return 0;
+    };
+    let layout = std::alloc::Layout::from_size_align(total_size, 8)
+        .unwrap_or(std::alloc::Layout::new::<u8>());
+    let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        return 0;
+    }
+    unsafe {
+        *(raw as *mut GcHeader) = GcHeader::new(type_id);
+    }
+    let obj = unsafe { raw.add(GcHeader::SIZE) };
+    unsafe {
+        *(obj.add(length_ofs) as *mut usize) = length;
+    }
+    obj as u64
+}
+
+fn active_runtime_alloc_varsize_typed_and_set_len(
+    type_id: u32,
+    base_size: usize,
+    item_size: usize,
+    length_ofs: usize,
+    length: usize,
+) -> u64 {
+    let Some(id) = ACTIVE_GC_RUNTIME_ID.with(|c| c.get()) else {
+        return raw_varsize_alloc_typed_and_set_len(
+            type_id, base_size, item_size, length_ofs, length,
+        );
+    };
+    GC_RUNTIMES.with(|r| {
+        let mut guard = r.borrow_mut();
+        match guard.get_mut(&id) {
+            Some(runtime) => {
+                let obj = runtime.alloc_varsize_typed(type_id, base_size, item_size, length);
+                if obj.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        *((obj.0 as *mut u8).add(length_ofs) as *mut usize) = length;
+                    }
+                    obj.0 as u64
+                }
+            }
+            None => raw_varsize_alloc_typed_and_set_len(
+                type_id, base_size, item_size, length_ofs, length,
+            ),
+        }
+    })
+}
+
+extern "C" fn gc_malloc_array_helper(item_size: u64, type_id: u64, num_elem: u64) -> u64 {
+    active_runtime_alloc_varsize_typed_and_set_len(
+        type_id as u32,
+        std::mem::size_of::<usize>(),
+        item_size as usize,
+        0,
+        num_elem as usize,
+    )
+}
+
+extern "C" fn gc_malloc_array_nonstandard_helper(
+    base_size: u64,
+    item_size: u64,
+    length_ofs: u64,
+    type_id: u64,
+    num_elem: u64,
+) -> u64 {
+    active_runtime_alloc_varsize_typed_and_set_len(
+        type_id as u32,
+        base_size as usize,
+        item_size as usize,
+        length_ofs as usize,
+        num_elem as usize,
+    )
+}
+
+extern "C" fn gc_malloc_str_helper(length: u64) -> u64 {
+    active_runtime_alloc_varsize_typed_and_set_len(
+        0,
+        BUILTIN_STR_TOKEN_BASE_SIZE,
+        1,
+        BUILTIN_STRING_LEN_OFFSET,
+        length as usize,
+    )
+}
+
+extern "C" fn gc_malloc_unicode_helper(length: u64) -> u64 {
+    active_runtime_alloc_varsize_typed_and_set_len(
+        0,
+        BUILTIN_UNICODE_TOKEN_BASE_SIZE,
+        4,
+        BUILTIN_STRING_LEN_OFFSET,
+        length as usize,
+    )
+}
+
 /// aarch64/assembler.py:342 get_write_barrier_fn()
 /// → incminimark.py:1569 jit_remember_young_pointer
 extern "C" fn gc_write_barrier_shim(runtime_id: u64, obj: u64) {
@@ -6043,6 +6154,16 @@ impl CraneliftBackend {
             // offset by `-HDR_SIZE` because pyre's HDR sits before the
             // object pointer.
             fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
+            malloc_array_fn: gc_malloc_array_helper as *const () as i64,
+            malloc_array_nonstandard_fn: gc_malloc_array_nonstandard_helper as *const () as i64,
+            malloc_str_fn: gc_malloc_str_helper as *const () as i64,
+            malloc_unicode_fn: gc_malloc_unicode_helper as *const () as i64,
+            malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
+            malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
+            malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
+            malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
+            standard_array_basesize: std::mem::size_of::<usize>(),
+            standard_array_length_ofs: 0,
             // rewrite.py:673 — read compiled_loop_token._ll_initial_locs and
             // rewrite.py:669 — ptr2int(compiled_loop_token.frame_info),
             // both sourced directly from the CLT Arc on the target
@@ -7996,7 +8117,7 @@ impl CraneliftBackend {
                     builder.seal_block(trap_block);
                     builder
                         .ins()
-                        .trap(cranelift_codegen::ir::TrapCode::user(0).unwrap());
+                        .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);
@@ -17666,6 +17787,38 @@ mod tests {
         let obj = backend.get_ref_value(&frame, 0);
         assert!(!obj.is_null());
         assert_eq!(unsafe { *(obj.0 as *const i64) }, 3);
+    }
+
+    #[test]
+    fn test_gc_call_malloc_array_helper_with_configured_runtime() {
+        let mut backend = make_gc_backend();
+        let mut consts = HashMap::new();
+        consts.insert(10000, gc_malloc_array_helper as *const () as i64);
+        consts.insert(10001, 8_i64);
+        consts.insert(10002, 7_i64);
+        backend.set_constants(consts);
+
+        let inputargs = vec![InputArg::new_int(0)];
+        let ops = vec![
+            mk_op(OpCode::Label, &[OpRef(0)], OpRef::NONE.0),
+            mk_op_with_descr(
+                OpCode::CallR,
+                &[OpRef(10000), OpRef(10001), OpRef(10002), OpRef(0)],
+                1,
+                majit_ir::make_malloc_array_calldescr(),
+            ),
+            mk_op(OpCode::CheckMemoryError, &[OpRef(1)], OpRef::NONE.0),
+            mk_op(OpCode::Finish, &[OpRef(1)], OpRef::NONE.0),
+        ];
+
+        let mut token = JitCellToken::new(1503);
+        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
+
+        let frame = backend.execute_token(&token, &[Value::Int(3)]);
+        let obj = backend.get_ref_value(&frame, 0);
+        assert!(!obj.is_null());
+        assert_eq!(unsafe { (*header_of(obj.0)).type_id() }, 7);
+        assert_eq!(unsafe { *(obj.0 as *const usize) }, 3);
     }
 
     #[test]

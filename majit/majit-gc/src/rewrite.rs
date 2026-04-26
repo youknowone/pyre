@@ -189,6 +189,27 @@ pub struct GcRewriterImpl {
     /// the object pointer); `gen_initialize_tid` translates the descr's
     /// offset by `-HDR_SIZE` so the GC_STORE addresses the header word.
     pub fielddescr_tid: Option<DescrRef>,
+    /// gc.py:422-431 `generate_function('malloc_array', ...)` function addr.
+    pub malloc_array_fn: i64,
+    /// gc.py:433-444 `generate_function('malloc_array_nonstandard', ...)`
+    /// function addr.
+    pub malloc_array_nonstandard_fn: i64,
+    /// gc.py:453-458 `generate_function('malloc_str', ...)` function addr.
+    pub malloc_str_fn: i64,
+    /// gc.py:460-465 `generate_function('malloc_unicode', ...)` function addr.
+    pub malloc_unicode_fn: i64,
+    /// gc.py:45 `self.malloc_array_descr = get_call_descr(...)`.
+    pub malloc_array_descr: DescrRef,
+    /// gc.py:45 `self.malloc_array_nonstandard_descr = get_call_descr(...)`.
+    pub malloc_array_nonstandard_descr: DescrRef,
+    /// gc.py:45 `self.malloc_str_descr = get_call_descr(...)`.
+    pub malloc_str_descr: DescrRef,
+    /// gc.py:45 `self.malloc_unicode_descr = get_call_descr(...)`.
+    pub malloc_unicode_descr: DescrRef,
+    /// gc.py:396 `self.standard_array_basesize`.
+    pub standard_array_basesize: usize,
+    /// gc.py:397 `self.standard_array_length_ofs`.
+    pub standard_array_length_ofs: usize,
 }
 
 /// JitFrame field descriptors for handle_call_assembler.
@@ -836,7 +857,30 @@ impl GcRewriterImpl {
         let size = round_up(descr.size() + crate::header::GcHeader::SIZE);
         let type_id = descr.type_id();
 
-        let obj_ref = self.gen_malloc_nursery(size, op.pos, st);
+        // rewrite.py:540-543 — `if gen_malloc_nursery(size, op): ... else:
+        // gen_malloc_fixedsize(size, descr.tid, op)`.  Upstream's
+        // gen_malloc_fixedsize emits CALL_R(malloc_big_fixedsize_fn, ...)
+        // and then `remember_write_barrier` (rewrite.py:794-796 — fresh
+        // fixed-size objects always satisfy wb_applied because their
+        // gc_fielddescrs are zeroed by clear_gc_fields).
+        //
+        // PRE-EXISTING-ADAPTATION: pyre's gen_malloc_fixedsize port is
+        // not yet available; when size exceeds the nursery threshold,
+        // emit the same CALL_MALLOC_NURSERY shape (the backend's
+        // CallMallocNursery slowpath does the oldgen alloc) and stamp
+        // wb_applied to preserve upstream's invariant.  Replace this
+        // block with a real `gen_malloc_fixedsize` call once the
+        // `malloc_big_fixedsize_descr` mirror lands.
+        let obj_ref = self
+            .gen_malloc_nursery(size, op.pos, st)
+            .unwrap_or_else(|| {
+                st.emitting_an_operation_that_can_collect();
+                let size_ref = st.const_int(size as i64);
+                let mn = Op::new(OpCode::CallMallocNursery, &[size_ref]);
+                let r = st.emit_result(mn, op.pos);
+                st.remember_wb(r);
+                r
+            });
         st.record_result_mapping(op.pos, obj_ref);
 
         // Initialize the tid header field.
@@ -899,7 +943,7 @@ impl GcRewriterImpl {
     }
 
     // ────────────────────────────────────────────────────────
-    // NEW_ARRAY / NEW_ARRAY_CLEAR  → CALL_MALLOC_NURSERY_VARSIZE
+    // NEW_ARRAY / NEW_ARRAY_CLEAR  → CALL_MALLOC_NURSERY_VARSIZE / CALL_R
     // ────────────────────────────────────────────────────────
 
     /// rewrite.py:546-586 handle_new_array parity.
@@ -913,16 +957,11 @@ impl GcRewriterImpl {
     /// `rewrite_for_gc_with_constants` is what threads the right
     /// instance through this signature.
     ///
-    /// TODO(rewrite.py:546-584 four-path port): paths (a) constant
-    /// total_size nursery fast path (`gen_malloc_nursery`) and
-    /// (b) varsize nursery fast path (`gen_malloc_nursery_varsize`) are
-    /// in place below; (c) boehm path (`gen_boehm_malloc_array`) and
-    /// (d) generic slow path (`gen_malloc_array` / `gen_malloc_str` /
-    /// `gen_malloc_unicode`) are still deferred to the backend runner.
-    /// Surfacing those needs the `malloc_array_descr` /
-    /// `malloc_str_descr` / `malloc_unicode_descr` mirrors plus
-    /// `gc_ll_descr.kind == 'boehm'` discrimination on
-    /// `GcRewriterImpl`.
+    /// PRE-EXISTING-ADAPTATION: pyre still lacks the Boehm branch
+    /// (`gen_boehm_malloc_array`).  Framework-GC path #4
+    /// (`gen_malloc_array` / `gen_malloc_str` / `gen_malloc_unicode`)
+    /// is ported below and emits CALL_R + CHECK_MEMORY_ERROR like
+    /// rewrite.py:768-846.
     fn handle_new_array(&self, descr_ref: DescrRef, op: &Op, st: &mut RewriteState, kind: i64) {
         let descr = descr_ref
             .as_array_descr()
@@ -949,58 +988,63 @@ impl GcRewriterImpl {
             // rewrite.py:557-558 — non-const length but zero itemsize
             // means no variable payload; fold to fixed-size basesize.
             total_size = descr.base_size() as i64;
+        } else if self.can_use_nursery(1) {
+            // rewrite.py:559-567 path #1 — varsize nursery fast path.
+            let r = self.gen_malloc_nursery_varsize(descr_ref.clone(), kind, v_length, op.pos, st);
+            st.record_result_mapping(op.pos, r);
+            if let Some(len_descr) = descr.len_descr() {
+                self.gen_initialize_len(r, v_length, descr_ref.clone(), len_descr, st);
+            }
+            self.clear_varsize_gc_fields(
+                kind,
+                descr_ref.clone(),
+                item_size as i64,
+                r,
+                v_length,
+                op.opcode,
+                st,
+            );
+            return;
         }
 
+        // rewrite.py:569-584 paths #2 / #4.
         let result = if total_size >= 0 {
-            // rewrite.py:569-572 path #2 — constant-size nursery.
-            //
             // pyre layout note: gen_malloc_nursery expects HDR + payload
             // bytes (handle_new_fixedsize line 836); upstream's basesize
             // already includes the header offset.  Add HDR_SIZE here so
             // the bump-pointer alloc covers the same span.
-            let alloc_size = crate::header::GcHeader::SIZE + total_size as usize;
-            let r = self.gen_malloc_nursery(alloc_size, op.pos, st);
-            st.record_result_mapping(op.pos, r);
-            // rewrite.py:571 — gen_initialize_tid(op, arraydescr.tid).
-            self.gen_initialize_tid(r, descr.type_id(), st);
-            // rewrite.py:572 — gen_initialize_len(op, v_length, lendescr).
-            if let Some(len_descr) = descr.len_descr() {
-                self.gen_initialize_len(r, v_length, descr_ref.clone(), len_descr, st);
+            let s = crate::header::GcHeader::SIZE + total_size as usize;
+            if let Some(r) = self.gen_malloc_nursery(s, op.pos, st) {
+                // rewrite.py:569-572 path #2 — constant-size nursery.
+                st.record_result_mapping(op.pos, r);
+                self.gen_initialize_tid(r, descr.type_id(), st);
+                if let Some(len_descr) = descr.len_descr() {
+                    self.gen_initialize_len(r, v_length, descr_ref.clone(), len_descr, st);
+                }
+                r
+            } else {
+                // rewrite.py:573-584 path #4 — typed slow malloc helpers.
+                let r = match op.opcode {
+                    OpCode::NewArray | OpCode::NewArrayClear => {
+                        self.gen_malloc_array(descr_ref.clone(), v_length, op.pos, st)
+                    }
+                    OpCode::Newstr => self.gen_malloc_str(v_length, op.pos, st),
+                    OpCode::Newunicode => self.gen_malloc_unicode(v_length, op.pos, st),
+                    _ => panic!("unexpected varsize alloc opcode: {:?}", op.opcode),
+                };
+                st.record_result_mapping(op.pos, r);
+                r
             }
-            r
         } else {
-            // rewrite.py:559-567 path #1 — varsize nursery fast path
-            // (with rewrite.py:863-865 "don't record into wb_applied"
-            // comment because large young arrays may need card marking).
-            //
-            // PRE-EXISTING-ADAPTATION (rewrite.py:573-584): when path #1
-            // gen_malloc_nursery_varsize would return False upstream
-            // (e.g. non-standard array shape), upstream branches into
-            // Boehm / slow paths.  Pyre keeps the descr-bearing
-            // CALL_MALLOC_NURSERY_VARSIZE here and defers that
-            // discrimination to the backend runner, which still owns
-            // the nursery_free / nursery_top state.
-            st.emitting_an_operation_that_can_collect();
-            let kind_ref = st.const_int(kind);
-            let itemsize_ref = st.const_int(item_size as i64);
-            let mut varsize_op = Op::new(
-                OpCode::CallMallocNurseryVarsize,
-                &[kind_ref, itemsize_ref, v_length],
-            );
-            // rewrite.py:858-860 — `arraydescr` is the descr passed
-            // into handle_new_array (gc_ll_descr.{str,unicode}_descr
-            // for NEWSTR/NEWUNICODE; op.getdescr() for NEW_ARRAY).
-            varsize_op.descr = Some(descr_ref.clone());
-            let r = st.emit_result(varsize_op, op.pos);
+            let r = match op.opcode {
+                OpCode::NewArray | OpCode::NewArrayClear => {
+                    self.gen_malloc_array(descr_ref.clone(), v_length, op.pos, st)
+                }
+                OpCode::Newstr => self.gen_malloc_str(v_length, op.pos, st),
+                OpCode::Newunicode => self.gen_malloc_unicode(v_length, op.pos, st),
+                _ => panic!("unexpected varsize alloc opcode: {:?}", op.opcode),
+            };
             st.record_result_mapping(op.pos, r);
-            // rewrite.py:565 — gen_initialize_len(op, v_length, lendescr).
-            // Note: NO gen_initialize_tid here — upstream comment
-            // (rewrite.py:562-564) is that the array might end up being
-            // allocated by malloc_external, which initializes the GC
-            // header fields differently.
-            if let Some(len_descr) = descr.len_descr() {
-                self.gen_initialize_len(r, v_length, descr_ref.clone(), len_descr, st);
-            }
             r
         };
 
@@ -1155,6 +1199,129 @@ impl GcRewriterImpl {
                 scale,
             });
         }
+    }
+
+    // ────────────────────────────────────────────────────────
+    // CALL_MALLOC_NURSERY_VARSIZE / slow malloc helpers
+    // ────────────────────────────────────────────────────────
+
+    /// rewrite.py:848-866 `gen_malloc_nursery_varsize`.
+    ///
+    /// PRE-EXISTING-ADAPTATION: unlike upstream's framework-GC port,
+    /// pyre's CALL_MALLOC_NURSERY_VARSIZE lowering accepts the full
+    /// ArrayDescr and writes the length via a follow-up
+    /// `gen_initialize_len`, so the helper does not reject
+    /// non-standard array shapes here.
+    fn gen_malloc_nursery_varsize(
+        &self,
+        arraydescr: DescrRef,
+        kind: i64,
+        v_length: OpRef,
+        result_pos: OpRef,
+        st: &mut RewriteState,
+    ) -> OpRef {
+        let ad = arraydescr
+            .as_array_descr()
+            .expect("gen_malloc_nursery_varsize descr must be ArrayDescr");
+        st.emitting_an_operation_that_can_collect();
+        let kind_ref = st.const_int(kind);
+        let itemsize_ref = st.const_int(ad.item_size() as i64);
+        let mut varsize_op = Op::new(
+            OpCode::CallMallocNurseryVarsize,
+            &[kind_ref, itemsize_ref, v_length],
+        );
+        varsize_op.descr = Some(arraydescr);
+        st.emit_result(varsize_op, result_pos)
+    }
+
+    /// rewrite.py:768-776 `_gen_call_malloc_gc`.
+    fn gen_call_malloc_gc(
+        &self,
+        args: &[OpRef],
+        result_pos: OpRef,
+        calldescr: DescrRef,
+        st: &mut RewriteState,
+    ) -> OpRef {
+        st.emitting_an_operation_that_can_collect();
+        let mut call_op = Op::new(OpCode::CallR, args);
+        call_op.descr = Some(calldescr);
+        let result = st.emit_result(call_op, result_pos);
+        st.emit(Op::new(OpCode::CheckMemoryError, &[result]));
+        result
+    }
+
+    /// rewrite.py:809-834 `gen_malloc_array`.
+    fn gen_malloc_array(
+        &self,
+        arraydescr: DescrRef,
+        v_num_elem: OpRef,
+        result_pos: OpRef,
+        st: &mut RewriteState,
+    ) -> OpRef {
+        let ad = arraydescr
+            .as_array_descr()
+            .expect("gen_malloc_array descr must be ArrayDescr");
+        let len_descr = ad.len_descr();
+        let length_ofs = len_descr.map_or(self.standard_array_length_ofs, |fd| fd.offset());
+        let is_standard = ad.base_size() == self.standard_array_basesize
+            && len_descr.is_some_and(|fd| fd.offset() == self.standard_array_length_ofs);
+        if is_standard {
+            let fn_ref = st.const_int(self.malloc_array_fn);
+            let itemsize_ref = st.const_int(ad.item_size() as i64);
+            let typeid_ref = st.const_int(ad.type_id() as i64);
+            self.gen_call_malloc_gc(
+                &[fn_ref, itemsize_ref, typeid_ref, v_num_elem],
+                result_pos,
+                self.malloc_array_descr.clone(),
+                st,
+            )
+        } else {
+            let fn_ref = st.const_int(self.malloc_array_nonstandard_fn);
+            let basesize_ref = st.const_int(ad.base_size() as i64);
+            let itemsize_ref = st.const_int(ad.item_size() as i64);
+            let lengthofs_ref = st.const_int(length_ofs as i64);
+            let typeid_ref = st.const_int(ad.type_id() as i64);
+            self.gen_call_malloc_gc(
+                &[
+                    fn_ref,
+                    basesize_ref,
+                    itemsize_ref,
+                    lengthofs_ref,
+                    typeid_ref,
+                    v_num_elem,
+                ],
+                result_pos,
+                self.malloc_array_nonstandard_descr.clone(),
+                st,
+            )
+        }
+    }
+
+    /// rewrite.py:836-840 `gen_malloc_str`.
+    fn gen_malloc_str(&self, v_num_elem: OpRef, result_pos: OpRef, st: &mut RewriteState) -> OpRef {
+        let fn_ref = st.const_int(self.malloc_str_fn);
+        self.gen_call_malloc_gc(
+            &[fn_ref, v_num_elem],
+            result_pos,
+            self.malloc_str_descr.clone(),
+            st,
+        )
+    }
+
+    /// rewrite.py:842-846 `gen_malloc_unicode`.
+    fn gen_malloc_unicode(
+        &self,
+        v_num_elem: OpRef,
+        result_pos: OpRef,
+        st: &mut RewriteState,
+    ) -> OpRef {
+        let fn_ref = st.const_int(self.malloc_unicode_fn);
+        self.gen_call_malloc_gc(
+            &[fn_ref, v_num_elem],
+            result_pos,
+            self.malloc_unicode_descr.clone(),
+            st,
+        )
     }
 
     // ────────────────────────────────────────────────────────
@@ -1978,18 +2145,29 @@ impl GcRewriterImpl {
     // gen_malloc_nursery: batched bump-pointer allocation
     // ────────────────────────────────────────────────────────
 
+    /// rewrite.py:879-912 `gen_malloc_nursery` parity.
+    ///
     /// Try to emit (or extend) a CALL_MALLOC_NURSERY for `size` bytes.
-    /// Returns the OpRef of the newly allocated object.
-    fn gen_malloc_nursery(&self, size: usize, result_pos: OpRef, st: &mut RewriteState) -> OpRef {
+    /// Returns `Some(result)` on success; you still need to write the
+    /// tid (rewrite.py:881-882).  Returns `None` when the requested
+    /// size exceeds `can_use_nursery_malloc` — upstream's caller then
+    /// falls back to `gen_malloc_fixedsize` /
+    /// `gen_malloc_array` / `gen_malloc_str` / `gen_malloc_unicode`,
+    /// whose `_gen_call_malloc_gc` helper does NOT mark the result as
+    /// wb_applied (rewrite.py:775-776) because the slow malloc path
+    /// may return an oldgen object.
+    fn gen_malloc_nursery(
+        &self,
+        size: usize,
+        result_pos: OpRef,
+        st: &mut RewriteState,
+    ) -> Option<OpRef> {
         let size = round_up(size);
 
+        // rewrite.py:884-886 — caller picks a slow path when nursery
+        // can't accommodate the size.
         if !self.can_use_nursery(size) {
-            st.emitting_an_operation_that_can_collect();
-            let size_ref = st.const_int(size as i64);
-            let op = Op::new(OpCode::CallMallocNursery, &[size_ref]);
-            let r = st.emit_result(op, result_pos);
-            st.remember_wb(r);
-            return r;
+            return None;
         }
 
         // rewrite.py:893-898 merge with previous CALL_MALLOC_NURSERY
@@ -2010,7 +2188,7 @@ impl GcRewriterImpl {
                 st.previous_size = size;
                 st.last_malloced_ref = r;
                 st.remember_wb(r);
-                return r;
+                return Some(r);
             }
         }
 
@@ -2024,7 +2202,7 @@ impl GcRewriterImpl {
         st.previous_size = size;
         st.last_malloced_ref = r;
         st.remember_wb(r);
-        r
+        Some(r)
     }
 
     // ────────────────────────────────────────────────────────
@@ -2048,6 +2226,19 @@ impl GcRewriterImpl {
     /// `tid` within the header struct (0 for pyre's single-word HDR);
     /// the actual store address is `obj_ptr + (-HDR_SIZE +
     /// descr.offset())`.  None disables the store (Boehm parity).
+    ///
+    /// `fielddescr_tid.field_size` is 4 bytes (descr.rs
+    /// `make_tid_field_descr`): pyre's HDR packs type id into the lower
+    /// 32 bits and gc flags (TRACK_YOUNG_PTRS / VISITED / …) into the
+    /// upper 32 bits, and the slow `dynasm_nursery_slowpath` /
+    /// cranelift-side malloc helpers may promote large or
+    /// post-collection allocations to the old gen, where
+    /// `collector.rs:449 alloc_in_oldgen` pre-stamps `TRACK_YOUNG_PTRS`
+    /// in those upper bits.  A full-word store from this helper would
+    /// wipe that bit and leave a fresh oldgen object invisible to the
+    /// remembered-set machinery, dropping any subsequent young pointer
+    /// written into it.  Restricting the GC_STORE width to
+    /// `field_size = 4` keeps the upper half intact.
     fn gen_initialize_tid(&self, obj: OpRef, tid: u32, st: &mut RewriteState) {
         let Some(tid_fd_ref) = self.fielddescr_tid.as_ref() else {
             return;
@@ -2515,6 +2706,13 @@ mod tests {
     use majit_ir::descr::{ArrayDescr, Descr, DescrRef, SizeDescr};
     use majit_ir::value::Type;
 
+    const TEST_STANDARD_ARRAY_BASESIZE: usize = std::mem::size_of::<usize>();
+    const TEST_STANDARD_ARRAY_LENGTH_OFS: usize = 0;
+    const TEST_MALLOC_ARRAY_FN: i64 = 0x1111;
+    const TEST_MALLOC_ARRAY_NONSTANDARD_FN: i64 = 0x2222;
+    const TEST_MALLOC_STR_FN: i64 = 0x3333;
+    const TEST_MALLOC_UNICODE_FN: i64 = 0x4444;
+
     // ── Minimal concrete descriptor implementations for testing ──
 
     #[derive(Debug)]
@@ -2583,6 +2781,7 @@ mod tests {
         item_size: usize,
         type_id: u32,
         item_type: Type,
+        len_descr: Option<Arc<TestFieldDescr>>,
     }
 
     impl Descr for TestArrayDescr {
@@ -2603,6 +2802,11 @@ mod tests {
         }
         fn item_type(&self) -> Type {
             self.item_type
+        }
+        fn len_descr(&self) -> Option<&dyn FieldDescr> {
+            self.len_descr
+                .as_ref()
+                .map(|fd| fd.as_ref() as &dyn FieldDescr)
         }
     }
 
@@ -2646,6 +2850,16 @@ mod tests {
             // Some so existing handle_new tests continue to exercise the
             // tid header stamping path (matches framework-GC mode).
             fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
+            malloc_array_fn: TEST_MALLOC_ARRAY_FN,
+            malloc_array_nonstandard_fn: TEST_MALLOC_ARRAY_NONSTANDARD_FN,
+            malloc_str_fn: TEST_MALLOC_STR_FN,
+            malloc_unicode_fn: TEST_MALLOC_UNICODE_FN,
+            malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
+            malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
+            malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
+            malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
+            standard_array_basesize: TEST_STANDARD_ARRAY_BASESIZE,
+            standard_array_length_ofs: TEST_STANDARD_ARRAY_LENGTH_OFS,
         }
     }
 
@@ -2708,21 +2922,31 @@ mod tests {
         })
     }
 
+    fn array_len_field_descr() -> Arc<TestFieldDescr> {
+        Arc::new(TestFieldDescr {
+            offset: TEST_STANDARD_ARRAY_LENGTH_OFS,
+            field_size: std::mem::size_of::<usize>(),
+            field_type: Type::Int,
+        })
+    }
+
     fn array_descr_ref() -> DescrRef {
         Arc::new(TestArrayDescr {
-            base_size: 16,
+            base_size: TEST_STANDARD_ARRAY_BASESIZE,
             item_size: 8,
             type_id: 5,
             item_type: Type::Ref,
+            len_descr: Some(array_len_field_descr()),
         })
     }
 
     fn array_descr_int() -> DescrRef {
         Arc::new(TestArrayDescr {
-            base_size: 16,
+            base_size: TEST_STANDARD_ARRAY_BASESIZE,
             item_size: 4,
             type_id: 6,
             item_type: Type::Int,
+            len_descr: Some(array_len_field_descr()),
         })
     }
 
@@ -2744,6 +2968,17 @@ mod tests {
         assert_eq!(result[1].opcode, OpCode::GcStore); // tid init
         let tid_val = constants[&result[1].args[2].0];
         assert_eq!(tid_val, 7); // type_id = 7
+        // GcHeader packs type id (lower 32 bits) and gc flags (upper 32
+        // bits) into a single u64.  gen_initialize_tid must emit a
+        // 4-byte store so that the runtime-set flags
+        // (collector.rs:449 alloc_in_oldgen ORs in TRACK_YOUNG_PTRS for
+        // oldgen-promoted allocs) survive the type id stamp.
+        let store_size = constants[&result[1].args[3].0];
+        assert_eq!(
+            store_size, 4,
+            "gen_initialize_tid must emit a 4-byte store (type id half) so \
+             oldgen TRACK_YOUNG_PTRS in the upper 32 bits is preserved"
+        );
     }
 
     // ── Test 2: NEW_ARRAY → CALL_MALLOC_NURSERY_VARSIZE ──
@@ -2772,6 +3007,50 @@ mod tests {
             .unwrap();
         // rewrite.py:858: [ConstInt(kind), ConstInt(itemsize), v_length]
         assert_eq!(varsize.args[2], length_ref);
+    }
+
+    /// Constant-length oversized arrays: rewrite.py:573-584 routes these
+    /// through `gen_malloc_array`, not CALL_MALLOC_NURSERY_VARSIZE.
+    /// Verify pyre now emits CALL_R(malloc_array_fn, ...) plus
+    /// CHECK_MEMORY_ERROR, with the typed slow helper receiving the
+    /// descriptor's type id directly.
+    #[test]
+    fn test_new_array_const_oversize_uses_malloc_array_helper() {
+        let rw = make_rewriter(); // max_nursery_size = 4096
+        let len_ref = OpRef(10_000);
+        // array_descr_ref: base_size=8, item_size=8 →
+        //   total = 8 + 8*512 = 4104; gen_malloc_nursery sees
+        //   round_up(GcHeader::SIZE + 4104) = 4112 > 4096 → returns None.
+        let mut constants = HashMap::new();
+        constants.insert(10_000, 512_i64);
+        let mut new_array = Op::with_descr(OpCode::NewArray, &[len_ref], array_descr_ref());
+        new_array.pos = OpRef(0);
+        let ops = vec![new_array, Op::new(OpCode::Finish, &[])];
+
+        let (result, consts) = rw.rewrite_for_gc_with_constants(&ops, &constants);
+
+        assert!(
+            !result
+                .iter()
+                .any(|o| o.opcode == OpCode::CallMallocNurseryVarsize),
+            "constant-length oversize must not fall back to \
+             CALL_MALLOC_NURSERY_VARSIZE anymore"
+        );
+        let call_idx = result
+            .iter()
+            .position(|o| o.opcode == OpCode::CallR)
+            .expect("constant-length oversize must emit CALL_R slow helper");
+        let call = &result[call_idx];
+        assert_eq!(consts[&call.args[0].0], TEST_MALLOC_ARRAY_FN);
+        assert_eq!(consts[&call.args[1].0], 8);
+        assert_eq!(consts[&call.args[2].0], 5);
+        assert_eq!(call.args[3], len_ref);
+        assert!(
+            result
+                .get(call_idx + 1)
+                .is_some_and(|o| o.opcode == OpCode::CheckMemoryError),
+            "CALL_R slow helper must be followed by CHECK_MEMORY_ERROR"
+        );
     }
 
     // ── Test 3: SETFIELD_GC with Ref value → write barrier inserted ──
@@ -3681,6 +3960,16 @@ mod tests {
             // (framework-GC mode) so handle_new tests exercise the tid
             // header stamping path.
             fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
+            malloc_array_fn: TEST_MALLOC_ARRAY_FN,
+            malloc_array_nonstandard_fn: TEST_MALLOC_ARRAY_NONSTANDARD_FN,
+            malloc_str_fn: TEST_MALLOC_STR_FN,
+            malloc_unicode_fn: TEST_MALLOC_UNICODE_FN,
+            malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
+            malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
+            malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
+            malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
+            standard_array_basesize: TEST_STANDARD_ARRAY_BASESIZE,
+            standard_array_length_ofs: TEST_STANDARD_ARRAY_LENGTH_OFS,
         }
     }
 
@@ -3781,6 +4070,11 @@ mod tests {
             item_size: 1,
             type_id: 7,
             item_type: Type::Int,
+            len_descr: Some(Arc::new(TestFieldDescr {
+                offset: std::mem::size_of::<usize>(),
+                field_size: std::mem::size_of::<usize>(),
+                field_type: Type::Int,
+            })),
         })
     }
 
@@ -3791,6 +4085,11 @@ mod tests {
             item_size: 4,
             type_id: 8,
             item_type: Type::Int,
+            len_descr: Some(Arc::new(TestFieldDescr {
+                offset: std::mem::size_of::<usize>(),
+                field_size: std::mem::size_of::<usize>(),
+                field_type: Type::Int,
+            })),
         })
     }
 

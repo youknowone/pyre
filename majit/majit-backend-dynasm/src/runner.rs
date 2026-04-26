@@ -219,6 +219,108 @@ pub extern "C" fn dynasm_nursery_slowpath_varsize(
     })
 }
 
+fn dynasm_raw_varsize_alloc_typed_and_set_len(
+    type_id: u32,
+    base_size: usize,
+    item_size: usize,
+    length_ofs: usize,
+    length: usize,
+) -> u64 {
+    let Some(var_bytes) = item_size.checked_mul(length) else {
+        return 0;
+    };
+    let Some(payload_size) = base_size.checked_add(var_bytes) else {
+        return 0;
+    };
+    let Some(total_size) = majit_gc::header::GcHeader::SIZE.checked_add(payload_size) else {
+        return 0;
+    };
+    unsafe {
+        let raw = libc::calloc(1, total_size) as *mut u8;
+        if raw.is_null() {
+            return 0;
+        }
+        *(raw as *mut majit_gc::header::GcHeader) = majit_gc::header::GcHeader::new(type_id);
+        let obj = raw.add(majit_gc::header::GcHeader::SIZE);
+        *(obj.add(length_ofs) as *mut usize) = length;
+        obj as u64
+    }
+}
+
+fn dynasm_alloc_varsize_typed_and_set_len(
+    type_id: u32,
+    base_size: usize,
+    item_size: usize,
+    length_ofs: usize,
+    length: usize,
+) -> u64 {
+    let result = DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        guard.as_mut().map(|gc| {
+            let obj = gc.alloc_varsize_typed(type_id, base_size, item_size, length);
+            if obj.is_null() {
+                0
+            } else {
+                unsafe {
+                    *((obj.0 as *mut u8).add(length_ofs) as *mut usize) = length;
+                }
+                obj.0 as u64
+            }
+        })
+    });
+    result.unwrap_or_else(|| {
+        dynasm_raw_varsize_alloc_typed_and_set_len(
+            type_id, base_size, item_size, length_ofs, length,
+        )
+    })
+}
+
+pub extern "C" fn dynasm_malloc_array(item_size: u64, type_id: u64, num_elem: u64) -> u64 {
+    dynasm_alloc_varsize_typed_and_set_len(
+        type_id as u32,
+        std::mem::size_of::<usize>(),
+        item_size as usize,
+        0,
+        num_elem as usize,
+    )
+}
+
+pub extern "C" fn dynasm_malloc_array_nonstandard(
+    base_size: u64,
+    item_size: u64,
+    length_ofs: u64,
+    type_id: u64,
+    num_elem: u64,
+) -> u64 {
+    dynasm_alloc_varsize_typed_and_set_len(
+        type_id as u32,
+        base_size as usize,
+        item_size as usize,
+        length_ofs as usize,
+        num_elem as usize,
+    )
+}
+
+pub extern "C" fn dynasm_malloc_str(length: u64) -> u64 {
+    dynasm_alloc_varsize_typed_and_set_len(
+        0,
+        BUILTIN_STR_TOKEN_BASE_SIZE,
+        1,
+        BUILTIN_STRING_LEN_OFFSET,
+        length as usize,
+    )
+}
+
+pub extern "C" fn dynasm_malloc_unicode(length: u64) -> u64 {
+    dynasm_alloc_varsize_typed_and_set_len(
+        0,
+        BUILTIN_UNICODE_TOKEN_BASE_SIZE,
+        4,
+        BUILTIN_STRING_LEN_OFFSET,
+        length as usize,
+    )
+}
+
 /// opassembler.py:956-976: non-array write barrier slow path.
 /// Calls gc.write_barrier(obj) which is the generic barrier.
 pub extern "C" fn dynasm_write_barrier(obj_ptr: u64) {
@@ -517,6 +619,16 @@ impl DynasmBackend {
                 // the descr's offset by `-HDR_SIZE` because pyre's HDR
                 // sits before the object pointer.
                 fielddescr_tid: Some(majit_ir::make_tid_field_descr()),
+                malloc_array_fn: dynasm_malloc_array as *const () as i64,
+                malloc_array_nonstandard_fn: dynasm_malloc_array_nonstandard as *const () as i64,
+                malloc_str_fn: dynasm_malloc_str as *const () as i64,
+                malloc_unicode_fn: dynasm_malloc_unicode as *const () as i64,
+                malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
+                malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
+                malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
+                malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
+                standard_array_basesize: std::mem::size_of::<usize>(),
+                standard_array_length_ofs: 0,
             }
         })
     }

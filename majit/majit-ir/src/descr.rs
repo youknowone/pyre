@@ -2287,11 +2287,22 @@ pub fn make_vtable_field_descr() -> DescrRef {
 /// framework-GC object's header.  None on Boehm builds (gc.py:157), where
 /// `gen_initialize_tid` is a no-op.
 ///
-/// pyre's `GcHeader` is a single u64 word (`tid_and_flags`) with the type
-/// id occupying the lower 32 bits — `offset = 0` within the header,
-/// `field_size = WORD`.  The header sits *before* the object pointer
-/// (rather than at it, as in RPython); `gen_initialize_tid` translates
-/// the descr's offset by `-HDR_SIZE` to point at the header word.
+/// pyre's `GcHeader` is a single u64 word (`tid_and_flags`) split into a
+/// lower 32-bit type id and an upper 32-bit flags half (header.rs
+/// FLAG_SHIFT = 32).  The descr addresses the *type id* slot only —
+/// `offset = 0`, `field_size = 4 bytes`.  Restricting the store width
+/// to four bytes is what lets `gen_initialize_tid` overwrite the type
+/// id without disturbing flag bits the runtime may already have set on
+/// the same word: collector.rs:449 `alloc_in_oldgen` ORs in
+/// `TRACK_YOUNG_PTRS` for any object the malloc-nursery slow path
+/// promotes to the old gen, and a full-word store would silently wipe
+/// it.  Upstream rewrite.py:914-918 has no analogue because
+/// `incminimark.HDR.tid` is a single Signed field where `tid` and
+/// flags coexist in the same value, and the rewriter never re-stamps
+/// tid after a slow malloc — pyre's split layout requires a narrower
+/// store at this site instead.  The header sits *before* the object
+/// pointer; `gen_initialize_tid` translates the descr's offset by
+/// `-HDR_SIZE` to point at the header word.
 ///
 /// Cached as a process-wide singleton via `OnceLock` to mirror gc.py's
 /// "single instance per CPU" semantic.
@@ -2300,15 +2311,16 @@ pub fn make_tid_field_descr() -> DescrRef {
     static TID_FIELD_DESCR: OnceLock<DescrRef> = OnceLock::new();
     TID_FIELD_DESCR
         .get_or_init(|| {
-            // header.rs `GcHeader.tid_and_flags: u64` — the tid bits live
-            // at offset 0 within the header struct; we emit the full
-            // u64 store on every initialize so size = WORD.
+            // header.rs `GcHeader.tid_and_flags: u64` is split:
+            // bits  0..32 — type id (this descr).
+            // bits 32..64 — gc flags (TRACK_YOUNG_PTRS / VISITED / PINNED /
+            //               HAS_CARDS …).  Owned by the GC, not the JIT.
             // is_immutable=false: incminimark mutates flag bits on mark
             // and rewrites the whole word on forwarding.
             Arc::new(SimpleFieldDescr::new(
                 0x7000_0000,
-                0,                            // offset within HDR
-                std::mem::size_of::<usize>(), // field_size = WORD
+                0,                          // offset within HDR
+                std::mem::size_of::<u32>(), // field_size = 4 bytes (lower 32 bits = type id)
                 crate::Type::Int,
                 false, // is_immutable — flags / forwarding marker mutate
             ))
@@ -2338,6 +2350,90 @@ pub fn make_memcpy_calldescr() -> DescrRef {
                 false,
                 0,
                 effect,
+            ))
+        })
+        .clone()
+}
+
+/// gc.py:45 + gc.py:420-431 generate_function('malloc_array', ...).
+/// CallDescr for CALL_R(malloc_array_fn, itemsize, type_id, num_elem) -> Ref.
+pub fn make_malloc_array_calldescr() -> DescrRef {
+    use std::sync::{Arc, OnceLock};
+    static MALLOC_ARRAY_DESCR: OnceLock<DescrRef> = OnceLock::new();
+    MALLOC_ARRAY_DESCR
+        .get_or_init(|| {
+            Arc::new(SimpleCallDescr::new(
+                0x5000_0001,
+                vec![crate::Type::Int, crate::Type::Int, crate::Type::Int],
+                crate::Type::Ref,
+                false,
+                std::mem::size_of::<usize>(),
+                EffectInfo::MOST_GENERAL,
+            ))
+        })
+        .clone()
+}
+
+/// gc.py:45 + gc.py:432-444
+/// generate_function('malloc_array_nonstandard', ...).
+/// CallDescr for CALL_R(malloc_array_nonstandard_fn,
+///                     basesize, itemsize, lengthofs, type_id, num_elem) -> Ref.
+pub fn make_malloc_array_nonstandard_calldescr() -> DescrRef {
+    use std::sync::{Arc, OnceLock};
+    static MALLOC_ARRAY_NONSTANDARD_DESCR: OnceLock<DescrRef> = OnceLock::new();
+    MALLOC_ARRAY_NONSTANDARD_DESCR
+        .get_or_init(|| {
+            Arc::new(SimpleCallDescr::new(
+                0x5000_0002,
+                vec![
+                    crate::Type::Int,
+                    crate::Type::Int,
+                    crate::Type::Int,
+                    crate::Type::Int,
+                    crate::Type::Int,
+                ],
+                crate::Type::Ref,
+                false,
+                std::mem::size_of::<usize>(),
+                EffectInfo::MOST_GENERAL,
+            ))
+        })
+        .clone()
+}
+
+/// gc.py:45 + gc.py:453-458 generate_function('malloc_str', ...).
+/// CallDescr for CALL_R(malloc_str_fn, length) -> Ref.
+pub fn make_malloc_str_calldescr() -> DescrRef {
+    use std::sync::{Arc, OnceLock};
+    static MALLOC_STR_DESCR: OnceLock<DescrRef> = OnceLock::new();
+    MALLOC_STR_DESCR
+        .get_or_init(|| {
+            Arc::new(SimpleCallDescr::new(
+                0x5000_0003,
+                vec![crate::Type::Int],
+                crate::Type::Ref,
+                false,
+                std::mem::size_of::<usize>(),
+                EffectInfo::MOST_GENERAL,
+            ))
+        })
+        .clone()
+}
+
+/// gc.py:45 + gc.py:460-465 generate_function('malloc_unicode', ...).
+/// CallDescr for CALL_R(malloc_unicode_fn, length) -> Ref.
+pub fn make_malloc_unicode_calldescr() -> DescrRef {
+    use std::sync::{Arc, OnceLock};
+    static MALLOC_UNICODE_DESCR: OnceLock<DescrRef> = OnceLock::new();
+    MALLOC_UNICODE_DESCR
+        .get_or_init(|| {
+            Arc::new(SimpleCallDescr::new(
+                0x5000_0004,
+                vec![crate::Type::Int],
+                crate::Type::Ref,
+                false,
+                std::mem::size_of::<usize>(),
+                EffectInfo::MOST_GENERAL,
             ))
         })
         .clone()
