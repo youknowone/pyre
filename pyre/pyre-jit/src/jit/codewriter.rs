@@ -5727,6 +5727,25 @@ pub fn register_portal_jitdriver(
         merge_point_pc,
     });
     // codewriter.py:74 `make_jitcodes()` — drain everything pending.
+    //
+    // KNOWN-INCOMPLETE G.4.4 (per-CodeObject jitcode emit no-op):
+    // the upstream `call.py:147` model expects
+    // `mainjitcode = self.get_jitcode(jd.portal_graph)` to be the
+    // single source of truth for the runtime jitcode and
+    // `make_jitcodes()` to populate THAT entry only.  Pyre's
+    // portal-bridge install (`canonical_bridge::install_portal_for`)
+    // is the analogue but does not yet supply everything the
+    // per-CodeObject jitcode does (per-PC liveness for the user
+    // bytecode that the tracer reads via `LiveVars`,
+    // `pc_map`-keyed resume routing in `call_jit.rs`).  An empirical
+    // probe (G.4.4 attempt, 2026-04-26) gating this drain off under
+    // `PYRE_PORTAL_REDIRECT=1` regressed flag-ON from 12/14 to 6/14
+    // (nbody/fannkuch + 6 simple benches timeout) because the trace
+    // path immediately hit the missing per-CodeObject entry.
+    // Closing this requires the encoder/decoder co-evolution chain
+    // (G.4.3b stack-box capture + G.4.4 reader unification) to first
+    // teach every per-CodeObject reader to fall back through the
+    // portal-bridge metadata.
     writer.make_jitcodes();
 }
 
@@ -5739,6 +5758,17 @@ pub fn register_portal_jitdriver(
 /// `get_jitcode` + the shared drain helper directly, *not* through
 /// `setup_jitdriver`.
 pub fn compile_jitcode_for_callee(code: &pyre_interpreter::CodeObject, w_code: *const ()) {
+    // KNOWN-INCOMPLETE G.4.4 (per-CodeObject jitcode emit no-op):
+    // upstream `call.py:155-172` keeps callee compilation but the
+    // returned `JitCode` would be the same object the trace-side
+    // lookup hands out — pyre's portal-bridge install
+    // (`canonical_bridge::install_portal_for`) is the analogue under
+    // flag-ON.  An empirical probe (G.4.4 attempt, 2026-04-26)
+    // returning early here under `PYRE_PORTAL_REDIRECT=1` regressed
+    // flag-ON from 12/14 to 6/14 because the trace path immediately
+    // hit the missing per-CodeObject `pc_map` / liveness.  Closing
+    // this requires the same encoder/decoder co-evolution chain
+    // tracked on `register_portal_jitdriver`'s drain comment.
     let writer = CodeWriter::instance();
     // call.py:155 `get_jitcode(graph)` — insert skeleton + queue.
     let _ = writer.callcontrol().get_jitcode(code, w_code, None);

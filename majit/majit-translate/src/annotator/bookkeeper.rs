@@ -2107,7 +2107,7 @@ fn check_no_flags_listitem(
     check_no_flags_value(&s_value, seen_classdefs, seen_listitems);
 }
 
-fn build_args_for_op(
+pub(crate) fn build_args_for_op(
     opname: &str,
     args_s: &[SomeValue],
 ) -> Result<ArgumentsForTranslation, AnnotatorError> {

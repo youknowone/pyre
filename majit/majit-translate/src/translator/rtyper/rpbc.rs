@@ -1298,6 +1298,220 @@ impl FunctionRepr {
 
         build_llfn_constant(&rtyper, &graph)
     }
+
+    /// RPython `FunctionReprBase.call(self, hop)` (rpbc.py:199-221).
+    /// FunctionRepr override — delegates to the shared free helper
+    /// [`pbc_call_via_concrete_llfn`] with `FunctionRepr`'s
+    /// `convert_to_concrete_llfn`.
+    pub fn call(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> Result<Option<Hlvalue>, TyperError> {
+        pbc_call_via_concrete_llfn(&self.base, self, hop, |v, shape, idx, llops| {
+            self.convert_to_concrete_llfn(v, shape, idx, llops)
+        })
+    }
+}
+
+/// Shared body of upstream `FunctionReprBase.call(self, hop)`
+/// (rpbc.py:199-221):
+///
+/// ```python
+/// def call(self, hop):
+///     bk = self.rtyper.annotator.bookkeeper
+///     args = hop.spaceop.build_args(hop.args_s[1:])
+///     s_pbc = hop.args_s[0]   # possibly more precise than self.s_pbc
+///     descs = list(s_pbc.descriptions)
+///     shape, index = self.callfamily.find_row(bk, descs, args, hop.spaceop)
+///     row_of_graphs = self.callfamily.calltables[shape][index]
+///     anygraph = row_of_graphs.itervalues().next()
+///     vfn = hop.inputarg(self, arg=0)
+///     vlist = [self.convert_to_concrete_llfn(vfn, shape, index, hop.llops)]
+///     vlist += callparse.callparse(self.rtyper, anygraph, hop)
+///     rresult = callparse.getrresult(self.rtyper, anygraph)
+///     hop.exception_is_here()
+///     if isinstance(vlist[0], Constant):
+///         v = hop.genop('direct_call', vlist, resulttype=rresult)
+///     else:
+///         vlist.append(hop.inputconst(Void, row_of_graphs.values()))
+///         v = hop.genop('indirect_call', vlist, resulttype=rresult)
+///     if hop.r_result is impossible_repr:
+///         return None
+///     else:
+///         return hop.llops.convertvar(v, rresult, hop.r_result)
+/// ```
+///
+/// Pyre composes rather than inherits — upstream's `call` lives on
+/// `FunctionReprBase` and dispatches through virtual
+/// `convert_to_concrete_llfn`. The Rust port encodes the polymorphism
+/// as a `FnOnce` parameter so each concrete repr (`FunctionRepr`,
+/// `FunctionsPBCRepr`, …) can plug in its own
+/// `convert_to_concrete_llfn` body without losing the line-by-line
+/// match against upstream `FunctionReprBase.call`.
+pub(super) fn pbc_call_via_concrete_llfn<F>(
+    base: &FunctionReprBase,
+    self_repr: &dyn Repr,
+    hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    convert_to_concrete_llfn: F,
+) -> Result<Option<Hlvalue>, TyperError>
+where
+    F: FnOnce(
+        &Hlvalue,
+        &CallShape,
+        usize,
+        &crate::translator::rtyper::rtyper::LowLevelOpList,
+    ) -> Result<Hlvalue, TyperError>,
+{
+    use crate::annotator::bookkeeper::build_args_for_op;
+    use crate::annotator::model::SomeValue;
+    use crate::translator::rtyper::callparse::{self, RResult};
+    use crate::translator::rtyper::rmodel::impossible_repr;
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    // upstream: `bk = self.rtyper.annotator.bookkeeper`.
+    let rtyper = base.rtyper.upgrade().ok_or_else(|| {
+        TyperError::message("FunctionReprBase.call: rtyper weak reference dropped")
+    })?;
+    let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+        TyperError::message("FunctionReprBase.call: annotator weak reference dropped")
+    })?;
+    let bookkeeper = annotator.bookkeeper.clone();
+
+    // upstream: `args = hop.spaceop.build_args(hop.args_s[1:])`.
+    //
+    // Pyre's analogue is `build_args_for_op(opname, args_s)` —
+    // bookkeeper.rs:2110 — which mirrors the upstream
+    // `CallOp.build_args` polymorphic dispatch
+    // (`flowspace/operation.py:678 simple_call`,
+    // `:699 call_args`).
+    let args_s_full = hop.args_s.borrow().clone();
+    if args_s_full.is_empty() {
+        return Err(TyperError::message(
+            "FunctionReprBase.call: hop.args_s must contain the receiver",
+        ));
+    }
+    let args = build_args_for_op(&hop.spaceop.opname, &args_s_full[1..])
+        .map_err(|e| TyperError::message(e.to_string()))?;
+
+    // upstream: `s_pbc = hop.args_s[0]; descs = list(s_pbc.descriptions);
+    //            shape, index = self.callfamily.find_row(bk, descs, args, hop.spaceop)
+    //            row_of_graphs = self.callfamily.calltables[shape][index]
+    //            anygraph = row_of_graphs.itervalues().next()`.
+    //
+    // Reuses `select_call_family_row` (rpbc.rs:277) which mirrors the
+    // four lines above. `op_key` is `None` because `HighLevelOp` does
+    // not carry its enclosing block/graph identity — upstream caches
+    // `find_row` keyed on `hop.spaceop` Python identity. The cache
+    // miss is benign: `find_row` recomputes deterministically.
+    let s_pbc = match args_s_full.first().cloned() {
+        Some(SomeValue::PBC(pbc)) => pbc,
+        Some(other) => {
+            return Err(TyperError::message(format!(
+                "FunctionReprBase.call: hop.args_s[0] is not a SomePBC: {other:?}"
+            )));
+        }
+        None => unreachable!("emptiness checked above"),
+    };
+    let callfamily = base
+        .callfamily
+        .as_ref()
+        .ok_or_else(|| TyperError::message("FunctionReprBase.call: callfamily not available"))?;
+    let row = select_call_family_row(&bookkeeper, callfamily, &s_pbc, &args, None)
+        .map_err(|e| TyperError::message(e.to_string()))?;
+
+    // upstream: `vfn = hop.inputarg(self, arg=0)`.
+    let vfn = hop.inputarg(self_repr, 0)?;
+
+    // upstream: `vlist = [self.convert_to_concrete_llfn(vfn, shape, index, hop.llops)]`.
+    //
+    // The borrow is released before the later `borrow_mut()` for
+    // `convertvar` so the closure cannot deadlock the RefCell.
+    let vlist0 = {
+        let llops = hop.llops.borrow();
+        convert_to_concrete_llfn(&vfn, &row.shape, row.index, &llops)?
+    };
+    let mut vlist: Vec<Hlvalue> = vec![vlist0];
+
+    // upstream: `vlist += callparse.callparse(self.rtyper, anygraph, hop)`.
+    vlist.extend(callparse::callparse(&rtyper, &row.anygraph, hop, None)?);
+
+    // upstream: `rresult = callparse.getrresult(self.rtyper, anygraph)`.
+    let rresult = callparse::getrresult(&rtyper, &row.anygraph)?;
+
+    // upstream: `hop.exception_is_here()`.
+    hop.exception_is_here()?;
+
+    // upstream:
+    //     if isinstance(vlist[0], Constant):
+    //         v = hop.genop('direct_call', vlist, resulttype=rresult)
+    //     else:
+    //         vlist.append(hop.inputconst(Void, row_of_graphs.values()))
+    //         v = hop.genop('indirect_call', vlist, resulttype=rresult)
+    let resulttype = match &rresult {
+        RResult::Repr(r) => GenopResult::Repr(r.clone()),
+        // upstream `resulttype=lltype.Void` enters the LLType arm
+        // (vresult.concretetype = Void; returns `Some(vresult)`), not
+        // `GenopResult::Void` (which would return `None`).
+        RResult::Void => GenopResult::LLType(LowLevelType::Void),
+    };
+    let v = if matches!(&vlist[0], Hlvalue::Constant(_)) {
+        hop.genop("direct_call", vlist, resulttype)
+    } else {
+        // PRE-EXISTING-ADAPTATION: upstream appends a Void-typed
+        // `Constant` carrying the Python list of candidate graphs
+        // (`row_of_graphs.values()`); pyre's `ConstValue` lacks a
+        // graph-list variant at the Hlvalue layer. The candidate
+        // graphs are recovered later by `lower_indirect_calls`
+        // (rpbc.rs:319) directly from the
+        // `OpKind::Call { CallTarget::Indirect, .. }` site, so a
+        // `ConstValue::None` placeholder is sufficient.
+        vlist.push(Hlvalue::Constant(
+            crate::translator::rtyper::rtyper::HighLevelOp::inputconst(
+                &LowLevelType::Void,
+                &ConstValue::None,
+            )?,
+        ));
+        hop.genop("indirect_call", vlist, resulttype)
+    };
+
+    // upstream:
+    //     if hop.r_result is impossible_repr:
+    //         return None
+    //     else:
+    //         return hop.llops.convertvar(v, rresult, hop.r_result)
+    let r_result = hop.r_result.borrow().clone().ok_or_else(|| {
+        TyperError::message("FunctionReprBase.call: hop.r_result not initialised")
+    })?;
+    // upstream `r is impossible_repr` is a Python identity check;
+    // pyre stores the singleton `Arc<VoidRepr>` so the underlying
+    // `VoidRepr` address is stable — compare via raw pointer through
+    // `&dyn Repr` (matches the pattern at `rtyper.rs:5638`
+    // `Arc::ptr_eq`).
+    let imp = impossible_repr();
+    let imp_ptr = (imp.as_ref() as *const _ as *const ()) as usize;
+    let r_result_ptr = (r_result.as_ref() as *const dyn Repr as *const ()) as usize;
+    if r_result_ptr == imp_ptr {
+        return Ok(None);
+    }
+    // `genop` always returns `Some(Variable)` because we passed a
+    // typed `resulttype`; the `None` case (upstream `resulttype=None`)
+    // does not apply here.
+    let v_h = v.ok_or_else(|| {
+        TyperError::message("FunctionReprBase.call: genop returned None despite typed resulttype")
+    })?;
+    let rresult_repr: std::sync::Arc<dyn Repr> = match rresult {
+        RResult::Repr(r) => r,
+        // Void rresult only reaches convertvar when r_result is also
+        // impossible_repr — which already short-circuited above.
+        // Defensive fallback: treat as the impossible_repr singleton
+        // so identity in convertvar holds.
+        RResult::Void => impossible_repr() as std::sync::Arc<dyn Repr>,
+    };
+    let converted =
+        hop.llops
+            .borrow_mut()
+            .convertvar(v_h, rresult_repr.as_ref(), r_result.as_ref())?;
+    Ok(Some(converted))
 }
 
 /// Build an `inputconst(typeOf(llfn), llfn)` Constant from an
@@ -1373,6 +1587,26 @@ impl Repr for FunctionRepr {
             ConstValue::None,
             LowLevelType::Void,
         ))
+    }
+
+    /// RPython `FunctionReprBase.rtype_simple_call(self, hop)`
+    /// (rpbc.py:193-194) — `return self.call(hop)`. Inherited by
+    /// `FunctionRepr` via `class FunctionRepr(FunctionReprBase)`.
+    fn rtype_simple_call(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        self.call(hop)
+    }
+
+    /// RPython `FunctionReprBase.rtype_call_args(self, hop)`
+    /// (rpbc.py:196-197) — `return self.call(hop)`. Inherited by
+    /// `FunctionRepr` via `class FunctionRepr(FunctionReprBase)`.
+    fn rtype_call_args(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        self.call(hop)
     }
 }
 
@@ -1456,6 +1690,73 @@ impl FunctionsPBCRepr {
             lltype,
             funccache: RefCell::new(HashMap::new()),
             state: ReprState::new(),
+        })
+    }
+
+    /// RPython `FunctionsPBCRepr.convert_to_concrete_llfn(self, v,
+    /// shape, index, llop)` (rpbc.py:300-312):
+    ///
+    /// ```python
+    /// def convert_to_concrete_llfn(self, v, shape, index, llop):
+    ///     assert v.concretetype == self.lowleveltype
+    ///     if len(self.uniquerows) == 1:
+    ///         return v
+    ///     else:
+    ///         row = self.concretetable[shape, index]
+    ///         cname = inputconst(Void, row.attrname)
+    ///         return self.get_specfunc_row(llop, v, cname, row.fntype)
+    /// ```
+    ///
+    /// Single-row port: returns `v` unchanged. The multi-row branch
+    /// requires `setup_specfunc` (rpbc.py:242-247) which is deferred
+    /// in tandem with `FunctionsPBCRepr::new`'s multi-row constructor
+    /// path; both surface `MissingRTypeOperation` when reached.
+    pub fn convert_to_concrete_llfn(
+        &self,
+        v: &Hlvalue,
+        _shape: &CallShape,
+        _index: usize,
+        _llop: &crate::translator::rtyper::rtyper::LowLevelOpList,
+    ) -> Result<Hlvalue, TyperError> {
+        // upstream: `assert v.concretetype == self.lowleveltype`.
+        let v_ty = match v {
+            Hlvalue::Variable(var) => var.concretetype(),
+            Hlvalue::Constant(c) => c.concretetype.clone(),
+        };
+        if v_ty.as_ref() != Some(&self.lltype) {
+            return Err(TyperError::message(format!(
+                "FunctionsPBCRepr.convert_to_concrete_llfn: v.concretetype \
+                 {:?} != self.lowleveltype {:?}",
+                v_ty, self.lltype,
+            )));
+        }
+        if self.uniquerows.len() == 1 {
+            // upstream: `return v`.
+            Ok(v.clone())
+        } else {
+            // upstream rpbc.py:308-312 — multi-row Struct field load
+            // via `get_specfunc_row` (`getfield`). Deferred in tandem
+            // with `setup_specfunc` (rpbc.py:242-247).
+            Err(TyperError::missing_rtype_operation(
+                "FunctionsPBCRepr.convert_to_concrete_llfn (rpbc.py:308-312) \
+                 multi-row specfunc getfield port pending",
+            ))
+        }
+    }
+
+    /// RPython `FunctionReprBase.call(self, hop)` (rpbc.py:199-221).
+    /// FunctionsPBCRepr override — delegates to the shared free helper
+    /// [`pbc_call_via_concrete_llfn`] with `FunctionsPBCRepr`'s
+    /// `convert_to_concrete_llfn`. For the single-row case the funcptr
+    /// arrives as a `Variable` from `inputarg(self, 0)` (the arg
+    /// carries `lowleveltype = Ptr(FuncType(...))`), so the dispatch
+    /// takes the `indirect_call` branch.
+    pub fn call(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> Result<Option<Hlvalue>, TyperError> {
+        pbc_call_via_concrete_llfn(&self.base, self, hop, |v, shape, idx, llops| {
+            self.convert_to_concrete_llfn(v, shape, idx, llops)
         })
     }
 }
@@ -1567,6 +1868,28 @@ impl Repr for FunctionsPBCRepr {
             "FunctionsPBCRepr.convert_const (rpbc.py:290-298) \
              non-None branch requires bookkeeper.getdesc dispatch",
         ))
+    }
+
+    /// RPython `FunctionReprBase.rtype_simple_call(self, hop)`
+    /// (rpbc.py:193-194) — `return self.call(hop)`. Inherited by
+    /// `FunctionsPBCRepr` via `class FunctionsPBCRepr(CanBeNull,
+    /// FunctionReprBase)`.
+    fn rtype_simple_call(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        self.call(hop)
+    }
+
+    /// RPython `FunctionReprBase.rtype_call_args(self, hop)`
+    /// (rpbc.py:196-197) — `return self.call(hop)`. Inherited by
+    /// `FunctionsPBCRepr` via `class FunctionsPBCRepr(CanBeNull,
+    /// FunctionReprBase)`.
+    fn rtype_call_args(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        self.call(hop)
     }
 }
 
@@ -4604,6 +4927,181 @@ mod pbc_repr_tests {
         assert!(
             const_points_at_graph(&result, &pygraph),
             "get_concrete_llfn should wrap funcdesc.get_graph's result as an LLPtr Constant"
+        );
+    }
+
+    #[test]
+    fn function_repr_simple_call_emits_direct_call_op() {
+        // rpbc.py:199-221 — `FunctionReprBase.call` (Rust binding on
+        // `FunctionRepr`). The Void-typed `convert_to_concrete_llfn`
+        // returns a Constant funcptr, so the dispatch must take the
+        // `direct_call` branch and short-circuit at the
+        // `r_result is impossible_repr` check (Void return graph).
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{
+            ConstValue, Constant as FlowConstant, Hlvalue, SpaceOperation, Variable,
+        };
+        use crate::translator::rtyper::rmodel::impossible_repr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+
+        let (ann, rtyper) = make_rtyper();
+        let (fd, _shape, _pygraph) = single_funcdesc_with_callfamily(&ann, "f");
+        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let r: std::sync::Arc<FunctionRepr> =
+            std::sync::Arc::new(FunctionRepr::new(&rtyper, s_pbc.clone()).unwrap());
+        let r_dyn: std::sync::Arc<dyn Repr> = r.clone();
+
+        // SpaceOperation: result_var = simple_call(receiver, c_int)
+        let mut receiver = Variable::new();
+        receiver.set_concretetype(Some(LowLevelType::Void));
+        let receiver_h = Hlvalue::Variable(receiver);
+
+        let int_const = FlowConstant::with_concretetype(ConstValue::Int(7), LowLevelType::Signed);
+        let int_const_h = Hlvalue::Constant(int_const);
+
+        let mut result_var = Variable::new();
+        result_var.set_concretetype(Some(LowLevelType::Void));
+        let result_h = Hlvalue::Variable(result_var);
+
+        let spaceop = SpaceOperation::new(
+            "simple_call",
+            vec![receiver_h.clone(), int_const_h.clone()],
+            result_h,
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+
+        // Seed args_v / args_s / args_r / r_result manually; the test
+        // PyGraph carries no annotation propagation so `hop.setup()`
+        // would not produce useful Reprs from the spaceop.
+        *hop.args_v.borrow_mut() = vec![receiver_h, int_const_h];
+        *hop.args_s.borrow_mut() = vec![
+            SomeValue::PBC(s_pbc),
+            SomeValue::Integer(SomeInteger::default()),
+        ];
+        *hop.args_r.borrow_mut() = vec![Some(r_dyn.clone()), None];
+        // The test PyGraph's returnvar has annotation=Impossible, so
+        // upstream rtyper would assign `impossible_repr` to r_result.
+        *hop.r_result.borrow_mut() = Some(impossible_repr() as std::sync::Arc<dyn Repr>);
+
+        // upstream rpbc.py:218-219 — `r_result is impossible_repr`
+        // short-circuits to None.
+        let result = r.rtype_simple_call(&hop).unwrap();
+        assert!(
+            result.is_none(),
+            "Void return + impossible_repr r_result must short-circuit to None"
+        );
+
+        // upstream rpbc.py:213 — direct_call is emitted because
+        // `convert_to_concrete_llfn` returns a Constant for Void-typed
+        // FunctionRepr.
+        let llops = hop.llops.borrow();
+        let opnames: Vec<&str> = llops.ops.iter().map(|op| op.opname.as_str()).collect();
+        assert!(
+            opnames.contains(&"direct_call"),
+            "expected a direct_call op in llops, got: {opnames:?}"
+        );
+        assert!(
+            !opnames.contains(&"indirect_call"),
+            "FunctionRepr (Void-typed funcptr) must not emit indirect_call, got: {opnames:?}"
+        );
+    }
+
+    #[test]
+    fn functions_pbc_repr_simple_call_emits_indirect_call_op() {
+        // rpbc.py:199-221 (`FunctionReprBase.call`) +
+        // rpbc.py:300-312 (`FunctionsPBCRepr.convert_to_concrete_llfn`).
+        // The single-row `convert_to_concrete_llfn` returns `v`
+        // unchanged — when `v` is a `Variable` (runtime funcptr),
+        // the dispatch must take the `indirect_call` branch and
+        // append the `c_graphs` placeholder Constant.
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{
+            ConstValue, Constant as FlowConstant, Hlvalue, SpaceOperation, Variable,
+        };
+        use crate::translator::rtyper::rmodel::impossible_repr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+
+        let (ann, rtyper) = make_rtyper();
+        let (fd, _shape, _pygraph) = single_funcdesc_with_callfamily(&ann, "f");
+        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd)], false);
+        let r: std::sync::Arc<FunctionsPBCRepr> =
+            std::sync::Arc::new(FunctionsPBCRepr::new(&rtyper, s_pbc.clone()).unwrap());
+        let r_dyn: std::sync::Arc<dyn Repr> = r.clone();
+        let funcptr_lltype = r.lowleveltype().clone();
+
+        // SpaceOperation: result_var = simple_call(receiver_funcptr, c_int)
+        // The receiver carries the PBCRepr's lowleveltype = Ptr(FuncType(...)),
+        // mirroring upstream's `vfn = hop.inputarg(self, arg=0)` path
+        // where `self` is the FunctionsPBCRepr.
+        let mut receiver = Variable::new();
+        receiver.set_concretetype(Some(funcptr_lltype.clone()));
+        let receiver_h = Hlvalue::Variable(receiver);
+
+        let int_const = FlowConstant::with_concretetype(ConstValue::Int(7), LowLevelType::Signed);
+        let int_const_h = Hlvalue::Constant(int_const);
+
+        let mut result_var = Variable::new();
+        result_var.set_concretetype(Some(LowLevelType::Void));
+        let result_h = Hlvalue::Variable(result_var);
+
+        let spaceop = SpaceOperation::new(
+            "simple_call",
+            vec![receiver_h.clone(), int_const_h.clone()],
+            result_h,
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+
+        // Seed args_v / args_s / args_r / r_result manually; the test
+        // PyGraph carries no annotation propagation so `hop.setup()`
+        // would not produce useful Reprs from the spaceop.
+        *hop.args_v.borrow_mut() = vec![receiver_h, int_const_h];
+        *hop.args_s.borrow_mut() = vec![
+            SomeValue::PBC(s_pbc),
+            SomeValue::Integer(SomeInteger::default()),
+        ];
+        *hop.args_r.borrow_mut() = vec![Some(r_dyn.clone()), None];
+        // The test PyGraph's returnvar has annotation=Impossible, so
+        // upstream rtyper would assign `impossible_repr` to r_result.
+        *hop.r_result.borrow_mut() = Some(impossible_repr() as std::sync::Arc<dyn Repr>);
+
+        // upstream rpbc.py:218-219 — `r_result is impossible_repr`
+        // short-circuits to None.
+        let result = r.rtype_simple_call(&hop).unwrap();
+        assert!(
+            result.is_none(),
+            "Void return + impossible_repr r_result must short-circuit to None"
+        );
+
+        // upstream rpbc.py:215-217 — indirect_call is emitted because
+        // `convert_to_concrete_llfn` returned `v` (a Variable funcptr,
+        // not a Constant) for the single-row FunctionsPBCRepr case.
+        let llops = hop.llops.borrow();
+        let opnames: Vec<&str> = llops.ops.iter().map(|op| op.opname.as_str()).collect();
+        assert!(
+            opnames.contains(&"indirect_call"),
+            "expected an indirect_call op in llops, got: {opnames:?}"
+        );
+        assert!(
+            !opnames.contains(&"direct_call"),
+            "FunctionsPBCRepr (Variable funcptr) must not emit direct_call, got: {opnames:?}"
+        );
+
+        // upstream rpbc.py:216 — the `c_graphs` placeholder Constant
+        // is appended as the last arg of the indirect_call op.
+        let indirect = llops
+            .ops
+            .iter()
+            .find(|op| op.opname == "indirect_call")
+            .expect("indirect_call op must exist");
+        assert!(
+            matches!(indirect.args.last(), Some(Hlvalue::Constant(_))),
+            "indirect_call's last arg must be a Constant (c_graphs placeholder), \
+             got: {:?}",
+            indirect.args.last()
         );
     }
 

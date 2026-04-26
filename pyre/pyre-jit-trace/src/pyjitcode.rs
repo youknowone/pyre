@@ -118,6 +118,37 @@ impl PyJitCode {
         !self.jitcode.code.is_empty() && self.metadata.pc_map.is_empty()
     }
 
+    /// True when the entry is "ready to dispatch" — either fully
+    /// compiled (per-CodeObject install via the codewriter drain) or
+    /// portal-bridged (`canonical_bridge::install_portal_for` clone of
+    /// the portal canonical jitcode).  Both have non-empty
+    /// `jitcode.code`; the discriminator between them is whether
+    /// `metadata.pc_map` carries a per-PC mapping (per-CodeObject) or
+    /// stays empty (portal-bridge dispatches on `pycode.instructions[pc]`
+    /// at runtime via its own arms — no per-PC mapping needed).
+    ///
+    /// The mutually-exclusive `is_populated()` / `is_portal_bridge()`
+    /// pair is preserved as the structural discriminator; this method
+    /// is the union and exists so CallControl readers can ask "is this
+    /// entry usable?" without needing to know which install kind it
+    /// is.  `PyJitCode::skeleton()` (call.py:168 — fresh shell awaiting
+    /// the drain) returns false for both predicates and therefore
+    /// `is_dispatchable() == false`, preserving the skeleton-filter
+    /// invariant `find_compiled_jitcode_arc` relies on
+    /// (`PRE-EXISTING-ADAPTATION` doc on
+    /// `pyre/pyre-jit/src/jit/call.rs:256-265`).
+    ///
+    /// G.4.4 prereq #2 step 1: introduced as the gate
+    /// `find_compiled_jitcode_arc` switches to so that future
+    /// `register_portal_bridge_in_callcontrol` activation
+    /// (`pyre-jit/src/jit/codewriter.rs:5854`) can route portal-bridge
+    /// entries through CallControl without the readers triggering
+    /// compile loops on what the narrow `is_populated()` gate would
+    /// otherwise classify as "not yet compiled".
+    pub fn is_dispatchable(&self) -> bool {
+        self.is_populated() || self.is_portal_bridge()
+    }
+
     /// Empty `PyJitCode` slot inserted by `CallControl::get_jitcode`
     /// (call.py:168 `jitcode = JitCode(graph.name, fnaddr, calldescr, ...)`).
     ///

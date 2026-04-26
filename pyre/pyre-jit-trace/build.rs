@@ -30,8 +30,31 @@ fn main() {
         collect_rs_files(dir, &mut sources, &mut source_paths);
     }
 
+    // Phase G follow-up — include the portal canonical source so
+    // `majit-translate` finds `eval_loop_jit` in `call_control
+    // .function_graphs()` and the default-portal logic at
+    // `majit-translate/src/lib.rs:621-644` flips from
+    // `execute_opcode_step` (single-opcode dispatch helper) to
+    // `eval_loop_jit` (the real portal with the `match instruction`
+    // dispatch loop).  Pre-fix `portal_jitcode()` returned the
+    // canonical for `execute_opcode_step` which a portal-bridge
+    // install (`canonical_bridge::install_portal_for`) cloned, leaving
+    // BH `setposition(pyjitcode.jitcode, jitcode_pc)` unable to
+    // resume into a user PC because `execute_opcode_step` lacks the
+    // dispatch loop the BH needs to walk forward.
+    //
+    // Single-file inclusion (not the whole `pyre-jit/src` tree)
+    // because `eval_loop_jit` is the only function in pyre-jit that
+    // belongs in the portal closure; the rest of pyre-jit
+    // (codewriter, assembler, regalloc, etc.) is JIT infrastructure
+    // that must NOT be analyzed as user code, and the orchestration
+    // would inflate analysis time and risk pulling unrelated
+    // helpers into `find_all_graphs(portal)` BFS.
+    let eval_path = format!("{pyre_base}/pyre-jit/src/eval.rs");
+    collect_single_file(&eval_path, &mut sources, &mut source_paths);
+
     eprintln!(
-        "[pyre-jit-trace build.rs] reading {} source files from {} dirs: {:?}",
+        "[pyre-jit-trace build.rs] reading {} source files from {} dirs (+ pyre-jit/src/eval.rs): {:?}",
         sources.len(),
         source_dirs.len(),
         source_paths,
@@ -253,6 +276,23 @@ fn build_call_effect_overrides() -> Vec<majit_translate::CallEffectOverride> {
             majit_translate::CallEffectOverride::new(target, effect)
         })
         .collect()
+}
+
+/// Collect a single `.rs` file by absolute path, mirroring
+/// `collect_rs_files`'s read-into-vecs convention.  Used by Phase G
+/// follow-up to thread `pyre-jit/src/eval.rs` (the portal canonical)
+/// into the analysis without including the rest of pyre-jit's JIT
+/// infrastructure (codewriter, assembler, regalloc, ...).
+fn collect_single_file(path: &str, sources: &mut Vec<String>, paths: &mut Vec<String>) {
+    match std::fs::read_to_string(path) {
+        Ok(content) => {
+            paths.push(path.to_string());
+            sources.push(content);
+        }
+        Err(e) => {
+            eprintln!("[pyre-jit-trace build.rs] warning: cannot read {path}: {e}");
+        }
+    }
 }
 
 /// Collect all `.rs` files from a directory tree.

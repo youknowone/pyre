@@ -662,6 +662,59 @@ impl MIFrame {
                     .copied()
                     .unwrap_or(0) as usize;
                 let target_count = stack_base + depth;
+                // KNOWN-INCOMPLETE G.4.3b (per-frame stack box capture):
+                // the prior diagnosis (`memory/G.4.3a` handoff) for
+                // fib_recursive `PYRE_PORTAL_REDIRECT=1` exit 139 SIGSEGV
+                // was "encoder reads NULL OpRefs from `registers_r_view`
+                // for stack slots → blackhole dereferences NULL during
+                // canonical opcode replay" with the proposed fix
+                // "encoder must read PyFrame heap directly via
+                // `getarrayitem_gc_r` emit at guard time (Option A)".
+                //
+                // Empirical probe (G.4.3b attempt, 2026-04-26) replaced
+                // the per-slot `OpRef::NONE` fallback with
+                // `frame_locals_cells_stack_array` + `trace_array_getitem_value`
+                // emits.  Aggressive variant (read heap for every slot)
+                // regressed `spectral_norm` (dynasm), `fannkuch` (both
+                // backends) with NEW exit 139 SIGSEGV.  Conservative
+                // variant (read heap only for `OpRef::NONE` slots,
+                // preserving real OpRefs) recovered the regressed
+                // benches but failed to close `fib_recursive` — the
+                // failure mode merely shifted from exit 101
+                // (`pyframe.rs:862` valuestackdepth assertion) to exit
+                // 139 (different SIGSEGV site during canonical replay).
+                //
+                // Conclusion: the heap-read-at-guard-time approach is
+                // unsound for portal-bridge mode.  The heap reflects the
+                // pre-residual-call state at guard time, but
+                // `consume_one_section` (BH-side) writes a different
+                // (resume-data-derived) value to the same slot, so the
+                // last-writer-wins ordering between
+                // `restore_guard_failure_values` and
+                // `consume_one_section` decides the effective slot value
+                // — and the two sources can disagree without warning.
+                //
+                // The real fix lives in the canonical RPython orthodox
+                // path: G.4.4 makes portal-bridge jitcodes the single
+                // source of every per-PC liveness read, so user opcodes
+                // emit `_opimpl_setarrayitem_vable` and the symbolic
+                // `virtualizable_boxes` shadow stays in sync with the
+                // heap (`pyjitpl.py:1242-1247`) — at which point the
+                // encoder can revert to reading `virtualizable_boxes`
+                // directly with no heap dereference at all.
+                //
+                // Until G.4.4 lands the encoder/decoder co-evolution
+                // (per-CodeObject jitcode emit no-op + reader
+                // unification + per-PC liveness exposure on the
+                // portal-bridge metadata), the G.4.3 positional fallback
+                // — emit `OpRef::NONE` for slots with no
+                // `registers_r` value — stays in force.  The NONE
+                // serializes to a NULL `set_local_at` / `set_stack_at`
+                // write on the decoder side; for the 12 benches that
+                // currently pass under `PYRE_PORTAL_REDIRECT=1` the
+                // subsequent `consume_one_section` overwrites those
+                // slots with the canonical resume value before the BH
+                // dereferences them, leaving the NULL writes harmless.
                 let mut boxes = Vec::with_capacity(target_count);
                 for reg in 0..target_count {
                     boxes.push(registers_r.get(reg).copied().unwrap_or(OpRef::NONE));

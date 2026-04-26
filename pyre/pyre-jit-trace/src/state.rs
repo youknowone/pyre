@@ -611,7 +611,13 @@ pub fn set_register_portal_bridge_fn(f: RegisterPortalBridgeFn) {
 /// a transitional probe so pyre can A/B compare its per-CodeObject
 /// path against the orthodox single-portal path during the G.3
 /// migration. Removed when G.4 (per-CodeObject emit no-op) lands.
-fn portal_redirect_enabled() -> bool {
+///
+/// G.4.4 makes the function `pub` so `pyre-jit::codewriter` can gate
+/// `register_portal_jitdriver`'s drain and `compile_jitcode_for_callee`
+/// to no-op under flag-ON without going through a separate callback
+/// hook (this read is on the cold init / per-callee paths, not a
+/// per-opcode hot loop).
+pub fn portal_redirect_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENABLED.get_or_init(|| {
         std::env::var_os("PYRE_PORTAL_REDIRECT")
