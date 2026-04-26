@@ -894,16 +894,17 @@ fn dispatch_op(
                 expect_reg(&args[2], Kind::Int),
             );
         }
-        // RPython opname parity (jtransform.py:765-927, blackhole.py:1374-1493):
-        // SpaceOperation names use `*_vable_*` infix. pyre's JitCodeBuilder
-        // methods retain `vable_*` prefix as a PRE-EXISTING-ADAPTATION so
-        // the rename is scoped to the Insn::Op key.
-        // `rpython/jit/codewriter/jtransform.py:844,923` emits field
-        // accessors with the FULL kind name (`getfield_vable_int`,
-        // `setfield_vable_ref`, etc.). The short-form aliases
-        // (`getfield_vable_i`, …) are pre-existing pyre-side dispatch
-        // arms kept here for backwards compatibility with any caller
-        // that has not yet migrated to the RPython-parity names.
+        // `rpython/jit/codewriter/jtransform.py:844,923` uses
+        // `kind = getkind(...)[0]`, so RPython only emits the short-form
+        // opnames `getfield_vable_i` / `_r` / `_f` and `setfield_vable_i`
+        // / `_r` / `_f`. pyre's `vable_*` builder-prefix is a
+        // pre-existing-adaptation and the rename is scoped to the
+        // `Insn::Op` key.
+        // Short-form arms below match the RPython contract directly.
+        // The long-form aliases (`getfield_vable_int`, …) are a
+        // pyre-side compatibility layer for callers that emit the full
+        // kind name; they are NOT RPython parity, just an additive
+        // dispatch shim.
         "getfield_vable_int" | "getfield_vable_i" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
             state

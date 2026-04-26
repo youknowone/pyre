@@ -380,6 +380,8 @@ thread_local! {
         // ref root slot past the first three bytes.
         #[cfg(feature = "cranelift")]
         majit_backend_cranelift::set_jitframe_gc_type_id(jitframe_tid);
+        #[cfg(feature = "dynasm")]
+        majit_backend_dynasm::set_jitframe_gc_type_id(jitframe_tid);
         // llsupport/gc.py:563 vtable→typeid mapping. RPython derives the
         // typeid arithmetically from gc_get_type_info_group; pyre keeps an
         // explicit table because every PyType is a static global

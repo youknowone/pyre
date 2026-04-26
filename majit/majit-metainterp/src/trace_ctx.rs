@@ -3275,7 +3275,12 @@ impl TraceCtx {
     /// `virtualizable_arg_index` of the emitted descriptor comes from the
     /// active `JitDriverStaticData`, matching RPython's
     /// `rewrite.py:684 jd.index_of_virtualizable` lookup.
-    #[allow(dead_code)]
+    ///
+    /// Dormant until Task #11 Step 3 migrates the tracer's
+    /// `call_assembler_with_vable_expansion_args` sites. Covered by
+    /// `call_assembler_red_only_ref_emits_no_vable_expansion` so the
+    /// descriptor shape stays honest until the call-site flip lands.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn call_assembler_red_only_ref(
         &mut self,
         target_number: u64,
@@ -3299,22 +3304,19 @@ impl TraceCtx {
         self.call_assembler_void_typed(target, args, &arg_types);
     }
 
-    /// Emit CALL_ASSEMBLER_I. Assumes all args are `Type::Int`.
-    /// For mixed-type args, use `call_assembler_int_typed`.
+    /// Emit CALL_ASSEMBLER_I, inferring arg types from the current boxes.
     pub fn call_assembler_int(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
         let arg_types = self.infer_arg_types(args);
         self.call_assembler_int_typed(target, args, &arg_types)
     }
 
-    /// Emit CALL_ASSEMBLER_R. Assumes all args are `Type::Int`.
-    /// For mixed-type args, use `call_assembler_ref_typed`.
+    /// Emit CALL_ASSEMBLER_R, inferring arg types from the current boxes.
     pub fn call_assembler_ref(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
         let arg_types = self.infer_arg_types(args);
         self.call_assembler_ref_typed(target, args, &arg_types)
     }
 
-    /// Emit CALL_ASSEMBLER_F. Assumes all args are `Type::Int`.
-    /// For mixed-type args, use `call_assembler_float_typed`.
+    /// Emit CALL_ASSEMBLER_F, inferring arg types from the current boxes.
     pub fn call_assembler_float(&mut self, target: &JitCellToken, args: &[OpRef]) -> OpRef {
         let arg_types = self.infer_arg_types(args);
         self.call_assembler_float_typed(target, args, &arg_types)
