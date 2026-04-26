@@ -233,6 +233,29 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         op: opname,
                         operand,
                         ..
+                    } if opname == "cast_int_to_float" => {
+                        // RPython `rfloat.py` rtype_int → calls
+                        // `hop.inputarg(Signed, ...)` before emitting
+                        // `cast_int_to_float`, so the operand's
+                        // concretetype is Signed by construction.
+                        // jtransform's `coerce_operand_to_float`
+                        // (jit_codewriter/jtransform.rs) emits this
+                        // op only when get_value_kind(operand) == 'i'
+                        // in pass 1.  Pass 2 runs on the rewritten
+                        // graph from a fresh state and may lose that
+                        // backward-constraint upgrade if the operand
+                        // lacks a definitive def-site classification
+                        // (e.g., Call with Unknown result_ty), which
+                        // would surface as `cast_int_to_float/r>f`
+                        // at the assembler.  Re-seed Signed here so
+                        // pass 2 converges to the same operand kind.
+                        changed |=
+                            maybe_seed_concrete_type(&mut state, *operand, ConcreteType::Signed);
+                    }
+                    OpKind::UnaryOp {
+                        op: opname,
+                        operand,
+                        ..
                     } if is_identity_unop(opname) => {
                         if let Some(result) = op.result {
                             let operand_ty = state.get(*operand).clone();
