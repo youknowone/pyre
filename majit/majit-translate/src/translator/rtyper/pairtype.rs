@@ -108,6 +108,12 @@ pub enum ReprClassId {
     ClassesPBCRepr,
     /// `rtuple.py:129 TupleRepr`.
     TupleRepr,
+    /// `rstr.py:483 AbstractCharRepr` (`CharRepr` lltypesystem
+    /// realisation, `lowleveltype = Char`).
+    CharRepr,
+    /// `rstr.py:758 AbstractUniCharRepr` (`UniCharRepr` lltypesystem
+    /// realisation, `lowleveltype = UniChar`).
+    UniCharRepr,
 }
 
 impl ReprClassId {
@@ -147,6 +153,8 @@ impl ReprClassId {
             MultipleFrozenPBCRepr => &[MultipleFrozenPBCRepr, Repr],
             ClassesPBCRepr => &[ClassesPBCRepr, Repr],
             TupleRepr => &[TupleRepr, Repr],
+            CharRepr => &[CharRepr, Repr],
+            UniCharRepr => &[UniCharRepr, Repr],
         }
     }
 }
@@ -362,6 +370,22 @@ fn dispatch_rtype_op(
         (TupleRepr, TupleRepr, "add") | (TupleRepr, TupleRepr, "inplace_add") => {
             committed(super::rtuple::pair_tuple_tuple_rtype_add(r1, r2, hop))
         }
+        // rtuple.py:329-334 — `pairtype(TupleRepr, TupleRepr).rtype_eq`
+        // dispatches to the per-shape `ll_eq` helper synthesised by
+        // `gen_eq_function`.
+        (TupleRepr, TupleRepr, "eq") => {
+            committed(super::rtuple::pair_tuple_tuple_rtype_eq(r1, r2, hop))
+        }
+        // rtuple.py:336-338 — `rtype_ne = rtype_eq + bool_not`.
+        (TupleRepr, TupleRepr, "ne") => {
+            committed(super::rtuple::pair_tuple_tuple_rtype_ne(r1, r2, hop))
+        }
+        // rtuple.py:292-315 — `pairtype(TupleRepr, Repr).rtype_contains`
+        // dispatches to a constant-tuple membership test using the
+        // synthesised per-type `ll_equal` helper.
+        (TupleRepr, _, "contains") => {
+            committed(super::rtuple::pair_tuple_repr_rtype_contains(r1, r2, hop))
+        }
         (PtrRepr, IntegerRepr, "setitem") | (InteriorPtrRepr, IntegerRepr, "setitem") => {
             committed(r1.rtype_setitem(hop))
         }
@@ -461,6 +485,49 @@ fn dispatch_rtype_op(
             committed(super::rfloat::rtype_compare_template(hop, "eq"))
         }
 
+        // rstr.py:740-746 — pairtype(AbstractCharRepr, AbstractCharRepr)
+        // dispatches all six compare ops to `char_<func>` lloperations.
+        (CharRepr, CharRepr, "eq") => {
+            committed(super::rstr::pair_char_char_rtype_compare(hop, "eq"))
+        }
+        (CharRepr, CharRepr, "ne") => {
+            committed(super::rstr::pair_char_char_rtype_compare(hop, "ne"))
+        }
+        (CharRepr, CharRepr, "lt") => {
+            committed(super::rstr::pair_char_char_rtype_compare(hop, "lt"))
+        }
+        (CharRepr, CharRepr, "le") => {
+            committed(super::rstr::pair_char_char_rtype_compare(hop, "le"))
+        }
+        (CharRepr, CharRepr, "gt") => {
+            committed(super::rstr::pair_char_char_rtype_compare(hop, "gt"))
+        }
+        (CharRepr, CharRepr, "ge") => {
+            committed(super::rstr::pair_char_char_rtype_compare(hop, "ge"))
+        }
+
+        // rstr.py:778-784 — pairtype(AbstractUniCharRepr, AbstractUniCharRepr).
+        // eq/ne dispatch to `unichar_<func>`; lt/le/gt/ge cast both
+        // arms via `cast_unichar_to_int` and dispatch to `int_<func>`.
+        (UniCharRepr, UniCharRepr, "eq") => committed(
+            super::rstr::pair_unichar_unichar_rtype_compare_eqne(hop, "eq"),
+        ),
+        (UniCharRepr, UniCharRepr, "ne") => committed(
+            super::rstr::pair_unichar_unichar_rtype_compare_eqne(hop, "ne"),
+        ),
+        (UniCharRepr, UniCharRepr, "lt") => committed(
+            super::rstr::pair_unichar_unichar_rtype_compare_ord(hop, "lt"),
+        ),
+        (UniCharRepr, UniCharRepr, "le") => committed(
+            super::rstr::pair_unichar_unichar_rtype_compare_ord(hop, "le"),
+        ),
+        (UniCharRepr, UniCharRepr, "gt") => committed(
+            super::rstr::pair_unichar_unichar_rtype_compare_ord(hop, "gt"),
+        ),
+        (UniCharRepr, UniCharRepr, "ge") => committed(
+            super::rstr::pair_unichar_unichar_rtype_compare_ord(hop, "ge"),
+        ),
+
         _ => Ok(None),
     }
 }
@@ -559,6 +626,10 @@ pub fn pair_rtype_cmp(r1: &dyn Repr, r2: &dyn Repr, hop: &HighLevelOp) -> RTypeR
 
 pub fn pair_rtype_coerce(r1: &dyn Repr, r2: &dyn Repr, hop: &HighLevelOp) -> RTypeResult {
     pair_rtype_op(r1, r2, hop, "coerce")
+}
+
+pub fn pair_rtype_contains(r1: &dyn Repr, r2: &dyn Repr, hop: &HighLevelOp) -> RTypeResult {
+    pair_rtype_op(r1, r2, hop, "contains")
 }
 
 pub fn pair_rtype_eq(r1: &dyn Repr, r2: &dyn Repr, hop: &HighLevelOp) -> RTypeResult {

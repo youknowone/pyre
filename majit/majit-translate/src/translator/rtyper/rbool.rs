@@ -101,6 +101,43 @@ impl Repr for BoolRepr {
         super::pairtype::ReprClassId::BoolRepr
     }
 
+    /// RPython `BoolRepr` inherits from `IntegerRepr` (`rbool.py:10`),
+    /// picking up `IntegerRepr.get_ll_eq_function` (`rint.py:39-42`)
+    /// which returns `None` for non-shortint widths. Bool's lltype
+    /// has a non-`None` `_opprefix` (`'int_'`), so the `None` branch
+    /// fires; explicit override in Rust since trait dispatch does not
+    /// inherit from a concrete type.
+    fn get_ll_eq_function(
+        &self,
+        _rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        Ok(None)
+    }
+
+    /// RPython `BoolRepr` inherits `IntegerRepr.get_ll_hash_function`
+    /// (`rint.py:50-54`) returning `ll_hash_int`. Bool's bit-pattern
+    /// representation is `Bool` lltype (1 bit / 1 byte); `intmask(b)`
+    /// widens it to `Signed` semantically — synthesizes the same
+    /// single-block helper graph as IntegerRepr via the shared
+    /// [`super::rint::build_ll_hash_int_helper_graph`] builder.
+    fn get_ll_hash_function(
+        &self,
+        rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        let lltype = LowLevelType::Bool;
+        let name = format!("ll_hash_int_{}", lltype.short_name());
+        rtyper
+            .lowlevel_helper_function_with_builder(
+                name.clone(),
+                vec![lltype.clone()],
+                LowLevelType::Signed,
+                move |_rtyper, args, _result| {
+                    super::rint::build_ll_hash_int_helper_graph(&name, &args[0])
+                },
+            )
+            .map(Some)
+    }
+
     /// RPython `BoolRepr.convert_const(self, value)` (`rbool.py:17-20`):
     ///
     /// ```python
@@ -337,6 +374,43 @@ mod tests {
         let r = BoolRepr::new();
         let err = r.convert_const(&ConstValue::Int(1)).unwrap_err();
         assert!(err.to_string().contains("not a bool"));
+    }
+
+    /// rbool.py inherits `IntegerRepr.get_ll_hash_function` (rint.py:50-54);
+    /// for `Bool` lltype the synthesized helper widens via
+    /// `cast_bool_to_int` (`intmask(b)` semantics) so the return value
+    /// matches the helper's `Signed` return type. Without the cast the
+    /// return link would carry a Bool-typed Variable into a
+    /// Signed-typed slot and break downstream `int_mul`/`int_xor`
+    /// mixing in `gen_hash_function`.
+    #[test]
+    fn bool_repr_get_ll_hash_function_widens_bool_to_signed_via_cast() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let r = bool_repr();
+
+        let llfn = r
+            .get_ll_hash_function(&rtyper)
+            .expect("get_ll_hash_function(Bool)")
+            .expect("returns Some helper");
+        assert_eq!(llfn.name, "ll_hash_int_Bool");
+        assert_eq!(llfn.args, vec![LowLevelType::Bool]);
+        assert_eq!(llfn.result, LowLevelType::Signed);
+
+        let graph = llfn.graph.as_ref().expect("helper carries a graph");
+        let inner = graph.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        let opnames: Vec<&str> = startblock
+            .operations
+            .iter()
+            .map(|op| op.opname.as_str())
+            .collect();
+        assert_eq!(
+            opnames,
+            vec!["cast_bool_to_int"],
+            "Bool inputarg must widen to Signed before the helper returns, got {:?}",
+            startblock.operations
+        );
     }
 
     #[test]

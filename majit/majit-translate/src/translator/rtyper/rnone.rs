@@ -100,6 +100,54 @@ impl Repr for NoneRepr {
         super::pairtype::ReprClassId::NoneRepr
     }
 
+    /// RPython `NoneRepr.get_ll_eq_function(self)` (`rnone.py:22-23`):
+    ///
+    /// ```python
+    /// def get_ll_eq_function(self):
+    ///     return None
+    /// ```
+    ///
+    /// `NoneRepr.lowleveltype` is `Void`, so `None == None` is the
+    /// only possible comparison; the primitive `int_eq` on Void
+    /// reduces to constant `True` at the typer level. Returning
+    /// `None` instructs callers to use the inline primitive op
+    /// (`gen_eq_function`'s `eq_funcs[i] or operator.eq` fallback).
+    fn get_ll_eq_function(
+        &self,
+        _rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        Ok(None)
+    }
+
+    /// RPython `NoneRepr.get_ll_hash_function(self)` (`rnone.py:25-26`):
+    ///
+    /// ```python
+    /// def get_ll_hash_function(self):
+    ///     return ll_none_hash
+    ///
+    /// def ll_none_hash(_):
+    ///     return 0
+    /// ```
+    ///
+    /// Synthesizes a single-block helper graph that ignores its `Void`
+    /// inputarg and returns the constant `Signed 0`. Used by
+    /// [`super::rtuple::gen_hash_function`] when a tuple item Repr is
+    /// `NoneRepr` (e.g. `Optional[int]` items dispatched as `None`).
+    fn get_ll_hash_function(
+        &self,
+        rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        let name = "ll_none_hash".to_string();
+        rtyper
+            .lowlevel_helper_function_with_builder(
+                name.clone(),
+                vec![LowLevelType::Void],
+                LowLevelType::Signed,
+                move |_rtyper, _args, _result| build_ll_none_hash_helper_graph(&name),
+            )
+            .map(Some)
+    }
+
     /// RPython `NoneRepr.rtype_bool(self, hop)` (`rnone.py:13-14`):
     /// `return Constant(False, Bool)`.
     ///
@@ -147,6 +195,45 @@ pub fn none_repr() -> Arc<NoneRepr> {
 /// when that lands.
 pub fn ll_none_hash(_: &ConstValue) -> i64 {
     0
+}
+
+/// Synthesizes the `ll_none_hash(_)` helper graph (`rnone.py:42-43`):
+/// single block, ignores the `Void` inputarg, returns `Signed 0`.
+///
+/// Used by [`NoneRepr::get_ll_hash_function`] via
+/// [`super::rtyper::RPythonTyper::lowlevel_helper_function_with_builder`].
+pub(crate) fn build_ll_none_hash_helper_graph(
+    name: &str,
+) -> Result<crate::flowspace::pygraph::PyGraph, TyperError> {
+    use crate::flowspace::model::{Block, BlockRefExt, FunctionGraph, GraphFunc, Hlvalue, Link};
+    use crate::translator::rtyper::rtyper::{
+        constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
+    };
+
+    let arg = variable_with_lltype("_", LowLevelType::Void);
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg)]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    let zero_const = constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed);
+    startblock.closeblock(vec![
+        Link::new(vec![zero_const], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["_".to_string()],
+        func,
+    ))
 }
 
 /// RPython `rtype_is_none(robj1, rnone2, hop, pos=0)`
@@ -401,6 +488,44 @@ mod tests {
         assert_eq!(r.state().get(), Setupstate::NotInitialized);
         r.setup().expect("NoneRepr.setup() should succeed");
         assert_eq!(r.state().get(), Setupstate::Finished);
+    }
+
+    /// rnone.py:25-26 — `NoneRepr.get_ll_hash_function` returns the
+    /// `ll_none_hash` function. The synthesized helper graph has a
+    /// single block with no operations and a closeblock returning the
+    /// constant `Signed 0` directly.
+    #[test]
+    fn none_repr_get_ll_hash_function_synthesizes_zero_returning_helper() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let r = none_repr();
+
+        let llfn = r
+            .get_ll_hash_function(&rtyper)
+            .expect("get_ll_hash_function(None)")
+            .expect("returns Some helper");
+        assert_eq!(llfn.name, "ll_none_hash");
+        assert_eq!(llfn.args, vec![LowLevelType::Void]);
+        assert_eq!(llfn.result, LowLevelType::Signed);
+
+        let graph = llfn.graph.as_ref().expect("helper carries a graph");
+        let inner = graph.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert!(
+            startblock.operations.is_empty(),
+            "ll_none_hash has no operations, got {:?}",
+            startblock.operations
+        );
+        assert_eq!(startblock.exits.len(), 1);
+        let exit = startblock.exits[0].borrow();
+        assert_eq!(exit.args.len(), 1);
+        match exit.args[0].as_ref() {
+            Some(Hlvalue::Constant(c)) => {
+                assert_eq!(c.value, ConstValue::Int(0));
+                assert_eq!(c.concretetype.as_ref(), Some(&LowLevelType::Signed));
+            }
+            other => panic!("expected Constant Signed 0, got {other:?}"),
+        }
     }
 
     #[test]

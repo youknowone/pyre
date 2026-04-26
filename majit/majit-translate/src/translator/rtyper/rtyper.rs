@@ -645,6 +645,45 @@ impl RPythonTyper {
         result: LowLevelType,
     ) -> Result<LowLevelFunction, TyperError> {
         let name = name.into();
+        let name_for_builder = name.clone();
+        self.lowlevel_helper_function_with_builder(
+            name,
+            args,
+            result,
+            move |rtyper, args, result| {
+                lowlevel_helper_graph(rtyper, &name_for_builder, args, result)
+            },
+        )
+    }
+
+    /// RPython `annlowlevel.annotate_lowlevel_helper()` for synthesized
+    /// helper functions whose body is built dynamically per call shape.
+    ///
+    /// Upstream (e.g. `rtuple.gen_eq_function`) builds a Python source
+    /// helper closure per shape, hands it to
+    /// `annlowlevel.annotate_lowlevel_helper`, and `cachedgraph` then
+    /// produces the FunctionGraph. Pyre cannot annotate Python source
+    /// at this stage of the port — instead the caller passes a
+    /// `builder` closure that emits a `PyGraph` directly. The closure
+    /// is invoked **only on cache miss**; the produced graph is
+    /// memoised under `(name, args, result)` and registered with the
+    /// translator's graph list (matching the bookkeeping path of the
+    /// hardcoded `lowlevel_helper_function`).
+    ///
+    /// Callers must encode the shape into `name` to avoid collisions —
+    /// e.g. `gen_eq_function([r_int, r_int])` uses
+    /// `"ll_tuple_eq_signed_signed"`.
+    pub fn lowlevel_helper_function_with_builder<F>(
+        &self,
+        name: impl Into<String>,
+        args: Vec<LowLevelType>,
+        result: LowLevelType,
+        builder: F,
+    ) -> Result<LowLevelFunction, TyperError>
+    where
+        F: FnOnce(&RPythonTyper, &[LowLevelType], &LowLevelType) -> Result<PyGraph, TyperError>,
+    {
+        let name = name.into();
         let key = LowLevelHelperKey {
             name: name.clone(),
             args: args.clone(),
@@ -654,7 +693,7 @@ impl RPythonTyper {
             return Ok(LowLevelFunction::from_pygraph(name, args, result, graph));
         }
 
-        let graph = Rc::new(lowlevel_helper_graph(self, &name, &args, &result)?);
+        let graph = Rc::new(builder(self, &args, &result)?);
         self.lowlevel_helper_graphs
             .borrow_mut()
             .insert(key, graph.clone());
@@ -1854,6 +1893,8 @@ impl RPythonTyper {
             // free function `rtuple.rtype_newtuple(hop)` which routes
             // to `TupleRepr._rtype_newtuple`. No per-Repr dispatch.
             "newtuple" => super::rtuple::TupleRepr::rtype_newtuple(hop),
+            // rtuple.py:292-315 — `pairtype(TupleRepr, Repr).rtype_contains`.
+            "contains" => self.translate_pair_operation(hop, super::pairtype::pair_rtype_contains),
             _ => self.default_translate_operation(hop),
         }
     }
@@ -2258,18 +2299,29 @@ impl HighLevelOp {
         if self.exceptionlinks.is_empty() {
             return Ok(()); // rtyper.py:735-736
         }
-        if let Some(_checked) = &llops.implicit_exceptions_checked {
-            // upstream sanity check rtyper.py:737-744: every
-            // exceptionlink.exitcase must appear in
-            // implicit_exceptions_checked. Pyre's `Link.exitcase` is
-            // `Option<Hlvalue>` carrying the exception class as a
-            // host-object constant; DEFERRED until
-            // `rpython/rtyper/exceptiondata.py` ports so the lookup
-            // has a canonical `ExceptionData.lltype_of_exception_type`
-            // surface to compare against. Parity-marker left in the
-            // typed field so the follow-up commit finds the wiring
-            // spot.
-            let _ = &self.exceptionlinks;
+        // upstream sanity check rtyper.py:737-744 — when
+        // `has_implicit_exception` was called at least once on this
+        // hop (`implicit_exceptions_checked` is Some, possibly
+        // empty), every `exceptionlink.exitcase` must appear in the
+        // checked list. Otherwise the graph catches an exception the
+        // rtyper did not explicitly handle.
+        if let Some(checked) = &llops.implicit_exceptions_checked {
+            for link in &self.exceptionlinks {
+                let exitcase = link.borrow().exitcase.clone();
+                let qualname = match exitcase {
+                    Some(Hlvalue::Constant(Constant {
+                        value: ConstValue::HostObject(cls),
+                        ..
+                    })) => cls.qualname().to_string(),
+                    _ => continue,
+                };
+                if !checked.contains(&qualname) {
+                    return Err(TyperError::message(format!(
+                        "the graph catches {qualname}, but the rtyper did not \
+                         explicitely handle it"
+                    )));
+                }
+            }
         }
         llops.llop_raising_exceptions = Some(LlopRaisingExceptions::Index(llops.ops.len()));
         Ok(())
@@ -2621,7 +2673,7 @@ fn lowlevel_helper_graph(
     }
 }
 
-fn variable_with_lltype(name: &str, lltype: LowLevelType) -> Variable {
+pub(crate) fn variable_with_lltype(name: &str, lltype: LowLevelType) -> Variable {
     let mut var = Variable::named(name);
     var.set_concretetype(Some(lltype.clone()));
     var.annotation
@@ -2629,11 +2681,11 @@ fn variable_with_lltype(name: &str, lltype: LowLevelType) -> Variable {
     var
 }
 
-fn constant_with_lltype(value: ConstValue, lltype: LowLevelType) -> Hlvalue {
+pub(crate) fn constant_with_lltype(value: ConstValue, lltype: LowLevelType) -> Hlvalue {
     Hlvalue::Constant(Constant::with_concretetype(value, lltype))
 }
 
-fn helper_pygraph_from_graph(
+pub(crate) fn helper_pygraph_from_graph(
     graph: FunctionGraph,
     argnames: Vec<String>,
     func: GraphFunc,
@@ -2647,7 +2699,7 @@ fn helper_pygraph_from_graph(
     }
 }
 
-fn void_field_const(name: &str) -> Hlvalue {
+pub(crate) fn void_field_const(name: &str) -> Hlvalue {
     constant_with_lltype(ConstValue::Str(name.to_string()), LowLevelType::Void)
 }
 
@@ -5324,6 +5376,78 @@ mod tests {
             llops.borrow().llop_raising_exceptions,
             Some(LlopRaisingExceptions::Removed)
         );
+    }
+
+    /// rtyper.py:737-744 — when `has_implicit_exception` was called
+    /// at least once on this hop (`implicit_exceptions_checked` is
+    /// `Some`, possibly empty), `exception_is_here` must verify that
+    /// every `exceptionlink.exitcase` was checked. If a catch arm is
+    /// not handled, raise `TyperError("the graph catches X, but the
+    /// rtyper did not explicitely handle it")`.
+    #[test]
+    fn exception_is_here_rejects_unchecked_exitcase() {
+        let rtyper = make_rtyper_rc();
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        // Two exceptionlinks: IndexError (will be checked) +
+        // ValueError (NOT checked) — sanity check must reject.
+        let exitblock1 = Rc::new(RefCell::new(crate::flowspace::model::Block::new(vec![])));
+        let exitblock2 = Rc::new(RefCell::new(crate::flowspace::model::Block::new(vec![])));
+        let cls_index = HOST_ENV.lookup_exception_class("IndexError").unwrap();
+        let cls_value = HOST_ENV.lookup_exception_class("ValueError").unwrap();
+        let link_index = Rc::new(RefCell::new(crate::flowspace::model::Link::new(
+            vec![],
+            Some(exitblock1),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                cls_index,
+            )))),
+        )));
+        let link_value = Rc::new(RefCell::new(crate::flowspace::model::Link::new(
+            vec![],
+            Some(exitblock2),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                cls_value,
+            )))),
+        )));
+        let hop = HighLevelOp::new(
+            rtyper,
+            empty_spaceop("nop"),
+            vec![link_index, link_value],
+            llops,
+        );
+        // Check IndexError only.
+        assert!(hop.has_implicit_exception("IndexError"));
+        let err = hop
+            .exception_is_here()
+            .expect_err("ValueError unchecked must error");
+        assert!(
+            format!("{err}").contains("ValueError"),
+            "expected ValueError-naming error, got: {err}"
+        );
+    }
+
+    /// rtyper.py:737-744 — sanity check passes when every
+    /// exceptionlink.exitcase was visited by has_implicit_exception.
+    #[test]
+    fn exception_is_here_accepts_all_checked_exitcases() {
+        let rtyper = make_rtyper_rc();
+        let llops = Rc::new(RefCell::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let exitblock = Rc::new(RefCell::new(crate::flowspace::model::Block::new(vec![])));
+        let cls_index = HOST_ENV.lookup_exception_class("IndexError").unwrap();
+        let link = Rc::new(RefCell::new(crate::flowspace::model::Link::new(
+            vec![],
+            Some(exitblock),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                cls_index,
+            )))),
+        )));
+        let hop = HighLevelOp::new(rtyper, empty_spaceop("nop"), vec![link], llops.clone());
+        assert!(hop.has_implicit_exception("IndexError"));
+        hop.exception_is_here()
+            .expect("all exitcases checked → exception_is_here OK");
+        assert!(matches!(
+            llops.borrow().llop_raising_exceptions,
+            Some(LlopRaisingExceptions::Index(_))
+        ));
     }
 
     #[test]

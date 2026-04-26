@@ -144,6 +144,65 @@ impl Repr for IntegerRepr {
         super::pairtype::ReprClassId::IntegerRepr
     }
 
+    /// RPython `IntegerRepr.get_ll_eq_function(self)` (`rint.py:39-42`):
+    ///
+    /// ```python
+    /// def get_ll_eq_function(self):
+    ///     if getattr(self, '_opprefix', '?') is None:
+    ///         return ll_eq_shortint
+    ///     return None
+    /// ```
+    ///
+    /// `_opprefix is None` is the "shortint" branch (RPython narrow
+    /// integers like `r_singleshort` whose `==` requires explicit
+    /// `intmask` widening). Pyre's primitive lltypes (`Signed`, `Bool`,
+    /// `Unsigned`, long-long variants) all carry an `opprefix`, so the
+    /// shortint branch is never taken; returning `None` instructs the
+    /// caller (`gen_eq_function` / `rtype_contains`) to fall back to
+    /// the primitive `int_eq`/`uint_eq`/... inline op via
+    /// `eq_funcs[i] or operator.eq`.
+    fn get_ll_eq_function(
+        &self,
+        _rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        Ok(None)
+    }
+
+    /// RPython `IntegerRepr.get_ll_hash_function(self)` (`rint.py:50-54`):
+    ///
+    /// ```python
+    /// def get_ll_hash_function(self):
+    ///     if (sys.maxint == 2147483647 and
+    ///         self.lowleveltype in (SignedLongLong, UnsignedLongLong)):
+    ///         return ll_hash_long_long
+    ///     return ll_hash_int
+    ///
+    /// def ll_hash_int(n):
+    ///     return intmask(n)
+    /// ```
+    ///
+    /// Pyre runs on 64-bit hosts (`sys.maxint == 2**63 - 1`); the
+    /// `ll_hash_long_long` branch is never taken. `ll_hash_int(n) =
+    /// intmask(n)` is identity for `Signed` and a width-narrowing cast
+    /// for the wider primitive widths. Synthesizes a single-block helper
+    /// graph per width so [`gen_hash_function`] can dispatch via
+    /// `direct_call`.
+    fn get_ll_hash_function(
+        &self,
+        rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        let lltype = self.lltype.clone();
+        let name = format!("ll_hash_int_{}", lltype.short_name());
+        rtyper
+            .lowlevel_helper_function_with_builder(
+                name.clone(),
+                vec![lltype.clone()],
+                LowLevelType::Signed,
+                move |_rtyper, args, _result| build_ll_hash_int_helper_graph(&name, &args[0]),
+            )
+            .map(Some)
+    }
+
     /// RPython `IntegerRepr.convert_const(self, value)` (`rint.py:31-37`):
     ///
     /// ```python
@@ -346,6 +405,88 @@ impl Repr for IntegerRepr {
             GenopResult::LLType(LowLevelType::UniChar),
         ))
     }
+}
+
+// ____________________________________________________________
+// Helper graph synthesis — `ll_hash_int(n) = intmask(n)` (`rint.py:619-620`).
+
+/// RPython `ll_hash_int(n) = intmask(n)` (`rint.py:619-620`).
+///
+/// Synthesizes a single-block helper graph that maps the per-width
+/// integer input to a `Signed` result. For `Signed`/`Bool` the body is
+/// identity (the value already fits in `Signed` and the lltype-level
+/// representation lines up); for wider widths a single `cast_*_to_int`
+/// op is emitted. The resulting graph is suitable as a `direct_call`
+/// target from [`super::rtuple::gen_hash_function`].
+///
+/// Reused from [`super::rbool::BoolRepr::get_ll_hash_function`] —
+/// upstream `BoolRepr(IntegerRepr)` inherits `get_ll_hash_function`
+/// directly via Python's MRO; the Rust port reaches the same
+/// `ll_hash_int` graph by both Repr's `get_ll_hash_function` calling
+/// this builder.
+pub(crate) fn build_ll_hash_int_helper_graph(
+    name: &str,
+    lltype: &LowLevelType,
+) -> Result<crate::flowspace::pygraph::PyGraph, TyperError> {
+    use crate::flowspace::model::{Block, FunctionGraph, GraphFunc, Hlvalue, Link, SpaceOperation};
+    use crate::translator::rtyper::rtyper::{helper_pygraph_from_graph, variable_with_lltype};
+
+    let arg = variable_with_lltype("n", lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(arg.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // upstream `intmask(n)`: identity for `Signed` (already 64-bit on
+    // host). For other primitive widths emit the matching cast-to-int
+    // op so the helper's `Signed` return type matches the link arg.
+    // Bool MUST cast (`cast_bool_to_int`) — without it the return link
+    // would carry a `Bool`-typed Variable into a `Signed`-typed return
+    // slot, a type mismatch that breaks downstream callers
+    // (`gen_hash_function` mixes the result with `int_mul`/`int_xor`).
+    let return_value = if lltype == &LowLevelType::Signed {
+        Hlvalue::Variable(arg)
+    } else {
+        let cast_op = match lltype {
+            LowLevelType::Bool => "cast_bool_to_int",
+            LowLevelType::Unsigned => "cast_uint_to_int",
+            LowLevelType::SignedLongLong => "cast_longlong_to_int",
+            LowLevelType::SignedLongLongLong => "cast_lllong_to_int",
+            LowLevelType::UnsignedLongLong => "cast_ulonglong_to_int",
+            LowLevelType::UnsignedLongLongLong => "cast_ulllong_to_int",
+            other => {
+                return Err(TyperError::message(format!(
+                    "ll_hash_int: no cast-to-Signed op for {other:?}"
+                )));
+            }
+        };
+        let cast_var = variable_with_lltype("hashed", LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            cast_op,
+            vec![Hlvalue::Variable(arg)],
+            Hlvalue::Variable(cast_var.clone()),
+        ));
+        Hlvalue::Variable(cast_var)
+    };
+
+    use crate::flowspace::model::BlockRefExt;
+    startblock.closeblock(vec![
+        Link::new(vec![return_value], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(
+        graph,
+        vec!["n".to_string()],
+        func,
+    ))
 }
 
 // ____________________________________________________________
@@ -933,6 +1074,87 @@ mod tests {
             &getintegerrepr(&LowLevelType::UnsignedLongLongLong),
             &unsignedlonglonglong_repr()
         ));
+    }
+
+    /// rint.py:50-54 — `IntegerRepr.get_ll_hash_function` returns
+    /// `ll_hash_int`. For Signed (host word), `intmask(n) = n`; the
+    /// synthesized helper graph should be a single block with no
+    /// operations, returning the inputarg directly.
+    #[test]
+    fn integer_repr_get_ll_hash_function_signed_synthesizes_identity_helper() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let r = signed_repr();
+
+        let llfn = r
+            .get_ll_hash_function(&rtyper)
+            .expect("get_ll_hash_function(Signed) should not error")
+            .expect("get_ll_hash_function(Signed) returns Some helper");
+        assert_eq!(llfn.name, "ll_hash_int_Signed");
+        assert_eq!(llfn.args, vec![LowLevelType::Signed]);
+        assert_eq!(llfn.result, LowLevelType::Signed);
+
+        let graph = llfn.graph.as_ref().expect("helper carries a graph");
+        let inner = graph.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert!(
+            startblock.operations.is_empty(),
+            "Signed identity has no operations, got {:?}",
+            startblock.operations
+        );
+        assert_eq!(
+            startblock.exits.len(),
+            1,
+            "single closeblock link to returnblock"
+        );
+        let exit = startblock.exits[0].borrow();
+        assert_eq!(exit.args.len(), 1);
+        assert!(
+            matches!(exit.args[0].as_ref(), Some(Hlvalue::Variable(_))),
+            "identity returns the inputarg directly"
+        );
+    }
+
+    /// rint.py:50-54 — wider widths emit a single `cast_*_to_int` op.
+    #[test]
+    fn integer_repr_get_ll_hash_function_unsigned_emits_cast_uint_to_int() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let r = unsigned_repr();
+
+        let llfn = r
+            .get_ll_hash_function(&rtyper)
+            .expect("get_ll_hash_function(Unsigned)")
+            .expect("returns Some helper");
+        assert_eq!(llfn.name, "ll_hash_int_Unsigned");
+        assert_eq!(llfn.args, vec![LowLevelType::Unsigned]);
+
+        let graph = llfn.graph.as_ref().expect("helper carries a graph");
+        let inner = graph.graph.borrow();
+        let startblock = inner.startblock.borrow();
+        assert_eq!(startblock.operations.len(), 1);
+        assert_eq!(startblock.operations[0].opname, "cast_uint_to_int");
+    }
+
+    /// `lowlevel_helper_function_with_builder` caches by
+    /// `(name, args, result)` so repeated calls return the same
+    /// graph — important so multiple tuple shapes share helpers.
+    #[test]
+    fn integer_repr_get_ll_hash_function_signed_caches_helper_graph() {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = RPythonTyper::new(&ann);
+        let r = signed_repr();
+        let a = r
+            .get_ll_hash_function(&rtyper)
+            .expect("first call")
+            .expect("Some");
+        let b = r
+            .get_ll_hash_function(&rtyper)
+            .expect("second call")
+            .expect("Some");
+        let ga = a.graph.as_ref().expect("a.graph");
+        let gb = b.graph.as_ref().expect("b.graph");
+        assert!(Rc::ptr_eq(&ga.graph, &gb.graph), "cached graph identity");
     }
 
     #[test]

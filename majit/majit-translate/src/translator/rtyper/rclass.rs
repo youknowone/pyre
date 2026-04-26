@@ -118,40 +118,96 @@ pub const IR_IMMUTABLE: ImmutableRanking = ImmutableRanking {
 // rclass.py:160-180 — OBJECT_VTABLE / OBJECT / NONGCOBJECT module constants.
 // ---------------------------------------------------------------------
 
-/// RPython module-level `OBJECT_VTABLE = lltype.ForwardReference()` resolved
-/// via `.become(Struct('object_vtable', ...))` (rclass.py:160, 167-174).
+/// Internal aggregate that materialises the four interdependent
+/// module-level types (`OBJECT_VTABLE` / `CLASSTYPE` / `OBJECT` /
+/// `OBJECTPTR`) in a single `LazyLock` body, mirroring upstream's
+/// mutable-ForwardReference + post-hoc `become()` ordering
+/// (rclass.py:160-174).
 ///
-/// Resolves the forward reference to `object_vtable` with four of the
-/// five upstream head fields: `subclassrange_min` /
-/// `subclassrange_max` / `rtti` / `name`. The remaining
-/// `instantiate: Ptr(FuncType([], OBJECTPTR))` stays deferred — its
-/// type would close the cycle `OBJECT_VTABLE → OBJECTPTR → OBJECT →
-/// CLASSTYPE → OBJECT_VTABLE` which the Rust port's `LazyLock`-based
-/// initialisation cannot resolve eagerly (upstream's mutable
-/// ForwardReference + post-hoc become() reads out of order).
-/// `name` does not participate in that cycle (`Ptr(rstr.STR)` lives
-/// in `lltypesystem/rstr.rs`) so it lands here.
+/// Cycle topology:
 ///
-/// Structural equality of two independently-built `OBJECT_VTABLE`
-/// clones is preserved by `LowLevelType`'s field-wise `PartialEq`,
-/// and the shared `Arc<Mutex<_>>` inside the resolved
-/// `ForwardReference` keeps the identity-level singleton semantics
-/// that `cast_vtable_to_typeptr` relies on.
-pub static OBJECT_VTABLE: LazyLock<LowLevelType> = LazyLock::new(|| {
-    let mut fwd = ForwardReference::new();
-    // Upstream `Ptr(RuntimeTypeInfo)` (rclass.py:170). The Rust port
-    // reconstructs it via the ported `Ptr::from_container_type` helper
-    // on the `RUNTIME_TYPE_INFO` opaque singleton.
+/// ```text
+/// OBJECT_VTABLE.instantiate  →  Ptr(FuncType([], OBJECTPTR))
+///                                                   ↓
+///                                                 OBJECTPTR
+///                                                   ↓
+///                                                 OBJECT
+///                                                   ↓
+///                                          OBJECT.typeptr = CLASSTYPE
+///                                                   ↓
+///                                              CLASSTYPE = Ptr(OBJECT_VTABLE)
+///                                                   ↺
+/// ```
+///
+/// Resolved by:
+/// 1. Mint an unresolved `vtable_fwd: ForwardReference`.
+/// 2. Build `CLASSTYPE = Ptr(ForwardReference(vtable_fwd.clone()))`
+///    — clones share `Arc<Mutex<Option<...>>>` so any later
+///    `become()` propagates.
+/// 3. Build `OBJECT` and `OBJECTPTR` referencing CLASSTYPE.
+/// 4. Build the full `object_vtable` Struct (with all 5 fields
+///    including `instantiate: Ptr(FuncType([], OBJECTPTR))`).
+/// 5. `vtable_fwd.become(struct_value)` — every clone (including
+///    the one embedded in CLASSTYPE) sees the resolution via the
+///    shared `Arc`.
+struct ObjectFamilyTypes {
+    object_vtable: LowLevelType,
+    classtype: LowLevelType,
+    object: LowLevelType,
+    objectptr: LowLevelType,
+}
+
+static OBJECT_FAMILY: LazyLock<ObjectFamilyTypes> = LazyLock::new(|| {
+    use crate::translator::rtyper::lltypesystem::lltype::FuncType;
+
+    // Step 1 — mint the unresolved ForwardReference.
+    let vtable_fwd = ForwardReference::new();
+
+    // Step 2 — CLASSTYPE = Ptr(OBJECT_VTABLE) via a Ptr wrapping a
+    // clone of `vtable_fwd`. Clones share the resolved state via
+    // `Arc<Mutex<_>>`, so step 5 propagates here.
+    let classtype = LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::ForwardReference(vtable_fwd.clone()),
+    }));
+
+    // Step 3a — OBJECT = GcStruct('object', ('typeptr', CLASSTYPE),
+    // rtti=True). Same body as before, but built from the local
+    // `classtype` rather than the static singleton.
+    let object = LowLevelType::Struct(Box::new(StructType::gc_rtti_with_hints(
+        "object",
+        vec![("typeptr".into(), classtype.clone())],
+        vec![
+            ("immutable".into(), ConstValue::Bool(true)),
+            ("shouldntbenull".into(), ConstValue::Bool(true)),
+            ("typeptr".into(), ConstValue::Bool(true)),
+        ],
+    )));
+
+    // Step 3b — OBJECTPTR = Ptr(OBJECT).
+    let LowLevelType::Struct(object_body) = object.clone() else {
+        unreachable!("OBJECT must be a Struct");
+    };
+    let objectptr = LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Struct(*object_body),
+    }));
+
+    // Step 4 — build the full object_vtable Struct, including the
+    // `instantiate: Ptr(FuncType([], OBJECTPTR))` field that closes
+    // the cycle.
     let rtti_ptr_type = LowLevelType::Ptr(Box::new(
         Ptr::from_container_type(RUNTIME_TYPE_INFO.clone()).expect(
             "Ptr(RuntimeTypeInfo) must be constructible from the RUNTIME_TYPE_INFO singleton",
         ),
     ));
-    // Upstream `Ptr(rstr.STR)` (rclass.py:171). `rstr::STRPTR` is
-    // self-contained — STR is a GcStruct with `(hash: Signed, chars:
-    // Array(Char))`; no dependency on OBJECT/OBJECTPTR so it does not
-    // re-enter this LazyLock.
     let name_ptr_type = crate::translator::rtyper::lltypesystem::rstr::STRPTR.clone();
+    // upstream rclass.py:172 — `Ptr(FuncType([], OBJECTPTR))`. The
+    // funcptr has zero args and returns OBJECTPTR.
+    let instantiate_funcptr_type = LowLevelType::Ptr(Box::new(Ptr {
+        TO: PtrTarget::Func(FuncType {
+            args: Vec::new(),
+            result: objectptr.clone(),
+        }),
+    }));
     let body = StructType::with_hints(
         "object_vtable",
         vec![
@@ -159,27 +215,43 @@ pub static OBJECT_VTABLE: LazyLock<LowLevelType> = LazyLock::new(|| {
             ("subclassrange_max".into(), LowLevelType::Signed),
             ("rtti".into(), rtti_ptr_type),
             ("name".into(), name_ptr_type),
+            ("instantiate".into(), instantiate_funcptr_type),
         ],
         vec![
             ("immutable".into(), ConstValue::Bool(true)),
             ("static_immutable".into(), ConstValue::Bool(true)),
         ],
     );
-    fwd.r#become(LowLevelType::Struct(Box::new(body)))
+
+    // Step 5 — resolve.
+    vtable_fwd
+        .r#become(LowLevelType::Struct(Box::new(body)))
         .expect("OBJECT_VTABLE.become should succeed");
-    LowLevelType::ForwardReference(Box::new(fwd))
+    let object_vtable = LowLevelType::ForwardReference(Box::new(vtable_fwd));
+
+    ObjectFamilyTypes {
+        object_vtable,
+        classtype,
+        object,
+        objectptr,
+    }
 });
 
+/// RPython module-level `OBJECT_VTABLE = lltype.ForwardReference()` resolved
+/// via `.become(Struct('object_vtable', ...))` (rclass.py:160, 167-174).
+///
+/// All 5 head fields land — `subclassrange_min`/`max`, `rtti`, `name`,
+/// and `instantiate: Ptr(FuncType([], OBJECTPTR))`. The instantiate
+/// funcptr field closes the `OBJECT_VTABLE → OBJECTPTR → OBJECT →
+/// CLASSTYPE → OBJECT_VTABLE` cycle, broken by `OBJECT_FAMILY`'s
+/// LazyLock body which builds an unresolved ForwardReference first,
+/// constructs the four types in dependency order, then `become()`s
+/// the ForwardReference to the full vtable Struct.
+pub static OBJECT_VTABLE: LazyLock<LowLevelType> =
+    LazyLock::new(|| OBJECT_FAMILY.object_vtable.clone());
+
 /// RPython `CLASSTYPE = Ptr(OBJECT_VTABLE)` (rclass.py:161).
-pub static CLASSTYPE: LazyLock<LowLevelType> = LazyLock::new(|| {
-    let vtable = OBJECT_VTABLE.clone();
-    let LowLevelType::ForwardReference(fwd) = vtable else {
-        panic!("OBJECT_VTABLE must be a ForwardReference");
-    };
-    LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::ForwardReference(*fwd),
-    }))
-});
+pub static CLASSTYPE: LazyLock<LowLevelType> = LazyLock::new(|| OBJECT_FAMILY.classtype.clone());
 
 /// RPython `OBJECT = GcStruct('object', ('typeptr', CLASSTYPE),
 /// hints={...}, rtti=True)` (rclass.py:162-165). `rtti=True` funnels
@@ -187,27 +259,10 @@ pub static CLASSTYPE: LazyLock<LowLevelType> = LazyLock::new(|| {
 /// `RuntimeTypeInfo` opaque stored on `_runtime_type_info`, so
 /// `getRuntimeTypeInfo(OBJECT)` succeeds once R3 consumers
 /// (`fill_vtable_root`) land.
-pub static OBJECT: LazyLock<LowLevelType> = LazyLock::new(|| {
-    LowLevelType::Struct(Box::new(StructType::gc_rtti_with_hints(
-        "object",
-        vec![("typeptr".into(), CLASSTYPE.clone())],
-        vec![
-            ("immutable".into(), ConstValue::Bool(true)),
-            ("shouldntbenull".into(), ConstValue::Bool(true)),
-            ("typeptr".into(), ConstValue::Bool(true)),
-        ],
-    )))
-});
+pub static OBJECT: LazyLock<LowLevelType> = LazyLock::new(|| OBJECT_FAMILY.object.clone());
 
 /// RPython `OBJECTPTR = Ptr(OBJECT)` (rclass.py:166).
-pub static OBJECTPTR: LazyLock<LowLevelType> = LazyLock::new(|| {
-    let LowLevelType::Struct(body) = OBJECT.clone() else {
-        panic!("OBJECT must be a Struct");
-    };
-    LowLevelType::Ptr(Box::new(Ptr {
-        TO: PtrTarget::Struct(*body),
-    }))
-});
+pub static OBJECTPTR: LazyLock<LowLevelType> = LazyLock::new(|| OBJECT_FAMILY.objectptr.clone());
 
 /// RPython `NONGCOBJECT = Struct('nongcobject', ('typeptr', CLASSTYPE))`
 /// (rclass.py:176).
@@ -2622,6 +2677,47 @@ mod tests {
     /// (rpbc.py:980-981), which emits a `getfield` op against this
     /// slot. The lltype of the field must be `Ptr(STR)` resolving to
     /// the `rpy_string` GcStruct.
+    /// `OBJECT_VTABLE.instantiate: Ptr(FuncType([], OBJECTPTR))`
+    /// (rclass.py:172). Closes the cycle `OBJECT_VTABLE → OBJECTPTR
+    /// → OBJECT → CLASSTYPE → OBJECT_VTABLE`. The Rust port resolves
+    /// it via the `OBJECT_FAMILY` LazyLock that builds an unresolved
+    /// ForwardReference first, constructs the four types, then
+    /// `become()`s the ForwardReference to the full vtable Struct
+    /// (mirroring upstream's mutable-ForwardReference + post-hoc
+    /// `become` ordering).
+    #[test]
+    fn object_vtable_carries_instantiate_funcptr_returning_objectptr() {
+        let LowLevelType::ForwardReference(fwd) = OBJECT_VTABLE.clone() else {
+            panic!("OBJECT_VTABLE must be ForwardReference");
+        };
+        let LowLevelType::Struct(body) = fwd.resolved().expect("resolved") else {
+            panic!("OBJECT_VTABLE must resolve to a Struct");
+        };
+        let instantiate_type = body
+            ._flds
+            .get("instantiate")
+            .expect("instantiate field must be present (rclass.py:172)");
+        let LowLevelType::Ptr(funcptr) = instantiate_type else {
+            panic!("instantiate must be a Ptr, got {instantiate_type:?}");
+        };
+        let PtrTarget::Func(funcsig) = &funcptr.TO else {
+            panic!(
+                "instantiate's Ptr target must be Func, got {:?}",
+                funcptr.TO
+            );
+        };
+        assert!(
+            funcsig.args.is_empty(),
+            "instantiate funcptr has zero args, got {} args",
+            funcsig.args.len()
+        );
+        // Result must be OBJECTPTR.
+        assert_eq!(
+            &funcsig.result, &*OBJECTPTR,
+            "instantiate funcptr result must be OBJECTPTR"
+        );
+    }
+
     #[test]
     fn object_vtable_carries_name_ptr_to_str() {
         let LowLevelType::ForwardReference(fwd) = OBJECT_VTABLE.clone() else {

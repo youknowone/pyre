@@ -220,13 +220,19 @@ impl LowLevelType {
             LowLevelType::Float | LowLevelType::SingleFloat | LowLevelType::LongFloat => {
                 matches!(value, ConstValue::Float(_))
             }
-            // upstream `Char` accepts a single-byte Python str; pyre
-            // represents both as `ConstValue::Str` so additional length
-            // validation belongs to convert_const callers (rmodel.py
-            // does not tighten here either — TyperError triggers
-            // downstream via _enforce on malformed constants).
-            LowLevelType::Char => matches!(value, ConstValue::Str(_)),
-            LowLevelType::UniChar => matches!(value, ConstValue::Str(_)),
+            // upstream `typeOf(value)` asserts `len(value) == 1` for
+            // both `str` (`Char`, `lltype.py:837-839`) and `unicode`
+            // (`UniChar`, `lltype.py:840-842`). `_contains_value` then
+            // routes through `isCompatibleType(typeOf(value), self)`
+            // (`lltype.py:194-197`), so multi-char strings are
+            // rejected at this layer upstream. Pyre's `ConstValue::Str`
+            // does not yet distinguish byte from unicode (cross-crate
+            // infrastructure gap, see `rstr.rs` module doc), so the
+            // Char vs UniChar boundary stays loose in this slice; the
+            // length invariant is enforced.
+            LowLevelType::Char | LowLevelType::UniChar => {
+                matches!(value, ConstValue::Str(s) if s.chars().count() == 1)
+            }
             // Address is a Primitive with `_defl = NULL`. Concrete
             // values are llmemory.fakeaddress instances; pyre carries
             // them as `ConstValue::LLAddress`.
@@ -376,15 +382,48 @@ pub enum LowLevelType {
 
 impl PartialEq for LowLevelType {
     fn eq(&self, other: &Self) -> bool {
+        // Cycle short-circuit: two ForwardReferences sharing the
+        // same Arc compare equal without descending into resolved
+        // types (closes `OBJECT_VTABLE → instantiate → OBJECTPTR →
+        // OBJECT → CLASSTYPE → OBJECT_VTABLE`).
+        if let (LowLevelType::ForwardReference(left_fwd), LowLevelType::ForwardReference(right_fwd)) =
+            (self, other)
+            && Arc::ptr_eq(&left_fwd.target, &right_fwd.target)
+        {
+            return true;
+        }
+        // Saferecursive guard — when one side is a ForwardReference
+        // and we're already comparing it elsewhere on the stack
+        // (cycle through the resolved type), short-circuit to `true`.
+        // Mirrors RPython `saferecursive(safe_equal, True)` from
+        // `lltype.py:74-95` — re-entering the same comparison means
+        // the outer call hasn't returned False, so the optimistic
+        // cycle assumption is "equal". The re-entry case happens for
+        // `Struct == ForwardReference` asymmetric pairs where the
+        // Struct contains a Ptr looping back to the same fwd.
         if let LowLevelType::ForwardReference(forward_ref) = self
             && let Some(real) = forward_ref.resolved()
         {
-            return real == *other;
+            let id = Arc::as_ptr(&forward_ref.target) as *const _ as usize;
+            if FORWARD_REF_EQ_GUARD.with(|g| g.borrow().contains(&id)) {
+                return true;
+            }
+            FORWARD_REF_EQ_GUARD.with(|g| g.borrow_mut().insert(id));
+            let r = real == *other;
+            FORWARD_REF_EQ_GUARD.with(|g| g.borrow_mut().remove(&id));
+            return r;
         }
         if let LowLevelType::ForwardReference(forward_ref) = other
             && let Some(real) = forward_ref.resolved()
         {
-            return *self == real;
+            let id = Arc::as_ptr(&forward_ref.target) as *const _ as usize;
+            if FORWARD_REF_EQ_GUARD.with(|g| g.borrow().contains(&id)) {
+                return true;
+            }
+            FORWARD_REF_EQ_GUARD.with(|g| g.borrow_mut().insert(id));
+            let r = *self == real;
+            FORWARD_REF_EQ_GUARD.with(|g| g.borrow_mut().remove(&id));
+            return r;
         }
         match (self, other) {
             (LowLevelType::Void, LowLevelType::Void)
@@ -457,8 +496,25 @@ impl Hash for LowLevelType {
                 t.hash(state);
             }
             LowLevelType::ForwardReference(t) => {
+                // Saferecursive cycle guard — when the resolved type
+                // contains a Ptr that loops back to this same
+                // ForwardReference (e.g. `OBJECT_VTABLE.instantiate
+                // → Ptr(FuncType([], OBJECTPTR)) → OBJECT.typeptr →
+                // CLASSTYPE → OBJECT_VTABLE`), hashing `real`
+                // unconditionally recurses forever. Mirrors RPython
+                // `saferecursive(get_hash, 0)` (lltype.py:136) — on
+                // re-entry hash a constant 0 so deterministic across
+                // runs and identity-independent.
+                let id = Arc::as_ptr(&t.target) as *const _ as usize;
+                let already = FORWARD_REF_HASH_GUARD.with(|g| g.borrow().contains(&id));
+                if already {
+                    0_u8.hash(state);
+                    return;
+                }
                 if let Some(real) = t.resolved() {
+                    FORWARD_REF_HASH_GUARD.with(|g| g.borrow_mut().insert(id));
                     real.hash(state);
+                    FORWARD_REF_HASH_GUARD.with(|g| g.borrow_mut().remove(&id));
                 } else {
                     18_u8.hash(state);
                     t.hash(state);
@@ -2492,8 +2548,30 @@ impl ForwardReference {
 
 impl PartialEq for ForwardReference {
     fn eq(&self, other: &Self) -> bool {
+        // Identity short-circuit: clones of the same `ForwardReference`
+        // share the `Arc<Mutex<_>>` target, so pointer equality on the
+        // Arc proves equivalence without recursing into the resolved
+        // type — required to break cycles like `OBJECT_VTABLE →
+        // OBJECTPTR → OBJECT → CLASSTYPE → OBJECT_VTABLE` (the
+        // `instantiate` funcptr field closes the cycle and structural
+        // recursion through `resolved == resolved` would not terminate).
+        if Arc::ptr_eq(&self.target, &other.target) {
+            return true;
+        }
         match (self.resolved(), other.resolved()) {
-            (Some(left), Some(right)) => left == right,
+            (Some(left), Some(right)) => {
+                let id = Arc::as_ptr(&self.target) as *const _ as usize;
+                if FORWARD_REF_EQ_GUARD.with(|g| g.borrow().contains(&id)) {
+                    // Already comparing this fwd elsewhere on the
+                    // stack — short-circuit to `true` per RPython
+                    // `saferecursive(safe_equal, True)` (lltype.py:74).
+                    return true;
+                }
+                FORWARD_REF_EQ_GUARD.with(|g| g.borrow_mut().insert(id));
+                let r = left == right;
+                FORWARD_REF_EQ_GUARD.with(|g| g.borrow_mut().remove(&id));
+                r
+            }
             (Some(_), None) | (None, Some(_)) => false,
             (None, None) => self._gckind == other._gckind,
         }
@@ -2502,10 +2580,37 @@ impl PartialEq for ForwardReference {
 
 impl Eq for ForwardReference {}
 
+thread_local! {
+    /// TLS-based saferecursive guard. Tracks the set of
+    /// `ForwardReference` Arc pointers currently being compared / hashed
+    /// on this thread's stack, so re-entry on the same `Arc` short-
+    /// circuits to identity comparison / identity hashing instead of
+    /// recursing forever through a cyclic type graph.
+    static FORWARD_REF_EQ_GUARD: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+    static FORWARD_REF_HASH_GUARD: std::cell::RefCell<std::collections::HashSet<usize>> =
+        std::cell::RefCell::new(std::collections::HashSet::new());
+}
+
 impl Hash for ForwardReference {
     fn hash<H: Hasher>(&self, state: &mut H) {
+        let id = Arc::as_ptr(&self.target) as *const _ as usize;
+        let already = FORWARD_REF_HASH_GUARD.with(|g| g.borrow().contains(&id));
+        if already {
+            // Re-entry on the same fwd — hash a constant 0 per
+            // RPython `saferecursive(get_hash, 0)` (lltype.py:136).
+            // Identity hashing here would make hash values depend
+            // on Arc address, breaking deterministic equality
+            // contract for structurally-equal cyclic types.
+            0_u8.hash(state);
+            return;
+        }
         match self.resolved() {
-            Some(real) => real.hash(state),
+            Some(real) => {
+                FORWARD_REF_HASH_GUARD.with(|g| g.borrow_mut().insert(id));
+                real.hash(state);
+                FORWARD_REF_HASH_GUARD.with(|g| g.borrow_mut().remove(&id));
+            }
             None => panic!("ForwardReference object is not hashable"),
         }
     }
@@ -3732,6 +3837,28 @@ mod tests {
     }
 
     #[test]
+    fn lowleveltype_char_unichar_contains_value_enforces_single_char_length() {
+        use crate::flowspace::model::ConstValue;
+        // upstream typeOf (`lltype.py:837-842`) asserts `len(value) == 1`
+        // on str/unicode before returning Char/UniChar. _contains_value
+        // routes through isCompatibleType(typeOf(value), self), so
+        // multi-char strings fail at this layer upstream.
+        assert!(LowLevelType::Char.contains_value(&ConstValue::Str("a".to_string())));
+        assert!(LowLevelType::Char.contains_value(&ConstValue::Str("π".to_string())));
+        assert!(!LowLevelType::Char.contains_value(&ConstValue::Str("ab".to_string())));
+        assert!(!LowLevelType::Char.contains_value(&ConstValue::Str(String::new())));
+
+        assert!(LowLevelType::UniChar.contains_value(&ConstValue::Str("a".to_string())));
+        assert!(LowLevelType::UniChar.contains_value(&ConstValue::Str("π".to_string())));
+        assert!(!LowLevelType::UniChar.contains_value(&ConstValue::Str("ab".to_string())));
+        assert!(!LowLevelType::UniChar.contains_value(&ConstValue::Str(String::new())));
+
+        // Non-Str variants stay rejected.
+        assert!(!LowLevelType::Char.contains_value(&ConstValue::Int(0)));
+        assert!(!LowLevelType::UniChar.contains_value(&ConstValue::Bool(false)));
+    }
+
+    #[test]
     fn lowleveltype_placeholder_value_is_universally_accepted() {
         use crate::flowspace::model::ConstValue;
 
@@ -4106,6 +4233,89 @@ mod tests {
         let mut right = std::collections::hash_map::DefaultHasher::new();
         real.hash(&mut right);
         assert_eq!(left.finish(), right.finish());
+    }
+
+    #[test]
+    fn cyclic_forward_reference_hash_uses_zero_on_re_entry_so_isomorphic_cycles_match() {
+        // Companion to the eq cycle test: hash and eq must agree
+        // (Eq+Hash contract). Two distinct ForwardReferences with
+        // self-referential isomorphic Struct shapes compare equal,
+        // therefore must hash equal. RPython `saferecursive(get_hash,
+        // 0)` (lltype.py:136) yields 0 on re-entry; hashing the Arc
+        // identity instead would diverge per allocation.
+        let fwd_a = ForwardReference::gc();
+        let s_a = StructType::gc(
+            "S",
+            vec![(
+                "next".into(),
+                LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::ForwardReference(fwd_a.clone()),
+                })),
+            )],
+        );
+        fwd_a.r#become(LowLevelType::Struct(Box::new(s_a))).unwrap();
+
+        let fwd_b = ForwardReference::gc();
+        let s_b = StructType::gc(
+            "S",
+            vec![(
+                "next".into(),
+                LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::ForwardReference(fwd_b.clone()),
+                })),
+            )],
+        );
+        fwd_b.r#become(LowLevelType::Struct(Box::new(s_b))).unwrap();
+
+        assert!(!Arc::ptr_eq(&fwd_a.target, &fwd_b.target));
+        let lhs = LowLevelType::ForwardReference(Box::new(fwd_a));
+        let rhs = LowLevelType::ForwardReference(Box::new(fwd_b));
+
+        let mut left_hasher = std::collections::hash_map::DefaultHasher::new();
+        lhs.hash(&mut left_hasher);
+        let mut right_hasher = std::collections::hash_map::DefaultHasher::new();
+        rhs.hash(&mut right_hasher);
+        assert_eq!(left_hasher.finish(), right_hasher.finish());
+    }
+
+    #[test]
+    fn cyclic_forward_reference_equality_short_circuits_to_true_on_re_entry() {
+        // Two distinct ForwardReferences fwd_a and fwd_b, each
+        // resolved to a Struct containing a Ptr looping back to
+        // itself. Comparing them recursively re-enters the same
+        // ForwardReference comparison; lltype.py:74
+        // `saferecursive(safe_equal, True)` short-circuits to True
+        // on re-entry so structurally identical cyclic types compare
+        // equal. Returning False there would propagate up through
+        // the Struct field comparison and report unequal.
+        let fwd_a = ForwardReference::gc();
+        let s_a = StructType::gc(
+            "S",
+            vec![(
+                "next".into(),
+                LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::ForwardReference(fwd_a.clone()),
+                })),
+            )],
+        );
+        fwd_a.r#become(LowLevelType::Struct(Box::new(s_a))).unwrap();
+
+        let fwd_b = ForwardReference::gc();
+        let s_b = StructType::gc(
+            "S",
+            vec![(
+                "next".into(),
+                LowLevelType::Ptr(Box::new(Ptr {
+                    TO: PtrTarget::ForwardReference(fwd_b.clone()),
+                })),
+            )],
+        );
+        fwd_b.r#become(LowLevelType::Struct(Box::new(s_b))).unwrap();
+
+        assert!(!Arc::ptr_eq(&fwd_a.target, &fwd_b.target));
+        let lhs = LowLevelType::ForwardReference(Box::new(fwd_a));
+        let rhs = LowLevelType::ForwardReference(Box::new(fwd_b));
+        assert_eq!(lhs, rhs);
     }
 
     #[test]

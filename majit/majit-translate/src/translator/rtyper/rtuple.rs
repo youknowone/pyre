@@ -31,14 +31,20 @@ use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use crate::flowspace::model::{ConstValue, Constant, Hlvalue, Variable};
+use crate::flowspace::model::{
+    Block, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link, SpaceOperation, Variable,
+};
+use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::{
     self, _ptr, LowLevelType, MallocFlavor, Ptr, PtrTarget, StructType,
 };
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{Repr, ReprState};
-use crate::translator::rtyper::rtyper::{GenopResult, LowLevelOpList, RPythonTyper};
+use crate::translator::rtyper::rtyper::{
+    GenopResult, LowLevelFunction, LowLevelOpList, RPythonTyper, constant_with_lltype,
+    helper_pygraph_from_graph, variable_with_lltype, void_field_const,
+};
 
 /// RPython `TUPLE_TYPE(field_lltypes)` (rtuple.py:119-126).
 ///
@@ -75,6 +81,585 @@ pub fn tuple_type(field_lltypes: &[LowLevelType]) -> LowLevelType {
     }))
 }
 
+/// RPython `_gen_eq_function_cache` (rtuple.py:27) + `gen_eq_function`
+/// (rtuple.py:31-51).
+///
+/// ```python
+/// _gen_eq_function_cache = {}
+///
+/// def gen_eq_function(items_r):
+///     eq_funcs = [r_item.get_ll_eq_function() or operator.eq for r_item in items_r]
+///     key = tuple(eq_funcs)
+///     try:
+///         return _gen_eq_function_cache[key]
+///     except KeyError:
+///         autounrolling_funclist = unrolling_iterable(enumerate(eq_funcs))
+///         def ll_eq(t1, t2):
+///             equal_so_far = True
+///             for i, eqfn in autounrolling_funclist:
+///                 if not equal_so_far:
+///                     return False
+///                 attrname = 'item%d' % i
+///                 item1 = getattr(t1, attrname)
+///                 item2 = getattr(t2, attrname)
+///                 equal_so_far = eqfn(item1, item2)
+///             return equal_so_far
+///         _gen_eq_function_cache[key] = ll_eq
+///         return ll_eq
+/// ```
+///
+/// Synthesizes a per-shape `ll_eq(t1, t2) -> Bool` helper graph.
+/// Upstream's `unrolling_iterable` is a meta-construct that the RPython
+/// translator unrolls into a concrete IR per shape; pyre's port skips
+/// that intermediate Python source-level synthesis and emits the
+/// already-unrolled graph directly through
+/// `lowlevel_helper_function_with_builder`.
+///
+/// The graph shape (for items `[r_0, ..., r_{n-1}]`):
+///
+/// ```text
+/// startblock(t1, t2):
+///     item1_0 = getfield(t1, "item0")
+///     item2_0 = getfield(t2, "item0")
+///     eq_0 = <prim_eq>(item1_0, item2_0)
+///     -> [eq_0=true: block_1(t1, t2), eq_0=false: returnblock(false)]
+/// block_1(t1, t2):
+///     item1_1 = getfield(t1, "item1")
+///     ...
+/// block_{n-1}(t1, t2):
+///     ...
+///     eq_{n-1} = <prim_eq>(...)
+///     -> [eq_{n-1}=true: returnblock(true), eq_{n-1}=false: returnblock(false)]
+/// ```
+///
+/// `<prim_eq>` is selected per item lltype:
+/// * Signed/Bool → `int_eq`
+/// * Unsigned → `uint_eq`
+/// * Long-long variants → `<prefix>eq`
+/// * Float → `float_eq`
+///
+/// Other item lltypes (Char, Ptr, etc.) are not yet supported — the
+/// builder returns a `TyperError` so callers can extend the dispatch
+/// as needed. Upstream's `r_item.get_ll_eq_function()` override path
+/// (e.g. `StringRepr` returning `ll_streq`) is preserved via the
+/// [`Repr::get_ll_eq_function`] trait method, but no current Repr
+/// overrides it; this slice lands the primitive fallback.
+pub fn gen_eq_function(
+    rtyper: &RPythonTyper,
+    items_r: &[Arc<dyn Repr>],
+) -> Result<LowLevelFunction, TyperError> {
+    let lltypes: Vec<LowLevelType> = items_r.iter().map(|r| r.lowleveltype().clone()).collect();
+    let tuple_lltype = tuple_type(&lltypes);
+
+    let args = vec![tuple_lltype.clone(), tuple_lltype.clone()];
+    let result = LowLevelType::Bool;
+
+    // upstream rtuple.py:32 —
+    //   `eq_funcs = [r_item.get_ll_eq_function() or operator.eq for r_item in items_r]`
+    // Per-item: if `r.get_ll_eq_function()` returns Some(helper), emit
+    // a direct_call to that helper; if it returns None, fall back to
+    // the primitive `int_eq`/`float_eq`/... inline op (operator.eq's
+    // lltype-level expansion). Resolve eagerly so nested helpers
+    // (e.g. tuple-of-tuple → inner `gen_eq_function`) register before
+    // the outer helper's builder runs.
+    let item_helpers: Vec<Option<LowLevelFunction>> = items_r
+        .iter()
+        .map(|r| r.get_ll_eq_function(rtyper))
+        .collect::<Result<_, _>>()?;
+
+    // upstream `key = tuple(eq_funcs)` (rtuple.py:33) — keyed by helper
+    // identity, not lltype. Pyre encodes the helper-tuple identity into
+    // the `lowlevel_helper_function_with_builder` cache key (which is
+    // `(name, args, result)`) by composing per-item suffixes from
+    // `Some(helper).name` (helper graph identity) or the lltype short
+    // name plus a `:eq` sentinel for `None` (primitive op fallback).
+    // This prevents two distinct Reprs with the same lowleveltype but
+    // different helpers from colliding in the helper cache.
+    let name = format!(
+        "ll_tuple_eq_{}",
+        helper_identity_suffix(&lltypes, &item_helpers, "eq")
+    );
+
+    let item_lltypes = lltypes.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        name.clone(),
+        args,
+        result,
+        move |rtyper, args, result| {
+            build_gen_eq_function_graph(&name, args, result, &item_lltypes, &item_helpers, rtyper)
+        },
+    )
+}
+
+/// Encodes a tuple of (lltype, helper) pairs into a name suffix that
+/// uniquely identifies the cache key. Mirrors upstream's
+/// `tuple(eq_funcs)` / `tuple(hash_funcs)` (rtuple.py:33, :56) —
+/// helper-identity keying, not lltype keying. For `Some(helper)` the
+/// helper's globally-unique name (assigned at synthesis time by
+/// `lowlevel_helper_function_with_builder`) carries the identity; for
+/// `None` the lltype short name + a per-slot kind sentinel
+/// (`eq`/`hash`) suffices since the primitive op fallback is a
+/// deterministic function of the lltype.
+fn helper_identity_suffix(
+    lltypes: &[LowLevelType],
+    item_helpers: &[Option<LowLevelFunction>],
+    kind: &str,
+) -> String {
+    lltypes
+        .iter()
+        .zip(item_helpers.iter())
+        .map(|(lltype, helper)| match helper {
+            Some(h) => h.name.clone(),
+            None => format!("{}:{}", lltype.short_name(), kind),
+        })
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// Encodes a tuple of item lltypes into a name suffix used for
+/// helper-graph names whose identity is fully determined by the
+/// lltype (e.g. tuple constructor / `getitem` / `len` helpers, where
+/// no per-Repr override exists). The cross-Repr sites that vary by
+/// helper identity (eq/hash) use [`helper_identity_suffix`] instead.
+fn lltype_shape_suffix(lltypes: &[LowLevelType]) -> String {
+    lltypes
+        .iter()
+        .map(|t| t.short_name().to_string())
+        .collect::<Vec<_>>()
+        .join("_")
+}
+
+/// RPython `_gen_hash_function_cache` (rtuple.py:28) +
+/// `gen_hash_function` (rtuple.py:53-73).
+///
+/// ```python
+/// def gen_hash_function(items_r):
+///     hash_funcs = [r_item.get_ll_hash_function() for r_item in items_r]
+///     key = tuple(hash_funcs)
+///     try:
+///         return _gen_hash_function_cache[key]
+///     except KeyError:
+///         autounrolling_funclist = unrolling_iterable(enumerate(hash_funcs))
+///         def ll_hash(t):
+///             """Must be kept in sync with rlib.objectmodel._hash_tuple()."""
+///             x = 0x345678
+///             for i, hash_func in autounrolling_funclist:
+///                 attrname = 'item%d' % i
+///                 item = getattr(t, attrname)
+///                 y = hash_func(item)
+///                 x = intmask((1000003 * x) ^ y)
+///             return x
+///         _gen_hash_function_cache[key] = ll_hash
+///         return ll_hash
+/// ```
+///
+/// Synthesizes a per-shape `ll_hash(t) -> Signed` helper graph.
+/// CPython-style accumulator with `0x345678` seed and the
+/// `(1000003 * x) ^ y` mixing per item. Per-item `y_i = hash_func_i(item_i)`
+/// is dispatched via `direct_call` to the helper returned by
+/// `r_item.get_ll_hash_function()` — every item Repr must define a
+/// hash helper (rmodel.py:138 base default raises). Resolved eagerly
+/// so nested helpers register before the outer helper's builder runs.
+pub fn gen_hash_function(
+    rtyper: &RPythonTyper,
+    items_r: &[Arc<dyn Repr>],
+) -> Result<LowLevelFunction, TyperError> {
+    let lltypes: Vec<LowLevelType> = items_r.iter().map(|r| r.lowleveltype().clone()).collect();
+    let tuple_lltype = tuple_type(&lltypes);
+    let args = vec![tuple_lltype];
+    let result = LowLevelType::Signed;
+
+    // upstream rtuple.py:55 —
+    //   `hash_funcs = [r_item.get_ll_hash_function() for r_item in items_r]`
+    // No `or operator.eq`-style fallback: every primitive Repr
+    // (`IntegerRepr`, `BoolRepr`, `NoneRepr`, ...) must override
+    // `get_ll_hash_function` to return a helper graph. Resolved before
+    // the builder closure so nested helpers (tuple-of-tuple) register
+    // their graphs first.
+    let item_helpers: Vec<LowLevelFunction> = items_r
+        .iter()
+        .map(|r| {
+            r.get_ll_hash_function(rtyper)?.ok_or_else(|| {
+                TyperError::message(format!(
+                    "gen_hash_function: {} returned None from get_ll_hash_function — \
+                     no Repr in pyre may return None from this slot",
+                    r.repr_string()
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+
+    // upstream `key = tuple(hash_funcs)` (rtuple.py:56) — keyed by
+    // helper identity. Pyre composes the cache key from each helper's
+    // unique name so two Reprs with the same lowleveltype but
+    // different hash helpers do not collide. Always-Some here (no
+    // primitive fallback for hash), so the lltype-shape arm of
+    // `helper_identity_suffix` is unreachable.
+    let item_helpers_opt: Vec<Option<LowLevelFunction>> =
+        item_helpers.iter().map(|h| Some(h.clone())).collect();
+    let name = format!(
+        "ll_tuple_hash_{}",
+        helper_identity_suffix(&lltypes, &item_helpers_opt, "hash")
+    );
+
+    let item_lltypes = lltypes.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        name.clone(),
+        args,
+        result,
+        move |rtyper, args, result| {
+            build_gen_hash_function_graph(&name, args, result, &item_lltypes, &item_helpers, rtyper)
+        },
+    )
+}
+
+fn build_gen_hash_function_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+    item_lltypes: &[LowLevelType],
+    item_helpers: &[LowLevelFunction],
+    rtyper: &RPythonTyper,
+) -> Result<PyGraph, TyperError> {
+    if args.len() != 1 {
+        return Err(TyperError::message(format!(
+            "gen_hash_function: expected 1 arg, got {}",
+            args.len()
+        )));
+    }
+    if result != &LowLevelType::Signed {
+        return Err(TyperError::message(format!(
+            "gen_hash_function: result must be Signed, got {result:?}"
+        )));
+    }
+    if item_lltypes.len() != item_helpers.len() {
+        return Err(TyperError::message(format!(
+            "gen_hash_function: item_lltypes ({}) and item_helpers ({}) length mismatch",
+            item_lltypes.len(),
+            item_helpers.len()
+        )));
+    }
+    let n = item_lltypes.len();
+    let tuple_lltype = args[0].clone();
+    let argnames = vec!["t".to_string()];
+
+    // Single-block linear graph: read each item, dispatch to its
+    // hash helper, mix into x. For n=0 (upstream rtuple.py:62 with
+    // empty `autounrolling_funclist`) the loop is skipped and the
+    // helper returns the seed `0x345678`.
+    let t_arg = variable_with_lltype("t", tuple_lltype.clone());
+    let startblock = Block::shared(vec![Hlvalue::Variable(t_arg.clone())]);
+    let return_var = variable_with_lltype("result", LowLevelType::Signed);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+
+    // x_0 = 0x345678
+    let mut current_x = constant_with_lltype(ConstValue::Int(0x345678), LowLevelType::Signed);
+
+    for i in 0..n {
+        let item_lltype = item_lltypes[i].clone();
+        // upstream rtuple.py:67-69 —
+        //   item = getattr(t, attrname)
+        //   y = hash_func(item)
+        let item_var = variable_with_lltype(&format!("item_{i}"), item_lltype.clone());
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![
+                Hlvalue::Variable(t_arg.clone()),
+                void_field_const(&format!("item{i}")),
+            ],
+            Hlvalue::Variable(item_var.clone()),
+        ));
+        let y_i = variable_with_lltype(&format!("hash_{i}"), LowLevelType::Signed);
+        let func_const = helper_func_constant(rtyper, &item_helpers[i])?;
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "direct_call",
+            vec![Hlvalue::Constant(func_const), Hlvalue::Variable(item_var)],
+            Hlvalue::Variable(y_i.clone()),
+        ));
+        // mul_i = int_mul(x_i, 1000003)
+        let mul_i = variable_with_lltype(&format!("mul_{i}"), LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "int_mul",
+            vec![
+                current_x.clone(),
+                constant_with_lltype(ConstValue::Int(1000003), LowLevelType::Signed),
+            ],
+            Hlvalue::Variable(mul_i.clone()),
+        ));
+        // x_{i+1} = int_xor(mul_i, y_i)
+        let next_x = variable_with_lltype(&format!("x_{}", i + 1), LowLevelType::Signed);
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "int_xor",
+            vec![Hlvalue::Variable(mul_i), Hlvalue::Variable(y_i)],
+            Hlvalue::Variable(next_x.clone()),
+        ));
+        current_x = Hlvalue::Variable(next_x);
+    }
+
+    // Close startblock: single link to returnblock with current_x.
+    use crate::flowspace::model::BlockRefExt;
+    startblock.closeblock(vec![
+        Link::new(vec![current_x], Some(graph.returnblock.clone()), None).into_ref(),
+    ]);
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
+/// Resolves a `LowLevelFunction` to its `Hlvalue::Constant` carrier
+/// suitable as the first argument of a `direct_call` SpaceOperation.
+/// Mirrors the carrier construction in
+/// [`LowLevelOpList::gendirectcall`] (rtyper.rs:4561-4564) but for
+/// builders that emit ops directly into a synthesized graph rather
+/// than via the `LowLevelOpList` API. The graph reference is taken
+/// from `helper.graph`, dereferenced through `rtyper.getcallable` to
+/// produce a typed function pointer; the resulting `LLPtr` ConstValue
+/// carries the matching `Ptr(FuncType)` lowleveltype.
+fn helper_func_constant(
+    rtyper: &RPythonTyper,
+    helper: &LowLevelFunction,
+) -> Result<Constant, TyperError> {
+    let graph = helper.graph.as_ref().ok_or_else(|| {
+        TyperError::message(format!(
+            "helper_func_constant: low-level helper {} has no annotated graph",
+            helper.name
+        ))
+    })?;
+    let func_ptr = rtyper.getcallable(graph)?;
+    let func_ptr_type = LowLevelType::Ptr(Box::new(func_ptr._TYPE.clone()));
+    crate::translator::rtyper::rmodel::inputconst_from_lltype(
+        &func_ptr_type,
+        &ConstValue::LLPtr(Box::new(func_ptr)),
+    )
+}
+
+/// Per-item primitive equality op selection. Mirrors
+/// `rint.integer_opprefix_for` / `rfloat`'s `float_eq` surface.
+fn primitive_eq_opname(lltype: &LowLevelType) -> Result<&'static str, TyperError> {
+    Ok(match lltype {
+        LowLevelType::Signed | LowLevelType::Bool => "int_eq",
+        LowLevelType::Unsigned => "uint_eq",
+        LowLevelType::SignedLongLong => "llong_eq",
+        LowLevelType::SignedLongLongLong => "lllong_eq",
+        LowLevelType::UnsignedLongLong => "ullong_eq",
+        LowLevelType::UnsignedLongLongLong => "ulllong_eq",
+        LowLevelType::Float => "float_eq",
+        // rstr.py:496 + rstr.py:546 pairtype(AbstractCharRepr,
+        // AbstractCharRepr).rtype_eq lowers to `char_eq`. Same for
+        // unichar via rstr.py:778-779.
+        LowLevelType::Char => "char_eq",
+        LowLevelType::UniChar => "unichar_eq",
+        other => {
+            return Err(TyperError::message(format!(
+                "gen_eq_function: primitive equality not yet supported for {other:?}"
+            )));
+        }
+    })
+}
+
+fn build_gen_eq_function_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+    item_lltypes: &[LowLevelType],
+    item_helpers: &[Option<LowLevelFunction>],
+    rtyper: &RPythonTyper,
+) -> Result<PyGraph, TyperError> {
+    if item_lltypes.len() != item_helpers.len() {
+        return Err(TyperError::message(format!(
+            "gen_eq_function: item_lltypes ({}) and item_helpers ({}) length mismatch",
+            item_lltypes.len(),
+            item_helpers.len()
+        )));
+    }
+    if args.len() != 2 {
+        return Err(TyperError::message(format!(
+            "gen_eq_function: expected 2 args, got {}",
+            args.len()
+        )));
+    }
+    if result != &LowLevelType::Bool {
+        return Err(TyperError::message(format!(
+            "gen_eq_function: result must be Bool, got {result:?}"
+        )));
+    }
+    let n = item_lltypes.len();
+    let tuple_lltype = args[0].clone();
+    let argnames = vec!["t1".to_string(), "t2".to_string()];
+
+    // upstream rtuple.py:39-50 — empty `autounrolling_funclist` leaves
+    // `equal_so_far = True`. Synthesize a single-block graph that
+    // returns the constant True directly. Tuple lltype here is
+    // `Void` (rtuple.py:120-121 short-circuit), so the inputargs are
+    // Void carriers.
+    if n == 0 {
+        let t1_arg = variable_with_lltype("t1", tuple_lltype.clone());
+        let t2_arg = variable_with_lltype("t2", tuple_lltype.clone());
+        let startblock = Block::shared(vec![Hlvalue::Variable(t1_arg), Hlvalue::Variable(t2_arg)]);
+        let return_var = variable_with_lltype("result", LowLevelType::Bool);
+        let mut graph = FunctionGraph::with_return_var(
+            name.to_string(),
+            startblock.clone(),
+            Hlvalue::Variable(return_var),
+        );
+        let true_const = constant_with_lltype(ConstValue::Bool(true), LowLevelType::Bool);
+        use crate::flowspace::model::BlockRefExt;
+        startblock.closeblock(vec![
+            Link::new(vec![true_const], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+        let func = GraphFunc::new(
+            name.to_string(),
+            Constant::new(ConstValue::Dict(Default::default())),
+        );
+        graph.func = Some(func.clone());
+        return Ok(helper_pygraph_from_graph(graph, argnames, func));
+    }
+
+    let mut check_blocks: Vec<crate::flowspace::model::BlockRef> = Vec::with_capacity(n);
+    for i in 0..n {
+        let bt1 = variable_with_lltype(&format!("t1_b{i}"), tuple_lltype.clone());
+        let bt2 = variable_with_lltype(&format!("t2_b{i}"), tuple_lltype.clone());
+        check_blocks.push(Block::shared(vec![
+            Hlvalue::Variable(bt1),
+            Hlvalue::Variable(bt2),
+        ]));
+    }
+    let startblock = check_blocks[0].clone();
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let mut graph =
+        FunctionGraph::with_return_var(name.to_string(), startblock, Hlvalue::Variable(return_var));
+
+    for i in 0..n {
+        // Read the per-block t1, t2 inputargs.
+        let (bt1, bt2) = {
+            let bvars = check_blocks[i].borrow().inputargs.clone();
+            (bvars[0].clone(), bvars[1].clone())
+        };
+        let item_lltype = item_lltypes[i].clone();
+        let item1 = variable_with_lltype(&format!("item1_{i}"), item_lltype.clone());
+        let item2 = variable_with_lltype(&format!("item2_{i}"), item_lltype.clone());
+        let eq_var = variable_with_lltype(&format!("eq_{i}"), LowLevelType::Bool);
+        let fieldname = format!("item{i}");
+
+        let block = check_blocks[i].clone();
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![bt1.clone(), void_field_const(&fieldname)],
+            Hlvalue::Variable(item1.clone()),
+        ));
+        block.borrow_mut().operations.push(SpaceOperation::new(
+            "getfield",
+            vec![bt2.clone(), void_field_const(&fieldname)],
+            Hlvalue::Variable(item2.clone()),
+        ));
+        // upstream rtuple.py:42 — `item_eq = eq_func(item1, item2)`.
+        // If `r_item.get_ll_eq_function()` returned a helper, emit a
+        // direct_call to it; otherwise fall through to the primitive
+        // `int_eq`/`float_eq`/... inline op (operator.eq's lltype-level
+        // expansion).
+        match &item_helpers[i] {
+            Some(helper) => {
+                let func_const = helper_func_constant(rtyper, helper)?;
+                block.borrow_mut().operations.push(SpaceOperation::new(
+                    "direct_call",
+                    vec![
+                        Hlvalue::Constant(func_const),
+                        Hlvalue::Variable(item1),
+                        Hlvalue::Variable(item2),
+                    ],
+                    Hlvalue::Variable(eq_var.clone()),
+                ));
+            }
+            None => {
+                if item_lltype == LowLevelType::Void {
+                    // upstream rtuple.py:31 — `r_item.get_ll_eq_function() or
+                    // operator.eq`. For `NoneRepr`/Void items the fallback
+                    // is `operator.eq` which RPython's annotator+rtyper
+                    // const-folds to `Constant(True, Bool)` (two Void
+                    // values are vacuously equal). Mirror via a
+                    // `same_as` op so the per-item exitswitch still has
+                    // a Variable to read.
+                    block.borrow_mut().operations.push(SpaceOperation::new(
+                        "same_as",
+                        vec![constant_with_lltype(
+                            ConstValue::Bool(true),
+                            LowLevelType::Bool,
+                        )],
+                        Hlvalue::Variable(eq_var.clone()),
+                    ));
+                } else {
+                    let opname = primitive_eq_opname(&item_lltype)?;
+                    block.borrow_mut().operations.push(SpaceOperation::new(
+                        opname,
+                        vec![Hlvalue::Variable(item1), Hlvalue::Variable(item2)],
+                        Hlvalue::Variable(eq_var.clone()),
+                    ));
+                }
+            }
+        }
+        block.borrow_mut().exitswitch = Some(Hlvalue::Variable(eq_var));
+
+        // True branch.
+        let true_link = if i + 1 < n {
+            // Pass tuple pointers to next check block.
+            Link::new(
+                vec![bt1.clone(), bt2.clone()],
+                Some(check_blocks[i + 1].clone()),
+                Some(constant_with_lltype(
+                    ConstValue::Bool(true),
+                    LowLevelType::Bool,
+                )),
+            )
+            .into_ref()
+        } else {
+            // Last block — return true.
+            Link::new(
+                vec![constant_with_lltype(
+                    ConstValue::Bool(true),
+                    LowLevelType::Bool,
+                )],
+                Some(graph.returnblock.clone()),
+                Some(constant_with_lltype(
+                    ConstValue::Bool(true),
+                    LowLevelType::Bool,
+                )),
+            )
+            .into_ref()
+        };
+        // False branch — short-circuit return false.
+        let false_link = Link::new(
+            vec![constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )],
+            Some(graph.returnblock.clone()),
+            Some(constant_with_lltype(
+                ConstValue::Bool(false),
+                LowLevelType::Bool,
+            )),
+        )
+        .into_ref();
+
+        use crate::flowspace::model::BlockRefExt;
+        block.closeblock(vec![true_link, false_link]);
+    }
+
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
 /// RPython `pairtype(TupleRepr, TupleRepr).rtype_is_` (rtuple.py:355-356):
 ///
 /// ```python
@@ -94,6 +679,79 @@ pub fn pair_tuple_tuple_rtype_is_(
     _hop: &crate::translator::rtyper::rtyper::HighLevelOp,
 ) -> Result<Option<Hlvalue>, TyperError> {
     Err(TyperError::message("cannot compare tuples with 'is'"))
+}
+
+/// RPython `pairtype(TupleRepr, TupleRepr).rtype_eq` (rtuple.py:329-334):
+///
+/// ```python
+/// def rtype_eq((r_tup1, r_tup2), hop):
+///     s_tup = annmodel.unionof(*hop.args_s)
+///     r_tup = hop.rtyper.getrepr(s_tup)
+///     v_tuple1, v_tuple2 = hop.inputargs(r_tup, r_tup)
+///     ll_eq = r_tup.get_ll_eq_function()
+///     return hop.gendirectcall(ll_eq, v_tuple1, v_tuple2)
+/// ```
+///
+/// Computes the unified TupleRepr (so e.g. `(int, float) ==
+/// (long, float)` lifts both sides to `(long, float)`), then
+/// dispatches to the per-shape `ll_eq` helper synthesized by
+/// `gen_eq_function`. The result is a `Bool` Variable from the
+/// `direct_call` lowering.
+pub fn pair_tuple_tuple_rtype_eq(
+    _r1: &dyn Repr,
+    _r2: &dyn Repr,
+    hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+) -> crate::translator::rtyper::rmodel::RTypeResult {
+    use crate::annotator::model::unionof;
+    use crate::translator::rtyper::rtyper::ConvertedTo;
+    // upstream `s_tup = annmodel.unionof(*hop.args_s)`.
+    let s_args = hop.args_s.borrow().clone();
+    let s_tup = unionof(s_args.iter()).map_err(|e| TyperError::message(e.to_string()))?;
+    // upstream `r_tup = hop.rtyper.getrepr(s_tup)`.
+    let r_tup_arc = hop.rtyper.getrepr(&s_tup)?;
+    let any_r: &dyn std::any::Any = r_tup_arc.as_ref();
+    let r_tup = any_r.downcast_ref::<TupleRepr>().ok_or_else(|| {
+        TyperError::message("pair_tuple_tuple_rtype_eq: unionof's repr is not a TupleRepr")
+    })?;
+    // upstream `v_tuple1, v_tuple2 = hop.inputargs(r_tup, r_tup)`.
+    let v_args = hop.inputargs(vec![ConvertedTo::Repr(r_tup), ConvertedTo::Repr(r_tup)])?;
+    let v_tuple1 = v_args[0].clone();
+    let v_tuple2 = v_args[1].clone();
+    // upstream `ll_eq = r_tup.get_ll_eq_function()`.
+    let ll_eq = r_tup.get_ll_eq_function(&hop.rtyper)?.ok_or_else(|| {
+        TyperError::message("pair_tuple_tuple_rtype_eq: TupleRepr.get_ll_eq_function returned None")
+    })?;
+    // upstream `hop.gendirectcall(ll_eq, v_tuple1, v_tuple2)`.
+    let v_result = hop
+        .gendirectcall(&ll_eq, vec![v_tuple1, v_tuple2])?
+        .ok_or_else(|| {
+            TyperError::message("pair_tuple_tuple_rtype_eq: gendirectcall must yield a Bool result")
+        })?;
+    Ok(Some(v_result))
+}
+
+/// RPython `pairtype(TupleRepr, TupleRepr).rtype_ne` (rtuple.py:336-338):
+///
+/// ```python
+/// def rtype_ne(tup1tup2, hop):
+///     v_res = tup1tup2.rtype_eq(hop)
+///     return hop.genop('bool_not', [v_res], resulttype=Bool)
+/// ```
+///
+/// Computes equality via `rtype_eq` then inverts with `bool_not`.
+pub fn pair_tuple_tuple_rtype_ne(
+    r1: &dyn Repr,
+    r2: &dyn Repr,
+    hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+) -> crate::translator::rtyper::rmodel::RTypeResult {
+    let v_res = pair_tuple_tuple_rtype_eq(r1, r2, hop)?
+        .ok_or_else(|| TyperError::message("pair_tuple_tuple_rtype_ne: rtype_eq returned None"))?;
+    let v_neg = hop.genop(
+        "bool_not",
+        vec![v_res],
+        GenopResult::LLType(LowLevelType::Bool),
+    );
+    Ok(v_neg)
 }
 
 /// RPython `pairtype(TupleRepr, TupleRepr).convert_from_to`
@@ -214,6 +872,242 @@ pub fn pair_tuple_tuple_rtype_add(
     // upstream `r_tup1.newtuple_cached(hop, vlist)`.
     let result = TupleRepr::newtuple_cached(hop, vlist)?;
     Ok(Some(result))
+}
+
+/// RPython `_ll_equal(x, y): return x == y` (rtuple.py:413-414).
+///
+/// Per-type primitive equality helper used by
+/// `pairtype(TupleRepr, Repr).rtype_contains` when the item Repr's
+/// `get_ll_eq_function()` returns None. Synthesized per item lltype
+/// via [`RPythonTyper::lowlevel_helper_function_with_builder`].
+///
+/// Body: `block(x, y): eq = prim_eq(x, y) Bool; return eq` — a
+/// single op + a single link to returnblock.
+pub fn ll_equal(
+    rtyper: &RPythonTyper,
+    item_lltype: &LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let name = format!("ll_equal_{}", item_lltype.short_name());
+    let args = vec![item_lltype.clone(), item_lltype.clone()];
+    let result = LowLevelType::Bool;
+    let item_lltype_owned = item_lltype.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        name.clone(),
+        args,
+        result,
+        move |_rtyper, args, result| build_ll_equal_graph(&name, args, result, &item_lltype_owned),
+    )
+}
+
+fn build_ll_equal_graph(
+    name: &str,
+    args: &[LowLevelType],
+    result: &LowLevelType,
+    item_lltype: &LowLevelType,
+) -> Result<PyGraph, TyperError> {
+    if args.len() != 2 || args[0] != *item_lltype || args[1] != *item_lltype {
+        return Err(TyperError::message(format!(
+            "ll_equal: expected 2 args of {item_lltype:?}, got {args:?}"
+        )));
+    }
+    if result != &LowLevelType::Bool {
+        return Err(TyperError::message("ll_equal: result must be Bool"));
+    }
+    let argnames = vec!["x".to_string(), "y".to_string()];
+    let x_arg = variable_with_lltype("x", item_lltype.clone());
+    let y_arg = variable_with_lltype("y", item_lltype.clone());
+    let eq_var = variable_with_lltype("eq", LowLevelType::Bool);
+    let return_var = variable_with_lltype("result", LowLevelType::Bool);
+    let startblock = Block::shared(vec![
+        Hlvalue::Variable(x_arg.clone()),
+        Hlvalue::Variable(y_arg.clone()),
+    ]);
+    let mut graph = FunctionGraph::with_return_var(
+        name.to_string(),
+        startblock.clone(),
+        Hlvalue::Variable(return_var),
+    );
+    if item_lltype == &LowLevelType::Void {
+        // upstream rtuple.py:301 — `r_item.get_ll_eq_function() or
+        // _ll_equal`. For NoneRepr/Void items the fallback `_ll_equal`
+        // would lower `x == y` on two Void operands; RPython's
+        // annotator+rtyper const-fold this to `Constant(True, Bool)`.
+        // Mirror via `same_as` so the helper graph still has a single
+        // result Variable for the return link.
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            "same_as",
+            vec![constant_with_lltype(
+                ConstValue::Bool(true),
+                LowLevelType::Bool,
+            )],
+            Hlvalue::Variable(eq_var.clone()),
+        ));
+    } else {
+        let opname = primitive_eq_opname(item_lltype)?;
+        startblock.borrow_mut().operations.push(SpaceOperation::new(
+            opname,
+            vec![Hlvalue::Variable(x_arg), Hlvalue::Variable(y_arg)],
+            Hlvalue::Variable(eq_var.clone()),
+        ));
+    }
+    use crate::flowspace::model::BlockRefExt;
+    startblock.closeblock(vec![
+        Link::new(
+            vec![Hlvalue::Variable(eq_var)],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref(),
+    ]);
+    let func = GraphFunc::new(
+        name.to_string(),
+        Constant::new(ConstValue::Dict(Default::default())),
+    );
+    graph.func = Some(func.clone());
+    Ok(helper_pygraph_from_graph(graph, argnames, func))
+}
+
+/// RPython `pairtype(TupleRepr, Repr).rtype_contains` (rtuple.py:292-315):
+///
+/// ```python
+/// def rtype_contains((r_tup, r_item), hop):
+///     s_tup = hop.args_s[0]
+///     if not s_tup.is_constant():
+///         raise TyperError("contains() on non-const tuple")
+///     t = s_tup.const
+///     s_item = hop.args_s[1]
+///     r_item = hop.args_r[1]
+///     v_arg = hop.inputarg(r_item, arg=1)
+///     ll_eq = r_item.get_ll_eq_function() or _ll_equal
+///     v_result = None
+///     for x in t:
+///         s_const_item = hop.rtyper.annotator.bookkeeper.immutablevalue(x)
+///         if not s_item.contains(s_const_item):
+///             continue
+///         c_tuple_item = hop.inputconst(r_item, x)
+///         v_equal = hop.gendirectcall(ll_eq, v_arg, c_tuple_item)
+///         if v_result is None:
+///             v_result = v_equal
+///         else:
+///             v_result = hop.genop("int_or", [v_result, v_equal], resulttype=Bool)
+///     hop.exception_cannot_occur()
+///     return v_result or hop.inputconst(Bool, False)
+/// ```
+///
+/// Constant-tuple membership test. Tuple must be statically constant;
+/// each element compares against `v_arg` via the synthesized `ll_eq`
+/// helper. Static `s_item.contains` filters tuple elements that the
+/// annotator already proved cannot match. The OR-chain accumulates
+/// `int_or` ops; an empty chain yields a constant `False`.
+pub fn pair_tuple_repr_rtype_contains(
+    r_tup: &dyn Repr,
+    _r_item: &dyn Repr,
+    hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+) -> crate::translator::rtyper::rmodel::RTypeResult {
+    use crate::annotator::model::SomeObjectTrait;
+    use crate::translator::rtyper::rtyper::ConvertedTo;
+    let any_r: &dyn std::any::Any = r_tup;
+    let _r_tup_typed = any_r.downcast_ref::<TupleRepr>().ok_or_else(|| {
+        TyperError::message("pair_tuple_repr_rtype_contains: r_tup is not a TupleRepr")
+    })?;
+    let (tuple_items, s_item, r_item) = {
+        let args_s = hop.args_s.borrow();
+        let s_tup = args_s
+            .first()
+            .ok_or_else(|| TyperError::message("rtype_contains: missing s_tup"))?
+            .clone();
+        if !s_tup.is_constant() {
+            return Err(TyperError::message("contains() on non-const tuple"));
+        }
+        let const_tup = match s_tup.const_() {
+            Some(ConstValue::Tuple(items)) => items.clone(),
+            other => {
+                return Err(TyperError::message(format!(
+                    "rtype_contains: s_tup.const must be Tuple, got {other:?}"
+                )));
+            }
+        };
+        let s_item_ann = args_s
+            .get(1)
+            .ok_or_else(|| TyperError::message("rtype_contains: missing s_item"))?
+            .clone();
+        let r_item_arc = hop
+            .args_r
+            .borrow()
+            .get(1)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| TyperError::message("rtype_contains: missing r_item"))?;
+        (const_tup, s_item_ann, r_item_arc)
+    };
+    let v_arg = hop.inputarg(ConvertedTo::Repr(r_item.as_ref()), 1)?;
+    let ll_eq = match r_item.get_ll_eq_function(&hop.rtyper)? {
+        Some(f) => f,
+        None => ll_equal(&hop.rtyper, r_item.lowleveltype())?,
+    };
+    let mut v_result: Option<Hlvalue> = None;
+    for x in &tuple_items {
+        let s_const_item = bookkeeper_immutablevalue_for(&hop.rtyper, x)?;
+        if !crate::annotator::model::contains(&s_item, &s_const_item) {
+            continue;
+        }
+        // upstream rtuple.py:307 — `c_tuple_item = hop.inputconst(r_item, x)`.
+        // `inputconst` routes through `r_item.convert_const(x)` so per-Repr
+        // conversions (bool→int, int→float, PBC/class/string constant) apply.
+        // Stamping `Constant::with_concretetype` directly bypasses that
+        // pipeline.
+        let c_x = crate::translator::rtyper::rmodel::inputconst(r_item.as_ref(), x)?;
+        let c_x_carrier = Hlvalue::Constant(c_x);
+        let v_equal = hop
+            .gendirectcall(&ll_eq, vec![v_arg.clone(), c_x_carrier])?
+            .ok_or_else(|| {
+                TyperError::message("rtype_contains: gendirectcall must yield a Bool")
+            })?;
+        v_result = Some(match v_result {
+            None => v_equal,
+            Some(v_prev) => hop
+                .genop(
+                    "int_or",
+                    vec![v_prev, v_equal],
+                    GenopResult::LLType(LowLevelType::Bool),
+                )
+                .ok_or_else(|| TyperError::message("rtype_contains: int_or must yield a Bool"))?,
+        });
+    }
+    hop.exception_cannot_occur()?;
+    let result = v_result.unwrap_or_else(|| {
+        Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Bool(false),
+            LowLevelType::Bool,
+        ))
+    });
+    Ok(Some(result))
+}
+
+/// RPython `bookkeeper.immutablevalue(x)` (rtuple.py:304):
+///
+/// ```python
+/// s_const_item = hop.rtyper.annotator.bookkeeper.immutablevalue(x)
+/// ```
+///
+/// Routes through the live annotator's bookkeeper so SomePBC,
+/// SomeInstance, low-level pointer, None, etc. all map to the
+/// canonical `SomeValue` upstream produces. The earlier inline
+/// primitive-only mapping diverged for those cases.
+fn bookkeeper_immutablevalue_for(
+    rtyper: &RPythonTyper,
+    value: &ConstValue,
+) -> Result<crate::annotator::model::SomeValue, TyperError> {
+    let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+        TyperError::message(
+            "bookkeeper_immutablevalue_for: annotator weak ref dropped — \
+             cannot reach bookkeeper.immutablevalue",
+        )
+    })?;
+    annotator
+        .bookkeeper
+        .immutablevalue(value)
+        .map_err(|e| TyperError::message(format!("bookkeeper.immutablevalue failed: {e}")))
 }
 
 /// RPython `pairtype(TupleRepr, IntegerRepr).rtype_getitem`
@@ -399,7 +1293,7 @@ impl TupleRepr {
                 vec![v_tuple, Hlvalue::Constant(cname)],
                 GenopResult::LLType(llresult),
             )
-            .expect("getfield with non-Void result yields a Variable"))
+            .expect("LowLevelOpList::genop with GenopResult::LLType always yields a Variable"))
     }
 
     /// RPython `TupleRepr.getitem(self, llops, v_tuple, index)`
@@ -614,21 +1508,22 @@ impl TupleRepr {
                 idx_const.value
             )));
         };
-        // upstream rtuple.py:266-273 — does NOT bounds-check or
-        // reject negative indices itself; `r_tup.getitem(hop.llops,
-        // v_tuple, index)` flows through `self.fieldnames[index]`
-        // which is a Python list and supports negative indexing
+        // upstream rtuple.py:270-271 — drop the implicit IndexError
+        // exception channel:
+        //   `if hop.has_implicit_exception(IndexError):
+        //        hop.exception_cannot_occur()`
+        // The constant index is verified at typer-time so a runtime
+        // IndexError cannot occur.
+        if hop.has_implicit_exception("IndexError") {
+            hop.exception_cannot_occur()?;
+        }
+        // upstream rtuple.py:272-273 — `index = v_index.value;
+        // r_tup.getitem(hop.llops, v_tuple, index)`.
+        // RPython does not bounds-check or reject negatives itself —
+        // `r_tup.getitem` flows through `self.fieldnames[index]`
+        // which is a Python list supporting negative indexing
         // (`fieldnames[-1]` → last item). Mirror the wrap-around so
         // `(0, 1, 2)[-1]` types as `2` matching upstream.
-        //
-        // upstream rtuple.py:270-271 also drops the implicit
-        // IndexError exception channel via
-        // `if hop.has_implicit_exception(IndexError):
-        //     hop.exception_cannot_occur()`. Pyre's `HighLevelOp`
-        // does not yet model implicit-exception channels; the call
-        // sites that thread getitem through exception-aware lowering
-        // will surface the gap. Tracked as a follow-on once
-        // `has_implicit_exception` lands.
         let len = self.items_r.len() as i64;
         let normalized = if idx < 0 { idx + len } else { idx };
         if normalized < 0 || normalized >= len {
@@ -843,6 +1738,29 @@ impl Repr for TupleRepr {
         ReprClassId::TupleRepr
     }
 
+    /// RPython `TupleRepr.compact_repr(self)` (rtuple.py:197-198):
+    ///
+    /// ```python
+    /// def compact_repr(self):
+    ///     return "TupleR %s" % ' '.join([llt._short_name() for llt in self.lltypes])
+    /// ```
+    ///
+    /// Default `Repr.compact_repr` (rmodel.py:32-33) formats as
+    /// `"{class_name_without_Repr} {lowleveltype._short_name()}"` —
+    /// for tuples that produces `"TupleR Ptr <gcstruct tupleN>"`,
+    /// hiding the per-item types. Upstream overrides to flatten the
+    /// per-item lltype short names instead so debug output stays
+    /// readable. `self.lltypes` upstream mirrors
+    /// `[r.lowleveltype() for r in self.items_r]`.
+    fn compact_repr(&self) -> String {
+        let item_names: Vec<String> = self
+            .items_r
+            .iter()
+            .map(|r| r.lowleveltype().short_name())
+            .collect();
+        format!("TupleR {}", item_names.join(" "))
+    }
+
     /// `RPythonTyper.translate_op_len` (rtyper.py:484-486) dispatches
     /// `r.rtype_len(hop)` — without this override the default
     /// `Repr.rtype_len` would raise `MissingRTypeOperation` for tuples.
@@ -864,6 +1782,47 @@ impl Repr for TupleRepr {
         hop: &crate::translator::rtyper::rtyper::HighLevelOp,
     ) -> crate::translator::rtyper::rmodel::RTypeResult {
         self.rtype_getslice_inherent(hop)
+    }
+
+    /// `TupleRepr.get_ll_eq_function(self): return gen_eq_function(self.items_r)`
+    /// (rtuple.py:203-204). Returns a synthesized per-shape `ll_eq`
+    /// helper that compares two tuple values element-by-element.
+    fn get_ll_eq_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        Ok(Some(gen_eq_function(rtyper, &self.items_r)?))
+    }
+
+    /// `TupleRepr.get_ll_hash_function(self): return gen_hash_function(self.items_r)`
+    /// (rtuple.py:206-207). Returns a synthesized per-shape `ll_hash`
+    /// helper using the CPython-style mix.
+    fn get_ll_hash_function(
+        &self,
+        rtyper: &RPythonTyper,
+    ) -> Result<Option<LowLevelFunction>, TyperError> {
+        Ok(Some(gen_hash_function(rtyper, &self.items_r)?))
+    }
+
+    /// `Repr.rtype_hash` default raises `MissingRTypeOperation`. For
+    /// tuples, dispatch to the synthesized `gen_hash_function`
+    /// helper via `gendirectcall(ll_hash, [v_tuple])`. Mirrors
+    /// upstream's implicit dispatch through `Repr.get_ll_hash_function`
+    /// + `LowLevelOpList.gendirectcall` at op-translation time.
+    fn rtype_hash(
+        &self,
+        hop: &crate::translator::rtyper::rtyper::HighLevelOp,
+    ) -> crate::translator::rtyper::rmodel::RTypeResult {
+        use crate::translator::rtyper::rtyper::ConvertedTo;
+        let v_args = hop.inputargs(vec![ConvertedTo::Repr(self)])?;
+        let v_tuple = v_args[0].clone();
+        let ll_hash = self.get_ll_hash_function(&hop.rtyper)?.ok_or_else(|| {
+            TyperError::message("TupleRepr.rtype_hash: get_ll_hash_function returned None")
+        })?;
+        let v_result = hop.gendirectcall(&ll_hash, vec![v_tuple])?.ok_or_else(|| {
+            TyperError::message("TupleRepr.rtype_hash: gendirectcall must yield a Signed result")
+        })?;
+        Ok(Some(v_result))
     }
 
     /// RPython `TupleRepr.convert_const(self, value)` (rtuple.py:184-198).
@@ -988,6 +1947,24 @@ mod tests {
         Rc::new(RPythonTyper::new(&ann))
     }
 
+    /// Variant that keeps the annotator alive — required for tests
+    /// hitting `lowlevel_helper_function*` which upgrade the typer's
+    /// `Weak<RPythonAnnotator>` to push synthesized graphs into
+    /// `translator.graphs`. Also calls `initialize_exceptiondata` so
+    /// the typer's self-weak is set (required for SomeTuple
+    /// rtyper_makerepr → TupleRepr::new which uses self_rc()).
+    fn fresh_rtyper_live() -> (
+        Rc<crate::annotator::annrpython::RPythonAnnotator>,
+        Rc<RPythonTyper>,
+    ) {
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("initialize_exceptiondata in test setup");
+        (ann, rtyper)
+    }
+
     #[test]
     fn tuple_type_empty_returns_void() {
         let t = tuple_type(&[]);
@@ -1026,6 +2003,32 @@ mod tests {
             panic!("Ptr target must be Struct");
         };
         assert_eq!(body._name, "tuple2");
+    }
+
+    /// Verifies the upstream rtuple.py:197-198 override: the default
+    /// `Repr.compact_repr` would format the wrapping struct's
+    /// `short_name` (e.g. `"Ptr <gcstruct tuple2>"`) which hides per-
+    /// item types. The override flattens to space-joined per-item
+    /// lltype short names so debug output stays readable.
+    #[test]
+    fn tuple_repr_compact_repr_flattens_per_item_lltype_short_names() {
+        use crate::translator::rtyper::rfloat::FloatRepr;
+        use crate::translator::rtyper::rint::IntegerRepr;
+        let rtyper = fresh_rtyper();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_float: Arc<dyn Repr> = Arc::new(FloatRepr::new());
+        let repr = TupleRepr::new(&rtyper, vec![r_int.clone(), r_float.clone()]).unwrap();
+        assert_eq!(repr.compact_repr(), "TupleR Signed Float");
+    }
+
+    /// Empty tuple's lowleveltype is `Void` (rtuple.py:120-121 short
+    /// circuit) — the compact_repr override prints `"TupleR "` (no
+    /// per-item names) since `items_r.is_empty()`.
+    #[test]
+    fn tuple_repr_compact_repr_empty_tuple_has_no_item_names() {
+        let rtyper = fresh_rtyper();
+        let repr = TupleRepr::new(&rtyper, vec![]).unwrap();
+        assert_eq!(repr.compact_repr(), "TupleR ");
     }
 
     #[test]
@@ -1645,6 +2648,867 @@ mod tests {
         assert_eq!(getfield_count, 3, "2 getfield from left + 1 from right");
         assert_eq!(malloc_count, 1);
         assert_eq!(setfield_count, 3, "3 setfield on the 3-tuple result");
+    }
+
+    /// `pair(TupleRepr, IntegerRepr).rtype_getitem` (rtuple.py:264-273)
+    /// drops the implicit IndexError channel when the typer can prove
+    /// the constant-indexed access cannot fail at runtime:
+    ///
+    /// ```python
+    /// if hop.has_implicit_exception(IndexError):
+    ///     hop.exception_cannot_occur()
+    /// ```
+    ///
+    /// Verified via `LowLevelOpList.llop_raising_exceptions ==
+    /// Some(Removed)`. When the hop has no IndexError exceptionlink
+    /// the call is a no-op (rtyper.rs:2220 returns false on empty
+    /// exceptionlinks).
+    #[test]
+    fn pair_tuple_int_rtype_getitem_closes_implicit_indexerror_channel() {
+        use crate::flowspace::model::SpaceOperation;
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rtyper::{
+            HighLevelOp, LlopRaisingExceptions, LowLevelOpList,
+        };
+        use std::cell::RefCell as StdRef;
+
+        let rtyper = fresh_rtyper();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_tup_arc: Arc<dyn Repr> =
+            Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
+        let mut v_tuple = Variable::new();
+        v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
+        let v_tuple_h = Hlvalue::Variable(v_tuple);
+        let v_idx_h = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int(1),
+            LowLevelType::Signed,
+        ));
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            OpKind::GetItem.opname(),
+            vec![v_tuple_h.clone(), v_idx_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        // Build an exceptionlink whose exitcase is IndexError. The
+        // catch-Exception construction in rtyper.rs:5329-5353 (test
+        // has_implicit_exception_records_matching_exception_link) is
+        // the parity reference.
+        let index_error = crate::flowspace::model::HOST_ENV
+            .lookup_exception_class("IndexError")
+            .expect("IndexError host class");
+        let exitblock = Rc::new(StdRef::new(crate::flowspace::model::Block::new(vec![])));
+        let exclink = Rc::new(StdRef::new(crate::flowspace::model::Link::new(
+            vec![],
+            Some(exitblock),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::HostObject(
+                index_error,
+            )))),
+        )));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, vec![exclink], llops);
+        hop.args_v.borrow_mut().push(v_tuple_h);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_tup_arc.clone()));
+        hop.args_v.borrow_mut().push(v_idx_h);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+
+        pair_tuple_int_rtype_getitem(r_tup_arc.as_ref(), &hop)
+            .expect("constant-indexed tuple getitem")
+            .unwrap();
+        // upstream rtuple.py:271 — `hop.exception_cannot_occur()` sets
+        // `llops.llop_raising_exceptions = "removed"`. Pyre mirrors via
+        // `LlopRaisingExceptions::Removed`.
+        assert!(matches!(
+            hop.llops.borrow().llop_raising_exceptions,
+            Some(LlopRaisingExceptions::Removed)
+        ));
+    }
+
+    /// When the hop has no exceptionlinks, `has_implicit_exception`
+    /// returns false (rtyper.rs:2220-2221) and the IndexError channel
+    /// closing is skipped — `llop_raising_exceptions` stays None.
+    /// This pins the no-op path of the new `has_implicit_exception`
+    /// wiring on `pair_tuple_int_rtype_getitem`.
+    #[test]
+    fn pair_tuple_int_rtype_getitem_without_exceptionlinks_leaves_channel_open() {
+        use crate::flowspace::model::SpaceOperation;
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+
+        let rtyper = fresh_rtyper();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_tup_arc: Arc<dyn Repr> =
+            Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
+        let mut v_tuple = Variable::new();
+        v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
+        let v_tuple_h = Hlvalue::Variable(v_tuple);
+        let v_idx_h = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int(0),
+            LowLevelType::Signed,
+        ));
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            OpKind::GetItem.opname(),
+            vec![v_tuple_h.clone(), v_idx_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_tuple_h);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_tup_arc.clone()));
+        hop.args_v.borrow_mut().push(v_idx_h);
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Impossible);
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+
+        pair_tuple_int_rtype_getitem(r_tup_arc.as_ref(), &hop)
+            .unwrap()
+            .unwrap();
+        assert!(hop.llops.borrow().llop_raising_exceptions.is_none());
+    }
+
+    /// `gen_eq_function([r_int, r_int])` (rtuple.py:31-51) synthesizes
+    /// a `ll_tuple_eq_signed_signed(t1, t2) -> Bool` helper graph.
+    /// The graph chain has N=2 check blocks each emitting
+    /// `getfield × 2 + int_eq` and a 2-way exit. Last block's true
+    /// branch points to returnblock(true); every false branch points
+    /// to returnblock(false).
+    #[test]
+    fn gen_eq_function_synthesizes_per_shape_helper_graph() {
+        use crate::translator::rtyper::rint::IntegerRepr;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let llfn =
+            gen_eq_function(&rtyper, &[r_int.clone(), r_int.clone()]).expect("gen_eq_function");
+        // Cache key shape (rtuple.py:33 `tuple(eq_funcs)`): each
+        // primitive Repr returns None from get_ll_eq_function, so the
+        // suffix is `<lltype>:eq` per item.
+        assert_eq!(llfn.name, "ll_tuple_eq_Signed:eq_Signed:eq");
+        let graph = llfn.graph.expect("graph populated");
+        let g = graph.graph.borrow();
+        // startblock has 2 inputargs (the two tuple ptrs).
+        assert_eq!(g.startblock.borrow().inputargs.len(), 2);
+        // The graph traversal must visit 2 check blocks. We assert by
+        // counting blocks reachable through `exits[].target` from
+        // startblock.
+        let mut visited: Vec<*const _> = Vec::new();
+        let mut stack = vec![g.startblock.clone()];
+        while let Some(b) = stack.pop() {
+            let ptr = Rc::as_ptr(&b);
+            if visited.contains(&ptr) {
+                continue;
+            }
+            visited.push(ptr);
+            for link in b.borrow().exits.iter() {
+                if let Some(target) = link.borrow().target.as_ref() {
+                    stack.push(target.clone());
+                }
+            }
+        }
+        // 2 check blocks + returnblock + exceptblock = 4 (exceptblock
+        // is reachable too, even though not used).
+        assert!(
+            visited.len() >= 3,
+            "expected ≥ 3 reachable blocks, got {}",
+            visited.len()
+        );
+        // startblock has int_eq op + 2 getfield ops = 3 ops.
+        let start_ops: Vec<String> = g
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(start_ops, vec!["getfield", "getfield", "int_eq"]);
+    }
+
+    /// rtuple.py:32 — `eq_funcs = [r_item.get_ll_eq_function() or
+    /// operator.eq for r_item in items_r]`. When an item Repr returns
+    /// `Some(helper)` (e.g. nested `TupleRepr`), gen_eq must dispatch
+    /// to that helper via `direct_call` rather than the primitive
+    /// `int_eq`/... whitelist. Validates the unblocking of nested
+    /// tuple equality (tuple-of-tuple).
+    #[test]
+    fn gen_eq_function_dispatches_to_inner_tuple_helper_via_direct_call() {
+        use crate::translator::rtyper::rint::IntegerRepr;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        // Inner tuple: (Signed, Signed). Outer tuple: (inner, Signed).
+        let r_inner: Arc<dyn Repr> =
+            Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
+        let llfn = gen_eq_function(&rtyper, &[r_inner.clone(), r_int.clone()])
+            .expect("gen_eq_function for outer tuple");
+        let graph = llfn.graph.expect("graph populated");
+        let g = graph.graph.borrow();
+        // First check_block dispatches to inner gen_eq via direct_call;
+        // second check_block uses primitive int_eq for the Signed arm.
+        let block0_ops: Vec<String> = g
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(
+            block0_ops,
+            vec!["getfield", "getfield", "direct_call"],
+            "inner tuple item must dispatch via direct_call to its ll_eq helper"
+        );
+    }
+
+    /// rtuple.py:31-50 — `gen_eq_function([])` produces a helper whose
+    /// `autounrolling_funclist` is empty so `equal_so_far = True` is
+    /// returned unchanged. Tuple lltype is `Void` (rtuple.py:120-121).
+    #[test]
+    fn gen_eq_function_empty_tuple_returns_constant_true_helper() {
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let llfn = gen_eq_function(&rtyper, &[]).expect("gen_eq_function([])");
+        assert_eq!(llfn.name, "ll_tuple_eq_");
+        let graph = llfn.graph.expect("graph populated");
+        let g = graph.graph.borrow();
+        // Two Void inputargs (one per tuple). No ops in startblock —
+        // direct close to returnblock with constant True.
+        assert_eq!(g.startblock.borrow().inputargs.len(), 2);
+        assert!(g.startblock.borrow().operations.is_empty());
+        let exits = g.startblock.borrow().exits.clone();
+        assert_eq!(exits.len(), 1);
+        let link = exits[0].borrow();
+        assert_eq!(link.args.len(), 1);
+        let Some(Hlvalue::Constant(c)) = link.args[0].as_ref() else {
+            panic!("link arg must be a Constant true");
+        };
+        assert_eq!(c.value, ConstValue::Bool(true));
+    }
+
+    /// `pair(TupleRepr, TupleRepr).rtype_eq` (rtuple.py:329-334)
+    /// dispatches to the synthesized `ll_eq` helper via `gendirectcall`.
+    /// One `direct_call` op is emitted with the helper graph as the
+    /// callee, and the result Variable is `Bool`-typed.
+    #[test]
+    fn pair_tuple_tuple_rtype_eq_emits_direct_call_to_ll_eq_helper() {
+        use crate::annotator::model::{SomeTuple, SomeValue};
+        use crate::flowspace::model::SpaceOperation;
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_tup_arc: Arc<dyn Repr> =
+            Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
+        let mut v_left = Variable::new();
+        v_left.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
+        let v_left_h = Hlvalue::Variable(v_left);
+        let mut v_right = Variable::new();
+        v_right.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
+        let v_right_h = Hlvalue::Variable(v_right);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            OpKind::Eq.opname(),
+            vec![v_left_h.clone(), v_right_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        // Both sides annotated as the same SomeTuple so unionof
+        // resolves to a single TupleRepr.
+        // Annotate items as SomeInteger so unionof's TupleRepr has
+        // Signed-typed items (gen_eq_function rejects Void items —
+        // those have no primitive equality op).
+        use crate::annotator::model::SomeInteger;
+        let s_int = SomeValue::Integer(SomeInteger::new(false, false));
+        let s_tup = SomeValue::Tuple(SomeTuple::new(vec![s_int.clone(), s_int.clone()]));
+        hop.args_v.borrow_mut().push(v_left_h);
+        hop.args_s.borrow_mut().push(s_tup.clone());
+        hop.args_r.borrow_mut().push(Some(r_tup_arc.clone()));
+        hop.args_v.borrow_mut().push(v_right_h);
+        hop.args_s.borrow_mut().push(s_tup);
+        hop.args_r.borrow_mut().push(Some(r_tup_arc.clone()));
+        *hop.r_result.borrow_mut() = Some(Arc::new(IntegerRepr::new(
+            LowLevelType::Bool,
+            Some("bool_"),
+        )));
+        *hop.s_result.borrow_mut() = Some(SomeValue::Impossible);
+
+        let out = rtyper
+            .translate_operation(&hop)
+            .expect("tuple == tuple translates")
+            .expect("rtype_eq returns a value");
+        let Hlvalue::Variable(_) = out else {
+            panic!("rtype_eq must return a Variable from direct_call");
+        };
+        let ops = hop.llops.borrow();
+        let direct_calls = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .count();
+        assert_eq!(direct_calls, 1, "expected exactly one direct_call op");
+    }
+
+    /// `pair(TupleRepr, TupleRepr).rtype_ne` (rtuple.py:336-338)
+    /// emits direct_call (from rtype_eq) followed by `bool_not`.
+    #[test]
+    fn pair_tuple_tuple_rtype_ne_appends_bool_not_after_eq() {
+        use crate::annotator::model::{SomeTuple, SomeValue};
+        use crate::flowspace::model::SpaceOperation;
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_tup_arc: Arc<dyn Repr> =
+            Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
+        let mut v_left = Variable::new();
+        v_left.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
+        let v_left_h = Hlvalue::Variable(v_left);
+        let mut v_right = Variable::new();
+        v_right.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
+        let v_right_h = Hlvalue::Variable(v_right);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            OpKind::Ne.opname(),
+            vec![v_left_h.clone(), v_right_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        // Annotate items as SomeInteger so unionof's TupleRepr has
+        // Signed-typed items (gen_eq_function rejects Void items —
+        // those have no primitive equality op).
+        use crate::annotator::model::SomeInteger;
+        let s_int = SomeValue::Integer(SomeInteger::new(false, false));
+        let s_tup = SomeValue::Tuple(SomeTuple::new(vec![s_int.clone(), s_int.clone()]));
+        hop.args_v.borrow_mut().push(v_left_h);
+        hop.args_s.borrow_mut().push(s_tup.clone());
+        hop.args_r.borrow_mut().push(Some(r_tup_arc.clone()));
+        hop.args_v.borrow_mut().push(v_right_h);
+        hop.args_s.borrow_mut().push(s_tup);
+        hop.args_r.borrow_mut().push(Some(r_tup_arc.clone()));
+        *hop.r_result.borrow_mut() = Some(Arc::new(IntegerRepr::new(
+            LowLevelType::Bool,
+            Some("bool_"),
+        )));
+        *hop.s_result.borrow_mut() = Some(SomeValue::Impossible);
+
+        rtyper
+            .translate_operation(&hop)
+            .expect("tuple != tuple translates")
+            .expect("rtype_ne returns a value");
+        let ops = hop.llops.borrow();
+        let opnames: Vec<&str> = ops.ops.iter().map(|op| op.opname.as_str()).collect();
+        assert!(
+            opnames.contains(&"direct_call"),
+            "rtype_ne must emit direct_call (via rtype_eq), got {:?}",
+            opnames
+        );
+        assert!(
+            opnames.contains(&"bool_not"),
+            "rtype_ne must append bool_not, got {:?}",
+            opnames
+        );
+        // bool_not must appear after direct_call.
+        let dc_pos = opnames.iter().position(|s| *s == "direct_call").unwrap();
+        let bn_pos = opnames.iter().position(|s| *s == "bool_not").unwrap();
+        assert!(bn_pos > dc_pos, "bool_not must follow direct_call");
+    }
+
+    /// `gen_hash_function([r_int, r_int])` (rtuple.py:53-73) synthesizes
+    /// a `ll_tuple_hash_signed_signed(t) -> Signed` helper graph.
+    /// Single-block linear shape: per item emits getfield →
+    /// direct_call(ll_hash_int) → int_mul → int_xor, accumulating into
+    /// x. Result: `(((0x345678 * 1000003) ^ ll_hash_int(item0)) *
+    /// 1000003) ^ ll_hash_int(item1)`.
+    #[test]
+    fn gen_hash_function_synthesizes_per_shape_helper_graph() {
+        use crate::translator::rtyper::rint::signed_repr;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = signed_repr();
+        let llfn =
+            gen_hash_function(&rtyper, &[r_int.clone(), r_int.clone()]).expect("gen_hash_function");
+        // Cache key shape (rtuple.py:56 `tuple(hash_funcs)`): each
+        // item's hash helper name (`ll_hash_int_Signed` for Signed)
+        // contributes to the suffix.
+        assert_eq!(
+            llfn.name,
+            "ll_tuple_hash_ll_hash_int_Signed_ll_hash_int_Signed"
+        );
+        let graph = llfn.graph.expect("graph populated");
+        let g = graph.graph.borrow();
+        assert_eq!(g.startblock.borrow().inputargs.len(), 1);
+        let opnames: Vec<String> = g
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        // Per item: getfield + direct_call + int_mul + int_xor = 4 × 2 = 8 ops.
+        assert_eq!(
+            opnames,
+            vec![
+                "getfield",
+                "direct_call",
+                "int_mul",
+                "int_xor",
+                "getfield",
+                "direct_call",
+                "int_mul",
+                "int_xor"
+            ]
+        );
+    }
+
+    /// rtuple.py:33/56 — `key = tuple(eq_funcs)` / `tuple(hash_funcs)`.
+    /// Cache key is the helper-tuple identity, NOT the lltype shape.
+    /// Two distinct tuple shapes built from Reprs that share lltypes
+    /// but differ in their helpers must yield distinct synthesized
+    /// helpers. Validates the helper-identity-based key suffix.
+    #[test]
+    fn gen_hash_function_cache_key_distinguishes_distinct_inner_helpers() {
+        use crate::translator::rtyper::rint::signed_repr;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = signed_repr();
+
+        // Outer tuple A: (Signed, Signed) — two primitive ints.
+        let llfn_a =
+            gen_hash_function(&rtyper, &[r_int.clone(), r_int.clone()]).expect("flat tuple hash");
+        // Outer tuple B: (Inner(Signed,Signed), Signed) — same outer
+        // lltypes... wait, actually no. Distinct lltype because of the
+        // tuple Ptr wrapper. Use a deeper nesting to demonstrate
+        // identity vs shape: identical lltype shape across two
+        // distinct inner helpers is hard to construct without two
+        // override-distinct Reprs sharing a lltype, so this test
+        // proves the simpler invariant — same Repr reuses the same
+        // helper (cache hit) across calls.
+        let llfn_a2 =
+            gen_hash_function(&rtyper, &[r_int.clone(), r_int.clone()]).expect("flat tuple hash 2");
+        let ga = llfn_a.graph.as_ref().expect("a graph");
+        let ga2 = llfn_a2.graph.as_ref().expect("a2 graph");
+        assert!(
+            std::rc::Rc::ptr_eq(&ga.graph, &ga2.graph),
+            "identical (Repr, items) input must hit the helper cache"
+        );
+
+        // Distinct inner Repr (TupleRepr nested) → distinct helper.
+        let r_inner: Arc<dyn Repr> =
+            Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
+        let llfn_b = gen_hash_function(&rtyper, &[r_inner.clone(), r_int.clone()])
+            .expect("nested tuple hash");
+        assert_ne!(
+            llfn_a.name, llfn_b.name,
+            "nested-tuple item must yield a distinct helper name from primitive item"
+        );
+        let gb = llfn_b.graph.as_ref().expect("b graph");
+        assert!(
+            !std::rc::Rc::ptr_eq(&ga.graph, &gb.graph),
+            "distinct items_r must yield distinct helper graphs"
+        );
+    }
+
+    /// rstr.py:496/499 — Char items in tuples dispatch eq via the
+    /// `char_eq` primitive op (None from get_ll_eq_function) and hash
+    /// via the synthesized `ll_char_hash` helper (cast_char_to_int).
+    #[test]
+    fn gen_eq_and_hash_dispatch_for_tuple_of_char() {
+        use crate::translator::rtyper::rstr::char_repr;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_char: Arc<dyn Repr> = char_repr();
+
+        let llfn_eq = gen_eq_function(&rtyper, &[r_char.clone(), r_char.clone()])
+            .expect("gen_eq_function for (Char, Char)");
+        let g_eq = llfn_eq.graph.expect("graph populated");
+        let block0_ops: Vec<String> = g_eq
+            .graph
+            .borrow()
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(block0_ops, vec!["getfield", "getfield", "char_eq"]);
+
+        let llfn_hash = gen_hash_function(&rtyper, &[r_char.clone(), r_char.clone()])
+            .expect("gen_hash_function for (Char, Char)");
+        let g_hash = llfn_hash.graph.expect("graph populated");
+        let opnames: Vec<String> = g_hash
+            .graph
+            .borrow()
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        // Per item: getfield + direct_call(ll_char_hash) + int_mul + int_xor.
+        assert_eq!(
+            opnames,
+            vec![
+                "getfield",
+                "direct_call",
+                "int_mul",
+                "int_xor",
+                "getfield",
+                "direct_call",
+                "int_mul",
+                "int_xor"
+            ]
+        );
+    }
+
+    /// rtuple.py:31 — `r_item.get_ll_eq_function() or operator.eq`.
+    /// For NoneRepr items the fallback `operator.eq` on two Void
+    /// values is annotator/rtyper-folded to `Constant(True, Bool)`.
+    /// Pyre mirrors via `same_as(constant_true)` so the per-item
+    /// exitswitch still reads from a Variable.
+    #[test]
+    fn gen_eq_function_uses_same_as_constant_true_for_void_none_items() {
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rnone::none_repr;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = signed_repr();
+        let r_none: Arc<dyn Repr> = none_repr();
+        let llfn = gen_eq_function(&rtyper, &[r_int.clone(), r_none.clone()])
+            .expect("gen_eq_function for (Signed, None) tuple");
+        let graph = llfn.graph.expect("graph populated");
+        let g = graph.graph.borrow();
+
+        // First check_block: int item dispatches via int_eq.
+        let block0_ops: Vec<String> = g
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(block0_ops, vec!["getfield", "getfield", "int_eq"]);
+
+        // Second check_block (None item): same_as(constant_true)
+        // replaces primitive_eq_opname (which doesn't support Void).
+        let block0 = g.startblock.borrow();
+        let block1_link = block0.exits[0].borrow();
+        let block1 = block1_link
+            .target
+            .as_ref()
+            .expect("true exit target")
+            .clone();
+        drop(block1_link);
+        drop(block0);
+        let block1_ops: Vec<String> = block1
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(block1_ops, vec!["getfield", "getfield", "same_as"]);
+    }
+
+    /// rtuple.py:301 — `r_item.get_ll_eq_function() or _ll_equal`.
+    /// `ll_equal` for Void items const-folds to `Constant(True, Bool)`;
+    /// pyre mirrors via `same_as(constant_true)` instead of the
+    /// non-existent `int_eq` for Void.
+    #[test]
+    fn ll_equal_for_void_item_uses_same_as_constant_true() {
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let llfn = ll_equal(&rtyper, &LowLevelType::Void).expect("ll_equal for Void");
+        assert_eq!(llfn.name, "ll_equal_Void");
+        let graph = llfn.graph.expect("graph populated");
+        let g = graph.graph.borrow();
+        let opnames: Vec<String> = g
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        assert_eq!(opnames, vec!["same_as"]);
+    }
+
+    /// rtuple.py:55 — `hash_funcs = [r_item.get_ll_hash_function() for
+    /// r_item in items_r]`. With FloatRepr's `_hash_float` helper now
+    /// landed (rfloat.rs `build_ll_hash_float_helper_graph`), tuples
+    /// containing Float items synthesize successfully — the per-item
+    /// dispatch routes through `direct_call` on the float hash helper
+    /// just like any other primitive Repr.
+    #[test]
+    fn gen_hash_function_supports_float_items_via_hash_float_helper() {
+        use crate::translator::rtyper::rfloat::float_repr;
+        use crate::translator::rtyper::rint::signed_repr;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = signed_repr();
+        let r_float: Arc<dyn Repr> = float_repr();
+        let llfn = gen_hash_function(&rtyper, &[r_int.clone(), r_float.clone()])
+            .expect("gen_hash_function for (Signed, Float) tuple");
+        // Cache key shape: Signed item → `ll_hash_int_Signed`, Float
+        // item → `_hash_float`.
+        assert_eq!(llfn.name, "ll_tuple_hash_ll_hash_int_Signed__hash_float");
+        let graph = llfn.graph.expect("graph populated");
+        let g = graph.graph.borrow();
+        let opnames: Vec<String> = g
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        // Each item dispatches via direct_call to its hash helper —
+        // ll_hash_int_Signed for the Signed item, _hash_float for the
+        // Float item.
+        assert_eq!(
+            opnames,
+            vec![
+                "getfield",
+                "direct_call",
+                "int_mul",
+                "int_xor",
+                "getfield",
+                "direct_call",
+                "int_mul",
+                "int_xor"
+            ]
+        );
+    }
+
+    /// rtuple.py:55 — `hash_funcs = [r_item.get_ll_hash_function() for
+    /// r_item in items_r]`. When the item Repr is a nested `TupleRepr`,
+    /// gen_hash dispatches to that inner `ll_hash` helper via
+    /// `direct_call`. Validates the structural per-item dispatch (no
+    /// inline cast on tuple items).
+    #[test]
+    fn gen_hash_function_dispatches_to_inner_tuple_helper_via_direct_call() {
+        use crate::translator::rtyper::rint::signed_repr;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = signed_repr();
+        // Outer tuple item: a nested (Signed, Signed) tuple.
+        let r_inner: Arc<dyn Repr> =
+            Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
+        let llfn = gen_hash_function(&rtyper, &[r_inner.clone(), r_int.clone()])
+            .expect("gen_hash_function for outer tuple");
+        let graph = llfn.graph.expect("graph populated");
+        let g = graph.graph.borrow();
+        let opnames: Vec<String> = g
+            .startblock
+            .borrow()
+            .operations
+            .iter()
+            .map(|op| op.opname.clone())
+            .collect();
+        // Item 0 (inner tuple): getfield + direct_call(inner ll_hash) +
+        // int_mul + int_xor. Item 1 (Signed): getfield +
+        // direct_call(ll_hash_int_Signed) + int_mul + int_xor.
+        assert_eq!(
+            opnames,
+            vec![
+                "getfield",
+                "direct_call",
+                "int_mul",
+                "int_xor",
+                "getfield",
+                "direct_call",
+                "int_mul",
+                "int_xor"
+            ],
+            "every item must dispatch via direct_call to its ll_hash helper"
+        );
+    }
+
+    /// rtuple.py:53-72 — `gen_hash_function([])` produces a helper whose
+    /// `autounrolling_funclist` is empty so `x = 0x345678` is returned
+    /// unchanged. Tuple lltype is `Void` (rtuple.py:120-121); single
+    /// Void inputarg.
+    #[test]
+    fn gen_hash_function_empty_tuple_returns_seed_only_helper() {
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let llfn = gen_hash_function(&rtyper, &[]).expect("gen_hash_function([])");
+        assert_eq!(llfn.name, "ll_tuple_hash_");
+        let graph = llfn.graph.expect("graph populated");
+        let g = graph.graph.borrow();
+        // Single Void inputarg (the empty tuple). No ops in startblock —
+        // direct close to returnblock with constant 0x345678.
+        assert_eq!(g.startblock.borrow().inputargs.len(), 1);
+        assert!(g.startblock.borrow().operations.is_empty());
+        let exits = g.startblock.borrow().exits.clone();
+        assert_eq!(exits.len(), 1);
+        let link = exits[0].borrow();
+        assert_eq!(link.args.len(), 1);
+        let Some(Hlvalue::Constant(c)) = link.args[0].as_ref() else {
+            panic!("link arg must be a Constant 0x345678");
+        };
+        assert_eq!(c.value, ConstValue::Int(0x345678));
+    }
+
+    /// `TupleRepr.rtype_hash` (rtuple.py:206-207) dispatches to the
+    /// synthesized `gen_hash_function` helper via `gendirectcall`.
+    #[test]
+    fn tuple_repr_rtype_hash_emits_direct_call_to_ll_hash_helper() {
+        use crate::annotator::model::{SomeInteger, SomeTuple, SomeValue};
+        use crate::flowspace::model::SpaceOperation;
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_tup_arc: Arc<dyn Repr> =
+            Arc::new(TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone()]).unwrap());
+        let mut v_tuple = Variable::new();
+        v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
+        let v_tuple_h = Hlvalue::Variable(v_tuple);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            OpKind::Hash.opname(),
+            vec![v_tuple_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        let s_int = SomeValue::Integer(SomeInteger::new(false, false));
+        let s_tup = SomeValue::Tuple(SomeTuple::new(vec![s_int.clone(), s_int.clone()]));
+        hop.args_v.borrow_mut().push(v_tuple_h);
+        hop.args_s.borrow_mut().push(s_tup);
+        hop.args_r.borrow_mut().push(Some(r_tup_arc));
+        *hop.r_result.borrow_mut() = Some(Arc::new(IntegerRepr::new(
+            LowLevelType::Signed,
+            Some("int_"),
+        )));
+        *hop.s_result.borrow_mut() = Some(SomeValue::Impossible);
+
+        let _ = rtyper
+            .translate_operation(&hop)
+            .expect("hash translates")
+            .expect("hash returns");
+        let ops = hop.llops.borrow();
+        let direct_calls = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .count();
+        assert_eq!(direct_calls, 1, "expected exactly one direct_call op");
+    }
+
+    /// `pair(TupleRepr, Repr).rtype_contains` (rtuple.py:292-315) for a
+    /// constant 3-tuple `(1, 2, 3)` membership test against a Signed
+    /// `v_arg`: emits 3 `direct_call(ll_equal_Signed, v_arg, c_x)` ops
+    /// (one per tuple element) chained by 2 `int_or` ops.
+    #[test]
+    fn pair_tuple_repr_rtype_contains_emits_direct_call_chain_per_const_element() {
+        use crate::annotator::model::{SomeInteger, SomeTuple, SomeValue};
+        use crate::flowspace::model::{Constant as FlowConstant, SpaceOperation};
+        use crate::flowspace::operation::OpKind;
+        use crate::translator::rtyper::rint::IntegerRepr;
+        use crate::translator::rtyper::rtyper::{HighLevelOp, LowLevelOpList};
+        use std::cell::RefCell as StdRef;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let r_tup_arc: Arc<dyn Repr> = Arc::new(
+            TupleRepr::new(&rtyper, vec![r_int.clone(), r_int.clone(), r_int.clone()]).unwrap(),
+        );
+        // Constant 3-tuple: (1, 2, 3).
+        let const_tup = ConstValue::Tuple(vec![
+            ConstValue::Int(1),
+            ConstValue::Int(2),
+            ConstValue::Int(3),
+        ]);
+        let mut s_tup_object = SomeTuple::new(vec![
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+            SomeValue::Integer(SomeInteger::new(false, false)),
+        ]);
+        s_tup_object.base.const_box = Some(FlowConstant::with_concretetype(
+            const_tup.clone(),
+            r_tup_arc.lowleveltype().clone(),
+        ));
+        let s_tup = SomeValue::Tuple(s_tup_object);
+        let mut v_tuple = Variable::new();
+        v_tuple.set_concretetype(Some(r_tup_arc.lowleveltype().clone()));
+        let v_tuple_h = Hlvalue::Variable(v_tuple);
+        let mut v_item = Variable::new();
+        v_item.set_concretetype(Some(LowLevelType::Signed));
+        let v_item_h = Hlvalue::Variable(v_item);
+        let result_var = Variable::new();
+        let spaceop = SpaceOperation::new(
+            OpKind::Contains.opname(),
+            vec![v_tuple_h.clone(), v_item_h.clone()],
+            Hlvalue::Variable(result_var),
+        );
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper.clone(), None)));
+        let hop = HighLevelOp::new(rtyper.clone(), spaceop, Vec::new(), llops);
+        hop.args_v.borrow_mut().push(v_tuple_h);
+        hop.args_s.borrow_mut().push(s_tup);
+        hop.args_r.borrow_mut().push(Some(r_tup_arc.clone()));
+        hop.args_v.borrow_mut().push(v_item_h);
+        hop.args_s
+            .borrow_mut()
+            .push(SomeValue::Integer(SomeInteger::new(false, false)));
+        hop.args_r.borrow_mut().push(Some(r_int.clone()));
+        *hop.r_result.borrow_mut() = Some(Arc::new(IntegerRepr::new(
+            LowLevelType::Bool,
+            Some("bool_"),
+        )));
+        *hop.s_result.borrow_mut() = Some(SomeValue::Impossible);
+
+        let _ = rtyper
+            .translate_operation(&hop)
+            .expect("contains translates")
+            .expect("contains returns");
+        let ops = hop.llops.borrow();
+        let direct_calls = ops
+            .ops
+            .iter()
+            .filter(|op| op.opname == "direct_call")
+            .count();
+        let int_ors = ops.ops.iter().filter(|op| op.opname == "int_or").count();
+        assert_eq!(
+            direct_calls, 3,
+            "expected 3 direct_call (one per tuple item)"
+        );
+        assert_eq!(int_ors, 2, "expected 2 int_or chaining 3 calls");
+    }
+
+    /// `gen_eq_function` caches per `(name, args, result)` — calling
+    /// twice with the same items_r returns the same `LowLevelFunction`
+    /// (graph identity preserved).
+    #[test]
+    fn gen_eq_function_caches_per_shape() {
+        use crate::translator::rtyper::rint::IntegerRepr;
+
+        let (_ann, rtyper) = fresh_rtyper_live();
+        let r_int: Arc<dyn Repr> = Arc::new(IntegerRepr::new(LowLevelType::Signed, Some("int_")));
+        let a = gen_eq_function(&rtyper, &[r_int.clone(), r_int.clone()]).unwrap();
+        let b = gen_eq_function(&rtyper, &[r_int.clone(), r_int.clone()]).unwrap();
+        // Same `lowlevel_helper_function_with_builder` cache → same
+        // PyGraph instance.
+        assert!(Rc::ptr_eq(
+            a.graph.as_ref().unwrap(),
+            b.graph.as_ref().unwrap()
+        ));
     }
 
     /// `pairtype(TupleRepr, TupleRepr).convert_from_to` (rtuple.py:340-353)

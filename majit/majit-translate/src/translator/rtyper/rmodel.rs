@@ -634,6 +634,54 @@ pub trait Repr: Debug + std::any::Any {
         true
     }
 
+    /// RPython `Repr.get_ll_eq_function(self)` (`rmodel.py:130-135`):
+    ///
+    /// ```python
+    /// def get_ll_eq_function(self):
+    ///     raise TyperError('no equality function for %r' % self)
+    /// ```
+    ///
+    /// The upstream contract is: the base default raises (signalling
+    /// "this Repr does not define a structural equality"), concrete
+    /// Reprs override either to return `None` (use the primitive
+    /// `int_eq`/`float_eq`/... inline op via `gen_eq_function`'s
+    /// `eq_funcs[i] or operator.eq` fallback) or to return a callable
+    /// helper (e.g. `StringRepr.get_ll_eq_function() -> ll_streq`).
+    ///
+    /// `rtyper` is threaded so overrides can synthesize per-shape
+    /// helpers via [`RPythonTyper::lowlevel_helper_function_with_builder`].
+    fn get_ll_eq_function(
+        &self,
+        _rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        Err(TyperError::message(format!(
+            "no equality function for {}",
+            self.repr_string()
+        )))
+    }
+
+    /// RPython `Repr.get_ll_hash_function(self)` (`rmodel.py:137-140`):
+    ///
+    /// ```python
+    /// def get_ll_hash_function(self):
+    ///     raise TyperError('no hashing function for %r' % self)
+    /// ```
+    ///
+    /// Same contract as `get_ll_eq_function`: base raises, concrete
+    /// Reprs override (e.g. `IntegerRepr → ll_hash_int`, `NoneRepr →
+    /// ll_none_hash`, `StringRepr → ll_strhash`). Unlike eq, there is
+    /// no `or _ll_equal` fallback at the caller site — every item Repr
+    /// participating in a hashed container must define its hash helper.
+    fn get_ll_hash_function(
+        &self,
+        _rtyper: &super::rtyper::RPythonTyper,
+    ) -> Result<Option<super::rtyper::LowLevelFunction>, TyperError> {
+        Err(TyperError::message(format!(
+            "no hashing function for {}",
+            self.repr_string()
+        )))
+    }
+
     /// RPython `make_missing_op(Repr, opname)` (`rmodel.py:330-340`).
     fn missing_rtype_operation(&self, opname: &str) -> TyperError {
         TyperError::missing_rtype_operation(format!(
@@ -2267,13 +2315,21 @@ pub fn rtyper_makerepr(
         SomeValue::LongFloat(_) => Ok(std::sync::Arc::new(
             crate::translator::rtyper::rfloat::LongFloatRepr::new(),
         ) as std::sync::Arc<dyn Repr>),
-        SomeValue::String(_)
-        | SomeValue::UnicodeString(_)
-        | SomeValue::ByteArray(_)
-        | SomeValue::Char(_)
-        | SomeValue::UnicodeCodePoint(_) => Err(TyperError::missing_rtype_operation(
-            "SomeString/ByteArray/Char.rtyper_makerepr — port rpython/rtyper/rstr.py",
-        )),
+        // rstr.py:589-590 — `SomeChar.rtyper_makerepr` returns
+        // `char_repr`. Pyre dispatches via the module-global singleton.
+        SomeValue::Char(_) => {
+            Ok(crate::translator::rtyper::rstr::char_repr() as std::sync::Arc<dyn Repr>)
+        }
+        // rstr.py:597-598 — `SomeUnicodeCodePoint.rtyper_makerepr`
+        // returns `unichar_repr`.
+        SomeValue::UnicodeCodePoint(_) => {
+            Ok(crate::translator::rtyper::rstr::unichar_repr() as std::sync::Arc<dyn Repr>)
+        }
+        SomeValue::String(_) | SomeValue::UnicodeString(_) | SomeValue::ByteArray(_) => {
+            Err(TyperError::missing_rtype_operation(
+                "SomeString/ByteArray.rtyper_makerepr — port rpython/rtyper/rstr.py string Repr",
+            ))
+        }
         // rclass.py:445-447 — SomeInstance.rtyper_makerepr.
         SomeValue::Instance(s) => {
             let rtyper_rc = rtyper.self_rc()?;
@@ -2519,6 +2575,30 @@ mod tests {
         // Already Delayed: returns true (the membership check) without
         // changing state.
         assert!(r.set_setup_maybe_delayed());
+    }
+
+    /// rmodel.py:130 — `Repr.get_ll_eq_function` / rmodel.py:138 —
+    /// `Repr.get_ll_hash_function` raise `TyperError` at the base.
+    /// Concrete Reprs (Integer/Float/Bool/None/String/Tuple/...)
+    /// override; the bare base path must surface the error so
+    /// callers (e.g. `gen_eq_function` per-item dispatch) loudly fail
+    /// for unsupported Reprs instead of silently using a wrong path.
+    #[test]
+    fn base_repr_get_ll_eq_and_hash_function_defaults_raise_typererror() {
+        let rtyper = rtyper_for_tests();
+        // VoidRepr has no get_ll_eq_function override → falls back to
+        // base default which raises.
+        let r = VoidRepr::new();
+        let eq_err = r.get_ll_eq_function(&rtyper).unwrap_err();
+        assert!(
+            eq_err.to_string().contains("no equality function"),
+            "got {eq_err:?}"
+        );
+        let hash_err = r.get_ll_hash_function(&rtyper).unwrap_err();
+        assert!(
+            hash_err.to_string().contains("no hashing function"),
+            "got {hash_err:?}"
+        );
     }
 
     #[test]
