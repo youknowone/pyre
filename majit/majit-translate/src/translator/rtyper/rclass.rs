@@ -2009,6 +2009,13 @@ pub struct InstanceRepr {
     /// Lazy-initialised by [`Self::get_reusable_prebuilt_instance`] —
     /// stays `None` until the first call.
     reusable_prebuilt_instance: RefCell<Option<_ptr>>,
+    /// RPython `self.iprebuiltinstances = identity_dict()` (rclass.py:482).
+    /// Value-keyed identity cache populated by
+    /// [`Self::convert_const_exact`]. The HostObject is the upstream
+    /// `value` argument; `Hash`/`Eq` use Arc identity matching
+    /// upstream's `identity_dict`. Stays empty until the first
+    /// exact-match `convert_const` reaches the cache.
+    iprebuiltinstances: RefCell<HashMap<HostObject, _ptr>>,
     /// RPython `Repr._initialized` state machine.
     state: ReprState,
 }
@@ -2040,6 +2047,7 @@ impl InstanceRepr {
             allinstancefields: RefCell::new(HashMap::new()),
             immutable_field_set: RefCell::new(HashSet::new()),
             reusable_prebuilt_instance: RefCell::new(None),
+            iprebuiltinstances: RefCell::new(HashMap::new()),
             state: ReprState::new(),
         }
     }
@@ -2323,17 +2331,102 @@ impl InstanceRepr {
             next_path.extend_from_slice(path);
             next_path.push("super");
             rbase.initialize_prebuilt_data(_value, classdef, result, &next_path)?;
-            // upstream rclass.py:951-971 — per-level fields. The
-            // standardexceptions classdefs carry no instance attrs, so
-            // `self.fields` is empty and this loop is a no-op for the
-            // immediate `get_standard_ll_exc_instance` consumer. The
-            // field-init body is left as a focused follow-up port.
-            if !self.fields.borrow().is_empty() && _value.is_none() {
-                return Err(TyperError::missing_rtype_operation(
-                    "InstanceRepr.initialize_prebuilt_data: per-level field-init \
-                     body (rclass.py:951-971) port pending — only empty-classdef \
-                     prebuilt instances supported today",
-                ));
+            // upstream rclass.py:951-971 — per-level fields:
+            //   for name, (mangled_name, r) in self.fields.items():
+            //       if r.lowleveltype is Void:
+            //           llattrvalue = None
+            //       else:
+            //           try:
+            //               attrvalue = getattr(value, name)
+            //           except AttributeError:
+            //               attrvalue = self.classdef.classdesc.read_attribute(
+            //                   name, None)
+            //               if attrvalue is None:
+            //                   llattrvalue = r.lowleveltype._defl()
+            //               else:
+            //                   llattrvalue = r.convert_desc_or_const(attrvalue)
+            //           else:
+            //               llattrvalue = r.convert_const(attrvalue)
+            //       setattr(result, mangled_name, llattrvalue)
+            //
+            // Pyre splits the upstream try/except on `getattr` into an
+            // explicit `instance_get` (live `__dict__`) → fall through
+            // to `read_attribute` (class-level dict) → fall through to
+            // `_defl` cascade. The Ellipsis-sentinel path
+            // (`get_reusable_prebuilt_instance` with `_value = None`)
+            // skips the `instance_get` lookup entirely and goes
+            // straight to `read_attribute` / `_defl`.
+            let fields_snapshot: Vec<(String, (String, Arc<dyn Repr>))> = self
+                .fields
+                .borrow()
+                .iter()
+                .map(|(name, (mangled, r))| (name.clone(), (mangled.clone(), r.clone())))
+                .collect();
+            if !fields_snapshot.is_empty() {
+                let classdef_b = _self_classdef.borrow();
+                let classdesc = classdef_b.classdesc.clone();
+                drop(classdef_b);
+                for (name, (mangled_name, r)) in &fields_snapshot {
+                    let llattrvalue = if matches!(r.lowleveltype(), LowLevelType::Void) {
+                        // upstream `if r.lowleveltype is Void: llattrvalue = None` —
+                        // pyre's `_ptr.setattr` with a Void-tagged value
+                        // is modeled as `LowLevelValue::Void`.
+                        lltype::LowLevelValue::Void
+                    } else {
+                        // upstream try/except: `getattr(value, name)` ⇒
+                        // pyre's `host.instance_get(name)`. AttributeError
+                        // ⇒ `read_attribute(name, None)` ⇒ `_defl`.
+                        let probe = _value.and_then(|host| host.instance_get(name));
+                        if let Some(attrvalue) = probe {
+                            let const_for_field =
+                                (r.as_ref() as &dyn Repr).convert_const(&attrvalue)?;
+                            constant_to_lowlevel_value(&const_for_field)?
+                        } else {
+                            // upstream rclass.py:959-968:
+                            //     attrvalue = self.classdef.classdesc.read_attribute(
+                            //         name, None)
+                            //     if attrvalue is None:
+                            //         llattrvalue = r.lowleveltype._defl()
+                            //     else:
+                            //         llattrvalue = r.convert_desc_or_const(attrvalue)
+                            //
+                            // `ClassDictEntry::Constant(c)` ↔ upstream
+                            // `Constant(value)` (classdesc.py:601,634), and
+                            // `ClassDictEntry::Desc(d)` ↔ upstream
+                            // `funcdesc` stored verbatim (classdesc.py:612).
+                            // Both arms project cleanly into `DescOrConst`,
+                            // matching upstream `convert_desc_or_const`
+                            // (rmodel.py:111-118).
+                            match super::super::super::annotator::classdesc::ClassDesc::read_attribute(
+                                &classdesc, name,
+                            ) {
+                                Some(class_entry) => {
+                                    let desc_or_const = match class_entry {
+                                        crate::annotator::classdesc::ClassDictEntry::Constant(c) => {
+                                            super::rmodel::DescOrConst::Const(c)
+                                        }
+                                        crate::annotator::classdesc::ClassDictEntry::Desc(d) => {
+                                            super::rmodel::DescOrConst::Desc(d)
+                                        }
+                                    };
+                                    let const_for_field =
+                                        (r.as_ref() as &dyn Repr).convert_desc_or_const(&desc_or_const)?;
+                                    constant_to_lowlevel_value(&const_for_field)?
+                                }
+                                None => r.lowleveltype()._defl(),
+                            }
+                        }
+                    };
+                    if path.is_empty() {
+                        result
+                            .setattr(mangled_name, llattrvalue)
+                            .map_err(TyperError::message)?;
+                    } else {
+                        result
+                            .setattr_at_path(path, mangled_name, llattrvalue)
+                            .map_err(TyperError::message)?;
+                    }
+                }
             }
         } else {
             // upstream rclass.py:973-975 — root sets typeptr.
@@ -2362,6 +2455,88 @@ impl InstanceRepr {
             }
         }
         Ok(())
+    }
+
+    /// RPython `InstanceRepr.convert_const_exact(self, value)`
+    /// (rclass.py:794-802):
+    ///
+    /// ```python
+    /// def convert_const_exact(self, value):
+    ///     try:
+    ///         return self.iprebuiltinstances[value]
+    ///     except KeyError:
+    ///         self.setup()
+    ///         result = self.create_instance()
+    ///         self.iprebuiltinstances[value] = result
+    ///         self.initialize_prebuilt_instance(value, self.classdef, result)
+    ///         return result
+    /// ```
+    ///
+    /// `iprebuiltinstances` is the value-keyed identity cache
+    /// (rclass.py:482); upstream uses `identity_dict()` which is
+    /// pointer-keyed dict semantics — pyre keys on
+    /// [`HostObject`]'s Arc identity (Hash + Eq via `Arc::ptr_eq`).
+    /// `initialize_prebuilt_instance` is a thin wrapper around
+    /// `initialize_prebuilt_data` (the recursion shield via
+    /// `_initialize_data_flattenrec` is folded into pyre's recursive
+    /// call structure since the `flattenrec` mechanism is upstream-only
+    /// and operates as a no-op for non-recursive
+    /// `initialize_prebuilt_data` graphs).
+    pub fn convert_const_exact(
+        self: &Arc<Self>,
+        host_obj: &HostObject,
+    ) -> Result<Constant, TyperError> {
+        // upstream `try: return self.iprebuiltinstances[value]`.
+        if let Some(cached) = self.iprebuiltinstances.borrow().get(host_obj).cloned() {
+            return Ok(Constant::with_concretetype(
+                ConstValue::LLPtr(Box::new(cached)),
+                self.lowleveltype.clone(),
+            ));
+        }
+        // upstream `self.setup()`. Repr::setup is idempotent.
+        Repr::setup(self.as_ref() as &dyn Repr)?;
+        // upstream `result = self.create_instance();
+        //           self.iprebuiltinstances[value] = result`. The
+        // cache must observe `result` BEFORE `initialize_prebuilt_data`
+        // recurses (rclass.py:799-800 ordering), so circular references
+        // through `convert_const(self)` find the partially-built
+        // pointer.
+        let result = self.create_instance()?;
+        self.iprebuiltinstances
+            .borrow_mut()
+            .insert(host_obj.clone(), result);
+        // upstream `self.initialize_prebuilt_instance(value,
+        //   self.classdef, result)`. Rust borrows `result` back out
+        // through the cache so the field-init body sees the same
+        // pointer the cache holds. The brief `borrow_mut` is safe
+        // because `initialize_prebuilt_data` does not re-enter
+        // `convert_const_exact` for the same key (recursion goes
+        // through `convert_const` → `convert_const_exact` of a
+        // different InstanceRepr or a different host_obj).
+        {
+            let mut cache = self.iprebuiltinstances.borrow_mut();
+            let result_in_cache = cache
+                .get_mut(host_obj)
+                .expect("iprebuiltinstances entry just inserted");
+            self.initialize_prebuilt_data(
+                Some(host_obj),
+                self.classdef.as_ref(),
+                result_in_cache,
+                &[],
+            )?;
+        }
+        let cached = self
+            .iprebuiltinstances
+            .borrow()
+            .get(host_obj)
+            .cloned()
+            .ok_or_else(|| {
+                TyperError::message("InstanceRepr.convert_const_exact: cache disappeared mid-init")
+            })?;
+        Ok(Constant::with_concretetype(
+            ConstValue::LLPtr(Box::new(cached)),
+            self.lowleveltype.clone(),
+        ))
     }
 
     /// RPython `InstanceRepr.get_reusable_prebuilt_instance(self)`
@@ -2604,21 +2779,15 @@ impl Repr for InstanceRepr {
 
         // upstream: `return self.convert_const_exact(value)`.
         //
-        // PRE-EXISTING-ADAPTATION: `convert_const_exact` (rclass.py:794-802)
-        // requires the `iprebuiltinstances` value-keyed identity cache
-        // plus the full `initialize_prebuilt_data` field-init body
-        // (rclass.py:947-975) for `classdef != None`. Pyre's
-        // [`InstanceRepr::initialize_prebuilt_data`] only handles the
-        // empty-fields case today (used by exception-class shells in
-        // [`get_standard_ll_exc_instance`]). Restoring the exact-match
-        // arm is gated on porting both the cache and the per-field
-        // `getattr` probe + per-field `convert_const` / `convert_desc`
-        // pipeline.
-        Err(TyperError::missing_rtype_operation(
-            "InstanceRepr.convert_const_exact (rclass.py:794-802) port pending — \
-             requires iprebuiltinstances cache + initialize_prebuilt_data \
-             field-init body for classdef!=None",
-        ))
+        // The trait method only carries `&self`, but
+        // [`convert_const_exact`] needs `&Arc<Self>` for the cache /
+        // setup() entry. Look ourselves back up via
+        // [`getinstancerepr`] — pyre's repr cache is keyed by
+        // `(classdef, flavor)`, which gives the same shared `Arc`
+        // back. The lookup is a no-op O(1) HashMap probe (the entry
+        // is guaranteed present since `self` exists).
+        let arc_self = getinstancerepr(&rtyper, self.classdef.as_ref(), self.gcflavor)?;
+        arc_self.convert_const_exact(&host_obj)
     }
 
     /// RPython `InstanceRepr._setup_repr` (rclass.py:487-558).
@@ -3888,6 +4057,66 @@ mod tests {
             panic!("convert_const(None) must produce LLPtr, got {:?}", c.value);
         };
         assert!(!ptr.nonzero(), "null_instance must be a null pointer");
+    }
+
+    #[test]
+    fn instance_repr_convert_const_exact_caches_prebuilt_instance() {
+        // rclass.py:794-802 — `convert_const_exact` populates
+        // `iprebuiltinstances[value]` on first call. Re-issuing
+        // `convert_const(value)` returns the same `_ptr` from the cache.
+        // For a class with no instance attrs (`fields` empty), the
+        // initialize_prebuilt_data branch only writes the root
+        // `typeptr`, so the cache identity is observable through the
+        // resulting `LLPtr` `_identity` equality.
+        use crate::annotator::annrpython::RPythonAnnotator;
+        use crate::flowspace::model::HostObject;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = Rc::new(RPythonTyper::new(&ann));
+        rtyper
+            .initialize_exceptiondata()
+            .expect("init exceptiondata");
+        let host = HostObject::new_class("PrebuiltCls", vec![]);
+        let entry = ann.bookkeeper.getdesc(&host).unwrap();
+        let DescEntry::Class(rc) = &entry else {
+            unreachable!()
+        };
+        let cd = crate::annotator::classdesc::ClassDesc::getuniqueclassdef(rc).unwrap();
+        let inst = getinstancerepr(&rtyper, Some(&cd), Flavor::Gc).expect("getinstancerepr");
+        Repr::setup(inst.as_ref() as &dyn Repr).expect("setup InstanceRepr");
+        // Drain pendingsetup so the associated ClassRepr (vtable_type
+        // ForwardReference) is also resolved before
+        // initialize_prebuilt_data writes typeptr.
+        rtyper.call_all_setups().expect("call_all_setups");
+        // ClassRepr.init_vtable wants `classdef.minid`, populated by
+        // normalizecalls.assign_inheritance_ids.
+        crate::translator::rtyper::normalizecalls::assign_inheritance_ids(&ann);
+
+        // Build a prebuilt host instance so convert_const reaches the
+        // exact-match arm.
+        let prebuilt = HostObject::new_instance(host.clone(), vec![]);
+        let value = ConstValue::HostObject(prebuilt.clone());
+        let c1 = (inst.as_ref() as &dyn Repr)
+            .convert_const(&value)
+            .expect("convert_const(prebuilt)#1");
+        let c2 = (inst.as_ref() as &dyn Repr)
+            .convert_const(&value)
+            .expect("convert_const(prebuilt)#2");
+        let (ConstValue::LLPtr(p1), ConstValue::LLPtr(p2)) = (&c1.value, &c2.value) else {
+            panic!(
+                "convert_const must produce LLPtr, got {:?} / {:?}",
+                c1.value, c2.value
+            );
+        };
+        // upstream identity: `iprebuiltinstances[value]` returns the
+        // same ptr each call. Pyre `_ptr` equality is by `_identity`
+        // which derives from the underlying object identity.
+        assert_eq!(
+            p1._hashable_identity(),
+            p2._hashable_identity(),
+            "iprebuiltinstances cache must return the same _ptr identity"
+        );
+        // The cache holds exactly one entry for this prebuilt.
+        assert_eq!(inst.iprebuiltinstances.borrow().len(), 1);
     }
 
     #[test]

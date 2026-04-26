@@ -560,6 +560,21 @@ pub trait Repr: Debug + std::any::Any {
     /// `Arc::new` of `self`, which is impossible from `&self` alone, so
     /// callers that need the Arc must invoke the impl-specific helper
     /// directly.
+    ///
+    /// **Convergence path** (PRE-EXISTING-ADAPTATION fix queue):
+    /// the dual-method shape collapses once `rbuiltin.rtype_hlinvoke`
+    /// (rpbc.py-side: rbuiltin.py:312) lands and reveals the production
+    /// call site shape. Two unification options at that point:
+    ///   (a) trait method takes `Arc<Self>` receiver — Rust trait
+    ///   methods cannot do this directly; would require a free function
+    ///   `pub fn get_r_implfunc(this: &Arc<dyn Repr>) -> Result<(Arc<dyn Repr>, usize)>`
+    ///   that downcasts on `repr_class_id()` to dispatch.
+    ///   (b) drop the `&dyn Repr` form entirely; impls that returned
+    ///   `(self, 0)` route through the rtyper's repr cache (similar to
+    ///   `getinstancerepr`) to recover their own `Arc<dyn Repr>`.
+    /// Either option requires updating all `get_r_implfunc` callers in
+    /// one pass — currently the only call site is the FunctionRepr
+    /// unit test, so the audit is small once `rtype_hlinvoke` exists.
     fn get_r_implfunc_arc(&self) -> Result<(std::sync::Arc<dyn Repr>, usize), TyperError> {
         Err(TyperError::message(format!(
             "{} has no corresponding implementation function representation \

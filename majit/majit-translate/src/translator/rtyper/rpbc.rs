@@ -1976,15 +1976,30 @@ impl Repr for FunctionsPBCRepr {
                 // non-NULL sentinels (so equality checks against None
                 // and against each other resolve correctly).
                 //
-                // pyre's parity equivalent: a fresh `_ptr` carrying
-                // [`DelayedPointer`] as the `_obj0` slot. `_ptr`'s
-                // PartialEq (lltype.rs:1048-1051) falls back to
-                // `_identity` for any non-Ok(Some) `_obj0`, and each
-                // `_ptr::new` allocation gets a fresh identity. The
-                // result: never-NULL, distinct-per-call, never
-                // dereferenceable — same observable semantics as
-                // upstream's int-encoded cast without needing the
-                // llmemory/rffi int-to-ptr machinery.
+                // PRE-EXISTING-ADAPTATION: pyre's parity equivalent is
+                // a fresh `_ptr` carrying [`DelayedPointer`] as the
+                // `_obj0` slot. `_ptr`'s PartialEq (lltype.rs:1048-1051)
+                // falls back to `_identity` for any non-Ok(Some)
+                // `_obj0`, and each `_ptr::new` allocation gets a
+                // fresh identity. The result: never-NULL,
+                // distinct-per-call, never dereferenceable — same
+                // observable semantics as upstream's int-encoded cast
+                // without needing the llmemory/rffi int-to-ptr
+                // machinery.
+                //
+                // **Convergence path** (PRE-EXISTING-ADAPTATION fix
+                // queue): once `rffi.cast` (rpython/rtyper/lltypesystem/
+                // rffi.py) and the `llmemory.cast_int_to_adr` chain
+                // (rpython/rtyper/lltypesystem/llmemory.py) port lands
+                // — both are int-to-ptr primitives currently absent
+                // from `lltypesystem/lltype.rs` — replace this branch
+                // with the byte-for-byte `rffi.cast(self.lowleveltype,
+                // !self.funccache.borrow().len())` call. The
+                // `DelayedPointer` shim is then dead code and may be
+                // deleted from this site (other DelayedPointer use
+                // sites stand on their own). Test coverage to add at
+                // that point: a port of `test_bug_callfamily`
+                // (rpython/rtyper/test/test_rpbc.py).
                 let LowLevelType::Ptr(boxed) = &self.lltype else {
                     return Err(TyperError::message(
                         "FunctionsPBCRepr.convert_desc: single-row lltype is not Ptr",
@@ -2054,14 +2069,31 @@ impl Repr for FunctionsPBCRepr {
     }
 
     /// RPython `FunctionsPBCRepr.convert_const(self, value)`
-    /// (rpbc.py:289-298).
+    /// (rpbc.py:289-298):
     ///
-    /// Ports the `value is None` arm: upstream emits
-    /// `nullptr(self.lowleveltype.TO)`. The MethodType /
-    /// staticmethod unwrapping and the `bookkeeper.getdesc(value)`
-    /// dispatch to `convert_desc` both defer pending host-object
-    /// infrastructure.
+    /// ```python
+    /// def convert_const(self, value):
+    ///     if isinstance(value, types.MethodType) and value.im_self is None:
+    ///         value = value.im_func  # unbound method -> bare function
+    ///     elif isinstance(value, staticmethod):
+    ///         value = value.__get__(42)  # staticmethod unwrap
+    ///     if value is None:
+    ///         null = nullptr(self.lowleveltype.TO)
+    ///         return null
+    ///     funcdesc = self.rtyper.annotator.bookkeeper.getdesc(value)
+    ///     return self.convert_desc(funcdesc)
+    /// ```
+    ///
+    /// `types.MethodType` with `im_self is None` is a Python 2 holdover
+    /// — pyre's `HostObject::BoundMethod` always carries non-None
+    /// `self_obj`, so the unbound-method unwrap never fires here. The
+    /// staticmethod unwrap is wired through
+    /// [`HostObject::staticmethod_func`].
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
+        // upstream `if value is None: ...`. Note: upstream's
+        // staticmethod unwrap can produce a None as well (rare), but
+        // `staticmethod(None)` would still be a HostObject
+        // wrapping None; handling that as a follow-up if it surfaces.
         if matches!(value, ConstValue::None) {
             let LowLevelType::Ptr(ptr) = &self.lltype else {
                 return Err(TyperError::message(
@@ -2074,10 +2106,37 @@ impl Repr for FunctionsPBCRepr {
                 self.lltype.clone(),
             ));
         }
-        Err(TyperError::missing_rtype_operation(
-            "FunctionsPBCRepr.convert_const (rpbc.py:290-298) \
-             non-None branch requires bookkeeper.getdesc dispatch",
-        ))
+        // upstream non-None arm: extract a HostObject for getdesc.
+        let host_obj = match value {
+            ConstValue::HostObject(h) => h.clone(),
+            other => {
+                return Err(TyperError::message(format!(
+                    "FunctionsPBCRepr.convert_const: expected HostObject or None, \
+                     got {other:?}"
+                )));
+            }
+        };
+        // upstream `elif isinstance(value, staticmethod):
+        //              value = value.__get__(42)`.
+        let host_obj = if host_obj.is_staticmethod() {
+            host_obj.staticmethod_func().cloned().ok_or_else(|| {
+                TyperError::message("FunctionsPBCRepr.convert_const: staticmethod has no func")
+            })?
+        } else {
+            host_obj
+        };
+        // upstream `funcdesc = bk.getdesc(value); return self.convert_desc(funcdesc)`.
+        let rtyper = self.base.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("FunctionsPBCRepr.convert_const: rtyper weak ref dropped")
+        })?;
+        let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
+            TyperError::message("FunctionsPBCRepr.convert_const: annotator weak ref dropped")
+        })?;
+        let desc = annotator
+            .bookkeeper
+            .getdesc(&host_obj)
+            .map_err(|e| TyperError::message(e.to_string()))?;
+        (self as &dyn Repr).convert_desc(&desc)
     }
 
     /// RPython `FunctionReprBase.rtype_simple_call(self, hop)`
@@ -5117,17 +5176,46 @@ impl Repr for MethodOfFrozenPBCRepr {
 
     /// RPython `MethodOfFrozenPBCRepr.get_r_implfunc(self)`
     /// (rpbc.py:874-876).
+    ///
+    /// Returns `MissingRTypeOperation` — the upstream return value
+    /// `r_func = self.rtyper.getrepr(self.get_s_callable())` is a
+    /// freshly-built Repr, so callers must take ownership rather than
+    /// borrow. Use [`get_r_implfunc_arc`] instead.
     fn get_r_implfunc(&self) -> Result<(&dyn Repr, usize), TyperError> {
-        // upstream: `r_func = self.rtyper.getrepr(self.get_s_callable());
-        //            return r_func, 1`.
-        // We cannot return a `&dyn Repr` to a temporary Arc, so the
-        // implfunc accessor is unsupported until callers route through
-        // an owned-Arc API. Surface as a typed error so the missing
-        // dependency is explicit.
         Err(TyperError::missing_rtype_operation(
-            "MethodOfFrozenPBCRepr.get_r_implfunc (rpbc.py:874-876) \
-             requires &dyn Repr from a freshly-built FunctionRepr",
+            "MethodOfFrozenPBCRepr.get_r_implfunc: use get_r_implfunc_arc \
+             (rpbc.py:874-876 returns a freshly-built Repr; callers must take \
+             ownership)",
         ))
+    }
+
+    /// RPython `MethodOfFrozenPBCRepr.get_r_implfunc(self)`
+    /// (rpbc.py:874-876):
+    ///
+    /// ```python
+    /// def get_r_implfunc(self):
+    ///     r_func = self.rtyper.getrepr(self.get_s_callable())
+    ///     return r_func, 1
+    /// ```
+    ///
+    /// Pyre exposes this through the trait's owned-Arc form because the
+    /// `getrepr` result is a freshly-built (or cached) `Arc<dyn Repr>`
+    /// that cannot be returned by reference from a method that does
+    /// not own a stable backing handle.
+    fn get_r_implfunc_arc(&self) -> Result<(Arc<dyn Repr>, usize), TyperError> {
+        // upstream: `r_func = self.rtyper.getrepr(self.get_s_callable())`.
+        let rtyper = self.rtyper.upgrade().ok_or_else(|| {
+            TyperError::message("MethodOfFrozenPBCRepr.get_r_implfunc_arc: rtyper weak ref dropped")
+        })?;
+        // upstream `get_s_callable` is `FunctionReprBase.get_s_callable`
+        // (rpbc.py:183-184) — `return self.s_pbc`. For
+        // MethodOfFrozenPBCRepr the equivalent is the funcdesc-derived
+        // SomePBC: a single-FunctionDesc PBC (no can_be_None).
+        let s_callable = SomePBC::new(vec![DescEntry::Function(self.funcdesc.clone())], false);
+        let r_func = rtyper.getrepr(&crate::annotator::model::SomeValue::PBC(s_callable))?;
+        // upstream: `return r_func, 1` — the `1` is the arg-position
+        // offset (skip the bound `self`).
+        Ok((r_func, 1))
     }
 
     /// RPython `MethodOfFrozenPBCRepr.convert_desc` (rpbc.py:878-882) —
@@ -8488,9 +8576,10 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn functions_pbc_repr_convert_const_non_none_defers_pending_getdesc() {
-        // Non-None convert_const requires bookkeeper.getdesc dispatch;
-        // until that lands, the call surfaces MissingRTypeOperation.
+    fn functions_pbc_repr_convert_const_non_hostobject_rejected() {
+        // rpbc.py:289-298 non-None arm now routes through
+        // `bookkeeper.getdesc(host_obj)`; non-HostObject inputs
+        // surface a typed error before reaching the bookkeeper.
         use crate::annotator::argument::ArgumentsForTranslation;
         use crate::annotator::description::GraphCacheKey;
         use crate::annotator::model::{SomeInteger, SomeValue};
@@ -8537,8 +8626,7 @@ mod pbc_repr_tests {
         );
         let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
         let err = r.convert_const(&ConstValue::Int(7)).unwrap_err();
-        assert!(err.is_missing_rtype_operation());
-        assert!(err.to_string().contains("bookkeeper.getdesc"));
+        assert!(err.to_string().contains("expected HostObject or None"));
     }
 
     #[test]
