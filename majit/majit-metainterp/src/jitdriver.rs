@@ -680,12 +680,6 @@ impl<S: JitState> JitDriver<S> {
         self.meta.bridge_info().is_some()
     }
 
-    /// Bridge origin (trace_id, fail_index) for compile_trace bridge_origin arg.
-    #[inline]
-    pub fn bridge_origin(&self) -> Option<(u64, u32)> {
-        self.meta.bridge_info().map(|b| (b.trace_id, b.fail_index))
-    }
-
     /// The green key of the active trace, if any.
     pub fn current_trace_green_key(&mut self) -> Option<u64> {
         self.meta.trace_ctx().map(|ctx| ctx.green_key())
@@ -721,6 +715,14 @@ impl<S: JitState> JitDriver<S> {
     /// reached_loop_header() called compile_trace() successfully and the
     /// driver should switch to compiled code after the merge-point closure
     /// returns.
+    ///
+    /// PRE-EXISTING-ADAPTATION: substitutes for `ContinueRunningNormally`
+    /// stack unwind (`pyjitpl.py:3095` `raise_if_successful`). RPython
+    /// raises across the interpreter to break out of trace recording; the
+    /// Rust dispatch loop cannot raise across the FFI boundary into
+    /// `merge_point_keyed`, so a one-shot `bool` consumed by
+    /// `take_compile_trace_success` substitutes. Same semantics: stop
+    /// tracing immediately, switch into compiled code on next iteration.
     pub fn note_compile_trace_success(&mut self) {
         if crate::majit_log_enabled() {
             eprintln!("[jit][compile-trace] note success");

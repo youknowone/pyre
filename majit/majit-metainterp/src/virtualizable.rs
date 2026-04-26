@@ -2392,7 +2392,7 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         let vable_ptr = virtualizable as *const u8;
         if !vable_ptr.is_null() {
             for array in &self.array_fields {
-                let arr_len = unsafe { vable_array_len(vable_ptr, array) };
+                let arr_len = unsafe { bhimpl_arraylen_vable(vable_ptr, array) };
                 size += arr_len;
             }
         }
@@ -2427,7 +2427,7 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
         }
         // virtualizable.py:134-137: array items
         for array in &self.array_fields {
-            let arr_len = unsafe { vable_array_len(vable_ptr as *const u8, array) };
+            let arr_len = unsafe { bhimpl_arraylen_vable(vable_ptr as *const u8, array) };
             for j in 0..arr_len {
                 let value = reader.next_value_of_type(array.item_type);
                 unsafe {
@@ -2440,7 +2440,7 @@ impl crate::resume::VirtualizableInfo for VirtualizableInfo {
 
 /// Read the length of a virtualizable array field.
 /// blackhole.py:1406-1409 bhimpl_arraylen_vable parity.
-pub unsafe fn vable_array_len(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
+pub unsafe fn bhimpl_arraylen_vable(vable_ptr: *const u8, array: &VableArrayInfo) -> usize {
     unsafe {
         match array.storage {
             VableArrayStorage::EmbeddedArray { .. } => {

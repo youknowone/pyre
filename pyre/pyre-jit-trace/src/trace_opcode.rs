@@ -558,7 +558,7 @@ impl MIFrame {
                 let _ = MIFrame::load_local_value(self, ctx, idx);
             }
         }
-        let (nlocals, registers_r_view, stack_values, jitcode_ptr) = {
+        let (nlocals, registers_r, stack_values, jitcode_ptr) = {
             let s = self.sym();
             // Stage 3.4 Phase B: unified abstract register file view.
             // When a guard is being captured mid-opcode, read from
@@ -582,20 +582,22 @@ impl MIFrame {
                     let pre_stack_only = pre_r.len().saturating_sub(s.nlocals);
                     (pre_stack_only, pre_r.len())
                 } else {
-                    (s.stack_only_depth(), s.registers_r.len())
+                    (
+                        s.valuestackdepth.saturating_sub(s.nlocals),
+                        s.registers_r.len(),
+                    )
                 };
             let valid_len = (s.nlocals + valid_stack_only).min(source_len);
-            let mut registers_r_view: Vec<OpRef> =
-                if let Some(ref pre_r) = self.pre_opcode_registers_r {
-                    pre_r[..valid_len.min(pre_r.len())].to_vec()
-                } else {
-                    s.registers_r[..valid_len.min(s.registers_r.len())].to_vec()
-                };
+            let mut registers_r: Vec<OpRef> = if let Some(ref pre_r) = self.pre_opcode_registers_r {
+                pre_r[..valid_len.min(pre_r.len())].to_vec()
+            } else {
+                s.registers_r[..valid_len.min(s.registers_r.len())].to_vec()
+            };
             if in_a_call {
                 if let Some(result_idx) = self.pending_result_stack_idx {
                     let abs_idx = s.nlocals + result_idx;
-                    if abs_idx < registers_r_view.len() {
-                        registers_r_view[abs_idx] = ctx.const_ref(pyre_object::PY_NULL as i64);
+                    if abs_idx < registers_r.len() {
+                        registers_r[abs_idx] = ctx.const_ref(pyre_object::PY_NULL as i64);
                     }
                 }
             }
@@ -603,12 +605,12 @@ impl MIFrame {
             // slice in per-slot kind shape; slice the tail of the
             // register-file view.
             let nlocals = s.nlocals;
-            let stack_values: Vec<OpRef> = if registers_r_view.len() > nlocals {
-                registers_r_view[nlocals..].to_vec()
+            let stack_values: Vec<OpRef> = if registers_r.len() > nlocals {
+                registers_r[nlocals..].to_vec()
             } else {
                 Vec::new()
             };
-            (nlocals, registers_r_view, stack_values, s.jitcode)
+            (nlocals, registers_r, stack_values, s.jitcode)
         };
         // pyjitpl.py:202-203: read the 2-byte offset from JitCode.code
         // (upstream uses `decode_offset(self.jitcode.code, pc + 1)`) and
@@ -640,7 +642,7 @@ impl MIFrame {
             // `metadata.stack_base + depth_at_py_pc[pc]` so the upstream
             // `pyjitpl.py:177` / `resume.py:1017-1026` packed-liveness
             // invariant is preserved.  Slots beyond
-            // `registers_r_view.len()` collapse to `OpRef::NONE`,
+            // `registers_r.len()` collapse to `OpRef::NONE`,
             // matching the snapshot helper's missing-slot convention —
             // the decoder skips writes for NONE values without raising.
             //
@@ -662,7 +664,7 @@ impl MIFrame {
                 let target_count = stack_base + depth;
                 let mut boxes = Vec::with_capacity(target_count);
                 for reg in 0..target_count {
-                    boxes.push(registers_r_view.get(reg).copied().unwrap_or(OpRef::NONE));
+                    boxes.push(registers_r.get(reg).copied().unwrap_or(OpRef::NONE));
                 }
                 return boxes;
             }
@@ -683,7 +685,7 @@ impl MIFrame {
         // op_live)` (`jitcode.py:82-93`), read the `[len_i][len_r]
         // [len_f]` header in `all_liveness`, then iterate per-bank
         // register indices with `LivenessIterator` (`liveness.py:168-
-        // 201`). Register indices snapshot into `registers_r_view` in
+        // 201`). Register indices snapshot into `registers_r` in
         // int → ref → float bank order to match the encoder/decoder
         // contract (`all_liveness` byte layout).
         let jit_pc = jc
@@ -716,9 +718,9 @@ impl MIFrame {
         // Stage 3.4 Phase B: unified register-file lookup. Bank
         // indices live in `stack_base=nlocals` register space, so any
         // `idx` in [0, nlocals+stack_depth) resolves to a single slot
-        // in `registers_r_view`. Out-of-range reads return NULL.
+        // in `registers_r`. Out-of-range reads return NULL.
         let snapshot =
-            |idx: usize| -> OpRef { registers_r_view.get(idx).copied().unwrap_or(OpRef::NONE) };
+            |idx: usize| -> OpRef { registers_r.get(idx).copied().unwrap_or(OpRef::NONE) };
         use majit_translate::liveness::LivenessIterator;
         for length in [length_i, length_r, length_f] {
             if length == 0 {
@@ -759,7 +761,7 @@ impl MIFrame {
         // does not appear in the register file.
         let sym = self.sym();
         let nlocals = sym.nlocals;
-        let stack_only = sym.stack_only_depth();
+        let stack_only = sym.valuestackdepth.saturating_sub(sym.nlocals);
         let reg_len = sym.registers_r.len();
         if let Some(idx) = sym.registers_r.iter().position(|&slot| slot == value) {
             if idx < nlocals {
@@ -799,7 +801,7 @@ impl MIFrame {
         };
         let (has_vable, reg_idx) = {
             let s = self.sym_mut();
-            let stack_idx = s.stack_only_depth();
+            let stack_idx = s.valuestackdepth.saturating_sub(s.nlocals);
             let reg_idx = s.nlocals + stack_idx;
             if reg_idx >= s.registers_r.len() {
                 s.registers_r.resize(reg_idx + 1, OpRef::NONE);
@@ -820,11 +822,11 @@ impl MIFrame {
         //     self.metainterp.virtualizable_boxes[flat_idx] = valuebox
         // The symbolic stack slice of `locals_cells_stack_w` must stay in
         // lock-step with the virtualizable_boxes shadow — the shadow is
-        // the single source of truth for `build_virtualizable_boxes`
+        // the single source of truth for `list_of_boxes_virtualizable`
         // (opencoder.py:718 `_list_of_boxes_virtualizable` parity). Stack
         // pushes mirror into the same flat layout that
         // `store_local_value` uses for locals: slot `reg_idx` →
-        // `(NUM_SCALAR_INPUTARGS - 1) + reg_idx` in virtualizable_boxes.
+        // `NUM_VABLE_SCALARS + reg_idx` in virtualizable_boxes.
         //
         // `concrete` is the caller's Box concrete (RPython valuebox). Ref /
         // Null concrete carries a real W_Root heap pointer, so update both
@@ -836,7 +838,7 @@ impl MIFrame {
         // the PyFrame slot already held (virtualizable.py:101
         // `write_boxes` parity: every slot must be a real W_Root).
         if has_vable {
-            let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_idx;
+            let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + reg_idx;
             match concrete.to_ir_ref_value() {
                 Some(v) => {
                     ctx.set_virtualizable_entry_at(flat_idx, boxed, v);
@@ -923,7 +925,7 @@ impl MIFrame {
         // subsequent snapshots do not pick up a stale pushed OpRef above
         // the current stack depth.
         if has_vable {
-            let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_idx;
+            let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + reg_idx;
             let null_opref = ctx.const_ref(pyre_object::PY_NULL as i64);
             let null_value = majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
             ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
@@ -987,7 +989,7 @@ impl MIFrame {
     pub(crate) fn swap_values(&mut self, ctx: &mut TraceCtx, depth: usize) -> Result<(), PyError> {
         let (has_vable, reg_top, reg_other) = {
             let s = self.sym_mut();
-            let stack_only = s.stack_only_depth();
+            let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
             if depth == 0 || stack_only < depth {
                 return Err(PyError::type_error("stack underflow during trace swap"));
             }
@@ -1027,8 +1029,8 @@ impl MIFrame {
         // separately and reconstructing concrete via `concrete_of_opref`
         // would drop non-const Box identity into the sentinel fallback.
         if has_vable {
-            let flat_top = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_top;
-            let flat_other = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + reg_other;
+            let flat_top = crate::virtualizable_gen::NUM_VABLE_SCALARS + reg_top;
+            let flat_other = crate::virtualizable_gen::NUM_VABLE_SCALARS + reg_other;
             if let (Some((op_top, val_top)), Some((op_other, val_other))) = (
                 ctx.virtualizable_entry_at(flat_top),
                 ctx.virtualizable_entry_at(flat_other),
@@ -1056,13 +1058,13 @@ impl MIFrame {
         //
         // Pyre's flat layout puts locals at flat indices
         // `num_static_extra_boxes .. num_static + nlocals`, i.e.
-        // `NUM_SCALAR_INPUTARGS - 1 + idx`. The scalar static fields live
-        // before the array items, the standard-vable identity
+        // `NUM_VABLE_SCALARS + idx`. The scalar static fields live before
+        // the array items, the standard-vable identity
         // (`virtualizable_boxes[-1]`) after.
         let vable_entry = {
             let s = self.sym();
             if s.vable_array_base.is_some() && s.bridge_local_oprefs.is_none() {
-                let flat_idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1 + idx;
+                let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + idx;
                 ctx.virtualizable_box_at(flat_idx)
             } else {
                 None
@@ -1166,11 +1168,11 @@ impl MIFrame {
         // `write_boxes` must see real boxed W_Root values in every slot.
         if has_vable && idx < nlocals {
             let _ = frame_ref;
-            // NUM_SCALAR_INPUTARGS - 1 = 6 (scalar fields excluding the
-            // frame-identity slot at index 0 of the inputarg stream).
+            // NUM_VABLE_SCALARS = 6 (vable static field count, excluding
+            // both the frame-identity slot and any non-vable extra reds).
             // virtualizable_boxes layout is [scalars.., array_items..,
-            // vable_ref], so local idx maps to `(NUM_SCALARS - 1) + idx`.
-            let flat_idx = (crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1) + idx;
+            // vable_ref], so local idx maps to `NUM_VABLE_SCALARS + idx`.
+            let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + idx;
             match concrete.to_ir_ref_value() {
                 Some(v) => {
                     ctx.set_virtualizable_entry_at(flat_idx, value, v);
@@ -1649,6 +1651,14 @@ impl MIFrame {
         self.close_loop_args_at(ctx, None)
     }
 
+    /// PRE-EXISTING-ADAPTATION: bundles `pyjitpl.py:2957-2965` `live_arg_boxes`
+    /// construction (`greenboxes + redboxes + virtualizable_boxes`,
+    /// `pop()` the trailing token) with the `vable_last_instr` pin
+    /// (`pyjitpl.py:2973`). RPython performs both inline within
+    /// `reached_loop_header`; pyre extracts them because pyre's "args"
+    /// are `OpRef`s pulled from the unified `registers_r` register
+    /// file, and the merge `target_pc` must be threaded through
+    /// explicitly (RPython has it implicitly in `redboxes`).
     pub(crate) fn close_loop_args_at(
         &mut self,
         ctx: &mut TraceCtx,
@@ -1664,7 +1674,7 @@ impl MIFrame {
             let s = self.sym_mut();
             s.nlocals = concrete_nlocals;
             s.valuestackdepth = concrete_vsd;
-            let stack_only = s.stack_only_depth();
+            let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
             // virtualizable.py:44 + interp_jit.py:25-31: locals_cells_stack_w[*]
             // is a W_Root array → every item is declared Ref. The loop-carried
             // types passed to the JUMP / merge point MUST be Ref for every
@@ -1721,7 +1731,7 @@ impl MIFrame {
         ) = {
             let s = self.sym();
             let nlocals = s.nlocals;
-            let stack_only = s.stack_only_depth();
+            let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
             // Stage 3.4 Phase C: `close_loop_args_at` builds JUMP args
             // from the unified register file. Locals = `[..nlocals]`
             // and stack = `[nlocals..nlocals+stack_only]`. RPython
@@ -1806,7 +1816,7 @@ impl MIFrame {
         // box/unbox decisions above still see the pre-loop truth.
         {
             let s = self.sym_mut();
-            let stack_only = s.stack_only_depth();
+            let stack_only = s.valuestackdepth.saturating_sub(s.nlocals);
             s.symbolic_local_types = vec![Type::Ref; concrete_nlocals];
             s.symbolic_stack_types = vec![Type::Ref; stack_only];
         }
@@ -2301,7 +2311,7 @@ impl MIFrame {
                 boxes: Self::fail_args_to_snapshot_boxes_typed(&parent_active, parent_types, ctx),
             });
         }
-        let vable_boxes = self.build_virtualizable_boxes(ctx);
+        let vable_boxes = self.list_of_boxes_virtualizable(ctx);
         let vref_boxes = Self::build_virtualref_boxes(self.sym(), ctx);
         majit_metainterp::recorder::Snapshot {
             frames,
@@ -2430,7 +2440,7 @@ impl MIFrame {
     /// expand num_boxes → larger fail_args → deadframe/exit layout mismatch.
     /// Fix requires backend exit block recompilation after numbering,
     /// or trace-time SameAs emission for fresh vable OpRefs.
-    fn build_virtualizable_boxes(
+    fn list_of_boxes_virtualizable(
         &self,
         ctx: &majit_metainterp::TraceCtx,
     ) -> Vec<majit_metainterp::recorder::SnapshotTagged> {
@@ -2443,7 +2453,7 @@ impl MIFrame {
         // read_boxes creates fresh Box objects for each field via wrap().
         // opencoder.py:722 _list_of_boxes_virtualizable: reorders
         //   vable_ptr from end to front → snapshot = [vable_ptr, fields..., items...]
-        let stack_only = sym.stack_only_depth();
+        let stack_only = sym.valuestackdepth.saturating_sub(sym.nlocals);
         let mut boxes = Vec::new();
         // opencoder.py:722: virtualizable_ptr FIRST.
         // The virtualizable frame pointer is always a GCREF.
@@ -2745,7 +2755,7 @@ impl MIFrame {
         // fields are a NEW-DEVIATION that will be removed once per-PC
         // liveness is ported (codewriter/liveness.py). Until then, clear
         // them here so flush_to_frame_for_guard, get_list_of_active_boxes,
-        // and build_virtualizable_boxes all read the current (post-pop)
+        // and list_of_boxes_virtualizable all read the current (post-pop)
         // `registers_r` / valuestackdepth. The next trace_code_step
         // re-captures the snapshot, so no restore is needed.
         self.clear_pre_opcode_state();
@@ -3098,7 +3108,7 @@ impl MIFrame {
     ) -> Result<Vec<FrontendOp>, PyError> {
         if concrete_seq.is_null() {
             let oprefs = TraceHelperAccess::trace_unpack_sequence(self, seq, count)?;
-            return Ok(oprefs.into_iter().map(FrontendOp::opref_only).collect());
+            return Ok(oprefs.into_iter().map(FrontendOp::void).collect());
         }
 
         // Extract concrete items from the sequence for RPython Box parity.
@@ -4526,9 +4536,17 @@ impl MIFrame {
             return Ok(FrontendOp::new(opref, ConcreteValue::Int(cv)));
         }
         let opref = self.trace_iter_next_value(iter)?;
-        Ok(FrontendOp::opref_only(opref))
+        Ok(FrontendOp::void(opref))
     }
 
+    /// PRE-EXISTING-ADAPTATION: pyre's tracer holds raw `PyObjectRef`
+    /// (the runtime W_Root pointer) instead of typed `FrontendOp`
+    /// banks. RPython's `pyjitpl.py:opimpl_goto_if_*` reads
+    /// `box.getint()` / `RefFrontendOp._resref` directly, dispatching
+    /// on `box.type == 'i'` / `'r'`. This wrapper collapses that
+    /// type-dispatched read into a single `objspace_truth_value` probe
+    /// gated by a null guard, since pyre's tracer keeps the W_Root
+    /// pointer rather than a typed-Box hierarchy.
     pub(crate) fn concrete_branch_truth_for_value(
         &mut self,
         _value: OpRef,
@@ -5002,7 +5020,7 @@ impl MIFrame {
                     self.with_ctx(|_this, ctx| ctx.const_ref(pyre_object::PY_NULL as i64));
                 let null_value =
                     majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
-                let static_offset = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS - 1;
+                let static_offset = crate::virtualizable_gen::NUM_VABLE_SCALARS;
                 // Clear shadow slots that were above new_vsd up to old_vsd.
                 let lo = new_vsd.min(old_vsd);
                 let hi = new_vsd.max(old_vsd);
@@ -5183,9 +5201,10 @@ impl MIFrame {
         match action {
             TraceAction::Continue => {
                 if let Some(mut pending) = self.pending_inline_frame.take() {
-                    let result_idx = self
-                        .sym()
-                        .stack_only_depth()
+                    let sym = self.sym();
+                    let result_idx = sym
+                        .valuestackdepth
+                        .saturating_sub(sym.nlocals)
                         .checked_sub(1)
                         .expect("pending inline frame missing caller result slot");
                     pending.caller_result_stack_idx = Some(result_idx);

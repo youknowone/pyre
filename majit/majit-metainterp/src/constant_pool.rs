@@ -114,8 +114,8 @@ impl ConstantPool {
         // Type-aware dedup: only match entries with matching type.
         // Consult both `constant_types` (intrinsic pool type) and
         // `numbering_type_overrides` (bridge-injected resume-data type)
-        // to prevent Ref-tagged slots (from `inject_bridge_constants`)
-        // from aliasing with Int constants — same rule as `get_or_insert`.
+        // to prevent Ref-tagged slots from aliasing with Int constants —
+        // same rule as `get_or_insert`.
         for (&idx, &v) in &self.constants {
             if v == value {
                 let pool_tp = self.constant_types.get(&idx).copied();

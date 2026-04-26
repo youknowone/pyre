@@ -2550,7 +2550,8 @@ impl BlackholeInterpreter {
                 let ptr = self.virtualizable_ptr as *mut u8;
                 unsafe { crate::virtualizable::bh_clear_vable_token(vinfo, ptr) };
                 let ainfo = &vinfo.array_fields[array_idx];
-                let len = unsafe { crate::virtualizable::vable_array_len(ptr as *const u8, ainfo) };
+                let len =
+                    unsafe { crate::virtualizable::bhimpl_arraylen_vable(ptr as *const u8, ainfo) };
                 self.registers_i[dst] = len as i64;
             }
             jitcode::BC_HINT_FORCE_VIRTUALIZABLE => {

@@ -382,23 +382,6 @@ pub trait TraceHelperAccess {
         self.with_trace_ctx(|ctx| emit_trace_unpack_sequence(ctx, seq, count))
     }
 
-    fn trace_load_name(&mut self, name: &str) -> Result<OpRef, PyError> {
-        let globals = self.trace_globals_ptr();
-        self.with_trace_ctx(|ctx| Ok(emit_trace_load_name_from_namespace(ctx, globals, name)))
-    }
-
-    fn trace_store_name(&mut self, name: &str, value: OpRef) -> Result<(), PyError> {
-        let globals = self.trace_globals_ptr();
-        self.with_trace_ctx(|ctx| {
-            emit_trace_store_name_to_namespace(ctx, globals, name, value);
-            Ok(())
-        })
-    }
-
-    fn trace_null_value(&mut self) -> Result<OpRef, PyError> {
-        self.with_trace_ctx(|ctx| Ok(ctx.const_int(0)))
-    }
-
     fn trace_iter_next_value(&mut self, iter: OpRef) -> Result<OpRef, PyError> {
         self.with_trace_ctx(|ctx| Ok(emit_trace_range_iter_next_or_null(ctx, iter)))
     }

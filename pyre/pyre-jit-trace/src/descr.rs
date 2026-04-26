@@ -11,6 +11,19 @@ use std::sync::Weak;
 
 use majit_ir::{ArrayDescr, Descr, DescrRef, FieldDescr, SizeDescr, Type};
 
+// PRE-EXISTING-ADAPTATION: tag bits in the high nibble of the descr
+// index discriminate Field/Array/Size descrs. RPython stores all descrs
+// in `setup_descrs`'s flat `all_descrs` list (descr.py:25-47) and
+// recovers the type via `isinstance` on the descr object. Pyre cannot
+// downcast `Arc<dyn Descr>` to a specific concrete trait via type id,
+// so the index itself encodes the discriminant.
+//
+// The Field tag is also load-bearing for `FieldIndexDescr` in
+// `optimizeopt/virtualize.rs:1620-1654` — that synthetic descriptor
+// reconstructs `offset`/`field_size`/`field_type`/`signed` from the
+// packed bits. Replacing the tag with a flat counter is contingent on
+// that synthetic descriptor being replaced with a real
+// `Arc<dyn FieldDescr>` lookup.
 const FIELD_DESCR_TAG: u32 = 0x1000_0000;
 const ARRAY_DESCR_TAG: u32 = 0x2000_0000;
 const SIZE_DESCR_TAG: u32 = 0x3000_0000;

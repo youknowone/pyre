@@ -73,7 +73,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
     ) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
         let opref = self.trace_make_function(code_obj.opref)?;
-        Ok(crate::state::FrontendOp::opref_only(opref))
+        Ok(crate::state::FrontendOp::void(opref))
     }
 
     fn call_callable(

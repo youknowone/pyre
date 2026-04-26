@@ -78,7 +78,7 @@ impl pyre_interpreter::SharedOpcodeHandler for crate::state::MIFrame {
     ) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
         let opref = self.trace_make_function(code_obj.opref)?;
-        Ok(crate::state::FrontendOp::opref_only(opref))
+        Ok(crate::state::FrontendOp::void(opref))
     }
 
     fn call_callable(
@@ -480,7 +480,7 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
             let code_ptr = unsafe { (*this.sym().jitcode).code };
             let back_edge_key = crate::driver::make_green_key(code_ptr, target);
             // pyjitpl.py:2951 self.heapcache.reset()
-            ctx.reset_heap_cache();
+            ctx.heap_cache_mut().reset();
             // pyjitpl.py:2957-2965 build live_arg_boxes ONCE.
             let live_args =
                 crate::state::MIFrame::close_loop_args_at(this, ctx, Some(target));
@@ -501,8 +501,11 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
             // pyjitpl.py:2978-2983 compile_trace attempt.
             {
                 let (driver, _) = crate::driver::driver_pair();
-                let has_partial = driver.meta_interp().has_partial_trace();
-                let bridge_origin = driver.bridge_origin();
+                let has_partial = driver.meta_interp().partial_trace().is_some();
+                let bridge_origin = driver
+                    .meta_interp()
+                    .bridge_info()
+                    .map(|b| (b.trace_id, b.fail_index));
                 let has_targets = driver.meta_interp().has_compiled_targets(back_edge_key);
                 if !has_partial && has_targets {
                     let outcome = driver.meta_interp_mut().compile_trace(
@@ -544,7 +547,7 @@ impl pyre_interpreter::ControlFlowOpcodeHandler for crate::state::MIFrame {
             Ok(Some(
                 live_args
                     .into_iter()
-                    .map(crate::state::FrontendOp::opref_only)
+                    .map(crate::state::FrontendOp::void)
                     .collect(),
             ))
         })
@@ -606,8 +609,20 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         use crate::helpers::TraceHelperAccess;
         let ns = self.sym().concrete_namespace;
         let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
-            let opref = self.trace_load_name(name)?;
-            return Ok(crate::state::FrontendOp::opref_only(opref));
+            let globals = self.trace_globals_ptr();
+            let opref = self.with_trace_ctx(|ctx| {
+                crate::helpers::emit_trace_load_name_from_namespace(ctx, globals, name)
+            });
+            let result_concrete = if ns.is_null() {
+                crate::state::ConcreteValue::Null
+            } else {
+                unsafe {
+                    let obj = pyre_interpreter::dict_storage_get(&*ns, name)
+                        .unwrap_or(std::ptr::null_mut());
+                    crate::state::ConcreteValue::from_pyobj(obj)
+                }
+            };
+            return Ok(crate::state::FrontendOp::new(opref, result_concrete));
         };
         let concrete_cv = crate::state::dict_storage_value_direct(ns, slot);
         let result_concrete = concrete_cv
@@ -651,7 +666,11 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
         use crate::helpers::TraceHelperAccess;
         let ns = self.sym().concrete_namespace;
         let Some(slot) = crate::state::dict_storage_slot_direct(ns, name) else {
-            return self.trace_store_name(name, value.opref);
+            let globals = self.trace_globals_ptr();
+            return self.with_trace_ctx(|ctx| {
+                crate::helpers::emit_trace_store_name_to_namespace(ctx, globals, name, value.opref);
+                Ok(())
+            });
         };
         self.with_ctx(|this, ctx| {
             crate::state::MIFrame::store_namespace_value(this, ctx, slot, value.opref)
@@ -660,7 +679,7 @@ impl pyre_interpreter::NamespaceOpcodeHandler for crate::state::MIFrame {
 
     fn null_value(&mut self) -> Result<Self::Value, pyre_interpreter::PyError> {
         use crate::helpers::TraceHelperAccess;
-        let opref = self.trace_null_value()?;
+        let opref = self.with_trace_ctx(|ctx| ctx.const_int(0));
         Ok(crate::state::FrontendOp::new(
             opref,
             crate::state::ConcreteValue::Ref(pyre_object::PY_NULL),

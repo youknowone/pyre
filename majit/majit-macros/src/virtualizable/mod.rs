@@ -39,8 +39,19 @@ pub(crate) struct VirtualizableMacroInput {
     heap_ptr_expr: Expr,
     /// Frame pointer field name in the state struct (e.g., `frame`).
     frame_field: Option<Ident>,
-    /// Scalar fields included in extract_live / jump_args, in order.
+    /// Vable scalar fields (= RPython `_virtualizable_` static fields,
+    /// `interp_jit.py:25-31`). Read/written via getfield_vable on the
+    /// vable heap object; included in extract_live / jump_args.
     inputargs: Vec<InputArgField>,
+    /// Extra red inputargs that are NOT vable scalar fields (= RPython
+    /// `JitDriver.reds` minus the vable, e.g. `ec` in
+    /// `interp_jit.py:67 reds = ['frame', 'ec']`). Pushed to
+    /// extract_live / jump_args between `frame` and the vable static
+    /// fields, mirroring `pyjitpl.py:2957 redboxes` followed by
+    /// `:2964 + virtualizable_boxes`. Restored via plain
+    /// `state.set_<name>(...)` accessors on the host-side state struct
+    /// (no vable heap deref).
+    extra_reds: Vec<InputArgField>,
     /// IR type for array items (default: Ref).
     array_item_type: Option<Ident>,
 }
@@ -55,6 +66,7 @@ impl Parse for VirtualizableMacroInput {
         let mut heap_ptr_expr = None;
         let mut frame_field = None;
         let mut inputargs = Vec::new();
+        let mut extra_reds = Vec::new();
         let mut array_item_type = None;
 
         while !input.is_empty() {
@@ -86,6 +98,23 @@ impl Parse for VirtualizableMacroInput {
                         inner.parse::<Token![:]>()?;
                         let ir_type: Ident = inner.parse()?;
                         inputargs.push(InputArgField { name, ir_type });
+                        let _ = inner.parse::<Token![,]>();
+                    }
+                }
+                "extra_reds" => {
+                    // Non-vable JitDriver red inputargs (e.g. `ec` in
+                    // `interp_jit.py:67 reds = ['frame', 'ec']`). Same syntax
+                    // as `inputargs`; layout-wise they sit between the frame
+                    // pointer and the vable static fields in the canonical
+                    // scalar block (`pyjitpl.py:2957 redboxes` then
+                    // `:2964 + virtualizable_boxes`).
+                    let inner;
+                    braced!(inner in input);
+                    while !inner.is_empty() {
+                        let name: Ident = inner.parse()?;
+                        inner.parse::<Token![:]>()?;
+                        let ir_type: Ident = inner.parse()?;
+                        extra_reds.push(InputArgField { name, ir_type });
                         let _ = inner.parse::<Token![,]>();
                     }
                 }
@@ -248,6 +277,7 @@ impl Parse for VirtualizableMacroInput {
             heap_ptr_expr,
             frame_field,
             inputargs,
+            extra_reds,
             array_item_type,
         })
     }
@@ -289,11 +319,12 @@ pub(crate) fn expand(input: VirtualizableMacroInput) -> TokenStream {
     let hooks = generate_standalone_hooks(state_type, &vable_name, heap_ptr_expr);
 
     // 4. Layout-based JitState helpers (extract, collect, live_types, etc.)
-    let layout_helpers = if !input.inputargs.is_empty() {
+    let layout_helpers = if !input.inputargs.is_empty() || !input.extra_reds.is_empty() {
         generate_layout_helpers(
             state_type,
             &input.frame_field,
             &input.inputargs,
+            &input.extra_reds,
             &input.array_item_type,
         )
     } else {
@@ -310,11 +341,24 @@ pub(crate) fn expand(input: VirtualizableMacroInput) -> TokenStream {
 
 /// Generate layout-based JitState helper functions.
 ///
-/// Layout: [frame:Ref, inputarg0:T0, inputarg1:T1, ..., locals[]:ItemT, stack[]:ItemT]
+/// Layout: [frame:Ref, extra_red0:U0, ..., inputarg0:T0, inputarg1:T1, ...,
+///          locals[]:ItemT, stack[]:ItemT]
+///
+/// Mirrors `pyjitpl.py:2957 redboxes` (= JitDriver.reds, frame first
+/// then extra reds) followed by `:2964 + virtualizable_boxes` (vable
+/// static fields then array items).
+///
+/// `extra_reds` and `inputargs` are concatenated for codegen — both
+/// contribute scalar params, SYM_*_IDX consts, restore calls, etc. The
+/// split exists at the macro boundary to mirror RPython's
+/// `_virtualizable_` (vable static fields, read via getfield_vable) vs
+/// `JitDriver.reds` minus the vable (e.g. `ec`, plain host-side scalar)
+/// distinction; the generated code treats both uniformly.
 fn generate_layout_helpers(
     state_type: &Ident,
     frame_field: &Option<Ident>,
     inputargs: &[InputArgField],
+    extra_reds: &[InputArgField],
     array_item_type: &Option<Ident>,
 ) -> TokenStream {
     let frame_ident = frame_field
@@ -324,18 +368,26 @@ fn generate_layout_helpers(
         .as_ref()
         .map_or_else(|| format_ident!("Ref"), |t| t.clone());
     let arr_type_token = ir_type_token(&arr_type);
-    let num_scalars = 1 + inputargs.len(); // frame + inputarg fields
+    // Red block (extra reds) first, then vable static fields — mirrors
+    // pyjitpl.py:2957 `live_arg_boxes = greenboxes + redboxes` followed by
+    // pyjitpl.py:2964 `+ virtualizable_boxes`. JitDriver.reds (e.g.
+    // `interp_jit.py:67 reds = ['frame', 'ec']`) come before the
+    // virtualizable's static fields in the OpRef stream.
+    let all_scalars: Vec<&InputArgField> = extra_reds.iter().chain(inputargs.iter()).collect();
+    let num_scalars = 1 + all_scalars.len(); // frame + extra_red + vable static fields
+    let num_extra_reds = extra_reds.len(); // non-vable JitDriver red inputargs
+    let num_vable_scalars = inputargs.len(); // vable static fields only (excludes frame, extra_reds)
 
     // ── extract_live_values ──
     // Parameters: state field values + closures for array access
-    let scalar_params: Vec<TokenStream> = inputargs
+    let scalar_params: Vec<TokenStream> = all_scalars
         .iter()
         .map(|f| {
             let name = &f.name;
             quote! { #name: usize }
         })
         .collect();
-    let scalar_value_pushes: Vec<TokenStream> = inputargs
+    let scalar_value_pushes: Vec<TokenStream> = all_scalars
         .iter()
         .map(|f| {
             let name = &f.name;
@@ -350,7 +402,7 @@ fn generate_layout_helpers(
     // ── live_value_types ──
     let scalar_type_pushes: Vec<TokenStream> = {
         let mut v = vec![quote! { __types.push(majit_ir::Type::Ref); }]; // frame
-        for f in inputargs {
+        for f in &all_scalars {
             let tp = ir_type_token(&f.ir_type);
             v.push(quote! { __types.push(#tp); });
         }
@@ -358,7 +410,7 @@ fn generate_layout_helpers(
     };
 
     // ── OpRef index constants for create_sym ──
-    let sym_idx_consts: Vec<TokenStream> = inputargs
+    let sym_idx_consts: Vec<TokenStream> = all_scalars
         .iter()
         .enumerate()
         .map(|(i, f)| {
@@ -370,7 +422,7 @@ fn generate_layout_helpers(
     let array_base_val = num_scalars as u32;
 
     // ── is_compatible helper ──
-    let compat_params: Vec<TokenStream> = inputargs
+    let compat_params: Vec<TokenStream> = all_scalars
         .iter()
         .map(|f| {
             let state_name = format_ident!("state_{}", f.name);
@@ -378,7 +430,7 @@ fn generate_layout_helpers(
             quote! { #state_name: usize, #meta_name: usize }
         })
         .collect();
-    let compat_checks: Vec<TokenStream> = inputargs
+    let compat_checks: Vec<TokenStream> = all_scalars
         .iter()
         .map(|f| {
             let state_name = format_ident!("state_{}", f.name);
@@ -388,8 +440,10 @@ fn generate_layout_helpers(
         .collect();
 
     // ── restore_values helper ──
-    // Use set_ accessors to write through to heap (source of truth).
-    let restore_scalars: Vec<TokenStream> = inputargs
+    // Use set_ accessors to write through to heap / host-side state. Vable
+    // inputargs route to heap (source of truth, virtualizable.py:101-107);
+    // extra reds route to plain host-side fields on the state struct.
+    let restore_scalars: Vec<TokenStream> = all_scalars
         .iter()
         .enumerate()
         .map(|(i, f)| {
@@ -408,7 +462,7 @@ fn generate_layout_helpers(
             }
         })
         .collect();
-    let restore_scalars_raw: Vec<TokenStream> = inputargs
+    let restore_scalars_raw: Vec<TokenStream> = all_scalars
         .iter()
         .enumerate()
         .map(|(i, f)| {
@@ -429,7 +483,45 @@ fn generate_layout_helpers(
         /// OpRef base index for array slots (locals + stack).
         pub const SYM_ARRAY_BASE: u32 = #array_base_val;
         /// Number of scalar inputargs (frame + declared fields).
+        ///
+        /// PRE-EXISTING-ADAPTATION: codegen-time constant equivalent to
+        /// `len(VABLEINFO.static_field_descrs) + 1` (frame ptr + N
+        /// `_virtualizable_` scalars from `interp_jit.py:25-31`). RPython
+        /// derives the count dynamically by iterating
+        /// `range(len(self.static_field_descrs))` (`virtualizable.py:86`);
+        /// pyre crystallises it at proc-macro expansion time so the flat
+        /// index arithmetic in trace/state code stays monomorphic.
+        ///
+        /// **Includes `extra_reds`**: when a JitDriver wires non-vable red
+        /// inputargs (e.g. `ec` from `interp_jit.py:67 reds = ['frame', 'ec']`),
+        /// they extend this count. Sites that count vable static fields only
+        /// (independent of red wiring) must use `NUM_VABLE_SCALARS` instead.
         pub const NUM_SCALAR_INPUTARGS: usize = #num_scalars;
+
+        /// Number of vable static fields (`_virtualizable_` declarations).
+        ///
+        /// `virtualizable.py:86 unroll_static_fields` length, excluding the
+        /// frame pointer and any `extra_reds` red inputargs. Stable across
+        /// JitDriver red-wiring changes; use this when iterating
+        /// `VABLEINFO.static_field_descrs` or computing offsets that pertain
+        /// to vable static fields specifically.
+        pub const NUM_VABLE_SCALARS: usize = #num_vable_scalars;
+
+        /// Number of non-vable JitDriver red inputargs (e.g. `ec`).
+        ///
+        /// `interp_jit.py:67 reds = ['frame', 'ec']` declares these alongside
+        /// `frame`; they live between the frame pointer and the vable static
+        /// fields in the OpRef stream (`pyjitpl.py:2957 redboxes`).
+        pub const NUM_EXTRA_REDS: usize = #num_extra_reds;
+
+        /// First OpRef index of the vable static field block.
+        ///
+        /// Equals `1 + NUM_EXTRA_REDS` — the frame pointer occupies OpRef(0),
+        /// extra reds occupy OpRef(1..1+NUM_EXTRA_REDS), and vable static
+        /// fields begin at this index. Use when seeding `virtualizable_boxes`
+        /// with vable scalar OpRefs (the start point shifts when extra reds
+        /// wire in).
+        pub const FIRST_VABLE_SCALAR_IDX: u32 = (1 + #num_extra_reds) as u32;
 
         // ── extract_live_values ──
 

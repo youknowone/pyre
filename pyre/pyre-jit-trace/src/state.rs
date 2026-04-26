@@ -540,6 +540,13 @@ fn ensure_finish_setup() {
 /// object. The fn pointer stays `Sync` because the upstream callback
 /// (`compile_jitcode_via_w_code`) reads `CodeWriter::instance()`
 /// which is itself per-thread.
+///
+/// PRE-EXISTING-ADAPTATION: pyre splits `pyre-jit-trace` (lower in the
+/// crate DAG) from `pyre-jit` (upper). RPython directly calls
+/// `CallControl.get_jitcode(graph)` (`call.py:155`) from `jtransform.py`
+/// because both live in the same Python module post-translation. The
+/// forward function pointer is the minimum-adaptation Rust workaround
+/// for the crate-layering split.
 pub type CompileJitcodeFn = fn(*const ()) -> Option<std::sync::Arc<crate::PyJitCode>>;
 
 static COMPILE_JITCODE_FN: std::sync::atomic::AtomicPtr<()> =
@@ -678,22 +685,6 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
         }
     };
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, supplied))
-}
-
-/// Replace the trace-side payload for an already-known code object with a
-/// freshly-refined `PyJitCode` from the codewriter.
-///
-/// This is the explicit cross-store propagation path for pyre's
-/// `merge_point_pc`-driven portal recompiles: `CallControl.jitcodes`
-/// rebuilds first, then the shared `Arc<PyJitCode>` is written into the
-/// trace-side `MetaInterpStaticData.jitcodes` slot so blackhole/resume
-/// reads observe the same refined payload.
-#[doc(hidden)]
-pub fn refresh_jitcode_payload(code: *const (), payload: std::sync::Arc<crate::PyJitCode>) {
-    ensure_finish_setup();
-    METAINTERP_SD.with(|r| {
-        r.borrow_mut().jitcode_for(code, Some(payload));
-    });
 }
 
 /// Ensure the trace-side staticdata has a JitCode slot for this
@@ -880,9 +871,11 @@ pub fn frame_value_count_at(jitcode_index: i32, pc: i32) -> usize {
 /// vable_box]` (the trailing `vable_box` is appended by
 /// `init_virtualizable_boxes`).
 ///
-/// * `scalar_oprefs` — the NUM_SCALAR_INPUTARGS − 1 static field OpRefs
-///   in declaration order (last_instr, pycode, valuestackdepth,
-///   debugdata, lastblock, w_globals).
+/// * `scalar_oprefs` — the NUM_VABLE_SCALARS static field OpRefs in
+///   declaration order (last_instr, pycode, valuestackdepth, debugdata,
+///   lastblock, w_globals). Excludes both the frame-identity slot and
+///   any non-vable extra reds (e.g. `ec`); virtualizable_boxes only
+///   carries the vable static fields plus array items.
 /// * `array_items` — pre-resolved OpRefs for the heap-side
 ///   `locals_cells_stack_w` array. Entries past `array_len` are ignored;
 ///   short lists are padded with a shared const-NULL Ref so the vable
@@ -902,12 +895,11 @@ pub(crate) fn seed_virtualizable_boxes(
     heap_ptr: *const u8,
 ) {
     let info = crate::frame_layout::build_pyframe_virtualizable_info();
-    let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-    let expected_scalars = num_scalars - 1;
+    let expected_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
     assert_eq!(
         scalar_oprefs.len(),
         expected_scalars,
-        "seed_virtualizable_boxes: scalar_oprefs.len() must equal NUM_SCALAR_INPUTARGS - 1",
+        "seed_virtualizable_boxes: scalar_oprefs.len() must equal NUM_VABLE_SCALARS",
     );
     let mut input_oprefs: Vec<OpRef> = Vec::with_capacity(expected_scalars + array_len);
     input_oprefs.extend_from_slice(scalar_oprefs);
@@ -1039,7 +1031,13 @@ impl FrontendOp {
         Self { opref, concrete }
     }
 
-    pub fn opref_only(opref: OpRef) -> Self {
+    /// `history.py:649-700` `FrontendOp(pos)` parity — the `type='v'`
+    /// (void) variant carries only a recorder position with no value
+    /// attribute. Pyre folds RPython's class hierarchy
+    /// (`IntFrontendOp`/`RefFrontendOp`/`FloatFrontendOp`/bare
+    /// `FrontendOp`) into `ConcreteValue` variants, so the void case is
+    /// `concrete: Null`.
+    pub fn void(opref: OpRef) -> Self {
         Self {
             opref,
             concrete: ConcreteValue::Null,
@@ -2334,8 +2332,8 @@ impl PyreSym {
     /// `PyreSym::new_uninit` in `push_inline_frame` (metainterp.rs:366-410)
     /// keep both fields `None` and must NOT mirror into the caller's shadow
     /// — their `nlocals + stack_idx` space is the callee's own, not the
-    /// caller's, so writing to `(NUM_SCALAR_INPUTARGS - 1) + reg_idx` in the
-    /// shared `TraceCtx` shadow would corrupt the caller's portal layout.
+    /// caller's, so writing to `NUM_VABLE_SCALARS + reg_idx` in the shared
+    /// `TraceCtx` shadow would corrupt the caller's portal layout.
     /// opencoder.py:718 `_list_of_boxes_virtualizable` treats
     /// `self.virtualizable_boxes` as the single source of truth; this
     /// predicate names the set of syms that are allowed to update it.
@@ -2568,11 +2566,18 @@ impl PyreSym {
             // beyond the current stack pointer are NULL on the PyFrame heap
             // (alloc_fixed_array_with_header(..., PY_NULL)) and the helper pads
             // them with a shared const-NULL OpRef.
-            let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            let num_vable_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
             let live_prefix = nlocals + stack_only_depth;
             let array_len = concrete_frame_array_len(concrete_frame).unwrap_or(live_prefix);
-            // Static fields inputargs OpRef(1)..OpRef(NUM_SCALARS).
-            let scalar_oprefs: Vec<OpRef> = (1..num_scalars).map(|i| OpRef(i as u32)).collect();
+            // Static fields inputargs at OpRef(FIRST_VABLE_SCALAR_IDX..+NUM_VABLE_SCALARS).
+            // virtualizable_boxes carries vable static fields only — non-vable
+            // extra reds (e.g. `ec`) sit between frame and vable scalars in the
+            // inputarg space (`pyjitpl.py:2957 redboxes` then `:2964
+            // + virtualizable_boxes`) and never enter the shadow.
+            let first = crate::virtualizable_gen::FIRST_VABLE_SCALAR_IDX;
+            let scalar_oprefs: Vec<OpRef> = (first..first + num_vable_scalars as u32)
+                .map(OpRef)
+                .collect();
             // Array items inputargs OpRef(base..base + live_prefix).
             let array_items: Vec<OpRef> =
                 (0..live_prefix).map(|i| OpRef(base + i as u32)).collect();
@@ -2586,7 +2591,7 @@ impl PyreSym {
             let (input_values, vable_ref_value) = if concrete_frame != 0 {
                 let (static_boxes, array_boxes) =
                     unsafe { info.read_all_boxes(concrete_frame as *const u8, &array_lengths) };
-                let mut values = Vec::with_capacity(num_scalars - 1 + array_len);
+                let mut values = Vec::with_capacity(num_vable_scalars + array_len);
                 for (i, bits) in static_boxes.iter().enumerate() {
                     values.push(value_for_slot(info.static_fields[i].field_type, *bits));
                 }
@@ -2596,7 +2601,7 @@ impl PyreSym {
                         values.push(value_for_slot(item_ty, *bits));
                     }
                 }
-                while values.len() < (num_scalars - 1) + array_len {
+                while values.len() < num_vable_scalars + array_len {
                     values.push(majit_ir::Value::Ref(majit_ir::GcRef::NULL));
                 }
                 (
@@ -2617,12 +2622,6 @@ impl PyreSym {
                 concrete_frame as *const u8,
             );
         }
-    }
-
-    /// Stack-only depth (number of values on the operand stack).
-    #[inline]
-    pub fn stack_only_depth(&self) -> usize {
-        self.valuestackdepth.saturating_sub(self.nlocals)
     }
 
     /// Read a concrete value from the Box arrays using an absolute
@@ -3119,6 +3118,30 @@ impl PyreJitState {
     pub fn w_globals_as_usize(&self) -> usize {
         self.read_frame_usize(PYFRAME_W_GLOBALS_OFFSET)
             .expect("PyreJitState.frame must point to a valid PyFrame")
+    }
+
+    /// Read the execution context pointer from the heap frame.
+    ///
+    /// `interp_jit.py:67 reds = ['frame', 'ec']`: ec is a non-vable red
+    /// inputarg in RPython. pyre's PyFrame carries it inline at
+    /// `execution_context`, so this accessor derefs the heap; from the
+    /// macro-generated layout's perspective ec sits at SYM_EC_IDX between
+    /// the frame pointer and the vable scalar block (`pyjitpl.py:2957
+    /// redboxes` then `:2964 + virtualizable_boxes`).
+    pub fn ec_as_usize(&self) -> usize {
+        self.read_frame_usize(crate::frame_layout::PYFRAME_EXECUTION_CONTEXT_OFFSET)
+            .expect("PyreJitState.frame must point to a valid PyFrame")
+    }
+
+    /// Write the execution context pointer into the heap frame.
+    ///
+    /// Called by `virt_restore_scalars` when reconstructing red inputargs
+    /// from a guard-failure resume vector.
+    pub fn set_ec(&mut self, value: usize) {
+        assert!(
+            self.write_frame_usize(crate::frame_layout::PYFRAME_EXECUTION_CONTEXT_OFFSET, value),
+            "PyreJitState.frame must point to a valid PyFrame"
+        );
     }
 
     /// Read the code pointer (pycode) from the heap frame.
@@ -4183,7 +4206,7 @@ impl JitState for PyreJitState {
         let frame0 = &resume_data.frames[0];
         let reg_indices =
             crate::state::frame_liveness_reg_indices_at(frame0.jitcode_index, frame0.pc);
-        let stack_only = sym.stack_only_depth();
+        let stack_only = sym.valuestackdepth.saturating_sub(sym.nlocals);
         let bridge_reg_len = nlocals + stack_only;
         let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
         // RPython parity: after A.1 the guard-recovery path calls

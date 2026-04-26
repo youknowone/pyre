@@ -184,7 +184,10 @@ impl PyreMetaInterp {
                 .take()
                 .unwrap_or_else(|| semantic_fallthrough_pc(code, pc));
             top.pc = next_pc;
-            let result_idx = sym.stack_only_depth().checked_sub(1);
+            let result_idx = sym
+                .valuestackdepth
+                .saturating_sub(sym.nlocals)
+                .checked_sub(1);
             if let Some(ref mut cf) = top.owned_concrete_frame {
                 cf.set_last_instr_from_next_instr(next_pc);
             }
@@ -271,7 +274,10 @@ impl PyreMetaInterp {
                 let sym = unsafe { &mut *top.sym };
                 let sfall = semantic_fallthrough_pc(code, pc);
                 top.pc = sym.pending_next_instr.take().unwrap_or(sfall);
-                let result_idx = sym.stack_only_depth().checked_sub(1);
+                let result_idx = sym
+                    .valuestackdepth
+                    .saturating_sub(sym.nlocals)
+                    .checked_sub(1);
                 // Pop concrete call args from parent owned_concrete_frame
                 if let Some(ref mut cf) = top.owned_concrete_frame {
                     for _ in 0..pending.nargs {
@@ -339,7 +345,10 @@ impl PyreMetaInterp {
                 let sym = unsafe { &mut *top.sym };
                 let sfall = semantic_fallthrough_pc(code, pc);
                 top.pc = sym.pending_next_instr.take().unwrap_or(sfall);
-                let result_idx = sym.stack_only_depth().checked_sub(1);
+                let result_idx = sym
+                    .valuestackdepth
+                    .saturating_sub(sym.nlocals)
+                    .checked_sub(1);
                 if let Some(ref mut cf) = top.owned_concrete_frame {
                     for _ in 0..pending.nargs {
                         cf.pop();

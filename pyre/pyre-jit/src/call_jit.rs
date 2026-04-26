@@ -3257,24 +3257,6 @@ pub extern "C" fn bh_store_subscr_fn(obj: i64, key: i64, value: i64) -> i64 {
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
         return 0;
     }
-    // TODO(parity): NEW-DEVIATION — upstream resume.py:1312
-    // blackhole_from_resumedata + consume_one_section reconstruct every
-    // register before dispatching to the opcode handler, so `value` is
-    // never null on the upstream path. Pyre's consume_one_section port
-    // is incomplete, so a stale/unreconstructed register can leak
-    // through here. We currently mask the internal gap as a user-visible
-    // TypeError via BH_LAST_EXC_VALUE to keep fannkuch green; this
-    // hides a real bug rather than fixing it. Remove this branch once
-    // consume_one_section is fully ported — the honest behavior is a
-    // panic here (see abandoned attempt 2026-04-18).
-    if value.is_null() {
-        let err = pyre_interpreter::PyError::new(
-            pyre_interpreter::PyErrorKind::TypeError,
-            "store subscript value is null (consume_one_section gap)".to_string(),
-        );
-        majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(err.to_exc_object() as i64));
-        return 0;
-    }
     if let Err(err) = pyre_interpreter::baseobjspace::setitem(obj, key, value) {
         let exc_obj = err.to_exc_object();
         majit_metainterp::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(exc_obj as i64));

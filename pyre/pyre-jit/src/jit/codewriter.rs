@@ -42,9 +42,13 @@ use super::flatten::{
 /// vector; `var_num` from `LOAD_FAST`/`STORE_FAST` is already a direct
 /// offset into that vector (no indirection).
 ///
-/// jtransform.py:1877 do_fixed_list_getitem / :1898 do_fixed_list_setitem
-/// rewrite portal local accesses into `getarrayitem_vable_r` /
-/// `setarrayitem_vable_r` against the virtualizable array.
+/// PRE-EXISTING-ADAPTATION: explicit local→vable-array remap.
+/// `jtransform.py:1877` `do_fixed_list_getitem` / `:1898`
+/// `do_fixed_list_setitem` derive the index implicitly from the
+/// `_virtualizable_` slot order on the W_Root subclass. Pyre's
+/// `PyFrame` lays locals first in `locals_cells_stack_w` so the remap
+/// is identity today; the indirection isolates the upstream rewrite
+/// step in case the layout ever diverges.
 #[inline]
 fn local_to_vable_slot(var_num: usize) -> usize {
     var_num
@@ -1102,6 +1106,13 @@ fn ensure_pc_block(
     block
 }
 
+/// PRE-EXISTING-ADAPTATION: Rust `FlowValue` is statically kinded
+/// (Int/Ref/Float) and requires `Kind::Ref` at construction. RPython
+/// `Variable()` (`flowspace/model.py`) is unkinded — flowgraph
+/// variables carry no type at construction; the annotator infers
+/// types in a later pass. The 1-line wrapper exists only because
+/// pyre's `Kind::Ref` parameter would otherwise repeat at every
+/// call site.
 fn fresh_ref_value(graph: &mut super::flow::FunctionGraph) -> super::flow::FlowValue {
     graph.fresh_variable(Kind::Ref).into()
 }
@@ -1446,13 +1457,19 @@ fn emit_frontend_compare(
     )
 }
 
+/// PRE-EXISTING-ADAPTATION: pyre's `ConstantData` enum is richer than
+/// RPython's flat `Constant(value)` — it carries variant-typed payloads
+/// (None/Boolean/Integer/Str/...) that not all map cleanly into a
+/// flowgraph `Constant`. Returns `None` for variants the shadow graph
+/// cannot represent (the caller falls back to `fresh_ref_value`).
+/// `flowcontext.py:838-843` (`LOAD_CONST` → `getconstant_w()` +
+/// `pushvalue`) has no analogous variant filter because RPython
+/// constants are uniform Python objects.
 fn frontend_constant_flow_value(
     constant: &pyre_interpreter::bytecode::ConstantData,
 ) -> Option<super::flow::FlowValue> {
-    // flowcontext.py:838-843 LOAD_CONST -> `getconstant_w()` and
-    // `pushvalue()` of the actual Constant object. Keep every
-    // representable frontend constant in the shadow graph instead of
-    // degrading immediately to a fresh Variable.
+    // Keep every representable frontend constant in the shadow graph
+    // instead of degrading immediately to a fresh Variable.
     match constant {
         pyre_interpreter::bytecode::ConstantData::None => {
             Some(super::flow::Constant::none().into())
@@ -2534,9 +2551,13 @@ impl CodeWriter {
             int_tmp1,
             op_code_reg,
         } = layout;
-        // jtransform.py: virtualizable field indices for getfield_vable_*
-        // interp_jit.py:25-31 / virtualizable_spec.rs parity:
-        //   0=last_instr, 1=code, 2=vsd, 3=debugdata, 4=lastblock, 5=namespace
+        // PRE-EXISTING-ADAPTATION: literal field indices crystallised at
+        // the codewriter call site. RPython looks up the index dynamically
+        // through `VABLEINFO.static_field_descrs` since each backend may
+        // reorder fields. Pyre's `interp_jit.py:25-31` `_virtualizable_`
+        // declaration has fixed order [last_instr, pycode, valuestackdepth,
+        // debugdata, lastblock, w_globals], so the literals match
+        // `virtualizable_spec.rs`.
         const VABLE_CODE_FIELD_IDX: u16 = 1;
         const VABLE_VALUESTACKDEPTH_FIELD_IDX: u16 = 2;
         const VABLE_NAMESPACE_FIELD_IDX: u16 = 5;
@@ -3326,10 +3347,11 @@ impl CodeWriter {
         // accessors. RPython parity: `jtransform.py:844-846` and
         // `jtransform.py:923-927` both compute `kind = getkind(...)[0]`
         // and emit `getfield_vable_%s` / `setfield_vable_%s` with the
-        // single-char suffix (`i` / `r` / `f`). The array variants
-        // (`getarrayitem_vable_%s` / `setarrayitem_vable_%s`) use the
-        // same short form. SSA emission below mirrors the upstream
-        // opnames verbatim; assembler dispatch matches the same keys
+        // single-char suffix (`i` / `r` / `f`). The array variants at
+        // `jtransform.py:765, 799, 1883, 1904` (`getarrayitem_vable_%s`
+        // / `setarrayitem_vable_%s`) use the same short form. SSA
+        // emission below mirrors the upstream opnames verbatim;
+        // assembler dispatch matches the same keys
         // (`assembler.rs:903-980`).
         //
         // Graph-side shadow intentionally absent: jtransform.py:919-922
@@ -3468,7 +3490,7 @@ impl CodeWriter {
         // trace pays only the final force-vable cost; pyre's
         // OptVirtualize does not yet fold these at the same grain, so
         // the emission is load-bearing for shadow parity with
-        // `build_virtualizable_boxes` + BH `virtualizable_boxes`
+        // `list_of_boxes_virtualizable` + BH `virtualizable_boxes`
         // reconstruction and the per-push cost is recovered only as the
         // optimizer port progresses.
         macro_rules! emit_pushvalue_ref {

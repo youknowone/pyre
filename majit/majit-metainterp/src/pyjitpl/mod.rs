@@ -504,7 +504,7 @@ pub enum BridgeCompileResult {
 /// When `compile_trace` (bridge path) fails to close the loop and sets
 /// `retrace_needed`, this struct stores the intermediate compilation result
 /// so that `compile_retrace` can append new body ops to it.
-pub(crate) struct PartialTrace {
+pub struct PartialTrace {
     /// Optimized ops from the first (incomplete) compilation attempt.
     pub(crate) ops: Vec<Op>,
     /// Inputargs from the partial trace.
@@ -3896,9 +3896,9 @@ impl<M: Clone> MetaInterp<M> {
         self.cancel_count > limit
     }
 
-    /// RPython pyjitpl.py: check if partial_trace is set for compile_retrace.
-    pub fn has_partial_trace(&self) -> bool {
-        self.partial_trace.is_some()
+    /// pyjitpl.py:2389 attribute access — `self.partial_trace`.
+    pub fn partial_trace(&self) -> Option<&PartialTrace> {
+        self.partial_trace.as_ref()
     }
 
     /// Clear retrace state (partial_trace, retracing_from, exported_state).
@@ -4203,7 +4203,7 @@ impl<M: Clone> MetaInterp<M> {
         self.exported_state = Some(exported_state);
         // pyjitpl.py:2418: self.heapcache.reset()
         if let Some(ctx) = self.tracing.as_mut() {
-            ctx.reset_heap_cache();
+            ctx.heap_cache_mut().reset();
         }
     }
 
@@ -6191,6 +6191,16 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Check whether a compiled loop exists for a given green key.
+    ///
+    /// PRE-EXISTING-ADAPTATION: short-circuits the two-step upstream
+    /// pattern `has_compiled_targets(get_procedure_token(greenboxes))`
+    /// (`pyjitpl.py:2982` / `:3162`). RPython splits the lookup
+    /// (`JitCell.get_procedure_token()` from `warmstate.py:191-196`,
+    /// then `pyjitpl.py:3898` `has_compiled_targets(token)` checking
+    /// `token.target_tokens`); pyre keeps `compiled_loops` keyed
+    /// directly by `green_key` so the green-key path never materialises
+    /// a procedure token. Convergence requires landing the JitCell
+    /// + procedure-token infrastructure first.
     #[inline]
     pub fn has_compiled_loop(&self, green_key: u64) -> bool {
         self.compiled_loops
@@ -6745,8 +6755,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // RPython-orthodox: bridgeopt.py / unroll.py have no source→bridge
         // constant pool merge. Const objects flow via rd_consts + fresh
-        // decode (resume.py:1245-1282). Typed seeding comes from
-        // inject_bridge_constants + decoded_box_to_opref.
+        // decode (resume.py:1245-1282).
         let (retraced_count, loop_num_inputs, parent_next_global_opref) = {
             let compiled = self.compiled_loops.get(&green_key).unwrap();
             (
@@ -7109,8 +7118,8 @@ impl<M: Clone> MetaInterp<M> {
 
         // RPython-orthodox: no source→bridge constant_types merge.
         // bridgeopt.py / unroll.py do not copy the source loop's constant
-        // pool; typed seeding flows through inject_bridge_constants +
-        // decoded_box_to_opref per TAGCONST decode.
+        // pool; typed seeding flows through decoded_box_to_opref per
+        // TAGCONST decode.
 
         // RPython bridgeopt.py:133-146 deserialize_optimizer_knowledge:
         // known_classes are restored from the per-guard bitfield that was

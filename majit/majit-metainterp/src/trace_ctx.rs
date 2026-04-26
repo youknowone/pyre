@@ -216,6 +216,13 @@ pub struct MergePoint {
 
 impl TraceCtx {
     /// pyjitpl.py:2991 — check if a loop header was already visited.
+    ///
+    /// PRE-EXISTING-ADAPTATION: clean Rust extraction of the inline scan
+    /// at `pyjitpl.py:2994-3036`. RPython has no method with this name
+    /// — the loop body iterates `current_merge_points` directly with
+    /// `same_greenkey` matching. The helper exists only because the
+    /// field is `pub(crate)`-private and the single caller in
+    /// pyre-jit-trace cannot reach it directly.
     pub fn has_merge_point(&self, key: u64) -> bool {
         self.current_merge_points
             .iter()
@@ -275,6 +282,14 @@ impl TraceCtx {
 
     /// pyjitpl.py:2994 same_greenkey + header identity: check if a specific
     /// loop header (key, header_pc) was already visited.
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre disambiguates loop headers by
+    /// `(green_key, header_pc)`. RPython's `same_greenkey` (`pyjitpl.py:2994`)
+    /// matches by Python box identity over a structural greenkey tuple;
+    /// pyre's `make_green_key` collapses `(W_CodeObject*, pc)` into a
+    /// `u64`, losing the per-header identity, so the explicit `header_pc`
+    /// disambiguator restores it for re-entrant loop headers within one
+    /// code object.
     pub fn has_merge_point_at(&self, key: u64, header_pc: usize) -> bool {
         self.current_merge_points
             .iter()
@@ -330,11 +345,6 @@ impl TraceCtx {
     /// Set pending quasi-immut guard with the field read's orgpc.
     pub fn set_pending_guard_not_invalidated(&mut self, pc: Option<usize>) {
         self.pending_guard_not_invalidated_pc = pc;
-    }
-
-    /// pyjitpl.py:2951, 2418: reset heap cache at loop header / retrace.
-    pub fn reset_heap_cache(&mut self) {
-        self.heap_cache.reset();
     }
 
     /// heapcache.py: EF_RANDOM_EFFECTS — invalidate ALL caches including
