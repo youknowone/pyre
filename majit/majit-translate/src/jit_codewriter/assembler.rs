@@ -603,7 +603,9 @@ impl Assembler {
                 // The JitCode object IS the descriptor for inline_call.
                 let descr_idx = self.descrs.len();
                 let calldescr = crate::jitcode::BhCallDescr {
-                    arg_classes: self.kinds_suffix(args_i, args_r, args_f).to_string(),
+                    arg_classes: self
+                        .kinds_suffix(args_i, args_r, args_f, *result_kind)
+                        .to_string(),
                     result_type: *result_kind,
                 };
                 self.descrs.push(AssemblerDescr::PendingJitCode {
@@ -615,7 +617,7 @@ impl Assembler {
                 argcodes.push('d');
                 // RPython jtransform.py:422-431: rewrite_call
                 // Only emit the kind sublists that are in 'kinds'.
-                let kinds = self.kinds_suffix(args_i, args_r, args_f);
+                let kinds = self.kinds_suffix(args_i, args_r, args_f, *result_kind);
                 if kinds.contains('i') {
                     self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
                     argcodes.push('I');
@@ -767,12 +769,14 @@ impl Assembler {
                 // `iIRd` / `iRd`.
                 let descr_idx = self.descrs.len();
                 let calldescr = crate::jitcode::BhCallDescr {
-                    arg_classes: self.kinds_suffix(args_i, args_r, args_f).to_string(),
+                    arg_classes: self
+                        .kinds_suffix(args_i, args_r, args_f, *result_kind)
+                        .to_string(),
                     result_type: *result_kind,
                 };
                 self.push_ready_descr(crate::jitcode::BhDescr::Call { calldescr });
                 // RPython jtransform.py:422-431: kind-separated sublists
-                let kinds = self.kinds_suffix(args_i, args_r, args_f);
+                let kinds = self.kinds_suffix(args_i, args_r, args_f, *result_kind);
                 if kinds.contains('i') {
                     self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
                     argcodes.push('I');
@@ -1323,15 +1327,26 @@ impl Assembler {
         }
     }
 
-    /// RPython rewrite_call: determine the 'kinds' suffix (ir/r/irf).
-    /// assembler.py:424-426.
+    /// RPython `jtransform.py:424-426 rewrite_call`:
+    /// ```text
+    /// if lst_f or reskind == 'f': kinds = 'irf'
+    /// elif lst_i or force_ir: kinds = 'ir'
+    /// else: kinds = 'r'
+    /// ```
+    /// Result float forces `irf` even if no float args (`test_jtransform.py:356`
+    /// `if RESTYPE == lltype.Float: with_f = True`). Without this rule a
+    /// `&self -> f64` shape (empty `args_i`/`args_f`, single `args_r`,
+    /// `result_kind='f'`) would map to a pyre-only `_r_f` handler that
+    /// has no RPython `bhimpl_*_r_f` counterpart (`blackhole.py:1224,1278`
+    /// only has `_r_{i,r,v}` / `_ir_*` / `_irf_*`).
     fn kinds_suffix(
         &self,
         args_i: &[ValueId],
         _args_r: &[ValueId],
         args_f: &[ValueId],
+        result_kind: char,
     ) -> &'static str {
-        if !args_f.is_empty() {
+        if !args_f.is_empty() || result_kind == 'f' {
             "irf"
         } else if !args_i.is_empty() {
             "ir"
@@ -1872,6 +1887,9 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
             // RPython `jtransform.py:1243-1255` produces these opnames as-is —
             // do not prefix with `int_`.
             "ptr_eq" | "ptr_ne" => op.clone(),
+            // jtransform-rewritten float operands carry the full RPython
+            // opname (`float_add` / `float_lt` / etc.) — preserve as-is.
+            s if s.starts_with("float_") => op.clone(),
             _ => format!("int_{op}"),
         },
         // RPython `blackhole.py:488-498`: bitwise NOT on i64 is `int_invert`.
@@ -1880,6 +1898,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // AST level); canonicalize to `int_invert` at the emission boundary.
         OpKind::UnaryOp { op, .. } => match op.as_str() {
             "not" => "int_invert".into(),
+            s if s.starts_with("float_") => op.clone(),
             _ => format!("int_{op}"),
         },
         OpKind::VableForce => "hint_force_virtualizable".into(),

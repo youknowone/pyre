@@ -655,6 +655,84 @@ impl<'a> Transformer<'a> {
                     },
                 }])
             }
+            // RPython rtyper produces `float_*` opnames directly when
+            // operand `concretetype` is `lltype.Float` — there is no
+            // `int_*` op with float operands in RPython's IR
+            // (`rpython/rtyper/rfloat.py` rtype_add etc. emit
+            // `float_add` / `float_sub` / `float_mul` / `float_truediv`
+            // / `float_lt` / `float_eq` etc.).  Pyre's front-end emits
+            // a unified `OpKind::BinOp { op: "add" }` because Rust's
+            // `+` is one AST node regardless of operand type; this
+            // jtransform pass mirrors RPython's rtyper-level
+            // distinction by rewriting `int_*` over Float operands to
+            // `float_*`.  Both operands Float → arithmetic returns
+            // Float; comparisons return Int (bool).  Mixed-kind
+            // operands need explicit `cast_int_to_float` insertion
+            // (RPython's rtyper does this upstream); pyre lacks that
+            // pass, so mixed cases keep the `int_*` opname for now.
+            //
+            // `mod` is intentionally excluded: RPython does not provide
+            // `float_mod` (`rpython/rtyper/lltypesystem/lloperation.py:260`
+            // "don't implement float_mod, use math.fmod instead") and
+            // `rfloat.py` only handles `add` / `sub` / `mul` / `truediv`.
+            // Pyre must lower `%` over floats via `math.fmod` residual
+            // call rather than a synthetic `float_mod` opname.
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if matches!(binop_name.as_str(), "add" | "sub" | "mul" | "div")
+                && self.get_value_kind(*lhs) == 'f'
+                && self.get_value_kind(*rhs) == 'f' =>
+            {
+                let canonical = match binop_name.as_str() {
+                    "div" => "truediv", // RPython lltype: `float_truediv`
+                    other => other,
+                };
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::BinOp {
+                        op: format!("float_{canonical}"),
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        result_ty: ValueType::Float,
+                    },
+                }])
+            }
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if matches!(binop_name.as_str(), "lt" | "le" | "gt" | "ge" | "eq" | "ne")
+                && self.get_value_kind(*lhs) == 'f'
+                && self.get_value_kind(*rhs) == 'f' =>
+            {
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::BinOp {
+                        op: format!("float_{binop_name}"),
+                        lhs: *lhs,
+                        rhs: *rhs,
+                        result_ty: ValueType::Int,
+                    },
+                }])
+            }
+            OpKind::UnaryOp {
+                op: unop_name,
+                operand,
+                ..
+            } if unop_name == "neg" && self.get_value_kind(*operand) == 'f' => {
+                RewriteResult::Replace(vec![SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::UnaryOp {
+                        op: "float_neg".into(),
+                        operand: *operand,
+                        result_ty: ValueType::Float,
+                    },
+                }])
+            }
             _ => RewriteResult::Keep,
         }
     }

@@ -1710,6 +1710,9 @@ fn lower_expr(
                 syn::Lit::Verbatim(_) => UnsupportedLiteralKind::Verbatim,
                 _ => UnsupportedLiteralKind::Other,
             };
+            if std::env::var("MAJIT_UNKNOWN_DUMP").is_ok() {
+                println!("cargo:warning=[UnsupportedLit] variant={variant:?}");
+            }
             Ok(continue_with_unknown_literal(graph, *block, variant))
         }
 
@@ -1737,6 +1740,18 @@ fn lower_expr(
 
         // ── reference &expr ──
         syn::Expr::Reference(r) => lower_expr(graph, block, &r.expr, options, ctx),
+
+        // `&raw const/mut expr` (`syn::Expr::RawAddr`) is intentionally
+        // *not* pass-through here.  Unlike `&expr`, the raw-address
+        // operator yields the *address* of the inner expr rather than
+        // its value, so reusing the inner lowering would silently
+        // misrepresent semantics (a downstream `as usize` cast would
+        // see the dereferenced value instead of the pointer).  Falling
+        // through to the `_ => other` unsupported handler classifies
+        // it as `UnsupportedExprKind::RawAddr` (data-creation arm),
+        // walks the inner expr for side effects via the `match other`
+        // RawAddr branch below, and emits an `Unknown` marker so the
+        // graph remains opaque rather than incorrect.
 
         // ── parenthesized (expr) ──
         syn::Expr::Paren(p) => lower_expr(graph, block, &p.expr, options, ctx),
@@ -2417,36 +2432,11 @@ fn lower_expr(
                 syn::Expr::Yield(_) => UnsupportedExprKind::Yield,
                 _ => UnsupportedExprKind::OtherExpr,
             };
-            if std::env::var("MAJIT_UNKNOWN_DUMP").is_ok() {
-                if let syn::Expr::Macro(m) = other {
-                    let path = m
-                        .mac
-                        .path
-                        .segments
-                        .iter()
-                        .map(|s| s.ident.to_string())
-                        .collect::<Vec<_>>()
-                        .join("::");
-                    let last = m
-                        .mac
-                        .path
-                        .segments
-                        .last()
-                        .map(|s| s.ident.to_string())
-                        .unwrap_or_default();
-                    let tag = if matches!(
-                        last.as_str(),
-                        "panic" | "unreachable" | "todo" | "unimplemented"
-                    ) {
-                        "[Raise]"
-                    } else {
-                        "[UnsupportedExpr]"
-                    };
-                    println!("cargo:warning={tag} variant=Macro path={path}");
-                } else {
-                    println!("cargo:warning=[UnsupportedExpr] variant={variant:?}");
-                }
-            }
+            // The diagnostic emit decision is made later in the
+            // `is_data_creation` / `stop_unsupported` chain below;
+            // the dump probe runs there so `[UnsupportedExpr]` covers
+            // the data-creation default-arm path and
+            // `[UnsupportedExpr/stop]` covers the abort path.
             // Helper: walk a sub-expression purely for its side effects
             // (the parent composite is about to be marked unsupported,
             // so the returned value is unused).  Propagate FlowingError
@@ -2542,6 +2532,15 @@ fn lower_expr(
                 syn::Expr::Let(l) => {
                     walk_for_side_effects!(&l.expr);
                 }
+                // `&raw const/mut EXPR` — the address operator
+                // produces a pointer rather than the inner value, so
+                // we emit an `Unknown` marker for the address itself
+                // (handled by the data-creation arm below) but still
+                // walk the inner expr so any side effects are
+                // captured before the pointer is taken.
+                syn::Expr::RawAddr(r) => {
+                    walk_for_side_effects!(&r.expr);
+                }
                 // `foo!(a, b, c)` / `foo![a, b, c]` / `foo!{a, b, c}`
                 // — most Rust macros whose bodies reach this point
                 // (vec!, format!, matches!, write!, writeln!, ...)
@@ -2563,9 +2562,16 @@ fn lower_expr(
                 }
                 _ => {}
             }
+            let dump_enabled = std::env::var("MAJIT_UNKNOWN_DUMP").is_ok();
             if is_data_creation {
+                if dump_enabled {
+                    println!("cargo:warning=[UnsupportedExpr] variant={variant:?}");
+                }
                 Ok(continue_with_unknown(graph, *block, variant))
             } else {
+                if dump_enabled {
+                    println!("cargo:warning=[UnsupportedExpr/stop] variant={variant:?}");
+                }
                 stop_unsupported(graph, *block, variant)
             }
         }

@@ -4845,14 +4845,10 @@ bhhandler_ii_i!(handler_int_sub, bhimpl_int_sub);
 // bhhandler_ir_i macro docs. Each wraps the same canonical `bhimpl_*` as
 // its `ii>i` sibling; only the register-class of one operand differs.
 bhhandler_ri_i!(handler_int_add_ri, bhimpl_int_add);
-bhhandler_ri_i!(handler_int_sub_ri, bhimpl_int_sub);
-bhhandler_ri_i!(handler_int_mul_ri, bhimpl_int_mul);
-bhhandler_ri_i!(handler_int_div_ri, bhimpl_int_floordiv);
 bhhandler_ri_i!(handler_int_and_ri, bhimpl_int_and);
 bhhandler_ri_i!(handler_int_lshift_ri, bhimpl_int_lshift);
 bhhandler_ri_i!(handler_int_rshift_ri, bhimpl_int_rshift);
 bhhandler_ir_i!(handler_int_add_ir, bhimpl_int_add);
-bhhandler_ir_i!(handler_int_sub_ir, bhimpl_int_sub);
 bhhandler_ir_i!(handler_int_and_ir, bhimpl_int_and);
 bhhandler_ir_i!(handler_int_eq_ir, bhimpl_int_eq);
 bhhandler_ir_i!(handler_int_ne_ir, bhimpl_int_ne);
@@ -4861,7 +4857,6 @@ bhhandler_ir_i!(handler_int_gt_ir, bhimpl_int_gt);
 bhhandler_ir_i!(handler_int_rshift_ir, bhimpl_int_rshift);
 bhhandler_ri_i!(handler_int_or_ri, bhimpl_int_or);
 bhhandler_ir_i!(handler_int_or_ir, bhimpl_int_or);
-bhhandler_ir_i!(handler_int_le_ir, bhimpl_int_le);
 bhhandler_ri_i!(handler_int_eq_ri, bhimpl_int_eq);
 bhhandler_ri_i!(handler_int_ne_ri, bhimpl_int_ne);
 bhhandler_ri_i!(handler_int_gt_ri, bhimpl_int_gt);
@@ -5225,11 +5220,6 @@ bhhandler_rr_i!(handler_int_or_rr, bhimpl_int_or);
 bhhandler_rr_i!(handler_int_and_rr, bhimpl_int_and);
 bhhandler_rr_i!(handler_int_xor_rr, bhimpl_int_xor);
 bhhandler_rr_i!(handler_int_lt_rr, bhimpl_int_lt);
-bhhandler_rr_i!(handler_int_le_rr, bhimpl_int_le);
-bhhandler_rr_i!(handler_int_eq_rr, bhimpl_int_eq);
-bhhandler_rr_i!(handler_int_ne_rr, bhimpl_int_ne);
-bhhandler_rr_i!(handler_int_gt_rr, bhimpl_int_gt);
-bhhandler_rr_i!(handler_int_ge_rr, bhimpl_int_ge);
 
 // pyre-only `int_same_as/r>i`: identity op where source is Ref-classified
 // but result is Int-classified. Same root cause as the `/rr>i` family.
@@ -6344,14 +6334,10 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     // different register source. See `bhhandler_ri_i` / `bhhandler_ir_i`
     // macro docs for the tagged-int deviation.
     builder.wire_handler("int_add/ri>i", handler_int_add_ri);
-    builder.wire_handler("int_sub/ri>i", handler_int_sub_ri);
-    builder.wire_handler("int_mul/ri>i", handler_int_mul_ri);
-    builder.wire_handler("int_div/ri>i", handler_int_div_ri);
     builder.wire_handler("int_and/ri>i", handler_int_and_ri);
     builder.wire_handler("int_lshift/ri>i", handler_int_lshift_ri);
     builder.wire_handler("int_rshift/ri>i", handler_int_rshift_ri);
     builder.wire_handler("int_add/ir>i", handler_int_add_ir);
-    builder.wire_handler("int_sub/ir>i", handler_int_sub_ir);
     builder.wire_handler("int_and/ir>i", handler_int_and_ir);
     builder.wire_handler("int_eq/ir>i", handler_int_eq_ir);
     builder.wire_handler("int_ne/ir>i", handler_int_ne_ir);
@@ -6360,7 +6346,6 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_rshift/ir>i", handler_int_rshift_ir);
     builder.wire_handler("int_or/ri>i", handler_int_or_ri);
     builder.wire_handler("int_or/ir>i", handler_int_or_ir);
-    builder.wire_handler("int_le/ir>i", handler_int_le_ir);
     builder.wire_handler("int_eq/ri>i", handler_int_eq_ri);
     builder.wire_handler("int_ne/ri>i", handler_int_ne_ri);
     builder.wire_handler("int_gt/ri>i", handler_int_gt_ri);
@@ -6374,11 +6359,6 @@ pub fn wire_bhimpl_handlers(builder: &mut BlackholeInterpBuilder) {
     builder.wire_handler("int_and/rr>i", handler_int_and_rr);
     builder.wire_handler("int_xor/rr>i", handler_int_xor_rr);
     builder.wire_handler("int_lt/rr>i", handler_int_lt_rr);
-    builder.wire_handler("int_le/rr>i", handler_int_le_rr);
-    builder.wire_handler("int_eq/rr>i", handler_int_eq_rr);
-    builder.wire_handler("int_ne/rr>i", handler_int_ne_rr);
-    builder.wire_handler("int_gt/rr>i", handler_int_gt_rr);
-    builder.wire_handler("int_ge/rr>i", handler_int_ge_rr);
     builder.wire_handler("int_same_as/r>i", handler_int_same_as_r);
     builder.wire_handler("int_neg/r>i", handler_int_neg_r);
     // pyre-only primitives — see handler comments for rationale.

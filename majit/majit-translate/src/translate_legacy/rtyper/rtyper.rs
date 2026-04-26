@@ -40,11 +40,17 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
         }
         for op in &block.operations {
             if let Some(result) = op.result {
-                if state.get(result) == &ConcreteType::Unknown {
-                    let inferred = infer_concrete_from_op(&op.kind);
-                    if inferred != ConcreteType::Unknown {
-                        state.concrete_types.insert(result, inferred);
-                    }
+                let inferred = infer_concrete_from_op(&op.kind);
+                if inferred != ConcreteType::Unknown {
+                    // The op carries authoritative result kind (post-
+                    // jtransform `float_*` rewrite, explicit Call /
+                    // FieldRead / etc. result_ty).  Override any
+                    // annotation default — annrpython defaults BinOp /
+                    // UnaryOp result to Int, which would shadow a later
+                    // Float inference for `float_add` / `float_neg` /
+                    // etc. produced by jtransform's float-operand
+                    // rewrite arm.
+                    state.concrete_types.insert(result, inferred);
                 }
             }
         }
@@ -140,8 +146,61 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         changed |= maybe_seed_concrete_type(&mut state, *lhs, ConcreteType::Signed);
                         changed |= maybe_seed_concrete_type(&mut state, *rhs, ConcreteType::Signed);
                         if let Some(result) = op.result {
-                            changed |=
-                                maybe_seed_concrete_type(&mut state, result, ConcreteType::Signed);
+                            // RPython rtyper resolves an `add` whose
+                            // operands are both `lltype.Float` to
+                            // `float_add` directly (`rfloat.py
+                            // rtype_add`); the result inherits Float
+                            // (or Int for comparisons).  When pyre's
+                            // upstream typing already classified both
+                            // operands as Float, mirror that: seed the
+                            // result as Float for arithmetic ops and
+                            // Int for comparisons.  jtransform will
+                            // then rewrite the BinOp's `op` from `add`
+                            // to `float_add` (etc.), keeping IR/regalloc
+                            // consistent.  Mixed-kind operands fall
+                            // through to the legacy Signed path until
+                            // `cast_int_to_float` insertion lands.
+                            let lhs_float = *state.get(*lhs) == ConcreteType::Float;
+                            let rhs_float = *state.get(*rhs) == ConcreteType::Float;
+                            // Mirror jtransform's float-rewrite set
+                            // (`jit_codewriter/jtransform.rs`):
+                            // arithmetic `add/sub/mul/div` →
+                            // `float_*` returns Float; comparisons
+                            // `lt/le/gt/ge/eq/ne` → `float_*` returns
+                            // Int (Bool — RPython `rfloat.py:133`,
+                            // `blackhole.py:731 bhimpl_float_eq`).
+                            // `mod` is intentionally absent: RPython
+                            // has no `float_mod` (`lloperation.py:260`
+                            // "use math.fmod instead"); overriding
+                            // its result to Float here would synthesize
+                            // a `mod/ff>f` shape with no jtransform
+                            // rewrite and no blackhole handler.
+                            let is_compare =
+                                matches!(opname.as_str(), "lt" | "le" | "gt" | "ge" | "eq" | "ne");
+                            let is_arith = matches!(opname.as_str(), "add" | "sub" | "mul" | "div");
+                            if lhs_float && rhs_float && (is_arith || is_compare) {
+                                let target = if is_compare {
+                                    ConcreteType::Signed
+                                } else {
+                                    ConcreteType::Float
+                                };
+                                if state.get(result) != &target {
+                                    state.concrete_types.insert(result, target);
+                                    changed = true;
+                                }
+                            } else if !(lhs_float && rhs_float) {
+                                changed |= maybe_seed_concrete_type(
+                                    &mut state,
+                                    result,
+                                    ConcreteType::Signed,
+                                );
+                            }
+                            // Float-float `mod` falls through with no
+                            // override: result keeps the
+                            // `infer_concrete_from_op` default
+                            // (Signed) so the legacy mixed-kind path
+                            // is used until math.fmod residual
+                            // lowering lands.
                         }
                     }
                     OpKind::UnaryOp {
@@ -152,8 +211,22 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         changed |=
                             maybe_seed_concrete_type(&mut state, *operand, ConcreteType::Signed);
                         if let Some(result) = op.result {
-                            changed |=
-                                maybe_seed_concrete_type(&mut state, result, ConcreteType::Signed);
+                            // Same Float-operand override as the BinOp
+                            // arm above.  Unary `neg` on a Float
+                            // returns Float (`float_neg`).
+                            let operand_float = *state.get(*operand) == ConcreteType::Float;
+                            if operand_float && opname == "neg" {
+                                if state.get(result) != &ConcreteType::Float {
+                                    state.concrete_types.insert(result, ConcreteType::Float);
+                                    changed = true;
+                                }
+                            } else {
+                                changed |= maybe_seed_concrete_type(
+                                    &mut state,
+                                    result,
+                                    ConcreteType::Signed,
+                                );
+                            }
                         }
                     }
                     OpKind::UnaryOp {
