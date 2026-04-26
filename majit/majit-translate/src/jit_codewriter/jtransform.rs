@@ -666,39 +666,43 @@ impl<'a> Transformer<'a> {
             // jtransform pass mirrors RPython's rtyper-level
             // distinction by rewriting `int_*` over Float operands to
             // `float_*`.  Both operands Float → arithmetic returns
-            // Float; comparisons return Int (bool).  Mixed-kind
-            // operands need explicit `cast_int_to_float` insertion
-            // (RPython's rtyper does this upstream); pyre lacks that
-            // pass, so mixed cases keep the `int_*` opname for now.
+            // Float; comparisons return Int (bool).  RPython's rtyper
+            // inserts `cast_int_to_float` for mixed int/float pairs
+            // before emitting the `float_*` op; pyre's lighter rtyper
+            // leaves the generic BinOp in place, so jtransform performs
+            // that local coercion here.
             //
-            // `mod` is intentionally excluded: RPython does not provide
+            // `mod` is handled separately: RPython does not provide
             // `float_mod` (`rpython/rtyper/lltypesystem/lloperation.py:260`
-            // "don't implement float_mod, use math.fmod instead") and
-            // `rfloat.py` only handles `add` / `sub` / `mul` / `truediv`.
-            // Pyre must lower `%` over floats via `math.fmod` residual
-            // call rather than a synthetic `float_mod` opname.
+            // "don't implement float_mod, use math.fmod instead"), so
+            // `%` over floats lowers to a residual `ll_math_fmod` call.
             OpKind::BinOp {
                 op: binop_name,
                 lhs,
                 rhs,
                 ..
             } if matches!(binop_name.as_str(), "add" | "sub" | "mul" | "div")
-                && self.get_value_kind(*lhs) == 'f'
-                && self.get_value_kind(*rhs) == 'f' =>
+                && is_int_float_domain(self.get_value_kind(*lhs))
+                && is_int_float_domain(self.get_value_kind(*rhs))
+                && (self.get_value_kind(*lhs) == 'f' || self.get_value_kind(*rhs) == 'f') =>
             {
                 let canonical = match binop_name.as_str() {
                     "div" => "truediv", // RPython lltype: `float_truediv`
                     other => other,
                 };
-                RewriteResult::Replace(vec![SpaceOperation {
+                let (lhs, mut ops) = self.coerce_operand_to_float(*lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float(*rhs);
+                ops.extend(rhs_ops);
+                ops.push(SpaceOperation {
                     result: op.result,
                     kind: OpKind::BinOp {
                         op: format!("float_{canonical}"),
-                        lhs: *lhs,
-                        rhs: *rhs,
+                        lhs,
+                        rhs,
                         result_ty: ValueType::Float,
                     },
-                }])
+                });
+                RewriteResult::Replace(ops)
             }
             OpKind::BinOp {
                 op: binop_name,
@@ -706,18 +710,60 @@ impl<'a> Transformer<'a> {
                 rhs,
                 ..
             } if matches!(binop_name.as_str(), "lt" | "le" | "gt" | "ge" | "eq" | "ne")
-                && self.get_value_kind(*lhs) == 'f'
-                && self.get_value_kind(*rhs) == 'f' =>
+                && is_int_float_domain(self.get_value_kind(*lhs))
+                && is_int_float_domain(self.get_value_kind(*rhs))
+                && (self.get_value_kind(*lhs) == 'f' || self.get_value_kind(*rhs) == 'f') =>
             {
-                RewriteResult::Replace(vec![SpaceOperation {
+                let (lhs, mut ops) = self.coerce_operand_to_float(*lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float(*rhs);
+                ops.extend(rhs_ops);
+                ops.push(SpaceOperation {
                     result: op.result,
                     kind: OpKind::BinOp {
                         op: format!("float_{binop_name}"),
-                        lhs: *lhs,
-                        rhs: *rhs,
+                        lhs,
+                        rhs,
                         result_ty: ValueType::Int,
                     },
-                }])
+                });
+                RewriteResult::Replace(ops)
+            }
+            OpKind::BinOp {
+                op: binop_name,
+                lhs,
+                rhs,
+                ..
+            } if binop_name == "mod"
+                && is_int_float_domain(self.get_value_kind(*lhs))
+                && is_int_float_domain(self.get_value_kind(*rhs))
+                && (self.get_value_kind(*lhs) == 'f' || self.get_value_kind(*rhs) == 'f') =>
+            {
+                let (lhs, mut ops) = self.coerce_operand_to_float(*lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float(*rhs);
+                ops.extend(rhs_ops);
+                let target = CallTarget::function_path(["ll_math_fmod"]);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
+                ops.push(funcptr_op);
+                ops.push(SpaceOperation {
+                    result: op.result,
+                    kind: OpKind::CallResidual {
+                        funcptr: CallFuncPtr::Value(funcptr),
+                        descriptor: CallDescriptor::known(EffectInfo::new(
+                            ExtraEffect::ElidableCanRaise,
+                            OopSpecIndex::None,
+                        )),
+                        args_i: vec![],
+                        args_r: vec![],
+                        args_f: vec![lhs, rhs],
+                        result_kind: 'f',
+                        indirect_targets: None,
+                    },
+                });
+                ops.push(SpaceOperation {
+                    result: None,
+                    kind: OpKind::Live,
+                });
+                RewriteResult::Replace(ops)
             }
             OpKind::UnaryOp {
                 op: unop_name,
@@ -789,6 +835,27 @@ impl<'a> Transformer<'a> {
             crate::jit_codewriter::type_state::ConcreteType::Void => Some(ValueType::Void),
             crate::jit_codewriter::type_state::ConcreteType::Unknown => None,
         }
+    }
+
+    /// RPython's float rtyper calls `hop.inputargs(Float, Float)`, which
+    /// inserts `cast_int_to_float` for mixed int/float operands before
+    /// emitting `float_*` or the `math.fmod` helper call.
+    fn coerce_operand_to_float(&mut self, value: ValueId) -> (ValueId, Vec<SpaceOperation>) {
+        if self.get_value_kind(value) != 'i' {
+            return (value, Vec::new());
+        }
+        let coerced = self.fresh_synthetic_value();
+        (
+            coerced,
+            vec![SpaceOperation {
+                result: Some(coerced),
+                kind: OpKind::UnaryOp {
+                    op: "cast_int_to_float".into(),
+                    operand: value,
+                    result_ty: ValueType::Float,
+                },
+            }],
+        )
     }
 
     // ── rewrite_op_* methods ──────────────────────────────────
@@ -2401,6 +2468,10 @@ fn value_type_to_kind(ty: &ValueType) -> char {
     }
 }
 
+fn is_int_float_domain(kind: char) -> bool {
+    matches!(kind, 'i' | 'f')
+}
+
 /// Convert codewriter ValueType to IR Type.
 ///
 /// RPython: `x.concretetype` → lltype mapping.
@@ -2962,6 +3033,7 @@ fn classify_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
     use crate::model::{CallFuncPtr, CallTarget, FunctionGraph, OpKind, ValueType};
 
     #[test]
@@ -2988,6 +3060,252 @@ mod tests {
             OpKind::BinOp { op, .. } => assert_eq!(op, "xor"),
             other => panic!("expected canonical BinOp, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn rewrite_graph_coerces_mixed_float_add() {
+        let mut graph = FunctionGraph::new("mixed_float_add");
+        let lhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Float,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "add".into(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Float,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let mut type_state = TypeResolutionState::new();
+        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
+        type_state.concrete_types.insert(rhs, ConcreteType::Float);
+        type_state
+            .concrete_types
+            .insert(result, ConcreteType::Float);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_type_state(&type_state)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let cast_result = match &ops[2].kind {
+            OpKind::UnaryOp {
+                op,
+                operand,
+                result_ty,
+            } => {
+                assert_eq!(op, "cast_int_to_float");
+                assert_eq!(*operand, lhs);
+                assert_eq!(*result_ty, ValueType::Float);
+                ops[2].result.unwrap()
+            }
+            other => panic!("expected cast_int_to_float, got {other:?}"),
+        };
+        match &ops[3].kind {
+            OpKind::BinOp {
+                op,
+                lhs: rewritten_lhs,
+                rhs: rewritten_rhs,
+                result_ty,
+            } => {
+                assert_eq!(op, "float_add");
+                assert_eq!(*rewritten_lhs, cast_result);
+                assert_eq!(*rewritten_rhs, rhs);
+                assert_eq!(*result_ty, ValueType::Float);
+            }
+            other => panic!("expected float_add, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_graph_coerces_mixed_float_comparison() {
+        let mut graph = FunctionGraph::new("mixed_float_eq");
+        let lhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Float,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "eq".into(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let mut type_state = TypeResolutionState::new();
+        type_state.concrete_types.insert(lhs, ConcreteType::Float);
+        type_state.concrete_types.insert(rhs, ConcreteType::Signed);
+        type_state
+            .concrete_types
+            .insert(result, ConcreteType::Signed);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_type_state(&type_state)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        let cast_result = match &ops[2].kind {
+            OpKind::UnaryOp {
+                op,
+                operand,
+                result_ty,
+            } => {
+                assert_eq!(op, "cast_int_to_float");
+                assert_eq!(*operand, rhs);
+                assert_eq!(*result_ty, ValueType::Float);
+                ops[2].result.unwrap()
+            }
+            other => panic!("expected cast_int_to_float, got {other:?}"),
+        };
+        match &ops[3].kind {
+            OpKind::BinOp {
+                op,
+                lhs: rewritten_lhs,
+                rhs: rewritten_rhs,
+                result_ty,
+            } => {
+                assert_eq!(op, "float_eq");
+                assert_eq!(*rewritten_lhs, lhs);
+                assert_eq!(*rewritten_rhs, cast_result);
+                assert_eq!(*result_ty, ValueType::Int);
+            }
+            other => panic!("expected float_eq, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn rewrite_graph_lowers_float_mod_to_ll_math_fmod_residual_call() {
+        let mut graph = FunctionGraph::new("float_mod");
+        let lhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "lhs".into(),
+                    ty: ValueType::Int,
+                },
+                true,
+            )
+            .unwrap();
+        let rhs = graph
+            .push_op(
+                graph.startblock,
+                OpKind::Input {
+                    name: "rhs".into(),
+                    ty: ValueType::Float,
+                },
+                true,
+            )
+            .unwrap();
+        let result = graph
+            .push_op(
+                graph.startblock,
+                OpKind::BinOp {
+                    op: "mod".into(),
+                    lhs,
+                    rhs,
+                    result_ty: ValueType::Float,
+                },
+                true,
+            )
+            .unwrap();
+        graph.set_return(graph.startblock, Some(result));
+
+        let mut type_state = TypeResolutionState::new();
+        type_state.concrete_types.insert(lhs, ConcreteType::Signed);
+        type_state.concrete_types.insert(rhs, ConcreteType::Float);
+        type_state
+            .concrete_types
+            .insert(result, ConcreteType::Float);
+
+        let config = GraphTransformConfig::default();
+        let transformed = Transformer::new(&config)
+            .with_type_state(&type_state)
+            .transform(&graph);
+        let ops = &transformed.graph.block(graph.startblock).operations;
+        assert_eq!(ops.len(), 6, "Input + Input + cast + fnptr + call + Live");
+        let cast_result = match &ops[2].kind {
+            OpKind::UnaryOp {
+                op,
+                operand,
+                result_ty,
+            } => {
+                assert_eq!(op, "cast_int_to_float");
+                assert_eq!(*operand, lhs);
+                assert_eq!(*result_ty, ValueType::Float);
+                ops[2].result.unwrap()
+            }
+            other => panic!("expected cast_int_to_float, got {other:?}"),
+        };
+        assert!(matches!(ops[3].kind, OpKind::ConstInt(_)));
+        match &ops[4].kind {
+            OpKind::CallResidual {
+                funcptr,
+                descriptor,
+                args_i,
+                args_r,
+                args_f,
+                result_kind,
+                indirect_targets,
+            } => {
+                assert!(matches!(funcptr, CallFuncPtr::Value(_)));
+                assert_eq!(
+                    descriptor.extra_info.extraeffect,
+                    ExtraEffect::ElidableCanRaise
+                );
+                assert!(args_i.is_empty());
+                assert!(args_r.is_empty());
+                assert_eq!(args_f, &vec![cast_result, rhs]);
+                assert_eq!(*result_kind, 'f');
+                assert!(indirect_targets.is_none());
+            }
+            other => panic!("expected CallResidual, got {other:?}"),
+        }
+        assert!(matches!(ops[5].kind, OpKind::Live));
     }
 
     #[test]

@@ -1898,7 +1898,7 @@ fn op_kind_to_opname(kind: &crate::model::OpKind) -> String {
         // AST level); canonicalize to `int_invert` at the emission boundary.
         OpKind::UnaryOp { op, .. } => match op.as_str() {
             "not" => "int_invert".into(),
-            s if s.starts_with("float_") => op.clone(),
+            s if s.starts_with("float_") || s.starts_with("cast_") => op.clone(),
             _ => format!("int_{op}"),
         },
         OpKind::VableForce => "hint_force_virtualizable".into(),

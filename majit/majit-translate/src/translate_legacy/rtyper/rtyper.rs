@@ -156,12 +156,19 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                             // result as Float for arithmetic ops and
                             // Int for comparisons.  jtransform will
                             // then rewrite the BinOp's `op` from `add`
-                            // to `float_add` (etc.), keeping IR/regalloc
-                            // consistent.  Mixed-kind operands fall
-                            // through to the legacy Signed path until
-                            // `cast_int_to_float` insertion lands.
+                            // to `float_add` (etc.) and insert
+                            // `cast_int_to_float` for mixed int/float
+                            // operands, keeping IR/regalloc consistent.
                             let lhs_float = *state.get(*lhs) == ConcreteType::Float;
                             let rhs_float = *state.get(*rhs) == ConcreteType::Float;
+                            let any_float = lhs_float || rhs_float;
+                            let both_numeric = matches!(
+                                *state.get(*lhs),
+                                ConcreteType::Signed | ConcreteType::Float
+                            ) && matches!(
+                                *state.get(*rhs),
+                                ConcreteType::Signed | ConcreteType::Float
+                            );
                             // Mirror jtransform's float-rewrite set
                             // (`jit_codewriter/jtransform.rs`):
                             // arithmetic `add/sub/mul/div` →
@@ -169,16 +176,15 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                             // `lt/le/gt/ge/eq/ne` → `float_*` returns
                             // Int (Bool — RPython `rfloat.py:133`,
                             // `blackhole.py:731 bhimpl_float_eq`).
-                            // `mod` is intentionally absent: RPython
-                            // has no `float_mod` (`lloperation.py:260`
-                            // "use math.fmod instead"); overriding
-                            // its result to Float here would synthesize
-                            // a `mod/ff>f` shape with no jtransform
-                            // rewrite and no blackhole handler.
+                            // `mod` is also Float when a Float operand is
+                            // present, but jtransform lowers it to the
+                            // residual `ll_math_fmod` helper rather than a
+                            // non-RPython `float_mod` opcode.
                             let is_compare =
                                 matches!(opname.as_str(), "lt" | "le" | "gt" | "ge" | "eq" | "ne");
-                            let is_arith = matches!(opname.as_str(), "add" | "sub" | "mul" | "div");
-                            if lhs_float && rhs_float && (is_arith || is_compare) {
+                            let is_arith =
+                                matches!(opname.as_str(), "add" | "sub" | "mul" | "div" | "mod");
+                            if any_float && both_numeric && (is_arith || is_compare) {
                                 let target = if is_compare {
                                     ConcreteType::Signed
                                 } else {
@@ -188,19 +194,13 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                                     state.concrete_types.insert(result, target);
                                     changed = true;
                                 }
-                            } else if !(lhs_float && rhs_float) {
+                            } else if !any_float || !both_numeric {
                                 changed |= maybe_seed_concrete_type(
                                     &mut state,
                                     result,
                                     ConcreteType::Signed,
                                 );
                             }
-                            // Float-float `mod` falls through with no
-                            // override: result keeps the
-                            // `infer_concrete_from_op` default
-                            // (Signed) so the legacy mixed-kind path
-                            // is used until math.fmod residual
-                            // lowering lands.
                         }
                     }
                     OpKind::UnaryOp {
