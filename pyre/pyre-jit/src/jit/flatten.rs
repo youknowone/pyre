@@ -288,6 +288,40 @@ pub enum DescrOperand {
     /// shape still matches upstream 1:1: one descr operand per residual
     /// call, final argument position.
     CallDescrStub(CallDescrStub),
+    /// `rpython/jit/metainterp/virtualizable.py:73` `VirtualizableInfo
+    /// .array_field_descrs[i]` — the `FieldDescr` for the frame field
+    /// holding a virtualizable array's pointer.  RPython
+    /// `jtransform.py:1882-1885 do_fixed_list_getitem` and `:1898-1906
+    /// do_fixed_list_setitem` emit it as the second-to-last operand of
+    /// `getarrayitem_vable_X` / `setarrayitem_vable_X` and as one of two
+    /// trailing descrs on `arraylen_vable`.  pyre stores only the
+    /// per-array index (today always 0 — pyre's `PyFrame` has a single
+    /// virtualizable array, `locals_cells_stack_w`) because the
+    /// assembler dispatch lowers to the existing `vable_setarrayitem_*`
+    /// / `vable_getarrayitem_*` / `vable_arraylen` builder API where
+    /// `array_idx:u16` already encodes both `array_field_descr` and
+    /// `array_descr` jointly.
+    VableArrayField(u16),
+    /// `rpython/jit/metainterp/virtualizable.py:58` `VirtualizableInfo
+    /// .array_descrs[i]` — the `ArrayDescr` for the GcArray that the
+    /// `array_field_descr` field points at.  Always paired with a
+    /// `VableArrayField(i)` operand at `i+1` in upstream's argv;
+    /// `assembler.py:80-138 emit_const` uses both to encode the per-op
+    /// bytecode.  pyre's bytecode jointly encodes the pair as
+    /// `array_idx:u16`, so this variant is carried at SSARepr level for
+    /// shape parity but absorbed by the assembler dispatch.
+    VableArray(u16),
+    /// `rpython/jit/metainterp/virtualizable.py:71` `VirtualizableInfo
+    /// .static_field_descrs[i]` — the `FieldDescr` for the i-th scalar
+    /// (non-array) field of the virtualizable struct. RPython
+    /// `jtransform.py:846` (getfield) emits it as the trailing descr
+    /// operand of `getfield_vable_<kind>` after `v_inst`;
+    /// `jtransform.py:927` (setfield) emits it after `v_inst, v_value`
+    /// on `setfield_vable_<kind>`. pyre stores only the per-field
+    /// index because the assembler dispatch lowers to the existing
+    /// `vable_setfield_*` / `vable_getfield_*` builder API which
+    /// already encodes the field as a single `u16`.
+    VableStaticField(u16),
 }
 
 /// Pyre-local stand-in for `rpython/jit/codewriter/effectinfo.py
@@ -442,6 +476,32 @@ impl Operand {
     /// Preserves identity for dedup (`assembler.py:197-199`).
     pub fn descr_rc(value: Rc<DescrOperand>) -> Self {
         Operand::Descr(value)
+    }
+
+    /// `Operand::Descr(Rc::new(DescrOperand::VableArrayField(idx)))` —
+    /// `rpython/jit/metainterp/virtualizable.py:73 array_field_descrs[i]`.
+    /// Used by `getarrayitem_vable_X` / `setarrayitem_vable_X` /
+    /// `arraylen_vable` SSARepr ops to carry the array-field index for
+    /// `assembler.py:80-138 emit_const` lowering.
+    pub fn descr_vable_array_field(idx: u16) -> Self {
+        Operand::Descr(Rc::new(DescrOperand::VableArrayField(idx)))
+    }
+
+    /// `Operand::Descr(Rc::new(DescrOperand::VableArray(idx)))` —
+    /// `rpython/jit/metainterp/virtualizable.py:58 array_descrs[i]`.
+    /// Paired with `descr_vable_array_field(i)` at the trailing operand
+    /// position of every vable arrayitem op.
+    pub fn descr_vable_array(idx: u16) -> Self {
+        Operand::Descr(Rc::new(DescrOperand::VableArray(idx)))
+    }
+
+    /// `Operand::Descr(Rc::new(DescrOperand::VableStaticField(idx)))` —
+    /// `rpython/jit/metainterp/virtualizable.py:71 static_field_descrs[i]`.
+    /// Trailing descr operand of `getfield_vable_<kind>` (after `v_inst`,
+    /// `jtransform.py:846`) and `setfield_vable_<kind>` (after `v_inst,
+    /// v_value`, `jtransform.py:927`).
+    pub fn descr_vable_static_field(idx: u16) -> Self {
+        Operand::Descr(Rc::new(DescrOperand::VableStaticField(idx)))
     }
 }
 
@@ -1070,17 +1130,10 @@ where
                     .collect(),
             )),
             // `flatten.py:365-367` passes AbstractDescr through
-            // unchanged.  pyre's `DescrOperand` is a closed enum over
-            // specific descr flavors (Bh/SwitchDict/ResidualCall/…)
-            // rather than a transparent wrapper; picking the correct
-            // variant requires per-opname semantic context that the
-            // generic flatten path does not carry.  No graph-emitted
-            // op currently ships a Descr arg — add the per-opname
-            // mapping here alongside the first such producer.
-            SpaceOperationArg::Descr(_) => panic!(
-                "GraphFlattener: lowering SpaceOperationArg::Descr requires \
-                 per-opname DescrOperand mapping; no production consumer yet"
-            ),
+            // unchanged.  Pyre routes the `DescrByPtr` to the matching
+            // `DescrOperand` variant via singleton `Arc::ptr_eq` —
+            // see `flatten_descr_by_ptr`.
+            SpaceOperationArg::Descr(descr_by_ptr) => flatten_descr_by_ptr(descr_by_ptr),
             // `flatten.py:365-367` also passes IndirectCallTargets
             // through unchanged.  `Operand::IndirectCallTargets` takes a
             // value, so clone the inner (the `Vec<Arc<JitCode>>` clone
@@ -1324,20 +1377,50 @@ where
             Operand::IndirectCallTargets((*targets.0).clone())
         }
         // `flatten.py:365-367` also passes `AbstractDescr` through
-        // unchanged.  Pyre's canonical `GraphFlattener::flatten_arg`
-        // (`flatten.rs:1080-1083`) panics on `SpaceOperationArg::Descr`
-        // because converting `DescrByPtr` to a concrete
-        // `DescrOperand` variant requires per-opname semantic context
-        // pyre does not yet thread.  No probed family
-        // (`setarrayitem_vable_r`, `setfield_vable_i`) carries a Descr
-        // arg today; if a future probed family does, the per-opname
-        // mapping required for canonical flatten lands first.
-        super::flow::SpaceOperationArg::Descr(_) => panic!(
-            "flatten_arg_for_probe: Descr arg requires per-opname \
-             DescrOperand mapping; no production consumer in the \
-             current probed family list"
-        ),
+        // unchanged.  The probe shares
+        // `flatten_descr_by_ptr` with the production
+        // `GraphFlattener::flatten_arg`; both match the `DescrByPtr`
+        // singleton by `Arc::ptr_eq` and lower to the same
+        // `DescrOperand` variant so the diagnostic shape compare at
+        // `codewriter.rs:6013` sees identical operand sequences when
+        // graph and SSA agree.
+        super::flow::SpaceOperationArg::Descr(descr_by_ptr) => flatten_descr_by_ptr(descr_by_ptr),
     }
+}
+
+/// Lower a `flow::DescrByPtr` to the matching SSARepr-side
+/// `DescrOperand` by `Arc::ptr_eq` against the singleton accessors in
+/// `majit_ir::descr`.  Today recognises the vable array_field /
+/// array / static_field singletons emitted by `record_graph_op` for
+/// vable get/setfield + get/setarrayitem ops
+/// (`jtransform.py:846-927`, `:1880-1906`).  Other concrete descr
+/// flavors (`Bh`, `SwitchDict`, `CallDescrStub`) are constructed
+/// directly at the SSARepr-emit site rather than going through
+/// `SpaceOperationArg::Descr`, so this fn rejects them.  Adding a
+/// new graph-side descr producer must extend the singleton list.
+fn flatten_descr_by_ptr(descr: &super::flow::DescrByPtr) -> Operand {
+    let descr_ref = &descr.0;
+    if std::sync::Arc::ptr_eq(descr_ref, &majit_ir::descr::vable_array_field_descr(0)) {
+        return Operand::descr_vable_array_field(0);
+    }
+    if std::sync::Arc::ptr_eq(descr_ref, &majit_ir::descr::vable_array_descr(0)) {
+        return Operand::descr_vable_array(0);
+    }
+    // VableStaticField: pyre's PyFrame _virtualizable_ has 6 static
+    // fields (interp_jit.py:25-31, idx 0..=5).  Probe each idx in
+    // turn and Arc::ptr_eq against the per-idx singleton.  Mirrors
+    // the `array_field_descrs[i]` enumeration above.
+    for idx in 0u16..6 {
+        if std::sync::Arc::ptr_eq(descr_ref, &majit_ir::descr::vable_static_field_descr(idx)) {
+            return Operand::descr_vable_static_field(idx);
+        }
+    }
+    panic!(
+        "flatten_descr_by_ptr: unmapped DescrByPtr {} — only vable \
+         array_field / array / static_field singletons are \
+         recognised today",
+        descr_ref.repr()
+    )
 }
 
 #[cfg(test)]
@@ -1372,6 +1455,52 @@ mod tests {
     fn tlabel_equality_follows_name() {
         assert_eq!(TLabel::new("foo"), TLabel::new("foo"));
         assert_ne!(TLabel::new("foo"), TLabel::new("bar"));
+    }
+
+    #[test]
+    fn descr_vable_array_field_helper_wraps_index() {
+        // `rpython/jit/metainterp/virtualizable.py:73 array_field_descrs[i]`
+        // is carried at SSARepr level via `DescrOperand::VableArrayField(i)`.
+        match Operand::descr_vable_array_field(0) {
+            Operand::Descr(rc) => match &*rc {
+                DescrOperand::VableArrayField(idx) => assert_eq!(*idx, 0),
+                other => panic!("expected VableArrayField(0), got {other:?}"),
+            },
+            other => panic!("expected Operand::Descr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn descr_vable_array_helper_wraps_index() {
+        // `rpython/jit/metainterp/virtualizable.py:58 array_descrs[i]` is
+        // carried at SSARepr level via `DescrOperand::VableArray(i)`,
+        // paired with `VableArrayField(i)` at the trailing operand
+        // position of every vable arrayitem op.
+        match Operand::descr_vable_array(0) {
+            Operand::Descr(rc) => match &*rc {
+                DescrOperand::VableArray(idx) => assert_eq!(*idx, 0),
+                other => panic!("expected VableArray(0), got {other:?}"),
+            },
+            other => panic!("expected Operand::Descr, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn descr_vable_static_field_helper_wraps_index() {
+        // `rpython/jit/metainterp/virtualizable.py:71 static_field_descrs[i]`
+        // is carried at SSARepr level via `DescrOperand::VableStaticField(i)`,
+        // emitted as the trailing descr operand of `getfield_vable_<kind>`
+        // (after `v_inst`) and `setfield_vable_<kind>` (after `v_inst,
+        // v_value`) — `jtransform.py:846, :927`.
+        for idx in [0u16, 2, 5] {
+            match Operand::descr_vable_static_field(idx) {
+                Operand::Descr(rc) => match &*rc {
+                    DescrOperand::VableStaticField(stored) => assert_eq!(*stored, idx),
+                    other => panic!("expected VableStaticField({idx}), got {other:?}"),
+                },
+                other => panic!("expected Operand::Descr, got {other:?}"),
+            }
+        }
     }
 
     #[test]

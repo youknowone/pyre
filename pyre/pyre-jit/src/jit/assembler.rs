@@ -873,10 +873,16 @@ fn dispatch_op(
                 .vable_getfield_int(dst, expect_small_u16(&args[0]));
         }
         "getfield_vable_r" => {
+            // 2-arg shape mirroring `jtransform.py:846-847` getfield:
+            // `[v_inst, descr]` with a Ref result.  `args[0]` is the
+            // `v_inst` sentinel (`ConstRef(0)`) — pyre's single-frame
+            // model leaves the frame implicit at `state.frame`.
+            // `field_idx` derives from the trailing
+            // `VableStaticField` descr.
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
-            state
-                .builder
-                .vable_getfield_ref(dst, expect_small_u16(&args[0]));
+            let _v_inst = &args[0];
+            let field_idx = expect_descr_vable_static_field(&args[1]);
+            state.builder.vable_getfield_ref(dst, field_idx);
         }
         "getfield_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
@@ -884,9 +890,17 @@ fn dispatch_op(
                 .builder
                 .vable_getfield_float(dst, expect_small_u16(&args[0]));
         }
-        "setfield_vable_i" => state
-            .builder
-            .vable_setfield_int(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Int)),
+        "setfield_vable_i" => {
+            // 3-arg shape mirroring `jtransform.py:927-928` setfield:
+            // `[v_inst, v_value, descr]`.  `args[0]` is the `v_inst`
+            // sentinel; see `getfield_vable_r` for rationale.
+            // `field_idx` derives from the trailing
+            // `VableStaticField` descr.
+            let _v_inst = &args[0];
+            let value_reg = expect_reg(&args[1], Kind::Int);
+            let field_idx = expect_descr_vable_static_field(&args[2]);
+            state.builder.vable_setfield_int(field_idx, value_reg);
+        }
         "setfield_vable_r" => state
             .builder
             .vable_setfield_ref(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Ref)),
@@ -903,12 +917,25 @@ fn dispatch_op(
             );
         }
         "getarrayitem_vable_r" => {
+            // 4-arg shape mirroring `jtransform.py:1882-1885
+            // do_fixed_list_getitem` (vable branch): `[v_base,
+            // v_index, arrayfielddescr, arraydescr]` with a Ref
+            // result.  See `setarrayitem_vable_r` arm for the
+            // descr-pair extraction + lowering rationale.
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
-            state.builder.vable_getarrayitem_ref(
-                dst,
-                expect_small_u16(&args[0]),
-                expect_reg(&args[1], Kind::Int),
+            let _v_base = &args[0];
+            let index_reg = expect_reg(&args[1], Kind::Int);
+            let array_idx = expect_descr_vable_array_field(&args[2]);
+            let array_descr_idx = expect_descr_vable_array(&args[3]);
+            debug_assert_eq!(
+                array_idx, array_descr_idx,
+                "getarrayitem_vable_r: VableArrayField({}) and VableArray({}) descrs \
+                 must reference the same array field",
+                array_idx, array_descr_idx,
             );
+            state
+                .builder
+                .vable_getarrayitem_ref(dst, array_idx, index_reg);
         }
         "getarrayitem_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
@@ -924,8 +951,26 @@ fn dispatch_op(
             expect_reg(&args[2], Kind::Int),
         ),
         "setarrayitem_vable_r" => {
-            let array_idx = expect_small_u16(&args[0]);
+            // 5-arg shape mirroring `jtransform.py:1898-1906
+            // do_fixed_list_setitem` (vable branch): `[v_base,
+            // v_index, v_value, arrayfielddescr, arraydescr]`.
+            // `args[0]` is the `v_base` sentinel (`ConstRef(0)`) —
+            // pyre's single-frame model leaves the frame implicit at
+            // `state.frame`; the operand exists for shape parity.
+            // `array_idx` derives from the trailing `VableArrayField`
+            // descr; `VableArray` is sanity-checked to match.
+            // Mirroring `assembler.py:80-138 emit_const`'s role of
+            // compressing descr operands into bytecode bytes.
+            let _v_base = &args[0];
             let index_reg = expect_reg(&args[1], Kind::Int);
+            let array_idx = expect_descr_vable_array_field(&args[3]);
+            let array_descr_idx = expect_descr_vable_array(&args[4]);
+            debug_assert_eq!(
+                array_idx, array_descr_idx,
+                "setarrayitem_vable_r: VableArrayField({}) and VableArray({}) descrs \
+                 must reference the same array field",
+                array_idx, array_descr_idx,
+            );
             match &args[2] {
                 Operand::Register(r) if r.kind == Kind::Ref => {
                     state
@@ -1586,6 +1631,55 @@ fn expect_small_u16(op: &Operand) -> u16 {
     match op {
         Operand::ConstInt(value) => u16::try_from(*value).expect("expected u16-sized ConstInt"),
         _ => panic!("expected ConstInt(u16), got {:?}", op),
+    }
+}
+
+/// `rpython/jit/metainterp/virtualizable.py:73 array_field_descrs[i]`:
+/// extract the per-array index `i` carried by an
+/// `Operand::Descr(DescrOperand::VableArrayField(i))` operand at the
+/// trailing position of `getarrayitem_vable_X` / `setarrayitem_vable_X`
+/// / `arraylen_vable` SSA ops (`jtransform.py:1880-1906`,
+/// `:1865-1873`). Used by the assembler dispatch to recover the
+/// `array_idx:u16` that the existing `vable_*` builder API expects.
+fn expect_descr_vable_array_field(op: &Operand) -> u16 {
+    match op {
+        Operand::Descr(rc) => match &**rc {
+            DescrOperand::VableArrayField(idx) => *idx,
+            other => panic!("expected DescrOperand::VableArrayField, got {:?}", other),
+        },
+        _ => panic!("expected Operand::Descr(VableArrayField), got {:?}", op),
+    }
+}
+
+/// `rpython/jit/metainterp/virtualizable.py:58 array_descrs[i]`:
+/// counterpart of `expect_descr_vable_array_field` for the second
+/// trailing descr operand (the GcArray layout descr).  Always paired
+/// with a `VableArrayField(i)` at the preceding position; the
+/// dispatch arms cross-check the indices match.
+fn expect_descr_vable_array(op: &Operand) -> u16 {
+    match op {
+        Operand::Descr(rc) => match &**rc {
+            DescrOperand::VableArray(idx) => *idx,
+            other => panic!("expected DescrOperand::VableArray, got {:?}", other),
+        },
+        _ => panic!("expected Operand::Descr(VableArray), got {:?}", op),
+    }
+}
+
+/// `rpython/jit/metainterp/virtualizable.py:71 static_field_descrs[i]`:
+/// extract the per-field index `i` carried by an
+/// `Operand::Descr(DescrOperand::VableStaticField(i))` operand at the
+/// trailing position of `getfield_vable_<kind>` / `setfield_vable_<kind>`
+/// SSA ops (`jtransform.py:846-927`).  Used by the assembler dispatch
+/// to recover the `field_idx:u16` that the existing `vable_getfield_*`
+/// / `vable_setfield_*` builder API expects.
+fn expect_descr_vable_static_field(op: &Operand) -> u16 {
+    match op {
+        Operand::Descr(rc) => match &**rc {
+            DescrOperand::VableStaticField(idx) => *idx,
+            other => panic!("expected DescrOperand::VableStaticField, got {:?}", other),
+        },
+        _ => panic!("expected Operand::Descr(VableStaticField), got {:?}", op),
     }
 }
 

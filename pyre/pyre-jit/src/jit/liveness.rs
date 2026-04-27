@@ -191,11 +191,19 @@ fn _compute_liveness_must_continue(
                             follow_label(&mut alive, label2alive, label);
                         }
                     }
-                    DescrOperand::Bh(_) | DescrOperand::CallDescrStub(_) => {
+                    DescrOperand::Bh(_)
+                    | DescrOperand::CallDescrStub(_)
+                    | DescrOperand::VableArrayField(_)
+                    | DescrOperand::VableArray(_)
+                    | DescrOperand::VableStaticField(_) => {
                         // RPython `liveness.py:59-78` ignores non-`SwitchDictDescr`
                         // descrs — they contribute no control-flow edges.
                         // `CallDescrStub` is a pyre-only dispatch tag at the
-                        // calldescr slot and likewise carries no edges.
+                        // calldescr slot, `VableArrayField` / `VableArray`
+                        // carry only an array-idx byte that the assembler
+                        // dispatch lowers to bytecode, and `VableStaticField`
+                        // similarly carries a single field-idx byte; none
+                        // contributes an edge.
                     }
                 },
                 _ => {}

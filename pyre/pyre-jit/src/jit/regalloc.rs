@@ -413,13 +413,15 @@ pub(super) fn count_link_renamings_per_kind(
             };
             let target_inputargs = target.borrow().inputargs.clone();
             // `model.py:114-116 Link.__init__` enforces
-            // `len(args) == len(target.inputargs)` (assert at :116).
+            // `len(args) == len(target.inputargs)` via plain `assert`
+            // (always-on in Python, only stripped under `-O`).
             // Pyre's `Link::new_mergeable` (flow.rs:797-800) carries
-            // the same assert at construction.  Mirror it here so the probe
-            // surfaces a debug-build panic if any future link-builder
-            // bypasses the constructor invariant — silently truncating
-            // via `.zip()` would under-report renaming steps.
-            debug_assert_eq!(
+            // a release-build `assert_eq!` at construction; mirror
+            // that strength here so a future link-builder that
+            // bypasses the constructor invariant fails identically
+            // in release.  Silently truncating via `.zip()` would
+            // under-report renaming steps.
+            assert_eq!(
                 link_borrow.args.len(),
                 target_inputargs.len(),
                 "count_link_renamings_per_kind: Link.__init__ arity invariant violated \

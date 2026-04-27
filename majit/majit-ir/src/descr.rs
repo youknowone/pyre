@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::sync::Weak;
 use std::sync::atomic::{AtomicI32, Ordering};
 
@@ -1406,6 +1407,156 @@ impl Descr for DebugMergePointDescr {
             self.info.call_depth
         )
     }
+}
+
+/// `rpython/jit/metainterp/virtualizable.py:73` —
+/// `VirtualizableInfo.array_field_descrs[i]` is a `FieldDescr` for the
+/// frame field that holds the i-th virtualizable array's pointer.
+/// `jtransform.py:1880-1885 do_fixed_list_getitem` and `:1898-1906
+/// do_fixed_list_setitem` (vable branches) emit it as the
+/// second-to-last operand of `getarrayitem_vable_X` /
+/// `setarrayitem_vable_X` and as one of the trailing descrs on
+/// `arraylen_vable`.
+///
+/// Pyre's bytecode jointly encodes the `(array_field_descr, array_descr)`
+/// pair as `array_idx:u16`, so this struct stores only the per-array
+/// index `i` for the assembler dispatch to recover. Today pyre's
+/// `PyFrame` has a single virtualizable array (`locals_cells_stack_w`,
+/// idx=0), but the struct is shaped to allow multi-array virtualizables.
+#[derive(Debug)]
+pub struct VableArrayFieldDescr {
+    pub idx: u16,
+}
+
+impl Descr for VableArrayFieldDescr {
+    fn repr(&self) -> String {
+        format!("vable_array_field_descr[{}]", self.idx)
+    }
+}
+
+/// `rpython/jit/metainterp/virtualizable.py:58` —
+/// `VirtualizableInfo.array_descrs[i]` is the `ArrayDescr` for the
+/// GcArray that the i-th `array_field_descr` points at. Always paired
+/// with a `VableArrayFieldDescr` at the same `i` in jtransform's
+/// `vable_array_vars` table; the pair appears at the trailing two
+/// operand positions of every `getarrayitem_vable_X` /
+/// `setarrayitem_vable_X` / `arraylen_vable` SpaceOperation.
+#[derive(Debug)]
+pub struct VableArrayDescr {
+    pub idx: u16,
+}
+
+impl Descr for VableArrayDescr {
+    fn repr(&self) -> String {
+        format!("vable_array_descr[{}]", self.idx)
+    }
+}
+
+/// Singleton accessor for `array_field_descrs[idx]`.
+///
+/// `rpython/jit/metainterp/virtualizable.py:73` constructs one
+/// `FieldDescr` per array field at `VirtualizableInfo.__init__` time
+/// and caches it on the `VirtualizableInfo` instance — every later
+/// reference (`vable_array_vars[var]` in jtransform, the optimizer,
+/// the assembler) uses Python object identity to dedup. Pyre mirrors
+/// this with a process-global `OnceLock<DescrRef>` per array index so
+/// `Arc::ptr_eq` over two `vable_array_field_descr(idx)` calls returns
+/// true. Currently only `idx=0` is supported (pyre's single
+/// virtualizable array).
+pub fn vable_array_field_descr(idx: u16) -> DescrRef {
+    assert_eq!(
+        idx, 0,
+        "pyre's PyFrame currently has only one virtualizable array \
+         (locals_cells_stack_w, idx=0); multi-array virtualizables \
+         are a future extension"
+    );
+    static SLOT: OnceLock<DescrRef> = OnceLock::new();
+    SLOT.get_or_init(|| Arc::new(VableArrayFieldDescr { idx: 0 }) as DescrRef)
+        .clone()
+}
+
+/// Singleton accessor for `array_descrs[idx]` — counterpart of
+/// `vable_array_field_descr` carrying the GcArray layout descr.
+/// Same identity-preservation invariant via `OnceLock<DescrRef>`.
+pub fn vable_array_descr(idx: u16) -> DescrRef {
+    assert_eq!(
+        idx, 0,
+        "pyre's PyFrame currently has only one virtualizable array \
+         (locals_cells_stack_w, idx=0); multi-array virtualizables \
+         are a future extension"
+    );
+    static SLOT: OnceLock<DescrRef> = OnceLock::new();
+    SLOT.get_or_init(|| Arc::new(VableArrayDescr { idx: 0 }) as DescrRef)
+        .clone()
+}
+
+/// `rpython/jit/metainterp/virtualizable.py:71` —
+/// `VirtualizableInfo.static_field_descrs[i]` is a `FieldDescr` for
+/// the i-th scalar (non-array) field of the virtualizable struct.
+/// `jtransform.py:846` (getfield) and `jtransform.py:927` (setfield)
+/// emit it as the trailing descr operand of `getfield_vable_<kind>`
+/// (after `v_inst`) and `setfield_vable_<kind>` (after `v_inst,
+/// v_value`).
+///
+/// Pyre's `PyFrame._virtualizable_` declaration (see
+/// `pyre-interpreter/src/pyframe.rs:406` and `interp_jit.py:25-31`)
+/// has 6 static fields in fixed order: `[last_instr, pycode,
+/// valuestackdepth, debugdata, lastblock, w_globals]`, so legitimate
+/// `idx` values are `0..=5`. The struct stores only the per-field
+/// index; bytecode emission and runtime field access still go
+/// through the field-idx-to-offset table maintained by
+/// `virtualizable_spec.rs`.
+#[derive(Debug)]
+pub struct VableStaticFieldDescr {
+    pub idx: u16,
+}
+
+impl Descr for VableStaticFieldDescr {
+    fn repr(&self) -> String {
+        format!("vable_static_field_descr[{}]", self.idx)
+    }
+}
+
+/// Number of `OnceLock<DescrRef>` slots reserved for
+/// `vable_static_field_descr(idx)` singletons. Sized at 8 to cover
+/// pyre's current 6-field PyFrame virtualizable
+/// (`interp_jit.py:25-31`) with headroom for two additional fields
+/// before this constant must grow. The assertion in
+/// `vable_static_field_descr` rejects out-of-range indices loudly.
+const VABLE_STATIC_FIELD_DESCR_SLOTS: usize = 8;
+
+/// Singleton accessor for `static_field_descrs[idx]`.
+///
+/// `rpython/jit/metainterp/virtualizable.py:71` builds one
+/// `FieldDescr` per scalar field eagerly at `VirtualizableInfo
+/// .__init__` and caches it; every later jtransform / optimizer /
+/// assembler reference uses Python object identity to dedup.  Pyre
+/// mirrors this with a per-`idx` `OnceLock<DescrRef>` so
+/// `Arc::ptr_eq` over two `vable_static_field_descr(idx)` calls with
+/// matching `idx` returns true.
+pub fn vable_static_field_descr(idx: u16) -> DescrRef {
+    static SLOTS: [OnceLock<DescrRef>; VABLE_STATIC_FIELD_DESCR_SLOTS] = [
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+        OnceLock::new(),
+    ];
+    let i = idx as usize;
+    assert!(
+        i < VABLE_STATIC_FIELD_DESCR_SLOTS,
+        "vable_static_field_descr: idx={} exceeds VABLE_STATIC_FIELD_DESCR_SLOTS={}; \
+         pyre's PyFrame _virtualizable_ declares only 6 static fields \
+         (interp_jit.py:25-31)",
+        idx,
+        VABLE_STATIC_FIELD_DESCR_SLOTS,
+    );
+    SLOTS[i]
+        .get_or_init(|| Arc::new(VableStaticFieldDescr { idx }) as DescrRef)
+        .clone()
 }
 
 // EffectInfo / ExtraEffect / OopSpecIndex moved to `crate::effectinfo`
