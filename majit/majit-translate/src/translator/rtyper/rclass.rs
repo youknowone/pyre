@@ -2495,46 +2495,49 @@ impl InstanceRepr {
         }
         // upstream `self.setup()`. Repr::setup is idempotent.
         Repr::setup(self.as_ref() as &dyn Repr)?;
-        // upstream `result = self.create_instance();
-        //           self.iprebuiltinstances[value] = result`. The
-        // cache must observe `result` BEFORE `initialize_prebuilt_data`
-        // recurses (rclass.py:799-800 ordering), so circular references
-        // through `convert_const(self)` find the partially-built
-        // pointer.
-        let result = self.create_instance()?;
+        // upstream rclass.py:799-800:
+        //     result = self.create_instance()
+        //     self.iprebuiltinstances[value] = result
+        //     self.initialize_prebuilt_data(value, self.classdef, result)
+        //
+        // Cache observes `result` BEFORE `initialize_prebuilt_data`
+        // recurses — so a recursive `convert_const(self)` from inside
+        // the field walk finds the partially-built pointer rather than
+        // restarting `convert_const_exact`.
+        //
+        // The Rust port runs the field-init body OUTSIDE the cache's
+        // `borrow_mut` guard so a recursive `convert_const_exact` call
+        // can re-enter the `iprebuiltinstances.borrow()` read at the
+        // top of this function without panicking on overlapping
+        // borrows. Three steps:
+        //   1. Insert a snapshot (cache observes the empty instance).
+        //   2. Drop the cache borrow_mut and run the field init on a
+        //      local clone. Both the cache snapshot and the local
+        //      share their `_struct._fields` / `_array.items` storage
+        //      via `Arc<Mutex<...>>` (lltype.rs:711-748, task #157),
+        //      so mutations performed on the local during init are
+        //      visible via every recursive `convert_const_exact` cache
+        //      hit before init completes — matching upstream's
+        //      `iprebuiltinstances[value] = result` aliasing semantics
+        //      for intra-class circular prebuilt instances
+        //      (`a.b.back == a`).
+        //   3. Re-acquire `borrow_mut` and re-insert the post-init
+        //      local. With shared `_fields` / `items` storage this is
+        //      observationally a no-op (both Arc clones already point
+        //      at the same Mutex), but keeps the cache slot owned by
+        //      the post-init Arc so the caller's `Constant` value
+        //      remains anchored.
+        let initial = self.create_instance()?;
         self.iprebuiltinstances
             .borrow_mut()
-            .insert(host_obj.clone(), result);
-        // upstream `self.initialize_prebuilt_instance(value,
-        //   self.classdef, result)`. Rust borrows `result` back out
-        // through the cache so the field-init body sees the same
-        // pointer the cache holds. The brief `borrow_mut` is safe
-        // because `initialize_prebuilt_data` does not re-enter
-        // `convert_const_exact` for the same key (recursion goes
-        // through `convert_const` → `convert_const_exact` of a
-        // different InstanceRepr or a different host_obj).
-        {
-            let mut cache = self.iprebuiltinstances.borrow_mut();
-            let result_in_cache = cache
-                .get_mut(host_obj)
-                .expect("iprebuiltinstances entry just inserted");
-            self.initialize_prebuilt_data(
-                Some(host_obj),
-                self.classdef.as_ref(),
-                result_in_cache,
-                &[],
-            )?;
-        }
-        let cached = self
-            .iprebuiltinstances
-            .borrow()
-            .get(host_obj)
-            .cloned()
-            .ok_or_else(|| {
-                TyperError::message("InstanceRepr.convert_const_exact: cache disappeared mid-init")
-            })?;
+            .insert(host_obj.clone(), initial.clone());
+        let mut local = initial;
+        self.initialize_prebuilt_data(Some(host_obj), self.classdef.as_ref(), &mut local, &[])?;
+        self.iprebuiltinstances
+            .borrow_mut()
+            .insert(host_obj.clone(), local.clone());
         Ok(Constant::with_concretetype(
-            ConstValue::LLPtr(Box::new(cached)),
+            ConstValue::LLPtr(Box::new(local)),
             self.lowleveltype.clone(),
         ))
     }
@@ -2671,11 +2674,15 @@ impl Repr for InstanceRepr {
     ///     return self.convert_const_exact(value)
     /// ```
     ///
-    /// The `convert_const_exact` (rclass.py:794-802) tail is gated on
-    /// the `iprebuiltinstances` cache + the full `initialize_prebuilt_data`
-    /// body for `classdef != None` (rclass.py:951-971), neither of
-    /// which has been ported yet — surfaces as `MissingRTypeOperation`
-    /// for the exact-match arm.
+    /// The `classdef == self.classdef` exact-match arm dispatches into
+    /// [`InstanceRepr::convert_const_exact`] (rclass.py:794-802) via
+    /// [`getinstancerepr`], which recovers the owning `Arc<Self>` from
+    /// the rtyper's repr cache so the borrow-cell-backed
+    /// `iprebuiltinstances` and `initialize_prebuilt_data` (rclass.py:
+    /// 947-975, including the class-level `read_attribute` /
+    /// `convert_desc_or_const` branch ported as Task #149) can run.
+    /// The Variable-arm field-init is in
+    /// [`InstanceRepr::initialize_prebuilt_data`].
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         use crate::annotator::classdesc::ClassDef;
 

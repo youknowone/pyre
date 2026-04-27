@@ -2199,6 +2199,17 @@ impl Repr for FunctionsPBCRepr {
 /// `small_cand`). Each desc maps to a distinct `chr(i)` index; runtime
 /// dispatch reads `c_pointer_table[v_int]` to recover a function
 /// pointer and `direct_call`s it.
+///
+/// `_conversion_tables` cache (rpbc.py:400 + rpbc.py:574-595): keyed
+/// on the *identity* of the target `SmallFunctionSetPBCRepr` (Python
+/// `r_from._conversion_tables[r_to]` is a dict-by-object-identity
+/// lookup). The Rust port uses the raw pointer address of the
+/// `&SmallFunctionSetPBCRepr` receiver as the key; this is sound
+/// because every live `SmallFunctionSetPBCRepr` is owned by an
+/// `Arc<dyn Repr>` slot in `RPythonTyper`'s per-`SomePBC` repr cache
+/// (rtyper.rs `getrepr` table) which outlives the cache, and
+/// `pair_..._convert_from_to` only inspects (does not store) the
+/// pointer.
 #[derive(Debug)]
 pub struct SmallFunctionSetPBCRepr {
     /// RPython `FunctionReprBase.__init__` (rpbc.py:395). Carries
@@ -2235,6 +2246,16 @@ pub struct SmallFunctionSetPBCRepr {
     /// hit builds the helper via [`SmallFunctionSetPBCRepr::compression_function`]
     /// and stashes the resulting `Constant` here.
     pub _compression_function: RefCell<Option<Constant>>,
+    /// RPython `self._conversion_tables = {}` (rpbc.py:400). Caches
+    /// `conversion_table(r_from=self, r_to)` results keyed on the
+    /// *identity* of the target `SmallFunctionSetPBCRepr`. `Some(c)`
+    /// stores the `Char Array` indexing constant; `None` records an
+    /// identity conversion (upstream's `r = None` branch when
+    /// `l == range(len(r_from.descriptions))`, rpbc.py:589-590) so
+    /// the caller skips the `getarrayitem` and returns `v` unchanged.
+    /// Key = pointer address of the target repr (see struct doc above
+    /// for the lifetime contract).
+    pub _conversion_tables: RefCell<HashMap<usize, Option<Constant>>>,
     /// RPython `self.lowleveltype = Char` (rpbc.py:398). Stored
     /// explicitly because `Repr::lowleveltype` returns `&LowLevelType`.
     lltype: LowLevelType,
@@ -2276,6 +2297,8 @@ impl SmallFunctionSetPBCRepr {
             _dispatch_cache: RefCell::new(HashMap::new()),
             // upstream rpbc.py:401 — `self._compression_function = None`.
             _compression_function: RefCell::new(None),
+            // upstream rpbc.py:400 — `self._conversion_tables = {}`.
+            _conversion_tables: RefCell::new(HashMap::new()),
             // upstream rpbc.py:398 — `self.lowleveltype = Char`.
             lltype: LowLevelType::Char,
             state: ReprState::new(),
@@ -2755,7 +2778,7 @@ impl SmallFunctionSetPBCRepr {
             let mut entries: Vec<Constant> = Vec::new();
             let n = array.getbounds().1;
             for i in 0..n {
-                let entry = array.getitem(i).cloned().ok_or_else(|| {
+                let entry = array.getitem(i).ok_or_else(|| {
                     TyperError::message(format!(
                         "SmallFunctionSetPBCRepr.make_compression_function: \
                          c_pointer_table entry {i} missing"
@@ -3629,11 +3652,11 @@ pub(super) fn pair_small_function_set_functions_pbc_convert_from_to(
 ///             return v
 /// ```
 ///
-/// Pyre omits the `_conversion_tables` per-target-Repr cache because
-/// callers reach this helper via `pairtype(...).convert_from_to`,
-/// which is invoked once per call site. The malloc reproduces the
-/// same `Array(Char, hints=...)` shape; identity (`l ==
-/// range(len)`) returns `v` unchanged.
+/// `_conversion_tables` cache (rpbc.py:400 + rpbc.py:574-595): keyed
+/// on the identity of `r_to` (pointer address of the target
+/// `SmallFunctionSetPBCRepr`). `Some(c_table)` reuses the cached
+/// `Char Array` constant; `None` records an identity conversion
+/// (upstream's `r = None` branch) so we return `v` without rebuilding.
 pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
     r_from: &dyn Repr,
     r_to: &dyn Repr,
@@ -3661,6 +3684,19 @@ pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
                  r_to is not SmallFunctionSetPBCRepr",
             )
         })?;
+
+    // upstream rpbc.py:574-576 — `if r_to in r_from._conversion_tables:
+    //     return r_from._conversion_tables[r_to]`. Cache key = identity
+    // of `r_to`; pointer address mirrors Python's dict-by-id semantics.
+    let cache_key = (r_to_set as *const SmallFunctionSetPBCRepr) as usize;
+    if let Some(cached) = r_from_set
+        ._conversion_tables
+        .borrow()
+        .get(&cache_key)
+        .cloned()
+    {
+        return small_function_set_apply_conversion(cached.as_ref(), v, llops);
+    }
 
     let from_descs = r_from_set.descriptions.borrow().clone();
     let to_descs = r_to_set.descriptions.borrow().clone();
@@ -3699,8 +3735,13 @@ pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
 
     // upstream rpbc.py:589-594 — `if l == range(len): r = None; else: r = inputconst(...)`.
     if all_identity {
+        // upstream rpbc.py:593 — `r_from._conversion_tables[r_to] = None`.
+        r_from_set
+            ._conversion_tables
+            .borrow_mut()
+            .insert(cache_key, None);
         // upstream pairtype `convert_from_to` else branch — `return v`.
-        return Ok(Some(v.clone()));
+        return small_function_set_apply_conversion(None, v, llops);
     }
 
     // upstream rpbc.py:578-580 — `t = malloc(Array(Char, hints=...),
@@ -3747,6 +3788,35 @@ pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
     ));
     let c_table = Constant::with_concretetype(ConstValue::LLPtr(Box::new(t)), ptr_type);
 
+    // upstream rpbc.py:593 — `r_from._conversion_tables[r_to] = r`.
+    r_from_set
+        ._conversion_tables
+        .borrow_mut()
+        .insert(cache_key, Some(c_table.clone()));
+
+    // upstream rpbc.py:600-605 emit path; shared with the cache-hit
+    // path via [`small_function_set_apply_conversion`].
+    small_function_set_apply_conversion(Some(&c_table), v, llops)
+}
+
+/// RPython `pairtype(SmallFunctionSetPBCRepr,
+/// SmallFunctionSetPBCRepr).convert_from_to` (rpbc.py:597-607) emit
+/// half — `c_table is None` ⇒ identity (`return v`); `c_table is
+/// Some(...)` ⇒ `cast_char_to_int` + `getarrayitem`. Shared between
+/// the cache-hit and cache-miss paths so the `_conversion_tables`
+/// lookup short-circuits straight to the same emission shape.
+fn small_function_set_apply_conversion(
+    c_table: Option<&Constant>,
+    v: &Hlvalue,
+    llops: &mut crate::translator::rtyper::rtyper::LowLevelOpList,
+) -> Result<Option<Hlvalue>, TyperError> {
+    use crate::translator::rtyper::rtyper::GenopResult;
+
+    let Some(c_table) = c_table else {
+        // upstream rpbc.py:606-607 — `else: return v`.
+        return Ok(Some(v.clone()));
+    };
+
     // upstream rpbc.py:601 — `assert v.concretetype is Char`.
     let v_ty = match v {
         Hlvalue::Variable(var) => var.concretetype(),
@@ -3775,7 +3845,7 @@ pub(super) fn pair_small_function_set_small_function_set_convert_from_to(
     let v_result = llops
         .genop(
             "getarrayitem",
-            vec![Hlvalue::Constant(c_table), Hlvalue::Variable(v_int)],
+            vec![Hlvalue::Constant(c_table.clone()), Hlvalue::Variable(v_int)],
             GenopResult::LLType(LowLevelType::Char),
         )
         .expect("getarrayitem with Char result yields a Variable");
@@ -3976,12 +4046,16 @@ impl Repr for SingleFrozenPBCRepr {
 ///         return llmemory.Address._defl()
 /// ```
 ///
-/// Pyre currently lands the shell: lowleveltype is
-/// [`LowLevelType::Address`], `null_instance` returns the
-/// [`LowLevelValue::Address`] NULL sentinel, and `convert_desc` /
-/// `convert_const` / `convert_pbc` / `create_instance` / `rtype_getattr`
-/// all surface [`TyperError::missing_rtype_operation`] until
-/// `Bookkeeper::getdesc` + `rtyper.getrepr` + `fakeaddress` body land.
+/// Pyre lowleveltype is [`LowLevelType::Address`]. `null_instance`
+/// returns the NULL fakeaddress sentinel; `convert_desc` /
+/// `convert_const` / `convert_pbc` / `create_instance` /
+/// `rtype_getattr` are all ported line-by-line from
+/// `rpbc.py:685-711`. `Bookkeeper::getdesc` + `rtyper.getrepr` +
+/// `_address::Fake` (fakeaddress) are wired through; the only
+/// remaining limitation is that `convert_desc` requires the
+/// per-frozendesc `r = rtyper.getrepr(SomePBC([d]))` to produce an
+/// `LLPtr` — desc lattices that route to a non-pointer repr surface
+/// the structural mismatch as a `TyperError`.
 #[derive(Debug)]
 pub struct MultipleUnrelatedFrozenPBCRepr {
     /// RPython `self.rtyper = rtyper` (rpbc.py:682).
@@ -5128,25 +5202,44 @@ impl MethodOfFrozenPBCRepr {
         hop2.args_s.borrow_mut()[0] = SomeValue::PBC(self.s_im_self.clone());
         hop2.args_r.borrow_mut()[0] = Some(self.r_im_self.clone());
 
-        // upstream:
+        // upstream rpbc.py:900-902:
         //     if isinstance(hop2.args_v[0], Constant):
         //         boundmethod = hop2.args_v[0].value
         //         hop2.args_v[0] = Constant(boundmethod.im_self)
         //
-        // PRE-EXISTING-ADAPTATION: pyre's `ConstValue` does not yet
-        // carry a "bound method" host-object variant from which
-        // `boundmethod.im_self` can be extracted. The Constant arm of
-        // upstream is a compile-time short-circuit that re-bases the
-        // hop's first arg on the frozen instance's host-side
-        // representation; pyre defers it until the bookkeeper carries
-        // a `BoundMethod` Constant kind. The Variable arm runs
-        // unmodified — `convertvar` will do the type adjustment under
-        // `args_r[0] = self.r_im_self`.
-        if matches!(hop2.args_v.borrow().get(0), Some(Hlvalue::Constant(_))) {
-            return Err(TyperError::missing_rtype_operation(
-                "MethodOfFrozenPBCRepr.redispatch_call (rpbc.py:900-902) \
-                 Constant boundmethod.im_self extraction port pending",
-            ));
+        // `hop2.args_v[0].value` is the host-side bound method object;
+        // `.im_self` is the receiver instance. Pyre's
+        // `HostObject::BoundMethod` carries the receiver as `self_obj`
+        // (model.rs:165), exposed via `bound_method_self()`. A
+        // non-`HostObject` Constant or a `HostObject` that is not a
+        // bound method surfaces as a structured TyperError — upstream
+        // would AttributeError on `.im_self`.
+        let new_first_const: Option<FlowConstant> = {
+            let args_v = hop2.args_v.borrow();
+            match args_v.get(0) {
+                Some(Hlvalue::Constant(c)) => match &c.value {
+                    ConstValue::HostObject(host_obj) => {
+                        let self_obj = host_obj.bound_method_self().ok_or_else(|| {
+                            TyperError::message(format!(
+                                "MethodOfFrozenPBCRepr.redispatch_call: \
+                                     Constant arg[0] HostObject is not a bound \
+                                     method (no im_self)"
+                            ))
+                        })?;
+                        Some(FlowConstant::new(ConstValue::HostObject(self_obj.clone())))
+                    }
+                    other => {
+                        return Err(TyperError::message(format!(
+                            "MethodOfFrozenPBCRepr.redispatch_call: Constant \
+                             arg[0] value is not a HostObject (got {other:?})"
+                        )));
+                    }
+                },
+                _ => None,
+            }
+        };
+        if let Some(new_const) = new_first_const {
+            hop2.args_v.borrow_mut()[0] = Hlvalue::Constant(new_const);
         }
 
         // upstream: `if call_args: swap_fst_snd_args(); _, s_shape =

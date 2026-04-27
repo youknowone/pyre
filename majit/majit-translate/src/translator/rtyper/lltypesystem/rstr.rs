@@ -186,10 +186,11 @@ pub fn alloc_array_name(name: &str) -> Result<_ptr, String> {
     let _ptr_obj::Struct(s) = obj else {
         return Err("alloc_array_name: STR pointer does not target a Struct".to_string());
     };
-    let Some((_, LowLevelValue::Array(chars))) =
-        s._fields.iter_mut().find(|(field, _)| field == "chars")
-    else {
-        return Err("alloc_array_name: STR struct has no chars array".to_string());
+    let chars_value = s
+        ._getattr("chars")
+        .ok_or_else(|| "alloc_array_name: STR struct has no chars field".to_string())?;
+    let LowLevelValue::Array(chars) = chars_value else {
+        return Err("alloc_array_name: STR struct chars field is not an Array".to_string());
     };
     for (i, byte) in name.bytes().enumerate() {
         chars.setitem(i, LowLevelValue::Char(byte as char));
@@ -221,10 +222,11 @@ pub fn alloc_array_unicode(value: &str) -> Result<_ptr, String> {
     let _ptr_obj::Struct(s) = obj else {
         return Err("alloc_array_unicode: UNICODE pointer does not target a Struct".to_string());
     };
-    let Some((_, LowLevelValue::Array(chars))) =
-        s._fields.iter_mut().find(|(field, _)| field == "chars")
-    else {
-        return Err("alloc_array_unicode: UNICODE struct has no chars array".to_string());
+    let chars_value = s
+        ._getattr("chars")
+        .ok_or_else(|| "alloc_array_unicode: UNICODE struct has no chars field".to_string())?;
+    let LowLevelValue::Array(chars) = chars_value else {
+        return Err("alloc_array_unicode: UNICODE struct chars field is not an Array".to_string());
     };
     for (i, ch) in value.chars().enumerate() {
         chars.setitem(i, LowLevelValue::UniChar(ch));
@@ -4580,15 +4582,14 @@ mod tests {
         let _ptr_obj::Struct(s) = obj else {
             panic!("STR pointer must target a Struct");
         };
-        let Some((_, LowLevelValue::Array(chars))) =
-            s._fields.iter().find(|(field, _)| field == "chars")
-        else {
+        let chars_value = s._getattr("chars").expect("chars field must be present");
+        let LowLevelValue::Array(chars) = chars_value else {
             panic!("chars field must be an Array");
         };
         assert_eq!(chars.getlength(), 3);
-        assert_eq!(chars.getitem(0), Some(&LowLevelValue::Char('F')));
-        assert_eq!(chars.getitem(1), Some(&LowLevelValue::Char('o')));
-        assert_eq!(chars.getitem(2), Some(&LowLevelValue::Char('o')));
+        assert_eq!(chars.getitem(0), Some(LowLevelValue::Char('F')));
+        assert_eq!(chars.getitem(1), Some(LowLevelValue::Char('o')));
+        assert_eq!(chars.getitem(2), Some(LowLevelValue::Char('o')));
     }
 
     /// `UNICODE` resolves to a GcStruct named `rpy_unicode` with
@@ -4650,15 +4651,14 @@ mod tests {
         let _ptr_obj::Struct(s) = obj else {
             panic!("UNICODE pointer must target a Struct");
         };
-        let Some((_, LowLevelValue::Array(chars))) =
-            s._fields.iter().find(|(field, _)| field == "chars")
-        else {
+        let chars_value = s._getattr("chars").expect("chars field must be present");
+        let LowLevelValue::Array(chars) = chars_value else {
             panic!("chars field must be an Array");
         };
         assert_eq!(chars.getlength(), 3);
-        assert_eq!(chars.getitem(0), Some(&LowLevelValue::UniChar('α')));
-        assert_eq!(chars.getitem(1), Some(&LowLevelValue::UniChar('β')));
-        assert_eq!(chars.getitem(2), Some(&LowLevelValue::UniChar('γ')));
+        assert_eq!(chars.getitem(0), Some(LowLevelValue::UniChar('α')));
+        assert_eq!(chars.getitem(1), Some(LowLevelValue::UniChar('β')));
+        assert_eq!(chars.getitem(2), Some(LowLevelValue::UniChar('γ')));
     }
 
     /// `ll_strlen` synthesised against `Ptr(STR)` produces a single

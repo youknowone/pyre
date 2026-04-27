@@ -834,6 +834,30 @@ impl<'a> GraphBuildContext<'a> {
 /// Build a SemanticFunction from a Rust function AST.  Mirrors
 /// RPython `flowspace/objspace.py:38` `build_flow()` — `FlowingError`
 /// propagates to the caller rather than producing a partial graph.
+thread_local! {
+    /// MAJIT_UNKNOWN_DUMP diagnostic context: name of the function
+    /// currently being lowered. Set on `build_function_graph` entry
+    /// and restored on exit so the per-`syn::Expr` Unknown emit sites
+    /// can attribute their stub to the source function. Read-only
+    /// elsewhere — purely cosmetic for the dump output.
+    static CURRENT_LOWERING_FN_NAME: std::cell::RefCell<Option<String>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// RAII guard for `CURRENT_LOWERING_FN_NAME` — restores the previous
+/// fn name on Drop so a `?` early-exit inside `build_function_graph`
+/// still leaves the thread-local in a sane state for sibling lowerings.
+struct LoweringFnNameGuard {
+    previous: Option<String>,
+}
+
+impl Drop for LoweringFnNameGuard {
+    fn drop(&mut self) {
+        let prev = self.previous.take();
+        CURRENT_LOWERING_FN_NAME.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
 fn build_function_graph(
     func: &ItemFn,
     options: &AstGraphOptions,
@@ -844,7 +868,10 @@ fn build_function_graph(
     known_struct_names: &std::collections::HashSet<String>,
     known_trait_names: &std::collections::HashSet<String>,
 ) -> Result<SemanticFunction, FlowingError> {
-    let mut graph = FunctionGraph::new(func.sig.ident.to_string());
+    let fn_name = func.sig.ident.to_string();
+    let previous = CURRENT_LOWERING_FN_NAME.with(|c| c.borrow_mut().replace(fn_name.clone()));
+    let _restore_fn = LoweringFnNameGuard { previous };
+    let mut graph = FunctionGraph::new(fn_name);
     let mut entry = graph.startblock;
     let mut ctx = GraphBuildContext::new(
         struct_fields,
@@ -1545,6 +1572,58 @@ fn lower_expr(
         // If both branches produce a value, merge_block gets an inputarg
         // (Phi node) that receives the value from each branch via Link args.
         syn::Expr::If(if_expr) => {
+            // ── if-let desugaring ──
+            // `if let pat = scrutinee { then } else { else }` is exact
+            // syntactic sugar for `match scrutinee { pat => then, _ =>
+            // else }` (Rust Reference, "If let expressions"). We build
+            // the synthetic `Expr::Match` AST and recurse so the
+            // existing `Expr::Match` lowering (the path immediately
+            // below at `syn::Expr::Match(m)`) handles the pattern
+            // dispatch — keeps a single match-emit codepath rather than
+            // duplicating the merge / phi / arm-entry logic.
+            //
+            // Without this desugar, `if_expr.cond` would be lowered as
+            // a regular expression and trip the catch-all `Expr::Let`
+            // arm below, emitting `OpKind::Unknown { Let }`. That stub
+            // makes any function carrying an `if let` un-portal-able
+            // (Phase G G.4.4 path A.1) since a BH resume could land on
+            // it and crash on "unknown bhimpl_*".
+            if let syn::Expr::Let(let_expr) = if_expr.cond.as_ref() {
+                let then_expr = syn::Expr::Block(syn::ExprBlock {
+                    attrs: vec![],
+                    label: None,
+                    block: if_expr.then_branch.clone(),
+                });
+                let else_expr: syn::Expr = match &if_expr.else_branch {
+                    Some((_, else_branch)) => (**else_branch).clone(),
+                    None => syn::parse_quote!({}),
+                };
+                let then_arm = syn::Arm {
+                    attrs: vec![],
+                    pat: (*let_expr.pat).clone(),
+                    guard: None,
+                    fat_arrow_token: Default::default(),
+                    body: Box::new(then_expr),
+                    comma: Some(Default::default()),
+                };
+                let else_arm = syn::Arm {
+                    attrs: vec![],
+                    pat: syn::parse_quote!(_),
+                    guard: None,
+                    fat_arrow_token: Default::default(),
+                    body: Box::new(else_expr),
+                    comma: None,
+                };
+                let synthetic = syn::Expr::Match(syn::ExprMatch {
+                    attrs: vec![],
+                    match_token: Default::default(),
+                    expr: let_expr.expr.clone(),
+                    brace_token: Default::default(),
+                    arms: vec![then_arm, else_arm],
+                });
+                return lower_expr(graph, block, &synthetic, options, ctx);
+            }
+
             // RPython `flowspace/flowcontext.py:91,107,364`: unsupported
             // cond raises `FlowingError`, halting the walk.  A child
             // that closed its path (`if return_early { ... } else ...`)
@@ -2219,6 +2298,62 @@ fn lower_expr(
                     macro_name.as_str(),
                     "assert_eq" | "assert_ne" | "debug_assert_eq" | "debug_assert_ne"
                 );
+
+                // ── matches! desugaring ──
+                // `matches!(scrutinee, pat)` and `matches!(scrutinee,
+                // pat if guard)` desugar (per std::matches docs) to
+                // `match scrutinee { pat => true, _ => false }` (with
+                // guard inlined onto the arm if present). We build the
+                // synthetic `Expr::Match` AST and recurse so the
+                // existing match lowering handles the dispatch — same
+                // shape as the `if let` desugar above.
+                //
+                // Without this desugar, `matches!` flows through the
+                // catch-all `Expr::Macro` arm below and emits
+                // `OpKind::Unknown { Macro }`. Phase G G.4.4 Path A.B.
+                if macro_name == "matches" {
+                    let tokens = m.mac.tokens.clone();
+                    if let Some((scrutinee_tokens, rest_tokens)) =
+                        split_macro_args_at_first_top_comma(tokens)
+                    {
+                        if let (Ok(scrutinee_expr), Ok((pat, guard))) = (
+                            syn::parse2::<syn::Expr>(scrutinee_tokens),
+                            syn::parse::Parser::parse2(parse_matches_pat_and_guard, rest_tokens),
+                        ) {
+                            let arm_then_body: syn::Expr = syn::parse_quote!(true);
+                            let arm_else_body: syn::Expr = syn::parse_quote!(false);
+                            let then_arm = syn::Arm {
+                                attrs: vec![],
+                                pat,
+                                guard: guard.map(|g| (Default::default(), Box::new(g))),
+                                fat_arrow_token: Default::default(),
+                                body: Box::new(arm_then_body),
+                                comma: Some(Default::default()),
+                            };
+                            let else_arm = syn::Arm {
+                                attrs: vec![],
+                                pat: syn::parse_quote!(_),
+                                guard: None,
+                                fat_arrow_token: Default::default(),
+                                body: Box::new(arm_else_body),
+                                comma: None,
+                            };
+                            let synthetic = syn::Expr::Match(syn::ExprMatch {
+                                attrs: vec![],
+                                match_token: Default::default(),
+                                expr: Box::new(scrutinee_expr),
+                                brace_token: Default::default(),
+                                arms: vec![then_arm, else_arm],
+                            });
+                            return lower_expr(graph, block, &synthetic, options, ctx);
+                        }
+                    }
+                    // Parse failure falls through to the catch-all
+                    // Macro arm — preserves the `OpKind::Unknown`
+                    // diagnostic for un-portable `matches!` shapes
+                    // rather than silently mis-lowering.
+                }
+
                 if is_assert || is_assert_cmp {
                     if let Ok(args) = m.mac.parse_body_with(
                         syn::punctuated::Punctuated::<syn::Expr, syn::Token![,]>::parse_terminated,
@@ -2565,12 +2700,20 @@ fn lower_expr(
             let dump_enabled = std::env::var("MAJIT_UNKNOWN_DUMP").is_ok();
             if is_data_creation {
                 if dump_enabled {
-                    println!("cargo:warning=[UnsupportedExpr] variant={variant:?}");
+                    let fn_name = CURRENT_LOWERING_FN_NAME
+                        .with(|c| c.borrow().clone())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    println!("cargo:warning=[UnsupportedExpr] fn={fn_name} variant={variant:?}");
                 }
                 Ok(continue_with_unknown(graph, *block, variant))
             } else {
                 if dump_enabled {
-                    println!("cargo:warning=[UnsupportedExpr/stop] variant={variant:?}");
+                    let fn_name = CURRENT_LOWERING_FN_NAME
+                        .with(|c| c.borrow().clone())
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    println!(
+                        "cargo:warning=[UnsupportedExpr/stop] fn={fn_name} variant={variant:?}"
+                    );
                 }
                 stop_unsupported(graph, *block, variant)
             }
@@ -2579,6 +2722,48 @@ fn lower_expr(
 }
 
 // ── Helpers ──────────────────────────────────────────────────────
+
+/// Split a macro token stream at the first top-level (depth-0) comma,
+/// returning `(prefix, suffix)` token streams without the comma. Used
+/// by the `matches!` desugar to peel `(scrutinee, pat [if guard])` —
+/// the first comma separates `scrutinee` from the rest, but commas
+/// inside `(...)` / `[...]` / `{...}` (e.g. tuple struct patterns,
+/// inner expression lists) must not split. Returns `None` when no
+/// top-level comma is present.
+fn split_macro_args_at_first_top_comma(
+    tokens: proc_macro2::TokenStream,
+) -> Option<(proc_macro2::TokenStream, proc_macro2::TokenStream)> {
+    let mut prefix: Vec<proc_macro2::TokenTree> = Vec::new();
+    let mut iter = tokens.into_iter();
+    for tt in iter.by_ref() {
+        if let proc_macro2::TokenTree::Punct(ref p) = tt {
+            if p.as_char() == ',' && p.spacing() == proc_macro2::Spacing::Alone {
+                let suffix: proc_macro2::TokenStream = iter.collect();
+                return Some((prefix.into_iter().collect(), suffix));
+            }
+        }
+        prefix.push(tt);
+    }
+    None
+}
+
+/// `syn::parse::Parser` adapter for the `pat [if guard]` tail of a
+/// `matches!` invocation. Mirrors the std `matches!` macro grammar
+/// (`std::macros::matches`): a single `Pat`, optionally followed by
+/// `if Expr`. The `Pat` parse uses `Pat::parse_multi_with_leading_vert`
+/// so top-level `|` alternations (`Some(_) | None`) are accepted.
+fn parse_matches_pat_and_guard(
+    input: syn::parse::ParseStream,
+) -> syn::Result<(syn::Pat, Option<syn::Expr>)> {
+    let pat = syn::Pat::parse_multi_with_leading_vert(input)?;
+    let guard = if input.peek(syn::Token![if]) {
+        let _: syn::Token![if] = input.parse()?;
+        Some(input.parse::<syn::Expr>()?)
+    } else {
+        None
+    };
+    Ok((pat, guard))
+}
 
 fn unary_op_name(op: &syn::UnOp) -> &'static str {
     match op {

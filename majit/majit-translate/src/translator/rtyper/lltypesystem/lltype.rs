@@ -708,18 +708,44 @@ impl _func {
     }
 }
 
+/// `_struct._fields` is wrapped in `Arc<Mutex<...>>` so a `_struct`
+/// `#[derive(Clone)]` shares its field storage with its clones.
+/// Mirrors RPython's pointer-by-identity semantics on Python objects:
+/// `iprebuiltinstances[value] = result; init(value, result)` (rclass.py
+/// :799-800) requires that mutations to `result` mid-init are visible
+/// to recursive `convert_const(value)` cache hits.
+///
+/// Without the Arc-share, `_ptr.clone()` deep-copies `_obj0` →
+/// `_struct.clone()` → `_fields.clone()` (owned `Vec`), so two clones
+/// of the same prebuilt instance carry independent field storage and
+/// intra-class circular prebuilt instances (`a.b.back == a`) wire
+/// `back` to a stale snapshot rather than the in-progress `a`. See
+/// task #157 — this is the structural pre-requisite for
+/// `InstanceRepr::convert_const_exact` byte-for-byte parity with
+/// `rclass.py:794-802`.
+///
+/// `Arc<Mutex<>>` (rather than `Rc<RefCell<>>`) because
+/// `LowLevelValue` carriers (e.g. `static LazyLock<LowLevelType>` for
+/// `STR`/`UNICODE`) traverse the Send/Sync boundary; `_struct` itself
+/// must therefore be Send+Sync. Single-threaded RPython has no need
+/// for the lock; pyre's lock acquisitions are uncontended in practice
+/// (the tracer/codewriter share the per-process repr cache without
+/// concurrent mutation of any single `_struct`).
 #[derive(Clone, Debug)]
 pub struct _struct {
     pub _identity: usize,
     pub TYPE: StructType,
-    pub _fields: Vec<(String, LowLevelValue)>,
+    pub _fields: Arc<Mutex<Vec<(String, LowLevelValue)>>>,
 }
 
+/// `_array.items` is wrapped in `Arc<Mutex<...>>` for the same shared-
+/// storage discipline as `_struct._fields` — see the `_struct` doc
+/// above for the parity rationale (task #157).
 #[derive(Clone, Debug)]
 pub struct _array {
     pub _identity: usize,
     pub TYPE: ArrayContainer,
-    pub items: Vec<LowLevelValue>,
+    pub items: Arc<Mutex<Vec<LowLevelValue>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
@@ -899,15 +925,24 @@ impl Hash for _opaque {
 }
 
 impl _struct {
-    pub fn _getattr(&self, field_name: &str) -> Option<&LowLevelValue> {
+    /// `_struct._fields` is an `Arc<Mutex<...>>`-shared cell so the
+    /// returned value must be cloned out of the lock guard. Cheap for
+    /// the primitive variants of `LowLevelValue`; `Struct`/`Array`
+    /// variants Clone the inner `_struct`/`_array` (which themselves
+    /// share their inner `_fields`/`items` via `Arc::clone` per the
+    /// shared-storage discipline).
+    pub fn _getattr(&self, field_name: &str) -> Option<LowLevelValue> {
         self._fields
+            .lock()
+            .unwrap()
             .iter()
             .find(|(name, _)| name == field_name)
-            .map(|(_, value)| value)
+            .map(|(_, value)| value.clone())
     }
 
-    pub fn _setattr(&mut self, field_name: &str, value: LowLevelValue) -> bool {
-        let Some((_, slot)) = self._fields.iter_mut().find(|(name, _)| name == field_name) else {
+    pub fn _setattr(&self, field_name: &str, value: LowLevelValue) -> bool {
+        let mut fields = self._fields.lock().unwrap();
+        let Some((_, slot)) = fields.iter_mut().find(|(name, _)| name == field_name) else {
             return false;
         };
         *slot = value;
@@ -920,20 +955,23 @@ impl _struct {
     /// [`_ptr::setattr_at_path`] to mutate vtable substructs in place
     /// without going through `_ptr.getattr` (which returns a detached
     /// copy for non-Gc Struct fields).
-    pub fn _setattr_descending(
-        &mut self,
-        path: &[&str],
-        field: &str,
-        value: LowLevelValue,
-    ) -> bool {
+    pub fn _setattr_descending(&self, path: &[&str], field: &str, value: LowLevelValue) -> bool {
         if path.is_empty() {
             return self._setattr(field, value);
         }
-        let Some((_, slot)) = self._fields.iter_mut().find(|(name, _)| name == path[0]) else {
-            return false;
-        };
-        let LowLevelValue::Struct(inner) = slot else {
-            return false;
+        // Pull the inner Struct out of the lock guard before recursing
+        // so the outer guard is released — the inner `_struct` carries
+        // its own `Arc<Mutex<_fields>>` cell, and `LowLevelValue::Struct`
+        // Clone shares the same Arc storage by `Arc::clone`.
+        let inner = {
+            let fields = self._fields.lock().unwrap();
+            let Some((_, slot)) = fields.iter().find(|(name, _)| name == path[0]) else {
+                return false;
+            };
+            let LowLevelValue::Struct(inner) = slot else {
+                return false;
+            };
+            (**inner).clone()
         };
         inner._setattr_descending(&path[1..], field, value)
     }
@@ -941,19 +979,21 @@ impl _struct {
 
 impl _array {
     pub fn getlength(&self) -> usize {
-        self.items.len()
+        self.items.lock().unwrap().len()
     }
 
     pub fn getbounds(&self) -> (usize, usize) {
-        (0, self.items.len())
+        (0, self.items.lock().unwrap().len())
     }
 
-    pub fn getitem(&self, index: usize) -> Option<&LowLevelValue> {
-        self.items.get(index)
+    /// Cloned out of the lock guard — same rationale as `_struct::_getattr`.
+    pub fn getitem(&self, index: usize) -> Option<LowLevelValue> {
+        self.items.lock().unwrap().get(index).cloned()
     }
 
-    pub fn setitem(&mut self, index: usize, value: LowLevelValue) -> bool {
-        let Some(slot) = self.items.get_mut(index) else {
+    pub fn setitem(&self, index: usize, value: LowLevelValue) -> bool {
+        let mut items = self.items.lock().unwrap();
+        let Some(slot) = items.get_mut(index) else {
             return false;
         };
         *slot = value;
@@ -1569,11 +1609,9 @@ impl _interior_ptr {
             ob = match (offset, ob) {
                 (InteriorOffset::Field(name), LowLevelValue::Struct(obj)) => obj
                     ._getattr(name)
-                    .cloned()
                     .unwrap_or_else(|| panic!("interior ptr field {name:?} missing")),
                 (InteriorOffset::Index(index), LowLevelValue::Array(obj)) => obj
                     .getitem(*index)
-                    .cloned()
                     .unwrap_or_else(|| panic!("interior ptr index path missing item {index}")),
                 (offset, other) => panic!("invalid interior ptr offset {offset:?} on {other:?}"),
             };
@@ -1717,36 +1755,40 @@ impl _interior_ptr {
         panic!("{:?} instance is not callable", self._TYPE())
     }
 
-    fn _resolve_mut(&mut self) -> Result<&mut LowLevelValue, String> {
-        fn descend<'a>(
-            current: &'a mut LowLevelValue,
+    /// Walks `_parent` by `_offsets` and returns the terminal element
+    /// as an owned `LowLevelValue`. The shared-storage discipline of
+    /// `_struct._fields` and `_array.items` (`Arc<Mutex<...>>`, see
+    /// task #157) means owned clones still alias the underlying
+    /// container, so subsequent `_setattr` / `setitem` calls on the
+    /// returned owned value mutate the same backing storage as the
+    /// original `_parent` chain.
+    fn _resolve_mut(&self) -> Result<LowLevelValue, String> {
+        fn descend(
+            current: LowLevelValue,
             offsets: &[InteriorOffset],
-        ) -> Result<&'a mut LowLevelValue, String> {
+        ) -> Result<LowLevelValue, String> {
             if offsets.is_empty() {
                 return Ok(current);
             }
             match (&offsets[0], current) {
                 (InteriorOffset::Field(name), LowLevelValue::Struct(obj)) => {
-                    let (_, slot) = obj
-                        ._fields
-                        .iter_mut()
-                        .find(|(field, _)| field == name)
+                    let next = obj
+                        ._getattr(name)
                         .ok_or_else(|| format!("interior ptr field {name:?} missing"))?;
-                    descend(slot, &offsets[1..])
+                    descend(next, &offsets[1..])
                 }
                 (InteriorOffset::Index(index), LowLevelValue::Array(obj)) => {
-                    let slot = obj
-                        .items
-                        .get_mut(*index)
+                    let next = obj
+                        .getitem(*index)
                         .ok_or_else(|| format!("array index out of bounds: {index}"))?;
-                    descend(slot, &offsets[1..])
+                    descend(next, &offsets[1..])
                 }
                 (offset, other) => Err(format!(
                     "invalid interior ptr offset {offset:?} on {other:?}"
                 )),
             }
         }
-        descend(&mut self._parent, &self._offsets)
+        descend(self._parent.clone(), &self._offsets)
     }
 }
 
@@ -2122,20 +2164,21 @@ impl StructType {
     }
 
     pub fn _container_example(&self) -> _struct {
+        let fields: Vec<(String, LowLevelValue)> = self
+            ._names
+            .iter()
+            .map(|name| {
+                let typ = self
+                    ._flds
+                    .get(name)
+                    .expect("StructType._names entry must exist in _flds");
+                (name.clone(), typ._defl())
+            })
+            .collect();
         _struct {
             _identity: fresh_low_level_container_identity(),
             TYPE: self.clone(),
-            _fields: self
-                ._names
-                .iter()
-                .map(|name| {
-                    let typ = self
-                        ._flds
-                        .get(name)
-                        .expect("StructType._names entry must exist in _flds");
-                    (name.clone(), typ._defl())
-                })
-                .collect(),
+            _fields: Arc::new(Mutex::new(fields)),
         }
     }
 
@@ -2224,7 +2267,7 @@ impl ArrayType {
         _array {
             _identity: fresh_low_level_container_identity(),
             TYPE: ArrayContainer::Array(self.clone()),
-            items: vec![self.OF._defl()],
+            items: Arc::new(Mutex::new(vec![self.OF._defl()])),
         }
     }
 
@@ -2311,10 +2354,11 @@ impl FixedSizeArrayType {
     }
 
     pub fn _container_example(&self) -> _array {
+        let items: Vec<LowLevelValue> = (0..self.length).map(|_| self.OF._defl()).collect();
         _array {
             _identity: fresh_low_level_container_identity(),
             TYPE: ArrayContainer::FixedSizeArray(self.clone()),
-            items: (0..self.length).map(|_| self.OF._defl()).collect(),
+            items: Arc::new(Mutex::new(items)),
         }
     }
 
@@ -3109,10 +3153,12 @@ pub fn malloc(
                             let LowLevelType::Array(array_t) = typ else {
                                 panic!("StructType._arrayfld must name an Array field");
                             };
+                            let inner_items: Vec<LowLevelValue> =
+                                (0..n).map(|_| array_t.OF._defl()).collect();
                             let arr = _array {
                                 _identity: fresh_low_level_container_identity(),
                                 TYPE: ArrayContainer::Array((**array_t).clone()),
-                                items: (0..n).map(|_| array_t.OF._defl()).collect(),
+                                items: Arc::new(Mutex::new(inner_items)),
                             };
                             (name.clone(), LowLevelValue::Array(Box::new(arr)))
                         } else {
@@ -3123,7 +3169,7 @@ pub fn malloc(
                 _ptr_obj::Struct(_struct {
                     _identity: fresh_low_level_container_identity(),
                     TYPE: (**struct_t).clone(),
-                    _fields: fields,
+                    _fields: Arc::new(Mutex::new(fields)),
                 })
             } else {
                 if n.is_some() {
@@ -3136,14 +3182,14 @@ pub fn malloc(
             }
         }
         LowLevelType::Array(array_t) => {
-            let items = match n {
+            let items: Vec<LowLevelValue> = match n {
                 Some(n) => (0..n).map(|_| array_t.OF._defl()).collect(),
-                None => array_t._container_example().items,
+                None => array_t._container_example().items.lock().unwrap().clone(),
             };
             _ptr_obj::Array(_array {
                 _identity: fresh_low_level_container_identity(),
                 TYPE: ArrayContainer::Array((**array_t).clone()),
-                items,
+                items: Arc::new(Mutex::new(items)),
             })
         }
         LowLevelType::Opaque(opaque_t) => {
@@ -3529,9 +3575,10 @@ mod tests {
         let Some(_ptr_obj::Struct(s)) = p._obj0.as_ref().unwrap().as_ref() else {
             panic!("malloc should return a live Struct pointer");
         };
-        let Some((_, LowLevelValue::Array(items))) =
-            s._fields.iter().find(|(field, _)| field == "items")
-        else {
+        let items_value = s
+            ._getattr("items")
+            .expect("varsize Struct must expose 'items' field");
+        let LowLevelValue::Array(items) = items_value else {
             panic!("varsize array field should be initialised as an Array");
         };
         assert_eq!(items.getlength(), 3);
@@ -4576,12 +4623,15 @@ mod tests {
             )],
         )
         ._container_example();
-        let LowLevelValue::Array(arr) = parent._fields[0].1.clone() else {
+        // The `_struct._fields` cell is shared via `Arc<Mutex<>>` so
+        // modifying `arr.items` propagates back to `parent._fields`.
+        let arr_value = parent
+            ._getattr("arr")
+            .expect("parent must expose 'arr' field");
+        let LowLevelValue::Array(arr) = arr_value else {
             panic!("expected array field");
         };
-        let mut arr = *arr;
-        arr.items[1] = LowLevelValue::Signed(7);
-        parent._fields[0].1 = LowLevelValue::Array(Box::new(arr));
+        arr.setitem(1, LowLevelValue::Signed(7));
         let iptr = _interior_ptr {
             _T: LowLevelType::Signed,
             _parent: LowLevelValue::Struct(Box::new(parent)),
@@ -4613,7 +4663,7 @@ mod tests {
         let LowLevelValue::Array(arr) = iptr._obj() else {
             panic!("expected array after interior setitem");
         };
-        assert_eq!(arr.getitem(0), Some(&LowLevelValue::Signed(9)));
+        assert_eq!(arr.getitem(0), Some(LowLevelValue::Signed(9)));
     }
 
     #[test]
