@@ -626,6 +626,13 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
     fn as_call_descr(&self) -> Option<&dyn CallDescr> {
         None
     }
+    /// Downcast to `JitCodeDescr` when this descriptor identifies a
+    /// sub-jitcode (emitted by codewriter for `inline_call_*` opnames).
+    /// Default `None` — only descriptors that wrap a `JitCode` body
+    /// override.
+    fn as_jitcode_descr(&self) -> Option<&dyn JitCodeDescr> {
+        None
+    }
     fn as_loop_token_descr(&self) -> Option<&dyn LoopTokenDescr> {
         None
     }
@@ -1293,6 +1300,21 @@ pub trait CallDescr: Descr {
     fn vable_expansion(&self) -> Option<&VableExpansion> {
         None
     }
+}
+
+/// Descriptor carrying a sub-jitcode reference (RPython
+/// `JitCode(AbstractDescr)`). Emitted by the codewriter for
+/// `inline_call_*` opcodes to identify the callee's bytecode body.
+///
+/// Walker / blackhole consumers retrieve the callee body via
+/// `jitcode_index()` indexing into the runtime's all-jitcodes table
+/// (cf. `pyre-jit-trace/src/jitcode_runtime.rs::ALL_JITCODES`).
+pub trait JitCodeDescr: Descr {
+    /// Index of the callee's bytecode body in the runtime's
+    /// all-jitcodes table. RPython parity:
+    /// `AssemblerDescr::PendingJitCode { jitcode, .. }` → resolved
+    /// `BhDescr::JitCode { jitcode_index, .. }` at snapshot time.
+    fn jitcode_index(&self) -> usize;
 }
 
 /// Descriptor carrying a `CALL_ASSEMBLER` loop token.

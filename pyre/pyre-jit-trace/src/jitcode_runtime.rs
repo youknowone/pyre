@@ -316,30 +316,59 @@ pub fn all_descrs() -> &'static [BhDescr] {
 }
 
 /// Build a `BlackholeInterpBuilder` pre-configured for this binary's
-/// jitcodes.
+/// jitcodes, paired with the list of `insns` opnames that
+/// `wire_bhimpl_handlers` did not assign a handler to.
 ///
-/// RPython: `BlackholeInterpBuilder.__init__` (blackhole.py:55-61) runs
-/// `setup_insns(asm.insns)` + `setup_descrs(asm.descrs)` immediately
-/// and `setup_insns` (blackhole.py:66) resolves each opname via
-/// `_get_method` eagerly, raising `AttributeError` if any `bhimpl_*` is
-/// missing.
+/// RPython parity: `BlackholeInterpBuilder.__init__` (blackhole.py:55-61)
+/// runs `setup_insns(asm.insns)` + `setup_descrs(asm.descrs)` and
+/// `setup_insns` (blackhole.py:66) resolves each opname via
+/// `_get_method` eagerly, raising `AttributeError` if any `bhimpl_*`
+/// is missing. The Rust port mirrors the `setup_insns` + `setup_descrs`
+/// + `wire_bhimpl_handlers` sequence, but surfaces the unwired list as
+/// a return value instead of panicking — Task #85 (`int_ge/ir>i`
+/// family root cause: assembler emits mixed `(ref, int)` operand kinds
+/// for some graphs, leaving the kind-suffixed opname unmapped to any
+/// `bhimpl_*`) is open and the panicking variant blocks unrelated
+/// tests from exercising the dispatch table.
 ///
-/// pyre mirrors that fail-fast contract: after `setup_insns` +
-/// `wire_bhimpl_handlers`, assert that every opname in the insns table
-/// has an explicit handler. If any remain unwired we panic here
-/// instead of letting dispatch surface a confusing runtime error.
-///
-/// The shared descr pool is handed over via `setup_descrs` — same call
-/// order as RPython. Every 'd'/'j' argcode in a `JitCode.code` byte
-/// stream resolves against `builder.descrs[index]`, which matches the
-/// RPython single-store model at `metainterp_sd.descrs`.
-pub fn build_default_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
+/// PRE-EXISTING-ADAPTATION (transitional). RPython has no equivalent
+/// of this Result-returning shape because upstream's `setup_insns`
+/// has total opname coverage at startup. Convergence path: when
+/// Task #85 closes the kind-flow bug the unwired set goes empty and
+/// every caller can use [`build_default_bh_builder`] (the panicking
+/// strict variant). Until then, callers that only execute opnames
+/// known to be wired (the synthetic-bytecode dispatch tests in this
+/// module, the bh-table coverage diagnostic) should call
+/// [`build_default_bh_builder_with_unwired_report`] and ignore the
+/// unwired list.
+pub fn build_default_bh_builder_with_unwired_report() -> (
+    majit_metainterp::blackhole::BlackholeInterpBuilder,
+    Vec<String>,
+) {
     let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
     // blackhole.py:58-59 order: setup_insns, then setup_descrs.
     builder.setup_insns(insns_opname_to_byte());
     builder.setup_descrs(all_descrs().to_vec());
     majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
-    let unwired = builder.unwired_opnames();
+    let unwired: Vec<String> = builder
+        .unwired_opnames()
+        .into_iter()
+        .map(|s| s.to_string())
+        .collect();
+    (builder, unwired)
+}
+
+/// Strict-coverage variant of [`build_default_bh_builder_with_unwired_report`]
+/// — panics when any `insns` opname lacks a `bhimpl_*` handler.
+///
+/// RPython parity: matches the `AttributeError` raised by upstream's
+/// `setup_insns` (blackhole.py:66) when `_get_method(name, argcodes)`
+/// fails. Use this in any code path that must run real production
+/// jitcodes; tests that exercise a fixed slice of opcodes prefer
+/// [`build_default_bh_builder_with_unwired_report`] to dodge Task #85
+/// noise.
+pub fn build_default_bh_builder() -> majit_metainterp::blackhole::BlackholeInterpBuilder {
+    let (builder, unwired) = build_default_bh_builder_with_unwired_report();
     if !unwired.is_empty() {
         panic!(
             "build_default_bh_builder: {} insns opnames have no bhimpl_* \
@@ -864,6 +893,56 @@ mod tests {
     }
 
     #[test]
+    fn pop_top_jitcode_op_sequence_matches_expected_shape() {
+        // Phase D-2 advance: lock in the assembler-emitted op sequence
+        // for `Instruction::PopTop`'s arm jitcode. The shape mirrors
+        // what RPython's `assemble.assemble(ssarepr, jitcode)`
+        // (assembler.py:60-86) would emit for a jtransformed
+        // `direct_call(pop_value) ; (return-or-raise)` graph: an
+        // `inline_call_*` for the sub-jitcode, a `live/` jit_merge_point
+        // marker, the standard `catch_exception/goto/reraise` exception
+        // shoulder, then the trampoline tail.
+        //
+        // RPython parity: same byte stream `BlackholeInterpBuilder.dispatch_loop`
+        // walks (blackhole.py:65-100). When the codewriter pipeline
+        // changes shape this test fails — that's the contract: it's
+        // the smallest end-to-end witness that
+        // `pipeline.opcode_dispatch[PopTop].flattened` produces a
+        // dispatch-able byte stream.
+        let jc = jitcode_for_instruction(&Instruction::PopTop)
+            .expect("PopTop must resolve to a jitcode");
+        assert_eq!(
+            jc.code.len(),
+            38,
+            "PopTop jitcode size shifted — refresh the expected sequence below",
+        );
+        let sequence: Vec<(String, String)> = decoded_ops(&jc.code)
+            .map(|op| (op.opname.to_string(), op.argcodes.to_string()))
+            .collect();
+        let expected: Vec<(String, String)> = [
+            ("inline_call_r_r", "dR>r"),
+            ("live", ""),
+            ("catch_exception", "L"),
+            ("goto", "L"),
+            ("reraise", ""),
+            ("int_copy", "i>i"),
+            ("residual_call_r_r", "iRd>r"),
+            ("live", ""),
+            ("ref_return", "r"),
+            ("live", ""),
+            ("raise", "r"),
+            ("ref_return", "r"),
+        ]
+        .iter()
+        .map(|(o, a)| (o.to_string(), a.to_string()))
+        .collect();
+        assert_eq!(
+            sequence, expected,
+            "PopTop op sequence drifted — investigate before updating",
+        );
+    }
+
+    #[test]
     fn decode_varlist_reads_length_byte_plus_items() {
         // Synthetic: inline_call_ir_r/dIR>r — d(2) + I(1+N) + R(1+M) + r(1).
         let op_byte = *insns_opname_to_byte()
@@ -1037,6 +1116,47 @@ mod tests {
     }
 
     #[test]
+    fn default_bh_builder_unwired_set_matches_task_85_snapshot() {
+        // Task #85 lock-in: the unwired-opname set surfaced by
+        // `build_default_bh_builder_with_unwired_report` is the
+        // documented kind-mismatch fallout — six opnames whose
+        // operand kinds disagree with their `bhimpl_*` handler
+        // (assembler emits `(ref, int)` `int_ge` for some graphs;
+        // similarly for `int_xor/ri>i`, `int_mul/ir>i`,
+        // `int_ne/fr>i`, `setarrayitem_gc_i/rrid`,
+        // `setarrayitem_gc_f/rrfd`). Pinning the exact set as a
+        // snapshot:
+        //   * Catches regressions that ADD a new unwired opname (a
+        //     fresh kind-mismatch shape upstream).
+        //   * Catches regressions that REMOVE a wired opname (handler
+        //     deletion that broke coverage).
+        //   * Auto-fails when Task #85 closes — the snapshot becomes
+        //     stale, the test forces an explicit empty-set update,
+        //     and the ignored strict-coverage tests above can have
+        //     `#[ignore]` lifted in the same change.
+        let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
+        unwired.sort();
+        let expected: Vec<String> = [
+            "int_ge/ir>i",
+            "int_mul/ir>i",
+            "int_ne/fr>i",
+            "int_xor/ri>i",
+            "setarrayitem_gc_f/rrfd",
+            "setarrayitem_gc_i/rrid",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        assert_eq!(
+            unwired, expected,
+            "Task #85 unwired-opname snapshot drifted. If a new entry \
+             appeared, find the new kind-flow bug upstream. If an entry \
+             disappeared (good — Task #85 progress), update this snapshot \
+             and lift `#[ignore]` from the strict-coverage tests above.",
+        );
+    }
+
+    #[test]
     #[ignore = "task #85: int_ge/ir>i root cause — assembler emits mixed (ref,int) ge kinds"]
     fn default_bh_builder_handler_coverage_report() {
         // Diagnostic: surface the opnames in the real insns table that
@@ -1119,16 +1239,12 @@ mod tests {
         // majit-metainterp. Closes the build-artifact → runtime →
         // BlackholeInterpBuilder round trip end-to-end.
         //
-        // `build_default_bh_builder()` is bypassed here because it
-        // panics on the 6 unwired opnames (`int_ge/ir>i` family —
-        // Task #85 root cause is open). Those opcodes aren't on this
-        // test's dispatch path, so the inline construction below
-        // matches `build_default_bh_builder()` minus the panic and
-        // exercises only the wired entries.
-        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
-        builder.setup_insns(insns_opname_to_byte());
-        builder.setup_descrs(all_descrs().to_vec());
-        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+        // `_with_unwired_report` over the strict `build_default_bh_builder()`
+        // because the latter panics on the 6 unwired opnames
+        // (`int_ge/ir>i` family — Task #85 root cause is open).
+        // Those opcodes aren't on this test's dispatch path; the
+        // unwired list is intentionally ignored.
+        let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
 
         let table = insns_opname_to_byte();
         let live_byte = *table.get("live/").expect("`live/` must be in insns");
@@ -1184,10 +1300,7 @@ mod tests {
         // :462-464 `bhimpl_int_sub` chained with the same register
         // file, identical to RPython's per-op `_get_method.handler`
         // dispatch.
-        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
-        builder.setup_insns(insns_opname_to_byte());
-        builder.setup_descrs(all_descrs().to_vec());
-        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+        let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
 
         let table = insns_opname_to_byte();
         let live_byte = *table.get("live/").expect("`live/` must be in insns");
@@ -1266,10 +1379,7 @@ mod tests {
         // RPython parity: blackhole.py:864-869 `bhimpl_goto_if_not`
         // — target is an absolute byte offset into the jitcode
         // `code` array.
-        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
-        builder.setup_insns(insns_opname_to_byte());
-        builder.setup_descrs(all_descrs().to_vec());
-        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+        let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
 
         let table = insns_opname_to_byte();
         let live_byte = *table.get("live/").expect("`live/` must be in insns");
@@ -1365,10 +1475,7 @@ mod tests {
         // float ops feed back into either box_float or another float
         // op). The test validates the float register file + binop
         // decode end-to-end and inspects `registers_f[2]` directly.
-        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
-        builder.setup_insns(insns_opname_to_byte());
-        builder.setup_descrs(all_descrs().to_vec());
-        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+        let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
 
         let table = insns_opname_to_byte();
         let live_byte = *table.get("live/").expect("`live/` must be in insns");
@@ -1433,10 +1540,7 @@ mod tests {
         // dispatch loop must drive the int→float bridge twice and
         // then a float binop on the resulting registers without
         // crossing wires.
-        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
-        builder.setup_insns(insns_opname_to_byte());
-        builder.setup_descrs(all_descrs().to_vec());
-        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+        let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
 
         let table = insns_opname_to_byte();
         let live_byte = *table.get("live/").expect("`live/` must be in insns");
@@ -1522,10 +1626,7 @@ mod tests {
         // `registers_i[code[pc+1]]`, which validates that the
         // constants area is reachable through the same register-index
         // protocol the bhimpl handlers consume.
-        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
-        builder.setup_insns(insns_opname_to_byte());
-        builder.setup_descrs(all_descrs().to_vec());
-        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+        let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
 
         let table = insns_opname_to_byte();
         let live_byte = *table.get("live/").expect("`live/` must be in insns");
@@ -1606,10 +1707,7 @@ mod tests {
         // `registers_r` and `tmpreg_r` store ref pointers as raw `i64`
         // bits; the test uses an arbitrary nonzero pattern to verify
         // the read is byte-for-byte without dereferencing.
-        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
-        builder.setup_insns(insns_opname_to_byte());
-        builder.setup_descrs(all_descrs().to_vec());
-        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+        let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
 
         let table = insns_opname_to_byte();
         let live_byte = *table.get("live/").expect("`live/` must be in insns");
@@ -1664,10 +1762,7 @@ mod tests {
         // bytecode through `dispatch_loop_with_probe` must produce
         // the same `tmpreg_i==42` + LeaveFrame as the bare
         // `dispatch_loop` (D-2.0 baseline).
-        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
-        builder.setup_insns(insns_opname_to_byte());
-        builder.setup_descrs(all_descrs().to_vec());
-        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+        let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
 
         let table = insns_opname_to_byte();
         let live_byte = *table.get("live/").expect("`live/` must be in insns");
@@ -1760,10 +1855,7 @@ mod tests {
         // chained handlers produce it. Shadow-execute logic can use
         // this to read input register values per op without re-running
         // the handler chain.
-        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
-        builder.setup_insns(insns_opname_to_byte());
-        builder.setup_descrs(all_descrs().to_vec());
-        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+        let (mut builder, _unwired) = build_default_bh_builder_with_unwired_report();
 
         let table = insns_opname_to_byte();
         let live_byte = *table.get("live/").expect("`live/` must be in insns");
