@@ -1013,93 +1013,155 @@ pub(crate) fn float_unop(values: &(impl ValueStore + ?Sized), op: &Op) -> f64 {
 ///     return func(cpu, metainterp, argboxes, descr)
 /// ```
 ///
-/// For CALL_* opcodes, `func` ultimately calls `cpu.bh_call_*(funcaddr, args)`.
-/// Pyre routes this through the existing `dispatch::call_int_function` /
-/// `dispatch::call_void_function` (and a future float variant) using the
-/// concrete values carried alongside each typed argbox.  `argboxes[0]`
-/// is the funcbox (carrying the function pointer in its `i64` slot) and
-/// the remaining slots are the typed call arguments.
+/// For CALL_* opcodes, `func` ultimately calls `cpu.bh_call_*(funcaddr,
+/// args)`.  Pyre routes Int/Ref/Void arms through
+/// `dispatch::call_int_function` / `dispatch::call_void_function`
+/// using the concrete values carried alongside each typed argbox.
+/// The Float arm is currently stubbed — see the inline comment on
+/// `Type::Float` below for the caller-contract gap (Task #16).
+/// `argboxes[0]` is the funcbox (carrying the function pointer in its
+/// `i64` slot) and the remaining slots are the typed call arguments.
+///
+/// `metainterp` mirrors RPython's `self` parameter: helper-side
+/// exceptions published on the `BH_LAST_EXC_VALUE` thread-local seam
+/// (the convention `bh_call_fn_impl` and friends use) are transcribed
+/// onto `metainterp.last_exc_value` before returning, the same way
+/// RPython's cpu auto-publishes onto `cpu.last_exc_value`.  Pyre has
+/// no separate `cpu` object; the metainterp owns the field directly.
 ///
 /// Returns the concrete result value as an `i64` — for void-returning
-/// calls returns `0` (caller ignores it).
-pub fn execute_varargs(
+/// calls returns `0` (caller ignores it); for float-returning calls
+/// returns `0` while the caller-contract for the Float arm is being
+/// audited (Task #16).
+pub fn execute_varargs<M: Clone>(
+    metainterp: &mut crate::pyjitpl::MetaInterp<M>,
     opnum: OpCode,
     argboxes: &[(crate::jitcode::JitArgKind, OpRef, i64)],
     descr: &dyn majit_ir::descr::CallDescr,
 ) -> i64 {
     debug_assert!(opnum.is_call(), "execute_varargs requires a call opcode");
-    // COND_CALL / COND_CALL_VALUE_* layout (pyjitpl.py:2128-2151):
-    //   argboxes[0] = condbox / valuebox
-    //   argboxes[1] = funcbox
-    //   argboxes[2..] = call args
-    // RPython's executor handles cond-call dispatch via a per-opcode
-    // execute function (`do_cond_call_*`); pyre inlines the same
-    // semantics here.
-    //
-    // Two distinct shapes (blackhole.py:1257-1276):
-    //   bhimpl_conditional_call_ir_v(condition, func, ...):
-    //       if condition: cpu.bh_call_v(func, ...)        # void
-    //   bhimpl_conditional_call_value_ir_{i,r}(value, func, ...):
-    //       if value == 0: value = cpu.bh_call_*(func, ...)
-    //       return value
-    if matches!(opnum, OpCode::CondCallN) {
-        debug_assert!(
-            argboxes.len() >= 2,
-            "COND_CALL_N requires [condbox, funcbox, *args]",
-        );
-        let cond = argboxes[0].2;
-        if cond == 0 {
-            // condition false → skip the call.
+    // RPython's `cpu` parameter is the seam through which helper-side
+    // exceptions reach `metainterp.last_exc_value` (`cpu.bh_call_*`
+    // writes onto `cpu.last_exception` and the metainterp's
+    // post-execute hook copies it).  Pyre has no separate cpu; we use
+    // the `BH_LAST_EXC_VALUE` thread-local that production helpers
+    // (`bh_call_fn_impl` etc.) publish on, mirroring the same convention
+    // every blackhole.rs CALL_* arm uses (blackhole.rs:2270-2392).
+    // Clear before dispatch so a stale value from a prior call cannot
+    // bleed into this one.
+    crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+    // Inner closure carries every existing return path so the outer
+    // wrapper can run BH_LAST_EXC_VALUE transcription regardless of
+    // which arm fires.
+    let result = (|| -> i64 {
+        // COND_CALL / COND_CALL_VALUE_* layout (pyjitpl.py:2128-2151):
+        //   argboxes[0] = condbox / valuebox
+        //   argboxes[1] = funcbox
+        //   argboxes[2..] = call args
+        // RPython's executor handles cond-call dispatch via a per-opcode
+        // execute function (`do_cond_call_*`); pyre inlines the same
+        // semantics here.
+        //
+        // Two distinct shapes (blackhole.py:1257-1276):
+        //   bhimpl_conditional_call_ir_v(condition, func, ...):
+        //       if condition: cpu.bh_call_v(func, ...)        # void
+        //   bhimpl_conditional_call_value_ir_{i,r}(value, func, ...):
+        //       if value == 0: value = cpu.bh_call_*(func, ...)
+        //       return value
+        if matches!(opnum, OpCode::CondCallN) {
+            debug_assert!(
+                argboxes.len() >= 2,
+                "COND_CALL_N requires [condbox, funcbox, *args]",
+            );
+            let cond = argboxes[0].2;
+            if cond == 0 {
+                // condition false → skip the call.
+                return 0;
+            }
+            let func_ptr = argboxes[1].2 as *const ();
+            let concrete_args: Vec<i64> = argboxes[2..].iter().map(|(_, _, c)| *c).collect();
+            crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
             return 0;
         }
-        let func_ptr = argboxes[1].2 as *const ();
-        let concrete_args: Vec<i64> = argboxes[2..].iter().map(|(_, _, c)| *c).collect();
-        crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
+        if matches!(opnum, OpCode::CondCallValueI | OpCode::CondCallValueR) {
+            debug_assert!(
+                argboxes.len() >= 2,
+                "COND_CALL_VALUE_* requires [valuebox, funcbox, *args]",
+            );
+            let value = argboxes[0].2;
+            if value != 0 {
+                // blackhole.py:1267 / 1274: nonzero `value` short-circuits
+                // and returns the existing value without calling.
+                return value;
+            }
+            // value == 0 → call and return the call's result.
+            let func_ptr = argboxes[1].2 as *const ();
+            let concrete_args: Vec<i64> = argboxes[2..].iter().map(|(_, _, c)| *c).collect();
+            return crate::pyjitpl::call_int_function(func_ptr, &concrete_args);
+        }
+        debug_assert!(
+            !argboxes.is_empty(),
+            "execute_varargs: argboxes must include funcbox at slot 0",
+        );
+        let func_ptr = argboxes[0].2 as *const ();
+        let concrete_args: Vec<i64> = argboxes[1..].iter().map(|(_, _, c)| *c).collect();
+        match descr.result_type() {
+            // RPython dispatches Int and Ref through the same backend
+            // primitive cpu.bh_call_i (returns i64); pyre's
+            // call_int_function does the same — Ref is bit-identical to Int
+            // at the ABI level.
+            majit_ir::Type::Int | majit_ir::Type::Ref => {
+                crate::pyjitpl::call_int_function(func_ptr, &concrete_args)
+            }
+            majit_ir::Type::Void => {
+                crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
+                0
+            }
+            majit_ir::Type::Float => {
+                // pyjitpl.py:2119 — CALL_F dispatches through cpu.bh_call_f.
+                // Pyre callers carry `funcbox.2` as a single `i64` slot,
+                // but `#[jit_module]` (majit-macros/src/lib.rs:253-272)
+                // emits two distinct float-helper wrappers — `trace_ptr`
+                // (`extern "C" fn(...) -> f64`, XMM0) and `concrete_ptr`
+                // (`extern "C" fn(...) -> i64`, GPR-packed via
+                // `f64::to_bits`).  Without a way to tell which wrapper
+                // the caller materialised into the funcbox slot, picking
+                // either ABI here risks transmuting the wrong wrapper
+                // signature.  Until the caller-contract is finalised
+                // (Task #16) and `JitCallTarget` is threaded through
+                // `(JitArgKind, OpRef, i64)`, this arm returns the
+                // type-neutral zero, matching main's previous stub.
+                // Production CALL_F goes through pyre's tracer
+                // `call_callable_value` path which has its own ABI seam.
+                0
+            }
+        }
+    })();
+    // Mirror RPython's executor.py:52-78 post-call exception flow:
+    // each `cpu.bh_call_*` arm wraps the call in `try: ... except
+    // Exception as e: metainterp.execute_raised(e); result = ZERO`.
+    // Pyre observes the same condition through the BH_LAST_EXC_VALUE
+    // thread-local seam.  Two pieces have to fire together:
+    //   1. `metainterp.execute_raised(bh_exc, constant=False)` — sets
+    //      `last_exc_value` AND clears `class_of_last_exc_is_const`,
+    //      so a stale `True` from a prior GUARD_EXCEPTION cannot make
+    //      `handle_possible_exception` treat the new exception's
+    //      class as constant (pyjitpl.py:2745-2755).
+    //   2. Override the returned value with the type's neutral zero —
+    //      `make_result_of_lastop` (pyjitpl/mod.rs:8893) snapshots the
+    //      concrete result *before* `handle_possible_exception` runs,
+    //      so leaving the helper's return value in place can pin a
+    //      garbage value into the resume snapshot.  `i64 == 0` covers
+    //      INT=0, REF=NULL, and FLOAT=longlong.ZEROF (0.0_f64.to_bits()
+    //      as i64 == 0); VOID callers ignore the slot.
+    let bh_exc = crate::blackhole::BH_LAST_EXC_VALUE.with(|c| {
+        let v = c.get();
+        c.set(0);
+        v
+    });
+    if bh_exc != 0 {
+        metainterp.execute_raised(bh_exc, false);
         return 0;
     }
-    if matches!(opnum, OpCode::CondCallValueI | OpCode::CondCallValueR) {
-        debug_assert!(
-            argboxes.len() >= 2,
-            "COND_CALL_VALUE_* requires [valuebox, funcbox, *args]",
-        );
-        let value = argboxes[0].2;
-        if value != 0 {
-            // blackhole.py:1267 / 1274: nonzero `value` short-circuits
-            // and returns the existing value without calling.
-            return value;
-        }
-        // value == 0 → call and return the call's result.
-        let func_ptr = argboxes[1].2 as *const ();
-        let concrete_args: Vec<i64> = argboxes[2..].iter().map(|(_, _, c)| *c).collect();
-        return crate::pyjitpl::call_int_function(func_ptr, &concrete_args);
-    }
-    debug_assert!(
-        !argboxes.is_empty(),
-        "execute_varargs: argboxes must include funcbox at slot 0",
-    );
-    let func_ptr = argboxes[0].2 as *const ();
-    let concrete_args: Vec<i64> = argboxes[1..].iter().map(|(_, _, c)| *c).collect();
-    match descr.result_type() {
-        // RPython dispatches Int and Ref through the same backend
-        // primitive cpu.bh_call_i (returns i64); pyre's
-        // call_int_function does the same — Ref is bit-identical to Int
-        // at the ABI level.
-        majit_ir::Type::Int | majit_ir::Type::Ref => {
-            crate::pyjitpl::call_int_function(func_ptr, &concrete_args)
-        }
-        majit_ir::Type::Void => {
-            crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
-            0
-        }
-        majit_ir::Type::Float => {
-            // Float-returning C-ABI calls return through XMM0 (x86-64),
-            // not the integer return register.  Pyre's float-call
-            // function pointer wrappers land in a future commit; until
-            // then, return 0 so the call still has the side-effects of
-            // its argument evaluation but the result is unusable.
-            // Documented deviation; production CALL_F goes through the
-            // pyre tracer's call_callable_value path.
-            0
-        }
-    }
+    result
 }

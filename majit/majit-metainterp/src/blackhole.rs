@@ -796,7 +796,9 @@ fn blackhole_with_recovery_layout(
 
 use crate::jitcode::{self, JitArgKind, JitCode};
 use crate::pyjitpl::{MIFrame, MIFrameStack};
-use crate::pyjitpl::{call_int_function, eval_binop_f, eval_binop_i, eval_unary_f, eval_unary_i};
+use crate::pyjitpl::{
+    call_int_function, call_void_function, eval_binop_f, eval_binop_i, eval_unary_f, eval_unary_i,
+};
 
 // ── BlackholeInterpBuilder: setup_insns infrastructure ──────────────
 //
@@ -2333,6 +2335,17 @@ impl BlackholeInterpreter {
                 self.registers_r[dst] = result;
             }
             // -- Float-typed calls --
+            // PRE-EXISTING-ADAPTATION: blackhole reads `target.concrete_ptr`,
+            // which `#[jit_module]` (majit-macros/src/lib.rs:267) emits as
+            // `extern "C" fn(...) -> i64` — the helper's f64 result is
+            // already pre-packed via `f64::to_bits()` inside the wrapper.
+            // We therefore call through `call_int_function` and store the
+            // i64 directly into `registers_f` (i64-carrier convention
+            // identical to RPython's `longlong.ZEROF` packing).  The f64-ABI
+            // wrapper lives at `target.trace_ptr` and is consumed only by
+            // the tracing path; using `call_float_function` here would
+            // transmute the i64-returning concrete wrapper through an
+            // `extern "C" fn(...) -> f64` signature and break the ABI.
             jitcode::BC_CALL_FLOAT
             | jitcode::BC_CALL_PURE_FLOAT
             | jitcode::BC_CALL_MAY_FORCE_FLOAT
@@ -2358,6 +2371,11 @@ impl BlackholeInterpreter {
                 self.registers_f[dst] = result;
             }
             // -- Void-typed calls --
+            // RPython blackhole.py:1218-1222 routes void CALL_* through
+            // `cpu.bh_call_v` (no return register at all).  Pyre's
+            // `call_void_function` does the same.  Using the int variant
+            // here would force an `extern "C" fn(...) -> i64` ABI on a
+            // helper that may genuinely return nothing.
             jitcode::BC_CALL_MAY_FORCE_VOID
             | jitcode::BC_CALL_RELEASE_GIL_VOID
             | jitcode::BC_CALL_LOOPINVARIANT_VOID
@@ -2368,7 +2386,7 @@ impl BlackholeInterpreter {
                 let args = self.read_call_args(num_args);
                 let target = self.jitcode.call_target(fn_ptr_idx);
                 BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                call_int_function(target.concrete_ptr, &args);
+                call_void_function(target.concrete_ptr, &args);
                 let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
                 if exc_val != 0 {
                     if self.handle_exception_in_frame(exc_val) {
@@ -2385,7 +2403,7 @@ impl BlackholeInterpreter {
                 let args = self.read_call_args(num_args);
                 let target = self.jitcode.call_target(fn_ptr_idx);
                 BH_LAST_EXC_VALUE.with(|c| c.set(0));
-                call_int_function(target.concrete_ptr, &args);
+                call_void_function(target.concrete_ptr, &args);
                 let exc_val = BH_LAST_EXC_VALUE.with(|c| c.get());
                 if exc_val != 0 {
                     if self.handle_exception_in_frame(exc_val) {

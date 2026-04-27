@@ -8970,8 +8970,8 @@ impl<M: Clone> MetaInterp<M> {
         // — pyre's profiler integration lands in a follow-up; skip
         // here and account for the op via the trace recorder's own
         // counters.
-        // pyjitpl.py:2646-2647: resvalue = executor.execute_varargs(...)
-        let resvalue = crate::executor::execute_varargs(opnum, argboxes, descr_view);
+        // pyjitpl.py:2646-2647: resvalue = executor.execute_varargs(self.cpu, self, ...)
+        let resvalue = crate::executor::execute_varargs(self, opnum, argboxes, descr_view);
         // pyjitpl.py:2649-2650: assert not rop._ALWAYS_PURE_FIRST <= opnum <= rop._ALWAYS_PURE_LAST
         debug_assert!(
             !opnum.is_call_pure(),
@@ -9180,7 +9180,6 @@ impl<M: Clone> MetaInterp<M> {
     ) -> Result<Option<OpRef>, SwitchToBlackhole> {
         // pyjitpl.py:3684: self.clear_exception()
         self.clear_exception();
-        // pyjitpl.py:3685-3686: executor.execute_varargs(cpu, self, CALL_N, allboxes, descr)
         debug_assert_eq!(
             descr.result_type(),
             majit_ir::Type::Void,
@@ -9190,9 +9189,12 @@ impl<M: Clone> MetaInterp<M> {
             !allboxes.is_empty(),
             "do_not_in_trace_call: allboxes must include funcbox at slot 0",
         );
-        let func_ptr = allboxes[0].2 as *const ();
-        let concrete_args: Vec<i64> = allboxes[1..].iter().map(|(_, _, c)| *c).collect();
-        crate::pyjitpl::call_void_function(func_ptr, &concrete_args);
+        // pyjitpl.py:3685-3686: executor.execute_varargs(cpu, self,
+        //                                                  CALL_N, allboxes, descr).
+        // `executor::execute_varargs` transcribes the helper-side
+        // exception (BH_LAST_EXC_VALUE thread-local) onto
+        // `self.last_exc_value` automatically.
+        let _ = crate::executor::execute_varargs(self, OpCode::CallN, allboxes, descr);
         // pyjitpl.py:3687-3692: if self.last_exc_value: raise SwitchToBlackhole(ABORT_ESCAPE)
         if self.last_exc_value != 0 {
             return Err(SwitchToBlackhole::abort_escape());
@@ -10868,7 +10870,7 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py:2019-2044: execute_varargs to get the concrete
             // result.  CALL_MAY_FORCE_* opnum picked by result type.
             let opnum1 = OpCode::call_may_force_for_type(descr_view.result_type());
-            let c_result = crate::executor::execute_varargs(opnum1, &allboxes, descr_view);
+            let c_result = crate::executor::execute_varargs(self, opnum1, &allboxes, descr_view);
             // pyjitpl.py:2049: vrefs_after_residual_call (stub)
             self.vrefs_after_residual_call();
             // pyjitpl.py:2053-2068: pick the right CALL recording path.
@@ -11023,17 +11025,23 @@ impl<M: Clone> MetaInterp<M> {
     ///     return allboxes
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython's `argboxes` arrives sorted by
-    /// type (the BC encoder lays out all int boxes first, then refs,
-    /// then floats), so the loop walks `descr.get_arg_types()` to pull
-    /// each box out of the per-type slot.  Pyre's call BC already
-    /// preserves declaration order in the typed
-    /// `(JitArgKind, OpRef, i64)` tuples, so the loop is a no-op
-    /// reorder; `_build_allboxes` simplifies to "prepend
-    /// `prepend_box` (if any), then `funcbox`, then `argboxes`".
-    /// `descr` is still consumed because production callers will want
-    /// to debug-assert that the kinds match the calldescr in pyre's
-    /// data layout.
+    /// The three independent counters `src_i` / `src_r` / `src_f` walk
+    /// `argboxes` separately, each skipping past boxes whose kind does
+    /// not match.  This demuxes a bank-sorted input layout (all ints
+    /// first, then refs, then floats) back into declaration order
+    /// matching `descr.get_arg_types()` — and degrades gracefully to a
+    /// 1:1 walk when the input already arrives in declaration order
+    /// (each counter advances past its own bank's previous matches).
+    /// The output ordering is the same regardless of input layout.
+    ///
+    /// RPython history kind chars and their pyre `Type` equivalents:
+    /// * `history.INT` and `'S'` (single-precision float, i32 ABI
+    ///   slot) → `Type::Int`.  Pyre only ships 64-bit targets where
+    ///   `'S'` collapses onto the int slot.
+    /// * `history.REF` → `Type::Ref`.
+    /// * `history.FLOAT` and `'L'` (long-long, 64-bit int riding the
+    ///   float ABI slot on 32-bit targets) → `Type::Float`.  Same
+    ///   collapse rationale as `'S'`.
     pub fn _build_allboxes(
         &self,
         funcbox: (crate::jitcode::JitArgKind, OpRef, i64),
@@ -11050,21 +11058,51 @@ impl<M: Clone> MetaInterp<M> {
         }
         // pyjitpl.py:1966-1967: allboxes[i] = funcbox; i += 1
         allboxes.push(funcbox);
-        // pyjitpl.py:1968-1991: walk descr.get_arg_types and copy
-        // boxes in declaration order.  Pyre's argboxes already arrive
-        // in declaration order, so debug_assert the kinds match.
-        debug_assert_eq!(
-            argboxes.len(),
-            descr.arg_types().len(),
-            "_build_allboxes: argboxes len mismatch with calldescr",
-        );
-        for (i, &(kind, opref, concrete)) in argboxes.iter().enumerate() {
-            debug_assert_eq!(
-                crate::jitcode::JitArgKind::from_type(descr.arg_types()[i]),
-                Some(kind),
-                "_build_allboxes: argbox kind mismatch at slot {i}",
-            );
-            allboxes.push((kind, opref, concrete));
+        // pyjitpl.py:1968-1991: per-bank counters that demux argboxes
+        // by `descr.get_arg_types()`.  Match `kind` directly against
+        // `majit_ir::Type` (rather than collapsing through
+        // `JitArgKind::from_type`) so the four RPython arms — INT|'S',
+        // REF, FLOAT|'L', AssertionError — stay 1:1 visible.
+        let arg_types = descr.arg_types();
+        let mut src_i: usize = 0;
+        let mut src_r: usize = 0;
+        let mut src_f: usize = 0;
+        for &kind in arg_types {
+            let pick = match kind {
+                // pyjitpl.py:1970-1975: kind == history.INT or kind == 'S'
+                // → walk src_i until argboxes[src_i].type == INT.
+                majit_ir::Type::Int => loop {
+                    let box_ = argboxes[src_i];
+                    src_i += 1;
+                    if matches!(box_.0, crate::jitcode::JitArgKind::Int) {
+                        break box_;
+                    }
+                },
+                // pyjitpl.py:1976-1981: kind == history.REF
+                // → walk src_r until argboxes[src_r].type == REF.
+                majit_ir::Type::Ref => loop {
+                    let box_ = argboxes[src_r];
+                    src_r += 1;
+                    if matches!(box_.0, crate::jitcode::JitArgKind::Ref) {
+                        break box_;
+                    }
+                },
+                // pyjitpl.py:1982-1987: kind == history.FLOAT or kind == 'L'
+                // → walk src_f until argboxes[src_f].type == FLOAT.
+                majit_ir::Type::Float => loop {
+                    let box_ = argboxes[src_f];
+                    src_f += 1;
+                    if matches!(box_.0, crate::jitcode::JitArgKind::Float) {
+                        break box_;
+                    }
+                },
+                // pyjitpl.py:1988-1989: else: raise AssertionError.
+                majit_ir::Type::Void => unreachable!(
+                    "_build_allboxes: descr arg_type is Void (only return types may be Void)",
+                ),
+            };
+            // pyjitpl.py:1990: allboxes[i] = box; i += 1
+            allboxes.push(pick);
         }
         // pyjitpl.py:1992: assert i == len(allboxes)
         debug_assert_eq!(allboxes.len(), total);
@@ -11583,12 +11621,16 @@ impl SwitchToBlackhole {
         }
     }
 
-    /// Construct a `SwitchToBlackhole(Counters.ABORT_ESCAPE)` per
-    /// pyjitpl.py:3691-3692 — `OS_NOT_IN_TRACE` call raised during tracing.
+    /// Construct a `SwitchToBlackhole(Counters.ABORT_ESCAPE,
+    /// raising_exception=True)` per pyjitpl.py:3691-3692 —
+    /// `OS_NOT_IN_TRACE` call raised during tracing.  Mirrors the
+    /// keyword argument upstream sets explicitly so the blackhole
+    /// resume path (blackhole.rs:3469-3487) re-raises the helper-side
+    /// exception instead of silently dropping it.
     pub fn abort_escape() -> Self {
         Self {
             reason: counters::ABORT_ESCAPE,
-            raising_exception: false,
+            raising_exception: true,
         }
     }
 
@@ -12949,6 +12991,97 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
+    fn build_allboxes_demuxes_bank_sorted_input_to_declaration_order() {
+        // pyjitpl.py:1968-1991 — the three-counter demuxing loop pulls
+        // each box from the bank that matches `descr.get_arg_types()`.
+        // When `argboxes` arrives in bank-sorted layout (all ints
+        // first, then refs, then floats), the output must still match
+        // declaration order.
+        use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        // descr declares [Int, Ref, Int, Ref] (declaration order).
+        let descr = StubCallDescr {
+            arg_types: vec![
+                majit_ir::Type::Int,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+                majit_ir::Type::Ref,
+            ],
+            result_type: majit_ir::Type::Void,
+            effect: majit_ir::EffectInfo::default(),
+        };
+        let ctx = meta.trace_ctx().expect("active trace");
+        let funcbox_ref = ctx.const_ref(0xdead);
+        let i0 = ctx.const_int(11);
+        let i1 = ctx.const_int(33);
+        let r0 = ctx.const_ref(22);
+        let r1 = ctx.const_ref(44);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, 0xdead);
+        // argboxes arrives bank-sorted: [int@0, int@2, ref@1, ref@3].
+        let argboxes = [
+            (JitArgKind::Int, i0, 11),
+            (JitArgKind::Int, i1, 33),
+            (JitArgKind::Ref, r0, 22),
+            (JitArgKind::Ref, r1, 44),
+        ];
+        let all = meta._build_allboxes(funcbox, &argboxes, &descr, None);
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0], funcbox);
+        // Output is declaration order [Int, Ref, Int, Ref].
+        assert_eq!(all[1], (JitArgKind::Int, i0, 11));
+        assert_eq!(all[2], (JitArgKind::Ref, r0, 22));
+        assert_eq!(all[3], (JitArgKind::Int, i1, 33));
+        assert_eq!(all[4], (JitArgKind::Ref, r1, 44));
+    }
+
+    #[test]
+    fn build_allboxes_passes_through_declaration_order_input_unchanged() {
+        // The demuxing loop degrades to a 1:1 walk when `argboxes`
+        // already arrives in declaration order — pyre's BC encoder
+        // produces this layout today, so the loop is exercised on
+        // every production call.
+        use crate::BackEdgeAction;
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        let descr = StubCallDescr {
+            arg_types: vec![
+                majit_ir::Type::Int,
+                majit_ir::Type::Ref,
+                majit_ir::Type::Int,
+                majit_ir::Type::Ref,
+            ],
+            result_type: majit_ir::Type::Void,
+            effect: majit_ir::EffectInfo::default(),
+        };
+        let ctx = meta.trace_ctx().expect("active trace");
+        let funcbox_ref = ctx.const_ref(0xdead);
+        let i0 = ctx.const_int(11);
+        let i1 = ctx.const_int(33);
+        let r0 = ctx.const_ref(22);
+        let r1 = ctx.const_ref(44);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, 0xdead);
+        // argboxes already in declaration order [Int, Ref, Int, Ref].
+        let argboxes = [
+            (JitArgKind::Int, i0, 11),
+            (JitArgKind::Ref, r0, 22),
+            (JitArgKind::Int, i1, 33),
+            (JitArgKind::Ref, r1, 44),
+        ];
+        let all = meta._build_allboxes(funcbox, &argboxes, &descr, None);
+        assert_eq!(all.len(), 5);
+        assert_eq!(all[0], funcbox);
+        assert_eq!(all[1], argboxes[0]);
+        assert_eq!(all[2], argboxes[1]);
+        assert_eq!(all[3], argboxes[2]);
+        assert_eq!(all[4], argboxes[3]);
+    }
+
+    #[test]
     fn jit_arg_kind_from_type_maps_int_ref_float_void() {
         use crate::jitcode::JitArgKind;
         assert_eq!(
@@ -13024,26 +13157,18 @@ mod metainterp_static_data_tests {
     }
 
     /// Helper that simulates a raising callable by writing the
-    /// "exception value" into a thread-local that the test below
-    /// transcribes onto MetaInterp::last_exc_value after the call
-    /// returns.  Real production helpers would plumb the exception
-    /// through ExceptionState; the test indirection lets us exercise
-    /// the do_not_in_trace_call branch shape without dragging in the
-    /// full backend exception infrastructure.
-    static NOT_IN_TRACE_RAISED_EXC: std::sync::atomic::AtomicI64 =
-        std::sync::atomic::AtomicI64::new(0);
-
+    /// exception value to the `BH_LAST_EXC_VALUE` thread-local — the
+    /// same seam production helpers (bh_call_fn_impl etc.) publish on
+    /// and that `do_not_in_trace_call` reads back into
+    /// `MetaInterp::last_exc_value`.
     extern "C" fn raising_not_in_trace_helper() {
-        NOT_IN_TRACE_RAISED_EXC.store(0xfeed, std::sync::atomic::Ordering::SeqCst);
+        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0xfeed));
     }
 
     #[test]
     fn do_not_in_trace_call_returns_abort_escape_on_exception() {
         // pyjitpl.py:3687-3692 — if last_exc_value is set after the
-        // call, raise SwitchToBlackhole(ABORT_ESCAPE).  We model the
-        // helper-side exception plumbing with a thread-local that the
-        // test reads back into MetaInterp::last_exc_value after the
-        // call returns — see the helper docstring above.
+        // call, raise SwitchToBlackhole(ABORT_ESCAPE).
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
@@ -13058,40 +13183,44 @@ mod metainterp_static_data_tests {
         let fnaddr = raising_not_in_trace_helper as *const () as i64;
         let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
         let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
+        let allboxes = [funcbox];
 
-        // Simulate the production exception plumbing by pre-setting
-        // the thread-local: the helper will write 0xfeed there, and
-        // we transcribe it onto last_exc_value after the call.
-        NOT_IN_TRACE_RAISED_EXC.store(0, std::sync::atomic::Ordering::SeqCst);
+        // Pre-set BH_LAST_EXC_VALUE to a stale value.  do_not_in_trace_call
+        // must clear it before the call (RPython's cpu auto-clears) and
+        // re-read after.  The helper writes 0xfeed; the named entry must
+        // transcribe that onto last_exc_value and return ABORT_ESCAPE.
+        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0xdead));
+        // Pre-set the class-const flag too — execute_raised must reset
+        // it (pyjitpl.py:2752: `self.class_of_last_exc_is_const = constant`
+        // with `constant=False`).
+        meta.class_of_last_exc_is_const = true;
 
-        // Drive do_not_in_trace_call manually so we can inject the
-        // post-call last_exc_value value.  Mirrors pyjitpl.py exactly
-        // except for the exception-plumbing seam.
-        meta.clear_exception();
-        crate::pyjitpl::call_void_function(funcbox.2 as *const (), &[]);
-        meta.last_exc_value = NOT_IN_TRACE_RAISED_EXC.load(std::sync::atomic::Ordering::SeqCst);
-        let abort = if meta.last_exc_value != 0 {
-            Err(SwitchToBlackhole::abort_escape())
-        } else {
-            Ok::<Option<OpRef>, SwitchToBlackhole>(None)
-        };
-        assert!(matches!(
-            abort,
+        let result = meta.do_not_in_trace_call(&allboxes, &descr);
+        // pyjitpl.py:3691: raise SwitchToBlackhole(Counters.ABORT_ESCAPE,
+        //                                          raising_exception=True)
+        // — the `raising_exception=True` keyword argument is part of the
+        // contract; the blackhole resume path (blackhole.rs:3469-3487)
+        // re-raises the helper-side exception only when it is set.
+        assert_eq!(
+            result,
             Err(SwitchToBlackhole {
                 reason: counters::ABORT_ESCAPE,
-                ..
+                raising_exception: true,
             })
-        ));
-
-        // Now invoke through the named entry — the helper writes the
-        // exception value too, but the named entry never sees the
-        // transcription, so it returns Ok(None).  Document the
-        // structural behavior: do_not_in_trace_call faithfully
-        // mirrors RPython's body; only the post-call exception
-        // visibility depends on the host-side exception seam.
-        let _ = funcbox;
-        let _ = descr;
-        let _ = meta;
+        );
+        assert_eq!(
+            meta.last_exc_value, 0xfeed,
+            "helper exception must be transcribed into last_exc_value"
+        );
+        // BH_LAST_EXC_VALUE must be cleared so the next call site starts
+        // clean.
+        assert_eq!(
+            crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()),
+            0,
+            "BH_LAST_EXC_VALUE must be cleared after read"
+        );
+        // class_of_last_exc_is_const cleared by execute_raised(.., false).
+        assert!(!meta.class_of_last_exc_is_const);
     }
 
     extern "C" fn execute_varargs_int_helper(a: i64, b: i64) -> i64 {
@@ -13099,6 +13228,91 @@ mod metainterp_static_data_tests {
     }
 
     extern "C" fn execute_varargs_void_helper() {}
+
+    #[test]
+    fn execute_varargs_call_f_returns_zero_until_caller_contract_resolved() {
+        // executor::execute_varargs's Type::Float arm currently returns
+        // the type-neutral zero (matching main's prior stub) because
+        // the funcbox carries a single `*const ()` slot but
+        // `#[jit_module]` (majit-macros/src/lib.rs:253-272) emits two
+        // distinct float wrappers (trace_ptr `-> f64`, concrete_ptr
+        // `-> i64`).  Picking either ABI without knowing which wrapper
+        // the caller materialised would risk a transmute mismatch — the
+        // Task #16 audit has to settle the caller-contract first.
+        // Until then, this test pins the stub behaviour so a future
+        // regression that "fixes" the arm without addressing the
+        // contract is caught.
+        use crate::executor;
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        let descr = StubCallDescr {
+            arg_types: vec![],
+            result_type: majit_ir::Type::Float,
+            effect: majit_ir::EffectInfo::default(),
+        };
+        // Dummy fn pointer — never called because the arm is stubbed.
+        let fnaddr = execute_varargs_void_helper as *const () as i64;
+        let argboxes = [(JitArgKind::Ref, OpRef(0), fnaddr)];
+        let raw = executor::execute_varargs(&mut meta, OpCode::CallF, &argboxes, &descr);
+        assert_eq!(raw, 0);
+        assert_eq!(f64::from_bits(raw as u64), 0.0);
+        assert_eq!(meta.last_exc_value, 0);
+    }
+
+    extern "C" fn execute_varargs_raising_int_helper(_a: i64) -> i64 {
+        // Helper raises by publishing onto BH_LAST_EXC_VALUE before
+        // returning a non-zero stub value — production helpers do this
+        // when their callee threw and the JIT bridges the exception
+        // back via the thread-local seam.
+        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0xfeed));
+        0xdeadbeef
+    }
+
+    #[test]
+    fn execute_varargs_zeros_result_and_routes_through_execute_raised_on_exception() {
+        // executor.py:52-78 — when the helper raises, the executor calls
+        // `metainterp.execute_raised(e)` AND returns the type's neutral
+        // zero (INT=0, REF=NULL, FLOAT=ZEROF, VOID ignored).  Pyre must
+        // also clear `class_of_last_exc_is_const` (pyjitpl.py:2745-2755)
+        // so a stale `True` from a prior GUARD_EXCEPTION cannot leak
+        // into the new exception's classification.
+        use crate::executor;
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        // Pre-set a stale class-const flag and a stale TLS value: the
+        // executor must overwrite both.
+        meta.class_of_last_exc_is_const = true;
+        crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.set(0));
+
+        let descr = StubCallDescr {
+            arg_types: vec![majit_ir::Type::Int],
+            result_type: majit_ir::Type::Int,
+            effect: majit_ir::EffectInfo::default(),
+        };
+        let fnaddr = execute_varargs_raising_int_helper as *const () as i64;
+        let argboxes = [
+            (JitArgKind::Ref, OpRef(0), fnaddr),
+            (JitArgKind::Int, OpRef(1), 7),
+        ];
+
+        let raw = executor::execute_varargs(&mut meta, OpCode::CallI, &argboxes, &descr);
+
+        // Result zeroed despite the helper returning 0xdeadbeef.
+        assert_eq!(
+            raw, 0,
+            "executor must override the helper's return value with 0 on exception",
+        );
+        // Exception state mirrored onto the metainterp.
+        assert_eq!(meta.last_exc_value, 0xfeed);
+        // class_of_last_exc_is_const cleared (execute_ll_raised sets
+        // constant=False per pyjitpl.py:2752).
+        assert!(
+            !meta.class_of_last_exc_is_const,
+            "class_of_last_exc_is_const must be reset when execute_raised fires",
+        );
+        // TLS drained so the next call site starts clean.
+        assert_eq!(crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()), 0);
+    }
 
     #[test]
     fn do_residual_call_emits_call_i_for_regular_int_call() {
