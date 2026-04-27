@@ -814,7 +814,7 @@ use crate::pyjitpl::{call_int_function, eval_binop_f, eval_binop_i, eval_unary_f
 /// Each handler decodes operands from `code[position..]` based on its
 /// argcodes, calls the corresponding `bhimpl_*` method on `bh`, writes
 /// results, and returns the updated position.
-pub(crate) type BhOpcodeHandler =
+pub type BhOpcodeHandler =
     fn(bh: &mut BlackholeInterpreter, code: &[u8], position: usize) -> Result<usize, DispatchError>;
 
 /// Default handler installed by `setup_insns` for opcodes whose
@@ -887,7 +887,7 @@ impl Default for BhReturnType {
 ///
 /// RPython: `LeaveFrame` exception + `except Exception` in blackhole.py run()
 #[derive(Debug)]
-pub(crate) enum DispatchError {
+pub enum DispatchError {
     /// Normal return from frame (RPython: LeaveFrame).
     LeaveFrame,
     /// Exception raised — must call handle_exception_in_frame.
@@ -3122,8 +3122,7 @@ impl BlackholeInterpBuilder {
     /// Runs the codewriter-orthodox bytecode dispatch loop. Each iteration
     /// reads one opcode byte, looks up the handler in `dispatch_table`,
     /// and calls it to advance position.
-    #[cfg(test)]
-    pub(crate) fn dispatch_loop(
+    pub fn dispatch_loop(
         &self,
         bh: &mut BlackholeInterpreter,
         code: &[u8],
@@ -3136,6 +3135,60 @@ impl BlackholeInterpBuilder {
                 panic!("bad opcode {opcode} at position {}", position - 1);
             }
             position = self.dispatch_table[opcode](bh, code, position)?;
+        }
+    }
+
+    /// `dispatch_loop` with a per-opcode probe hook (Phase D-2 shadow
+    /// execution scaffolding).
+    ///
+    /// PRE-EXISTING-ADAPTATION: RPython's `BlackholeInterpBuilder.dispatch_loop`
+    /// has no probe parameter because upstream runs a single dispatch
+    /// path (jitcode). Pyre is mid-migration: trait-based
+    /// `MIFrame::execute_opcode_step` (trace_opcode.rs) and this
+    /// codewriter-orthodox jitcode path coexist while Phase D
+    /// validates the latter against the former. The probe lets a
+    /// shadow-execute caller capture the jitcode op sequence so it
+    /// can compare against the trace-side IR emitted by
+    /// `execute_opcode_step`.
+    ///
+    /// Convergence path: removed in Phase E (eval-loop automation
+    /// plan) when trait dispatch is deleted and `dispatch_loop`
+    /// becomes the single production path. Until then this method
+    /// stays alongside `dispatch_loop` without disturbing it — the
+    /// non-probe loop is verbatim RPython parity, the probe variant
+    /// is the opt-in transitional surface.
+    ///
+    /// `probe(bh_view, pc, opcode_byte, opname_key)` fires once per
+    /// dispatched opcode, BEFORE the handler runs.
+    ///
+    /// * `bh_view` — shared reborrow of the interpreter. The probe
+    ///   can read `registers_i/r/f`, `tmpreg_*`, `descrs`, etc. to
+    ///   capture the input data flow consumed by the upcoming
+    ///   handler. The reborrow expires at the end of the probe call,
+    ///   so the handler runs against the same `&mut BlackholeInterpreter`
+    ///   the loop holds.
+    /// * `pc` — position of the opcode byte (not the position after
+    ///   operand decode). `code[pc] == opcode_byte`.
+    /// * `opname_key` — the `_insns[opcode]` entry (e.g.
+    ///   `"int_add/ii>i"`).
+    pub fn dispatch_loop_with_probe(
+        &self,
+        bh: &mut BlackholeInterpreter,
+        code: &[u8],
+        mut position: usize,
+        mut probe: impl FnMut(&BlackholeInterpreter, usize, u8, &str),
+    ) -> Result<(), DispatchError> {
+        loop {
+            let pc = position;
+            let opcode = code[position];
+            let opcode_idx = opcode as usize;
+            if opcode_idx >= self.dispatch_table.len() {
+                panic!("bad opcode {opcode_idx} at position {pc}");
+            }
+            let opname = self._insns[opcode_idx].as_str();
+            probe(&*bh, pc, opcode, opname);
+            position += 1;
+            position = self.dispatch_table[opcode_idx](bh, code, position)?;
         }
     }
 

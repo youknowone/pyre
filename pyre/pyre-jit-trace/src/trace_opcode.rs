@@ -729,6 +729,28 @@ impl MIFrame {
             // `consume_one_section` overwrites those slots with the
             // canonical resume value before the BH dereferences
             // them, leaving the NULL writes harmless.
+            //
+            // KNOWN-INCOMPLETE divergences from `pyjitpl.py:177-234`:
+            //   1. Single-bank read.  RPython iterates the 3-bank
+            //      liveness header and reads from `registers_i`,
+            //      `registers_r`, `registers_f` in lockstep with the
+            //      bank a register belongs to.  Pyre reads only from
+            //      `registers_r` here because the portal-bridge
+            //      install does not yet carry per-PC liveness
+            //      metadata, so the snapshot does not know which
+            //      bank each `reg` index belongs to.
+            //   2. Always-box vs sometimes-NONE.  RPython unconditionally
+            //      builds a `Box*` for every live register (even if the
+            //      Python-level value is None); the box wraps the raw
+            //      i64/Ptr/f64 read out of the kind-specific bank.
+            //      Pyre emits `OpRef::NONE` for any `reg` index past
+            //      `registers_r.len()`, accepting the NULL serialisation
+            //      because (per the discussion above)
+            //      `consume_one_section` will overwrite the slot before
+            //      a dereference.
+            // Both close once G.4.4 lands the per-PC liveness exposure
+            // and the encoder reads from a 3-bank-aware shadow tied to
+            // `virtualizable_boxes`.
             let mut boxes = Vec::with_capacity(target_count);
             for reg in 0..target_count {
                 boxes.push(registers_r.get(reg).copied().unwrap_or(OpRef::NONE));
@@ -787,6 +809,22 @@ impl MIFrame {
         // not Python-semantic stack-slot indices. Reverse-map each live
         // color through the current jitcode's live stack prefix first,
         // then fall back to the local inputarg prefix.
+        //
+        // KNOWN-INCOMPLETE divergence from `pyjitpl.py:177-234`:
+        // RPython reads each live register out of its kind-specific
+        // bank — `registers_i[reg_i]` / `registers_r[reg_r]` /
+        // `registers_f[reg_f]` — once per liveness-header entry.
+        // Pyre folds all three banks into a single `registers_r`
+        // (OpRef-typed) array and uses `semantic_ref_slot_for_reg_color`
+        // to reverse-map every register color to a ref-slot index
+        // before reading.  This mirrors the pyre trace-side state
+        // model where boxes are tracked as `OpRef` regardless of
+        // primitive kind, but it is not a line-by-line port of
+        // RPython's 3-bank read.  Convergence path: split MIFrame's
+        // register-file storage into `registers_i/r/f` (Phase D
+        // shadow-execute prerequisite, eval-loop automation plan),
+        // then drop `semantic_ref_slot_for_reg_color` and read from
+        // the bank the liveness header dictates.
         let snapshot = |reg: usize| -> OpRef {
             let Some(slot_idx) = crate::state::semantic_ref_slot_for_reg_color(
                 nlocals,

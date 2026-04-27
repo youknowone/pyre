@@ -1102,4 +1102,741 @@ mod tests {
             bt_jc.num_regs_f() + bt_jc.constants_f.len()
         );
     }
+
+    #[test]
+    fn dispatch_loop_executes_int_add_via_real_insns_table() {
+        // Phase D-2.0: confirm the build-time `pipeline.insns` byte
+        // assignments resolve to the real `wire_bhimpl_handlers`
+        // dispatch entries — a hand-assembled bytecode using those
+        // bytes runs end-to-end through
+        // `BlackholeInterpBuilder::dispatch_loop` and lands the
+        // expected `bhimpl_int_add` result.
+        //
+        // RPython parity: same shape as `setup_insns + dispatch_loop +
+        // bhimpl_int_add` (blackhole.py:66-100 + 452-460), but driven
+        // by the artifact this binary actually loads — not a synthetic
+        // 3-entry insns dict like the analogous test inside
+        // majit-metainterp. Closes the build-artifact → runtime →
+        // BlackholeInterpBuilder round trip end-to-end.
+        //
+        // `build_default_bh_builder()` is bypassed here because it
+        // panics on the 6 unwired opnames (`int_ge/ir>i` family —
+        // Task #85 root cause is open). Those opcodes aren't on this
+        // test's dispatch path, so the inline construction below
+        // matches `build_default_bh_builder()` minus the panic and
+        // exercises only the wired entries.
+        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+        builder.setup_insns(insns_opname_to_byte());
+        builder.setup_descrs(all_descrs().to_vec());
+        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+
+        let table = insns_opname_to_byte();
+        let live_byte = *table.get("live/").expect("`live/` must be in insns");
+        let int_add_byte = *table
+            .get("int_add/ii>i")
+            .expect("`int_add/ii>i` must be in insns");
+        let int_return_byte = *table
+            .get("int_return/i")
+            .expect("`int_return/i` must be in insns");
+
+        // live + int_add(r0, r1) → r2 + int_return(r2). The two zero
+        // bytes after `live/` are the OFFSET_SIZE liveness offset that
+        // `bhimpl_live` skips (blackhole.py:1603-1605).
+        let code: Vec<u8> = vec![
+            live_byte,
+            0x00,
+            0x00, //
+            int_add_byte,
+            0x00,
+            0x01,
+            0x02, //
+            int_return_byte,
+            0x02,
+        ];
+
+        let mut bh = builder.acquire_interp();
+        bh.registers_i = vec![0i64; 3];
+        bh.registers_i[0] = 10;
+        bh.registers_i[1] = 32;
+
+        let result = builder.dispatch_loop(&mut bh, &code, 0);
+        assert!(
+            matches!(
+                result,
+                Err(majit_metainterp::blackhole::DispatchError::LeaveFrame)
+            ),
+            "dispatch_loop must terminate with LeaveFrame after \
+             int_return; got {result:?}",
+        );
+        assert_eq!(bh.tmpreg_i, 42, "int_add(10, 32) must produce 42");
+    }
+
+    #[test]
+    fn dispatch_loop_chains_int_add_then_int_sub_via_real_insns_table() {
+        // Phase D-2.1: chain two binops + a label-free linear control
+        // flow through `dispatch_loop`. Validates that the second
+        // binop reads the register the first wrote (multi-step value
+        // flow through the register file) and that two distinct wired
+        // bhimpl handlers (`bhimpl_int_add`, `bhimpl_int_sub`) advance
+        // `position` correctly back to back.
+        //
+        // RPython parity: blackhole.py:452-460 `bhimpl_int_add` +
+        // :462-464 `bhimpl_int_sub` chained with the same register
+        // file, identical to RPython's per-op `_get_method.handler`
+        // dispatch.
+        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+        builder.setup_insns(insns_opname_to_byte());
+        builder.setup_descrs(all_descrs().to_vec());
+        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+
+        let table = insns_opname_to_byte();
+        let live_byte = *table.get("live/").expect("`live/` must be in insns");
+        let int_add_byte = *table
+            .get("int_add/ii>i")
+            .expect("`int_add/ii>i` must be in insns");
+        let int_sub_byte = *table
+            .get("int_sub/ii>i")
+            .expect("`int_sub/ii>i` must be in insns");
+        let int_return_byte = *table
+            .get("int_return/i")
+            .expect("`int_return/i` must be in insns");
+
+        // live + int_add(r0=10, r1=32) → r2 (=42)
+        //      + int_sub(r2, r0)        → r3 (=32)
+        //      + int_return(r3)
+        let code: Vec<u8> = vec![
+            live_byte,
+            0x00,
+            0x00, //
+            int_add_byte,
+            0x00,
+            0x01,
+            0x02, //
+            int_sub_byte,
+            0x02,
+            0x00,
+            0x03, //
+            int_return_byte,
+            0x03,
+        ];
+
+        let mut bh = builder.acquire_interp();
+        bh.registers_i = vec![0i64; 4];
+        bh.registers_i[0] = 10;
+        bh.registers_i[1] = 32;
+
+        let result = builder.dispatch_loop(&mut bh, &code, 0);
+        assert!(
+            matches!(
+                result,
+                Err(majit_metainterp::blackhole::DispatchError::LeaveFrame)
+            ),
+            "dispatch_loop must terminate with LeaveFrame after \
+             int_return; got {result:?}",
+        );
+        assert_eq!(bh.registers_i[2], 42, "first int_add must store 42 into r2",);
+        assert_eq!(
+            bh.registers_i[3], 32,
+            "second int_sub must store (42-10)=32 into r3",
+        );
+        assert_eq!(bh.tmpreg_i, 32, "int_return must place r3 into tmpreg_i",);
+    }
+
+    #[test]
+    fn dispatch_loop_executes_count_up_loop_via_real_insns_table() {
+        // Phase D-2.2: closed loop via `int_lt/ii>i` + `goto_if_not/iL`
+        // + `goto/L` — exercises the dispatch_loop's absolute-target
+        // label semantics on both backward and forward jumps.
+        //
+        // pyre's build-time assembler does not currently emit the
+        // fused `goto_if_not_int_*` family; the orthodox unfused
+        // shape (`int_lt` produces a 0/1 register, `goto_if_not`
+        // dispatches on it) is what `pipeline.insns` actually
+        // contains, so the loop is wired against the unfused pair.
+        //
+        // Loop body (count r0 from 0 up to r1=5, step r2=1):
+        //
+        //   PC=0:  live/
+        //   PC=3:  LOOP: int_lt r0, r1 → r3
+        //   PC=7:        goto_if_not r3, END   (forward jump)
+        //   PC=11:       int_add r0, r2 → r0
+        //   PC=15:       goto LOOP=3            (backward jump)
+        //   PC=18: END:  int_return r0
+        //
+        // RPython parity: blackhole.py:864-869 `bhimpl_goto_if_not`
+        // — target is an absolute byte offset into the jitcode
+        // `code` array.
+        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+        builder.setup_insns(insns_opname_to_byte());
+        builder.setup_descrs(all_descrs().to_vec());
+        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+
+        let table = insns_opname_to_byte();
+        let live_byte = *table.get("live/").expect("`live/` must be in insns");
+        let int_lt_byte = *table
+            .get("int_lt/ii>i")
+            .expect("`int_lt/ii>i` must be in insns");
+        let goto_if_not_byte = *table
+            .get("goto_if_not/iL")
+            .expect("`goto_if_not/iL` must be in insns");
+        let int_add_byte = *table
+            .get("int_add/ii>i")
+            .expect("`int_add/ii>i` must be in insns");
+        let goto_byte = *table.get("goto/L").expect("`goto/L` must be in insns");
+        let int_return_byte = *table
+            .get("int_return/i")
+            .expect("`int_return/i` must be in insns");
+
+        // PC offsets (must match the layout above): LOOP_HEAD = 3, END = 18.
+        const LOOP_HEAD: u8 = 3;
+        const END: u8 = 18;
+        let code: Vec<u8> = vec![
+            // PC=0:  live/  (1 + OFFSET_SIZE = 3 bytes)
+            live_byte,
+            0x00,
+            0x00, //
+            // PC=3:  int_lt r0, r1 → r3  (1 + 3 = 4 bytes)
+            int_lt_byte,
+            0x00,
+            0x01,
+            0x03, //
+            // PC=7:  goto_if_not r3, END  (1 + 1 + 2 = 4 bytes)
+            goto_if_not_byte,
+            0x03,
+            END,
+            0x00, //
+            // PC=11: int_add r0, r2 → r0  (1 + 3 = 4 bytes)
+            int_add_byte,
+            0x00,
+            0x02,
+            0x00, //
+            // PC=15: goto LOOP_HEAD  (1 + 2 = 3 bytes)
+            goto_byte,
+            LOOP_HEAD,
+            0x00, //
+            // PC=18: int_return r0  (1 + 1 = 2 bytes)
+            int_return_byte,
+            0x00,
+        ];
+        assert_eq!(code.len(), 20, "loop bytecode must be exactly 20 bytes");
+
+        let mut bh = builder.acquire_interp();
+        bh.registers_i = vec![0i64; 4];
+        bh.registers_i[0] = 0; // counter
+        bh.registers_i[1] = 5; // limit
+        bh.registers_i[2] = 1; // step
+        // r3 is the int_lt result slot — left zero, written each loop iter.
+
+        let result = builder.dispatch_loop(&mut bh, &code, 0);
+        assert!(
+            matches!(
+                result,
+                Err(majit_metainterp::blackhole::DispatchError::LeaveFrame)
+            ),
+            "dispatch_loop must terminate with LeaveFrame after the \
+             loop's int_return; got {result:?}",
+        );
+        assert_eq!(
+            bh.registers_i[0], 5,
+            "counter r0 must reach the limit (5) before the loop \
+             exits via int_lt(5,5)=0 → goto_if_not jumps to END",
+        );
+        assert_eq!(bh.tmpreg_i, 5, "int_return must place r0 into tmpreg_i");
+    }
+
+    #[test]
+    fn dispatch_loop_executes_float_add_via_real_insns_table() {
+        // Phase D-2.3: float register file + ff>f decode/encode +
+        // void_return termination.
+        //
+        //   PC=0:  live/
+        //   PC=3:  float_add r0, r1 → r2
+        //   PC=7:  void_return
+        //
+        // RPython parity: blackhole.py:574-577 `bhimpl_float_add` +
+        // :859-862 `bhimpl_void_return`. Pyre's `registers_f` stores
+        // `f64::to_bits() as i64`; the `bhhandler_ff_f!` macro decodes
+        // via `f64::from_bits` on read and `to_bits()` on write, so
+        // the test setup mirrors that encoding.
+        //
+        // `float_return/f` is wired in `wire_bhimpl_handlers` but is
+        // NOT in the build-time `pipeline.insns` (no jitcode emitted
+        // by the production assembler currently returns a float — all
+        // float ops feed back into either box_float or another float
+        // op). The test validates the float register file + binop
+        // decode end-to-end and inspects `registers_f[2]` directly.
+        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+        builder.setup_insns(insns_opname_to_byte());
+        builder.setup_descrs(all_descrs().to_vec());
+        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+
+        let table = insns_opname_to_byte();
+        let live_byte = *table.get("live/").expect("`live/` must be in insns");
+        let float_add_byte = *table
+            .get("float_add/ff>f")
+            .expect("`float_add/ff>f` must be in insns");
+        let void_return_byte = *table
+            .get("void_return/")
+            .expect("`void_return/` must be in insns");
+
+        let code: Vec<u8> = vec![
+            live_byte,
+            0x00,
+            0x00, //
+            float_add_byte,
+            0x00,
+            0x01,
+            0x02, //
+            void_return_byte,
+        ];
+
+        let mut bh = builder.acquire_interp();
+        bh.registers_f = vec![0i64; 3];
+        bh.registers_f[0] = (1.5_f64).to_bits() as i64;
+        bh.registers_f[1] = (2.5_f64).to_bits() as i64;
+
+        let result = builder.dispatch_loop(&mut bh, &code, 0);
+        assert!(
+            matches!(
+                result,
+                Err(majit_metainterp::blackhole::DispatchError::LeaveFrame)
+            ),
+            "dispatch_loop must terminate with LeaveFrame after \
+             void_return; got {result:?}",
+        );
+        assert_eq!(
+            f64::from_bits(bh.registers_f[2] as u64),
+            4.0,
+            "float_add(1.5, 2.5) must store 4.0 (bits) into r2",
+        );
+        assert_eq!(
+            bh.return_type,
+            majit_metainterp::blackhole::BhReturnType::Void,
+            "void_return must set return_type = Void",
+        );
+    }
+
+    #[test]
+    fn dispatch_loop_executes_cross_type_cast_then_float_add() {
+        // Phase D-2.4: cross-type register file bridge —
+        // `cast_int_to_float/i>f` reads from `registers_i` and writes
+        // to `registers_f` in the same dispatch pass.
+        //
+        //   PC=0:  live/
+        //   PC=3:  cast_int_to_float r0 → f0
+        //   PC=6:  cast_int_to_float r1 → f1
+        //   PC=9:  float_add f0, f1 → f2
+        //   PC=13: void_return
+        //
+        // RPython parity: `bhimpl_cast_int_to_float`
+        // (blackhole.py:565-568) — `(a as f64).to_bits()`. The
+        // dispatch loop must drive the int→float bridge twice and
+        // then a float binop on the resulting registers without
+        // crossing wires.
+        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+        builder.setup_insns(insns_opname_to_byte());
+        builder.setup_descrs(all_descrs().to_vec());
+        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+
+        let table = insns_opname_to_byte();
+        let live_byte = *table.get("live/").expect("`live/` must be in insns");
+        let cast_byte = *table
+            .get("cast_int_to_float/i>f")
+            .expect("`cast_int_to_float/i>f` must be in insns");
+        let float_add_byte = *table
+            .get("float_add/ff>f")
+            .expect("`float_add/ff>f` must be in insns");
+        let void_return_byte = *table
+            .get("void_return/")
+            .expect("`void_return/` must be in insns");
+
+        let code: Vec<u8> = vec![
+            live_byte,
+            0x00,
+            0x00, //
+            cast_byte,
+            0x00,
+            0x00, // r0 → f0
+            cast_byte,
+            0x01,
+            0x01, // r1 → f1
+            float_add_byte,
+            0x00,
+            0x01,
+            0x02, //
+            void_return_byte,
+        ];
+        assert_eq!(code.len(), 14, "code must be 14 bytes");
+
+        let mut bh = builder.acquire_interp();
+        bh.registers_i = vec![10, 20];
+        bh.registers_f = vec![0i64; 3];
+
+        let result = builder.dispatch_loop(&mut bh, &code, 0);
+        assert!(
+            matches!(
+                result,
+                Err(majit_metainterp::blackhole::DispatchError::LeaveFrame)
+            ),
+            "dispatch_loop must terminate with LeaveFrame after \
+             void_return; got {result:?}",
+        );
+        assert_eq!(
+            f64::from_bits(bh.registers_f[0] as u64),
+            10.0,
+            "cast_int_to_float r0=10 must store 10.0 into f0",
+        );
+        assert_eq!(
+            f64::from_bits(bh.registers_f[1] as u64),
+            20.0,
+            "cast_int_to_float r1=20 must store 20.0 into f1",
+        );
+        assert_eq!(
+            f64::from_bits(bh.registers_f[2] as u64),
+            30.0,
+            "float_add(10.0, 20.0) must store 30.0 into f2",
+        );
+    }
+
+    #[test]
+    fn dispatch_loop_loads_constant_via_setposition_lifecycle() {
+        // Phase D-2.5: full RPython-shape lifecycle —
+        // `acquire_interp` + `setposition` + `dispatch_loop`. Earlier
+        // dispatch_loop tests bypassed `setposition` by hand-setting
+        // `bh.registers_i = vec![...]`; here we construct a real
+        // runtime `JitCode` with `c_num_regs_i = 1` and
+        // `constants_i = [42]` so `setposition` allocates a register
+        // file of `num_regs_and_consts_i() = 2` slots and copies the
+        // constant into slot 1 (RPython
+        // `blackhole.py:312 setposition` parity).
+        //
+        //   slot 0 = scratch dst
+        //   slot 1 = constant 42 (preloaded by setposition)
+        //
+        //   PC=0:  live/
+        //   PC=3:  int_copy r1 → r0    (r0 := constant)
+        //   PC=6:  int_return r0
+        //
+        // RPython parity: `bhimpl_int_copy` (blackhole.py:455-457)
+        // reads from `registers_i[code[pc]]` and writes
+        // `registers_i[code[pc+1]]`, which validates that the
+        // constants area is reachable through the same register-index
+        // protocol the bhimpl handlers consume.
+        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+        builder.setup_insns(insns_opname_to_byte());
+        builder.setup_descrs(all_descrs().to_vec());
+        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+
+        let table = insns_opname_to_byte();
+        let live_byte = *table.get("live/").expect("`live/` must be in insns");
+        let int_copy_byte = *table
+            .get("int_copy/i>i")
+            .expect("`int_copy/i>i` must be in insns");
+        let int_return_byte = *table
+            .get("int_return/i")
+            .expect("`int_return/i` must be in insns");
+
+        let code: Vec<u8> = vec![
+            live_byte,
+            0x00,
+            0x00, //
+            int_copy_byte,
+            0x01,
+            0x00, //   r1 (= constant) → r0
+            int_return_byte,
+            0x00,
+        ];
+
+        let jc = std::sync::Arc::new(majit_metainterp::jitcode::JitCode {
+            c_num_regs_i: 1,
+            constants_i: vec![42],
+            code: code.clone(),
+            ..Default::default()
+        });
+
+        let mut bh = builder.acquire_interp();
+        bh.setposition(jc.clone(), 0);
+
+        // setposition must have allocated num_regs_i + constants_i.len() slots
+        // and copied the constant into the upper half.
+        assert_eq!(
+            bh.registers_i.len(),
+            2,
+            "setposition must size registers_i to num_regs_and_consts_i = 2",
+        );
+        assert_eq!(
+            bh.registers_i[1], 42,
+            "setposition must copy constants_i[0]=42 into slot num_regs_i = 1",
+        );
+
+        let result = builder.dispatch_loop(&mut bh, &jc.code, 0);
+        assert!(
+            matches!(
+                result,
+                Err(majit_metainterp::blackhole::DispatchError::LeaveFrame)
+            ),
+            "dispatch_loop must terminate with LeaveFrame after \
+             int_return; got {result:?}",
+        );
+        assert_eq!(
+            bh.registers_i[0], 42,
+            "int_copy r1→r0 must move the preloaded constant 42 into r0",
+        );
+        assert_eq!(bh.tmpreg_i, 42, "int_return must surface 42 via tmpreg_i");
+    }
+
+    #[test]
+    fn dispatch_loop_executes_ref_return_via_real_insns_table() {
+        // Phase D-2.6: ref register file + ref_return r-typed
+        // termination — fills the third register-file dimension that
+        // the earlier dispatch_loop tests did not touch.
+        //
+        // The build-time insns table has only `ref_return/r` from the
+        // `ref_*` family (no `ref_copy/r>r`, no `ref_push/r`, no
+        // `ref_pop/>r`) — pyre's production assembler does not emit
+        // those today. So the smallest ref-typed round-trip uses
+        // `ref_return/r` as the sole ref-side opcode and validates
+        // that `registers_r[k]` is reachable through the standard
+        // `r`-argcode protocol that `bhhandler_*` macros consume.
+        //
+        //   PC=0: live/
+        //   PC=3: ref_return r0
+        //
+        // RPython parity: blackhole.py:847-851 `bhimpl_ref_return`.
+        // `registers_r` and `tmpreg_r` store ref pointers as raw `i64`
+        // bits; the test uses an arbitrary nonzero pattern to verify
+        // the read is byte-for-byte without dereferencing.
+        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+        builder.setup_insns(insns_opname_to_byte());
+        builder.setup_descrs(all_descrs().to_vec());
+        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+
+        let table = insns_opname_to_byte();
+        let live_byte = *table.get("live/").expect("`live/` must be in insns");
+        let ref_return_byte = *table
+            .get("ref_return/r")
+            .expect("`ref_return/r` must be in insns");
+
+        let code: Vec<u8> = vec![
+            live_byte,
+            0x00,
+            0x00, //
+            ref_return_byte,
+            0x00,
+        ];
+
+        let mut bh = builder.acquire_interp();
+        bh.registers_r = vec![0i64; 1];
+        // Arbitrary nonzero pattern. Treated as a raw ref pointer; the
+        // test does not dereference it.
+        let probe: i64 = 0x1234_5678_9abc_def0_u64 as i64;
+        bh.registers_r[0] = probe;
+
+        let result = builder.dispatch_loop(&mut bh, &code, 0);
+        assert!(
+            matches!(
+                result,
+                Err(majit_metainterp::blackhole::DispatchError::LeaveFrame)
+            ),
+            "dispatch_loop must terminate with LeaveFrame after \
+             ref_return; got {result:?}",
+        );
+        assert_eq!(
+            bh.tmpreg_r, probe,
+            "ref_return must place r0's bits into tmpreg_r byte-for-byte",
+        );
+        assert_eq!(
+            bh.return_type,
+            majit_metainterp::blackhole::BhReturnType::Ref,
+            "ref_return must set return_type = Ref",
+        );
+    }
+
+    #[test]
+    fn dispatch_loop_with_probe_captures_opcode_sequence_and_preserves_result() {
+        // Phase D-2.7: probe-hook variant of dispatch_loop — first
+        // shadow-execution scaffold. Each dispatched opcode invokes
+        // the probe BEFORE the handler runs, so a shadow caller
+        // (Phase D plan: MIFrame side) can capture the jitcode op
+        // sequence and compare it against the trace IR emitted by the
+        // trait-based `execute_opcode_step`. The probe must NOT
+        // change the dispatch result — running the same int_add
+        // bytecode through `dispatch_loop_with_probe` must produce
+        // the same `tmpreg_i==42` + LeaveFrame as the bare
+        // `dispatch_loop` (D-2.0 baseline).
+        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+        builder.setup_insns(insns_opname_to_byte());
+        builder.setup_descrs(all_descrs().to_vec());
+        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+
+        let table = insns_opname_to_byte();
+        let live_byte = *table.get("live/").expect("`live/` must be in insns");
+        let int_add_byte = *table
+            .get("int_add/ii>i")
+            .expect("`int_add/ii>i` must be in insns");
+        let int_return_byte = *table
+            .get("int_return/i")
+            .expect("`int_return/i` must be in insns");
+
+        // Same shape as D-2.0 baseline:
+        //   PC=0: live/                3 bytes
+        //   PC=3: int_add r0, r1 → r2  4 bytes
+        //   PC=7: int_return r2        2 bytes
+        let code: Vec<u8> = vec![
+            live_byte,
+            0x00,
+            0x00, //
+            int_add_byte,
+            0x00,
+            0x01,
+            0x02, //
+            int_return_byte,
+            0x02,
+        ];
+
+        let mut bh = builder.acquire_interp();
+        bh.registers_i = vec![0i64; 3];
+        bh.registers_i[0] = 10;
+        bh.registers_i[1] = 32;
+
+        let mut captured: Vec<(usize, u8, String)> = Vec::new();
+        let result =
+            builder.dispatch_loop_with_probe(&mut bh, &code, 0, |_bh, pc, opcode, opname| {
+                captured.push((pc, opcode, opname.to_string()));
+            });
+
+        assert!(
+            matches!(
+                result,
+                Err(majit_metainterp::blackhole::DispatchError::LeaveFrame)
+            ),
+            "dispatch_loop_with_probe must terminate with LeaveFrame after \
+             int_return; got {result:?}",
+        );
+        assert_eq!(
+            bh.tmpreg_i, 42,
+            "probe must not perturb dispatch — int_add(10,32)→42 still \
+             surfaces via tmpreg_i",
+        );
+
+        // Probe fired exactly once per opcode at the opcode-byte
+        // position (not after operand decode).
+        assert_eq!(
+            captured.len(),
+            3,
+            "probe must fire exactly once per opcode (live + int_add + \
+             int_return); got {captured:?}",
+        );
+        assert_eq!(captured[0], (0, live_byte, "live/".to_string()));
+        assert_eq!(captured[1], (3, int_add_byte, "int_add/ii>i".to_string()));
+        assert_eq!(
+            captured[2],
+            (7, int_return_byte, "int_return/i".to_string())
+        );
+    }
+
+    #[test]
+    fn dispatch_loop_probe_observes_register_state_at_each_op() {
+        // Phase D-2.8: probe receives `&BlackholeInterpreter` at each
+        // firing — the second piece of shadow-execution scaffolding.
+        // The closure can read register values BEFORE the upcoming
+        // handler runs, capturing the input data flow needed to
+        // compare against the trace IR emitted by the trait-based
+        // `execute_opcode_step`.
+        //
+        // Bytecode: live + int_add(r0,r1)→r2 + int_sub(r2,r0)→r3
+        //         + int_return(r3)  (same shape as D-2.1).
+        //
+        // Probe captures `registers_i[0..4]` at every firing. The
+        // sequence must be:
+        //
+        //   probe[0] (live/):       [10, 32, 0, 0]   (initial state)
+        //   probe[1] (int_add):     [10, 32, 0, 0]   (operands visible, dst still 0)
+        //   probe[2] (int_sub):     [10, 32, 42, 0]  (int_add's effect now visible)
+        //   probe[3] (int_return):  [10, 32, 42, 32] (int_sub's effect now visible)
+        //
+        // The non-trivial validation: at probe[2], `registers_i[2] == 42`
+        // — proving the probe sees the live data flow exactly as the
+        // chained handlers produce it. Shadow-execute logic can use
+        // this to read input register values per op without re-running
+        // the handler chain.
+        let mut builder = majit_metainterp::blackhole::BlackholeInterpBuilder::new();
+        builder.setup_insns(insns_opname_to_byte());
+        builder.setup_descrs(all_descrs().to_vec());
+        majit_metainterp::blackhole::wire_bhimpl_handlers(&mut builder);
+
+        let table = insns_opname_to_byte();
+        let live_byte = *table.get("live/").expect("`live/` must be in insns");
+        let int_add_byte = *table
+            .get("int_add/ii>i")
+            .expect("`int_add/ii>i` must be in insns");
+        let int_sub_byte = *table
+            .get("int_sub/ii>i")
+            .expect("`int_sub/ii>i` must be in insns");
+        let int_return_byte = *table
+            .get("int_return/i")
+            .expect("`int_return/i` must be in insns");
+
+        let code: Vec<u8> = vec![
+            live_byte,
+            0x00,
+            0x00, //
+            int_add_byte,
+            0x00,
+            0x01,
+            0x02, //
+            int_sub_byte,
+            0x02,
+            0x00,
+            0x03, //
+            int_return_byte,
+            0x03,
+        ];
+
+        let mut bh = builder.acquire_interp();
+        bh.registers_i = vec![0i64; 4];
+        bh.registers_i[0] = 10;
+        bh.registers_i[1] = 32;
+
+        let mut snapshots: Vec<(String, [i64; 4])> = Vec::new();
+        let result =
+            builder.dispatch_loop_with_probe(&mut bh, &code, 0, |bh_view, _pc, _opcode, opname| {
+                snapshots.push((
+                    opname.to_string(),
+                    [
+                        bh_view.registers_i[0],
+                        bh_view.registers_i[1],
+                        bh_view.registers_i[2],
+                        bh_view.registers_i[3],
+                    ],
+                ));
+            });
+
+        assert!(
+            matches!(
+                result,
+                Err(majit_metainterp::blackhole::DispatchError::LeaveFrame)
+            ),
+            "dispatch_loop_with_probe must terminate with LeaveFrame; \
+             got {result:?}",
+        );
+        assert_eq!(bh.tmpreg_i, 32, "int_return must place r3=32 into tmpreg_i");
+        assert_eq!(
+            snapshots.len(),
+            4,
+            "probe must fire 4 times (live + int_add + int_sub + int_return)",
+        );
+        // probe[0] live/: pre-everything snapshot.
+        assert_eq!(snapshots[0].0, "live/");
+        assert_eq!(snapshots[0].1, [10, 32, 0, 0]);
+        // probe[1] int_add: about to compute r2 = r0 + r1; r2 still 0.
+        assert_eq!(snapshots[1].0, "int_add/ii>i");
+        assert_eq!(snapshots[1].1, [10, 32, 0, 0]);
+        // probe[2] int_sub: int_add's effect (r2=42) now visible; r3 still 0.
+        assert_eq!(snapshots[2].0, "int_sub/ii>i");
+        assert_eq!(snapshots[2].1, [10, 32, 42, 0]);
+        // probe[3] int_return: int_sub's effect (r3=32) now visible.
+        assert_eq!(snapshots[3].0, "int_return/i");
+        assert_eq!(snapshots[3].1, [10, 32, 42, 32]);
+    }
 }

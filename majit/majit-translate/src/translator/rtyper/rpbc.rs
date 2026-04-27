@@ -1654,11 +1654,12 @@ impl Repr for FunctionRepr {
 ///         self.funccache = {}
 /// ```
 ///
-/// Pyre lands the single-row case (one uniquerow → `lowleveltype = row.fntype`)
-/// and defers the multi-row `setup_specfunc` branch. The `CanBeNull`
-/// mixin (upstream rmodel.py:251-260 — `rtype_bool` via
-/// `ptr_nonzero`) is not yet wired and will land when `rtype_bool` is
-/// routed through the pairtype dispatcher.
+/// Pyre lands both the single-row case (one uniquerow → `lowleveltype =
+/// row.fntype`, rpbc.py:233-234) and the multi-row `setup_specfunc`
+/// branch (rpbc.py:235-239 → `Self::setup_specfunc(...)` below). The
+/// `CanBeNull` mixin (upstream rmodel.py:251-260 — `rtype_bool` via
+/// `ptr_nonzero`) is wired through `Self::rtype_bool` →
+/// `can_be_null_rtype_bool`.
 #[derive(Debug)]
 pub struct FunctionsPBCRepr {
     /// Inherited state from `FunctionReprBase` (rpbc.py:178-181).
@@ -1799,10 +1800,13 @@ impl FunctionsPBCRepr {
     ///         return self.get_specfunc_row(llop, v, cname, row.fntype)
     /// ```
     ///
-    /// Single-row port: returns `v` unchanged. The multi-row branch
-    /// requires `setup_specfunc` (rpbc.py:242-247) which is deferred
-    /// in tandem with `FunctionsPBCRepr::new`'s multi-row constructor
-    /// path; both surface `MissingRTypeOperation` when reached.
+    /// Both arms ported:
+    ///   * Single-row (rpbc.py:307): returns `v` unchanged — the
+    ///     funcptr is already the `Ptr(FuncType)` lowleveltype.
+    ///   * Multi-row (rpbc.py:308-312): looks up the row in
+    ///     `concretetable[shape, index]`, then emits
+    ///     `getfield(v, c_rowname)` via [`Self::get_specfunc_row`] to
+    ///     pull the per-variant funcptr out of the `specfunc` struct.
     pub fn convert_to_concrete_llfn(
         &self,
         v: &Hlvalue,
@@ -1905,12 +1909,17 @@ impl Repr for FunctionsPBCRepr {
     /// RPython `FunctionsPBCRepr.convert_desc(self, funcdesc)`
     /// (rpbc.py:255-287).
     ///
-    /// Single-row port: pulls the `_ptr` stored at `row[funcdesc]`
-    /// and caches the resulting `Constant` in `funccache`. The
-    /// multi-row branch (build a `specfunc` Struct with one field per
-    /// uniquerow) and the "funcdesc missing from the row" rffi-cast
-    /// fallback both surface as `MissingRTypeOperation` until the
-    /// spec-func malloc path lands.
+    /// Both arms ported:
+    ///   * Single-row (rpbc.py:272-280): returns the `_ptr` stored at
+    ///     `row[funcdesc]`, or a fresh distinct-identity `_ptr` carrying
+    ///     `DelayedPointer` for the "funcdesc missing from the row"
+    ///     case (upstream's `rffi.cast(self.lowleveltype, ~len(funccache))`
+    ///     int-encoded sentinel).
+    ///   * Multi-row (rpbc.py:281-285): allocates a `specfunc` Struct
+    ///     via `ll_malloc(immortal=True)` and `setattr`s each
+    ///     `(attrname, llfn)` from `llfns`.
+    ///
+    /// Result is cached in `funccache` keyed by `DescKey` (rpbc.py:286-287).
     fn convert_desc(&self, desc: &DescEntry) -> Result<Constant, TyperError> {
         let desc_rowkey = desc
             .rowkey()
@@ -2088,12 +2097,30 @@ impl Repr for FunctionsPBCRepr {
     /// — pyre's `HostObject::BoundMethod` always carries non-None
     /// `self_obj`, so the unbound-method unwrap never fires here. The
     /// staticmethod unwrap is wired through
-    /// [`HostObject::staticmethod_func`].
+    /// [`HostObject::staticmethod_func`] and runs BEFORE the None
+    /// check so the rare `staticmethod(None)` case behaves as upstream
+    /// would (rpbc.py:291-294).
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
-        // upstream `if value is None: ...`. Note: upstream's
-        // staticmethod unwrap can produce a None as well (rare), but
-        // `staticmethod(None)` would still be a HostObject
-        // wrapping None; handling that as a follow-up if it surfaces.
+        // upstream rpbc.py:291-292 staticmethod unwrap fires BEFORE the
+        // None check; keep that order. The borrow-stable holder is
+        // needed because `host.staticmethod_func()` returns a borrow,
+        // and we need an owned value rebind to drop into the None /
+        // getdesc paths below.
+        let unwrapped: ConstValue;
+        let value: &ConstValue = match value {
+            ConstValue::HostObject(host) if host.is_staticmethod() => {
+                let func = host.staticmethod_func().ok_or_else(|| {
+                    TyperError::message(
+                        "FunctionsPBCRepr.convert_const: is_staticmethod \
+                         host without staticmethod_func",
+                    )
+                })?;
+                unwrapped = ConstValue::HostObject(func.clone());
+                &unwrapped
+            }
+            other => other,
+        };
+
         if matches!(value, ConstValue::None) {
             let LowLevelType::Ptr(ptr) = &self.lltype else {
                 return Err(TyperError::message(
@@ -2106,37 +2133,27 @@ impl Repr for FunctionsPBCRepr {
                 self.lltype.clone(),
             ));
         }
-        // upstream non-None arm: extract a HostObject for getdesc.
-        let host_obj = match value {
-            ConstValue::HostObject(h) => h.clone(),
-            other => {
-                return Err(TyperError::message(format!(
-                    "FunctionsPBCRepr.convert_const: expected HostObject or None, \
-                     got {other:?}"
-                )));
-            }
+        // upstream rpbc.py:296-297:
+        //     funcdesc = self.rtyper.annotator.bookkeeper.getdesc(value)
+        //     return self.convert_desc(funcdesc)
+        let ConstValue::HostObject(host) = value else {
+            return Err(TyperError::message(format!(
+                "FunctionsPBCRepr.convert_const: non-None value is not a \
+                 HostObject (got {value:?}); upstream `bookkeeper.getdesc` \
+                 only accepts callable host objects",
+            )));
         };
-        // upstream `elif isinstance(value, staticmethod):
-        //              value = value.__get__(42)`.
-        let host_obj = if host_obj.is_staticmethod() {
-            host_obj.staticmethod_func().cloned().ok_or_else(|| {
-                TyperError::message("FunctionsPBCRepr.convert_const: staticmethod has no func")
-            })?
-        } else {
-            host_obj
-        };
-        // upstream `funcdesc = bk.getdesc(value); return self.convert_desc(funcdesc)`.
         let rtyper = self.base.rtyper.upgrade().ok_or_else(|| {
-            TyperError::message("FunctionsPBCRepr.convert_const: rtyper weak ref dropped")
+            TyperError::message("FunctionsPBCRepr.convert_const: rtyper has been dropped")
         })?;
         let annotator = rtyper.annotator.upgrade().ok_or_else(|| {
-            TyperError::message("FunctionsPBCRepr.convert_const: annotator weak ref dropped")
+            TyperError::message("FunctionsPBCRepr.convert_const: annotator has been dropped")
         })?;
         let desc = annotator
             .bookkeeper
-            .getdesc(&host_obj)
+            .getdesc(host)
             .map_err(|e| TyperError::message(e.to_string()))?;
-        (self as &dyn Repr).convert_desc(&desc)
+        self.convert_desc(&desc)
     }
 
     /// RPython `FunctionReprBase.rtype_simple_call(self, hop)`
@@ -6735,6 +6752,289 @@ mod pbc_repr_tests {
         ));
     }
 
+    /// Build a multi-uniquerow `FunctionsPBCRepr` for the
+    /// `setup_specfunc` / multi-row tests. The shape:
+    ///   1. `consider_call_site` populates a CallFamily with one row
+    ///      that contains both `fd_f` and `fd_g`.
+    ///   2. We then `calltable_add_row` a second row whose descs are
+    ///      disjoint from the first, so `build_concrete_calltable` 's
+    ///      merge step (rpbc.rs LLCallTable::lookup) cannot fold them
+    ///      together — `llct.uniquerows.len()` becomes 2.
+    ///
+    /// Returns `(repr, fd_f, fd_g, rtyper)` for downstream
+    /// `convert_desc` / `convert_to_concrete_llfn` tests. The `rtyper`
+    /// is returned alongside so the caller keeps the strong `Rc` alive
+    /// — the repr only holds a `Weak<RPythonTyper>` and would deny
+    /// upgrade once the helper's local Rc drops.
+    fn build_multi_row_functions_pbc_repr() -> (
+        FunctionsPBCRepr,
+        Rc<StdRefCell<crate::annotator::description::FunctionDesc>>,
+        Rc<StdRefCell<crate::annotator::description::FunctionDesc>>,
+        Rc<RPythonTyper>,
+    ) {
+        use crate::annotator::argument::ArgumentsForTranslation;
+        use crate::annotator::description::{CallTableRow, DescKey, GraphCacheKey};
+        use crate::annotator::model::{SomeInteger, SomeValue};
+
+        let (ann, rtyper) = make_rtyper();
+        let sig = Signature::new(vec!["x".to_string()], None, None);
+        let fd_f = Rc::new(StdRefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "f",
+            sig.clone(),
+            None,
+            None,
+        )));
+        let fd_g = Rc::new(StdRefCell::new(FunctionDesc::new(
+            ann.bookkeeper.clone(),
+            None,
+            "g",
+            sig,
+            None,
+            None,
+        )));
+        for (desc, name) in [(&fd_f, "f_graph"), (&fd_g, "g_graph")] {
+            desc.borrow()
+                .cache
+                .borrow_mut()
+                .insert(GraphCacheKey::None, super::tests::make_pygraph(name));
+        }
+        let args = ArgumentsForTranslation::new(
+            vec![SomeValue::Integer(SomeInteger::default())],
+            None,
+            None,
+        );
+        FunctionDesc::consider_call_site(
+            &[fd_f.clone(), fd_g.clone()],
+            &args,
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap();
+
+        // Inject a second row with descs disjoint from row0 so
+        // build_concrete_calltable produces 2 uniquerows. Reuses the
+        // shape consider_call_site populated.
+        {
+            let family = fd_f.borrow().base.getcallfamily().unwrap();
+            let mut family_mut = family.borrow_mut();
+            let shape = family_mut
+                .calltables
+                .keys()
+                .next()
+                .cloned()
+                .expect("consider_call_site must populate at least one shape");
+            let mut row2 = CallTableRow::new();
+            // DescKey value matters only for hash-table identity here —
+            // any value not aliasing fd_f / fd_g works.
+            row2.insert(DescKey(99_999), super::tests::make_pygraph("h_graph"));
+            family_mut.calltable_add_row(shape, row2);
+        }
+
+        let s_pbc = SomePBC::new(
+            vec![
+                DescEntry::Function(fd_f.clone()),
+                DescEntry::Function(fd_g.clone()),
+            ],
+            false,
+        );
+        let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
+        (r, fd_f, fd_g, rtyper)
+    }
+
+    #[test]
+    fn functions_pbc_repr_setup_specfunc_lowleveltype_is_ptr_specfunc_struct() {
+        // rpbc.py:235-247 — when len(uniquerows) > 1 the constructor
+        // calls `setup_specfunc()` which builds
+        // `Ptr(Struct('specfunc', (attr0, fntype0), (attr1, fntype1),
+        // ..., hints={'immutable': True, 'static_immutable': True}))`.
+        // pyre's port (rpbc.rs:1732 setup_specfunc) emits the same
+        // shape; `build_concrete_calltable` stamps each uniquerow
+        // with `variant{N}` attrnames (rpbc.rs:174-176).
+        let (r, _fd_f, _fd_g, _rtyper) = build_multi_row_functions_pbc_repr();
+        assert_eq!(
+            r.uniquerows.len(),
+            2,
+            "test fixture must drive multi-row branch"
+        );
+
+        let LowLevelType::Ptr(boxed) = r.lowleveltype() else {
+            panic!(
+                "multi-row lowleveltype must be Ptr, got {:?}",
+                r.lowleveltype()
+            );
+        };
+        let PtrTarget::Struct(struct_t) = &boxed.TO else {
+            panic!(
+                "multi-row lowleveltype.TO must be Struct, got {:?}",
+                boxed.TO
+            );
+        };
+        assert_eq!(
+            struct_t._name, "specfunc",
+            "upstream rpbc.py:247 names the struct 'specfunc'"
+        );
+        assert_eq!(
+            struct_t._names.len(),
+            2,
+            "specfunc must have one field per uniquerow; got names {:?}",
+            struct_t._names,
+        );
+        let mut names_sorted = struct_t._names.clone();
+        names_sorted.sort();
+        assert_eq!(
+            names_sorted,
+            vec!["variant0".to_string(), "variant1".to_string()],
+            "build_concrete_calltable stamps `variant{{N}}` attrnames",
+        );
+        for name in &struct_t._names {
+            let fld = struct_t._flds.get(name).expect("specfunc field present");
+            assert!(
+                matches!(fld, LowLevelType::Ptr(p) if matches!(p.TO, PtrTarget::Func(_))),
+                "specfunc field {name} must be Ptr(Func), got {fld:?}",
+            );
+        }
+
+        // hints from setup_specfunc (rpbc.rs:1748-1751).
+        use crate::flowspace::model::ConstValue;
+        assert!(
+            matches!(
+                struct_t._hints.get("immutable"),
+                Some(ConstValue::Bool(true))
+            ),
+            "setup_specfunc must set hints['immutable']=True",
+        );
+        assert!(
+            matches!(
+                struct_t._hints.get("static_immutable"),
+                Some(ConstValue::Bool(true))
+            ),
+            "setup_specfunc must set hints['static_immutable']=True",
+        );
+    }
+
+    #[test]
+    fn functions_pbc_repr_convert_desc_multi_row_returns_specfunc_struct_constant() {
+        // rpbc.py:281-285 — when len(uniquerows) > 1, convert_desc
+        // calls `create_specfunc()` (≡ ll_malloc(specfunc_struct,
+        // immortal=True)) and `setattr(result, attrname, llfn)` for
+        // each (attrname, llfn) in llfns. The Constant returned has
+        // the multi-row Ptr(Struct) concretetype, value is LLPtr to
+        // the populated specfunc.
+        use crate::flowspace::model::ConstValue;
+        let (r, fd_f, _fd_g, _rtyper) = build_multi_row_functions_pbc_repr();
+        let desc_f = DescEntry::Function(fd_f);
+
+        let c1 = r.convert_desc(&desc_f).unwrap();
+        assert_eq!(
+            c1.concretetype.as_ref(),
+            Some(r.lowleveltype()),
+            "Constant.concretetype must match the repr's multi-row Ptr(Struct)",
+        );
+        assert!(
+            matches!(c1.value, ConstValue::LLPtr(_)),
+            "Constant.value must wrap a _ptr to the specfunc struct; got {:?}",
+            c1.value,
+        );
+
+        // rpbc.py:286-287 caches the result. Second call returns the
+        // same Constant (pointer-identity-stable on the inner _ptr).
+        let c2 = r.convert_desc(&desc_f).unwrap();
+        let (ConstValue::LLPtr(p1), ConstValue::LLPtr(p2)) = (&c1.value, &c2.value) else {
+            panic!("expected LLPtr values for both convert_desc calls");
+        };
+        assert_eq!(
+            p1, p2,
+            "funccache must return the same _ptr identity on re-lookup"
+        );
+    }
+
+    #[test]
+    fn functions_pbc_repr_convert_to_concrete_llfn_multi_row_emits_getfield() {
+        // rpbc.py:308-312 — when len(uniquerows) > 1,
+        // convert_to_concrete_llfn looks up the row at
+        // (shape, index) in concretetable, then emits
+        // `getfield(v, c_rowname) -> row.fntype` (rpbc.rs
+        // get_specfunc_row). Validates the multi-row dispatch path's
+        // emitted op shape end-to-end.
+        use crate::flowspace::model::{ConstValue, Hlvalue, Variable};
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        use std::cell::RefCell as StdRef;
+
+        let (r, _fd_f, _fd_g, rtyper) = build_multi_row_functions_pbc_repr();
+
+        // Pick the first concretetable entry (shape, index=0) and its
+        // attrname — we don't care which row, only that the emitted
+        // getfield names that exact variant.
+        let ((shape, index), row_ref) = r
+            .concretetable
+            .iter()
+            .next()
+            .map(|(k, v)| (k.clone(), v.clone()))
+            .expect("multi-row concretetable must be populated");
+        let row = row_ref.borrow();
+        let expected_attrname = row
+            .attrname
+            .clone()
+            .expect("multi-row uniquerow must carry a variant{N} attrname");
+        let expected_resulttype = LowLevelType::Ptr(Box::new(LLPtr {
+            TO: PtrTarget::Func(row.fntype.clone()),
+        }));
+        drop(row);
+
+        // Build a Variable carrying the repr's multi-row lowleveltype
+        // (Ptr(Struct('specfunc', ...))) — upstream `assert
+        // v.concretetype == self.lowleveltype` (rpbc.py:301).
+        let mut v_var = Variable::new();
+        v_var.set_concretetype(Some(r.lowleveltype().clone()));
+        let v = Hlvalue::Variable(v_var);
+
+        let llops = Rc::new(StdRef::new(LowLevelOpList::new(rtyper, None)));
+        let result = r
+            .convert_to_concrete_llfn(&v, &shape, index, &llops)
+            .expect("multi-row convert_to_concrete_llfn must succeed");
+
+        // The returned value's concretetype is the row's fntype
+        // wrapped in Ptr(Func) — upstream `resulttype = row.fntype`
+        // is a `Ptr(Func)`.
+        match &result {
+            Hlvalue::Variable(var) => assert_eq!(
+                var.concretetype(),
+                Some(expected_resulttype.clone()),
+                "convert_to_concrete_llfn return must carry the row's fntype as Ptr(Func)",
+            ),
+            other => panic!("expected Variable result from getfield, got {other:?}"),
+        }
+
+        // get_specfunc_row emits `getfield(v, c_rowname)` —
+        // assert the op shape: opname + first arg is v + second arg
+        // is a Constant carrying the variant name as bytes.
+        let llops_borrow = llops.borrow();
+        let getfield_op = llops_borrow
+            .ops
+            .iter()
+            .find(|op| op.opname == "getfield")
+            .expect("multi-row dispatch must emit a getfield op");
+        assert_eq!(
+            getfield_op.args.len(),
+            2,
+            "getfield op signature: (v, c_rowname); got {} args",
+            getfield_op.args.len(),
+        );
+        let Hlvalue::Constant(rowname_const) = &getfield_op.args[1] else {
+            panic!("getfield's second arg must be a Constant carrying the attrname");
+        };
+        match &rowname_const.value {
+            ConstValue::ByteStr(bytes) => assert_eq!(
+                bytes.as_slice(),
+                expected_attrname.as_bytes(),
+                "getfield's c_rowname must equal the chosen uniquerow's attrname",
+            ),
+            other => panic!("getfield c_rowname must be ByteStr, got {other:?}"),
+        }
+    }
+
     #[test]
     fn function_repr_convert_desc_returns_void_none_constant() {
         use crate::flowspace::model::ConstValue;
@@ -8576,10 +8876,12 @@ mod pbc_repr_tests {
     }
 
     #[test]
-    fn functions_pbc_repr_convert_const_non_hostobject_rejected() {
-        // rpbc.py:289-298 non-None arm now routes through
-        // `bookkeeper.getdesc(host_obj)`; non-HostObject inputs
-        // surface a typed error before reaching the bookkeeper.
+    fn functions_pbc_repr_convert_const_non_host_object_surfaces_message_error() {
+        // rpbc.py:296-297 funnels every non-None value through
+        // `bookkeeper.getdesc`, which only accepts callable host
+        // objects. Non-`HostObject` ConstValue payloads (e.g.
+        // `ConstValue::Int`) cannot reach getdesc — pyre surfaces
+        // a typed message error instead of attempting the lookup.
         use crate::annotator::argument::ArgumentsForTranslation;
         use crate::annotator::description::GraphCacheKey;
         use crate::annotator::model::{SomeInteger, SomeValue};
@@ -8626,7 +8928,80 @@ mod pbc_repr_tests {
         );
         let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
         let err = r.convert_const(&ConstValue::Int(7)).unwrap_err();
-        assert!(err.to_string().contains("expected HostObject or None"));
+        assert!(
+            err.to_string().contains("not a HostObject"),
+            "expected non-HostObject diagnostic, got {err}",
+        );
+    }
+
+    #[test]
+    fn functions_pbc_repr_convert_const_host_object_dispatches_through_getdesc_to_convert_desc() {
+        // rpbc.py:296-297 — the standard non-None path:
+        //     funcdesc = self.rtyper.annotator.bookkeeper.getdesc(value)
+        //     return self.convert_desc(funcdesc)
+        //
+        // Routes a `ConstValue::HostObject(UserFunction)` through
+        // `bookkeeper.getdesc` (which materialises a `FunctionDesc`)
+        // and then through `convert_desc`. Result: a Constant of the
+        // repr's lowleveltype carrying the cached `_ptr`.
+        //
+        // NOTE: this test cannot reuse `build_multi_row_functions_pbc_repr`
+        // because the host function and the FunctionDescs that drive
+        // `consider_call_site` must share identity. Instead we
+        // `bookkeeper.newfuncdesc(host)` first, then attach the
+        // resulting FunctionDesc to consider_call_site.
+        use crate::annotator::argument::ArgumentsForTranslation;
+        use crate::annotator::description::GraphCacheKey;
+        use crate::annotator::model::{SomeInteger, SomeValue};
+        use crate::flowspace::model::{
+            ConstValue, Constant as FlowConstant, GraphFunc, HostObject,
+        };
+
+        let (ann, rtyper) = make_rtyper();
+        let host_f = HostObject::new_user_function(GraphFunc::new(
+            "test::f",
+            FlowConstant::new(ConstValue::Dict(Default::default())),
+        ));
+        let fd_rc = ann.bookkeeper.newfuncdesc(&host_f).unwrap();
+        // newfuncdesc already inserts the desc into bookkeeper.descs
+        // keyed on the host object — `getdesc(host_f)` later returns
+        // the same FunctionDesc.
+
+        // Pre-populate the graph cache so consider_call_site can build
+        // a row without hitting the missing pyobj path.
+        fd_rc
+            .borrow()
+            .cache
+            .borrow_mut()
+            .insert(GraphCacheKey::None, super::tests::make_pygraph("f_graph"));
+        FunctionDesc::consider_call_site(
+            &[fd_rc.clone()],
+            &ArgumentsForTranslation::new(
+                vec![SomeValue::Integer(SomeInteger::default())],
+                None,
+                None,
+            ),
+            &SomeValue::Impossible,
+            None,
+        )
+        .unwrap();
+        let s_pbc = SomePBC::new(vec![DescEntry::Function(fd_rc)], false);
+        let r = FunctionsPBCRepr::new(&rtyper, s_pbc).unwrap();
+
+        let host_value = ConstValue::HostObject(host_f);
+        let c = r.convert_const(&host_value).unwrap();
+        assert_eq!(
+            c.concretetype.as_ref(),
+            Some(r.lowleveltype()),
+            "convert_const must hand back a Constant typed as the \
+             repr's lowleveltype",
+        );
+        assert!(
+            matches!(c.value, ConstValue::LLPtr(_)),
+            "convert_const must wrap the convert_desc-produced _ptr; \
+             got {:?}",
+            c.value,
+        );
     }
 
     #[test]
