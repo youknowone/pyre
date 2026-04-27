@@ -11,10 +11,12 @@
 //! | `error`               | `error.py`                    |
 //! | `flattenrec`          | `flattenrec.py`               |
 //! | `pairtype`            | `pairtype.py`                 |
+//! | `sourcetools`         | `sourcetools.py`              |
 //! | `udir`                | `udir.py`                     |
 
 pub mod algo;
 pub mod error;
 pub mod flattenrec;
 pub mod pairtype;
+pub mod sourcetools;
 pub mod udir;

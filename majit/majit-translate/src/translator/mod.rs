@@ -13,6 +13,7 @@
 pub mod backendopt;
 pub mod c;
 pub mod driver;
+pub mod gensupp;
 pub mod goal;
 pub mod interactive;
 pub mod platform;

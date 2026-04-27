@@ -19,6 +19,7 @@
 pub mod database;
 pub mod dlltool;
 pub mod genc;
+pub mod support;
 
 use std::path::PathBuf;
 

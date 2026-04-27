@@ -113,23 +113,7 @@ use super::lltypesystem::lltype::{
 use super::rmodel::Repr;
 use super::rtyper::RPythonTyper;
 
-/// RPython `rpython.tool.sourcetools.valid_identifier` — fold any
-/// non-alphanumeric character to `_`, prepend `_` if the first byte
-/// would otherwise be a digit, truncate to 120 characters. Shared
-/// between [`self`] and [`super::normalizecalls`] (both upstream
-/// modules import from `rpython.tool.sourcetools`).
-pub(super) fn valid_identifier(stuff: impl std::fmt::Display) -> String {
-    let mut stuff: String = stuff
-        .to_string()
-        .chars()
-        .map(|ch| if ch.is_ascii_alphanumeric() { ch } else { '_' })
-        .collect();
-    if stuff.is_empty() || stuff.as_bytes()[0].is_ascii_digit() {
-        stuff.insert(0, '_');
-    }
-    stuff.truncate(120);
-    stuff
-}
+use crate::tool::sourcetools::valid_identifier;
 
 // ---------------------------------------------------------------------
 // annlowlevel.py:20-41 — KeyComp

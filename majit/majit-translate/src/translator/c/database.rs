@@ -9,6 +9,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::rc::Rc;
 
+use crate::translator::c::support::CNameManager;
 use crate::translator::rtyper::lltypesystem::lltype::{_ptr, _ptr_obj};
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
@@ -121,6 +122,12 @@ pub struct LowLevelDatabase {
     pub completed: Cell<bool>,
     pub instrument_ncounter: Cell<usize>,
     pub all_field_names: RefCell<Option<Vec<String>>>,
+
+    /// RPython `database.py:61 self.namespace = CNameManager()`. The
+    /// per-DB name uniquifier; consulted by [`Self::get`]'s delayed-
+    /// pointer path (upstream `:208`) and by every node renderer
+    /// once the node-factory ports land.
+    pub namespace: RefCell<CNameManager>,
 }
 
 impl LowLevelDatabase {
@@ -163,6 +170,7 @@ impl LowLevelDatabase {
             completed: Cell::new(false),
             instrument_ncounter: Cell::new(0),
             all_field_names: RefCell::new(all_field_names),
+            namespace: RefCell::new(CNameManager::new()),
         }
     }
 

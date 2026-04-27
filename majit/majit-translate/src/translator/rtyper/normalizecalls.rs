@@ -994,7 +994,7 @@ pub fn create_instantiate_function(
 
     // upstream: `name = valid_identifier('instantiate_' + classdef.name)`.
     let classdef_name = classdef.borrow().name.clone();
-    let name = super::annlowlevel::valid_identifier(format!("instantiate_{classdef_name}"));
+    let name = crate::tool::sourcetools::valid_identifier(format!("instantiate_{classdef_name}"));
 
     // upstream: `graph = FunctionGraph(name, block)` — fresh
     // returnblock/exceptblock allocated inside the ctor.
