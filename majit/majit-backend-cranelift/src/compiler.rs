@@ -3373,6 +3373,29 @@ extern "C" fn plain_malloc_zeroed_shim(size: u64) -> u64 {
     unsafe { std::alloc::alloc_zeroed(layout) as u64 }
 }
 
+/// `gc.py:51` malloc-helper OOM signaling — Cranelift counterpart of
+/// `runner::oom_signal_if_zero`.  `do_malloc_fixedsize_clear` raises
+/// `MemoryError` on failure; translation lowers that to "store the
+/// singleton in `cpu.pos_exc_value`, return NULL".  pyre malloc
+/// helpers return 0 directly, so this wrapper performs the equivalent
+/// thread-local store before propagating the NULL up to the
+/// JIT-emitted `CHECK_MEMORY_ERROR` (compiler.rs:7997).
+#[inline]
+fn oom_signal_if_zero(result: u64) -> u64 {
+    if result == 0 {
+        let v = majit_backend::memory_error_singleton_ref();
+        if v != 0 {
+            JIT_EXC_VALUE.store(v, std::sync::atomic::Ordering::Relaxed);
+            // llmodel.py:194-199 _store_exception parity: typeptr is
+            // value's first word.  Safe because the singleton is a
+            // valid `W_ExceptionObject` allocated by pyre-object.
+            let exc_type = unsafe { *(v as *const i64) };
+            JIT_EXC_TYPE.store(exc_type, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    result
+}
+
 extern "C" fn gc_alloc_typed_nursery_shim(_type_id: u64, size: u64) -> u64 {
     // RPython rewrite.py: CALL_MALLOC_NURSERY fallback path.
     // Use no-collect allocation to avoid triggering GC during compiled code
@@ -3452,13 +3475,13 @@ fn active_runtime_alloc_varsize_typed_and_set_len(
 }
 
 extern "C" fn gc_malloc_array_helper(item_size: u64, type_id: u64, num_elem: u64) -> u64 {
-    active_runtime_alloc_varsize_typed_and_set_len(
+    oom_signal_if_zero(active_runtime_alloc_varsize_typed_and_set_len(
         type_id as u32,
         std::mem::size_of::<usize>(),
         item_size as usize,
         0,
         num_elem as usize,
-    )
+    ))
 }
 
 extern "C" fn gc_malloc_array_nonstandard_helper(
@@ -3468,13 +3491,60 @@ extern "C" fn gc_malloc_array_nonstandard_helper(
     type_id: u64,
     num_elem: u64,
 ) -> u64 {
-    active_runtime_alloc_varsize_typed_and_set_len(
+    oom_signal_if_zero(active_runtime_alloc_varsize_typed_and_set_len(
         type_id as u32,
         base_size as usize,
         item_size as usize,
         length_ofs as usize,
         num_elem as usize,
-    )
+    ))
+}
+
+fn raw_fixedsize_alloc_typed(type_id: u32, size: usize) -> u64 {
+    let Some(total_size) = GcHeader::SIZE.checked_add(size) else {
+        return 0;
+    };
+    let Ok(layout) = std::alloc::Layout::from_size_align(total_size, 8) else {
+        return 0;
+    };
+    let raw = unsafe { std::alloc::alloc_zeroed(layout) };
+    if raw.is_null() {
+        return 0;
+    }
+    unsafe {
+        *(raw as *mut GcHeader) = GcHeader::new(type_id);
+    }
+    let obj = unsafe { raw.add(GcHeader::SIZE) };
+    obj as u64
+}
+
+fn active_runtime_alloc_oldgen_typed(type_id: u32, payload_size: usize) -> u64 {
+    // gc.py:51 contract: helper returns NULL on OOM so
+    // CHECK_MEMORY_ERROR can convert it into a MemoryError.  Only
+    // `None` (no active runtime — typical for unit tests) falls back
+    // to a raw alloc; `Some(0)` (a real OOM from the registered
+    // allocator) propagates as 0 unchanged, mirroring the existing
+    // CALL_MALLOC_NURSERY slowpath at runner.rs:184 / compiler.rs:8959.
+    match with_cranelift_gc(|gc| gc.alloc_oldgen_typed(type_id, payload_size).0 as u64) {
+        None => raw_fixedsize_alloc_typed(type_id, payload_size),
+        Some(v) => v,
+    }
+}
+
+/// gc.py:481-490 `malloc_big_fixedsize(size, tid)` — fixed-size object
+/// large enough to skip the nursery, allocated directly in the old gen
+/// via `do_malloc_fixedsize_clear`.  Header is stamped with the type
+/// id so callers MUST NOT emit a separate `gen_initialize_tid`.
+extern "C" fn gc_malloc_big_fixedsize_helper(size: u64, type_id: u64) -> u64 {
+    // The CALL_R arg is `total = payload + GcHeader::SIZE` (built by
+    // `handle_new` at rewrite.rs:857 to include the GC header).  The
+    // runtime allocators (`alloc_oldgen_typed`, `alloc_nursery_typed`)
+    // and the raw fallback both prepend the GC header themselves and
+    // expect a payload-only size, so subtract `HDR` here once —
+    // mirroring the existing CALL_MALLOC_NURSERY slowpath at
+    // runner.rs:184 (`alloc_nursery(total_size - gc_hdr)`).
+    let payload = (size as usize).saturating_sub(GcHeader::SIZE);
+    oom_signal_if_zero(active_runtime_alloc_oldgen_typed(type_id as u32, payload))
 }
 
 /// gc.py:460 `malloc_str(length)` — but the upstream closure captures
@@ -3483,25 +3553,25 @@ extern "C" fn gc_malloc_array_nonstandard_helper(
 /// CALL_R as an explicit Signed arg and the calldescr's first param is
 /// it (see `make_malloc_str_calldescr`).
 extern "C" fn gc_malloc_str_helper(type_id: u64, length: u64) -> u64 {
-    active_runtime_alloc_varsize_typed_and_set_len(
+    oom_signal_if_zero(active_runtime_alloc_varsize_typed_and_set_len(
         type_id as u32,
         BUILTIN_STR_TOKEN_BASE_SIZE,
         1,
         BUILTIN_STRING_LEN_OFFSET,
         length as usize,
-    )
+    ))
 }
 
 /// gc.py:469 `malloc_unicode(length)` — see `gc_malloc_str_helper` for
 /// the closure-vs-extern type-id threading rationale.
 extern "C" fn gc_malloc_unicode_helper(type_id: u64, length: u64) -> u64 {
-    active_runtime_alloc_varsize_typed_and_set_len(
+    oom_signal_if_zero(active_runtime_alloc_varsize_typed_and_set_len(
         type_id as u32,
         BUILTIN_UNICODE_TOKEN_BASE_SIZE,
         4,
         BUILTIN_STRING_LEN_OFFSET,
         length as usize,
-    )
+    ))
 }
 
 /// aarch64/assembler.py:342 get_write_barrier_fn()
@@ -5366,10 +5436,78 @@ fn run_compiled_code_inner(
     let result_jf = result_jf;
     let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
 
+    // compile.py:1085-1098 `PropagateExceptionDescr.handle_fail`:
+    //     exception = cpu.grab_exc_value(deadframe)
+    //     if not exception:
+    //         exception = cast_instance_to_gcref(memory_error)
+    //     raise jitexc.ExitFrameWithExceptionRef(exception)
+    //
+    // Detect-and-transfer before the regular match chain so the
+    // upstream "ExitFrameWithExceptionRef" tail can absorb the
+    // exception ref through the ordinary slot-0 reader path.  The
+    // emitted propagate path (compiler.rs OpCode::CheckMemoryError /
+    // x86 / aarch64 assembler.rs) stores the raw value into
+    // `jf_guard_exc`; here we mirror `cpu.grab_exc_value` (read +
+    // clear) and stage the result into `jf_frame[0]` so
+    // `EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL`'s consumer path
+    // (compile.py:660) reads it through the existing accessor.
+    let propagate_descr_ptr = attachments
+        .propagate_exception_descr
+        .as_ref()
+        .map_or(0, |arc| Arc::as_ptr(arc) as *const () as usize);
+    if propagate_descr_ptr != 0 && jf_descr_raw as usize == propagate_descr_ptr {
+        let header_words = JF_FRAME_ITEM0_OFS as usize / 8;
+        let exc_val = unsafe {
+            let slot = result_jf.add(JF_GUARD_EXC_OFS as usize / 8);
+            let v = *slot;
+            *slot = 0;
+            v
+        };
+        let exc_val = if exc_val != 0 {
+            exc_val
+        } else {
+            // compile.py:1095 `cast_instance_to_gcref(memory_error)`
+            // — fallback when Layer 1's singleton store didn't fire
+            // (no provider registered, or test setup that bypasses
+            // pyre's malloc helpers).
+            majit_backend::memory_error_singleton_ref()
+        };
+        unsafe {
+            *result_jf.add(header_words) = exc_val;
+        }
+        // Reroute jf_descr to the attached
+        // `exit_frame_with_exception_descr_ref` so the existing
+        // match arm picks up the ExitFrameWithExceptionRef tail.
+        // When unattached (unit-test setup), fall through to the
+        // cranelift singleton via `direct_descr` below.
+        let attached_exit = attachments
+            .exit_frame_with_exception_descr_ref
+            .as_ref()
+            .map_or(0, |arc| Arc::as_ptr(arc) as *const () as usize);
+        if attached_exit != 0 {
+            unsafe {
+                *result_jf.add(JF_DESCR_OFS as usize / 8) = attached_exit as i64;
+            }
+        }
+    }
+    let jf_descr_raw = unsafe { *result_jf.add(JF_DESCR_OFS as usize / 8) };
+
     let (fail_index, direct_descr) = if jf_descr_raw == CALL_ASSEMBLER_DEADFRAME_SENTINEL as i64 {
         (CALL_ASSEMBLER_DEADFRAME_SENTINEL, None)
     } else if jf_descr_raw == 0 {
-        (0u32, None)
+        // Propagate-into-exit fall-through: when the metainterp
+        // didn't attach an `exit_frame_with_exception_descr_ref`
+        // (unit-test setups), the rewrite above leaves jf_descr at 0;
+        // surface the cranelift singleton directly so the consumer
+        // still sees `is_exit_frame_with_exception=true`.
+        if propagate_descr_ptr != 0 {
+            (
+                u32::MAX,
+                Some(EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL.clone()),
+            )
+        } else {
+            (0u32, None)
+        }
     } else if let Some((metainterp_finish, cl_singleton)) =
         match_metainterp_finish_descr(jf_descr_raw, attachments)
     {
@@ -5985,6 +6123,12 @@ impl CraneliftBackend {
             // ISA scaled addressing mode, so we keep the rewriter in the
             // "pre-scale everything" contract that the lowering expects.
             load_supported_factors: &[1],
+            // x86/runner.py:22 + arm/runner.py:26 — both pyre cranelift
+            // lowering paths emit LOAD_EFFECTIVE_ADDRESS as a single
+            // Cranelift `iadd` chain (no LEA fallback expansion needed
+            // at the IR level), so the rewriter takes the single-LEA
+            // path (rewrite.py:1083-1088).
+            supports_load_effective_address: true,
             // nursery.rs:68 `alloc_zeroed` + nursery.rs:105-110 `reset`
             // memset-to-zero on recycle mean the nursery payload is
             // always zero-filled at allocation time; `clear_gc_fields`
@@ -6023,10 +6167,12 @@ impl CraneliftBackend {
             malloc_array_nonstandard_fn: gc_malloc_array_nonstandard_helper as *const () as i64,
             malloc_str_fn: gc_malloc_str_helper as *const () as i64,
             malloc_unicode_fn: gc_malloc_unicode_helper as *const () as i64,
+            malloc_big_fixedsize_fn: gc_malloc_big_fixedsize_helper as *const () as i64,
             malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
             malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
             malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
             malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
+            malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
             standard_array_basesize: std::mem::size_of::<usize>(),
             standard_array_length_ofs: 0,
             // rewrite.py:673 — read compiled_loop_token._ll_initial_locs and
@@ -6426,6 +6572,14 @@ impl CraneliftBackend {
         // Pre-scan for vector-producing ops (SIMD variable types)
         let vec_oprefs = build_vec_oprefs(ops, num_inputs);
         let vec_float_oprefs = build_vec_float_oprefs(ops, num_inputs);
+
+        // pyjitpl.py:2283 `cpu.propagate_exception_descr` — snapshot the
+        // attached descr pointer at compile time so the OpCode::CheckMemoryError
+        // emitter can stamp it into `jf_descr` instead of unconditionally
+        // trapping (`_build_propagate_exception_path` parity, x86/aarch64
+        // assembler.py:328-345 / :559-577).  Snapshot taken before
+        // `std::mem::take(&mut self.constants)` so `&self` is available.
+        let propagate_exception_descr_ptr = self.attached_descr_ptrs().propagate_exception_descr;
 
         // Take constants out of self to avoid borrow conflicts with func_ctx
         let constants = std::mem::take(&mut self.constants);
@@ -7934,26 +8088,70 @@ impl CraneliftBackend {
                         .store(MemFlags::trusted(), exc_type, exc_type_addr, 0);
                 }
                 OpCode::CheckMemoryError => {
-                    // args[0] = pointer to check. If null (0), abort via trap.
-                    // In RPython, check_memory_error raises MemoryError on null.
-                    // We trap unconditionally on null; the runtime catches this.
+                    // x86/assembler.py:1630-1641 `genop_discard_check_memory_error`
+                    // — emit `is_null?` branch into the propagate path (a tail
+                    // that mirrors `_build_propagate_exception_path`,
+                    // x86/assembler.py:328-345 / aarch64/assembler.py:559-577).
                     let ptr_val = resolve_opref(&mut builder, &constants, op.args[0]);
                     let zero = builder.ins().iconst(cl_types::I64, 0);
                     let is_null = builder.ins().icmp(IntCC::Equal, ptr_val, zero);
-                    let trap_block = builder.create_block();
+                    let propagate_block = builder.create_block();
                     let cont_block = builder.create_block();
                     if preamble_phase {
                         builder.set_cold_block(cont_block);
                     }
                     builder
                         .ins()
-                        .brif(is_null, trap_block, &[], cont_block, &[]);
+                        .brif(is_null, propagate_block, &[], cont_block, &[]);
 
-                    builder.switch_to_block(trap_block);
-                    builder.seal_block(trap_block);
-                    builder
-                        .ins()
-                        .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                    builder.switch_to_block(propagate_block);
+                    builder.seal_block(propagate_block);
+                    if propagate_exception_descr_ptr == 0 {
+                        // Unattached `propagate_exception_descr` — typical for
+                        // unit tests that bypass `MetaInterp::finish_setup`.
+                        // In production (`pyjitpl.py:2283
+                        // self.cpu.propagate_exception_descr = exc_descr`) the
+                        // descr is always set before `compile_loop` runs.
+                        builder
+                            .ins()
+                            .trap(cranelift_codegen::ir::TrapCode::user(1).unwrap());
+                    } else {
+                        // _store_and_reset_exception (assembler.py:1826-1843):
+                        // read JIT_EXC_VALUE → tmp, clear both globals.
+                        let exc_val_addr =
+                            builder.ins().iconst(ptr_type, jit_exc_value_addr() as i64);
+                        let exc_val =
+                            builder
+                                .ins()
+                                .load(cl_types::I64, MemFlags::trusted(), exc_val_addr, 0);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), zero, exc_val_addr, 0);
+                        let exc_type_addr =
+                            builder.ins().iconst(ptr_type, jit_exc_type_addr() as i64);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), zero, exc_type_addr, 0);
+                        // assembler.py:336-337 — MOV [jf_guard_exc], tmp
+                        // so `cpu.grab_exc_value(deadframe)` in
+                        // `PropagateExceptionDescr.handle_fail`
+                        // (compile.py:1095) can read it back.
+                        let cur_jf = builder.use_var(jf_ptr_var);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), exc_val, cur_jf, JF_GUARD_EXC_OFS);
+                        // assembler.py:339-340 — MOV [jf_descr], descr.
+                        let descr_val = builder
+                            .ins()
+                            .iconst(ptr_type, propagate_exception_descr_ptr as i64);
+                        builder
+                            .ins()
+                            .store(MemFlags::trusted(), descr_val, cur_jf, JF_DESCR_OFS);
+                        // assembler.py:1101 _call_footer_shadowstack
+                        // + assembler.py:1097 _call_footer.
+                        emit_call_footer_shadowstack(&mut builder, ptr_type);
+                        builder.ins().return_(&[cur_jf]);
+                    }
 
                     builder.switch_to_block(cont_block);
                     builder.seal_block(cont_block);

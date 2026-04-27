@@ -3087,15 +3087,17 @@ impl<M: Clone> MetaInterp<M> {
     /// Helper name matches compile.py so audits can grep the same symbol on
     /// both sides.
     ///
-    /// **Parity gap — JUMP-terminated paths**: RPython's `loop.inputargs` is
-    /// the preamble-entry contract; the closing JUMP targets the
-    /// TargetToken's internal LABEL whose arity is independent. In pyre the
-    /// simple-loop / retry-without-unroll paths inline
-    /// `LABEL(inputargs)` at `compiled_ops[0]` and close with `JUMP(inputargs)`;
-    /// truncating `inputargs` in those paths would desync LABEL/JUMP arity
-    /// until the tracer stops threading expanded vable fields through the
-    /// back-edge JUMP (separate pyre-tracer epic). For now this helper is
-    /// only invoked from `finish_and_compile`, where no JUMP exists.
+    /// Invoked from both compile sites that mirror RPython's
+    /// `send_loop_to_backend` (compile.py:504-511): the JUMP-terminated
+    /// `compile_loop_body` and the FINISH-terminated `finish_and_compile`.
+    /// Pyre's structure matches RPython compile.py:312/320/327 — `inputargs`
+    /// (entry contract) and `start_label.args` carry the trace's ROOT
+    /// expanded shape ([0..num_inputs)), while the body `LABEL`/`JUMP`
+    /// inside `compiled_ops` use virtualstate-allocated OpRefs that are
+    /// outside the forwarding map. Truncating `inputargs` to `num_red_args`
+    /// and prepending GETFIELD_GC / GETARRAYITEM_GC therefore only rewrites
+    /// the entry contract and `start_label.args`; body LABEL/JUMP arities
+    /// stay independent.
     pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         &self,
         inputargs: &mut Vec<InputArg>,
@@ -3153,16 +3155,14 @@ impl<M: Clone> MetaInterp<M> {
         );
         // compile.py:425-461 `patch_new_loop_to_load_virtualizable_fields`
         // only touches `loop.inputargs`; it does not rewrite any LABEL/JUMP
-        // inside `loop.operations`. RPython keeps those arities independent
-        // because the entry LABEL is synthesized by the backend from
-        // `loop.inputargs` and the closing JUMP targets a separate
-        // TargetToken. pyre's JUMP-terminated paths currently couple them
-        // (see `MetaInterp::compile_loop` simple-loop path that inlines
-        // `LABEL(inputargs)` at `compiled_ops[0]`), which is a separate
-        // pyre-tracer divergence resolved by threading only red_args across
-        // the back-edge — not by this helper. Until that tracer work lands
-        // the only supported caller is the finish-terminated path, which
-        // has neither LABEL nor JUMP in `optimized_ops`.
+        // arity inside `loop.operations`. The helper's forwarding map is
+        // ROOT inputarg OpRef → fresh GETFIELD result OpRef, so any op that
+        // referenced a removed inputarg slot (start_label, preamble ops, and
+        // any guard fail_args reaching back to it) gets rewritten in place;
+        // body LABEL/JUMP carry virtualstate-allocated OpRefs outside that
+        // map and stay untouched. Both `compile_loop_body` and
+        // `finish_and_compile` invoke this helper, mirroring RPython's
+        // unconditional `send_loop_to_backend` wiring (compile.py:504-511).
     }
 
     /// Close the current trace, optimize, and compile.
@@ -3332,6 +3332,9 @@ impl<M: Clone> MetaInterp<M> {
 
         self.force_finish_trace = false;
         let mut ctx = self.tracing.take().unwrap();
+        // Cache driver descriptor before ctx is partially consumed below;
+        // mirrors the FINISH-path capture pattern (see `finish_and_compile`).
+        let driver_descriptor = ctx.driver_descriptor().cloned();
         let cross_loop_cut = if cut_inner_green_key.is_some() {
             ctx.get_merge_point_at(green_key, ctx.header_pc)
                 .filter(|mp| mp.position._pos > 0)
@@ -3750,16 +3753,25 @@ impl<M: Clone> MetaInterp<M> {
         // virtualizable.py:86 read_boxes: set num_scalar_inputargs on token
         // so the backend can find the first local in force_fn paths.
         token.num_scalar_inputargs = self.num_scalar_inputargs;
-        // NOTE: `patch_new_loop_to_load_virtualizable_fields` is NOT invoked
-        // on this JUMP-terminated compile path. compile.py:504 wires it into
-        // every `send_loop_to_backend`, but the pyre helper currently only
-        // supports the FINISH-terminated `finish_and_compile` site — the
-        // JUMP path requires the closing JUMP to carry red_args only (not
-        // the expanded vable fields) so that LABEL and JUMP arities stay
-        // aligned after the truncation. That restructure is the pyre-tracer
-        // / CALL_ASSEMBLER epic (VableExpansion removal + RPython
-        // `direct_assembler_call` layout); enabling the hook here before
-        // that lands would desync backend LABEL/JUMP arity.
+        // compile.py:504-511 send_loop_to_backend — unconditional virtualizable
+        // field reload for every loop. Mirrors the FINISH-path call in
+        // `finish_and_compile`; see `MetaInterp::patch_new_loop_to_load_virtualizable_fields`
+        // for the shared helper. RPython's `loop.inputargs` is independent
+        // from the inner body LABEL/JUMP arity (compile.py:312/320/327 — entry
+        // contract is `start_state.renamed_inputargs`, body LABEL is
+        // `loop_info.label_op`); pyre's `start_label.args` and `inputargs`
+        // are at the trace's ROOT inputarg shape ([0..num_inputs)), and the
+        // body LABEL inside `compiled_ops` carries virtualstate-allocated
+        // OpRefs that the helper's forwarding map does not touch. Truncating
+        // `inputargs` to `num_red_args` and prepending GETFIELD_GC /
+        // GETARRAYITEM_GC therefore leaves body LABEL/JUMP arities intact.
+        self.patch_new_loop_to_load_virtualizable_fields(
+            &mut inputargs,
+            &mut compiled_ops,
+            &mut constants,
+            &mut constant_types,
+            driver_descriptor.as_ref(),
+        );
         let compiled_constants = constants.clone();
         let compiled_constant_types = constant_types.clone();
         self.backend.set_constants(constants);

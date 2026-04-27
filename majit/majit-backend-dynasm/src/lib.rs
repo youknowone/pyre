@@ -88,6 +88,19 @@ pub fn jit_exc_clear() {
     JIT_EXC_TYPE.store(0, Ordering::Relaxed);
 }
 
+/// Address of `JIT_EXC_VALUE` for direct memory load/store from JIT-emitted
+/// code (`_store_and_reset_exception` parity, `x86/assembler.py:1826-1843`).
+pub fn jit_exc_value_addr() -> usize {
+    &JIT_EXC_VALUE as *const _ as usize
+}
+
+/// Address of `JIT_EXC_TYPE` for direct memory load/store from JIT-emitted
+/// code.  Mirrors `cpu.pos_exception()`; cleared together with
+/// `pos_exc_value` whenever the propagate path drains the global exception.
+pub fn jit_exc_type_addr() -> usize {
+    &JIT_EXC_TYPE as *const _ as usize
+}
+
 /// Override the JITFRAME type id used by dynasm nursery slow paths.
 ///
 /// The frontend registers `jitframe_type_info()` on its active GC before
@@ -173,7 +186,6 @@ pub fn register_jitframe_layout(info: JitFrameLayoutInfo) {
     let _ = JITFRAME_LAYOUT.set(info);
 }
 
-#[allow(dead_code)]
 pub(crate) fn jitframe_layout() -> Option<JitFrameLayoutInfo> {
     JITFRAME_LAYOUT.get().cloned()
 }
@@ -378,6 +390,18 @@ fn handle_fail_dispatch(
         // FailDescr and re-raises through `jit_exc_value`.
         return handle_fail_exit_frame_with_exception(frame_ptr);
     }
+    if descr_raw != 0 && descr_raw == attached.propagate_exception_descr {
+        // compile.py:1085-1098 `PropagateExceptionDescr.handle_fail`:
+        //     exception = cpu.grab_exc_value(deadframe)
+        //     if not exception:
+        //         exception = cast_instance_to_gcref(memory_error)
+        //     raise jitexc.ExitFrameWithExceptionRef(exception)
+        // The CALL_ASSEMBLER caller observes `is_exit_frame_with_exception`
+        // on the synthesized FailDescr (runner.rs::find_descr_by_ptr) and
+        // re-raises through `jit_exc_value`; the same shape applies here
+        // — read jf_guard_exc, fall back to memory_error, re-raise.
+        return handle_fail_propagate_exception(frame_ptr);
+    }
     // compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
     let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
     handle_fail_resume_guard(descr, descr_raw, frame_ptr, green_key)
@@ -438,6 +462,28 @@ fn handle_fail_done_with_this_frame(
 /// carries `is_exit_frame_with_exception = true`.
 fn handle_fail_exit_frame_with_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
     unsafe { llmodel::get_ref_value_direct(frame_ptr, 0) as i64 }
+}
+
+/// compile.py:1085-1098 `PropagateExceptionDescr.handle_fail`.
+///
+/// Reads `jf_guard_exc` (set by Layer 3's emitted
+/// `_store_and_reset_exception` in `OpCode::CheckMemoryError`),
+/// clears it (`grab_exc_value`), and falls back to `memory_error`
+/// when empty (`cast_instance_to_gcref(memory_error)`).  The caller
+/// observes `is_exit_frame_with_exception=true` on the synthesized
+/// FailDescr and re-raises the value through `jit_exc_value`.
+fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
+    let exc_val = unsafe {
+        let slot = &mut (*frame_ptr).jf_guard_exc;
+        let v = *slot;
+        *slot = 0;
+        v
+    };
+    if exc_val != 0 {
+        exc_val as i64
+    } else {
+        majit_backend::memory_error_singleton_ref()
+    }
 }
 
 /// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
@@ -557,12 +603,16 @@ pub fn call_assembler_execute_addr() -> usize {
 pub fn register_pending_call_assembler_target(
     token_number: u64,
     _inputarg_types: Vec<majit_ir::Type>,
-    _num_inputs: usize,
+    num_inputs: usize,
     _num_scalar_inputargs: usize,
-    _index_of_virtualizable: i32,
+    index_of_virtualizable: i32,
 ) {
     // Delegate to the runner's CALL_ASSEMBLER_TARGETS registry.
-    runner::DynasmBackend::register_pending_call_assembler_target_static(token_number);
+    runner::DynasmBackend::register_pending_call_assembler_target_static(
+        token_number,
+        num_inputs,
+        index_of_virtualizable,
+    );
 }
 
 #[cfg(test)]

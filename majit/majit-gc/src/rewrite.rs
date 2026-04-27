@@ -126,6 +126,12 @@ pub struct GcRewriterImpl {
     /// whether a non-constant index's factor can be folded into the
     /// backend's addressing mode or must be pre-scaled in IR.
     pub load_supported_factors: &'static [i64],
+    /// model.py:22 `supports_load_effective_address = False` (base) /
+    /// x86/runner.py:22 + arm/runner.py:26 override to `True`.
+    /// Consumed by `emit_load_effective_address` (rewrite.py:1083): when
+    /// `True` the helper emits a single `LOAD_EFFECTIVE_ADDRESS`; when
+    /// `False` it expands to `(INT_LSHIFT?) + INT_ADD + INT_ADD`.
+    pub supports_load_effective_address: bool,
     /// llsupport/gc.py:30-34 `malloc_zero_filled` parity.
     ///
     /// `true` when the allocator zero-fills payload bytes on
@@ -198,6 +204,10 @@ pub struct GcRewriterImpl {
     pub malloc_str_fn: i64,
     /// gc.py:460-465 `generate_function('malloc_unicode', ...)` function addr.
     pub malloc_unicode_fn: i64,
+    /// gc.py:481-490 `generate_function('malloc_big_fixedsize', ...)` function addr.
+    /// Consumed by `rewrite.py:778-796 gen_malloc_fixedsize` framework-GC arm
+    /// when a fixed-size NEW exceeds the nursery threshold.
+    pub malloc_big_fixedsize_fn: i64,
     /// gc.py:45 `self.malloc_array_descr = get_call_descr(...)`.
     pub malloc_array_descr: DescrRef,
     /// gc.py:45 `self.malloc_array_nonstandard_descr = get_call_descr(...)`.
@@ -206,6 +216,8 @@ pub struct GcRewriterImpl {
     pub malloc_str_descr: DescrRef,
     /// gc.py:45 `self.malloc_unicode_descr = get_call_descr(...)`.
     pub malloc_unicode_descr: DescrRef,
+    /// gc.py:45 `self.malloc_big_fixedsize_descr = get_call_descr(...)`.
+    pub malloc_big_fixedsize_descr: DescrRef,
     /// gc.py:396 `self.standard_array_basesize`.
     pub standard_array_basesize: usize,
     /// gc.py:397 `self.standard_array_length_ofs`.
@@ -262,6 +274,25 @@ impl JitFrameDescrs {
             Type::Void => panic!("CALL_ASSEMBLER arg must have a concrete type"),
         }
     }
+}
+
+/// rewrite.py:1117-1132 `cpu_simplify_scale` return value.
+///
+/// Encodes the three semantic outcomes that upstream signals via the
+/// `(index_box, emit)` tuple:
+///   - `Const`        — index folded into offset; caller must emit the
+///                      non-indexed GC_LOAD / GC_STORE form (upstream's
+///                      `index_box is None` check at rewrite.py:148, :199).
+///   - `Passthrough`  — original index re-used unchanged; the CPU's
+///                      addressing mode supports the requested factor.
+///   - `PreScale(op)` — the helper constructed an unemitted INT_LSHIFT /
+///                      INT_MUL; `_emit_mul_if_factor_offset_not_supported`
+///                      (or vector_ext callers) emits it before reading the
+///                      OpRef back as the final indexed-op `index` arg.
+enum ScaledIndex {
+    Const,
+    Passthrough(OpRef),
+    PreScale(Op),
 }
 
 /// rewrite.py:719-758 last_zero_arrays parity.
@@ -857,34 +888,22 @@ impl GcRewriterImpl {
         let size = round_up(descr.size() + crate::header::GcHeader::SIZE);
         let type_id = descr.type_id();
 
-        // rewrite.py:540-543 — `if gen_malloc_nursery(size, op): ... else:
-        // gen_malloc_fixedsize(size, descr.tid, op)`.  Upstream's
-        // gen_malloc_fixedsize emits CALL_R(malloc_big_fixedsize_fn, ...)
-        // and then `remember_write_barrier` (rewrite.py:794-796 — fresh
-        // fixed-size objects always satisfy wb_applied because their
-        // gc_fielddescrs are zeroed by clear_gc_fields).
-        //
-        // PRE-EXISTING-ADAPTATION: pyre's gen_malloc_fixedsize port is
-        // not yet available; when size exceeds the nursery threshold,
-        // emit the same CALL_MALLOC_NURSERY shape (the backend's
-        // CallMallocNursery slowpath does the oldgen alloc) and stamp
-        // wb_applied to preserve upstream's invariant.  Replace this
-        // block with a real `gen_malloc_fixedsize` call once the
-        // `malloc_big_fixedsize_descr` mirror lands.
-        let obj_ref = self
-            .gen_malloc_nursery(size, op.pos, st)
-            .unwrap_or_else(|| {
-                st.emitting_an_operation_that_can_collect();
-                let size_ref = st.const_int(size as i64);
-                let mn = Op::new(OpCode::CallMallocNursery, &[size_ref]);
-                let r = st.emit_result(mn, op.pos);
-                st.remember_wb(r);
+        // rewrite.py:540-543 — `if gen_malloc_nursery(size, op):
+        //                          gen_initialize_tid(op, descr.tid)
+        //                       else:
+        //                          gen_malloc_fixedsize(size, descr.tid, op)`.
+        // The fast path stamps the tid header inline; the slow path's
+        // CALL_R helper (`malloc_big_fixedsize`) does it inside the
+        // helper so `gen_malloc_fixedsize` does NOT call
+        // `gen_initialize_tid` after the fact.
+        let obj_ref = match self.gen_malloc_nursery(size, op.pos, st) {
+            Some(r) => {
+                self.gen_initialize_tid(r, type_id, st);
                 r
-            });
+            }
+            None => self.gen_malloc_fixedsize(size, type_id, op.pos, st),
+        };
         st.record_result_mapping(op.pos, obj_ref);
-
-        // Initialize the tid header field.
-        self.gen_initialize_tid(obj_ref, type_id, st);
 
         // rewrite.py:479-484 handle_malloc_operation parity:
         //   elif opnum == rop.NEW_WITH_VTABLE:
@@ -998,7 +1017,7 @@ impl GcRewriterImpl {
             {
                 st.record_result_mapping(op.pos, r);
                 if let Some(len_descr) = descr.len_descr() {
-                    self.gen_initialize_len(r, v_length, descr_ref.clone(), len_descr, st);
+                    self.gen_initialize_len(r, v_length, len_descr, st);
                 }
                 self.clear_varsize_gc_fields(
                     kind,
@@ -1025,7 +1044,7 @@ impl GcRewriterImpl {
                 st.record_result_mapping(op.pos, r);
                 self.gen_initialize_tid(r, descr.type_id(), st);
                 if let Some(len_descr) = descr.len_descr() {
-                    self.gen_initialize_len(r, v_length, descr_ref.clone(), len_descr, st);
+                    self.gen_initialize_len(r, v_length, len_descr, st);
                 }
                 r
             } else {
@@ -1129,11 +1148,8 @@ impl GcRewriterImpl {
             let hash_fd = hash_descr_ref
                 .as_field_descr()
                 .expect("gc_ll_descr.{str,unicode}_hash_descr must be a FieldDescr");
-            let ofs_ref = st.const_int(hash_fd.offset() as i64);
-            let zero_ref = st.const_int(0);
-            let size_ref = st.const_int(hash_fd.field_size() as i64);
-            let store = Op::new(OpCode::GcStore, &[result, ofs_ref, zero_ref, size_ref]);
-            st.emit(store);
+            let zero = st.const_int(0);
+            self.emit_setfield(result, zero, hash_fd, st);
         }
     }
 
@@ -1160,26 +1176,19 @@ impl GcRewriterImpl {
         if matches!(length_const, Some(0)) {
             return;
         }
-        // rewrite.py:598-602 cpu_simplify_scale for non-const length —
-        // pre-scale the length box when the backend's addressing mode
-        // cannot carry the itemsize as a factor.  Mirrors the shared
-        // `emit_gc_{load,store}_or_indexed` fast path
-        // (rewrite.py:1124-1134).
+        // rewrite.py:600-602 — only pre-scale for non-ConstInt v_length.
+        // Upstream gates the helper call on `not isinstance(v_length,
+        // ConstInt)`; for ConstInt the scale stays in args[3]/args[4]
+        // and `emit_pending_zeros` handles it later.
         let mut scale = ad_itemsize;
         let mut v_length_scaled = v_length;
-        if length_const.is_none() && scale != 1 && !self.load_supported_factors.contains(&scale) {
-            assert!(scale > 0, "cpu_simplify_scale: factor must be positive");
-            let mul_op = if (scale & (scale - 1)) == 0 {
-                let shift = (scale as u64).trailing_zeros() as i64;
-                let shift_ref = st.const_int(shift);
-                Op::new(OpCode::IntLshift, &[v_length, shift_ref])
-            } else {
-                let scale_ref = st.const_int(scale);
-                Op::new(OpCode::IntMul, &[v_length, scale_ref])
-            };
-            let scaled = st.emit_result(mul_op, OpRef::NONE);
-            v_length_scaled = scaled;
-            scale = 1;
+        if length_const.is_none() {
+            let (new_scale, _new_offset, scaled_opt) =
+                self._emit_mul_if_factor_offset_not_supported(v_length, scale, 0, st);
+            if let Some(s) = scaled_opt {
+                v_length_scaled = s;
+                scale = new_scale;
+            }
         }
         // rewrite.py:603-609 emit ZERO_ARRAY with scale doubled into
         // args[3] and args[4] (upstream puts both to `ConstInt(scale)`;
@@ -1318,6 +1327,46 @@ impl GcRewriterImpl {
                 st,
             )
         }
+    }
+
+    /// rewrite.py:778-796 `gen_malloc_fixedsize` (framework GC arm).
+    ///
+    /// Emits `CALL_R(malloc_big_fixedsize_fn, size, typeid)` followed
+    /// by `CHECK_MEMORY_ERROR` (via `gen_call_malloc_gc`) and stamps
+    /// `remember_wb` on the result so the freshly-malloc'd object
+    /// skips the write barrier (rewrite.py:794-796 — fixed-size
+    /// objects are zero-initialized by `clear_gc_fields`, so any
+    /// store into a gc field needs no WB).
+    ///
+    /// pyre is framework-GC only; the Boehm `else` arm
+    /// (`malloc_fixedsize_fn`) is intentionally not ported.  The
+    /// helper itself stamps the tid into the GC header (matching
+    /// upstream `malloc_big_fixedsize` at gc.py:481-490 which goes
+    /// through `do_malloc_fixedsize_clear` with type_id), so callers
+    /// MUST NOT emit a separate `gen_initialize_tid`.
+    fn gen_malloc_fixedsize(
+        &self,
+        size: usize,
+        type_id: u32,
+        result_pos: OpRef,
+        st: &mut RewriteState,
+    ) -> OpRef {
+        debug_assert_eq!(
+            size & (std::mem::size_of::<usize>() - 1),
+            0,
+            "rewrite.py:785 `assert (size & (WORD-1)) == 0` — size must be word-aligned"
+        );
+        let fn_ref = st.const_int(self.malloc_big_fixedsize_fn);
+        let size_ref = st.const_int(size as i64);
+        let typeid_ref = st.const_int(type_id as i64);
+        let result = self.gen_call_malloc_gc(
+            &[fn_ref, size_ref, typeid_ref],
+            result_pos,
+            self.malloc_big_fixedsize_descr.clone(),
+            st,
+        );
+        st.remember_wb(result);
+        result
     }
 
     /// rewrite.py:836-840 `gen_malloc_str`.
@@ -1471,11 +1520,11 @@ impl GcRewriterImpl {
 
     /// rewrite.py:1082-1098 `emit_load_effective_address`.
     ///
-    /// Emits LOAD_EFFECTIVE_ADDRESS on CPUs that support it (pyre's x86
-    /// and aarch64 backends both do — llsupport `supports_load_effective_
-    /// address=True` equivalent).  The result op encodes upstream's
-    /// `[v_gcptr, v_index, c_baseofs, c_shift]` argument order
-    /// (resoperation.py:1052-1054).
+    /// CPUs with `supports_load_effective_address = True` (x86, aarch64)
+    /// emit a single LEA op; CPUs without it (model.py:22 base default)
+    /// expand to `(INT_LSHIFT? + INT_ADD + INT_ADD)`.  The LEA arg order
+    /// is `[v_gcptr, v_index, c_baseofs, c_shift]` per
+    /// resoperation.py:1052-1054.
     fn emit_load_effective_address(
         &self,
         v_gcptr: OpRef,
@@ -1484,13 +1533,34 @@ impl GcRewriterImpl {
         itemscale: i64,
         st: &mut RewriteState,
     ) -> OpRef {
-        let base_ref = st.const_int(base);
-        let shift_ref = st.const_int(itemscale);
-        let lea = Op::new(
-            OpCode::LoadEffectiveAddress,
-            &[v_gcptr, v_index, base_ref, shift_ref],
-        );
-        st.emit_result(lea, OpRef::NONE)
+        if self.supports_load_effective_address {
+            // rewrite.py:1083-1088 — single LEA op.
+            let base_ref = st.const_int(base);
+            let shift_ref = st.const_int(itemscale);
+            let lea = Op::new(
+                OpCode::LoadEffectiveAddress,
+                &[v_gcptr, v_index, base_ref, shift_ref],
+            );
+            st.emit_result(lea, OpRef::NONE)
+        } else {
+            // rewrite.py:1089-1098 — fallback expansion.
+            //   if itemscale > 0:
+            //       v_index = INT_LSHIFT(v_index, ConstInt(itemscale))
+            //   i1b = INT_ADD(v_gcptr, v_index)
+            //   i1  = INT_ADD(i1b, ConstInt(base))
+            let scaled = if itemscale > 0 {
+                let shift_ref = st.const_int(itemscale);
+                let lshift = Op::new(OpCode::IntLshift, &[v_index, shift_ref]);
+                st.emit_result(lshift, OpRef::NONE)
+            } else {
+                v_index
+            };
+            let add1 = Op::new(OpCode::IntAdd, &[v_gcptr, scaled]);
+            let i1b = st.emit_result(add1, OpRef::NONE);
+            let base_ref = st.const_int(base);
+            let add2 = Op::new(OpCode::IntAdd, &[i1b, base_ref]);
+            st.emit_result(add2, OpRef::NONE)
+        }
     }
 
     // ────────────────────────────────────────────────────────
@@ -1665,66 +1735,111 @@ impl GcRewriterImpl {
         &self,
         original: Option<&Op>,
         ptr: OpRef,
-        mut index: OpRef,
+        index: OpRef,
         value: OpRef,
         itemsize: i64,
-        mut factor: i64,
-        mut offset: i64,
+        factor: i64,
+        offset: i64,
         st: &mut RewriteState,
     ) {
-        // rewrite.py:142-143: index_box, offset = self._try_use_older_box(
-        //     index_box, factor, offset)
-        let (new_index, new_offset) = st._try_use_older_box(index, factor, offset);
-        index = new_index;
-        offset = new_offset;
+        // rewrite.py:142-143
+        let (index, offset) = st._try_use_older_box(index, factor, offset);
 
-        // rewrite.py:1118-1122 cpu_simplify_scale, ConstInt path.
-        if let Some(index_val) = st.resolve_constant(index.0) {
-            offset = index_val * factor + offset;
-            let offset_ref = st.const_int(offset);
-            let itemsize_ref = st.const_int(itemsize);
-            let newload = Op::new(OpCode::GcStore, &[ptr, offset_ref, value, itemsize_ref]);
-            if original.is_some() {
-                st.set_forwarded(newload);
-            } else {
-                st.emit(newload);
+        // rewrite.py:144-146
+        let (factor, offset, index_opt) =
+            self._emit_mul_if_factor_offset_not_supported(index, factor, offset, st);
+
+        // rewrite.py:148-154 — GC_STORE vs GC_STORE_INDEXED.
+        let newload = match index_opt {
+            None => {
+                let offset_ref = st.const_int(offset);
+                let itemsize_ref = st.const_int(itemsize);
+                Op::new(OpCode::GcStore, &[ptr, offset_ref, value, itemsize_ref])
             }
-            return;
-        }
-
-        // rewrite.py:1124-1134 cpu_simplify_scale, non-constant path.
-        // Pre-scale only when the CPU's native addressing mode cannot carry
-        // this factor (mirrors `factor != 1 and factor not in
-        // cpu.load_supported_factors`).
-        if factor != 1 && !self.load_supported_factors.contains(&factor) {
-            assert!(factor > 0, "cpu_simplify_scale: factor must be positive");
-            let mul_op = if (factor & (factor - 1)) == 0 {
-                let shift = (factor as u64).trailing_zeros() as i64;
-                let shift_ref = st.const_int(shift);
-                Op::new(OpCode::IntLshift, &[index, shift_ref])
-            } else {
+            Some(idx) => {
                 let factor_ref = st.const_int(factor);
-                Op::new(OpCode::IntMul, &[index, factor_ref])
-            };
-            // rewrite.py:169-170 — the pre-scale op is emitted directly
-            // (not forwarded) even when the final store is forwarded.
-            let scaled = st.emit_result(mul_op, OpRef::NONE);
-            index = scaled;
-            factor = 1;
-        }
+                let offset_ref = st.const_int(offset);
+                let itemsize_ref = st.const_int(itemsize);
+                Op::new(
+                    OpCode::GcStoreIndexed,
+                    &[ptr, idx, value, factor_ref, offset_ref, itemsize_ref],
+                )
+            }
+        };
 
-        let factor_ref = st.const_int(factor);
-        let offset_ref = st.const_int(offset);
-        let itemsize_ref = st.const_int(itemsize);
-        let newload = Op::new(
-            OpCode::GcStoreIndexed,
-            &[ptr, index, value, factor_ref, offset_ref, itemsize_ref],
-        );
+        // rewrite.py:155-158
         if original.is_some() {
             st.set_forwarded(newload);
         } else {
             st.emit(newload);
         }
+    }
+
+    /// rewrite.py:166-171 `_emit_mul_if_factor_offset_not_supported`.
+    ///
+    /// Wrapper around `cpu_simplify_scale` that emits the constructed
+    /// pre-scale op (when one was needed) and folds the result into the
+    /// `(factor, offset, index)` triple consumed by the indexed GC
+    /// load/store builders.  `Option<OpRef>` mirrors upstream's
+    /// `index_box is None` ConstInt sentinel — `None` means the index
+    /// folded into `offset` and the caller should emit the non-indexed
+    /// GC_LOAD / GC_STORE form.
+    fn _emit_mul_if_factor_offset_not_supported(
+        &self,
+        index_box: OpRef,
+        factor: i64,
+        offset: i64,
+        st: &mut RewriteState,
+    ) -> (i64, i64, Option<OpRef>) {
+        let (factor, offset, scaled) = self.cpu_simplify_scale(index_box, factor, offset, st);
+        let index_opt = match scaled {
+            ScaledIndex::Const => None,
+            ScaledIndex::Passthrough(idx) => Some(idx),
+            // rewrite.py:169-170 — the pre-scale op is emitted here.
+            ScaledIndex::PreScale(op) => Some(st.emit_result(op, OpRef::NONE)),
+        };
+        (factor, offset, index_opt)
+    }
+
+    /// rewrite.py:1117-1132 `cpu_simplify_scale`.
+    ///
+    /// Pure decision function: given the raw `(index, factor, offset)`
+    /// triple supplied by an indexed GC load/store builder, decide
+    /// whether to (a) fold a ConstInt index into `offset`, (b) pass the
+    /// triple through unchanged when the CPU's addressing mode supports
+    /// `factor`, or (c) construct (but not emit) an `INT_LSHIFT` /
+    /// `INT_MUL` pre-scale op.  The returned `ScaledIndex` carries the
+    /// constructed pre-scale op so `_emit_mul_if_factor_offset_not_
+    /// supported` can emit it; vector_ext.py callers (rpython/jit/
+    /// backend/llsupport/vector_ext.py:127, :157) emit it themselves.
+    fn cpu_simplify_scale(
+        &self,
+        index_box: OpRef,
+        factor: i64,
+        offset: i64,
+        st: &mut RewriteState,
+    ) -> (i64, i64, ScaledIndex) {
+        // rewrite.py:1118-1122 — ConstInt path.
+        if let Some(index_val) = st.resolve_constant(index_box.0) {
+            return (1, index_val * factor + offset, ScaledIndex::Const);
+        }
+        // rewrite.py:1124-1133 — non-constant path.
+        if factor != 1 && !self.load_supported_factors.contains(&factor) {
+            assert!(factor > 0, "cpu_simplify_scale: factor must be positive");
+            // rewrite.py:1127-1131 — power-of-two factor → INT_LSHIFT,
+            // else INT_MUL.
+            let mul_op = if (factor & (factor - 1)) == 0 {
+                let shift = (factor as u64).trailing_zeros() as i64;
+                let shift_ref = st.const_int(shift);
+                Op::new(OpCode::IntLshift, &[index_box, shift_ref])
+            } else {
+                let factor_ref = st.const_int(factor);
+                Op::new(OpCode::IntMul, &[index_box, factor_ref])
+            };
+            return (1, offset, ScaledIndex::PreScale(mul_op));
+        }
+        // rewrite.py:1132 — pass-through.
+        (factor, offset, ScaledIndex::Passthrough(index_box))
     }
 
     /// rewrite.py:160-164 handle_getarrayitem.
@@ -1761,60 +1876,84 @@ impl GcRewriterImpl {
         &self,
         original: &Op,
         ptr: OpRef,
-        mut index: OpRef,
+        index: OpRef,
         itemsize: i64,
-        mut factor: i64,
-        mut offset: i64,
+        factor: i64,
+        offset: i64,
         sign: bool,
         st: &mut RewriteState,
     ) {
-        // rewrite.py:186-187: index_box, offset = self._try_use_older_box(
-        //     index_box, factor, offset)
-        let (new_index, new_offset) = st._try_use_older_box(index, factor, offset);
-        index = new_index;
-        offset = new_offset;
+        // rewrite.py:186-187
+        let (index, offset) = st._try_use_older_box(index, factor, offset);
 
-        // rewrite.py:192-194: encode signed-ness into the itemsize value.
+        // rewrite.py:188-190
+        let (factor, offset, index_opt) =
+            self._emit_mul_if_factor_offset_not_supported(index, factor, offset, st);
+
+        // rewrite.py:192-194 — encode signed-ness into the itemsize value.
         let itemsize_enc = if sign { -itemsize } else { itemsize };
 
-        // rewrite.py:196-198: optype from op.type (result-kind of the
+        // rewrite.py:196-198 — optype from op.type (result-kind of the
         // original load op determines the GC_LOAD_I / R / F variant).
         let optype = original.opcode.result_type();
 
-        // rewrite.py:1118-1122 cpu_simplify_scale, ConstInt path.
-        if let Some(index_val) = st.resolve_constant(index.0) {
-            offset = index_val * factor + offset;
-            let offset_ref = st.const_int(offset);
-            let itemsize_ref = st.const_int(itemsize_enc);
-            let newload = Op::new(get_gc_load(optype), &[ptr, offset_ref, itemsize_ref]);
-            st.set_forwarded(newload);
-            return;
-        }
-
-        // rewrite.py:1124-1134 cpu_simplify_scale, non-constant path.
-        if factor != 1 && !self.load_supported_factors.contains(&factor) {
-            assert!(factor > 0, "cpu_simplify_scale: factor must be positive");
-            let mul_op = if (factor & (factor - 1)) == 0 {
-                let shift = (factor as u64).trailing_zeros() as i64;
-                let shift_ref = st.const_int(shift);
-                Op::new(OpCode::IntLshift, &[index, shift_ref])
-            } else {
+        // rewrite.py:199-205 — GC_LOAD vs GC_LOAD_INDEXED.
+        let newload = match index_opt {
+            None => {
+                let offset_ref = st.const_int(offset);
+                let itemsize_ref = st.const_int(itemsize_enc);
+                Op::new(get_gc_load(optype), &[ptr, offset_ref, itemsize_ref])
+            }
+            Some(idx) => {
                 let factor_ref = st.const_int(factor);
-                Op::new(OpCode::IntMul, &[index, factor_ref])
-            };
-            let scaled = st.emit_result(mul_op, OpRef::NONE);
-            index = scaled;
-            factor = 1;
-        }
+                let offset_ref = st.const_int(offset);
+                let itemsize_ref = st.const_int(itemsize_enc);
+                Op::new(
+                    get_gc_load_indexed(optype),
+                    &[ptr, idx, factor_ref, offset_ref, itemsize_ref],
+                )
+            }
+        };
 
-        let factor_ref = st.const_int(factor);
-        let offset_ref = st.const_int(offset);
-        let itemsize_ref = st.const_int(itemsize_enc);
-        let newload = Op::new(
-            get_gc_load_indexed(optype),
-            &[ptr, index, factor_ref, offset_ref, itemsize_ref],
-        );
+        // rewrite.py:206-209 — pyre callers always pass `op`, so we
+        // always replace_op_with (set_forwarded).
         st.set_forwarded(newload);
+    }
+
+    /// rewrite.py:660-663 `emit_setfield`.
+    ///
+    /// Synthetic field store helper: emits `GC_STORE(ptr, ConstInt(0),
+    /// value, ConstInt(size))` via `emit_gc_store_or_indexed` (which
+    /// folds the ConstInt(0)*1 + ofs into a non-indexed GC_STORE per
+    /// `cpu_simplify_scale`'s ConstInt branch).  `op=None` so the
+    /// lowered op is emitted directly rather than forwarded.
+    fn emit_setfield(&self, ptr: OpRef, value: OpRef, fd: &dyn FieldDescr, st: &mut RewriteState) {
+        self.emit_setfield_raw(ptr, value, fd.offset() as i64, fd.field_size() as i64, st);
+    }
+
+    /// Raw-offset variant of `emit_setfield` (Rust adaptation).
+    ///
+    /// pyre's `JitFrameDescrs` carries raw `i32` offsets and
+    /// `sign_size: usize` rather than upstream's per-field `FieldDescr`
+    /// objects (see rewrite.py:641-650 `emit_setfield(frame, c_null,
+    /// descr=descrs.jf_*)`).  `handle_call_assembler` consumes those
+    /// raw offsets directly; this helper deduplicates the
+    /// `Op::new(GcStore, ...) + st.emit` boilerplate so the lowering
+    /// still passes through `emit_gc_store_or_indexed` and
+    /// `cpu_simplify_scale` like every other field store.  Convergence
+    /// path: replace `JitFrameDescrs::jf_*_ofs` with `SimpleFieldDescr`
+    /// instances, then have these callers use `emit_setfield(fd)`
+    /// directly.
+    fn emit_setfield_raw(
+        &self,
+        ptr: OpRef,
+        value: OpRef,
+        ofs: i64,
+        size: i64,
+        st: &mut RewriteState,
+    ) {
+        let zero = st.const_int(0);
+        self.emit_gc_store_or_indexed(None, ptr, zero, value, size, 1, ofs, st);
     }
 
     /// rewrite.py:212-342 `transform_to_gc_load`.
@@ -2316,30 +2455,25 @@ impl GcRewriterImpl {
         let vtable_fd = vtable_fd_ref
             .as_field_descr()
             .expect("gc_ll_descr.fielddescr_vtable must be a FieldDescr");
-        let ofs = st.const_int(vtable_fd.offset() as i64);
         let vtable_ref = st.const_int(vtable as i64);
-        let size = st.const_int(vtable_fd.field_size() as i64);
-        let store = Op::new(OpCode::GcStore, &[obj, ofs, vtable_ref, size]);
-        st.emit(store);
+        self.emit_setfield(obj, vtable_ref, vtable_fd, st);
     }
 
-    /// rewrite.py:550-554 gen_initialize_len parity.
+    /// rewrite.py:920-922 gen_initialize_len parity.
     ///
-    /// RPython: emit_setfield(obj, length, descr=lendescr)
-    /// The length field offset comes from the array descriptor.
+    /// RPython: `emit_setfield(v_newgcobj, v_length, descr=arraylen_descr)`.
+    /// Routes through the local `emit_setfield` helper so the lowered
+    /// store passes through `cpu_simplify_scale` (rewrite.py:1118-1122)
+    /// for the ConstInt(0) index fold, matching upstream's emission
+    /// path.
     fn gen_initialize_len(
         &self,
         obj: OpRef,
         length: OpRef,
-        array_descr: DescrRef,
         len_descr: &dyn FieldDescr,
         st: &mut RewriteState,
     ) {
-        let ofs = st.const_int(len_descr.offset() as i64);
-        let size = st.const_int(len_descr.field_size() as i64);
-        let mut store = Op::new(OpCode::GcStore, &[obj, ofs, length, size]);
-        store.descr = Some(array_descr);
-        st.emit(store);
+        self.emit_setfield(obj, length, len_descr, st);
     }
 
     /// rewrite.py:665-695 handle_call_assembler:
@@ -2347,6 +2481,18 @@ impl GcRewriterImpl {
     ///   2. gen_initialize_tid + zero GC fields
     ///   3. store each arg at _ll_initial_locs[i] offset
     ///   4. replace multi-arg CALL_ASSEMBLER with single-arg [frame]
+    ///
+    /// Currently uncalled — the dispatch arm at the CALL_ASSEMBLER opcodes
+    /// goes through the generic `rewrite_op` path because both backends
+    /// do `vable_expansion` + JitFrame init at the BACKEND level
+    /// (cranelift `compiler.rs:8138` TODO), expecting the multi-arg
+    /// CALL_ASSEMBLER shape.  Wiring this function (RPython
+    /// `rewrite.py:413-416` parity) requires migrating `vable_expansion`
+    /// from backend to tracer (so op.args carries the expanded slot
+    /// values) AND rewriting both backend arms to consume the
+    /// post-rewriter `[frame]` / `[frame, vable]` shape.  Tracked as a
+    /// multi-session port; this function stays alive as the canonical
+    /// landing target.
     #[allow(dead_code)]
     fn handle_call_assembler(&self, op: &Op, st: &mut RewriteState) {
         let descrs = self.jitframe_info.as_ref().unwrap();
@@ -2414,6 +2560,7 @@ impl GcRewriterImpl {
         // sign_size; route through sign_size to mirror the per-descr
         // read.
         let zero = st.const_int(0);
+        let signed_size_val = descrs.sign_size as i64;
         for &ofs in &[
             descrs.jf_descr_ofs,
             descrs.jf_force_descr_ofs,
@@ -2421,11 +2568,7 @@ impl GcRewriterImpl {
             descrs.jf_guard_exc_ofs,
             descrs.jf_forward_ofs,
         ] {
-            let ofs_ref = st.const_int(ofs as i64);
-            st.emit(Op::new(
-                OpCode::GcStore,
-                &[frame, ofs_ref, zero, signed_size],
-            ));
+            self.emit_setfield_raw(frame, zero, ofs as i64, signed_size_val, st);
         }
 
         // rewrite.py:639-640 — emit_getfield(frame_info, descrs.jfi_frame_depth),
@@ -2437,21 +2580,25 @@ impl GcRewriterImpl {
             OpCode::GcLoadI,
             &[llfi, jfi_frame_depth_ofs, signed_size],
         ));
-        let len_ofs = st.const_int(descrs.jf_frame_lengthofs as i64);
-        st.emit(Op::new(
-            OpCode::GcStore,
-            &[frame, len_ofs, length, signed_size],
-        ));
+        self.emit_setfield_raw(
+            frame,
+            length,
+            descrs.jf_frame_lengthofs as i64,
+            signed_size_val,
+            st,
+        );
 
         // rewrite.py:671 — emit_setfield(frame, ConstInt(llfi),
         // descr=descrs.jf_frame_info). jf_frame_info is Ptr(JITFRAMEINFO)
         // (jitframe.py:63) so the field size is the pointer width, which
         // in majit's layout coincides with sign_size.
-        let fi_ofs = st.const_int(descrs.jf_frame_info_ofs as i64);
-        st.emit(Op::new(
-            OpCode::GcStore,
-            &[frame, fi_ofs, llfi, signed_size],
-        ));
+        self.emit_setfield_raw(
+            frame,
+            llfi,
+            descrs.jf_frame_info_ofs as i64,
+            signed_size_val,
+            st,
+        );
 
         // rewrite.py:672-683 — store each arg at _ll_initial_locs[i] with
         // per-arg itemsize from getarraydescr_for_frame(arg.type).
@@ -2653,6 +2800,11 @@ impl GcRewriter for GcRewriterImpl {
                 }
 
                 // ── call_assembler: rewrite.py:414 handle_call_assembler ──
+                // Convergence path: replace the generic rewrite_op fallback
+                // with `self.handle_call_assembler(op, &mut st)` once both
+                // backends consume the post-rewriter `[frame]` shape and
+                // `vable_expansion` has been migrated from backend to tracer
+                // (tracked in handle_call_assembler's doc comment).
                 OpCode::CallAssemblerI
                 | OpCode::CallAssemblerR
                 | OpCode::CallAssemblerF
@@ -2768,6 +2920,7 @@ mod tests {
     const TEST_MALLOC_ARRAY_NONSTANDARD_FN: i64 = 0x2222;
     const TEST_MALLOC_STR_FN: i64 = 0x3333;
     const TEST_MALLOC_UNICODE_FN: i64 = 0x4444;
+    const TEST_MALLOC_BIG_FIXEDSIZE_FN: i64 = 0x5555;
 
     // ── Minimal concrete descriptor implementations for testing ──
 
@@ -2887,6 +3040,10 @@ mod tests {
             // in tests written against it; per-backend overrides have dedicated
             // tests below.
             load_supported_factors: &[1],
+            // x86/runner.py:22 + arm/runner.py:26 — production parity;
+            // dedicated `_without_load_effective_address` tests flip this
+            // to `false` to exercise the fallback (rewrite.py:1089-1098).
+            supports_load_effective_address: true,
             // Match the production nursery's zero-fill behavior; the
             // `clear_gc_fields` / `_delayed_zero_setfields` tests flip
             // this to `false` per-test.
@@ -2910,10 +3067,12 @@ mod tests {
             malloc_array_nonstandard_fn: TEST_MALLOC_ARRAY_NONSTANDARD_FN,
             malloc_str_fn: TEST_MALLOC_STR_FN,
             malloc_unicode_fn: TEST_MALLOC_UNICODE_FN,
+            malloc_big_fixedsize_fn: TEST_MALLOC_BIG_FIXEDSIZE_FN,
             malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
             malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
             malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
             malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
+            malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
             standard_array_basesize: TEST_STANDARD_ARRAY_BASESIZE,
             standard_array_length_ofs: TEST_STANDARD_ARRAY_LENGTH_OFS,
         }
@@ -4001,6 +4160,7 @@ mod tests {
             constant_types: HashMap::new(),
             call_assembler_callee_locs: None,
             load_supported_factors: &[1],
+            supports_load_effective_address: true,
             malloc_zero_filled: true,
             memcpy_fn: majit_ir::memcpy_fn_addr(),
             memcpy_descr: majit_ir::make_memcpy_calldescr(),
@@ -4020,10 +4180,12 @@ mod tests {
             malloc_array_nonstandard_fn: TEST_MALLOC_ARRAY_NONSTANDARD_FN,
             malloc_str_fn: TEST_MALLOC_STR_FN,
             malloc_unicode_fn: TEST_MALLOC_UNICODE_FN,
+            malloc_big_fixedsize_fn: TEST_MALLOC_BIG_FIXEDSIZE_FN,
             malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
             malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
             malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
             malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
+            malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
             standard_array_basesize: TEST_STANDARD_ARRAY_BASESIZE,
             standard_array_length_ofs: TEST_STANDARD_ARRAY_LENGTH_OFS,
         }
@@ -4236,5 +4398,110 @@ mod tests {
         assert_eq!(constants[&result[2].arg(1).0], 2);
         assert_eq!(result[3].opcode, OpCode::CallN);
         assert_eq!(result[3].arg(3), result[2].pos);
+    }
+
+    // ── COPYSTRCONTENT without LEA → INT_ADD × 4 + CALL_N ──
+    //
+    // rpython/jit/backend/llsupport/test/test_rewrite.py:1471-1483
+    // `test_rewrite_copystrcontents_without_load_effective_address`.
+    #[test]
+    fn test_rewrite_copystrcontents_without_load_effective_address() {
+        let mut rw = make_rewriter();
+        rw.supports_load_effective_address = false;
+        let p0 = OpRef(0);
+        let p1 = OpRef(1);
+        let i0 = OpRef(2);
+        let i1 = OpRef(3);
+        let i_len = OpRef(4);
+        let ops = vec![Op::with_descr(
+            OpCode::Copystrcontent,
+            &[p0, p1, i0, i1, i_len],
+            str_array_descr(),
+        )];
+
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+
+        // Expect (itemscale=0 so no INT_LSHIFT):
+        //   i2b = int_add(p0, i0)
+        //   i2  = int_add(i2b, basesize-1)
+        //   i3b = int_add(p1, i1)
+        //   i3  = int_add(i3b, basesize-1)
+        //   call_n(memcpy_fn, i3, i2, i_len, descr=memcpy_descr)
+        assert_eq!(result.len(), 5);
+        assert_eq!(result[0].opcode, OpCode::IntAdd);
+        assert_eq!(result[0].arg(0), p0);
+        assert_eq!(result[0].arg(1), i0);
+        assert_eq!(result[1].opcode, OpCode::IntAdd);
+        assert_eq!(result[1].arg(0), result[0].pos);
+        assert_eq!(constants[&result[1].arg(1).0], 16); // str_basesize - 1
+        assert_eq!(result[2].opcode, OpCode::IntAdd);
+        assert_eq!(result[2].arg(0), p1);
+        assert_eq!(result[2].arg(1), i1);
+        assert_eq!(result[3].opcode, OpCode::IntAdd);
+        assert_eq!(result[3].arg(0), result[2].pos);
+        assert_eq!(constants[&result[3].arg(1).0], 16);
+        assert_eq!(result[4].opcode, OpCode::CallN);
+        assert_eq!(result[4].arg(1), result[3].pos); // dst
+        assert_eq!(result[4].arg(2), result[1].pos); // src
+        assert_eq!(result[4].arg(3), i_len);
+        assert!(result[4].descr.is_some(), "CALL_N must carry memcpy_descr");
+    }
+
+    // ── COPYUNICODECONTENT without LEA → LSHIFT + INT_ADD + INT_ADD per side + LSHIFT(len) + CALL_N ──
+    //
+    // rpython/jit/backend/llsupport/test/test_rewrite.py:1497-1512
+    // `test_rewrite_copyunicodecontents_without_load_effective_address`.
+    #[test]
+    fn test_rewrite_copyunicodecontents_without_load_effective_address() {
+        let mut rw = make_rewriter();
+        rw.supports_load_effective_address = false;
+        let p0 = OpRef(0);
+        let p1 = OpRef(1);
+        let i0 = OpRef(2);
+        let i1 = OpRef(3);
+        let i_len = OpRef(4);
+        let ops = vec![Op::with_descr(
+            OpCode::Copyunicodecontent,
+            &[p0, p1, i0, i1, i_len],
+            unicode_array_descr(),
+        )];
+
+        let (result, constants) = rw.rewrite_for_gc_with_constants(&ops, &HashMap::new());
+
+        // Expect (itemscale=2):
+        //   i0s = int_lshift(i0, 2)
+        //   i2b = int_add(p0, i0s)
+        //   i2  = int_add(i2b, basesize)
+        //   i1s = int_lshift(i1, 2)
+        //   i3b = int_add(p1, i1s)
+        //   i3  = int_add(i3b, basesize)
+        //   i4  = int_lshift(i_len, 2)
+        //   call_n(memcpy_fn, i3, i2, i4, descr=memcpy_descr)
+        assert_eq!(result.len(), 8);
+        assert_eq!(result[0].opcode, OpCode::IntLshift);
+        assert_eq!(result[0].arg(0), i0);
+        assert_eq!(constants[&result[0].arg(1).0], 2);
+        assert_eq!(result[1].opcode, OpCode::IntAdd);
+        assert_eq!(result[1].arg(0), p0);
+        assert_eq!(result[1].arg(1), result[0].pos);
+        assert_eq!(result[2].opcode, OpCode::IntAdd);
+        assert_eq!(result[2].arg(0), result[1].pos);
+        assert_eq!(constants[&result[2].arg(1).0], 16);
+        assert_eq!(result[3].opcode, OpCode::IntLshift);
+        assert_eq!(result[3].arg(0), i1);
+        assert_eq!(constants[&result[3].arg(1).0], 2);
+        assert_eq!(result[4].opcode, OpCode::IntAdd);
+        assert_eq!(result[4].arg(0), p1);
+        assert_eq!(result[4].arg(1), result[3].pos);
+        assert_eq!(result[5].opcode, OpCode::IntAdd);
+        assert_eq!(result[5].arg(0), result[4].pos);
+        assert_eq!(constants[&result[5].arg(1).0], 16);
+        assert_eq!(result[6].opcode, OpCode::IntLshift);
+        assert_eq!(result[6].arg(0), i_len);
+        assert_eq!(constants[&result[6].arg(1).0], 2);
+        assert_eq!(result[7].opcode, OpCode::CallN);
+        assert_eq!(result[7].arg(1), result[5].pos); // dst
+        assert_eq!(result[7].arg(2), result[2].pos); // src
+        assert_eq!(result[7].arg(3), result[6].pos);
     }
 }

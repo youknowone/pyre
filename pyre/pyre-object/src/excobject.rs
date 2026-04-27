@@ -46,6 +46,12 @@ pub enum ExcKind {
     UnicodeEncodeError = 22,
     /// Raised by sys.exit(). Subclass of BaseException, not Exception.
     SystemExit = 23,
+    /// rpython/jit/metainterp/compile.py:1090 `memory_error = MemoryError()`
+    /// — module-level singleton instance the JIT raises through
+    /// `PropagateExceptionDescr.handle_fail` when a malloc helper
+    /// returns NULL.  Subclass of Exception per
+    /// pypy/module/exceptions/interp_exceptions.py.
+    MemoryError = 24,
 }
 
 /// Layout: `[ob_type: *const PyType | kind: ExcKind | message: *mut String]`
@@ -81,6 +87,22 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
         kind,
         message,
     }) as PyObjectRef
+}
+
+/// `compile.py:1090` `memory_error = MemoryError()` parity — module-level
+/// singleton instance the JIT raises through
+/// `PropagateExceptionDescr.handle_fail` when a malloc helper returns
+/// NULL.  RPython allocates the singleton at translation time; pyre
+/// allocates lazily on first OOM (most workloads never trigger it).
+///
+/// Stored as `usize` because `PyObjectRef` is `*mut PyObject`, which is
+/// neither `Send` nor `Sync` — `OnceLock<usize>` is the standard escape
+/// hatch.  The `W_ExceptionObject` lives forever (`malloc_typed` is
+/// `Box::into_raw` today; future GC integration must root it).
+pub fn memory_error_singleton() -> PyObjectRef {
+    static MEMORY_ERROR_SINGLETON: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MEMORY_ERROR_SINGLETON.get_or_init(|| w_exception_new(ExcKind::MemoryError, "") as usize)
+        as PyObjectRef
 }
 
 /// Check if an object is an exception instance.
@@ -137,6 +159,7 @@ pub fn exc_kind_name(kind: ExcKind) -> &'static str {
         ExcKind::UnicodeDecodeError => "UnicodeDecodeError",
         ExcKind::UnicodeEncodeError => "UnicodeEncodeError",
         ExcKind::SystemExit => "SystemExit",
+        ExcKind::MemoryError => "MemoryError",
     }
 }
 
@@ -249,6 +272,18 @@ mod tests {
         ] {
             let name = exc_kind_name(kind);
             assert_eq!(exc_kind_from_name(name), Some(kind));
+        }
+    }
+
+    #[test]
+    fn memory_error_singleton_is_idempotent_and_typed() {
+        let a = memory_error_singleton();
+        let b = memory_error_singleton();
+        assert_eq!(a as usize, b as usize, "singleton must be stable");
+        unsafe {
+            assert!(is_exception(a));
+            assert_eq!(w_exception_get_kind(a), ExcKind::MemoryError);
+            assert_eq!(w_exception_get_message(a), "");
         }
     }
 

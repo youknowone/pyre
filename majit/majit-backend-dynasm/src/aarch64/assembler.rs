@@ -25,6 +25,7 @@ use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
 use crate::guard::DynasmFailDescr;
 use crate::jitframe::{
     FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FRAME_OFS, JF_GCMAP_OFS,
+    JF_GUARD_EXC_OFS,
 };
 use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::Loc;
@@ -381,6 +382,14 @@ impl AssemblerARM64 {
     /// `compile.py:658` parity: `self.cpu.exit_frame_with_exception_descr_ref`.
     fn exit_frame_with_exception_descr_ref_ptr(&self) -> i64 {
         self.attached_descrs.exit_frame_with_exception_descr_ref as i64
+    }
+
+    /// `pyjitpl.py:2283` parity: `self.cpu.propagate_exception_descr`.
+    /// Stamped into `jf_descr` by the inline propagate path emitted at
+    /// `OpCode::CheckMemoryError` (opassembler.py:258
+    /// `emit_op_check_memory_error` → `propagate_memoryerror_if_reg_is_null`).
+    fn propagate_exception_descr_ptr(&self) -> i64 {
+        self.attached_descrs.propagate_exception_descr as i64
     }
 
     // ----------------------------------------------------------------
@@ -2492,17 +2501,78 @@ impl AssemblerARM64 {
                     self.store_rax_to_result(op.pos);
                 }
             }
-            // aarch64/opassembler.py:258 `emit_op_check_memory_error` —
-            // upstream calls `propagate_memoryerror_if_reg_is_null` so a
-            // NULL return from a malloc helper raises a MemoryError via
-            // `self.cpu.propagate_exception_descr`.
+            // aarch64/opassembler.py:258 `emit_op_check_memory_error` →
+            // assembler.py:342-346 `propagate_memoryerror_if_reg_is_null`
+            // — emit `CBNZ reg, skip` and inline the propagate path
+            // (`_build_propagate_exception_path`, assembler.py:559-577)
+            // so a NULL return from a malloc helper raises a MemoryError
+            // via `self.cpu.propagate_exception_descr`.
             //
-            // PRE-EXISTING-ADAPTATION: pyre's dynasm aarch64 backend has
-            // no `propagate_memoryerror_if_reg_is_null` analog yet — see
-            // the matching note in `x86/assembler.rs`.  Until the
-            // recovery stub is wired, this op is a no-op and a NULL
-            // result faults on its first dereference.
-            OpCode::CheckMemoryError => {}
+            // Upstream materializes `propagate_exception_path` once per
+            // backend instance and per-CHECK_MEMORY_ERROR branches to
+            // it.  Pyre's dynasm doesn't have that out-of-line trampoline
+            // infrastructure yet, so the path is inlined per occurrence
+            // — equivalent semantics, slightly more code per site.
+            // CHECK_MEMORY_ERROR is rare (only after the four CALL_R
+            // malloc helpers in `gen_call_malloc_gc`), so the size
+            // overhead is negligible.
+            //
+            // Sequence per assembler.py:559-577:
+            //   1. _store_and_reset_exception(mc, r.x0)
+            //      — load pos_exc_value → x0, clear pos_exc_value and
+            //      pos_exception (assembler.py:501-536).
+            //   2. str x0, [fp, jf_guard_exc]
+            //      — transfer the saved value into the deadframe so
+            //      `cpu.grab_exc_value(deadframe)` can read it back in
+            //      `PropagateExceptionDescr.handle_fail` (compile.py:1095).
+            //   3. gen_load_int x0, propagate_exception_descr
+            //   4. str x0, [fp, jf_descr]
+            //   5. mov x0, fp + gen_func_epilog
+            OpCode::CheckMemoryError => {
+                let propagate_descr = self.propagate_exception_descr_ptr();
+                if propagate_descr == 0 {
+                    // Unattached `propagate_exception_descr` — typical
+                    // for unit tests that bypass `MetaInterp::finish_setup`.
+                    // Skip the null-check; in production
+                    // (`pyjitpl.py:2283 self.cpu.propagate_exception_descr
+                    // = exc_descr`) the descr is always set before
+                    // `compile_loop` runs.
+                } else {
+                    let reg = match arglocs.first() {
+                        Some(Loc::Reg(r)) if !r.is_xmm => r.value,
+                        _ => panic!("CheckMemoryError arglocs[0] must be a non-xmm register"),
+                    };
+                    let skip = self.mc.new_dynamic_label();
+                    let exc_value_addr = crate::jit_exc_value_addr() as i64;
+                    let exc_type_addr = crate::jit_exc_type_addr() as i64;
+                    // x0 is freely clobberable on the propagate path:
+                    // _call_footer (assembler.py:574) overwrites x0 with fp
+                    // before returning, so any live value in x0 was already
+                    // dead the moment we branched into the path.
+                    dynasm!(self.mc ; .arch aarch64
+                        ; cbnz X(reg), =>skip
+                    );
+                    // assembler.py:509-512 — load pos_exc_value into x0.
+                    self.emit_mov_imm64(16, exc_value_addr);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; ldr x0, [x16]
+                        // assembler.py:531-533 — clear pos_exc_value.
+                        ; str xzr, [x16]
+                    );
+                    // assembler.py:535-536 — clear pos_exception.
+                    self.emit_mov_imm64(16, exc_type_addr);
+                    dynasm!(self.mc ; .arch aarch64
+                        ; str xzr, [x16]
+                        // assembler.py:565 — store x0 → jf_guard_exc.
+                        ; str x0, [x29, JF_GUARD_EXC_OFS as u32]
+                    );
+                    // assembler.py:572-573 — store propagate_descr → jf_descr.
+                    self.emit_mov_imm64(0, propagate_descr);
+                    dynasm!(self.mc ; .arch aarch64 ; str x0, [x29, JF_DESCR_OFS as u32]);
+                    self._call_footer();
+                    dynasm!(self.mc ; .arch aarch64 ; =>skip);
+                }
+            }
             // aarch64/opassembler.py:912 _write_barrier_fastpath parity.
             OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
                 self.emit_write_barrier_fastpath(op, &arglocs);

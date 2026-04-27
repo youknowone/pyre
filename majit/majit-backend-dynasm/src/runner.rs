@@ -29,14 +29,63 @@ use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
 /// address directly from the descriptor. pyre identifies callee tokens
 /// by `u64 token_number` inside `MetaCallAssemblerDescr` (pyre PRE-
 /// EXISTING-ADAPTATION — serializable descriptors), so a process-wide
-/// `token_number -> _ll_function_addr` index is required.
+/// `token_number -> DynasmCaTarget` index is required.
 ///
-/// Metadata orthodox to `CompiledLoopToken` (`_ll_initial_locs`,
-/// `frame_info`, `index_of_virtualizable`) lives on the token itself,
-/// not in this registry — `handle_call_assembler` (rewrite.py:665-695)
-/// reads it from `token.compiled_loop_token`.
-static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<HashMap<u64, usize>>> =
+/// Each entry retains the callee's `Arc<CompiledLoopToken>` so
+/// `handle_call_assembler` (rewrite.py:665-695) can sample
+/// `_ll_initial_locs` and `frame_info` for the
+/// `call_assembler_callee_locs` callback.  The Arc is created at
+/// `register_pending_target` time and adopted onto
+/// `JitCellToken.compiled_loop_token` at real-target registration so the
+/// `frame_info` address baked into already-rewritten caller traces
+/// stays valid across the pending → real transition (mirrors
+/// `majit-backend-cranelift::compiler::register_call_assembler_target`,
+/// `compiler.rs:2310-2326`).
+struct DynasmCaTarget {
+    /// 0 while pending; `compile_loop` overwrites with `_ll_function_addr`
+    /// per `x86/assembler.py:599`.  Snapshot helpers filter out 0 entries
+    /// so emitted CALL_ASSEMBLER code falls through to the force-fn
+    /// trampoline until the callee compiles.
+    code_addr: usize,
+    /// `model.py:292-338` `CompiledLoopToken` — Arc-shared with the
+    /// owning `JitCellToken` once the real target registers.
+    compiled_loop_token: Arc<majit_backend::CompiledLoopToken>,
+    /// `pyjitpl.py:3605` `outermost_jitdriver_sd.index_of_virtualizable`.
+    /// Captured at pending-target registration since the Backend trait
+    /// receives it there but `JitCellToken.virtualizable_arg_index` may
+    /// not yet be wired at that moment.
+    index_of_virtualizable: i32,
+}
+
+static CALL_ASSEMBLER_TARGETS: LazyLock<Mutex<HashMap<u64, DynasmCaTarget>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
+
+/// `rewrite.py:665-695` `handle_call_assembler` per-callee metadata
+/// lookup, sourced from the registered `DynasmCaTarget`'s CLT Arc.
+/// Mirrors `majit-backend-cranelift::compiler.rs:6097-6121`.
+pub(crate) fn lookup_call_assembler_callee_locs(
+    token_number: u64,
+) -> Option<majit_gc::rewrite::CallAssemblerCalleeLocs> {
+    let guard = CALL_ASSEMBLER_TARGETS
+        .lock()
+        .expect("CALL_ASSEMBLER_TARGETS poisoned");
+    let target = guard.get(&token_number)?;
+    let clt = &target.compiled_loop_token;
+    // `JitFrameInfo` is `#[repr(C)]` and the Arc keeps the allocation
+    // pinned, matching cranelift's `compiler.rs:6107-6110` pattern.
+    let frame_info_ptr = {
+        let info = clt.frame_info.lock();
+        &*info as *const majit_backend::JitFrameInfo as usize
+    };
+    let frame_depth = clt.frame_info.lock().jfi_frame_depth as usize;
+    let ll_initial_locs = clt._ll_initial_locs.lock().clone();
+    Some(majit_gc::rewrite::CallAssemblerCalleeLocs {
+        _ll_initial_locs: ll_initial_locs,
+        frame_depth,
+        frame_info_ptr,
+        index_of_virtualizable: target.index_of_virtualizable,
+    })
+}
 
 thread_local! {
     /// llmodel.py self.gc_ll_descr — owned by the active dynasm
@@ -89,6 +138,20 @@ fn gc_store_supported_factors() -> &'static [i64] {
 #[cfg(target_arch = "aarch64")]
 fn gc_store_supported_factors() -> &'static [i64] {
     &[1]
+}
+
+/// Per-backend `CPU.supports_load_effective_address` — x86/runner.py:22
+/// overrides model.py:22 base default `False` to `True`; aarch64/runner.py
+/// inherits the base `False` (rewriter expands to INT_LSHIFT + INT_ADD +
+/// INT_ADD per rewrite.py:1089-1098 instead of emitting LOAD_EFFECTIVE_ADDRESS).
+#[cfg(target_arch = "x86_64")]
+fn supports_load_effective_address() -> bool {
+    true
+}
+
+#[cfg(target_arch = "aarch64")]
+fn supports_load_effective_address() -> bool {
+    false
 }
 
 fn dynasm_typeid_is_object(typeid: u32) -> Option<bool> {
@@ -173,6 +236,33 @@ fn dynasm_gc_owns_object(addr: usize) -> bool {
             None => false,
         }
     })
+}
+
+/// `gc.py:51` malloc-helper OOM signaling.
+///
+/// `do_malloc_fixedsize_clear` raises `MemoryError` on failure;
+/// translation lowers that to "store the singleton in
+/// `cpu.pos_exc_value`, return NULL".  pyre malloc helpers return 0
+/// directly, so this wrapper performs the equivalent thread-local
+/// store before propagating the NULL up to the JIT-emitted
+/// `CHECK_MEMORY_ERROR` (`x86/assembler.py:2334`,
+/// `aarch64/assembler.py:1845`).  When no provider is registered
+/// (typical for unit tests), `JIT_EXC_VALUE` stays 0 and Layer 4's
+/// `cast_instance_to_gcref(memory_error)` fallback in
+/// `compile.py:1095` will fill in the gap.
+#[inline]
+fn oom_signal_if_zero(result: u64) -> u64 {
+    if result == 0 {
+        let v = majit_backend::memory_error_singleton_ref();
+        if v != 0 {
+            // llmodel.py:194-199 `_store_exception` parity — `jit_exc_raise`
+            // sets both `JIT_EXC_VALUE` and the typeptr-derived
+            // `JIT_EXC_TYPE`, matching the translated `raise MemoryError`
+            // sequence inside RPython's `do_malloc_fixedsize_clear`.
+            crate::jit_exc_raise(v);
+        }
+    }
+    result
 }
 
 /// _build_malloc_slowpath parity: nursery overflow slow path.
@@ -276,13 +366,13 @@ fn dynasm_alloc_varsize_typed_and_set_len(
 }
 
 pub extern "C" fn dynasm_malloc_array(item_size: u64, type_id: u64, num_elem: u64) -> u64 {
-    dynasm_alloc_varsize_typed_and_set_len(
+    oom_signal_if_zero(dynasm_alloc_varsize_typed_and_set_len(
         type_id as u32,
         std::mem::size_of::<usize>(),
         item_size as usize,
         0,
         num_elem as usize,
-    )
+    ))
 }
 
 pub extern "C" fn dynasm_malloc_array_nonstandard(
@@ -292,13 +382,64 @@ pub extern "C" fn dynasm_malloc_array_nonstandard(
     type_id: u64,
     num_elem: u64,
 ) -> u64 {
-    dynasm_alloc_varsize_typed_and_set_len(
+    oom_signal_if_zero(dynasm_alloc_varsize_typed_and_set_len(
         type_id as u32,
         base_size as usize,
         item_size as usize,
         length_ofs as usize,
         num_elem as usize,
-    )
+    ))
+}
+
+fn dynasm_raw_fixedsize_alloc_typed(type_id: u32, size: usize) -> u64 {
+    let Some(total_size) = majit_gc::header::GcHeader::SIZE.checked_add(size) else {
+        return 0;
+    };
+    unsafe {
+        let raw = libc::calloc(1, total_size) as *mut u8;
+        if raw.is_null() {
+            return 0;
+        }
+        *(raw as *mut majit_gc::header::GcHeader) = majit_gc::header::GcHeader::new(type_id);
+        let obj = raw.add(majit_gc::header::GcHeader::SIZE);
+        obj as u64
+    }
+}
+
+fn dynasm_alloc_oldgen_typed_or_raw(type_id: u32, payload_size: usize) -> u64 {
+    let result = DYNASM_ACTIVE_GC.with(|cell| {
+        let mut guard = cell.borrow_mut();
+        guard.as_mut().map(|gc| {
+            let obj = gc.alloc_oldgen_typed(type_id, payload_size);
+            if obj.is_null() { 0 } else { obj.0 as u64 }
+        })
+    });
+    // gc.py:51 contract: helper returns NULL on OOM so
+    // CHECK_MEMORY_ERROR can convert it into a MemoryError.  Only
+    // `None` (no active runtime — typical for unit tests) falls back
+    // to a raw alloc; `Some(0)` (a real OOM from the registered
+    // allocator) propagates as 0 unchanged, mirroring
+    // `dynasm_nursery_slowpath` above.
+    match result {
+        None => dynasm_raw_fixedsize_alloc_typed(type_id, payload_size),
+        Some(v) => v,
+    }
+}
+
+/// gc.py:481-490 `malloc_big_fixedsize(size, tid)` — fixed-size object
+/// large enough to skip the nursery, allocated directly in the old gen
+/// via `do_malloc_fixedsize_clear`.  Header is stamped with the type
+/// id so callers MUST NOT emit a separate `gen_initialize_tid`.
+pub extern "C" fn dynasm_malloc_big_fixedsize(size: u64, type_id: u64) -> u64 {
+    // The CALL_R arg is `total = payload + GcHeader::SIZE` (built by
+    // `handle_new` at rewrite.rs:857 to include the GC header).  The
+    // runtime allocators (`alloc_oldgen_typed`, `alloc_nursery_typed`)
+    // and the raw fallback both prepend the GC header themselves and
+    // expect a payload-only size, so subtract `HDR` here once —
+    // mirroring `dynasm_nursery_slowpath` above
+    // (`alloc_nursery(total_size - gc_hdr)`).
+    let payload = (size as usize).saturating_sub(majit_gc::header::GcHeader::SIZE);
+    oom_signal_if_zero(dynasm_alloc_oldgen_typed_or_raw(type_id as u32, payload))
 }
 
 /// gc.py:460 `malloc_str(length)` — but the upstream closure captures
@@ -307,25 +448,25 @@ pub extern "C" fn dynasm_malloc_array_nonstandard(
 /// CALL_R as an explicit Signed arg and the calldescr's first param is
 /// it (see `make_malloc_str_calldescr`).
 pub extern "C" fn dynasm_malloc_str(type_id: u64, length: u64) -> u64 {
-    dynasm_alloc_varsize_typed_and_set_len(
+    oom_signal_if_zero(dynasm_alloc_varsize_typed_and_set_len(
         type_id as u32,
         BUILTIN_STR_TOKEN_BASE_SIZE,
         1,
         BUILTIN_STRING_LEN_OFFSET,
         length as usize,
-    )
+    ))
 }
 
 /// gc.py:469 `malloc_unicode(length)` — see `dynasm_malloc_str` for the
 /// closure-vs-extern type-id threading rationale.
 pub extern "C" fn dynasm_malloc_unicode(type_id: u64, length: u64) -> u64 {
-    dynasm_alloc_varsize_typed_and_set_len(
+    oom_signal_if_zero(dynasm_alloc_varsize_typed_and_set_len(
         type_id as u32,
         BUILTIN_UNICODE_TOKEN_BASE_SIZE,
         4,
         BUILTIN_STRING_LEN_OFFSET,
         length as usize,
-    )
+    ))
 }
 
 /// opassembler.py:956-976: non-array write barrier slow path.
@@ -578,15 +719,27 @@ impl DynasmBackend {
                     }
                     descr
                 },
-                jitframe_info: None,
+                jitframe_info: crate::jitframe_layout().and_then(|info| info.jitframe_descrs),
                 constant_types: ct,
-                call_assembler_callee_locs: None,
+                // rewrite.py:673 — read compiled_loop_token._ll_initial_locs +
+                // ptr2int(compiled_loop_token.frame_info), both sourced from the
+                // CLT Arc on the registered DynasmCaTarget (model.py:292-338).
+                call_assembler_callee_locs: Some(Box::new(|token_number| {
+                    lookup_call_assembler_callee_locs(token_number)
+                })),
                 // x86/runner.py:31 `load_supported_factors = (1, 2, 4, 8)`
                 // vs llmodel.py:39 default `(1,)` used by the aarch64
                 // backend (which has no scaled store addressing mode and
                 // asserts boxes[3].getint() == 1 in its regalloc — see
                 // `consider_gc_store_indexed` cfg(target_arch = "aarch64")).
                 load_supported_factors: gc_store_supported_factors(),
+                // x86/runner.py:22 overrides model.py:22 base default
+                // `False` to `True`.  aarch64/runner.py inherits the
+                // base `False`, so the rewriter expands LEA to
+                // INT_LSHIFT + INT_ADD + INT_ADD (rewrite.py:1089-1098)
+                // even though the aarch64 backend has a native
+                // `genop_load_effective_address` lowering.
+                supports_load_effective_address: supports_load_effective_address(),
                 // nursery.rs:68 `alloc_zeroed` + nursery.rs:105-110
                 // `reset` memset-to-zero on recycle mean the nursery
                 // payload is always zero-filled at allocation time;
@@ -624,10 +777,12 @@ impl DynasmBackend {
                 malloc_array_nonstandard_fn: dynasm_malloc_array_nonstandard as *const () as i64,
                 malloc_str_fn: dynasm_malloc_str as *const () as i64,
                 malloc_unicode_fn: dynasm_malloc_unicode as *const () as i64,
+                malloc_big_fixedsize_fn: dynasm_malloc_big_fixedsize as *const () as i64,
                 malloc_array_descr: majit_ir::make_malloc_array_calldescr(),
                 malloc_array_nonstandard_descr: majit_ir::make_malloc_array_nonstandard_calldescr(),
                 malloc_str_descr: majit_ir::make_malloc_str_calldescr(),
                 malloc_unicode_descr: majit_ir::make_malloc_unicode_calldescr(),
+                malloc_big_fixedsize_descr: majit_ir::make_malloc_big_fixedsize_calldescr(),
                 standard_array_basesize: std::mem::size_of::<usize>(),
                 standard_array_length_ofs: 0,
             }
@@ -762,7 +917,18 @@ impl DynasmBackend {
     ///
     /// Panics if not found — RPython uses object identity, so lookup
     /// failure is impossible in well-formed execution.
-    fn find_descr_by_ptr(&self, token: &JitCellToken, ptr: usize) -> Arc<DynasmFailDescr> {
+    ///
+    /// `frame_ptr` is required so the `propagate_exception_descr` arm
+    /// can run the equivalent of `compile.py:1092-1098`'s
+    /// `cpu.grab_exc_value(deadframe)` — read+clear `jf_guard_exc` and
+    /// stage the value into `jf_frame[0]` before synthesizing the
+    /// exit-frame-with-exception descr the toplevel consumer expects.
+    fn find_descr_by_ptr(
+        &self,
+        token: &JitCellToken,
+        ptr: usize,
+        frame_ptr: *mut JitFrame,
+    ) -> Arc<DynasmFailDescr> {
         let attached = self.attached_descr_ptrs();
         // compile.py:618-669 done_with_this_frame_descr — check all 4 variants
         if ptr != 0
@@ -788,6 +954,48 @@ impl DynasmBackend {
         // jitexc.ExitFrameWithExceptionRef via is_exit_frame_with_exception.
         // Result type is Ref (exc value at slot 0, jitexc.py:45).
         if ptr != 0 && ptr == attached.exit_frame_with_exception_descr_ref {
+            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true);
+            d.is_exit_frame_with_exception = true;
+            return Arc::new(d);
+        }
+
+        // pyjitpl.py:2283 propagate_exception_descr — stamped into
+        // jf_descr by the inline propagate path emitted at
+        // OpCode::CheckMemoryError when a malloc helper returns NULL.
+        //
+        // compile.py:1092-1098 `PropagateExceptionDescr.handle_fail`:
+        //     exception = cpu.grab_exc_value(deadframe)
+        //     if not exception:
+        //         exception = cast_instance_to_gcref(memory_error)
+        //     raise jitexc.ExitFrameWithExceptionRef(exception)
+        //
+        // pyre routes this through the same FailDescr the toplevel
+        // consumer (eval.rs:2564, 3166) already understands —
+        // `is_exit_frame_with_exception=true` + `fail_arg_types=[Ref]`
+        // — by transferring `jf_guard_exc` (set by Layer 3's emitted
+        // _store_and_reset_exception, x86/assembler.rs:2304-...) into
+        // `jf_frame[0]` so the existing slot-0 Ref reader picks it up.
+        if ptr != 0 && ptr == attached.propagate_exception_descr {
+            // grab_exc_value: read+clear jf_guard_exc.
+            let exc_val = unsafe {
+                let slot = &mut (*frame_ptr).jf_guard_exc;
+                let v = *slot;
+                *slot = 0;
+                v
+            };
+            // memory_error fallback (compile.py:1095) for the unlikely
+            // case where the propagate path fired without Layer 1's
+            // singleton store winning the race (or the singleton
+            // provider was never registered — unit tests).
+            let exc_val = if exc_val != 0 {
+                exc_val as i64
+            } else {
+                majit_backend::memory_error_singleton_ref()
+            };
+            // Stage into jf_frame[0] so EXIT_FRAME_WITH_EXCEPTION
+            // dispatch reads the exc value through the standard
+            // get_ref_value(0) path (compile.py:660).
+            unsafe { crate::llmodel::set_int_value(frame_ptr, 0, exc_val as isize) };
             let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true);
             d.is_exit_frame_with_exception = true;
             return Arc::new(d);
@@ -904,21 +1112,59 @@ impl DynasmBackend {
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
             .iter()
-            .filter_map(|(&k, &addr)| if addr != 0 { Some((k, addr)) } else { None })
+            .filter_map(|(&k, t)| {
+                if t.code_addr != 0 {
+                    Some((k, t.code_addr))
+                } else {
+                    None
+                }
+            })
             .collect()
     }
 
-    fn register_call_assembler_target(token_number: u64, code_addr: usize) {
+    /// `rpython/jit/backend/x86/assembler.py:599` parity: store
+    /// `_ll_function_addr` after the loop is fully assembled.  Adopts the
+    /// pending CLT Arc onto `token.compiled_loop_token` so the
+    /// `frame_info` address baked into already-rewritten caller traces
+    /// stays valid (mirrors cranelift `compiler.rs:2310-2326`).  Falls
+    /// back to the token's existing eager Arc when no pending entry was
+    /// registered (e.g. tokens compiled directly without going through
+    /// `compile_tmp_callback`).
+    fn register_call_assembler_target(token: &mut JitCellToken, code_addr: usize) {
+        let token_number = token.number;
+        let index_of_virtualizable = token.virtualizable_arg_index.map_or(-1_i32, |i| i as i32);
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
                 "[dynasm][ca-target] register token={} addr=0x{:x}",
                 token_number, code_addr
             );
         }
-        CALL_ASSEMBLER_TARGETS
+        let mut guard = CALL_ASSEMBLER_TARGETS
             .lock()
-            .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .insert(token_number, code_addr);
+            .expect("CALL_ASSEMBLER_TARGETS poisoned");
+        match guard.get_mut(&token_number) {
+            Some(existing) => {
+                existing.code_addr = code_addr;
+                // Adopt the pending CLT Arc onto the JitCellToken so the
+                // pending-window allocation remains the live one.
+                token.compiled_loop_token = Some(Arc::clone(&existing.compiled_loop_token));
+            }
+            None => {
+                let clt = token
+                    .compiled_loop_token
+                    .as_ref()
+                    .expect("JitCellToken missing compiled_loop_token")
+                    .clone();
+                guard.insert(
+                    token_number,
+                    DynasmCaTarget {
+                        code_addr,
+                        compiled_loop_token: clt,
+                        index_of_virtualizable,
+                    },
+                );
+            }
+        }
     }
 
     fn redirect_call_assembler_target(old_number: u64, new_addr: usize) {
@@ -928,21 +1174,41 @@ impl DynasmBackend {
                 old_number, new_addr
             );
         }
-        CALL_ASSEMBLER_TARGETS
+        if let Some(existing) = CALL_ASSEMBLER_TARGETS
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
-            .insert(old_number, new_addr);
+            .get_mut(&old_number)
+        {
+            existing.code_addr = new_addr;
+        }
     }
 
     /// Static entry point for `lib.rs register_pending_call_assembler_target`.
-    /// Inserts `code_addr = 0` (pending) so `call_assembler_targets_snapshot`
-    /// filters it out; `compile_loop` overwrites with the real address.
-    pub fn register_pending_call_assembler_target_static(token_number: u64) {
+    /// Creates a fresh `Arc<CompiledLoopToken>` (mirrors cranelift
+    /// `compiler.rs:2427`) and inserts `code_addr = 0`; snapshot helpers
+    /// filter the pending entry out so generated CALL_ASSEMBLER code
+    /// falls through to the force-fn trampoline until `compile_loop`
+    /// overwrites the address.
+    pub fn register_pending_call_assembler_target_static(
+        token_number: u64,
+        num_inputs: usize,
+        index_of_virtualizable: i32,
+    ) {
+        let pending_clt = Arc::new(majit_backend::CompiledLoopToken::new(token_number));
+        // `regalloc.py:861-871` `_set_initial_bindings`: contiguous
+        // layout, `locs[i] = i * SIZEOFSIGNED`.
+        *pending_clt._ll_initial_locs.lock() = (0..num_inputs)
+            .map(|i| (i as i32) * (crate::jitframe::SIZEOFSIGNED as i32))
+            .collect();
         CALL_ASSEMBLER_TARGETS
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
             .entry(token_number)
-            .or_insert(0);
+            .or_insert_with(|| DynasmCaTarget {
+                code_addr: 0,
+                compiled_loop_token: pending_clt,
+                index_of_virtualizable,
+            });
     }
 
     /// `rpython/jit/backend/llsupport/llmodel.py:534-537`
@@ -989,7 +1255,7 @@ impl Backend for DynasmBackend {
         let code_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
         let code_size = compiled.buffer.len();
         let frame_depth = compiled.frame_depth.load(Ordering::Acquire) as i64;
-        Self::register_call_assembler_target(token.number, code_addr);
+        Self::register_call_assembler_target(token, code_addr);
         self.register_fail_descrs(&compiled.fail_descrs);
 
         // `compile.py:183-186 record_loop_or_bridge`: for each ResumeDescr
@@ -1286,7 +1552,7 @@ impl Backend for DynasmBackend {
 
         // llmodel.py:412-420 get_latest_descr: read jf_descr from frame.
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
-        let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize);
+        let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
 
         if std::env::var_os("MAJIT_LOG").is_some() {
             eprintln!(
@@ -1372,7 +1638,7 @@ impl Backend for DynasmBackend {
         let result_jf = unsafe { func(jf_ptr) };
 
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
-        let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize);
+        let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
 
         let num_fail_args = descr.fail_arg_types.len();
         let mut outputs: Vec<i64> = Vec::with_capacity(num_slots);
@@ -1697,25 +1963,20 @@ impl Backend for DynasmBackend {
         &mut self,
         token_number: u64,
         _input_types: Vec<Type>,
-        _num_inputs: usize,
+        num_inputs: usize,
         _num_scalar_inputargs: usize,
-        _index_of_virtualizable: i32,
+        index_of_virtualizable: i32,
     ) {
-        // Insert code_addr = 0 (pending). call_assembler_targets_snapshot
-        // excludes pending entries, so the generated CALL_ASSEMBLER code
-        // takes the "unresolved target" path → helper trampoline →
-        // force_fn. `compile_loop` overwrites with the real code_addr.
-        //
-        // The typed-metadata args (`num_inputs`, `num_scalar_inputargs`,
-        // `index_of_virtualizable`) are the cranelift backend's API —
-        // dynasm does not consume them because the address registry is
-        // purely a `token_number -> _ll_function_addr` index. RPython
-        // parity: `x86/assembler.py:599` stores `_ll_function_addr` on
-        // the looptoken; pyre serializes the token by number, so this
-        // HashMap is the minimum adaptation needed. Orthodox metadata
-        // (`_ll_initial_locs`, `frame_info`) lives on
-        // `token.compiled_loop_token` (`model.py:293-294`).
-        Self::register_pending_call_assembler_target_static(token_number);
+        // Insert pending entry (code_addr = 0).  The CLT Arc + initial
+        // `_ll_initial_locs` are populated here so `handle_call_assembler`
+        // (rewrite.py:665-695) can look up callee metadata even before
+        // the callee finishes compiling — mirrors cranelift
+        // `compiler.rs:2427-2444`.
+        Self::register_pending_call_assembler_target_static(
+            token_number,
+            num_inputs,
+            index_of_virtualizable,
+        );
     }
 
     fn compiled_fail_descr_layouts(

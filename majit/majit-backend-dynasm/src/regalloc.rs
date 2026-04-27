@@ -2477,7 +2477,7 @@ impl RegAlloc {
                 self.consider_call_malloc_nursery_varsize(op, i, output);
             }
             OpCode::CheckMemoryError => {
-                output.push(RegAllocOp::Skip);
+                self.consider_check_memory_error(op, i, output);
             }
 
             // ── Control flow ──
@@ -2826,6 +2826,18 @@ impl RegAlloc {
     /// Guards with no arguments (guard_no_exception, guard_not_forced, etc.)
     fn consider_guard_no_args(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         self.perform_guard(op, i, vec![], None, output);
+    }
+
+    /// x86/regalloc.py:466 consider_check_memory_error.
+    /// Reserves a register for `args[0]` (the malloc-helper return
+    /// value) so the assembler arm can TEST it against zero and route
+    /// NULL into the propagate-exception path
+    /// (assembler.py:1630-1641 `genop_discard_check_memory_error` /
+    /// opassembler.py:258 `emit_op_check_memory_error`).
+    fn consider_check_memory_error(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let tp = self.tp(op.args[0]);
+        let loc = self.make_sure_var_in_reg(op.args[0], tp, &[], None, false);
+        self.perform(i, vec![loc], None, output);
     }
 
     /// x86/regalloc.py:445 consider_finish

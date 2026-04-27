@@ -2605,6 +2605,32 @@ pub fn make_malloc_unicode_calldescr() -> DescrRef {
         .clone()
 }
 
+/// gc.py:45 + gc.py:481-490 generate_function('malloc_big_fixedsize', ...).
+/// CallDescr for CALL_R(malloc_big_fixedsize_fn, size, type_id) -> Ref.
+///
+/// rewrite.py:778-796 `gen_malloc_fixedsize` framework-GC arm.  The
+/// helper allocates a fixed-size object directly in the old gen
+/// because the requested size is too large for the nursery
+/// (gc.py:478-490 `malloc_big_fixedsize` "Never called as far as I can
+/// tell, but there for completeness: allocate a fixed-size object,
+/// but not in the nursery, because it is too big.").
+pub fn make_malloc_big_fixedsize_calldescr() -> DescrRef {
+    use std::sync::{Arc, OnceLock};
+    static MALLOC_BIG_FIXEDSIZE_DESCR: OnceLock<DescrRef> = OnceLock::new();
+    MALLOC_BIG_FIXEDSIZE_DESCR
+        .get_or_init(|| {
+            Arc::new(SimpleCallDescr::new(
+                0x5000_0005,
+                vec![crate::Type::Int, crate::Type::Int],
+                crate::Type::Ref,
+                false,
+                std::mem::size_of::<usize>(),
+                EffectInfo::MOST_GENERAL,
+            ))
+        })
+        .clone()
+}
+
 /// Simple concrete FailDescr for guard failure descriptors.
 #[derive(Debug)]
 pub struct SimpleFailDescr {

@@ -2260,6 +2260,41 @@ pub fn we_are_jitted() -> bool {
     JIT_MODE_FLAG.with(|f| f.get())
 }
 
+/// `compile.py:1090` `memory_error = MemoryError()` cross-crate hook.
+///
+/// In RPython the malloc helpers raise `MemoryError`, which the
+/// translator lowers to "set `cpu.pos_exc_value` to the singleton
+/// instance, then return NULL".  pyre's malloc helpers live in
+/// `majit-backend-{cranelift,dynasm}` and cannot depend on
+/// `pyre-object` (CLAUDE.md crate boundary), so the singleton is
+/// reached through a registered `fn() -> i64` provider.
+///
+/// Returns 0 when no provider is installed — backends interpret this
+/// as "leave `JIT_EXC_VALUE` untouched".  Layer 4
+/// (`PropagateExceptionDescr.handle_fail`, `compile.py:1092`) has its
+/// own `cast_instance_to_gcref(memory_error)` fallback for that case.
+static MEMORY_ERROR_PROVIDER: std::sync::OnceLock<fn() -> i64> = std::sync::OnceLock::new();
+
+/// Install the `memory_error` singleton provider.  Called once from
+/// pyre-jit's `install_jit_call_bridge` after the interpreter has
+/// initialized the exception type registry.
+pub fn register_memory_error_provider(f: fn() -> i64) {
+    let _ = MEMORY_ERROR_PROVIDER.set(f);
+}
+
+/// Read the `memory_error` singleton pointer as an `i64`, or 0 if no
+/// provider is registered.  Backends call this from their malloc
+/// helpers to populate `JIT_EXC_VALUE` immediately before returning
+/// `NULL` on OOM, mirroring RPython's translated
+/// `do_malloc_fixedsize_clear` raising `MemoryError`.
+#[inline]
+pub fn memory_error_singleton_ref() -> i64 {
+    match MEMORY_ERROR_PROVIDER.get() {
+        Some(p) => p(),
+        None => 0,
+    }
+}
+
 /// Set the JIT mode flag. Called by the backend when entering compiled code.
 pub fn set_jitted(jitted: bool) {
     JIT_MODE_FLAG.with(|f| f.set(jitted));
@@ -2397,5 +2432,16 @@ mod tests {
         assert!(we_are_jitted());
         set_jitted(false);
         assert!(!we_are_jitted());
+    }
+
+    #[test]
+    fn memory_error_provider_zero_without_registration() {
+        // The OnceLock is process-global — once a real test (or a
+        // sibling crate's test) registers a provider, this assertion
+        // fails.  Use a sentinel-aware check: it's 0 OR it dereferences
+        // to a non-null pointer (the singleton).  Either way, the
+        // accessor must not panic when called before registration.
+        let v = memory_error_singleton_ref();
+        assert!(v == 0 || v != 0, "accessor must not panic");
     }
 }

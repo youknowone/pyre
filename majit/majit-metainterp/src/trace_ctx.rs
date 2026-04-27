@@ -1757,6 +1757,79 @@ impl TraceCtx {
         self.vable_setfield_descr(vable_opref, null, info.token_field_descr());
     }
 
+    /// `compile.py:425-461 patch_new_loop_to_load_virtualizable_fields`
+    /// mirrored at the call site instead of the callee preamble.
+    ///
+    /// Emits `GETFIELD_GC` for every static field and `GETFIELD_GC_R`
+    /// + `GETARRAYITEM_GC` for every array item of the virtualizable
+    /// referenced by `vable`. Returns the freshly recorded OpRefs in
+    /// `[scalar_0, ..., scalar_{N-1}, array_0_item_0, ...,
+    /// array_K_item_M]` order — matching `VableExpansion`'s slot
+    /// layout (excluding the leading frame ref at slot 0).
+    ///
+    /// `array_lengths[i]` is the live element count of the i-th array
+    /// field, mirroring `vinfo.get_array_length(vable, arrayindex)`
+    /// at compile.py:443. The caller is expected to have read these
+    /// off the concrete virtualizable before tracing the call.
+    ///
+    /// Dormant — call-site migration from
+    /// `call_assembler_with_vable_expansion_args` to
+    /// `call_assembler_red_only_*` will plug this in once the callee
+    /// JUMP-terminated paths run `patch_new_loop_to_load_virtualizable
+    /// _fields` (pyjitpl/mod.rs:3090-3098 deferred epic). Covered by
+    /// `emit_vable_field_reads_emits_compile_py_shape` so the helper
+    /// stays honest until the call-site flip lands.
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn emit_vable_field_reads(
+        &mut self,
+        vable: OpRef,
+        vinfo: &VirtualizableInfo,
+        array_lengths: &[usize],
+    ) -> Vec<OpRef> {
+        let mut expanded = Vec::with_capacity(
+            vinfo.static_fields.len() + array_lengths.iter().copied().sum::<usize>(),
+        );
+
+        // compile.py:434-440 — GETFIELD_GC per static field.
+        let static_descrs = vinfo.static_field_descrs();
+        for (fi, field) in vinfo.static_fields.iter().enumerate() {
+            let opcode = match field.field_type {
+                Type::Int => OpCode::GetfieldGcI,
+                Type::Ref => OpCode::GetfieldGcR,
+                Type::Float => OpCode::GetfieldGcF,
+                Type::Void => panic!("emit_vable_field_reads: static field {fi} has Void type"),
+            };
+            let descr = static_descrs[fi].clone();
+            let opref = self.record_op_with_descr(opcode, &[vable], descr);
+            expanded.push(opref);
+        }
+
+        // compile.py:441-457 — GETFIELD_GC_R(array ptr) + GETARRAYITEM_GC.
+        let array_field_descrs = vinfo.array_field_descrs();
+        for (ai, array_field_descr) in array_field_descrs.iter().enumerate() {
+            let array_len = array_lengths.get(ai).copied().unwrap_or(0);
+            let array_opref =
+                self.record_op_with_descr(OpCode::GetfieldGcR, &[vable], array_field_descr.clone());
+            let array_descr = vinfo.array_descrs[ai].clone();
+            let item_opcode = match vinfo.array_fields[ai].item_type {
+                Type::Int => OpCode::GetarrayitemGcI,
+                Type::Ref => OpCode::GetarrayitemGcR,
+                Type::Float => OpCode::GetarrayitemGcF,
+                Type::Void => panic!("emit_vable_field_reads: array {ai} has Void item_type"),
+            };
+            for index in 0..array_len {
+                let const_idx = self.const_int(index as i64);
+                let opref = self.record_op_with_descr(
+                    item_opcode,
+                    &[array_opref, const_idx],
+                    array_descr.clone(),
+                );
+                expanded.push(opref);
+            }
+        }
+        expanded
+    }
+
     /// pyjitpl.py:1148-1158 `MIFrame.emit_force_virtualizable(fielddescr, box)`.
     ///
     /// ```text
@@ -4961,5 +5034,62 @@ mod tests {
             ops.is_empty(),
             "nonstandard virtualizable must not use standard store-back path"
         );
+    }
+
+    #[test]
+    fn emit_vable_field_reads_emits_compile_py_shape() {
+        // compile.py:425-461 patch_new_loop_to_load_virtualizable_fields shape:
+        //   [GETFIELD_GC_I(vable, pc_descr),
+        //    GETFIELD_GC_R(vable, locals_array_descr),
+        //    GETARRAYITEM_GC_I(arr, 0, item_descr),
+        //    GETARRAYITEM_GC_I(arr, 1, item_descr),
+        //    GETARRAYITEM_GC_I(arr, 2, item_descr)]
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_array_field(
+            "locals",
+            Type::Int,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Int),
+        );
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+
+        let expanded = ctx.emit_vable_field_reads(vable, &info, &[3]);
+        assert_eq!(
+            expanded.len(),
+            4,
+            "1 scalar + 3 array items = 4 expanded slots"
+        );
+
+        let ops = take_all_ops(ctx);
+        // 1 GETFIELD_GC (pc) + 1 GETFIELD_GC_R (locals ptr) + 3 GETARRAYITEM_GC = 5 ops.
+        assert_eq!(ops.len(), 5);
+        assert_eq!(ops[0].opcode, OpCode::GetfieldGcI);
+        assert_eq!(
+            ops[0].descr.as_ref().map(|d| d.index()),
+            Some(info.static_field_descr(0).index())
+        );
+        assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
+        assert_eq!(
+            ops[1].descr.as_ref().map(|d| d.index()),
+            Some(info.array_pointer_field_descr(0).index())
+        );
+        for k in 0..3 {
+            assert_eq!(ops[2 + k].opcode, OpCode::GetarrayitemGcI);
+            assert_eq!(
+                ops[2 + k].descr.as_ref().map(|d| d.index()),
+                Some(info.array_item_descr(0).index())
+            );
+        }
     }
 }

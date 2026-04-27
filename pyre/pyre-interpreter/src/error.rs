@@ -113,6 +113,12 @@ pub enum PyErrorKind {
     DescrMismatch,
     /// Raised by sys.exit(). Not a subclass of Exception.
     SystemExit,
+    /// rpython/jit/metainterp/compile.py:1090 `memory_error = MemoryError()`
+    /// — raised by `PropagateExceptionDescr.handle_fail` when a JIT
+    /// malloc helper returns NULL (true OOM).  Not raised by user code
+    /// in pyre; the runtime allocator never returns NULL except on
+    /// genuine system OOM.
+    MemoryError,
 }
 
 impl PyError {
@@ -213,6 +219,18 @@ impl PyError {
         }
     }
 
+    /// rpython/jit/metainterp/compile.py:1090 `memory_error = MemoryError()`
+    /// — module-level singleton instance the JIT raises through
+    /// `PropagateExceptionDescr.handle_fail` when a malloc helper
+    /// returns NULL.
+    pub fn memory_error(msg: impl Into<String>) -> Self {
+        PyError {
+            kind: PyErrorKind::MemoryError,
+            message: msg.into(),
+            exc_object: std::ptr::null_mut(),
+        }
+    }
+
     pub fn stop_iteration() -> Self {
         PyError {
             kind: PyErrorKind::StopIteration,
@@ -261,6 +279,7 @@ impl PyError {
             // as a TypeError, matching PyPy's eventual descr_call_mismatch.
             PyErrorKind::DescrMismatch => ExcKind::TypeError,
             PyErrorKind::SystemExit => ExcKind::SystemExit,
+            PyErrorKind::MemoryError => ExcKind::MemoryError,
         }
     }
 
@@ -306,6 +325,7 @@ impl PyError {
             // flow through the general ValueError handler.
             ExcKind::UnicodeDecodeError | ExcKind::UnicodeEncodeError => PyErrorKind::ValueError,
             ExcKind::SystemExit => PyErrorKind::SystemExit,
+            ExcKind::MemoryError => PyErrorKind::MemoryError,
         }
     }
 

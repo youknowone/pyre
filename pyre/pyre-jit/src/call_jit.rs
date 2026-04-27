@@ -142,24 +142,35 @@ static mut ARENA_INITIALIZED: usize = 0;
 /// Returns the jitframe layout descriptors needed by the GC rewriter's
 /// `handle_call_assembler` pass to emit the correct GC_LOAD / GC_STORE /
 /// CallMallocNurseryVarsizeFrame sequence for callee jitframes.
+fn arena_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
+    use majit_metainterp::jitframe::*;
+    majit_gc::rewrite::JitFrameDescrs {
+        jitframe_tid: crate::jit::descr::JITFRAME_GC_TYPE_ID,
+        jitframe_fixed_size: JITFRAME_FIXED_SIZE,
+        jf_frame_info_ofs: JF_FRAME_INFO_OFS,
+        jf_descr_ofs: JF_DESCR_OFS,
+        jf_force_descr_ofs: JF_FORCE_DESCR_OFS,
+        jf_savedata_ofs: JF_SAVEDATA_OFS,
+        jf_guard_exc_ofs: JF_GUARD_EXC_OFS,
+        jf_forward_ofs: JF_FORWARD_OFS,
+        jf_frame_ofs: JF_FRAME_OFS,
+        jf_frame_baseitemofs: BASEITEMOFS,
+        jf_frame_lengthofs: LENGTHOFS,
+        sign_size: SIGN_SIZE,
+    }
+}
+
 #[cfg(feature = "cranelift")]
 pub fn arena_global_info() -> majit_backend_cranelift::JitFrameLayoutInfo {
-    use majit_metainterp::jitframe::*;
     majit_backend_cranelift::JitFrameLayoutInfo {
-        jitframe_descrs: Some(majit_gc::rewrite::JitFrameDescrs {
-            jitframe_tid: crate::jit::descr::JITFRAME_GC_TYPE_ID,
-            jitframe_fixed_size: JITFRAME_FIXED_SIZE,
-            jf_frame_info_ofs: JF_FRAME_INFO_OFS,
-            jf_descr_ofs: JF_DESCR_OFS,
-            jf_force_descr_ofs: JF_FORCE_DESCR_OFS,
-            jf_savedata_ofs: JF_SAVEDATA_OFS,
-            jf_guard_exc_ofs: JF_GUARD_EXC_OFS,
-            jf_forward_ofs: JF_FORWARD_OFS,
-            jf_frame_ofs: JF_FRAME_OFS,
-            jf_frame_baseitemofs: BASEITEMOFS,
-            jf_frame_lengthofs: LENGTHOFS,
-            sign_size: SIGN_SIZE,
-        }),
+        jitframe_descrs: Some(arena_jitframe_descrs()),
+    }
+}
+
+#[cfg(feature = "dynasm")]
+pub fn arena_global_info_dynasm() -> majit_backend_dynasm::JitFrameLayoutInfo {
+    majit_backend_dynasm::JitFrameLayoutInfo {
+        jitframe_descrs: Some(arena_jitframe_descrs()),
     }
 }
 
@@ -1522,6 +1533,15 @@ pub fn install_jit_call_bridge() {
     static INSTALL: Once = Once::new();
     INSTALL.call_once(|| {
         register_jit_function_caller(jit_call_user_function_from_frame);
+        // compile.py:1090 `memory_error = MemoryError()` parity — give
+        // the backend malloc helpers a way to set `JIT_EXC_VALUE` to
+        // pyre's lazy `W_ExceptionObject(MemoryError, "")` singleton
+        // before propagating NULL on OOM.  Backend-shared (mirrors
+        // RPython where the same `memory_error` instance is reachable
+        // from both the x86 and aarch64 backends).
+        majit_backend::register_memory_error_provider(|| {
+            pyre_object::excobject::memory_error_singleton() as i64
+        });
         // rpython/translator/c/src/stack.h:42-43 LL_stack_criticalcode_start
         // /stop hooks — wrap blackhole_from_resumedata,
         // handle_async_forcing, and handle_guard_failure_in_trace so
@@ -1591,6 +1611,7 @@ pub fn install_jit_call_bridge() {
             majit_backend_dynasm::register_call_assembler_blackhole(
                 jit_blackhole_resume_from_guard,
             );
+            majit_backend_dynasm::register_jitframe_layout(arena_global_info_dynasm());
             majit_backend_dynasm::register_call_assembler_unbox_int(unbox_int_for_force);
             // rpython/jit/backend/llsupport/llmodel.py:229-234 insert_stack_check
             // parity. The backend inlines MOV [endaddr]; SUB rsp; CMP [lengthaddr]
