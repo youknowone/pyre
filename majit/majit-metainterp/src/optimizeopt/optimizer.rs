@@ -175,6 +175,19 @@ pub struct Optimizer {
     /// receives transformed ops (after fold_box/elide). This map covers
     /// positions that were removed during trace transformation.
     pub original_trace_op_types: std::collections::HashMap<u32, majit_ir::Type>,
+    /// jitprof.Counters.OPT_OPS / OPT_GUARDS / OPT_GUARDS_SHARED accumulators.
+    ///
+    /// RPython optimizer.py:626/629/673 calls
+    /// `self.metainterp_sd.profiler.count(...)` directly inside
+    /// `_emit_operation` / `emit_guard_operation`.  Pyre's `Optimizer`
+    /// does not hold a reference to `MetaInterpStaticData.profiler`, so
+    /// we mirror the same deferred-fold pattern already in use for
+    /// `nvirtuals` / `nvholes` / `nvreused`: accumulate per-counter here
+    /// and let the caller fold them into `JitStatsCounters` via
+    /// `update_counters` after each `propagate_all_forward` exit.
+    pub(crate) opt_ops_emitted: usize,
+    pub(crate) opt_guards_emitted: usize,
+    pub(crate) opt_guards_shared_emitted: usize,
 }
 
 fn value_from_backend_constant_bits_typed(
@@ -1046,6 +1059,9 @@ impl Optimizer {
             snapshot_frame_pcs: std::collections::HashMap::new(),
             prev_phase_value_types: std::collections::HashMap::new(),
             original_trace_op_types: std::collections::HashMap::new(),
+            opt_ops_emitted: 0,
+            opt_guards_emitted: 0,
+            opt_guards_shared_emitted: 0,
         }
     }
 
@@ -1217,8 +1233,33 @@ impl Optimizer {
     /// reference to `MetaInterp.stats`, so this is a thin accessor the
     /// caller invokes after each optimize_loop / optimize_bridge /
     /// propagate_all_forward exit to fold counters into the JIT stats.
-    pub fn update_counters(&self, stats: &mut crate::pyjitpl::JitStatsCounters) {
-        self.resumedata_memo.update_counters(stats);
+    ///
+    /// Also folds OPT_OPS / OPT_GUARDS / OPT_GUARDS_SHARED accumulated
+    /// inside `_emit_operation` / `emit_guard_operation`
+    /// (optimizer.py:626/629/673-674).  RPython publishes these
+    /// directly via `self.metainterp_sd.profiler.count(...)`; pyre's
+    /// `Optimizer` carries no `metainterp_sd` reference and therefore
+    /// piggybacks on the same deferred-fold pattern as the resumedata
+    /// memo counters.
+    pub fn update_counters(&mut self, profiler: &crate::jitprof::JitProfiler) {
+        self.resumedata_memo.update_counters(profiler);
+        profiler.count(crate::pyjitpl::counters::OPT_OPS, self.opt_ops_emitted);
+        profiler.count(
+            crate::pyjitpl::counters::OPT_GUARDS,
+            self.opt_guards_emitted,
+        );
+        profiler.count(
+            crate::pyjitpl::counters::OPT_GUARDS_SHARED,
+            self.opt_guards_shared_emitted,
+        );
+        self.opt_ops_emitted = 0;
+        self.opt_guards_emitted = 0;
+        self.opt_guards_shared_emitted = 0;
+        // Drain per-pass `Counters.*` accumulators (e.g.
+        // VectorizingOptimizer's OPT_VECTORIZE_TRY / OPT_VECTORIZED).
+        for pass in &mut self.passes {
+            pass.drain_profiler_counters(profiler);
+        }
     }
 
     /// optimizer.py: flush()
@@ -3283,7 +3324,13 @@ impl Optimizer {
             let arg = ctx.get_box_replacement(op.arg(i));
             op.args[i] = self.force_box(arg, ctx);
         }
+        // optimizer.py:626: self.metainterp_sd.profiler.count(Counters.OPT_OPS).
+        // Pyre defers the fold into JitStatsCounters via update_counters
+        // (see field doc for the rationale).
+        self.opt_ops_emitted = self.opt_ops_emitted.saturating_add(1);
         if op.opcode.is_guard() {
+            // optimizer.py:629: profiler.count(Counters.OPT_GUARDS).
+            self.opt_guards_emitted = self.opt_guards_emitted.saturating_add(1);
             // optimizer.py:630-631: pendingfields = self.pendingfields; self.pendingfields = None
             // — captured into ctx.pending_for_guard by the heap pass via emitting_operation.
             // emit_guard_operation reads ctx.pending_for_guard inside store_final_boxes_in_guard
@@ -3473,6 +3520,10 @@ impl Optimizer {
             && opcode != OpCode::GuardNotForced
             && opcode != OpCode::GuardNotForced2;
         if shared {
+            // optimizer.py:673-674:
+            //   self.metainterp_sd.profiler.count_ops(
+            //       opnum, jitprof.Counters.OPT_GUARDS_SHARED)
+            self.opt_guards_shared_emitted = self.opt_guards_shared_emitted.saturating_add(1);
             op = self._copy_resume_data_from(op, ctx);
         } else {
             // optimizer.py:630-631 + resume.py:428-445 + 520-558:
@@ -5155,5 +5206,34 @@ mod tests {
             guard.resolved_rd_consts().is_some(),
             "resumedata_memo should set rd_consts on guard"
         );
+    }
+
+    #[test]
+    fn update_counters_folds_opt_ops_opt_guards_opt_guards_shared_into_profiler() {
+        // optimizer.py:626/629/673-674: every emit_operation bumps OPT_OPS,
+        // each guard bumps OPT_GUARDS additionally, and the sharing path
+        // bumps OPT_GUARDS_SHARED.  Pyre defers the fold via
+        // update_counters; assert the accumulators land in the matching
+        // `JitProfiler` atomics and reset after the fold so a second
+        // call doesn't double-count.
+        let mut opt = Optimizer::new();
+        opt.opt_ops_emitted = 5;
+        opt.opt_guards_emitted = 2;
+        opt.opt_guards_shared_emitted = 1;
+        let prof = crate::jitprof::JitProfiler::default();
+        opt.update_counters(&prof);
+        let snap = prof.snapshot();
+        assert_eq!(snap.opt_ops, 5);
+        assert_eq!(snap.opt_guards, 2);
+        assert_eq!(snap.opt_guards_shared, 1);
+        // Accumulators reset so a second update doesn't re-add.
+        assert_eq!(opt.opt_ops_emitted, 0);
+        assert_eq!(opt.opt_guards_emitted, 0);
+        assert_eq!(opt.opt_guards_shared_emitted, 0);
+        opt.update_counters(&prof);
+        let snap = prof.snapshot();
+        assert_eq!(snap.opt_ops, 5);
+        assert_eq!(snap.opt_guards, 2);
+        assert_eq!(snap.opt_guards_shared, 1);
     }
 }

@@ -855,21 +855,21 @@ pub struct MetaInterp<M: Clone> {
 }
 
 /// Internal mutable counters for JIT compilation statistics.
+///
+/// Holds only the pyre-specific lifetime counters (`loops_compiled`,
+/// `loops_aborted`, `bridges_compiled`, `guard_failures`) that have no
+/// `Counters.*` slot upstream.  Every counter that maps to a
+/// `Counters.*` id (OPS / HEAPCACHED_OPS / RECORDED_OPS / GUARDS /
+/// OPT_OPS / OPT_GUARDS / OPT_GUARDS_SHARED / NV* / ABORT_* /
+/// FORCE_VIRTUALIZABLES / OPT_VECTORIZE_*) lives on
+/// [`crate::jitprof::JitProfiler`] in `MetaInterpStaticData.profiler`
+/// and is published via `profiler.snapshot()`.
 #[derive(Default, Clone, Debug)]
 pub(crate) struct JitStatsCounters {
     loops_compiled: usize,
     loops_aborted: usize,
     bridges_compiled: usize,
     guard_failures: usize,
-    /// jitprof.Counters.NVIRTUALS — cumulative count of virtual entries
-    /// allocated across all finished resume data blobs (resume.py:290-291).
-    pub nvirtuals: usize,
-    /// jitprof.Counters.NVHOLES — entries in rd_virtuals that ended up unused
-    /// (resume.py:290-292).
-    pub nvholes: usize,
-    /// jitprof.Counters.NVREUSED — cached virtuals reused across resume
-    /// blobs (resume.py:290-293).
-    pub nvreused: usize,
 }
 
 /// Snapshot of cumulative JIT compilation statistics.
@@ -879,12 +879,6 @@ pub struct JitStats {
     pub loops_aborted: usize,
     pub bridges_compiled: usize,
     pub guard_failures: usize,
-    /// jitprof.Counters.NVIRTUALS (resume.py:290-291).
-    pub nvirtuals: usize,
-    /// jitprof.Counters.NVHOLES (resume.py:290-292).
-    pub nvholes: usize,
-    /// jitprof.Counters.NVREUSED (resume.py:290-293).
-    pub nvreused: usize,
 }
 
 /// Callback hooks for JIT events (compilation, guard failures, etc.).
@@ -995,6 +989,25 @@ impl<M: Clone> MetaInterp<M> {
         if let Some(ref hook) = self.hooks.on_guard_failure {
             hook(green_key, fail_index, 0);
         }
+    }
+
+    /// jitprof.py:118-122 `Profiler.count_ops(opnum, kind=Counters.OPS)`.
+    ///
+    /// Thin pass-through to `staticdata.profiler.count_ops`.  RPython
+    /// callers reach the profiler through `self.staticdata.profiler`;
+    /// pyre's MetaInterp keeps the accessor as a convenience because
+    /// the borrow shape is friendlier than spelling
+    /// `self.staticdata.profiler.count_ops(...)` at every site.
+    pub fn count_ops(&self, opnum: OpCode, kind: i32) {
+        self.staticdata.profiler.count_ops(opnum, kind);
+    }
+
+    /// jitprof.py:101-102 `Profiler.count(kind, inc=1)`.
+    ///
+    /// Thin pass-through to `staticdata.profiler.count`.  Same
+    /// rationale as `count_ops` above.
+    pub fn count(&self, kind: i32, inc: usize) {
+        self.staticdata.profiler.count(kind, inc);
     }
 
     #[inline]
@@ -2211,15 +2224,16 @@ impl<M: Clone> MetaInterp<M> {
     }
 
     /// Return a snapshot of the cumulative JIT compilation statistics.
+    ///
+    /// Counters that map to a `Counters.*` id (OPS, RECORDED_OPS, NV*,
+    /// OPT_*, ABORT_*, ...) live on `staticdata.profiler` and are
+    /// published via [`crate::jitprof::JitProfiler::snapshot`].
     pub fn get_stats(&self) -> JitStats {
         JitStats {
             loops_compiled: self.stats.loops_compiled,
             loops_aborted: self.stats.loops_aborted,
             bridges_compiled: self.stats.bridges_compiled,
             guard_failures: self.stats.guard_failures,
-            nvirtuals: self.stats.nvirtuals,
-            nvholes: self.stats.nvholes,
-            nvreused: self.stats.nvreused,
         }
     }
 
@@ -4906,7 +4920,7 @@ impl<M: Clone> MetaInterp<M> {
         let optimized_ops = optimized_ops;
         let num_ops_after = optimized_ops.len();
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
-        optimizer.update_counters(&mut self.stats);
+        optimizer.update_counters(&self.staticdata.profiler);
         // RPython compile.py:234 parity: transfer quasi-immutable deps
         // from optimizer to MetaInterp for post-compile watcher registration.
         self.last_quasi_immutable_deps = optimizer.quasi_immutable_deps.drain().collect();
@@ -5242,7 +5256,7 @@ impl<M: Clone> MetaInterp<M> {
         };
 
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
-        optimizer.update_counters(&mut self.stats);
+        optimizer.update_counters(&self.staticdata.profiler);
         self.last_quasi_immutable_deps = optimizer.quasi_immutable_deps.drain().collect();
 
         let num_ops_after = optimized_ops.len();
@@ -6923,7 +6937,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
-        optimizer.update_counters(&mut self.stats);
+        optimizer.update_counters(&self.staticdata.profiler);
         // RPython-orthodox: unroll.py replay uses Const args directly;
         // no cross-trace constant pool merge step.
         if retrace_requested {
@@ -7292,7 +7306,7 @@ impl<M: Clone> MetaInterp<M> {
             }
         };
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
-        optimizer.update_counters(&mut self.stats);
+        optimizer.update_counters(&self.staticdata.profiler);
         // RPython-orthodox: no post-optimize cross-trace constant merge.
         // Short preamble replay (unroll.py) emits ops with Const args
         // directly; missing-constant recovery from source_trace is
@@ -9006,7 +9020,11 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns `(OpRef, resvalue)` for non-void calls, `None` for void
     /// calls.  The OpRef points at the recorded `CALL_*` IR op; the
     /// resvalue is the concrete return value to keep alongside the
-    /// OpRef in the caller's symbolic stack.
+    /// OpRef in the caller's symbolic stack.  For Float results the
+    /// resvalue carries the f64 bits via `f64::to_bits` (i64-return
+    /// ABI shared with `executor::execute_varargs`); the caller must
+    /// unpack with `f64::from_bits(resvalue as u64)` before observing
+    /// the slot as an f64.
     pub fn execute_and_record_varargs(
         &mut self,
         opnum: OpCode,
@@ -9015,9 +9033,7 @@ impl<M: Clone> MetaInterp<M> {
         descr_view: &dyn majit_ir::descr::CallDescr,
     ) -> Option<(OpRef, i64)> {
         // pyjitpl.py:2645: profiler.count_ops(opnum)
-        // — pyre's profiler integration lands in a follow-up; skip
-        // here and account for the op via the trace recorder's own
-        // counters.
+        self.count_ops(opnum, counters::OPS);
         // pyjitpl.py:2646-2647: resvalue = executor.execute_varargs(self.cpu, self, ...)
         let resvalue = crate::executor::execute_varargs(self, opnum, argboxes, descr_view);
         // pyjitpl.py:2649-2650: assert not rop._ALWAYS_PURE_FIRST <= opnum <= rop._ALWAYS_PURE_LAST
@@ -9053,6 +9069,10 @@ impl<M: Clone> MetaInterp<M> {
         descr: majit_ir::DescrRef,
         argboxes: &[OpRef],
     ) -> Option<(OpRef, i64)> {
+        // pyjitpl.py:2658: profiler.count_ops(opnum, Counters.RECORDED_OPS)
+        // — fires before the heapcache touch + history.record so a
+        // dropped trace (`self.tracing.is_none()`) is not double-counted.
+        self.count_ops(opnum, counters::RECORDED_OPS);
         let ctx = self.tracing.as_mut()?;
         // pyjitpl.py:2659: self.heapcache.invalidate_caches_varargs(opnum, descr, argboxes)
         let effectinfo = descr.as_call_descr().map(|cd| cd.get_extra_info());
@@ -9166,8 +9186,14 @@ impl<M: Clone> MetaInterp<M> {
     ///
     /// `reason` is the upstream `Counters.ABORT_*` int (pyre routes
     /// `AbortReason::as_int()` through here).
-    pub fn aborted_tracing(&mut self, _reason: i32) {
-        // pyjitpl.py:2761: profiler.count(reason) / 2786: stats.aborted()
+    pub fn aborted_tracing(&mut self, reason: i32) {
+        // pyjitpl.py:2761: profiler.count(reason) — reason-keyed bump
+        // lands on the matching `staticdata.profiler.abort_*` atomic.
+        self.count(reason, 1);
+        // pyjitpl.py:2786: self.staticdata.stats.aborted() — pyre's
+        // mapping of the lifetime aborted-loop tally lives on
+        // `JitStatsCounters.loops_aborted` (separate from the
+        // reason-keyed `profiler.abort_*`).
         self.stats.loops_aborted = self.stats.loops_aborted.saturating_add(1);
         // pyjitpl.py:2770 on_abort hook payload — pyre's single hook
         // receives (greenkey, permanent).  `abort_trace_live` stashes the
@@ -10810,6 +10836,10 @@ impl<M: Clone> MetaInterp<M> {
             })
             .unwrap_or(false);
         if is_known_nonstandard {
+            // pyjitpl.py:2164: profiler.count_ops(rop.PTR_EQ, Counters.HEAPCACHED_OPS)
+            self.staticdata
+                .profiler
+                .count_ops(OpCode::PtrEq, counters::HEAPCACHED_OPS);
             return None;
         }
         // pyjitpl.py:2165: eqbox = self.metainterp.execute_and_record(rop.PTR_EQ,
@@ -11665,6 +11695,30 @@ pub struct SwitchToBlackhole {
 /// without renumbering.
 #[allow(dead_code)]
 pub mod counters {
+    /// jit.py:1416 `Counters.TRACING`.
+    pub const TRACING: i32 = 0;
+    /// jit.py:1417 `Counters.BACKEND`.
+    pub const BACKEND: i32 = 1;
+    /// jit.py:1418 `Counters.OPS`.
+    pub const OPS: i32 = 2;
+    /// jit.py:1419 `Counters.HEAPCACHED_OPS`.
+    pub const HEAPCACHED_OPS: i32 = 3;
+    /// jit.py:1420 `Counters.RECORDED_OPS`.
+    pub const RECORDED_OPS: i32 = 4;
+    /// jit.py:1421 `Counters.GUARDS`.
+    pub const GUARDS: i32 = 5;
+    /// jit.py:1422 `Counters.OPT_OPS`.
+    pub const OPT_OPS: i32 = 6;
+    /// jit.py:1423 `Counters.OPT_GUARDS`.
+    pub const OPT_GUARDS: i32 = 7;
+    /// jit.py:1424 `Counters.OPT_GUARDS_SHARED`.
+    pub const OPT_GUARDS_SHARED: i32 = 8;
+    /// jit.py:1425 `Counters.OPT_FORCINGS`.
+    pub const OPT_FORCINGS: i32 = 9;
+    /// jit.py:1426 `Counters.OPT_VECTORIZE_TRY`.
+    pub const OPT_VECTORIZE_TRY: i32 = 10;
+    /// jit.py:1427 `Counters.OPT_VECTORIZED`.
+    pub const OPT_VECTORIZED: i32 = 11;
     /// jit.py:1428 `Counters.ABORT_TOO_LONG`.
     pub const ABORT_TOO_LONG: i32 = 12;
     /// jit.py:1429 `Counters.ABORT_BRIDGE`.
@@ -11677,6 +11731,14 @@ pub mod counters {
     pub const ABORT_FORCE_QUASIIMMUT: i32 = 16;
     /// jit.py:1433 `Counters.ABORT_SEGMENTED_TRACE`.
     pub const ABORT_SEGMENTED_TRACE: i32 = 17;
+    /// jit.py:1434 `Counters.FORCE_VIRTUALIZABLES`.
+    pub const FORCE_VIRTUALIZABLES: i32 = 18;
+    /// jit.py:1435 `Counters.NVIRTUALS`.
+    pub const NVIRTUALS: i32 = 19;
+    /// jit.py:1436 `Counters.NVHOLES`.
+    pub const NVHOLES: i32 = 20;
+    /// jit.py:1437 `Counters.NVREUSED`.
+    pub const NVREUSED: i32 = 21;
 }
 
 impl SwitchToBlackhole {
@@ -11882,6 +11944,20 @@ pub struct MetaInterpStaticData {
     /// Mutex lock. RPython's Python dicts are shared mutable references
     /// by default; Rust needs interior mutability for the same behavior.
     pub all_descrs: std::sync::Mutex<Vec<DescrRef>>,
+    /// pyjitpl.py:2199-2200 `self.profiler = ProfilerClass()` —
+    /// `metainterp_sd.profiler` is the shared counter sink hit from
+    /// every metainterp / optimizer / heapcache / tracer site
+    /// (`self.metainterp_sd.profiler.count_ops(...)`).  Pyre mirrors
+    /// the location so cross-crate callers (TraceCtx in
+    /// `pyre-jit-trace`, heapcache in `majit-trace`, the vector pass)
+    /// can hit it through the same shared `Arc`.
+    ///
+    /// Implemented as a struct of `AtomicUsize` (see [`crate::jitprof`])
+    /// because `Arc<MetaInterpStaticData>` is shared across threads in
+    /// pyre's pipeline and a `Mutex` would serialise every counter
+    /// bump.  Each fetch_add is `Relaxed` — counters have no causal
+    /// dependency on each other.
+    pub profiler: crate::jitprof::JitProfiler,
 }
 
 /// pyjitpl.py:2357-2373 `class MetaInterpGlobalData`.
@@ -13322,33 +13398,50 @@ mod metainterp_static_data_tests {
 
     extern "C" fn execute_varargs_void_helper() {}
 
+    extern "C" fn execute_varargs_float_concrete_helper(a: i64) -> i64 {
+        // Mirrors the `concrete_ptr` shape `#[jit_module]` emits for a
+        // Float helper (majit-macros/src/lib.rs:267): the f64 result is
+        // pre-packed via `f64::to_bits` and the wrapper returns through
+        // the integer return register.  Same ABI shape as
+        // `bh_portal_runner` (pyre-jit/src/call_jit.rs:467).
+        let value = a as f64 * 0.5;
+        value.to_bits() as i64
+    }
+
     #[test]
-    fn execute_varargs_call_f_returns_zero_until_caller_contract_resolved() {
-        // executor::execute_varargs's Type::Float arm currently returns
-        // the type-neutral zero (matching main's prior stub) because
-        // the funcbox carries a single `*const ()` slot but
-        // `#[jit_module]` (majit-macros/src/lib.rs:253-272) emits two
-        // distinct float wrappers (trace_ptr `-> f64`, concrete_ptr
-        // `-> i64`).  Picking either ABI without knowing which wrapper
-        // the caller materialised would risk a transmute mismatch — the
-        // Task #16 audit has to settle the caller-contract first.
-        // Until then, this test pins the stub behaviour so a future
-        // regression that "fixes" the arm without addressing the
-        // contract is caught.
+    fn execute_varargs_call_f_routes_through_concrete_ptr_i64_bits() {
+        // Float-arm ABI contract: every path that reaches the Float arm
+        // (do_recursive_call → portal_runner_adr, force-virtual
+        // do_residual_call_full) materialises `funcbox.2` as a function
+        // pointer with i64-return ABI — either the hand-written
+        // `bh_portal_runner` or `#[jit_module]`'s `concrete_ptr` wrapper
+        // that pre-packs the f64 result via `f64::to_bits`.  The f64-ABI
+        // `trace_ptr` is consumed only by pyre-jit-trace's
+        // `TraceCtx::call_may_force_*` family, which has its own seam
+        // and never reaches this arm.  The executor routes through
+        // `call_int_function` (i64-bits ABI), and callers recover the
+        // f64 via `f64::from_bits` when the slot needs to be interpreted
+        // as a float (pyjitpl/mod.rs:8901-8902).  This test pins that
+        // contract so a regression that re-introduces the f64-ABI
+        // transmute path is caught.
         use crate::executor;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
         let descr = StubCallDescr {
-            arg_types: vec![],
+            arg_types: vec![majit_ir::Type::Int],
             result_type: majit_ir::Type::Float,
             effect: majit_ir::EffectInfo::default(),
         };
-        // Dummy fn pointer — never called because the arm is stubbed.
-        let fnaddr = execute_varargs_void_helper as *const () as i64;
-        let argboxes = [(JitArgKind::Ref, OpRef(0), fnaddr)];
+        let fnaddr = execute_varargs_float_concrete_helper as *const () as i64;
+        let argboxes = [
+            (JitArgKind::Ref, OpRef(0), fnaddr),
+            (JitArgKind::Int, OpRef(1), 6),
+        ];
         let raw = executor::execute_varargs(&mut meta, OpCode::CallF, &argboxes, &descr);
-        assert_eq!(raw, 0);
-        assert_eq!(f64::from_bits(raw as u64), 0.0);
+        // Helper returns `f64::to_bits(3.0)`; executor must carry the
+        // raw i64 unmodified so the caller can `f64::from_bits` it.
+        assert_eq!(raw, 3.0_f64.to_bits() as i64);
+        assert_eq!(f64::from_bits(raw as u64), 3.0);
         assert_eq!(meta.last_exc_value, 0);
     }
 
@@ -13405,6 +13498,103 @@ mod metainterp_static_data_tests {
         );
         // TLS drained so the next call site starts clean.
         assert_eq!(crate::blackhole::BH_LAST_EXC_VALUE.with(|c| c.get()), 0);
+    }
+
+    #[test]
+    fn count_ops_increments_by_kind_and_bumps_calls_only_on_call_recorded_ops() {
+        // jitprof.py:118-122 contract: `count_ops(opnum, kind)` bumps
+        // `counters[kind]` by 1; if `kind == RECORDED_OPS` AND the op is
+        // a CALL_*, also bumps `calls`.  Other (kind, opnum) pairs leave
+        // `calls` untouched.  Counters now live on
+        // `staticdata.profiler` — read via `snapshot()`.
+        let meta = MetaInterp::<()>::new(0);
+        let prof = &meta.staticdata.profiler;
+        // OPS path: not a call, kind=OPS → ops += 1, calls unchanged.
+        meta.count_ops(OpCode::IntAdd, counters::OPS);
+        assert_eq!(prof.snapshot().ops, 1);
+        assert_eq!(prof.snapshot().calls, 0);
+        // OPS path on a CALL_*: kind=OPS so calls is NOT bumped (only
+        // RECORDED_OPS path bumps calls per jitprof.py:121).
+        meta.count_ops(OpCode::CallI, counters::OPS);
+        assert_eq!(prof.snapshot().ops, 2);
+        assert_eq!(prof.snapshot().calls, 0);
+        // RECORDED_OPS path on a non-call: recorded_ops += 1, calls
+        // unchanged.
+        meta.count_ops(OpCode::IntAdd, counters::RECORDED_OPS);
+        assert_eq!(prof.snapshot().recorded_ops, 1);
+        assert_eq!(prof.snapshot().calls, 0);
+        // RECORDED_OPS + CALL_*: recorded_ops += 1 AND calls += 1.
+        meta.count_ops(OpCode::CallI, counters::RECORDED_OPS);
+        assert_eq!(prof.snapshot().recorded_ops, 2);
+        assert_eq!(prof.snapshot().calls, 1);
+        // HEAPCACHED_OPS / GUARDS independent buckets.
+        meta.count_ops(OpCode::PtrEq, counters::HEAPCACHED_OPS);
+        meta.count_ops(OpCode::GuardTrue, counters::GUARDS);
+        assert_eq!(prof.snapshot().heapcached_ops, 1);
+        assert_eq!(prof.snapshot().guards, 1);
+        // ABORT_* bumps the abort_* atomic on the profiler (count_ops
+        // permits any kind that field_for_kind knows about), and never
+        // touches `calls`.
+        meta.count_ops(OpCode::IntAdd, counters::ABORT_ESCAPE);
+        assert_eq!(prof.snapshot().abort_escape, 1);
+        assert_eq!(prof.snapshot().calls, 1);
+    }
+
+    #[test]
+    fn count_routes_abort_kinds_into_profiler_atomics_and_nv_kinds_into_their_buckets() {
+        // jitprof.py:101-102 — `count(reason)` bumps the matching
+        // `Counters.*` atomic on `staticdata.profiler`.
+        let meta = MetaInterp::<()>::new(0);
+        let prof = &meta.staticdata.profiler;
+        meta.count(counters::ABORT_TOO_LONG, 1);
+        meta.count(counters::ABORT_ESCAPE, 2);
+        meta.count(counters::ABORT_BAD_LOOP, 3);
+        let snap = prof.snapshot();
+        assert_eq!(snap.abort_too_long, 1);
+        assert_eq!(snap.abort_escape, 2);
+        assert_eq!(snap.abort_bad_loop, 3);
+        meta.count(counters::NVIRTUALS, 5);
+        meta.count(counters::NVHOLES, 2);
+        meta.count(counters::NVREUSED, 7);
+        let snap = prof.snapshot();
+        assert_eq!(snap.nvirtuals, 5);
+        assert_eq!(snap.nvholes, 2);
+        assert_eq!(snap.nvreused, 7);
+    }
+
+    #[test]
+    fn execute_and_record_varargs_bumps_ops_then_record_helper_bumps_recorded_ops() {
+        // pyjitpl.py:2645 + 2658 contract: `execute_and_record_varargs`
+        // bumps `OPS` before dispatch; `_record_helper_varargs` bumps
+        // `RECORDED_OPS` (and `calls` when the op is a CALL_*).  Without
+        // an active tracing session `_record_helper_varargs` early-exits
+        // after the count_ops call, so we still observe both bumps.
+        use crate::jitcode::JitArgKind;
+        let mut meta = MetaInterp::<()>::new(0);
+        let descr_view = StubCallDescr {
+            arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Int],
+            result_type: majit_ir::Type::Int,
+            effect: majit_ir::EffectInfo::default(),
+        };
+        let descr_ref = majit_ir::descr::make_call_descr(
+            vec![majit_ir::Type::Int, majit_ir::Type::Int],
+            majit_ir::Type::Int,
+            majit_ir::EffectInfo::default(),
+        );
+        let fnaddr = execute_varargs_int_helper as *const () as i64;
+        let argboxes = [
+            (JitArgKind::Ref, OpRef(0), fnaddr),
+            (JitArgKind::Int, OpRef(1), 3),
+            (JitArgKind::Int, OpRef(2), 4),
+        ];
+        let _ = meta.execute_and_record_varargs(OpCode::CallI, &argboxes, descr_ref, &descr_view);
+        let snap = meta.staticdata.profiler.snapshot();
+        // OPS bumped exactly once (entry into execute_and_record_varargs).
+        assert_eq!(snap.ops, 1);
+        // RECORDED_OPS bumped exactly once (entry into _record_helper_varargs).
+        assert_eq!(snap.recorded_ops, 1);
+        // CALL_I + RECORDED_OPS path → calls += 1 (jitprof.py:121-122).
+        assert_eq!(snap.calls, 1);
     }
 
     #[test]
@@ -13490,10 +13680,11 @@ mod metainterp_static_data_tests {
     #[test]
     fn aborted_tracing_bumps_loops_aborted_counter() {
         // pyjitpl.py:2761/2786 — profiler.count(reason) + stats.aborted()
-        // The pyre integration folds both into the loops_aborted counter.
+        // pyre's `count` routes every Counters.ABORT_* into
+        // `loops_aborted` (reason-keyed split is a future expansion).
         let mut meta = MetaInterp::<()>::new(0);
         let stats_before = meta.get_stats();
-        meta.aborted_tracing(0);
+        meta.aborted_tracing(counters::ABORT_ESCAPE);
         let stats_after = meta.get_stats();
         assert_eq!(stats_after.loops_aborted, stats_before.loops_aborted + 1,);
     }

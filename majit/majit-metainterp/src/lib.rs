@@ -29,6 +29,7 @@ pub mod jitcode;
 mod jitdriver;
 pub mod jitexc;
 pub mod jitframe;
+pub mod jitprof;
 pub mod opencoder;
 pub mod optimize;
 pub mod optimizeopt;
@@ -78,7 +79,7 @@ pub use pyjitpl::{
     DetailedDriverRunOutcome, DriverRunOutcome, InlineDecision, JitCodeMachine, JitCodeRuntime,
     JitCodeSym, JitHooks, JitStats, MIFrame, MIFrameStack, MetaInterp, MetaInterpGlobalData,
     MetaInterpStaticData, RawCompileResult, StandaloneFrameStack, build_state_field_snapshot,
-    trace_jitcode,
+    counters, trace_jitcode,
 };
 pub use quasiimmut::QuasiImmut;
 pub use trace_ctx::{MergePoint, TraceCtx};

@@ -2416,6 +2416,12 @@ impl MIFrame {
             &active_boxes,
             &snapshot_full_types,
         );
+        // pyjitpl.py:2581: self.staticdata.profiler.count_ops(opnum, Counters.GUARDS).
+        // Atomic fetch_add through the shared `Arc<MetaInterpStaticData>`
+        // — `&self` access is enough because `JitProfiler::count_ops`
+        // bumps an `AtomicUsize` (Task #17 infrastructure).
+        ctx.profiler()
+            .count_ops(opcode, majit_metainterp::counters::GUARDS);
     }
 
     /// pyjitpl.py:2586-2602 capture_resumedata parity.

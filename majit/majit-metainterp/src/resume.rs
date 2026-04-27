@@ -3333,10 +3333,10 @@ impl ResumeDataLoopMemo {
     /// caller-supplied profiler. Called from optimizeopt/optimizer.py:557
     /// once per trace compilation. The caller owns the profiler state;
     /// the memo only exposes its counters.
-    pub fn update_counters(&self, profiler: &mut crate::pyjitpl::JitStatsCounters) {
-        profiler.nvirtuals += self.nvirtuals;
-        profiler.nvholes += self.nvholes;
-        profiler.nvreused += self.nvreused;
+    pub fn update_counters(&self, profiler: &crate::jitprof::JitProfiler) {
+        profiler.count(crate::pyjitpl::counters::NVIRTUALS, self.nvirtuals);
+        profiler.count(crate::pyjitpl::counters::NVHOLES, self.nvholes);
+        profiler.count(crate::pyjitpl::counters::NVREUSED, self.nvreused);
     }
 
     /// resume.py:286 clear_box_virtual_numbers.

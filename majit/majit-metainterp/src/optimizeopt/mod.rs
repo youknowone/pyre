@@ -4760,6 +4760,18 @@ pub trait Optimization {
     /// Name of this pass (for debugging).
     fn name(&self) -> &'static str;
 
+    /// optimizer.py:557 parity hook — drain this pass's accumulated
+    /// `Counters.*` bumps into `staticdata.profiler` and reset the
+    /// internal accumulators.
+    ///
+    /// Each pass that records its own `Counters.*` bumps
+    /// (vector.py:139/146 OPT_VECTORIZE_TRY/OPT_VECTORIZED, heap.py
+    /// HEAPCACHED_OPS, ...) overrides this; the default impl does
+    /// nothing for passes that have no counters of their own.
+    /// `Optimizer::update_counters` calls this on every pass after
+    /// each `propagate_all_forward` exit.
+    fn drain_profiler_counters(&mut self, _profiler: &crate::jitprof::JitProfiler) {}
+
     /// optimizer.py: produce_potential_short_preamble_ops(sb)
     /// Contribute operations to the short preamble builder.
     /// Called after preamble optimization to collect ops that bridges need to replay.

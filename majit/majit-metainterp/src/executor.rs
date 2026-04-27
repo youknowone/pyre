@@ -1014,11 +1014,14 @@ pub(crate) fn float_unop(values: &(impl ValueStore + ?Sized), op: &Op) -> f64 {
 /// ```
 ///
 /// For CALL_* opcodes, `func` ultimately calls `cpu.bh_call_*(funcaddr,
-/// args)`.  Pyre routes Int/Ref/Void arms through
-/// `dispatch::call_int_function` / `dispatch::call_void_function`
-/// using the concrete values carried alongside each typed argbox.
-/// The Float arm is currently stubbed — see the inline comment on
-/// `Type::Float` below for the caller-contract gap (Task #16).
+/// args)`.  Pyre routes every arm through `dispatch::call_int_function`
+/// / `dispatch::call_void_function` using the concrete values carried
+/// alongside each typed argbox.  The Float arm shares the i64-return
+/// ABI: helper concrete pointers built by `#[jit_module]` pre-pack the
+/// f64 result via `f64::to_bits` (majit-macros/src/lib.rs:194), and
+/// callers recover the f64 with `f64::from_bits(resvalue as u64)`
+/// (pyjitpl/mod.rs:8901-8902) — bit-identical to the BC_CALL_FLOAT
+/// family in blackhole.rs:2349-2371 which uses the same convention.
 /// `argboxes[0]` is the funcbox (carrying the function pointer in its
 /// `i64` slot) and the remaining slots are the typed call arguments.
 ///
@@ -1031,8 +1034,12 @@ pub(crate) fn float_unop(values: &(impl ValueStore + ?Sized), op: &Op) -> f64 {
 ///
 /// Returns the concrete result value as an `i64` — for void-returning
 /// calls returns `0` (caller ignores it); for float-returning calls
-/// returns `0` while the caller-contract for the Float arm is being
-/// audited (Task #16).
+/// the i64 carries the f64 bits via `f64::to_bits` and the caller
+/// must unpack with `f64::from_bits(resvalue as u64)`.  When the
+/// helper raises (BH_LAST_EXC_VALUE seam fires), the post-call hook
+/// transcribes onto `metainterp.last_exc_value` and overrides the
+/// result with `0` — matching `executor.py:52-78`'s neutral-zero
+/// behavior across INT, REF (NULL), FLOAT (longlong.ZEROF), and VOID.
 pub fn execute_varargs<M: Clone>(
     metainterp: &mut crate::pyjitpl::MetaInterp<M>,
     opnum: OpCode,
@@ -1119,21 +1126,28 @@ pub fn execute_varargs<M: Clone>(
             }
             majit_ir::Type::Float => {
                 // pyjitpl.py:2119 — CALL_F dispatches through cpu.bh_call_f.
-                // Pyre callers carry `funcbox.2` as a single `i64` slot,
-                // but `#[jit_module]` (majit-macros/src/lib.rs:253-272)
-                // emits two distinct float-helper wrappers — `trace_ptr`
-                // (`extern "C" fn(...) -> f64`, XMM0) and `concrete_ptr`
-                // (`extern "C" fn(...) -> i64`, GPR-packed via
-                // `f64::to_bits`).  Without a way to tell which wrapper
-                // the caller materialised into the funcbox slot, picking
-                // either ABI here risks transmuting the wrong wrapper
-                // signature.  Until the caller-contract is finalised
-                // (Task #16) and `JitCallTarget` is threaded through
-                // `(JitArgKind, OpRef, i64)`, this arm returns the
-                // type-neutral zero, matching main's previous stub.
-                // Production CALL_F goes through pyre's tracer
-                // `call_callable_value` path which has its own ABI seam.
-                0
+                // Caller-contract: every path that reaches this arm carries
+                // `funcbox.2` as a hand-written or `#[jit_module]`-generated
+                // function pointer with i64-return ABI:
+                //   * `do_recursive_call` (mod.rs:11148-11152) sets funcbox.2
+                //     to `targetjitdriver_sd.portal_runner_adr`.  Pyre's
+                //     portal entry is `bh_portal_runner(all_i, all_r, all_f)
+                //     -> i64` (pyre-jit/src/call_jit.rs:467); it never
+                //     declares an f64 return.
+                //   * `#[jit_module]` (majit-macros/src/lib.rs:267) emits a
+                //     Float helper's `concrete_ptr` as `extern "C" fn(...)
+                //     -> i64` with the f64 result pre-packed via
+                //     `f64::to_bits`; the f64-ABI `trace_ptr` is consumed
+                //     only by pyre-jit-trace's `TraceCtx::call_may_force_*`
+                //     family, which has its own seam and never reaches
+                //     this arm.
+                // Therefore route through `call_int_function` and let the
+                // caller recover the f64 via `f64::from_bits` when needed
+                // — bit-identical to blackhole.rs:2349-2371 BC_CALL_FLOAT
+                // family which makes the same ABI choice for the same
+                // reason (`registers_f` is an i64-carrier mirroring
+                // RPython's `longlong.ZEROF` packing).
+                crate::pyjitpl::call_int_function(func_ptr, &concrete_args)
             }
         }
     })();

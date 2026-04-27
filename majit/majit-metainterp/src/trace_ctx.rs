@@ -1188,6 +1188,18 @@ impl TraceCtx {
         self.green_key
     }
 
+    /// `staticdata.profiler` accessor — RPython parity for
+    /// `self.metainterp.staticdata.profiler` (pyjitpl.py:2581 etc.).
+    ///
+    /// Cross-crate tracers (`pyre-jit-trace`) reach the shared atomic
+    /// counter sink through this method instead of holding the Arc
+    /// directly; the borrow shape stays `&self` because every counter
+    /// op on [`crate::jitprof::JitProfiler`] is an `AtomicUsize`
+    /// fetch_add.
+    pub fn profiler(&self) -> &crate::jitprof::JitProfiler {
+        &self.metainterp_sd.profiler
+    }
+
     /// Root portal merge-point green key for this trace.
     ///
     /// Mirrors RPython's `current_merge_points[0]`: this stays anchored to the

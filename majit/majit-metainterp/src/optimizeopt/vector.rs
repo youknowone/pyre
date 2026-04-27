@@ -309,6 +309,18 @@ pub struct VectorizingOptimizer {
     cost_model: CostModel,
     /// schedule.py:669: label inputargs — populated on Label entry.
     label_args: Vec<OpRef>,
+    /// jitprof.Counters.OPT_VECTORIZE_TRY / OPT_VECTORIZED accumulators.
+    ///
+    /// vector.py:139 / 146 calls `metainterp_sd.profiler.count(...)`
+    /// directly inside the vectorisation entry point.  Pyre's
+    /// `VectorizingOptimizer` is an `Optimization` pass with no
+    /// `metainterp_sd` access, so we mirror the deferred-fold pattern
+    /// already in use by `Optimizer::opt_ops_emitted` etc.: bump the
+    /// accumulators here, then `Optimizer::update_counters` folds them
+    /// into `staticdata.profiler` after each
+    /// `propagate_all_forward` exit.
+    pub(crate) opt_vectorize_try_emitted: usize,
+    pub(crate) opt_vectorized_emitted: usize,
 }
 
 impl VectorizingOptimizer {
@@ -318,6 +330,8 @@ impl VectorizingOptimizer {
             in_loop: false,
             cost_model: CostModel::new(),
             label_args: Vec::new(),
+            opt_vectorize_try_emitted: 0,
+            opt_vectorized_emitted: 0,
         }
     }
 
@@ -755,8 +769,12 @@ impl Optimization for VectorizingOptimizer {
                 OptimizationResult::Emit(op.clone())
             }
             OpCode::Jump if self.in_loop => {
-                // End of loop body — attempt vectorization
+                // End of loop body — attempt vectorization.
+                // vector.py:139: metainterp_sd.profiler.count(Counters.OPT_VECTORIZE_TRY)
+                self.opt_vectorize_try_emitted = self.opt_vectorize_try_emitted.saturating_add(1);
                 if let Some(vectorized) = self.try_vectorize(ctx) {
+                    // vector.py:146: metainterp_sd.profiler.count(Counters.OPT_VECTORIZED)
+                    self.opt_vectorized_emitted = self.opt_vectorized_emitted.saturating_add(1);
                     for vop in vectorized {
                         ctx.emit(vop);
                     }
@@ -789,6 +807,22 @@ impl Optimization for VectorizingOptimizer {
 
     fn name(&self) -> &'static str {
         "vectorize_simd"
+    }
+
+    fn drain_profiler_counters(&mut self, profiler: &crate::jitprof::JitProfiler) {
+        // vector.py:139/146 — fold accumulated OPT_VECTORIZE_TRY /
+        // OPT_VECTORIZED into the shared profiler and reset so the
+        // next propagate_all_forward starts clean.
+        profiler.count(
+            crate::pyjitpl::counters::OPT_VECTORIZE_TRY,
+            self.opt_vectorize_try_emitted,
+        );
+        profiler.count(
+            crate::pyjitpl::counters::OPT_VECTORIZED,
+            self.opt_vectorized_emitted,
+        );
+        self.opt_vectorize_try_emitted = 0;
+        self.opt_vectorized_emitted = 0;
     }
 }
 
@@ -1428,5 +1462,31 @@ mod tests {
         assert_eq!(vloop.body_len(), 2); // IntAdd + IntMul
         assert!(vloop.label.is_some());
         assert!(vloop.jump.is_some());
+    }
+
+    #[test]
+    fn drain_profiler_counters_folds_opt_vectorize_try_and_opt_vectorized_into_profiler() {
+        // vector.py:139 / 146 contract via the deferred-fold pattern:
+        // VectorizingOptimizer accumulates OPT_VECTORIZE_TRY /
+        // OPT_VECTORIZED locally, and Optimizer::update_counters drains
+        // them into staticdata.profiler.  This test exercises just the
+        // drain step in isolation so an Optimization-trait method
+        // regression (e.g. forgetting to override
+        // drain_profiler_counters here) is caught without spinning up
+        // the whole optimizer.
+        use crate::pyjitpl::counters;
+        let mut vopt = VectorizingOptimizer::new();
+        vopt.opt_vectorize_try_emitted = 4;
+        vopt.opt_vectorized_emitted = 1;
+        let prof = crate::jitprof::JitProfiler::default();
+        Optimization::drain_profiler_counters(&mut vopt, &prof);
+        assert_eq!(prof.get_counter(counters::OPT_VECTORIZE_TRY), Some(4));
+        assert_eq!(prof.get_counter(counters::OPT_VECTORIZED), Some(1));
+        assert_eq!(vopt.opt_vectorize_try_emitted, 0);
+        assert_eq!(vopt.opt_vectorized_emitted, 0);
+        // Second drain is a no-op now that accumulators are zero.
+        Optimization::drain_profiler_counters(&mut vopt, &prof);
+        assert_eq!(prof.get_counter(counters::OPT_VECTORIZE_TRY), Some(4));
+        assert_eq!(prof.get_counter(counters::OPT_VECTORIZED), Some(1));
     }
 }
