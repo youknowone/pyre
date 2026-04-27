@@ -12462,17 +12462,16 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let fnaddr = execute_varargs_void_helper as *const () as i64;
+        let action = meta.force_start_tracing(
+            0,
+            (0, 0),
+            None,
+            &[Value::Ref(majit_ir::GcRef(fnaddr as usize))],
+        );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let (descr_ref, descr_view) = make_call_descr_void();
-        // Use a real callable address so executor::execute_varargs does
-        // not jump to bogus memory.  bytecode_for_address still misses
-        // because no jitcode is registered for this address.
-        let funcbox = (
-            JitArgKind::Ref,
-            OpRef(100),
-            execute_varargs_void_helper as i64,
-        );
+        let funcbox = (JitArgKind::Ref, OpRef(0), fnaddr);
         let result = meta
             .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0, None)
             .expect("Ok");
@@ -12495,14 +12494,21 @@ mod metainterp_static_data_tests {
         // falling through to do_residual_call_full — but only when the
         // funcbox OpRef is a Const (pyjitpl.py:2178 `isinstance(funcbox,
         // Const)`).
+        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let fnaddr = execute_varargs_void_helper as i64 as usize;
+        let fnaddr = execute_varargs_void_helper as *const () as i64 as usize;
         std::sync::Arc::get_mut(&mut meta.staticdata)
             .unwrap()
             .setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(fnaddr)]);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        let funcbox_ref = meta
+            .trace_ctx()
+            .expect("active trace")
+            .const_ref(fnaddr as i64);
         let (descr_ref, descr_view) = make_call_descr_void();
-        let funcbox = (JitArgKind::Ref, OpRef::from_const(0), fnaddr as i64);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr as i64);
         let result =
             meta.do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0, None);
         // Const funcbox + registered target → perform_call raises
@@ -12524,14 +12530,15 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let fnaddr = execute_varargs_void_helper as i64 as usize;
+        let fnaddr = execute_varargs_void_helper as *const () as i64 as usize;
         std::sync::Arc::get_mut(&mut meta.staticdata)
             .unwrap()
             .setup_indirectcalltargets(vec![make_jitcode_with_fnaddr(fnaddr)]);
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let action =
+            meta.force_start_tracing(0, (0, 0), None, &[Value::Ref(majit_ir::GcRef(fnaddr))]);
         assert!(matches!(action, BackEdgeAction::StartedTracing));
         let (descr_ref, descr_view) = make_call_descr_void();
-        let funcbox = (JitArgKind::Ref, OpRef(100), fnaddr as i64); // non-Const
+        let funcbox = (JitArgKind::Ref, OpRef(0), fnaddr as i64); // non-Const
         let result = meta
             .do_residual_or_indirect_call(funcbox, &[], descr_ref, &descr_view, 0, None)
             .expect("Ok — falls through to residual call, no ChangeFrame");
@@ -12554,9 +12561,17 @@ mod metainterp_static_data_tests {
     fn finishframe_raises_done_with_this_frame_int_when_stack_exhausted_with_int_result() {
         // pyjitpl.py:2497-2498: result_type == INT → raise
         // DoneWithThisFrameInt(resultbox.getint()).
+        // RPython parity: `compile_done_with_this_frame(resultbox)` reads
+        // `resultbox.getint()` — the symbolic resultbox must be a real
+        // ConstInt(0xc0ffee), not a bare unset OpRef. Mint via
+        // `ctx.const_int` so the trace's constant pool resolves the slot.
+        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let result = meta.finishframe(Some((JitArgKind::Int, 0, OpRef(100), 0xc0ffee)), true);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        let resultbox_ref = meta.trace_ctx().expect("active trace").const_int(0xc0ffee);
+        let result = meta.finishframe(Some((JitArgKind::Int, 0, resultbox_ref, 0xc0ffee)), true);
         assert!(matches!(
             result,
             Err(FinishFrameSignal::Done(DoneWithThisFrame::Int(0xc0ffee)))
@@ -12847,17 +12862,24 @@ mod metainterp_static_data_tests {
     fn build_allboxes_simple_case_no_prepend_box() {
         // pyjitpl.py:1960-1993 — without prepend_box, allboxes is just
         // [funcbox, *argboxes].
+        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
-        let meta = MetaInterp::<()>::new(0);
+        let mut meta = MetaInterp::<()>::new(0);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr = StubCallDescr {
             arg_types: vec![majit_ir::Type::Int, majit_ir::Type::Ref],
             result_type: majit_ir::Type::Int,
             effect: majit_ir::EffectInfo::default(),
         };
-        let funcbox = (JitArgKind::Ref, OpRef(100), 0xdead);
+        let ctx = meta.trace_ctx().expect("active trace");
+        let funcbox_ref = ctx.const_ref(0xdead);
+        let argbox0_ref = ctx.const_int(11);
+        let argbox1_ref = ctx.const_ref(22);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, 0xdead);
         let argboxes = [
-            (JitArgKind::Int, OpRef(1), 11),
-            (JitArgKind::Ref, OpRef(2), 22),
+            (JitArgKind::Int, argbox0_ref, 11),
+            (JitArgKind::Ref, argbox1_ref, 22),
         ];
         let all = meta._build_allboxes(funcbox, &argboxes, &descr, None);
         assert_eq!(all.len(), 3);
@@ -12870,16 +12892,23 @@ mod metainterp_static_data_tests {
     fn build_allboxes_with_prepend_box_places_it_first() {
         // pyjitpl.py:1963-1965 — prepend_box (e.g. condbox in
         // do_conditional_call) goes to slot 0.
+        use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
-        let meta = MetaInterp::<()>::new(0);
+        let mut meta = MetaInterp::<()>::new(0);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
         let descr = StubCallDescr {
             arg_types: vec![majit_ir::Type::Int],
             result_type: majit_ir::Type::Void,
             effect: majit_ir::EffectInfo::default(),
         };
-        let prepend = (JitArgKind::Int, OpRef(99), 0);
-        let funcbox = (JitArgKind::Ref, OpRef(100), 0xfeed);
-        let argboxes = [(JitArgKind::Int, OpRef(1), 1)];
+        let ctx = meta.trace_ctx().expect("active trace");
+        let prepend_ref = ctx.const_int(0);
+        let funcbox_ref = ctx.const_ref(0xfeed);
+        let argbox_ref = ctx.const_int(1);
+        let prepend = (JitArgKind::Int, prepend_ref, 0);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, 0xfeed);
+        let argboxes = [(JitArgKind::Int, argbox_ref, 1)];
         let all = meta._build_allboxes(funcbox, &argboxes, &descr, Some(prepend));
         assert_eq!(all.len(), 3);
         assert_eq!(all[0], prepend);
@@ -12935,11 +12964,9 @@ mod metainterp_static_data_tests {
             result_type: majit_ir::Type::Void,
             effect: majit_ir::EffectInfo::default(),
         };
-        let funcbox = (
-            JitArgKind::Ref,
-            OpRef(100),
-            not_in_trace_record_arg_helper as *const () as i64,
-        );
+        let fnaddr = not_in_trace_record_arg_helper as *const () as i64;
+        let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let argbox = (JitArgKind::Int, OpRef(1), 0xc0ffee);
         let allboxes = [funcbox, argbox];
 
@@ -12996,11 +13023,9 @@ mod metainterp_static_data_tests {
             result_type: majit_ir::Type::Void,
             effect: majit_ir::EffectInfo::default(),
         };
-        let funcbox = (
-            JitArgKind::Ref,
-            OpRef(100),
-            raising_not_in_trace_helper as *const () as i64,
-        );
+        let fnaddr = raising_not_in_trace_helper as *const () as i64;
+        let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
 
         // Simulate the production exception plumbing by pre-setting
         // the thread-local: the helper will write 0xfeed there, and
@@ -13063,11 +13088,9 @@ mod metainterp_static_data_tests {
             majit_ir::Type::Int,
             majit_ir::EffectInfo::default(),
         );
-        let funcbox = (
-            JitArgKind::Ref,
-            OpRef(100),
-            execute_varargs_int_helper as *const () as i64,
-        );
+        let fnaddr = execute_varargs_int_helper as *const () as i64;
+        let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let argboxes = [
             (JitArgKind::Int, OpRef(1), 4),
             (JitArgKind::Int, OpRef(2), 6),
@@ -13337,12 +13360,10 @@ mod metainterp_static_data_tests {
             majit_ir::Type::Void,
             majit_ir::EffectInfo::default(),
         );
+        let fnaddr = cond_call_void_helper as *const () as i64;
+        let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
         let condbox = (JitArgKind::Int, OpRef(50), 1);
-        let funcbox = (
-            JitArgKind::Ref,
-            OpRef(100),
-            cond_call_void_helper as *const () as i64,
-        );
+        let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let result = meta.do_conditional_call(
             condbox,
             funcbox,
@@ -13367,10 +13388,27 @@ mod metainterp_static_data_tests {
     #[test]
     fn do_conditional_call_emits_cond_call_value_int_when_is_value() {
         // pyjitpl.py:2141-2146 — is_value=True + Int result → COND_CALL_VALUE_I.
+        // RPython sets funcbox to a Const* fn pointer; we deliberately
+        // seed funcbox as a live Ref inputarg (OpRef(0)) instead because
+        // pyre's record_result_of_call_pure (trace_ctx.rs:2685-2706)
+        // unconditionally folds when normargboxes (`argboxes[1..]`,
+        // skipping condbox) are all Const. With a Const funcbox + empty
+        // argboxes the fold fires and cuts the COND_CALL_VALUE_I op,
+        // hiding the recording path this test exercises. Using a live
+        // Ref inputarg keeps the op in the trace until the
+        // record_result_of_call_pure parity gap (cond_value should fold
+        // only when condbox is known-true, not unconditionally) is
+        // closed in a follow-up.
         use crate::BackEdgeAction;
         use crate::jitcode::JitArgKind;
         let mut meta = MetaInterp::<()>::new(0);
-        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        let fnaddr = execute_varargs_int_helper as *const () as i64;
+        let action = meta.force_start_tracing(
+            0,
+            (0, 0),
+            None,
+            &[Value::Ref(majit_ir::GcRef(fnaddr as usize))],
+        );
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let descr_view = StubCallDescr {
@@ -13384,11 +13422,7 @@ mod metainterp_static_data_tests {
             majit_ir::EffectInfo::default(),
         );
         let condbox = (JitArgKind::Int, OpRef(50), 0);
-        let funcbox = (
-            JitArgKind::Ref,
-            OpRef(100),
-            execute_varargs_int_helper as *const () as i64,
-        );
+        let funcbox = (JitArgKind::Ref, OpRef(0), fnaddr);
         let result = meta.do_conditional_call(
             condbox,
             funcbox,
@@ -13433,11 +13467,9 @@ mod metainterp_static_data_tests {
             effect: effect.clone(),
         };
         let descr_ref = majit_ir::descr::make_call_descr(vec![], majit_ir::Type::Int, effect);
-        let funcbox = (
-            JitArgKind::Ref,
-            OpRef(100),
-            execute_varargs_int_helper as *const () as i64,
-        );
+        let fnaddr = execute_varargs_int_helper as *const () as i64;
+        let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
 
         let result =
             meta.do_residual_call_full(funcbox, &[], descr_ref, &descr_view, 0, false, None, None);
@@ -13480,11 +13512,9 @@ mod metainterp_static_data_tests {
             majit_ir::Type::Int,
             majit_ir::EffectInfo::default(),
         );
-        let funcbox = (
-            JitArgKind::Ref,
-            OpRef(100),
-            execute_varargs_int_helper as *const () as i64,
-        );
+        let fnaddr = execute_varargs_int_helper as *const () as i64;
+        let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let argboxes = [
             funcbox,
             (JitArgKind::Int, OpRef(1), 5),
@@ -13527,11 +13557,9 @@ mod metainterp_static_data_tests {
             majit_ir::Type::Int,
             majit_ir::EffectInfo::default(),
         );
-        let funcbox = (
-            JitArgKind::Ref,
-            OpRef(100),
-            execute_varargs_int_helper as *const () as i64,
-        );
+        let fnaddr = execute_varargs_int_helper as *const () as i64;
+        let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let argboxes = [
             funcbox,
             (JitArgKind::Int, OpRef(1), 7),
@@ -13551,7 +13579,7 @@ mod metainterp_static_data_tests {
             .expect("CallI must be recorded");
         assert_eq!(op.pos, opref);
         assert_eq!(op.args.len(), 3);
-        assert_eq!(op.args[0], OpRef(100));
+        assert_eq!(op.args[0], funcbox_ref);
         assert_eq!(op.args[1], OpRef(1));
         assert_eq!(op.args[2], OpRef(2));
     }
@@ -13576,11 +13604,9 @@ mod metainterp_static_data_tests {
             majit_ir::Type::Void,
             majit_ir::EffectInfo::default(),
         );
-        let funcbox = (
-            JitArgKind::Ref,
-            OpRef(100),
-            execute_varargs_void_helper as *const () as i64,
-        );
+        let fnaddr = execute_varargs_void_helper as *const () as i64;
+        let funcbox_ref = meta.trace_ctx().expect("active trace").const_ref(fnaddr);
+        let funcbox = (JitArgKind::Ref, funcbox_ref, fnaddr);
         let result =
             meta.execute_and_record_varargs(OpCode::CallN, &[funcbox], descr_ref, &descr_view);
         assert!(result.is_none(), "void call must return None");
@@ -14825,6 +14851,14 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard_op = mk_op(OpCode::GuardNotForced, &[], OpRef::NONE.0);
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef(1), OpRef(0)]));
+        // pyre cranelift test-fixture quirk (NOT RPython parity): the bare
+        // OpRef(100) literal is paired with `constants.insert(100, ...)` below
+        // because `backend.set_constants` keys the function-pointer literal by
+        // raw OpRef value. RPython expresses the same callable as a `Const*`
+        // box wrapping the address; pyre's test backend short-circuits that by
+        // exposing the address through a HashMap whose key happens to equal
+        // the OpRef raw bits. Keep the literal in sync with the constants
+        // entry — they are co-load-bearing.
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
             mk_op(OpCode::ForceToken, &[], 2),
@@ -15744,6 +15778,10 @@ mod tests {
         // Install a simple compiled loop with a guard
         let green_key = 50;
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
+        // Backend test-fixture quirk (NOT RPython parity): both constants
+        // are paired with `constants.insert(100|101, ...)` below; the
+        // backend HashMap keys the function-pointer / value literals by
+        // raw OpRef value. RPython expresses these as Const* boxes.
         let _const_one = OpRef(100);
         let const_zero = OpRef(101);
         let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef(2)], OpRef::NONE.0);
