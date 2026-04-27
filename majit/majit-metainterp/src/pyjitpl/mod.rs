@@ -10452,15 +10452,26 @@ impl<M: Clone> MetaInterp<M> {
             target_sd.num_reds(),
             "pyjitpl.py:3596 — direct_assembler_call args.len() must match num_red_args",
         );
-        // pyjitpl.py:3597-3599 token = warmrunnerstate.get_assembler_token(greenargs)
-        let arg_types: Vec<Type> = args
-            .iter()
-            .map(|(kind, _, _)| match kind {
-                crate::jitcode::JitArgKind::Int => Type::Int,
-                crate::jitcode::JitArgKind::Ref => Type::Ref,
-                crate::jitcode::JitArgKind::Float => Type::Float,
-            })
-            .collect();
+        // pyjitpl.py:3597-3599 token = warmrunnerstate.get_assembler_token(greenargs).
+        //
+        // S2.4 follow-up: pull `arg_types` from `target_sd.red_args_types`
+        // (warmspot.py:664) — the static spec is the source of truth.
+        // The previous shape recomputed types from runtime arg kinds
+        // every call; the consistency assert at
+        // compile.rs::compile_tmp_callback (S2.4) already locks the
+        // contract that the runtime kinds match jd.red_args_types in
+        // declaration order, so the two derivations are observationally
+        // identical. Routing through the static spec removes the
+        // per-call recomputation and makes the failure surface
+        // immediate when a future caller drifts from the registered
+        // driver.
+        let arg_types: Vec<Type> = target_sd.red_arg_types_as_ir_types();
+        debug_assert_eq!(
+            arg_types.len(),
+            args.len(),
+            "pyjitpl.py:3596 already verified args.len() == num_red_args; \
+             red_arg_types_as_ir_types must agree with that count",
+        );
         let green_values: Vec<i64> = greenargs.iter().map(|(_, _, value)| *value).collect();
         let green_key = crate::green_key_hash(&green_values);
         let (target_token, vable_index) = if let Some(token) = self.get_loop_token(green_key) {
@@ -11151,6 +11162,19 @@ impl<M: Clone> MetaInterp<M> {
         pc: usize,
         assembler_call: bool,
     ) -> Result<Option<(OpRef, i64)>, DoResidualCallAbort> {
+        // S2.1 invariant (wiggly-barto plan, mirrors `compile_tmp_callback`'s
+        // pre-check at compile.rs:2123): the recursive-call funcbox dereferences
+        // `portal_runner_adr` directly (line below), so a 0 address would jump
+        // to NULL on the bh_call_r side. `warmspot.py:1010-1012` populates this
+        // before any do_recursive_call can fire; `debug_assert!` catches a
+        // mis-wired registration in dev/test builds (the bench harness runs in
+        // dev so violations surface via `pyre/check.sh`).
+        debug_assert!(
+            targetjitdriver_sd.portal_runner_adr != 0,
+            "do_recursive_call: targetjitdriver_sd.portal_runner_adr is 0 — \
+             warmspot.py:1010-1012 must populate it before any recursive-call \
+             site can build a CALL_ASSEMBLER funcbox"
+        );
         // pyjitpl.py:1428: k = targetjitdriver_sd.portal_runner_adr
         let k = targetjitdriver_sd.portal_runner_adr;
         // pyjitpl.py:1429: funcbox = ConstInt(adr2int(k))
@@ -12246,6 +12270,23 @@ impl MetaInterpStaticData {
     /// `pyjitpl.py:2266` `self.jitdrivers_sd = codewriter.callcontrol.jitdrivers_sd`,
     /// except pyre populates the table incrementally as drivers register
     /// instead of taking it wholesale from the codewriter's CallControl.
+    ///
+    /// # S2.1 invariant (wiggly-barto plan)
+    ///
+    /// The caller must populate `jd.portal_runner_adr` to the host's
+    /// `ll_portal_runner` address (`warmspot.py:1010-1012`) **before**
+    /// passing the driver to this function. `compile_tmp_callback`
+    /// (`compile.rs::compile_tmp_callback`) and
+    /// `MIFrame::do_recursive_call` (`pyjitpl/mod.rs::do_recursive_call`)
+    /// both `debug_assert!(jd.portal_runner_adr != 0)` at their entry
+    /// points; a `0`-address registration silently broke the trampoline
+    /// in earlier iterations because the assertion fired only at the
+    /// guard-failure-bridge boundary, far from the registration site.
+    ///
+    /// `portal_calldescr`, `portal_finishtoken`, and `propagate_exc_descr`
+    /// are populated automatically by the
+    /// [`Self::finish_setup_descrs_for_jitdrivers`] tail call below; the
+    /// caller does not need to set them.
     pub fn register_jitdriver_sd(
         &mut self,
         jd: crate::jitdriver::JitDriverStaticData,
@@ -12717,6 +12758,10 @@ mod metainterp_static_data_tests {
             portal_calldescr: None,
             portal_finishtoken: None,
             propagate_exc_descr: None,
+            red_args_types: vec![],
+            no_loop_header: false,
+            assembler_helper_adr: 0,
+            vable_token_descr: None,
         };
         {
             let MetaInterp {
@@ -13550,6 +13595,37 @@ mod metainterp_static_data_tests {
 
     extern "C" fn portal_runner_helper() -> i64 {
         0xc0ffee
+    }
+
+    /// S2.1 invariant (wiggly-barto plan): `do_recursive_call` requires
+    /// `portal_runner_adr != 0`. The default `with_virtualizable` /
+    /// `JitDriverStaticData::new` constructor leaves the address at 0
+    /// until the host runtime populates it (`warmspot.py:1010-1012`).
+    /// Skipping the population must trip the debug_assert at
+    /// `do_recursive_call` entry — locks the contract so a future
+    /// caller that forgets to wire `portal_runner_adr` fails fast in
+    /// dev/test builds (the bench harness runs in dev profile).
+    #[test]
+    #[should_panic(expected = "portal_runner_adr is 0")]
+    fn do_recursive_call_panics_when_portal_runner_adr_is_zero() {
+        use crate::BackEdgeAction;
+        let mut meta = MetaInterp::<()>::new(0);
+        let action = meta.force_start_tracing(0, (0, 0), None, &[]);
+        assert!(matches!(action, BackEdgeAction::StartedTracing));
+        let descr_view = StubCallDescr {
+            arg_types: vec![],
+            result_type: majit_ir::Type::Int,
+            effect: majit_ir::EffectInfo::default(),
+        };
+        let descr_ref = majit_ir::descr::make_call_descr(
+            vec![],
+            majit_ir::Type::Int,
+            majit_ir::EffectInfo::default(),
+        );
+        // Deliberately do NOT set jd.portal_runner_adr — the default 0
+        // sentinel must trigger the S2.1 invariant assertion.
+        let jd = crate::jitdriver::JitDriverStaticData::new(vec![], vec![]);
+        let _ = meta.do_recursive_call(&jd, &[], descr_ref, &descr_view, 0, 0, false);
     }
 
     #[test]

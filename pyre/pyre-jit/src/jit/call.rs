@@ -82,11 +82,29 @@ pub struct JitDriverStaticData {
     /// pyre-only: the `PyObjectRef` wrapper around `portal_graph`,
     /// kept on the jd so the trace-side jitcode table indexes by the
     /// same identity the runtime uses.
+    ///
+    /// **Deletion criterion (S3.2)**: removable once a canonical
+    /// `CodeObject ↔ PyObjectRef` registry exists, OR every callback
+    /// that consumes `w_code` (green-key build, get_jitcode, the
+    /// portal-discovery hook in `eval.rs::jit_merge_point_hook`) has
+    /// migrated to keying by the raw `*const CodeObject` stored in
+    /// `portal_graph`. Until then this slot is the single source of
+    /// truth that bridges the two identities — see the wiggly-barto
+    /// epic plan, "Risk Assessment" row 4.
     pub w_code: *const (),
     /// pyre-only refinement hint forwarded to `get_jitcode`.
     /// `Some(pc)` rebuilds the cached `PyJitCode` if the recorded
     /// merge-point PC changes from a previous registration. RPython
     /// has no analog because its portal PCs are statically known.
+    ///
+    /// **Deletion criterion (S3.2)**: removable once the per-Python-bytecode
+    /// `orgpc` is carried explicitly by `MIFrame`'s
+    /// `BC_JIT_MERGE_POINT` payload (mirroring upstream `pyjitpl.py:
+    /// 1536-1538` `orgpc` operand) and the JitCode PC ↔ Python PC map
+    /// is the single source of truth. Until then this slot keeps the
+    /// existing trace-side `make_green_key(code, pc)` lookup keyed on
+    /// the same merge-point PC the runtime registered — see plan
+    /// "Risk Assessment" row 3.
     pub merge_point_pc: Option<usize>,
 }
 

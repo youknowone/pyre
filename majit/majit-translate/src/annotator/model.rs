@@ -2207,6 +2207,32 @@ impl SomeValue {
                     .into_iter()
                     .map(|(k, v)| (format!("s_{k}"), v))
                     .collect();
+                // upstream `SomeBuiltin.analyser` is the bound method
+                // `entry.compute_result_annotation` for builtins
+                // produced via `extregistry.py:62-67` —
+                // `SomeBuiltin(self.compute_result_annotation, ...)`.
+                // Rust splits dispatch in two: the registered
+                // `BUILTIN_ANALYZERS` table covers the `bookkeeper.py`
+                // builtin path, and entries from the value-level
+                // extregistry (rlib/jit.py markers, etc.) carry their
+                // host identity in `const_box`. Re-look-up the
+                // ExtRegistryEntry via that identity and dispatch
+                // through `compute_annotation_with_kwds` so the
+                // marker's `compute_result_annotation` body fires
+                // exactly as `analyser(*args_s, **kwds_s)` does
+                // upstream.
+                if let Some(c) = sb.base.const_box.as_ref()
+                    && let crate::flowspace::model::ConstValue::HostObject(_) = &c.value
+                    && let Some(entry) =
+                        crate::translator::rtyper::extregistry::lookup(&c.value)
+                    && matches!(
+                        entry,
+                        crate::translator::rtyper::extregistry::ExtRegistryEntry::EnterLeaveMarker { .. }
+                            | crate::translator::rtyper::extregistry::ExtRegistryEntry::LoopHeader { .. }
+                    )
+                {
+                    return entry.compute_annotation_with_kwds(&bk, &kwds_s);
+                }
                 super::builtin::call_builtin(&bk, &sb.analyser_name, &args_s, &kwds_s)
             }
             _ => Err(AnnotatorError::new(

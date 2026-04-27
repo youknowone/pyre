@@ -3138,6 +3138,23 @@ pub struct GraphFunc {
     /// can apply the same default as upstream's
     /// `getattr(func, 'relax_sig_check', False)`.
     pub relax_sig_check: Option<bool>,
+    /// Upstream function attribute set by
+    /// `ExtEnterLeaveMarker.compute_result_annotation` at
+    /// `rpython/rlib/jit.py:916-921`:
+    ///
+    /// ```python
+    /// try:
+    ///     graph = self.bookkeeper.position_key[0]
+    ///     graph.func._dont_reach_me_in_del_ = True
+    /// except (TypeError, AttributeError):
+    ///     pass
+    /// ```
+    ///
+    /// Read by `rpython/rtyper/rclass.py` to suppress the
+    /// `_del_method_must_not_run_when_jit_marker_is_present` assertion
+    /// for graphs that contain a `jit_merge_point`. `false` mirrors the
+    /// "attribute absent" upstream default.
+    pub _dont_reach_me_in_del_: bool,
     /// Upstream `func.exported_symbol` attribute set by
     /// `rpython/rlib/entrypoint.py:10-12 export_symbol(func)` —
     /// `func.exported_symbol = True; return func`. Consumed only by
@@ -3192,6 +3209,7 @@ impl GraphFunc {
             _generator_next_method_of_: None,
             _jit_look_inside_: None,
             relax_sig_check: None,
+            _dont_reach_me_in_del_: false,
             exported_symbol: Arc::new(AtomicBool::new(false)),
             _llfnobjattrs_: HashMap::new(),
             globals,

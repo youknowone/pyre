@@ -4799,4 +4799,111 @@ mod tests {
             vec![],
         );
     }
+
+    /// Upstream parity test for the entry-level dispatch shape — a
+    /// straight port of `test_jtransform.py:1011-1046 test_jit_merge_point_1`.
+    ///
+    /// Input: `try_handle_jit_marker(JitMergePoint, [receiver, g1, g2,
+    /// r1])` with two greens and one red, all int-typed via
+    /// TypeResolutionState. Expected output (`promote_greens` +
+    /// `handle_jit_marker__jit_merge_point`):
+    ///
+    /// ```text
+    /// op0 = -live-
+    /// op1 = int_guard_value(g1)
+    /// op2 = -live-
+    /// op3 = int_guard_value(g2)
+    /// op4 = -live-                                   ← live_preamble
+    /// op5 = jit_merge_point(idx, I[g1,g2], R[], F[], ← merge
+    ///                       I[r1],     R[], F[])
+    /// op6 = -live-                                   ← live_recursive
+    /// ```
+    ///
+    /// Locks the entry-level `try_handle_jit_marker` ↔
+    /// `promote_greens` ↔ `handle_jit_marker__jit_merge_point`
+    /// composition shape so a regression that drops the promote_greens
+    /// prefix or the trailing live ops fails immediately.
+    #[test]
+    fn try_handle_jit_marker_jit_merge_point_emits_full_promote_greens_sequence() {
+        use crate::jit_codewriter::call::CallControl;
+        use crate::jit_codewriter::type_state::{ConcreteType, TypeResolutionState};
+        use crate::parse::CallPath;
+
+        let g1 = ValueId(10);
+        let g2 = ValueId(11);
+        let r1 = ValueId(12);
+        let receiver = ValueId(99);
+
+        let mut cc = CallControl::new();
+        cc.setup_jitdriver(
+            CallPath::from_segments(["test", "portal"]),
+            vec!["green1".into(), "green2".into()],
+            vec!["red1".into()],
+            Vec::new(),
+            Vec::new(),
+        );
+
+        let mut ts = TypeResolutionState::new();
+        ts.concrete_types.insert(g1, ConcreteType::Signed);
+        ts.concrete_types.insert(g2, ConcreteType::Signed);
+        ts.concrete_types.insert(r1, ConcreteType::Signed);
+
+        let config = GraphTransformConfig::default();
+        let mut transformer = Transformer::new(&config)
+            .with_callcontrol(&mut cc)
+            .with_portal_jd(Some(0))
+            .with_type_state(&ts);
+
+        let args = [receiver, g1, g2, r1];
+        let ops = transformer
+            .try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args)
+            .expect("portal_jd + cc + 2-greens + 1-red satisfies dispatch preconditions");
+
+        assert_eq!(ops.len(), 7, "promote_greens(2 greens)*2 + merge*3 = 7");
+
+        // promote_greens prefix: -live-, int_guard_value(g1), -live-, int_guard_value(g2)
+        assert!(matches!(ops[0].kind, OpKind::Live));
+        match &ops[1].kind {
+            OpKind::GuardValue { value, kind_char } => {
+                assert_eq!(*value, g1);
+                assert_eq!(*kind_char, 'i');
+            }
+            other => panic!("ops[1] expected GuardValue(g1, 'i'), got {other:?}"),
+        }
+        assert!(matches!(ops[2].kind, OpKind::Live));
+        match &ops[3].kind {
+            OpKind::GuardValue { value, kind_char } => {
+                assert_eq!(*value, g2);
+                assert_eq!(*kind_char, 'i');
+            }
+            other => panic!("ops[3] expected GuardValue(g2, 'i'), got {other:?}"),
+        }
+        // live_preamble + merge + live_recursive
+        assert!(matches!(ops[4].kind, OpKind::Live));
+        match &ops[5].kind {
+            OpKind::JitMergePoint {
+                jitdriver_index,
+                greens_i,
+                greens_r,
+                greens_f,
+                reds_i,
+                reds_r,
+                reds_f,
+            } => {
+                assert_eq!(*jitdriver_index, 0);
+                assert_eq!(greens_i, &vec![g1, g2]);
+                assert!(greens_r.is_empty());
+                assert!(greens_f.is_empty());
+                assert_eq!(reds_i, &vec![r1]);
+                assert!(reds_r.is_empty());
+                assert!(reds_f.is_empty());
+            }
+            other => panic!("ops[5] expected JitMergePoint, got {other:?}"),
+        }
+        assert!(matches!(ops[6].kind, OpKind::Live));
+        assert!(
+            ops[5].result.is_none(),
+            "jit_merge_point produces no result"
+        );
+    }
 }

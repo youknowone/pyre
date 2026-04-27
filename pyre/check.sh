@@ -3,6 +3,7 @@
 # Usage:
 #   ./pyre/check.sh [--backend dynasm|cranelift] [--timeout-scale N]
 #                   [--dynasm-timeout-scale N] [--cranelift-timeout-scale N]
+#                   [--snapshot|--snapshot-diff] [--threshold=N]
 #                   [path/to/pyre]
 
 set -euo pipefail
@@ -12,12 +13,18 @@ DYNASM_TIMEOUT_SCALE=""
 CRANELIFT_TIMEOUT_SCALE=""
 TIMEOUT_SCALE="1"
 PYRE_PATH=""
+SNAPSHOT_MODE=""    # "" | record | diff
+THRESHOLD_PCT=""    # numeric percentage; empty = no gate
+SNAP_DIR="pyre/check.snap"
+SNAPSHOT_DIFFS=()
+SNAPSHOT_MISSING=()
 
 usage() {
     cat <<'EOF'
 Usage:
   ./pyre/check.sh [--backend dynasm|cranelift] [--timeout-scale N]
                   [--dynasm-timeout-scale N] [--cranelift-timeout-scale N]
+                  [--snapshot|--snapshot-diff] [--threshold=N]
                   [path/to/pyre]
 
 Options:
@@ -25,10 +32,19 @@ Options:
   --timeout-scale N             Multiply all benchmark timeouts by N.
   --dynasm-timeout-scale N      Override dynasm timeout multiplier.
   --cranelift-timeout-scale N   Override cranelift timeout multiplier.
+  --snapshot                    Record per-bench output and user CPU time
+                                under pyre/check.snap/<backend>/.
+  --snapshot-diff               Compare current run against saved snapshot;
+                                fail when output bytes differ.
+  --threshold=N                 Fail when current user CPU time exceeds the
+                                snapshot baseline by more than N%. Requires a
+                                saved snapshot. Combinable with --snapshot-diff.
 
 Notes:
   - Without --backend, the script runs both dynasm and cranelift.
   - The optional positional binary path is only accepted with --backend.
+  - Snapshots are gitignored and per-machine. Re-record with --snapshot when
+    output changes intentionally.
 EOF
 }
 
@@ -50,6 +66,14 @@ while [[ $# -gt 0 ]]; do
             CRANELIFT_TIMEOUT_SCALE="$2"; shift 2 ;;
         --cranelift-timeout-scale=*)
             CRANELIFT_TIMEOUT_SCALE="${1#*=}"; shift ;;
+        --snapshot)
+            SNAPSHOT_MODE="record"; shift ;;
+        --snapshot-diff)
+            SNAPSHOT_MODE="diff"; shift ;;
+        --threshold)
+            THRESHOLD_PCT="$2"; shift 2 ;;
+        --threshold=*)
+            THRESHOLD_PCT="${1#*=}"; shift ;;
         -h|--help)
             usage
             exit 0 ;;
@@ -309,6 +333,59 @@ run_and_capture() {
     rm -f "$out_file" "$time_file"
 }
 
+SNAP_GATE_STATUS=""
+SNAP_GATE_REASON=""
+
+snapshot_path() {
+    # $1 backend, $2 name, $3 suffix (out|time)
+    printf '%s' "$SNAP_DIR/$1/$2.$3"
+}
+
+apply_snapshot_gate() {
+    local backend="$1" name="$2" output="$3" elapsed="$4"
+    local out_path time_path saved_out saved_time slower
+    SNAP_GATE_STATUS="ok"
+    SNAP_GATE_REASON=""
+    out_path=$(snapshot_path "$backend" "$name" out)
+    time_path=$(snapshot_path "$backend" "$name" time)
+
+    if [[ "$SNAPSHOT_MODE" == "record" ]]; then
+        mkdir -p "$SNAP_DIR/$backend"
+        printf '%s' "$output" > "$out_path"
+        printf '%s' "$elapsed" > "$time_path"
+    fi
+
+    if [[ "$SNAPSHOT_MODE" == "diff" ]]; then
+        if [[ ! -f "$out_path" ]]; then
+            SNAPSHOT_MISSING+=("$backend/$name")
+        else
+            saved_out=$(cat "$out_path")
+            if [[ "$output" != "$saved_out" ]]; then
+                SNAPSHOT_DIFFS+=("$backend/$name")
+                SNAP_GATE_STATUS="fail"
+                SNAP_GATE_REASON="snapshot output diff"
+                return
+            fi
+        fi
+    fi
+
+    if [[ -n "$THRESHOLD_PCT" && "$elapsed" != "-" && -f "$time_path" ]]; then
+        saved_time=$(cat "$time_path")
+        if [[ -n "$saved_time" && "$saved_time" != "-" ]]; then
+            slower=$(python3 -c "
+elapsed = float('$elapsed')
+saved = float('$saved_time')
+limit = saved * (1 + $THRESHOLD_PCT / 100.0)
+print('yes' if elapsed > limit else 'no')" 2>/dev/null || echo "no")
+            if [[ "$slower" == "yes" ]]; then
+                SNAP_GATE_STATUS="fail"
+                SNAP_GATE_REASON="threshold ${elapsed}s > baseline ${saved_time}s +${THRESHOLD_PCT}%"
+                return
+            fi
+        fi
+    fi
+}
+
 record_result() {
     local backend="$1" status="$2" name="$3" detail="$4"
     if [[ "$status" == "PASS" ]]; then
@@ -379,6 +456,14 @@ run_backend_bench() {
             append_comparison "$backend" "$name" "$(fmt_time "$t_cpython")" "$(fmt_time "$t_pypy")" "$(fmt_time "$elapsed")" "(${ratio} vs pypy)"
             return
         fi
+    fi
+
+    apply_snapshot_gate "$backend" "$name" "$output" "$elapsed"
+    if [[ "$SNAP_GATE_STATUS" == "fail" ]]; then
+        record_result "$backend" "FAIL" "$name" "$SNAP_GATE_REASON"
+        printf "$(red "SNAPDIFF")  %s\n" "$SNAP_GATE_REASON"
+        append_comparison "$backend" "$name" "$(fmt_time "$t_cpython")" "$(fmt_time "$t_pypy")" "SNAPDIFF"
+        return
     fi
 
     record_result "$backend" "PASS" "$name" "${elapsed}s"
@@ -494,6 +579,17 @@ if [[ -n "$BACKEND" ]]; then
     esac
 fi
 
+if [[ -n "$THRESHOLD_PCT" ]]; then
+    if ! python3 -c "float('$THRESHOLD_PCT')" >/dev/null 2>&1; then
+        echo "ERROR: --threshold expects a number, got '$THRESHOLD_PCT'"
+        exit 1
+    fi
+fi
+if [[ "$SNAPSHOT_MODE" == "record" && -n "$THRESHOLD_PCT" ]]; then
+    echo "NOTE: --threshold ignored in --snapshot record mode"
+    THRESHOLD_PCT=""
+fi
+
 if [[ -n "$BACKEND" ]]; then
     build_backend "$BACKEND"
     pyre_bin="${PYRE_PATH:-$(default_binary_for_backend "$BACKEND")}"
@@ -587,6 +683,26 @@ fi
 
 print_comparison_table
 echo ""
+if [[ -n "$SNAPSHOT_MODE" || -n "$THRESHOLD_PCT" ]]; then
+    case "$SNAPSHOT_MODE" in
+        record)
+            echo "$(dim "snapshot recorded under $SNAP_DIR/")" ;;
+        diff)
+            if [ ${#SNAPSHOT_DIFFS[@]} -gt 0 ]; then
+                echo "$(red "snapshot diff"): ${#SNAPSHOT_DIFFS[@]} bench(es) — ${SNAPSHOT_DIFFS[*]}"
+            fi
+            if [ ${#SNAPSHOT_MISSING[@]} -gt 0 ]; then
+                echo "$(dim "snapshot missing"): ${#SNAPSHOT_MISSING[@]} bench(es) — ${SNAPSHOT_MISSING[*]}"
+            fi
+            if [ ${#SNAPSHOT_DIFFS[@]} -eq 0 ] && [ ${#SNAPSHOT_MISSING[@]} -eq 0 ]; then
+                echo "$(dim "snapshot diff: clean")"
+            fi ;;
+    esac
+    if [[ -n "$THRESHOLD_PCT" ]]; then
+        echo "$(dim "threshold: ±${THRESHOLD_PCT}% vs baseline")"
+    fi
+    echo ""
+fi
 if backend_enabled dynasm; then
     if [ $DYNASM_FAIL -gt 0 ]; then
         echo "$(red "FAILED"): dynasm $DYNASM_FAIL failed, $DYNASM_PASS passed"

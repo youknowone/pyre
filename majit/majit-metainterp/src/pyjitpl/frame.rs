@@ -182,6 +182,51 @@ impl MIFrame {
         read_u16(&self.jitcode.code, &mut self.code_cursor)
     }
 
+    /// pyjitpl.py:1530-1535 `MIFrame.verify_green_args(jitdriver_sd, varargs)`.
+    ///
+    /// ```python
+    /// def verify_green_args(self, jitdriver_sd, varargs):
+    ///     num_green_args = jitdriver_sd.num_green_args
+    ///     assert len(varargs) == num_green_args
+    ///     for i in range(num_green_args):
+    ///         assert isinstance(varargs[i], Const)
+    /// ```
+    ///
+    /// Called from `opimpl_jit_merge_point` (pyjitpl.py:1541) so the
+    /// metainterp aborts immediately if a green arg arrives as a Box
+    /// (non-constant) — that would mean the codewriter / annotator
+    /// failed to mark it as compile-time-known. The pyre port lifts
+    /// `varargs` from the upstream `boxes3` typed-list to a flat
+    /// `&[OpRef]` (the trace-side representation of green args after
+    /// `make_three_lists` flattens by kind in jtransform). Each element
+    /// must satisfy [`OpRef::is_constant`] — the constant-namespace
+    /// flag set by `OpRef::from_const`.
+    ///
+    /// Production callers land with S2.3 follow-up (the metainterp-side
+    /// `opimpl_jit_merge_point` port). For now the helper is dead code
+    /// outside tests; it locks the contract upstream relies on so a
+    /// future caller cannot silently accept a non-Const green.
+    pub fn verify_green_args(
+        jitdriver_sd: &crate::jitdriver::JitDriverStaticData,
+        varargs: &[majit_ir::OpRef],
+    ) {
+        let num_green_args = jitdriver_sd.num_green_args();
+        assert_eq!(
+            varargs.len(),
+            num_green_args,
+            "verify_green_args: expected {} greens, got {}",
+            num_green_args,
+            varargs.len()
+        );
+        for (i, opref) in varargs.iter().enumerate() {
+            assert!(
+                opref.is_constant(),
+                "verify_green_args: greens[{i}] = {opref:?} is not a Const \
+                 (upstream pyjitpl.py:1534 asserts isinstance(varargs[i], Const))",
+            );
+        }
+    }
+
     /// pyjitpl.py:98-119 `MIFrame.copy_constants`.
     ///
     /// RPython copies each entry of `jitcode.constants_{i,r,f}` into the
@@ -1113,5 +1158,41 @@ mod tests {
         assert!(frame.int_regs[1].is_some());
         assert!(frame.ref_regs[1].is_some());
         assert!(frame.float_regs[1].is_some());
+    }
+
+    /// pyjitpl.py:1530-1535 — `verify_green_args` accepts only Const
+    /// OpRefs whose count matches `jitdriver_sd.num_green_args`.
+    #[test]
+    fn verify_green_args_accepts_constants_matching_num_greens() {
+        use majit_ir::Type;
+        let jd = crate::jitdriver::JitDriverStaticData::new(
+            vec![("g0", Type::Int), ("g1", Type::Int)],
+            vec![("r0", Type::Int)],
+        );
+        let greens = vec![OpRef::from_const(0), OpRef::from_const(1)];
+        // Must not panic — both opref are Const-tagged and length matches.
+        MIFrame::verify_green_args(&jd, &greens);
+    }
+
+    #[test]
+    #[should_panic(expected = "expected 2 greens")]
+    fn verify_green_args_rejects_wrong_count() {
+        use majit_ir::Type;
+        let jd = crate::jitdriver::JitDriverStaticData::new(
+            vec![("g0", Type::Int), ("g1", Type::Int)],
+            vec![],
+        );
+        // Only one green provided — must fail count check.
+        MIFrame::verify_green_args(&jd, &[OpRef::from_const(0)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "is not a Const")]
+    fn verify_green_args_rejects_non_const_opref() {
+        use majit_ir::Type;
+        let jd = crate::jitdriver::JitDriverStaticData::new(vec![("g0", Type::Int)], vec![]);
+        // Plain OpRef(0) is in the operation namespace (no CONST_BIT) —
+        // upstream pyjitpl.py:1534 asserts isinstance(varargs[i], Const).
+        MIFrame::verify_green_args(&jd, &[OpRef(0)]);
     }
 }

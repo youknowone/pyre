@@ -18,6 +18,13 @@ cranelift-module = "0.130"
 cranelift-native = "0.130"
 target-lexicon = "0.13"
 
+[features]
+# No-op feature — declared so workspace-wide `cargo test --all
+# --features dynasm` does not error on a crate that has no dynasm
+# code path. The cranelift backend has no dynasm-specific code; this
+# crate stays unaffected when the workspace selects the dynasm feature.
+dynasm = []
+
 [dev-dependencies]
 majit-metainterp = { workspace = true, features = ["cranelift"] }
 smallvec = "1"

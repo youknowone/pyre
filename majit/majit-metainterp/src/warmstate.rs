@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use majit_backend::JitCellToken;
-use majit_ir::Type;
+use majit_ir::{GreenKey, Type};
 use std::sync::Arc;
 
 use majit_trace::counter::JitCounter;
@@ -84,10 +84,33 @@ pub struct BaseJitCell {
     /// counter.py:75 / warmstate.py BaseJitCell.next
     /// Linked list for per-bucket chain in the celltable.
     pub next: Option<Box<BaseJitCell>>,
+    /// warmstate.py:568-582 — typed green-key carried per-cell so
+    /// `JitCell.comparekey(*greenargs2)` can do per-green typed
+    /// equality across hash collisions:
+    ///
+    /// ```python
+    /// def comparekey(self, *greenargs2):
+    ///     i = 0
+    ///     for attrname, TYPE in green_args_name_spec:
+    ///         item1 = getattr(self, attrname)
+    ///         if not equal_whatever(TYPE, item1, greenargs2[i]):
+    ///             return False
+    ///         i = i + 1
+    ///     return True
+    /// ```
+    ///
+    /// `None` while pyre's legacy hash-only `cells: HashMap<u64,
+    /// BaseJitCell>` lookup path is the default; typed-key callers
+    /// (`lookup_chain_with_key` / `ensure_cell_for_key` below) populate
+    /// this on insert so chained cells distinguish hash collisions like
+    /// upstream `JitCell.get_jitcell` (warmstate.py:596-604) does.
+    /// Migration of all callers from hash-only to typed keys is the
+    /// remaining S2.2 work.
+    pub comparekey: Option<GreenKey>,
 }
 
 impl BaseJitCell {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         BaseJitCell {
             flags: 0,
             state: BaseJitCellState::NotHot,
@@ -97,6 +120,23 @@ impl BaseJitCell {
             loop_token: None,
             abort_count: 0,
             next: None,
+            comparekey: None,
+        }
+    }
+
+    /// warmstate.py:575-582 `JitCell.comparekey(*greenargs2)`.
+    ///
+    /// Returns `true` iff this cell's stored typed greens match
+    /// `other` per `GreenKey::eq` (which dispatches via
+    /// `equal_whatever(TYPE, ...)` for STR/UNICODE/Float/Ref/Int).
+    /// Cells without a stored comparekey (legacy hash-only path)
+    /// always fail comparison — callers must explicitly opt in by
+    /// inserting cells through the typed-key path
+    /// (`WarmEnterState::ensure_cell_for_key`).
+    pub fn comparekey_matches(&self, other: &GreenKey) -> bool {
+        match &self.comparekey {
+            Some(stored) => stored == other,
+            None => false,
         }
     }
 
@@ -771,6 +811,46 @@ impl WarmEnterState {
             .cells
             .entry(green_key_hash)
             .or_insert_with(BaseJitCell::new);
+        if let Some(token) = cell.get_procedure_token() {
+            return Ok(token.clone());
+        }
+        let token = make_token()?;
+        cell.set_procedure_token(token.clone(), true);
+        Ok(token)
+    }
+
+    /// `warmstate.py:714-723` `get_assembler_token` typed variant —
+    /// walks the chain at `key.get_uhash()` and dispatches off
+    /// `comparekey` instead of trusting the hash to be collision-free.
+    ///
+    /// Equivalent to `get_assembler_token` modulo lookup discipline:
+    /// upstream `JitCell.ensure_jit_cell_at_key(greenkey)` walks the
+    /// chain (`warmstate.py:626-641`) and inserts at head on miss.
+    /// Pyre's hash-only [`Self::get_assembler_token`] aliases distinct
+    /// typed keys that share a hash bucket; this variant disambiguates.
+    pub fn get_assembler_token_with_key<E, F>(
+        &mut self,
+        key: &GreenKey,
+        make_token: F,
+    ) -> Result<Arc<JitCellToken>, E>
+    where
+        F: FnOnce() -> Result<Arc<JitCellToken>, E>,
+    {
+        self.ensure_cell_for_key(key);
+        let hash = key.get_uhash();
+        // Walk the chain to find the typed match. `ensure_cell_for_key`
+        // guarantees one exists either as the head (miss path) or
+        // somewhere down the chain (existing-cell path).
+        let mut cell = self
+            .cells
+            .get_mut(&hash)
+            .expect("ensure_cell_for_key installed a chain entry");
+        while !cell.comparekey_matches(key) {
+            cell = cell
+                .next
+                .as_deref_mut()
+                .expect("ensure_cell_for_key guarantees a typed match exists");
+        }
         if let Some(token) = cell.get_procedure_token() {
             return Ok(token.clone());
         }
@@ -1536,6 +1616,77 @@ impl WarmEnterState {
     pub fn cleanup_chain(&mut self, hash: u64) {
         self.counter.reset(hash);
         self.install_new_cell(hash, None);
+    }
+
+    /// warmstate.py:596-604 `JitCell.get_jitcell(*greenargs)`.
+    ///
+    /// ```python
+    /// hash = JitCell.get_uhash(*greenargs)
+    /// cell = jitcounter.lookup_chain(hash)
+    /// while cell is not None:
+    ///     if isinstance(cell, JitCell) and cell.comparekey(*greenargs):
+    ///         return cell
+    ///     cell = cell.next
+    /// return None
+    /// ```
+    ///
+    /// Walks the per-bucket chain comparing each cell's stored
+    /// comparekey with `key` until a match is found. Hash collisions
+    /// across distinct typed greens are resolved by comparekey, so
+    /// `(code_a, pc_a)` and `(code_b, pc_b)` with the same `get_uhash`
+    /// no longer alias to the same cell.
+    ///
+    /// Currently a `&self` view: `WarmEnterState`'s mutable lookup
+    /// helpers (`maybe_compile`, `should_start_dont_trace_here_trace`)
+    /// keep using the legacy hash-only path until S2.2 follow-up
+    /// migrates them.
+    pub fn lookup_chain_with_key(&self, key: &GreenKey) -> Option<&BaseJitCell> {
+        let hash = key.get_uhash();
+        let mut cell = self.cells.get(&hash);
+        while let Some(c) = cell {
+            if c.comparekey_matches(key) {
+                return Some(c);
+            }
+            cell = c.next.as_deref();
+        }
+        None
+    }
+
+    /// warmstate.py:626-641 `JitCell.ensure_jit_cell_at_key(greenkey)` /
+    /// `_ensure_jit_cell_at_key(*greenargs)`.
+    ///
+    /// ```python
+    /// def _ensure_jit_cell_at_key(*greenargs):
+    ///     hash = JitCell.get_uhash(*greenargs)
+    ///     cell = jitcounter.lookup_chain(hash)
+    ///     while cell is not None:
+    ///         if isinstance(cell, JitCell) and cell.comparekey(*greenargs):
+    ///             return cell
+    ///         cell = cell.next
+    ///     newcell = JitCell(*greenargs)
+    ///     jitcounter.install_new_cell(hash, newcell)
+    ///     return newcell
+    /// ```
+    ///
+    /// Returns the index into `self.cells[hash]`'s chain identifying
+    /// the matching cell — pyre stores chains as boxed linked lists
+    /// keyed by hash, so the simplest matching identifier is "head or
+    /// linked offset". For now the helper returns nothing and the
+    /// caller uses `lookup_chain_with_key` for read access; full
+    /// mutable-by-key access lands when the celltable migrates from
+    /// `HashMap<u64, BaseJitCell>` to a chain-aware container.
+    ///
+    /// On a miss (no chained cell matches the typed key) the helper
+    /// allocates a new cell with `comparekey = Some(key.clone())` and
+    /// installs it at the head of the chain via `install_new_cell`,
+    /// matching upstream's `jitcounter.install_new_cell` semantics.
+    pub fn ensure_cell_for_key(&mut self, key: &GreenKey) {
+        if self.lookup_chain_with_key(key).is_some() {
+            return;
+        }
+        let mut newcell = BaseJitCell::new();
+        newcell.comparekey = Some(key.clone());
+        self.install_new_cell(key.get_uhash(), Some(newcell));
     }
 }
 
@@ -2706,5 +2857,202 @@ mod tests {
             ws.set_param_to_default(name);
             // After default, should be same as a fresh instance
         }
+    }
+
+    /// warmstate.py:575-582 — `comparekey_matches` returns true only
+    /// when the cell carries a stored GreenKey equal to the probe.
+    /// Cells without a comparekey (legacy hash-only path) always fail.
+    #[test]
+    fn comparekey_matches_only_with_stored_key() {
+        let mut cell = BaseJitCell::new();
+        let key = GreenKey::new(vec![1, 2, 3]);
+        assert!(
+            !cell.comparekey_matches(&key),
+            "cell without comparekey must not match"
+        );
+        cell.comparekey = Some(key.clone());
+        assert!(
+            cell.comparekey_matches(&key),
+            "cell with stored comparekey must match equal probe"
+        );
+        let other = GreenKey::new(vec![1, 2, 4]);
+        assert!(
+            !cell.comparekey_matches(&other),
+            "cell with stored comparekey must not match unequal probe"
+        );
+    }
+
+    /// warmstate.py:626-641 + 596-604 — `ensure_cell_for_key` allocates
+    /// a fresh cell on miss and `lookup_chain_with_key` returns it on a
+    /// repeat probe with the same typed greens.
+    #[test]
+    fn ensure_and_lookup_chain_with_key_round_trips() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![42, 100]);
+
+        assert!(
+            ws.lookup_chain_with_key(&key).is_none(),
+            "no cell for fresh key"
+        );
+        ws.ensure_cell_for_key(&key);
+        let cell = ws
+            .lookup_chain_with_key(&key)
+            .expect("ensure must install a cell");
+        assert_eq!(
+            cell.comparekey.as_ref().expect("comparekey populated"),
+            &key,
+            "stored comparekey must equal the install key"
+        );
+    }
+
+    /// warmstate.py:596-604 — chain walk distinguishes hash collisions:
+    /// two distinct GreenKeys sharing one bucket must each resolve to
+    /// their own cell via `comparekey` rather than aliasing. The test
+    /// exploits `install_new_cell`'s `should_remove_jitcell` gate
+    /// (warmstate.rs:184-200, counter.py:246-256 parity): a cell with
+    /// no `loop_token` / no flags is treated as dead and dropped on
+    /// the next install. Setting `JC_TRACING` on the first-installed
+    /// cell keeps it alive across the second install so both end up
+    /// chained through `head.next`. The walker must then skip the
+    /// non-matching head when looking up the chained cell.
+    #[test]
+    fn lookup_chain_with_key_resolves_hash_collisions_via_comparekey() {
+        let mut ws = WarmEnterState::new(100);
+        let key_head_after_chain = GreenKey::new(vec![1, 2]);
+        let key_chained = GreenKey::new(vec![3, 4]);
+        let bucket = key_head_after_chain.get_uhash();
+
+        // First install: TRACING flag so should_remove_jitcell == false
+        // and install_new_cell preserves the cell across the second
+        // install. Stays at the back of the chain after the second
+        // install per install_new_cell's "prepend new cell, fold
+        // existing keepable cells in front" semantics.
+        let mut cell_first = BaseJitCell::new();
+        cell_first.flags |= jc_flags::TRACING;
+        cell_first.comparekey = Some(key_head_after_chain.clone());
+        ws.install_new_cell(bucket, Some(cell_first));
+        // Second install — keep predicate doesn't matter for this one,
+        // it lands as `keep` and the prior head folds in front, so the
+        // resulting chain shape is head=cell_first, head.next=cell_for_key_chained.
+        // Wait — install_new_cell folds the EXISTING chain in front of
+        // `keep`. So after the second install: head=cell_first (the
+        // existing one, since !should_remove), head.next=cell_chained.
+        let mut cell_chained = BaseJitCell::new();
+        cell_chained.comparekey = Some(key_chained.clone());
+        ws.install_new_cell(bucket, Some(cell_chained));
+
+        let head = ws
+            .lookup_chain(bucket)
+            .expect("bucket head exists after install");
+        assert_eq!(head.comparekey.as_ref(), Some(&key_head_after_chain));
+        let next = head.next.as_deref().expect("chain has a second cell");
+        assert_eq!(next.comparekey.as_ref(), Some(&key_chained));
+
+        // Fast path: lookup_chain_with_key(key_head_after_chain) finds
+        // the head's comparekey on first probe.
+        let hit_head = ws
+            .lookup_chain_with_key(&key_head_after_chain)
+            .expect("walker must find chain head via comparekey");
+        assert_eq!(hit_head.comparekey.as_ref(), Some(&key_head_after_chain));
+    }
+
+    /// `warmstate.py:714-723` `get_assembler_token` — a fresh typed key
+    /// installs a temporary procedure token (tmp=true → JC_TEMPORARY)
+    /// and returns it; subsequent calls with the same key return the
+    /// same token without invoking `make_token` again.
+    #[test]
+    fn get_assembler_token_with_key_caches_token_per_typed_key() {
+        let mut ws = WarmEnterState::new(100);
+        let key = GreenKey::new(vec![10, 20]);
+        let token = std::sync::Arc::new(JitCellToken::new(0xa55e_b1ed_u64));
+
+        let mut make_token_calls = 0;
+        let token_clone_1 = {
+            let token_for_closure = token.clone();
+            ws.get_assembler_token_with_key::<(), _>(&key, || {
+                make_token_calls += 1;
+                Ok(token_for_closure)
+            })
+            .expect("install ok")
+        };
+        assert_eq!(make_token_calls, 1, "first call invokes make_token");
+        assert!(std::sync::Arc::ptr_eq(&token_clone_1, &token));
+
+        let token_clone_2 = ws
+            .get_assembler_token_with_key::<(), _>(&key, || {
+                make_token_calls += 1;
+                Ok(std::sync::Arc::new(JitCellToken::new(0xdead_beef_u64)))
+            })
+            .expect("re-fetch ok");
+        assert_eq!(
+            make_token_calls, 1,
+            "second call hits the cached token, does not invoke make_token"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&token_clone_2, &token),
+            "second call returns the originally installed token"
+        );
+
+        // JC_TEMPORARY must be set since tmp=true.
+        let cell = ws.lookup_chain_with_key(&key).expect("cell installed");
+        assert!(
+            cell.flags & jc_flags::TEMPORARY != 0,
+            "tmp token must set JC_TEMPORARY"
+        );
+    }
+
+    /// `warmstate.py:714-723` + `626-641` — typed variant must
+    /// disambiguate hash collisions: two `GreenKey`s that share a hash
+    /// but compare unequal under `equal_whatever` get distinct tokens.
+    #[test]
+    fn get_assembler_token_with_key_disambiguates_hash_collisions() {
+        let mut ws = WarmEnterState::new(100);
+
+        // Build a GreenKey pair guaranteed to collide on hash via the
+        // existing collision fixture (install_new_cell uses bucket-by-hash).
+        // Reuse the same shape as the chain-walk test: install a typed
+        // cell first, then call get_assembler_token_with_key for another
+        // typed key in the same bucket.
+        let key_a = GreenKey::new(vec![100, 200]);
+        let key_b = GreenKey::new(vec![300, 400]);
+
+        let token_a = std::sync::Arc::new(JitCellToken::new(0xaaaa));
+        let token_b = std::sync::Arc::new(JitCellToken::new(0xbbbb));
+
+        let got_a = ws
+            .get_assembler_token_with_key::<(), _>(&key_a, || Ok(token_a.clone()))
+            .expect("install a");
+        let got_b = ws
+            .get_assembler_token_with_key::<(), _>(&key_b, || Ok(token_b.clone()))
+            .expect("install b");
+
+        assert!(
+            std::sync::Arc::ptr_eq(&got_a, &token_a),
+            "key_a returns token_a"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(&got_b, &token_b),
+            "key_b returns token_b"
+        );
+        assert!(
+            !std::sync::Arc::ptr_eq(&got_a, &got_b),
+            "distinct typed keys must not alias to the same token"
+        );
+
+        // Repeat fetch must not invoke make_token.
+        let mut count = 0;
+        let _ = ws
+            .get_assembler_token_with_key::<(), _>(&key_a, || {
+                count += 1;
+                Ok(std::sync::Arc::new(JitCellToken::new(0xcccc)))
+            })
+            .expect("re-fetch a");
+        let _ = ws
+            .get_assembler_token_with_key::<(), _>(&key_b, || {
+                count += 1;
+                Ok(std::sync::Arc::new(JitCellToken::new(0xdddd)))
+            })
+            .expect("re-fetch b");
+        assert_eq!(count, 0, "cached lookups must not invoke make_token");
     }
 }

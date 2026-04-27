@@ -2120,6 +2120,36 @@ pub fn compile_tmp_callback(
     greenboxes: &[Value],
     red_arg_types: &[Type],
 ) -> Result<Arc<JitCellToken>, BackendError> {
+    // S2.1 invariant (wiggly-barto plan): every `JitDriverStaticData` reaching
+    // `compile_tmp_callback` must have `portal_runner_adr` AND `portal_calldescr`
+    // populated. `portal_runner_adr == 0` is the "attribute absent" sentinel
+    // upstream (`warmspot.py:1010-1012` sets the address before any tmp_callback
+    // can fire); `portal_calldescr.is_none()` means
+    // `MetaInterpStaticData::finish_setup_descrs_for_jitdrivers` (pyjitpl/mod.rs:
+    // 12336-12338, mirroring `pyjitpl.py:2274-2281` + `warmspot.py:1013-1017`)
+    // never ran for this driver, so `funcbox` would dereference a null portal
+    // address and the resulting tmp callback would jump to 0x0. `debug_assert!`
+    // catches the misuse in dev/test builds (the bench harness runs in dev
+    // profile so violations surface in `pyre/check.sh`); release builds opt
+    // out for the same hot-path reason upstream avoids per-call asserts.
+    debug_assert!(
+        jitdriver_sd.portal_runner_adr != 0,
+        "compile_tmp_callback: jitdriver_sd.portal_runner_adr is 0 — \
+         warmspot.py:1010-1012 must populate portal_runner_adr before tmp_callback \
+         can build a real funcbox"
+    );
+    debug_assert!(
+        jitdriver_sd.portal_calldescr.is_some(),
+        "compile_tmp_callback: jitdriver_sd.portal_calldescr is None — \
+         MetaInterpStaticData::register_jitdriver_sd must have run \
+         finish_setup_descrs_for_jitdrivers (pyjitpl.py:2274-2281 + \
+         warmspot.py:1013-1017) so the CALL_* descr is available"
+    );
+    // The caller-supplied `red_arg_types` ↔ `jd.red_args_types` consistency
+    // check lives below the upstream length assertion (`compile.py:1113`)
+    // adjacent to the InputArg loop so the two signal-pairs (length /
+    // typed-shape) sit together. See the `debug_assert_eq!` block at
+    // `compile.py:1113` parity below.
     // `compile.py:1107` `jitcell_token = make_jitcell_token(jitdriver_sd)`.
     // Pyre adaptation: the token carries `green_key` (enabling cell lookup
     // on later CALL_ASSEMBLER) and `virtualizable_arg_index` (cached from
@@ -2136,12 +2166,27 @@ pub fn compile_tmp_callback(
     // module is not ported; skip.
     //
     // `compile.py:1112` `nb_red_args = jitdriver_sd.num_red_args`.
-    let nb_red_args = jitdriver_sd.num_reds();
+    let nb_red_args = jitdriver_sd.num_red_args();
     // `compile.py:1113` `assert len(redargtypes) == nb_red_args`.
     assert_eq!(
         red_arg_types.len(),
         nb_red_args,
         "compile_tmp_callback: red_arg_types length mismatch",
+    );
+    // S2.4 contract (wiggly-barto plan): caller-passed `red_arg_types`
+    // must match `jd.red_args_types` — upstream's `compile.py:1107-1124`
+    // reads `redargtypes` from `jitdriver_sd.red_args_types` directly so
+    // the tmp-callback signature is owned by the jd, not by the call
+    // site. Pyre still threads `red_arg_types` through the parameter
+    // list while runtime callers derive kinds from CALL_ASSEMBLER args
+    // (see pyjitpl/mod.rs:10444-10451); this assertion locks the
+    // invariant so the S2.4 cutover can drop the parameter without
+    // a silent semantic shift.
+    debug_assert_eq!(
+        red_arg_types,
+        jitdriver_sd.red_arg_types_as_ir_types().as_slice(),
+        "compile_tmp_callback: caller-provided red_arg_types must match \
+         jd.red_args_types — warmspot.py:664 makes the jd the source of truth"
     );
     // `compile.py:1114-1124` build `inputargs`:
     //     for kind in redargtypes:

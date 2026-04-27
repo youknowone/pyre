@@ -146,6 +146,50 @@ pub struct JitDriverStaticData {
     /// instance across all jitdrivers.  Used as the `GUARD_NO_EXCEPTION`
     /// descr emitted by `compile_tmp_callback` (`compile.py:1141`).
     pub propagate_exc_descr: Option<majit_ir::DescrRef>,
+    /// jitdriver.py:14 `self.red_args_types ... rpython.jit.metainterp.warmspot`.
+    ///
+    /// `warmspot.py:664` `red_args_types = [history.getkind(TYPE)[0] for
+    /// TYPE in jd._JIT_ENTER_FUNCTYPE.ARGS[jd.num_green_args:]]`.
+    /// One char per red arg: 'i' / 'r' / 'f'. Consumed by
+    /// `compile_tmp_callback` (`compile.py:1107-1118`) to decide the
+    /// `CALL_*` opcode for each red and to size `rd_consts` /
+    /// `rd_unicodes` arrays.
+    ///
+    /// Populated at construction from `vars[red].tp.to_char()`.
+    pub red_args_types: Vec<char>,
+    /// jitdriver.py:20 `self.no_loop_header ... rpython.jit.metainterp.warmspot`.
+    ///
+    /// `warmspot.py:558` sets True when the codewriter has not emitted a
+    /// `loop_header` op for this driver — read by `MIFrame.opimpl_jit_
+    /// merge_point` (`pyjitpl.py:1571-1574`) to skip the implicit
+    /// `can_enter_jit` check at the merge point.
+    ///
+    /// Default `false` matches upstream's "attribute absent until
+    /// warmspot decides otherwise" state.
+    pub no_loop_header: bool,
+    /// jitdriver.py:27 `self.assembler_helper_adr` (CALL_ASSEMBLER).
+    ///
+    /// `warmspot.py:1031-1035` `jd.assembler_helper_adr =
+    /// llmemory.cast_ptr_to_adr(self.cpu.cast_ptr_to_int(
+    /// assembler_helper_ptr))`. Address of the per-driver
+    /// `assembler_helper` callable invoked by the backend's
+    /// `CALL_ASSEMBLER` op to handle the `done_with_this_frame_*` /
+    /// `propagate_exception` post-loop branch.
+    ///
+    /// `0` mirrors upstream's "attribute absent" / "not yet wired" state
+    /// — populated by S2.1 alongside `portal_runner_adr`.
+    pub assembler_helper_adr: i64,
+    /// jitdriver.py:29 `self.vable_token_descr` (CALL_ASSEMBLER).
+    ///
+    /// `warmspot.py:546` `jd.vable_token_descr = self.cpu.fielddescrof(
+    /// VABLERTI, 'vable_token')`. Used by the backend's `CALL_ASSEMBLER`
+    /// op to load / clear the virtualizable's `vable_token` slot when
+    /// crossing the assembler-helper boundary.
+    ///
+    /// `None` until the per-driver virtualizable layout is known —
+    /// populated alongside `virtualizable_info` once the host runtime
+    /// supplies the field descriptor.
+    pub vable_token_descr: Option<majit_ir::DescrRef>,
 }
 
 impl JitDriverStaticData {
@@ -167,6 +211,15 @@ impl JitDriverStaticData {
         for (name, tp) in reds {
             vars.push(JitDriverVar::red(name, tp));
         }
+        // warmspot.py:664 — `red_args_types` carries one history-kind
+        // char per red arg in declaration order. Built from the red-only
+        // slice of `vars` so adding a green/red split helper later (S2)
+        // does not need a parallel update path here.
+        let red_args_types: Vec<char> = vars
+            .iter()
+            .filter(|v| v.kind == VarKind::Red)
+            .map(|v| v.tp.to_char())
+            .collect();
         let mut sd = JitDriverStaticData {
             index: None,
             vars,
@@ -181,6 +234,10 @@ impl JitDriverStaticData {
             portal_calldescr: None,
             portal_finishtoken: None,
             propagate_exc_descr: None,
+            red_args_types,
+            no_loop_header: false,
+            assembler_helper_adr: 0,
+            vable_token_descr: None,
         };
         // warmspot.py:529/538 — keep `index_of_virtualizable` in sync
         // with the `virtualizable_arg_index()` derived from `reds`.
@@ -253,6 +310,104 @@ impl JitDriverStaticData {
     /// Number of red variables.
     pub fn num_reds(&self) -> usize {
         self.vars.iter().filter(|v| v.kind == VarKind::Red).count()
+    }
+
+    /// jitdriver.py:12 `self.num_green_args ... rpython.jit.metainterp.warmspot`.
+    ///
+    /// Upstream-canonical name; alias of [`Self::num_greens`]. Matches
+    /// `warmspot.py:665` `jd.num_green_args = len(jd._green_args_spec)`
+    /// callers (`compile.py:1107-1118` `compile_tmp_callback`,
+    /// `pyjitpl.py:1530-1535` green-constant assertion).
+    pub fn num_green_args(&self) -> usize {
+        self.num_greens()
+    }
+
+    /// jitdriver.py:13 `self.num_red_args ... rpython.jit.metainterp.warmspot`.
+    ///
+    /// Upstream-canonical name; alias of [`Self::num_reds`]. Matches
+    /// `warmspot.py:666` `jd.num_red_args = len(red_args_types)` callers
+    /// (`compile.py:1107-1118` red-arg loop bounds).
+    pub fn num_red_args(&self) -> usize {
+        self.num_reds()
+    }
+
+    /// `warmspot.py:663` `jd._green_args_spec = [TYPE for ARG, TYPE in
+    /// jd._JIT_ENTER_FUNCTYPE.ARGS[:jd.num_green_args]]`.
+    ///
+    /// Returns the per-green-arg `GreenType` spec used by
+    /// `make_unwrap_greenkey` (`warmstate.py:535-553`) and
+    /// `make_jitcell_subclass` (`warmstate.py:557-654`) to dispatch
+    /// `equal_whatever` / `hash_whatever`.
+    ///
+    /// PRE-EXISTING-ADAPTATION: pyre's `JitDriverVar.tp` carries only
+    /// the IR-level [`Type`] (i/r/f/v) without the upstream STR/UNICODE
+    /// distinction (`GreenType::Str`, `GreenType::Unicode`). The
+    /// resulting spec collapses string / unicode greens to plain
+    /// `GreenType::Ref` and falls back to pointer identity equality.
+    /// Drivers that need typed string greens must override via the
+    /// `EntryPoint::schema` registration path (`register_entry_point_typed`
+    /// at jitdriver.rs:2047) until the IR carries the subtype natively.
+    pub fn green_args_spec(&self) -> Vec<GreenType> {
+        self.vars
+            .iter()
+            .filter(|v| v.kind == VarKind::Green)
+            .map(|v| GreenType::from(v.tp))
+            .collect()
+    }
+
+    /// Convert `self.red_args_types` (history-kind char list per
+    /// `warmspot.py:664`) into the IR-level `Type` slice consumed by
+    /// `compile_tmp_callback` (`compile.py:1114-1124` red-arg loop).
+    ///
+    /// Pyre stores `red_args_types: Vec<char>` to mirror upstream's
+    /// `'i' / 'r' / 'f'` representation; this helper bridges to the IR
+    /// `Type` enum without the caller having to re-implement the
+    /// mapping. The S2.4 cutover will drop the explicit `red_arg_types`
+    /// argument from `compile_tmp_callback` and read from the jd
+    /// directly via this helper.
+    ///
+    /// Panics if any entry is not one of 'i', 'r', 'f', 'v'.
+    pub fn red_arg_types_as_ir_types(&self) -> Vec<Type> {
+        self.red_args_types
+            .iter()
+            .map(|c| match c {
+                'i' => Type::Int,
+                'r' => Type::Ref,
+                'f' => Type::Float,
+                'v' => Type::Void,
+                other => panic!(
+                    "JitDriverStaticData::red_arg_types_as_ir_types: \
+                     unknown history kind char {:?} in red_args_types — \
+                     warmspot.py:664 emits only 'i' / 'r' / 'f' / 'v'",
+                    other
+                ),
+            })
+            .collect()
+    }
+
+    /// `warmstate.py:535-553` `make_unwrap_greenkey().unwrap_greenkey(greenkey)`.
+    ///
+    /// Upstream's `unwrap_greenkey` walks `_green_args_spec` and calls
+    /// `unwrap(TYPE, greenbox)` on each `Const` greenbox, returning a
+    /// tuple of unwrapped values. Pyre's caller has already extracted
+    /// the `i64` payload from the `Const` opref before calling this
+    /// helper (the upstream `Const`-isinstance check lives in
+    /// `MIFrame::verify_green_args` at `frame.rs` per `pyjitpl.py:1530-1535`),
+    /// so the input here is the already-unwrapped value list.
+    ///
+    /// Panics if `values.len() != self.num_green_args()` — upstream's
+    /// spec-driven loop has an implicit assertion via the
+    /// `unrolling_iterable` length match.
+    pub fn unwrap_greenkey(&self, values: &[i64]) -> GreenKey {
+        let spec = self.green_args_spec();
+        assert_eq!(
+            values.len(),
+            spec.len(),
+            "unwrap_greenkey: expected {} green values per _green_args_spec, got {}",
+            spec.len(),
+            values.len(),
+        );
+        GreenKey::with_types(values.to_vec(), spec)
     }
 
     /// Get the virtualizable variable, if any.
@@ -4184,5 +4339,85 @@ mod tests {
             driver.meta.staticdata.op_live,
             crate::jitcode::BC_LIVE as i32,
         );
+    }
+
+    /// `warmspot.py:663-665` `jd._green_args_spec = [...]` /
+    /// `jd.num_green_args = len(jd._green_args_spec)` — spec length
+    /// must match the number of green vars on the jd.
+    #[test]
+    fn green_args_spec_length_matches_num_green_args() {
+        let sd = JitDriverStaticData::new(
+            vec![("g0", Type::Int), ("g1", Type::Ref)],
+            vec![("r0", Type::Int)],
+        );
+        let spec = sd.green_args_spec();
+        assert_eq!(spec.len(), sd.num_green_args());
+        assert_eq!(spec, vec![GreenType::Int, GreenType::Ref]);
+    }
+
+    /// `warmstate.py:535-553` `make_unwrap_greenkey().unwrap_greenkey(greenkey)`
+    /// — the resulting `GreenKey` carries values + types in declaration
+    /// order so `comparekey` / `get_uhash` dispatch is type-correct.
+    #[test]
+    fn unwrap_greenkey_uses_green_args_spec_in_declaration_order() {
+        let sd = JitDriverStaticData::new(
+            vec![("g_int", Type::Int), ("g_ref", Type::Ref)],
+            vec![("r_int", Type::Int)],
+        );
+        let key = sd.unwrap_greenkey(&[42, 0xdeadbeef]);
+        assert_eq!(key.values, vec![42, 0xdeadbeef]);
+        assert_eq!(key.types, vec![GreenType::Int, GreenType::Ref]);
+    }
+
+    /// `warmstate.py:535-553` — upstream's `unrolling_iterable` loop
+    /// implicitly asserts `len(greenkey) == len(_green_args_spec)`. The
+    /// pyre helper makes that assertion explicit.
+    #[test]
+    #[should_panic(expected = "expected 2 green values per _green_args_spec, got 1")]
+    fn unwrap_greenkey_panics_when_value_count_mismatches_spec() {
+        let sd = JitDriverStaticData::new(vec![("g0", Type::Int), ("g1", Type::Int)], vec![]);
+        let _ = sd.unwrap_greenkey(&[42]);
+    }
+
+    /// `warmspot.py:664` `red_args_types = [history.getkind(TYPE)[0] ...]`.
+    /// The IR-type bridge must preserve declaration order and each char
+    /// must round-trip to the matching `Type` variant.
+    #[test]
+    fn red_arg_types_as_ir_types_maps_chars_in_declaration_order() {
+        let sd = JitDriverStaticData::new(
+            vec![],
+            vec![("r0", Type::Int), ("r1", Type::Ref), ("r2", Type::Float)],
+        );
+        let mapped = sd.red_arg_types_as_ir_types();
+        assert_eq!(mapped, vec![Type::Int, Type::Ref, Type::Float]);
+        assert_eq!(mapped.len(), sd.num_red_args());
+    }
+
+    /// `warmspot.py:664` only emits 'i' / 'r' / 'f' / 'v'; an unknown
+    /// char indicates corrupted state and must surface immediately.
+    #[test]
+    #[should_panic(expected = "unknown history kind char")]
+    fn red_arg_types_as_ir_types_panics_on_unknown_char() {
+        let mut sd = JitDriverStaticData::new(vec![], vec![("r0", Type::Int)]);
+        sd.red_args_types = vec!['x'];
+        let _ = sd.red_arg_types_as_ir_types();
+    }
+
+    /// `warmstate.py:574-582` `JitCell.comparekey(*greenargs2)` — two
+    /// `GreenKey`s built from the same spec + values must compare equal,
+    /// and a value mismatch in any position must compare unequal.
+    #[test]
+    fn unwrap_greenkey_round_trips_through_comparekey_matches() {
+        use crate::warmstate::BaseJitCell;
+
+        let sd = JitDriverStaticData::new(vec![("g0", Type::Int), ("g1", Type::Ref)], vec![]);
+        let key_a = sd.unwrap_greenkey(&[7, 0x1000]);
+        let key_b = sd.unwrap_greenkey(&[7, 0x1000]);
+        let key_c = sd.unwrap_greenkey(&[7, 0x2000]);
+
+        let mut cell = BaseJitCell::new();
+        cell.comparekey = Some(key_a);
+        assert!(cell.comparekey_matches(&key_b));
+        assert!(!cell.comparekey_matches(&key_c));
     }
 }

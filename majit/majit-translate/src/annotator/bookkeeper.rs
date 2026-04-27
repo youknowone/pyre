@@ -39,7 +39,8 @@ use super::dictdef::DictDef;
 use super::listdef::ListDef;
 use super::model::{
     AnnotatorError, SomeBool, SomeBuiltin, SomeChar, SomeDict, SomeFloat, SomeInteger, SomeList,
-    SomePBC, SomeString, SomeTuple, SomeUnicodeCodePoint, SomeUnicodeString, SomeValue, s_none,
+    SomePBC, SomeString, SomeTuple, SomeUnicodeCodePoint, SomeUnicodeString, SomeValue,
+    s_impossible_value, s_none, union,
 };
 use super::policy::AnnotatorPolicy;
 use crate::flowspace::argument::CallShape;
@@ -216,6 +217,24 @@ pub struct Bookkeeper {
     pub pbc_maximal_call_families: RefCell<UnionFind<DescKey, Rc<RefCell<CallFamily>>>>,
     /// RPython `self.emulated_pbc_calls = {}` (bookkeeper.py:66).
     pub emulated_pbc_calls: RefCell<HashMap<EmulatedPbcCallKey, (SomePBC, Vec<SomeValue>)>>,
+    /// RPython `bookkeeper._jit_annotation_cache = {}`
+    /// (rlib/jit.py:903-914), populated lazily by
+    /// `ExtEnterLeaveMarker.compute_result_annotation`.
+    ///
+    /// Outer key: JitDriver `HostObject` identity — RPython keys on
+    /// the driver object directly (`cache = self.bookkeeper.
+    /// _jit_annotation_cache[driver]`), so the Rust port keys on the
+    /// `HostObject` whose `Hash` / `Eq` already match upstream's
+    /// `id(driver)` semantics. Storing the `HostObject` (not just
+    /// `usize`) preserves the strong reference upstream holds via the
+    /// dict, avoiding identity reuse if the underlying object is
+    /// dropped. Inner map: kwarg name → merged annotation across all
+    /// `jit_merge_point` / `can_enter_jit` call sites for that
+    /// driver. Upstream merges via `annmodel.unionof`; the Rust port
+    /// uses [`super::model::union`] (model.rs:2568) with
+    /// [`super::model::s_impossible_value`] (model.rs:2436) as the
+    /// seed for the first hit.
+    pub _jit_annotation_cache: RefCell<HashMap<HostObject, HashMap<String, SomeValue>>>,
     /// RPython `self.immutable_cache = {}` (bookkeeper.py:61), keyed by
     /// the identity of `Constant(x)` for the List / Dict / OrderedDict /
     /// r_dict branches of `immutablevalue` (bookkeeper.py:255-298).
@@ -431,6 +450,7 @@ impl Bookkeeper {
                 Rc::new(RefCell::new(CallFamily::new(*desc)))
             })),
             emulated_pbc_calls: RefCell::new(HashMap::new()),
+            _jit_annotation_cache: RefCell::new(HashMap::new()),
             immutable_cache: RefCell::new(HashMap::new()),
             pending_specializations: RefCell::new(Vec::new()),
             position_entered: std::cell::Cell::new(false),
@@ -1509,6 +1529,42 @@ impl Bookkeeper {
         // upstream: `s_result = unionof(*results)`.
         super::model::unionof(results.iter())
             .map_err(|e| AnnotatorError::new(format!("pbc_call unionof: {}", e)))
+    }
+
+    /// rlib/jit.py:903-914 — fold `kwds_s` into
+    /// [`Self::_jit_annotation_cache`] under `driver`, unioning
+    /// against any previous annotation seen for the same kwarg key.
+    ///
+    /// Upstream:
+    ///
+    /// ```python
+    /// for key, s_value in kwds_s.items():
+    ///     s_previous = cache.get(key, annmodel.s_ImpossibleValue)
+    ///     s_value = annmodel.unionof(s_previous, s_value)
+    ///     cache[key] = s_value
+    /// ```
+    ///
+    /// `kwds_s` keys carry the upstream `'s_'` prefix (rlib/jit.py:895
+    /// `expected = ['s_' + name for name in ...]`), so callers must
+    /// preserve the prefix to keep the cache shape line-by-line with
+    /// upstream.
+    pub fn union_jit_annotation_kwds(
+        self: &Rc<Self>,
+        driver: &HostObject,
+        kwds_s: &HashMap<String, SomeValue>,
+    ) -> Result<(), AnnotatorError> {
+        let mut cache_outer = self._jit_annotation_cache.borrow_mut();
+        let cache = cache_outer.entry(driver.clone()).or_default();
+        for (key, s_value) in kwds_s {
+            let s_previous = cache.remove(key).unwrap_or_else(s_impossible_value);
+            let s_unioned = union(&s_previous, s_value).map_err(|e| {
+                AnnotatorError::new(format!(
+                    "_jit_annotation_cache union for key {key:?}: {e:?}"
+                ))
+            })?;
+            cache.insert(key.clone(), s_unioned);
+        }
+        Ok(())
     }
 
     /// RPython `Bookkeeper.emulate_pbc_call(self, unique_key, pbc,

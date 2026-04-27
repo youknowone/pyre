@@ -45,7 +45,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use crate::annotator::model::{SomeBuiltin, SomeBuiltinMethod, SomeValue};
 use crate::flowspace::model::{ConstValue, Constant, HOST_ENV, HostObject};
 use crate::translator::rtyper::error::TyperError;
-use crate::translator::rtyper::extregistry;
+use crate::translator::rtyper::extregistry::{self, ExtRegistryEntry};
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::pairtype::ReprClassId;
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
@@ -262,6 +262,41 @@ impl BuiltinFunctionRepr {
     /// ```
     ///
     fn _call(&self, hop2: &HighLevelOp, kwds_i: &HashMap<String, usize>) -> RTypeResult {
+        // upstream `extregistry.lookup(self.builtinfunc).specialize_call`
+        // returns a *bound method* whose `self` carries entry-instance
+        // state. Rust's `BuiltinTyperFn` is a function pointer with no
+        // capture, so marker entries (which need `meta` + `marker_kind`
+        // to lower into `jit_marker(...)`) bypass the
+        // `findbltintyper` → `BuiltinTyperFn` indirection and dispatch
+        // through `ExtRegistryEntry::specialize_marker_call` directly.
+        // The pre-typer `_called_exception_is_here_or_cannot_occur =
+        // false` reset and the post-typer assertion stay intact so the
+        // upstream contract on `hop.exception_cannot_occur()` /
+        // `hop.exception_is_here()` is enforced identically.
+        let as_const = ConstValue::HostObject(self.builtinfunc.clone());
+        if extregistry::is_registered(&as_const)
+            && let Some(entry) = extregistry::lookup(&as_const)
+            && matches!(
+                entry,
+                ExtRegistryEntry::EnterLeaveMarker { .. } | ExtRegistryEntry::LoopHeader { .. }
+            )
+        {
+            hop2.llops
+                .borrow_mut()
+                ._called_exception_is_here_or_cannot_occur = false;
+            let v_result = entry.specialize_marker_call(hop2, kwds_i)?;
+            let checked = hop2
+                .llops
+                .borrow()
+                ._called_exception_is_here_or_cannot_occur;
+            if !checked {
+                return Err(TyperError::message(
+                    "missing hop.exception_cannot_occur() or hop.exception_is_here() in marker \
+                     specialize_call",
+                ));
+            }
+            return Ok(v_result);
+        }
         let bltintyper = self.findbltintyper()?;
         hop2.llops
             .borrow_mut()

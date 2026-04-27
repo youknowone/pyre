@@ -1104,33 +1104,61 @@ pub(crate) fn get_virtualizable_info() -> *const majit_metainterp::virtualizable
 
 /// pypy/module/pypyjit/interp_jit.py → PyPyJitDriver(JitDriver).
 ///
-/// RPython: reds = ['frame', 'ec'], greens = ['next_instr', 'is_being_profiled', 'pycode'],
-///          virtualizables = ['frame']
+/// Mirrors RPython JitDriver (`rpython/rlib/jit.py:610-693`) field set:
+/// class-level attrs (`virtualizables`, `greens`, `reds`) from
+/// interp_jit.py:67-71 and constructor kwargs from interp_jit.py:72-78
+/// frozen onto a single static instance, matching the upstream
+/// `pypyjitdriver = PyPyJitDriver(...)` module-scope binding.
 #[derive(Clone, Copy)]
-pub struct PyPyJitDriver;
+pub struct PyPyJitDriver {
+    /// rlib/jit.py:617 `active = True` — class attr controlling whether
+    /// the marker fires.
+    pub active: bool,
+    /// rlib/jit.py:618 / interp_jit.py:70 `virtualizables = ['frame']`.
+    pub virtualizables: &'static [&'static str],
+    /// rlib/jit.py:619 / interp_jit.py:77 `name = 'pypyjit'`.
+    pub name: &'static str,
+    /// rlib/jit.py:620 `inline_jit_merge_point = False`.
+    pub inline_jit_merge_point: bool,
+    /// rlib/jit.py:649-650 / interp_jit.py:69
+    /// `greens = ['next_instr', 'is_being_profiled', 'pycode']`.
+    pub greens: &'static [&'static str],
+    /// rlib/jit.py:652-662 / interp_jit.py:68 `reds = ['frame', 'ec']`.
+    pub reds: &'static [&'static str],
+    /// rlib/jit.py:653/661 — True iff `reds='auto'`.
+    pub autoreds: bool,
+    /// rlib/jit.py:655/662 — `len(reds)`; `None` when `autoreds`.
+    pub numreds: Option<usize>,
+    /// rlib/jit.py:684 — `has_unique_id = (get_unique_id is not None)`.
+    /// Stays in sync with `get_unique_id` below.
+    pub has_unique_id: bool,
+    /// rlib/jit.py:691 `check_untranslated=True` default.
+    pub check_untranslated: bool,
+    /// rlib/jit.py:692 / interp_jit.py:78 `is_recursive=True`.
+    pub is_recursive: bool,
+    /// rlib/jit.py:693 `vec = vectorize` default False.
+    pub vec: bool,
+
+    /// rlib/jit.py:682 — `get_printable_location` hook callable.
+    pub get_printable_location: Option<fn(usize, bool, pyre_object::PyObjectRef) -> String>,
+    /// rlib/jit.py:683 — `get_location` hook callable.
+    pub get_location: Option<fn(usize, bool, pyre_object::PyObjectRef) -> pyre_object::PyObjectRef>,
+    /// rlib/jit.py:685-687 — `get_unique_id` hook callable.
+    pub get_unique_id: Option<fn(usize, bool, pyre_object::PyObjectRef) -> usize>,
+    /// rlib/jit.py:690 — `should_unroll_one_iteration` hook callable.
+    pub should_unroll_one_iteration: Option<fn(usize, bool, pyre_object::PyObjectRef) -> bool>,
+    /// rlib/jit.py:688 — `confirm_enter_jit` hook (concrete pyre signature
+    /// is wired alongside S1.3 specialize_call; until then, `None`).
+    pub confirm_enter_jit: Option<fn() -> bool>,
+    /// rlib/jit.py:689 — `can_never_inline` hook (signature ported with S1.3).
+    pub can_never_inline: Option<fn() -> bool>,
+}
 
 impl PyPyJitDriver {
-    pub fn new(
-        get_printable_location: Option<fn(usize, bool, pyre_object::PyObjectRef) -> String>,
-        get_location: Option<fn(usize, bool, pyre_object::PyObjectRef) -> pyre_object::PyObjectRef>,
-        get_unique_id: Option<fn(usize, bool, pyre_object::PyObjectRef) -> usize>,
-        should_unroll_one_iteration: Option<fn(usize, bool, pyre_object::PyObjectRef) -> bool>,
-        name: Option<&'static str>,
-        is_recursive: bool,
-    ) -> Self {
-        let _ = (
-            get_printable_location,
-            get_location,
-            get_unique_id,
-            should_unroll_one_iteration,
-            name,
-            is_recursive,
-        );
-        PyPyJitDriver
-    }
-
     /// interp_jit.py:85-87 — jit_merge_point inside dispatch loop.
-    /// Delegates to the real JitDriver via driver_pair().
+    /// API-parity stub: the merge point is handled inside
+    /// `eval_loop_jit`'s `jit_merge_point_hook` until the S3 cutover
+    /// replaces this with the upstream marker call.
     pub fn jit_merge_point(
         &self,
         frame: &mut PyFrame,
@@ -1139,14 +1167,12 @@ impl PyPyJitDriver {
         pycode: pyre_object::PyObjectRef,
         is_being_profiled: bool,
     ) {
-        let _ = (ec, pycode, is_being_profiled);
-        // The actual merge point is handled inside eval_loop_jit's
-        // jit_merge_point_hook. This method exists for API parity.
-        let _ = (frame, next_instr);
+        let _ = (frame, ec, next_instr, pycode, is_being_profiled);
     }
 
     /// interp_jit.py:114-117 — can_enter_jit at back-edge.
-    /// Delegates to the real JitDriver via driver_pair().
+    /// API-parity stub: handled by `eval_loop_jit`'s
+    /// `maybe_compile_and_run` on `StepResult::CloseLoop`.
     pub fn can_enter_jit(
         &self,
         frame: &mut PyFrame,
@@ -1155,14 +1181,55 @@ impl PyPyJitDriver {
         pycode: pyre_object::PyObjectRef,
         is_being_profiled: bool,
     ) {
-        let _ = (ec, is_being_profiled, pycode);
-        // The actual can_enter_jit is handled inside eval_loop_jit's
-        // maybe_compile_and_run on StepResult::CloseLoop.
-        let _ = (frame, next_instr);
+        let _ = (frame, ec, next_instr, pycode, is_being_profiled);
     }
 }
 
-pub const pypyjitdriver: PyPyJitDriver = PyPyJitDriver;
+/// pypy/module/pypyjit/interp_jit.py:72-78 —
+/// `pypyjitdriver = PyPyJitDriver(...)`.
+///
+/// All four upstream hook kwargs that interp_jit.py:72-76 passes are
+/// wired to the per-hook pyre implementations defined later in this
+/// file (`get_printable_location`, `get_location`, `get_unique_id`,
+/// `should_unroll_one_iteration`). `has_unique_id` mirrors
+/// `get_unique_id` per rlib/jit.py:684 so the two cannot drift.
+///
+/// Field defaults that match `JitDriver.__init__` (rlib/jit.py:610-693)
+/// when the corresponding kwarg is not passed:
+///
+///   - `active = true`               ← rlib/jit.py:617 class attr.
+///   - `inline_jit_merge_point = false` ← rlib/jit.py:670.
+///   - `autoreds = false`            ← interp_jit.py passes a list, not 'auto'.
+///   - `check_untranslated = true`   ← rlib/jit.py:674.
+///   - `vec = false`                 ← rlib/jit.py:693.
+///   - `confirm_enter_jit = None`    ← interp_jit.py omits the kwarg, so
+///                                     `JitDriver.__init__` (rlib/jit.py:680)
+///                                     leaves the slot as the class-level
+///                                     `confirm_enter_jit = None` default.
+///   - `can_never_inline = None`     ← same path: rlib/jit.py:681 default
+///                                     because interp_jit.py omits it.
+pub const pypyjitdriver: PyPyJitDriver = PyPyJitDriver {
+    active: true,
+    virtualizables: &["frame"],
+    name: "pypyjit",
+    inline_jit_merge_point: false,
+    greens: &["next_instr", "is_being_profiled", "pycode"],
+    reds: &["frame", "ec"],
+    autoreds: false,
+    numreds: Some(2),
+    has_unique_id: true,
+    check_untranslated: true,
+    is_recursive: true,
+    vec: false,
+    get_printable_location: Some(get_printable_location),
+    get_location: Some(get_location),
+    get_unique_id: Some(get_unique_id),
+    should_unroll_one_iteration: Some(should_unroll_one_iteration),
+    // interp_jit.py:72-78 omits these kwargs — keep at upstream
+    // default `None` (see field-default block above).
+    confirm_enter_jit: None,
+    can_never_inline: None,
+};
 
 /// interp_jit.py:77 — class __extend__(PyFrame)
 ///
