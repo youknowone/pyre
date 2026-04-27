@@ -1357,12 +1357,10 @@ mod tests {
         assert_eq!(new(101), 3, "portal_ec_reg must land on color 3");
     }
 
-    /// (b) A dead local's color is reused by a later temp value at
-    /// the chordal-coloring stage (RPython `regalloc.py:54-60`).
-    /// `enforce_input_args` only swaps the inputarg colors into the
-    /// 0..n_inputs slots; non-inputarg colors are left where the
-    /// chordal allocator placed them, so a temp whose live range
-    /// starts after the inputarg dies legitimately reuses color 0.
+    /// (b) RPython `regalloc.py:54-60` parity: a dead local's color is
+    /// reused by an SSA temp whose live range starts after the local
+    /// dies.  Resume data is Box-by-identity, not register-slot indexed,
+    /// so temp/local color sharing is sound.
     #[test]
     fn dead_local_color_reused() {
         let mut ssarepr = SSARepr::new("t");
@@ -1389,12 +1387,12 @@ mod tests {
         assert_eq!(
             new(100),
             0,
-            "temp 100 reuses dead local 0's color (chordal coloring)"
+            "temp 100 reuses local 0's color (local dies before temp's def)"
         );
         assert_eq!(
             result.num_regs.get(&Kind::Ref).copied(),
             Some(1),
-            "single color shared between inputarg and dead-range temp"
+            "single color for the disjoint live ranges"
         );
     }
 
@@ -1488,10 +1486,11 @@ mod tests {
         );
     }
 
-    /// (e) RPython `enforce_input_args` only swaps inputargs into
-    /// 0..n_inputs; non-inputarg registers can reuse those colors
-    /// when the inputarg's live range has ended. This mirrors
-    /// `flatten.py:88-100` exactly.
+    /// (e) RPython `flatten.py:88-100` parity: non-inputarg registers
+    /// reuse a dead inputarg's slot when their live range starts after
+    /// the inputarg's last use.  Resume data is Box-by-identity, so the
+    /// reuse is sound — the same color identifying two non-overlapping
+    /// values does not break the resume contract.
     #[test]
     fn non_inputarg_can_reuse_inputarg_color() {
         let mut ssarepr = SSARepr::new("t");
@@ -1520,7 +1519,7 @@ mod tests {
         let new50 = result.rename.get(&(Kind::Ref, 50)).copied().unwrap_or(50);
         assert_eq!(
             new50, 0,
-            "non-inputarg reg 50 reuses dead inputarg 0's color (no shift)"
+            "non-inputarg reg 50 reuses dead inputarg 0's color (RPython parity)"
         );
     }
 

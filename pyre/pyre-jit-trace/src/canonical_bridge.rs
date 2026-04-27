@@ -543,27 +543,21 @@ pub fn install_portal_for(
     // would find duplicates).
     let runtime = build_runtime_jitcode(&canonical, JitCodeExecState::default(), None);
 
-    // RPython `JitDriverStaticData` derives the portal frame/ec
-    // register slots from the jitdriver's `greens` / `reds`
-    // declarations (`rpython/jit/metainterp/warmspot.py` setup_jit
-    // chain), not from the canonical's name.  pyre lacks the
-    // jitdriver greens/reds → register-slot mapping infrastructure;
-    // until that lands, both registers stay sentinel-skipped with
-    // `u16::MAX` so `fill_portal_registers`
-    // (`majit-metainterp/src/blackhole.rs:1163`) becomes a no-op
-    // for portal-bridge installs.
+    // Portal-bridge installs do not run the per-CodeObject regalloc, so
+    // the post-regalloc colors of the portal red inputargs (`pypy/module/
+    // pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`) are unknown
+    // here.  The snapshot serializer at
+    // `trace_opcode::get_list_of_active_boxes` sentinel-skips
+    // `u16::MAX` so portal-bridge frames that hit guard capture fall
+    // through to the locals/stack-only resolution path.
     //
-    // PRE-EXISTING-ADAPTATION: the conservative sentinel is
-    // localised-wrong-but-harmless.  An earlier patch
-    // (`054fdc69865`) gated `portal_frame_reg = 0` on
-    // `canonical.name == "eval_loop_jit"` — name-based register
-    // inference has no RPython precedent (RPython resolves the slot
-    // from the actual inputarg layout) and could actively corrupt
-    // ref reg 0 if the canonical layout shifts or the callback
-    // activates downstream of the no-op window
-    // (`register_portal_bridge_in_callcontrol` is currently
-    // `#[allow(dead_code)]` at `pyre-jit/src/jit/codewriter.rs:5854`).
-    // Revert to the sentinel pending the proper derivation port.
+    // RPython parity: `rpython/jit/metainterp/warmspot.py setup_jit`
+    // derives the red arg inputarg indices from the jitdriver's
+    // `reds=[]` declaration, not from the canonical jitcode's name.
+    // Pyre lacks the jitdriver greens/reds → register-slot
+    // infrastructure to do the analogous derivation here; the sentinel
+    // is the safe default until the portal-bridge readers consult the
+    // canonical's own portal_red_colors directly.
     let portal_frame_reg = u16::MAX;
     let portal_ec_reg = u16::MAX;
 

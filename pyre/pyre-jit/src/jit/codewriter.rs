@@ -2180,13 +2180,20 @@ fn filter_liveness_in_place(
                 live_r.push(idx);
             }
         }
-        // PRE-EXISTING-ADAPTATION: pyre's tracer + blackhole are still
-        // wired to Python's per-bytecode LiveVars answer for locals
-        // (which omits function parameters at pc=0 and dead locals).
-        // Narrowing live_r to LV∩SSA restores that contract until
-        // SSA liveness becomes the sole authority — see
-        // `phase4_ssa_liveness_blocker_2026_04_18.md` for the rework
-        // required to drop this intersection (Task #62 scope).
+        // liveness.  RPython's `liveness.py:19-76` produces a single
+        // SSA-driven alive set as the sole authority — there is no
+        // per-bytecode local-liveness narrowing layered on top.  Pyre's
+        // tracer + blackhole register-file decode (the
+        // `semantic_ref_slot_for_reg_color` path at
+        // `pyre-jit-trace/src/state.rs`) is still wired to the Python
+        // LV answer for locals (which omits function parameters at pc=0
+        // and dead locals); SSA-only widening here would make those
+        // decode sites read uninitialised slots.  Convergence path:
+        // SSA-authoritative live_r — Task #110 +
+        // `phase4_ssa_liveness_blocker_2026_04_18.md`.  Multi-session
+        // epic; remove this `live_r.retain` only when both the tracer
+        // encoder and the BH decoder consume the SSA-driven liveness
+        // directly.
         let lv_live: std::collections::BTreeSet<u16> = {
             let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
                 .filter(|&idx| live_vars.is_local_live(py_pc, idx))

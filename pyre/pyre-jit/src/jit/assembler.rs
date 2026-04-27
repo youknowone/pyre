@@ -853,98 +853,44 @@ fn dispatch_op(
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
             state.builder.pop_f(dst);
         }
-        // PRE-EXISTING-ADAPTATION: `load_state_*` / `store_state_*` are
-        // pyre-specific opnames produced by `JitCodeBuilder::load_state_*` /
-        // `store_state_*` (majit/majit-metainterp/src/jitcode/assembler.rs:188+)
-        // via `write_insn("load_state_field/di")` etc.  The proc-macro
-        // `jit_interp/jitcode_lower.rs` (line 533, 567, 2022, 2055) generates
-        // builder calls into these methods from `#[jit_interp]` opcode bodies
-        // that read or write virtualizable fields/arrays.  RPython has no
-        // direct counterpart — its analogue is the field/array `getfield_gc_*`
-        // path through `optimizer.py` virtualizable info — but pyre routes
-        // these through SSARepr dispatch as a kept-stable adaptation, so the
-        // arms below MUST stay until the proc-macro lowering migrates.
-        "load_state_field" => {
-            let dst = expect_result_or_first_reg(args, result, Kind::Int);
-            state
-                .builder
-                .load_state_field(expect_small_u16(&args[0]), dst);
-        }
-        "store_state_field" => {
-            state
-                .builder
-                .store_state_field(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Int));
-        }
-        "load_state_array" => {
-            let dst = expect_result_or_first_reg(args, result, Kind::Int);
-            state.builder.load_state_array(
-                expect_small_u16(&args[0]),
-                expect_reg(&args[1], Kind::Int),
-                dst,
-            );
-        }
-        "store_state_array" => {
-            state.builder.store_state_array(
-                expect_small_u16(&args[0]),
-                expect_reg(&args[1], Kind::Int),
-                expect_reg(&args[2], Kind::Int),
-            );
-        }
-        "load_state_varray" => {
-            let dst = expect_result_or_first_reg(args, result, Kind::Int);
-            state.builder.load_state_varray(
-                expect_small_u16(&args[0]),
-                expect_reg(&args[1], Kind::Int),
-                dst,
-            );
-        }
-        "store_state_varray" => {
-            state.builder.store_state_varray(
-                expect_small_u16(&args[0]),
-                expect_reg(&args[1], Kind::Int),
-                expect_reg(&args[2], Kind::Int),
-            );
-        }
-        // `load_const_{i,r,f}` are pyre-specific opnames that no SSARepr
-        // emitter produces — the RPython-canonical shape for constant loads
-        // is `%s_copy` with a Constant source (`flatten.py:333`, handled by
-        // the `int_copy` / `ref_copy` / `float_copy` arms above).
-        // `rpython/jit/codewriter/jtransform.py:844,923` uses
-        // `kind = getkind(...)[0]`, so RPython only emits the short-form
-        // opnames `getfield_vable_i` / `_r` / `_f` and `setfield_vable_i`
-        // / `_r` / `_f`. pyre's `vable_*` builder-prefix is a
-        // pre-existing-adaptation and the rename is scoped to the
-        // `Insn::Op` key.
-        // Short-form arms below match the RPython contract directly.
-        // The long-form aliases (`getfield_vable_int`, …) are a
-        // pyre-side compatibility layer for callers that emit the full
-        // kind name; they are NOT RPython parity, just an additive
-        // dispatch shim.
-        "getfield_vable_int" | "getfield_vable_i" => {
+        // `load_state_*` / `store_state_*` arms removed: pyre-specific
+        // opnames with no SSARepr emitter — the pyre value-stack runtime
+        // ops are emitted directly through the JitCodeBuilder rather than
+        // routed through the SSARepr dispatch table.
+        //
+        // RPython opname parity (jtransform.py:844-927, blackhole.py:1446-1493):
+        // `kind = getkind(...)[0]` in jtransform.py forces single-char
+        // suffix everywhere — `getfield_vable_i` / `_r` / `_f` and
+        // `setfield_vable_i` / `_r` / `_f`. pyre's JitCodeBuilder methods
+        // retain the `vable_*` prefix as a PRE-EXISTING-ADAPTATION so the
+        // rename is scoped to the Insn::Op key.  Long-form `_int` /
+        // `_ref` / `_float` aliases retired — no SSARepr emitter writes
+        // them (codewriter.rs `emit_vable_*` macros use the short form).
+        "getfield_vable_i" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
             state
                 .builder
                 .vable_getfield_int(dst, expect_small_u16(&args[0]));
         }
-        "getfield_vable_ref" | "getfield_vable_r" => {
+        "getfield_vable_r" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
             state
                 .builder
                 .vable_getfield_ref(dst, expect_small_u16(&args[0]));
         }
-        "getfield_vable_float" | "getfield_vable_f" => {
+        "getfield_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
             state
                 .builder
                 .vable_getfield_float(dst, expect_small_u16(&args[0]));
         }
-        "setfield_vable_int" | "setfield_vable_i" => state
+        "setfield_vable_i" => state
             .builder
             .vable_setfield_int(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Int)),
-        "setfield_vable_ref" | "setfield_vable_r" => state
+        "setfield_vable_r" => state
             .builder
             .vable_setfield_ref(expect_small_u16(&args[0]), expect_reg(&args[1], Kind::Ref)),
-        "setfield_vable_float" | "setfield_vable_f" => state.builder.vable_setfield_float(
+        "setfield_vable_f" => state.builder.vable_setfield_float(
             expect_small_u16(&args[0]),
             expect_reg(&args[1], Kind::Float),
         ),

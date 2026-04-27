@@ -2664,9 +2664,16 @@ fn execute_assembler(
                         }
                         crate::call_jit::BlackholeResult::Failed => {
                             // RPython: blackhole resume never fails — rd_numb
-                            // is always complete. Hitting this path means
-                            // resume data generation has a bug. Invalidate
-                            // the loop and fall back to the interpreter.
+                            // is always complete (`blackhole.py:1679` raises
+                            // `ExitFrameWithExceptionRef` for uncaught
+                            // exceptions, never returns a failure code).
+                            // Pyre's `BlackholeResult::Failed` is a layered
+                            // adaptation that should be removed once the
+                            // upstream SSA-authoritative live_r work lands
+                            // (Task #110 / Option α step 6).  Until then
+                            // the bare `invalidate_loop` keeps the cell
+                            // retraceable; the failure surfaces in
+                            // check.sh rather than being masked.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
                                     "[jit][BUG] blackhole failed key={} trace={} guard={} — invalidating",
@@ -3043,6 +3050,15 @@ pub fn try_function_entry_jit(frame: &mut PyFrame) -> Option<PyResult> {
                             // Fall through to eval_loop_jit
                         }
                         crate::call_jit::BlackholeResult::Failed => {
+                            // RPython blackhole resume cannot fail
+                            // (`blackhole.py:1679` raises
+                            // `ExitFrameWithExceptionRef` instead).  The
+                            // `BlackholeResult::Failed` variant is a pyre
+                            // layering on top of an upstream SSA liveness
+                            // gap (Task #110 / Option α step 6); when it
+                            // hits, surface the failure to check.sh by
+                            // invalidating the loop without forcing a
+                            // permanent dont-trace.
                             if majit_metainterp::majit_log_enabled() {
                                 eprintln!(
                                     "[jit][BUG] blackhole failed key={} — invalidating",
@@ -5494,12 +5510,24 @@ mod tests {
             Value::Ref(GcRef(0)),                        // lastblock
             Value::Ref(GcRef(frame.w_globals as usize)), // w_globals
         ];
-        for reg in live_regs {
+        let ec_value = unsafe { (*(frame_ptr as *const PyFrame)).execution_context as i64 };
+        for reg in live_regs.iter() {
             match reg {
                 0 => values.push(Value::Ref(GcRef(w_int_new(1) as usize))), // local a
                 1 => values.push(Value::Ref(GcRef(w_int_new(2) as usize))), // local b
                 2 => values.push(Value::Ref(GcRef(w_int_new(3) as usize))), // local c
                 3 => values.push(Value::Int(7)),                            // local i
+                // pypy/module/pypyjit/interp_jit.py:68 reds = ['frame',
+                // 'ec'] — portal red args ride the live_r mask after
+                // codewriter commit 9f0d0f6c18 (interp_jit.py parity).
+                // The two trailing live regs are portal_frame_reg /
+                // portal_ec_reg holding the runtime frame_ptr and ec.
+                _ if Some(reg) == live_regs.iter().rev().nth(1) => {
+                    values.push(Value::Ref(GcRef(frame_ptr)));
+                }
+                _ if Some(reg) == live_regs.iter().rev().next() => {
+                    values.push(Value::Int(ec_value));
+                }
                 other => panic!("unexpected live reg {other} at resume pc {resume_pc}"),
             }
         }

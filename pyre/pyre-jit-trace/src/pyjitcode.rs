@@ -78,9 +78,21 @@ pub struct PyJitCodeMetadata {
     pub pc_map: Vec<usize>,
     /// Value-stack depth at each Python PC, in slots above stack_base.
     pub depth_at_py_pc: Vec<u16>,
-    /// Register allocated for the portal's frame red argument.
+    /// Post-regalloc Ref-bank color of the portal jitdriver's first red
+    /// argument (`frame`).  RPython parity: `pypy/module/pypyjit/
+    /// interp_jit.py:67 reds = ['frame', 'ec']` declares the portal
+    /// calling convention, and `JitDriverStaticData.red_args_indices`
+    /// (`rpython/jit/metainterp/warmspot.py`) records the inputarg
+    /// position of each red arg.  This field is the pyre equivalent —
+    /// the snapshot serializer at
+    /// `pyre-jit-trace::trace_opcode::get_list_of_active_boxes` uses it
+    /// to map the live_r color back to the symbolic `sym.frame` OpRef.
+    /// `u16::MAX` for portal-bridge installs that don't run the
+    /// per-CodeObject regalloc (the snapshot helper sentinel-skips).
     pub portal_frame_reg: u16,
-    /// Register allocated for the portal's execution-context red argument.
+    /// Post-regalloc Ref-bank color of the portal jitdriver's second red
+    /// argument (`ec`, `pypy/module/pypyjit/interp_jit.py:67`).
+    /// Snapshot serializer maps this color to `sym.execution_context`.
     pub portal_ec_reg: u16,
     /// Absolute start index of the operand stack in PyFrame.locals_cells_stack_w.
     pub stack_base: usize,

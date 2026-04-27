@@ -1132,10 +1132,20 @@ pub fn resume_in_blackhole(
             release_bh(bh);
 
             let Some(mut caller_bh) = next.map(|b| *b) else {
-                if nbody_debug {
+                if nbody_debug || majit_metainterp::majit_log_enabled() {
+                    let kind_dbg = if exc_value != 0 {
+                        let raw = unsafe {
+                            pyre_object::excobject::w_exception_get_kind(
+                                exc_value as pyre_object::PyObjectRef,
+                            )
+                        };
+                        format!("{:?}", raw)
+                    } else {
+                        "<null>".to_string()
+                    };
                     eprintln!(
-                        "[nbody-debug] resume_in_blackhole failed: uncaught exception at outermost exc_value={:#x}",
-                        exc_value as usize
+                        "[bh-fail-1079] uncaught exception at outermost exc_value={:#x} kind={}",
+                        exc_value as usize, kind_dbg
                     );
                 }
                 // blackhole.py:1679-1682 _exit_frame_with_exception:
