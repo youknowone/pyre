@@ -441,6 +441,39 @@ fn dispatch_rtype_op(
         (TupleRepr, IntegerRepr, "getitem") => {
             committed(super::rtuple::pair_tuple_int_rtype_getitem(r1, hop))
         }
+        // rstr.py:614-632 — `pair(AbstractStringRepr, IntegerRepr).rtype_getitem`.
+        // Pyre handles the nonneg + checkidx=False branch; other
+        // branches (negative-index ll_stritem, checkidx
+        // ll_stritem_*_checked) surface a TyperError until those
+        // helpers land.
+        (StringRepr, IntegerRepr, "getitem") => {
+            committed(super::rstr::pair_string_int_rtype_getitem(hop))
+        }
+        (UnicodeRepr, IntegerRepr, "getitem") => {
+            committed(super::rstr::pair_unicode_int_rtype_getitem(hop))
+        }
+        // rstr.py:634-635 — `rtype_getitem_idx` defers to
+        // `rtype_getitem(hop, checkidx=True)`. The checked path raises
+        // IndexError from inside ll_stritem_checked /
+        // ll_stritem_nonneg_checked.
+        (StringRepr, IntegerRepr, "getitem_idx") => {
+            committed(super::rstr::pair_string_int_rtype_getitem_idx(hop))
+        }
+        (UnicodeRepr, IntegerRepr, "getitem_idx") => {
+            committed(super::rstr::pair_unicode_int_rtype_getitem_idx(hop))
+        }
+        // rstr.py:723-730 — `pairtype(AbstractCharRepr, IntegerRepr)`
+        // and `pairtype(AbstractUniCharRepr, IntegerRepr)` rtype_getitem
+        // share the same body (constant-0 pass-through). Non-constant
+        // index falls through to the AbstractStringRepr+IntegerRepr
+        // branch via `ll_chr2str` (Slice 10) and surfaces a TyperError
+        // until that helper lands.
+        (CharRepr, IntegerRepr, "getitem") => {
+            committed(super::rstr::pair_char_int_rtype_getitem(hop))
+        }
+        (UniCharRepr, IntegerRepr, "getitem") => {
+            committed(super::rstr::pair_unichar_int_rtype_getitem(hop))
+        }
         // rtuple.py:319-327 — `pairtype(TupleRepr, TupleRepr).rtype_add`
         // (and its `rtype_inplace_add` alias) concatenates two tuples
         // by per-position getfield + newtuple_cached.
@@ -604,6 +637,51 @@ fn dispatch_rtype_op(
         (UniCharRepr, UniCharRepr, "ge") => committed(
             super::rstr::pair_unichar_unichar_rtype_compare_ord(hop, "ge"),
         ),
+
+        // rstr.py:651-692 — pairtype(AbstractStringRepr, AbstractStringRepr).
+        // eq routes through ll_streq, ne wraps ll_streq with bool_not,
+        // lt/le/gt/ge route through ll_strcmp + int_<func>(diff, 0).
+        (StringRepr, StringRepr, "eq") => {
+            committed(super::rstr::pair_string_string_rtype_compare(hop, "eq"))
+        }
+        (StringRepr, StringRepr, "ne") => {
+            committed(super::rstr::pair_string_string_rtype_compare(hop, "ne"))
+        }
+        (StringRepr, StringRepr, "lt") => {
+            committed(super::rstr::pair_string_string_rtype_compare(hop, "lt"))
+        }
+        (StringRepr, StringRepr, "le") => {
+            committed(super::rstr::pair_string_string_rtype_compare(hop, "le"))
+        }
+        (StringRepr, StringRepr, "gt") => {
+            committed(super::rstr::pair_string_string_rtype_compare(hop, "gt"))
+        }
+        (StringRepr, StringRepr, "ge") => {
+            committed(super::rstr::pair_string_string_rtype_compare(hop, "ge"))
+        }
+
+        // rstr.py:651-692 inherited via AbstractUnicodeRepr(AbstractStringRepr) —
+        // pairtype(AbstractUnicodeRepr, AbstractUnicodeRepr) routes through
+        // the same body modulo the helper-graph identity (ll_unicode_eq /
+        // ll_unicode_cmp).
+        (UnicodeRepr, UnicodeRepr, "eq") => {
+            committed(super::rstr::pair_unicode_unicode_rtype_compare(hop, "eq"))
+        }
+        (UnicodeRepr, UnicodeRepr, "ne") => {
+            committed(super::rstr::pair_unicode_unicode_rtype_compare(hop, "ne"))
+        }
+        (UnicodeRepr, UnicodeRepr, "lt") => {
+            committed(super::rstr::pair_unicode_unicode_rtype_compare(hop, "lt"))
+        }
+        (UnicodeRepr, UnicodeRepr, "le") => {
+            committed(super::rstr::pair_unicode_unicode_rtype_compare(hop, "le"))
+        }
+        (UnicodeRepr, UnicodeRepr, "gt") => {
+            committed(super::rstr::pair_unicode_unicode_rtype_compare(hop, "gt"))
+        }
+        (UnicodeRepr, UnicodeRepr, "ge") => {
+            committed(super::rstr::pair_unicode_unicode_rtype_compare(hop, "ge"))
+        }
 
         _ => Ok(None),
     }

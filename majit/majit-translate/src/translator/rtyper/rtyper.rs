@@ -2875,7 +2875,7 @@ fn lowlevel_type_helper_graph(
     Ok(helper_pygraph_from_graph(graph, argnames, func))
 }
 
-fn exception_args(exc_name: &str) -> Result<Vec<Hlvalue>, TyperError> {
+pub(crate) fn exception_args(exc_name: &str) -> Result<Vec<Hlvalue>, TyperError> {
     let exc_cls = HOST_ENV
         .lookup_exception_class(exc_name)
         .ok_or_else(|| TyperError::message(format!("missing host {exc_name} exception class")))?;
