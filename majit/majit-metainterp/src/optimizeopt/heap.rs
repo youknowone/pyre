@@ -292,9 +292,12 @@ impl CachedField {
     /// cached entry that still has a non-None `opinfo._fields[descr_idx]`.
     /// PyPy's method calls `info.produce_short_preamble_ops(...)` on
     /// each cached_info, which itself emits a `GETFIELD_GC` /
-    /// `GETARRAYITEM_GC` to the short preamble; the Rust port inlines
-    /// the emission here because info.produce_short_preamble_ops is
-    /// not yet ported.
+    /// `GETARRAYITEM_GC` to the short preamble; the Rust port still
+    /// inlines the emission here even though
+    /// [`crate::optimizeopt::info::produce_short_preamble_ops`] is now
+    /// ported. Migration is a follow-up cleanup — the inline path
+    /// stays for callers that lack the `OptContext` plumbing the info
+    /// helper expects.
     fn produce_potential_short_preamble_ops(
         &self,
         sb: &mut crate::optimizeopt::shortpreamble::ShortBoxes,

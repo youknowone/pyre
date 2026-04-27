@@ -28,8 +28,12 @@
 //!   [`crate::translator::rtyper::extregistry::is_registered_type`] /
 //!   `lookup_type`.
 //! * `lltype.LowLevelType` branch (`_compute_annotation`
-//!   signature.py:59-60) — deferred until `rtyper/lltypesystem/lltype.py`
-//!   is ported.
+//!   signature.py:59-60) — `lltype.py` is now ported under
+//!   [`crate::translator::rtyper::lltypesystem::lltype`]; the
+//!   signature.py:59-60 dispatch (build a `SomeLowLevelType` from a
+//!   `LowLevelType` instance) still needs the matching
+//!   `SomeLowLevelType` variant on [`super::model::SomeValue`] before
+//!   wire-up.
 //! * `_annotation_cache` memoization (signature.py:13, 30-38) —
 //!   skipped; callers re-compute on every call. Performance-only;
 //!   correctness matches upstream.

@@ -1899,9 +1899,13 @@ impl TranslationDriver {
         let interp = Rc::new(LLInterpreter::new(rtyper, true, None));
         // Upstream `:549-550`: `bk = translator.annotator.bookkeeper`,
         // `graph = bk.getdesc(self.entry_point).getuniquegraph()`.
-        // `bookkeeper.getdesc(...).getuniquegraph()` is not yet ported
-        // — once it lands, this becomes the concrete graph fed into
-        // `eval_graph`.
+        // `getuniquegraph` is ported on
+        // [`crate::annotator::description::FunctionDesc::getuniquegraph`]
+        // and the c-backend driver already calls it
+        // (`translator/c/genc.rs:453`). The placeholder below remains
+        // because the `LLInterpreter::eval_graph` consumer surface
+        // expects an `Rc<dyn Any>` opaque graph handle until the
+        // llinterp port narrows it to `Rc<PyGraph>`.
         let _annotator = translator.annotator().ok_or_else(|| TaskError {
             message: "task_llinterpret_lltype: translator.annotator slot is unset".to_string(),
         })?;

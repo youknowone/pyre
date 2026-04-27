@@ -193,8 +193,14 @@ fn any_to_llvalue(value: &Rc<dyn Any>) -> Result<LLValue, TaskError> {
 /// parts of `LLFrame` (`:214-309`, `:405-525`).
 pub struct LLInterpreter {
     /// Upstream `self.bindings = {}` at `:73`. Maps each Variable to
-    /// its concrete value during a frame's `eval()`. The local port
-    /// keeps the shape opaque (`Rc<dyn Any>`) until lltype lands.
+    /// its concrete value during a frame's `eval()`. Stored as
+    /// `Vec<(Rc<dyn Any>, Rc<dyn Any>)>` because the bindings carry
+    /// heterogeneous (Variable, [`LLValue`]) pairs that callers
+    /// downcast at the read site. lltype is now ported under
+    /// [`crate::translator::rtyper::lltypesystem::lltype`]; a
+    /// follow-up could narrow the value slot to
+    /// `lltype::LowLevelValue` once every read site is migrated
+    /// off `Rc<dyn Any>::downcast_ref`.
     pub bindings: RefCell<Vec<(Rc<dyn Any>, Rc<dyn Any>)>>,
     /// Upstream `self.typer = typer` at `:74`.
     pub typer: Rc<RPythonTyper>,

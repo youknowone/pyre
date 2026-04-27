@@ -11,18 +11,24 @@
 //! | `ll_none_hash` (`rnone.py:42-43`) | [`ll_none_hash`] |
 //! | `rtype_is_none(robj1, rnone2, hop, pos=0)` (`rnone.py:66-84`) | [`rtype_is_none`] |
 //!
-//! ## Deferred to follow-up commits
+//! ## Wired through the pairtype dispatcher
 //!
 //! * `class __extend__(pairtype(Repr, NoneRepr))` + `pairtype(NoneRepr,
-//!   Repr)` `convert_from_to` / `rtype_is_` dispatch (rnone.py:46-64)
-//!   — upstream `pair(r1, r2).rtype_is_` is resolved by the double-
-//!   dispatch `pairtype` metaclass that `translate_op_is` in
-//!   `rtyper.py:translate_hl_to_ll` consults. Pyre has not yet ported
-//!   that dispatch surface (it lives in `tool/pairtype.py` — outside
-//!   rtyper); this module provides the [`rtype_is_none`] helper as a
-//!   freestanding function so the future pairtype bridge can call it
-//!   without further rewiring. Before the bridge lands the helper is
-//!   exercised by unit tests only.
+//!   Repr)` `convert_from_to` / `rtype_is_` (rnone.py:46-64) — wired via
+//!   [`super::pairtype::pair_convert_from_to`] +
+//!   [`super::pairtype::pair_rtype_is_`] dispatchers calling
+//!   [`pair_any_none_convert_from_to`], [`pair_none_any_convert_from_to`],
+//!   [`pair_any_none_rtype_is_`], and [`pair_none_any_rtype_is_`]. The
+//!   freestanding [`rtype_is_none`] helper used to be the entire surface
+//!   while the dispatcher was unported; it is still public so callers
+//!   that already hold concrete reprs can skip the double-dispatch.
+//! * The `SmallFunctionSetPBCRepr` branch (rnone.py:76-82) is wired
+//!   through [`super::pairtype::ReprClassId::SmallFunctionSetPBCRepr`]
+//!   plus [`Repr::pbc_s_pbc`] — `can_be_None` true emits
+//!   `char_eq(v1, '\000')`, false folds to `inputconst(Bool, False)`.
+//!
+//! ## Deferred to follow-up commits
+//!
 //! * `get_ll_eq_function` / `get_ll_hash_function` /
 //!   `get_ll_fasthash_function` (rnone.py:22-28) — the [`Repr`] trait
 //!   does not yet carry these slots; they land with the `rdict.py`
@@ -31,10 +37,6 @@
 //!   `lltype.Address` + `adr_eq` + `robj1.null_instance()` which have no
 //!   Rust counterpart (`rpython/rtyper/lltypesystem/llmemory.py` is
 //!   unported). Marked with a structured TyperError placeholder.
-//! * The `SmallFunctionSetPBCRepr` branch (rnone.py:76-82) is wired
-//!   through [`super::pairtype::ReprClassId::SmallFunctionSetPBCRepr`]
-//!   plus [`Repr::pbc_s_pbc`] — `can_be_None` true emits
-//!   `char_eq(v1, '\000')`, false folds to `inputconst(Bool, False)`.
 
 use std::sync::Arc;
 use std::sync::OnceLock;

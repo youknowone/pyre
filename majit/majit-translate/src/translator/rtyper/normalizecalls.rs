@@ -29,9 +29,10 @@
 //!   — build the `my_instantiate_graph` helper consumed by
 //!   `ClassRepr.fill_vtable_root` (upstream line 266-295). The source
 //!   of the `bookkeeper.needs_generic_instantiate` set is
-//!   `merge_classpbc_getattr_into_classdef`, not yet ported; callers
-//!   that populate the set manually (tests / downstream R3 helpers)
-//!   will exercise this driver immediately.
+//!   [`merge_classpbc_getattr_into_classdef`] (this module), invoked
+//!   from the [`perform_normalizations`] driver. Tests can also
+//!   populate the set manually to exercise this entry point in
+//!   isolation.
 //!
 //! ## Upstream call-family clarification
 //!

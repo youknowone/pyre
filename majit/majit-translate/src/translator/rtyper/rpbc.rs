@@ -5657,9 +5657,10 @@ impl Repr for ClassesPBCRepr {
     /// All three arms ported:
     /// - `cls is None` + `Void` → `Constant(None, Void)`
     /// - `cls is None` + non-Void → `Constant(LLPtr(_defl), Ptr(...))`
-    /// - non-None → `bk.getdesc(cls); self.convert_desc(desc)` (the
-    ///   non-Void downstream path still surfaces the `getruntime`
-    ///   blocker through `convert_desc`).
+    /// - non-None → `bk.getdesc(cls); self.convert_desc(desc)` —
+    ///   `convert_desc` walks `getuniqueclassdef` → `getclassrepr_arc`
+    ///   → `getruntime(self.lowleveltype)` to materialise the vtable
+    ///   pointer constant.
     /// RPython `ClassesPBCRepr.rtype_getattr(self, hop)` (rpbc.py:970-987):
     ///
     /// ```python
@@ -5683,11 +5684,13 @@ impl Repr for ClassesPBCRepr {
     ///         return hop.llops.convertvar(v_res, r_res, hop.r_result)
     /// ```
     ///
-    /// The `__name__` arm currently surfaces a missing-op TyperError —
-    /// both `rstr.STR` and the `OBJECT_VTABLE.{name,instantiate}`
-    /// fields are pre-existing blockers tracked separately. The body
-    /// here matches upstream's structure so the arm uncloses to a
-    /// single-line `genop` once those land.
+    /// The `__name__` arm is ported line-by-line: it pulls the rooted
+    /// `ClassRepr` from `rtyper.rootclass_repr`, calls
+    /// `hop.inputargs(class_repr, Void)` for the (`vcls`, `vattr`)
+    /// pair, and emits the upstream `getfield` op into `hop.llops`
+    /// with `STRPTR` (= `Ptr(rstr.STR)`) as the result type. The
+    /// downstream non-`__name__` access-set arm reuses the same
+    /// `getpbcfield` shape via `class_repr.get_access_set`.
     fn rtype_getattr(
         &self,
         hop: &crate::translator::rtyper::rtyper::HighLevelOp,
@@ -5889,13 +5892,22 @@ impl Repr for ClassesPBCRepr {
 ///             return result
 /// ```
 ///
-/// Pyre's port currently handles:
+/// Pyre's port handles:
 /// * single-desc + `!can_be_None` → [`SingleFrozenPBCRepr`],
 /// * multi-desc with any two descs whose `queryattrfamily` differ →
-///   [`MultipleUnrelatedFrozenPBCRepr`] (fresh instance per call;
-///   `rtyper.pbc_reprs['unrelated']` cache deferred),
-/// * multi-desc with a common access set → `MissingRTypeOperation`
-///   pending [`MultipleFrozenPBCRepr`].
+///   [`MultipleUnrelatedFrozenPBCRepr`] keyed in
+///   `rtyper.pbc_reprs[PbcReprKey::Unrelated]` (singleton cache,
+///   matching upstream's `'unrelated'` dict slot),
+/// * multi-desc with a common `Some(access)` set →
+///   [`MultipleFrozenPBCRepr`] keyed in
+///   `rtyper.pbc_reprs[PbcReprKey::Access(access_key)]`, registered
+///   via `rtyper.add_pendingsetup`.
+///
+/// The `None`-access edge case (every desc has no attrfamily) still
+/// surfaces `MissingRTypeOperation`: upstream constructs
+/// `MultipleFrozenPBCRepr(rtyper, access_set=None)` to materialise a
+/// zero-field struct PBC; pyre defers the body because no current
+/// consumer reaches it.
 ///
 /// Called from both `somepbc_rtyper_makerepr` DescKind::Frozen and the
 /// Function-kind uncallable branch — `FunctionDesc.queryattrfamily` is
@@ -6571,33 +6583,25 @@ impl Repr for MethodsPBCRepr {
     }
 }
 
-/// RPython `SomePBC.rtyper_makerepr` single-FunctionDesc arm
-/// (rpbc.py:35-62, limited to the degenerate branch `len(descriptions)
-/// == 1 and not can_be_None`). Other shapes surface as
-/// `MissingRTypeOperation` until their concrete reprs land.
+/// RPython `SomePBC.rtyper_makerepr` (rpbc.py:35-62), the
+/// `DescKind`-keyed factory. Each `DescKind` arm dispatches to the
+/// matching Repr constructor:
 ///
-/// Outstanding SomePBC repr stubs (each would be a full Repr class
-/// with `_setup_repr` / `convert_desc` / `convert_const` /
-/// `rtype_simple_call` / `rtype_call_args` / `call`):
+///   * `Function`: `len(descriptions) == 1 && !can_be_None` →
+///     [`FunctionRepr`]; small multi-desc → [`SmallFunctionSetPBCRepr`]
+///     (chosen by `small_cand`); larger multi-desc →
+///     [`FunctionsPBCRepr`]; uncallable → [`get_frozen_pbc_repr`].
+///   * `Class` → [`ClassesPBCRepr`] (constant + non-constant arms).
+///   * `Method` → [`MethodsPBCRepr`].
+///   * `MethodOfFrozen` → [`MethodOfFrozenPBCRepr`].
+///   * `Frozen` → [`get_frozen_pbc_repr`] (Single / MultipleUnrelated /
+///     Multiple arms).
 ///
-///   * `SmallFunctionSetPBCRepr` (rpbc.py:47, class at rpbc.py:~393) —
-///     Small multi-desc Function PBCs chosen by
-///     `small_cand(rtyper, s_pbc)` (already ported at rpbc.rs
-///     `small_cand`). Blocked on `Char` / `Signed` integer-indexed
-///     vtable layout + `inputconst(Char, i)` call-site lowering.
-///   * `MethodsPBCRepr` (rpbc.py:53, class at rpbc.py:~1126) —
-///     DescKind::Method. Blocked on upstream `MethodDesc` /
-///     `get_funcdesc_or_implfunc` split, plus bound-method
-///     `convert_desc_or_const` that unwraps `im_func` / `im_self`.
-///   * `MethodOfFrozenPBCRepr` (rpbc.py:57, class at rpbc.py:~869) —
-///     DescKind::MethodOfFrozen. Blocked on `MethodOfFrozenDesc`
-///     receiver-repr delegation (`get_r_implfunc` returns
-///     `(r_func, 1)`) and the associated frozen-receiver Constant
-///     build.
-///
-/// All three ultimately call through `FunctionReprBase.call` whose
-/// port is blocked on ExceptionData + callparse (see the deferred-
-/// ports comment at the end of the `FunctionReprBase` impl above).
+/// All callable arms route through `FunctionReprBase.call`, which is
+/// ported via the `callparse` module (rpbc.py:160-176). The remaining
+/// `MissingRTypeOperation` paths are scoped to specific edge cases
+/// documented at each repr (e.g. `get_frozen_pbc_repr` `None`-access
+/// arm, `FunctionsPBCRepr` multi-row `setup_specfunc` corners).
 pub fn somepbc_rtyper_makerepr(
     s_pbc: &SomePBC,
     rtyper: &Rc<RPythonTyper>,
@@ -6658,20 +6662,24 @@ pub fn somepbc_rtyper_makerepr(
                     }
                 } else {
                     // rpbc.py:49 — uncallable Function-kind PBCs route
-                    // through `getFrozenPBCRepr`. The multi-desc path
-                    // inside the factory still surfaces
-                    // `MissingRTypeOperation`, but single-desc
-                    // !can_be_None (degenerate uncallable) lands
-                    // directly as `SingleFrozenPBCRepr`.
+                    // through `getFrozenPBCRepr`. The factory dispatches
+                    // to `SingleFrozenPBCRepr` (single-desc + !can_be_None),
+                    // `MultipleUnrelatedFrozenPBCRepr` (cached at
+                    // `pbc_reprs[Unrelated]`), or `MultipleFrozenPBCRepr`
+                    // (cached at `pbc_reprs[Access(_)]`). The remaining
+                    // `MissingRTypeOperation` path is the `None`-access
+                    // edge case (every desc has no attrfamily — upstream's
+                    // zero-field struct PBC), deferred until a consumer
+                    // reaches it.
                     get_frozen_pbc_repr(rtyper, s_pbc)
                 }
             }
         }
         DescKind::Class => {
-            // rpbc.py:50-52 — `getRepr = ClassesPBCRepr`. Pyre's port
-            // only handles the constant-class branch today (lowleveltype
-            // = Void); non-constant shapes surface `MissingRTypeOperation`
-            // from inside `ClassesPBCRepr::new`.
+            // rpbc.py:50-52 — `getRepr = ClassesPBCRepr`. Both
+            // constant (lowleveltype = Void) and non-constant
+            // (lowleveltype = CLASSTYPE) arms are ported in
+            // `ClassesPBCRepr::new` (rpbc.rs:5434-5453).
             Ok(
                 std::sync::Arc::new(ClassesPBCRepr::new(rtyper, s_pbc.clone())?)
                     as std::sync::Arc<dyn Repr>,

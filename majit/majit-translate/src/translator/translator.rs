@@ -23,8 +23,12 @@ use crate::translator::simplify;
 /// `rpython.config.translationoption.get_combined_translation_config`
 /// output that the annotator driver actually reads. Fields land
 /// incrementally as `self.translator.config.translation.*` accesses
-/// manifest — upstream's full `OptionDescription` tree lives in
-/// `rpython/config/translationoption.py` and is not yet ported.
+/// manifest. The full upstream `OptionDescription` tree is ported in
+/// [`crate::config::translationoption`] (with
+/// [`crate::config::translationoption::translation_optiondescription`]
+/// mirroring `translationoption.py:44-282`); this struct stays the
+/// flat bool-shaped subset until consumers route through the option
+/// tree.
 #[derive(Clone, Debug)]
 pub struct TranslationOptions {
     /// RPython `config.translation.verbose` (FLOWING_FLAGS default

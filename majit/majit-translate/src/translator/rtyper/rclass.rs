@@ -67,10 +67,12 @@ use crate::translator::rtyper::rtyper::{GenopResult, LowLevelOpList, RPythonType
 ///
 /// RPython equivalent: `ClassRepr.getclsfield(vcls, attr, llops)`
 /// (`rclass.py:371-377`), which appends `cast_pointer + getfield(vtable,
-/// mangled_name)` to `llops`. The full `getclsfield` ports with Phase R2
-/// `ClassRepr._setup_repr`; this helper stays as a PRE-EXISTING-ADAPTATION
-/// bridge for the pyre IR representation of vtable method slots (see the
-/// `OpKind::VtableMethodPtr` comment block in `model.rs`).
+/// mangled_name)` to `llops`. The full `getclsfield` is ported on
+/// [`ClassRepr`] (`rclass.rs:1096`) and on the rooted [`RootClassRepr`]
+/// (`rclass.rs:1828`); this freestanding helper stays as a
+/// PRE-EXISTING-ADAPTATION bridge for the pyre IR representation of
+/// vtable method slots (see the `OpKind::VtableMethodPtr` comment
+/// block in `model.rs`).
 pub fn class_get_method_ptr(
     graph: &mut FunctionGraph,
     type_state: &mut TypeResolutionState,
@@ -671,8 +673,8 @@ impl ClassRepr {
     ///
     /// `vtable` points at the vtable sub-struct for the level
     /// `r_parentcls` describes (rclass.py:298-304 walks the super chain
-    /// via `init_vtable`, not yet ported). Upstream calls `setattr` on
-    /// the live `_struct` container; the Rust port routes through
+    /// via [`Self::init_vtable`]). Upstream calls `setattr` on the
+    /// live `_struct` container; the Rust port routes through
     /// [`_ptr::setattr`] after mapping the converted
     /// [`crate::flowspace::model::Constant`] to a
     /// [`lltype::LowLevelValue`] via [`constant_to_lowlevel_value`].
@@ -2500,42 +2502,27 @@ impl InstanceRepr {
         //     self.iprebuiltinstances[value] = result
         //     self.initialize_prebuilt_data(value, self.classdef, result)
         //
-        // Cache observes `result` BEFORE `initialize_prebuilt_data`
-        // recurses — so a recursive `convert_const(self)` from inside
-        // the field walk finds the partially-built pointer rather than
-        // restarting `convert_const_exact`.
+        // RPython aliases `result` between the cache slot and the
+        // init target via Python object identity, so mutations made
+        // by `initialize_prebuilt_data` are visible through
+        // `iprebuiltinstances[value]` for recursive
+        // `convert_const(value)` calls during init (`a.b.back == a`
+        // intra-class circular prebuilt instances).
         //
-        // The Rust port runs the field-init body OUTSIDE the cache's
-        // `borrow_mut` guard so a recursive `convert_const_exact` call
-        // can re-enter the `iprebuiltinstances.borrow()` read at the
-        // top of this function without panicking on overlapping
-        // borrows. Three steps:
-        //   1. Insert a snapshot (cache observes the empty instance).
-        //   2. Drop the cache borrow_mut and run the field init on a
-        //      local clone. Both the cache snapshot and the local
-        //      share their `_struct._fields` / `_array.items` storage
-        //      via `Arc<Mutex<...>>` (lltype.rs:711-748, task #157),
-        //      so mutations performed on the local during init are
-        //      visible via every recursive `convert_const_exact` cache
-        //      hit before init completes — matching upstream's
-        //      `iprebuiltinstances[value] = result` aliasing semantics
-        //      for intra-class circular prebuilt instances
-        //      (`a.b.back == a`).
-        //   3. Re-acquire `borrow_mut` and re-insert the post-init
-        //      local. With shared `_fields` / `items` storage this is
-        //      observationally a no-op (both Arc clones already point
-        //      at the same Mutex), but keeps the cache slot owned by
-        //      the post-init Arc so the caller's `Constant` value
-        //      remains anchored.
+        // Pyre clones `result` into the cache; both the cached clone
+        // and the init target (`local`, the moved original) share
+        // `_struct._fields` / `_array.items` via `Arc<Mutex<...>>`
+        // (lltype.rs:711-748, task #157), preserving the same
+        // mid-init aliasing semantics. The cache `borrow_mut` is
+        // dropped before init runs so a recursive `convert_const_exact`
+        // cache probe at the top of this function can re-acquire
+        // `borrow()` without panicking on overlapping borrows.
         let initial = self.create_instance()?;
         self.iprebuiltinstances
             .borrow_mut()
             .insert(host_obj.clone(), initial.clone());
         let mut local = initial;
         self.initialize_prebuilt_data(Some(host_obj), self.classdef.as_ref(), &mut local, &[])?;
-        self.iprebuiltinstances
-            .borrow_mut()
-            .insert(host_obj.clone(), local.clone());
         Ok(Constant::with_concretetype(
             ConstValue::LLPtr(Box::new(local)),
             self.lowleveltype.clone(),

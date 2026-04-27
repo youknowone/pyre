@@ -14,8 +14,10 @@
 //!   Python runtime. The [`Specializer::Memo`] variant surfaces as
 //!   [`AnnotatorError`] matching upstream's `pyobj is None` path.
 //! * `specialize__ll` / `specialize__ll_and_arg` — forward to
-//!   `rpython/rtyper/annlowlevel.py:LowLevelAnnotatorPolicy` —
-//!   deferred until the rtyper's annlowlevel lands.
+//!   [`LowLevelAnnotatorPolicy`] in
+//!   [`crate::translator::rtyper::annlowlevel`], wired through the
+//!   `Specializer::Ll` / `Specializer::LlAndArg` arms in
+//!   [`crate::annotator::description::FunctionDesc::pycall`].
 //! * `no_more_blocks_to_annotate(annotator)` (policy.py:69-100) —
 //!   fully structurally ported. Drains `bk.pending_specializations`
 //!   and iterates `added_blocks` / `annotated`, then rewrites call
@@ -25,13 +27,16 @@
 //!   **Deferred**: upstream's `make_sandbox_trampoline` (rsandbox.py:
 //!   see `rpython/translator/sandbox/rsandbox.py`) produces a real
 //!   Python function carrying `_signature_ = ([SomeTuple(items=params_s
-//!   )], s_result)` and a `functionptr` lltype stub. Porting it
-//!   requires rtyper infrastructure (`lltype.FuncType`, `functionptr`,
-//!   `ll_ptrtype`) which is not yet ported. The Rust port substitutes
-//!   a `HostObject::new_user_function` stand-in so the
+//!   )], s_result)` and a `functionptr` lltype stub. The rtyper
+//!   primitives this depends on (`lltype.FuncType`, `functionptr`,
+//!   `ll_ptrtype`) are now ported in
+//!   [`crate::translator::rtyper::lltypesystem::lltype`]; what
+//!   remains is the `rsandbox` body itself, which has no Rust
+//!   counterpart yet. The Rust port substitutes a
+//!   `HostObject::new_user_function` stand-in so the
 //!   `emulated_pbc_calls` bookkeeping + instr rewrite are upstream-
 //!   faithful even though the synthesized trampoline itself is an
-//!   empty placeholder.  When rtyper + rsandbox land, the
+//!   empty placeholder. When `rsandbox` lands, the
 //!   `trampoline_name`/`GraphFunc` construction inside
 //!   `no_more_blocks_to_annotate` is the single point to wire into
 //!   real `make_sandbox_trampoline(name, params_s, s_result)`.

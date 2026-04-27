@@ -13723,7 +13723,12 @@ mod tests {
     fn test_compiled_terminal_exit_layouts_include_backend_jump_recovery_layout() {
         let mut backend = CraneliftBackend::new();
 
-        let inputargs = vec![InputArg::new_float(0), InputArg::new_ref(1)];
+        // Int (not Float) at slot 0 so the JUMP backedge passes Int into a
+        // Ref-typed inputarg position. build_ref_root_slots permits Int-at-Ref
+        // (SameAsI may forward GC pointers without changing runtime value);
+        // Float-at-Ref is rejected because IEEE754 bits are never valid
+        // pointers.
+        let inputargs = vec![InputArg::new_int(0), InputArg::new_ref(1)];
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef(0), OpRef(1)], OpRef::NONE.0),
             mk_op(OpCode::Jump, &[OpRef(1), OpRef(0)], OpRef::NONE.0),
@@ -13742,7 +13747,7 @@ mod tests {
         assert_eq!(layout.op_index, 1);
         assert_eq!(layout.trace_id, 77);
         assert_eq!(layout.fail_index, u32::MAX);
-        assert_eq!(layout.exit_types, vec![Type::Ref, Type::Float]);
+        assert_eq!(layout.exit_types, vec![Type::Ref, Type::Int]);
         assert!(!layout.is_finish);
         assert_eq!(layout.gc_ref_slots, vec![0]);
         assert!(layout.force_token_slots.is_empty());
@@ -13763,7 +13768,7 @@ mod tests {
         );
         assert_eq!(
             recovery.frames[0].slot_types,
-            Some(vec![Type::Ref, Type::Float])
+            Some(vec![Type::Ref, Type::Int])
         );
     }
 

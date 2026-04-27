@@ -9,7 +9,9 @@
 //! (this commit) adds `MethodDesc`, `FrozenDesc`, and
 //! `MethodOfFrozenDesc` — description.py:407-637 — completing the
 //! description.py port surface. ClassDef references are carried via
-//! opaque [`ClassDefKey`] handles until `classdesc.py` lands.
+//! opaque [`ClassDefKey`] handles for pointer-identity hashing on
+//! the live `Rc<RefCell<super::classdesc::ClassDef>>` (the
+//! `classdesc.py` port lives in [`super::classdesc`]).
 //!
 //! ## PRE-EXISTING-ADAPTATION: DescKey
 //!
@@ -17,11 +19,9 @@
 //! `ClassAttrFamily.descs` on the `Desc` instance itself — Python
 //! dict uses object identity by default for user classes. The Rust
 //! port uses a [`DescKey`] newtype wrapping `usize` (the pointer
-//! identity of the eventual `Rc<Desc>`). Until commits 2-3 land the
-//! real `Desc` hierarchy, callers pass a pointer-derived usize to
-//! key entries; once `Desc` is ported, the helper
-//! [`DescKey::from_desc_ptr`] will supply the identity hash from
-//! `Rc::as_ptr`.
+//! identity of the live `Rc<RefCell<Desc>>` variants behind
+//! [`DescEntry`]). [`DescEntry::desc_key`] derives the key from
+//! `Rc::as_ptr` per variant; tests use [`DescKey::from_raw`].
 
 use std::cell::RefCell;
 use std::collections::HashMap;
@@ -54,8 +54,9 @@ type GraphBuilder<'a> = Box<
 /// Opaque identity handle for a `Desc` instance.
 ///
 /// Upstream uses Python object identity; the Rust port stores a
-/// `usize` derived from `Rc::as_ptr(&desc)`. Commits 2-3 add a
-/// helper constructor once the `Desc` struct lands.
+/// `usize` derived from `Rc::as_ptr(&desc)`. The live conversion
+/// happens per-variant inside [`DescEntry::desc_key`] (see line ~553
+/// for the per-variant `Rc::as_ptr` calls).
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct DescKey(pub usize);
 
@@ -540,9 +541,10 @@ pub enum DescEntry {
     Frozen(Rc<RefCell<FrozenDesc>>),
     /// upstream `MethodOfFrozenDesc` — description.py:601-637.
     MethodOfFrozen(Rc<RefCell<MethodOfFrozenDesc>>),
-    /// upstream `ClassDesc` — classdesc.py:488-918. Currently the c1
-    /// shell (`classdesc::ClassDesc::new_shell`) until c2 lands the
-    /// full `__init__` body.
+    /// upstream `ClassDesc` — classdesc.py:488-918. The full
+    /// `__init__` body is ported at [`super::classdesc::ClassDesc::new`];
+    /// [`super::classdesc::ClassDesc::new_shell`] is the test-only
+    /// shell that skips mixin resolution and `add_source_attribute`.
     Class(Rc<RefCell<super::classdesc::ClassDesc>>),
 }
 
@@ -2039,8 +2041,11 @@ impl MemoDesc {
 
 /// Opaque handle for `ClassDef` references used by
 /// [`MethodDesc::originclassdef`] / `selfclassdef`. Upstream carries
-/// a live `ClassDef` object; Rust keeps a pointer-identity handle
-/// until `classdesc.py` lands the real registry.
+/// a live `ClassDef` object; Rust uses a pointer-identity handle so
+/// the same `Rc<RefCell<super::classdesc::ClassDef>>` value hashes
+/// stably across borrows. The classdesc registry itself is ported
+/// in [`super::classdesc`] — see [`Self::from_classdef`] for the
+/// `Rc::as_ptr` conversion.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct ClassDefKey(pub usize);
 

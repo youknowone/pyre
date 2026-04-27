@@ -13,8 +13,10 @@
 //!   `find_all_graphs` seeds the BFS from this list so the inliner can
 //!   always reach `int_abs` / `int_floordiv` / `int_mod` /
 //!   `ll_math.ll_math_sqrt`.  Pyre's `find_all_graphs`
-//!   (`call.rs::find_all_graphs`) does not consume this seed today —
-//!   the loop at `call.py:60-64` is not yet ported.
+//!   ([`crate::jit_codewriter::call::CallControl::find_all_graphs_bfs`])
+//!   already iterates this slice (see the seed loop at `call.rs:1422`);
+//!   re-enabling the four entries above only requires landing the
+//!   matching `register_function_graph` entries upstream of the BFS.
 //! - [`decode_builtin_call`] returns the last segment of the call
 //!   target as the oopspec name and an empty arg list.  The upstream
 //!   resolution that walks `op.args[0].value._obj` to recover the full
