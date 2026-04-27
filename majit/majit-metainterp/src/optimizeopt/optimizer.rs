@@ -1354,7 +1354,7 @@ impl Optimizer {
                 if is_virtual {
                     return self.force_at_the_end_of_preamble(resolved, ctx);
                 }
-                resolved
+                opref
             }
             // optimizer.py:314-318 — `box.type == 'i'` path.
             //
@@ -1367,10 +1367,10 @@ impl Optimizer {
                 if ctx.get_ptr_info(resolved).is_some() {
                     return self.force_at_the_end_of_preamble(resolved, ctx);
                 }
-                resolved
+                opref
             }
             // optimizer.py:319 — fall-through `return box`.
-            _ => resolved,
+            _ => opref,
         }
     }
 
@@ -1952,24 +1952,29 @@ impl Optimizer {
                     );
                 }
             }
-            self.imported_label_args = Some(label_args);
+            self.imported_label_args = Some(label_args.clone());
+            if !self.imported_virtuals.is_empty() {
+                self.install_imported_virtuals(&mut ctx);
+                if crate::optimizeopt::majit_log_enabled() {
+                    let upper = ctx.inputarg_base + ctx.num_inputs;
+                    for raw in ctx.inputarg_base..upper {
+                        let raw = OpRef(raw);
+                        eprintln!(
+                            "[jit] import_state_resolved: raw={raw:?} resolved={:?}",
+                            ctx.get_box_replacement(raw)
+                        );
+                    }
+                }
+            }
+            crate::optimizeopt::unroll::import_short_preamble_state(
+                &targetargs,
+                &label_args,
+                exported_state,
+                &mut ctx,
+            );
         }
         // Restore the temporarily-taken imported_loop_state.
         self.imported_loop_state = imported_loop_state_taken;
-
-        if !self.imported_virtuals.is_empty() {
-            self.install_imported_virtuals(&mut ctx);
-            if crate::optimizeopt::majit_log_enabled() {
-                let upper = ctx.inputarg_base + ctx.num_inputs;
-                for raw in ctx.inputarg_base..upper {
-                    let raw = OpRef(raw);
-                    eprintln!(
-                        "[jit] import_state_resolved: raw={raw:?} resolved={:?}",
-                        ctx.get_box_replacement(raw)
-                    );
-                }
-            }
-        }
 
         // RPython shortpreamble.py: PureOp.produce_op stores PreambleOp
         // directly in opt.optimizer.optpure. In majit, imported short pure ops
@@ -2016,21 +2021,14 @@ impl Optimizer {
         //
         // Capture is performed below, *after* the terminal_op force pass
         // and `flush()` have run inside the `exported_loop_state` map
-        // closure, mirroring RPython's order. The pre-force resolved
-        // jump args are still recorded here so the closure can stash them
-        // for downstream consumers (e.g. the unroll.rs assembly path that
-        // wants the original incoming OpRefs for source-slot mapping).
-        let pre_jump_resolved_args =
-            last_op
-                .as_ref()
-                .filter(|op| op.opcode == OpCode::Jump)
-                .map(|jump_op| {
-                    jump_op
-                        .args
-                        .iter()
-                        .map(|&arg| ctx.get_box_replacement(arg))
-                        .collect::<Vec<OpRef>>()
-                });
+        // closure, mirroring RPython's order. Keep the raw jump args here:
+        // unroll.py:452-455 passes `original_label_args` directly to
+        // `force_box_for_end_of_preamble`, and optimizer.py:306-319 returns
+        // the original box unchanged when no force is required.
+        let pre_jump_resolved_args = last_op
+            .as_ref()
+            .filter(|op| op.opcode == OpCode::Jump)
+            .map(|jump_op| jump_op.args.clone());
 
         // RPython optimizer.py:552-556 (_propagate_all_forward):
         //     if flush:
@@ -2245,9 +2243,6 @@ impl Optimizer {
                     // loop-tail relocation workaround below.
                     extra_same_as_aliases.push(op);
                     ctx.register_value_type(fresh, arg_type);
-                    if let Some(val) = ctx.get_constant(orig).cloned() {
-                        ctx.make_constant(fresh, val);
-                    }
                     if let Some(info) = ctx.get_ptr_info(orig).cloned() {
                         let fresh_info = match info {
                             crate::optimizeopt::info::PtrInfo::Virtual(mut vinfo) => {
@@ -2258,11 +2253,6 @@ impl Optimizer {
                                     // RPython Box type parity: copy type
                                     if let Some(&tp) = ctx.value_types.get(&orig_field.0) {
                                         ctx.register_value_type(ff, tp);
-                                    }
-                                    if let Some(val) =
-                                        ctx.get_constant(orig_field).cloned()
-                                    {
-                                        ctx.make_constant(ff, val);
                                     }
                                     field.1 = ff;
                                 }

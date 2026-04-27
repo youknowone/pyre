@@ -2286,7 +2286,7 @@ impl OptUnroll {
         for &arg in &label_args {
             self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
         }
-        let mut short_args = label_args.clone();
+        let mut short_args = label_args.to_vec();
         short_args.extend(virtuals);
         let exported_short_ops = self.collect_exported_short_ops(&short_args, ctx);
         let exported_short_boxes = ctx.exported_short_boxes.clone();
@@ -3110,6 +3110,23 @@ impl OptUnroll {
                 ));
             }
         };
+        // The short-preamble replay part of unroll.py:496-502 is performed
+        // by import_short_preamble_state after majit's split-out
+        // Optimizer::install_imported_virtuals has completed. RPython's
+        // virtual_state.make_inputargs installs virtual PtrInfo before
+        // produced_op.produce_op; doing it earlier here replays short ops
+        // against incomplete virtual state.
+        // return label_args
+        label_args
+    }
+
+    pub fn import_short_preamble_state(
+        &self,
+        targetargs: &[OpRef],
+        label_args: &[OpRef],
+        exported_state: &ExportedState,
+        ctx: &mut OptContext,
+    ) {
         // self.short_preamble_producer = ShortPreambleBuilder(
         //     label_args, exported_state.short_boxes,
         //     exported_state.short_inputargs, exported_state.exported_infos,
@@ -3129,7 +3146,7 @@ impl OptUnroll {
             .filter(|(_, info)| info.is_virtual())
             .filter_map(|(i, _)| targetargs.get(i).copied())
             .collect();
-        let mut short_args = label_args.clone();
+        let mut short_args = label_args.to_vec();
         short_args.extend(virtuals);
         // for produced_op in exported_state.short_boxes:
         //     produced_op.produce_op(self, exported_state.exported_infos)
@@ -3152,8 +3169,6 @@ impl OptUnroll {
              This was previously masked by the legacy initialize_imported_short_preamble_builder \
              fallback path, which is now removed for RPython parity."
         );
-        // return label_args
-        label_args
     }
 
     /// unroll.py:432-443 `_expand_info` + `unroll.py:548`
@@ -3846,6 +3861,15 @@ pub(crate) fn import_state(
     ctx: &mut OptContext,
 ) -> Vec<OpRef> {
     OptUnroll::new().import_state(targetargs, exported_state, optimizer, ctx)
+}
+
+pub(crate) fn import_short_preamble_state(
+    targetargs: &[OpRef],
+    label_args: &[OpRef],
+    exported_state: &ExportedState,
+    ctx: &mut OptContext,
+) {
+    OptUnroll::new().import_short_preamble_state(targetargs, label_args, exported_state, ctx)
 }
 
 /// unroll.py: pick_virtual_state(my_vs, label_vs, target_tokens)
@@ -5636,7 +5660,9 @@ mod tests {
         );
 
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(4, 2);
-        let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut optimizer, &mut ctx2);
+        let targetargs = [OpRef(0), OpRef(1)];
+        let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
+        import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(10), OpRef(11)]);
         // RPython PreambleOp parity: PreambleOp stored in PtrInfo._fields.
         // No imported_short_fields for heap fields — PtrInfo is the single
@@ -5731,7 +5757,9 @@ mod tests {
         );
 
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(8, 2);
-        let label_args = import_state(&[OpRef(0), OpRef(1)], &exported, &mut optimizer, &mut ctx2);
+        let targetargs = [OpRef(0), OpRef(1)];
+        let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
+        import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
         assert_eq!(label_args, vec![OpRef(12), OpRef(11)]);
         // unroll.py:454: the imported constant must land in a fresh
         // const-pool slot in the consumer trace, not reuse the producer
@@ -5872,12 +5900,9 @@ mod tests {
         );
 
         let mut ctx2 = crate::optimizeopt::OptContext::with_num_inputs(6, 1024);
-        import_state(
-            &[OpRef(0), OpRef(1), OpRef(2)],
-            &exported,
-            &mut optimizer,
-            &mut ctx2,
-        );
+        let targetargs = [OpRef(0), OpRef(1), OpRef(2)];
+        let label_args = import_state(&targetargs, &exported, &mut optimizer, &mut ctx2);
+        import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
         let imported_result = ctx2.imported_short_pure_ops[0].result;
         assert_ne!(imported_result, OpRef(30));
         let forced = ctx2.force_op_from_preamble(imported_result);

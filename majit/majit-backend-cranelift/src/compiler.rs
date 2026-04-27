@@ -4136,13 +4136,7 @@ fn build_ref_root_slots(
     let mut non_ref_at_backedge: HashSet<u32> = HashSet::new();
     let mut has_float_at_ref_position = false;
     {
-        // Build type map: pos → result_type for all ops
-        let mut type_map: HashMap<u32, Type> = HashMap::new();
-        for op in ops.iter() {
-            if op.result_type() != Type::Void && !op.pos.is_none() {
-                type_map.insert(op.pos.0, op.result_type());
-            }
-        }
+        let type_map = build_value_type_map_simple(inputargs, ops);
         // Find the closing JUMP and check arg types against inputarg types
         if let Some(jump) = ops.iter().rfind(|op| op.opcode == OpCode::Jump) {
             let num_inputs = inputargs.len();
@@ -4153,7 +4147,7 @@ fn build_ref_root_slots(
                 if inputargs[i].tp != Type::Ref {
                     continue;
                 }
-                if (arg.0 as usize) < num_inputs {
+                if (arg.0 as usize) < num_inputs && inputargs[arg.0 as usize].tp == Type::Ref {
                     continue; // inputarg reference — always safe
                 }
                 if let Some(&actual_tp) = type_map.get(&arg.0) {
@@ -4236,9 +4230,9 @@ fn build_ref_root_slots(
     // allows type substitution (SameAsF/SameAsI replacing Ref) which RPython
     // cannot express.
     //
-    // Float at Ref always segfaults (IEEE754 bits are never valid pointers).
-    // Int at Ref can be safe: the optimizer may forward a GC pointer through
-    // SameAsI without changing the actual runtime value.
+    // Float at Ref is unsafe: IEEE754 bits are never valid pointers. Int at Ref
+    // can be safe when the optimizer forwards a GC pointer through SameAsI
+    // without changing the actual runtime value.
     if has_float_at_ref_position {
         return Err(BackendError::Unsupported(
             "jump_to_preamble: backedge passes Float at Ref-typed inputarg position".to_string(),

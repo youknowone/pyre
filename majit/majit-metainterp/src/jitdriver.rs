@@ -1516,7 +1516,7 @@ impl<S: JitState> JitDriver<S> {
                 &raw_values,
                 descr_addr,
             );
-            // compile.py:702-703: must_compile() and not stack_almost_full()
+            // compile.py:702-703: must_compile() and not stack_almost_full().
             let should_bridge =
                 must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
 
@@ -2482,7 +2482,7 @@ impl<S: JitState> JitDriver<S> {
             &raw_values,
             descr_addr,
         );
-        // compile.py:702-703: must_compile() and not stack_almost_full()
+        // compile.py:702-703: must_compile() and not stack_almost_full().
         let should_bridge =
             must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
 
@@ -3174,7 +3174,7 @@ impl<S: JitState> JitDriver<S> {
                 &raw_values,
                 descr_addr,
             );
-            // compile.py:702-703: must_compile() and not stack_almost_full()
+            // compile.py:702-703: must_compile() and not stack_almost_full().
             let should_bridge =
                 must_compile && !majit_metainterp::MetaInterp::<S::Meta>::stack_almost_full();
 

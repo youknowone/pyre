@@ -3597,28 +3597,53 @@ impl<M: Clone> MetaInterp<M> {
         // root inputarg types. RPython has no synthetic recovery when this
         // is absent; abort compilation so the caller falls back to the
         // interpreter instead of synthesizing Int-padded InputArgs.
-        let root_inputargs = match unroll_opt
-            .final_exported_state
-            .as_ref()
-            .map(|es| es.renamed_inputarg_types.as_slice())
-            .filter(|types| types.len() == final_num_inputs)
-        {
-            Some(types) => types
-                .iter()
-                .enumerate()
-                .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
-                .collect::<Vec<_>>(),
-            None => {
-                if crate::majit_log_enabled() {
-                    eprintln!(
-                        "[jit] abort compile: root loop missing ExportedState inputarg types \
-                         (final_num_inputs={final_num_inputs})",
-                    );
+        let root_inputargs = if retried_without_unroll {
+            // compile.py:233 compile_simple_loop: loop.inputargs is the
+            // original trace inputargs. There is no ExportedState on the
+            // simple path.
+            trace.inputargs.clone()
+        } else {
+            match unroll_opt
+                .final_exported_state
+                .as_ref()
+                .map(|es| es.renamed_inputarg_types.as_slice())
+                .filter(|types| types.len() == final_num_inputs)
+            {
+                Some(types) => types
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
+                    .collect::<Vec<_>>(),
+                None => {
+                    if crate::majit_log_enabled() {
+                        eprintln!(
+                            "[jit] abort compile: root loop missing ExportedState inputarg types \
+                             (final_num_inputs={final_num_inputs})",
+                        );
+                    }
+                    self.cancel_count += 1;
+                    return CompileOutcome::Cancelled;
                 }
-                self.cancel_count += 1;
-                return CompileOutcome::Cancelled;
             }
         };
+        let mut optimized_ops = optimized_ops;
+        if retried_without_unroll
+            && !optimized_ops
+                .first()
+                .is_some_and(|op| op.opcode == OpCode::Label)
+        {
+            // compile.py:251-259 compile_simple_loop synthesizes
+            // LABEL(inputargs) before the optimized body.
+            let mut label_op = majit_ir::Op::new(
+                majit_ir::OpCode::Label,
+                &root_inputargs
+                    .iter()
+                    .map(|ia| majit_ir::OpRef(ia.index))
+                    .collect::<Vec<_>>(),
+            );
+            label_op.pos = majit_ir::OpRef::NONE;
+            optimized_ops.insert(0, label_op);
+        }
         let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
             root_inputargs,
             optimized_ops,
@@ -3698,16 +3723,23 @@ impl<M: Clone> MetaInterp<M> {
             {
                 jump_op.descr = Some(target_token.as_jump_target_descr());
             }
-            let mut label_op = majit_ir::Op::new(
-                majit_ir::OpCode::Label,
-                &inputargs
-                    .iter()
-                    .map(|ia| majit_ir::OpRef(ia.index))
-                    .collect::<Vec<_>>(),
-            );
-            label_op.pos = majit_ir::OpRef::NONE;
-            label_op.descr = Some(target_token.as_jump_target_descr());
-            compiled_ops.insert(0, label_op);
+            if let Some(label_op) = compiled_ops
+                .iter_mut()
+                .find(|op| op.opcode == OpCode::Label)
+            {
+                label_op.descr = Some(target_token.as_jump_target_descr());
+            } else {
+                let mut label_op = majit_ir::Op::new(
+                    majit_ir::OpCode::Label,
+                    &inputargs
+                        .iter()
+                        .map(|ia| majit_ir::OpRef(ia.index))
+                        .collect::<Vec<_>>(),
+                );
+                label_op.pos = majit_ir::OpRef::NONE;
+                label_op.descr = Some(target_token.as_jump_target_descr());
+                compiled_ops.insert(0, label_op);
+            }
             vec![target_token]
         } else if unroll_opt.target_tokens.is_empty() {
             prior_front_target_tokens.clone()

@@ -204,6 +204,23 @@ const DEFAULT_TRACE_LIMIT: u32 = crate::trace_ctx::DEFAULT_TRACE_LIMIT as u32;
 /// warmspot.py:93 retrace_limit=5
 const DEFAULT_RETRACE_LIMIT: u32 = 5;
 
+/// rlib/jit.py:598 max_unroll_loops = 0
+const DEFAULT_MAX_UNROLL_LOOPS: u32 = 0;
+
+/// rlib/jit.py:600 enable_opts = "all"
+fn default_enable_opts() -> Vec<String> {
+    vec![
+        "intbounds".to_string(),
+        "rewrite".to_string(),
+        "virtualize".to_string(),
+        "string".to_string(),
+        "pure".to_string(),
+        "earlyforce".to_string(),
+        "heap".to_string(),
+        "unroll".to_string(),
+    ]
+}
+
 /// Maximum number of trace aborts before permanently marking a green key
 /// as DONT_TRACE_HERE. Prevents infinite retrace loops when optimization
 /// always fails (e.g. InvalidLoop) for the same key.
@@ -364,20 +381,19 @@ impl WarmEnterState {
             vectorize: false,
             vec_all: false,
             vec_cost: 0,
-            enable_opts: Vec::new(),
+            enable_opts: default_enable_opts(),
             inlining: true,
-            disable_unrolling_threshold: 0,
+            disable_unrolling_threshold: DEFAULT_DISABLE_UNROLLING,
             pureop_historylength: 16,
             memory_manager: {
                 let mut m = majit_trace::memmgr::LoopAging::new(0);
                 // warmspot.py:93 test default retrace_limit=5 (rlib/jit.py:588
                 // PARAMETERS is 0, applied in production via set_user_param).
                 m.retrace_limit = DEFAULT_RETRACE_LIMIT;
-                // pyre quirk: rlib/jit.py:588 PARAMETERS default is 0 but
-                // pyre's cancel_count path aborts immediately on the first
-                // InvalidLoop when max_unroll_loops is 0. 4 matches prior
-                // pyre-side constructor behavior.
-                m.max_unroll_loops = 4;
+                // rlib/jit.py:598 / pyjitpl.py:2946: default 0 means
+                // the first cancelled unrolled compile immediately retries
+                // once without unrolling.
+                m.max_unroll_loops = DEFAULT_MAX_UNROLL_LOOPS;
                 m
             },
         }
@@ -402,20 +418,19 @@ impl WarmEnterState {
             vectorize: false,
             vec_all: false,
             vec_cost: 0,
-            enable_opts: Vec::new(),
+            enable_opts: default_enable_opts(),
             inlining: true,
-            disable_unrolling_threshold: 0,
+            disable_unrolling_threshold: DEFAULT_DISABLE_UNROLLING,
             pureop_historylength: 16,
             memory_manager: {
                 let mut m = majit_trace::memmgr::LoopAging::new(0);
                 // warmspot.py:93 test default retrace_limit=5 (rlib/jit.py:588
                 // PARAMETERS is 0, applied in production via set_user_param).
                 m.retrace_limit = DEFAULT_RETRACE_LIMIT;
-                // pyre quirk: rlib/jit.py:588 PARAMETERS default is 0 but
-                // pyre's cancel_count path aborts immediately on the first
-                // InvalidLoop when max_unroll_loops is 0. 4 matches prior
-                // pyre-side constructor behavior.
-                m.max_unroll_loops = 4;
+                // rlib/jit.py:598 / pyjitpl.py:2946: default 0 means
+                // the first cancelled unrolled compile immediately retries
+                // once without unrolling.
+                m.max_unroll_loops = DEFAULT_MAX_UNROLL_LOOPS;
                 m
             },
         }
@@ -1252,17 +1267,7 @@ impl WarmEnterState {
     /// "all" enables all passes.
     pub fn set_param_enable_opts(&mut self, value: &str) {
         self.enable_opts = if value == "all" || value.is_empty() {
-            // All passes enabled (default)
-            vec![
-                "intbounds".to_string(),
-                "rewrite".to_string(),
-                "virtualize".to_string(),
-                "string".to_string(),
-                "pure".to_string(),
-                "earlyforce".to_string(),
-                "heap".to_string(),
-                "unroll".to_string(),
-            ]
+            default_enable_opts()
         } else {
             value
                 .split(':')

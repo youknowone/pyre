@@ -1230,16 +1230,7 @@ impl Optimization for OptPure {
                 })
                 .collect();
             let descr_identity = entry.descr.as_ref().map(majit_ir::descr::descr_identity);
-            let source = ctx.imported_short_source(entry.result);
-            let mut replay = majit_ir::Op::new(entry.opcode, &resolved_args);
-            replay.pos = source;
-            replay.descr = entry.descr.clone();
-            let pop = crate::optimizeopt::info::PreambleOp {
-                op: source,
-                resolved: entry.result,
-                invented_name: false,
-                preamble_op: replay,
-            };
+            let pop = entry.pop.clone();
             if entry.opcode.is_call_pure() || entry.opcode.is_call() {
                 // shortpreamble.py:122-123: optpure.extra_call_pure.append(PreambleOp(...))
                 self.extra_call_pure_preamble(entry.opcode, resolved_args, descr_identity, pop);
