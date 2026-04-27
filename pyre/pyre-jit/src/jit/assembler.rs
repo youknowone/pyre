@@ -927,7 +927,7 @@ fn dispatch_op(
             let index_reg = expect_reg(&args[1], Kind::Int);
             let array_idx = expect_descr_vable_array_field(&args[2]);
             let array_descr_idx = expect_descr_vable_array(&args[3]);
-            debug_assert_eq!(
+            assert_eq!(
                 array_idx, array_descr_idx,
                 "getarrayitem_vable_r: VableArrayField({}) and VableArray({}) descrs \
                  must reference the same array field",
@@ -965,7 +965,7 @@ fn dispatch_op(
             let index_reg = expect_reg(&args[1], Kind::Int);
             let array_idx = expect_descr_vable_array_field(&args[3]);
             let array_descr_idx = expect_descr_vable_array(&args[4]);
-            debug_assert_eq!(
+            assert_eq!(
                 array_idx, array_descr_idx,
                 "setarrayitem_vable_r: VableArrayField({}) and VableArray({}) descrs \
                  must reference the same array field",

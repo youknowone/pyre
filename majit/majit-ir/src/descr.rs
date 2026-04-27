@@ -1540,12 +1540,15 @@ impl Descr for VableStaticFieldDescr {
 }
 
 /// Number of `OnceLock<DescrRef>` slots reserved for
-/// `vable_static_field_descr(idx)` singletons. Sized at 8 to cover
-/// pyre's current 6-field PyFrame virtualizable
-/// (`interp_jit.py:25-31`) with headroom for two additional fields
-/// before this constant must grow. The assertion in
-/// `vable_static_field_descr` rejects out-of-range indices loudly.
-const VABLE_STATIC_FIELD_DESCR_SLOTS: usize = 8;
+/// `vable_static_field_descr(idx)` singletons. Matches the exact
+/// scalar-field count of pyre's PyFrame virtualizable
+/// (`interp_jit.py:25-31`: `last_instr, pycode, valuestackdepth,
+/// debugdata, lastblock, w_globals`), mirroring upstream
+/// `rpython/jit/metainterp/virtualizable.py:71`'s
+/// `static_field_descrs = [... for name in static_fields]` which
+/// is sized exactly to `len(static_fields)`. Bump this when the
+/// PyFrame `_virtualizable_` declaration grows.
+const VABLE_STATIC_FIELD_DESCR_SLOTS: usize = 6;
 
 /// Singleton accessor for `static_field_descrs[idx]`.
 ///
@@ -1564,16 +1567,15 @@ pub fn vable_static_field_descr(idx: u16) -> DescrRef {
         OnceLock::new(),
         OnceLock::new(),
         OnceLock::new(),
-        OnceLock::new(),
-        OnceLock::new(),
     ];
     let i = idx as usize;
     assert!(
         i < VABLE_STATIC_FIELD_DESCR_SLOTS,
         "vable_static_field_descr: idx={} exceeds VABLE_STATIC_FIELD_DESCR_SLOTS={}; \
-         pyre's PyFrame _virtualizable_ declares only 6 static fields \
+         pyre's PyFrame _virtualizable_ declares only {} static fields \
          (interp_jit.py:25-31)",
         idx,
+        VABLE_STATIC_FIELD_DESCR_SLOTS,
         VABLE_STATIC_FIELD_DESCR_SLOTS,
     );
     SLOTS[i]
