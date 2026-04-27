@@ -113,7 +113,7 @@ pub fn copy_str_content(
 
     // vstring.py:347: if lgt.is_constant() and lgt.get_constant_int() <= M
     if lgt_bound.is_constant() {
-        let length = lgt_bound.get_constant();
+        let length = lgt_bound.get_constant_int();
         if length >= 0 && (length as usize) <= m {
             // vstring.py:350-357: inline STRGETITEM/STRSETITEM
             // RPython calls optstring.strgetitem(None, srcbox, srcoffsetbox, mode)
@@ -129,7 +129,7 @@ pub fn copy_str_content(
                     // vstring.py:495: vindex = self.getintbound(index)
                     let vindex = ctx.getintbound(src_offset);
                     let resolved_idx = if vindex.is_constant() {
-                        Some(vindex.get_constant())
+                        Some(vindex.get_constant_int())
                     } else {
                         None
                     };
@@ -588,7 +588,7 @@ impl OptString {
     fn get_constant_int_bound(&self, opref: OpRef, ctx: &OptContext) -> Option<i64> {
         ctx.get_int_bound(opref)
             .filter(|bound| bound.is_constant())
-            .map(|bound| bound.get_constant())
+            .map(|bound| bound.get_constant_int())
             .or_else(|| ctx.get_constant_int(opref))
     }
 
@@ -1032,7 +1032,7 @@ impl OptString {
         // vstring.py:795-805: l2info = self.getintbound(l2box)
         if let Some(l2ref) = l2box {
             let l2info = ctx.getintbound(l2ref);
-            if l2info.is_constant() && l2info.get_constant() == 1 {
+            if l2info.is_constant() && l2info.get_constant_int() == 1 {
                 // vstring.py:799: vchar = self.strgetitem(None, arg2, CONST_0, mode)
                 if let Some(vchar) = self.strgetitem(arg2, 0, ctx) {
                     // vstring.py:800-804
@@ -1339,7 +1339,7 @@ mod tests {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::Remove => {

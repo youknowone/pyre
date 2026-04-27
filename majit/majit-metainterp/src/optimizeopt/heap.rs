@@ -3809,7 +3809,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -4102,7 +4102,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -4574,7 +4574,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -5026,7 +5026,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -5083,7 +5083,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -5181,7 +5181,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -5262,7 +5262,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -5332,7 +5332,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -5401,7 +5401,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -5477,7 +5477,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -5647,7 +5647,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -5703,7 +5703,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {
@@ -5753,7 +5753,7 @@ mod tests {
                     ctx.emit(emitted);
                 }
                 OptimizationResult::Remove => {}
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::PassOn => {

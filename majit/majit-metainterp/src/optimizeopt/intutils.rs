@@ -172,7 +172,16 @@ impl IntBound {
         }
     }
 
-    /// Bounded in [lower, upper] with shrinking.
+    /// PRE-EXISTING-ADAPTATION: RPython's keyword-default constructor
+    /// `IntBound(lower=lower, upper=upper)` (intutils.py:81-115) leaves
+    /// `tvalue` / `tmask` at the `TNUM_ONLY_VALUE_DEFAULT` (= 0) and
+    /// `TNUM_ONLY_MASK_DEFAULT` (= TNUM_UNKNOWN = r_uint(-1)) defaults
+    /// while still running `shrink()`. Rust has no keyword defaults so
+    /// `IntBound::new(lower, upper, 0, u64::MAX)` would have to repeat
+    /// the magic constants at every call site (~150 sites). This named
+    /// factory captures the exact same default semantics in one place.
+    ///
+    /// Bounded in [lower, upper] with shrinking; tvalue/tmask = TNUM_UNKNOWN.
     pub fn bounded(lower: i64, upper: i64) -> Self {
         debug_assert!(lower <= upper, "bounded: lower({lower}) > upper({upper})");
         Self::new_raw(lower, upper, 0, u64::MAX, true)
@@ -203,8 +212,9 @@ impl IntBound {
         self.tmask == 0
     }
 
-    /// Get the known constant value (panics if not constant).
-    pub fn get_constant(&self) -> i64 {
+    /// intutils.py:448 `get_constant_int` — return the known constant value
+    /// (panics if not constant).
+    pub fn get_constant_int(&self) -> i64 {
         debug_assert!(self.is_constant());
         self.lower
     }
@@ -212,21 +222,6 @@ impl IntBound {
     /// Whether the value is known to be non-negative.
     pub fn known_nonnegative(&self) -> bool {
         self.lower >= 0
-    }
-
-    /// intutils.py: known_nonzero — is the value definitely nonzero?
-    pub fn known_nonzero(&self) -> bool {
-        (self.lower > 0) || (self.upper < 0)
-    }
-
-    /// intutils.py: known_negative — is the value definitely negative?
-    pub fn known_negative(&self) -> bool {
-        self.upper < 0
-    }
-
-    /// intutils.py: known_positive — is the value definitely > 0?
-    pub fn known_positive(&self) -> bool {
-        self.lower > 0
     }
 
     /// intutils.py:1318-1329 `IntBound.getnullness()` parity (line-by-line port).
@@ -248,7 +243,7 @@ impl IntBound {
     pub fn getnullness(&self) -> i8 {
         if self.known_gt_const(0) || self.known_lt_const(0) || self.tvalue != 0 {
             crate::optimizeopt::INFO_NONNULL
-        } else if self.is_constant() && self.get_constant() == 0 {
+        } else if self.is_constant() && self.get_constant_int() == 0 {
             crate::optimizeopt::INFO_NULL
         } else {
             crate::optimizeopt::INFO_UNKNOWN
@@ -360,11 +355,6 @@ impl IntBound {
     /// Check if all numbers are between lower and upper.
     pub fn is_within_range(&self, lower: i64, upper: i64) -> bool {
         lower <= self.lower && self.upper <= upper
-    }
-
-    /// Returns a copy of this abstract integer.
-    pub fn clone_bound(&self) -> IntBound {
-        self.clone()
     }
 
     // ── Signed comparisons ──
@@ -809,14 +799,9 @@ impl IntBound {
         }
     }
 
-    /// C-style truncation division (not used much, but available).
-    pub fn floordiv_bound(&self, other: &IntBound) -> IntBound {
-        self.py_div_bound(other)
-    }
-
     /// Python-style modulo bound.
     pub fn mod_bound(&self, other: &IntBound) -> IntBound {
-        if other.is_constant() && other.get_constant() == 0 {
+        if other.is_constant() && other.get_constant_int() == 0 {
             return IntBound::unbounded();
         }
         // with Python's modulo:  0 <= (x % pos) < pos
@@ -826,16 +811,11 @@ impl IntBound {
         IntBound::bounded(lower, upper)
     }
 
-    /// Alias for mod_bound (Python-style).
-    pub fn py_mod_bound(&self, other: &IntBound) -> IntBound {
-        self.mod_bound(other)
-    }
-
     /// Bound after left shift.
     pub fn lshift_bound(&self, other: &IntBound) -> IntBound {
         let (mut tvalue, mut tmask) = (0u64, u64::MAX); // TNUM_UNKNOWN
         if other.is_constant() {
-            let c_other = other.get_constant();
+            let c_other = other.get_constant_int();
             if c_other >= 64 {
                 tvalue = 0;
                 tmask = 0; // TNUM_KNOWN_ZERO
@@ -872,7 +852,7 @@ impl IntBound {
     pub fn rshift_bound(&self, other: &IntBound) -> IntBound {
         let (mut tvalue, mut tmask) = (0u64, u64::MAX); // TNUM_UNKNOWN
         if other.is_constant() {
-            let c_other = other.get_constant();
+            let c_other = other.get_constant_int();
             if c_other >= 64 {
                 // shift value out to the right, but do sign extend
                 if msbonly(self.tmask) != 0 {
@@ -918,7 +898,7 @@ impl IntBound {
         let (mut tvalue, mut tmask) = (0u64, u64::MAX); // TNUM_UNKNOWN
 
         if other.is_constant() {
-            let c_other = other.get_constant();
+            let c_other = other.get_constant_int();
             if c_other >= 64 {
                 tvalue = 0;
                 tmask = 0; // TNUM_KNOWN_ZERO
@@ -1007,7 +987,7 @@ impl IntBound {
         if !other.is_constant() {
             return IntBound::unbounded();
         }
-        let c_other = other.get_constant();
+        let c_other = other.get_constant_int();
         let (mut tvalue, mut tmask) = (0u64, u64::MAX);
         if c_other >= 0 && c_other < 64 {
             let shift = c_other as u32;
@@ -1028,7 +1008,7 @@ impl IntBound {
         if !other.is_constant() {
             return Ok(IntBound::unbounded());
         }
-        let c_other = other.get_constant();
+        let c_other = other.get_constant_int();
         let (mut tvalue, mut tmask) = (0u64, u64::MAX);
         if c_other >= 0 && c_other < 64 {
             let shift = c_other as u32;
@@ -1391,7 +1371,7 @@ impl Default for IntBound {
 impl std::fmt::Display for IntBound {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         if self.is_constant() {
-            write!(f, "({})", self.get_constant())
+            write!(f, "({})", self.get_constant_int())
         } else if self.lower == i64::MIN && self.upper == i64::MAX {
             write!(f, "(?)")
         } else {
@@ -1420,7 +1400,7 @@ mod tests {
     fn test_constant() {
         let b = IntBound::from_constant(42);
         assert!(b.is_constant());
-        assert_eq!(b.get_constant(), 42);
+        assert_eq!(b.get_constant_int(), 42);
         assert_eq!(b.lower, 42);
         assert_eq!(b.upper, 42);
         assert_eq!(b.tvalue, 42);
@@ -1431,7 +1411,7 @@ mod tests {
     fn test_constant_negative() {
         let b = IntBound::from_constant(-1);
         assert!(b.is_constant());
-        assert_eq!(b.get_constant(), -1);
+        assert_eq!(b.get_constant_int(), -1);
         assert_eq!(b.tvalue, u64::MAX);
         assert_eq!(b.tmask, 0);
     }
@@ -1440,7 +1420,7 @@ mod tests {
     fn test_constant_zero() {
         let b = IntBound::from_constant(0);
         assert!(b.is_constant());
-        assert_eq!(b.get_constant(), 0);
+        assert_eq!(b.get_constant_int(), 0);
         assert_eq!(b.tvalue, 0);
         assert_eq!(b.tmask, 0);
     }
@@ -1467,7 +1447,7 @@ mod tests {
     fn test_bounded_exact() {
         let b = IntBound::bounded(42, 42);
         assert!(b.is_constant());
-        assert_eq!(b.get_constant(), 42);
+        assert_eq!(b.get_constant_int(), 42);
     }
 
     #[test]
@@ -1483,7 +1463,7 @@ mod tests {
         // All bits known
         let b = IntBound::from_knownbits(0xFF, 0);
         assert!(b.is_constant());
-        assert_eq!(b.get_constant(), 0xFF);
+        assert_eq!(b.get_constant_int(), 0xFF);
 
         // Low byte known to be 0xFF, rest unknown
         let b = IntBound::from_knownbits(0xFF, !0xFFu64);
@@ -1674,7 +1654,7 @@ mod tests {
         let mut a = IntBound::bounded(0, 100);
         a.make_eq_const(42).unwrap();
         assert!(a.is_constant());
-        assert_eq!(a.get_constant(), 42);
+        assert_eq!(a.get_constant_int(), 42);
     }
 
     #[test]
@@ -1766,7 +1746,7 @@ mod tests {
         let b = IntBound::from_constant(20);
         let result = a.add_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 30);
+        assert_eq!(result.get_constant_int(), 30);
     }
 
     #[test]
@@ -1784,7 +1764,7 @@ mod tests {
         let b = IntBound::from_constant(3);
         let result = a.add_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), -2);
+        assert_eq!(result.get_constant_int(), -2);
     }
 
     #[test]
@@ -1797,7 +1777,7 @@ mod tests {
         // correct modular result. The knownbits are fully known (both constants).
         // So the result is from_knownbits which gives us i64::MIN as constant.
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), i64::MIN);
+        assert_eq!(result.get_constant_int(), i64::MIN);
     }
 
     #[test]
@@ -1836,7 +1816,7 @@ mod tests {
         let b = IntBound::from_constant(10);
         let result = a.sub_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 20);
+        assert_eq!(result.get_constant_int(), 20);
     }
 
     #[test]
@@ -1867,7 +1847,7 @@ mod tests {
         let b = IntBound::from_constant(7);
         let result = a.mul_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 42);
+        assert_eq!(result.get_constant_int(), 42);
     }
 
     #[test]
@@ -1938,7 +1918,7 @@ mod tests {
         let b = IntBound::from_constant(2);
         let result = a.py_div_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 3);
+        assert_eq!(result.get_constant_int(), 3);
     }
 
     #[test]
@@ -1948,7 +1928,7 @@ mod tests {
         let result = a.py_div_bound(&b);
         // Python: -7 // 2 == -4
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), -4);
+        assert_eq!(result.get_constant_int(), -4);
     }
 
     #[test]
@@ -2013,7 +1993,7 @@ mod tests {
         let b = IntBound::from_constant(0x0F);
         let result = a.and_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 0x0F);
+        assert_eq!(result.get_constant_int(), 0x0F);
     }
 
     #[test]
@@ -2044,7 +2024,7 @@ mod tests {
         let b = IntBound::from_constant(0x0F);
         let result = a.or_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 0xFF);
+        assert_eq!(result.get_constant_int(), 0xFF);
     }
 
     #[test]
@@ -2065,7 +2045,7 @@ mod tests {
         let b = IntBound::from_constant(0x0F);
         let result = a.xor_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 0xF0);
+        assert_eq!(result.get_constant_int(), 0xF0);
     }
 
     #[test]
@@ -2073,7 +2053,7 @@ mod tests {
         let a = IntBound::from_constant(42);
         let result = a.xor_bound(&a);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 0);
+        assert_eq!(result.get_constant_int(), 0);
     }
 
     // ── Negation and inversion tests ──
@@ -2083,7 +2063,7 @@ mod tests {
         let a = IntBound::from_constant(42);
         let result = a.neg_bound();
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), -42);
+        assert_eq!(result.get_constant_int(), -42);
     }
 
     #[test]
@@ -2099,7 +2079,7 @@ mod tests {
         let a = IntBound::from_constant(0);
         let result = a.invert_bound();
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), -1);
+        assert_eq!(result.get_constant_int(), -1);
     }
 
     #[test]
@@ -2118,7 +2098,7 @@ mod tests {
         let shift = IntBound::from_constant(3);
         let result = a.lshift_bound(&shift);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 8);
+        assert_eq!(result.get_constant_int(), 8);
     }
 
     #[test]
@@ -2136,7 +2116,7 @@ mod tests {
         let shift = IntBound::from_constant(64);
         let result = a.lshift_bound(&shift);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 0);
+        assert_eq!(result.get_constant_int(), 0);
     }
 
     #[test]
@@ -2145,7 +2125,7 @@ mod tests {
         let shift = IntBound::from_constant(2);
         let result = a.lshift_bound(&shift);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 0b10100);
+        assert_eq!(result.get_constant_int(), 0b10100);
     }
 
     // ── Right shift tests ──
@@ -2156,7 +2136,7 @@ mod tests {
         let shift = IntBound::from_constant(2);
         let result = a.rshift_bound(&shift);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 4);
+        assert_eq!(result.get_constant_int(), 4);
     }
 
     #[test]
@@ -2165,7 +2145,7 @@ mod tests {
         let shift = IntBound::from_constant(2);
         let result = a.rshift_bound(&shift);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), -4);
+        assert_eq!(result.get_constant_int(), -4);
     }
 
     #[test]
@@ -2183,7 +2163,7 @@ mod tests {
         let shift = IntBound::from_constant(64);
         let result = a.rshift_bound(&shift);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 0);
+        assert_eq!(result.get_constant_int(), 0);
     }
 
     #[test]
@@ -2192,7 +2172,7 @@ mod tests {
         let shift = IntBound::from_constant(64);
         let result = a.rshift_bound(&shift);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), -1);
+        assert_eq!(result.get_constant_int(), -1);
     }
 
     // ── Unsigned right shift tests ──
@@ -2203,7 +2183,7 @@ mod tests {
         let shift = IntBound::from_constant(2);
         let result = a.urshift_bound(&shift);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 4);
+        assert_eq!(result.get_constant_int(), 4);
     }
 
     #[test]
@@ -2213,7 +2193,7 @@ mod tests {
         let result = a.urshift_bound(&shift);
         // -1 as u64 is 0xFFFF...FFFF, >> 1 = 0x7FFF...FFFF = i64::MAX
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), i64::MAX);
+        assert_eq!(result.get_constant_int(), i64::MAX);
     }
 
     #[test]
@@ -2222,7 +2202,7 @@ mod tests {
         let shift = IntBound::from_constant(64);
         let result = a.urshift_bound(&shift);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 0);
+        assert_eq!(result.get_constant_int(), 0);
     }
 
     // ── Backwards transfer function tests ──
@@ -2526,7 +2506,7 @@ mod tests {
         let b = IntBound::from_constant(i64::MAX);
         let result = a.add_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), -1);
+        assert_eq!(result.get_constant_int(), -1);
     }
 
     #[test]
@@ -2545,7 +2525,7 @@ mod tests {
         let b = IntBound::from_constant(0xFF);
         let result = a.and_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 0xFF);
+        assert_eq!(result.get_constant_int(), 0xFF);
     }
 
     #[test]
@@ -2554,7 +2534,7 @@ mod tests {
         let b = IntBound::from_constant(0xFF);
         let result = a.or_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), 0xFF);
+        assert_eq!(result.get_constant_int(), 0xFF);
     }
 
     #[test]
@@ -2563,7 +2543,7 @@ mod tests {
         let b = IntBound::from_constant(-1); // all ones
         let result = a.xor_bound(&b);
         assert!(result.is_constant());
-        assert_eq!(result.get_constant(), !0xFFi64);
+        assert_eq!(result.get_constant_int(), !0xFFi64);
     }
 
     #[test]
@@ -2692,7 +2672,7 @@ mod tests {
     #[test]
     fn test_clone_bound() {
         let a = IntBound::bounded(10, 20);
-        let b = a.clone_bound();
+        let b = a.clone();
         assert_eq!(a, b);
     }
 

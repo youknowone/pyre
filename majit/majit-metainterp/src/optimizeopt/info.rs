@@ -480,7 +480,7 @@ impl StrPtrInfo {
             return ctx.get_constant_int(lgtop).or_else(|| {
                 ctx.get_int_bound(lgtop)
                     .filter(|b| b.is_constant())
-                    .map(|b| b.get_constant())
+                    .map(|b| b.get_constant_int())
             });
         }
         match &self.variant {

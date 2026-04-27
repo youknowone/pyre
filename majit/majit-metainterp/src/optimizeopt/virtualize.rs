@@ -2211,7 +2211,7 @@ mod tests {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::Remove => {}
@@ -2299,7 +2299,7 @@ mod tests {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::Remove => {}
@@ -3290,7 +3290,7 @@ mod tests {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                OptimizationResult::Replace(replaced) => {
+                OptimizationResult::Replace(replaced) | OptimizationResult::Restart(replaced) => {
                     ctx.emit(replaced);
                 }
                 OptimizationResult::Remove => {}

@@ -66,8 +66,14 @@ pub fn make_resume_at_position_descr() -> DescrRef {
 pub enum OptimizationResult {
     /// Emit this operation (possibly modified).
     Emit(Op),
-    /// Replace with a different operation.
+    /// Replace with a different operation; continue with the next pass.
     Replace(Op),
+    /// optimizer.py:567 `send_extra_operation(newop, opt=None)` — re-dispatch
+    /// the new op from the first optimization, dropping the original.
+    /// autogenintrules.py:54-55 uses this pattern for every rewrite-style
+    /// rule so that chained OptIntBounds rules (add_zero, int_is_zero, …)
+    /// fire on the rewritten op.
+    Restart(Op),
     /// Remove the operation entirely.
     Remove,
     /// Pass the operation to the next pass unchanged.
@@ -3001,7 +3007,7 @@ impl OptContext {
         self.get_constant_int(resolved).or_else(|| {
             self.get_int_bound(resolved)
                 .filter(|b| b.is_constant())
-                .map(|b| b.get_constant())
+                .map(|b| b.get_constant_int())
         })
     }
 

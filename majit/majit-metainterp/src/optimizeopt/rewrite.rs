@@ -646,7 +646,7 @@ impl OptRewrite {
         if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
             let result_bound = ba.and_bound(&bb);
             if result_bound.is_constant() {
-                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant()));
+                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant_int()));
                 return OptimizationResult::Remove;
             }
             // and_idempotent: int_and(x, y) => x (if y.ones | x.zeros == -1)
@@ -760,7 +760,7 @@ impl OptRewrite {
         if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
             let result_bound = ba.or_bound(&bb);
             if result_bound.is_constant() {
-                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant()));
+                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant_int()));
                 return OptimizationResult::Remove;
             }
             // or_idempotent: int_or(x, y) => x (if x.ones | y.zeros == -1)
@@ -979,7 +979,7 @@ impl OptRewrite {
         if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
             let result_bound = ba.rshift_bound(&bb);
             if result_bound.is_constant() {
-                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant()));
+                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant_int()));
                 return OptimizationResult::Remove;
             }
         }
@@ -1047,7 +1047,7 @@ impl OptRewrite {
         if let (Some(ba), Some(bb)) = (ctx.get_int_bound(arg0), ctx.get_int_bound(arg1)) {
             let result_bound = ba.urshift_bound(&bb);
             if result_bound.is_constant() {
-                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant()));
+                ctx.make_constant(op.pos, Value::Int(result_bound.get_constant_int()));
                 return OptimizationResult::Remove;
             }
         }
@@ -1806,7 +1806,7 @@ impl OptRewrite {
         if !b2.is_constant() {
             return None;
         }
-        let val = b2.get_constant();
+        let val = b2.get_constant_int();
         // rewrite.py:783-784
         if val <= 0 {
             return None;
@@ -1885,7 +1885,7 @@ impl OptRewrite {
             }
             return None;
         }
-        let val = b2.get_constant();
+        let val = b2.get_constant_int();
         // rewrite.py:743-749: x // -1 → -x (if x > MININT)
         if val == -1 {
             if b1.known_gt_const(i64::MIN) {
@@ -3083,7 +3083,8 @@ mod tests {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                OptimizationResult::Replace(replacement) => {
+                OptimizationResult::Replace(replacement)
+                | OptimizationResult::Restart(replacement) => {
                     ctx.emit(replacement);
                 }
                 OptimizationResult::Remove => {
@@ -3573,7 +3574,8 @@ mod tests {
                 OptimizationResult::Emit(emitted) => {
                     ctx.emit(emitted);
                 }
-                OptimizationResult::Replace(replacement) => {
+                OptimizationResult::Replace(replacement)
+                | OptimizationResult::Restart(replacement) => {
                     ctx.emit(replacement);
                 }
                 OptimizationResult::Remove => {}
@@ -3623,7 +3625,8 @@ mod tests {
                     OptimizationResult::Emit(emitted) => {
                         ctx.emit(emitted);
                     }
-                    OptimizationResult::Replace(replacement) => {
+                    OptimizationResult::Replace(replacement)
+                    | OptimizationResult::Restart(replacement) => {
                         ctx.emit(replacement);
                     }
                     OptimizationResult::Remove => {}

@@ -3189,6 +3189,37 @@ impl Optimizer {
                     }
                     current_op = op;
                 }
+                OptimizationResult::Restart(op) => {
+                    // optimizer.py:567 `send_extra_operation(newop, opt=None)`:
+                    // re-dispatch from `first_optimization`, dropping the
+                    // original op (the rule that returned Restart already
+                    // skipped its own emit). autogenintrules.py uses this
+                    // for every rewrite rule so that chained OptIntBounds
+                    // rules (add_zero, int_is_zero, reassoc) re-fire on the
+                    // rewritten op.
+                    debug_assert!(
+                        !(current_op.opcode.is_guard()
+                            && op.opcode.is_guard()
+                            && current_op.rd_resume_position >= 0
+                            && op.rd_resume_position < 0),
+                        "Restart dropped rd_resume_position: {:?} -> {:?}",
+                        current_op.opcode,
+                        op.opcode,
+                    );
+                    if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
+                        ctx.register_value_type(op.pos, op.result_type());
+                    }
+                    self.propagate_from_pass_range(start_pass, end_pass, &op, ctx);
+                    // Run any postprocess callbacks accumulated in the outer
+                    // chain (passes that already returned PassOn for the
+                    // original op before the Restart-returning pass fired).
+                    // RPython's send_extra_operation does not unwind these —
+                    // they belong to the original chain.
+                    for &pp_idx in postprocess_passes.iter().rev() {
+                        self.passes[pp_idx].propagate_postprocess(&current_op, ctx);
+                    }
+                    return;
+                }
                 OptimizationResult::Remove => {
                     // optimizer.py:573-575: op removed → no postprocess.
                     ctx.pending_mark_last_guard = None;
@@ -3330,7 +3361,7 @@ impl Optimizer {
             let replaced = ctx.get_box_replacement(emitted);
             if let Some(bound) = ctx.peek_intbound(replaced) {
                 if bound.is_constant() {
-                    let const_val = bound.get_constant();
+                    let const_val = bound.get_constant_int();
                     ctx.make_constant(replaced, majit_ir::Value::Int(const_val));
                 }
             }
