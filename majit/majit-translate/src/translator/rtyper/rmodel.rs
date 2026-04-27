@@ -210,14 +210,23 @@ fn lowlevel_container_field_type(container: &LowLevelType, attr: &str) -> Option
     }
 }
 
-fn lowlevel_type_const(lltype: LowLevelType) -> Hlvalue {
+/// Build a `Constant` carrying a [`LowLevelType`] payload — the
+/// `cTEMP` argument shape used by `malloc` / `malloc_varsize`
+/// SpaceOperations (and other ops that take a struct/array type as
+/// their first arg). Mirrors upstream `inputconst(Void, TYPE)`
+/// (rmodel.py:215).
+pub(crate) fn lowlevel_type_const(lltype: LowLevelType) -> Hlvalue {
     Hlvalue::Constant(Constant::with_concretetype(
         ConstValue::LowLevelType(Box::new(lltype)),
         LowLevelType::Void,
     ))
 }
 
-fn gc_flavor_const() -> Result<Hlvalue, TyperError> {
+/// Build a `Constant` carrying the `{'flavor': 'gc'}` flags dict —
+/// the `cflags` argument shape used by `malloc` / `malloc_varsize`
+/// SpaceOperations. Mirrors upstream `inputconst(Void, {'flavor':
+/// 'gc'})` (rmodel.py:216, rstr.py:1130).
+pub(crate) fn gc_flavor_const() -> Result<Hlvalue, TyperError> {
     let flags = HashMap::from([(ConstValue::byte_str("flavor"), ConstValue::byte_str("gc"))]);
     HighLevelOp::inputconst(&LowLevelType::Void, &ConstValue::Dict(flags)).map(Hlvalue::Constant)
 }
@@ -1986,32 +1995,22 @@ impl Repr for LLADTMethRepr {
 /// `SomeBuiltin.rtyper_makekey`'s `const` slot (rbuiltin.py:29-33).
 ///
 /// Upstream swaps `const` for the registered `ExtRegistryEntry`
-/// singleton when `extregistry.is_registered(const)`; pyre keys on a
-/// stable tag per `ExtRegistryEntry` variant to get the same
-/// "identical-entry collapses to one cache bucket" semantics. Hosts
-/// fall back to `HostObject` pointer identity.
+/// instance when `extregistry.is_registered(const)`; pyre keys on
+/// [`crate::translator::rtyper::extregistry::ExtRegistryEntryKey`],
+/// mirroring upstream `ExtRegistryEntry.__hash__` over
+/// `(entry.__class__, entry.type, entry.instance)`. Hosts fall back to
+/// `HostObject` pointer identity.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum BuiltinConstKey {
-    /// The const is registered in the extregistry. The tag names the
-    /// `ExtRegistryEntry` variant so two builtin consts routed to the
-    /// same entry type share a single cache entry (matching upstream's
-    /// identity comparison against the singleton entry instance).
-    ExtRegistry(ExtRegistryEntryTag),
+    /// The const is registered in the extregistry. The key preserves
+    /// entry class + type/instance identity instead of collapsing every
+    /// variant to a single tag.
+    ExtRegistry(crate::translator::rtyper::extregistry::ExtRegistryEntryKey),
     /// Non-registered const. Pyre stores the [`HostObject`] pointer
     /// identity, which is the closest analogue to upstream's
     /// `(self.__class__, const)` tuple where `const` is a Python
     /// callable or attribute.
     Host(usize),
-}
-
-/// Which [`crate::translator::rtyper::extregistry::ExtRegistryEntry`]
-/// variant a builtin const was mapped to by `extregistry.lookup`. Kept
-/// as a separate enum so adding new extregistry variants does not
-/// require rewiring every cache-key consumer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum ExtRegistryEntryTag {
-    /// Upstream `lltype.py:1513-1518 _ptrEntry`.
-    Ptr,
 }
 
 /// RPython `S.rtyper_makekey()` upstream tuple hashed by
@@ -2141,12 +2140,10 @@ pub enum ReprKey {
     ///     return self.__class__, const
     /// ```
     ///
-    /// The extregistry remap routes all consts that resolve to the
-    /// same [`crate::translator::rtyper::extregistry::ExtRegistryEntry`]
-    /// variant into one cache bucket — matching upstream's identity
-    /// comparison against the (singleton) entry object. Non-registered
-    /// consts key on the [`HostObject`] pointer identity; `None`
-    /// covers the non-constant fallback.
+    /// The extregistry remap preserves
+    /// `ExtRegistryEntry.__hash__`-equivalent identity. Non-registered
+    /// consts key on the [`HostObject`] pointer identity; `None` covers
+    /// the non-constant fallback.
     Builtin(Option<BuiltinConstKey>),
     /// RPython `SomeBuiltinMethod.rtyper_makekey` (rbuiltin.py:41-50).
     ///
@@ -2282,11 +2279,8 @@ pub fn rtyper_makekey(s_obj: &crate::annotator::model::SomeValue) -> ReprKey {
             use crate::translator::rtyper::extregistry;
             let key = s.base.const_box.as_ref().and_then(|c| {
                 if extregistry::is_registered(&c.value) {
-                    extregistry::lookup(&c.value).map(|entry| match entry {
-                        extregistry::ExtRegistryEntry::Ptr(_) => {
-                            BuiltinConstKey::ExtRegistry(ExtRegistryEntryTag::Ptr)
-                        }
-                    })
+                    extregistry::lookup(&c.value)
+                        .map(|entry| BuiltinConstKey::ExtRegistry(entry.makekey()))
                 } else {
                     match &c.value {
                         crate::flowspace::model::ConstValue::HostObject(host) => {
@@ -3757,13 +3751,14 @@ mod tests {
     }
 
     #[test]
-    fn rtyper_makekey_somebuiltin_with_llptr_const_collapses_via_extregistry_entry() {
+    fn rtyper_makekey_somebuiltin_with_llptr_const_preserves_extregistry_entry_identity() {
         // Upstream rbuiltin.py:29-33 remaps `extregistry.is_registered(const)`
-        // through `extregistry.lookup(const)` so two distinct `_ptr`
-        // consts still share one cache entry. Pyre mirrors this via
-        // `BuiltinConstKey::ExtRegistry(ExtRegistryEntryTag::Ptr)`.
+        // through `extregistry.lookup(const)`. The resulting
+        // ExtRegistryEntry hashes on `(entry.__class__, type, instance)`,
+        // so two distinct `_ptr` consts must not collapse.
         use crate::annotator::model::SomeBuiltin;
         use crate::flowspace::model::{ConstValue, Constant};
+        use crate::translator::rtyper::extregistry::ExtRegistryEntryKey;
         use crate::translator::rtyper::lltypesystem::lltype::{
             _ptr, FuncType, LowLevelType, Ptr, PtrTarget,
         };
@@ -3788,11 +3783,19 @@ mod tests {
         )))));
         let key1 = rtyper_makekey(&SomeValue::Builtin(sb1));
         let key2 = rtyper_makekey(&SomeValue::Builtin(sb2));
-        assert_eq!(
-            key1,
-            ReprKey::Builtin(Some(BuiltinConstKey::ExtRegistry(ExtRegistryEntryTag::Ptr)))
-        );
-        assert_eq!(key1, key2);
+        let ReprKey::Builtin(Some(BuiltinConstKey::ExtRegistry(ExtRegistryEntryKey::Ptr {
+            instance_identity: Some(identity1),
+        }))) = key1
+        else {
+            panic!("expected ptr extregistry key, got {key1:?}");
+        };
+        let ReprKey::Builtin(Some(BuiltinConstKey::ExtRegistry(ExtRegistryEntryKey::Ptr {
+            instance_identity: Some(identity2),
+        }))) = key2
+        else {
+            panic!("expected ptr extregistry key, got {key2:?}");
+        };
+        assert_ne!(identity1, identity2);
     }
 
     #[test]

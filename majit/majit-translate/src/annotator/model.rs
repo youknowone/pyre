@@ -2122,6 +2122,49 @@ impl SomeValue {
         cb.map(|c| &c.value)
     }
 
+    /// Polymorphic `result.const = x` setter — mirrors upstream
+    /// `bookkeeper.py:347` (`try: result.const = x; except AttributeError: pass`).
+    ///
+    /// Upstream wraps the assignment in `try/except` because some
+    /// `SomeXXX` subclasses define `const` as a property without a
+    /// setter (raising `AttributeError`). The Rust port routes every
+    /// variant to its `SomeObjectBase.const_box`; the few variants
+    /// upstream rejects (`SomeImpossibleValue`) match `Impossible` here
+    /// and silently no-op, matching the AttributeError swallow.
+    pub fn set_const_box(&mut self, c: Constant) {
+        match self {
+            SomeValue::Impossible => {} // upstream AttributeError swallow.
+            SomeValue::Object(s) => s.const_box = Some(c),
+            SomeValue::Type(s) => s.base.const_box = Some(c),
+            SomeValue::Float(s) => s.base.const_box = Some(c),
+            SomeValue::SingleFloat(s) => s.base.const_box = Some(c),
+            SomeValue::LongFloat(s) => s.base.const_box = Some(c),
+            SomeValue::Integer(s) => s.base.const_box = Some(c),
+            SomeValue::Bool(s) => s.base.const_box = Some(c),
+            SomeValue::String(s) => s.inner.base.const_box = Some(c),
+            SomeValue::UnicodeString(s) => s.inner.base.const_box = Some(c),
+            SomeValue::ByteArray(s) => s.inner.base.const_box = Some(c),
+            SomeValue::Char(s) => s.inner.base.const_box = Some(c),
+            SomeValue::UnicodeCodePoint(s) => s.inner.base.const_box = Some(c),
+            SomeValue::List(s) => s.base.const_box = Some(c),
+            SomeValue::Tuple(s) => s.base.const_box = Some(c),
+            SomeValue::Dict(s) => s.base.const_box = Some(c),
+            SomeValue::Iterator(s) => s.base.const_box = Some(c),
+            SomeValue::Instance(s) => s.base.const_box = Some(c),
+            SomeValue::Exception(s) => s.base.const_box = Some(c),
+            SomeValue::PBC(s) => s.base.const_box = Some(c),
+            SomeValue::None_(s) => s.base.const_box = Some(c),
+            SomeValue::Property(s) => s.base.const_box = Some(c),
+            SomeValue::Ptr(s) => s.base.const_box = Some(c),
+            SomeValue::InteriorPtr(s) => s.base.const_box = Some(c),
+            SomeValue::LLADTMeth(s) => s.base.const_box = Some(c),
+            SomeValue::Builtin(s) => s.base.const_box = Some(c),
+            SomeValue::BuiltinMethod(s) => s.base.const_box = Some(c),
+            SomeValue::WeakRef(s) => s.base.const_box = Some(c),
+            SomeValue::TypeOf(s) => s.base.const_box = Some(c),
+        }
+    }
+
     /// RPython `SomeObject.find_method(self, name)` (unaryop.py:206-213).
     pub fn find_method(&self, name: &str) -> Option<SomeValue> {
         super::unaryop::find_method(self, name).map(SomeValue::BuiltinMethod)

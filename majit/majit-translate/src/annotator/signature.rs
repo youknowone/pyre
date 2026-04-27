@@ -18,9 +18,15 @@
 //!
 //! ## Dependency-blocked paths
 //!
-//! * `extregistry` branch (`_compute_annotation` signature.py:73-76,
-//!   `annotationoftype` signature.py:98-100) — deferred until
-//!   `rpython/rtyper/extregistry.py` is ported.
+//! * `extregistry` value-level branch (`_compute_annotation`
+//!   signature.py:25-26, 73-76) — wired in
+//!   [`crate::annotator::bookkeeper::Bookkeeper::immutablevalue`] via
+//!   [`crate::translator::rtyper::extregistry::is_registered`]; per-entry
+//!   coverage extends as registrations land.
+//! * `extregistry` type-level branch (`annotationoftype`
+//!   signature.py:98-100) — wired below in [`annotationoftype`] via
+//!   [`crate::translator::rtyper::extregistry::is_registered_type`] /
+//!   `lookup_type`.
 //! * `lltype.LowLevelType` branch (`_compute_annotation`
 //!   signature.py:59-60) — deferred until `rtyper/lltypesystem/lltype.py`
 //!   is ported.
@@ -201,6 +207,29 @@ pub fn annotationoftype(
         AnnotationSpec::NoneType => Ok(s_none()),
         AnnotationSpec::Type => Ok(SomeValue::Type(SomeType::new())),
         AnnotationSpec::UserClass(cls) => {
+            // upstream signature.py:98-100:
+            //     elif bookkeeper and extregistry.is_registered_type(t):
+            //         return (extregistry.lookup_type(t)
+            //                 .compute_annotation_bk(bookkeeper))
+            //
+            // HostObject type entries are registered in extregistry's
+            // EXT_REGISTRY_BY_TYPE analogue; misses fall through to
+            // the `getuniqueclassdef` UserClass path below.
+            if let Some(bk) = bookkeeper
+                && crate::translator::rtyper::extregistry::is_registered_type(cls)
+            {
+                let entry = crate::translator::rtyper::extregistry::lookup_type(cls).expect(
+                    "annotationoftype: extregistry.lookup_type must succeed after \
+                     is_registered_type",
+                );
+                return entry.compute_annotation_bk(bk).map_err(|e| {
+                    SignatureError::new(format!(
+                        "Annotation of registered type {:?}: {}",
+                        cls.qualname(),
+                        e
+                    ))
+                });
+            }
             // upstream signature.py:103-104:
             //     elif bookkeeper and not hasattr(t, '_freeze_'):
             //         return SomeInstance(bookkeeper.getuniqueclassdef(t))
@@ -733,6 +762,24 @@ mod tests {
             }
             other => panic!("expected SomeInstance, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn annotationoftype_uses_registered_extregistry_type_before_classdef() {
+        let cls = HostObject::new_class("pkg.signature.RegisteredType", vec![]);
+        crate::translator::rtyper::extregistry::register_host_type(
+            cls.clone(),
+            crate::translator::rtyper::extregistry::ExtRegistryEntry::HostTypeAnnotation {
+                type_obj: cls.clone(),
+                instance: None,
+                annotation: crate::translator::rtyper::extregistry::RegisteredAnnotation::Int,
+            },
+        )
+        .expect("register extregistry type");
+        let bk = bk();
+        let s = annotationoftype(&AnnotationSpec::UserClass(cls), Some(&bk))
+            .expect("registered type should resolve via extregistry");
+        assert!(matches!(s, SomeValue::Integer(_)));
     }
 
     #[test]

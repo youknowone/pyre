@@ -19,11 +19,9 @@
 //!
 //! ## Deferred to follow-up commits
 //!
-//! * `rtype_str` / `rtype_chr` / `rtype_unichr` / `rtype_int` / `rtype_float`
+//! * `rtype_chr` / `rtype_unichr` / `rtype_int` / `rtype_float`
 //!   (rstr.py:516-541, 772-784) — char-side conversions that lower
 //!   non-trivial usages and have no caller on the tuple eq/hash path.
-//! * `AbstractCharRepr.ll_str` / `AbstractUniCharRepr.ll_str`
-//!   (rstr.py:554-562) — chr→str conversion (allocates GC string).
 //! * `AbstractStringRepr` / `AbstractUnicodeRepr` method bodies
 //!   (`rtype_len`, `rtype_bool`, `rtype_method_*`, pairtype `rtype_eq`
 //!   / `rtype_add` / `rtype_getitem`, `rtype_int` / `rtype_float`,
@@ -31,17 +29,15 @@
 //!   module-global singletons land here today; method bodies arrive
 //!   slice-by-slice — see the epic plan in
 //!   `~/.claude/projects/.../memory/item3_abstractstringrepr_epic_plan.md`.
-//! * `LLHelpers.ll_*` helper graphs (`ll_strhash`, `ll_streq`,
-//!   `ll_strconcat`, `ll_strlen` family, `ll_str2int` / `ll_str2float`,
+//! * `LLHelpers.ll_*` helper graphs (`ll_str2int` / `ll_str2float`,
 //!   `ll_startswith` / `ll_endswith` / `ll_find` / `ll_strip` /
 //!   `ll_lower` / `ll_upper` / `ll_split` / `ll_join` / `ll_replace`)
-//!   live in `lltypesystem/rstr.rs`; only `ll_strlen` / `ll_unilen`
-//!   exist today.
+//!   live in `lltypesystem/rstr.rs` and land slice-by-slice.
 
 use std::sync::Arc;
 use std::sync::OnceLock;
 
-use crate::annotator::model::SomeValue;
+use crate::annotator::model::{SomeObjectTrait, SomeValue};
 use crate::flowspace::model::{
     Block, BlockRefExt, ConstValue, Constant, FunctionGraph, GraphFunc, Hlvalue, Link,
     SpaceOperation,
@@ -50,18 +46,23 @@ use crate::flowspace::pygraph::PyGraph;
 use crate::translator::rtyper::error::TyperError;
 use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
 use crate::translator::rtyper::lltypesystem::rstr::{
-    STRPTR, UNICODEPTR, build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
+    STRPTR, UNICODEPTR, build_ll_chr2str_helper_graph, build_ll_count_char_helper_graph,
+    build_ll_endswith_char_helper_graph, build_ll_endswith_helper_graph,
+    build_ll_find_char_helper_graph, build_ll_int_helper_graph,
+    build_ll_replace_chr_chr_helper_graph, build_ll_rfind_char_helper_graph,
     build_ll_startswith_char_helper_graph, build_ll_startswith_helper_graph,
-    build_ll_str_is_true_helper_graph, build_ll_strcmp_helper_graph, build_ll_streq_helper_graph,
-    build_ll_strhash_helper_graph, build_ll_string_isxxx_helper_graph,
-    build_ll_stritem_checked_helper_graph, build_ll_stritem_helper_graph,
-    build_ll_stritem_nonneg_checked_helper_graph, build_ll_stritem_nonneg_helper_graph,
-    build_ll_strlen_helper_graph,
+    build_ll_str_is_true_helper_graph, build_ll_str2unicode_helper_graph,
+    build_ll_strcmp_helper_graph, build_ll_strconcat_helper_graph, build_ll_streq_helper_graph,
+    build_ll_strhash_helper_graph, build_ll_string_casefold_helper_graph,
+    build_ll_string_isxxx_helper_graph, build_ll_stritem_checked_helper_graph,
+    build_ll_stritem_helper_graph, build_ll_stritem_nonneg_checked_helper_graph,
+    build_ll_stritem_nonneg_helper_graph, build_ll_strlen_helper_graph,
+    build_ll_unichr2str_helper_graph,
 };
 use crate::translator::rtyper::rmodel::{RTypeResult, Repr, ReprState};
 use crate::translator::rtyper::rtyper::{
-    ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, RPythonTyper, constant_with_lltype,
-    helper_pygraph_from_graph, variable_with_lltype,
+    ConvertedTo, GenopResult, HighLevelOp, LowLevelFunction, LowLevelOpList, RPythonTyper,
+    constant_with_lltype, helper_pygraph_from_graph, variable_with_lltype,
 };
 
 // ____________________________________________________________
@@ -156,6 +157,18 @@ impl Repr for StringRepr {
         rtype_abstract_string_bool(self, hop, "ll_str_is_true", STRPTR.clone())
     }
 
+    /// RPython `AbstractStringRepr.rtype_unicode` (`rstr.py:385-396`):
+    /// non-constant byte strings lower through `LLHelpers.ll_str2unicode`.
+    fn rtype_unicode(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_abstract_string_unicode(self, hop)
+    }
+
+    /// RPython `AbstractStringRepr.rtype_int` (`rstr.py:371-383`):
+    /// dispatch to `LLHelpers.ll_int(s, base)`.
+    fn rtype_int(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_abstract_string_int(self, hop, "ll_int", STRPTR.clone())
+    }
+
     /// RPython `AbstractStringRepr.rtype_method_*` dispatch table
     /// (`rstr.py:134-449`). Pyre lands methods slice-by-slice; today
     /// `startswith` (rstr.py:134-145) and `endswith` (rstr.py:147-158)
@@ -178,6 +191,30 @@ impl Repr for StringRepr {
                 STRPTR.clone(),
                 LowLevelType::Char,
             ),
+            "find" => rtype_abstract_string_method_findlike_char(
+                self,
+                hop,
+                "ll_find_char",
+                FindLikeCharKind::Find,
+                STRPTR.clone(),
+                LowLevelType::Char,
+            ),
+            "rfind" => rtype_abstract_string_method_findlike_char(
+                self,
+                hop,
+                "ll_rfind_char",
+                FindLikeCharKind::RFind,
+                STRPTR.clone(),
+                LowLevelType::Char,
+            ),
+            "count" => rtype_abstract_string_method_findlike_char(
+                self,
+                hop,
+                "ll_count_char",
+                FindLikeCharKind::Count,
+                STRPTR.clone(),
+                LowLevelType::Char,
+            ),
             "isdigit" => rtype_abstract_string_method_isdigit(
                 self,
                 hop,
@@ -186,6 +223,81 @@ impl Repr for StringRepr {
                 STRPTR.clone(),
                 LowLevelType::Char,
                 "cast_char_to_int",
+            ),
+            "isalpha" => rtype_abstract_string_method_isxxx(
+                self,
+                hop,
+                "ll_isalpha",
+                "ll_char_isalpha",
+                STRPTR.clone(),
+                LowLevelType::Char,
+                "cast_char_to_int",
+                StringIsxxxPredicate::OrConditions(ISALPHA_CONDITIONS),
+            ),
+            "isalnum" => rtype_abstract_string_method_isxxx(
+                self,
+                hop,
+                "ll_isalnum",
+                "ll_char_isalnum",
+                STRPTR.clone(),
+                LowLevelType::Char,
+                "cast_char_to_int",
+                StringIsxxxPredicate::OrConditions(ISALNUM_CONDITIONS),
+            ),
+            "isspace" => rtype_abstract_string_method_isxxx(
+                self,
+                hop,
+                "ll_isspace",
+                "ll_char_isspace",
+                STRPTR.clone(),
+                LowLevelType::Char,
+                "cast_char_to_int",
+                StringIsxxxPredicate::OrConditions(ISSPACE_CONDITIONS),
+            ),
+            "isupper" => rtype_abstract_string_method_isxxx(
+                self,
+                hop,
+                "ll_isupper",
+                "ll_char_isupper",
+                STRPTR.clone(),
+                LowLevelType::Char,
+                "cast_char_to_int",
+                StringIsxxxPredicate::InRange(65, 90),
+            ),
+            "islower" => rtype_abstract_string_method_isxxx(
+                self,
+                hop,
+                "ll_islower",
+                "ll_char_islower",
+                STRPTR.clone(),
+                LowLevelType::Char,
+                "cast_char_to_int",
+                StringIsxxxPredicate::InRange(97, 122),
+            ),
+            "upper" => rtype_abstract_string_method_casefold(
+                self,
+                hop,
+                "ll_upper",
+                "ll_upper_char",
+                97,
+                122,
+                -32,
+            ),
+            "lower" => rtype_abstract_string_method_casefold(
+                self,
+                hop,
+                "ll_lower",
+                "ll_lower_char",
+                65,
+                90,
+                32,
+            ),
+            "replace" => rtype_abstract_string_method_replace(
+                self,
+                hop,
+                "ll_replace_chr_chr",
+                STRPTR.clone(),
+                LowLevelType::Char,
             ),
             _ => Err(TyperError::message(format!(
                 "missing StringRepr.rtype_method_{method_name}"
@@ -317,6 +429,18 @@ impl Repr for UnicodeRepr {
         rtype_abstract_string_bool(self, hop, "ll_unicode_is_true", UNICODEPTR.clone())
     }
 
+    /// RPython `AbstractStringRepr.rtype_unicode` identity branch for
+    /// values whose repr already equals the result UnicodeRepr.
+    fn rtype_unicode(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_abstract_string_unicode(self, hop)
+    }
+
+    /// `AbstractStringRepr.rtype_int`, inherited by UnicodeRepr with
+    /// the unicode-specialised helper graph.
+    fn rtype_int(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_abstract_string_int(self, hop, "ll_unicode_int", UNICODEPTR.clone())
+    }
+
     /// RPython `AbstractUnicodeRepr.rtype_method_*` dispatch table
     /// (`rstr.py:134-449` inherited via `AbstractUnicodeRepr(AbstractStringRepr)`).
     /// Pyre lands methods slice-by-slice; today `startswith` and
@@ -340,6 +464,30 @@ impl Repr for UnicodeRepr {
                 UNICODEPTR.clone(),
                 LowLevelType::UniChar,
             ),
+            "find" => rtype_abstract_string_method_findlike_char(
+                self,
+                hop,
+                "ll_unicode_find_char",
+                FindLikeCharKind::Find,
+                UNICODEPTR.clone(),
+                LowLevelType::UniChar,
+            ),
+            "rfind" => rtype_abstract_string_method_findlike_char(
+                self,
+                hop,
+                "ll_unicode_rfind_char",
+                FindLikeCharKind::RFind,
+                UNICODEPTR.clone(),
+                LowLevelType::UniChar,
+            ),
+            "count" => rtype_abstract_string_method_findlike_char(
+                self,
+                hop,
+                "ll_unicode_count_char",
+                FindLikeCharKind::Count,
+                UNICODEPTR.clone(),
+                LowLevelType::UniChar,
+            ),
             "isdigit" => rtype_abstract_string_method_isdigit(
                 self,
                 hop,
@@ -348,6 +496,68 @@ impl Repr for UnicodeRepr {
                 UNICODEPTR.clone(),
                 LowLevelType::UniChar,
                 "cast_unichar_to_int",
+            ),
+            "isalpha" => rtype_abstract_string_method_isxxx(
+                self,
+                hop,
+                "ll_unicode_isalpha",
+                "ll_unichar_isalpha",
+                UNICODEPTR.clone(),
+                LowLevelType::UniChar,
+                "cast_unichar_to_int",
+                StringIsxxxPredicate::OrConditions(ISALPHA_CONDITIONS),
+            ),
+            "isalnum" => rtype_abstract_string_method_isxxx(
+                self,
+                hop,
+                "ll_unicode_isalnum",
+                "ll_unichar_isalnum",
+                UNICODEPTR.clone(),
+                LowLevelType::UniChar,
+                "cast_unichar_to_int",
+                StringIsxxxPredicate::OrConditions(ISALNUM_CONDITIONS),
+            ),
+            "isspace" => rtype_abstract_string_method_isxxx(
+                self,
+                hop,
+                "ll_unicode_isspace",
+                "ll_unichar_isspace",
+                UNICODEPTR.clone(),
+                LowLevelType::UniChar,
+                "cast_unichar_to_int",
+                StringIsxxxPredicate::OrConditions(ISSPACE_CONDITIONS),
+            ),
+            "isupper" => rtype_abstract_string_method_isxxx(
+                self,
+                hop,
+                "ll_unicode_isupper",
+                "ll_unichar_isupper",
+                UNICODEPTR.clone(),
+                LowLevelType::UniChar,
+                "cast_unichar_to_int",
+                StringIsxxxPredicate::InRange(65, 90),
+            ),
+            "islower" => rtype_abstract_string_method_isxxx(
+                self,
+                hop,
+                "ll_unicode_islower",
+                "ll_unichar_islower",
+                UNICODEPTR.clone(),
+                LowLevelType::UniChar,
+                "cast_unichar_to_int",
+                StringIsxxxPredicate::InRange(97, 122),
+            ),
+            // AbstractUnicodeRepr overrides these to raise TyperError
+            // instead of inheriting AbstractStringRepr's byte-string
+            // casefold helpers (rstr.py:452-457).
+            "upper" => Err(TyperError::message("Cannot do toupper on unicode string")),
+            "lower" => Err(TyperError::message("Cannot do tolower on unicode string")),
+            "replace" => rtype_abstract_string_method_replace(
+                self,
+                hop,
+                "ll_unicode_replace_chr_chr",
+                UNICODEPTR.clone(),
+                LowLevelType::UniChar,
             ),
             _ => Err(TyperError::message(format!(
                 "missing UnicodeRepr.rtype_method_{method_name}"
@@ -507,6 +717,221 @@ fn rtype_abstract_string_bool(
     }
 }
 
+fn lowlevel_str2unicode_function(rtyper: &RPythonTyper) -> Result<LowLevelFunction, TyperError> {
+    rtyper.lowlevel_helper_function_with_builder(
+        "ll_str2unicode".to_string(),
+        vec![STRPTR.clone()],
+        UNICODEPTR.clone(),
+        move |_rtyper, _args, _result| build_ll_str2unicode_helper_graph("ll_str2unicode"),
+    )
+}
+
+fn lowlevel_int_function(
+    rtyper: &RPythonTyper,
+    helper_name: &str,
+    ptr_lltype: LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let helper_name_owned = helper_name.to_string();
+    let ptr_for_builder = ptr_lltype.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        helper_name_owned.clone(),
+        vec![ptr_lltype, LowLevelType::Signed],
+        LowLevelType::Signed,
+        move |_rtyper, _args, _result| {
+            build_ll_int_helper_graph(&helper_name_owned, ptr_for_builder.clone())
+        },
+    )
+}
+
+/// RPython `AbstractStringRepr.rtype_int` (`rstr.py:371-383`).
+/// The helper itself implements the upstream base parser
+/// (`LLHelpers.ll_int(s, base)`) including base range validation,
+/// leading/trailing spaces, sign handling, and ValueError exits.
+fn rtype_abstract_string_int(
+    self_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    helper_name: &str,
+    ptr_lltype: LowLevelType,
+) -> RTypeResult {
+    hop.has_implicit_exception("ValueError");
+    let helper = lowlevel_int_function(hop.rtyper.as_ref(), helper_name, ptr_lltype)?;
+    match hop.nb_args() {
+        1 => {
+            let v_str = hop.inputarg(ConvertedTo::Repr(self_repr), 0)?;
+            let c_base = Hlvalue::Constant(HighLevelOp::inputconst(
+                ConvertedTo::LowLevelType(&LowLevelType::Signed),
+                &ConstValue::Int(10),
+            )?);
+            hop.exception_is_here()?;
+            hop.gendirectcall(&helper, vec![v_str, c_base])
+        }
+        2 => {
+            let r_base = hop
+                .args_r
+                .borrow()
+                .get(1)
+                .cloned()
+                .flatten()
+                .ok_or_else(|| TyperError::message("rtype_int: args_r[1] missing"))?;
+            if r_base.lowleveltype() != &LowLevelType::Signed {
+                return Err(TyperError::message("base needs to be an int"));
+            }
+            let vlist = hop.inputargs(vec![
+                ConvertedTo::Repr(self_repr),
+                ConvertedTo::LowLevelType(&LowLevelType::Signed),
+            ])?;
+            hop.exception_is_here()?;
+            hop.gendirectcall(&helper, vlist)
+        }
+        other => Err(TyperError::message(format!(
+            "rtype_int: expected 1 or 2 args, got {other}"
+        ))),
+    }
+}
+
+/// RPython `AbstractStringRepr.rtype_unicode` (`rstr.py:385-396`).
+/// The same body is inherited by UnicodeRepr: constants are returned as
+/// constants, already-unicode values are identity, byte strings call
+/// `ll_str2unicode` and can raise `UnicodeDecodeError`.
+fn rtype_abstract_string_unicode(self_repr: &dyn Repr, hop: &HighLevelOp) -> RTypeResult {
+    if let Some(result_const) = hop
+        .s_result
+        .borrow()
+        .as_ref()
+        .and_then(|s| s.const_().cloned())
+    {
+        hop.exception_cannot_occur()?;
+        let r_result = hop
+            .r_result
+            .borrow()
+            .clone()
+            .ok_or_else(|| TyperError::message("rtype_unicode: r_result missing"))?;
+        return HighLevelOp::inputconst(ConvertedTo::Repr(r_result.as_ref()), &result_const)
+            .map(Hlvalue::Constant)
+            .map(Some);
+    }
+
+    let v_str = hop.inputarg(ConvertedTo::Repr(self_repr), 0)?;
+    let r_result = hop
+        .r_result
+        .borrow()
+        .clone()
+        .ok_or_else(|| TyperError::message("rtype_unicode: r_result missing"))?;
+    if self_repr.lowleveltype() == r_result.lowleveltype() {
+        hop.exception_cannot_occur()?;
+        return Ok(Some(v_str));
+    }
+
+    hop.exception_is_here()?;
+    let helper = lowlevel_str2unicode_function(hop.rtyper.as_ref())?;
+    hop.gendirectcall(&helper, vec![v_str])
+}
+
+fn lowlevel_chr2str_function(
+    rtyper: &RPythonTyper,
+    helper_name: &str,
+    ptr_lltype: LowLevelType,
+    elem_lltype: LowLevelType,
+) -> Result<LowLevelFunction, TyperError> {
+    let helper_name_owned = helper_name.to_string();
+    let ptr_for_builder = ptr_lltype.clone();
+    let elem_for_builder = elem_lltype.clone();
+    rtyper.lowlevel_helper_function_with_builder(
+        helper_name_owned.clone(),
+        vec![elem_lltype],
+        ptr_lltype,
+        move |_rtyper, _args, _result| {
+            build_ll_chr2str_helper_graph(&helper_name_owned, ptr_for_builder, elem_for_builder)
+        },
+    )
+}
+
+fn lowlevel_unichr2str_function(rtyper: &RPythonTyper) -> Result<LowLevelFunction, TyperError> {
+    rtyper.lowlevel_helper_function_with_builder(
+        "ll_unichr2str".to_string(),
+        vec![LowLevelType::UniChar],
+        STRPTR.clone(),
+        move |_rtyper, _args, _result| build_ll_unichr2str_helper_graph("ll_unichr2str"),
+    )
+}
+
+/// RPython `AbstractCharRepr.ll_str(ch) -> ll_chr2str(ch)` and the
+/// UniChar→Unicode half of `pairtype(AbstractUniCharRepr,
+/// AbstractUnicodeRepr).convert_from_to` (`rstr.py:554-562, 805-814`).
+fn rtype_charlike_chr2str(
+    hop: &HighLevelOp,
+    helper_name: &str,
+    ptr_lltype: LowLevelType,
+    elem_lltype: LowLevelType,
+) -> RTypeResult {
+    let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&elem_lltype)])?;
+    hop.exception_cannot_occur()?;
+    let helper =
+        lowlevel_chr2str_function(hop.rtyper.as_ref(), helper_name, ptr_lltype, elem_lltype)?;
+    hop.gendirectcall(&helper, vlist)
+}
+
+/// RPython `pairtype(AbstractCharRepr, AbstractStringRepr)` and
+/// `pairtype(AbstractUniCharRepr, AbstractUnicodeRepr).convert_from_to`
+/// (`rstr.py:805-814`): char-to-one-character-string conversion.
+pub fn pair_charlike_string_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+    v: &Hlvalue,
+    llops: &mut LowLevelOpList,
+) -> Result<Option<Hlvalue>, TyperError> {
+    let (helper_name, ptr_lltype, elem_lltype) =
+        match (r_from.repr_class_id(), r_to.repr_class_id()) {
+            (super::pairtype::ReprClassId::CharRepr, super::pairtype::ReprClassId::StringRepr) => {
+                ("ll_chr2str", STRPTR.clone(), LowLevelType::Char)
+            }
+            (
+                super::pairtype::ReprClassId::UniCharRepr,
+                super::pairtype::ReprClassId::UnicodeRepr,
+            ) => (
+                "ll_unichr2unicode",
+                UNICODEPTR.clone(),
+                LowLevelType::UniChar,
+            ),
+            _ => return Ok(None),
+        };
+
+    let helper =
+        lowlevel_chr2str_function(llops.rtyper.as_ref(), helper_name, ptr_lltype, elem_lltype)?;
+    let result = llops.gendirectcall(&helper, vec![v.clone()])?;
+    Ok(result.map(Hlvalue::Variable))
+}
+
+/// RPython `pairtype(AbstractStringRepr, AbstractCharRepr).convert_from_to`
+/// (`rstr.py:815-820`): `string_repr -> char_repr` extracts index 0
+/// through `ll_stritem_nonneg`.
+pub fn pair_string_char_convert_from_to(
+    r_from: &dyn Repr,
+    r_to: &dyn Repr,
+    v: &Hlvalue,
+    llops: &mut LowLevelOpList,
+) -> Result<Option<Hlvalue>, TyperError> {
+    if r_from.repr_class_id() != super::pairtype::ReprClassId::StringRepr
+        || r_to.repr_class_id() != super::pairtype::ReprClassId::CharRepr
+    {
+        return Ok(None);
+    }
+    let helper = llops.rtyper.lowlevel_helper_function_with_builder(
+        "ll_stritem_nonneg".to_string(),
+        vec![STRPTR.clone(), LowLevelType::Signed],
+        LowLevelType::Char,
+        move |_rtyper, _args, _result| {
+            build_ll_stritem_nonneg_helper_graph("ll_stritem_nonneg", STRPTR.clone())
+        },
+    )?;
+    let zero = Hlvalue::Constant(HighLevelOp::inputconst(
+        &LowLevelType::Signed,
+        &ConstValue::Int(0),
+    )?);
+    let result = llops.gendirectcall(&helper, vec![v.clone(), zero])?;
+    Ok(result.map(Hlvalue::Variable))
+}
+
 // ____________________________________________________________
 // CharRepr — `rstr.py:483-541` (lltypesystem-bound `AbstractCharRepr`).
 
@@ -655,6 +1080,13 @@ impl Repr for CharRepr {
     fn rtype_bool(&self, _hop: &HighLevelOp) -> RTypeResult {
         let c = HighLevelOp::inputconst(&LowLevelType::Bool, &ConstValue::Bool(true))?;
         Ok(Some(Hlvalue::Constant(c)))
+    }
+
+    /// RPython `AbstractCharRepr.ll_str(ch)` (`rstr.py:554-555`) plus
+    /// the builtin `str(ch)` lowering path: allocate a one-character
+    /// `Ptr(STR)` via `LLHelpers.ll_chr2str`.
+    fn rtype_str(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_charlike_chr2str(hop, "ll_chr2str", STRPTR.clone(), LowLevelType::Char)
     }
 
     /// RPython `BaseCharReprMixin.rtype_ord(_, hop)` (`rstr.py:511-514`):
@@ -878,6 +1310,31 @@ impl Repr for UniCharRepr {
     fn rtype_bool(&self, _hop: &HighLevelOp) -> RTypeResult {
         let c = HighLevelOp::inputconst(&LowLevelType::Bool, &ConstValue::Bool(true))?;
         Ok(Some(Hlvalue::Constant(c)))
+    }
+
+    /// RPython `AbstractUniCharRepr.ll_unicode(ch)` (`rstr.py:564-565`):
+    /// `return unicode(ch)`. In lltypesystem this is the same
+    /// one-character allocation shape as `ll_chr2str`, specialised to
+    /// `UniChar -> Ptr(UNICODE)`.
+    fn rtype_unicode(&self, hop: &HighLevelOp) -> RTypeResult {
+        rtype_charlike_chr2str(
+            hop,
+            "ll_unichr2unicode",
+            UNICODEPTR.clone(),
+            LowLevelType::UniChar,
+        )
+    }
+
+    /// RPython `AbstractUniCharRepr.ll_str(ch)` (`rstr.py:560-562`):
+    /// `str(unicode(ch))`. The helper implements the single-codepoint
+    /// ASCII encode path and raises `UnicodeEncodeError` for
+    /// non-ASCII, matching the upstream unicode-to-str conversion
+    /// surface for this narrowed input.
+    fn rtype_str(&self, hop: &HighLevelOp) -> RTypeResult {
+        let vlist = hop.inputargs(vec![ConvertedTo::LowLevelType(&LowLevelType::UniChar)])?;
+        hop.exception_is_here()?;
+        let helper = lowlevel_unichr2str_function(hop.rtyper.as_ref())?;
+        hop.gendirectcall(&helper, vlist)
     }
 
     /// `BaseCharReprMixin.rtype_ord` (`rstr.py:772-775`) — UniChar variant
@@ -1179,6 +1636,102 @@ pub fn pair_unicode_unicode_rtype_compare(hop: &HighLevelOp, func: &str) -> RTyp
     )
 }
 
+/// RPython `pair(AbstractStringRepr, AbstractStringRepr).rtype_add`
+/// (`rstr.py:651-659`):
+///
+/// ```python
+/// def rtype_add((r_str1, r_str2), hop):
+///     str1_repr = r_str1.repr
+///     str2_repr = r_str2.repr
+///     if hop.s_result.is_constant():
+///         return hop.inputconst(str1_repr, hop.s_result.const)
+///     v_str1, v_str2 = hop.inputargs(str1_repr, str2_repr)
+///     return hop.gendirectcall(r_str1.ll.ll_strconcat, v_str1, v_str2)
+/// rtype_inplace_add = rtype_add
+/// ```
+///
+/// Pyre mirrors the constant-result fast path first, then lowers the
+/// non-constant case to `direct_call(ll_strconcat, v_s1, v_s2)`.
+/// Helper-cache identity diverges per pair (`ll_strconcat` for STR +
+/// STR, `ll_unicode_concat` for UNICODE + UNICODE) so the two helper
+/// families do not collide.
+fn pair_same_string_rtype_add(
+    hop: &HighLevelOp,
+    self_repr: &dyn Repr,
+    helper_name: &str,
+    ptr_lltype: LowLevelType,
+) -> RTypeResult {
+    if let Some(s_result) = hop.s_result.borrow().as_ref()
+        && s_result.is_constant()
+    {
+        let value = s_result
+            .const_()
+            .ok_or_else(|| TyperError::message("rtype_add: constant s_result missing const"))?;
+        return HighLevelOp::inputconst(ConvertedTo::Repr(self_repr), value)
+            .map(Hlvalue::Constant)
+            .map(Some);
+    }
+
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(self_repr),
+        ConvertedTo::Repr(self_repr),
+    ])?;
+
+    let helper_name_owned = helper_name.to_string();
+    let ptr_for_builder = ptr_lltype.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        helper_name_owned.clone(),
+        vec![ptr_lltype.clone(), ptr_lltype.clone()],
+        ptr_lltype,
+        move |_rtyper, _args, _result| {
+            build_ll_strconcat_helper_graph(&helper_name_owned, ptr_for_builder)
+        },
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
+/// Abstract pairtype entry used when dispatch reaches
+/// `pair(AbstractStringRepr, AbstractStringRepr)` through the repr MRO.
+pub fn pair_abstract_string_rtype_add(
+    r1: &dyn Repr,
+    r2: &dyn Repr,
+    hop: &HighLevelOp,
+) -> RTypeResult {
+    let helper_name = match r1.repr_class_id() {
+        super::pairtype::ReprClassId::StringRepr => "ll_strconcat",
+        super::pairtype::ReprClassId::UnicodeRepr => "ll_unicode_concat",
+        other => {
+            return Err(TyperError::message(format!(
+                "rtype_add: expected string-family left repr, got {other:?}"
+            )));
+        }
+    };
+    let ptr_lltype = r1.lowleveltype().clone();
+    if r2.lowleveltype() != &ptr_lltype {
+        return Err(TyperError::message(format!(
+            "rtype_add: mixed string-family concat requires conversion before lowering: left={:?}, right={:?}",
+            r1.lowleveltype(),
+            r2.lowleveltype()
+        )));
+    }
+    pair_same_string_rtype_add(hop, r1, helper_name, ptr_lltype)
+}
+
+/// `pair(StringRepr, StringRepr).rtype_add` — STR surface.
+pub fn pair_string_string_rtype_add(hop: &HighLevelOp) -> RTypeResult {
+    pair_same_string_rtype_add(hop, string_repr().as_ref(), "ll_strconcat", STRPTR.clone())
+}
+
+/// `pair(UnicodeRepr, UnicodeRepr).rtype_add` — UNICODE surface.
+pub fn pair_unicode_unicode_rtype_add(hop: &HighLevelOp) -> RTypeResult {
+    pair_same_string_rtype_add(
+        hop,
+        unicode_repr().as_ref(),
+        "ll_unicode_concat",
+        UNICODEPTR.clone(),
+    )
+}
+
 /// Per-pair helper-name bundle for
 /// [`pair_abstract_string_int_rtype_getitem`]. Mirrors the
 /// `r_str.ll.ll_stritem*` lookup table at upstream `rstr.py:619-627`:
@@ -1414,13 +1967,12 @@ pub fn pair_unicode_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
 ///     return paircls.rtype_getitem(pair(r_char, r_int), hop, checkidx)
 /// ```
 ///
-/// Pyre lands the constant-0 branch only — `c[0]` returns the char
-/// itself via `hop.inputarg(r_result, 0)`. The fall-through path
-/// (non-constant or non-zero index) requires a Char→Str cast through
-/// `ll_chr2str` (Slice 10) so it can reuse the
-/// AbstractStringRepr+IntegerRepr getitem dispatcher; that branch
-/// surfaces a TyperError until Slice 10 lands.
-fn pair_abstract_char_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
+/// The constant-0 branch returns the char itself via
+/// `hop.inputarg(r_result, 0)`. Other indexes fall through exactly as
+/// upstream: convert the char to a one-character STR/UNICODE via
+/// `ll_chr2str`, then reuse the AbstractStringRepr+IntegerRepr getitem
+/// dispatcher (including the checked `getitem_idx` variant).
+fn pair_abstract_char_int_rtype_getitem(hop: &HighLevelOp, checkidx: bool) -> RTypeResult {
     let s1 = hop
         .args_s
         .borrow()
@@ -1428,40 +1980,71 @@ fn pair_abstract_char_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
         .cloned()
         .ok_or_else(|| TyperError::message("rtype_getitem (Char, Int): args_s[1] missing"))?;
 
-    if !matches!(s1.const_(), Some(ConstValue::Int(0))) {
-        return Err(TyperError::message(
-            "pair(Char|UniChar, Int).rtype_getitem: only constant-0 index is \
-             supported; non-zero index requires the AbstractStringRepr fallback \
-             which depends on ll_chr2str (Slice 10)",
-        ));
+    if matches!(s1.const_(), Some(ConstValue::Int(0))) {
+        // rstr.py:725 — `hop.exception_cannot_occur()` precedes the inputarg.
+        hop.exception_cannot_occur()?;
+
+        // rstr.py:726 — `return hop.inputarg(hop.r_result, arg=0)` —
+        // identity-coerce the char arg into the result repr (CharRepr or
+        // UniCharRepr). The result repr equals args_r[0] for the constant-0
+        // case since `c[0] == c`.
+        let r_result =
+            hop.r_result.borrow().clone().ok_or_else(|| {
+                TyperError::message("rtype_getitem (Char, Int): r_result missing")
+            })?;
+        return hop
+            .inputarg(ConvertedTo::Repr(r_result.as_ref()), 0)
+            .map(Some);
     }
 
-    // rstr.py:725 — `hop.exception_cannot_occur()` precedes the inputarg.
-    hop.exception_cannot_occur()?;
-
-    // rstr.py:726 — `return hop.inputarg(hop.r_result, arg=0)` —
-    // identity-coerce the char arg into the result repr (CharRepr or
-    // UniCharRepr). The result repr equals args_r[0] for the constant-0
-    // case since `c[0] == c`.
-    let r_result = hop
-        .r_result
+    let r_char = hop
+        .args_r
         .borrow()
-        .clone()
-        .ok_or_else(|| TyperError::message("rtype_getitem (Char, Int): r_result missing"))?;
-    hop.inputarg(ConvertedTo::Repr(r_result.as_ref()), 0)
-        .map(Some)
+        .first()
+        .cloned()
+        .flatten()
+        .ok_or_else(|| TyperError::message("rtype_getitem (Char, Int): args_r[0] missing"))?;
+    match r_char.repr_class_id() {
+        super::pairtype::ReprClassId::CharRepr => pair_abstract_string_int_rtype_getitem(
+            hop,
+            string_repr().as_ref(),
+            STR_STRITEM_HELPER_NAMES,
+            STRPTR.clone(),
+            LowLevelType::Char,
+            checkidx,
+        ),
+        super::pairtype::ReprClassId::UniCharRepr => pair_abstract_string_int_rtype_getitem(
+            hop,
+            unicode_repr().as_ref(),
+            UNICODE_STRITEM_HELPER_NAMES,
+            UNICODEPTR.clone(),
+            LowLevelType::UniChar,
+            checkidx,
+        ),
+        other => Err(TyperError::message(format!(
+            "rtype_getitem (Char, Int): unsupported char repr {other:?}"
+        ))),
+    }
 }
 
-/// `pair(CharRepr, IntegerRepr).rtype_getitem` — Char surface
-/// (constant-0 fast path; non-constant index TyperErrors).
+/// `pair(CharRepr, IntegerRepr).rtype_getitem` — Char surface.
 pub fn pair_char_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
-    pair_abstract_char_int_rtype_getitem(hop)
+    pair_abstract_char_int_rtype_getitem(hop, false)
 }
 
-/// `pair(UniCharRepr, IntegerRepr).rtype_getitem` — UniChar surface
-/// (constant-0 fast path; non-constant index TyperErrors).
+/// `pair(CharRepr, IntegerRepr).rtype_getitem_idx` — checked Char surface.
+pub fn pair_char_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
+    pair_abstract_char_int_rtype_getitem(hop, true)
+}
+
+/// `pair(UniCharRepr, IntegerRepr).rtype_getitem` — UniChar surface.
 pub fn pair_unichar_int_rtype_getitem(hop: &HighLevelOp) -> RTypeResult {
-    pair_abstract_char_int_rtype_getitem(hop)
+    pair_abstract_char_int_rtype_getitem(hop, false)
+}
+
+/// `pair(UniCharRepr, IntegerRepr).rtype_getitem_idx` — checked UniChar surface.
+pub fn pair_unichar_int_rtype_getitem_idx(hop: &HighLevelOp) -> RTypeResult {
+    pair_abstract_char_int_rtype_getitem(hop, true)
 }
 
 /// RPython `AbstractStringRepr.rtype_method_isdigit(self, hop)`
@@ -1488,6 +2071,34 @@ fn rtype_abstract_string_method_isdigit(
     elem_lltype: LowLevelType,
     cast_op: &'static str,
 ) -> RTypeResult {
+    rtype_abstract_string_method_isxxx(
+        self_repr,
+        hop,
+        helper_name,
+        inner_predicate_name,
+        ptr_lltype,
+        elem_lltype,
+        cast_op,
+        StringIsxxxPredicate::InRange(48, 57),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum StringIsxxxPredicate {
+    InRange(i64, i64),
+    OrConditions(&'static [CharCondition]),
+}
+
+fn rtype_abstract_string_method_isxxx(
+    self_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    helper_name: &str,
+    inner_predicate_name: &str,
+    ptr_lltype: LowLevelType,
+    elem_lltype: LowLevelType,
+    cast_op: &'static str,
+    predicate: StringIsxxxPredicate,
+) -> RTypeResult {
     let vlist = hop.inputargs(vec![ConvertedTo::Repr(self_repr)])?;
     // rstr.py:256 — hop.exception_cannot_occur() before gendirectcall.
     hop.exception_cannot_occur()?;
@@ -1508,15 +2119,127 @@ fn rtype_abstract_string_method_isdigit(
                 &helper_name_owned,
                 ptr_for_builder,
                 &inner_name_owned,
-                move |_inner_name| {
-                    build_ll_charlike_predicate_inrange_helper_graph(
-                        &inner_for_predicate,
-                        elem_for_predicate,
-                        cast_op,
-                        48,
-                        57,
-                    )
+                move |_inner_name| match predicate {
+                    StringIsxxxPredicate::InRange(lo, hi) => {
+                        build_ll_charlike_predicate_inrange_helper_graph(
+                            &inner_for_predicate,
+                            elem_for_predicate,
+                            cast_op,
+                            lo,
+                            hi,
+                        )
+                    }
+                    StringIsxxxPredicate::OrConditions(conditions) => {
+                        build_ll_charlike_or_of_conditions_helper_graph(
+                            &inner_for_predicate,
+                            elem_for_predicate,
+                            cast_op,
+                            conditions,
+                        )
+                    }
                 },
+            )
+        },
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
+/// RPython `AbstractStringRepr.rtype_method_upper/lower`
+/// (`rstr.py:241-251`): byte strings dispatch to
+/// `LLHelpers.ll_upper/lower`; UnicodeRepr overrides these methods and
+/// never reaches this helper.
+fn rtype_abstract_string_method_casefold(
+    self_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    helper_name: &str,
+    inner_helper_name: &str,
+    lo: i64,
+    hi: i64,
+    offset: i64,
+) -> RTypeResult {
+    let vlist = hop.inputargs(vec![ConvertedTo::Repr(self_repr)])?;
+    // rstr.py:244/250 — hop.exception_cannot_occur() before gendirectcall.
+    hop.exception_cannot_occur()?;
+
+    let helper_name_owned = helper_name.to_string();
+    let inner_name_owned = inner_helper_name.to_string();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        helper_name_owned.clone(),
+        vec![STRPTR.clone()],
+        STRPTR.clone(),
+        move |rtyper_inner, _args, _result| {
+            let inner_for_builder = inner_name_owned.clone();
+            build_ll_string_casefold_helper_graph(
+                rtyper_inner,
+                &helper_name_owned,
+                STRPTR.clone(),
+                &inner_name_owned,
+                move |_inner_name| {
+                    build_ll_char_case_fold_helper_graph(&inner_for_builder, lo, hi, offset)
+                },
+            )
+        },
+    )?;
+    hop.gendirectcall(&helper, vlist)
+}
+
+/// RPython `AbstractStringRepr.rtype_method_replace`
+/// (`rstr.py:363-369`): currently only the `(str-or-unicode, char,
+/// char)` form is supported upstream here; non-char arguments raise
+/// `TyperError('replace only works for char args')`.
+fn rtype_abstract_string_method_replace(
+    self_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    helper_name: &str,
+    ptr_lltype: LowLevelType,
+    elem_lltype: LowLevelType,
+) -> RTypeResult {
+    use super::pairtype::ReprClassId;
+
+    let expected = match elem_lltype {
+        LowLevelType::Char => ReprClassId::CharRepr,
+        LowLevelType::UniChar => ReprClassId::UniCharRepr,
+        ref other => {
+            return Err(TyperError::message(format!(
+                "rtype_method_replace unsupported char element type {other:?}"
+            )));
+        }
+    };
+    for idx in [1usize, 2usize] {
+        let r_arg = hop
+            .args_r
+            .borrow()
+            .get(idx)
+            .cloned()
+            .flatten()
+            .ok_or_else(|| {
+                TyperError::message(format!("rtype_method_replace: args_r[{idx}] missing"))
+            })?;
+        if r_arg.repr_class_id() != expected {
+            return Err(TyperError::message("replace only works for char args"));
+        }
+    }
+
+    let vlist = hop.inputargs(vec![
+        ConvertedTo::Repr(self_repr),
+        ConvertedTo::LowLevelType(&elem_lltype),
+        ConvertedTo::LowLevelType(&elem_lltype),
+    ])?;
+    // rstr.py:368 — hop.exception_cannot_occur() before gendirectcall.
+    hop.exception_cannot_occur()?;
+
+    let helper_name_owned = helper_name.to_string();
+    let ptr_for_builder = ptr_lltype.clone();
+    let elem_for_builder = elem_lltype.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        helper_name_owned.clone(),
+        vec![ptr_lltype.clone(), elem_lltype.clone(), elem_lltype],
+        ptr_lltype,
+        move |_rtyper, _args, _result| {
+            build_ll_replace_chr_chr_helper_graph(
+                &helper_name_owned,
+                ptr_for_builder,
+                elem_for_builder,
             )
         },
     )?;
@@ -1708,6 +2431,116 @@ fn rtype_abstract_string_method_endswith(
         },
     )?;
     hop.gendirectcall(&helper, vlist)
+}
+
+#[derive(Clone, Copy)]
+enum FindLikeCharKind {
+    Find,
+    RFind,
+    Count,
+}
+
+/// Char-needle slice of RPython `rtype_method_find` /
+/// `rtype_method_count` (`rstr.py:160-189`, `:191-207`).
+///
+/// Full PyPy parity also accepts string-family substring needles and
+/// routes to `ll_find` / `ll_rfind` / `ll_count`. The current helper
+/// graph set only contains the single-char helpers; non-char needles
+/// therefore fail closed instead of pretending the substring branch was
+/// ported.
+fn rtype_abstract_string_method_findlike_char(
+    self_repr: &dyn Repr,
+    hop: &HighLevelOp,
+    helper_name: &str,
+    kind: FindLikeCharKind,
+    ptr_lltype: LowLevelType,
+    elem_lltype: LowLevelType,
+) -> RTypeResult {
+    use super::pairtype::ReprClassId;
+
+    let method_name = match kind {
+        FindLikeCharKind::Find => "find",
+        FindLikeCharKind::RFind => "rfind",
+        FindLikeCharKind::Count => "count",
+    };
+    let r1_arc = hop
+        .args_r
+        .borrow()
+        .get(1)
+        .cloned()
+        .flatten()
+        .ok_or_else(|| {
+            TyperError::message(format!("rtype_method_{method_name}: args_r[1] missing"))
+        })?;
+    if !matches!(
+        r1_arc.repr_class_id(),
+        ReprClassId::CharRepr | ReprClassId::UniCharRepr
+    ) {
+        return Err(TyperError::message(format!(
+            "rtype_method_{method_name}: substring helper is not ported yet"
+        )));
+    }
+    let nb_args = hop.nb_args();
+    if !(2..=4).contains(&nb_args) {
+        return Err(TyperError::message(format!(
+            "rtype_method_{method_name}: expected 2 to 4 arguments, got {nb_args}"
+        )));
+    }
+
+    let v_str = hop.inputarg(ConvertedTo::Repr(self_repr), 0)?;
+    let v_ch = hop.inputarg(ConvertedTo::LowLevelType(&elem_lltype), 1)?;
+    let v_start = if nb_args >= 3 {
+        hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 2)?
+    } else {
+        constant_with_lltype(ConstValue::Int(0), LowLevelType::Signed)
+    };
+    let v_end = if nb_args >= 4 {
+        hop.inputarg(ConvertedTo::LowLevelType(&LowLevelType::Signed), 3)?
+    } else {
+        let strlen_name = if ptr_lltype == STRPTR.clone() {
+            "ll_strlen"
+        } else {
+            "ll_unicode_strlen"
+        };
+        let strlen_name_owned = strlen_name.to_string();
+        let ptr_for_builder = ptr_lltype.clone();
+        let strlen = hop.rtyper.lowlevel_helper_function_with_builder(
+            strlen_name_owned.clone(),
+            vec![ptr_lltype.clone()],
+            LowLevelType::Signed,
+            move |_rtyper, _args, _result| {
+                build_ll_strlen_helper_graph(&strlen_name_owned, ptr_for_builder)
+            },
+        )?;
+        hop.gendirectcall(&strlen, vec![v_str.clone()])?
+            .ok_or_else(|| TyperError::message("ll_strlen returned Void"))?
+    };
+
+    hop.exception_cannot_occur()?;
+    let helper_name_owned = helper_name.to_string();
+    let ptr_for_builder = ptr_lltype.clone();
+    let helper = hop.rtyper.lowlevel_helper_function_with_builder(
+        helper_name_owned.clone(),
+        vec![
+            ptr_lltype.clone(),
+            elem_lltype,
+            LowLevelType::Signed,
+            LowLevelType::Signed,
+        ],
+        LowLevelType::Signed,
+        move |_rtyper, _args, _result| match kind {
+            FindLikeCharKind::Find => {
+                build_ll_find_char_helper_graph(&helper_name_owned, ptr_for_builder)
+            }
+            FindLikeCharKind::RFind => {
+                build_ll_rfind_char_helper_graph(&helper_name_owned, ptr_for_builder)
+            }
+            FindLikeCharKind::Count => {
+                build_ll_count_char_helper_graph(&helper_name_owned, ptr_for_builder)
+            }
+        },
+    )?;
+    hop.gendirectcall(&helper, vec![v_str, v_ch, v_start, v_end])
 }
 
 // ____________________________________________________________
@@ -3105,6 +3938,95 @@ mod tests {
         );
     }
 
+    /// rstr.py:160-207 — char-needle `find` / `rfind` / `count`
+    /// dispatch to their single-char helpers with explicit start/end.
+    #[test]
+    fn string_repr_rtype_method_findlike_dispatches_to_char_helpers_for_char_arg1() {
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+
+        for (method, expected_helper) in [
+            ("find", "ll_find_char"),
+            ("rfind", "ll_rfind_char"),
+            ("count", "ll_count_char"),
+        ] {
+            let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+                rtyper.clone(),
+                None,
+            )));
+            let v_str = Variable::new();
+            v_str.set_concretetype(Some(STRPTR.clone()));
+            let v_ch = Variable::new();
+            v_ch.set_concretetype(Some(LowLevelType::Char));
+            let v_start = Variable::new();
+            v_start.set_concretetype(Some(LowLevelType::Signed));
+            let v_end = Variable::new();
+            v_end.set_concretetype(Some(LowLevelType::Signed));
+            let v_result = Variable::new();
+            v_result.set_concretetype(Some(LowLevelType::Signed));
+            let hop = HighLevelOp::new(
+                rtyper.clone(),
+                SpaceOperation::new(
+                    method.to_string(),
+                    vec![
+                        Hlvalue::Variable(v_str),
+                        Hlvalue::Variable(v_ch),
+                        Hlvalue::Variable(v_start),
+                        Hlvalue::Variable(v_end),
+                    ],
+                    Hlvalue::Variable(v_result),
+                ),
+                Vec::new(),
+                llops.clone(),
+            );
+            hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+            hop.args_s.borrow_mut().extend([
+                crate::annotator::model::SomeValue::String(
+                    crate::annotator::model::SomeString::new(false, false),
+                ),
+                crate::annotator::model::SomeValue::Char(crate::annotator::model::SomeChar::new(
+                    false,
+                )),
+                crate::annotator::model::SomeValue::Integer(
+                    crate::annotator::model::SomeInteger::new(false, false),
+                ),
+                crate::annotator::model::SomeValue::Integer(
+                    crate::annotator::model::SomeInteger::new(false, false),
+                ),
+            ]);
+            hop.args_r.borrow_mut().extend([
+                Some(string_repr() as Arc<dyn Repr>),
+                Some(char_repr() as Arc<dyn Repr>),
+                Some(signed_repr() as Arc<dyn Repr>),
+                Some(signed_repr() as Arc<dyn Repr>),
+            ]);
+
+            let result = string_repr()
+                .rtype_method(method, &hop)
+                .unwrap_or_else(|err| panic!("rtype_method {method} char-side: {err:?}"));
+            assert!(matches!(result, Some(Hlvalue::Variable(_))));
+            let ops = llops.borrow();
+            assert_eq!(ops.ops.len(), 1, "{method}: one direct_call");
+            assert_eq!(ops.ops[0].opname, "direct_call");
+            assert!(
+                ops._called_exception_is_here_or_cannot_occur,
+                "{method}: must call hop.exception_cannot_occur()"
+            );
+            let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+                panic!("expected Constant funcptr");
+            };
+            let dbg = format!("{:?}", c.value);
+            assert!(
+                dbg.contains(expected_helper),
+                "{method}: expected '{expected_helper}' in {dbg}"
+            );
+        }
+    }
+
     /// Audit fix #2 regression coverage — Unicode/UniChar matched-pair
     /// char-branch dispatch must use UniChar as the helper signature
     /// elem type so the dispatcher and `build_ll_startswith_char_helper_graph`
@@ -3478,11 +4400,11 @@ mod tests {
         );
     }
 
-    /// rstr.py:253-257 — `AbstractStringRepr.rtype_method_isdigit`
-    /// lowers to `direct_call(ll_isdigit, v_str)`. The helper graph
-    /// itself sub-helper-direct-calls `ll_char_isdigit` per char.
+    /// rstr.py:651-659 — `pair(StringRepr, StringRepr).rtype_add`
+    /// emits `direct_call(ll_strconcat, v_s1, v_s2)` returning Ptr(STR).
     #[test]
-    fn string_repr_rtype_method_isdigit_emits_direct_call_to_ll_isdigit() {
+    fn pair_string_string_rtype_add_emits_direct_call_to_ll_strconcat() {
+        use crate::flowspace::model::Variable;
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
@@ -3490,42 +4412,53 @@ mod tests {
             rtyper.clone(),
             None,
         )));
+        let v_s1 = Variable::new();
+        v_s1.set_concretetype(Some(STRPTR.clone()));
+        let v_s2 = Variable::new();
+        v_s2.set_concretetype(Some(STRPTR.clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(STRPTR.clone()));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "add".to_string(),
+                vec![Hlvalue::Variable(v_s1), Hlvalue::Variable(v_s2)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
         let s_str = crate::annotator::model::SomeValue::String(
             crate::annotator::model::SomeString::new(false, false),
         );
-        let hop = build_string_unary_hop(
-            rtyper.clone(),
-            llops.clone(),
-            "isdigit",
-            STRPTR.clone(),
-            LowLevelType::Bool,
-            string_repr() as Arc<dyn Repr>,
-            s_str,
-        );
-        let result = string_repr()
-            .rtype_method("isdigit", &hop)
-            .unwrap_or_else(|err| panic!("rtype_method isdigit: {err:?}"));
+        hop.args_s.borrow_mut().extend([s_str.clone(), s_str]);
+        hop.args_r.borrow_mut().extend([
+            Some(string_repr() as Arc<dyn Repr>),
+            Some(string_repr() as Arc<dyn Repr>),
+        ]);
+
+        let result =
+            pair_string_string_rtype_add(&hop).unwrap_or_else(|err| panic!("pair add: {err:?}"));
         assert!(matches!(result, Some(Hlvalue::Variable(_))));
         let ops = llops.borrow();
-        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops.len(), 1, "string add: one direct_call");
         assert_eq!(ops.ops[0].opname, "direct_call");
-        // rstr.py:256 — `hop.exception_cannot_occur()` precedes the
-        // gendirectcall.
-        assert!(
-            ops._called_exception_is_here_or_cannot_occur,
-            "rtype_method_isdigit must call hop.exception_cannot_occur()"
-        );
         let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
             panic!("expected Constant funcptr");
         };
         let dbg = format!("{:?}", c.value);
-        assert!(dbg.contains("ll_isdigit"), "expected 'll_isdigit' in {dbg}");
+        assert!(
+            dbg.contains("ll_strconcat"),
+            "expected 'll_strconcat' in {dbg}"
+        );
     }
 
-    /// Mirror for UnicodeRepr — distinct helper-cache identity
-    /// `ll_unicode_isdigit`.
+    /// rstr.py:651-659 (UnicodeRepr inherited) — UNICODE pair surface
+    /// uses distinct helper-cache identity `ll_unicode_concat`.
     #[test]
-    fn unicode_repr_rtype_method_isdigit_emits_direct_call_to_ll_unicode_isdigit() {
+    fn pair_unicode_unicode_rtype_add_emits_direct_call_to_ll_unicode_concat() {
+        use crate::flowspace::model::Variable;
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
         let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
@@ -3533,21 +4466,34 @@ mod tests {
             rtyper.clone(),
             None,
         )));
+        let v_s1 = Variable::new();
+        v_s1.set_concretetype(Some(UNICODEPTR.clone()));
+        let v_s2 = Variable::new();
+        v_s2.set_concretetype(Some(UNICODEPTR.clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(UNICODEPTR.clone()));
+        let hop = HighLevelOp::new(
+            rtyper.clone(),
+            SpaceOperation::new(
+                "add".to_string(),
+                vec![Hlvalue::Variable(v_s1), Hlvalue::Variable(v_s2)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
         let s_uni = crate::annotator::model::SomeValue::UnicodeString(
             crate::annotator::model::SomeUnicodeString::new(false, false),
         );
-        let hop = build_string_unary_hop(
-            rtyper.clone(),
-            llops.clone(),
-            "isdigit",
-            UNICODEPTR.clone(),
-            LowLevelType::Bool,
-            unicode_repr() as Arc<dyn Repr>,
-            s_uni,
-        );
-        let result = unicode_repr()
-            .rtype_method("isdigit", &hop)
-            .unwrap_or_else(|err| panic!("rtype_method isdigit: {err:?}"));
+        hop.args_s.borrow_mut().extend([s_uni.clone(), s_uni]);
+        hop.args_r.borrow_mut().extend([
+            Some(unicode_repr() as Arc<dyn Repr>),
+            Some(unicode_repr() as Arc<dyn Repr>),
+        ]);
+
+        let result = pair_unicode_unicode_rtype_add(&hop)
+            .unwrap_or_else(|err| panic!("pair unicode add: {err:?}"));
         assert!(matches!(result, Some(Hlvalue::Variable(_))));
         let ops = llops.borrow();
         assert_eq!(ops.ops.len(), 1);
@@ -3557,9 +4503,319 @@ mod tests {
         };
         let dbg = format!("{:?}", c.value);
         assert!(
-            dbg.contains("ll_unicode_isdigit"),
-            "expected 'll_unicode_isdigit' in {dbg}"
+            dbg.contains("ll_unicode_concat"),
+            "expected 'll_unicode_concat' in {dbg}"
         );
+        // Helper-cache identity must NOT alias with the STR family.
+        assert!(
+            !dbg.contains("ll_strconcat"),
+            "UNICODE add must use ll_unicode_concat, not ll_strconcat: {dbg}"
+        );
+    }
+
+    /// rstr.py:253-269 plus Slice 9 isxxx batch —
+    /// `AbstractStringRepr.rtype_method_isxxx` lowers to
+    /// `direct_call(ll_isxxx, v_str)`. The helper graph itself
+    /// sub-helper-direct-calls the per-char predicate.
+    #[test]
+    fn string_repr_rtype_method_isxxx_emit_direct_call_to_string_predicate_helpers() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+
+        for (method, expected_helper) in [
+            ("isdigit", "ll_isdigit"),
+            ("isalpha", "ll_isalpha"),
+            ("isalnum", "ll_isalnum"),
+            ("isspace", "ll_isspace"),
+            ("isupper", "ll_isupper"),
+            ("islower", "ll_islower"),
+        ] {
+            let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+                rtyper.clone(),
+                None,
+            )));
+            let s_str = crate::annotator::model::SomeValue::String(
+                crate::annotator::model::SomeString::new(false, false),
+            );
+            let hop = build_string_unary_hop(
+                rtyper.clone(),
+                llops.clone(),
+                method,
+                STRPTR.clone(),
+                LowLevelType::Bool,
+                string_repr() as Arc<dyn Repr>,
+                s_str,
+            );
+            let result = string_repr()
+                .rtype_method(method, &hop)
+                .unwrap_or_else(|err| panic!("rtype_method {method}: {err:?}"));
+            assert!(matches!(result, Some(Hlvalue::Variable(_))));
+            let ops = llops.borrow();
+            assert_eq!(ops.ops.len(), 1, "{method}: one direct_call");
+            assert_eq!(ops.ops[0].opname, "direct_call");
+            assert!(
+                ops._called_exception_is_here_or_cannot_occur,
+                "{method}: must call hop.exception_cannot_occur()"
+            );
+            let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+                panic!("expected Constant funcptr");
+            };
+            let dbg = format!("{:?}", c.value);
+            assert!(
+                dbg.contains(expected_helper),
+                "{method}: expected '{expected_helper}' in {dbg}"
+            );
+        }
+    }
+
+    /// rstr.py:241-251 — `str.upper/lower` dispatch to
+    /// `LLHelpers.ll_upper/lower` and cannot raise.
+    #[test]
+    fn string_repr_rtype_method_casefold_emit_direct_call_to_string_helpers() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+
+        for (method, expected_helper) in [("upper", "ll_upper"), ("lower", "ll_lower")] {
+            let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+                rtyper.clone(),
+                None,
+            )));
+            let s_str = crate::annotator::model::SomeValue::String(
+                crate::annotator::model::SomeString::new(false, false),
+            );
+            let hop = build_string_unary_hop(
+                rtyper.clone(),
+                llops.clone(),
+                method,
+                STRPTR.clone(),
+                STRPTR.clone(),
+                string_repr() as Arc<dyn Repr>,
+                s_str,
+            );
+            let result = string_repr()
+                .rtype_method(method, &hop)
+                .unwrap_or_else(|err| panic!("rtype_method {method}: {err:?}"));
+            assert!(matches!(result, Some(Hlvalue::Variable(_))));
+            let ops = llops.borrow();
+            assert_eq!(ops.ops.len(), 1, "{method}: one direct_call");
+            assert_eq!(ops.ops[0].opname, "direct_call");
+            assert!(
+                ops._called_exception_is_here_or_cannot_occur,
+                "{method}: must call hop.exception_cannot_occur()"
+            );
+            let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+                panic!("expected Constant funcptr");
+            };
+            let dbg = format!("{:?}", c.value);
+            assert!(
+                dbg.contains(expected_helper),
+                "{method}: expected '{expected_helper}' in {dbg}"
+            );
+        }
+    }
+
+    /// Mirror for UnicodeRepr — distinct helper-cache identities
+    /// (`ll_unicode_isxxx`).
+    #[test]
+    fn unicode_repr_rtype_method_isxxx_emit_direct_call_to_unicode_predicate_helpers() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+
+        for (method, expected_helper) in [
+            ("isdigit", "ll_unicode_isdigit"),
+            ("isalpha", "ll_unicode_isalpha"),
+            ("isalnum", "ll_unicode_isalnum"),
+            ("isspace", "ll_unicode_isspace"),
+            ("isupper", "ll_unicode_isupper"),
+            ("islower", "ll_unicode_islower"),
+        ] {
+            let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+                rtyper.clone(),
+                None,
+            )));
+            let s_uni = crate::annotator::model::SomeValue::UnicodeString(
+                crate::annotator::model::SomeUnicodeString::new(false, false),
+            );
+            let hop = build_string_unary_hop(
+                rtyper.clone(),
+                llops.clone(),
+                method,
+                UNICODEPTR.clone(),
+                LowLevelType::Bool,
+                unicode_repr() as Arc<dyn Repr>,
+                s_uni,
+            );
+            let result = unicode_repr()
+                .rtype_method(method, &hop)
+                .unwrap_or_else(|err| panic!("rtype_method {method}: {err:?}"));
+            assert!(matches!(result, Some(Hlvalue::Variable(_))));
+            let ops = llops.borrow();
+            assert_eq!(ops.ops.len(), 1, "{method}: one direct_call");
+            assert_eq!(ops.ops[0].opname, "direct_call");
+            assert!(
+                ops._called_exception_is_here_or_cannot_occur,
+                "{method}: must call hop.exception_cannot_occur()"
+            );
+            let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+                panic!("expected Constant funcptr");
+            };
+            let dbg = format!("{:?}", c.value);
+            assert!(
+                dbg.contains(expected_helper),
+                "{method}: expected '{expected_helper}' in {dbg}"
+            );
+        }
+    }
+
+    /// rstr.py:452-457 — UnicodeRepr intentionally rejects
+    /// `upper/lower` instead of using byte-string casefolding.
+    #[test]
+    fn unicode_repr_rtype_method_casefold_raises_typererror() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+
+        for (method, expected_message) in [
+            ("upper", "Cannot do toupper on unicode string"),
+            ("lower", "Cannot do tolower on unicode string"),
+        ] {
+            let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+                rtyper.clone(),
+                None,
+            )));
+            let s_uni = crate::annotator::model::SomeValue::UnicodeString(
+                crate::annotator::model::SomeUnicodeString::new(false, false),
+            );
+            let hop = build_string_unary_hop(
+                rtyper.clone(),
+                llops,
+                method,
+                UNICODEPTR.clone(),
+                UNICODEPTR.clone(),
+                unicode_repr() as Arc<dyn Repr>,
+                s_uni,
+            );
+            let err = unicode_repr()
+                .rtype_method(method, &hop)
+                .expect_err("unicode upper/lower must be rejected");
+            assert!(
+                format!("{err:?}").contains(expected_message),
+                "{method}: got {err:?}"
+            );
+        }
+    }
+
+    /// rstr.py:363-369 — `replace` accepts only char/unichar needle
+    /// and replacement args, then dispatches to `ll_replace_chr_chr`.
+    #[test]
+    fn string_unicode_rtype_method_replace_emit_direct_call_to_chr_chr_helpers() {
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        struct Case<'a> {
+            method_repr: Arc<dyn Repr>,
+            ptr_lltype: LowLevelType,
+            elem_lltype: LowLevelType,
+            s_str: crate::annotator::model::SomeValue,
+            s_char: crate::annotator::model::SomeValue,
+            char_repr: Arc<dyn Repr>,
+            expected_helper: &'a str,
+        }
+
+        let cases = [
+            Case {
+                method_repr: string_repr() as Arc<dyn Repr>,
+                ptr_lltype: STRPTR.clone(),
+                elem_lltype: LowLevelType::Char,
+                s_str: crate::annotator::model::SomeValue::String(
+                    crate::annotator::model::SomeString::new(false, false),
+                ),
+                s_char: crate::annotator::model::SomeValue::Char(
+                    crate::annotator::model::SomeChar::new(false),
+                ),
+                char_repr: char_repr() as Arc<dyn Repr>,
+                expected_helper: "ll_replace_chr_chr",
+            },
+            Case {
+                method_repr: unicode_repr() as Arc<dyn Repr>,
+                ptr_lltype: UNICODEPTR.clone(),
+                elem_lltype: LowLevelType::UniChar,
+                s_str: crate::annotator::model::SomeValue::UnicodeString(
+                    crate::annotator::model::SomeUnicodeString::new(false, false),
+                ),
+                s_char: crate::annotator::model::SomeValue::UnicodeCodePoint(
+                    crate::annotator::model::SomeUnicodeCodePoint::new(false),
+                ),
+                char_repr: unichar_repr() as Arc<dyn Repr>,
+                expected_helper: "ll_unicode_replace_chr_chr",
+            },
+        ];
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+
+        for case in cases {
+            let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+                rtyper.clone(),
+                None,
+            )));
+            let v_str = Variable::new();
+            v_str.set_concretetype(Some(case.ptr_lltype.clone()));
+            let v_c1 = Variable::new();
+            v_c1.set_concretetype(Some(case.elem_lltype.clone()));
+            let v_c2 = Variable::new();
+            v_c2.set_concretetype(Some(case.elem_lltype.clone()));
+            let v_result = Variable::new();
+            v_result.set_concretetype(Some(case.ptr_lltype.clone()));
+            let hop = HighLevelOp::new(
+                rtyper.clone(),
+                SpaceOperation::new(
+                    "replace".to_string(),
+                    vec![
+                        Hlvalue::Variable(v_str),
+                        Hlvalue::Variable(v_c1),
+                        Hlvalue::Variable(v_c2),
+                    ],
+                    Hlvalue::Variable(v_result),
+                ),
+                Vec::new(),
+                llops.clone(),
+            );
+            hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+            hop.args_s
+                .borrow_mut()
+                .extend([case.s_str, case.s_char.clone(), case.s_char]);
+            hop.args_r.borrow_mut().extend([
+                Some(case.method_repr.clone()),
+                Some(case.char_repr.clone()),
+                Some(case.char_repr),
+            ]);
+
+            let result = case
+                .method_repr
+                .rtype_method("replace", &hop)
+                .unwrap_or_else(|err| panic!("rtype_method replace: {err:?}"));
+            assert!(matches!(result, Some(Hlvalue::Variable(_))));
+            let ops = llops.borrow();
+            assert_eq!(ops.ops.len(), 1);
+            assert_eq!(ops.ops[0].opname, "direct_call");
+            assert!(
+                ops._called_exception_is_here_or_cannot_occur,
+                "replace must call hop.exception_cannot_occur()"
+            );
+            let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+                panic!("expected Constant funcptr");
+            };
+            let dbg = format!("{:?}", c.value);
+            assert!(
+                dbg.contains(case.expected_helper),
+                "expected '{}' in {dbg}",
+                case.expected_helper
+            );
+        }
     }
 
     /// Mirror for UnicodeRepr — distinct helper-cache identity
@@ -4254,6 +5510,295 @@ mod tests {
         );
     }
 
+    /// rstr.py:385-396 — `unicode(s)` for a byte string emits
+    /// `direct_call(ll_str2unicode, s)` and marks the operation as
+    /// exception-capable because non-ASCII bytes raise
+    /// UnicodeDecodeError inside the helper graph.
+    #[test]
+    fn string_repr_rtype_unicode_emits_direct_call_to_ll_str2unicode() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let hop = build_string_unary_hop(
+            rtyper.clone(),
+            llops.clone(),
+            "unicode",
+            STRPTR.clone(),
+            UNICODEPTR.clone(),
+            string_repr() as Arc<dyn Repr>,
+            crate::annotator::model::SomeValue::String(crate::annotator::model::SomeString::new(
+                false, false,
+            )),
+        );
+        *hop.r_result.borrow_mut() = Some(unicode_repr() as Arc<dyn Repr>);
+
+        let result = string_repr()
+            .rtype_unicode(&hop)
+            .unwrap_or_else(|err| panic!("StringRepr.rtype_unicode: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_str2unicode"),
+            "expected ll_str2unicode in {dbg}"
+        );
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+    }
+
+    /// Same upstream method, identity branch: if the source repr already
+    /// matches `hop.r_result`, no helper call is emitted.
+    #[test]
+    fn unicode_repr_rtype_unicode_returns_identity_without_direct_call() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let hop = build_string_unary_hop(
+            rtyper.clone(),
+            llops.clone(),
+            "unicode",
+            UNICODEPTR.clone(),
+            UNICODEPTR.clone(),
+            unicode_repr() as Arc<dyn Repr>,
+            crate::annotator::model::SomeValue::UnicodeString(
+                crate::annotator::model::SomeUnicodeString::new(false, false),
+            ),
+        );
+        *hop.r_result.borrow_mut() = Some(unicode_repr() as Arc<dyn Repr>);
+
+        let result = unicode_repr()
+            .rtype_unicode(&hop)
+            .unwrap_or_else(|err| panic!("UnicodeRepr.rtype_unicode: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 0, "unicode identity path emits no llops");
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+    }
+
+    /// rstr.py:371-383 — `int(s)` records ValueError and calls
+    /// `LLHelpers.ll_int(s, 10)`.
+    #[test]
+    fn string_repr_rtype_int_default_base_emits_direct_call_to_ll_int() {
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_arg = Variable::new();
+        v_arg.set_concretetype(Some(STRPTR.clone()));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "int".to_string(),
+                vec![Hlvalue::Variable(v_arg)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::String(
+                crate::annotator::model::SomeString::new(false, false),
+            ));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(string_repr() as Arc<dyn Repr>));
+        *hop.r_result.borrow_mut() = Some(signed_repr() as Arc<dyn Repr>);
+
+        let result = string_repr()
+            .rtype_int(&hop)
+            .unwrap_or_else(|err| panic!("StringRepr.rtype_int: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c_func) = &ops.ops[0].args[0] else {
+            panic!("expected direct_call funcptr constant");
+        };
+        assert!(format!("{:?}", c_func.value).contains("ll_int"));
+        assert!(matches!(
+            ops.ops[0].args[2],
+            Hlvalue::Constant(Constant {
+                value: ConstValue::Int(10),
+                ..
+            })
+        ));
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+    }
+
+    /// Two-argument `int(u, base)` is inherited by UnicodeRepr and
+    /// routes through the unicode-specialised `ll_unicode_int` helper.
+    #[test]
+    fn unicode_repr_rtype_int_with_base_emits_direct_call_to_ll_unicode_int() {
+        use crate::flowspace::model::Variable;
+        use crate::translator::rtyper::rint::signed_repr;
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let v_str = Variable::new();
+        v_str.set_concretetype(Some(UNICODEPTR.clone()));
+        let v_base = Variable::new();
+        v_base.set_concretetype(Some(LowLevelType::Signed));
+        let v_result = Variable::new();
+        v_result.set_concretetype(Some(LowLevelType::Signed));
+        let hop = HighLevelOp::new(
+            rtyper,
+            SpaceOperation::new(
+                "int".to_string(),
+                vec![Hlvalue::Variable(v_str), Hlvalue::Variable(v_base)],
+                Hlvalue::Variable(v_result),
+            ),
+            Vec::new(),
+            llops.clone(),
+        );
+        hop.args_v.borrow_mut().extend(hop.spaceop.args.clone());
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::UnicodeString(
+                crate::annotator::model::SomeUnicodeString::new(false, false),
+            ));
+        hop.args_s
+            .borrow_mut()
+            .push(crate::annotator::model::SomeValue::Integer(
+                crate::annotator::model::SomeInteger::new(false, false),
+            ));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(unicode_repr() as Arc<dyn Repr>));
+        hop.args_r
+            .borrow_mut()
+            .push(Some(signed_repr() as Arc<dyn Repr>));
+        *hop.r_result.borrow_mut() = Some(signed_repr() as Arc<dyn Repr>);
+
+        let result = unicode_repr()
+            .rtype_int(&hop)
+            .unwrap_or_else(|err| panic!("UnicodeRepr.rtype_int: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c_func) = &ops.ops[0].args[0] else {
+            panic!("expected direct_call funcptr constant");
+        };
+        assert!(format!("{:?}", c_func.value).contains("ll_unicode_int"));
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+    }
+
+    /// rstr.py:554-555 — `AbstractCharRepr.ll_str(ch)` delegates to
+    /// `LLHelpers.ll_chr2str`, so `str(ch)` emits one direct_call to the
+    /// one-character STR allocator helper.
+    #[test]
+    fn char_repr_rtype_str_emits_direct_call_to_ll_chr2str() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let hop = build_string_unary_hop(
+            rtyper.clone(),
+            llops.clone(),
+            "str",
+            LowLevelType::Char,
+            STRPTR.clone(),
+            char_repr() as Arc<dyn Repr>,
+            crate::annotator::model::SomeValue::Char(crate::annotator::model::SomeChar::new(false)),
+        );
+
+        let result = char_repr()
+            .rtype_str(&hop)
+            .unwrap_or_else(|err| panic!("CharRepr.rtype_str: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(dbg.contains("ll_chr2str"), "expected ll_chr2str in {dbg}");
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+    }
+
+    /// rstr.py:564-565 — `AbstractUniCharRepr.ll_unicode(ch)` returns
+    /// `unicode(ch)`, represented here by the UniChar-specialised
+    /// one-character UNICODE allocator helper.
+    #[test]
+    fn unichar_repr_rtype_unicode_emits_direct_call_to_ll_unichr2unicode() {
+        use crate::translator::rtyper::rtyper::LowLevelOpList;
+
+        let ann = RPythonAnnotator::new(None, None, None, false);
+        let rtyper = std::rc::Rc::new(RPythonTyper::new(&ann));
+        let llops = std::rc::Rc::new(std::cell::RefCell::new(LowLevelOpList::new(
+            rtyper.clone(),
+            None,
+        )));
+        let hop = build_string_unary_hop(
+            rtyper.clone(),
+            llops.clone(),
+            "unicode",
+            LowLevelType::UniChar,
+            UNICODEPTR.clone(),
+            unichar_repr() as Arc<dyn Repr>,
+            crate::annotator::model::SomeValue::UnicodeCodePoint(
+                crate::annotator::model::SomeUnicodeCodePoint::new(false),
+            ),
+        );
+
+        let result = unichar_repr()
+            .rtype_unicode(&hop)
+            .unwrap_or_else(|err| panic!("UniCharRepr.rtype_unicode: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        assert_eq!(ops.ops.len(), 1);
+        assert_eq!(ops.ops[0].opname, "direct_call");
+        let Hlvalue::Constant(c) = &ops.ops[0].args[0] else {
+            panic!("expected Constant funcptr");
+        };
+        let dbg = format!("{:?}", c.value);
+        assert!(
+            dbg.contains("ll_unichr2unicode"),
+            "expected ll_unichr2unicode in {dbg}"
+        );
+        assert!(ops._called_exception_is_here_or_cannot_occur);
+    }
+
     /// rstr.py:723-726 — `pairtype(AbstractCharRepr, IntegerRepr).rtype_getitem`
     /// constant-0 path returns the char itself via
     /// `hop.inputarg(hop.r_result, arg=0)`. No SpaceOperation is
@@ -4367,11 +5912,11 @@ mod tests {
         );
     }
 
-    /// rstr.py:728-730 — non-constant or non-zero index falls through
-    /// to the AbstractStringRepr+IntegerRepr branch via `ll_chr2str`,
-    /// which is deferred until Slice 10. Pyre surfaces a TyperError.
+    /// rstr.py:728-730 — non-zero index falls through to the
+    /// AbstractStringRepr+IntegerRepr branch via `ll_chr2str`; the
+    /// converted one-character STR then reuses `ll_stritem_nonneg`.
     #[test]
-    fn pair_char_int_rtype_getitem_rejects_non_zero_index() {
+    fn pair_char_int_rtype_getitem_non_zero_index_falls_through_via_ll_chr2str() {
         use crate::flowspace::model::Variable;
         use crate::translator::rtyper::rtyper::LowLevelOpList;
         let ann = RPythonAnnotator::new(None, None, None, false);
@@ -4410,12 +5955,29 @@ mod tests {
         ]);
         *hop.r_result.borrow_mut() = Some(char_repr() as Arc<dyn Repr>);
 
-        let err = pair_char_int_rtype_getitem(&hop)
-            .expect_err("non-zero index must surface TyperError until ll_chr2str (Slice 10) lands");
-        let msg = format!("{err:?}");
+        let result = pair_char_int_rtype_getitem(&hop)
+            .unwrap_or_else(|err| panic!("non-zero index fallback via ll_chr2str: {err:?}"));
+        assert!(matches!(result, Some(Hlvalue::Variable(_))));
+
+        let ops = llops.borrow();
+        let opnames: Vec<&str> = ops.ops.iter().map(|op| op.opname.as_str()).collect();
+        assert_eq!(opnames, vec!["direct_call", "direct_call"]);
+        let Hlvalue::Constant(c_cast) = &ops.ops[0].args[0] else {
+            panic!("expected ll_chr2str funcptr");
+        };
+        let cast_dbg = format!("{:?}", c_cast.value);
         assert!(
-            msg.contains("ll_chr2str") || msg.contains("Slice 10"),
-            "TyperError should reference the missing fallback (ll_chr2str / Slice 10): {msg}"
+            cast_dbg.contains("ll_chr2str"),
+            "expected first direct_call to ll_chr2str in {cast_dbg}"
         );
+        let Hlvalue::Constant(c_item) = &ops.ops[1].args[0] else {
+            panic!("expected ll_stritem_nonneg funcptr");
+        };
+        let item_dbg = format!("{:?}", c_item.value);
+        assert!(
+            item_dbg.contains("ll_stritem_nonneg"),
+            "expected second direct_call to ll_stritem_nonneg in {item_dbg}"
+        );
+        assert!(ops._called_exception_is_here_or_cannot_occur);
     }
 }

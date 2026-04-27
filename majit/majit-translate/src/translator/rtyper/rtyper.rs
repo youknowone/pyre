@@ -2878,9 +2878,15 @@ fn lowlevel_type_helper_graph(
 pub(crate) fn exception_args(exc_name: &str) -> Result<Vec<Hlvalue>, TyperError> {
     let exc_cls = HOST_ENV
         .lookup_exception_class(exc_name)
+        .or_else(|| {
+            crate::annotator::exception::standard_exception_classes()
+                .into_iter()
+                .find(|cls| cls.qualname() == exc_name)
+        })
         .ok_or_else(|| TyperError::message(format!("missing host {exc_name} exception class")))?;
     let exc_instance = HOST_ENV
         .lookup_standard_exception_instance(exc_name)
+        .or_else(|| exc_cls.reusable_prebuilt_instance())
         .ok_or_else(|| {
             TyperError::message(format!("missing host {exc_name} exception instance"))
         })?;

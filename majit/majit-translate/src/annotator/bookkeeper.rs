@@ -11,8 +11,10 @@
 //! ## Dependency-blocked paths
 //!
 //! * `immutablevalue(HostObject)` — the `extregistry.is_registered(x)`
-//!   branch (bookkeeper.py:312-314) returns `AnnotatorError` until the
-//!   extregistry bridge lands.
+//!   branch (bookkeeper.py:312-314) is wired in
+//!   [`Self::immutablevalue_hostobject`] via
+//!   [`crate::translator::rtyper::extregistry::is_registered`]; per-entry
+//!   value-level coverage extends as registrations land.
 //! * `BUILTIN_ANALYZERS` registry — ported in [`super::builtin`].
 //!   `SomeBuiltin.analyser_name` is seeded from the host qualname;
 //!   `SomeValue::call()` for `Builtin(_)` dispatches through
@@ -1857,8 +1859,32 @@ impl Bookkeeper {
             sb.base.const_box = Some(Constant::new(raw.clone()));
             return Ok(SomeValue::Builtin(sb));
         }
-        // upstream bookkeeper.py:312-314 — `elif extregistry.is_registered(x)` —
-        // deferred until the Rust port grows an extregistry bridge.
+        // upstream bookkeeper.py:312-314:
+        //
+        //     elif extregistry.is_registered(x):
+        //         entry = extregistry.lookup(x)
+        //         result = entry.compute_annotation_bk(self)
+        //
+        // The HostObject side of the value-level registry currently has
+        // no entries (see [`extregistry::is_registered`] doc) — adding
+        // one means extending the match arm there, the call below
+        // automatically picks it up. Until then this branch declines
+        // and falls through to the is_class / is_user_function / etc.
+        // checks just like upstream's `elif extregistry.is_registered`
+        // declines when `x` is not registered.
+        let host_const = ConstValue::HostObject(obj.clone());
+        if crate::translator::rtyper::extregistry::is_registered(&host_const) {
+            let entry = crate::translator::rtyper::extregistry::lookup(&host_const).expect(
+                "Bookkeeper.immutablevalue_hostobject: extregistry.lookup must succeed after \
+                 is_registered",
+            );
+            let mut result = entry.compute_annotation_bk(self)?;
+            // upstream bookkeeper.py:347 — `try: result.const = x;
+            // except AttributeError: pass`. SomeValue::set_const_box
+            // mirrors the swallow contract.
+            result.set_const_box(Constant::new(raw.clone()));
+            return Ok(result);
+        }
         // upstream bookkeeper.py:315-316 — `elif tp is type: result =
         // SomeConstantType(x, self)`. Implemented as a constant
         // SomePBC over the real [`ClassDesc`] returned by [`Self::getdesc`].

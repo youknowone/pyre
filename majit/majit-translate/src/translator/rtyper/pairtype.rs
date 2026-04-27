@@ -126,6 +126,8 @@ pub enum ReprClassId {
     /// `rstr.py:450 AbstractUnicodeRepr` (`lltypesystem.rstr.UnicodeRepr`
     /// realisation, `lowleveltype = Ptr(UNICODE)`).
     UnicodeRepr,
+    /// Abstract base shared by `StringRepr` and `UnicodeRepr`.
+    AbstractStringRepr,
 }
 
 impl ReprClassId {
@@ -170,8 +172,9 @@ impl ReprClassId {
             TupleRepr => &[TupleRepr, Repr],
             CharRepr => &[CharRepr, Repr],
             UniCharRepr => &[UniCharRepr, Repr],
-            StringRepr => &[StringRepr, Repr],
-            UnicodeRepr => &[UnicodeRepr, Repr],
+            StringRepr => &[StringRepr, AbstractStringRepr, Repr],
+            UnicodeRepr => &[UnicodeRepr, AbstractStringRepr, Repr],
+            AbstractStringRepr => &[AbstractStringRepr, Repr],
         }
     }
 }
@@ -364,6 +367,18 @@ fn dispatch_convert_from_to(
         (TupleRepr, TupleRepr) => {
             super::rtuple::pair_tuple_tuple_convert_from_to(r_from, r_to, v, llops)
         }
+        // rstr.py:805-814 — Char→String and UniChar→Unicode conversion
+        // routes through `ll_chr2str`, allocating a one-character
+        // STR/UNICODE before downstream string operations reuse the
+        // AbstractStringRepr machinery.
+        (CharRepr, StringRepr) | (UniCharRepr, UnicodeRepr) => {
+            super::rstr::pair_charlike_string_convert_from_to(r_from, r_to, v, llops)
+        }
+        // rstr.py:815-820 — String→Char conversion extracts
+        // `ll_stritem_nonneg(s, 0)`.
+        (StringRepr, CharRepr) => {
+            super::rstr::pair_string_char_convert_from_to(r_from, r_to, v, llops)
+        }
         // rmodel.py:361-363 — `pairtype(Repr, VoidRepr).convert_from_to`
         // returns `inputconst(Void, None)`.
         (Repr, VoidRepr) => Ok(Some(Hlvalue::Constant(inputconst_from_lltype(
@@ -464,15 +479,36 @@ fn dispatch_rtype_op(
         }
         // rstr.py:723-730 — `pairtype(AbstractCharRepr, IntegerRepr)`
         // and `pairtype(AbstractUniCharRepr, IntegerRepr)` rtype_getitem
-        // share the same body (constant-0 pass-through). Non-constant
-        // index falls through to the AbstractStringRepr+IntegerRepr
-        // branch via `ll_chr2str` (Slice 10) and surfaces a TyperError
-        // until that helper lands.
+        // share the same body: constant-0 pass-through, otherwise
+        // Char→Str/UniChar→Unicode via `ll_chr2str` and reuse
+        // AbstractStringRepr+IntegerRepr.
         (CharRepr, IntegerRepr, "getitem") => {
             committed(super::rstr::pair_char_int_rtype_getitem(hop))
         }
         (UniCharRepr, IntegerRepr, "getitem") => {
             committed(super::rstr::pair_unichar_int_rtype_getitem(hop))
+        }
+        (CharRepr, IntegerRepr, "getitem_idx") => {
+            committed(super::rstr::pair_char_int_rtype_getitem_idx(hop))
+        }
+        (UniCharRepr, IntegerRepr, "getitem_idx") => {
+            committed(super::rstr::pair_unichar_int_rtype_getitem_idx(hop))
+        }
+        // rstr.py:651-659 — `pair(AbstractStringRepr, AbstractStringRepr).rtype_add`
+        // (and `rtype_inplace_add`) lower to
+        // `direct_call(ll_strconcat, v_s1, v_s2)` against the
+        // helper graph synthesised by
+        // `build_ll_strconcat_helper_graph` (malloc_varsize +
+        // chars-array copy loop).
+        (StringRepr, StringRepr, "add") | (StringRepr, StringRepr, "inplace_add") => {
+            committed(super::rstr::pair_string_string_rtype_add(hop))
+        }
+        (UnicodeRepr, UnicodeRepr, "add") | (UnicodeRepr, UnicodeRepr, "inplace_add") => {
+            committed(super::rstr::pair_unicode_unicode_rtype_add(hop))
+        }
+        (AbstractStringRepr, AbstractStringRepr, "add")
+        | (AbstractStringRepr, AbstractStringRepr, "inplace_add") => {
+            committed(super::rstr::pair_abstract_string_rtype_add(r1, r2, hop))
         }
         // rtuple.py:319-327 — `pairtype(TupleRepr, TupleRepr).rtype_add`
         // (and its `rtype_inplace_add` alias) concatenates two tuples
