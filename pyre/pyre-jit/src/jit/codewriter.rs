@@ -1844,7 +1844,10 @@ struct RegisterLayout {
     /// Absolute index where the operand stack begins in
     /// `PyFrame.locals_cells_stack_w` — `nlocals + pyframe::ncells(code)`.
     stack_base_absolute: usize,
-    /// Compile-time depth bound from `code.max_stackdepth` (clamped to ≥ 1).
+    /// Compile-time depth bound from `code.max_stackdepth` (= CPython
+    /// `co_stacksize`). Used directly without clamping so the per-CodeObject
+    /// `stack_slot_color_map` length matches the runtime PyFrame allocation
+    /// `nlocals + ncells + max_stackdepth` (`pyframe.rs:1576`).
     max_stackdepth: usize,
     /// Ref register index where the operand stack begins
     /// (`stack_base = nlocals` since locals occupy the first registers).
@@ -1860,7 +1863,7 @@ impl RegisterLayout {
     fn compute(code: &CodeObject) -> Self {
         let nlocals = code.varnames.len();
         let stack_base_absolute = nlocals + pyre_interpreter::pyframe::ncells(code);
-        let max_stackdepth = code.max_stackdepth.max(1) as usize;
+        let max_stackdepth = code.max_stackdepth as usize;
         let stack_base = nlocals as u16;
         Self {
             nlocals,
@@ -2202,7 +2205,37 @@ fn filter_liveness_in_place(
             s.extend(live_stack_colors.iter().copied());
             s
         };
-        live_r.retain(|idx| lv_live.contains(idx));
+        // Phase 0.4 probe (Task #181 follow-up). When
+        // MAJIT_PROBE_LIVENESS is set, dump the indices that pass the
+        // `in_locals || in_stack` filter (above) but fail the LV∩SSA
+        // retain (below) — these are exactly the entries Phase 2.3
+        // would have widened live_r with. The 2026-04-27 attempt
+        // surfaced a bridge re-trace panic
+        // (`set_virtualizable_entry_at: index 21 out of range for 21
+        // slots`); this probe captures which indices are responsible.
+        if std::env::var_os("MAJIT_PROBE_LIVENESS").is_some() {
+            let lv_drops: Vec<u16> = live_r
+                .iter()
+                .copied()
+                .filter(|idx| !lv_live.contains(idx))
+                .collect();
+            if !lv_drops.is_empty() {
+                eprintln!(
+                    "[probe-B][filter_liveness] code={} py_pc={} depth={} nlocals={} \
+                     stack_colors={:?} live_r_pre={:?} lv_drops={:?}",
+                    code.obj_name, py_pc, depth, nlocals, live_stack_colors, live_r, lv_drops,
+                );
+            }
+        }
+        // Task #110 slice 1 diagnostic: `MAJIT_PHASE06_DROP_LV=1` reproduces
+        // the (now panic-free, post-Phase 0.6) wrong-value behaviour so the
+        // probe-A logs in `consume_one_section` (call_jit.rs:909-965) capture
+        // what BH writes per color when live_r widens to the SSA-alive set.
+        // Default off — bench / production unchanged. Removed in Task #110
+        // slice 4 cleanup.
+        if std::env::var_os("MAJIT_PHASE06_DROP_LV").is_none() {
+            live_r.retain(|idx| lv_live.contains(idx));
+        }
 
         existing.clear();
         for &idx in &live_i {
@@ -4344,18 +4377,18 @@ impl CodeWriter {
                     // LOAD_FAST_BORROW_LOAD_FAST_BORROW decompose to two plain
                     // LOAD_FAST reads. Portal parity with plain LoadFast would
                     // route both halves through vable_getarrayitem_ref, but
-                    // flipping this arm (attempted 2026-04-19 after P1 Step 1
-                    // + P3 seed helper + unroll reserve_pos refactor
-                    // `66d1f7212d`) still breaks spectral_norm/nbody/fannkuch
-                    // on both backends. The heap-vs-symbolic-state gap
-                    // persists — the compiled loop's vable reads still see
-                    // stale slots that the bridge / blackhole resume path
-                    // has not re-synchronized. Keep ref_copy here until the
-                    // liveness pipeline rework (Priority 4) lands; the full
-                    // `flatten → compute_liveness(ssarepr) → assemble`
-                    // sequence should close the gap by ensuring the vable
-                    // mirror is write-back-consistent before each compiled
-                    // entry.
+                    // flipping this arm (attempted multiple times — most
+                    // recently 2026-04-27 alongside Phase 2.3 LV∩SSA drop)
+                    // reproduces the same `set_virtualizable_entry_at: index
+                    // X out of range for X slots` bridge re-trace panic, with
+                    // the same mechanism Phase 2.3 hit. The 2026-04-24 LFLF
+                    // flip (commit 776c763575) recovered correctness on
+                    // top-level benches but was reverted at 2648598f9da
+                    // because float-typed locals returned NaN — and even the
+                    // 2026-04-27 retry on the post-Phase-2.2 base hits the
+                    // same bridge re-trace push_value overflow as Phase 2.3.
+                    // The shared root cause is the LV-driven tracer encoder
+                    // (Task #110, see filter_liveness_in_place docstring).
                     Instruction::LoadFastBorrowLoadFastBorrow { var_nums }
                     | Instruction::LoadFastLoadFast { var_nums } => {
                         let pair = var_nums.get(op_arg);
@@ -6240,14 +6273,26 @@ impl CodeWriter {
         // decoder can drop the assumption `color = stack_base + d`
         // before step C removes the input-arg pinning.
         //
+        // Length is `code.max_stackdepth` (= CPython `co_stacksize`) so
+        // the map covers every stack slot the runtime PyFrame allocates
+        // (`pyframe.rs:1576` `alloc_fixed_array_with_header(num_locals +
+        // num_cells + max_stack, ...)`). Earlier this used
+        // `max_stack_depth_observed = max(depth_at_pc)` which can fall
+        // short of `co_stacksize` on programs whose JIT-traced PCs do
+        // not reach the static peak; the bridge fallback at
+        // `state.rs::setup_bridge_sym` (`stack_base + color_map.len()`)
+        // requires the full PyFrame length, so widening this to
+        // `co_stacksize` is the contract `pyjitcode.rs:97-110` already
+        // documents.
+        //
         // Currently with stack-slot pinning still in place (regalloc.rs
         // :455-466), `enforce_input_args` rotates the stack pre-colors
         // `stack_base + d` to `nlocals + d` — an identity rotation in
         // the typical case. Step A populates the side channel without
         // changing decoder behaviour.
-        let mut stack_slot_color_map: Vec<u16> =
-            Vec::with_capacity(max_stack_depth_observed as usize);
-        for d in 0..max_stack_depth_observed {
+        let stack_map_len = max_stackdepth as u16;
+        let mut stack_slot_color_map: Vec<u16> = Vec::with_capacity(stack_map_len as usize);
+        for d in 0..stack_map_len {
             let pre = stack_base + d;
             let post = alloc_result
                 .rename
@@ -6255,6 +6300,29 @@ impl CodeWriter {
                 .copied()
                 .unwrap_or(pre);
             stack_slot_color_map.push(post);
+        }
+        // Task #110 slice 3a (parent #185 epic, plan
+        // `task110_ssa_authoritative_live_r_epic_plan.md`): record each
+        // Python-semantic local slot's post-regalloc color so the encoder
+        // (`pyre-jit-trace::trace_opcode::get_list_of_active_boxes`) can
+        // stop assuming `local_idx == post-regalloc-color` before slice
+        // 3b rewrites it to read from `registers_r[color]` directly per
+        // `pyjitpl.py:218-234`.
+        //
+        // Today `enforce_input_args` (regalloc.rs:524-563, flatten.py:88
+        // -100 parity) pins each local-i inputarg color to identity
+        // (`color = i`), so this map is `[0, 1, ..., nlocals-1]` for
+        // every populated jitcode. The map exists as a side channel —
+        // no production reader consumes it yet; slice 3b will pick it
+        // up site-by-site.
+        let mut pyre_color_for_semantic_local: Vec<u16> = Vec::with_capacity(nlocals);
+        for i in 0..nlocals as u16 {
+            let post = alloc_result
+                .rename
+                .get(&(Kind::Ref, i))
+                .copied()
+                .unwrap_or(i);
+            pyre_color_for_semantic_local.push(post);
         }
         // After step C the chordal coloring is free to coalesce
         // disjointly-live stack slots into the same color, so the full
@@ -6325,6 +6393,7 @@ impl CodeWriter {
             merge_point_pc,
             num_regs,
             stack_slot_color_map,
+            pyre_color_for_semantic_local,
         )
     }
 
@@ -6362,6 +6431,7 @@ impl CodeWriter {
         merge_point_pc: Option<usize>,
         num_regs: super::assembler::NumRegs,
         stack_slot_color_map: Vec<u16>,
+        pyre_color_for_semantic_local: Vec<u16>,
     ) -> PyJitCode {
         // pc_map[py_pc] currently holds SSARepr insn indices (returned by
         // SSAReprEmitter::current_pos()). Translate them to JitCode byte
@@ -6410,6 +6480,7 @@ impl CodeWriter {
             portal_ec_reg,
             stack_base: frame_stack_base,
             stack_slot_color_map,
+            pyre_color_for_semantic_local,
         };
 
         PyJitCode {

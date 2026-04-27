@@ -825,6 +825,7 @@ impl MIFrame {
         // shadow-execute prerequisite, eval-loop automation plan),
         // then drop `semantic_ref_slot_for_reg_color` and read from
         // the bank the liveness header dictates.
+        let probe_live_r = std::env::var_os("MAJIT_PROBE_LIVE_R").is_some();
         let snapshot = |reg: usize| -> OpRef {
             let Some(slot_idx) = crate::state::semantic_ref_slot_for_reg_color(
                 nlocals,
@@ -832,9 +833,22 @@ impl MIFrame {
                 &stack_slot_color_map,
                 reg,
             ) else {
+                if probe_live_r {
+                    eprintln!(
+                        "[probe-E][snapshot] live_pc={} reg={} slot=NONE (no semantic mapping)",
+                        live_pc, reg
+                    );
+                }
                 return OpRef::NONE;
             };
-            registers_r.get(slot_idx).copied().unwrap_or(OpRef::NONE)
+            let opref = registers_r.get(slot_idx).copied().unwrap_or(OpRef::NONE);
+            if probe_live_r {
+                eprintln!(
+                    "[probe-E][snapshot] live_pc={} reg={} slot={} opref={:?}",
+                    live_pc, reg, slot_idx, opref,
+                );
+            }
+            opref
         };
         use majit_translate::liveness::LivenessIterator;
         for length in [length_i, length_r, length_f] {
@@ -954,6 +968,28 @@ impl MIFrame {
         // `write_boxes` parity: every slot must be a real W_Root).
         if has_vable {
             let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + reg_idx;
+            // Phase 0.5 probe-D — `MAJIT_PROBE_BRIDGE` gated. Captures
+            // every push_typed_value that targets a virtualizable shadow
+            // slot, so we can correlate the panic at
+            // `set_virtualizable_entry_at: index N out of range for N
+            // slots` with the symbolic state that produced it. Logging
+            // every push instead of only the panicking one is intentional:
+            // we need to see whether `valuestackdepth` was already at
+            // `nlocals + max_stackdepth` (Phase 0.4 hypothesis) when the
+            // failing push fired or whether it climbed there during the
+            // bridge re-trace.
+            if std::env::var_os("MAJIT_PROBE_BRIDGE").is_some() {
+                let s = self.sym_mut();
+                eprintln!(
+                    "[probe-D][push_typed_value] valuestackdepth={} nlocals={} \
+                     reg_idx={} flat_idx={} vable_boxes_len={:?}",
+                    s.valuestackdepth,
+                    s.nlocals,
+                    reg_idx,
+                    flat_idx,
+                    ctx.virtualizable_boxes_len(),
+                );
+            }
             match concrete.to_ir_ref_value() {
                 Some(v) => {
                     ctx.set_virtualizable_entry_at(flat_idx, boxed, v);
@@ -4340,6 +4376,9 @@ impl MIFrame {
                 vable_lastblock,
                 vable_w_globals,
             ) = self.with_ctx(|_, ctx| {
+                // pyjitpl.py:74-90 MIFrame.setup parity for the per-kind banks
+                // (including pyjitpl.py:97-119 copy_constants).
+                sym.setup_kind_register_banks(ctx);
                 let null = ctx.const_ref(pyre_object::PY_NULL as i64);
                 (
                     ctx.const_int(0),
@@ -4408,6 +4447,9 @@ impl MIFrame {
                 .resize(callee_nlocals, ConcreteValue::Null);
             sym.concrete_stack = Vec::new();
             sym.jitcode = jitcode_for(w_code);
+            // pyjitpl.py:74-90 MIFrame.setup parity for the per-kind banks
+            // (including pyjitpl.py:97-119 copy_constants).
+            self.with_ctx(|_, ctx| sym.setup_kind_register_banks(ctx));
             sym.concrete_namespace = callee_globals as *mut DictStorage;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             (sym, Some(callee_frame_opref))

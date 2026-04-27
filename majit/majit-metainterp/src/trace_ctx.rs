@@ -1481,6 +1481,15 @@ impl TraceCtx {
             .and_then(|boxes| boxes.last().copied())
     }
 
+    /// Length of the symbolic virtualizable shadow, or `None` when no
+    /// virtualizable is bound.  Probe-only accessor used by the
+    /// `MAJIT_PROBE_BRIDGE`-gated logging in pyre's bridge setup +
+    /// `push_typed_value` to surface bound-check off-by-ones before
+    /// `set_virtualizable_entry_at` panics.
+    pub fn virtualizable_boxes_len(&self) -> Option<usize> {
+        self.virtualizable_boxes.as_ref().map(|boxes| boxes.len())
+    }
+
     /// Concrete shadow of the standard virtualizable — the raw heap pointer
     /// `standard_virtualizable_box` refers to. Parallels
     /// `MetaInterp.virtualizable_boxes[-1].getref_base()` at runtime; pyre

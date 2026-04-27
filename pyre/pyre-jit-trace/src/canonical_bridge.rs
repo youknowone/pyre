@@ -580,16 +580,36 @@ pub fn install_portal_for(
     // `pc_map` stays empty so `PyJitCode::is_portal_bridge()`
     // (`pyjitcode.rs:117-119`) keeps reporting `true` for portal-bridge
     // installs — the discriminator the G.3 reader audit branches on.
-    let (stack_base, depth_at_py_pc) = if code_ptr.is_null() {
-        (0, Vec::new())
-    } else {
-        let stack_base = unsafe {
-            let code = &*code_ptr;
-            code.varnames.len() + pyre_interpreter::pyframe::ncells(code)
+    // Portal-bridge install does not run regalloc, so the post-color
+    // maps are populated as identity over the PyFrame slot ranges. Both
+    // map lengths must match the runtime PyFrame allocation
+    // (`pyframe.rs:1576` `nlocals + ncells + max_stackdepth`) so the
+    // bridge fallback at `state.rs::setup_bridge_sym`
+    // (`stack_base + stack_slot_color_map.len()`) reconstructs the full
+    // `len(locals_cells_stack_w)` virtualizable shape rather than
+    // collapsing to `stack_base + 0`. The contract is documented at
+    // `pyjitcode.rs:97-110`. With no regalloc the color of each slot is
+    // its own pre-color, hence the identity fill.
+    let (stack_base, depth_at_py_pc, stack_slot_color_map, pyre_color_for_semantic_local) =
+        if code_ptr.is_null() {
+            (0, Vec::new(), Vec::new(), Vec::new())
+        } else {
+            let code = unsafe { &*code_ptr };
+            let nlocals = code.varnames.len();
+            let stack_base = nlocals + pyre_interpreter::pyframe::ncells(code);
+            let depth_at_py_pc = crate::liveness::liveness_for(code_ptr).depth_at_py_pc();
+            let max_stackdepth = code.max_stackdepth as usize;
+            let stack_slot_color_map: Vec<u16> = (0..max_stackdepth as u16)
+                .map(|d| stack_base as u16 + d)
+                .collect();
+            let pyre_color_for_semantic_local: Vec<u16> = (0..nlocals as u16).collect();
+            (
+                stack_base,
+                depth_at_py_pc,
+                stack_slot_color_map,
+                pyre_color_for_semantic_local,
+            )
         };
-        let depth_at_py_pc = crate::liveness::liveness_for(code_ptr).depth_at_py_pc();
-        (stack_base, depth_at_py_pc)
-    };
 
     Arc::new(PyJitCode {
         jitcode: runtime,
@@ -599,7 +619,8 @@ pub fn install_portal_for(
             portal_frame_reg,
             portal_ec_reg,
             stack_base,
-            stack_slot_color_map: Vec::new(),
+            stack_slot_color_map,
+            pyre_color_for_semantic_local,
         },
         code_ptr,
         w_code,
@@ -1083,6 +1104,7 @@ def f(x, y):
                 portal_ec_reg: 0,
                 stack_base: 0,
                 stack_slot_color_map: Vec::new(),
+                pyre_color_for_semantic_local: Vec::new(),
             },
             code_ptr: std::ptr::null(),
             w_code: std::ptr::null(),

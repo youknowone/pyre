@@ -1384,27 +1384,38 @@ pub struct PyreSym {
     /// resume.py:1093 restores virtual references on guard failure.
     /// Pairs stored flat: [virt_sym, virt_ptr, real_sym, real_ptr, ...].
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
-    // ── RPython MIFrame.registers_{i,r,f} port (pyjitpl.py:74-78) ──
+    // ── RPython MIFrame.registers_{i,r,f} port (pyjitpl.py:74-90) ──
     //
     // RPython reference (target shape):
-    //   self.registers_i = [history.CONST_NULL] * jitcode.num_regs_i()
-    //   self.registers_r = [history.CONST_NULL] * jitcode.num_regs_r()
-    //   self.registers_f = [history.CONST_NULL] * jitcode.num_regs_f()
+    //   self.registers_i = [history.CONST_NULL] * jitcode.num_regs_and_consts_i()
+    //   self.registers_r = [history.CONST_NULL] * jitcode.num_regs_and_consts_r()
+    //   self.registers_f = [history.CONST_NULL] * jitcode.num_regs_and_consts_f()
     //
-    // `registers_r` is the abstract register file: index `[0, nlocals)`
-    // holds local slots, index `[nlocals, nlocals+stack_only)` holds the
-    // operand-stack tail. The tracer and the blackhole bridge-resume
-    // decoder index this single Vec — Stage 3.4 Phase A/B/C collapsed
-    // the legacy `symbolic_stack` side-Vec into the tail.
+    // Each bank is sized to `num_regs_X + len(constants_X)` and indexed
+    // by post-regalloc-color: `[0, num_regs_X)` are register slots
+    // initialised to `CONST_NULL`, `[num_regs_X, ...)` are the constant
+    // pool entries copied from `jitcode.constants_X`.
     //
-    // `registers_i` / `registers_f` are placeholders for the same
-    // abstract-register-file shape per kind (RPython's int/float
-    // register banks). They are currently unused because
-    // `filter_liveness_in_place` (`pyre-jit/src/jit/codewriter.rs`)
-    // drops non-Ref registers from the live set — extending these
-    // banks is part of the tracer rework required to drop the
-    // LiveVars intersection and make SSA authoritative (see
-    // `phase4_ssa_liveness_blocker_2026_04_18.md`).
+    // Slice 2 / slice 3b-1 of the SSA-authoritative live_r epic
+    // (Task #185) size `registers_i` / `registers_r` / `registers_f`
+    // via `setup_kind_register_banks` when the owning JitCode is
+    // bound — the leading slots stay `OpRef::NONE` placeholders.
+    // Slice 3b-2 rewrites `get_list_of_active_boxes::snapshot` to
+    // dispatch reads per kind (`registers_i` / `registers_r` /
+    // `registers_f`) directly by post-regalloc-color, and slice 3b-3
+    // populates the trailing constant slots from
+    // `jitcode.constants_X` per `pyjitpl.py:97-119 copy_constants`.
+    //
+    // `registers_r` retains the existing pyre adaptation in the
+    // *prefix* range: index `[0, nlocals)` holds local slots and
+    // `[nlocals, nlocals+stack_only)` holds the operand-stack tail
+    // (Stage 3.4 Phase A/B/C collapsed the legacy `symbolic_stack`
+    // side-Vec into the tail). Slice 3b-1 widens the buffer to
+    // `num_regs_and_consts_r` so the trailing post-regalloc-color
+    // slots exist as `OpRef::NONE` placeholders ahead of the slice
+    // 3b-2/3b-3 reader/writer flips; today no production reader
+    // touches the trailing range, so the growth is byte-for-byte
+    // runtime no-op.
     pub(crate) registers_i: Vec<OpRef>,
     #[vable(locals)]
     pub(crate) registers_r: Vec<OpRef>,
@@ -2352,11 +2363,98 @@ impl PyreSym {
             current_exc_box: OpRef::NONE,
             virtualref_boxes: Vec::new(),
             // RPython pyjitpl.py:74-78 init: registers_X[i] = CONST_NULL for
-            // i in num_regs. Sized lazily here — Stage 3.2 will resize each
-            // register file when the owning JitCode's num_regs is known.
+            // i in num_regs. Sized lazily here — `setup_kind_register_banks`
+            // resizes `registers_i` / `registers_f` once the owning JitCode is
+            // bound. `registers_r` continues to be driven by the existing
+            // semantic-slot logic until the SSA-authoritative live_r epic
+            // (Task #185) rewires the encoder to per-bank reads.
             registers_i: Vec::new(),
             registers_r: Vec::new(),
             registers_f: Vec::new(),
+        }
+    }
+
+    /// `pyjitpl.py:74-90 MIFrame.setup` parity for the per-kind register
+    /// files. Sizes `registers_i` and `registers_f` to
+    /// `num_regs_and_consts_X`, matching the RPython MIFrame layout where
+    /// each bank holds the post-regalloc-color register slots followed by
+    /// the constant pool entries. The leading `num_regs_X` slots stay
+    /// `OpRef::NONE` (RPython's `CONST_NULL` placeholder); the trailing
+    /// `[num_regs_X..num_regs_and_consts_X)` slots are filled with the
+    /// constant-pool OpRefs in `pyjitpl.py:97-119 copy_constants` order:
+    ///   - `registers_i[num_regs_i + i]` ← `ctx.const_int(constants_i[i])`
+    ///   - `registers_r[num_regs_r + i]` ← `ctx.const_ref(constants_r[i])`
+    ///   - `registers_f[num_regs_f + i]` ← `ctx.const_float(constants_f[i])`
+    /// `TraceCtx::const_*` dedup by value, so this fill is idempotent
+    /// across re-entries (`copy_constants` overwrite semantics).
+    ///
+    /// `registers_r` carries the unified locals + stack-tail abstract
+    /// register file (Stage 3.4 Phase C). Slice 3b-1 of the
+    /// SSA-authoritative live_r epic (Task #185) extends the resize to
+    /// `registers_r` so its size matches the post-regalloc-color shape
+    /// `num_regs_and_consts_r` already in use for `registers_i` /
+    /// `registers_f`.
+    ///
+    /// This helper now ports the full upstream
+    /// `pyjitpl.py:74-90 MIFrame.setup` body (resize + `copy_constants`).
+    /// Slice 3b-2 (encoder per-bank read flip) and slice 3b-3 (tracer
+    /// write redirect) of the Task #185 epic remain the consumers that
+    /// will start reading from `registers_X[num_regs_X + i]`; until then
+    /// no production reader visits the trailing range, so the constant
+    /// fill is observable only to slices that opt in.
+    ///
+    /// Today no reader of `registers_r` touches the trailing slots
+    /// `[len_before_setup, num_regs_and_consts_r)`: encoder snapshot
+    /// (`get_list_of_active_boxes`) bounds its slice to
+    /// `nlocals + valid_stack_only`, dedup (`value_type`)
+    /// short-circuits before `iter().position` whenever the search
+    /// value is `OpRef::NONE`, and per-Python-PC writes
+    /// (LOAD_FAST/STORE_FAST/push/pop) operate on the locals + stack
+    /// tail prefix only. The growth is therefore byte-for-byte runtime
+    /// no-op until slice 3b-2 / 3b-3 wire readers/writers to the
+    /// trailing post-regalloc-color slots.
+    ///
+    /// Safe to call when `self.jitcode` points at the thread-local
+    /// `null_jitcode()` placeholder — the skeleton's
+    /// `num_regs_and_consts_X` values are zero and the constant pools
+    /// are empty, which makes both the resize and the constant fill a
+    /// no-op.
+    pub(crate) fn setup_kind_register_banks(&mut self, ctx: &mut TraceCtx) {
+        debug_assert!(!self.jitcode.is_null());
+        let (num_regs_i, num_regs_r, num_regs_f, constants_i, constants_r, constants_f) = {
+            let jc = unsafe { &*self.jitcode };
+            let runtime_jc = &jc.payload.jitcode;
+            (
+                runtime_jc.num_regs_i() as usize,
+                runtime_jc.num_regs_r() as usize,
+                runtime_jc.num_regs_f() as usize,
+                runtime_jc.constants_i.clone(),
+                runtime_jc.constants_r.clone(),
+                runtime_jc.constants_f.clone(),
+            )
+        };
+        let total_i = num_regs_i + constants_i.len();
+        let total_r = num_regs_r + constants_r.len();
+        let total_f = num_regs_f + constants_f.len();
+        if self.registers_i.len() < total_i {
+            self.registers_i.resize(total_i, OpRef::NONE);
+        }
+        if self.registers_r.len() < total_r {
+            self.registers_r.resize(total_r, OpRef::NONE);
+        }
+        if self.registers_f.len() < total_f {
+            self.registers_f.resize(total_f, OpRef::NONE);
+        }
+        // pyjitpl.py:97-119 copy_constants — overwrite trailing slots with
+        // the constant-pool OpRefs.
+        for (i, &val) in constants_i.iter().enumerate() {
+            self.registers_i[num_regs_i + i] = ctx.const_int(val);
+        }
+        for (i, &val) in constants_r.iter().enumerate() {
+            self.registers_r[num_regs_r + i] = ctx.const_ref(val);
+        }
+        for (i, &val) in constants_f.iter().enumerate() {
+            self.registers_f[num_regs_f + i] = ctx.const_float(val);
         }
     }
 
@@ -2581,6 +2679,9 @@ impl PyreSym {
             self.concrete_namespace = frame.w_globals;
             self.concrete_execution_context = frame.execution_context;
             self.concrete_vable_ptr = concrete_frame as *mut u8;
+            // pyjitpl.py:74-90 MIFrame.setup parity for the per-kind banks
+            // (including pyjitpl.py:97-119 copy_constants).
+            self.setup_kind_register_banks(ctx);
         }
         // pyjitpl.py:3458-3462 / virtualizable.py:86-99 read_boxes parity:
         // seed the tracing-time `virtualizable_boxes` cache with the
@@ -4352,8 +4453,38 @@ impl JitState for PyreJitState {
         // local prefix with a shared const-NULL OpRef so every
         // interpreter-visible slot has a tracing-time mirror (matches
         // the portal path above).
-        let bridge_array_len =
-            concrete_frame_array_len(sym.concrete_vable_ptr as usize).unwrap_or(nlocals);
+        // pyframe.py:107-110 + pyjitpl.py:3437: the virtualizable shape
+        // committed at portal-entry time (`nlocals + ncells +
+        // max_stackdepth` array slots) does not change at guard-failure
+        // resume; `rebuild_state_after_failure` writes the resume blob
+        // into the same `virtualizable_boxes` layout the portal seeded.
+        // pyre's root portal seeds via `initialize_virtualizable` with
+        // exactly that full layout, so the bridge entry must match it
+        // here. Earlier `unwrap_or(nlocals)` undersized the shadow when
+        // `concrete_frame_array_len` returned None (e.g. when
+        // `sym.concrete_vable_ptr` had not yet been bound at
+        // setup_bridge_sym time), causing pushes past `nlocals`/the
+        // local prefix to panic at `set_virtualizable_entry_at: index N
+        // out of range for N slots`. Phase 0.5 probe-C captured the
+        // mismatch directly: root portal sized `vable_boxes_len=25`
+        // (= 6 + 18 + 1) but a fannkuch bridge fell back to
+        // `bridge_array_len=14` → `vable_boxes_len=21`, then pushed
+        // `flat_idx=21` and panicked. Fall back to the metadata-derived
+        // size — `metadata.stack_base + metadata.stack_slot_color_map
+        // .len()` is the same `nlocals + ncells + max_stackdepth` the
+        // codewriter committed to and the runtime PyFrame allocates
+        // (pyframe.rs:1576).
+        let bridge_array_len = concrete_frame_array_len(sym.concrete_vable_ptr as usize)
+            .or_else(|| {
+                METAINTERP_SD.with(|r| {
+                    let sd = r.borrow();
+                    sd.jitcodes.get(frame0.jitcode_index as usize).map(|jc| {
+                        jc.payload.metadata.stack_base
+                            + jc.payload.metadata.stack_slot_color_map.len()
+                    })
+                })
+            })
+            .unwrap_or(nlocals);
         let scalar_oprefs = [
             sym.vable_last_instr,
             sym.vable_pycode,
@@ -4388,6 +4519,44 @@ impl JitState for PyreJitState {
         // Bridge stack: the target loop header has stack_only=0, so no
         // stack tail needs to be appended to registers_r.
         sym.symbolic_stack_types = Vec::new();
+        // Phase 0.5 probe-C — `MAJIT_PROBE_BRIDGE` gated. Captures the
+        // hardcoded `sym.valuestackdepth = sym.nlocals` against the static
+        // depth the codewriter recorded for `frame0.pc` (the bridge entry
+        // PC) so we can verify the Phase 0.4 hypothesis: bridges resumed
+        // mid-stack hit `push_typed_value` with `flat_idx == boxes.len()`
+        // because this initialisation ignores `depth_at_py_pc[bridge_pc]`.
+        // No behaviour change — log only.
+        if std::env::var_os("MAJIT_PROBE_BRIDGE").is_some() {
+            let (depth_at_pc, stack_base_meta) = METAINTERP_SD.with(|r| {
+                let sd = r.borrow();
+                sd.jitcodes
+                    .get(frame0.jitcode_index as usize)
+                    .map(|jc| {
+                        let depth = jc
+                            .payload
+                            .metadata
+                            .depth_at_py_pc
+                            .get(frame0.pc as usize)
+                            .copied()
+                            .unwrap_or(u16::MAX);
+                        (depth, jc.payload.metadata.stack_base)
+                    })
+                    .unwrap_or((u16::MAX, usize::MAX))
+            });
+            eprintln!(
+                "[probe-C][setup_bridge_sym] jitcode_index={} bridge_pc={} \
+                 nlocals={} depth_at_py_pc={} stack_base_meta={} \
+                 bridge_array_len={} vable_boxes_len={:?} setting valuestackdepth={}",
+                frame0.jitcode_index,
+                frame0.pc,
+                sym.nlocals,
+                depth_at_pc,
+                stack_base_meta,
+                bridge_array_len,
+                ctx.virtualizable_boxes_len(),
+                sym.nlocals,
+            );
+        }
         sym.valuestackdepth = sym.nlocals;
         sym.bridge_local_oprefs = Some(bridge_locals);
         sym.bridge_local_types = Some(bridge_local_types);
@@ -7002,6 +7171,120 @@ mod tests {
 
     // test_close_loop_args_at_target_pc_preserves_virtualizable_stack moved
     // to `pyre-jit` so close_loop_args_at runs with a real compiled jitcode.
+
+    /// `pyjitpl.py:74-90 MIFrame.setup` parity: after
+    /// `setup_kind_register_banks` runs, `registers_i` / `registers_r` /
+    /// `registers_f` are sized to `num_regs_X + len(constants_X)` and
+    /// the trailing `[num_regs_X..)` slots hold the constant-pool
+    /// OpRefs from `pyjitpl.py:97-119 copy_constants`
+    /// (`ctx.const_int(constants_i[i])` for the int bank, `ctx.const_ref`
+    /// for the ref bank, `ctx.const_float` for the float bank). The
+    /// leading `[..num_regs_X)` register slots stay `OpRef::NONE` (the
+    /// `CONST_NULL`-shaped placeholder).
+    #[test]
+    fn test_setup_kind_register_banks_sizes_per_num_regs_and_consts() {
+        let mut runtime_jc = majit_metainterp::jitcode::JitCode::default();
+        runtime_jc.c_num_regs_i = 3;
+        runtime_jc.c_num_regs_r = 4;
+        runtime_jc.c_num_regs_f = 2;
+        runtime_jc.constants_i = vec![100, 200];
+        runtime_jc.constants_r = vec![0xAABB_CCDD_u64 as i64];
+        runtime_jc.constants_f = vec![3.14_f64.to_bits() as i64];
+
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
+        pyjit.jitcode = std::sync::Arc::new(runtime_jc);
+        let inner_jc = super::JitCode {
+            code: std::ptr::null(),
+            index: -1,
+            payload: std::sync::Arc::new(pyjit),
+        };
+        let inner_jc_ptr = Box::into_raw(Box::new(inner_jc));
+
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = inner_jc_ptr;
+
+        assert_eq!(sym.registers_i.len(), 0);
+        assert_eq!(sym.registers_r.len(), 0);
+        assert_eq!(sym.registers_f.len(), 0);
+
+        let mut ctx = TraceCtx::for_test(1);
+        sym.setup_kind_register_banks(&mut ctx);
+
+        // bank size = num_regs_X + len(constants_X)
+        assert_eq!(sym.registers_i.len(), 3 + 2, "registers_i sized to 5");
+        assert_eq!(sym.registers_r.len(), 4 + 1, "registers_r sized to 5");
+        assert_eq!(sym.registers_f.len(), 2 + 1, "registers_f sized to 3");
+
+        // Leading register slots — CONST_NULL placeholder per
+        // pyjitpl.py:86-90.
+        for i in 0..3 {
+            assert_eq!(sym.registers_i[i], OpRef::NONE, "registers_i[{i}] reg-slot");
+        }
+        for i in 0..4 {
+            assert_eq!(sym.registers_r[i], OpRef::NONE, "registers_r[{i}] reg-slot");
+        }
+        for i in 0..2 {
+            assert_eq!(sym.registers_f[i], OpRef::NONE, "registers_f[{i}] reg-slot");
+        }
+        // Trailing constant slots — copy_constants populated. The pool
+        // dedups by (type, raw value) so each kind's trailing slot
+        // resolves to a distinct constant OpRef.
+        for i in 0..2 {
+            let op = sym.registers_i[3 + i];
+            assert_ne!(op, OpRef::NONE, "registers_i[{}] constant slot", 3 + i);
+            let val = ctx
+                .constants_get_value(op)
+                .expect("constants pool resolves trailing int slot");
+            assert_eq!(val, majit_ir::Value::Int(100 + 100 * i as i64));
+        }
+        let op_r = sym.registers_r[4];
+        assert_ne!(op_r, OpRef::NONE);
+        assert!(matches!(
+            ctx.constants_get_value(op_r),
+            Some(majit_ir::Value::Ref(_))
+        ));
+        let op_f = sym.registers_f[2];
+        assert_ne!(op_f, OpRef::NONE);
+        assert!(matches!(
+            ctx.constants_get_value(op_f),
+            Some(majit_ir::Value::Float(_))
+        ));
+
+        // Idempotent: calling twice does not shrink or duplicate. Constant
+        // dedup means the trailing slots map to the same OpRefs.
+        let trailing_i_before = sym.registers_i[3];
+        let trailing_r_before = sym.registers_r[4];
+        let trailing_f_before = sym.registers_f[2];
+        sym.setup_kind_register_banks(&mut ctx);
+        assert_eq!(sym.registers_i.len(), 5);
+        assert_eq!(sym.registers_r.len(), 5);
+        assert_eq!(sym.registers_f.len(), 3);
+        assert_eq!(sym.registers_i[3], trailing_i_before);
+        assert_eq!(sym.registers_r[4], trailing_r_before);
+        assert_eq!(sym.registers_f[2], trailing_f_before);
+
+        // SAFETY: drop the boxed JitCode; sym.jitcode now dangles but goes
+        // out of scope at the end of this test.
+        unsafe {
+            let _ = Box::from_raw(inner_jc_ptr);
+        }
+    }
+
+    /// `setup_kind_register_banks` is safe to call when `self.jitcode`
+    /// points at the thread-local `null_jitcode()` placeholder — the
+    /// skeleton's `num_regs_and_consts_X` values are zero and the
+    /// constant pools are empty so the resize and the constant fill are
+    /// both no-ops.
+    #[test]
+    fn test_setup_kind_register_banks_is_no_op_for_null_jitcode_placeholder() {
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        // sym.jitcode was initialized by new_uninit to null_jitcode().
+        let mut ctx = TraceCtx::for_test(1);
+        sym.setup_kind_register_banks(&mut ctx);
+        assert_eq!(sym.registers_i.len(), 0);
+        assert_eq!(sym.registers_f.len(), 0);
+        assert_eq!(sym.registers_r.len(), 0);
+    }
 }
 
 // ── Virtualizable configuration ──────────────────────────────────────

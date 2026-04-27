@@ -3199,7 +3199,7 @@ impl Optimizer {
                     if !op.pos.is_none() && op.result_type() != majit_ir::Type::Void {
                         ctx.register_value_type(op.pos, op.result_type());
                     }
-                    self.propagate_from_pass_range(start_pass, end_pass, &op, ctx);
+                    self.propagate_from_pass_range(0, end_pass, &op, ctx);
                     // Run any postprocess callbacks accumulated in the outer
                     // chain (passes that already returned PassOn for the
                     // original op before the Restart-returning pass fired).
@@ -4024,6 +4024,61 @@ mod tests {
         }
     }
 
+    struct QueueRestartCandidate {
+        queued: bool,
+    }
+
+    impl Optimization for QueueRestartCandidate {
+        fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
+            if !self.queued && op.opcode == OpCode::IntMul {
+                self.queued = true;
+                ctx.emit_extra(
+                    ctx.current_pass_idx,
+                    Op::new(OpCode::IntAdd, &[op.arg(0), op.arg(1)]),
+                );
+            }
+            OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "queue_restart_candidate"
+        }
+    }
+
+    struct CountRestartedIntSub {
+        hits: Rc<Cell<usize>>,
+    }
+
+    impl Optimization for CountRestartedIntSub {
+        fn propagate_forward(&mut self, op: &Op, _ctx: &mut OptContext) -> OptimizationResult {
+            if op.opcode == OpCode::IntSub {
+                self.hits.set(self.hits.get() + 1);
+            }
+            OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "count_restarted_int_sub"
+        }
+    }
+
+    struct RestartIntAddAsSub;
+
+    impl Optimization for RestartIntAddAsSub {
+        fn propagate_forward(&mut self, op: &Op, _ctx: &mut OptContext) -> OptimizationResult {
+            if op.opcode == OpCode::IntAdd {
+                let mut restarted = Op::new(OpCode::IntSub, &[op.arg(0), op.arg(1)]);
+                restarted.pos = op.pos;
+                return OptimizationResult::Restart(restarted);
+            }
+            OptimizationResult::PassOn
+        }
+
+        fn name(&self) -> &'static str {
+            "restart_int_add_as_sub"
+        }
+    }
+
     #[test]
     fn test_optimizer_passthrough() {
         let mut opt = Optimizer::new();
@@ -4035,6 +4090,31 @@ mod tests {
         );
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::IntAdd);
+    }
+
+    #[test]
+    fn test_restart_from_extra_operation_rediscovers_first_pass() {
+        let hits = Rc::new(Cell::new(0));
+        let mut opt = Optimizer::new();
+        opt.trace_inputarg_types = vec![majit_ir::Type::Int; 8];
+        opt.add_pass(Box::new(QueueRestartCandidate { queued: false }));
+        opt.add_pass(Box::new(RestartIntAddAsSub));
+        opt.add_pass(Box::new(CountRestartedIntSub { hits: hits.clone() }));
+
+        let mut ops = vec![Op::new(OpCode::IntMul, &[OpRef(0), OpRef(1)])];
+        ops[0].pos = OpRef(2);
+        let result =
+            opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 2);
+
+        assert_eq!(
+            hits.get(),
+            1,
+            "Restart must re-dispatch from first_optimization, as optimizer.py:567 does"
+        );
+        assert!(
+            result.iter().any(|op| op.opcode == OpCode::IntSub),
+            "restarted extra operation should be emitted as IntSub: {result:?}"
+        );
     }
 
     #[test]

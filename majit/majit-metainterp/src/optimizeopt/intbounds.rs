@@ -2825,30 +2825,20 @@ impl Optimization for OptIntBounds {
                         match ei.oopspecindex {
                             majit_ir::OopSpecIndex::IntPyDiv => {
                                 if op.num_args() >= 3 {
-                                    let divisor_bound = self.getintbound(op.arg(2), ctx);
-                                    if divisor_bound.known_gt_const(0) {
-                                        let result_bound = IntBound::new(
-                                            0,
-                                            divisor_bound.upper.saturating_sub(1),
-                                            0,
-                                            u64::MAX,
-                                        );
-                                        self.intersect_bound(op.pos, &result_bound, ctx);
-                                    }
+                                    // intbounds.py:165-169 post_call_INT_PY_DIV.
+                                    let b1 = self.getintbound(op.arg(1), ctx);
+                                    let b2 = self.getintbound(op.arg(2), ctx);
+                                    let result_bound = b1.py_div_bound(&b2);
+                                    self.intersect_bound(op.pos, &result_bound, ctx);
                                 }
                             }
                             majit_ir::OopSpecIndex::IntPyMod => {
                                 if op.num_args() >= 3 {
-                                    let divisor_bound = self.getintbound(op.arg(2), ctx);
-                                    if divisor_bound.known_gt_const(0) {
-                                        let result_bound = IntBound::new(
-                                            0,
-                                            divisor_bound.upper.saturating_sub(1),
-                                            0,
-                                            u64::MAX,
-                                        );
-                                        self.intersect_bound(op.pos, &result_bound, ctx);
-                                    }
+                                    // intbounds.py:171-175 post_call_INT_PY_MOD.
+                                    let b1 = self.getintbound(op.arg(1), ctx);
+                                    let b2 = self.getintbound(op.arg(2), ctx);
+                                    let result_bound = b1.mod_bound(&b2);
+                                    self.intersect_bound(op.pos, &result_bound, ctx);
                                 }
                             }
                             _ => {}
@@ -2925,6 +2915,17 @@ mod tests {
 
     fn descr(idx: u32) -> DescrRef {
         Arc::new(TestDescr(idx))
+    }
+
+    fn call_descr(idx: u32, oopspecindex: majit_ir::OopSpecIndex) -> DescrRef {
+        Arc::new(majit_ir::SimpleCallDescr::new(
+            idx,
+            vec![majit_ir::Type::Int, majit_ir::Type::Int],
+            majit_ir::Type::Int,
+            true,
+            std::mem::size_of::<i64>(),
+            majit_ir::EffectInfo::new(majit_ir::ExtraEffect::ElidableCanRaise, oopspecindex),
+        ))
     }
 
     fn run_pass(ops: &[Op]) -> Vec<Op> {
@@ -3852,6 +3853,41 @@ mod tests {
         let b = ctx.getintbound(OpRef(2));
         assert!(b.lower >= 0, "STRGETITEM lower should be >= 0");
         assert!(b.upper <= 255, "STRGETITEM upper should be <= 255");
+    }
+
+    #[test]
+    fn test_call_int_py_div_uses_numerator_and_divisor_bounds() {
+        // RPython intbounds.py:165-169 post_call_INT_PY_DIV:
+        //   r.intersect(b1.py_div_bound(b2))
+        // This must not use the modulo-style [0, divisor-1] bound.
+        let mut call = make_op(OpCode::CallPureI, &[OpRef(10), OpRef(0), OpRef(1)], 2);
+        call.descr = Some(call_descr(12, majit_ir::OopSpecIndex::IntPyDiv));
+        let initial_bounds = vec![
+            (OpRef(0), IntBound::bounded(-100, -10)),
+            (OpRef(1), IntBound::bounded(2, 4)),
+        ];
+
+        let (_result, mut ctx) = run_pass_with_bounds(&[call], &initial_bounds);
+        let b = ctx.getintbound(OpRef(2));
+        assert_eq!(b.lower, -50);
+        assert_eq!(b.upper, -3);
+    }
+
+    #[test]
+    fn test_call_int_py_mod_uses_mod_bound_for_negative_divisor() {
+        // RPython intbounds.py:171-175 post_call_INT_PY_MOD:
+        //   r.intersect(b1.mod_bound(b2))
+        let mut call = make_op(OpCode::CallPureI, &[OpRef(10), OpRef(0), OpRef(1)], 2);
+        call.descr = Some(call_descr(14, majit_ir::OopSpecIndex::IntPyMod));
+        let initial_bounds = vec![
+            (OpRef(0), IntBound::bounded(-100, 100)),
+            (OpRef(1), IntBound::bounded(-4, -2)),
+        ];
+
+        let (_result, mut ctx) = run_pass_with_bounds(&[call], &initial_bounds);
+        let b = ctx.getintbound(OpRef(2));
+        assert_eq!(b.lower, -3);
+        assert_eq!(b.upper, 0);
     }
 
     /// RPython postprocess_GUARD_TRUE parity test:

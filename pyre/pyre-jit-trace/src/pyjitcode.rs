@@ -100,8 +100,20 @@ pub struct PyJitCodeMetadata {
     /// `~/.claude/plans/staged-sauteeing-koala.md`): post-regalloc
     /// color of each Python-semantic stack slot.
     /// `stack_slot_color_map[d]` = `apply_rename(Kind::Ref, stack_base + d)`
-    /// for `d in 0..max_stackdepth`. Populated in `finalize_jitcode`
-    /// after `apply_rename` runs.
+    /// for `d in 0..code.max_stackdepth` (= CPython `co_stacksize`).
+    /// Populated in `finalize_jitcode` after `apply_rename` runs;
+    /// portal-bridge installs (`canonical_bridge::install_portal_for`)
+    /// populate it as identity over the same range.
+    ///
+    /// Length invariant: `stack_slot_color_map.len() == code.max_stackdepth`,
+    /// so the bridge fallback at `state.rs::setup_bridge_sym`
+    /// (`stack_base + stack_slot_color_map.len()`) reconstructs the full
+    /// runtime PyFrame allocation
+    /// (`pyframe.rs:1576` `nlocals + ncells + max_stackdepth`). Earlier
+    /// per-CodeObject installs sized this to
+    /// `max_stack_depth_observed = max(depth_at_pc)` which under-sized
+    /// the map when JIT-traced PCs did not reach the static peak; the
+    /// `co_stacksize` invariant restores parity with the runtime.
     ///
     /// Currently with stack-slot input-arg pinning (regalloc.rs:455-466),
     /// this is identical to `[stack_base, stack_base+1, ..., stack_base+max-1]`
@@ -109,6 +121,28 @@ pub struct PyJitCodeMetadata {
     /// a side channel so the decoder can stop assuming this invariant
     /// before commit 2.1 step C removes the pinning.
     pub stack_slot_color_map: Vec<u16>,
+    /// Task #110 slice 3a (parent #185 epic, plan
+    /// `task110_ssa_authoritative_live_r_epic_plan.md`):
+    /// post-regalloc color of each Python-semantic local slot.
+    /// `pyre_color_for_semantic_local[i]` = `apply_rename(Kind::Ref, i)`
+    /// for `i in 0..code.varnames.len()`. Populated in `finalize_jitcode`
+    /// after `apply_rename` runs, parallel to `stack_slot_color_map`;
+    /// portal-bridge installs (`canonical_bridge::install_portal_for`)
+    /// populate it as identity over the same range.
+    ///
+    /// Length invariant: `pyre_color_for_semantic_local.len() == nlocals`,
+    /// matching the locals prefix of the runtime PyFrame allocation.
+    ///
+    /// Today `enforce_input_args` (regalloc.rs:524-563, flatten.py:88-100
+    /// parity) pins each local-i inputarg color to identity (`color = i`),
+    /// so this map is `[0, 1, ..., nlocals-1]` for every populated jitcode.
+    /// The map exists as a side channel so the encoder
+    /// (`get_list_of_active_boxes` / `setup_kind_register_banks`) can
+    /// stop assuming `local_idx == post-regalloc-color` before slice 3b
+    /// rewrites the encoder to read `registers_r[color]` directly per
+    /// `pyjitpl.py:218-234`. No production reader consumes this map
+    /// today; slice 3b will pick it up site-by-site.
+    pub pyre_color_for_semantic_local: Vec<u16>,
 }
 
 /// Compiled JitCode plus pyre-only metadata.
@@ -224,6 +258,7 @@ impl PyJitCode {
                 portal_ec_reg: 0,
                 stack_base: 0,
                 stack_slot_color_map: Vec::new(),
+                pyre_color_for_semantic_local: Vec::new(),
             },
             code_ptr,
             w_code,
