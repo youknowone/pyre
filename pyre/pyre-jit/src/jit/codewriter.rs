@@ -835,16 +835,28 @@ fn exception_edge_extravars(
 fn update_catch_landing_state(
     graph: &mut super::flow::FunctionGraph,
     target: &SpamBlockRef,
-    source_state: &FrameState,
+    edge_state: &FrameState,
 ) {
-    let candidate = exception_landing_state(graph, source_state);
-    if let Some(existing) = target.framestate() {
+    let new_state = if let Some(existing) = target.framestate() {
         let mut fresh = |kind| fresh_variable_for_state(graph, kind);
-        if let Some(merged) = existing.union(&candidate, &mut fresh) {
-            target.set_framestate(merged);
-        }
+        existing.union(edge_state, &mut fresh)
     } else {
-        target.set_framestate(candidate);
+        Some(edge_state.clone())
+    };
+    // `flowcontext.py:139` `egg = EggBlock(vars2, block, case)` — the
+    // catch landing's inputargs receive the exception edge's incoming
+    // values.  Single-source case is `vars2 = [Variable(), Variable()]`;
+    // pyre's union path (multi-source raise sites flowing into the
+    // same handler) merges via `existing.union(&candidate)` and the
+    // inputargs become the union state's Variables.  Mirrors the
+    // `target.inputargs = state.getvariables()` pattern at
+    // `make_next_block` (codewriter.rs:932) and `initialize_spam_block`
+    // (codewriter.rs:913).  When `union` returns `None` (incompatible
+    // states), framestate and inputargs both stay at the existing
+    // values.
+    if let Some(state) = new_state {
+        target.block().borrow_mut().inputargs = state.getvariables();
+        target.set_framestate(state);
     }
 }
 
@@ -1012,7 +1024,7 @@ fn mergeblock(
             link_exit_states,
         );
 
-        // Phase P3 — unconditional supersede per flowcontext.py:455-463.
+        // flowcontext.py:455-463 supersede.  The line-by-line port:
         //
         //     block.dead = True
         //     block.operations = ()
@@ -1022,21 +1034,15 @@ fn mergeblock(
         //     candidates.insert(0, newblock)
         //     self.pendingblocks.append(newblock)
         //
-        // The `pendingblocks.append(newblock)` re-queues the merged
-        // block so the walker re-enters the superseded range under
-        // the widened inputargs.  Pyre's outer walker loop guards
-        // duplicate ssarepr emission with `emitted_pc_starts`: a PC
-        // that was already walked on the first pass is not
-        // re-emitted on re-pop (walker state stays untouched).  Ops
-        // already emitted at the old register slots remain valid
-        // because pyre's positional register model is state-width
-        // invariant — the widened Variables live in the graph CFG
-        // but the ssarepr bytes reference fixed tmp slots + stack
-        // offsets that do not change across widening.  Graph-level
-        // regalloc probe (Phase 1 pilot, log-only) will see the
-        // populated chain go orphan from `iterblocks` after the
-        // clobber; its probe output shifts but no runtime behavior
-        // depends on it.
+        // PRE-EXISTING-ADAPTATION at the surrounding walker loop
+        // (codewriter.rs:3781 `emitted_pc_starts` skip) prevents the
+        // re-walk that upstream relies on after the
+        // `pendingblocks.append(newblock)` below — RPython re-emits
+        // the superseded range's operations into newblock under the
+        // widened inputargs, while pyre keeps the first pass's
+        // ssarepr bytes verbatim.  Convergence: Task #227 Phase 4 +
+        // Task #212 walker CFG/Link restructure
+        // (`codewriter.py:44-67` target).
         block.mark_dead();
         block.block().borrow_mut().operations.clear();
         block.block().borrow_mut().exitswitch = None;
@@ -1143,6 +1149,68 @@ fn duplicate_shadow_tos(
         .unwrap_or_else(|| fresh_ref_value(graph));
     state.stack.push(duplicated.clone());
     duplicated
+}
+
+/// Phase 4 Session 18 probe helper — operand-shape descriptor used by
+/// the `[phase4-flatten-family]` log line for structural comparison
+/// between the parallel `flatten_family_ops` output and the inline
+/// SSARepr emit.  Returns a per-arg slot tag (one of `"const_int"`,
+/// `"const_ref"`, `"const_float"`, `"reg_i"`, `"reg_r"`, `"reg_f"`,
+/// `"list_i"`, `"list_r"`, `"list_f"`, `"tlabel"`, `"descr"`,
+/// `"indirect"`).  Register indices are deliberately ignored — graph
+/// regalloc and SSA `RegisterLayout::compute` produce different
+/// colorings for the same logical slot, so a register-index match is
+/// the wrong invariant for the soft probe.  The byte-equivalence
+/// invariant (which would require matching indices) is the
+/// retirement-readiness criterion proper, gated on regalloc
+/// unification (Task #227 walker restructure).  This descriptor
+/// exhaustively covers `Operand` and `Insn` variants — adding a new
+/// variant must extend this match instead of falling through.
+fn shape_descriptor(insn: &super::flatten::Insn) -> String {
+    use super::flatten::{Insn, Kind, Operand};
+    let (opname, args, has_result) = match insn {
+        Insn::Op {
+            opname,
+            args,
+            result,
+        } => (opname.as_str(), args, result.is_some()),
+        Insn::Label(_) => return "Label".to_owned(),
+        Insn::Unreachable => return "---".to_owned(),
+        Insn::PcAnchor(_) => return "PcAnchor".to_owned(),
+    };
+    let mut tags = Vec::with_capacity(args.len());
+    for arg in args {
+        let tag = match arg {
+            Operand::ConstInt(_) => "const_int",
+            Operand::ConstRef(_) => "const_ref",
+            Operand::ConstFloat(_) => "const_float",
+            Operand::Register(register) => match register.kind {
+                Kind::Int => "reg_i",
+                Kind::Ref => "reg_r",
+                Kind::Float => "reg_f",
+            },
+            Operand::ListOfKind(list) => match list.kind {
+                Kind::Int => "list_i",
+                Kind::Ref => "list_r",
+                Kind::Float => "list_f",
+            },
+            Operand::TLabel(_) => "tlabel",
+            Operand::Descr(_) => "descr",
+            Operand::IndirectCallTargets(_) => "indirect",
+        };
+        tags.push(tag);
+    }
+    let result_tag = if has_result { "->reg" } else { "" };
+    format!("{opname}({}){result_tag}", tags.join(","))
+}
+
+/// Phase 4 Session 18 probe helper — true iff two SSARepr `Insn` values
+/// have identical operand shapes (per `shape_descriptor`).  Wraps the
+/// `==` comparison of the descriptor strings to keep the probe call
+/// site readable; not perf-critical (probe runs once per CodeObject
+/// under env-gated logging).
+fn insn_shape_matches(left: &super::flatten::Insn, right: &super::flatten::Insn) -> bool {
+    shape_descriptor(left) == shape_descriptor(right)
 }
 
 /// Step 6 transitional dual-write.  `rpython/jit/codewriter/codewriter.py:44-67`
@@ -1542,15 +1610,65 @@ fn attach_catch_exception_edge(
     source_state: &FrameState,
     link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
 ) -> super::flow::LinkRef {
-    let mut link = super::flow::Link::new(Vec::new(), Some(target.block()), None);
-    let mut block_mut = block.borrow_mut();
-    block_mut.exitswitch = Some(super::flow::ExitSwitch::Value(
-        super::flow::c_last_exception().into(),
-    ));
-    drop(block_mut);
-    let (exc_type, exc_value) = exception_edge_vars(graph);
+    // `flowcontext.py:148-149 guessexception` sets
+    // `block.exitswitch = c_last_exception` before the link is
+    // attached.  Run the source-block side first so that the link
+    // construction below sees a stable target/source pair.
+    {
+        let mut block_mut = block.borrow_mut();
+        block_mut.exitswitch = Some(super::flow::ExitSwitch::Value(
+            super::flow::c_last_exception().into(),
+        ));
+    }
+
+    // `flowcontext.py:130-134 guessexception` synthesises the
+    // `(last_exception, last_exc_value)` Variable pair for this
+    // edge.  `exception_landing_state` clones `source_state` and
+    // sets `last_exception` to the fresh pair, so the same
+    // Variables can be threaded into BOTH `link.args` (via
+    // `getoutputargs_with_positions` below) AND `link.extravars`.
+    let edge_state = exception_landing_state(graph, source_state);
+
+    // Update the landing block's framestate / inputargs from the
+    // edge state.  PRE-EXISTING-ADAPTATION: RPython models each
+    // raise site with its own `EggBlock(vars2, block, case)`
+    // (`flowcontext.py:138`), with `vars2 = [Variable(),
+    // Variable()]` per case — the egg's body is responsible for
+    // any subsequent frame-state restoration.  Pyre coalesces
+    // every raise site flowing into the same handler PC into a
+    // single catch landing block, so the landing's inputargs are
+    // the union of all incoming edge states (pyre-only).  The
+    // arity invariant below is satisfied either way because
+    // `getoutputargs_with_positions` walks `target_state.mergeable()`
+    // — the same mergeable layout as `target.inputargs`.
+    update_catch_landing_state(graph, target, &edge_state);
+
+    // `model.py:114-116 Link.__init__` enforces
+    // `len(args) == len(target.inputargs)`.  Build `link.args` via
+    // `FrameState::getoutputargs_with_positions(target_state)` so
+    // each link arg aligns with the corresponding target inputarg
+    // by mergeable position.  This restores the RPython invariant
+    // that the previous `Link::new(Vec::new(), …)` then-mutate
+    // flow bypassed (the `Link::new` arity assert ran before
+    // `update_catch_landing_state` populated `target.inputargs`).
+    let target_state = target
+        .framestate()
+        .expect("catch landing must have a framestate after update_catch_landing_state");
+    let (link_args, arg_positions) = edge_state.getoutputargs_with_positions(&target_state);
+
+    // `model.py:127-129 Link.extravars` carries the source-side
+    // `(last_exception, last_exc_value)` pair so
+    // `flatten.py:340-347` can identify the exception edge and
+    // emit `last_exception` / `last_exc_value` SSA renamings at
+    // link entry.  The pair is the SAME (exc_type, exc_value)
+    // Variables as `edge_state.last_exception`, so they appear in
+    // BOTH `link.args` (via `getoutputargs` at the
+    // `last_exception` mergeable position) AND `link.extravars`
+    // — matching `flowcontext.py:141-143`.
+    let (exc_type, exc_value) = exception_edge_extravars(&edge_state);
+    let mut link = super::flow::Link::new(link_args, Some(target.block()), None)
+        .with_arg_positions(arg_positions);
     link.extravars(Some(exc_type), Some(exc_value));
-    update_catch_landing_state(graph, target, source_state);
     let link = link.into_ref();
     append_exit_with_state(block, link.clone(), source_state, link_exit_states);
     link
@@ -3387,6 +3505,29 @@ impl CodeWriter {
                 $ssarepr.insns.push(insn.clone());
             }};
         }
+        // PRE-EXISTING-ADAPTATION (shared by both `getarrayitem_vable_r`
+        // and `setarrayitem_vable_r` macros below + every
+        // `record_graph_op("…vable_r", …)` call site).  Upstream
+        // `jtransform.py:1880-1885` (`do_fixed_list_getitem`, vable
+        // branch) emits `getarrayitem_vable_X` with **4 args**:
+        // `[v_base, v_index, arrayfielddescr, arraydescr]`.  Likewise
+        // `jtransform.py:1898-1906` (`do_fixed_list_setitem`, vable
+        // branch) emits `setarrayitem_vable_X` with **5 args**:
+        // `[v_base, v_index, v_value, arrayfielddescr, arraydescr]`.
+        // Pyre's lowered shape uses **3 args** (set) / **2 args**
+        // (get), substituting `Constant::signed(0)` for `v_base` and
+        // omitting both descrs.  The graph-side dual-write in this
+        // file (`record_graph_op("…vable_r", …)`) mirrors the
+        // inline-emitted shape so positional / multiset shape probes
+        // remain valid; it does NOT match the RPython 5-arg shape.
+        // Convergence to the upstream shape requires
+        // `arrayfielddescr` + `arraydescr` infrastructure (cf.
+        // `VirtualizableInfo.array_field_descrs` /
+        // `VirtualizableInfo.array_descrs` at
+        // `rpython/jit/metainterp/virtualizable.py:58,73`, threaded
+        // into `jtransform.py`'s `vable_array_vars` map), which pyre
+        // has not ported yet (Task #105 jitcode-side / Task #227
+        // follow-up).
         macro_rules! emit_vable_getarrayitem_ref {
             ($ssarepr:expr, $dst:expr, $field_idx:expr, $index:expr) => {{
                 let dst = $dst;
@@ -3507,6 +3648,41 @@ impl CodeWriter {
                     // stack, instead of the Session 2 `Constant::none()`
                     // placeholder. Graph offset -1 matches the emit_vsd
                     // shadow convention.
+                    //
+                    // PRE-EXISTING-ADAPTATION: 3-arg shape vs upstream 5
+                    // args.  RPython `jtransform.py:1898
+                    // do_fixed_list_setitem` lowers to
+                    // `setarrayitem_vable_r(v_base, index, value,
+                    // arrayfielddescr, arraydescr)` — 5 args after the
+                    // `-live-` marker.  Pyre carries 3 args
+                    // (`Constant::signed(0)` for the field discriminator,
+                    // `v_idx`, value) at this AND every other
+                    // `record_graph_op("setarrayitem_vable_r", ...)`
+                    // site (`emit_pushvalue_ref!`,
+                    // `emit_pushvalue_ref_const!`, `emit_popvalue_ref!`,
+                    // `emit_load_fast_ref!`, `Instruction::StoreFast`,
+                    // `StoreFastLoadFast` STORE/LOAD halves,
+                    // `StoreFastStoreFast`, exception unwind PY_NULL).
+                    // The two missing trailing args
+                    // (\`arrayfielddescr\`, \`arraydescr\`) require pyre to
+                    // thread `AbstractDescr` through `record_graph_op`
+                    // and the canonical `flatten_arg` path
+                    // (`flatten.rs:1080-1083` panics on
+                    // `SpaceOperationArg::Descr` for this reason — no
+                    // per-opname `DescrOperand` mapping yet).
+                    // Convergence path:
+                    // (a) port `vable_array_descr` /
+                    //     `vable_array_field_descr` from
+                    //     `rpython/jit/codewriter/jtransform.py:920-928`
+                    //     into the pyre descr layer,
+                    // (b) extend `flatten_arg`'s `Descr` arm to map
+                    //     them onto a `DescrOperand` variant,
+                    // (c) update every site listed above to record the
+                    //     5-arg shape.
+                    // Tracked alongside Task #227 Phase 4 (multi-session
+                    // epic; see Session 17 memory's
+                    // `phase_4_session_17_setarrayitem_vable_r_coverage`
+                    // for the full deferred site list).
                     let v_idx = emit_graph_op_with_result(
                         &mut graph,
                         &current_block.block(),
@@ -3654,23 +3830,72 @@ impl CodeWriter {
             ($ssarepr:expr, $depth:ident, $reg:expr) => {{
                 let reg = $reg;
                 if is_portal {
-                    emit_load_const_i!(
-                        $ssarepr,
-                        int_tmp0,
-                        local_to_vable_slot(reg as usize) as i64
-                    );
+                    let local_slot = local_to_vable_slot(reg as usize) as i64;
+                    let stack_slot = (stack_base_absolute + $depth as usize) as i64;
+                    emit_load_const_i!($ssarepr, int_tmp0, local_slot);
                     emit_vable_getarrayitem_ref!($ssarepr, stack_base + $depth, 0_u16, int_tmp0);
-                    emit_load_const_i!(
-                        $ssarepr,
-                        int_tmp0,
-                        (stack_base_absolute + $depth as usize) as i64
+                    // Graph-side dual-write of BOTH halves of the
+                    // LOAD_FAST lowering:
+                    //   - local read: jtransform.py:1877
+                    //     `do_fixed_list_getitem` lowers
+                    //     `locals_cells_stack_w[local_slot]` to
+                    //     `getarrayitem_vable_r(_, ConstInt(local_slot))`,
+                    //     producing a Ref result that is the loaded
+                    //     local value.
+                    //   - stack write: jtransform.py:1898
+                    //     `do_fixed_list_setitem` lowers the subsequent
+                    //     `pushvalue(loaded)` to
+                    //     `setarrayitem_vable_r(_, ConstInt(stack_slot),
+                    //     loaded)`.
+                    // The result of the read feeds the source of the
+                    // write — a single fresh Ref Variable threads
+                    // through both ops.
+                    //
+                    // `current_state.locals_w[reg]` is left UNCHANGED:
+                    // pyopcode.py:500-507 LOAD_FAST is a stack push,
+                    // not a local-binding mutation.  The pre-existing
+                    // Variable in `locals_w[reg]` continues to identify
+                    // the local slot for subsequent reads (matching
+                    // RPython, where `getarrayitem_vable_r` reads do
+                    // not feed back into `vable_array_vars`).
+                    let v_local_idx = emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "int_const",
+                        vec![super::flow::Constant::signed(local_slot).into()],
+                        Kind::Int,
+                        -1,
                     );
+                    let v_loaded = emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "getarrayitem_vable_r",
+                        vec![super::flow::Constant::signed(0).into(), v_local_idx.into()],
+                        Kind::Ref,
+                        -1,
+                    );
+                    let loaded: super::flow::FlowValue = v_loaded.into();
+                    let v_stack_idx = emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "int_const",
+                        vec![super::flow::Constant::signed(stack_slot).into()],
+                        Kind::Int,
+                        -1,
+                    );
+                    record_graph_op(
+                        &current_block.block(),
+                        "setarrayitem_vable_r",
+                        vec![
+                            super::flow::Constant::signed(0).into(),
+                            v_stack_idx.into(),
+                            loaded.clone().into(),
+                        ],
+                        None,
+                        -1,
+                    );
+                    emit_load_const_i!($ssarepr, int_tmp0, stack_slot);
                     emit_vable_setarrayitem_ref!($ssarepr, 0_u16, int_tmp0, stack_base + $depth);
-                    let loaded = current_state
-                        .locals_w
-                        .get(reg as usize)
-                        .and_then(|value| value.clone())
-                        .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     current_state.stack.push(loaded);
                     $depth += 1;
                     emit_vsd!($depth);
@@ -3759,20 +3984,13 @@ impl CodeWriter {
                 .expect("pending block must carry a FrameState (flowcontext.py:408)");
             let start_pc = pending_state.next_offset;
             // PRE-EXISTING-ADAPTATION — upstream `flowcontext.py:402-405`
-            // pops and re-records unconditionally: `while self.pendingblocks:
-            // block = self.pendingblocks.popleft(); if not block.dead:
-            // self.record_block(block)`.  Pyre's walker emits into
-            // program-wide `ssarepr.insns` (not per-block
-            // `block.operations`), so re-popping an already-walked
-            // `start_pc` would duplicate `Insn::Label("pcN")` entries
-            // that `AssemblyState::label_positions.insert` silently
-            // overwrites, breaking `insns_pos[N]`.  Walker state is
-            // left untouched so post-loop catch-site emission still
-            // sees the first pass's exit state.  This guard retires
-            // together with the `for py_pc` loop below when Task #227
-            // Phase 4 lands `record_block` per-block op accumulation
-            // (see codewriter.rs:989-1013 mergeblock companion note
-            // and codewriter.py:44-67 for the target pipeline shape).
+            // pops and re-records unconditionally; pyre skips the
+            // re-pop because the walker emits into program-wide
+            // `ssarepr.insns` (not per-block `block.operations`).
+            // Convergence: Task #227 Phase 4 + Task #212 (walker
+            // restructure to per-block accumulation + post-walk
+            // `flatten_graph(graph, regallocs)` per
+            // `codewriter.py:44-67`).
             if emitted_pc_starts.get(start_pc).copied().unwrap_or(false) {
                 continue;
             }
@@ -3783,16 +4001,13 @@ impl CodeWriter {
             pending_bool_fallthrough_case = None;
             // PRE-EXISTING-ADAPTATION — upstream `flowcontext.py:407-416`
             // drives per-block op accumulation via `while True:
-            // handle_bytecode(...)` exiting through `StopFlowing` at a
-            // terminator, then appends the block's `operations` as a
-            // tuple; the surrounding `record_block` is what calls
-            // `block.operations = self.recorder.crnt_block.operations`.
-            // Pyre iterates PCs linearly because the walker emits
-            // directly into program-wide `ssarepr.insns`.  This loop
-            // and its sibling `emitted_pc_starts` guard above retire
-            // together when Task #227 Phase 4 lands `record_block` +
-            // post-walk `flatten_graph(graph, regallocs)` per
-            // `codewriter.py:44-67`.
+            // handle_bytecode(...)` until a terminator, then
+            // `record_block` assigns `block.operations` from the
+            // recorder.  Pyre iterates PCs linearly because the walker
+            // emits directly into program-wide `ssarepr.insns`.
+            // Convergence: Task #227 Phase 4 + Task #212 (per-block
+            // `record_block` + post-walk `flatten_graph(graph,
+            // regallocs)` per `codewriter.py:44-67`).
             for py_pc in start_pc..num_instrs {
                 // Mark this PC as emitted before processing so
                 // `mergeblock`'s own pendingblocks push within
@@ -3978,6 +4193,39 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        if is_portal {
+                            // Graph-side dual-write of jtransform.py:1898
+                            // `do_fixed_list_setitem` —
+                            // STORE_FAST → setarrayitem_vable_r(
+                            // locals_cells_stack_w, local_slot, w_value).
+                            // Mirrors the existing emit_pushvalue_ref!
+                            // dual-write so graph regalloc observes the
+                            // locals-side setarrayitem_vable_r liverange.
+                            // SSA emission below stays in
+                            // emit_store_local_with_mirror! — graph and
+                            // SSA are independent IRs.  Synthetic shadow
+                            // offset -1 matches the emit_vsd convention.
+                            let local_slot = local_to_vable_slot(reg as usize) as i64;
+                            let v_idx = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "int_const",
+                                vec![super::flow::Constant::signed(local_slot).into()],
+                                Kind::Int,
+                                -1,
+                            );
+                            record_graph_op(
+                                &current_block.block(),
+                                "setarrayitem_vable_r",
+                                vec![
+                                    super::flow::Constant::signed(0).into(),
+                                    v_idx.into(),
+                                    stored.clone().into(),
+                                ],
+                                None,
+                                -1,
+                            );
+                        }
                         emit_store_local_with_mirror!(ssarepr, reg, stored_reg);
                         if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                             *slot = Some(stored);
@@ -4001,9 +4249,24 @@ impl CodeWriter {
                             ResKind::Ref,
                             Some(stack_base + current_depth),
                         );
-                        current_state
-                            .stack
-                            .push(super::flow::Constant::signed(val).into());
+                        // Push a Ref-typed Variable onto the symbolic
+                        // stack — Python value-stack slots all hold
+                        // boxed `PyObjectRef` at runtime, mirroring
+                        // RPython's post-rtyper invariant where `box_int`
+                        // (`rtyper/lltypesystem/rtagged.py:32`,
+                        // `rtyper/rmodel.py:181`) wraps the int constant
+                        // into a Ref-typed Variable.  PRE-EXISTING-
+                        // ADAPTATION: pyre lacks the rtyper layer so the
+                        // fresh Variable has no defining op in the graph
+                        // (the boxing is realised by the inline
+                        // `box_int_fn_idx` residual_call above, not a
+                        // graph op).  The dangling Variable is treated
+                        // as live-on-entry by `make_dependencies`
+                        // (`regalloc.rs:78-86`); runtime register holds
+                        // the boxed Ref written by the residual_call.
+                        // Convergence: rtyper-equivalent `box_int_const`
+                        // graph op (Task #229 TmpVarEnv epic).
+                        current_state.stack.push(fresh_ref_value(&mut graph));
                         current_depth += 1;
                         emit_vsd!(current_depth);
                     }
@@ -4034,11 +4297,37 @@ impl CodeWriter {
                             ResKind::Ref,
                             Some(dst_slot),
                         );
-                        let value = code
+                        // Symbolic stack must hold a Ref-typed value
+                        // (Python value-stack slots are all boxed
+                        // `PyObjectRef`).  `frontend_constant_flow_value`
+                        // returns the un-boxed semantic constant — Ref
+                        // for `None` (`Constant::none()`), Int for
+                        // `Integer`/`Boolean`, no-kind for `Str`.  Only
+                        // the `None` case matches the post-rtyper
+                        // invariant; for the rest push a fresh Ref
+                        // Variable representing the boxed form (the
+                        // boxing is realised by the inline
+                        // `load_const_fn_idx` residual_call above, not
+                        // a graph op).  Same PRE-EXISTING-ADAPTATION as
+                        // `LoadSmallInt`'s push above — see that arm
+                        // for the rtyper-equivalent convergence note.
+                        let raw_value = code
                             .constants
                             .get(idx)
-                            .and_then(frontend_constant_flow_value)
-                            .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            .and_then(frontend_constant_flow_value);
+                        let value = match raw_value {
+                            Some(super::flow::FlowValue::Constant(c))
+                                if c.kind == Some(Kind::Ref) =>
+                            {
+                                super::flow::FlowValue::Constant(c)
+                            }
+                            Some(super::flow::FlowValue::Variable(v))
+                                if v.kind == Some(Kind::Ref) =>
+                            {
+                                super::flow::FlowValue::Variable(v)
+                            }
+                            _ => fresh_ref_value(&mut graph),
+                        };
                         current_state.stack.push(value);
                         current_depth += 1;
                         emit_vsd!(current_depth);
@@ -4100,6 +4389,32 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        if is_portal {
+                            // STORE_FAST half graph dual-write
+                            // (jtransform.py:1898 `do_fixed_list_setitem`).
+                            // SSA emission for this half is delegated to
+                            // `emit_store_local_with_mirror!` below.
+                            let store_slot = local_to_vable_slot(store_reg as usize) as i64;
+                            let v_store_idx = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "int_const",
+                                vec![super::flow::Constant::signed(store_slot).into()],
+                                Kind::Int,
+                                -1,
+                            );
+                            record_graph_op(
+                                &current_block.block(),
+                                "setarrayitem_vable_r",
+                                vec![
+                                    super::flow::Constant::signed(0).into(),
+                                    v_store_idx.into(),
+                                    stored.clone().into(),
+                                ],
+                                None,
+                                -1,
+                            );
+                        }
                         // STORE_FAST half: same dual-write as Instruction::StoreFast.
                         // Non-portal popvalue places `stored_reg` at
                         // `stack_base + current_depth` post-decrement, so the
@@ -4108,38 +4423,96 @@ impl CodeWriter {
                         // `ref_copy(store_reg, stack_base + current_depth)`.
                         emit_store_local_with_mirror!(ssarepr, store_reg, stored_reg);
                         if is_portal {
+                            let load_slot = local_to_vable_slot(load_reg as usize) as i64;
+                            let stack_slot = (stack_base_absolute + current_depth as usize) as i64;
                             // LOAD_FAST half: read local, then pyframe.py:378-381
                             // pushvalue parity — mirror to the value-stack slot.
-                            emit_load_const_i!(
-                                ssarepr,
-                                int_tmp0,
-                                local_to_vable_slot(load_reg as usize) as i64
-                            );
+                            emit_load_const_i!(ssarepr, int_tmp0, load_slot);
                             emit_vable_getarrayitem_ref!(
                                 ssarepr,
                                 stack_base + current_depth,
                                 0_u16,
                                 int_tmp0
                             );
-                            emit_load_const_i!(
-                                ssarepr,
-                                int_tmp0,
-                                (stack_base_absolute + current_depth as usize) as i64
+                            // CPython 3.13 super-instruction semantics: STORE
+                            // is observable to the immediately-following LOAD
+                            // when store_reg == load_reg. Apply the locals_w
+                            // update before recording the graph LOAD half so
+                            // any prior Variable on `store_reg` is replaced
+                            // with `stored` first.
+                            if let Some(slot) = current_state.locals_w.get_mut(store_reg as usize) {
+                                *slot = Some(stored);
+                            }
+                            // Graph-side dual-write of BOTH halves of the
+                            // LOAD half lowering — symmetric to
+                            // `emit_load_fast_ref!` (codewriter.rs:3833+):
+                            //   - local read: jtransform.py:1877
+                            //     `do_fixed_list_getitem` lowers
+                            //     `locals_cells_stack_w[load_slot]` to
+                            //     `getarrayitem_vable_r(_, ConstInt(load_slot))`,
+                            //     producing a Ref result.  Every read in SSA
+                            //     form produces a fresh Variable; when
+                            //     load_reg == store_reg the optimizer is
+                            //     responsible for CSE'ing the read back to
+                            //     `stored`.
+                            //   - stack write: jtransform.py:1898
+                            //     `do_fixed_list_setitem` lowers the
+                            //     subsequent `pushvalue(loaded)` to
+                            //     `setarrayitem_vable_r(_, ConstInt(stack_slot),
+                            //     loaded)`.
+                            //
+                            // `current_state.locals_w[load_reg]` is left
+                            // UNCHANGED — the LOAD half of
+                            // StoreFastLoadFast is a stack push, not a
+                            // local-binding mutation.  When
+                            // load_reg == store_reg the just-set
+                            // `Some(stored)` from the STORE half
+                            // remains as the slot's Variable
+                            // (matching pyopcode.py super-instruction
+                            // semantics).
+                            let v_load_idx = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "int_const",
+                                vec![super::flow::Constant::signed(load_slot).into()],
+                                Kind::Int,
+                                -1,
                             );
+                            let v_loaded = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "getarrayitem_vable_r",
+                                vec![super::flow::Constant::signed(0).into(), v_load_idx.into()],
+                                Kind::Ref,
+                                -1,
+                            );
+                            let loaded: super::flow::FlowValue = v_loaded.into();
+                            let v_stack_idx = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "int_const",
+                                vec![super::flow::Constant::signed(stack_slot).into()],
+                                Kind::Int,
+                                -1,
+                            );
+                            record_graph_op(
+                                &current_block.block(),
+                                "setarrayitem_vable_r",
+                                vec![
+                                    super::flow::Constant::signed(0).into(),
+                                    v_stack_idx.into(),
+                                    loaded.clone().into(),
+                                ],
+                                None,
+                                -1,
+                            );
+                            emit_load_const_i!(ssarepr, int_tmp0, stack_slot);
                             emit_vable_setarrayitem_ref!(
                                 ssarepr,
                                 0_u16,
                                 int_tmp0,
                                 stack_base + current_depth
                             );
-                            if let Some(slot) = current_state.locals_w.get_mut(store_reg as usize) {
-                                *slot = Some(stored);
-                            }
-                            let loaded = current_state
-                                .locals_w
-                                .get(load_reg as usize)
-                                .and_then(|value| value.clone())
-                                .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             current_state.stack.push(loaded);
                             current_depth += 1;
                             emit_vsd!(current_depth);
@@ -5044,6 +5417,32 @@ impl CodeWriter {
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                            if is_portal {
+                                // Graph-side dual-write — same shape as the
+                                // StoreFast handler.  SSA emission is
+                                // delegated to `emit_store_local_with_mirror!`
+                                // below.
+                                let local_slot = local_to_vable_slot(reg as usize) as i64;
+                                let v_idx = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "int_const",
+                                    vec![super::flow::Constant::signed(local_slot).into()],
+                                    Kind::Int,
+                                    -1,
+                                );
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setarrayitem_vable_r",
+                                    vec![
+                                        super::flow::Constant::signed(0).into(),
+                                        v_idx.into(),
+                                        stored.clone().into(),
+                                    ],
+                                    None,
+                                    -1,
+                                );
+                            }
                             emit_store_local_with_mirror!(ssarepr, reg, stored_reg);
                             if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                                 *slot = Some(stored);
@@ -5133,6 +5532,22 @@ impl CodeWriter {
 
         for site in catch_sites {
             emit_mark_label_catch_landing!(ssarepr, site.landing_label);
+            // `emit_mark_label_catch_landing!` (codewriter.rs:3318)
+            // reassigns `current_block` to the pre-allocated catch
+            // landing block on every iteration, so subsequent graph
+            // emits in this loop body land in a block reachable from
+            // `graph.iterblocks()`.  Lock the invariant in debug
+            // builds — Session 17's exception unwind PY_NULL graph
+            // dual-write (codewriter.rs:5481-5491) and any future
+            // catch-landing dual-write rely on this targeting being
+            // intact.
+            debug_assert_eq!(
+                current_block, catch_landing_blocks[&site.landing_label],
+                "catch_landing block-targeting invariant violated: \
+                 current_block != catch_landing_blocks[{}] after \
+                 emit_mark_label_catch_landing!",
+                site.landing_label,
+            );
             // eval.rs:150-168 handle_exception parity:
             // the handler edge enters with the protected prefix of the
             // value stack preserved, then `push_lasti` (if any), then the
@@ -5143,12 +5558,29 @@ impl CodeWriter {
             if site.push_lasti {
                 current_state.stack.push(fresh_ref_value(&mut graph));
             }
-            let exc_value = current_state
-                .last_exception
-                .as_ref()
-                .map(|(_w_type, w_value)| w_value.clone())
-                .unwrap_or_else(|| fresh_ref_value(&mut graph));
-            current_state.stack.push(exc_value);
+            // flatten.py:336-347 `generate_last_exc` lowering — every
+            // catch entry produces its own Ref Variable via the
+            // upstream `last_exc_value` op emitted at flatten time
+            // (`emitline("last_exc_value", "->", color)` at
+            // flatten.py:347).  The Variable that
+            // `current_state.last_exception` may carry is the
+            // raising-edge Variable, which is upstream of THIS catch
+            // landing block; using a fresh graph-defined Variable
+            // here matches RPython parity (one `last_exc_value()`
+            // per catch entry) and gives the subsequent
+            // `setarrayitem_vable_r` push a graph-side def-use
+            // chain that does not depend on raise-edge graph
+            // coverage.
+            let v_exc_value = emit_graph_op_with_result(
+                &mut graph,
+                &current_block.block(),
+                "last_exc_value",
+                vec![],
+                Kind::Ref,
+                -1,
+            );
+            let exc_value: super::flow::FlowValue = v_exc_value.into();
+            current_state.stack.push(exc_value.clone());
             // pyframe.py:503-510 + eval.rs:155-158 `dropvaluesuntil` parity:
             //
             //     while frame.valuestackdepth > target_depth:
@@ -5175,11 +5607,31 @@ impl CodeWriter {
                 let mut unwind_depth = raising_depth;
                 while unwind_depth > site.stack_depth {
                     unwind_depth -= 1;
-                    emit_load_const_i!(
-                        ssarepr,
-                        int_tmp0,
-                        (stack_base_absolute + unwind_depth as usize) as i64,
+                    let depth_value = (stack_base_absolute + unwind_depth as usize) as i64;
+                    // Graph-side dual-write — same shape as
+                    // `emit_pushvalue_ref_const!` at codewriter.rs:3576-3603.
+                    // The unwind PY_NULL is `Constant::none()` per
+                    // assembler.py:109 ConstPtr.NULL.
+                    let v_idx = emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "int_const",
+                        vec![super::flow::Constant::signed(depth_value).into()],
+                        Kind::Int,
+                        -1,
                     );
+                    record_graph_op(
+                        &current_block.block(),
+                        "setarrayitem_vable_r",
+                        vec![
+                            super::flow::Constant::signed(0).into(),
+                            v_idx.into(),
+                            super::flow::Constant::none().into(),
+                        ],
+                        None,
+                        -1,
+                    );
+                    emit_load_const_i!(ssarepr, int_tmp0, depth_value);
                     emit_vable_setarrayitem_ref_const!(
                         ssarepr,
                         0_u16,
@@ -5225,13 +5677,71 @@ impl CodeWriter {
             }
             emit_last_exc_value!(ssarepr, exc_slot);
             if is_portal {
-                emit_load_const_i!(
-                    ssarepr,
-                    int_tmp0,
-                    (stack_base_absolute + depth as usize) as i64,
+                let depth_value = (stack_base_absolute + depth as usize) as i64;
+                // pyframe.py:378-387 `pushvalue` semantics — graph
+                // dual-write of the stack mirror.  Source is the
+                // graph-defined `v_exc_value` produced by
+                // `last_exc_value` above, so the def-use chain is
+                // intact (no orphan use).
+                let v_idx = emit_graph_op_with_result(
+                    &mut graph,
+                    &current_block.block(),
+                    "int_const",
+                    vec![super::flow::Constant::signed(depth_value).into()],
+                    Kind::Int,
+                    -1,
                 );
+                record_graph_op(
+                    &current_block.block(),
+                    "setarrayitem_vable_r",
+                    vec![
+                        super::flow::Constant::signed(0).into(),
+                        v_idx.into(),
+                        exc_value.clone().into(),
+                    ],
+                    None,
+                    -1,
+                );
+                emit_load_const_i!(ssarepr, int_tmp0, depth_value);
                 emit_vable_setarrayitem_ref!(ssarepr, 0_u16, int_tmp0, exc_slot);
             }
+            // CATCH-LANDING dual-write follow-up (Task #227).
+            // RPython parity: `pypy/interpreter/pyopcode.py` exception
+            // handler entry pushes the lasti box (`push_lasti` arm) and
+            // the captured exc_value onto the value stack; both writes
+            // lower through `jtransform.py:1898 do_fixed_list_setitem`
+            // to `setarrayitem_vable_r` in the upstream graph.
+            //
+            // Push exc_value graph dual-write — LANDED above:
+            // `last_exc_value -> v_exc_value` produces a fresh Ref
+            // Variable per catch entry (flatten.py:336-347
+            // `generate_last_exc`), and the subsequent
+            // `setarrayitem_vable_r(_, ConstInt(stack_base+depth),
+            // v_exc_value)` consumes it.
+            //
+            // Push lasti graph dual-write — STILL DEFERRED:
+            //   - `box_int(lasti_py_pc)` lowers to a `residual_call_*`
+            //     shape that pyre's graph layer does not yet record
+            //     (the `residual_call_*` family has zero graph
+            //     coverage as of Session 17 — `flatten_arg` panics on
+            //     `SpaceOperationArg::Descr`, and per-call-shape
+            //     variant routing for `residual_call_ir_r` / `_r_r` /
+            //     `_r_v` / `_r_i` is absent).  Adding the
+            //     `setarrayitem_vable_r` dual-write alone would
+            //     introduce an orphan def-use chain (def: nothing,
+            //     use: setarrayitem) that breaks RPython's
+            //     "every Variable has exactly one def" invariant.
+            //
+            // Block-targeting (was Session 17 blocker #1) is CLOSED:
+            // `emit_mark_label_catch_landing!` (codewriter.rs:3318)
+            // runs at the head of every iteration and reassigns
+            // `current_block` to the pre-allocated catch landing
+            // block.  The invariant is locked in via
+            // `debug_assert_eq!` at the head of the loop body.
+            //
+            // The push_lasti dual-write joins when graph coverage for
+            // `residual_call_*` (via `flatten_arg` Descr handling +
+            // per-shape variant routing) lands.
             depth += 1;
             emit_vsd!(depth);
             emit_goto!(ssarepr, site.handler_py_pc);
@@ -5338,6 +5848,364 @@ impl CodeWriter {
             }
             if log_enabled {
                 eprintln!("[phase1-regalloc] {}{}", code.obj_name, log_line);
+            }
+
+            // Phase 4 Session 15 (Task #214) — Link renaming count probe.
+            // With `Block.inputargs` populated at every walker block-creation
+            // site (Session 14), `insert_renamings` (`flatten.py:306-334`)
+            // can be simulated at every Link to count the
+            // `{kind}_copy/{kind}_push/{kind}_pop` ops that
+            // `flatten_graph(graph, regallocs)` would emit. Compared against
+            // pyre's inline-walker `*_copy` count in `ssarepr.insns` to
+            // quantify the walker→flatten transition surface (Task #227
+            // Phase 4 endgame).
+            if log_enabled {
+                let link_renamings =
+                    super::regalloc::count_link_renamings_per_kind(&graph, &graph_regallocs);
+                let ssa_copies = super::regalloc::count_ssa_copy_ops_per_kind(&ssarepr);
+                let mut renaming_line = String::new();
+                for &kind in super::flatten::Kind::ALL.iter() {
+                    let kind_tag = match kind {
+                        super::flatten::Kind::Int => "int",
+                        super::flatten::Kind::Ref => "ref",
+                        super::flatten::Kind::Float => "float",
+                    };
+                    let link = link_renamings.get(&kind).copied().unwrap_or(0);
+                    let ssa = ssa_copies.get(&kind).copied().unwrap_or(0);
+                    use std::fmt::Write as _;
+                    let _ = write!(&mut renaming_line, " {kind_tag}={link}/{ssa}");
+                }
+                eprintln!("[phase4-renamings] {}{}", code.obj_name, renaming_line);
+            }
+
+            // Phase 4 Session 16 (Task #227 prerequisite) — per-opname
+            // coverage probe for graph vs inline emit.  Counts ops in
+            // `graph.iterblocks().operations` (what
+            // `flatten_graph(graph, regallocs)` would walk per
+            // `flatten.py:60-100 generate_ssa_form`) and compares
+            // against `Insn::Op` count in `ssarepr.insns` (what pyre's
+            // inline walker emits today). As `record_graph_op`
+            // coverage expands one op family at a time, the
+            // graph-side count converges toward the SSA-side count
+            // for each retired family — when they match, the
+            // family's inline emit is safe to drop in favour of
+            // `flatten_graph` emission.
+            if log_enabled {
+                let graph_ops = super::regalloc::count_graph_ops_per_opname(&graph);
+                let ssa_ops = super::regalloc::count_ssa_ops_per_opname(&ssarepr);
+                let total_graph: usize = graph_ops.values().sum();
+                let total_ssa: usize = ssa_ops.values().sum();
+                eprintln!(
+                    "[phase4-graph-ops] {} graph={total_graph} ssa={total_ssa} \
+                     (graph_uniq={} ssa_uniq={})",
+                    code.obj_name,
+                    graph_ops.len(),
+                    ssa_ops.len(),
+                );
+
+                // Per-opname divergence breakdown so retirement
+                // candidates (high ssa-side count, zero graph-side
+                // count) surface directly. Skip when the obj has zero
+                // SSA emissions to avoid noise on trivial CodeObjects.
+                if total_ssa > 0 {
+                    use std::collections::HashSet;
+                    let all_opnames: HashSet<&String> =
+                        graph_ops.keys().chain(ssa_ops.keys()).collect();
+                    let mut ssa_only: Vec<(&String, usize)> = Vec::new();
+                    let mut graph_only: Vec<(&String, usize)> = Vec::new();
+                    let mut divergent: Vec<(&String, usize, usize)> = Vec::new();
+                    for opname in all_opnames {
+                        let g = graph_ops.get(opname).copied().unwrap_or(0);
+                        let s = ssa_ops.get(opname).copied().unwrap_or(0);
+                        if g == 0 && s > 0 {
+                            ssa_only.push((opname, s));
+                        } else if g > 0 && s == 0 {
+                            graph_only.push((opname, g));
+                        } else if g != s {
+                            divergent.push((opname, g, s));
+                        }
+                    }
+                    ssa_only.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                    graph_only.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                    divergent.sort_by_key(|(_, g, s)| {
+                        std::cmp::Reverse((*g as isize - *s as isize).unsigned_abs())
+                    });
+                    let format_ssa_only = ssa_only
+                        .iter()
+                        .take(8)
+                        .map(|(n, c)| format!("{n}={c}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let format_graph_only = graph_only
+                        .iter()
+                        .take(8)
+                        .map(|(n, c)| format!("{n}={c}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    let format_divergent = divergent
+                        .iter()
+                        .take(8)
+                        .map(|(n, g, s)| format!("{n}={g}/{s}"))
+                        .collect::<Vec<_>>()
+                        .join(" ");
+                    if !format_ssa_only.is_empty() {
+                        eprintln!(
+                            "[phase4-graph-ops]   {} ssa-only(top): {format_ssa_only}",
+                            code.obj_name,
+                        );
+                    }
+                    if !format_graph_only.is_empty() {
+                        eprintln!(
+                            "[phase4-graph-ops]   {} graph-only(top): {format_graph_only}",
+                            code.obj_name,
+                        );
+                    }
+                    if !format_divergent.is_empty() {
+                        eprintln!(
+                            "[phase4-graph-ops]   {} divergent(top, g/s): {format_divergent}",
+                            code.obj_name,
+                        );
+                    }
+                }
+            }
+
+            // Phase 4 Session 18 (Task #227 prerequisite) — single-family
+            // structural diff probe.  Walks `graph.iterblocks()` for one
+            // family (today: `setarrayitem_vable_r`, the family Session
+            // 17 paired all 5 walker emit sites for) and produces the
+            // `Vec<Insn>` that `flatten_graph(graph, regallocs)` would
+            // emit for it via the new `flatten_family_ops` helper.
+            // Compares position-by-position against the inline SSARepr
+            // emit (filtered to the same opname).  Both sides report the
+            // PRE-`apply_rename` SSARepr; coloring schemes differ
+            // (graph regalloc vs `RegisterLayout::compute`), so the
+            // probe ignores register indices and compares operand
+            // SHAPE only — `ConstInt`/`ConstRef`/`Register{kind}`/
+            // `ListOfKind{kind}` per arg position.
+            //
+            // Goal: answer "would `flatten_graph` produce the same
+            // `setarrayitem_vable_r` op sequence as the inline emit, in
+            // the same order, with the same operand shape?"  When the
+            // answer is yes for a family across all production
+            // CodeObjects, that family's inline emit at codewriter.rs
+            // can be retired in favour of going through `flatten_graph`
+            // end-to-end — Phase 4 Session 19 entry.
+            if log_enabled {
+                // Phase 4 Session 18 slice 6 (Task #227 prerequisite):
+                // probe runs over a list of op families instead of a
+                // single hardcoded one.  `setarrayitem_vable_r` is the
+                // family Session 17 paired all 5 walker emit sites for
+                // (and slice 4 closed the multiset-content divergence
+                // for); `setfield_vable_i` is the next candidate
+                // because `emit_vsd!` (codewriter.rs:2868) records it
+                // graph-side at every push/pop and the inline emit
+                // (`emit_vable_setfield_int!` at codewriter.rs:2903)
+                // mirrors it.  Adding more families here as the
+                // dual-write coverage expands surfaces the next
+                // retirement candidate without re-instrumenting.
+                const FAMILIES: &[&str] = &["setarrayitem_vable_r", "setfield_vable_i"];
+                for &family in FAMILIES {
+                    let parallel = super::flatten::flatten_family_ops(
+                        &graph,
+                        family,
+                        |variable: super::flow::Variable| {
+                            // Default to `Kind::Ref` for untyped Variables.
+                            // Pyre synthesises untyped Variables only at
+                            // exception edges (`exception_edge_vars`,
+                            // codewriter.rs:745) where the runtime payload is
+                            // a Ref-typed `(exc_type, exc_value)` pair.  An
+                            // earlier `unwrap_or(Kind::Int)` made these
+                            // surface as `reg_i` in the shape diff and
+                            // produced false multiset divergence on
+                            // raise_catch_loop's exception unwind path —
+                            // there is no `Kind::Int` Variable on the value
+                            // stack at any portal-bound site today.
+                            let kind = variable.kind.unwrap_or(super::flatten::Kind::Ref);
+                            let color = graph_regallocs
+                                .get(&kind)
+                                .and_then(|r| r.coloring.get(&variable.id).copied())
+                                .unwrap_or(u16::MAX);
+                            super::flatten::Register::new(kind, color)
+                        },
+                    );
+                    let inline: Vec<&super::flatten::Insn> = ssarepr
+                    .insns
+                    .iter()
+                    .filter(|insn| matches!(insn, super::flatten::Insn::Op { opname, .. } if opname == family))
+                    .collect();
+                    let common = parallel.len().min(inline.len());
+                    // Phase 4 Session 18 slice 3: dual metric.
+                    //
+                    // `sequence_match` (slice 1+2): position-by-position
+                    // shape compare.  Slice 2 surfaced a 5+5 paired-inversion
+                    // pattern on fib_recursive that proved purely
+                    // ordering-induced — graph DFS via `iterblocks()` and
+                    // walker linear order place paired sites in opposite
+                    // positions, so a per-position compare sees swap pairs
+                    // that cancel.  Sequence is the right metric for
+                    // "would `flatten_graph` produce the SAME byte
+                    // sequence as inline?", but it conflates ordering
+                    // divergence with content divergence.
+                    //
+                    // `multiset_match` (new): shape-multiset compare over
+                    // the full parallel/inline lists.  For each shape the
+                    // contribution is `min(count_in_graph, count_in_inline)`;
+                    // the sum is the order-insensitive content overlap.
+                    // This is the right metric for "do the same shapes
+                    // appear on both sides, regardless of position?".
+                    //
+                    // Reading the two together:
+                    // - `multiset_match == common` AND `sequence_match
+                    //   == common` → both content and order match.
+                    // - `multiset_match == common` AND `sequence_match
+                    //   < common` → content matches, only ORDER diverges
+                    //   (Task #227 walker iteration order vs graph DFS).
+                    // - `multiset_match < common` → real shape divergence
+                    //   exists; the pattern dump below pinpoints it.
+                    let mut shape_match = 0_usize;
+                    let mut mismatch_patterns: HashMap<(String, String), (usize, usize)> =
+                        HashMap::new();
+                    for i in 0..common {
+                        if insn_shape_matches(&parallel[i], inline[i]) {
+                            shape_match += 1;
+                        } else {
+                            let key = (shape_descriptor(&parallel[i]), shape_descriptor(inline[i]));
+                            let entry = mismatch_patterns.entry(key).or_insert((0, i));
+                            entry.0 += 1;
+                        }
+                    }
+
+                    let mut graph_shape_counts: HashMap<String, usize> = HashMap::new();
+                    for insn in &parallel {
+                        *graph_shape_counts
+                            .entry(shape_descriptor(insn))
+                            .or_insert(0) += 1;
+                    }
+                    let mut inline_shape_counts: HashMap<String, usize> = HashMap::new();
+                    for insn in &inline {
+                        *inline_shape_counts
+                            .entry(shape_descriptor(insn))
+                            .or_insert(0) += 1;
+                    }
+                    let mut multiset_match = 0_usize;
+                    for (shape, &graph_count) in &graph_shape_counts {
+                        let inline_count = inline_shape_counts.get(shape).copied().unwrap_or(0);
+                        multiset_match += graph_count.min(inline_count);
+                    }
+
+                    eprintln!(
+                        "[phase4-flatten-family] {} {family} parallel={} inline={} \
+                     sequence_match={}/{common} multiset_match={}/{common}",
+                        code.obj_name,
+                        parallel.len(),
+                        inline.len(),
+                        shape_match,
+                        multiset_match,
+                    );
+
+                    // The pattern dump is meaningful only when the multiset
+                    // shows real divergence (`multiset_match < common`).
+                    // For pure ordering divergence the per-position pairs
+                    // come in cancelling inversions — surfacing them would
+                    // suggest a problem to fix where there is none.
+                    if multiset_match < common && !mismatch_patterns.is_empty() {
+                        let mut patterns: Vec<((String, String), (usize, usize))> =
+                            mismatch_patterns.into_iter().collect();
+                        patterns.sort_by_key(|(_, (count, _))| std::cmp::Reverse(*count));
+                        let total_patterns = patterns.len();
+                        for ((graph_shape, inline_shape), (count, first_pos)) in
+                            patterns.iter().take(5)
+                        {
+                            eprintln!(
+                                "[phase4-flatten-family]   {} mismatch x{count} (first@{first_pos}): \
+                             graph={graph_shape} inline={inline_shape}",
+                                code.obj_name,
+                            );
+                        }
+                        if total_patterns > 5 {
+                            eprintln!(
+                                "[phase4-flatten-family]   {} ... and {} more pattern(s)",
+                                code.obj_name,
+                                total_patterns - 5,
+                            );
+                        }
+                    }
+                }
+            }
+
+            // Phase 4 Session 18 slice 7 (Task #227 prerequisite) —
+            // debug-mode retirement-readiness invariant for
+            // `setfield_vable_i`.  Slice 6's `[phase4-flatten-family]`
+            // probe surfaced that on every portal-bound CodeObject the
+            // graph-flattened sequence's shape multiset is a
+            // sub-multiset of the inline ssarepr-filtered sequence
+            // (orphan inline emits OK, orphan graph emits not).
+            // Promote that observation to a debug-mode invariant —
+            // **multiset-only**, not positional.  RPython's
+            // `flatten.py:60-100 generate_ssa_form` walks
+            // `block.operations` in graph DFS order, while pyre's
+            // inline walker emits at bytecode dispatch time; the two
+            // orderings can legitimately disagree on the position of
+            // a `setfield_vable_i` even when both sides emit the same
+            // shape multiset.  The surrounding `[phase4-flatten-family]`
+            // probe (codewriter.rs:5947+) already documents this
+            // divergence — the assert here MUST match the probe's
+            // tolerance, otherwise a debug build can panic on a graph
+            // that release builds accept (and that the probe correctly
+            // reports as `multiset_match == common`).  When this
+            // invariant holds across all production CodeObjects,
+            // retirement of `emit_vsd!`'s inline emit pair
+            // (`emit_load_const_i!` + `emit_vable_setfield_int!` at
+            // codewriter.rs:2902-2903) in favour of post-walk
+            // `flatten_graph(graph, regallocs)` emission becomes
+            // safe.  Release builds skip the check entirely.
+            if cfg!(debug_assertions) {
+                const FAMILY: &str = "setfield_vable_i";
+                let parallel = super::flatten::flatten_family_ops(
+                    &graph,
+                    FAMILY,
+                    |variable: super::flow::Variable| {
+                        let kind = variable.kind.unwrap_or(super::flatten::Kind::Ref);
+                        let color = graph_regallocs
+                            .get(&kind)
+                            .and_then(|r| r.coloring.get(&variable.id).copied())
+                            .unwrap_or(u16::MAX);
+                        super::flatten::Register::new(kind, color)
+                    },
+                );
+                let inline: Vec<&super::flatten::Insn> = ssarepr
+                    .insns
+                    .iter()
+                    .filter(|insn| {
+                        matches!(insn, super::flatten::Insn::Op { opname, .. } if opname == FAMILY)
+                    })
+                    .collect();
+                assert!(
+                    parallel.len() <= inline.len(),
+                    "{FAMILY} retirement-readiness invariant violated: graph emitted {} ops, \
+                     inline emitted {} ops (graph must be a sub-multiset of inline) for {}",
+                    parallel.len(),
+                    inline.len(),
+                    code.obj_name,
+                );
+                let mut inline_shape_counts: HashMap<String, usize> = HashMap::new();
+                for insn in &inline {
+                    *inline_shape_counts
+                        .entry(shape_descriptor(insn))
+                        .or_insert(0) += 1;
+                }
+                for parallel_op in &parallel {
+                    let key = shape_descriptor(parallel_op);
+                    let entry = inline_shape_counts.get_mut(&key);
+                    match entry {
+                        Some(count) if *count > 0 => *count -= 1,
+                        _ => panic!(
+                            "{FAMILY} retirement-readiness invariant violated: graph emitted \
+                             shape {key} for which inline has no remaining match in {}",
+                            code.obj_name,
+                        ),
+                    }
+                }
             }
         }
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
@@ -7400,6 +8268,62 @@ mod tests {
             .expect("catch landing should acquire a FrameState");
         assert!(catch_state.last_exception.is_some());
         assert_eq!(link_exit_states.get(&link), Some(&source_state));
+    }
+
+    #[test]
+    fn attach_catch_exception_edge_populates_target_inputargs() {
+        let code = first_nested_function_code("def f(a):\n    return a\n");
+        let mut graph = new_shadow_graph(&code);
+        let catch_block = graph.new_block(Vec::new());
+        let catch_ref = SpamBlockRef::new(catch_block.clone(), None);
+        let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
+        let local = Variable::new(VariableId(0), Kind::Ref);
+        let source_state =
+            FrameState::new(vec![Some(local.into())], Vec::new(), None, Vec::new(), 0);
+        let startblock_ref = graph.startblock.clone();
+
+        assert!(
+            catch_block.borrow().inputargs.is_empty(),
+            "catch landing block starts with no inputargs"
+        );
+
+        attach_catch_exception_edge(
+            &mut graph,
+            &startblock_ref,
+            &catch_ref,
+            &source_state,
+            &mut link_exit_states,
+        );
+
+        let inputargs = catch_block.borrow().inputargs.clone();
+        assert_eq!(
+            inputargs.len(),
+            3,
+            "expected 1 local + 2 exception Variables, got {:?}",
+            inputargs
+        );
+        assert!(
+            inputargs
+                .iter()
+                .all(|v| matches!(v, FlowValue::Variable(_))),
+            "all catch landing inputargs must be Variables, got {:?}",
+            inputargs
+        );
+
+        // model.py:114-116 Link.__init__ invariant:
+        // `len(args) == len(target.inputargs)`.  Pyre's previous
+        // `Link::new(Vec::new(), …)` + then-mutate flow bypassed
+        // this assert (the assert ran while target.inputargs was
+        // still empty, then update_catch_landing_state populated
+        // it after the fact).  The regression test pins the
+        // post-fix arity match.
+        let startblock = graph.startblock.borrow();
+        let link_borrow = startblock.exits[0].borrow();
+        assert_eq!(
+            link_borrow.args.len(),
+            inputargs.len(),
+            "Link.__init__ invariant: len(args) == len(target.inputargs)",
+        );
     }
 
     #[test]

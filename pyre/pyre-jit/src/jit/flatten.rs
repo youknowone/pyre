@@ -1217,6 +1217,129 @@ pub fn flatten_graph<F, C>(
     flattener.make_bytecode_block(graph.startblock.clone(), false);
 }
 
+/// Phase 4 Session 18 (Task #227 prerequisite) — single-family parallel
+/// flatten probe.  Walks `graph.iterblocks()` (DFS from startblock per
+/// `flowspace/model.py:66-77 FunctionGraph.iterblocks`) and emits one
+/// `Insn::Op` per `block.operations` entry whose `opname` matches
+/// `family_opname`, using `get_register` to project graph Variables onto
+/// register slots.  Constants in arg position lower through
+/// `flatten_constant_operand`.
+///
+/// **NOT a `flatten_graph` replacement.**  `rpython/jit/codewriter/
+/// flatten.py:63 flatten_graph` runs `enforce_input_args()` followed by
+/// `generate_ssa_form()` (`flatten.py:88` + `:102`); the latter walks
+/// `make_bytecode_block`/`make_link`/`insert_exits` recursively and
+/// emits the canonical `Label` per block, `make_return` /
+/// `make_exception_link` per terminator, and `insert_renamings` per
+/// link.  This helper deliberately skips ALL of that:
+///   - no `enforce_input_args` simulation (start inputarg colors are
+///     left at their raw chordal-coloring assignment, which can differ
+///     from the canonical `0, 1, 2, …` per kind),
+///   - no `Label` emission (the SSARepr would interleave block-entry
+///     labels with the family ops),
+///   - no `insert_exits` / `make_link` / `insert_renamings` (link-arg
+///     rename `*_copy` / `*_push` / `*_pop` ops are absent),
+///   - no return / exception terminator emission (`make_return`,
+///     `make_exception_link`, `reraise`, `raise`),
+///   - no `last_exception` / `last_exc_value` book-keeping.
+///
+/// The helper exists for the `[phase4-flatten-family]` probe at
+/// `codewriter.rs::transform_graph_to_jitcode` whose goal is the
+/// narrower question "does the graph carry the SAME `family_opname`
+/// op sequence the inline walker emits, in the same order and with
+/// the same operand shape, IGNORING register colors?".  Probe-positive
+/// answer is necessary but not sufficient for retirement: full
+/// retirement still requires regalloc unification (graph regalloc and
+/// SSA `RegisterLayout::compute` produce different colorings) and
+/// proper canonical `flatten_graph` plumbing including all the items
+/// above.  Tracked as Task #227 walker restructure.
+pub fn flatten_family_ops<F>(
+    graph: &super::flow::FunctionGraph,
+    family_opname: &str,
+    mut get_register: F,
+) -> Vec<Insn>
+where
+    F: FnMut(Variable) -> Register,
+{
+    let mut out = Vec::new();
+    for block in graph.iterblocks() {
+        let block = block.borrow();
+        for op in &block.operations {
+            if op.opname != family_opname {
+                continue;
+            }
+            let args: Vec<Operand> = op
+                .args
+                .iter()
+                .map(|arg| flatten_arg_for_probe(arg, &mut get_register))
+                .collect();
+            let insn = match &op.result {
+                None => Insn::op(op.opname.clone(), args),
+                Some(FlowValue::Variable(variable)) => {
+                    let reg = get_register(*variable);
+                    Insn::op_with_result(op.opname.clone(), args, reg)
+                }
+                Some(FlowValue::Constant(_)) => {
+                    // Same invariant as `flatten_space_operation`:
+                    // graph op results must be Variables.  Drop into
+                    // a no-result Op so the probe still produces a
+                    // comparable sequence rather than panicking on
+                    // unexpected graph shape.
+                    Insn::op(op.opname.clone(), args)
+                }
+            };
+            out.push(insn);
+        }
+    }
+    out
+}
+
+fn flatten_arg_for_probe<F>(arg: &super::flow::SpaceOperationArg, get_register: &mut F) -> Operand
+where
+    F: FnMut(Variable) -> Register,
+{
+    match arg {
+        super::flow::SpaceOperationArg::Value(FlowValue::Variable(v)) => {
+            Operand::Register(get_register(*v))
+        }
+        super::flow::SpaceOperationArg::Value(FlowValue::Constant(c)) => {
+            flatten_constant_operand(c)
+        }
+        super::flow::SpaceOperationArg::ListOfKind(list) => Operand::ListOfKind(ListOfKind::new(
+            list.kind,
+            list.content
+                .iter()
+                .map(|value| match value {
+                    FlowValue::Variable(v) => Operand::Register(get_register(*v)),
+                    FlowValue::Constant(c) => flatten_constant_operand(c),
+                })
+                .collect(),
+        )),
+        // `flatten.py:365-367` passes `IndirectCallTargets` through the
+        // generic flatten path unchanged.  Mirror that here so the
+        // probe sees the same operand shape inline emits would
+        // produce; `Operand::IndirectCallTargets` clones the inner
+        // `Vec<Arc<JitCode>>` (cheap Arc bumps).
+        super::flow::SpaceOperationArg::IndirectCallTargets(targets) => {
+            Operand::IndirectCallTargets((*targets.0).clone())
+        }
+        // `flatten.py:365-367` also passes `AbstractDescr` through
+        // unchanged.  Pyre's canonical `GraphFlattener::flatten_arg`
+        // (`flatten.rs:1080-1083`) panics on `SpaceOperationArg::Descr`
+        // because converting `DescrByPtr` to a concrete
+        // `DescrOperand` variant requires per-opname semantic context
+        // pyre does not yet thread.  No probed family
+        // (`setarrayitem_vable_r`, `setfield_vable_i`) carries a Descr
+        // arg today; if a future probed family does, the per-opname
+        // mapping required for canonical flatten lands first.
+        super::flow::SpaceOperationArg::Descr(_) => panic!(
+            "flatten_arg_for_probe: Descr arg requires per-opname \
+             DescrOperand mapping; no production consumer in the \
+             current probed family list"
+        ),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

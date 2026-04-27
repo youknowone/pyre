@@ -37,6 +37,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use majit_translate::jit_codewriter::flatten::reorder_renaming_list;
 use majit_translate::model::ValueId;
 use majit_translate::regalloc::DependencyGraph;
 use majit_translate::tool::algo::unionfind::UnionFind;
@@ -363,6 +364,197 @@ pub(super) fn perform_graph_register_allocation_all_kinds(
         regallocs.insert(kind, perform_graph_register_allocation(graph, kind));
     }
     regallocs
+}
+
+/// Count the `*_copy` / `*_push` / `*_pop` ops that `insert_renamings`
+/// (`rpython/jit/codewriter/flatten.py:306-334`) would emit per `Kind`
+/// across every Link in `graph`, using `regallocs[kind].coloring` to
+/// project Variables to register colors.
+///
+/// Companion to `perform_graph_register_allocation_all_kinds`: with
+/// `Block.inputargs` populated at every walker block-creation site
+/// (Phase 4 Session 14), the `link.args ↔ target.inputargs`
+/// correspondence is well-defined for every Link in the graph, so the
+/// renaming count matches the post-coalesce shape `flatten_graph` will
+/// produce when it replaces the inline `*_copy` walker emission
+/// (Task #227 Phase 4 endgame).
+///
+/// Skips the same-color pairs that upstream `insert_renamings` filters
+/// at `flatten.py:317` (`if src == RenameOperand::Register(dst):
+/// continue`) and the `last_exception` / `last_exc_value` pairs that
+/// `generate_last_exc` covers separately.
+///
+/// Observation-only — no SSARepr or graph mutation.
+pub(super) fn count_link_renamings_per_kind(
+    graph: &FlowGraph,
+    regallocs: &HashMap<Kind, GraphAllocationResult>,
+) -> HashMap<Kind, usize> {
+    // PRE-EXISTING-ADAPTATION: the `regallocs` passed in come from
+    // `perform_graph_register_allocation_all_kinds`, which runs the
+    // chordal coloring directly without simulating
+    // `enforce_input_args` (`flatten.py:88-100`).  Upstream
+    // `flatten_graph` swaps inputarg colors so the startblock's
+    // inputargs land at colors `0, 1, 2, …` per kind before
+    // `generate_ssa_form` walks links.  Pyre's probe sees the
+    // pre-swap colors, so the per-link step count it reports is a
+    // lower bound on what `flatten_graph` would actually emit when
+    // the swap shifts inputarg colors and re-introduces previously
+    // coalesced renamings.  Convergence: run `enforce_input_args`
+    // simulation here (it permutes `regallocs[kind].coloring`
+    // pairwise per `swapcolors`).  Tracked as Task #214 production
+    // wiring follow-up.
+    let mut counts: HashMap<Kind, usize> = HashMap::new();
+    for block in graph.iterblocks() {
+        let block_borrow = block.borrow();
+        for link in &block_borrow.exits {
+            let link_borrow = link.borrow();
+            let Some(target) = link_borrow.target.clone() else {
+                continue;
+            };
+            let target_inputargs = target.borrow().inputargs.clone();
+            // `model.py:114-116 Link.__init__` enforces
+            // `len(args) == len(target.inputargs)` (assert at :116).
+            // Pyre's `Link::new_mergeable` (flow.rs:797-800) carries
+            // the same assert at construction.  Mirror it here so the probe
+            // surfaces a debug-build panic if any future link-builder
+            // bypasses the constructor invariant — silently truncating
+            // via `.zip()` would under-report renaming steps.
+            debug_assert_eq!(
+                link_borrow.args.len(),
+                target_inputargs.len(),
+                "count_link_renamings_per_kind: Link.__init__ arity invariant violated \
+                 (link.args={} target.inputargs={})",
+                link_borrow.args.len(),
+                target_inputargs.len(),
+            );
+            let last_exception = link_borrow.last_exception;
+            let last_exc_value = link_borrow.last_exc_value;
+            let mut per_kind: HashMap<Kind, (Vec<Register>, Vec<Register>)> = HashMap::new();
+            for (arg, inputarg) in link_borrow.args.iter().zip(target_inputargs.iter()) {
+                let Some(src_value) = arg.as_ref() else {
+                    continue;
+                };
+                let Some(dst_var) = inputarg.as_variable() else {
+                    continue;
+                };
+                let Some(kind) = dst_var.kind else {
+                    continue;
+                };
+                let Some(regalloc) = regallocs.get(&kind) else {
+                    continue;
+                };
+                let Some(&dst_color) = regalloc.coloring.get(&dst_var.id) else {
+                    continue;
+                };
+
+                // `flatten.py:306-334 insert_renamings` calls
+                // `getcolor(v_out)` which (`flatten.py:382`) returns
+                // the source variable's color when `v_out` is a
+                // Variable, OR returns the constant itself when
+                // `v_out` is a Constant.  Constant sources can never
+                // equal a Register-typed `dst_color`, so they ALWAYS
+                // generate a renaming step (`load const into dst`)
+                // — count them as +1 step each, separate from the
+                // Variable cycle-resolution path that
+                // `reorder_renaming_list` handles.  The previous
+                // version of this probe skipped Constant args
+                // entirely, undercounting renamings whenever a Link
+                // carried a Constant into a typed inputarg.
+                if let Some(src_var) = src_value.as_variable() {
+                    let src_var_opt = Some(src_var);
+                    if src_var_opt == last_exception || src_var_opt == last_exc_value {
+                        continue;
+                    }
+                    if src_var.kind != Some(kind) {
+                        continue;
+                    }
+                    let Some(&src_color) = regalloc.coloring.get(&src_var.id) else {
+                        continue;
+                    };
+                    if src_color == dst_color {
+                        continue;
+                    }
+                    let (frm, to) = per_kind.entry(kind).or_default();
+                    frm.push(Register::new(kind, src_color));
+                    to.push(Register::new(kind, dst_color));
+                } else if src_value.as_constant().is_some() {
+                    // Constant src — always emits one renaming step.
+                    *counts.entry(kind).or_insert(0) += 1;
+                }
+            }
+            for (kind, (frm, to)) in per_kind {
+                let steps = reorder_renaming_list(&frm, &to);
+                *counts.entry(kind).or_insert(0) += steps.len();
+            }
+        }
+    }
+    counts
+}
+
+/// Count operations recorded in `graph.iterblocks().operations` per
+/// opname. This is what `flatten_graph(graph, regallocs)` would walk
+/// before emitting the SSARepr (`flatten.py:60-100 generate_ssa_form`
+/// iterates `block.operations` per reachable block). Compared against
+/// `count_ssa_ops_per_opname(ssarepr)` to quantify the gap between
+/// pyre's parallel graph (sparse `record_graph_op` coverage today) and
+/// the canonical inline-emit SSARepr the walker still produces.
+///
+/// As `record_graph_op` coverage expands one op family at a time
+/// (Task #227 Phase 4 endgame), the graph-side per-opname count
+/// converges toward the SSA-side count for each retired family. Once
+/// they match for a family, that family's inline emit is safe to
+/// drop in favour of `flatten_graph` emission.
+pub(super) fn count_graph_ops_per_opname(graph: &FlowGraph) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for block in graph.iterblocks() {
+        for op in &block.borrow().operations {
+            *counts.entry(op.opname.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Count `Insn::Op` opnames in `ssarepr.insns`. The inline-emit
+/// counterpart to `count_graph_ops_per_opname`; together they bracket
+/// the convergence target for `flatten_graph` adoption (Task #227).
+/// Skips `Insn::Label`, `Insn::Unreachable`, and `Insn::PcAnchor`
+/// (none of which are emitted by `GraphFlattener::emit_space_operation`).
+pub(super) fn count_ssa_ops_per_opname(ssarepr: &SSARepr) -> HashMap<String, usize> {
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for insn in &ssarepr.insns {
+        if let Insn::Op { opname, .. } = insn {
+            *counts.entry(opname.clone()).or_insert(0) += 1;
+        }
+    }
+    counts
+}
+
+/// Count `*_copy` opnames in `ssarepr.insns` per `Kind`. Pyre's walker
+/// emits these inline at `emit_ref_copy!` / `emit_load_const_i` /
+/// `emit_pushvalue_ref!` / `emit_popvalue_ref!` etc. for stack/local
+/// lifecycle (no upstream equivalent — RPython `flatten.py:306-334`
+/// emits `*_copy` only via `insert_renamings` at link points). The two
+/// counts are tracked separately so the walker→flatten transition
+/// (Task #227) can be quantified before flipping the canonical SSARepr
+/// source.
+pub(super) fn count_ssa_copy_ops_per_kind(ssarepr: &SSARepr) -> HashMap<Kind, usize> {
+    let mut counts: HashMap<Kind, usize> = HashMap::new();
+    for insn in &ssarepr.insns {
+        if let Insn::Op { opname, .. } = insn {
+            for &kind in &Kind::ALL {
+                let prefix = match kind {
+                    Kind::Int => "int_copy",
+                    Kind::Ref => "ref_copy",
+                    Kind::Float => "float_copy",
+                };
+                if opname == prefix {
+                    *counts.entry(kind).or_insert(0) += 1;
+                    break;
+                }
+            }
+        }
+    }
+    counts
 }
 
 /// External-input registers preserved across coloring.
@@ -1347,5 +1539,140 @@ mod tests {
         assert_eq!(alloc.find_rep(2), 3);
         assert_eq!(alloc.find_rep(4), 3);
         assert_eq!(alloc.find_rep(5), 3);
+    }
+
+    #[test]
+    fn count_link_renamings_skips_same_color_pair() {
+        // startblock(v0 Int) → returnblock(v_ret Int) via Link args=[v0].
+        // Graph regalloc coalesces v0 and v_ret to the same color (both
+        // 0), so insert_renamings would emit zero `*_copy` ops.
+        let v0 = flow_var(0, Kind::Int);
+        let v_ret = flow_var(1, Kind::Int);
+        let start = Block::shared(vec![v0.into()]);
+        let graph = FunctionGraph::new("count_renamings_same", start.clone(), Some(v_ret));
+        start.closeblock(vec![
+            Link::new(vec![v0.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+        let regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let counts = count_link_renamings_per_kind(&graph, &regallocs);
+        assert_eq!(counts.get(&Kind::Int).copied().unwrap_or(0), 0);
+        assert_eq!(counts.get(&Kind::Ref).copied().unwrap_or(0), 0);
+        assert_eq!(counts.get(&Kind::Float).copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn count_link_renamings_counts_one_step_when_colors_differ() {
+        // Synthesize a one-step renaming using a hand-built coloring
+        // map so the test pins the helper's pair-emission logic
+        // directly (without depending on coalesce/interference
+        // shapes that perform_graph_register_allocation chooses).
+        // startblock(v_src Int) → next(v_dst Int) via Link args=[v_src].
+        let v_src = flow_var(0, Kind::Int);
+        let v_dst = flow_var(1, Kind::Int);
+        let start = Block::shared(vec![v_src.into()]);
+        let mut graph = FunctionGraph::new("count_renamings_step", start.clone(), None);
+        let next = graph.new_block(vec![v_dst.into()]);
+        start.closeblock(vec![
+            Link::new(vec![v_src.into()], Some(next.clone()), None).into_ref(),
+        ]);
+        next.closeblock(vec![
+            // graph.returnblock has 1 untyped Variable as inputarg
+            // (FunctionGraph::new with `None` allocates one). Pass any
+            // FlowValue; the helper skips untyped dst pairs at the
+            // `dst_var.kind` short-circuit.
+            Link::new(vec![v_dst.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        let mut coloring = HashMap::new();
+        coloring.insert(v_src.id, 0u16);
+        coloring.insert(v_dst.id, 1u16);
+        let mut regallocs: HashMap<Kind, GraphAllocationResult> = HashMap::new();
+        regallocs.insert(
+            Kind::Int,
+            GraphAllocationResult {
+                coloring,
+                num_colors: 2,
+            },
+        );
+        // Empty per-kind entries for Ref/Float so the helper's
+        // `regallocs.get(&kind)` short-circuits cleanly.
+        regallocs.insert(
+            Kind::Ref,
+            GraphAllocationResult {
+                coloring: HashMap::new(),
+                num_colors: 0,
+            },
+        );
+        regallocs.insert(
+            Kind::Float,
+            GraphAllocationResult {
+                coloring: HashMap::new(),
+                num_colors: 0,
+            },
+        );
+
+        let counts = count_link_renamings_per_kind(&graph, &regallocs);
+        // Single (v_src@0 → v_dst@1) pair: no cycle, one `int_copy` step.
+        assert_eq!(counts.get(&Kind::Int).copied().unwrap_or(0), 1);
+        assert_eq!(counts.get(&Kind::Ref).copied().unwrap_or(0), 0);
+        assert_eq!(counts.get(&Kind::Float).copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn count_graph_ops_per_opname_aggregates_across_blocks() {
+        // Graph with 2 reachable blocks; each block carries
+        // SpaceOperations that the helper aggregates by opname.
+        let v0 = flow_var(0, Kind::Int);
+        let start = Block::shared(vec![v0.into()]);
+        let mut graph = FunctionGraph::new("graph_ops_count", start.clone(), Some(v0));
+        push_op(&start, SpaceOperation::new("foo", vec![v0.into()], None, 0));
+        push_op(&start, SpaceOperation::new("bar", vec![v0.into()], None, 0));
+        let mid = graph.new_block(vec![v0.into()]);
+        start.closeblock(vec![
+            Link::new(vec![v0.into()], Some(mid.clone()), None).into_ref(),
+        ]);
+        push_op(&mid, SpaceOperation::new("foo", vec![v0.into()], None, 0));
+        mid.closeblock(vec![
+            Link::new(vec![v0.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+        let counts = count_graph_ops_per_opname(&graph);
+        assert_eq!(counts.get("foo").copied().unwrap_or(0), 2);
+        assert_eq!(counts.get("bar").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("baz").copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn count_ssa_ops_per_opname_aggregates_insns() {
+        let mut ssarepr = SSARepr::new("ssa_ops_count");
+        ssarepr.insns.push(op_use("foo", vec![]));
+        ssarepr.insns.push(op_use("foo", vec![]));
+        ssarepr.insns.push(op_use("bar", vec![]));
+        let counts = count_ssa_ops_per_opname(&ssarepr);
+        assert_eq!(counts.get("foo").copied().unwrap_or(0), 2);
+        assert_eq!(counts.get("bar").copied().unwrap_or(0), 1);
+        assert_eq!(counts.get("baz").copied().unwrap_or(0), 0);
+    }
+
+    #[test]
+    fn count_ssa_copy_ops_aggregates_per_kind() {
+        let mut ssarepr = SSARepr::new("count_copy_ops");
+        ssarepr.insns.push(op_def(
+            "int_copy",
+            vec![Operand::ConstInt(7)],
+            r(Kind::Int, 0),
+        ));
+        ssarepr
+            .insns
+            .push(op_def("int_copy", vec![reg(Kind::Int, 0)], r(Kind::Int, 1)));
+        ssarepr
+            .insns
+            .push(op_def("ref_copy", vec![reg(Kind::Ref, 0)], r(Kind::Ref, 1)));
+        ssarepr
+            .insns
+            .push(op_use("ref_return", vec![reg(Kind::Ref, 1)]));
+        let counts = count_ssa_copy_ops_per_kind(&ssarepr);
+        assert_eq!(counts.get(&Kind::Int).copied().unwrap_or(0), 2);
+        assert_eq!(counts.get(&Kind::Ref).copied().unwrap_or(0), 1);
+        assert_eq!(counts.get(&Kind::Float).copied().unwrap_or(0), 0);
     }
 }
