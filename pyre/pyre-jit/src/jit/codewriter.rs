@@ -2666,18 +2666,13 @@ impl CodeWriter {
         static INIT_COMPILE_CALLBACK: std::sync::Once = std::sync::Once::new();
         INIT_COMPILE_CALLBACK.call_once(|| {
             pyre_jit_trace::set_compile_jitcode_fn(compile_jitcode_via_w_code);
-            // G.4.3a-fix Issue 1 KNOWN-INCOMPLETE: the matching
-            // `set_register_portal_bridge_fn` registration is
-            // intentionally NOT wired here. Empirically a
-            // direct CallControl insert of the portal-bridge Arc
-            // breaks `PYRE_PORTAL_REDIRECT=1` (5 benches timeout —
-            // CallControl readers expect `is_populated()` and loop
-            // on portal-bridge skeletons). Closing this requires
-            // co-evolving every CallControl reader to handle
-            // portal-bridge entries (Phase G.4.4 territory).  The
-            // helper `register_portal_bridge_in_callcontrol` below
-            // stays in place as the wire-up function the eventual
-            // landing will register.
+            // G.4.4 shared-identity hook is intentionally not registered yet.
+            // `state::jitcode_for`'s portal-bridge path cannot safely insert
+            // into `CallControl.jitcodes` until blackhole resume can translate
+            // a user Python PC to the corresponding canonical portal jitcode
+            // PC. Registering this hook early makes `find_jitcode(code)` hit a
+            // portal-bridge entry with an empty `pc_map`, which regresses the
+            // resume path documented at `state.rs:679`.
         });
         Self {
             assembler: RefCell::new(Assembler::new()),
@@ -6868,15 +6863,18 @@ impl CodeWriter {
         pyre_jit_trace::state::setup_indirectcalltargets(targets);
     }
 
-    /// call.py:148 `jd.mainjitcode.jitdriver_sd = jd` — propagate the
-    /// jdindex from `CallControl.jitdrivers_sd` onto each portal's
-    /// inner `JitCode.jitdriver_sd`. RPython mutates the same Python
-    /// `JitCode` object the dict references; pyre uses
-    /// `Arc::get_mut` on the freshly-installed `Arc<PyJitCode>` (and
-    /// the inner `Arc<JitCode>`) for the same effect. Idempotent — a
-    /// later `make_jitcodes` call may find the `Arc` already cloned
-    /// into `MetaInterpStaticData.jitcodes` and skip the assignment;
-    /// the previously-set value still holds.
+    /// call.py:147-148 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`
+    /// + `jd.mainjitcode.jitdriver_sd = jd` — propagate the jdindex
+    /// from `CallControl.jitdrivers_sd` onto each portal's inner
+    /// `JitCode.jitdriver_sd` and bind the same `Arc<PyJitCode>` to
+    /// `jd.mainjitcode`.  RPython mutates the same Python `JitCode`
+    /// object the dict references; pyre uses `Arc::get_mut` on the
+    /// freshly-installed `Arc<PyJitCode>` (and the inner
+    /// `Arc<JitCode>`) for the same effect.  Idempotent — a later
+    /// `make_jitcodes` call may find the `Arc` already cloned into
+    /// `MetaInterpStaticData.jitcodes` and skip the inner mutation;
+    /// the previously-set values still hold and `jd.mainjitcode` is
+    /// re-bound to the (still identical) `Arc`.
     fn assign_portal_jitdriver_indices(&self) {
         let cc = self.callcontrol();
         // Snapshot the (key, jdindex) pairs first so the borrow on
@@ -6888,12 +6886,16 @@ impl CodeWriter {
             .map(|(idx, jd)| (super::call::CallControl::jitcode_key(jd.portal_graph), idx))
             .collect();
         for (key, idx) in assignments {
-            if let Some(arc) = cc.jitcodes.get_mut(&key) {
+            let arc_clone = cc.jitcodes.get_mut(&key).map(|arc| {
                 if let Some(pyjitcode) = std::sync::Arc::get_mut(arc) {
                     if let Some(inner) = std::sync::Arc::get_mut(&mut pyjitcode.jitcode) {
                         inner.jitdriver_sd = Some(idx);
                     }
                 }
+                std::sync::Arc::clone(arc)
+            });
+            if let Some(clone) = arc_clone {
+                cc.jitdrivers_sd[idx].mainjitcode = Some(clone);
             }
         }
     }
@@ -6990,6 +6992,7 @@ pub fn register_portal_jitdriver(
         portal_graph: code as *const pyre_interpreter::CodeObject,
         w_code,
         merge_point_pc,
+        mainjitcode: None,
     });
     // codewriter.py:74 `make_jitcodes()` — drain everything pending.
     //
@@ -7031,9 +7034,14 @@ pub fn compile_jitcode_for_callee(code: &pyre_interpreter::CodeObject, w_code: *
     // flag-ON.  An empirical probe (G.4.4 attempt, 2026-04-26)
     // returning early here under `PYRE_PORTAL_REDIRECT=1` regressed
     // flag-ON from 12/14 to 6/14 because the trace path immediately
-    // hit the missing per-CodeObject `pc_map` / liveness.  Closing
-    // this requires the same encoder/decoder co-evolution chain
-    // tracked on `register_portal_jitdriver`'s drain comment.
+    // hit the missing per-CodeObject `pc_map` / liveness.
+    //
+    // G.4.4-encoder closure (2026-04-28) was expected to unblock this
+    // re-attempt but a re-run under PYRE_PORTAL_REDIRECT=1 with this
+    // gate flipped regressed cranelift fannkuch to `crash (exit 101)`,
+    // showing additional reader paths beyond the encoder still depend
+    // on per-CodeObject jitcodes.  Closing this requires further
+    // co-evolution of the readers identified by the future audit.
     let writer = CodeWriter::instance();
     // call.py:155 `get_jitcode(graph)` — insert skeleton + queue.
     let _ = writer.callcontrol().get_jitcode(code, w_code, None);
@@ -7085,35 +7093,23 @@ fn compile_jitcode_via_w_code(w_code: *const ()) -> Option<std::sync::Arc<PyJitC
         .find_compiled_jitcode_arc(code as *const _)
 }
 
-/// G.4.3a-fix Issue 1 callback (KNOWN-INCOMPLETE — currently NOT
-/// registered): insert a freshly-installed portal-bridge `Arc<PyJitCode>`
-/// into `CallControl.jitcodes` so blackhole resume's
-/// `CallControl::find_jitcode` / `find_compiled_jitcode_arc` lookups
-/// (`pyre/pyre-jit/src/jit/call.rs:236,266`) find the same entry the
-/// trace-side `MetaInterpStaticData.jitcodes` stores.
+/// Future `call.py:145-148` shared-identity bridge — insert the
+/// freshly-installed portal-bridge `Arc<PyJitCode>` into
+/// `CallControl.jitcodes` so blackhole resume's `find_jitcode(code)` /
+/// `find_compiled_jitcode_arc(code)` lookups find the same entry the
+/// trace-side `MetaInterpStaticData.jitcodes` stores. Mirrors the upstream
+/// `jd.mainjitcode = self.get_jitcode(...)` two-step: the `get_jitcode`
+/// insert + `make_jitcodes` drain in upstream populate both stores with
+/// refcount-shared `JitCode` objects; pyre's split-store layout requires
+/// explicit Arc duplication via this hook.
 ///
-/// Designed to wire through `pyre_jit_trace::set_register_portal_bridge_fn`
-/// from `CodeWriter::new()` once per process — same lazy-init pattern as
-/// `set_compile_jitcode_fn` for `compile_jitcode_via_w_code`.
+/// Kept as the registration target for the eventual portal-resume fix. It is
+/// not wired from `CodeWriter::new()` yet because redirect-ON blackhole resume
+/// still needs a portal-bridge PC translation before CallControl readers can
+/// safely observe these entries.
 ///
-/// **Why not registered**: empirically (G.4.3a parity-fix probe,
-/// 2026-04-26) wiring this callback regressed
-/// `PYRE_PORTAL_REDIRECT=1` from 12/14 to 8/14 with 5 simple benches
-/// timing out (>5s).  Every CallControl reader downstream of
-/// `find_jitcode` (`call_jit.rs:794,1670`,
-/// `compile_jitcode_via_w_code:5745`) still expects an
-/// `is_populated()` per-CodeObject entry and falls into compile loops
-/// on portal-bridge skeletons.
-///
-/// **Convergence path**: Phase G.4.4 (per-CodeObject jitcode emit
-/// no-op) co-evolves every CallControl reader to handle portal-bridge
-/// entries, the same direction `install_portal_for` itself moves.  At
-/// that point this callback is enabled and the upstream
-/// `call.py:147` `mainjitcode = self.get_jitcode(jd.portal_graph)` ⇄
-/// `metainterp_sd.jitcodes[]` shared-identity invariant is restored.
-///
-/// `w_code` is the `W_CodeObject` wrapper pointer; the wrapper's
-/// underlying `CodeObject` raw pointer is the dict key used by
+/// `w_code` is the `W_CodeObject` wrapper pointer; the wrapper's underlying
+/// `CodeObject` raw pointer is the dict key used by
 /// `compile_jitcode_for_callee` and matches what `find_jitcode(code)`
 /// resolves at resume time.
 #[allow(dead_code)]
@@ -8826,11 +8822,13 @@ mod tests {
             portal_graph: &code as *const _,
             w_code: w_code as *const (),
             merge_point_pc: None,
+            mainjitcode: None,
         });
         writer.setup_jitdriver(crate::jit::call::JitDriverStaticData {
             portal_graph: raw_code,
             w_code: w_code as *const (),
             merge_point_pc: Some(7),
+            mainjitcode: None,
         });
 
         let cc = writer.callcontrol();

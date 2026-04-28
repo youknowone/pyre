@@ -6521,12 +6521,6 @@ impl Repr for MethodsPBCRepr {
     /// Body delegates to `InstanceRepr.convert_const` for the bound-self
     /// arm; the `None` arm returns a null pointer typed at
     /// `self.lowleveltype` (= `r_im_self.lowleveltype`).
-    ///
-    /// `InstanceRepr.convert_const` itself surfaces a partial port today
-    /// — the exact-match common case (`convert_const_exact`) is gated
-    /// on the `iprebuiltinstances` cache + full
-    /// `initialize_prebuilt_data` body. Subclass-delegate / null-instance
-    /// arms work end-to-end.
     fn convert_const(&self, value: &ConstValue) -> Result<Constant, TyperError> {
         // upstream: `if method is None: return nullptr(self.lowleveltype.TO)`.
         //   `self.lowleveltype == r_im_self.lowleveltype`, so reuse

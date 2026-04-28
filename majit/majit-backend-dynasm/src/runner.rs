@@ -903,6 +903,13 @@ impl DynasmBackend {
         arch::JITFRAME_FIXED_SIZE + position
     }
 
+    /// llsupport/regalloc.py:861-871 `_set_initial_bindings` parity:
+    /// `_ll_initial_locs` stores `loc.value - base_ofs`, measured in bytes
+    /// from `FIRST_ITEM_OFFSET`, not input-order slot numbers.
+    fn input_initial_loc(position: usize) -> i32 {
+        (Self::input_slot(position) * crate::jitframe::SIZEOFSIGNED) as i32
+    }
+
     /// llmodel.py:412 get_latest_descr parity: resolve a raw jf_descr
     /// pointer to its Arc<DynasmFailDescr>. Searches root loop
     /// fail_descrs first, then all bridge fail_descrs stored in
@@ -1197,16 +1204,15 @@ impl DynasmBackend {
         let pending_clt = Arc::new(majit_backend::CompiledLoopToken::new(token_number));
         // `regalloc.py:861-871` `_set_initial_bindings`: each input lands at
         // `loc.value - base_ofs = (JITFRAME_FIXED_SIZE + i) * SIZEOFSIGNED` —
-        // the same formula `compile_loop` finalisation applies via
-        // `Self::input_slot`. Self-recursive CALL_ASSEMBLER registers this
-        // stub before its own trace finalises, so the rewriter's
+        // the same formula `Self::input_initial_loc` uses when finalising
+        // a real compile. Self-recursive CALL_ASSEMBLER registers this stub
+        // before its own trace finalises, so the rewriter's
         // `handle_call_assembler` reads these pending offsets to emit the
         // callee inputarg `GcStore`s; if they omit the JITFRAME_FIXED_SIZE
         // shift the stores land in the managed-register save area and the
         // callee enters with NULL inputs.
-        *pending_clt._ll_initial_locs.lock() = (0..num_inputs)
-            .map(|i| (Self::input_slot(i) * crate::jitframe::SIZEOFSIGNED) as i32)
-            .collect();
+        *pending_clt._ll_initial_locs.lock() =
+            (0..num_inputs).map(Self::input_initial_loc).collect();
         CALL_ASSEMBLER_TARGETS
             .lock()
             .expect("CALL_ASSEMBLER_TARGETS poisoned")
@@ -1289,13 +1295,12 @@ impl Backend for DynasmBackend {
                 .lock()
                 .update_frame_depth(baseofs, frame_depth);
             // `llsupport/regalloc.py:861-871` `_set_initial_bindings` —
-            // pyre lays inputargs at contiguous word slots in the frame
-            // array, so loc.value - base_ofs = i * SIZEOFSIGNED for
-            // inputarg i. The list length must match `inputargs.len()`
-            // so `handle_call_assembler` (rewrite.py:673) can index it.
-            let locs: Vec<i32> = (0..inputargs.len())
-                .map(|i| (i as i32) * (crate::jitframe::SIZEOFSIGNED as i32))
-                .collect();
+            // each input lands at `loc.value - base_ofs =
+            // (JITFRAME_FIXED_SIZE + i) * SIZEOFSIGNED` so the GcStores
+            // synthesized by `handle_call_assembler` (rewrite.py:673)
+            // hit the actual input slots, not the managed-register save
+            // area at the head of `jf_frame`.
+            let locs: Vec<i32> = (0..inputargs.len()).map(Self::input_initial_loc).collect();
             *clt._ll_initial_locs.lock() = locs;
         }
         // `x86/assembler.py:599` `looptoken._ll_function_addr =

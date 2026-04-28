@@ -2307,13 +2307,18 @@ impl InstanceRepr {
     /// root (`classdef is None`) writes the `typeptr` slot to point at
     /// the leaf-class's vtable via `getclassrepr(rtyper, classdef)`.
     ///
-    /// Pyre-port deviations:
+    /// Pyre-port adaptations:
     /// - `value` is the live HostObject (or `None` for the upstream
-    ///   `Ellipsis` sentinel meaning "use defaults").
-    /// - The non-root branch's `getattr(value, name)` HostObject probe
-    ///   is deferred — exception classes have no readonly attrs in
-    ///   the standardexceptions set, so the field-init loop is a no-op
-    ///   for the immediate consumer.
+    ///   `Ellipsis` sentinel meaning "use defaults"). The Ellipsis
+    ///   path skips the live `instance_get` probe and falls through
+    ///   straight to `read_attribute` → `_defl`.
+    /// - Upstream's `try: getattr(value, name) except AttributeError:`
+    ///   is split into an explicit `host.instance_get(name)` lookup
+    ///   on the per-instance `__dict__` followed by the same
+    ///   `read_attribute(name, None)` → `_defl` cascade upstream uses
+    ///   inside the except branch — see the body block at
+    ///   `for (name, ...) in &fields_snapshot` below for the full
+    ///   try/except mirror.
     pub fn initialize_prebuilt_data(
         &self,
         _value: Option<&HostObject>,
@@ -2554,37 +2559,25 @@ impl InstanceRepr {
         }
         // upstream: `self.setup()`. Repr::setup is idempotent.
         Repr::setup(self.as_ref() as &dyn Repr)?;
-        // upstream rclass.py:810-811 — `result = self.create_instance();
-        // self._reusable_prebuilt_instance = result` BEFORE calling
-        // `initialize_prebuilt_data`. Pyre's `_ptr` is value-typed
-        // (Clone deep-copies the underlying `_obj0`), so we cannot keep
-        // an aliased handle outside the cache. Instead we move the
-        // pointer into the cache up front, then mutate it through a
-        // brief `borrow_mut` for the duration of `initialize_prebuilt_data`.
-        // This matches upstream's "cache visible mid-init" semantics
-        // for the no-recursion case (`get_standard_ll_exc_instance`).
+        // upstream rclass.py:810-813:
+        //     result = self.create_instance()
+        //     self._reusable_prebuilt_instance = result
+        //     self.initialize_prebuilt_data(Ellipsis, self.classdef, result)
+        //     return result
+        //
+        // Pyre clones `result` into the cache; the cached clone and the
+        // init target (`local`, the moved original) share
+        // `_struct._fields` / `_array.items` via `Arc<Mutex<...>>`
+        // (lltype.rs:711-748, task #157), so mutations applied by
+        // `initialize_prebuilt_data` are visible through
+        // `_reusable_prebuilt_instance` for the no-recursion case
+        // (`get_standard_ll_exc_instance`). The cache `borrow_mut` is
+        // dropped before init runs.
         let result = self.create_instance()?;
-        *self.reusable_prebuilt_instance.borrow_mut() = Some(result);
-        // initialize_prebuilt_data may walk rbase but never re-enters
-        // the same InstanceRepr's prebuilt cache, so holding the
-        // `borrow_mut` for the call is safe today.
-        {
-            let mut cache = self.reusable_prebuilt_instance.borrow_mut();
-            let result_in_cache = cache.as_mut().expect("cache slot just inserted");
-            self.initialize_prebuilt_data(None, self.classdef.as_ref(), result_in_cache, &[])?;
-        }
-        // Clone the cached entry for return — observationally
-        // identical to returning `result` directly upstream.
-        let cached = self
-            .reusable_prebuilt_instance
-            .borrow()
-            .clone()
-            .ok_or_else(|| {
-                TyperError::message(
-                    "InstanceRepr.get_reusable_prebuilt_instance: cache disappeared mid-init",
-                )
-            })?;
-        Ok(cached)
+        *self.reusable_prebuilt_instance.borrow_mut() = Some(result.clone());
+        let mut local = result;
+        self.initialize_prebuilt_data(None, self.classdef.as_ref(), &mut local, &[])?;
+        Ok(local)
     }
 }
 

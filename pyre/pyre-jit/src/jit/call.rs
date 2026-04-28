@@ -73,7 +73,7 @@ impl CallInfoCollection {
 /// the Python PC of the `MERGE_POINT` opcode the first trace through
 /// the portal reveals (RPython has no analog because portal PCs are
 /// statically known at flow-graph time).
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub struct JitDriverStaticData {
     /// RPython: `JitDriverStaticData.portal_graph`. The CodeObject
     /// the portal_runner enters when `get_jitcode(jd.portal_graph)`
@@ -106,6 +106,15 @@ pub struct JitDriverStaticData {
     /// the same merge-point PC the runtime registered — see plan
     /// "Risk Assessment" row 3.
     pub merge_point_pc: Option<usize>,
+    /// RPython: `JitDriverStaticData.mainjitcode`
+    /// (`call.py:147` `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`
+    /// left-hand side).  Populated by
+    /// [`super::super::codewriter::CodeWriter::make_jitcodes`] after
+    /// the drain via `assign_portal_jitdriver_indices` — the same
+    /// `Arc<PyJitCode>` `CallControl.jitcodes[graph]` holds.  Stays
+    /// `None` until `make_jitcodes` runs (RPython mirrors this with
+    /// `jd.mainjitcode = None` until `grab_initial_jitcodes` fires).
+    pub mainjitcode: Option<std::sync::Arc<PyJitCode>>,
 }
 
 impl JitDriverStaticData {
@@ -223,16 +232,32 @@ impl CallControl {
     ///     jd.mainjitcode.jitdriver_sd = jd
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's `PyJitCode` does not carry the
-    /// `mainjitcode.jitdriver_sd = jd` back-reference (call.py:148)
-    /// because no runtime path reads it — `CallControl.jitcodes`
-    /// already provides the lookup the runtime needs. The iteration
-    /// itself matches RPython exactly.
+    /// PARITY (deferred): the back-reference at call.py:148
+    /// `jd.mainjitcode.jitdriver_sd = jd` is set after the drain by
+    /// `CodeWriter::assign_portal_jitdriver_indices` (called from
+    /// `make_jitcodes`), so each portal's inner
+    /// `JitCode.jitdriver_sd: Option<usize>` ends up with its
+    /// position in `CallControl.jitdrivers_sd` — deferring the
+    /// assignment matches the actual jdindex instead of hardcoding
+    /// `Some(0)`. The runtime reads the flag at
+    /// `pyre-jit-trace::jitcode_runtime::PORTAL_JITCODE_INDEX`,
+    /// which panics on a second hit so the upstream "exactly one
+    /// jitcode per `JitDriverStaticData` carries the flag"
+    /// invariant is enforced.
+    ///
+    /// PARITY: `JitDriverStaticData.mainjitcode` (call.py:147 left-hand
+    /// side) is now an explicit field; this iteration only inserts the
+    /// skeleton via `get_jitcode`, with the actual `Arc<PyJitCode>`
+    /// bound onto `jd.mainjitcode` later in
+    /// `CodeWriter::assign_portal_jitdriver_indices` (after the drain
+    /// has populated the entry).  The iteration itself matches RPython
+    /// exactly.
     pub fn grab_initial_jitcodes(&mut self) {
         // Index loop because get_jitcode borrows `self.jitcodes`
         // mutably, which would conflict with an immutable borrow over
-        // `self.jitdrivers_sd`. The values are Copy so the snapshot
-        // is cheap.
+        // `self.jitdrivers_sd`. The fields snapshotted below
+        // (`portal_graph`, `w_code`, `merge_point_pc`) are all `Copy`,
+        // so the per-iteration field reads stay cheap.
         for i in 0..self.jitdrivers_sd.len() {
             let portal_graph = self.jitdrivers_sd[i].portal_graph;
             let w_code = self.jitdrivers_sd[i].w_code;

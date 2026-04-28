@@ -569,32 +569,46 @@ pub fn set_compile_jitcode_fn(f: CompileJitcodeFn) {
     COMPILE_JITCODE_FN.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
 }
 
-/// G.4.3a-fix Issue 1 callback: hand a freshly-installed portal-bridge
-/// `Arc<PyJitCode>` to `pyre-jit::CallControl` so its `.jitcodes`
-/// dictionary holds the SAME allocation as `MetaInterpStaticData
-/// .jitcodes`.  Mirrors the upstream `call.py:147` `jd.mainjitcode =
-/// self.get_jitcode(jd.portal_graph)` invariant where the two stores
-/// share Python `JitCode` objects via refcount semantics; pyre's
-/// `find_jitcode_arc` (`pyre-jit/src/jit/call.rs:246`) is the Rust
-/// analog and the comment there explicitly pins this shared-Arc
-/// expectation.
+/// Future `call.py:147` invariant bridge: hand a freshly-installed
+/// portal-bridge `Arc<PyJitCode>` to `pyre-jit::CallControl` so its
+/// `.jitcodes` dictionary holds the SAME allocation as
+/// `MetaInterpStaticData.jitcodes`.
+/// Mirrors upstream `call.py:145-148`:
 ///
-/// Why a callback instead of direct call: `pyre-jit-trace` cannot
-/// depend on `pyre-jit` (the dependency runs the other way), so the
-/// CallControl insert lives on the pyre-jit side and is wired through
-/// a fn-pointer hook the same way `COMPILE_JITCODE_FN` is.
+/// ```python
+/// for jd in self.jitdrivers_sd:
+///     jd.mainjitcode = self.get_jitcode(jd.portal_graph)
+///     jd.mainjitcode.jitdriver_sd = jd
+/// ```
+///
+/// where `get_jitcode` inserts the JitCode object into
+/// `CallControl.jitcodes` while the surrounding `make_jitcodes` drain
+/// populates `metainterp_sd.jitcodes` — both stores hold the same Python
+/// `JitCode` object via refcount semantics. Pyre's split-store layout
+/// requires an explicit callback once redirect-ON resume readers can safely
+/// consume portal-bridge entries.
+///
+/// PRE-EXISTING-ADAPTATION: pyre splits `pyre-jit-trace` (lower in the
+/// crate DAG) from `pyre-jit` (upper). RPython directly indexes
+/// `CallControl.jitcodes[graph]` (`call.py:155`) from `jtransform.py`
+/// because both live in the same Python module post-translation. The
+/// forward function pointer is the minimum-adaptation Rust workaround
+/// for the crate-layering split.
 ///
 /// The arguments mirror the per-CodeObject path's call shape: the
 /// `*const ()` is the `W_CodeObject` wrapper pointer used as the dict
-/// key (`compile_jitcode_via_w_code` → `compile_jitcode_for_callee`
-/// derives `raw_code` and inserts at `raw_code as usize`); the `Arc`
-/// is the install_portal_for output that should be cloned into both
-/// stores.
+/// key (`compile_jitcode_for_callee` derives `raw_code` and inserts at
+/// `raw_code as usize`); the `Arc` is the `install_portal_for` output
+/// that should be cloned into both stores.
 pub type RegisterPortalBridgeFn = fn(*const (), std::sync::Arc<crate::PyJitCode>);
 
 static REGISTER_PORTAL_BRIDGE_FN: std::sync::atomic::AtomicPtr<()> =
     std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
 
+/// Registration hook for the future portal-bridge shared-identity fix.
+/// `CodeWriter::new()` intentionally leaves it unset today; `jitcode_for`
+/// must not call through until blackhole resume can translate a user Python
+/// PC to the corresponding canonical portal jitcode PC.
 pub fn set_register_portal_bridge_fn(f: RegisterPortalBridgeFn) {
     REGISTER_PORTAL_BRIDGE_FN.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
 }
@@ -661,24 +675,32 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
         // whose `metadata` is empty. Readers that follow this path
         // observe `PyJitCode::is_portal_bridge() == true`.
         //
-        // KNOWN-INCOMPLETE Issue 1 (G.4.3a parity audit, 2026-04-26):
-        // upstream `call.py:147` requires
-        // `MetaInterpStaticData.jitcodes` ⇄ `CallControl.jitcodes` to
-        // hold the same Python `JitCode` objects via refcount semantics,
-        // but the redirect-ON path here installs into the SD only.
-        // Empirically (G.4.3a parity-fix probe) routing the
-        // freshly-installed `Arc<PyJitCode>` into CallControl via the
-        // `set_register_portal_bridge_fn` callback regressed
-        // `PYRE_PORTAL_REDIRECT=1` from 12/14 to 8/14 with 5 simple
-        // benches timing out (>5s) — every CallControl reader still
-        // expects a per-CodeObject `is_populated()` entry and falls
-        // into compile loops on portal-bridge skeletons.  The proper
-        // closure is co-evolving every CallControl reader to handle
-        // portal-bridge entries (Phase G.4.4+ multi-session), the same
-        // direction as install_portal_for itself.  The
-        // `RegisterPortalBridgeFn` API and `set_register_portal_bridge_fn`
-        // hook are kept in `state.rs` so the eventual G.4.4 land can
-        // wire it without re-inventing the callback shape.
+        // KNOWN-INCOMPLETE Issue 1 (`call.py:145-148` shared-identity):
+        // upstream installs the same Python `JitCode` object into both
+        // `MetaInterpStaticData.jitcodes` and `CallControl.jitcodes`
+        // (refcount semantics).  Pyre's split-store layout would
+        // require cloning the Arc into both via the registered
+        // `REGISTER_PORTAL_BRIDGE_FN` callback below — empirically
+        // wiring that callback while readers `pyjitcode.metadata
+        // .pc_map[py_pc]` (call_jit.rs:818, 1856) still bounds-check
+        // against an empty pc_map regresses `PYRE_PORTAL_REDIRECT=1`
+        // 13/14 → 9/14 (most benches fall into invalidate loops).
+        // Setting `jitcode_pc = 0` for portal-bridge entries also
+        // failed empirically (4/14) — BH at pc 0 of the canonical
+        // portal jitcode does not match the trace's own resume
+        // snapshot pc, which encodes a specific dispatch-arm offset.
+        //
+        // Closing this requires either (a) routing portal-bridge
+        // resume through the snapshot's frames[i].pc directly (skip
+        // the `find_jitcode → pc_map` translation entirely) or
+        // (b) populating per-PC portal jitcode pc on the portal-
+        // bridge metadata, which requires understanding the
+        // canonical portal jitcode's bytecode layout per dispatch
+        // arm.  Either path is its own multi-session slice.
+        // The callback infrastructure is registered (so the wire-up
+        // is one branch flip away) but not invoked here until that
+        // resume design lands.  Tracked in
+        // `g4_4_drain_audit_2026_04_28.md`.
         let raw_code = unsafe {
             pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
                 as *const pyre_interpreter::CodeObject
@@ -972,6 +994,26 @@ pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
             return Vec::new();
         };
         let payload = &jc.payload;
+        // G.4.4 portal-bridge fallback (symmetric with frame_value_count_at:803
+        // and trace_opcode.rs:642 get_list_of_active_boxes encoder):
+        // portal-bridge installs leave `metadata.pc_map` empty and emit a
+        // positional Ref-typed box list of length
+        // `stack_base + depth_at_py_pc[pc]` covering locals + cells + the
+        // live operand stack tail. Color map is identity (no regalloc for
+        // portal-bridge), so `reg_idx == slot index` for each box.
+        // Without this fallback, `setup_bridge_sym`'s `reg_indices.len() ==
+        // frame.values.len()` assert fires on every guard exit out of a
+        // portal-bridge trace.
+        if payload.is_portal_bridge() {
+            let depth = payload
+                .metadata
+                .depth_at_py_pc
+                .get(pc as usize)
+                .copied()
+                .unwrap_or(0) as usize;
+            let total = payload.metadata.stack_base + depth;
+            return (0..total as u32).collect();
+        }
         let Some(&jit_pc) = payload.metadata.pc_map.get(pc as usize) else {
             return Vec::new();
         };
@@ -1363,6 +1405,30 @@ pub struct PyreSym {
     pub(crate) vable_w_globals: OpRef,
     #[vable(array_base)]
     pub(crate) vable_array_base: Option<u32>,
+    /// True when this frame's `locals_cells_stack_w` array IS the active
+    /// virtualizable shadow for the current trace — i.e. when reads /
+    /// writes against this frame's locals must consult / mutate
+    /// `TraceCtx::virtualizable_boxes` (RPython `metainterp
+    /// .virtualizable_boxes`, pyjitpl.py:1230) instead of going through
+    /// regular MIFrame `registers_X`.
+    ///
+    /// Invariant: `is_active_vable_owner == vable_array_base.is_some()`.
+    /// The boolean predicate (this field) and the u32 OpRef-offset (the
+    /// `Option<u32>` value of `vable_array_base`) are split because their
+    /// semantic roles differ: the predicate decides "consult vable
+    /// shadow vs. registers", while the offset is only used as a
+    /// fallback OpRef synthesizer at `trace_opcode.rs:1248` when the
+    /// metainterp-scope shadow is not yet populated. RPython has neither
+    /// per-frame state — the codewriter emits `getarrayitem_vable`
+    /// opcodes only on the toplevel frame's bytecode. Pyre dispatches
+    /// the same `load_local_value` for all frames, so we encode the
+    /// "active vable owner" identity per-frame.
+    ///
+    /// Helpers `become_active_vable_owner` / `clear_active_vable`
+    /// maintain the invariant; do not write `vable_array_base` directly
+    /// outside of those (or the macro-generated `init_vable_indices`
+    /// invoked through `become_active_vable_owner`).
+    pub(crate) is_active_vable_owner: bool,
     // ── MIFrame concrete Box tracking (RPython registers_i/r/f parity) ──
     // Concrete Python object values for locals and stack, tracked in
     // parallel with `registers_r`. Each opcode handler updates these
@@ -2368,6 +2434,7 @@ impl PyreSym {
             vable_lastblock: OpRef::NONE,
             vable_w_globals: OpRef::NONE,
             vable_array_base: None,
+            is_active_vable_owner: false,
             concrete_locals: Vec::new(),
             concrete_stack: Vec::new(),
             // jitcode and concrete_namespace initialized below
@@ -2478,21 +2545,59 @@ impl PyreSym {
         }
     }
 
-    /// True when this frame owns the tracing-time `virtualizable_boxes`
-    /// shadow for the current trace — i.e. portal entry (`vable_array_base`
-    /// seeded by `init_vable_indices`) or bridge entry (`bridge_local_oprefs`
-    /// populated by `setup_bridge_sym` after `seed_virtualizable_boxes`
-    /// reseeds the shadow). Callee inline frames allocated via
-    /// `PyreSym::new_uninit` in `push_inline_frame` (metainterp.rs:366-410)
-    /// keep both fields `None` and must NOT mirror into the caller's shadow
-    /// — their `nlocals + stack_idx` space is the callee's own, not the
-    /// caller's, so writing to `NUM_VABLE_SCALARS + reg_idx` in the shared
-    /// `TraceCtx` shadow would corrupt the caller's portal layout.
-    /// opencoder.py:718 `_list_of_boxes_virtualizable` treats
+    /// True when this frame is allowed to mirror writes into the
+    /// metainterp-scope `TraceCtx::virtualizable_boxes` cache (RPython
+    /// `metainterp.virtualizable_boxes`, pyjitpl.py:1230). Two disjoint
+    /// states satisfy the predicate:
+    ///
+    ///   1. **portal entry** — `is_active_vable_owner == true` after
+    ///      `become_active_vable_owner` (which wraps the macro-generated
+    ///      `init_vable_indices`). The frame's `locals_cells_stack_w`
+    ///      array IS the active virtualizable.
+    ///   2. **bridge entry** — `bridge_local_oprefs == Some(...)` after
+    ///      `setup_bridge_sym` calls `seed_virtualizable_boxes` to
+    ///      repopulate the shadow from resume data. `is_active_vable_owner`
+    ///      is cleared (`clear_active_vable`) because the bridge's
+    ///      inputarg layout lacks the 7-slot scalar header that
+    ///      `init_vable_indices` assumes; the frame still owns the shadow
+    ///      semantically though.
+    ///
+    /// Callee inline frames (`inline_function_call` allocates a fresh
+    /// `PyreSym::new_uninit`) keep both fields at their defaults and
+    /// must NOT mirror into the caller's shadow — their
+    /// `nlocals + stack_idx` space is the callee's own, not the
+    /// caller's, so writing to `NUM_VABLE_SCALARS + reg_idx` in the
+    /// shared `TraceCtx` shadow would corrupt the caller's portal
+    /// layout. opencoder.py:718 `_list_of_boxes_virtualizable` treats
     /// `self.virtualizable_boxes` as the single source of truth; this
     /// predicate names the set of syms that are allowed to update it.
     pub(crate) fn owns_virtualizable_shadow(&self) -> bool {
-        self.vable_array_base.is_some() || self.bridge_local_oprefs.is_some()
+        self.is_active_vable_owner || self.bridge_local_oprefs.is_some()
+    }
+
+    /// Promote this frame to active virtualizable owner. Wraps the
+    /// macro-generated `init_vable_indices` so the per-frame
+    /// `is_active_vable_owner` boolean and the u32 OpRef-offset stay in
+    /// lock-step. Call this everywhere `init_vable_indices()` was
+    /// previously invoked directly.
+    pub(crate) fn become_active_vable_owner(&mut self) {
+        self.init_vable_indices();
+        self.is_active_vable_owner = true;
+        debug_assert!(
+            self.vable_array_base.is_some(),
+            "init_vable_indices must seed vable_array_base = Some(...)"
+        );
+    }
+
+    /// Demote this frame from active virtualizable owner. Used at bridge
+    /// setup (`setup_bridge_sym`) where the bridge's inputarg layout
+    /// does not have the 7-slot scalar header that the loop-portal
+    /// `init_vable_indices` assumes; subsequent reads consult
+    /// `bridge_local_oprefs` or fall through to the heap array via
+    /// `locals_cells_stack_array_ref`.
+    pub(crate) fn clear_active_vable(&mut self) {
+        self.vable_array_base = None;
+        self.is_active_vable_owner = false;
     }
 
     #[doc(hidden)]
@@ -2557,7 +2662,7 @@ impl PyreSym {
         let valuestackdepth = concrete_stack_depth(concrete_frame).unwrap_or(nlocals);
         let stack_only_depth = valuestackdepth.saturating_sub(nlocals);
         self.nlocals = nlocals;
-        self.locals_cells_stack_array_ref = if self.vable_array_base.is_some() {
+        self.locals_cells_stack_array_ref = if self.is_active_vable_owner {
             OpRef::NONE
         } else {
             frame_locals_cells_stack_array(ctx, self.frame)
@@ -2969,7 +3074,7 @@ impl PyreJitState {
     fn pypyjit_create_sym(meta: &PyreMeta, _header_pc: usize) -> PyreSym {
         let mut sym = PyreSym::new_uninit(OpRef(0));
         sym.execution_context = OpRef(1);
-        sym.init_vable_indices();
+        sym.become_active_vable_owner();
         sym.shift_virtualizable_input_indices(1);
         sym.nlocals = meta.num_locals;
         sym.valuestackdepth = meta.valuestackdepth;
@@ -4144,7 +4249,7 @@ impl JitState for PyreJitState {
 
     fn create_sym(_meta: &Self::Meta, _header_pc: usize) -> Self::Sym {
         let mut sym = PyreSym::new_uninit(OpRef(0));
-        sym.init_vable_indices();
+        sym.become_active_vable_owner();
         sym.nlocals = _meta.num_locals;
         sym.valuestackdepth = _meta.valuestackdepth;
         // virtualizable.py:44 + interp_jit.py:25-31: all locals_cells_stack_w
@@ -4365,34 +4470,39 @@ impl JitState for PyreJitState {
         let mut vable_array_values: Vec<majit_ir::Value> =
             Vec::with_capacity(vvals.len().saturating_sub(num_scalars));
         let mut vable_ref_value = majit_ir::Value::Void;
-        // `read_boxes` layout: `[vable_ref, static_fields..., array_items...]`.
-        // Boundary is `NUM_VABLE_SCALARS` (count of `_virtualizable_` static
-        // fields, excluding the leading vable_ref); slots `1..=NUM_VABLE_SCALARS`
-        // dispatch to `sym.vable_*` in macro-declared static-field order
-        // (`virtualizable_gen.rs::fields = { last_instr, pycode, valuestackdepth,
-        // debugdata, lastblock, w_globals }`). Read-boxes does not include
-        // `extra_reds` (those live only in the inputarg layout), so this
-        // dispatch is invariant under the Task #22 `extra_reds` macro flip.
-        let num_vable_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
         for (i, v) in vvals.iter().enumerate() {
             let resolved = resolve(ctx, &mut virtuals_cache, v);
             let concrete = decode_concrete(v);
-            if i == 0 {
-                vable_ref_value = concrete; // frame_ptr — implicit OpRef, explicit concrete
-            } else if i <= num_vable_scalars {
-                match i - 1 {
-                    0 => sym.vable_last_instr = resolved,
-                    1 => sym.vable_pycode = resolved,
-                    2 => sym.vable_valuestackdepth = resolved,
-                    3 => sym.vable_debugdata = resolved,
-                    4 => sym.vable_lastblock = resolved,
-                    5 => sym.vable_w_globals = resolved,
-                    _ => {}
+            match i {
+                0 => vable_ref_value = concrete, // frame_ptr — implicit OpRef, explicit concrete
+                1 => {
+                    sym.vable_last_instr = resolved;
+                    vable_scalar_values.push(concrete);
                 }
-                vable_scalar_values.push(concrete);
-            } else {
-                vable_array_items.push(resolved);
-                vable_array_values.push(concrete);
+                2 => {
+                    sym.vable_pycode = resolved;
+                    vable_scalar_values.push(concrete);
+                }
+                3 => {
+                    sym.vable_valuestackdepth = resolved;
+                    vable_scalar_values.push(concrete);
+                }
+                4 => {
+                    sym.vable_debugdata = resolved;
+                    vable_scalar_values.push(concrete);
+                }
+                5 => {
+                    sym.vable_lastblock = resolved;
+                    vable_scalar_values.push(concrete);
+                }
+                6 => {
+                    sym.vable_w_globals = resolved;
+                    vable_scalar_values.push(concrete);
+                }
+                _ => {
+                    vable_array_items.push(resolved);
+                    vable_array_values.push(concrete);
+                }
             }
         }
 
@@ -4497,10 +4607,11 @@ impl JitState for PyreJitState {
             types
         };
         // The bridge inputs do NOT have the 7-slot scalar header that
-        // init_vable_indices assumes. Clear vable_array_base so any later
-        // LOAD_FAST falling through to the vable_array_base branch uses
-        // the heap-array path instead of synthesizing parent OpRefs.
-        sym.vable_array_base = None;
+        // init_vable_indices assumes. Demote this frame from active
+        // virtualizable owner so any later LOAD_FAST falling through to
+        // the vable_array_base branch uses the heap-array path instead
+        // of synthesizing parent OpRefs.
+        sym.clear_active_vable();
         // pyjitpl.py:3400-3430 rebuild_state_after_failure parity: after
         // a guard failure the tracing-time `virtualizable_boxes` mirror
         // must be rebuilt from the resume data so subsequent vable
@@ -6563,7 +6674,7 @@ mod tests {
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
         let mut ctx = TraceCtx::for_test(1);
         let mut sym = PyreSym::new_uninit(OpRef(0));
-        sym.init_vable_indices();
+        sym.become_active_vable_owner();
 
         sym.init_symbolic(&mut ctx, frame_ptr);
 

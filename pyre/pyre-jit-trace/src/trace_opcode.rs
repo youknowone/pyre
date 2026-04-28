@@ -501,8 +501,37 @@ impl MIFrame {
             // Skeleton payload (no `pc_map` yet) → skip the lazy-load
             // preamble; the main path's skeleton-fallback branch
             // handles the same case.
+            //
+            // Portal-bridge (G.4.4-encoder.2/3): the portal jitcode
+            // has no per-Python-PC `pc_map` because user opcodes are
+            // dispatched by canonical portal arms at runtime.  The
+            // RPython orthodox encoder (`pyjitpl.py:218-225`) reads
+            // every live register unconditionally.  Pyre's portal-
+            // bridge install seeds `metadata.stack_base` (G.3h) +
+            // `depth_at_py_pc[pc]` (G.4.2) so the live ref slots at
+            // this PC span `0..stack_base + depth` — locals + cells +
+            // operand-stack tail.  Slice 3 covers the full range; the
+            // lazy-load preamble (lines 555+) routes each through
+            // `load_local_value` whose vable-shadow read (line 1218)
+            // works for any flat slot in `vb[NUM_VABLE_SCALARS..
+            // NUM_VABLE_SCALARS + nlocals + ncells + stackdepth]`.
+            // The semantic_ref_slot_for_reg_color in-loop special-
+            // case below provides identity mapping for portal-bridge
+            // since no regalloc happens (color == slot index).
             if jc.payload.metadata.pc_map.is_empty() {
-                Vec::new()
+                if jc.payload.is_portal_bridge() {
+                    let stack_base = jc.payload.metadata.stack_base;
+                    let depth = jc
+                        .payload
+                        .metadata
+                        .depth_at_py_pc
+                        .get(live_pc)
+                        .copied()
+                        .unwrap_or(0) as usize;
+                    (0..stack_base + depth).collect()
+                } else {
+                    Vec::new()
+                }
             } else {
                 // RPython `pyjitpl.py:218-225` analog: every live
                 // register index in the abstract register file
@@ -538,27 +567,49 @@ impl MIFrame {
                 }
             }
         };
-        let (nlocals, valid_stack_only, jitcode_ptr, stack_slot_color_map) = {
+        let (nlocals, valid_stack_only, jitcode_ptr, stack_slot_color_map, is_portal_bridge) = {
             let s = self.sym();
             let valid_stack_only = if let Some(ref pre_r) = self.pre_opcode_registers_r {
                 pre_r.len().saturating_sub(s.nlocals)
             } else {
                 s.valuestackdepth.saturating_sub(s.nlocals)
             };
-            let stack_slot_color_map = if s.jitcode.is_null() {
-                Vec::new()
+            let (stack_slot_color_map, is_portal_bridge) = if s.jitcode.is_null() {
+                (Vec::new(), false)
             } else {
-                unsafe { (&*s.jitcode).payload.metadata.stack_slot_color_map.clone() }
+                unsafe {
+                    let jc = &*s.jitcode;
+                    (
+                        jc.payload.metadata.stack_slot_color_map.clone(),
+                        jc.payload.is_portal_bridge(),
+                    )
+                }
             };
-            (s.nlocals, valid_stack_only, s.jitcode, stack_slot_color_map)
+            (
+                s.nlocals,
+                valid_stack_only,
+                s.jitcode,
+                stack_slot_color_map,
+                is_portal_bridge,
+            )
         };
         for idx in live_reg_idxs {
-            let Some(slot_idx) = crate::state::semantic_ref_slot_for_reg_color(
-                nlocals,
-                valid_stack_only,
-                &stack_slot_color_map,
-                idx,
-            ) else {
+            // G.4.4-encoder.3: portal-bridge has no regalloc, so
+            // colors == slot indices (identity).  Bypass
+            // `semantic_ref_slot_for_reg_color`'s color-map search
+            // and stack_color_map fallback (which would only return
+            // identity for `idx < nlocals`, dropping cells + stack).
+            let slot_idx_opt = if is_portal_bridge {
+                Some(idx)
+            } else {
+                crate::state::semantic_ref_slot_for_reg_color(
+                    nlocals,
+                    valid_stack_only,
+                    &stack_slot_color_map,
+                    idx,
+                )
+            };
+            let Some(slot_idx) = slot_idx_opt else {
                 continue;
             };
             // `load_local_value` errors when `slot_idx >= registers_r.len()`;
@@ -581,7 +632,7 @@ impl MIFrame {
                 let _ = MIFrame::load_local_value(self, ctx, slot_idx);
             }
         }
-        let registers_r = {
+        let (registers_i, registers_r_bank, registers_r_semantic, registers_f) = {
             let s = self.sym();
             // Stage 3.4 Phase B: unified abstract register file view.
             // When a guard is being captured mid-opcode, read from
@@ -600,26 +651,55 @@ impl MIFrame {
             // surface as active OpRefs. This matches the OLD
             // `stack_values.len()` bound on the
             // `stack_values[idx - nlocals]` read path.
+            //
+            // Portal-bridge (G.4.4-encoder.3): the trace's
+            // `valuestackdepth` does not track user-bytecode stack
+            // depth (the canonical portal jitcode owns the trace's
+            // stack tracker, not user opcodes), so the per-CodeObject
+            // bound `nlocals + valid_stack_only` undercounts.  The
+            // metadata-derived `stack_base + depth_at_py_pc[pc]`
+            // (G.3h + G.4.2) is the correct bound for portal-bridge
+            // — symmetric with the encoder count side
+            // (`state::frame_value_count_at` portal-bridge branch).
             let source_len = if let Some(ref pre_r) = self.pre_opcode_registers_r {
                 pre_r.len()
             } else {
                 s.registers_r.len()
             };
-            let valid_len = (s.nlocals + valid_stack_only).min(source_len);
-            let mut registers_r: Vec<OpRef> = if let Some(ref pre_r) = self.pre_opcode_registers_r {
-                pre_r[..valid_len.min(pre_r.len())].to_vec()
+            let valid_len = if is_portal_bridge {
+                let payload = unsafe { &(&*jitcode_ptr).payload };
+                let stack_base = payload.metadata.stack_base;
+                let depth = payload
+                    .metadata
+                    .depth_at_py_pc
+                    .get(live_pc)
+                    .copied()
+                    .unwrap_or(0) as usize;
+                (stack_base + depth).min(source_len)
             } else {
-                s.registers_r[..valid_len.min(s.registers_r.len())].to_vec()
+                (s.nlocals + valid_stack_only).min(source_len)
             };
+            let registers_r_bank = s.registers_r.clone();
+            let mut registers_r_semantic: Vec<OpRef> =
+                if let Some(ref pre_r) = self.pre_opcode_registers_r {
+                    pre_r[..valid_len.min(pre_r.len())].to_vec()
+                } else {
+                    s.registers_r[..valid_len.min(s.registers_r.len())].to_vec()
+                };
             if in_a_call {
                 if let Some(result_idx) = self.pending_result_stack_idx {
                     let abs_idx = s.nlocals + result_idx;
-                    if abs_idx < registers_r.len() {
-                        registers_r[abs_idx] = ctx.const_ref(pyre_object::PY_NULL as i64);
+                    if abs_idx < registers_r_semantic.len() {
+                        registers_r_semantic[abs_idx] = ctx.const_ref(pyre_object::PY_NULL as i64);
                     }
                 }
             }
-            registers_r
+            (
+                s.registers_i.clone(),
+                registers_r_bank,
+                registers_r_semantic,
+                s.registers_f.clone(),
+            )
         };
         // pyjitpl.py:202-203: read the 2-byte offset from JitCode.code
         // (upstream uses `decode_offset(self.jitcode.code, pc + 1)`) and
@@ -640,32 +720,40 @@ impl MIFrame {
         // has a non-empty `pc_map`) falls through to the canonical
         // `pyjitpl.py:199-233` decode path below.
         if jc.payload.is_portal_bridge() {
-            // G.4.3 portal-bridge encoder: emit a positional Ref-typed
-            // box list of length `stack_base + depth_at_py_pc[live_pc]`,
-            // covering locals + cells + the live operand stack tail.
+            // Portal-bridge encoder (G.4.3 + G.4.4-encoder.2/3):
+            // emit a positional Ref-typed box list of length
+            // `stack_base + depth_at_py_pc[live_pc]`, covering locals
+            // + cells + the live operand stack tail.
             // `metadata.stack_base = code.varnames.len() + ncells(code)`
-            // (G.3h derivation) is the absolute boundary in
+            // (G.3h) is the absolute boundary in
             // `PyFrame.locals_cells_stack_w` between the "always live"
             // slots and the depth-dependent operand stack — the same
             // boundary `set_stack_at` (state.rs:2762) uses on the
             // decoder writeback side.
             //
-            // Encoder/decoder symmetry (G.4.3): both
+            // Encoder/decoder symmetry (G.4.3 + G.4.4-encoder.3): both
             // `state::frame_value_count_at` and
             // `restore_guard_failure_values` source their counts from
-            // `metadata.stack_base + depth_at_py_pc[pc]` so the upstream
-            // `pyjitpl.py:177` / `resume.py:1017-1026` packed-liveness
-            // invariant is preserved.  Slots beyond
-            // `registers_r.len()` collapse to `OpRef::NONE`,
-            // matching the snapshot helper's missing-slot convention —
-            // the decoder skips writes for NONE values without raising.
+            // `metadata.stack_base + depth_at_py_pc[pc]` so the
+            // upstream `pyjitpl.py:177` / `resume.py:1017-1026`
+            // packed-liveness invariant is preserved.  The
+            // `live_reg_idxs` derivation above (line 504-516) emits
+            // the same range so the lazy-load preamble (line 584-633)
+            // populates `registers_r` from the vable shadow before
+            // the snapshot — RPython orthodox always-box semantics
+            // (`pyjitpl.py:218-225`).  Slots whose vable shadow is
+            // NONE fall through to the heap-read path inside
+            // `load_local_value` (line 1240-1265), so the encoder
+            // emits a real OpRef for every live slot.
             //
-            // (Pre-G.4.3a-fix used `s.nlocals = code.varnames.len()`
-            // which dropped `ncells` — symmetric with
-            // `nlocals_from_code()` on the count side, but both wrong
-            // for closure-bearing functions.  `metadata.stack_base`
-            // matches upstream's `pypy/interpreter/pyframe.py:111
-            // valuestackdepth = co_nlocals + ncellvars + nfreevars`.)
+            // Pre-G.4.4-encoder.2/3 the encoder fell back to
+            // `OpRef::NONE` for slots beyond `registers_r.len()`
+            // (relying on `consume_one_section` to overwrite before
+            // BH deref); slice 2/3 closed both KNOWN-INCOMPLETE
+            // divergences from `pyjitpl.py:177-234` (single-bank
+            // read + always-box) by routing the full live range
+            // through the same lazy-load mechanism per-CodeObject
+            // mode uses.
             let stack_base = jc.payload.metadata.stack_base;
             let depth = jc
                 .payload
@@ -675,85 +763,14 @@ impl MIFrame {
                 .copied()
                 .unwrap_or(0) as usize;
             let target_count = stack_base + depth;
-            // KNOWN-INCOMPLETE G.4.3b (per-frame stack box capture).
-            //
-            // Diagnosis: fib_recursive `PYRE_PORTAL_REDIRECT=1` exit
-            // 139 SIGSEGV traced to the encoder reading NULL OpRefs
-            // from `registers_r_view` for stack slots — the blackhole
-            // then dereferences NULL during canonical opcode replay.
-            // Proposed fix: emit `getarrayitem_gc_r` against the
-            // PyFrame heap at guard time (Option A).
-            //
-            // Empirical probe (G.4.3b attempt) replaced the per-slot
-            // `OpRef::NONE` fallback below with
-            // `frame_locals_cells_stack_array` +
-            // `trace_array_getitem_value` emits.  Aggressive variant
-            // (read heap for every slot) regressed `spectral_norm`
-            // (dynasm) and `fannkuch` (both backends) with NEW exit
-            // 139 SIGSEGV.  Conservative variant (read heap only for
-            // `OpRef::NONE` slots, preserving real OpRefs) recovered
-            // the regressed benches but failed to close
-            // `fib_recursive` — the failure mode merely shifted from
-            // exit 101 (`pyframe.rs:862` valuestackdepth assertion)
-            // to exit 139 (different SIGSEGV site during canonical
-            // replay).
-            //
-            // Conclusion: the heap-read-at-guard-time approach is
-            // unsound for portal-bridge mode.  The heap reflects the
-            // pre-residual-call state at guard time, but
-            // `consume_one_section` (BH-side) writes a different
-            // (resume-data-derived) value to the same slot, so the
-            // last-writer-wins ordering between
-            // `restore_guard_failure_values` and
-            // `consume_one_section` decides the effective slot value
-            // — and the two sources can disagree without warning.
-            //
-            // The real fix lives in the canonical RPython orthodox
-            // path: G.4.4 makes portal-bridge jitcodes the single
-            // source of every per-PC liveness read, so user opcodes
-            // emit `_opimpl_setarrayitem_vable` and the symbolic
-            // `virtualizable_boxes` shadow stays in sync with the
-            // heap (`pyjitpl.py:1242-1247`) — at which point the
-            // encoder can revert to reading `virtualizable_boxes`
-            // directly with no heap dereference at all.
-            //
-            // Until G.4.4 lands the encoder/decoder co-evolution
-            // (per-CodeObject jitcode emit no-op + reader
-            // unification + per-PC liveness exposure on the
-            // portal-bridge metadata), the G.4.3 positional fallback
-            // — emit `OpRef::NONE` for slots with no `registers_r`
-            // value — stays in force.  The NONE serializes to a
-            // NULL `set_local_at` / `set_stack_at` write on the
-            // decoder side; for the benches that currently pass
-            // under `PYRE_PORTAL_REDIRECT=1` the subsequent
-            // `consume_one_section` overwrites those slots with the
-            // canonical resume value before the BH dereferences
-            // them, leaving the NULL writes harmless.
-            //
-            // KNOWN-INCOMPLETE divergences from `pyjitpl.py:177-234`:
-            //   1. Single-bank read.  RPython iterates the 3-bank
-            //      liveness header and reads from `registers_i`,
-            //      `registers_r`, `registers_f` in lockstep with the
-            //      bank a register belongs to.  Pyre reads only from
-            //      `registers_r` here because the portal-bridge
-            //      install does not yet carry per-PC liveness
-            //      metadata, so the snapshot does not know which
-            //      bank each `reg` index belongs to.
-            //   2. Always-box vs sometimes-NONE.  RPython unconditionally
-            //      builds a `Box*` for every live register (even if the
-            //      Python-level value is None); the box wraps the raw
-            //      i64/Ptr/f64 read out of the kind-specific bank.
-            //      Pyre emits `OpRef::NONE` for any `reg` index past
-            //      `registers_r.len()`, accepting the NULL serialisation
-            //      because (per the discussion above)
-            //      `consume_one_section` will overwrite the slot before
-            //      a dereference.
-            // Both close once G.4.4 lands the per-PC liveness exposure
-            // and the encoder reads from a 3-bank-aware shadow tied to
-            // `virtualizable_boxes`.
             let mut boxes = Vec::with_capacity(target_count);
             for reg in 0..target_count {
-                boxes.push(registers_r.get(reg).copied().unwrap_or(OpRef::NONE));
+                boxes.push(
+                    registers_r_semantic
+                        .get(reg)
+                        .copied()
+                        .unwrap_or(OpRef::NONE),
+                );
             }
             return boxes;
         }
@@ -805,28 +822,17 @@ impl MIFrame {
         let length_f = all_liveness[off + 2] as u32;
         let mut cursor = off + 3;
         let mut boxes = Vec::with_capacity((length_i + length_r + length_f) as usize);
-        // Stage 3.4 Phase B/C: liveness now stores post-regalloc colors,
-        // not Python-semantic stack-slot indices. Reverse-map each live
-        // color through the current jitcode's live stack prefix first,
-        // then fall back to the local inputarg prefix.
-        //
-        // KNOWN-INCOMPLETE divergence from `pyjitpl.py:177-234`:
-        // RPython reads each live register out of its kind-specific
-        // bank — `registers_i[reg_i]` / `registers_r[reg_r]` /
-        // `registers_f[reg_f]` — once per liveness-header entry.
-        // Pyre folds all three banks into a single `registers_r`
-        // (OpRef-typed) array and uses `semantic_ref_slot_for_reg_color`
-        // to reverse-map every register color to a ref-slot index
-        // before reading.  This mirrors the pyre trace-side state
-        // model where boxes are tracked as `OpRef` regardless of
-        // primitive kind, but it is not a line-by-line port of
-        // RPython's 3-bank read.  Convergence path: split MIFrame's
-        // register-file storage into `registers_i/r/f` (Phase D
-        // shadow-execute prerequisite, eval-loop automation plan),
-        // then drop `semantic_ref_slot_for_reg_color` and read from
-        // the bank the liveness header dictates.
+        // RPython reads each live register out of its kind-specific bank:
+        // `registers_i[reg_i]`, `registers_r[reg_r]`, `registers_f[reg_f]`.
+        // Pyre still keeps Python semantic locals/stack in the prefix of
+        // `registers_r`, so Ref registers prefer the semantic-color view
+        // and then fall back to the full Ref bank.
+        // Int/Float registers now read their real banks first and fall back
+        // only when that bank slot is still unpopulated by the current tracer
+        // surface. This closes the first slice of the 3-bank parity gap
+        // without removing the older semantic stack model in the same patch.
         let probe_live_r = std::env::var_os("MAJIT_PROBE_LIVE_R").is_some();
-        let snapshot = |reg: usize| -> OpRef {
+        let snapshot_ref = |reg: usize| -> OpRef {
             let Some(slot_idx) = crate::state::semantic_ref_slot_for_reg_color(
                 nlocals,
                 valid_stack_only,
@@ -841,7 +847,10 @@ impl MIFrame {
                 }
                 return OpRef::NONE;
             };
-            let opref = registers_r.get(slot_idx).copied().unwrap_or(OpRef::NONE);
+            let opref = registers_r_semantic
+                .get(slot_idx)
+                .copied()
+                .unwrap_or(OpRef::NONE);
             if probe_live_r {
                 eprintln!(
                     "[probe-E][snapshot] live_pc={} reg={} slot={} opref={:?}",
@@ -850,16 +859,40 @@ impl MIFrame {
             }
             opref
         };
+        let snapshot_bank = |bank: &[OpRef], reg: usize| -> Option<OpRef> {
+            bank.get(reg).copied().filter(|op| !op.is_none())
+        };
         use majit_translate::liveness::LivenessIterator;
-        for length in [length_i, length_r, length_f] {
-            if length == 0 {
-                continue;
-            }
-            let mut it = LivenessIterator::new(cursor, length, &all_liveness);
+        if length_i != 0 {
+            let mut it = LivenessIterator::new(cursor, length_i, &all_liveness);
             while let Some(reg_idx) = it.next() {
-                boxes.push(snapshot(reg_idx as usize));
+                boxes.push(
+                    snapshot_bank(&registers_i, reg_idx as usize)
+                        .unwrap_or_else(|| snapshot_ref(reg_idx as usize)),
+                );
             }
             cursor = it.offset;
+        }
+        if length_r != 0 {
+            let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
+            while let Some(reg_idx) = it.next() {
+                let mapped = snapshot_ref(reg_idx as usize);
+                boxes.push(if !mapped.is_none() {
+                    mapped
+                } else {
+                    snapshot_bank(&registers_r_bank, reg_idx as usize).unwrap_or(OpRef::NONE)
+                });
+            }
+            cursor = it.offset;
+        }
+        if length_f != 0 {
+            let mut it = LivenessIterator::new(cursor, length_f, &all_liveness);
+            while let Some(reg_idx) = it.next() {
+                boxes.push(
+                    snapshot_bank(&registers_f, reg_idx as usize)
+                        .unwrap_or_else(|| snapshot_ref(reg_idx as usize)),
+                );
+            }
         }
         boxes
     }
@@ -1031,7 +1064,7 @@ impl MIFrame {
             }
             let value = s.registers_r[reg_idx];
             s.valuestackdepth -= 1;
-            // Task #136 partial: gating on `vable_array_base.is_some()`
+            // Task #136 partial: gating on `is_active_vable_owner`
             // intentionally does NOT cover bridges here. Unlike the other
             // four mirror sites (push_typed_value / swap_values /
             // store_local_value / finishframe_exception, all flipped to
@@ -1066,7 +1099,7 @@ impl MIFrame {
             // the vable shadow (multi-session) or teaching the bridge
             // optimizer to recognise cleared-stack-slot sentinels
             // separately from real null heap bases.
-            (value, s.vable_array_base.is_some(), reg_idx)
+            (value, s.is_active_vable_owner, reg_idx)
         };
         // pyframe.py:411-417 `popvalue_maybe_none` parity: the popped slot
         // is cleared to None in `locals_cells_stack_w`. Upstream lowers
@@ -1214,7 +1247,7 @@ impl MIFrame {
         // (`virtualizable_boxes[-1]`) after.
         let vable_entry = {
             let s = self.sym();
-            if s.vable_array_base.is_some() && s.bridge_local_oprefs.is_none() {
+            if s.is_active_vable_owner && s.bridge_local_oprefs.is_none() {
                 let flat_idx = crate::virtualizable_gen::NUM_VABLE_SCALARS + idx;
                 ctx.virtualizable_box_at(flat_idx)
             } else {
@@ -1245,13 +1278,19 @@ impl MIFrame {
                 let frame_ref = s.frame;
                 let idx_const = ctx.const_int(idx as i64);
                 s.registers_r[idx] = trace_array_getitem_value(ctx, frame_ref, idx_const);
-            } else if let Some(base) = s.vable_array_base {
-                // Virtualizable: locals[idx] was loaded in the preamble
-                // and carried as a JUMP arg. OpRef(base + idx) references it.
-                // Reached only when virtualizable_boxes has no entry (e.g.
-                // very early in setup, before initialize_virtualizable runs).
-                s.registers_r[idx] = OpRef(base + idx as u32);
             } else {
+                // Active vable owner whose registers_r[idx] is NONE cannot
+                // exist: init_symbolic (state.rs:2618-2619) seeds
+                // registers_r[idx] = OpRef(base + idx) for every i in
+                // 0..nlocals before any load_local_value runs. Reachability
+                // audit (2026-04-28, MAJIT_PROBE_VABLE_FALLBACK) confirmed
+                // this empirically: 0 firings across debug unit tests
+                // (debug_assert!(false)) and 0 firings across 28 release
+                // benchmark runs (env-gated eprintln). The remaining
+                // fallthrough is the non-vable-owner path —
+                // `s.locals_cells_stack_array_ref` is the callee's own
+                // locals_cells_stack_w array (seeded by Stage 1 at
+                // inline_function_call).
                 let idx_const = ctx.const_int(idx as i64);
                 s.registers_r[idx] =
                     trace_array_getitem_value(ctx, s.locals_cells_stack_array_ref, idx_const);
@@ -1985,7 +2024,7 @@ impl MIFrame {
             }
         }
         debug_assert!(
-            self.sym().nlocals > 0 || self.sym().vable_array_base.is_none(),
+            self.sym().nlocals > 0 || !self.sym().is_active_vable_owner,
             "nlocals must be set by init_symbolic before close_loop_args_at"
         );
         let (
@@ -2193,42 +2232,18 @@ impl MIFrame {
         // reached_loop_header returns without closing. Harmless on the "close
         // loop" path since the frame won't be reused.
         {
-            // Inputarg layout (`pyjitpl.py:2957 redboxes`): `[frame,
-            // extra_reds..., vable_scalars..., array_items...]`. Indices
-            // resolve to PyreSym fields via the macro-emitted constants —
-            // no hardcoded position numbers — so a future `extra_reds`
-            // wiring (Task #22 `extra_reds = { ec: Ref }`) automatically
-            // routes idx=1 to `s.execution_context` without touching this
-            // dispatcher.
             let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-            let first_vable = crate::virtualizable_gen::FIRST_VABLE_SCALAR_IDX as usize;
             let s = self.sym_mut();
             for &(idx, new_opref) in &dedup_changed {
-                if idx == 0 {
-                    s.frame = new_opref;
-                } else if idx < first_vable {
-                    // Extra reds occupy `[1, FIRST_VABLE_SCALAR_IDX)`.
-                    // Today `NUM_EXTRA_REDS == 0`, so this range is
-                    // empty; once `ec` wires in (`interp_jit.py:67 reds
-                    // = ['frame', 'ec']`), idx=1 maps to `ec`.
-                    if idx == 1 {
-                        s.execution_context = new_opref;
-                    }
-                } else if idx < num_scalars {
-                    // Vable scalars in static-field declaration order
-                    // (`virtualizable_gen.rs::fields = { last_instr,
-                    // pycode, valuestackdepth, debugdata, lastblock,
-                    // w_globals }`). The match-by-offset stays in sync
-                    // with the macro's `static_field_descrs` order — if
-                    // the declaration order changes, every `s.vable_*`
-                    // consumer must change with it.
-                    match idx - first_vable {
-                        0 => s.vable_last_instr = new_opref,
-                        1 => s.vable_pycode = new_opref,
-                        2 => s.vable_valuestackdepth = new_opref,
-                        3 => s.vable_debugdata = new_opref,
-                        4 => s.vable_lastblock = new_opref,
-                        5 => s.vable_w_globals = new_opref,
+                if idx < num_scalars {
+                    match idx {
+                        0 => s.frame = new_opref,
+                        1 => s.vable_last_instr = new_opref,
+                        2 => s.vable_pycode = new_opref,
+                        3 => s.vable_valuestackdepth = new_opref,
+                        4 => s.vable_debugdata = new_opref,
+                        5 => s.vable_lastblock = new_opref,
+                        6 => s.vable_w_globals = new_opref,
                         _ => {}
                     }
                 } else {
@@ -4601,7 +4616,30 @@ impl MIFrame {
             sym.jitcode = jitcode_for(w_code);
             // pyjitpl.py:74-90 MIFrame.setup parity for the per-kind banks
             // (including pyjitpl.py:97-119 copy_constants).
-            self.with_ctx(|_, ctx| sym.setup_kind_register_banks(ctx));
+            //
+            // pyjitpl.py:1230 `_opimpl_getarrayitem_vable`: every MIFrame
+            // accesses the metainterp-scope `virtualizable_boxes` cache
+            // (already provided by `TraceCtx::virtualizable_boxes` /
+            // `ctx.virtualizable_box_at`) only when its own bytecode
+            // emits a vable opcode — i.e. when this MIFrame is the
+            // active vable owner. For inlined callee frames, vable_*
+            // opcodes are not emitted; locals are accessed via
+            // `metainterp.framestack[i].registers_r` (in pyre this is
+            // `sym.registers_r`) or, for slots that have not yet been
+            // populated symbolically (cell / nested-scope slots that
+            // arrive pre-populated on the heap), via the callee's own
+            // `locals_cells_stack_w` array.  Seed
+            // `locals_cells_stack_array_ref` to that array OpRef so the
+            // heap fall-through in `load_local_value` /
+            // `push_typed_value` / `pop_value` reads from the callee's
+            // locals_cells_stack_w (parity with init_symbolic's non-vable
+            // branch in state.rs:2540-2543), not from the unset OpRef::NONE
+            // that emitted invalid `getarrayitem(NONE, idx)` IR before.
+            self.with_ctx(|_, ctx| {
+                sym.setup_kind_register_banks(ctx);
+                sym.locals_cells_stack_array_ref =
+                    frame_locals_cells_stack_array(ctx, callee_frame_opref);
+            });
             sym.concrete_namespace = callee_globals as *mut DictStorage;
             sym.concrete_execution_context = self.sym().concrete_execution_context;
             (sym, Some(callee_frame_opref))
@@ -6388,5 +6426,68 @@ mod tests {
         assert_eq!(err.kind, pyre_interpreter::PyErrorKind::RuntimeError);
         assert_eq!(err.message, "raise helper missing current frame");
         clear_pending_jit_exception();
+    }
+
+    #[test]
+    fn get_list_of_active_boxes_reads_kind_specific_register_banks() {
+        use majit_translate::liveness::encode_liveness;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let mut all_liveness = vec![1, 1, 1];
+        all_liveness.extend(encode_liveness(&[2]));
+        all_liveness.extend(encode_liveness(&[1]));
+        all_liveness.extend(encode_liveness(&[3]));
+        let mut insns = HashMap::new();
+        insns.insert("live/".to_string(), majit_metainterp::jitcode::BC_LIVE);
+        crate::assembler::publish_state(&insns, &all_liveness, all_liveness.len(), 1);
+
+        let runtime_jc = majit_metainterp::jitcode::JitCode {
+            code: vec![majit_metainterp::jitcode::BC_LIVE, 0, 0],
+            c_num_regs_i: 4,
+            c_num_regs_r: 4,
+            c_num_regs_f: 4,
+            ..Default::default()
+        };
+        let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
+        pyjit.jitcode = Arc::new(runtime_jc);
+        pyjit.metadata.pc_map.push(0);
+        let inner_jc = crate::state::JitCode {
+            code: std::ptr::null(),
+            index: 0,
+            payload: Arc::new(pyjit),
+        };
+        let inner_jc_ptr = Box::into_raw(Box::new(inner_jc));
+
+        let int_box = OpRef(10);
+        let ref_box = OpRef(20);
+        let float_box = OpRef(30);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.jitcode = inner_jc_ptr;
+        sym.nlocals = 0;
+        sym.valuestackdepth = 0;
+        sym.registers_i = vec![OpRef::NONE, OpRef::NONE, int_box];
+        sym.registers_r = vec![OpRef::NONE, ref_box];
+        sym.registers_f = vec![OpRef::NONE, OpRef::NONE, OpRef::NONE, float_box];
+
+        let mut ctx = TraceCtx::for_test(1);
+        let mut frame = MIFrame {
+            ctx: &mut ctx,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        let active = frame.get_list_of_active_boxes(&mut ctx, false, false);
+        assert_eq!(active, vec![int_box, ref_box, float_box]);
+
+        unsafe {
+            let _ = Box::from_raw(inner_jc_ptr as *mut crate::state::JitCode);
+        }
     }
 }

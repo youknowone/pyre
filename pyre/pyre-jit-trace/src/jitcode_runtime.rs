@@ -96,12 +96,11 @@ pub fn get_jitcode_by_index(index: usize) -> Option<Arc<JitCode>> {
 /// jitcode the codewriter side stored in
 /// `JitDriverStaticData.mainjitcode`.
 ///
-/// Production identity (Phase D snapshot 2026-04-25): the portal name
-/// is currently `execute_opcode_step` because `pyre-jit-trace/build.rs`
-/// only walks `pyre-object/src` + `pyre-interpreter/src`. Once that
-/// build script is widened to include `pyre/pyre-jit/src/eval.rs`
-/// (Phase G follow-up), the portal flips to `eval_loop_jit` and this
-/// accessor returns that JitCode without code change.
+/// Production identity: `pyre-jit-trace/build.rs:33-54` (Task #140)
+/// includes `pyre/pyre-jit/src/eval.rs` in the source-only walk so the
+/// scan below picks up the `eval_loop_jit` jitcode whose
+/// `jitdriver_sd` is populated by `assign_portal_jitdriver_indices`
+/// (`pyre-jit/src/jit/codewriter.rs:6544` — call.py:148 deferred port).
 static PORTAL_JITCODE_INDEX: LazyLock<Option<usize>> = LazyLock::new(|| {
     let mut hits = ALL_JITCODES
         .iter()

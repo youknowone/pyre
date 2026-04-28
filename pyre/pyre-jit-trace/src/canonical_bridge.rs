@@ -26,8 +26,8 @@
 //! | Source-only `residual_call_*/iRd>k`, `inline_call_*/dR>k`, `getfield_gc_*`, `getarrayitem_gc_*`, … | `'d'` / `'j'` | Global `bh.descrs` (`Vec<BhDescr>` = `ALL_DESCRS`) — `read_descr` (`blackhole.rs:5558`) | ✅ — global pool already populated by metainterp init |
 //! | Legacy `JitCodeBuilder` (per-CodeObject lazy compile) `BC_CALL_INT`/`BC_INLINE_CALL` | `next_u16` (raw 2-byte index) | Per-jitcode `self.jitcode.exec.descrs` (`Vec<RuntimeBhDescr>`) — `JitCode::call_target` (`jitcode/mod.rs:699`) | ❌ — bridge must populate the slot |
 //!
-//! The build-time portal jitcode (`execute_opcode_step` /
-//! `eval_loop_jit`) is produced by the source-only translator
+//! The build-time portal jitcode (`eval_loop_jit`) is produced by the
+//! source-only translator
 //! (`analyze_multiple_pipeline_with_vinfo_and_fnaddr_bindings`), so 100%
 //! of its `'d'`/`'j'` operand sites resolve through the **global pool**.
 //! The per-jitcode `exec.descrs` is dead weight for portal execution.
@@ -67,10 +67,15 @@
 //! `compile_jitcode_for_callee`. See the function docstring for the
 //! full reader-site audit (G.3a).
 //!
-//! No production caller invokes `bridge_canonical_jitcode_*` or
-//! `install_portal_for` at this commit — the functions are the
-//! building blocks G.3b (reader portal-mode awareness) and G.3c
-//! (caller flip) will consume.
+//! Production caller: `state::jitcode_for` (state.rs:686) routes
+//! through `install_portal_for` whenever `PYRE_PORTAL_REDIRECT` is
+//! set (G.3c flip, Task #126).  Reader portal-mode awareness landed
+//! in G.3b (Task #125) and G.3d/e/h (Tasks #127/#128/#132).
+//! `bridge_canonical_jitcode_basic` is reachable through
+//! `install_portal_for`'s `build_runtime_jitcode` call;
+//! `bridge_canonical_jitcode_full` is currently exercised only by the
+//! tests in this module and is kept for future legacy-encoded
+//! jitcodes.
 //!
 //! ## RPython references
 //!
