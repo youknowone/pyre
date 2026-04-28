@@ -2303,9 +2303,25 @@ impl MIFrame {
             for i in 0..args.len() {
                 let opref = args[i];
                 if opref.is_constant() || !duplicates.insert(opref) {
-                    let tp = inputarg_types
-                        .get(i)
-                        .copied()
+                    // pyjitpl.py:2934-2965 `record_same_as(box)` uses the
+                    // `box.type` intrinsic to pick `same_as_i/r/f` — the
+                    // SameAs op's result type matches the input box, NEVER
+                    // the slot's declared type. When `args[i]` is a constant
+                    // whose Value type differs from the slot's declared
+                    // `inputarg_types[i]` (e.g. an Int constant placeholder
+                    // routed into a Ref-typed vable header slot), wrapping
+                    // it as `same_as_for_type(slot_type)` produces a
+                    // cross-type SameAs whose `make_equal_to` absorb in
+                    // `optimizer.rs::propagate_from_pass_range` violates the
+                    // Box.type invariant in `OptContext::replace_op`.
+                    //
+                    // Match RPython by deriving the SameAs op from the
+                    // OpRef's actual type via `ctx.get_opref_type`, falling
+                    // back to the slot type only when the OpRef has no
+                    // recoverable type (which would be a separate bug).
+                    let tp = ctx
+                        .get_opref_type(opref)
+                        .or_else(|| inputarg_types.get(i).copied())
                         .unwrap_or(majit_ir::Type::Ref);
                     let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
                     let new_opref = ctx.record_op(same_as_op, &[opref]);
