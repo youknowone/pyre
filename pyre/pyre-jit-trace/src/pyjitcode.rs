@@ -63,6 +63,8 @@
 //! for every reader that branches on install style.
 
 use majit_metainterp::jitcode::JitCode as RuntimeJitCode;
+use std::cell::UnsafeCell;
+use std::ops::{Deref, DerefMut};
 
 /// Pyre-only metadata attached to a Python CodeObject's compiled JitCode.
 ///
@@ -167,14 +169,7 @@ pub struct PyJitCodeMetadata {
 }
 
 /// Compiled JitCode plus pyre-only metadata.
-///
-/// Held by `Arc` so the same instance can sit in both
-/// `MetaInterpStaticData.jitcodes` (the runtime list) and
-/// `CallControl.jitcodes` (the codewriter dict) without duplicating
-/// the bytecode buffer or metadata vectors. RPython's
-/// `JitCode` references are shared the same way through Python's
-/// refcount semantics.
-pub struct PyJitCode {
+pub struct PyJitCodePayload {
     pub jitcode: std::sync::Arc<RuntimeJitCode>,
     pub metadata: PyJitCodeMetadata,
     /// pyre's graph identity for the cached jitcode slot.
@@ -193,7 +188,85 @@ pub struct PyJitCode {
     pub merge_point_pc: Option<usize>,
 }
 
+/// Shared `PyJitCode` identity whose payload is filled in place.
+///
+/// Held by `Arc` so the same instance can sit in both
+/// `MetaInterpStaticData.jitcodes` (the runtime list) and
+/// `CallControl.jitcodes` (the codewriter dict) without duplicating
+/// the bytecode buffer or metadata vectors. RPython's
+/// `JitCode` references are shared the same way through Python's
+/// refcount semantics.
+///
+/// RPython mutates the `JitCode` shell inserted by `call.py:168-170`
+/// when `assembler.assemble(..., jitcode, ...)` runs in
+/// `codewriter.py:67`. Pyre's assembler still returns a fresh payload,
+/// so the outer `PyJitCode` uses interior mutability to preserve the
+/// same object identity while replacing the payload during the writer
+/// drain. Production mutation is confined to the single-threaded
+/// codewriter publication path before runtime readers observe the
+/// populated object.
+pub struct PyJitCode {
+    payload: UnsafeCell<PyJitCodePayload>,
+}
+
+// SAFETY: `PyJitCode` payload replacement is restricted to the codewriter
+// publication path, which runs under pyre's single-threaded JIT setup before
+// the populated object is handed to runtime readers. Runtime-visible index
+// stamping uses atomics on the inner `RuntimeJitCode`.
+unsafe impl Sync for PyJitCode {}
+
+impl Deref for PyJitCode {
+    type Target = PyJitCodePayload;
+
+    fn deref(&self) -> &Self::Target {
+        // SAFETY: shared readers only observe immutable payload references.
+        unsafe { &*self.payload.get() }
+    }
+}
+
+impl DerefMut for PyJitCode {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.payload.get_mut()
+    }
+}
+
 impl PyJitCode {
+    pub fn new(payload: PyJitCodePayload) -> Self {
+        Self {
+            payload: UnsafeCell::new(payload),
+        }
+    }
+
+    pub fn from_parts(
+        jitcode: std::sync::Arc<RuntimeJitCode>,
+        metadata: PyJitCodeMetadata,
+        code_ptr: *const pyre_interpreter::CodeObject,
+        w_code: *const (),
+        has_abort: bool,
+        merge_point_pc: Option<usize>,
+    ) -> Self {
+        Self::new(PyJitCodePayload {
+            jitcode,
+            metadata,
+            code_ptr,
+            w_code,
+            has_abort,
+            merge_point_pc,
+        })
+    }
+
+    /// Replace the payload without changing the outer `PyJitCode`
+    /// allocation. This is pyre's Rust-side stand-in for RPython
+    /// `assembler.assemble(..., jitcode, ...)` mutating the existing
+    /// `JitCode` object from `CallControl.jitcodes[graph]`.
+    pub fn replace_with(&self, next: PyJitCode) {
+        // SAFETY: see the `Sync` impl comment; this method is only for
+        // the codewriter publication path.
+        unsafe {
+            *self.payload.get() = next.payload.into_inner();
+        }
+    }
+
     /// Check if this jitcode has BC_ABORT opcodes.
     pub fn has_abort_opcode(&self) -> bool {
         self.has_abort
@@ -271,9 +344,9 @@ impl PyJitCode {
         w_code: *const (),
         merge_point_pc: Option<usize>,
     ) -> Self {
-        Self {
-            jitcode: std::sync::Arc::new(RuntimeJitCode::default()),
-            metadata: PyJitCodeMetadata {
+        Self::from_parts(
+            std::sync::Arc::new(RuntimeJitCode::default()),
+            PyJitCodeMetadata {
                 pc_map: Vec::new(),
                 depth_at_py_pc: Vec::new(),
                 portal_frame_reg: 0,
@@ -284,8 +357,8 @@ impl PyJitCode {
             },
             code_ptr,
             w_code,
-            has_abort: false,
+            false,
             merge_point_pc,
-        }
+        )
     }
 }

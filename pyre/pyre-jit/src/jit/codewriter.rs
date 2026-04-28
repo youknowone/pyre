@@ -6720,14 +6720,14 @@ impl CodeWriter {
             pyre_color_for_semantic_local,
         };
 
-        PyJitCode {
-            jitcode: std::sync::Arc::new(jitcode),
+        PyJitCode::from_parts(
+            std::sync::Arc::new(jitcode),
             metadata,
-            code_ptr: code as *const CodeObject,
+            code as *const CodeObject,
             w_code,
             has_abort,
             merge_point_pc,
-        }
+        )
     }
 
     /// RPython: `CodeWriter.make_jitcodes(verbose)` (codewriter.py:74-89).
@@ -6807,11 +6807,9 @@ impl CodeWriter {
             //
             // PRE-EXISTING-ADAPTATION: `transform_graph_to_jitcode`
             // still returns a fresh `PyJitCode`, but `publish_jitcode`
-            // now mutates the cached skeleton in place whenever the
-            // slot's `Arc` is still unique. That keeps pyre closer to
-            // RPython's "same JitCode object is filled later" flow; the
-            // fallback for already-shared slots is still to replace the
-            // `Arc`.
+            // replaces the cached skeleton's payload in place. That
+            // matches RPython's "same JitCode object is filled later"
+            // identity flow even after other stores cloned the Arc.
             let pyjitcode =
                 self.transform_graph_to_jitcode(unsafe { &*code_ptr }, w_code, merge_point_pc);
             let key = code_ptr as usize;
@@ -6842,12 +6840,11 @@ impl CodeWriter {
 
     /// call.py:147-148 follow-up after the drain. `grab_initial_jitcodes`
     /// already binds `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`;
-    /// the drain may replace the cached Arc when the skeleton was already
-    /// cloned into `jd.mainjitcode`, so re-bind each jd to the populated
-    /// `CallControl.jitcodes[portal_graph]` Arc. `finalize_jitcode` stamps
-    /// the exact `jitdriver_sd` on the populated runtime `JitCode`; the
-    /// `Arc::get_mut` block below only preserves the old unique-Arc fast
-    /// path for entries that were not shared before publication.
+    /// the drain fills that same Arc in place, so this method only refreshes
+    /// each jd from `CallControl.jitcodes[portal_graph]`. `finalize_jitcode` stamps
+    /// the exact `jitdriver_sd` on the populated runtime `JitCode`; because
+    /// `publish_jitcode` replaces the payload in place, this no longer needs
+    /// to repair identity after the drain.
     fn assign_portal_jitdriver_indices(&self) {
         let cc = self.callcontrol();
         // Snapshot the (key, jdindex) pairs first so the borrow on
@@ -6859,14 +6856,7 @@ impl CodeWriter {
             .map(|(idx, jd)| (super::call::CallControl::jitcode_key(jd.portal_graph), idx))
             .collect();
         for (key, idx) in assignments {
-            let arc_clone = cc.jitcodes.get_mut(&key).map(|arc| {
-                if let Some(pyjitcode) = std::sync::Arc::get_mut(arc) {
-                    if let Some(inner) = std::sync::Arc::get_mut(&mut pyjitcode.jitcode) {
-                        inner.jitdriver_sd = Some(idx);
-                    }
-                }
-                std::sync::Arc::clone(arc)
-            });
+            let arc_clone = cc.jitcodes.get(&key).map(std::sync::Arc::clone);
             if let Some(clone) = arc_clone {
                 cc.jitdrivers_sd[idx].mainjitcode = Some(clone);
             }
@@ -7001,19 +6991,16 @@ pub fn compile_jitcode_for_callee(code: &pyre_interpreter::CodeObject, w_code: *
     // upstream `call.py:155-172` keeps callee compilation and the
     // returned `JitCode` is the same object the trace-side lookup hands
     // out. Pyre still compiles the per-CodeObject body under flag-ON
-    // because runtime readers have not all been unified onto the
-    // canonical portal metadata. An empirical probe (G.4.4 attempt,
-    // 2026-04-26)
-    // returning early here under `PYRE_PORTAL_REDIRECT=1` regressed
-    // flag-ON from 12/14 to 6/14 because the trace path immediately
-    // hit the missing per-CodeObject `pc_map` / liveness.
-    //
-    // G.4.4-encoder closure (2026-04-28) was expected to unblock this
-    // re-attempt but a re-run under PYRE_PORTAL_REDIRECT=1 with this
-    // gate flipped regressed cranelift fannkuch to `crash (exit 101)`,
-    // showing additional reader paths beyond the encoder still depend
-    // on per-CodeObject jitcodes.  Closing this requires further
-    // co-evolution of the readers identified by the future audit.
+    // because non-portal callees (user functions called from inside a
+    // traced loop) are not registered as portals via
+    // `register_portal_jitdriver`, so the redirect path returns None
+    // and the trace-side reader needs the per-CodeObject drain output.
+    // Probes 2026-04-26 and 2026-04-28 PM both regressed flag-ON
+    // (`inline_helper crash 101` + intermittent nbody/fannkuch timeouts)
+    // when this body returned early under `PYRE_PORTAL_REDIRECT=1`.
+    // Closing this requires every callee path to either (a) register
+    // through the portal driver or (b) the trace-side reader to lazily
+    // synthesize a portal-bridge entry on miss.
     let writer = CodeWriter::instance();
     // call.py:155 `get_jitcode(graph)` — insert skeleton + queue.
     let _ = writer.callcontrol().get_jitcode(code, w_code, None);
@@ -8557,7 +8544,7 @@ mod tests {
     }
 
     #[test]
-    fn make_jitcodes_rebinds_mainjitcode_to_populated_portal_arc() {
+    fn make_jitcodes_fills_mainjitcode_payload_in_place() {
         let writer = CodeWriter::new();
         let code = pyre_interpreter::compile_exec("x = 5\n").expect("source must compile");
         let w_code = pyre_interpreter::box_code_constant(&code);
@@ -8571,6 +8558,27 @@ mod tests {
             mainjitcode: None,
         });
 
+        writer.callcontrol().grab_initial_jitcodes();
+        let shell = writer.callcontrol().jitdrivers_sd[0]
+            .mainjitcode
+            .as_ref()
+            .expect("grab_initial_jitcodes must bind jd.mainjitcode")
+            .clone();
+        let shell_ptr = Arc::as_ptr(&shell);
+        let cached_shell = writer
+            .callcontrol()
+            .jitcodes
+            .get(&(code_ptr as usize))
+            .expect("grab_initial_jitcodes must cache the same shell");
+        assert!(
+            Arc::ptr_eq(&shell, cached_shell),
+            "call.py:147-170 binds jd.mainjitcode to self.jitcodes[portal_graph]"
+        );
+        assert!(
+            shell.is_skeleton(),
+            "test must start from the call.py:147 shell"
+        );
+
         writer.make_jitcodes();
 
         let cached = writer
@@ -8581,6 +8589,11 @@ mod tests {
             .mainjitcode
             .as_ref()
             .expect("make_jitcodes must leave jd.mainjitcode bound");
+        assert_eq!(
+            Arc::as_ptr(mainjitcode),
+            shell_ptr,
+            "codewriter.py:80 must fill the call.py:147 shell in place"
+        );
         assert!(
             Arc::ptr_eq(mainjitcode, &cached),
             "jd.mainjitcode and CallControl.jitcodes[portal_graph] must share the populated Arc"
@@ -8699,7 +8712,7 @@ mod tests {
             .expect("test setup must keep a registered portal driver");
         assert!(
             Arc::ptr_eq(mainjitcode, &returned),
-            "redirect path must rebind jd.mainjitcode to the populated CallControl entry"
+            "redirect path must return the populated CallControl entry already shared by jd.mainjitcode"
         );
         assert!(
             returned.is_populated(),

@@ -462,9 +462,9 @@ impl CallControl {
     /// Reset the cached slot back to an empty skeleton — the state that
     /// follows `JitCode(graph.name, fnaddr, calldescr, ...)` at
     /// `call.py:168` before the drain re-runs `assembler.assemble`
-    /// (codewriter.py:67) on it. Mutates the cached object in place
-    /// via `Arc::get_mut` when the slot is still unique; falls back to
-    /// `Arc` replacement only when another store has already cloned it.
+    /// (codewriter.py:67) on it. Mutates the cached object's payload
+    /// in place so any existing `Arc<PyJitCode>` clones keep observing
+    /// the same identity.
     pub fn reset_jitcode_skeleton(
         &mut self,
         key: usize,
@@ -473,10 +473,8 @@ impl CallControl {
         merge_point_pc: Option<usize>,
     ) {
         if let Some(slot) = self.jitcodes.get_mut(&key) {
-            if let Some(existing) = std::sync::Arc::get_mut(slot) {
-                *existing = PyJitCode::skeleton(code_ptr, w_code, merge_point_pc);
-                return;
-            }
+            slot.replace_with(PyJitCode::skeleton(code_ptr, w_code, merge_point_pc));
+            return;
         }
         self.jitcodes.insert(
             key,
@@ -495,16 +493,11 @@ impl CallControl {
     ///
     /// Pyre's `transform_graph_to_jitcode` returns a fresh `PyJitCode`
     /// instead of mutating the skeleton, so this helper bridges the
-    /// split by mutating the cached object via `Arc::get_mut` when the
-    /// slot is still unique, falling back to `Arc` replacement only
-    /// when another store has already cloned the skeleton.
+    /// split by replacing the cached object's payload without changing
+    /// the outer `Arc<PyJitCode>` identity.
     pub fn publish_jitcode(&mut self, key: usize, pyjitcode: PyJitCode) -> *const PyJitCode {
         if let Some(slot) = self.jitcodes.get_mut(&key) {
-            if let Some(existing) = std::sync::Arc::get_mut(slot) {
-                *existing = pyjitcode;
-                return existing as *const PyJitCode;
-            }
-            *slot = std::sync::Arc::new(pyjitcode);
+            slot.replace_with(pyjitcode);
             return std::sync::Arc::as_ptr(slot);
         }
         let arc = std::sync::Arc::new(pyjitcode);

@@ -615,9 +615,9 @@ pub fn install_portal_for(
             )
         };
 
-    Arc::new(PyJitCode {
-        jitcode: runtime,
-        metadata: PyJitCodeMetadata {
+    Arc::new(PyJitCode::from_parts(
+        runtime,
+        PyJitCodeMetadata {
             pc_map: Vec::new(),
             depth_at_py_pc,
             portal_frame_reg,
@@ -628,9 +628,9 @@ pub fn install_portal_for(
         },
         code_ptr,
         w_code,
-        has_abort: false,
-        merge_point_pc: None,
-    })
+        false,
+        None,
+    ))
 }
 
 #[cfg(test)]
@@ -1090,7 +1090,7 @@ def f(x, y):
         // (so `code` is non-empty) and stamp a synthesized `pc_map`
         // entry. This mirrors what `compile_jitcode_for_callee`'s
         // drain produces — both fields populated.
-        let mut drained_runtime = (*portal.jitcode).clone();
+        let drained_runtime = (*portal.jitcode).clone();
         // Defensively assert the precondition the discriminator relies
         // on — if a future refactor empties `code` here, the
         // assertion below would still pass but would no longer
@@ -1099,9 +1099,9 @@ def f(x, y):
             !drained_runtime.code.is_empty(),
             "test setup: cloned portal jitcode must have non-empty code"
         );
-        let drained = PyJitCode {
-            jitcode: std::sync::Arc::new(drained_runtime),
-            metadata: PyJitCodeMetadata {
+        let drained = PyJitCode::from_parts(
+            std::sync::Arc::new(drained_runtime),
+            PyJitCodeMetadata {
                 pc_map: vec![0],
                 depth_at_py_pc: Vec::new(),
                 portal_frame_reg: 0,
@@ -1110,11 +1110,11 @@ def f(x, y):
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),
             },
-            code_ptr: std::ptr::null(),
-            w_code: std::ptr::null(),
-            has_abort: false,
-            merge_point_pc: None,
-        };
+            std::ptr::null(),
+            std::ptr::null(),
+            false,
+            None,
+        );
         assert!(
             !drained.is_portal_bridge(),
             "drained per-CodeObject (pc_map populated) must NOT report portal-bridge"
