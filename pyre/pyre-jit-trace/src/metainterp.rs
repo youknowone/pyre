@@ -4,7 +4,7 @@
 //! and inline frames. CALL → push_inline_frame (RPython perform_call),
 //! RETURN → finishframe_inline (RPython finishframe).
 
-use majit_ir::{OpRef, Type};
+use majit_ir::{OpRef, Type, Value};
 use majit_metainterp::{TraceAction, TraceCtx};
 use pyre_interpreter::CodeObject;
 use pyre_interpreter::bytecode::Instruction;
@@ -37,6 +37,14 @@ pub struct MetaInterpFrame {
     pub drop_frame_opref: Option<OpRef>,
     pub caller_result_stack_idx: Option<usize>,
     pub arg_state: pyre_interpreter::bytecode::OpArgState,
+    /// `virtualizable_boxes` static-slot snapshot taken when this inline
+    /// frame was pushed (Slice 3.0e').  Empty for the root frame and for
+    /// non-virtualizable traces.  At pop, each `Some((opref, value))`
+    /// entry is written back into `ctx.virtualizable_boxes` so the
+    /// outer frame's vable shadow returns to its pre-call state after
+    /// the callee's `flush_to_frame_for_guard` mirrors (Slice 3.0c)
+    /// have written callee values into the same shadow.
+    pub saved_vable_static_box_entries: Vec<Option<(OpRef, Value)>>,
 }
 
 impl MetaInterpFrame {
@@ -400,6 +408,23 @@ impl PyreMetaInterp {
             }
         }
 
+        // Slice 3.0e': capture the caller's `virtualizable_boxes`
+        // static-slot state before the callee starts running.  The
+        // callee's per-emit `mirror_vable_static_to_boxes` calls
+        // (Slice 3.0a/b/c/e) will overwrite these slots with callee
+        // values during execution; at `finishframe_inline` /
+        // `finishframe_exception` we restore the caller's pre-call
+        // shadow from this Vec so the outer frame's writeback /
+        // snapshot path reads the right identity.
+        let n_static = ctx
+            .virtualizable_info()
+            .map(|info| info.num_static_extra_boxes)
+            .unwrap_or(0);
+        let mut saved_vable_static_box_entries = Vec::with_capacity(n_static);
+        for idx in 0..n_static {
+            saved_vable_static_box_entries.push(ctx.virtualizable_entry_at(idx));
+        }
+
         let frame = MetaInterpFrame {
             sym: sym_ptr,
             owned_sym: Some(owned_sym),
@@ -412,6 +437,7 @@ impl PyreMetaInterp {
             drop_frame_opref: pending.drop_frame_opref,
             caller_result_stack_idx: caller_result_idx,
             arg_state: pyre_interpreter::bytecode::OpArgState::default(),
+            saved_vable_static_box_entries,
         };
 
         self.portal_call_depth += 1;
@@ -435,6 +461,17 @@ impl PyreMetaInterp {
         let popped = self.framestack.pop().unwrap();
         self.portal_call_depth -= 1;
         ctx.pop_inline_trace_position();
+
+        // Slice 3.0e': restore the caller's `virtualizable_boxes` shadow
+        // captured at `push_inline_frame`.  Slice 3.0c flush mirrors
+        // overwrote the slots with callee values during inline
+        // execution; this puts the outer frame's identity back in
+        // place before the trace continues with the parent sym.
+        for (idx, entry) in popped.saved_vable_static_box_entries.iter().enumerate() {
+            if let Some((opref, value)) = entry {
+                ctx.set_virtualizable_entry_at(idx, *opref, *value);
+            }
+        }
 
         // executioncontext.py:89 / pyjitpl.py:1819: virtual_ref_finish for callee frame.
         if let Some(frame_opref) = popped.drop_frame_opref {
@@ -697,6 +734,13 @@ impl PyreMetaInterp {
                 let popped = self.framestack.pop().unwrap();
                 self.portal_call_depth -= 1;
                 ctx.pop_inline_trace_position();
+
+                // Slice 3.0e': restore caller's vable shadow saved at push.
+                for (idx, entry) in popped.saved_vable_static_box_entries.iter().enumerate() {
+                    if let Some((opref, value)) = entry {
+                        ctx.set_virtualizable_entry_at(idx, *opref, *value);
+                    }
+                }
 
                 // executioncontext.py:89 / pyjitpl.py:1819: virtual_ref_finish on exception leave.
                 if let Some(frame_opref) = popped.drop_frame_opref {

@@ -47,6 +47,9 @@ pub fn trace_bytecode(
         drop_frame_opref: None,
         caller_result_stack_idx: None,
         arg_state: pyre_interpreter::bytecode::OpArgState::default(),
+        // Slice 3.0e': root frame has no caller to restore; only inline
+        // frames pushed via `push_inline_frame` populate this Vec.
+        saved_vable_static_box_entries: Vec::new(),
     };
 
     let mut metainterp = PyreMetaInterp::new(w_code, std::ptr::null_mut());
