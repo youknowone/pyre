@@ -238,14 +238,13 @@ impl MetaInterpStaticData {
     /// Returns a stable pointer (Box ensures no reallocation moves).
     ///
     /// `supplied` carries the shared `Arc<PyJitCode>` from the
-    /// upstream codewriter (see [`COMPILE_JITCODE_FN`]); when present
+    /// upstream codewriter via [`install_jitcode_for`]; when present
     /// we install it as the entry's payload so both stores reference
     /// the same allocation. On a `by_code` hit a fresh `supplied`
     /// replaces the existing payload — this is how a
     /// `merge_point_pc`-driven recompile in `CallControl` propagates
     /// to readers that hold a cached `*const JitCode`. When
-    /// `supplied` is `None` (no callback registered, or callback
-    /// declined), we fall back to a skeleton so the entry slot
+    /// `supplied` is `None` (no published payload), we fall back to a skeleton so the entry slot
     /// exists with a well-formed `Arc`.
     fn jitcode_for(
         &mut self,
@@ -317,13 +316,13 @@ impl MetaInterpStaticData {
     }
 
     /// Return the existing SD entry only when its payload is already
-    /// populated. Skeleton entries must still go through the compile
-    /// callback so `CallControl` can drain and fill the bytecode body.
+    /// populated. Skeleton entries must still go through pyre-jit's
+    /// ensure path so `CallControl` can drain and fill the bytecode body.
     ///
     /// PRE-EXISTING-ADAPTATION: RPython's `MetaInterpStaticData` never
     /// observes a skeleton entry — every `self.jitcodes` slot is
     /// populated by `make_jitcodes` (codewriter.py:74-89) before any
-    /// trace runs. Pyre compiles lazily via `set_compile_jitcode_fn`,
+    /// trace runs. Pyre compiles lazily via `CallJitCallbacks`,
     /// so a cached entry here can still be the shell produced by
     /// `JitCode(name, fnaddr, calldescr, ...)` (call.py:168) before
     /// `assembler.assemble(ssarepr, jitcode, num_regs)`
@@ -526,103 +525,17 @@ fn ensure_finish_setup() {
     });
 }
 
-/// Process-global hook the upper `pyre-jit` crate registers from
-/// `CodeWriter::new()` so the trace-side `jitcode_for` can drive the
-/// codewriter pipeline without `pyre_jit_trace` taking a build
-/// dependency on `pyre-jit`. RPython parity: jtransform's lookup of a
-/// callee graph in `cc.callcontrol.get_jitcode(callee)` (call.py:155)
-/// directly populates `CallControl.jitcodes` and queues the entry on
-/// `unfinished_graphs`; `make_jitcodes`'s drain (codewriter.py:79-89)
-/// then calls `transform_graph_to_jitcode` and `assembler.finished()`
-/// in one transitive pass. Pyre cannot perform that pass eagerly at
-/// warmspot time (no static callee discovery), so the lazy analog
-/// fires on every trace-side `jitcode_for` instead.
-///
-/// The callback returns the shared `Arc<PyJitCode>` it just installed
-/// in `CallControl.jitcodes`; `jitcode_for` then stores the same
-/// `Arc` on the SD entry so both stores reference one allocation —
-/// the Rust analog of RPython's two stores holding the same Python
-/// object. The fn pointer stays `Sync` because the upstream callback
-/// (`compile_jitcode_via_w_code`) reads `CodeWriter::instance()`
-/// which is itself per-thread.
-///
-/// PRE-EXISTING-ADAPTATION: pyre splits `pyre-jit-trace` (lower in the
-/// crate DAG) from `pyre-jit` (upper). RPython directly calls
-/// `CallControl.get_jitcode(graph)` (`call.py:155`) from `jtransform.py`
-/// because both live in the same Python module post-translation. The
-/// forward function pointer is the minimum-adaptation Rust workaround
-/// for the crate-layering split.
-pub type CompileJitcodeFn = fn(*const ()) -> Option<std::sync::Arc<crate::PyJitCode>>;
-
-static COMPILE_JITCODE_FN: std::sync::atomic::AtomicPtr<()> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-/// Registered once per process from `CodeWriter::new()` (under a
-/// `Once` guard). Invoked by `jitcode_for` before the canonical
-/// `MetaInterpStaticData.jitcodes` insert so that
-/// `CallControl.jitcodes` is populated under the same RPython
-/// invariant: any code object whose `JitCode` index appears in
-/// `MetaInterpStaticData` also has a populated `PyJitCode` reachable
-/// through `CallControl.find_jitcode` for the blackhole/resume
-/// lookup (resume.py:1338 `metainterp_sd.jitcodes[jitcode_pos]`).
-pub fn set_compile_jitcode_fn(f: CompileJitcodeFn) {
-    COMPILE_JITCODE_FN.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Future `call.py:147` invariant bridge: hand a freshly-installed
-/// portal-bridge `Arc<PyJitCode>` to `pyre-jit::CallControl` so its
-/// `.jitcodes` dictionary holds the SAME allocation as
-/// `MetaInterpStaticData.jitcodes`.
-/// Mirrors upstream `call.py:145-148`:
-///
-/// ```python
-/// for jd in self.jitdrivers_sd:
-///     jd.mainjitcode = self.get_jitcode(jd.portal_graph)
-///     jd.mainjitcode.jitdriver_sd = jd
-/// ```
-///
-/// where `get_jitcode` inserts the JitCode object into
-/// `CallControl.jitcodes` while the surrounding `make_jitcodes` drain
-/// populates `metainterp_sd.jitcodes` — both stores hold the same Python
-/// `JitCode` object via refcount semantics. Pyre's split-store layout
-/// requires an explicit callback once redirect-ON resume readers can safely
-/// consume portal-bridge entries.
-///
-/// PRE-EXISTING-ADAPTATION: pyre splits `pyre-jit-trace` (lower in the
-/// crate DAG) from `pyre-jit` (upper). RPython directly indexes
-/// `CallControl.jitcodes[graph]` (`call.py:155`) from `jtransform.py`
-/// because both live in the same Python module post-translation. The
-/// forward function pointer is the minimum-adaptation Rust workaround
-/// for the crate-layering split.
-///
-/// The arguments mirror the per-CodeObject path's call shape: the
-/// `*const ()` is the `W_CodeObject` wrapper pointer used as the dict
-/// key (`compile_jitcode_for_callee` derives `raw_code` and inserts at
-/// `raw_code as usize`); the `Arc` is the `install_portal_for` output
-/// that should be cloned into both stores.
-pub type RegisterPortalBridgeFn = fn(*const (), std::sync::Arc<crate::PyJitCode>);
-
-static REGISTER_PORTAL_BRIDGE_FN: std::sync::atomic::AtomicPtr<()> =
-    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
-
-/// Registration hook for the future portal-bridge shared-identity fix.
-/// `CodeWriter::new()` intentionally leaves it unset today; `jitcode_for`
-/// must not call through until blackhole resume can translate a user Python
-/// PC to the corresponding canonical portal jitcode PC.
-pub fn set_register_portal_bridge_fn(f: RegisterPortalBridgeFn) {
-    REGISTER_PORTAL_BRIDGE_FN.store(f as *mut (), std::sync::atomic::Ordering::Relaxed);
-}
-
 /// G.3c — `PYRE_PORTAL_REDIRECT` opt-in switch. Read once on first
 /// call and cached in a `OnceLock` so subsequent `jitcode_for` lookups
 /// pay no env-var cost.
 ///
-/// When the variable is set to a non-empty value, `jitcode_for(code)`
-/// short-circuits the COMPILE_JITCODE_FN callback path and installs a
-/// portal-bridged `Arc<PyJitCode>` (G.3a `install_portal_for`)
-/// instead. The flag is the controlled probe surface that lets G.3d
-/// collect empirical reader-failure data per benchmark without
-/// destabilizing the default baseline.
+/// When the variable is set to a non-empty value, pyre-jit's
+/// `ensure_majit_jitcode` path supplies the populated writer-owned
+/// portal jitcode for registered portals and falls back to the ordinary
+/// per-CodeObject jitcode for non-portal callees. The flag is the
+/// controlled probe surface that lets G.3d collect empirical
+/// reader-failure data per benchmark without destabilizing the default
+/// baseline.
 ///
 /// RPython parity note: upstream has no equivalent flag because every
 /// user CodeObject is the portal's `pycode` input — there is no
@@ -648,81 +561,63 @@ pub fn portal_redirect_enabled() -> bool {
 /// pyjitpl.py:74: frame.jitcode — get or create JitCode for CodeObject.
 /// RPython: MetaInterp.staticdata.jitcodes[idx]; pyre: METAINTERP_SD.
 ///
-/// Fires the registered compile callback before installing the SD
-/// entry; the callback returns the shared `Arc<PyJitCode>` from the
-/// upstream `CallControl.jitcodes` so both stores reference one
-/// allocation. RPython's equivalent is `cc.callcontrol.get_jitcode(graph)`
-/// inside jtransform, which inserts the JitCode object into the
+/// Requests pyre-jit to ensure the writer-owned `CallControl.jitcodes`
+/// entry exists, then reads the payload that pyre-jit publishes into
+/// this SD table. RPython's equivalent is `cc.callcontrol.get_jitcode(
+/// graph)` inside jtransform, which inserts the JitCode object into the
 /// `CallControl.jitcodes` dict and lets the surrounding `make_jitcodes`
 /// drain populate `MetaInterpStaticData.jitcodes` — both holding the
-/// same Python object. Pyre's lazy split runs that pipeline for one
-/// code object per trace-side reference; see `set_compile_jitcode_fn`.
+/// same Python object.
 ///
-/// G.3c — when `PYRE_PORTAL_REDIRECT` env is set, the callback path is
-/// replaced by `canonical_bridge::install_portal_for(...)`. Existing
-/// cached entries (per-CodeObject or portal-bridge) are still served
-/// by `compiled_jitcode_lookup`. The flag is OFF by default — flag-OFF
+/// G.3c — when `PYRE_PORTAL_REDIRECT` env is set, pyre-jit's ensure path
+/// publishes a writer-owned portal jitcode for registered portals instead
+/// of letting the trace crate construct a bridge itself. Existing cached entries
+/// (per-CodeObject or portal-bridge) are still served by
+/// `compiled_jitcode_lookup`. The flag is OFF by default — flag-OFF
 /// behavior is byte-for-byte identical to pre-G.3c.
 pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
     ensure_finish_setup();
     if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code)) {
         return existing;
     }
-    let supplied = if portal_redirect_enabled() {
-        // G.3c short-circuit: skip the per-CodeObject codewriter
-        // callback entirely; install a portal-bridged Arc<PyJitCode>
-        // whose `jitcode.code` is the portal canonical bytecode and
-        // whose `metadata` is empty. Readers that follow this path
-        // observe `PyJitCode::is_portal_bridge() == true`.
-        //
-        // `call.py:145-148` shared-identity invariant: clone the same
-        // `Arc<PyJitCode>` into both `MetaInterpStaticData.jitcodes`
-        // (via the `METAINTERP_SD.jitcode_for(code, supplied)` call
-        // below) and `CallControl.jitcodes` (via the registered
-        // `REGISTER_PORTAL_BRIDGE_FN` callback). Without the second
-        // store, blackhole resume's `find_jitcode(code)` (call_jit.rs
-        // :805) misses → `BlackholeResult::Failed` → invalidate-
-        // recompile loop. Two prior probes regressed before the merge
-        // landed: (a) wiring the callback while readers still bounds-
-        // checked an empty `pc_map` (13/14 → 9/14), (b) using
-        // `jitcode_pc = 0` for portal-bridge entries (→ 4/14, BH at pc
-        // 0 mismatch with the trace's snapshot pc). The post-nested-
-        // merge code path no longer regresses under this wire-up
-        // (default 14/14, `PYRE_PORTAL_REDIRECT=1` 13/14 maintained),
-        // so the upstream invariant can finally be satisfied here.
+    if let Some(callbacks) = crate::callbacks::try_get() {
         let raw_code = unsafe {
-            pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
-                as *const pyre_interpreter::CodeObject
+            if code.is_null() {
+                std::ptr::null()
+            } else {
+                pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
+                    as *const pyre_interpreter::CodeObject
+            }
         };
-        let portal_bridge = crate::canonical_bridge::install_portal_for(raw_code, code);
-        let cb = REGISTER_PORTAL_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
-        if !cb.is_null() {
-            // SAFETY: only `set_register_portal_bridge_fn` writes to
-            // this slot, and it stores a `RegisterPortalBridgeFn` cast
-            // through `as *mut ()`.
-            let f: RegisterPortalBridgeFn = unsafe { std::mem::transmute(cb) };
-            f(code, portal_bridge.clone());
+        if !raw_code.is_null() {
+            (callbacks.ensure_majit_jitcode)(raw_code, code);
+            if let Some(existing) = METAINTERP_SD.with(|r| r.borrow().compiled_jitcode_lookup(code))
+            {
+                return existing;
+            }
         }
-        Some(portal_bridge)
-    } else {
-        let cb = COMPILE_JITCODE_FN.load(std::sync::atomic::Ordering::Relaxed);
-        if cb.is_null() {
-            None
-        } else {
-            // SAFETY: only `set_compile_jitcode_fn` writes to this slot,
-            // and it stores a `CompileJitcodeFn` cast through `as *mut ()`.
-            let f: CompileJitcodeFn = unsafe { std::mem::transmute(cb) };
-            f(code)
-        }
-    };
-    METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, supplied))
+    }
+    METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, None))
+}
+
+/// Install a pyre-jit-owned `PyJitCode` payload into this trace-side
+/// `MetaInterpStaticData.jitcodes` table and return the stable wrapper
+/// pointer. This replaces the old trace-local compile return channel:
+/// pyre-jit owns compilation, then explicitly publishes the populated
+/// Arc here so both stores share the same allocation.
+pub fn install_jitcode_for(
+    code: *const (),
+    payload: std::sync::Arc<crate::PyJitCode>,
+) -> *const () {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, Some(payload)) as *const ())
 }
 
 /// Ensure the trace-side staticdata has a JitCode slot for this
 /// `W_CodeObject` and return its SD-local `jitcode.index`.
 ///
 /// This is the real runtime path: it goes through `jitcode_for(code)`,
-/// which in turn invokes the registered compile callback when the slot is
+/// which in turn invokes pyre-jit's ensure path when the slot is
 /// missing or still a skeleton. Used by higher-level integration tests in
 /// `pyre-jit` so they can exercise guard/resume decoding without
 /// reintroducing synthetic test-only JitCode builders in this crate.
@@ -740,7 +635,7 @@ pub fn ensure_jitcode_index(code: *const ()) -> Option<i32> {
 ///
 /// Cross-crate tests in `pyre-jit` use this to seed `PyreSym.jitcode`
 /// with the same pointer the tracer and blackhole paths would see after
-/// `jitcode_for(code)` ran the registered compile callback.
+/// `jitcode_for(code)` ran pyre-jit's ensure path.
 #[doc(hidden)]
 pub fn ensure_jitcode_ptr(code: *const ()) -> Option<*const ()> {
     if code.is_null() {
@@ -756,7 +651,7 @@ pub fn frame_locals_cells_stack_array_ref(ctx: &mut TraceCtx, frame: OpRef) -> O
 
 /// Read-only JitCode lookup by CodeObject-wrapper pointer.
 ///
-/// Blackhole/resume paths must not invoke the compile callback: any
+/// Blackhole/resume paths must not invoke the compile path: any
 /// nested `jitcode_for` call re-enters the JIT pipeline (compile,
 /// warmstate bookkeeping) from inside a guard-failure decoder, which
 /// caused SIGSEGVs on nbody. Returns null if the code has never been

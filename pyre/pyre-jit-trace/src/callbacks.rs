@@ -52,3 +52,10 @@ pub fn init(cb: &'static CallJitCallbacks) {
 pub fn get() -> &'static CallJitCallbacks {
     CALLBACKS.with(|c| c.get().expect("CallJitCallbacks not initialized"))
 }
+
+/// Optional callback table lookup for cold paths that can fall back to
+/// skeleton-only behavior in tests before pyre-jit initializes callbacks.
+#[inline]
+pub fn try_get() -> Option<&'static CallJitCallbacks> {
+    CALLBACKS.with(|c| c.get())
+}

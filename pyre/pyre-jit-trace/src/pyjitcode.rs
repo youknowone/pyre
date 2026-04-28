@@ -244,9 +244,10 @@ impl PyJitCode {
     /// `canonical_bridge::install_portal_for` for the full reader
     /// audit (G.3a).
     ///
-    /// G.3b commit lands this discriminator only.  No production
-    /// reader currently calls it — readers will pick it up site-by-site
-    /// in G.3c when concrete callers flip onto `install_portal_for`.
+    /// G.3b landed this discriminator for reader-audit probes. The
+    /// orthodox redirect path now avoids binding portal-bridge payloads as
+    /// `jd.mainjitcode`; production readers still branch on this predicate
+    /// only for explicit bridge-probe installs.
     pub fn is_portal_bridge(&self) -> bool {
         !self.jitcode.code.is_empty() && self.metadata.pc_map.is_empty()
     }

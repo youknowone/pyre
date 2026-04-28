@@ -1753,13 +1753,8 @@ fn init_callbacks() {
                 driver_pair: || JIT_DRIVER.with(|cell| cell.get() as *mut u8),
                 ensure_majit_jitcode: |code, w_code| {
                     if !code.is_null() {
-                        // Trace-side callee compile — must NOT touch
-                        // `jitdrivers_sd`. See call.py:155-172 +
-                        // `feedback_setup_jitdriver_portal_only`.
-                        crate::jit::codewriter::compile_jitcode_for_callee(
-                            unsafe { &*code },
-                            w_code,
-                        );
+                        let _ =
+                            crate::jit::codewriter::ensure_trace_jitcode_for_w_code(code, w_code);
                     }
                 },
             }));
@@ -5420,6 +5415,11 @@ mod tests {
             .unwrap_or_else(|| panic!("test source should contain function code {name}"))
     }
 
+    fn ensure_test_jit_callbacks() {
+        super::init_callbacks();
+        let _ = crate::jit::codewriter::CodeWriter::instance();
+    }
+
     /// Translate Python-stack depths into the post-regalloc Ref-bank
     /// colors the dispatcher would actually touch. Phase 2.1c removed the
     /// `register_color = nlocals + depth` identity (chordal coloring may
@@ -5477,7 +5477,7 @@ mod tests {
         use pyre_interpreter::compile_exec;
         use pyre_jit_trace::state as trace_state;
 
-        let _ = crate::jit::codewriter::CodeWriter::instance();
+        ensure_test_jit_callbacks();
         let module = compile_exec(source).expect("test code should compile");
         let code = function_code_from_module(&module, function_name);
         let mut frame = Box::new(PyFrame::new(code.clone()));
@@ -5521,7 +5521,7 @@ mod tests {
         use pyre_interpreter::compile_exec;
         use pyre_jit_trace::state as trace_state;
 
-        let _ = crate::jit::codewriter::CodeWriter::instance();
+        ensure_test_jit_callbacks();
         let module = compile_exec(source).expect("test code should compile");
         let code = function_code_from_module(&module, function_name);
         let mut frame = Box::new(PyFrame::new(code.clone()));
@@ -5588,7 +5588,7 @@ mod tests {
         use pyre_object::pyobject::is_int;
         use pyre_object::{w_int_get_value, w_int_new};
 
-        let _ = crate::jit::codewriter::CodeWriter::instance();
+        ensure_test_jit_callbacks();
         let module = compile_exec("def f(a, b, c):\n    i = 0\n    return i\nf(1, 2, 3)\n")
             .expect("test code should compile");
         let code = module
@@ -5696,7 +5696,7 @@ mod tests {
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
         use pyre_object::{w_int_new, w_list_new};
 
-        let _ = crate::jit::codewriter::CodeWriter::instance();
+        ensure_test_jit_callbacks();
         let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
@@ -5773,7 +5773,7 @@ mod tests {
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
         use pyre_object::{w_int_new, w_list_new};
 
-        let _ = crate::jit::codewriter::CodeWriter::instance();
+        ensure_test_jit_callbacks();
         let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
@@ -5852,7 +5852,7 @@ mod tests {
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
         use pyre_object::{w_int_new, w_list_new};
 
-        let _ = crate::jit::codewriter::CodeWriter::instance();
+        ensure_test_jit_callbacks();
         let module =
             compile_exec("def f(b):\n    return b\nf(1)\n").expect("test code should compile");
         let code = function_code_from_module(&module, "f");
@@ -5924,7 +5924,7 @@ mod tests {
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
         use pyre_object::{INT_TYPE, w_int_new, w_list_new};
 
-        let _ = crate::jit::codewriter::CodeWriter::instance();
+        ensure_test_jit_callbacks();
         let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
@@ -5990,7 +5990,7 @@ mod tests {
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
         use pyre_object::{w_int_new, w_list_new};
 
-        let _ = crate::jit::codewriter::CodeWriter::instance();
+        ensure_test_jit_callbacks();
         let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
@@ -6078,7 +6078,7 @@ mod tests {
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
         use pyre_object::{w_int_new, w_list_new};
 
-        let _ = crate::jit::codewriter::CodeWriter::instance();
+        ensure_test_jit_callbacks();
         let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");
@@ -6215,7 +6215,7 @@ mod tests {
         use pyre_jit_trace::state::{self as trace_state, MIFrame, PyreSym, TestSymState};
         use pyre_object::{w_int_new, w_list_new};
 
-        let _ = crate::jit::codewriter::CodeWriter::instance();
+        ensure_test_jit_callbacks();
         let module = compile_exec("def f(x):\n    i = 7\n    return x[i - 7]\nf([1])\n")
             .expect("test code should compile");
         let code = function_code_from_module(&module, "f");

@@ -22,9 +22,6 @@ pub mod state;
 pub mod super_inst_expand;
 mod trace_opcode;
 pub use pyjitcode::{PyJitCode, PyJitCodeMetadata};
-pub use state::{
-    CompileJitcodeFn, RegisterPortalBridgeFn, set_compile_jitcode_fn, set_register_portal_bridge_fn,
-};
 pub mod trace;
 pub mod virtualizable_gen;
 pub mod virtualizable_spec;

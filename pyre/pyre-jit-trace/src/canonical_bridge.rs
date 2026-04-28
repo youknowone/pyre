@@ -67,10 +67,11 @@
 //! `compile_jitcode_for_callee`. See the function docstring for the
 //! full reader-site audit (G.3a).
 //!
-//! Production caller: `state::jitcode_for` (state.rs:686) routes
-//! through `install_portal_for` whenever `PYRE_PORTAL_REDIRECT` is
-//! set (G.3c flip, Task #126).  Reader portal-mode awareness landed
-//! in G.3b (Task #125) and G.3d/e/h (Tasks #127/#128/#132).
+//! Redirect production path: `pyre_jit::jit::codewriter` now routes
+//! registered portals through its own `grab_initial_jitcodes()` + drain
+//! sequence and supplies the populated `JitDriverStaticData.mainjitcode`.
+//! `install_portal_for` remains available as a bridge-constructor probe for
+//! reader audits, but it is not bound as the canonical `mainjitcode`.
 //! `bridge_canonical_jitcode_basic` is reachable through
 //! `install_portal_for`'s `build_runtime_jitcode` call;
 //! `bridge_canonical_jitcode_full` is currently exercised only by the
@@ -517,19 +518,17 @@ fn collect_referenced_descr_indices(code: &[u8]) -> Vec<usize> {
 ///    are not portal PCs.
 ///
 /// G.3b chooses per-category based on what semantics the reader actually
-/// requires. G.3c then flips one caller (likely
-/// `state::jitcode_for(code)` portal short-circuit, or
-/// `inline_function_call`'s residual-call replacement) to use
+/// requires. G.3c then flips the writer-side ensure path to use
 /// `install_portal_for` instead of the existing per-CodeObject path,
 /// gated by env var so dynasm/cranelift baselines can A/B compare.
 ///
 /// ### Caller (G.3c)
 ///
-/// `state::jitcode_for(code)` invokes `install_portal_for` when the
-/// `PYRE_PORTAL_REDIRECT` environment variable is set, replacing the
-/// per-CodeObject `COMPILE_JITCODE_FN` callback path. Flag OFF
-/// preserves byte-for-byte the pre-G.3c behavior; flag ON is the
-/// controlled probe surface for G.3d empirical reader-failure data.
+/// Pyre-jit's `ensure_majit_jitcode` path now drives the codewriter-owned
+/// `grab_initial_jitcodes()` + drain path for registered portals when
+/// `PYRE_PORTAL_REDIRECT` is set. `install_portal_for` remains the low-level
+/// bridge constructor used by focused tests and reader-audit probes; it is
+/// not the orthodox `jd.mainjitcode` binding path.
 pub fn install_portal_for(
     code_ptr: *const pyre_interpreter::CodeObject,
     w_code: *const (),

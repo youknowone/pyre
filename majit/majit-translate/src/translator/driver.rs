@@ -1493,8 +1493,7 @@ impl TranslationDriver {
     /// **not** depend on `majit-metainterp` (the dependency runs the
     /// other way per `majit-metainterp/Cargo.toml`), so the call has no
     /// in-crate path. Convergence: register the apply-jit hook from
-    /// `majit-metainterp` via a thread-local (similar to
-    /// [`set_compile_jitcode_fn`](crate::jit_codewriter)) once
+    /// `majit-metainterp` via a thread-local callback table once
     /// `warmspot.rs` lands. Until then the body assembles every
     /// upstream-shaped argument it can (`policy`, `backend_name`,
     /// `inline=True`) and surfaces a TaskError citing `:358`.
