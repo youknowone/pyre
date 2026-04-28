@@ -3964,6 +3964,30 @@ fn resolve_call_assembler_target(
         call_descr.arg_types().len()
     };
     if target.inputarg_types.len() != expected_arity {
+        // PRE-EXISTING-ADAPTATION: pyre's `direct_assembler_call`
+        // emits CALL_ASSEMBLER with `arg_types = [frame]` (or
+        // `[frame, ec]` once `extra_reds` flips) while the callee's
+        // compiled trace still exposes the full vable-expanded
+        // inputarg list (`frame + scalars + items`, e.g. 8 for fib).
+        // The shrink-to-reds happens in
+        // `patch_new_loop_to_load_virtualizable_fields`
+        // (compile.py:425-461), which only fires when
+        // `state.rs driver_descriptor()` returns `Some(...)`.
+        // Pyre holds it disabled pending Task #21 vable
+        // heap-writeback (see state.rs comment for the full
+        // prerequisite chain). Until then, when the target exposes
+        // scalar header slots (`num_scalar_inputargs >` caller's red
+        // count), the mismatch IS the vable-expansion case; treat it
+        // as unresolved so the runtime falls through to the helper
+        // (force_fn) path, matching how the pending-token path
+        // already handles `code_ptr = null`. The `Err` branch is
+        // reserved for cases that look like a real layout bug —
+        // typically when the target's scalar header is SMALLER than
+        // the caller's red count, which would not be explained by
+        // pending vable expansion.
+        if target.num_scalar_inputargs > call_descr.arg_types().len() {
+            return Ok(None);
+        }
         return Err(unsupported_semantics(
             opcode,
             &format!(
@@ -5831,6 +5855,19 @@ pub struct CraneliftBackend {
 
 impl CraneliftBackend {
     /// llmodel.py:467-478 read_int_at_mem(gcref, ofs, size, sign).
+    ///
+    /// PRE-EXISTING-ADAPTATION: RPython's `llop.raw_load(STYPE, gcref, ofs)`
+    /// segfaults on a null `gcref`; the JIT relies on emitted guards
+    /// (`guard_nonnull`, `guard_class`, etc.) to filter null inputs
+    /// before reaching the helper. Cranelift currently calls this helper
+    /// from sites that occasionally pass `addr == 0` (fannkuch fails
+    /// when the guard is removed; dynasm's identical helper is null-
+    /// agnostic and works because dynasm's call sites always guard).
+    /// The convergence path is to audit cranelift's call sites and
+    /// either add the missing `addr != 0` guard at emit time or migrate
+    /// to a guarded helper variant; until then, the silent-zero return
+    /// shadows the missing guard. dynasm parity (`runner.rs:434`) is
+    /// already RPython-orthodox.
     fn read_int_at_mem(&self, addr: i64, offset: i64, size: usize, sign: bool) -> i64 {
         if addr == 0 {
             return 0;
@@ -5850,6 +5887,9 @@ impl CraneliftBackend {
     }
 
     /// llmodel.py:481-488 write_int_at_mem(gcref, ofs, size, newvalue).
+    ///
+    /// PRE-EXISTING-ADAPTATION: see `read_int_at_mem` above for the
+    /// null-guard rationale (cranelift call-site auditing required).
     fn write_int_at_mem(&self, addr: i64, offset: i64, size: usize, newvalue: i64) {
         if addr == 0 {
             return;
@@ -5866,6 +5906,9 @@ impl CraneliftBackend {
     }
 
     /// llmodel.py:490-491 read_float_at_mem(gcref, ofs).
+    ///
+    /// PRE-EXISTING-ADAPTATION: see `read_int_at_mem` above for the
+    /// null-guard rationale.
     fn read_float_at_mem(&self, addr: i64, offset: i64) -> f64 {
         if addr == 0 {
             return 0.0;
@@ -5875,6 +5918,9 @@ impl CraneliftBackend {
     }
 
     /// llmodel.py:493-494 write_float_at_mem(gcref, ofs, newvalue).
+    ///
+    /// PRE-EXISTING-ADAPTATION: see `read_int_at_mem` above for the
+    /// null-guard rationale.
     fn write_float_at_mem(&self, addr: i64, offset: i64, newvalue: f64) {
         if addr == 0 {
             return;

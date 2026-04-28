@@ -352,6 +352,24 @@ fn translate_trace_iter_box_map(
     box_map
 }
 
+/// PRE-EXISTING-ADAPTATION (parked, test-only).
+///
+/// unroll.py:183 `trace = trace.get_iter()` mints fresh InputArg /
+/// ResOperation objects before `optimize_bridge()` consumes the trace,
+/// and opencoder.py:249 makes a per-iterator box namespace. This Rust
+/// wrapper is the structural analog: `TraceIterator` walks the bridge
+/// ops with `start_fresh = bridge_inputarg_base`, producing a renamed
+/// op vector whose OpRefs do not collide with the parent loop's.
+///
+/// Production is currently NOT wired: `compile_bridge` keeps the raw
+/// `bridge_inputargs` numbering and passes `bridge_inputarg_base`
+/// through the optimizer interface where it is dropped (see
+/// `optimizer.rs optimize_bridge` for the documented blocker — a
+/// partial activation SIGSEGV'd fib_recursive). The unblocking change
+/// set is shared with the descriptor=Some flip (state.rs
+/// driver_descriptor) and Task #21 vable heap-writeback; once those
+/// land, every site receiving `bridge_inputarg_base` (here +
+/// optimizer.rs) flips together.
 #[allow(dead_code)]
 fn prepare_bridge_trace_for_optimizer(
     bridge_ops: &[Op],
@@ -468,8 +486,8 @@ pub(crate) struct CompiledEntry<M> {
     /// previous functions are kept here so external target_token JUMPs
     /// can redirect to them via runtime trampoline.
     pub(crate) previous_tokens: Vec<JitCellToken>,
-    /// Box identity plan Phase E Step 1 (dormant): high-water OpRef at
-    /// which a future bridge compilation should start allocating.
+    /// Box identity plan Phase E: high-water OpRef at which a bridge
+    /// compilation starts allocating fresh boxes.
     ///
     /// RPython `opencoder.py:249-273 TraceIterator.__init__` allocates
     /// fresh `InputArg` Python objects every iteration, so bridge
@@ -477,12 +495,10 @@ pub(crate) struct CompiledEntry<M> {
     /// by Python `is` identity. In pyre `OpRef(u32)` IS the identity, so
     /// a bridge that re-uses the `[0..num_inputs)` range collides with
     /// the parent loop's OpRefs. `next_global_opref` records the first
-    /// OpRef Phase 2 did *not* allocate, so a bridge can start at
-    /// `max(next_global_opref, bridge_inputargs.len())` and stay disjoint.
-    ///
-    /// Dormant until Step 2 wires `compile_bridge` / `optimize_bridge`
-    /// to consume the value — for now Phase 2 records it so the contract
-    /// is honest when the wiring lands.
+    /// OpRef Phase 2 did *not* allocate; `compile_bridge` /
+    /// `start_retrace_from_guard` read it to pick a disjoint
+    /// `bridge_inputarg_base` (see the `bridge_inputarg_base` derivation
+    /// in `compile_bridge` below).
     pub(crate) next_global_opref: u32,
 }
 
@@ -1780,6 +1796,21 @@ impl<M: Clone> MetaInterp<M> {
             .driver_descriptor()
             .map(|driver| driver.num_reds())
             .unwrap_or(1);
+        // pyjitpl.py:3290-3307 `initialize_virtualizable` only gates on
+        // `vinfo is not None` and unconditionally calls
+        // `vinfo.read_boxes(cpu, virtualizable, startindex)`. Pyre's
+        // current callers (descriptor=None default) supply `live_values`
+        // already in the expanded shape that `read_boxes` would produce,
+        // so the function reuses those slots instead of re-minting
+        // inputargs. The `live_values.len() < num_reds + total_vable`
+        // gate below preserves the descriptor=None contract:
+        // re-minting under descriptor=None breaks pyre's downstream
+        // virtualizable_boxes consumers (dynasm nested_loop crashes
+        // exit 101 if the gate is removed without also flipping
+        // descriptor=Some + Task #21 heap-writeback). PRE-EXISTING-
+        // ADAPTATION: the gate is the convergence-debt marker; the
+        // fully-RPython-orthodox shape lands together with descriptor
+        // activation (state.rs driver_descriptor + Task #21 plan).
         if total_vable == 0 || live_values.len() < num_reds + total_vable {
             return;
         }
@@ -6827,11 +6858,26 @@ impl<M: Clone> MetaInterp<M> {
         trace_id: u64,
         fail_index: u32,
     ) -> Option<Arc<ResumeStorage>> {
+        // compile.py:853 `ResumeGuardDescr` storage is shared via the
+        // FailDescr identity, so the same guard descriptor exposes the
+        // same `rd_*` pool regardless of which retrieval path looks it
+        // up (frontend export, backend-recovered layout, previous-token
+        // bridge). Mirror that by falling back to the same lookup chain
+        // `get_compiled_exit_layout_in_trace` uses (frontend trace ->
+        // backend layout -> previous-token bridges) so callers like
+        // `get_rd_virtuals` and `get_resume_data_summary` see the
+        // storage even when only the backend has it.
         let compiled = self.compiled_loops.get(&green_key)?;
         let trace_id = Self::normalize_trace_id(compiled, trace_id);
-        let (_, trace_data) = Self::trace_for_exit(compiled, trace_id)?;
-        let exit_layout = trace_data.exit_layouts.get(&fail_index)?;
-        exit_layout.storage.clone()
+        if let Some((_, trace_data)) = Self::trace_for_exit(compiled, trace_id) {
+            if let Some(exit_layout) = trace_data.exit_layouts.get(&fail_index) {
+                if let Some(ref storage) = exit_layout.storage {
+                    return Some(storage.clone());
+                }
+            }
+        }
+        self.get_compiled_exit_layout_in_trace(green_key, trace_id, fail_index)
+            .and_then(|layout| layout.storage.clone())
     }
 
     /// Get exit_types for a guard (for decode_ref type dispatch).

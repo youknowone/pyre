@@ -2829,18 +2829,29 @@ impl Optimizer {
         _loop_num_inputs: Option<usize>,
         // Box Identity plan Phase E Step 2a (dormant): disjoint OpRef
         // namespace for bridge inputargs. RPython opencoder.py:249-273
-        // TraceIterator allocates fresh InputArg Python objects, which
-        // carry Python `is` identity distinct from the parent loop's
-        // boxes. Pyre's flat `OpRef(u32)` must encode this explicitly:
-        // a bridge whose `inputarg_base == 0` reuses the parent loop's
-        // `[0..num_inputs)` identities. Passing the parent loop's
-        // recorded `next_global_opref` (from `CompiledEntry`) here
-        // lets Step 2b hoist the bridge's inputargs into
-        // `[bridge_inputarg_base..bridge_inputarg_base+num_inputs)`.
+        // `TraceIterator.__init__` allocates fresh `InputArg` Python
+        // objects per iteration, so bridges carry Python `is` identity
+        // distinct from the parent loop's boxes automatically. Pyre's
+        // flat `OpRef(u32)` threads the parent's recorded
+        // `CompiledEntry.next_global_opref` here.
         //
-        // Currently unused — Step 2b (internal switch to
-        // `optimize_with_constants_and_inputs_at`) lands in a follow-up
-        // commit.
+        // Step 2b (activation) requires parallel rewrites of every
+        // OpRef-keyed side channel: `snapshot_boxes`,
+        // `snapshot_vable_boxes`, `pending_bridge_rd.liveboxes`,
+        // `constant_types`, the export path's `renamed_inputargs`
+        // (`optimize_with_constants_and_inputs_at` still passes raw
+        // `[0..num_inputs)` for Phase 2 parity), and the caller's
+        // `pre_opt_jump_args` capture. The remap compaction at
+        // `optimizer.rs` (immediately below this signature) must coexist
+        // with the shifted namespace. Until all of those are unified in
+        // one patch, keep the param unused.
+        //
+        // A partial activation that only raised `start_next_pos` past
+        // `bridge_inputarg_base + num_inputs` (keeping `inputarg_base=0`)
+        // was attempted and also SIGSEGVs on fib_recursive: the backend's
+        // compile pipeline cannot handle the OpRef range gap introduced
+        // by forcing the first optimizer-emitted op far beyond the raw
+        // trace's max position.
         #[allow(unused_variables)] bridge_inputarg_base: u32,
     ) -> (Vec<Op>, bool) {
         // bridgeopt.py:124-185: deserialize_optimizer_knowledge

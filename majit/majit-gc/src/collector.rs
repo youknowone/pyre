@@ -822,6 +822,20 @@ impl MiniMarkGC {
                 }
             }
         }
+        crate::walk_active_extra_roots(&mut |gcref| {
+            if !gcref.is_null() && self.is_managed_heap_object(gcref.0) {
+                let hdr = unsafe { header_of(gcref.0) };
+                // SAFETY: header_of returns `*mut GcHeader`; materialize a
+                // short-lived reference for each single-method access to
+                // avoid stacked-borrows violations (see 363dd31413).
+                unsafe {
+                    if !(*hdr).has_flag(flags::VISITED) {
+                        (*hdr).set_flag(flags::VISITED);
+                        self.incr_state.gray_stack.push(gcref.0);
+                    }
+                }
+            }
+        });
     }
 
     fn seed_major_roots(&mut self) {

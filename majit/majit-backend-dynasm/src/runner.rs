@@ -1195,10 +1195,17 @@ impl DynasmBackend {
         index_of_virtualizable: i32,
     ) {
         let pending_clt = Arc::new(majit_backend::CompiledLoopToken::new(token_number));
-        // `regalloc.py:861-871` `_set_initial_bindings`: contiguous
-        // layout, `locs[i] = i * SIZEOFSIGNED`.
+        // `regalloc.py:861-871` `_set_initial_bindings`: each input lands at
+        // `loc.value - base_ofs = (JITFRAME_FIXED_SIZE + i) * SIZEOFSIGNED` —
+        // the same formula `compile_loop` finalisation applies via
+        // `Self::input_slot`. Self-recursive CALL_ASSEMBLER registers this
+        // stub before its own trace finalises, so the rewriter's
+        // `handle_call_assembler` reads these pending offsets to emit the
+        // callee inputarg `GcStore`s; if they omit the JITFRAME_FIXED_SIZE
+        // shift the stores land in the managed-register save area and the
+        // callee enters with NULL inputs.
         *pending_clt._ll_initial_locs.lock() = (0..num_inputs)
-            .map(|i| (i as i32) * (crate::jitframe::SIZEOFSIGNED as i32))
+            .map(|i| (Self::input_slot(i) * crate::jitframe::SIZEOFSIGNED) as i32)
             .collect();
         CALL_ASSEMBLER_TARGETS
             .lock()

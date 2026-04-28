@@ -1530,6 +1530,45 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
 ) {
     use majit_ir::{Op, OpCode, OpRef};
 
+    // PRE-EXISTING-ADAPTATION (Rust language constraint, not a logic
+    // divergence): RPython `compile.py:425-461` calls
+    // `box.set_forwarded(extra_ops[-1])` to set Python-Box-attached
+    // forwarding pointers, which `emit_op`'s default `get_box_replacement`
+    // walks transitively when later body ops reference the original box.
+    // Pyre uses a flat-`OpRef` IR (no per-Box mutable forwarding cell),
+    // so the equivalent rewrite uses a function-local
+    // `forwarding: Vec<OpRef>` indexed by source `OpRef.0`. The Vec is
+    // discarded when the function returns; its lifetime mirrors the
+    // single in-place loop rewrite that RPython's `_forwarded` model
+    // accomplishes via Box mutation. No semantic divergence.
+    fn set_local_forwarded(forwarding: &mut Vec<OpRef>, source: OpRef, target: OpRef) {
+        if source.is_none() || source.is_constant() {
+            return;
+        }
+        let idx = source.0 as usize;
+        if idx >= forwarding.len() {
+            forwarding.resize(idx + 1, OpRef::NONE);
+        }
+        forwarding[idx] = target;
+    }
+
+    fn get_local_box_replacement(forwarding: &[OpRef], mut opref: OpRef) -> OpRef {
+        if opref.is_none() || opref.is_constant() {
+            return opref;
+        }
+        loop {
+            let idx = opref.0 as usize;
+            if idx >= forwarding.len() {
+                return opref;
+            }
+            let next = forwarding[idx];
+            if next.is_none() {
+                return opref;
+            }
+            opref = next;
+        }
+    }
+
     assert!(
         index_of_virtualizable < num_red_args,
         "virtualizable must live inside the red args (pyjitpl.py:3589 index_of_virtualizable < num_red_args)"
@@ -1559,7 +1598,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         .map(|m| m + 1)
         .unwrap_or(0);
 
-    let mut forwarding: HashMap<OpRef, OpRef> = HashMap::new();
+    let mut forwarding: Vec<OpRef> = vec![OpRef::NONE; (max_inputarg as usize).saturating_add(1)];
     let mut extra_ops: Vec<Op> = Vec::new();
     let mut i = num_red_args;
 
@@ -1589,7 +1628,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
         op.pos = new_opref;
         op.descr = Some(descr);
         extra_ops.push(op);
-        forwarding.insert(old_opref, new_opref);
+        set_local_forwarded(&mut forwarding, old_opref, new_opref);
         i += 1;
     }
 
@@ -1635,7 +1674,7 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
             elem_op.pos = new_opref;
             elem_op.descr = Some(array_descr.clone());
             extra_ops.push(elem_op);
-            forwarding.insert(old_opref, new_opref);
+            set_local_forwarded(&mut forwarding, old_opref, new_opref);
             i += 1;
         }
     }
@@ -1650,18 +1689,14 @@ pub(crate) fn patch_new_loop_to_load_virtualizable_fields(
     inputargs.truncate(num_red_args);
 
     // compile.py:459-461 — emit_op walks existing ops through
-    // get_box_replacement; in pyre we apply the forwarding map directly.
+    // get_box_replacement; in pyre we apply the forwarding Vec directly.
     for op in ops.iter_mut() {
         for arg in op.args.iter_mut() {
-            if let Some(&new_ref) = forwarding.get(arg) {
-                *arg = new_ref;
-            }
+            *arg = get_local_box_replacement(&forwarding, *arg);
         }
         if let Some(fa) = op.fail_args.as_mut() {
             for arg in fa.iter_mut() {
-                if let Some(&new_ref) = forwarding.get(arg) {
-                    *arg = new_ref;
-                }
+                *arg = get_local_box_replacement(&forwarding, *arg);
             }
         }
     }

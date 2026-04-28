@@ -273,24 +273,20 @@ impl UnrollOptimizer {
         vable_config: Option<crate::optimizeopt::virtualize::VirtualizableConfig>,
         phase1_out: Option<&mut Option<(Vec<Op>, ExportedState)>>,
     ) -> (Vec<Op>, usize) {
-        // unroll.py:112 / 156 / 171 / 238-242 parity:
-        // `jump_to_preamble(celltoken, end_jump)` retargets the ORIGINAL
-        // end-jump arglist captured from the trace iterator. The body
-        // optimization path may temporarily rewrite the detached terminal
-        // JUMP into Phase-2-local OpRefs, but when we fall back to the
-        // preamble we must restore the trace's original jump contract
-        // instead of reusing the mangled Phase-2 arglist.
-        let pre_opt_jump_args: Vec<OpRef> = ops
-            .iter()
-            .rfind(|op| op.opcode == OpCode::Jump)
-            .map(|jump| jump.args.to_vec())
-            .unwrap_or_default();
-
         // compile.py:362: if imported_state is pre-set (compile_retrace path),
         // skip Phase 1 and go directly to Phase 2 with the imported state.
         let (mut exported_state, consts_p1, p1_ops) = if let Some(pre_imported) =
             self.imported_state.take()
         {
+            // RPython uses object identity for Boxes, so a TraceIterator over a
+            // retrace can never numerically collide with the already optimized
+            // partial preamble. Majit's OpRef is the identity; when Phase 1 is
+            // skipped, recover the partial preamble high-water from the imported
+            // state before allocating Phase 2 input/result OpRefs.
+            self.next_global_opref = self
+                .next_global_opref
+                .max(num_inputs as u32)
+                .max(pre_imported.opref_high_water());
             // Retrace path: Phase 1 already done; preamble ops are in
             // the caller's partial_trace, not produced here.
             // RPython: same Optimizer persists patchguardop. Recover here.
@@ -978,7 +974,6 @@ impl UnrollOptimizer {
             let mut jump_ctx = opt_p2.final_ctx.take().unwrap_or_else(|| {
                 crate::optimizeopt::OptContext::with_num_inputs(32, body_num_inputs)
             });
-            jump_ctx.clear_newoperations();
 
             // unroll.py:151-158: jump_to_existing_trace(force_boxes=False)
             // RPython: except InvalidLoop → jump_to_preamble immediately,
@@ -1047,7 +1042,6 @@ impl UnrollOptimizer {
                         );
                     }
                     // unroll.py:164-168: force_boxes=True, except InvalidLoop: pass
-                    jump_ctx.clear_newoperations();
                     jumped = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         opt_unroll
                             .jump_to_existing_trace(
@@ -1085,7 +1079,6 @@ impl UnrollOptimizer {
                     };
                 } else {
                     // unroll.py:220-226: limit reached, try force_boxes=true
-                    jump_ctx.clear_newoperations();
                     jumped = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                         opt_unroll
                             .jump_to_existing_trace(
@@ -1133,7 +1126,7 @@ impl UnrollOptimizer {
             if jumped && redirected_tail_ops.is_empty() {
                 // Only take jump_ctx ops if we don't already have
                 // a self-loop Jump from the retrace path.
-                redirected_tail_ops = jump_ctx.new_operations;
+                redirected_tail_ops = std::mem::take(&mut jump_ctx.new_operations);
                 // Check if the redirected Jump targets the current body token
                 // (last in target_tokens) or an external token from a previous
                 // compilation.  The Cranelift backend compiles each trace as a
@@ -1164,6 +1157,7 @@ impl UnrollOptimizer {
                     jumped = false;
                 }
             }
+            opt_p2.final_ctx = Some(jump_ctx);
             jumped
         };
 
@@ -1208,36 +1202,20 @@ impl UnrollOptimizer {
                 );
             }
             if let Some(mut end_jump) = body_terminal_op {
-                if let Some(final_ctx) = opt_p2.final_ctx.as_ref() {
-                    // unroll.py:238-242 retargets the live end_jump after
-                    // force_box_for_end_of_preamble/get_box_replacement have
-                    // updated forwarding. Keep the detached terminal clone in
-                    // the same canonicalized state before swapping it back in.
-                    apply_box_replacements(&mut end_jump, final_ctx);
-                    if !pre_opt_jump_args.is_empty() {
-                        end_jump.args = pre_opt_jump_args
-                            .iter()
-                            .map(|&arg| final_ctx.get_box_replacement(arg))
-                            .collect();
-                    }
-                } else if !pre_opt_jump_args.is_empty() {
-                    end_jump.args = pre_opt_jump_args.clone().into();
-                }
                 end_jump.descr = Some(preamble_target.as_jump_target_descr());
-                // compile.py:320/327 parity: start_label uses
-                // start_state.renamed_inputargs, while unroll.py:238-242
-                // retargets the body's JUMP to the preamble token without
-                // rebuilding it. In majit, the backend needs exact arity for
-                // that start-label contract, so reshape the JUMP to the same
-                // preamble args: drop extra short-preamble slots and restore
-                // any invariant slots the body no longer carries explicitly.
-                let mut reshaped_jump_args = end_jump.args.to_vec();
-                reshape_jump_args_for_preamble(
-                    &mut reshaped_jump_args,
-                    &exported_renamed_inputargs[..preamble_arity],
-                );
-                end_jump.args = reshaped_jump_args.into();
-                body_ops = replace_terminal_jump(&body_ops, end_jump);
+                if let Some(mut final_ctx) = opt_p2.final_ctx.take() {
+                    // unroll.py:238-242 parity: jump_to_preamble retargets
+                    // the live end_jump and routes it through
+                    // send_extra_operation, preserving any force_box /
+                    // partial-inline operations already appended to
+                    // _newoperations.
+                    opt_p2.send_extra_operation(&end_jump, &mut final_ctx);
+                    let redirected_tail_ops = std::mem::take(&mut final_ctx.new_operations);
+                    opt_p2.final_ctx = Some(final_ctx);
+                    body_ops = splice_redirected_tail(&body_ops, &redirected_tail_ops);
+                } else {
+                    body_ops = replace_terminal_jump(&body_ops, end_jump);
+                }
             } else {
                 body_ops = Self::jump_to_preamble(&body_ops, &preamble_target);
             }
@@ -1573,7 +1551,6 @@ impl ExportedState {
     /// `ExportedState`. Majit uses integer OpRefs, so compile_retrace must
     /// reconstruct this high-water mark before creating the fresh Phase 2
     /// TraceIterator namespace.
-    #[allow(dead_code)]
     fn opref_high_water(&self) -> u32 {
         let mut high = 0_u32;
         let mut visit = |opref: OpRef| {
@@ -2523,23 +2500,11 @@ impl OptUnroll {
             .iter()
             .map(|&a| ctx.get_box_replacement(a))
             .collect();
-        let mut first_target_attempt = true;
 
         for (tt_idx, target_token) in target_tokens.iter_mut().enumerate() {
             if crate::optimizeopt::majit_log_enabled() {
                 eprintln!("[jit][jump_to_existing] trying target_token #{tt_idx}");
             }
-            if !first_target_attempt {
-                // RPython unroll.py leaves bogus ops from failed target-token
-                // attempts at the end of the live trace, which is safe there.
-                // majit's detached jump_ctx later splices the redirected tail
-                // back into the body, so stale extra guards/short-preamble ops
-                // from an earlier failed target must not leak into a later
-                // successful redirect.
-                ctx.clear_newoperations();
-            }
-            first_target_attempt = false;
-
             let target_vs = match &target_token.virtual_state {
                 Some(vs) => vs,
                 None => continue,
@@ -4985,12 +4950,30 @@ mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
+    use std::collections::HashMap;
 
     /// Assign sequential positions to ops starting from `base`.
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos = OpRef(base + i as u32);
         }
+    }
+
+    #[test]
+    fn test_exported_state_high_water_covers_retrace_namespace() {
+        let exported = ExportedState::new(
+            vec![OpRef(52)],
+            vec![OpRef(109), OpRef::from_const(3)],
+            crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
+            HashMap::new(),
+            Vec::new(),
+            Vec::new(),
+            vec![OpRef(14)],
+            Vec::new(),
+            vec![OpRef(23)],
+        );
+
+        assert_eq!(exported.opref_high_water(), 110);
     }
 
     fn run_unroll_pass(ops: &[Op]) -> Vec<Op> {

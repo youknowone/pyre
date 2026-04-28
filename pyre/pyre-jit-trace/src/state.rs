@@ -4164,14 +4164,66 @@ impl JitState for PyreJitState {
         //   greens = ['next_instr', 'is_being_profiled', 'pycode']
         //   virtualizables = ['frame']
         //
-        // Returns None until the CA emission path is migrated to the
-        // reds-only shape. Activating this triggers
-        // `patch_new_loop_to_load_virtualizable_fields` (compile.py:504-511),
-        // which reduces the compiled callee loop's inputargs to
-        // `[frame]`. That breaks the caller-side `CallAssemblerR` whose
-        // `VableExpansion` still passes the 8-arg expanded shape to the
-        // callee (rewrite.py:672-683 contract: CA arg count must match
-        // target num_red_args). Both ends must flip together.
+        // Held disabled: the atomic flip needs a vable heap-writeback
+        // pass that pyre's tracer does not yet emit. Concretely,
+        // `patch_new_loop_to_load_virtualizable_fields` (compile.py:425-461)
+        // collapses the patched LABEL to `[reds]` and prepends a
+        // GETFIELD_GC + GETARRAYITEM_GC preamble. The body then reads
+        // every vable static field and locals_cells_stack_w slot from
+        // the frame heap object on each iteration. pyre's tracer
+        // updates symbolic state (`sym.vable_*`, `sym.registers_r[i]`)
+        // but never emits the matching `SetfieldGc(frame, value, descr)`
+        // or `SetarrayitemGc(array_ref, idx, value)` — only the
+        // freshly-allocated W_IntObject.intval setfields appear in
+        // trace dumps. With descriptor=None, this is fine because the
+        // closing JUMP carries the post-loop state via expanded inputargs;
+        // the patched-LABEL contract makes the heap the source of truth
+        // and breaks that invariant.
+        //
+        // Prerequisites for the flip (all atomic with descriptor=Some):
+        //   (a) `trace_extra_reds=1` — emit `live_values=[frame, ec]`
+        //       matching descriptor reds. The legacy `extract_live_values`
+        //       shape relies on `descriptor=None`; flipping (a) alone
+        //       breaks dynasm nested_loop / fannkuch / nbody (live_values
+        //       consumers expect the expanded shape) and panics on
+        //       `live_values[index>1]` access without (b).
+        //   (b) `initialize_virtualizable` short-live_values gate: allow
+        //       the heap-read branch when `vable_ptr` is non-null.
+        //       Required to consume (a)'s reds-only live_values.
+        //   (c1) `pending_frontend_boxes.clone()`: the second
+        //        `compile_bridge` call needs the same stash as the
+        //        first; current `take()` empties on the first call and
+        //        the second hits `frontend_boxes.len()=0 vs
+        //        liveboxes.len()=N`.
+        //   (c2) Bridge JUMP arity vs patched LABEL: source emits the
+        //        live-window shape (`num_scalars + valuestackdepth`) but
+        //        the patched LABEL grows to full vable capacity. Const
+        //        padding SSA-forwards `PY_NULL` into outer-loop locals
+        //        on cranelift; heap-read padding via
+        //        `trace_array_getitem_value` against
+        //        `locals_cells_stack_array_ref` is the correct shape.
+        //   (d) **Vable heap-writeback infrastructure** — *blocking*. With
+        //       (a)+(b)+(c1) applied, cranelift nested_loop dispatches
+        //       the bridge 5622+ times with identical inputs because the
+        //       patched parent reloads stale state from heap each
+        //       iteration; the bridge body has no `SetfieldGc` /
+        //       `SetarrayitemGc` to advance the heap. RPython's
+        //       OptVirtualize emits these via `force_at_end_of_preamble`;
+        //       pyre's `OptVirtualize::force_virtualizable` has the
+        //       SETFIELD_RAW emission machinery but is not wired to fire
+        //       at JUMP. The smallest-delta fix is a new
+        //       `gen_writeback_vable_to_heap` helper (modeled on
+        //       `trace_ctx.rs gen_store_back_in_vable` minus the
+        //       force-virtualizable bookkeeping) invoked from
+        //       `close_loop_args_at`.
+        //   (e) Task #24 dynasm recursive CA frame contract — *blocking*
+        //       for dynasm SIGSEGV at fib(24).
+        //
+        // Until (d) lands, descriptor=Some alone (no (a)/(b)/(c1))
+        // measures as a ~10x perf cliff on cranelift nested_loop
+        // (5000x5000: 0.70s baseline → 6.35s under flip) but completes
+        // correctly. The bundle (a)+(b)+(c1) is what activates the
+        // ouroboros via the heap-writeback gap.
         None
     }
 
@@ -5264,63 +5316,6 @@ impl JitState for PyreJitState {
 }
 
 impl PyreJitState {
-    /// Portal trace entry values in RPython red-only shape (Task #11 target).
-    ///
-    /// warmstate.py:387 `execute_assembler(*args)` is called with exactly the
-    /// JitDriver reds. For pypy that is `[frame, ec]`, but this helper
-    /// currently models the `[frame]`-only single-red shim (interp_jit.py:67
-    /// activation still pending the `ec` red plumbing in Task #11 Phase B).
-    ///
-    /// Unused in production today — `extract_live_values` still returns the
-    /// expanded `[frame, last_instr, pycode, ..., locals..., stack...]`
-    /// vector until the CALL_ASSEMBLER VableExpansion path is collapsed.
-    /// Covered by `test_portal_red_only_live_values_returns_just_frame` so
-    /// the shape stays verified while the legacy contract is retired.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn portal_red_only_live_values(&self) -> Vec<Value> {
-        vec![Value::Ref(majit_ir::GcRef(self.frame))]
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn portal_red_only_live_value_types() -> Vec<Type> {
-        vec![Type::Ref]
-    }
-
-    /// Red-only JUMP args: the loop carries a single `frame` OpRef through
-    /// back-edges. The virtualizable's scalar/array slots live as preamble
-    /// GETFIELD_GC / GETARRAYITEM_GC ops emitted by
-    /// `patch_new_loop_to_load_virtualizable_fields` (compile.py:425-461)
-    /// rather than as trailing JUMP operands.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn portal_red_only_jump_args(sym: &PyreSym) -> Vec<OpRef> {
-        vec![sym.frame]
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn portal_red_only_typed_jump_args(sym: &PyreSym) -> Vec<(OpRef, Type)> {
-        vec![(sym.frame, Type::Ref)]
-    }
-
-    /// Red-only `create_sym`: the trace has a single `frame` inputarg at
-    /// `OpRef(0)`. The symbolic virtualizable fields are not pre-seeded
-    /// here — they come in via the compiled preamble's GETFIELD_GC /
-    /// GETARRAYITEM_GC ops. Tracer-side reads still use the symbolic
-    /// `vable_last_instr` / `vable_pycode` / ... indices once those point
-    /// at the preamble-produced OpRefs; wiring that is part of the atomic
-    /// flip in Task #11 Phase A.
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn portal_red_only_create_sym(meta: &PyreMeta, _header_pc: usize) -> PyreSym {
-        let mut sym = PyreSym::new_uninit(OpRef(0));
-        sym.init_vable_indices();
-        sym.nlocals = meta.num_locals;
-        sym.valuestackdepth = meta.valuestackdepth;
-        sym.symbolic_local_types = vec![Type::Ref; meta.num_locals];
-        sym.symbolic_stack_types = vec![Type::Ref; meta.vable_stack_only_depth()];
-        let stack_only = meta.vable_stack_only_depth();
-        sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
-        sym
-    }
-
     fn materialize_virtual_ref_from_layout(
         &mut self,
         materialized: &majit_metainterp::resume::MaterializedVirtual,

@@ -139,9 +139,6 @@ static mut ARENA_BUF_BASE: *mut u8 = std::ptr::null_mut();
 static mut ARENA_TOP: usize = 0;
 static mut ARENA_INITIALIZED: usize = 0;
 
-/// Returns the jitframe layout descriptors needed by the GC rewriter's
-/// `handle_call_assembler` pass to emit the correct GC_LOAD / GC_STORE /
-/// CallMallocNurseryVarsizeFrame sequence for callee jitframes.
 fn arena_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
     use majit_metainterp::jitframe::*;
     majit_gc::rewrite::JitFrameDescrs {
@@ -154,8 +151,11 @@ fn arena_jitframe_descrs() -> majit_gc::rewrite::JitFrameDescrs {
         jf_guard_exc_ofs: JF_GUARD_EXC_OFS,
         jf_forward_ofs: JF_FORWARD_OFS,
         jf_frame_ofs: JF_FRAME_OFS,
-        jf_frame_baseitemofs: BASEITEMOFS,
-        jf_frame_lengthofs: LENGTHOFS,
+        // RPython llmodel.py:385-395 + rewrite.py:680-684 consume
+        // unpack_arraydescr()/lendescr offsets as jitframe-base-relative
+        // addresses, not offsets relative to jf_frame itself.
+        jf_frame_baseitemofs: FIRST_ITEM_OFFSET,
+        jf_frame_lengthofs: JF_FRAME_OFS + LENGTHOFS,
         sign_size: SIGN_SIZE,
     }
 }
@@ -3402,8 +3402,16 @@ pub extern "C" fn bh_set_current_exception(exc: i64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use majit_metainterp::jitframe::{FIRST_ITEM_OFFSET, JF_FRAME_OFS};
     use pyre_interpreter::eval::eval_frame_plain;
     use pyre_interpreter::{PyErrorKind, compile_exec};
+
+    #[test]
+    fn arena_jitframe_descrs_uses_frame_relative_offsets() {
+        let descrs = arena_jitframe_descrs();
+        assert_eq!(descrs.jf_frame_baseitemofs, FIRST_ITEM_OFFSET);
+        assert_eq!(descrs.jf_frame_lengthofs, JF_FRAME_OFS);
+    }
 
     #[test]
     fn bh_normalize_raise_varargs_rejects_builtin_callables_that_are_not_exception_classes() {
