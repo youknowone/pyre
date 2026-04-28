@@ -675,37 +675,35 @@ pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
         // whose `metadata` is empty. Readers that follow this path
         // observe `PyJitCode::is_portal_bridge() == true`.
         //
-        // KNOWN-INCOMPLETE Issue 1 (`call.py:145-148` shared-identity):
-        // upstream installs the same Python `JitCode` object into both
-        // `MetaInterpStaticData.jitcodes` and `CallControl.jitcodes`
-        // (refcount semantics).  Pyre's split-store layout would
-        // require cloning the Arc into both via the registered
-        // `REGISTER_PORTAL_BRIDGE_FN` callback below — empirically
-        // wiring that callback while readers `pyjitcode.metadata
-        // .pc_map[py_pc]` (call_jit.rs:818, 1856) still bounds-check
-        // against an empty pc_map regresses `PYRE_PORTAL_REDIRECT=1`
-        // 13/14 → 9/14 (most benches fall into invalidate loops).
-        // Setting `jitcode_pc = 0` for portal-bridge entries also
-        // failed empirically (4/14) — BH at pc 0 of the canonical
-        // portal jitcode does not match the trace's own resume
-        // snapshot pc, which encodes a specific dispatch-arm offset.
-        //
-        // Closing this requires either (a) routing portal-bridge
-        // resume through the snapshot's frames[i].pc directly (skip
-        // the `find_jitcode → pc_map` translation entirely) or
-        // (b) populating per-PC portal jitcode pc on the portal-
-        // bridge metadata, which requires understanding the
-        // canonical portal jitcode's bytecode layout per dispatch
-        // arm.  Either path is its own multi-session slice.
-        // The callback infrastructure is registered (so the wire-up
-        // is one branch flip away) but not invoked here until that
-        // resume design lands.  Tracked in
-        // `g4_4_drain_audit_2026_04_28.md`.
+        // `call.py:145-148` shared-identity invariant: clone the same
+        // `Arc<PyJitCode>` into both `MetaInterpStaticData.jitcodes`
+        // (via the `METAINTERP_SD.jitcode_for(code, supplied)` call
+        // below) and `CallControl.jitcodes` (via the registered
+        // `REGISTER_PORTAL_BRIDGE_FN` callback). Without the second
+        // store, blackhole resume's `find_jitcode(code)` (call_jit.rs
+        // :805) misses → `BlackholeResult::Failed` → invalidate-
+        // recompile loop. Two prior probes regressed before the merge
+        // landed: (a) wiring the callback while readers still bounds-
+        // checked an empty `pc_map` (13/14 → 9/14), (b) using
+        // `jitcode_pc = 0` for portal-bridge entries (→ 4/14, BH at pc
+        // 0 mismatch with the trace's snapshot pc). The post-nested-
+        // merge code path no longer regresses under this wire-up
+        // (default 14/14, `PYRE_PORTAL_REDIRECT=1` 13/14 maintained),
+        // so the upstream invariant can finally be satisfied here.
         let raw_code = unsafe {
             pyre_interpreter::w_code_get_ptr(code as pyre_object::PyObjectRef)
                 as *const pyre_interpreter::CodeObject
         };
-        Some(crate::canonical_bridge::install_portal_for(raw_code, code))
+        let portal_bridge = crate::canonical_bridge::install_portal_for(raw_code, code);
+        let cb = REGISTER_PORTAL_BRIDGE_FN.load(std::sync::atomic::Ordering::Relaxed);
+        if !cb.is_null() {
+            // SAFETY: only `set_register_portal_bridge_fn` writes to
+            // this slot, and it stores a `RegisterPortalBridgeFn` cast
+            // through `as *mut ()`.
+            let f: RegisterPortalBridgeFn = unsafe { std::mem::transmute(cb) };
+            f(code, portal_bridge.clone());
+        }
+        Some(portal_bridge)
     } else {
         let cb = COMPILE_JITCODE_FN.load(std::sync::atomic::Ordering::Relaxed);
         if cb.is_null() {
