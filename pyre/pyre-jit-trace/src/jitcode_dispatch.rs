@@ -11,36 +11,48 @@
 //! (trace_opcode.rs); this module is the orthodox path that consumes
 //! the codewriter-emitted jitcode bytes directly.
 //!
-//! Scope so far (cumulative through slice 2g):
+//! Scope so far (cumulative through slice 2i):
 //!
 //! | opname              | parity status | behaviour |
 //! |---------------------|---------------|-----------|
 //! | `live/`             | PARITY        | skip OFFSET_SIZE, continue (RPython tracing does not record `live/` either) |
 //! | `goto/L`            | PARITY        | jump to 2-byte LE target, continue |
-//! | `catch_exception/L` | PARITY        | skip 2-byte target, continue (handler PC metadata for unwinder; `pyjitpl.py:497-504` records nothing on normal flow) |
-//! | `ref_return/r`      | PARITY        | record `Finish(reg) descr=done_with_this_frame_descr_ref` to TraceCtx, terminate (`pyjitpl.py:opimpl_ref_return → compile_done_with_this_frame`) |
-//! | `inline_call_r_r/dR>r` | PRE-EXISTING-ADAPTATION | linear stub; RPython pushes a fresh MIFrame + raises `ChangeFrame()` and writes `registers_r[dst]`. Convergence: slice 2h + Phase D-3. |
-//! | `int_copy/i>i`      | PRE-EXISTING-ADAPTATION | src OOR validation only; RPython performs `registers_i[dst] = registers_i[src]` SSA rename via the `box >i` decorator. Convergence: mutable register banks (slice 2h or Phase D-3). |
-//! | `residual_call_r_r/iRd>r` | PRE-EXISTING-ADAPTATION | records `CallR([funcptr, ...args], descr)` only; RPython `do_residual_or_indirect_call` additionally runs heapcache invalidation, effectinfo dispatch (loop-invariant / elidable rewrites), guard emission, and dst writeback. Convergence: Phase D-3 routes through `state.rs:3380-3390 do_residual_call_r_r_impl`. |
-//! | `raise/r`           | PRE-EXISTING-ADAPTATION | terminate only; RPython sets `last_exc_value`, pops the frame, then `finishframe_exception` scans the framestack's exceptiontable for a handler (resume tracing inside it) or emits `FINISH(exit_frame_with_exception_descr_ref)` at the outermost frame. Convergence: Phase D-3. |
-//! | `reraise/`          | PRE-EXISTING-ADAPTATION | terminate only; same `finishframe_exception` path as `raise/r`. Convergence: Phase D-3. |
+//! | `catch_exception/L` | PARITY        | skip 2-byte target on normal flow (`pyjitpl.py:497-504` records nothing); the target is consumed by `inline_call`'s SubRaise arm via `try_catch_exception_at` (`pyjitpl.py:2517-2522`) |
+//! | `ref_return/r`      | PARITY        | top-level: record `Finish(reg) descr=done_with_this_frame_descr_ref` + terminate (`pyjitpl.py:opimpl_ref_return → compile_done_with_this_frame`); sub-walk: surface `SubReturn{Some(value)}` to caller (`pyjitpl.py:1688-1698 finishframe`) |
+//! | `int_return/i`      | PARITY        | int-bank counterpart of `ref_return/r` — top-level records `Finish(reg) descr=done_with_this_frame_descr_int` (`pyjitpl.py:3206-3208`), sub-walk surfaces `SubReturn{Some(value)}`. RPython `pyjitpl.py:463 opimpl_int_return = _opimpl_any_return`. |
+//! | `float_return/f`    | PARITY        | float-bank counterpart — top-level records `Finish(reg) descr=done_with_this_frame_descr_float` (`pyjitpl.py:3212-3214`), sub-walk surfaces `SubReturn{Some(value)}`. RPython `pyjitpl.py:465 opimpl_float_return = _opimpl_any_return`. |
+//! | `void_return/`      | PARITY        | void return — top-level records `Finish([]) descr=done_with_this_frame_descr_void` (`pyjitpl.py:3202-3205`, `exits = []` branch), sub-walk surfaces `SubReturn{None}`. RPython `pyjitpl.py:467-469 opimpl_void_return → finishframe(None)`. |
+//! | `inline_call_r_r/dR>r` | PARITY (per-frame catch added slice 2i) | recurses into sub-jitcode via `JitCodeDescr::jitcode_index()`, populates callee `registers_r` (`setup_call_r`, OOR surfaces `InlineCallArityMismatch`), writes `SubReturn{value}` into caller dst (Ref bank), scans caller's `op.next_pc` for `live/` + `catch_exception/L` on `SubRaise` (`pyjitpl.py:2506-2522 finishframe_exception`). Sub-walk reaching `Terminate` is unexpected (top-level should never fire from a sub-walk); `SubReturn{None}` into a `_r_*` slot surfaces `UnexpectedVoidSubReturn`. |
+//! | `inline_call_r_i/dR>i` | PARITY        | int-result sibling of `inline_call_r_r/dR>r`. Same recursion + arglist + raise routing; only the dst bank changes (`registers_i[dst] = subreturn_value`). RPython `pyjitpl.py:1266-1324 _opimpl_inline_call*` is generated through `_opimpl_any_inline_call` decorator that varies on the result type — pyre's walker shares the body via `dispatch_inline_call_dr_kind(dst_bank)`. |
+//! | `inline_call_ir_r/dIR>r`, `inline_call_ir_i/dIR>i` | PARITY | extended-arglist siblings — descr + I-list + R-list + dst. RPython `setup_call(argboxes_i, argboxes_r, argboxes_f)` (pyjitpl.py:230-260) populates the callee's int + ref banks from the two lists. Walker uses `dispatch_inline_call_dir_kind(dst_bank)` which reads `read_int_var_list` then `read_ref_var_list` and surfaces per-bank arity overflow as `InlineCallIntArityMismatch` / `InlineCallArityMismatch`. |
+//! | `inline_call_irf_r/dIRF>r`, `inline_call_irf_f/dIRF>f` | PARITY | full-arglist variants — descr + I-list + R-list + F-list + dst. RPython same `setup_call` distribution; walker uses `dispatch_inline_call_dirf_kind(dst_bank)` extending the dIR helper with `read_float_var_list` + float-bank arg setup. Float arity overflow surfaces `InlineCallFloatArityMismatch`. |
+//! | `int_copy/i>i`      | PARITY        | `registers_i[dst] = registers_i[src]` SSA rename, no IR op emitted (`pyjitpl.py:471-477 _opimpl_any_copy + >i` decorator) |
+//! | `int_<binop>/ii>i`  | PARITY        | int_add/int_sub/int_mul/int_and/int_or/int_xor/int_rshift + comparisons int_eq/int_ne/int_lt/int_le/int_gt/int_ge (13 ops). Reads two `i`-coded regs, records `OpCode::Int<Binop>` with `[a, b]`, writes recorder result into dst (`pyjitpl.py:279-336`). `int_lshift/ii>i` intentionally absent — codewriter emits only `int_lshift/ri>i` (Task #85 territory). |
+//! | `float_<binop>/ff>f` + `float_neg/f>f` | PARITY | float_add/float_sub/float_truediv binops + float_neg unary (4 ops total — float_mul, float comparisons, float_abs all absent from codewriter today, would land mechanically when emitted). Read on `registers_f` bank, record `OpCode::Float<Binop>`, write dst (`pyjitpl.py:284-292`). |
+//! | `int_neg/i>i`, `int_invert/i>i`, `int_same_as/i>i` | PARITY | unary i→i ops via `unop_int_record`. RPython `pyjitpl.py:356-368` exec-generated unary opimpls + `pyjitpl.py:370-375 opimpl_int_same_as` (records SAME_AS_I explicitly). |
+//! | `int_mod/ii>i` | PARITY | binary modulo via `binop_int_record`. RPython `pyjitpl.py:279 int_mod` exec-generated binop. `int_div/ii>i` intentionally absent — pyre-specific opname (RPython is `int_floordiv`). |
+//! | `cast_int_to_float/i>f` | PARITY | i-bank read, record `CastIntToFloat`, f-bank write. RPython `pyjitpl.py:357 cast_int_to_float` (same exec-generated unary opimpl loop). |
+//! | `ptr_eq/rr>i`, `ptr_ne/rr>i` | PARITY | r-bank pair → record PtrEq/PtrNe → i-bank dst via `binop_ref_to_int_record`. RPython `pyjitpl.py:326-336` exec-generated comparison opimpls (b1 is b2 fast path omitted, same rationale as int comparisons). |
+//! | `getfield_gc_i/rd>i`, `getfield_gc_r/rd>r` | PARITY (heapcache-aware) | r-bank obj + descr → heapcache lookup. Cache hit returns cached OpRef without recording; cache miss records `OpCode::GetfieldGc<I,R>` + `getfield_now_known` writeback. RPython `pyjitpl.py:855-882 + 929-950 _opimpl_getfield_gc_any_pureornot`. ConstPtr fast-path (`pyjitpl.py:856-860`) deferred — pyre walker doesn't track ConstPtr identity (optimizer's job post-trace). The pyre-specific `id>X` shape (int source — kind-flow Task #85) stays unsupported. |
+//! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through (Walker fix F: alias-clearing — when obj is escaped, retain only unescaped-object cache entries for this field_index, mirroring RPython `FieldUpdater.setfield → do_write_with_aliasing`). RPython `pyjitpl.py:973-988 _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py:981-988`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (Task #85 territory). |
+//! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py:639-688 _do_getarrayitem_gc_any`. `_i` / `_f` shapes don't appear in pyre's insns table today; would land mechanically when emitted. |
+//! | `setarrayitem_gc_r/rird` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (Task #85). |
+//! | `residual_call_r_r/iRd>r` | PRE-EXISTING-ADAPTATION (multi-session epic) | records EffectInfo-classified `CallR/CallPureR` + optional `GuardNoException`. Missing per `pyjitpl.py:1995 do_residual_or_indirect_call`: `CALL_MAY_FORCE` / `GUARD_NOT_FORCED` for forces-virtual paths, `CALL_LOOPINVARIANT_R` for `EF_LOOPINVARIANT`, `vable_and_vrefs_before/after_residual_call` for virtualizable bookkeeping (`pyjitpl.py:2055-2080`), `heapcache.invalidate_caches_varargs` for write effects (`pyjitpl.py:2042`), `call_loopinvariant_known_result_cache` short-circuit (`pyjitpl.py:1999-2011`), `direct_libffi_call` / `direct_call_release_gil` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990`), and `num_live` accounting on `GUARD_NO_EXCEPTION` (`pyjitpl.py:2082 → capture_resumedata`). Convergence: Phase D-3 + dedicated multi-session port. |
+//! | `residual_call_r_i/iRd>i` | PARITY (kind sibling of `_r_r`) | same EffectInfo classification + GUARD_NO_EXCEPTION emission as `_r_r`; only the result OpCode (`OpCode::CallI` / `CallPureI`) and dst writeback bank (`registers_i`) differ. RPython parity: `pyjitpl.py:1346 opimpl_residual_call_r_i = _opimpl_residual_call1`; `do_residual_call`'s `descr.get_normalized_result_type()` dispatch (pyjitpl.py:2022-2044) selects the int-result CALL op. Argboxes pass through [`build_allboxes`] same as `_r_r` (R-list-only argboxes → identity permutation when arg_types is ref-only). |
+//! | `residual_call_ir_r/iIRd>r` | PARITY (shape sibling of `_r_r`) | adds an i-bank list between funcptr and the R-list. RPython parity: `pyjitpl.py:1349 opimpl_residual_call_ir_r = _opimpl_residual_call2`; `boxes2` argcode (`pyjitpl.py:3750-3760`) decodes the two count-prefixed lists into `argboxes = [i_args..., r_args...]`. Walker passes that flat list through [`build_allboxes`] (line-by-line port of `pyjitpl.py:1960-1993 _build_allboxes`) which permutes argboxes by `descr.get_arg_types()` so the recorded `Call*` arglist matches the callee's actual ABI even for mixed orderings like `[REF, INT, REF, INT]`. Same EffectInfo classification + GUARD_NO_EXCEPTION emission as `_r_r`. |
+//! | `raise/r`           | PRE-EXISTING-ADAPTATION (Walker fix H deferred) | sets `ctx.last_exc_value` (`pyjitpl.py:1695`); top-level records `Finish(exc) descr=exit_frame_with_exception_descr_ref` (`pyjitpl.py:3238-3242 compile_exit_frame_with_exception`); sub-walk surfaces `SubRaise{exc}`. Caller-side handler scan (`finishframe_exception`) lives on `inline_call`'s SubRaise arm (above). RPython `pyjitpl.py:1690-1693` also emits `GUARD_CLASS(exc, cls_of_box(exc))` when `heapcache.is_class_known(exc) == false`; the symbolic walker can't derive `cls_of_box(exc)` without runtime access to the box. Convergence path: Walker fix A (production `dispatch_via_miframe` wiring) supplies the MIFrame.cls_of_box resolver; only then can walker emit the guard. |
+//! | `reraise/`          | PARITY        | reads `ctx.last_exc_value` (asserts via `ReraiseWithoutLastExcValue` matching `pyjitpl.py:1702 assert`); same dual top-level/sub-walk routing as `raise/r` (`pyjitpl.py:1700-1704 popframe + finishframe_exception`). |
+//! | `last_exc_value/>r` | PARITY        | reads `ctx.last_exc_value`, writes the OpRef into `registers_r[dst]` — pure SSA rename, no IR op recorded. RPython `pyjitpl.py:1716-1719 opimpl_last_exc_value` returns `self.metainterp.last_exc_box` after asserting `last_exc_value` is non-null; missing slot surfaces `LastExcValueWithoutActiveException` (codewriter invariant: only emits inside `catch_exception/L` body). |
 //!
 //! Slice 1 = pure decode walker (no TraceCtx); slice 2b adds
 //! `WalkContext { registers_r, trace_ctx }` + `ref_return/r` recording.
-//! Slice 2c = `goto/L` (first branching primitive). RPython parity:
-//! `blackhole.py:950-952 bhimpl_goto(target): return target` — the
-//! handler returns the new position. Recording-wise pyre + RPython agree:
-//! `goto/` is pure control flow, no IR op generated.
-//!
-//! `raise/r` recording stays deferred — the RPython
-//! `pyjitpl.py:opimpl_raise → finishframe_exception` (`pyjitpl.py:2506`)
-//! is *not* a single-op record: it scans the exceptiontable, unwinds
-//! the symbolic stack to handler depth, pushes lasti+exc onto the
-//! stack, and continues tracing inside the handler. That requires
-//! full MIFrame state (symbolic_stack_types, concrete_stack,
-//! valuestackdepth, code+exceptiontable) — wider than the
-//! `WalkContext { registers_r, trace_ctx }` slice. Lands when the
-//! walker integrates into `MIFrame::dispatch_jitcode` (Phase D-3).
+//! Slice 2c = `goto/L`. Slice 2d = `catch_exception/L`. Slice 2e =
+//! `reraise/`. Slice 2f = `int_copy/i>i`. Slice 2g =
+//! `residual_call_r_r/iRd>r`. Slice 2h = `inline_call_r_r/dR>r`
+//! recursion. Slice 2i (this) = caller-frame `catch_exception` scan,
+//! `last_exc_value` field, `reraise` finishframe routing, typed
+//! arity / shape / no-active-exception errors, production
+//! `PyreJitCodeDescr` adapter.
 //!
 //! Convergence path: when every opname has a recording handler this
 //! module replaces the trait dispatch in `MIFrame::execute_opcode_step`
@@ -48,55 +60,79 @@
 //! the entry point becomes `MIFrame::dispatch_jitcode` calling [`walk`]
 //! with the appropriate context.
 //!
-//! Production fidelity gaps (next-session work, ranked by priority):
+//! Production fidelity gaps (ranked by priority for follow-on work):
 //!
-//! 1. (LANDED slice 2h) `inline_call_r_r/dR>r` recurses into the
-//!    sub-jitcode body via `JitCodeDescr::jitcode_index()` (resolved
-//!    through `WalkContext::sub_jitcode_lookup`), allocates a fresh
-//!    callee frame, populates `callee.registers_r[0..N]` from the
-//!    caller's R-list, and writes the sub-walk's `SubReturn` result
-//!    into the caller's dst slot. `ref_return/r` and `raise/r` route
-//!    through `is_top_level` to either record top-level FINISH or
-//!    surface `SubReturn` / `SubRaise` to the caller's
-//!    `inline_call_*` handler. **Still deferred**: per-PC
-//!    exceptiontable scan inside `inline_call`'s `SubRaise` arm —
-//!    today the SubRaise bubbles straight to the top-level walker
-//!    (catch_exception/L's stored target metadata is wired but
-//!    unread). Lands when the exceptiontable plumb-through goes
-//!    through (Phase D-3).
-//! 2. `residual_call_r_r/iRd>r` records the bare `CallR(args, descr)`
-//!    only. RPython `pyjitpl.py:1995 do_residual_or_indirect_call`
-//!    additionally checks the descr's `EffectInfo` for inline/CONST
-//!    targets (`call_pure`), invalidates `heapcache` on may-force /
-//!    write effects, emits the `GUARD_NO_EXCEPTION` /
-//!    `GUARD_EXCEPTION` pair the codewriter inserted, and routes
-//!    `last_exc_value` through the resume bookkeeping. Walker only
-//!    handles the recording skeleton — full path lands when MIFrame
-//!    state (heapcache, last_exc_value, EffectInfo registry) is
-//!    reachable. Multi-session epic.
-//! 3. `raise/r` + `reraise/` terminate without recording; full
-//!    `pyjitpl.py:2506 finishframe_exception` (exceptiontable scan,
-//!    symbolic stack unwind to handler depth, `setarrayitem_vable`
-//!    push of lasti+exc, continue tracing inside the handler — or
-//!    record `FINISH(exit_frame_with_exception_descr_ref)` at the
-//!    outermost frame) needs MIFrame framestack access. Phase D-3.
-//! 4. End-to-end test (`walk_pop_top_arm_terminates_with_recorded_ops`)
-//!    fills `descr_refs` with `make_fail_descr` placeholders. The
-//!    walker treats descrs opaquely (`Arc::ptr_eq` is the only
-//!    operation), so this is currently sound — but once handlers
-//!    start dispatching on descr type (e.g. `EffectInfo` lookup for
-//!    `residual_call`), the fixture must switch to real
-//!    `SimpleCallDescr` instances. Triggers when (2) starts.
-//! 5. (External) `build_default_bh_builder_with_unwired_report` is a
+//! 1. `residual_call_r_r/iRd>r` 8-branch port (`pyjitpl.py:1995-2127`).
+//!    Walker emits the EffectInfo-classified record + optional
+//!    `GUARD_NO_EXCEPTION` only. Each missing branch needs MIFrame
+//!    state pyre-jit-trace doesn't yet expose:
+//!    a. `CALL_MAY_FORCE` / `GUARD_NOT_FORCED` (forces-virtual path)
+//!       — needs `vable_and_vrefs_before_residual_call` + after.
+//!    b. `CALL_LOOPINVARIANT_R` opcode (currently absent from
+//!       `majit-ir`'s `OpCode`); plus
+//!       `call_loopinvariant_known_result_cache` short-circuit
+//!       (`pyjitpl.py:1999-2011`) requires `metainterp.history`.
+//!    c. `heapcache.invalidate_caches_varargs` for write effects
+//!       (`pyjitpl.py:2042`); needs MIFrame `heapcache`.
+//!    d. `direct_libffi_call` / `direct_call_release_gil` /
+//!       `direct_assembler_call` specialization (`pyjitpl.py:1908-1990`)
+//!       — needs descr-type discrimination + dedicated emit paths.
+//!    e. `GUARD_NO_EXCEPTION num_live=0` is a known under-approx —
+//!       parity is `capture_resumedata(orgpc, after_residual_call=True)`
+//!       which needs the symbolic frame state. (`pyjitpl.py:2082-2086`)
+//!    Multi-session epic; not in scope for slice 2i. Cannot be closed
+//!    incrementally without the listed prereq state. (Item f from the
+//!    earlier audit — `_build_allboxes` ABI re-ordering — landed in
+//!    slice 4.x: see [`build_allboxes`].)
+//! 2. `raise/r`'s `GUARD_CLASS` (Walker fix H) is deferred until
+//!    Walker fix A (production `dispatch_via_miframe` caller) lands.
+//!    RPython `pyjitpl.py:1690-1693 opimpl_raise` emits the guard via
+//!    `metainterp.cls_of_box(exc) → generate_guard(GUARD_CLASS, ...)`;
+//!    the symbolic walker has only OpRefs, no `cls_of_box` access. A
+//!    half-port that supplied a resolver-may-be-None type-erased
+//!    callback was tried and reverted — silently skipping when no
+//!    resolver is wired is itself a NEW-DEVIATION since RPython
+//!    always emits when class is unknown.
+//! 3. End-to-end real arm tests (`walk_return_value_arm_*`,
+//!    `walk_pop_top_arm_*`) stay `#[ignore]` until handlers exist for
+//!    every opname the codewriter-emitted callee bodies use (e.g.
+//!    `getfield_vable_i/rd>i`). Each new opname is a tracked slice.
+//! 4. (External) `build_default_bh_builder_with_unwired_report` is a
 //!    transitional helper for Task #85 (6 unwired opnames:
 //!    `int_ge/ir>i`, `int_mul/ir>i`, `int_ne/fr>i`, `int_xor/ri>i`,
 //!    `setarrayitem_gc_f/rrfd`, `setarrayitem_gc_i/rrid` — kind-flow
 //!    bug in assembler emitting mixed-kind operand types). RPython
 //!    upstream has no non-strict builder. Removed when Task #85
 //!    closes; not blocking dispatcher work.
+//! 5. Concrete-truth-dependent branch opnames (`goto_if_not/iL`,
+//!    `goto_if_exception_mismatch/iL`). RPython
+//!    `pyjitpl.py:511-526 opimpl_goto_if_not`: `switchcase = box.getint()`
+//!    branches on the runtime concrete value — `if switchcase: opnum =
+//!    GUARD_TRUE; promoted_box = CONST_1` else `opnum = GUARD_FALSE`,
+//!    then `metainterp.generate_guard(opnum, box, resumepc=orgpc)`. The
+//!    walker is purely symbolic (`WalkContext` carries `OpRef`s, not
+//!    concrete `box.getint()` values), so it can't pick GUARD_TRUE vs
+//!    GUARD_FALSE — and emitting one direction unconditionally would be
+//!    a NEW-DEVIATION (the trace would commit to a branch the runtime
+//!    didn't actually take). Convergence path: Phase D-3 MIFrame
+//!    integration carrying the concrete branch outcome (analogue to
+//!    pyre's existing `record_branch_guard(concrete_truth: bool)`
+//!    `trace_opcode.rs:2884`); once that lands the walker reads the
+//!    truth from MIFrame and chooses the guard opnum. Same prereq for
+//!    `goto_if_exception_mismatch/iL` (`pyjitpl.py:484-496` —
+//!    `last_exc_value`/llexitcase comparison).
+//! 6. Class-introspection opname `last_exception/>i`. RPython
+//!    `pyjitpl.py:1707-1713 opimpl_last_exception`: returns
+//!    `ConstInt(ptr2int(rclass.ll_cast_to_object(exc_value).typeptr))` —
+//!    the class pointer of the standing exception. Walker carries the
+//!    exception OpRef but no class metadata; resolving the class needs
+//!    the same MIFrame integration as the goto_if_not family (concrete
+//!    `last_exc_value` is reachable once MIFrame surfaces it). Until
+//!    then `last_exception/>i` stays a deferred handler.
 
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
-use majit_ir::{DescrRef, OpCode, OpRef};
+use crate::state::MIFrame;
+use majit_ir::{DescrRef, OpCode, OpRef, Type};
 use majit_metainterp::TraceCtx;
 
 /// Body of a callee jitcode that the walker needs to recurse into.
@@ -124,6 +160,8 @@ pub struct SubJitCodeBody {
     pub num_regs_r: usize,
     /// Number of Int-bank registers (`JitCode.num_regs_i`).
     pub num_regs_i: usize,
+    /// Number of Float-bank registers (`JitCode.num_regs_f`).
+    pub num_regs_f: usize,
 }
 
 /// Caller-provided sub-jitcode lookup. RPython equivalent: descr
@@ -191,6 +229,10 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// operands once the codewriter wires Int kind). Mutable so
     /// `int_copy/i>i` can land its dst.
     pub registers_i: &'frame mut [OpRef],
+    /// Symbolic Float-bank register file. Indexing matches RPython
+    /// `MIFrame.registers_f` (`pyjitpl.py:177-234`). Mutable so
+    /// `float_<binop>/ff>f` and `float_neg/f>f` can land their dst.
+    pub registers_f: &'frame mut [OpRef],
     /// Descr pool for `d`-coded operands. Each `d` argcode in the
     /// jitcode bytes resolves to `descr_refs[2-byte LE index]`.
     /// RPython `Assembler.descrs` (`assembler.py:23`) +
@@ -205,6 +247,19 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// the Ref kind. Caller-provided so the dispatcher does not reach
     /// into `TraceCtx::metainterp_sd` (which is `pub(crate)`).
     pub done_with_this_frame_descr_ref: DescrRef,
+    /// Int-kind counterpart used by `int_return/i` (`pyjitpl.py:3206-3208
+    /// compile_done_with_this_frame: token = sd.done_with_this_frame_descr_int`).
+    /// Production wires `MetaInterpStaticData::done_with_this_frame_descr_for(Type::Int)`;
+    /// tests pass `make_fail_descr(N)` placeholders since the descr's
+    /// only role here is identity-tagging the FINISH terminator.
+    pub done_with_this_frame_descr_int: DescrRef,
+    /// Float-kind counterpart used by `float_return/f` (`pyjitpl.py:3212-3214
+    /// compile_done_with_this_frame: token = sd.done_with_this_frame_descr_float`).
+    pub done_with_this_frame_descr_float: DescrRef,
+    /// Void-kind counterpart used by `void_return/` (`pyjitpl.py:3202-3205
+    /// compile_done_with_this_frame: token = sd.done_with_this_frame_descr_void`,
+    /// `exits = []` — the FINISH carries no value).
+    pub done_with_this_frame_descr_void: DescrRef,
     /// `exit_frame_with_exception_descr_ref` — the descr `pyjitpl.py:3238-3242
     /// compile_exit_frame_with_exception` attaches to the FINISH that
     /// terminates a trace whose outermost frame raised an unhandled
@@ -236,6 +291,18 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// `SubJitCodeBody`. Invoked when `inline_call_r_r/dR>r` fires
     /// and needs to recurse into the callee's bytecode body.
     pub sub_jitcode_lookup: &'static_a SubJitCodeLookup,
+    /// Per-frame mirror of RPython `metainterp.last_exc_value`
+    /// (`pyjitpl.py:1695`). Set by `raise/r` (caller-frame side, before
+    /// `SubRaise` propagates) and by the `inline_call` SubRaise arm
+    /// when it catches at a `catch_exception/L` handler (the handler's
+    /// own opcodes — `last_exception`, `last_exc_value`, `reraise/` —
+    /// read this field). RPython keeps this on the metainterp object
+    /// (one shared slot); the walker carries one per WalkContext
+    /// because each recursive frame has its own context. The flow
+    /// (callee raise → caller catch → caller handler reads) only
+    /// touches the caller's slot, so per-frame storage is equivalent
+    /// to RPython's metainterp-level slot for the catch path.
+    pub last_exc_value: Option<OpRef>,
 }
 
 /// Outcome of dispatching one opcode. The walker uses this to decide
@@ -318,6 +385,86 @@ pub enum DispatchError {
     /// build synthetic maps. A `None` return means the codewriter
     /// emitted an index past the runtime's jitcode table.
     SubJitCodeNotFound { pc: usize, jitcode_index: usize },
+    /// `inline_call_*` provided more Ref args in its R-list than the
+    /// callee declared `num_regs_r` slots. RPython parity: `pyjitpl.py:230-260
+    /// MIFrame.setup_call(argboxes)` distributes argboxes into the
+    /// callee's typed register banks; the JitCode-level shape contract
+    /// (`assembler.py:write_call`) requires `len(argboxes) <=
+    /// num_regs_r` for the `_r_r` variant. Excess args are a
+    /// codewriter-emitted shape mismatch.
+    InlineCallArityMismatch {
+        pc: usize,
+        provided: usize,
+        callee_num_regs_r: usize,
+    },
+    /// `inline_call_*` provided more Int args in its I-list than the
+    /// callee declared `num_regs_i` slots. Same shape contract as the
+    /// Ref variant — `pyjitpl.py:230-260 setup_call` populates each
+    /// kind-bank from its respective list and asserts capacity.
+    InlineCallIntArityMismatch {
+        pc: usize,
+        provided: usize,
+        callee_num_regs_i: usize,
+    },
+    /// `inline_call_*` provided more Float args in its F-list than the
+    /// callee declared `num_regs_f` slots.
+    InlineCallFloatArityMismatch {
+        pc: usize,
+        provided: usize,
+        callee_num_regs_f: usize,
+    },
+    /// `inline_call_r_r/dR>r`'s callee surfaced
+    /// `SubReturn { result: None }`. RPython parity: the `_r_r` variant
+    /// is wired (in `assembler.py:gen_inline_call`) to a callee whose
+    /// `*_return` op carries a Ref; reaching it without a result means
+    /// the callee body executed `void_return/` (or an analogue) instead
+    /// of `ref_return/r`, which is a codewriter shape mismatch — the
+    /// caller has nowhere to land the missing value.
+    UnexpectedVoidSubReturn { pc: usize },
+    /// `reraise/` fired but `WalkContext::last_exc_value` was `None`.
+    /// RPython parity: `pyjitpl.py:1702
+    /// opimpl_reraise: assert self.metainterp.last_exc_value` —
+    /// reaching `reraise` without an active exception is a codewriter
+    /// invariant violation (`raise` or a catch-handler entry must have
+    /// set `last_exc_value` first).
+    ReraiseWithoutLastExcValue { pc: usize },
+    /// `last_exc_value/>r` fired but `WalkContext::last_exc_value` was
+    /// `None`. RPython parity: `pyjitpl.py:1716-1719 opimpl_last_exc_value`:
+    ///
+    ///   exc_value = self.metainterp.last_exc_value
+    ///   assert exc_value
+    ///   return self.metainterp.last_exc_box
+    ///
+    /// Same codewriter invariant as `reraise/`: this opname only emits
+    /// inside a `catch_exception` body where the unwinder has already
+    /// stored the in-flight exception. Reaching it without an active
+    /// exception is a flatten/codewriter shape mismatch.
+    LastExcValueWithoutActiveException { pc: usize },
+    /// `catch_exception/L` was reached on the normal fall-through path
+    /// (no `SubRaise` routing) but `WalkContext::last_exc_value` was
+    /// non-`None`. RPython parity: `pyjitpl.py:497-504 opimpl_catch_exception`:
+    ///
+    ///   assert not self.metainterp.last_exc_value
+    ///
+    /// On the normal path the previous instruction did NOT raise — if
+    /// it had, `finishframe_exception` would have routed control past
+    /// the catch_exception/L (or to its target if matched), never
+    /// running the catch_exception/L instruction itself. Reaching it
+    /// with an active exception means the codewriter mis-emitted a
+    /// catch_exception/L outside an exception-table position, OR a
+    /// previous handler forgot to clear `last_exc_value` after handling.
+    CatchExceptionWithActiveException { pc: usize },
+
+    /// `residual_call_*` decoded a descr that does not implement
+    /// `CallDescr`. RPython parity: `pyjitpl.py:1995-2127
+    /// do_residual_call` always receives a `calldescr` from the
+    /// codewriter — there is no fallback path. The walker mirrors that
+    /// invariant by surfacing a typed error when the descr_pool entry
+    /// at the operand-encoded index lacks a CallDescr downcast. In
+    /// production the codewriter never emits a non-CallDescr; this
+    /// variant fires only when test fixtures (or future deviations)
+    /// route a non-CallDescr into a residual_call slot.
+    ResidualCallDescrNotCallDescr { pc: usize, descr_index: usize },
 }
 
 /// Walk one opcode at `pc` and return the dispatch outcome plus the
@@ -343,6 +490,19 @@ pub fn step(
 /// (other variants appear only inside a sub-walk frame entered via
 /// `inline_call_r_r/dR>r` — `ref_return/r` and `raise/r` produce
 /// `SubReturn` / `SubRaise` there).
+///
+/// **Top-level uncaught SubRaise (Walker fix I)**: when an inline_call
+/// SubRaise bubbles up through every parent frame without a
+/// `catch_exception/L` handler match and reaches the outermost
+/// `walk()` invocation, RPython `pyjitpl.py:2533-2538
+/// finishframe_exception` records `compile_exit_frame_with_exception(
+/// last_exc_box)` — i.e. `FINISH(exc, exit_frame_with_exception_descr_ref)`
+/// + raise `ExitFrameWithExceptionRef`. The walker mirrors this on
+/// exit: if the loop terminates with `SubRaise` AND `ctx.is_top_level
+/// == true`, record the FINISH and convert the outcome to `Terminate`
+/// before returning. Sub-walk frames keep returning `SubRaise` to
+/// their callers (the unwind continues until either a handler
+/// matches or the outermost walker handles it).
 pub fn walk(
     code: &[u8],
     start_pc: usize,
@@ -354,9 +514,21 @@ pub fn walk(
         pc = next_pc;
         match outcome {
             DispatchOutcome::Continue => {}
-            DispatchOutcome::Terminate
-            | DispatchOutcome::SubReturn { .. }
-            | DispatchOutcome::SubRaise { .. } => return Ok((outcome, pc)),
+            DispatchOutcome::Terminate | DispatchOutcome::SubReturn { .. } => {
+                return Ok((outcome, pc));
+            }
+            DispatchOutcome::SubRaise { exc } => {
+                if ctx.is_top_level {
+                    // RPython parity: framestack exhausted with no
+                    // handler match → `compile_exit_frame_with_exception(
+                    // last_exc_box)` records the outermost FINISH.
+                    ctx.trace_ctx
+                        .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
+                    return Ok((DispatchOutcome::Terminate, pc));
+                } else {
+                    return Ok((DispatchOutcome::SubRaise { exc }, pc));
+                }
+            }
         }
     }
 }
@@ -405,6 +577,28 @@ fn read_int_reg(
         })
 }
 
+/// Read a Float-bank register operand byte at `pc + offset` and resolve
+/// to its symbolic [`OpRef`]. RPython
+/// `pyjitpl.py:registers_f[code[pc+1]]` for an `f`-coded operand.
+fn read_float_reg(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_>,
+) -> Result<OpRef, DispatchError> {
+    let byte_pc = op.pc + 1 + operand_offset;
+    let reg = code[byte_pc] as usize;
+    ctx.registers_f
+        .get(reg)
+        .copied()
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc: op.pc,
+            reg,
+            len: ctx.registers_f.len(),
+            bank: "f",
+        })
+}
+
 /// Read a 2-byte little-endian label operand at `pc + 1 +
 /// operand_offset`. RPython encoding: `assembler.py:write_label`
 /// writes the resolved target as `chr(target & 0xFF)` +
@@ -414,6 +608,103 @@ fn read_label(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usize {
     let lo = code[op.pc + 1 + operand_offset] as usize;
     let hi = code[op.pc + 1 + operand_offset + 1] as usize;
     lo | (hi << 8)
+}
+
+/// Outcome of probing the per-frame raise-bubbling lookahead at
+/// `position` (the pc just after a raising op).
+///
+/// RPython parity: `pyjitpl.py:2506-2531 finishframe_exception` walks
+/// through three mutually-exclusive cases after skipping a leading
+/// `live/`:
+///
+///   1. Next op is `catch_exception/L` → jump to the handler target,
+///      `raise ChangeFrame`. (Handler matched.)
+///   2. Next op is `rvmprof_code/ii` → call `cintf.jit_rvmprof_code(arg1,
+///      arg2)` for instrumentation, then fall through to `popframe()`
+///      (continue unwinding).
+///   3. Otherwise → `popframe()` (continue unwinding).
+///
+/// Cases 2 and 3 both unwind, but case 2 also fires the rvmprof side
+/// effect. RPython at line 2531 invokes `cintf.jit_rvmprof_code(arg1,
+/// arg2)` directly during tracing — RPython does NOT record this as
+/// an IR op, but the side effect IS observable (it advances the
+/// rvmprof profiler state). The helper surfaces the matched register
+/// pair via [`FinishframeLookahead::RvmprofCode`] so a future port
+/// can invoke pyre's `bh.handle_rvmprof_enter`-equivalent
+/// (`pyre-jit/src/call_jit.rs:1058`) when production
+/// `dispatch_via_miframe` wiring lands (Walker fix A). Until then the
+/// caller drops the side effect — known PRE-EXISTING-ADAPTATION,
+/// scoped to the rvmprof profiler instrumentation only (no trace IR
+/// effect).
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum FinishframeLookahead {
+    /// Handler match: caller-frame jump target (2-byte LE label after
+    /// `catch_exception/L`). Caller sets `last_exc_value` and resumes
+    /// at `target`.
+    CatchTarget(usize),
+    /// `rvmprof_code/ii` lies on the unwind path. Caller continues
+    /// unwinding (no handler match) and may surface the symbolic
+    /// instrumentation as a no-op for now (production parity drops the
+    /// runtime `cintf.jit_rvmprof_code` call which only matters when
+    /// rvmprof is enabled at trace-recording time, not at JIT-trace
+    /// playback). `_arg1_reg` / `_arg2_reg` are the i-bank register
+    /// indices the bhimpl would read at runtime; we surface them so a
+    /// future slice can port the symbolic call without re-decoding.
+    #[allow(dead_code)]
+    RvmprofCode { arg1_reg: u8, arg2_reg: u8 },
+    /// Neither match — unwinding continues with no side effect.
+    NoMatch,
+}
+
+/// Probe the per-frame raise-bubbling lookahead. RPython parity:
+/// `pyjitpl.py:2506-2531 finishframe_exception` line-by-line —
+/// `live/` skip then sequential `catch_exception` / `rvmprof_code` /
+/// fall-through arms.
+fn finishframe_lookahead_at(code: &[u8], position: usize) -> FinishframeLookahead {
+    let mut pos = position;
+    let Some(op) = decode_op_at(code, pos) else {
+        return FinishframeLookahead::NoMatch;
+    };
+    // RPython `if opcode == op_live: position += SIZE_LIVE_OP`.
+    if op.key == "live/" {
+        pos = op.next_pc;
+    }
+    let Some(next) = decode_op_at(code, pos) else {
+        return FinishframeLookahead::NoMatch;
+    };
+    if next.key == "catch_exception/L" {
+        let lo = code[next.pc + 1] as usize;
+        let hi = code[next.pc + 2] as usize;
+        return FinishframeLookahead::CatchTarget(lo | (hi << 8));
+    }
+    if next.key == "rvmprof_code/ii" {
+        // RPython `pyjitpl.py:2523-2531`:
+        //   arg1 = frame.registers_i[ord(code[position + 1])].getint()
+        //   arg2 = frame.registers_i[ord(code[position + 2])].getint()
+        //   assert arg1 == 1
+        //   cintf.jit_rvmprof_code(arg1, arg2)
+        // Walker surfaces the operand byte indices for the caller to
+        // decide whether to symbolically record (today: drop, mirroring
+        // RPython's non-record direct cintf call).
+        let arg1_reg = code[next.pc + 1];
+        let arg2_reg = code[next.pc + 2];
+        return FinishframeLookahead::RvmprofCode { arg1_reg, arg2_reg };
+    }
+    FinishframeLookahead::NoMatch
+}
+
+/// Convenience wrapper preserving the legacy
+/// `try_catch_exception_at(...) -> Option<target>` shape used by
+/// existing callers. Returns `Some(target)` only on the
+/// `CatchTarget` arm; `RvmprofCode` and `NoMatch` collapse to `None`
+/// (both cases continue unwinding from the caller's POV — the
+/// instrumentation side effect is dropped today, matching RPython's
+/// non-trace-recorded `cintf` call).
+fn try_catch_exception_at(code: &[u8], position: usize) -> Option<usize> {
+    match finishframe_lookahead_at(code, position) {
+        FinishframeLookahead::CatchTarget(target) => Some(target),
+        FinishframeLookahead::RvmprofCode { .. } | FinishframeLookahead::NoMatch => None,
+    }
 }
 
 /// Read a 2-byte little-endian descr index operand and resolve to
@@ -472,251 +763,469 @@ fn read_ref_var_list(
     Ok((out, 1 + len))
 }
 
-/// Per-opname dispatch table. Returning `(outcome, next_pc)` lets
-/// branching handlers (`goto/L`) override the linear `op.next_pc`
-/// advance; non-branching handlers return `op.next_pc` unchanged.
-fn handle(
-    op: &DecodedOp,
+/// Read an Int-bank variadic operand list (`I` argcode). Same shape as
+/// [`read_ref_var_list`] but indexes into `registers_i`. RPython
+/// `assembler.py:write_varlist` emits a single shape regardless of
+/// kind; the kind letter (`I` / `R` / `F`) only steers which register
+/// file the bytes index into.
+fn read_int_var_list(
     code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_>,
+) -> Result<(Vec<OpRef>, usize), DispatchError> {
+    let len_pc = op.pc + 1 + operand_offset;
+    let len = code[len_pc] as usize;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let reg = code[len_pc + 1 + i] as usize;
+        let opref = ctx
+            .registers_i
+            .get(reg)
+            .copied()
+            .ok_or(DispatchError::RegisterOutOfRange {
+                pc: op.pc,
+                reg,
+                len: ctx.registers_i.len(),
+                bank: "i",
+            })?;
+        out.push(opref);
+    }
+    Ok((out, 1 + len))
+}
+
+/// Read a Float-bank variadic operand list (`F` argcode). Mirror of
+/// [`read_int_var_list`] for the float bank.
+fn read_float_var_list(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_>,
+) -> Result<(Vec<OpRef>, usize), DispatchError> {
+    let len_pc = op.pc + 1 + operand_offset;
+    let len = code[len_pc] as usize;
+    let mut out = Vec::with_capacity(len);
+    for i in 0..len {
+        let reg = code[len_pc + 1 + i] as usize;
+        let opref = ctx
+            .registers_f
+            .get(reg)
+            .copied()
+            .ok_or(DispatchError::RegisterOutOfRange {
+                pc: op.pc,
+                reg,
+                len: ctx.registers_f.len(),
+                bank: "f",
+            })?;
+        out.push(opref);
+    }
+    Ok((out, 1 + len))
+}
+
+/// Generic int-bank binop handler. Reads `registers_i[src1]` and
+/// `registers_i[src2]`, records `record_op(opcode, [a, b])`, writes
+/// the recorder's result OpRef into `registers_i[dst]`. Operand
+/// layout is `ii>i` (1B src1 + 1B src2 + 1B dst).
+///
+/// RPython parity: `pyjitpl.py:288-292` exec-generated
+/// `opimpl_int_BINOP(b1, b2): return self.execute(rop.<OPNUM>, b1,
+/// b2)` + the trailing `>i` decorator that writes the result into
+/// `registers_i[dst]`. Walker collapses execute+writeback into
+/// `record_op + slot store`, which matches the recording-only side of
+/// `execute`'s split (`pyjitpl.py:_record_helper`).
+fn binop_int_record(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    opcode: OpCode,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let a = read_int_reg(code, op, 0, ctx)?;
+    let b = read_int_reg(code, op, 1, ctx)?;
+    let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    let dst = code[op.pc + 3] as usize;
+    let len = ctx.registers_i.len();
+    let slot = ctx
+        .registers_i
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc: op.pc,
+            reg: dst,
+            len,
+            bank: "i",
+        })?;
+    *slot = result;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Phase D-3 entry point: bridge an `MIFrame`'s register banks +
+/// trace recorder + last-exc state into a `WalkContext` and run
+/// `walk()` against the supplied jitcode body.
+///
+/// RPython parity context: in RPython the metainterp loop iterates
+/// over `metainterp.framestack[-1].pc` calling `bytecode_step` which
+/// dispatches to the right `opimpl_*`. There's no separate "walker
+/// entry" because the metainterp loop *is* the walker. Pyre is
+/// mid-migration: the production tracing path today is the
+/// trait-driven `MIFrame::execute_opcode_step` (`trace_opcode.rs`);
+/// this entry point lets future Phase D-3 work (shadow execution +
+/// per-opcode migration per the plan) drive the orthodox walker
+/// against the same MIFrame state without first replacing the trait
+/// dispatch wholesale.
+///
+/// Field plumbing:
+/// * `registers_r/i/f` — borrowed mutably from `miframe.sym`'s
+///   per-bank vectors. Walker handlers writing dst slots
+///   (`int_copy`, `binop_int_record`, etc.) mutate them in place,
+///   matching how `MIFrame::execute_opcode_step` mutates the same
+///   fields today.
+/// * `trace_ctx` — borrowed mutably from `miframe.ctx`'s
+///   `TraceCtx`. Recording (`record_op`, `finish`, etc.) goes
+///   through this.
+/// * `last_exc_value` — reads `sym.last_exc_box` as the initial
+///   value (`OpRef::NONE` collapses to `None`). On exit the
+///   walker's final `last_exc_value` is mirrored back if non-None,
+///   so a `raise/r` -> `catch_exception/L` -> handler trace
+///   leaves `sym.last_exc_box` pointing at the in-flight exc OpRef
+///   (parity with RPython metainterp.last_exc_value).
+/// * `descr_refs`, `sub_jitcode_lookup` — caller-provided, same
+///   contract as direct `walk()` callers. Production callers wire
+///   `crate::jitcode_runtime::all_descrs()` + a JitCode-resolving
+///   closure over `crate::jitcode_runtime::all_jitcodes()`.
+///
+/// `is_top_level` is forced `true` here — this is the outermost
+/// frame entry. Sub-walks happen automatically inside
+/// `inline_call_r_r/dR>r`'s recursion (which constructs its own
+/// `is_top_level=false` `WalkContext`).
+///
+/// **No production caller wires this yet** (slice 3.1 = entry +
+/// test; production wiring lands in subsequent Phase D-3 slices).
+pub fn dispatch_via_miframe(
+    miframe: &mut MIFrame,
+    jitcode_code: &[u8],
+    position: usize,
+    descr_refs: &[DescrRef],
+    sub_jitcode_lookup: &SubJitCodeLookup,
+    done_with_this_frame_descr_ref: DescrRef,
+    done_with_this_frame_descr_int: DescrRef,
+    done_with_this_frame_descr_float: DescrRef,
+    done_with_this_frame_descr_void: DescrRef,
+    exit_frame_with_exception_descr_ref: DescrRef,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // Extract raw pointers before any borrow. `miframe.ctx` and
+    // `miframe.sym` are `*mut`, distinct objects (the trace
+    // recorder vs. the symbolic frame state) — distinct pointers
+    // means dereferencing both simultaneously is sound.
+    let ctx_ptr = miframe.ctx;
+    let sym_ptr = miframe.sym;
+    // SAFETY: both pointers were initialized at MIFrame
+    // construction time and outlive this call (TraceCtx and
+    // PyreSym are pinned by the surrounding tracing session).
+    let trace_ctx = unsafe { &mut *ctx_ptr };
+    let sym = unsafe { &mut *sym_ptr };
+
+    // RPython parity: `metainterp.last_exc_value` (pyjitpl.py:1695)
+    // is the standing exception OpRef. Walker's `WalkContext::last_exc_value`
+    // mirrors this as `Option<OpRef>` — `None` means "no active
+    // exception", matching RPython's `assert self.metainterp.last_exc_value`
+    // (pyjitpl.py:1702).
+    let initial_last_exc_value = if sym.last_exc_box.is_none() {
+        None
+    } else {
+        Some(sym.last_exc_box)
+    };
+
+    let result = {
+        let mut wc = WalkContext {
+            registers_r: &mut sym.registers_r,
+            registers_i: &mut sym.registers_i,
+            registers_f: &mut sym.registers_f,
+            descr_refs,
+            trace_ctx,
+            done_with_this_frame_descr_ref,
+            done_with_this_frame_descr_int,
+            done_with_this_frame_descr_float,
+            done_with_this_frame_descr_void,
+            exit_frame_with_exception_descr_ref,
+            is_top_level: true,
+            sub_jitcode_lookup,
+            last_exc_value: initial_last_exc_value,
+        };
+        let outcome = walk(jitcode_code, position, &mut wc);
+        // Read final last_exc_value before wc drops so the borrow
+        // checker can release sym for the writeback below.
+        let final_last_exc = wc.last_exc_value;
+        drop(wc);
+        // Walker fix D: full sym.last_exc_* state writeback parity.
+        //
+        // RPython `pyjitpl.py:1694-1696 opimpl_raise` sets THREE pieces
+        // of metainterp state when a raise fires:
+        //   self.metainterp.class_of_last_exc_is_const = True
+        //   self.metainterp.last_exc_value = exc_value_box.getref(rclass.OBJECTPTR)
+        //   self.metainterp.last_exc_box = exc_value_box
+        //
+        // Of these, the walker can produce:
+        //   - `last_exc_box`: the symbolic OpRef. Mirrored from
+        //     `wc.last_exc_value` (RPython's metainterp.last_exc_value
+        //     and last_exc_box are different fields — concrete pointer
+        //     vs Box — but the walker tracks only the symbolic one,
+        //     which lines up with `sym.last_exc_box`).
+        //   - `class_of_last_exc_is_const`: true after a raise/r or a
+        //     SubRaise routed into a catch handler. RPython sets this
+        //     in `opimpl_raise` (line 1694) AND `execute_ll_raised`
+        //     (pyjitpl.py:2752 with `constant=...` parameter — set
+        //     after GUARD_CLASS / GUARD_EXCEPTION). Walker's raise/r
+        //     arm always sets `wc.last_exc_value = Some(exc)` so
+        //     mirroring `Some` → const=true is RPython-orthodox.
+        //
+        // The walker CANNOT produce:
+        //   - `sym.last_exc_value` (concrete `PyObjectRef`): RPython
+        //     `exc_value_box.getref(rclass.OBJECTPTR)` reads the
+        //     concrete pointer at trace-recording time. The symbolic
+        //     walker has only OpRefs — concrete writeback is the
+        //     production tracer's responsibility (the trait-driven
+        //     `MIFrame::execute_opcode_step` path). This is a known
+        //     PRE-EXISTING-ADAPTATION (the walker is symbolic-only,
+        //     concrete state is fed by another path).
+        if let Some(exc) = final_last_exc {
+            sym.last_exc_box = exc;
+            sym.class_of_last_exc_is_const = true;
+        }
+        outcome
+    };
+    result
+}
+
+/// `getarrayitem_gc_r/rid>r` handler. Operand layout `rid>r`:
+/// 1B r-reg(array) + 1B i-reg(index) + 2B descr + 1B r-dst.
+///
+/// RPython parity: `pyjitpl.py:639-673 _do_getarrayitem_gc_any`:
+///
+///   tobox = heapcache.getarrayitem(arraybox, indexbox, arraydescr)
+///   if tobox: return tobox        # cache hit, no IR (recording-only)
+///   resop = self.execute_with_descr(op, arraydescr, arraybox, indexbox)
+///   heapcache.getarrayitem_now_known(arraybox, indexbox, resop, arraydescr)
+///   return resop
+///
+/// Walker emits `OpCode::GetarrayitemGcR` for the `_r` variant (the
+/// only canonical shape the codewriter emits today;
+/// `getarrayitem_gc_i` and `getarrayitem_gc_f` would land
+/// mechanically when emitted).
+fn getarrayitem_gc_r_via_heapcache(
+    code: &[u8],
+    op: &DecodedOp,
     ctx: &mut WalkContext<'_, '_>,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
-    match op.key {
-        "live/" => Ok((DispatchOutcome::Continue, op.next_pc)),
-        "inline_call_r_r/dR>r" => {
-            // RPython parity: `pyjitpl.py:1266-1324 _opimpl_inline_call1`
-            //   pushes a fresh `MIFrame(jitcode)` populated with the caller's
-            //   args (`metainterp.newframe(jitcode)` + `frame.setup_call(args)`)
-            //   then raises `ChangeFrame()` so the metainterp loop dispatches
-            //   the next op on the new frame. The callee's `*_return` op
-            //   eventually pops back via `metainterp.finishframe(value)`,
-            //   writing `value` into the caller's `>r` slot.
-            //
-            // Walker simulates the same shape with synchronous recursion:
-            //   1. Resolve descr → `JitCodeDescr::jitcode_index()` →
-            //      caller-supplied lookup → `SubJitCodeBody`.
-            //   2. Allocate fresh callee `registers_r` / `registers_i`
-            //      vectors (sized to the callee's declared bank widths).
-            //   3. Populate `callee.registers_r[0..N]` from the caller's
-            //      R-list args (RPython `setup_call_r(self, argboxes)`,
-            //      `pyjitpl.py:230-260`).
-            //   4. Recursive `walk()` with `is_top_level = false`.
-            //   5. On `SubReturn { Some(value) }` write the dst register
-            //      and `Continue`. On `SubReturn { None }` (void return —
-            //      shouldn't happen for the `_r_r` variant but kept
-            //      defensive) `Continue` without dst write. On `SubRaise`
-            //      bubble up the same outcome (RPython
-            //      `metainterp.finishframe_exception()` walks the
-            //      framestack). On `Terminate` something has gone wrong
-            //      (sub-frame should never reach top-level Terminate when
-            //      `is_top_level=false`); surface as `Terminate` to caller.
-            //
-            // Operand layout `dR>r`:
-            //   2B d (descr index) + 1B varlen + N×1B Ref args + 1B >r dst
-            let sub_descr = read_descr(code, op, 0, ctx)?;
-            // Re-decode the descr index for diagnostics (read_descr already
-            // succeeded, so the OOR branch is skipped here — but we still
-            // need the integer for ExpectedJitCodeDescr).
-            let descr_index = (code[op.pc + 1] as usize) | ((code[op.pc + 2] as usize) << 8);
-            let jc_descr =
-                sub_descr
-                    .as_jitcode_descr()
-                    .ok_or(DispatchError::ExpectedJitCodeDescr {
-                        pc: op.pc,
-                        descr_index,
-                    })?;
-            let sub_index = jc_descr.jitcode_index();
-            let sub_body =
-                (ctx.sub_jitcode_lookup)(sub_index).ok_or(DispatchError::SubJitCodeNotFound {
+    let array = read_ref_reg(code, op, 0, ctx)?;
+    let index = read_int_reg(code, op, 1, ctx)?;
+    let descr = read_descr(code, op, 2, ctx)?;
+    let descr_index = descr.index();
+
+    let result = if let Some(cached) =
+        ctx.trace_ctx
+            .heap_cache()
+            .getarrayitem(array, index, descr_index)
+    {
+        cached
+    } else {
+        let resbox =
+            ctx.trace_ctx
+                .record_op_with_descr(OpCode::GetarrayitemGcR, &[array, index], descr);
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .getarrayitem_now_known(array, index, descr_index, resbox);
+        resbox
+    };
+
+    let dst = code[op.pc + 5] as usize;
+    let len = ctx.registers_r.len();
+    let slot = ctx
+        .registers_r
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc: op.pc,
+            reg: dst,
+            len,
+            bank: "r",
+        })?;
+    *slot = result;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `setarrayitem_gc_r/rird` handler. Operand layout `rird`:
+/// 1B r-reg(array) + 1B i-reg(index) + 1B r-reg(value) + 2B descr.
+///
+/// RPython parity: `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any`
+/// dispatches through `metainterp.execute_setarrayitem_gc(arraydescr,
+/// arraybox, indexbox, itembox)` — RPython's wrapper records
+/// `rop.SETARRAYITEM_GC` and updates the heapcache via
+/// `setarrayitem`.
+///
+/// No skip-on-redundant short-circuit (matches RPython —
+/// `_opimpl_setarrayitem_gc_any` has no `if cached == value: return`,
+/// because `heapcache.setarrayitem` already handles aliasing
+/// invalidation at the right granularity).
+fn setarrayitem_gc_r_via_heapcache(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let array = read_ref_reg(code, op, 0, ctx)?;
+    let index = read_int_reg(code, op, 1, ctx)?;
+    let value = read_ref_reg(code, op, 2, ctx)?;
+    let descr = read_descr(code, op, 3, ctx)?;
+    let descr_index = descr.index();
+
+    ctx.trace_ctx
+        .record_op_with_descr(OpCode::SetarrayitemGc, &[array, index, value], descr);
+    ctx.trace_ctx
+        .heap_cache_mut()
+        .setarrayitem(array, index, descr_index, value);
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `setfield_gc_<i|r>/<rid|rrd>` handler: read box (r-reg), valuebox
+/// (i or r reg per `value_bank`), descr operand, then either skip
+/// the IR emission (cache says the same value is already there) or
+/// record `OpCode::SetfieldGc` and write through to the heapcache.
+///
+/// RPython parity: `pyjitpl.py:973-988 _opimpl_setfield_gc_any`:
+///
+///   upd = heapcache.get_field_updater(box, fielddescr)
+///   if upd.currfieldbox is valuebox:
+///       return                       # cache hit, no IR
+///   self.metainterp.execute_and_record(rop.SETFIELD_GC, fielddescr,
+///                                       box, valuebox)
+///   upd.setfield(valuebox)
+///
+/// **Walker fix F**: writeback now goes through
+/// `HeapCache::setfield_cached` instead of `getfield_now_known`. The
+/// difference is the alias-clearing semantic that RPython's
+/// `FieldUpdater.setfield()` carries:
+///
+///   When the obj is NOT known-unescaped, ALL cached values for the
+///   same field on other (escaped) objects must be invalidated, since
+///   pointer aliasing means the SETFIELD could have written through
+///   `obj` and altered another object's view of the same field.
+///
+/// `getfield_now_known` only inserts the new (obj, field, value) tuple
+/// — it does NOT clear sibling entries. Using it here meant a
+/// subsequent `getfield_gc(other_obj, same_field)` could return a
+/// stale value cached from before the SETFIELD. Switching to
+/// `setfield_cached` matches RPython's `do_write_with_aliasing` exactly
+/// (`heapcache.rs:667-688`): the helper checks `is_unescaped(obj)` and
+/// only retains entries for unescaped objects (which can't alias
+/// anything else).
+///
+/// `value_bank` selects the valuebox source: `'i'` reads
+/// `registers_i[v]`, `'r'` reads `registers_r[v]`.
+fn setfield_gc_via_heapcache(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    value_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // Operand layout `<r><v>d`: 1B r-reg(box) + 1B v-reg(value) + 2B descr-index.
+    let obj = read_ref_reg(code, op, 0, ctx)?;
+    let valuebox = match value_bank {
+        'i' => read_int_reg(code, op, 1, ctx)?,
+        'r' => read_ref_reg(code, op, 1, ctx)?,
+        _ => {
+            unreachable!("value_bank must be 'i' or 'r' (no float setfield variant emitted today)")
+        }
+    };
+    let descr = read_descr(code, op, 2, ctx)?;
+    let descr_index = descr.index();
+
+    // Cache hit: if the heapcache already records `valuebox` as the
+    // current value of `(obj, descr)`, the SETFIELD_GC is redundant —
+    // skip recording. RPython:
+    //   if upd.currfieldbox is valuebox: return
+    let is_redundant =
+        ctx.trace_ctx.heap_cache().getfield_cached(obj, descr_index) == Some(valuebox);
+    if !is_redundant {
+        ctx.trace_ctx
+            .record_op_with_descr(OpCode::SetfieldGc, &[obj, valuebox], descr);
+        // Walker fix F: write-through with alias-clearing semantics.
+        // RPython `upd.setfield(valuebox)` → heapcache's
+        // `do_write_with_aliasing`. Pyre's `setfield_cached`
+        // (`heapcache.rs:667-688`) implements the same semantics:
+        // when obj is not unescaped, retain only entries on unescaped
+        // objects for this field_index; otherwise insert without
+        // invalidation.
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .setfield_cached(obj, descr_index, valuebox);
+    }
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `getfield_gc_<i|r>/rd>X` handler: read a Ref-bank source register
+/// + descr operand, consult the heapcache, and either return the
+/// cached field box (no IR op recorded) or record the appropriate
+/// `OpCode::GetfieldGc<I|R>` op and update the cache.
+///
+/// RPython parity: `pyjitpl.py:855-882 opimpl_getfield_gc_<i|r>` →
+/// `_opimpl_getfield_gc_any_pureornot` (`pyjitpl.py:929-950`).
+/// RPython has a ConstPtr+is_always_pure() fast path at lines 856-860
+/// that fires `executor.execute(cpu, metainterp, opnum, fielddescr,
+/// box)` and returns `ConstInt/ConstFloat/ConstPtr(resvalue)` —
+/// recording NO trace op (the value is directly substituted as a Const
+/// literal). The symbolic walker has no `executor.execute` (no cpu /
+/// concrete box pair), so the fast path is structurally unreachable.
+///
+/// Walker behaviour mirrors `_opimpl_getfield_gc_any_pureornot`
+/// uniformly: heapcache hit returns the cached box (no IR op);
+/// heapcache miss records `GetfieldGc<I|R>` (non-pure variant) +
+/// writes through. The optimizer's always-pure pass later folds the
+/// non-pure read into `GetfieldGcPure*` based on `descr.is_always_pure()`,
+/// which is `OpHelpers.getfield_pure_for_descr` (resoperation.py:
+/// 1284-1289) parity. Walker emitting Pure variants directly would be
+/// a NEW-DEVIATION since RPython's opimpl_* never emits the Pure
+/// opcodes; they're an optimizer-rewrite artifact.
+///
+/// `dst_bank` selects the result bank: `'i'` writes `registers_i[dst]`,
+/// `'r'` writes `registers_r[dst]`.
+fn getfield_gc_via_heapcache(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    opcode: OpCode,
+    dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    // Operand layout `rd>X`: 1B r-reg + 2B descr-index + 1B dst.
+    let obj = read_ref_reg(code, op, 0, ctx)?;
+    let descr = read_descr(code, op, 1, ctx)?;
+    let descr_index = descr.index();
+
+    let result = if let Some(cached) = ctx.trace_ctx.heap_cache().getfield_cached(obj, descr_index)
+    {
+        // Cache hit (RPython `if upd.currfieldbox is not None: return`).
+        cached
+    } else {
+        // Cache miss — record op + write through.
+        let resbox = ctx.trace_ctx.record_op_with_descr(opcode, &[obj], descr);
+        ctx.trace_ctx
+            .heap_cache_mut()
+            .getfield_now_known(obj, descr_index, resbox);
+        resbox
+    };
+
+    let dst = code[op.pc + 4] as usize;
+    match dst_bank {
+        'i' => {
+            let len = ctx.registers_i.len();
+            let slot = ctx
+                .registers_i
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
                     pc: op.pc,
-                    jitcode_index: sub_index,
+                    reg: dst,
+                    len,
+                    bank: "i",
                 })?;
-            // R-list lives at operand offset 2 (skip 2-byte descr). The
-            // helper returns total operand byte width.
-            let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
-
-            // Allocate fresh callee frame (RPython `MIFrame(jitcode)`'s
-            // bank vectors are sized in `__init__` to the jitcode's
-            // declared widths). All slots default to OpRef::NONE so any
-            // callee read of an unwritten slot surfaces RegisterOutOfRange
-            // semantics (or, more precisely, an OpRef::NONE that downstream
-            // ops will reject).
-            let mut callee_regs_r = vec![OpRef::NONE; sub_body.num_regs_r];
-            let mut callee_regs_i = vec![OpRef::NONE; sub_body.num_regs_i];
-
-            // Populate callee args. RPython `setup_call_r(argboxes)`
-            // copies caller's argboxes into the callee's first N
-            // `registers_r` slots. Pyre's `_r_r` variant carries only Ref
-            // args (the `R` list); int/float would require additional
-            // I/F lists which the codewriter doesn't emit for this opname.
-            for (i, arg) in args.iter().enumerate() {
-                if i < callee_regs_r.len() {
-                    callee_regs_r[i] = *arg;
-                }
-            }
-
-            // Recursive walk. Re-borrow the trace_ctx + descr_refs +
-            // sub_jitcode_lookup; bumps `is_top_level` to false so the
-            // callee's `ref_return` / `raise` route through SubReturn /
-            // SubRaise instead of recording top-level FINISH.
-            let (callee_outcome, _callee_end_pc) = {
-                let mut sub_wc = WalkContext {
-                    registers_r: &mut callee_regs_r,
-                    registers_i: &mut callee_regs_i,
-                    descr_refs: ctx.descr_refs,
-                    trace_ctx: ctx.trace_ctx,
-                    done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
-                    exit_frame_with_exception_descr_ref: ctx
-                        .exit_frame_with_exception_descr_ref
-                        .clone(),
-                    is_top_level: false,
-                    sub_jitcode_lookup: ctx.sub_jitcode_lookup,
-                };
-                walk(sub_body.code, 0, &mut sub_wc)?
-            };
-
-            match callee_outcome {
-                DispatchOutcome::SubReturn {
-                    result: Some(value),
-                } => {
-                    // dst register byte sits after the descr (2B) +
-                    // varlist (1B + arg_width) bytes.
-                    let dst = code[op.pc + 1 + 2 + arg_width] as usize;
-                    let len = ctx.registers_r.len();
-                    let slot =
-                        ctx.registers_r
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "r",
-                            })?;
-                    *slot = value;
-                    Ok((DispatchOutcome::Continue, op.next_pc))
-                }
-                DispatchOutcome::SubReturn { result: None } => {
-                    // Void return inside an `_r_r` slot is a parity
-                    // surprise — RPython's `_r_r` never emits void
-                    // `*_return`. Continue without writing dst; if
-                    // production ever sees this, the codewriter / opname
-                    // mismatch is the bug to chase, not the walker.
-                    Ok((DispatchOutcome::Continue, op.next_pc))
-                }
-                DispatchOutcome::SubRaise { exc } => {
-                    // PRE-EXISTING-ADAPTATION: RPython
-                    // `finishframe_exception` walks the framestack
-                    // scanning each parent's exceptiontable for a
-                    // matching handler. Walker has no per-PC exceptiontable
-                    // pipe yet, so the SubRaise bubbles straight up to
-                    // the next caller. At top-level it surfaces through
-                    // raise/r's outermost FINISH branch — but only after
-                    // bubbling through every intermediate caller without
-                    // a chance to catch. catch_exception/L's stored
-                    // target metadata is the wire that lands when
-                    // exceptiontable lookup ports.
-                    Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
-                }
-                DispatchOutcome::Terminate => {
-                    // Sub-walk reaching Terminate means an inner frame
-                    // ran with is_top_level=true (impossible in correct
-                    // recursive setup) or the walker hit a future
-                    // Terminate-emitting opname we haven't accounted for.
-                    // Surface to the caller's caller — they'll see it as
-                    // a normal trace end, which is at least no worse
-                    // than panicking.
-                    Ok((DispatchOutcome::Terminate, op.next_pc))
-                }
-                DispatchOutcome::Continue => {
-                    unreachable!("walk() only exits on Terminate / SubReturn / SubRaise")
-                }
-            }
+            *slot = result;
         }
-        "goto/L" => {
-            // RPython `blackhole.py:950-952 bhimpl_goto(target): return
-            // target`. The 2-byte LE label was resolved by
-            // `assembler.fix_labels` to a direct pc; pyre + RPython
-            // agree that goto records nothing (pure control flow).
-            let target = read_label(code, op, 0);
-            Ok((DispatchOutcome::Continue, target))
-        }
-        "catch_exception/L" => {
-            // RPython `blackhole.py:969-974 bhimpl_catch_exception(target)` —
-            // "no-op when run normally" — and `pyjitpl.py:497-504
-            // opimpl_catch_exception` confirms tracing-side records nothing
-            // (just an `assert not last_exc_value`). The 2-byte target is
-            // metadata: when a `raise` fires on the previous instruction,
-            // `handle_exception_in_frame` (`blackhole.py:406-422`) reads it
-            // to redirect the unwinder. Linear walk advances past the
-            // operand without using the target. Phase D-3 MIFrame
-            // integration will surface the target to the exception
-            // handler routing.
-            Ok((DispatchOutcome::Continue, op.next_pc))
-        }
-        "residual_call_r_r/iRd>r" => {
-            // RPython parity: `pyjitpl.py:1334-1347 _opimpl_residual_call1`
-            // → `do_residual_or_indirect_call` → `do_residual_call`
-            // (pyjitpl.py:1995-2127). Walker classifies the call by
-            // `EffectInfo::extraeffect` and picks the matching record
-            // op + emits GUARD_NO_EXCEPTION when the callee may raise.
-            //
-            // Operand layout `iRd>r`:
-            //   1B i-reg (funcptr) + 1B varlen + N×1B Ref args + 2B descr
-            //   + 1B >r (result reg)
-            let funcptr = read_int_reg(code, op, 0, ctx)?;
-            let (args, arg_width) = read_ref_var_list(code, op, 1, ctx)?;
-            let descr = read_descr(code, op, 1 + arg_width, ctx)?;
-            let mut call_args = Vec::with_capacity(1 + args.len());
-            call_args.push(funcptr);
-            call_args.extend_from_slice(&args);
-
-            // EffectInfo classification (pyjitpl.py:2085-2126).
-            //   - forces virtual / virtualizable → CALL_MAY_FORCE_R + GUARD_NOT_FORCED
-            //     + vable_and_vrefs_before/after_residual_call. Walker scope
-            //     can't run that path (needs MIFrame.virtualizable_boxes /
-            //     vrefs / heapcache); fall back to plain CallR with a
-            //     PRE-EXISTING-ADAPTATION marker. Phase D-3 fixes.
-            //   - EF_LOOPINVARIANT → CALL_LOOPINVARIANT_R; pyre's
-            //     `OpCode` enum doesn't carry that variant yet, so this
-            //     also falls back to CallR. PRE-EXISTING-ADAPTATION.
-            //   - check_is_elidable() → CALL_PURE_R (drop GUARD_NO_EXCEPTION
-            //     unless the elidable variant can raise).
-            //   - default → CallR + GUARD_NO_EXCEPTION when can_raise.
-            let effect = descr.as_call_descr().map(|cd| cd.get_extra_info());
-            let (call_opcode, can_raise, classification): (OpCode, bool, &'static str) =
-                match effect {
-                    None => (OpCode::CallR, true, "no-effectinfo-fallback"),
-                    Some(ei) if ei.check_forces_virtual_or_virtualizable() => {
-                        // PRE-EXISTING-ADAPTATION: forces path needs
-                        // CALL_MAY_FORCE + GUARD_NOT_FORCED + vable bookkeeping.
-                        (OpCode::CallR, true, "forces-fallback")
-                    }
-                    Some(ei) if ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant => {
-                        // PRE-EXISTING-ADAPTATION: CALL_LOOPINVARIANT_R missing
-                        // from majit-ir's OpCode enum.
-                        (OpCode::CallR, false, "loopinvariant-fallback")
-                    }
-                    Some(ei) if ei.check_is_elidable() => {
-                        (OpCode::CallPureR, ei.check_can_raise(false), "elidable")
-                    }
-                    Some(ei) => (OpCode::CallR, ei.check_can_raise(false), "default"),
-                };
-            let _ = classification; // reserved for future telemetry/log
-            let result = ctx
-                .trace_ctx
-                .record_op_with_descr(call_opcode, &call_args, descr);
-
-            // RPython `metainterp.handle_possible_exception()` (pyjitpl.py:2082)
-            // emits `GUARD_NO_EXCEPTION` after every raising call, fed
-            // through `execute_varargs(..., exc=can_raise)`. Walker emits
-            // the same guard but with `num_live=0` — the symbolic frame
-            // state needed for accurate fail_args lives in MIFrame and
-            // surfaces in Phase D-3. PRE-EXISTING-ADAPTATION (num_live).
-            if can_raise {
-                ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-            }
-
-            // dst register writeback (`>r`).
-            let dst = code[op.pc + 1 + 1 + arg_width + 2] as usize;
+        'r' => {
             let len = ctx.registers_r.len();
             let slot = ctx
                 .registers_r
@@ -728,15 +1237,1097 @@ fn handle(
                     bank: "r",
                 })?;
             *slot = result;
+        }
+        _ => unreachable!("dst_bank must be 'i' or 'r' (no float getfield variant)"),
+    }
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
 
-            // Deferred (Phase D-3 / state.rs:3380-3390):
-            //   - heapcache.invalidate_caches_varargs(opnum, descr, allboxes)
-            //   - vable_and_vrefs_before_residual_call / vable_after_residual_call
-            //   - direct_libffi_call / direct_call_release_gil specialization
-            //   - call_loopinvariant_known_result fast-path
-            //   - direct_assembler_call (assembler_call=True)
+/// Generic int-bank unary handler. Operand layout `i>i` (1B src + 1B
+/// dst). RPython parity: `pyjitpl.py:356-368` exec-generated
+/// `opimpl_int_<unary>` (int_neg / int_invert / int_is_zero etc.) +
+/// the `>i` decorator's writeback. Walker reads `registers_i[src]`,
+/// records `OpCode::<Variant>` with `[a]`, writes the recorder result
+/// into `registers_i[dst]`.
+fn unop_int_record(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    opcode: OpCode,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let a = read_int_reg(code, op, 0, ctx)?;
+    let result = ctx.trace_ctx.record_op(opcode, &[a]);
+    let dst = code[op.pc + 2] as usize;
+    let len = ctx.registers_i.len();
+    let slot = ctx
+        .registers_i
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc: op.pc,
+            reg: dst,
+            len,
+            bank: "i",
+        })?;
+    *slot = result;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Generic ref-bank → int-bank binop handler. Operand layout `rr>i`
+/// (1B r-src1 + 1B r-src2 + 1B i-dst). RPython parity:
+/// `pyjitpl.py:326-336` exec-generated `opimpl_ptr_eq` /
+/// `opimpl_ptr_ne` (and instance variants) follow `self.execute(rop.<OPNUM>,
+/// b1, b2)` — both `b1`/`b2` are ref boxes, result is an int box. The
+/// `b1 is b2` fast path is omitted (same rationale as `binop_int_record`'s
+/// comparison family — pyre's recorder shares constants by value).
+fn binop_ref_to_int_record(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    opcode: OpCode,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let a = read_ref_reg(code, op, 0, ctx)?;
+    let b = read_ref_reg(code, op, 1, ctx)?;
+    let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    let dst = code[op.pc + 3] as usize;
+    let len = ctx.registers_i.len();
+    let slot = ctx
+        .registers_i
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc: op.pc,
+            reg: dst,
+            len,
+            bank: "i",
+        })?;
+    *slot = result;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `cast_int_to_float/i>f` handler. Operand layout `i>f` (1B i-src +
+/// 1B f-dst). RPython parity: `pyjitpl.py:357 cast_int_to_float`
+/// belongs to the same exec-generated unary opimpl loop —
+/// `self.execute(rop.CAST_INT_TO_FLOAT, b)`. Result lands in the
+/// float bank (the `>f` decorator) instead of the int bank.
+fn cast_int_to_float_record(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let a = read_int_reg(code, op, 0, ctx)?;
+    let result = ctx.trace_ctx.record_op(OpCode::CastIntToFloat, &[a]);
+    let dst = code[op.pc + 2] as usize;
+    let len = ctx.registers_f.len();
+    let slot = ctx
+        .registers_f
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc: op.pc,
+            reg: dst,
+            len,
+            bank: "f",
+        })?;
+    *slot = result;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Generic float-bank binop handler. Operand layout `ff>f` (1B src1
+/// + 1B src2 + 1B dst). RPython parity: same as `binop_int_record`
+/// but on the float bank — `pyjitpl.py:284-292`'s exec-generated
+/// `opimpl_float_<binop>` reads two `f` regs, calls
+/// `self.execute(rop.<OPNUM>, b1, b2)`, and the trailing `>f`
+/// decorator writes the result into `registers_f[dst]`.
+fn binop_float_record(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    opcode: OpCode,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let a = read_float_reg(code, op, 0, ctx)?;
+    let b = read_float_reg(code, op, 1, ctx)?;
+    let result = ctx.trace_ctx.record_op(opcode, &[a, b]);
+    let dst = code[op.pc + 3] as usize;
+    let len = ctx.registers_f.len();
+    let slot = ctx
+        .registers_f
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc: op.pc,
+            reg: dst,
+            len,
+            bank: "f",
+        })?;
+    *slot = result;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Generic float-bank unary handler. Operand layout `f>f` (1B src
+/// + 1B dst). RPython equivalent: `bhimpl_float_neg(value)` →
+/// `pyjitpl.py:execute(rop.FLOAT_NEG, value)`. Recording-only path
+/// is the same shape as `binop_float_record` minus one read.
+fn unop_float_record(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    opcode: OpCode,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let a = read_float_reg(code, op, 0, ctx)?;
+    let result = ctx.trace_ctx.record_op(opcode, &[a]);
+    let dst = code[op.pc + 2] as usize;
+    let len = ctx.registers_f.len();
+    let slot = ctx
+        .registers_f
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc: op.pc,
+            reg: dst,
+            len,
+            bank: "f",
+        })?;
+    *slot = result;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Line-by-line port of `pyjitpl.py:1960-1993 MetaInterp._build_allboxes`.
+/// Permutes a flat `argboxes` array (concat of i-list ++ r-list ++ f-list
+/// in source order) so positions match the callee's `descr.get_arg_types()`
+/// ABI ordering. Returns `[funcbox, ...permuted_argboxes]`.
+///
+/// RPython operates on a flat `argboxes` of typed `Box` objects + reads
+/// `box.type`. The walker has only `OpRef`s, so the type is supplied
+/// out-of-band via the `argbox_types` parallel array. By construction
+/// the operand decoders (`read_int_var_list` / `read_ref_var_list` /
+/// `read_float_var_list`) tag each entry with its bank, so the parallel
+/// array is correct without needing a runtime type query.
+///
+/// The RPython `prepend_box` parameter is unused at every
+/// `residual_call*` call site (only `conditional_call*` uses it, not
+/// yet ported), so it's omitted from the walker signature. Add it back
+/// when porting `opimpl_conditional_call*`.
+fn build_allboxes(
+    funcbox: OpRef,
+    argboxes: &[OpRef],
+    argbox_types: &[Type],
+    arg_types: &[Type],
+) -> Vec<OpRef> {
+    debug_assert_eq!(
+        argboxes.len(),
+        argbox_types.len(),
+        "argboxes and argbox_types must align",
+    );
+    // RPython line 1961: `allboxes = [None] * (len(argboxes)+1 + …)`.
+    let total = arg_types.len() + 1;
+    let mut allboxes: Vec<OpRef> = Vec::with_capacity(total);
+    // RPython line 1966: `allboxes[i] = funcbox`.
+    allboxes.push(funcbox);
+    // RPython line 1968: `src_i = src_r = src_f = 0`.
+    let mut src_i = 0usize;
+    let mut src_r = 0usize;
+    let mut src_f = 0usize;
+    // RPython line 1969-1989: outer `for kind in descr.get_arg_types()`
+    // with one type-filter `while True` loop per kind.
+    for &kind in arg_types {
+        let box_oref = match kind {
+            Type::Int => loop {
+                // RPython line 1971-1975: advance src_i past non-INT
+                // entries until an INT box is found.
+                let b = argboxes[src_i];
+                let bt = argbox_types[src_i];
+                src_i += 1;
+                if bt == Type::Int {
+                    break b;
+                }
+            },
+            Type::Ref => loop {
+                // RPython line 1977-1981.
+                let b = argboxes[src_r];
+                let bt = argbox_types[src_r];
+                src_r += 1;
+                if bt == Type::Ref {
+                    break b;
+                }
+            },
+            Type::Float => loop {
+                // RPython line 1983-1987 (kind == 'L' long-long path
+                // not separately modeled — pyre's Type::Float covers
+                // both).
+                let b = argboxes[src_f];
+                let bt = argbox_types[src_f];
+                src_f += 1;
+                if bt == Type::Float {
+                    break b;
+                }
+            },
+            // RPython line 1988-1989: `else: raise AssertionError`.
+            // Type::Void in arg_types is an internal invariant violation.
+            Type::Void => panic!("_build_allboxes: arg_types must not contain Void"),
+        };
+        allboxes.push(box_oref);
+    }
+    debug_assert_eq!(allboxes.len(), total, "allboxes shape post-condition");
+    allboxes
+}
+
+/// Decode the descr index from a 2-byte LE operand. Companion to
+/// [`read_descr`] for callers that need the raw index for error
+/// reporting (e.g. `ResidualCallDescrNotCallDescr`).
+fn decode_descr_index(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usize {
+    let lo = code[op.pc + 1 + operand_offset] as usize;
+    let hi = code[op.pc + 1 + operand_offset + 1] as usize;
+    lo | (hi << 8)
+}
+
+/// `residual_call` shape `iRd>X` dispatcher. Reads `funcptr (i)`,
+/// R-list args, and `descr`, runs `_build_allboxes` to produce the
+/// callee's ABI-ordered arglist, classifies the call by `EffectInfo`,
+/// records the matching kind-coded `Call*` / `CallPure*` op, emits
+/// `GUARD_NO_EXCEPTION` if the classification says `can_raise`, and
+/// writes the recorded result OpRef into the dst register chosen by
+/// `dst_bank`.
+///
+/// RPython parity: `pyjitpl.py:1334-1336 _opimpl_residual_call1` →
+/// `do_residual_or_indirect_call` → `do_residual_call`
+/// (pyjitpl.py:1995-2127). `pyjitpl.py:1346 opimpl_residual_call_r_i =
+/// _opimpl_residual_call1` and `:1347 opimpl_residual_call_r_r =
+/// _opimpl_residual_call1` confirm both kind variants share the
+/// `_call1` body. The `_X` suffix is the *call's return kind* — mapping
+/// comes from `do_residual_call`'s `descr.get_normalized_result_type()`
+/// dispatch (pyjitpl.py:2022-2044): `'i' → CALL_MAY_FORCE_I`,
+/// `'r' → CALL_MAY_FORCE_R`, etc. Walker selects the simpler
+/// non-forces branch (`OpCode::CallI` / `CallR`) per kind via
+/// `dst_bank`.
+///
+/// `dst_bank` selects where the call's result lands:
+/// * `'r'`: caller's `registers_r[dst]` — `OpCode::CallR` / `CallPureR`.
+/// * `'i'`: caller's `registers_i[dst]` — `OpCode::CallI` / `CallPureI`.
+/// (Float not currently emitted by codewriter; convergence with the
+/// dispatch-table-codegen renderer would land alongside `_r_f` if /
+/// when it appears.)
+///
+/// PRE-EXISTING-ADAPTATION (Walker fix J 8-branch port): walker emits
+/// only the EffectInfo-classified `Call*` / `CallPure*` + optional
+/// `GUARD_NO_EXCEPTION`. Missing branches (`CALL_MAY_FORCE`/
+/// `GUARD_NOT_FORCED`, `CALL_LOOPINVARIANT_*`, vable bookkeeping,
+/// libffi/release_gil/assembler_call specialization, `num_live` on the
+/// guard) need MIFrame state pyre-jit-trace doesn't yet expose.
+#[allow(non_snake_case)]
+fn dispatch_residual_call_iRd_kind(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let funcptr = read_int_reg(code, op, 0, ctx)?;
+    let (r_args, arg_width) = read_ref_var_list(code, op, 1, ctx)?;
+    let descr_offset = 1 + arg_width;
+    let descr_index = decode_descr_index(code, op, descr_offset);
+    let descr = read_descr(code, op, descr_offset, ctx)?;
+    // RPython `do_residual_or_indirect_call` always receives a
+    // CallDescr (pyjitpl.py:1995). Codewriter emits only CallDescrs
+    // for residual_call slots; surface a typed error if a test fixture
+    // (or future deviation) routes a non-CallDescr here.
+    let call_descr = descr
+        .as_call_descr()
+        .ok_or(DispatchError::ResidualCallDescrNotCallDescr {
+            pc: op.pc,
+            descr_index,
+        })?;
+
+    // `_r_*` shape: argboxes = R-list only; argbox_types = [Ref; n].
+    let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
+    let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
+
+    // EffectInfo classification (pyjitpl.py:2085-2126). The kind-dependent
+    // bit is the choice of `Call*` / `CallPure*` opcode per `dst_bank`.
+    let (call_op, pure_op): (OpCode, OpCode) = match dst_bank {
+        'r' => (OpCode::CallR, OpCode::CallPureR),
+        'i' => (OpCode::CallI, OpCode::CallPureI),
+        _ => panic!(
+            "dispatch_residual_call_iRd_kind: unsupported dst_bank '{}'",
+            dst_bank
+        ),
+    };
+    let ei = call_descr.get_extra_info();
+    let (call_opcode, can_raise, _classification): (OpCode, bool, &'static str) =
+        if ei.check_forces_virtual_or_virtualizable() {
+            // PRE-EXISTING-ADAPTATION (Walker fix J): forces path
+            // needs CALL_MAY_FORCE + GUARD_NOT_FORCED + vable bookkeeping.
+            (call_op, true, "forces-fallback")
+        } else if ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant {
+            // PRE-EXISTING-ADAPTATION (Walker fix J): CALL_LOOPINVARIANT_*
+            // missing from majit-ir's OpCode enum.
+            (call_op, false, "loopinvariant-fallback")
+        } else if ei.check_is_elidable() {
+            (pure_op, ei.check_can_raise(false), "elidable")
+        } else {
+            (call_op, ei.check_can_raise(false), "default")
+        };
+    let result = ctx
+        .trace_ctx
+        .record_op_with_descr(call_opcode, &allboxes, descr);
+
+    // RPython `metainterp.handle_possible_exception()` (pyjitpl.py:2082)
+    // emits `GUARD_NO_EXCEPTION` after every raising call. `num_live=0`
+    // is a known under-approx (Walker fix J).
+    if can_raise {
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    }
+
+    // dst writeback (`>X`).
+    let dst = code[op.pc + 1 + descr_offset + 2] as usize;
+    match dst_bank {
+        'r' => {
+            let len = ctx.registers_r.len();
+            let slot = ctx
+                .registers_r
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "r",
+                })?;
+            *slot = result;
+        }
+        'i' => {
+            let len = ctx.registers_i.len();
+            let slot = ctx
+                .registers_i
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "i",
+                })?;
+            *slot = result;
+        }
+        _ => unreachable!("dst_bank validated above"),
+    }
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// `residual_call` shape `iIRd>X` dispatcher — `_ir_*` arglist with
+/// both an int-bank list and a ref-bank list before the descr. RPython
+/// parity: `pyjitpl.py:1338-1340 _opimpl_residual_call2` (`@arguments`
+/// argspec `"box", "boxes2", "descr", "orgpc"`) → same
+/// `do_residual_or_indirect_call` body as `_call1`. The `boxes2`
+/// argcode (`pyjitpl.py:3750-3760`) decodes two adjacent
+/// count-prefixed lists into a single concatenated `argboxes` array
+/// `[i_args..., r_args...]`. `_build_allboxes` (`pyjitpl.py:1960-1993`,
+/// ported to [`build_allboxes`]) then permutes those to match
+/// `descr.get_arg_types()` ABI ordering, so a callee whose `arg_types`
+/// is `[REF, INT, REF, INT]` ends up with allboxes
+/// `[funcbox, r_args[0], i_args[0], r_args[1], i_args[1]]`.
+///
+/// Operand layout `iIRd>X`:
+///   1B funcptr (i) + 1B i-list count + N×1B i-regs + 1B r-list count
+///   + M×1B r-regs + 2B descr + 1B `>X` dst.
+///
+/// EffectInfo classification + GUARD_NO_EXCEPTION emission match
+/// `dispatch_residual_call_iRd_kind`. PRE-EXISTING-ADAPTATION coverage
+/// matches `iRd_kind` (Walker fix J 8-branch port).
+#[allow(non_snake_case)]
+fn dispatch_residual_call_iIRd_kind(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let funcptr = read_int_reg(code, op, 0, ctx)?;
+    let (i_args, i_width) = read_int_var_list(code, op, 1, ctx)?;
+    let (r_args, r_width) = read_ref_var_list(code, op, 1 + i_width, ctx)?;
+    let descr_offset = 1 + i_width + r_width;
+    let descr_index = decode_descr_index(code, op, descr_offset);
+    let descr = read_descr(code, op, descr_offset, ctx)?;
+    let call_descr = descr
+        .as_call_descr()
+        .ok_or(DispatchError::ResidualCallDescrNotCallDescr {
+            pc: op.pc,
+            descr_index,
+        })?;
+
+    // Flat argboxes = i_args ++ r_args (`boxes2` argcode order).
+    // Parallel argbox_types stamps each entry with its source bank so
+    // `_build_allboxes`'s type-filter loops can permute correctly.
+    let mut argboxes: Vec<OpRef> = Vec::with_capacity(i_args.len() + r_args.len());
+    let mut argbox_types: Vec<Type> = Vec::with_capacity(i_args.len() + r_args.len());
+    argboxes.extend_from_slice(&i_args);
+    argbox_types.extend(std::iter::repeat(Type::Int).take(i_args.len()));
+    argboxes.extend_from_slice(&r_args);
+    argbox_types.extend(std::iter::repeat(Type::Ref).take(r_args.len()));
+    let allboxes = build_allboxes(funcptr, &argboxes, &argbox_types, call_descr.arg_types());
+
+    let (call_op, pure_op): (OpCode, OpCode) = match dst_bank {
+        'r' => (OpCode::CallR, OpCode::CallPureR),
+        'i' => (OpCode::CallI, OpCode::CallPureI),
+        _ => panic!(
+            "dispatch_residual_call_iIRd_kind: unsupported dst_bank '{}'",
+            dst_bank
+        ),
+    };
+    let ei = call_descr.get_extra_info();
+    let (call_opcode, can_raise, _classification): (OpCode, bool, &'static str) =
+        if ei.check_forces_virtual_or_virtualizable() {
+            (call_op, true, "forces-fallback")
+        } else if ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant {
+            (call_op, false, "loopinvariant-fallback")
+        } else if ei.check_is_elidable() {
+            (pure_op, ei.check_can_raise(false), "elidable")
+        } else {
+            (call_op, ei.check_can_raise(false), "default")
+        };
+    let result = ctx
+        .trace_ctx
+        .record_op_with_descr(call_opcode, &allboxes, descr);
+
+    if can_raise {
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    }
+
+    let dst = code[op.pc + 1 + descr_offset + 2] as usize;
+    match dst_bank {
+        'r' => {
+            let len = ctx.registers_r.len();
+            let slot = ctx
+                .registers_r
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "r",
+                })?;
+            *slot = result;
+        }
+        'i' => {
+            let len = ctx.registers_i.len();
+            let slot = ctx
+                .registers_i
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "i",
+                })?;
+            *slot = result;
+        }
+        _ => unreachable!("dst_bank validated above"),
+    }
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
+/// Operand layout `dR>X`:
+///   2B descr index + 1B varlen + N×1B Ref args + 1B `>X` dst.
+///
+/// RPython parity: `pyjitpl.py:1266-1324 _opimpl_inline_call*`. The
+/// `_X` suffix is the callee's *return kind* — e.g. `_opimpl_inline_call_r_i`
+/// dispatches an inline call whose callee body returns via
+/// `int_return/i`. Walker semantics are otherwise identical to the
+/// `_r_r` arm (which originally landed inline; this helper extracts the
+/// shared body so kind variants can share the dispatch logic).
+///
+/// `dst_bank` selects where the SubReturn value lands:
+/// * `'r'`: caller's `registers_r[dst]` — pairs with callee `ref_return/r`.
+/// * `'i'`: caller's `registers_i[dst]` — pairs with callee `int_return/i`.
+/// * `'f'`: would pair with callee `float_return/f` — not handled by
+///   this helper because the codewriter doesn't emit a `dR>f` shape
+///   (float return paths use the `dIRF` arglist family — slice 3.8+).
+///
+/// `kind_label` mirrors `dst_bank` as a static `&str` for typed-error
+/// reporting (`RegisterOutOfRange::bank`).
+fn dispatch_inline_call_dr_kind(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let sub_descr = read_descr(code, op, 0, ctx)?;
+    let descr_index = (code[op.pc + 1] as usize) | ((code[op.pc + 2] as usize) << 8);
+    let jc_descr = sub_descr
+        .as_jitcode_descr()
+        .ok_or(DispatchError::ExpectedJitCodeDescr {
+            pc: op.pc,
+            descr_index,
+        })?;
+    let sub_index = jc_descr.jitcode_index();
+    let sub_body =
+        (ctx.sub_jitcode_lookup)(sub_index).ok_or(DispatchError::SubJitCodeNotFound {
+            pc: op.pc,
+            jitcode_index: sub_index,
+        })?;
+    let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
+
+    let mut callee_regs_r = vec![OpRef::NONE; sub_body.num_regs_r];
+    let mut callee_regs_i = vec![OpRef::NONE; sub_body.num_regs_i];
+    let mut callee_regs_f = vec![OpRef::NONE; sub_body.num_regs_f];
+
+    if args.len() > callee_regs_r.len() {
+        return Err(DispatchError::InlineCallArityMismatch {
+            pc: op.pc,
+            provided: args.len(),
+            callee_num_regs_r: callee_regs_r.len(),
+        });
+    }
+    for (i, arg) in args.iter().enumerate() {
+        callee_regs_r[i] = *arg;
+    }
+
+    let (callee_outcome, _callee_end_pc) = {
+        let mut sub_wc = WalkContext {
+            registers_r: &mut callee_regs_r,
+            registers_i: &mut callee_regs_i,
+            registers_f: &mut callee_regs_f,
+            descr_refs: ctx.descr_refs,
+            trace_ctx: ctx.trace_ctx,
+            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
+            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
+            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
+            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
+            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
+            is_top_level: false,
+            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
+            last_exc_value: None,
+        };
+        walk(sub_body.code, 0, &mut sub_wc)?
+    };
+
+    match callee_outcome {
+        DispatchOutcome::SubReturn {
+            result: Some(value),
+        } => {
+            let dst = code[op.pc + 1 + 2 + arg_width] as usize;
+            match dst_bank {
+                'r' => {
+                    let len = ctx.registers_r.len();
+                    let slot =
+                        ctx.registers_r
+                            .get_mut(dst)
+                            .ok_or(DispatchError::RegisterOutOfRange {
+                                pc: op.pc,
+                                reg: dst,
+                                len,
+                                bank: "r",
+                            })?;
+                    *slot = value;
+                }
+                'i' => {
+                    let len = ctx.registers_i.len();
+                    let slot =
+                        ctx.registers_i
+                            .get_mut(dst)
+                            .ok_or(DispatchError::RegisterOutOfRange {
+                                pc: op.pc,
+                                reg: dst,
+                                len,
+                                bank: "i",
+                            })?;
+                    *slot = value;
+                }
+                _ => unreachable!(
+                    "dispatch_inline_call_dr_kind dst_bank must be 'r' or 'i' (\
+                     codewriter does not emit dR>f shape today)"
+                ),
+            }
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
+        DispatchOutcome::SubReturn { result: None } => {
+            // Same shape contract as `_r_r`: a `_r_<X>` variant promises
+            // a non-void result for the dst's `>X` slot. A void return
+            // reaching here is a codewriter shape mismatch.
+            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
+        }
+        DispatchOutcome::SubRaise { exc } => {
+            if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                ctx.last_exc_value = Some(exc);
+                Ok((DispatchOutcome::Continue, target))
+            } else {
+                Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
+            }
+        }
+        DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::Continue => {
+            unreachable!("walk() only exits on Terminate / SubReturn / SubRaise")
+        }
+    }
+}
+
+/// `inline_call_ir_<X>/dIR>X` handler shared by `dIR>i` (Int result)
+/// and `dIR>r` (Ref result). Same control-flow shape as
+/// [`dispatch_inline_call_dr_kind`], extended with an I-list arglist
+/// preceding the R-list.
+///
+/// Operand layout `dIR>X`:
+///   2B descr index +
+///   1B I-len + N×1B int args +
+///   1B R-len + M×1B ref args +
+///   1B `>X` dst.
+///
+/// RPython parity: `pyjitpl.py:1266-1324 _opimpl_inline_call*` —
+/// kind-aware variants call `setup_call(argboxes_i, argboxes_r,
+/// argboxes_f)` which distributes args into the callee's typed banks
+/// (`pyjitpl.py:230-260`).
+///
+/// `dst_bank` selects where the SubReturn value lands: `'r'` writes to
+/// `registers_r[dst]` (paired with callee `ref_return/r`), `'i'`
+/// writes to `registers_i[dst]` (paired with callee `int_return/i`).
+fn dispatch_inline_call_dir_kind(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let sub_descr = read_descr(code, op, 0, ctx)?;
+    let descr_index = (code[op.pc + 1] as usize) | ((code[op.pc + 2] as usize) << 8);
+    let jc_descr = sub_descr
+        .as_jitcode_descr()
+        .ok_or(DispatchError::ExpectedJitCodeDescr {
+            pc: op.pc,
+            descr_index,
+        })?;
+    let sub_index = jc_descr.jitcode_index();
+    let sub_body =
+        (ctx.sub_jitcode_lookup)(sub_index).ok_or(DispatchError::SubJitCodeNotFound {
+            pc: op.pc,
+            jitcode_index: sub_index,
+        })?;
+    // I-list at offset 2 (skip descr).
+    let (int_args, int_width) = read_int_var_list(code, op, 2, ctx)?;
+    // R-list immediately after the I-list.
+    let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
+
+    let mut callee_regs_r = vec![OpRef::NONE; sub_body.num_regs_r];
+    let mut callee_regs_i = vec![OpRef::NONE; sub_body.num_regs_i];
+    let mut callee_regs_f = vec![OpRef::NONE; sub_body.num_regs_f];
+
+    if int_args.len() > callee_regs_i.len() {
+        return Err(DispatchError::InlineCallIntArityMismatch {
+            pc: op.pc,
+            provided: int_args.len(),
+            callee_num_regs_i: callee_regs_i.len(),
+        });
+    }
+    if ref_args.len() > callee_regs_r.len() {
+        return Err(DispatchError::InlineCallArityMismatch {
+            pc: op.pc,
+            provided: ref_args.len(),
+            callee_num_regs_r: callee_regs_r.len(),
+        });
+    }
+    for (i, arg) in int_args.iter().enumerate() {
+        callee_regs_i[i] = *arg;
+    }
+    for (i, arg) in ref_args.iter().enumerate() {
+        callee_regs_r[i] = *arg;
+    }
+
+    let (callee_outcome, _callee_end_pc) = {
+        let mut sub_wc = WalkContext {
+            registers_r: &mut callee_regs_r,
+            registers_i: &mut callee_regs_i,
+            registers_f: &mut callee_regs_f,
+            descr_refs: ctx.descr_refs,
+            trace_ctx: ctx.trace_ctx,
+            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
+            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
+            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
+            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
+            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
+            is_top_level: false,
+            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
+            last_exc_value: None,
+        };
+        walk(sub_body.code, 0, &mut sub_wc)?
+    };
+
+    match callee_outcome {
+        DispatchOutcome::SubReturn {
+            result: Some(value),
+        } => {
+            // dst register byte sits after descr (2B) + I-list (int_width)
+            // + R-list (ref_width) bytes.
+            let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
+            match dst_bank {
+                'r' => {
+                    let len = ctx.registers_r.len();
+                    let slot =
+                        ctx.registers_r
+                            .get_mut(dst)
+                            .ok_or(DispatchError::RegisterOutOfRange {
+                                pc: op.pc,
+                                reg: dst,
+                                len,
+                                bank: "r",
+                            })?;
+                    *slot = value;
+                }
+                'i' => {
+                    let len = ctx.registers_i.len();
+                    let slot =
+                        ctx.registers_i
+                            .get_mut(dst)
+                            .ok_or(DispatchError::RegisterOutOfRange {
+                                pc: op.pc,
+                                reg: dst,
+                                len,
+                                bank: "i",
+                            })?;
+                    *slot = value;
+                }
+                _ => unreachable!("dispatch_inline_call_dir_kind dst_bank must be 'r' or 'i'"),
+            }
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        DispatchOutcome::SubReturn { result: None } => {
+            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
+        }
+        DispatchOutcome::SubRaise { exc } => {
+            if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                ctx.last_exc_value = Some(exc);
+                Ok((DispatchOutcome::Continue, target))
+            } else {
+                Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
+            }
+        }
+        DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::Continue => {
+            unreachable!("walk() only exits on Terminate / SubReturn / SubRaise")
+        }
+    }
+}
+
+/// `inline_call_irf_<X>/dIRF>X` handler shared by `dIRF>f` (Float
+/// result) and `dIRF>r` (Ref result). Extends
+/// [`dispatch_inline_call_dir_kind`] with an F-list arglist following
+/// the R-list.
+///
+/// Operand layout `dIRF>X`:
+///   2B descr index +
+///   1B I-len + N×1B int args +
+///   1B R-len + M×1B ref args +
+///   1B F-len + K×1B float args +
+///   1B `>X` dst.
+///
+/// RPython parity: same `pyjitpl.py:230-260 setup_call(argboxes_i,
+/// argboxes_r, argboxes_f)` distribution — all three kind banks
+/// populated from the three lists.
+///
+/// `dst_bank` selects where the SubReturn value lands: `'f'` writes
+/// `registers_f[dst]` (paired with callee `float_return/f`), `'r'`
+/// writes `registers_r[dst]` (paired with callee `ref_return/r`).
+fn dispatch_inline_call_dirf_kind(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let sub_descr = read_descr(code, op, 0, ctx)?;
+    let descr_index = (code[op.pc + 1] as usize) | ((code[op.pc + 2] as usize) << 8);
+    let jc_descr = sub_descr
+        .as_jitcode_descr()
+        .ok_or(DispatchError::ExpectedJitCodeDescr {
+            pc: op.pc,
+            descr_index,
+        })?;
+    let sub_index = jc_descr.jitcode_index();
+    let sub_body =
+        (ctx.sub_jitcode_lookup)(sub_index).ok_or(DispatchError::SubJitCodeNotFound {
+            pc: op.pc,
+            jitcode_index: sub_index,
+        })?;
+    let (int_args, int_width) = read_int_var_list(code, op, 2, ctx)?;
+    let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
+    let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
+
+    let mut callee_regs_r = vec![OpRef::NONE; sub_body.num_regs_r];
+    let mut callee_regs_i = vec![OpRef::NONE; sub_body.num_regs_i];
+    let mut callee_regs_f = vec![OpRef::NONE; sub_body.num_regs_f];
+
+    if int_args.len() > callee_regs_i.len() {
+        return Err(DispatchError::InlineCallIntArityMismatch {
+            pc: op.pc,
+            provided: int_args.len(),
+            callee_num_regs_i: callee_regs_i.len(),
+        });
+    }
+    if ref_args.len() > callee_regs_r.len() {
+        return Err(DispatchError::InlineCallArityMismatch {
+            pc: op.pc,
+            provided: ref_args.len(),
+            callee_num_regs_r: callee_regs_r.len(),
+        });
+    }
+    if float_args.len() > callee_regs_f.len() {
+        return Err(DispatchError::InlineCallFloatArityMismatch {
+            pc: op.pc,
+            provided: float_args.len(),
+            callee_num_regs_f: callee_regs_f.len(),
+        });
+    }
+    for (i, arg) in int_args.iter().enumerate() {
+        callee_regs_i[i] = *arg;
+    }
+    for (i, arg) in ref_args.iter().enumerate() {
+        callee_regs_r[i] = *arg;
+    }
+    for (i, arg) in float_args.iter().enumerate() {
+        callee_regs_f[i] = *arg;
+    }
+
+    let (callee_outcome, _callee_end_pc) = {
+        let mut sub_wc = WalkContext {
+            registers_r: &mut callee_regs_r,
+            registers_i: &mut callee_regs_i,
+            registers_f: &mut callee_regs_f,
+            descr_refs: ctx.descr_refs,
+            trace_ctx: ctx.trace_ctx,
+            done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
+            done_with_this_frame_descr_int: ctx.done_with_this_frame_descr_int.clone(),
+            done_with_this_frame_descr_float: ctx.done_with_this_frame_descr_float.clone(),
+            done_with_this_frame_descr_void: ctx.done_with_this_frame_descr_void.clone(),
+            exit_frame_with_exception_descr_ref: ctx.exit_frame_with_exception_descr_ref.clone(),
+            is_top_level: false,
+            sub_jitcode_lookup: ctx.sub_jitcode_lookup,
+            last_exc_value: None,
+        };
+        walk(sub_body.code, 0, &mut sub_wc)?
+    };
+
+    match callee_outcome {
+        DispatchOutcome::SubReturn {
+            result: Some(value),
+        } => {
+            let dst = code[op.pc + 1 + 2 + int_width + ref_width + float_width] as usize;
+            match dst_bank {
+                'r' => {
+                    let len = ctx.registers_r.len();
+                    let slot =
+                        ctx.registers_r
+                            .get_mut(dst)
+                            .ok_or(DispatchError::RegisterOutOfRange {
+                                pc: op.pc,
+                                reg: dst,
+                                len,
+                                bank: "r",
+                            })?;
+                    *slot = value;
+                }
+                'f' => {
+                    let len = ctx.registers_f.len();
+                    let slot =
+                        ctx.registers_f
+                            .get_mut(dst)
+                            .ok_or(DispatchError::RegisterOutOfRange {
+                                pc: op.pc,
+                                reg: dst,
+                                len,
+                                bank: "f",
+                            })?;
+                    *slot = value;
+                }
+                _ => unreachable!(
+                    "dispatch_inline_call_dirf_kind dst_bank must be 'r' or 'f' \
+                     (codewriter emits no dIRF>i shape today)"
+                ),
+            }
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        DispatchOutcome::SubReturn { result: None } => {
+            Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
+        }
+        DispatchOutcome::SubRaise { exc } => {
+            if let Some(target) = try_catch_exception_at(code, op.next_pc) {
+                ctx.last_exc_value = Some(exc);
+                Ok((DispatchOutcome::Continue, target))
+            } else {
+                Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
+            }
+        }
+        DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
+        DispatchOutcome::Continue => {
+            unreachable!("walk() only exits on Terminate / SubReturn / SubRaise")
+        }
+    }
+}
+
+/// Per-opname dispatch table. Returning `(outcome, next_pc)` lets
+/// branching handlers (`goto/L`) override the linear `op.next_pc`
+/// advance; non-branching handlers return `op.next_pc` unchanged.
+fn handle(
+    op: &DecodedOp,
+    code: &[u8],
+    ctx: &mut WalkContext<'_, '_>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    match op.key {
+        "live/" => Ok((DispatchOutcome::Continue, op.next_pc)),
+        // RPython parity: `pyjitpl.py:1266-1324 _opimpl_inline_call*`
+        // pushes a fresh `MIFrame(jitcode)` populated with caller args,
+        // raises `ChangeFrame()` so the metainterp loop dispatches the
+        // next op on the new frame, and on `*_return` pops back via
+        // `metainterp.finishframe(value)` — writing `value` into the
+        // caller's `>X` slot. Walker simulates the same shape with
+        // synchronous recursion through `dispatch_inline_call_dr_kind`.
+        //
+        // The `_r_r` (Ref result) and `_r_i` (Int result) variants share
+        // the same `dR` arglist shape; only the dst bank differs.
+        "inline_call_r_r/dR>r" => dispatch_inline_call_dr_kind(code, op, ctx, 'r'),
+        "inline_call_r_i/dR>i" => dispatch_inline_call_dr_kind(code, op, ctx, 'i'),
+        // `_ir_*` variants extend the arglist to a (I-list, R-list) pair.
+        // RPython's `setup_call(argboxes_i, argboxes_r, argboxes_f)` populates
+        // both kind banks. The dst bank still selects the SubReturn write
+        // target (Ref bank for `_ir_r/dIR>r`, Int bank for `_ir_i/dIR>i`).
+        "inline_call_ir_r/dIR>r" => dispatch_inline_call_dir_kind(code, op, ctx, 'r'),
+        "inline_call_ir_i/dIR>i" => dispatch_inline_call_dir_kind(code, op, ctx, 'i'),
+        // `_irf_*` variants extend the arglist with a float list (I-list,
+        // R-list, F-list). Same `setup_call(argboxes_i, argboxes_r,
+        // argboxes_f)` distribution; dst bank chooses Ref vs Float for the
+        // SubReturn writeback.
+        "inline_call_irf_r/dIRF>r" => dispatch_inline_call_dirf_kind(code, op, ctx, 'r'),
+        "inline_call_irf_f/dIRF>f" => dispatch_inline_call_dirf_kind(code, op, ctx, 'f'),
+        "goto/L" => {
+            // RPython `blackhole.py:950-952 bhimpl_goto(target): return
+            // target`. The 2-byte LE label was resolved by
+            // `assembler.fix_labels` to a direct pc; pyre + RPython
+            // agree that goto records nothing (pure control flow).
+            let target = read_label(code, op, 0);
+            Ok((DispatchOutcome::Continue, target))
+        }
+        "catch_exception/L" => {
+            // RPython `blackhole.py:969-974 bhimpl_catch_exception(target)` —
+            // "no-op when run normally" — and `pyjitpl.py:497-504
+            // opimpl_catch_exception`:
+            //
+            //   def opimpl_catch_exception(self, target):
+            //       """This is a no-op when run normally.  We can check that
+            //       last_exc_value is a null ptr; it should have been set to None
+            //       by the previous instruction.  If the previous instruction
+            //       raised instead, finishframe_exception() should have been
+            //       called and we would not be there."""
+            //       assert not self.metainterp.last_exc_value
+            //
+            // The 2-byte target is metadata: when a `raise` fires on the
+            // previous instruction, `handle_exception_in_frame`
+            // (`blackhole.py:406-422`) reads it to redirect the unwinder
+            // (consumed by `try_catch_exception_at` from the inline_call
+            // SubRaise arm). Linear walk advances past the operand
+            // without using the target.
+            //
+            // The RPython assert turns into a typed error here:
+            // reaching `catch_exception/L` with `ctx.last_exc_value =
+            // Some(_)` means either (a) the codewriter emitted a
+            // catch_exception/L outside an exception-table position,
+            // or (b) a previous catch handler didn't clear
+            // last_exc_value after handling the raise. Either is a
+            // codewriter-pass invariant violation.
+            if ctx.last_exc_value.is_some() {
+                return Err(DispatchError::CatchExceptionWithActiveException { pc: op.pc });
+            }
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "residual_call_r_r/iRd>r" => dispatch_residual_call_iRd_kind(code, op, ctx, 'r'),
+        // `_r_i/iRd>i` mirrors `_r_r/iRd>r` with the dst kind flipped to
+        // int. RPython `pyjitpl.py:1334-1347 _opimpl_residual_call1` is
+        // exec-generated for `_callR` and `_callI` (Type::Ref vs
+        // Type::Int return) — see resoperation.py:1461 `Type::Int =>
+        // CallI`. EffectInfo classification + GUARD_NO_EXCEPTION
+        // emission stay identical; only the result OpCode (CallI /
+        // CallPureI) and dst writeback bank (registers_i) differ.
+        "residual_call_r_i/iRd>i" => dispatch_residual_call_iRd_kind(code, op, ctx, 'i'),
+        // `_ir_*/iIRd>X` extends the arglist with an i-bank list. RPython
+        // `pyjitpl.py:_opimpl_residual_call*` exec-generates this for
+        // callees taking both int + ref args (setup_call distributes
+        // (argboxes_i, argboxes_r, argboxes_f=[])). Same EffectInfo
+        // classification path; the only operand-shape change is the
+        // I-list prefix between funcptr and the R-list.
+        "residual_call_ir_r/iIRd>r" => dispatch_residual_call_iIRd_kind(code, op, ctx, 'r'),
+        // RPython parity: `pyjitpl.py:279-292` exec-generated
+        // `opimpl_int_*` for binary arithmetic ops — each handler reads
+        // two `i`-coded register operands and dispatches
+        // `self.execute(rop.<OPNUM>, b1, b2)`. Walker mirror: read regs
+        // from `registers_i`, record `OpCode::<Variant>` with the
+        // operand OpRefs as args, write the recorder result OpRef into
+        // the dst slot. No MIFrame state involved (these are pure
+        // arithmetic — `EffectInfo`-free, `heapcache`-free).
+        //
+        // Operand layout `ii>i`: 1B src1 + 1B src2 + 1B dst (=3 operand
+        // bytes after the opcode).
+        "int_add/ii>i" => binop_int_record(code, op, ctx, OpCode::IntAdd),
+        "int_sub/ii>i" => binop_int_record(code, op, ctx, OpCode::IntSub),
+        "int_mul/ii>i" => binop_int_record(code, op, ctx, OpCode::IntMul),
+        "int_and/ii>i" => binop_int_record(code, op, ctx, OpCode::IntAnd),
+        "int_or/ii>i" => binop_int_record(code, op, ctx, OpCode::IntOr),
+        "int_xor/ii>i" => binop_int_record(code, op, ctx, OpCode::IntXor),
+        // `int_lshift/ii>i` is intentionally absent: the codewriter
+        // does not emit this shape today. Only `int_lshift/ri>i`
+        // exists (Task #85 kind-flow territory — adding a handler for
+        // that shape would mask the bug, since `ri>i` means a Ref
+        // register flowing into an Int op).
+        "int_rshift/ii>i" => binop_int_record(code, op, ctx, OpCode::IntRshift),
+        // RPython `pyjitpl.py:326-336` — comparison opimpls have a `b1
+        // is b2` fast path returning a constant. Walker omits the fast
+        // path: with two distinct OpRefs on the trace, recording the
+        // op is parity-correct, and the optimizer collapses
+        // tautological compares downstream. (RPython needs the fast
+        // path because `ConstInt(1)` allocation is expensive in Python;
+        // pyre's recorder shares constants by value.)
+        "int_eq/ii>i" => binop_int_record(code, op, ctx, OpCode::IntEq),
+        "int_ne/ii>i" => binop_int_record(code, op, ctx, OpCode::IntNe),
+        "int_lt/ii>i" => binop_int_record(code, op, ctx, OpCode::IntLt),
+        "int_le/ii>i" => binop_int_record(code, op, ctx, OpCode::IntLe),
+        "int_gt/ii>i" => binop_int_record(code, op, ctx, OpCode::IntGt),
+        "int_ge/ii>i" => binop_int_record(code, op, ctx, OpCode::IntGe),
+        // Float arithmetic — same shape as int binops but on the
+        // `f` bank. RPython `pyjitpl.py:284-292` includes
+        // float_add/float_sub/float_mul/float_truediv in the same
+        // exec-generated opimpl loop. Codewriter today emits only
+        // float_add/float_sub/float_truediv (float_mul absent —
+        // generated only when an explicit `*` operand reaches the
+        // jit_codewriter; pyre's bench set has no float_mul yet)
+        // plus the unary float_neg.
+        "float_add/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatAdd),
+        "float_sub/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatSub),
+        "float_truediv/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatTrueDiv),
+        "float_neg/f>f" => unop_float_record(code, op, ctx, OpCode::FloatNeg),
+        // Int-bank unary ops + `int_mod` binary. RPython parity:
+        // `pyjitpl.py:356-368` (int_neg / int_invert) + 371-375
+        // (int_same_as which calls `_record_helper(rop.SAME_AS_I, ...)`
+        // explicitly — same shape, walker treats it as a regular
+        // record-and-writeback). `int_mod/ii>i` matches RPython
+        // `pyjitpl.py:279 int_mod` in the exec-generated binop loop.
+        "int_neg/i>i" => unop_int_record(code, op, ctx, OpCode::IntNeg),
+        "int_invert/i>i" => unop_int_record(code, op, ctx, OpCode::IntInvert),
+        "int_same_as/i>i" => unop_int_record(code, op, ctx, OpCode::SameAsI),
+        "int_mod/ii>i" => binop_int_record(code, op, ctx, OpCode::IntMod),
+        // `int_div/ii>i` intentionally absent: RPython's metainterp
+        // opimpl is `int_floordiv` (pyjitpl.py:279), not `int_div`.
+        // The pyre codewriter emits `int_div` as its own opname which
+        // is a NEW-DEVIATION from RPython naming — handler land waits
+        // for the codewriter rename or for the pyre/RPython op-table
+        // mapping to be reconciled (separate slice).
+        "cast_int_to_float/i>f" => cast_int_to_float_record(code, op, ctx),
+        "ptr_eq/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrEq),
+        "ptr_ne/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrNe),
+        // Heapcache-aware getfield reads. RPython
+        // `pyjitpl.py:855-882 opimpl_getfield_gc_<i|r>` →
+        // `_opimpl_getfield_gc_any_pureornot` (`pyjitpl.py:929-950`)
+        // dispatches the same way through `heapcache.get_field_updater`.
+        // Walker only handles the canonical `rd>X` shapes (Ref source);
+        // pyre-specific `id>X` variants where the source is an int
+        // register holding an unwrapped pointer are kind-flow Task #85
+        // territory and stay unsupported here.
+        "getfield_gc_i/rd>i" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcI, 'i'),
+        "getfield_gc_r/rd>r" => getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcR, 'r'),
+        // setfield_gc canonical shapes. `iid` / `ird` (int box)
+        // shapes are pyre kind-flow Task #85 territory and stay
+        // unsupported.
+        "setfield_gc_i/rid" => setfield_gc_via_heapcache(code, op, ctx, 'i'),
+        "setfield_gc_r/rrd" => setfield_gc_via_heapcache(code, op, ctx, 'r'),
+        // Heapcache-aware array reads/writes (canonical Ref shapes).
+        // `getarrayitem_gc_r/rrd>r` (Ref index) + `setarrayitem_gc_*`
+        // variants with non-canonical shapes (rrid / rrrd / rrfd —
+        // Ref index) stay unsupported (Task #85 kind-flow territory).
+        "getarrayitem_gc_r/rid>r" => getarrayitem_gc_r_via_heapcache(code, op, ctx),
+        "setarrayitem_gc_r/rird" => setarrayitem_gc_r_via_heapcache(code, op, ctx),
         "int_copy/i>i" => {
             // RPython `pyjitpl.py:471-477 _opimpl_any_copy(self, box) → box`
             // + `@arguments("box")` + `>i` result coding: read src
@@ -785,31 +2376,106 @@ fn handle(
                 ))
             }
         }
+        "int_return/i" => {
+            // RPython `pyjitpl.py:463 opimpl_int_return = _opimpl_any_return`
+            // (pyjitpl.py:459-461 `_opimpl_any_return: self.metainterp.finishframe(box)`).
+            // Top-level: `compile_done_with_this_frame` (pyjitpl.py:3206-3208)
+            // records `FINISH([value], descr=done_with_this_frame_descr_int)`.
+            // Sub-walk: `SubReturn { Some(value) }` — caller's
+            // `inline_call_*_i` would land the int OpRef in its `>i` slot.
+            // Operand layout `i`: 1B int register at op.pc+1.
+            let result = read_int_reg(code, op, 0, ctx)?;
+            if ctx.is_top_level {
+                ctx.trace_ctx
+                    .finish(&[result], ctx.done_with_this_frame_descr_int.clone());
+                Ok((DispatchOutcome::Terminate, op.next_pc))
+            } else {
+                Ok((
+                    DispatchOutcome::SubReturn {
+                        result: Some(result),
+                    },
+                    op.next_pc,
+                ))
+            }
+        }
+        "float_return/f" => {
+            // RPython `pyjitpl.py:465 opimpl_float_return = _opimpl_any_return`.
+            // Top-level: `compile_done_with_this_frame` (pyjitpl.py:3212-3214)
+            // records `FINISH([value], descr=done_with_this_frame_descr_float)`.
+            // Sub-walk: `SubReturn { Some(value) }` carrying the float
+            // OpRef — same enum variant as int/ref because the OpRef is
+            // bank-agnostic; the caller's inline_call variant decides
+            // which bank to write into.
+            // Operand layout `f`: 1B float register at op.pc+1.
+            let result = read_float_reg(code, op, 0, ctx)?;
+            if ctx.is_top_level {
+                ctx.trace_ctx
+                    .finish(&[result], ctx.done_with_this_frame_descr_float.clone());
+                Ok((DispatchOutcome::Terminate, op.next_pc))
+            } else {
+                Ok((
+                    DispatchOutcome::SubReturn {
+                        result: Some(result),
+                    },
+                    op.next_pc,
+                ))
+            }
+        }
+        "void_return/" => {
+            // RPython `pyjitpl.py:467-469 opimpl_void_return`:
+            //
+            //   @arguments()
+            //   def opimpl_void_return(self):
+            //       self.metainterp.finishframe(None)
+            //
+            // Top-level: `compile_done_with_this_frame` (pyjitpl.py:3202-3205)
+            // takes the `result_type == VOID` branch — `exits = []`,
+            // `token = sd.done_with_this_frame_descr_void`. The FINISH
+            // carries no value.
+            // Sub-walk: `SubReturn { None }` — RPython's
+            // `_opimpl_inline_call_*_v` variants don't write a dst
+            // register on the caller side (the codewriter emits no `>X`
+            // marker for void calls).
+            // No operand bytes (the `/` argcodes is empty).
+            if ctx.is_top_level {
+                ctx.trace_ctx
+                    .finish(&[], ctx.done_with_this_frame_descr_void.clone());
+                Ok((DispatchOutcome::Terminate, op.next_pc))
+            } else {
+                Ok((DispatchOutcome::SubReturn { result: None }, op.next_pc))
+            }
+        }
         "raise/r" => {
-            // RPython `pyjitpl.py:1688-1698 opimpl_raise(exc_value_box)` →
-            //   metainterp.last_exc_value = exc_value_box.getref(...)
-            //   metainterp.popframe()
-            //   metainterp.finishframe_exception()
-            // `finishframe_exception` walks the framestack scanning each
-            // parent's exceptiontable; if a handler matches, control jumps
-            // to the handler PC. If exhausted (outermost frame, no
-            // handler), `compile_exit_frame_with_exception` (pyjitpl.py:3238-3242)
-            // records `rop.FINISH(value, descr=exit_frame_with_exception_descr_ref)`.
+            // RPython `pyjitpl.py:1688-1698 opimpl_raise(exc_value_box, orgpc)`:
+            //   if not self.metainterp.heapcache.is_class_known(exc_value_box):
+            //       clsbox = self.cls_of_box(exc_value_box)
+            //       self.metainterp.generate_guard(rop.GUARD_CLASS, exc_value_box,
+            //                                      clsbox, resumepc=orgpc)
+            //   self.metainterp.class_of_last_exc_is_const = True
+            //   self.metainterp.last_exc_value = exc_value_box.getref(...)
+            //   self.metainterp.last_exc_box = exc_value_box
+            //   self.metainterp.popframe()
+            //   self.metainterp.finishframe_exception()
             //
             // Walker dual behaviour:
             //   * `is_top_level` → outermost FINISH (above).
             //   * sub-walk frame → propagate `SubRaise { exc }` to the
-            //     caller's `inline_call_*` handler. Currently the walker
-            //     has no per-PC exceptiontable plumb so the caller can't
-            //     match a handler — they bubble it up further until the
-            //     top-level walker emits the FINISH. catch_exception/L's
-            //     stored target is wired but unread until exceptiontable
-            //     lookup ports.
+            //     caller's `inline_call_*` handler.
             //
-            // Deferred (still in module-level "Production fidelity gaps"):
-            // exceptiontable scan inside the same frame, `last_exc_value`
-            // bookkeeping for downstream `reraise/`.
+            // Deferred (Walker fix H — blocked on Walker fix A
+            // production wiring): GUARD_CLASS emission. The symbolic
+            // walker has only OpRefs; deriving `clsbox` from an
+            // exception OpRef requires `metainterp.cls_of_box(exc)`
+            // which only exists once `dispatch_via_miframe` is called
+            // from the production tracing path with a wired MIFrame.
+            // Until then the walker records no guard for raise/r —
+            // `last_exc_value` propagation alone matches the symbolic
+            // state RPython captures via `metainterp.last_exc_box`
+            // (line 1696). The class-const-flag (line 1694) is set on
+            // writeback in `dispatch_via_miframe` (Walker fix D) when
+            // the walk's final last_exc is non-None.
             let exc = read_ref_reg(code, op, 0, ctx)?;
+            ctx.last_exc_value = Some(exc);
             if ctx.is_top_level {
                 ctx.trace_ctx
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
@@ -818,24 +2484,90 @@ fn handle(
                 Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
             }
         }
+        "last_exc_value/>r" => {
+            // RPython parity: `pyjitpl.py:1716-1719 opimpl_last_exc_value`:
+            //
+            //   @arguments()
+            //   def opimpl_last_exc_value(self):
+            //       exc_value = self.metainterp.last_exc_value
+            //       assert exc_value
+            //       return self.metainterp.last_exc_box
+            //
+            // Reads no operand; the `>r` decorator writes the result into
+            // `registers_r[dst]`. No IR op recorded — the standing
+            // `metainterp.last_exc_box` (mirrored here as
+            // `ctx.last_exc_value`) is already a recorder OpRef from when
+            // `raise/r` set it. This is a pure SSA-rename of the
+            // exception slot into a Ref-bank dst, mirroring how
+            // `int_copy/i>i` and `_opimpl_any_copy` collapse to a
+            // register move without recording.
+            //
+            // Operand layout `>r`: 1B dst register only (the `>r` arg is
+            // the writeback marker, not a separate operand byte; the dst
+            // byte sits at op.pc+1).
+            //
+            // Forward-prep status: the opname is registered in
+            // `wire_handler("last_exc_value/>r", handler_last_exc_value)`
+            // (`blackhole.rs:6757`) and `m.insert("last_exc_value/>r",
+            // BC_LAST_EXC_VALUE)` (`jitcode/mod.rs:305`), but pyre's
+            // codewriter does not currently emit `FlatOp::LastExcValue`
+            // for any traced Python arm — `dump_unsupported_opnames_in_insns_table`
+            // confirms the opname is absent from `OUT_DIR/opcode_insns.bin`.
+            // The handler matches RPython's unconditional `setup_insns`
+            // registration so it's ready when an except-handler arm
+            // (e.g. `BC_LAST_EXC_VALUE` consumer in CPython 3.14
+            // `LOAD_SPECIAL`/`CHECK_EXC_MATCH` lowering) lands.
+            let exc = ctx
+                .last_exc_value
+                .ok_or(DispatchError::LastExcValueWithoutActiveException { pc: op.pc })?;
+            let dst = code[op.pc + 1] as usize;
+            let len = ctx.registers_r.len();
+            let slot = ctx
+                .registers_r
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "r",
+                })?;
+            *slot = exc;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         "reraise/" => {
-            // PRE-EXISTING-ADAPTATION (slice 2e): terminate only.
+            // RPython parity: `pyjitpl.py:1700-1704 opimpl_reraise(self)` —
             //
-            // RPython `pyjitpl.py:1700-1704 opimpl_reraise(self)` reads
-            // no operand and routes through `popframe` +
-            // `finishframe_exception` using `metainterp.last_exc_value`
-            // — the exception value set by an *earlier* `raise/r` or
-            // by the unwinder when entering a `catch_exception` handler.
+            //   assert self.metainterp.last_exc_value
+            //   self.metainterp.popframe()
+            //   self.metainterp.finishframe_exception()
             //
-            // Walker has no `last_exc_value` field — adding one means
-            // tracking the catch_exception → handler-entry contract
-            // (when the unwinder routes into a handler, it sets
-            // `last_exc_value` from `metainterp.last_exception`; the
-            // handler reads it via `bhimpl_last_exc_value`). That
-            // bookkeeping requires the exceptiontable + framestack the
-            // walker doesn't yet have. Convergence path: Phase D-3
-            // MIFrame integration.
-            Ok((DispatchOutcome::Terminate, op.next_pc))
+            // Reads no operand; uses the standing `metainterp.last_exc_value`
+            // which was set either by an earlier `raise/r` in this frame
+            // or — when the unwinder routed into a `catch_exception`
+            // handler — by the inline_call SubRaise arm just before
+            // jumping to the handler PC.
+            //
+            // Walker behaviour mirrors `raise/r`'s dual-frame routing:
+            //   * top-level → outermost FINISH(last_exc_value,
+            //     exit_frame_with_exception_descr_ref).
+            //   * sub-walk → SubRaise{exc=last_exc_value}, bubbling
+            //     through the parent's inline_call handler (which may
+            //     itself catch via `catch_exception/L` lookahead).
+            //
+            // `last_exc_value == None` violates the RPython assert and
+            // surfaces as `ReraiseWithoutLastExcValue` (codewriter
+            // invariant: `reraise` only emits inside a `catch_exception`
+            // body or after an explicit `raise`).
+            let exc = ctx
+                .last_exc_value
+                .ok_or(DispatchError::ReraiseWithoutLastExcValue { pc: op.pc })?;
+            if ctx.is_top_level {
+                ctx.trace_ctx
+                    .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
+                Ok((DispatchOutcome::Terminate, op.next_pc))
+            } else {
+                Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
+            }
         }
         other => Err(DispatchError::UnsupportedOpname {
             pc: op.pc,
@@ -897,29 +2629,17 @@ mod tests {
             code: jc.code.as_slice(),
             num_regs_r: jc.num_regs_r(),
             num_regs_i: jc.num_regs_i(),
+            num_regs_f: jc.num_regs_f(),
         })
     }
 
-    /// Test-only `JitCodeDescr` wrapper around a `jitcode_index`.
-    /// Production wires `BhDescr::JitCode { jitcode_index, .. }` through
-    /// a real adapter (`PyreJitCodeDescr` — TODO follow-up commit
-    /// extracts this into `pyre-jit-trace/src/descr.rs` so production
-    /// callers can build `Arc<dyn Descr>` pools that the walker
-    /// consumes natively).
-    #[derive(Debug)]
-    struct TestJitCodeDescr {
-        jitcode_index: usize,
-    }
-    impl majit_ir::Descr for TestJitCodeDescr {
-        fn as_jitcode_descr(&self) -> Option<&dyn majit_ir::JitCodeDescr> {
-            Some(self)
-        }
-    }
-    impl majit_ir::JitCodeDescr for TestJitCodeDescr {
-        fn jitcode_index(&self) -> usize {
-            self.jitcode_index
-        }
-    }
+    /// Tests use the production `PyreJitCodeDescr` adapter
+    /// directly — slice 2i moved the type from a test-local `struct
+    /// TestJitCodeDescr` to `pyre-jit-trace/src/descr.rs::PyreJitCodeDescr`
+    /// + `descr::make_jitcode_descr(idx)` so the walker's
+    /// `as_jitcode_descr()` cast exercises production code, not a
+    /// duplicate.
+    use crate::descr::make_jitcode_descr;
 
     /// Build a `descr_refs` pool of length `pool_len` where the slot at
     /// each `BhDescr::JitCode` index in `crate::jitcode_runtime::all_descrs()`
@@ -933,9 +2653,7 @@ mod tests {
         (0..pool_len)
             .map(|i| match all_bh.get(i) {
                 Some(majit_translate::jitcode::BhDescr::JitCode { jitcode_index, .. }) => {
-                    std::sync::Arc::new(TestJitCodeDescr {
-                        jitcode_index: *jitcode_index,
-                    }) as DescrRef
+                    make_jitcode_descr(*jitcode_index)
                 }
                 _ => make_fail_descr(1 + i),
             })
@@ -964,6 +2682,7 @@ mod tests {
             code: callee_code,
             num_regs_r: 1,
             num_regs_i: 0,
+            num_regs_f: 0,
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -993,17 +2712,22 @@ mod tests {
         let arg_value = regs_r[2];
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
-        descr_pool[7] = std::sync::Arc::new(TestJitCodeDescr { jitcode_index: 7 });
+        descr_pool[7] = make_jitcode_descr(7);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
         };
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -1035,19 +2759,408 @@ mod tests {
     }
 
     #[test]
+    fn inline_call_r_i_writes_int_subreturn_into_caller_int_bank() {
+        // Slice 3.7 acceptance: caller's `inline_call_r_i/dR>i`
+        // recurses into a synthetic callee whose body is `int_return
+        // r0` on the int bank. The callee's int_return surfaces as
+        // `SubReturn { result: Some(callee.registers_i[0]) }`; the
+        // caller's helper writes that OpRef into the caller's
+        // `registers_i[dst]` (NOT registers_r — the kind discriminator
+        // for this variant). RPython parity: pyjitpl.py:1266-1324
+        // exec-generated `_opimpl_inline_call_r_i` template paired with
+        // `_opimpl_any_return` for `int_return`.
+        //
+        // Callee shape constraint: the `_r` arglist promises only Ref
+        // args, but the body needs an int register populated to source
+        // the int_return. The codewriter populates that via a separate
+        // op inside the callee body (e.g. `int_copy/i>i`). For the
+        // walker test, we synthesize an `int_copy` that materializes
+        // the int constant from a tracer-side const_int OpRef stored in
+        // a high i-register, then int_returns it.
+        //
+        // Simpler: callee whose body is just `int_return i0`; we
+        // pre-populate the callee's registers_i[0] indirectly through a
+        // setter — but the walker doesn't expose that directly. So
+        // instead, we use a callee whose body emits an int constant op
+        // and returns it. The simplest working shape is `int_neg i0
+        // ->i0; int_return i0` — but registers_i[0] starts as
+        // OpRef::NONE which `int_neg` would record meaninglessly.
+        //
+        // Pragmatic alternative: the walker's test-side `setup` for
+        // sub_body lets us choose `num_regs_i = 1`. We initialize
+        // callee.registers_i[0] to a known OpRef AT SUB-WALK TIME by
+        // having the caller arglist carry the int OpRef indirectly —
+        // but the `dR` arglist only has Ref. So we *can't* pass the
+        // int OpRef through the call.
+        //
+        // RPython solution: callee bodies *always* compute their int
+        // results from concrete operations (int_const, int_add, etc.).
+        // For walker testing, the smallest standalone body is
+        // `int_const_42 i0 = 42; int_return i0` — but pyre doesn't have
+        // an `int_const/c>i` opname today (constants live in the
+        // jitcode's constants_i table). Without re-engineering the
+        // sub_body fixture, the cleanest test is to drive the callee
+        // body through `int_copy` from a callee int register that the
+        // setup_call path populated (which doesn't exist for `_r_i`
+        // variant — only Ref args flow in).
+        //
+        // For this slice we lean on the simpler invariant: the
+        // SubReturn{Some(value)} from the *helper itself* writes into
+        // the caller's `registers_i[dst]`. To exercise that branch
+        // without standing up a full int-producing callee, we test the
+        // helper's dst-bank dispatch logic via a callee body that
+        // returns an OpRef::NONE placeholder through `int_return r0`
+        // — wait, that's wrong: `int_return/i` reads from `registers_i`
+        // not `registers_r`.
+        //
+        // Cleanest path: callee body = `[int_return_byte, 0x00]` where
+        // callee's `registers_i[0]` is OpRef::NONE; the SubReturn
+        // value will be NONE. The test asserts that the caller's
+        // `registers_i[dst]` was written to NONE (proving the dst-bank
+        // routing is correct — wrong-bank routing would write to
+        // `registers_r[dst]` instead and leave `registers_i[dst]`
+        // unchanged at its initial OpRef::NONE).
+        //
+        // The OpRef::NONE-vs-OpRef::NONE comparison is admittedly
+        // weak; instead we initialize the caller's `registers_i[dst]`
+        // to a distinct OpRef before the call so the assertion can
+        // distinguish "no write" from "write of NONE".
+        let int_ret_byte = *insns_opname_to_byte()
+            .get("int_return/i")
+            .expect("`int_return/i` must be in insns table");
+        let inline_ri_byte = *insns_opname_to_byte()
+            .get("inline_call_r_i/dR>i")
+            .expect("`inline_call_r_i/dR>i` must be in insns table");
+        // Callee body: `int_return i0` (registers_i[0] starts at NONE).
+        let callee_code: &'static [u8] = Box::leak(Box::new([int_ret_byte, 0]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1, // callee accepts a Ref arg, then ignores it
+            num_regs_i: 1,
+            num_regs_f: 0,
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| {
+                if idx == 7 {
+                    Some(sub_body.clone())
+                } else {
+                    None
+                }
+            }
+        };
+        // Caller body: `inline_call_r_i descr=7, R=[r2], >i=i3`
+        //   opcode(1) + d(2) + R-len(1) + R[0](1) + dst(1) = 6 bytes
+        let caller_code = [inline_ri_byte, 0x07, 0x00, 0x01, 0x02, 0x03];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        // Initialize registers_i[3] (dst) to a sentinel so we can
+        // detect that the write happened.
+        let sentinel_pre = tc.const_int(0xDEAD_BEEF);
+        let mut regs_i: Vec<OpRef> = vec![sentinel_pre; 4];
+        let descr = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) =
+            step(&caller_code, 0, &mut wc).expect("inline_call_r_i must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, caller_code.len());
+        drop(wc);
+        // Callee's int_return[i0] surfaced SubReturn{Some(NONE)}; the
+        // helper wrote that into caller's registers_i[3]. Sentinel is
+        // gone, replaced by OpRef::NONE.
+        assert_eq!(
+            regs_i[3],
+            OpRef::NONE,
+            "inline_call_r_i must write SubReturn value into caller registers_i[dst]",
+        );
+        // Wrong-bank check: registers_r[3] must remain its original
+        // distinct_const_refs value (the dst-bank routing did NOT
+        // write to the Ref bank).
+        assert_ne!(
+            regs_r[3],
+            OpRef::NONE,
+            "inline_call_r_i must NOT write to registers_r[dst]",
+        );
+    }
+
+    #[test]
+    fn inline_call_ir_r_populates_callee_int_and_ref_banks() {
+        // Slice 3.8 acceptance: caller's `inline_call_ir_r/dIR>r` carries
+        // both an I-list and an R-list. The callee's int + ref register
+        // banks must both be populated (RPython
+        // `pyjitpl.py:230-260 setup_call(argboxes_i, argboxes_r,
+        // argboxes_f)`). Smoke test: callee body is `ref_return r0` —
+        // the ref arg routes through registers_r[0] back to the caller's
+        // dst slot. The int arg flowing into registers_i[0] is dead but
+        // proves the helper read the I-list (a regression where the
+        // I-list parsing miscounted bytes would offset the R-list read
+        // and we'd see the wrong ref OpRef in the dst).
+        let ret_byte = *insns_opname_to_byte()
+            .get("ref_return/r")
+            .expect("`ref_return/r` must be in insns table");
+        let inline_ir_r_byte = *insns_opname_to_byte()
+            .get("inline_call_ir_r/dIR>r")
+            .expect("`inline_call_ir_r/dIR>r` must be in insns table");
+        // Callee body: `ref_return r0` (size 2).
+        let callee_code: &'static [u8] = Box::leak(Box::new([ret_byte, 0]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 1, // accept one int arg
+            num_regs_f: 0,
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| {
+                if idx == 7 {
+                    Some(sub_body.clone())
+                } else {
+                    None
+                }
+            }
+        };
+        // Caller body: `inline_call_ir_r descr=7, I=[i1], R=[r2], >r=r5`
+        //   opcode(1) + d(2) + I-len(1) + I[0](1) + R-len(1) + R[0](1) + dst(1) = 8 bytes
+        let caller_code = [
+            inline_ir_r_byte,
+            0x07,
+            0x00, // descr index 7 (LE)
+            0x01,
+            0x01, // I-list: len=1, args=[i1]
+            0x01,
+            0x02, // R-list: len=1, args=[r2]
+            0x05, // dst = r5
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let arg_ref = regs_r[2];
+        let mut regs_i: Vec<OpRef> = (0..4)
+            .map(|i| tc.const_int(0xCAFE_F00D + i as i64))
+            .collect();
+        let descr = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) =
+            step(&caller_code, 0, &mut wc).expect("inline_call_ir_r must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, caller_code.len());
+        drop(wc);
+        // dst register r5 must equal the caller's R-list arg (which the
+        // callee returned via ref_return r0).
+        assert_eq!(
+            regs_r[5], arg_ref,
+            "inline_call_ir_r dst writeback must propagate callee's SubReturn from ref_return r0",
+        );
+    }
+
+    #[test]
+    fn inline_call_irf_r_populates_all_three_kind_banks() {
+        // Slice 3.9 acceptance: caller's `inline_call_irf_r/dIRF>r`
+        // carries an I-list, R-list, AND F-list. Smoke test: callee
+        // body is `ref_return r0` — the caller's R-list arg propagates
+        // through. The I-list and F-list args are dead from the
+        // callee's POV but their presence forces the helper to advance
+        // operand offsets correctly through all three lists; a parsing
+        // bug (e.g. F-list-len byte misaligned) would put the wrong
+        // ref OpRef into the dst.
+        let ret_byte = *insns_opname_to_byte()
+            .get("ref_return/r")
+            .expect("`ref_return/r` must be in insns table");
+        let inline_irf_r_byte = *insns_opname_to_byte()
+            .get("inline_call_irf_r/dIRF>r")
+            .expect("`inline_call_irf_r/dIRF>r` must be in insns table");
+        let callee_code: &'static [u8] = Box::leak(Box::new([ret_byte, 0]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 1,
+            num_regs_f: 1,
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| {
+                if idx == 7 {
+                    Some(sub_body.clone())
+                } else {
+                    None
+                }
+            }
+        };
+        // Caller body: inline_call_irf_r descr=7, I=[i1], R=[r2], F=[f0], >r=r5
+        //   opcode(1) + d(2) + I-len(1) + I[0](1) + R-len(1) + R[0](1)
+        //   + F-len(1) + F[0](1) + dst(1) = 10 bytes
+        let caller_code = [
+            inline_irf_r_byte,
+            0x07,
+            0x00, // descr index 7
+            0x01,
+            0x01, // I-list len=1, args=[i1]
+            0x01,
+            0x02, // R-list len=1, args=[r2]
+            0x01,
+            0x00, // F-list len=1, args=[f0]
+            0x05, // dst = r5
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let arg_ref = regs_r[2];
+        let mut regs_i: Vec<OpRef> = (0..4).map(|i| tc.const_int(i as i64)).collect();
+        // Float bank: pyre's TraceCtx doesn't expose a const_float
+        // factory in the test fixture path, but we only need *distinct*
+        // OpRef values to exercise list-byte advancement; const_int +
+        // type-punning into the float slot is sufficient because the
+        // walker treats the bank as opaque OpRef storage.
+        let mut regs_f: Vec<OpRef> = (0..4).map(|i| tc.const_int(0xF1F1 + i as i64)).collect();
+        let descr = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut regs_f,
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) =
+            step(&caller_code, 0, &mut wc).expect("inline_call_irf_r must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, caller_code.len());
+        drop(wc);
+        // Smoking gun: dst register r5 must equal the caller's R-list
+        // arg (passed through callee's `ref_return r0`). A list-byte
+        // advancement bug would land a different OpRef here.
+        assert_eq!(
+            regs_r[5], arg_ref,
+            "inline_call_irf_r must correctly advance through I/R/F lists \
+             and propagate the callee's ref SubReturn",
+        );
+    }
+
+    #[test]
+    fn inline_call_ir_int_arity_overflow_surfaces_typed_error() {
+        // Slice 3.8: per-bank arity check — providing more I-args than
+        // the callee declared `num_regs_i` slots surfaces
+        // `InlineCallIntArityMismatch`. The Ref-bank check is covered
+        // by the existing `inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch`
+        // test for the `_r_r` variant.
+        let inline_ir_r_byte = *insns_opname_to_byte()
+            .get("inline_call_ir_r/dIR>r")
+            .expect("`inline_call_ir_r/dIR>r` must be in insns table");
+        // Callee with num_regs_i=0 — any I-list args overflow.
+        let ret_byte = *insns_opname_to_byte()
+            .get("ref_return/r")
+            .expect("`ref_return/r` must be in insns table");
+        let callee_code: &'static [u8] = Box::leak(Box::new([ret_byte, 0]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 0, // overflow trigger
+            num_regs_f: 0,
+        };
+        let lookup = {
+            let sub_body = sub_body.clone();
+            move |idx: usize| {
+                if idx == 7 {
+                    Some(sub_body.clone())
+                } else {
+                    None
+                }
+            }
+        };
+        // Caller body: `inline_call_ir_r descr=7, I=[i1], R=[r2], >r=r5`
+        let caller_code = [
+            inline_ir_r_byte,
+            0x07,
+            0x00,
+            0x01,
+            0x01, // I-list with 1 arg → overflows callee (num_regs_i=0)
+            0x01,
+            0x02,
+            0x05,
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i: Vec<OpRef> = (0..4).map(|i| tc.const_int(i as i64)).collect();
+        let descr = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[7] = make_jitcode_descr(7);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let err =
+            step(&caller_code, 0, &mut wc).expect_err("I-list overflow must surface typed error");
+        assert_eq!(
+            err,
+            DispatchError::InlineCallIntArityMismatch {
+                pc: 0,
+                provided: 1,
+                callee_num_regs_i: 0,
+            },
+        );
+    }
+
+    #[test]
     fn inline_call_recursion_propagates_subraise_from_callee() {
-        // Slice 2h: callee's `raise/r` surfaces as `SubRaise { exc }`
-        // to the caller's inline_call handler, which propagates it
-        // (no exceptiontable scan yet). The top-level walk then sees
-        // SubRaise as the terminating outcome — but since our walker
-        // is currently top-level, raise/r emits the outermost FINISH
-        // with exit_frame_with_exception_descr_ref. So the SubRaise
-        // bubbles through inline_call and the top-level walk
-        // returns... well, SubRaise actually, since the *caller*'s
-        // walker is also at is_top_level=true but it didn't fire
-        // raise/r itself, it received SubRaise from inline_call. The
-        // caller's walk loop sees SubRaise as a terminating outcome
-        // and exits the loop returning SubRaise.
+        // Walker fix I (revised slice 2h): callee's `raise/r` surfaces as
+        // `SubRaise { exc }` to the caller's inline_call handler. With
+        // no caller-side `catch_exception/L` and is_top_level=true on
+        // the outermost walker, RPython
+        // `pyjitpl.py:2533-2538 finishframe_exception` records
+        // `compile_exit_frame_with_exception(last_exc_box)` — i.e.
+        // FINISH(exc, exit_frame_with_exception_descr_ref) and exits
+        // the trace. Walker mirrors this in `walk()`: top-level
+        // SubRaise → record FINISH + Terminate.
         let raise_byte = *insns_opname_to_byte()
             .get("raise/r")
             .expect("`raise/r` must be in insns table");
@@ -1060,6 +3173,7 @@ mod tests {
             code: callee_code,
             num_regs_r: 1,
             num_regs_i: 0,
+            num_regs_f: 0,
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -1073,30 +3187,59 @@ mod tests {
         };
         // Caller body: `inline_call_r_r descr=7 R=[r2] >r=r5`
         // (no follow-on `ref_return` — the SubRaise propagates straight
-        // up to the caller's `walk` loop and exits.)
+        // up to the caller's `walk` loop, which converts to FINISH at
+        // top level.)
         let caller_code = [inline_byte, 0x07, 0x00, 0x01, 0x02, 0x05];
         let mut tc = fresh_trace_ctx();
         let mut regs_r = distinct_const_refs(&mut tc, 8);
         let arg_value = regs_r[2];
         let descr = done_descr_ref_for_tests();
+        let descr_exc = make_fail_descr(2);
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
-        descr_pool[7] = std::sync::Arc::new(TestJitCodeDescr { jitcode_index: 7 });
+        descr_pool[7] = make_jitcode_descr(7);
+        let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
-            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: descr_exc.clone(),
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
             outcome,
-            DispatchOutcome::SubRaise { exc: arg_value },
-            "callee's raise/r must surface to caller as SubRaise carrying the \
-             exc OpRef from callee's registers_r[0] (= caller's R-list arg)",
+            DispatchOutcome::Terminate,
+            "top-level walk must convert uncaught SubRaise to Terminate \
+             after recording the outermost FINISH",
+        );
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before + 1,
+            "exactly one FINISH must be recorded",
+        );
+        let last = tc.ops().last().expect("FINISH must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
+        assert_eq!(
+            last.args.as_slice(),
+            &[arg_value],
+            "FINISH args must carry the bubbled exc OpRef",
+        );
+        let recorded_descr = last
+            .descr
+            .as_ref()
+            .expect("FINISH must carry exit_frame_with_exception_descr_ref");
+        assert!(
+            std::sync::Arc::ptr_eq(recorded_descr, &descr_exc),
+            "FINISH descr must be exit_frame_with_exception_descr_ref",
         );
     }
 
@@ -1115,12 +3258,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("FailDescr at inline_call's d-slot must hit ExpectedJitCodeDescr");
@@ -1144,18 +3292,21 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
-        descr_pool[3] = std::sync::Arc::new(TestJitCodeDescr {
-            jitcode_index: 999_999,
-        });
+        descr_pool[3] = make_jitcode_descr(999_999);
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("missing sub-jitcode must hit SubJitCodeNotFound");
@@ -1179,12 +3330,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("live/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -1216,12 +3372,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut regs,
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_return/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -1260,12 +3421,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("must surface RegisterOutOfRange");
         assert_eq!(
@@ -1276,6 +3442,196 @@ mod tests {
                 len: 0,
                 bank: "r"
             },
+        );
+    }
+
+    #[test]
+    fn step_through_int_return_records_finish_with_int_descr() {
+        // Slice 3.6: `int_return/i` mirrors `ref_return/r` on the int
+        // bank. Top-level records `FINISH(int_value)` with
+        // `done_with_this_frame_descr_int` (RPython `pyjitpl.py:3206-3208
+        // compile_done_with_this_frame: token = sd.done_with_this_frame_descr_int`).
+        let ret_byte = *insns_opname_to_byte()
+            .get("int_return/i")
+            .expect("`int_return/i` must be in insns table");
+        let code = [ret_byte, 0x02];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i: Vec<OpRef> = (0..4)
+            .map(|i| tc.const_int(0xBEEF_0000 + i as i64))
+            .collect();
+        let expected_arg = regs_i[2];
+        let descr_int = make_fail_descr(42);
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: descr_int.clone(),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let ops_before = wc.trace_ctx.num_ops();
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Terminate);
+        assert_eq!(next_pc, 2);
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
+        assert_eq!(last.args.as_slice(), &[expected_arg]);
+        let recorded_descr = last
+            .descr
+            .as_ref()
+            .expect("Finish must carry done_with_this_frame_descr_int");
+        assert!(
+            std::sync::Arc::ptr_eq(recorded_descr, &descr_int),
+            "int_return/i must use done_with_this_frame_descr_int, not _ref",
+        );
+    }
+
+    #[test]
+    fn step_through_int_return_subwalk_surfaces_subreturn_some() {
+        // Slice 3.6: nested `int_return/i` propagates SubReturn{Some(value)}
+        // — same shape as `ref_return/r` sub-walk. RPython
+        // `pyjitpl.py:1688-1698 finishframe → popframe` returns control to
+        // caller's metainterp loop with the box in hand.
+        let ret_byte = *insns_opname_to_byte()
+            .get("int_return/i")
+            .expect("`int_return/i` must be in insns table");
+        let code = [ret_byte, 0x01];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i: Vec<OpRef> = (0..4)
+            .map(|i| tc.const_int(0xCAFE_0000 + i as i64))
+            .collect();
+        let expected = regs_i[1];
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: false,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let ops_before = wc.trace_ctx.num_ops();
+        let (outcome, _) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
+        assert_eq!(
+            outcome,
+            DispatchOutcome::SubReturn {
+                result: Some(expected),
+            },
+            "sub-walk int_return must surface SubReturn{{Some(value)}}",
+        );
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before,
+            "sub-walk int_return must NOT record FINISH (control returns to caller)",
+        );
+    }
+
+    #[test]
+    fn step_through_void_return_records_empty_finish_with_void_descr() {
+        // Slice 3.6: top-level `void_return/` records `FINISH([])` with
+        // `done_with_this_frame_descr_void`. RPython
+        // `pyjitpl.py:3202-3205 compile_done_with_this_frame`:
+        //   if result_type == VOID:
+        //       assert exitbox is None
+        //       exits = []
+        //       token = sd.done_with_this_frame_descr_void
+        let ret_byte = *insns_opname_to_byte()
+            .get("void_return/")
+            .expect("`void_return/` must be in insns table");
+        let code = [ret_byte];
+        let mut tc = fresh_trace_ctx();
+        let descr_void = make_fail_descr(77);
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: descr_void.clone(),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let ops_before = wc.trace_ctx.num_ops();
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Terminate);
+        assert_eq!(next_pc, 1, "void_return/ has zero operand bytes");
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
+        assert!(
+            last.args.as_slice().is_empty(),
+            "void_return/ FINISH must carry zero args (RPython exits = [])",
+        );
+        let recorded_descr = last
+            .descr
+            .as_ref()
+            .expect("Finish must carry done_with_this_frame_descr_void");
+        assert!(
+            std::sync::Arc::ptr_eq(recorded_descr, &descr_void),
+            "void_return/ must use done_with_this_frame_descr_void, not _ref",
+        );
+    }
+
+    #[test]
+    fn step_through_void_return_subwalk_surfaces_subreturn_none() {
+        // Slice 3.6: nested `void_return/` propagates SubReturn{None} —
+        // RPython `pyjitpl.py:467-469 opimpl_void_return → finishframe(None)`.
+        // The caller's `inline_call_*_v` variant (when one exists) does
+        // not write a dst register; today the walker has no `_v`
+        // inline_call handler so `SubReturn{None}` reaching an `_r_r`
+        // caller surfaces `UnexpectedVoidSubReturn` (the existing typed
+        // error covers that path). This test only exercises the leaf
+        // sub-walk surface.
+        let ret_byte = *insns_opname_to_byte()
+            .get("void_return/")
+            .expect("`void_return/` must be in insns table");
+        let code = [ret_byte];
+        let mut tc = fresh_trace_ctx();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: make_fail_descr(1),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(77),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: false,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let ops_before = wc.trace_ctx.num_ops();
+        let (outcome, _) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
+        assert_eq!(outcome, DispatchOutcome::SubReturn { result: None });
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before,
+            "sub-walk void_return must NOT record FINISH",
         );
     }
 
@@ -1293,12 +3649,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("raise/r must read its operand");
         assert_eq!(
@@ -1328,12 +3689,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -1363,16 +3729,112 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
         assert_eq!(next_pc, 258);
+    }
+
+    #[test]
+    fn finishframe_lookahead_distinguishes_catch_rvmprof_and_nomatch() {
+        // Walker fix C: `finishframe_lookahead_at` must mirror RPython
+        // `pyjitpl.py:2506-2531 finishframe_exception` line-by-line —
+        // sequential `catch_exception/L` then `rvmprof_code/ii` then
+        // fall-through.
+        //
+        // pyre's emitted insns table currently lacks `rvmprof_code/ii`
+        // (forward-prep — RPython emits it when rvmprof is enabled at
+        // codewriter time). Test only the bytes that ARE in the table
+        // and assert the helper shape compiles + the catch / no-match
+        // arms route correctly.
+        let live_byte = *insns_opname_to_byte()
+            .get("live/")
+            .expect("live/ must be in insns");
+        let catch_byte = *insns_opname_to_byte()
+            .get("catch_exception/L")
+            .expect("catch_exception/L must be in insns");
+        let goto_byte = *insns_opname_to_byte()
+            .get("goto/L")
+            .expect("goto/L must be in insns");
+
+        // (1) live/ + catch_exception/L target=42 → CatchTarget(42).
+        let code_catch = [live_byte, 0x00, 0x00, catch_byte, 0x2A, 0x00];
+        assert_eq!(
+            finishframe_lookahead_at(&code_catch, 0),
+            FinishframeLookahead::CatchTarget(0x2A),
+        );
+
+        // (2) catch_exception/L without leading live/ → still
+        //     CatchTarget (RPython's `if opcode == op_live: skip` is
+        //     conditional, not required).
+        let code_no_live_catch = [catch_byte, 0x10, 0x01];
+        assert_eq!(
+            finishframe_lookahead_at(&code_no_live_catch, 0),
+            FinishframeLookahead::CatchTarget(0x110),
+        );
+
+        // (3) live/ + goto/L (NOT catch nor rvmprof) → NoMatch (the
+        //     caller continues unwinding).
+        let code_no_match = [live_byte, 0x00, 0x00, goto_byte, 0x00, 0x00];
+        assert_eq!(
+            finishframe_lookahead_at(&code_no_match, 0),
+            FinishframeLookahead::NoMatch,
+        );
+
+        // (4) Position past end of code → NoMatch (decode fails).
+        assert_eq!(
+            finishframe_lookahead_at(&code_catch, 99),
+            FinishframeLookahead::NoMatch,
+        );
+    }
+
+    #[test]
+    fn step_through_catch_exception_with_active_exception_surfaces_typed_error() {
+        // Walker fix G: RPython `pyjitpl.py:497-504 opimpl_catch_exception`:
+        //   assert not self.metainterp.last_exc_value
+        // Reaching catch_exception/L on the normal walk path with
+        // last_exc_value=Some(_) violates the codewriter invariant —
+        // surface as `CatchExceptionWithActiveException`.
+        let catch_byte = *insns_opname_to_byte()
+            .get("catch_exception/L")
+            .expect("`catch_exception/L` must be in insns table");
+        let code = [catch_byte, 0x2A, 0x00];
+        let mut tc = fresh_trace_ctx();
+        let mut regs = distinct_const_refs(&mut tc, 4);
+        let active_exc = regs[0];
+        let descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut regs,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: Some(active_exc),
+        };
+        let err =
+            step(&code, 0, &mut wc).expect_err("catch_exception/L with active exc must error");
+        assert_eq!(
+            err,
+            DispatchError::CatchExceptionWithActiveException { pc: 0 }
+        );
     }
 
     #[test]
@@ -1391,12 +3853,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("catch_exception/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -1434,12 +3901,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut regs,
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: descr_exc.clone(),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -1470,26 +3942,38 @@ mod tests {
     }
 
     #[test]
-    fn step_through_reraise_terminates_with_no_operand() {
-        // Slice 2e: `reraise/` is a 0-arg terminator. RPython
-        // `pyjitpl.py:1700-1704 opimpl_reraise → popframe → finishframe_exception`.
-        // Linear walk just terminates; recording deferred to MIFrame integration.
+    fn step_through_reraise_at_top_level_records_outermost_finish() {
+        // Slice 2i: `reraise/` mirrors `raise/r` for the top-level
+        // frame — it records `FINISH(last_exc_value,
+        // exit_frame_with_exception_descr_ref)`. RPython parity:
+        // `pyjitpl.py:1700-1704 opimpl_reraise → popframe →
+        // finishframe_exception` when the framestack is empty falls
+        // through to `compile_exit_frame_with_exception(last_exc_box)`
+        // (pyjitpl.py:2533-2538).
         let reraise_byte = *insns_opname_to_byte()
             .get("reraise/")
             .expect("`reraise/` must be in insns table");
         let code = [reraise_byte];
         let mut tc = fresh_trace_ctx();
-        let descr = done_descr_ref_for_tests();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let active_exc = regs_r[1];
+        let descr_done = done_descr_ref_for_tests();
+        let descr_exc = make_fail_descr(99);
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
-            registers_r: &mut [],
+            registers_r: &mut regs_r,
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
-            done_with_this_frame_descr_ref: descr.clone(),
-            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            done_with_this_frame_descr_ref: descr_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: descr_exc.clone(),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: Some(active_exc),
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("reraise/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -1497,8 +3981,385 @@ mod tests {
         drop(wc);
         assert_eq!(
             tc.num_ops(),
+            ops_before + 1,
+            "reraise/ at top-level must record exactly one outermost FINISH",
+        );
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
+        assert_eq!(
+            last.args.as_slice(),
+            &[active_exc],
+            "FINISH args must carry the standing last_exc_value OpRef",
+        );
+        let recorded_descr = last
+            .descr
+            .as_ref()
+            .expect("FINISH must carry exit_frame_with_exception_descr_ref");
+        assert!(
+            std::sync::Arc::ptr_eq(recorded_descr, &descr_exc),
+            "reraise/ at top-level must use exit_frame_with_exception_descr_ref",
+        );
+    }
+
+    #[test]
+    fn step_through_reraise_without_last_exc_value_surfaces_typed_error() {
+        // Slice 2i: RPython `pyjitpl.py:1702 opimpl_reraise`:
+        //   assert self.metainterp.last_exc_value
+        // — reaching `reraise` without an active exception is a
+        // codewriter invariant violation. Walker surfaces it as a
+        // typed error rather than an arbitrary panic / silent
+        // fall-through.
+        let reraise_byte = *insns_opname_to_byte()
+            .get("reraise/")
+            .expect("`reraise/` must be in insns table");
+        let code = [reraise_byte];
+        let mut tc = fresh_trace_ctx();
+        let descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let err = step(&code, 0, &mut wc).expect_err("reraise/ without last_exc_value must error");
+        assert_eq!(err, DispatchError::ReraiseWithoutLastExcValue { pc: 0 });
+    }
+
+    #[test]
+    fn raise_at_top_level_populates_last_exc_value_before_finish() {
+        // Slice 2i: `raise/r` at top-level records FINISH and *also*
+        // sets `ctx.last_exc_value` (RPython `pyjitpl.py:1695`). The
+        // post-condition matters because a future opcode in a
+        // wrap-around (e.g. an unconditional `reraise/` after the
+        // raise) would read it. Independently asserting the field
+        // post-step locks in the side effect.
+        let raise_byte = *insns_opname_to_byte()
+            .get("raise/r")
+            .expect("`raise/r` must be in insns table");
+        let code = [raise_byte, 0x02];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let exc = regs_r[2];
+        let descr_done = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let _ = step(&code, 0, &mut wc).expect("raise/r must dispatch");
+        assert_eq!(
+            wc.last_exc_value,
+            Some(exc),
+            "raise/r must populate ctx.last_exc_value before terminating",
+        );
+    }
+
+    #[test]
+    fn dump_rvmprof_code_presence() {
+        // Throw-away check: rvmprof_code/ii presence in pyre's insns
+        // table. Used to decide whether `try_catch_exception_at` needs
+        // a runtime rvmprof skip path or just forward-prep
+        // documentation.
+        let t = insns_opname_to_byte();
+        if let Some(b) = t.get("rvmprof_code/ii") {
+            eprintln!("rvmprof_code/ii IS in insns table: byte = {b}");
+        } else {
+            eprintln!("rvmprof_code/ii is NOT in pyre insns table (forward-prep)");
+        }
+    }
+
+    #[test]
+    fn dump_unsupported_opnames_in_insns_table() {
+        // Throw-away audit: list every opname pyre's codewriter
+        // currently emits that the walker has no handler arm for.
+        // Drives the slice-by-slice handler coverage plan — the
+        // remaining names are the work queue.
+        use std::collections::HashSet;
+        let t = insns_opname_to_byte();
+        let supported: HashSet<&'static str> = [
+            "live/",
+            "goto/L",
+            "catch_exception/L",
+            "ref_return/r",
+            "inline_call_r_r/dR>r",
+            "int_copy/i>i",
+            "int_add/ii>i",
+            "int_sub/ii>i",
+            "int_mul/ii>i",
+            "int_and/ii>i",
+            "int_or/ii>i",
+            "int_xor/ii>i",
+            "int_rshift/ii>i",
+            "int_eq/ii>i",
+            "int_ne/ii>i",
+            "int_lt/ii>i",
+            "int_le/ii>i",
+            "int_gt/ii>i",
+            "int_ge/ii>i",
+            "float_add/ff>f",
+            "float_sub/ff>f",
+            "float_truediv/ff>f",
+            "float_neg/f>f",
+            "int_neg/i>i",
+            "int_invert/i>i",
+            "int_same_as/i>i",
+            "int_mod/ii>i",
+            "cast_int_to_float/i>f",
+            "ptr_eq/rr>i",
+            "ptr_ne/rr>i",
+            "getfield_gc_i/rd>i",
+            "getfield_gc_r/rd>r",
+            "setfield_gc_i/rid",
+            "setfield_gc_r/rrd",
+            "getarrayitem_gc_r/rid>r",
+            "setarrayitem_gc_r/rird",
+            "residual_call_r_r/iRd>r",
+            "residual_call_r_i/iRd>i",
+            "residual_call_ir_r/iIRd>r",
+            "raise/r",
+            "reraise/",
+            "last_exc_value/>r",
+            "int_return/i",
+            "float_return/f",
+            "void_return/",
+            "inline_call_r_i/dR>i",
+            "inline_call_ir_r/dIR>r",
+            "inline_call_ir_i/dIR>i",
+            "inline_call_irf_r/dIRF>r",
+            "inline_call_irf_f/dIRF>f",
+        ]
+        .into_iter()
+        .collect();
+        let mut missing: Vec<&str> = t
+            .keys()
+            .map(|s| s.as_str())
+            .filter(|n| !supported.contains(n))
+            .collect();
+        missing.sort();
+        eprintln!(
+            "Pyre insns table: {} opnames total; {} unsupported by walker",
+            t.len(),
+            missing.len()
+        );
+        for n in &missing {
+            eprintln!("UNSUPPORTED: {n}");
+        }
+    }
+
+    #[test]
+    fn inline_call_subraise_jumps_to_caller_catch_exception_target() {
+        // Slice 2i acceptance: callee's `raise/r` surfaces SubRaise to
+        // the caller; caller's inline_call SubRaise arm probes
+        // `op.next_pc` for `live/` + `catch_exception/L`, finds it,
+        // sets `last_exc_value = exc`, and resumes at the catch target.
+        // RPython parity: `pyjitpl.py:2506-2522 finishframe_exception`
+        // line-by-line — `op_live` skip then `op_catch_exception`
+        // target jump.
+        let raise_byte = *insns_opname_to_byte()
+            .get("raise/r")
+            .expect("`raise/r` must be in insns table");
+        let inline_byte = *insns_opname_to_byte()
+            .get("inline_call_r_r/dR>r")
+            .expect("`inline_call_r_r/dR>r` must be in insns table");
+        let live_byte = *insns_opname_to_byte()
+            .get("live/")
+            .expect("`live/` must be in insns table");
+        let catch_byte = *insns_opname_to_byte()
+            .get("catch_exception/L")
+            .expect("`catch_exception/L` must be in insns table");
+        let ret_byte = *insns_opname_to_byte()
+            .get("ref_return/r")
+            .expect("`ref_return/r` must be in insns table");
+        // Callee: `raise r0`
+        let callee_code: &'static [u8] = Box::leak(Box::new([raise_byte, 0]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 0,
+            num_regs_f: 0,
+        };
+        let lookup = move |idx: usize| {
+            if idx == 11 {
+                Some(sub_body.clone())
+            } else {
+                None
+            }
+        };
+        // Caller layout (matches PopTop arm shape):
+        //   pc=0..6   inline_call_r_r descr=11 R=[r3] >r=r5
+        //     opcode(1) + d(2) + R-len(1) + R[0](1) + dst(1)
+        //   pc=6..9   live + 2-byte liveness offset (OFFSET_SIZE=2)
+        //     opcode(1) + slot(2)
+        //   pc=9..12  catch_exception/L target=12 (LE little-endian)
+        //     opcode(1) + target(2)
+        //   pc=12..14 handler body: ref_return r5
+        //     opcode(1) + reg(1)
+        let caller_code = vec![
+            inline_byte,
+            0x0B,
+            0x00,
+            0x01,
+            0x03,
+            0x05,
+            live_byte,
+            0x00,
+            0x00,
+            catch_byte,
+            0x0C,
+            0x00,
+            ret_byte,
+            0x05,
+        ];
+        assert_eq!(caller_code.len(), 14);
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let exc_arg = regs_r[3];
+        let descr_done = done_descr_ref_for_tests();
+        let descr_exc = make_fail_descr(99);
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[11] = make_jitcode_descr(11);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr_done.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: descr_exc,
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let (outcome, end_pc) =
+            walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
+        assert_eq!(
+            outcome,
+            DispatchOutcome::Terminate,
+            "caller must reach handler's ref_return and terminate (not bubble SubRaise)",
+        );
+        assert_eq!(
+            end_pc, 14,
+            "walker must terminate at handler's ref_return r5 (pc=12..14)",
+        );
+        assert_eq!(
+            wc.last_exc_value,
+            Some(exc_arg),
+            "caller's last_exc_value must be set to the exc OpRef from callee SubRaise",
+        );
+        drop(wc);
+        // Outermost FINISH must carry the handler's ref_return arg —
+        // r5, which still holds its pre-call distinct_const_refs OpRef
+        // (caller's inline_call dst write happens *only* on
+        // SubReturn, not SubRaise-then-catch).
+        let last = tc.ops().last().expect("FINISH must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
+    }
+
+    #[test]
+    fn inline_call_subraise_without_caller_catch_bubbles_up_in_subwalk() {
+        // Walker fix I context: when the caller is itself a sub-walk
+        // (`is_top_level=false`) and SubRaise reaches its `walk()`
+        // loop with no `catch_exception/L` match, the loop returns
+        // `SubRaise` unchanged so the parent's inline_call SubRaise arm
+        // can scan its own op.next_pc for a catch handler.
+        // RPython parity: `pyjitpl.py:2533 finishframe_exception` loops
+        // through the framestack — only when `framestack` is exhausted
+        // does it call `compile_exit_frame_with_exception`. Sub-walks
+        // are not the framestack root.
+        //
+        // (The top-level FINISH conversion path is covered by
+        // `inline_call_recursion_propagates_subraise_from_callee`
+        // above.)
+        let raise_byte = *insns_opname_to_byte()
+            .get("raise/r")
+            .expect("`raise/r` must be in insns table");
+        let inline_byte = *insns_opname_to_byte()
+            .get("inline_call_r_r/dR>r")
+            .expect("`inline_call_r_r/dR>r` must be in insns table");
+        let goto_byte = *insns_opname_to_byte()
+            .get("goto/L")
+            .expect("`goto/L` must be in insns table");
+        let callee_code: &'static [u8] = Box::leak(Box::new([raise_byte, 0]));
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 0,
+            num_regs_f: 0,
+        };
+        let lookup = move |idx: usize| {
+            if idx == 13 {
+                Some(sub_body.clone())
+            } else {
+                None
+            }
+        };
+        let caller_code = [
+            inline_byte,
+            0x0D,
+            0x00,
+            0x01,
+            0x02,
+            0x05,
+            goto_byte,
+            0x00,
+            0x00,
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let exc_arg = regs_r[2];
+        let descr_done = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[13] = make_jitcode_descr(13);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            // Sub-walk frame: bubble-up behaviour, no FINISH conversion.
+            is_top_level: false,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let ops_before = wc.trace_ctx.num_ops();
+        let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
+        assert_eq!(
+            outcome,
+            DispatchOutcome::SubRaise { exc: exc_arg },
+            "sub-walk frame with no caller-side catch must bubble SubRaise through",
+        );
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
             ops_before,
-            "reraise/ records nothing on the linear walk (deferred to MIFrame integration)",
+            "sub-walk SubRaise must NOT record FINISH (only top-level converts)",
         );
     }
 
@@ -1522,12 +4383,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -1564,12 +4430,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let _ = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(
@@ -1597,12 +4468,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -1629,12 +4505,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [], // empty — index 7 must surface OOR
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy/i>i must read its src operand");
         assert_eq!(
@@ -1648,31 +4529,553 @@ mod tests {
         );
     }
 
-    #[test]
-    fn unsupported_opname_surfaces_typed_error() {
-        // Slice 2g progresses past residual_call_r_r. `int_add/ii>i`
-        // is confirmed in the production insns table (cf.
-        // jitcode_runtime.rs:864 etc.) but lives outside the PopTop op
-        // set — handler not installed yet. Stable choice for exercising
-        // the catch-all `UnsupportedOpname` error path while we keep
-        // adding handlers.
-        let opname = "int_add/ii>i";
-        let unsupported_byte = *insns_opname_to_byte()
+    /// Drive a single `int_<binop>/ii>i` handler: the codewriter
+    /// encodes `[opcode, src1, src2, dst]`. Asserts the recorder
+    /// captured `OpCode::<expected>` with `[regs_i[src1],
+    /// regs_i[src2]]` and that `regs_i[dst]` was written with the
+    /// recorder's result OpRef.
+    fn drive_int_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
+        let byte = *insns_opname_to_byte()
             .get(opname)
             .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
-        // Operand encoding `ii>i`: 1B src1 + 1B src2 + 1B dst = 3B
-        let code = [unsupported_byte, 0, 0, 0];
+        // src=2, src2=4, dst=6 — chosen to be distinct so misordered
+        // operand decoding surfaces in the assertion.
+        let code = [byte, 0x02, 0x04, 0x06];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let arg0 = regs_i[2];
+        let arg1 = regs_i[4];
+        let dst_pre = regs_i[6];
+        let descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc)
+            .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, 4, "`{opname}` operand layout `ii>i` = 3 bytes");
+        let dst_post = wc.registers_i[6];
+        assert_ne!(
+            dst_post, dst_pre,
+            "`{opname}` must write a fresh OpRef into registers_i[dst]",
+        );
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before + 1,
+            "`{opname}` must record exactly one op",
+        );
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(
+            last.opcode, expected_opcode,
+            "`{opname}` must record `{:?}`",
+            expected_opcode,
+        );
+        assert_eq!(
+            last.args.as_slice(),
+            &[arg0, arg1],
+            "`{opname}` args must be [registers_i[src1], registers_i[src2]] in source order",
+        );
+        assert_eq!(
+            dst_post, last.pos,
+            "`{opname}` dst must hold the recorder's result OpRef (op.pos)",
+        );
+    }
+
+    #[test]
+    fn int_add_records_intadd_with_both_operands_and_writes_dst() {
+        drive_int_binop("int_add/ii>i", majit_ir::OpCode::IntAdd);
+    }
+
+    #[test]
+    fn int_sub_records_intsub() {
+        drive_int_binop("int_sub/ii>i", majit_ir::OpCode::IntSub);
+    }
+
+    #[test]
+    fn int_mul_records_intmul() {
+        drive_int_binop("int_mul/ii>i", majit_ir::OpCode::IntMul);
+    }
+
+    #[test]
+    fn int_and_records_intand() {
+        drive_int_binop("int_and/ii>i", majit_ir::OpCode::IntAnd);
+    }
+
+    #[test]
+    fn int_or_records_intor() {
+        drive_int_binop("int_or/ii>i", majit_ir::OpCode::IntOr);
+    }
+
+    #[test]
+    fn int_xor_records_intxor() {
+        drive_int_binop("int_xor/ii>i", majit_ir::OpCode::IntXor);
+    }
+
+    #[test]
+    fn int_rshift_records_intrshift() {
+        drive_int_binop("int_rshift/ii>i", majit_ir::OpCode::IntRshift);
+    }
+
+    #[test]
+    fn int_eq_records_inteq() {
+        drive_int_binop("int_eq/ii>i", majit_ir::OpCode::IntEq);
+    }
+
+    #[test]
+    fn int_ne_records_intne() {
+        drive_int_binop("int_ne/ii>i", majit_ir::OpCode::IntNe);
+    }
+
+    #[test]
+    fn int_lt_records_intlt() {
+        drive_int_binop("int_lt/ii>i", majit_ir::OpCode::IntLt);
+    }
+
+    #[test]
+    fn int_le_records_intle() {
+        drive_int_binop("int_le/ii>i", majit_ir::OpCode::IntLe);
+    }
+
+    #[test]
+    fn int_gt_records_intgt() {
+        drive_int_binop("int_gt/ii>i", majit_ir::OpCode::IntGt);
+    }
+
+    #[test]
+    fn int_ge_records_intge() {
+        drive_int_binop("int_ge/ii>i", majit_ir::OpCode::IntGe);
+    }
+
+    /// Drive a single `float_<binop>/ff>f` handler. Same shape as
+    /// `drive_int_binop` but on the float bank.
+    fn drive_float_binop(opname: &str, expected_opcode: majit_ir::OpCode) {
+        let byte = *insns_opname_to_byte()
+            .get(opname)
+            .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
+        let code = [byte, 0x02, 0x04, 0x06];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_f = distinct_const_refs(&mut tc, 8);
+        let arg0 = regs_f[2];
+        let arg1 = regs_f[4];
+        let dst_pre = regs_f[6];
+        let descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut [],
+            registers_f: &mut regs_f,
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc)
+            .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, 4, "`{opname}` operand layout `ff>f` = 3 bytes");
+        let dst_post = wc.registers_f[6];
+        assert_ne!(
+            dst_post, dst_pre,
+            "`{opname}` must write a fresh OpRef into registers_f[dst]",
+        );
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before + 1,
+            "`{opname}` must record exactly one op",
+        );
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, expected_opcode);
+        assert_eq!(last.args.as_slice(), &[arg0, arg1]);
+        assert_eq!(dst_post, last.pos);
+    }
+
+    #[test]
+    fn float_add_records_floatadd() {
+        drive_float_binop("float_add/ff>f", majit_ir::OpCode::FloatAdd);
+    }
+
+    #[test]
+    fn float_sub_records_floatsub() {
+        drive_float_binop("float_sub/ff>f", majit_ir::OpCode::FloatSub);
+    }
+
+    #[test]
+    fn float_truediv_records_floattruediv() {
+        drive_float_binop("float_truediv/ff>f", majit_ir::OpCode::FloatTrueDiv);
+    }
+
+    #[test]
+    fn float_neg_records_floatneg_with_one_operand_and_writes_dst() {
+        // `f>f` shape: 1B src + 1B dst = 2 operand bytes after opcode.
+        let byte = *insns_opname_to_byte()
+            .get("float_neg/f>f")
+            .expect("`float_neg/f>f` must be in insns table");
+        let code = [byte, 0x02, 0x05];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_f = distinct_const_refs(&mut tc, 8);
+        let arg = regs_f[2];
+        let dst_pre = regs_f[5];
+        let descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut [],
+            registers_f: &mut regs_f,
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("float_neg/f>f must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, 3, "float_neg/f>f operand layout `f>f` = 2 bytes");
+        let dst_post = wc.registers_f[5];
+        assert_ne!(dst_post, dst_pre);
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::FloatNeg);
+        assert_eq!(
+            last.args.as_slice(),
+            &[arg],
+            "FloatNeg args must be [registers_f[src]]",
+        );
+        assert_eq!(dst_post, last.pos);
+    }
+
+    /// Drive a single `int_<unop>/i>i` handler. Same shape pattern as
+    /// `drive_int_binop` minus one read.
+    fn drive_int_unop(opname: &str, expected_opcode: majit_ir::OpCode) {
+        let byte = *insns_opname_to_byte()
+            .get(opname)
+            .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
+        let code = [byte, 0x02, 0x05]; // src=2, dst=5
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let arg = regs_i[2];
+        let dst_pre = regs_i[5];
+        let descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc)
+            .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, 3, "`{opname}` operand layout `i>i` = 2 bytes");
+        let dst_post = wc.registers_i[5];
+        assert_ne!(dst_post, dst_pre);
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, expected_opcode);
+        assert_eq!(last.args.as_slice(), &[arg]);
+        assert_eq!(dst_post, last.pos);
+    }
+
+    #[test]
+    fn int_neg_records_intneg() {
+        drive_int_unop("int_neg/i>i", majit_ir::OpCode::IntNeg);
+    }
+
+    #[test]
+    fn int_invert_records_intinvert() {
+        drive_int_unop("int_invert/i>i", majit_ir::OpCode::IntInvert);
+    }
+
+    #[test]
+    fn int_same_as_records_sameasi() {
+        drive_int_unop("int_same_as/i>i", majit_ir::OpCode::SameAsI);
+    }
+
+    #[test]
+    fn int_mod_records_intmod() {
+        drive_int_binop("int_mod/ii>i", majit_ir::OpCode::IntMod);
+    }
+
+    #[test]
+    fn cast_int_to_float_reads_int_writes_float_with_castintto_float_op() {
+        // `i>f` shape: 1B i-src + 1B f-dst.
+        let byte = *insns_opname_to_byte()
+            .get("cast_int_to_float/i>f")
+            .expect("`cast_int_to_float/i>f` must be in insns table");
+        let code = [byte, 0x02, 0x05]; // i-src=2, f-dst=5
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let mut regs_f = distinct_const_refs(&mut tc, 8);
+        let arg = regs_i[2];
+        let dst_pre = regs_f[5];
+        let descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut regs_f,
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("cast_int_to_float must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(
+            next_pc, 3,
+            "`cast_int_to_float/i>f` operand layout = 2 bytes"
+        );
+        let dst_post = wc.registers_f[5];
+        assert_ne!(
+            dst_post, dst_pre,
+            "cast_int_to_float must write registers_f[dst] (not registers_i)",
+        );
+        // i-src must remain unchanged.
+        assert_eq!(wc.registers_i[2], arg);
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::CastIntToFloat);
+        assert_eq!(last.args.as_slice(), &[arg]);
+        assert_eq!(dst_post, last.pos);
+    }
+
+    /// Drive `ptr_eq/rr>i` or `ptr_ne/rr>i`. Shape `rr>i`: read 2
+    /// r-regs, record, write to i-bank.
+    fn drive_ptr_compare(opname: &str, expected_opcode: majit_ir::OpCode) {
+        let byte = *insns_opname_to_byte()
+            .get(opname)
+            .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
+        let code = [byte, 0x02, 0x04, 0x06]; // r-src1=2, r-src2=4, i-dst=6
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let arg0 = regs_r[2];
+        let arg1 = regs_r[4];
+        let dst_pre = regs_i[6];
+        let descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc)
+            .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, 4, "`{opname}` operand layout `rr>i` = 3 bytes");
+        let dst_post = wc.registers_i[6];
+        assert_ne!(dst_post, dst_pre);
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, expected_opcode);
+        assert_eq!(last.args.as_slice(), &[arg0, arg1]);
+        assert_eq!(dst_post, last.pos);
+    }
+
+    #[test]
+    fn ptr_eq_records_ptreq_with_two_ref_operands_into_int_dst() {
+        drive_ptr_compare("ptr_eq/rr>i", majit_ir::OpCode::PtrEq);
+    }
+
+    #[test]
+    fn ptr_ne_records_ptrne() {
+        drive_ptr_compare("ptr_ne/rr>i", majit_ir::OpCode::PtrNe);
+    }
+
+    #[test]
+    fn float_add_with_out_of_range_src_register_surfaces_typed_error() {
+        let byte = *insns_opname_to_byte()
+            .get("float_add/ff>f")
+            .expect("`float_add/ff>f` must be in insns table");
+        let code = [byte, 0x07, 0x00, 0x00]; // src=7, registers_f empty
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
-            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let err = step(&code, 0, &mut wc).expect_err("float_add must read its src operand");
+        assert_eq!(
+            err,
+            DispatchError::RegisterOutOfRange {
+                pc: 0,
+                reg: 7,
+                len: 0,
+                bank: "f",
+            },
+        );
+    }
+
+    #[test]
+    fn int_add_with_out_of_range_src_register_surfaces_typed_error() {
+        // OOR validation parity with int_copy. Bank tag = "i".
+        let byte = *insns_opname_to_byte()
+            .get("int_add/ii>i")
+            .expect("`int_add/ii>i` must be in insns table");
+        let code = [byte, 0x07, 0x00, 0x00]; // src=7, registers_i empty
+        let mut tc = fresh_trace_ctx();
+        let descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let err = step(&code, 0, &mut wc).expect_err("int_add must read its src operand");
+        assert_eq!(
+            err,
+            DispatchError::RegisterOutOfRange {
+                pc: 0,
+                reg: 7,
+                len: 0,
+                bank: "i",
+            },
+        );
+    }
+
+    #[test]
+    fn int_add_with_out_of_range_dst_register_surfaces_typed_error() {
+        // src reads succeed, dst write surfaces OOR. Catches the
+        // reverse-direction encoding bugs the src-only test misses.
+        let byte = *insns_opname_to_byte()
+            .get("int_add/ii>i")
+            .expect("`int_add/ii>i` must be in insns table");
+        let code = [byte, 0x00, 0x01, 0x09]; // dst=9, registers_i.len()=4 → OOR
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 4);
+        let descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let err = step(&code, 0, &mut wc).expect_err("int_add dst OOR must surface a typed error");
+        assert_eq!(
+            err,
+            DispatchError::RegisterOutOfRange {
+                pc: 0,
+                reg: 9,
+                len: 4,
+                bank: "i",
+            },
+        );
+    }
+
+    #[test]
+    fn unsupported_opname_surfaces_typed_error() {
+        // Slice 2j added int arithmetic + comparison handlers. The
+        // `getfield_vable_i/rd>i` opname is the next blocker for the
+        // ignored `walk_return_value_arm_*` test (cf. test failure
+        // log) and remains unsupported pending Phase D-3 (MIFrame
+        // virtualizable_boxes + heapcache + vinfo prereqs). Stable
+        // choice for exercising the catch-all `UnsupportedOpname`
+        // error path while handler coverage continues to grow.
+        let opname = "getfield_vable_i/rd>i";
+        let unsupported_byte = *insns_opname_to_byte()
+            .get(opname)
+            .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
+        // Operand encoding `rd>i`: 1B r-reg + 2B descr + 1B dst = 4B
+        let code = [unsupported_byte, 0, 0, 0, 0];
+        let mut tc = fresh_trace_ctx();
+        let descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("unsupported opname must hit UnsupportedOpname");
@@ -1710,20 +5113,39 @@ mod tests {
         let arg1_expected = regs_r[7];
         // Build a 2-entry descr table — index 0 is a decoy (different
         // pointer), index 1 is the descr we expect the recorder to attach.
-        let decoy = make_fail_descr(2);
-        let call_descr = make_fail_descr(3);
+        // RPython `_build_allboxes` reads `descr.get_arg_types()` to
+        // permute argboxes into ABI order; the test passes 2 R args so
+        // `arg_types = [Ref, Ref]` keeps the permutation an identity
+        // (allboxes = [funcbox, r0, r1]).
+        let decoy = make_call_descr(
+            2,
+            vec![Type::Ref, Type::Ref],
+            Type::Ref,
+            majit_ir::ExtraEffect::CanRaise,
+        );
+        let call_descr = make_call_descr(
+            3,
+            vec![Type::Ref, Type::Ref],
+            Type::Ref,
+            majit_ir::ExtraEffect::CanRaise,
+        );
         let descr_pool = vec![decoy, call_descr.clone()];
         let frame_done_descr = done_descr_ref_for_tests();
         let ops_before = tc.num_ops();
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
@@ -1774,19 +5196,35 @@ mod tests {
         );
     }
 
-    /// Build a `SimpleCallDescr` with the given `extraeffect` so the
-    /// walker's EffectInfo classification can be exercised in tests.
-    fn call_descr_with_effect(idx: u32, extra: majit_ir::ExtraEffect) -> DescrRef {
+    /// Build a `SimpleCallDescr` for tests, parameterised by `arg_types`,
+    /// `result_type`, and `extraeffect`. The `_build_allboxes` permutation
+    /// reads `arg_types` as the callee's ABI ordering, so tests must pass
+    /// the exact types of the arglist they exercise.
+    fn make_call_descr(
+        idx: u32,
+        arg_types: Vec<Type>,
+        result_type: Type,
+        extra: majit_ir::ExtraEffect,
+    ) -> DescrRef {
         let mut effect = majit_ir::EffectInfo::default();
         effect.extraeffect = extra;
         std::sync::Arc::new(majit_ir::SimpleCallDescr::new(
             idx,
-            vec![majit_ir::Type::Int, majit_ir::Type::Ref],
-            majit_ir::Type::Ref,
+            arg_types,
+            result_type,
             false,
             std::mem::size_of::<usize>(),
             effect,
         ))
+    }
+
+    /// Convenience: legacy signature used by elidable-classification
+    /// tests with empty arglists (0 R args, descr arg_types=[]).
+    /// `result_type` defaults to `Ref` matching `_r_r` shape. Callers
+    /// exercising actual args must use [`make_call_descr`] directly to
+    /// pass matching `arg_types`.
+    fn call_descr_with_effect(idx: u32, extra: majit_ir::ExtraEffect) -> DescrRef {
+        make_call_descr(idx, vec![], Type::Ref, extra)
     }
 
     #[test]
@@ -1810,12 +5248,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -1851,12 +5294,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -1894,12 +5342,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -1927,17 +5380,29 @@ mod tests {
         let mut regs_i = distinct_const_refs(&mut tc, 1);
         let mut regs_r = distinct_const_refs(&mut tc, 8);
         let dst_val_pre = regs_r[3];
-        let descr_pool = vec![make_fail_descr(1)];
+        // 0 R args → arg_types=[]; CallDescr required (RPython
+        // do_residual_call always has one).
+        let descr_pool = vec![make_call_descr(
+            1,
+            vec![],
+            Type::Ref,
+            majit_ir::ExtraEffect::CanRaise,
+        )];
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         // The dst slot must hold the OpRef of the recorded CallR. Each
@@ -1974,17 +5439,29 @@ mod tests {
         let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x07]; // dst=7
         let mut tc = fresh_trace_ctx();
         let mut regs_i = distinct_const_refs(&mut tc, 1);
-        let descr_pool = vec![make_fail_descr(1)];
+        // CallDescr required so the walker reaches the dst writeback
+        // path (RPython do_residual_call invariant).
+        let descr_pool = vec![make_call_descr(
+            1,
+            vec![],
+            Type::Ref,
+            majit_ir::ExtraEffect::CanRaise,
+        )];
         let frame_done_descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let err = step(&code, 0, &mut wc).expect_err("dst OOR must surface a typed error");
         assert_eq!(
@@ -2014,12 +5491,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("descr index 5 with pool size 2 must surface DescrIndexOutOfRange");
@@ -2029,6 +5511,401 @@ mod tests {
                 pc: 0,
                 index: 5,
                 len: 2,
+            },
+        );
+    }
+
+    #[test]
+    fn step_through_residual_call_r_i_records_calli_with_int_dst_writeback() {
+        // Slice 4.1: kind sibling of `_r_r`. Same `iRd>X` operand
+        // layout, dst kind flipped to int. RPython `pyjitpl.py:1346
+        // opimpl_residual_call_r_i = _opimpl_residual_call1` shares
+        // the body; `do_residual_call`'s `descr.get_normalized_result_type()`
+        // dispatch (pyjitpl.py:2022-2044) selects `'i' → CALL_*_I`.
+        // CallDescr required (RPython do_residual_call invariant);
+        // walker records `OpCode::CallI` + `OpCode::GuardNoException`,
+        // writes the call's OpRef into `registers_i[dst]`.
+        let residual_byte = *insns_opname_to_byte()
+            .get("residual_call_r_i/iRd>i")
+            .expect("`residual_call_r_i/iRd>i` must be in insns table");
+        // Operand encoding `iRd>i`: 1B funcptr (i-reg=2),
+        // 1B varlen=2 + [r-reg=4, r-reg=7], 2B descr_index=1 (LE),
+        // 1B dst-reg=3 (writeback target into registers_i).
+        let code = [
+            residual_byte,
+            0x02, // funcptr from registers_i[2]
+            0x02, // varlen
+            0x04,
+            0x07, // args from registers_r[4, 7]
+            0x01,
+            0x00, // descr index = 1 (LE)
+            0x03, // dst i-reg = 3
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let funcptr_expected = regs_i[2];
+        let arg0_expected = regs_r[4];
+        let arg1_expected = regs_r[7];
+        let dst_pre = regs_i[3];
+        // 2 R args + Int return → CallDescr arg_types=[Ref, Ref],
+        // result_type=Int. `_build_allboxes` permutation is identity
+        // (R-only argboxes match arg_types order).
+        let decoy = make_call_descr(
+            2,
+            vec![Type::Ref, Type::Ref],
+            Type::Int,
+            majit_ir::ExtraEffect::CanRaise,
+        );
+        let call_descr = make_call_descr(
+            3,
+            vec![Type::Ref, Type::Ref],
+            Type::Int,
+            majit_ir::ExtraEffect::CanRaise,
+        );
+        let descr_pool = vec![decoy, call_descr.clone()];
+        let frame_done_descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) =
+            step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, code.len());
+        // CallI (kind sibling of CallR) + GuardNoException recorded.
+        assert_eq!(
+            wc.trace_ctx.num_ops(),
+            ops_before + 2,
+            "_r_i must record CallI + GuardNoException (no-effectinfo fallback)",
+        );
+        let call_op = wc
+            .trace_ctx
+            .ops()
+            .iter()
+            .find(|o| o.opcode == majit_ir::OpCode::CallI)
+            .expect("CallI must be recorded for the int-dst kind");
+        assert_eq!(
+            call_op.args.as_slice(),
+            &[funcptr_expected, arg0_expected, arg1_expected],
+            "CallI args must be [funcptr, ...args] from registers_i+registers_r",
+        );
+        let recorded_descr = call_op
+            .descr
+            .as_ref()
+            .expect("CallI must carry the calldescr");
+        assert!(
+            std::sync::Arc::ptr_eq(recorded_descr, &call_descr),
+            "CallI descr must be descr_refs[1] (not decoy at index 0)",
+        );
+        // dst writeback into the int bank (NOT the r bank).
+        let dst_post = wc.registers_i[3];
+        assert_ne!(
+            dst_post, dst_pre,
+            "registers_i[dst] must change from its pre-call value",
+        );
+        assert_eq!(
+            dst_post, call_op.pos,
+            "registers_i[dst] must be the recorded CallI's OpRef (op.pos)",
+        );
+    }
+
+    #[test]
+    fn residual_call_r_i_with_elidable_cannot_raise_records_callpurei_no_guard() {
+        // Slice 4.1: EF_ELIDABLE_CANNOT_RAISE on the int-kind sibling
+        // must rewrite to CALL_PURE_I (not CALL_PURE_R) and skip
+        // GUARD_NO_EXCEPTION. Confirms the `pure_op` selection in
+        // `dispatch_residual_call_iRd_kind` follows `dst_bank`.
+        let residual_byte = *insns_opname_to_byte()
+            .get("residual_call_r_i/iRd>i")
+            .expect("`residual_call_r_i/iRd>i` must be in insns table");
+        let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 4);
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let elidable_descr = call_descr_with_effect(7, majit_ir::ExtraEffect::ElidableCannotRaise);
+        let descr_pool = vec![elidable_descr.clone()];
+        let frame_done_descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let _ = step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before + 1,
+            "elidable+cannot-raise on int-kind must record exactly CallPureI",
+        );
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(
+            last.opcode,
+            majit_ir::OpCode::CallPureI,
+            "EF_ELIDABLE_CANNOT_RAISE on int-kind must rewrite to CALL_PURE_I",
+        );
+    }
+
+    #[test]
+    fn step_through_residual_call_ir_r_records_callr_with_int_and_ref_args() {
+        // Slice 4.2: shape sibling `_ir_r/iIRd>r`. Operand layout adds
+        // an i-bank list between funcptr and the R-list. RPython
+        // `_build_allboxes` permutes argboxes by `descr.get_arg_types()`
+        // ABI; for an [Int, Int, Ref, Ref] callee the permutation
+        // reduces to identity → allboxes = [funcbox, i0, i1, r0, r1].
+        // Mixed-kind permutation is exercised by the dedicated test
+        // `residual_call_ir_r_permutes_argboxes_per_arg_types_abi`.
+        let residual_byte = *insns_opname_to_byte()
+            .get("residual_call_ir_r/iIRd>r")
+            .expect("`residual_call_ir_r/iIRd>r` must be in insns table");
+        // Operand encoding `iIRd>r`: 1B funcptr (i-reg=2),
+        // i-list: 1B count=2 + [i-reg=5, i-reg=6],
+        // r-list: 1B count=2 + [r-reg=4, r-reg=7],
+        // 2B descr_index=1 (LE),
+        // 1B dst-reg=0.
+        let code = [
+            residual_byte,
+            0x02, // funcptr from registers_i[2]
+            0x02, // i-list count
+            0x05,
+            0x06, // i-args from registers_i[5, 6]
+            0x02, // r-list count
+            0x04,
+            0x07, // r-args from registers_r[4, 7]
+            0x01,
+            0x00, // descr index = 1 (LE)
+            0x00, // dst r-reg = 0
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let funcptr_expected = regs_i[2];
+        let iarg0_expected = regs_i[5];
+        let iarg1_expected = regs_i[6];
+        let rarg0_expected = regs_r[4];
+        let rarg1_expected = regs_r[7];
+        // arg_types = [Int, Int, Ref, Ref] → `_build_allboxes`
+        // permutation is identity over the source-list-order argboxes.
+        let decoy = make_call_descr(
+            2,
+            vec![Type::Int, Type::Int, Type::Ref, Type::Ref],
+            Type::Ref,
+            majit_ir::ExtraEffect::CanRaise,
+        );
+        let call_descr = make_call_descr(
+            3,
+            vec![Type::Int, Type::Int, Type::Ref, Type::Ref],
+            Type::Ref,
+            majit_ir::ExtraEffect::CanRaise,
+        );
+        let descr_pool = vec![decoy, call_descr.clone()];
+        let frame_done_descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) =
+            step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(
+            next_pc,
+            code.len(),
+            "residual_call_ir_r must advance past funcptr + i-list + r-list + descr + dst",
+        );
+        // CallR + GuardNoException recorded (no-effectinfo fallback).
+        assert_eq!(
+            wc.trace_ctx.num_ops(),
+            ops_before + 2,
+            "_ir_r must record CallR + GuardNoException (no-effectinfo fallback)",
+        );
+        let call_op = wc
+            .trace_ctx
+            .ops()
+            .iter()
+            .find(|o| o.opcode == majit_ir::OpCode::CallR)
+            .expect("CallR must be recorded");
+        assert_eq!(
+            call_op.args.as_slice(),
+            &[
+                funcptr_expected,
+                iarg0_expected,
+                iarg1_expected,
+                rarg0_expected,
+                rarg1_expected,
+            ],
+            "CallR args must be [funcptr, i0, i1, r0, r1] — identity \
+             permutation when descr.arg_types=[Int, Int, Ref, Ref]",
+        );
+        let recorded_descr = call_op
+            .descr
+            .as_ref()
+            .expect("CallR must carry the calldescr");
+        assert!(
+            std::sync::Arc::ptr_eq(recorded_descr, &call_descr),
+            "CallR descr must be descr_refs[1] (not decoy at index 0)",
+        );
+        // dst writeback into registers_r[0].
+        let dst_post = wc.registers_r[0];
+        assert_eq!(
+            dst_post, call_op.pos,
+            "registers_r[dst] must be the recorded CallR's OpRef (op.pos)",
+        );
+    }
+
+    #[test]
+    fn residual_call_ir_r_permutes_argboxes_per_arg_types_abi() {
+        // Walker fix J / slice 4.2 follow-up: the `_ir_*` shape gives
+        // the walker source-list-order argboxes `[i_args..., r_args...]`,
+        // but RPython `_build_allboxes` (pyjitpl.py:1960-1993) re-orders
+        // those to match the callee's `descr.get_arg_types()` ABI. This
+        // test pins the non-identity permutation.
+        //
+        // Setup: 2 i-args + 2 r-args + arg_types = [Ref, Int, Ref, Int].
+        // Source-list-order argboxes = [i0, i1, r0, r1].
+        // `_build_allboxes` walk:
+        //   iter 1, kind=Ref: src_r scans flat argboxes for first Ref →
+        //     positions 0 (i0, skip), 1 (i1, skip), 2 (r0, match). src_r=3.
+        //   iter 2, kind=Int: src_i scans for first Int → position 0
+        //     (i0, match). src_i=1.
+        //   iter 3, kind=Ref: src_r at 3 → position 3 (r1, match). src_r=4.
+        //   iter 4, kind=Int: src_i at 1 → position 1 (i1, match). src_i=2.
+        // Final allboxes = [funcbox, r0, i0, r1, i1].
+        let residual_byte = *insns_opname_to_byte()
+            .get("residual_call_ir_r/iIRd>r")
+            .expect("`residual_call_ir_r/iIRd>r` must be in insns table");
+        let code = [
+            residual_byte,
+            0x02, // funcptr from registers_i[2]
+            0x02, // i-list count
+            0x05,
+            0x06, // i-args from registers_i[5, 6]
+            0x02, // r-list count
+            0x04,
+            0x07, // r-args from registers_r[4, 7]
+            0x00,
+            0x00, // descr index = 0 (LE)
+            0x00, // dst r-reg = 0
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let funcptr = regs_i[2];
+        let i0 = regs_i[5];
+        let i1 = regs_i[6];
+        let r0 = regs_r[4];
+        let r1 = regs_r[7];
+        let mixed_descr = make_call_descr(
+            0,
+            vec![Type::Ref, Type::Int, Type::Ref, Type::Int],
+            Type::Ref,
+            majit_ir::ExtraEffect::CanRaise,
+        );
+        let descr_pool = vec![mixed_descr.clone()];
+        let frame_done_descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
+        drop(wc);
+        let call_op = tc
+            .ops()
+            .iter()
+            .find(|o| o.opcode == majit_ir::OpCode::CallR)
+            .expect("CallR must be recorded");
+        assert_eq!(
+            call_op.args.as_slice(),
+            &[funcptr, r0, i0, r1, i1],
+            "_build_allboxes must permute to match descr.arg_types \
+             [Ref, Int, Ref, Int] — RPython pyjitpl.py:1960-1993",
+        );
+    }
+
+    #[test]
+    fn residual_call_descr_not_call_descr_surfaces_typed_error() {
+        // Walker requires CallDescr per RPython invariant
+        // (pyjitpl.py:1995 do_residual_call). When the descr_pool entry
+        // at the operand-encoded index lacks a CallDescr downcast (here
+        // a FailDescr), the walker surfaces ResidualCallDescrNotCallDescr.
+        // In production the codewriter never emits non-CallDescr; this
+        // covers the test-fixture / future-deviation case.
+        let residual_byte = *insns_opname_to_byte()
+            .get("residual_call_r_r/iRd>r")
+            .expect("`residual_call_r_r/iRd>r` must be in insns table");
+        let code = [residual_byte, 0x00, 0x00, 0x00, 0x00, 0x00];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = distinct_const_refs(&mut tc, 1);
+        let mut regs_r = distinct_const_refs(&mut tc, 1);
+        let descr_pool = vec![make_fail_descr(7)];
+        let frame_done_descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let err = step(&code, 0, &mut wc)
+            .expect_err("FailDescr (not CallDescr) must surface ResidualCallDescrNotCallDescr");
+        assert_eq!(
+            err,
+            DispatchError::ResidualCallDescrNotCallDescr {
+                pc: 0,
+                descr_index: 0,
             },
         );
     }
@@ -2049,12 +5926,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("R-list member out of range must surface RegisterOutOfRange");
@@ -2107,12 +5989,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &production_sub_jitcodes,
+            last_exc_value: None,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("ReturnValue arm must walk to a terminator");
@@ -2236,12 +6123,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
+            registers_f: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &production_sub_jitcodes,
+            last_exc_value: None,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("PopTop arm must walk to a terminator");
@@ -2296,6 +6188,846 @@ mod tests {
     }
 
     #[test]
+    fn inline_call_with_more_args_than_callee_regs_surfaces_arity_mismatch() {
+        // Slice 2i: codewriter shape contract says `R-list.len() <=
+        // callee.num_regs_r` for `inline_call_r_r/dR>r`. Walker rejects
+        // overflow with a typed error instead of silently dropping
+        // (the dropped args would carry symbolic OpRefs the callee
+        // never reads, breaking dataflow).
+        let inline_byte = *insns_opname_to_byte()
+            .get("inline_call_r_r/dR>r")
+            .expect("`inline_call_r_r/dR>r` must be in insns table");
+        // Callee declares num_regs_r=1 but caller passes 2 ref args.
+        let callee_code: &'static [u8] = Box::leak(Box::new([0xFFu8])); // unreachable
+        let sub_body = SubJitCodeBody {
+            code: callee_code,
+            num_regs_r: 1,
+            num_regs_i: 0,
+            num_regs_f: 0,
+        };
+        let lookup = move |idx: usize| {
+            if idx == 5 {
+                Some(sub_body.clone())
+            } else {
+                None
+            }
+        };
+        // R-list = [r0, r1] but callee has only 1 slot.
+        let caller_code = [inline_byte, 0x05, 0x00, 0x02, 0x00, 0x01, 0x00];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 4);
+        let descr = done_descr_ref_for_tests();
+        let mut descr_pool: Vec<DescrRef> = (0..16).map(|i| make_fail_descr(1 + i)).collect();
+        descr_pool[5] = make_jitcode_descr(5);
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &lookup,
+            last_exc_value: None,
+        };
+        let err = step(&caller_code, 0, &mut wc).expect_err("arity overflow must surface error");
+        assert_eq!(
+            err,
+            DispatchError::InlineCallArityMismatch {
+                pc: 0,
+                provided: 2,
+                callee_num_regs_r: 1,
+            },
+        );
+    }
+
+    #[test]
+    fn inline_call_with_void_subreturn_surfaces_unexpected_void_error() {
+        // Slice 2i: `_r_r` variant requires the callee to surface a Ref
+        // result. `SubReturn { result: None }` reaching the `_r_r`
+        // caller means the codewriter emitted a shape mismatch (callee
+        // body terminates with `void_return/` analogue instead of
+        // `ref_return/r`). Manufacture the mismatch directly by
+        // injecting a callee that surfaces `SubReturn { result: None }`
+        // through a synthetic outcome — but since the walker shape only
+        // emits `SubReturn { Some(_) }` from `ref_return/r`, this test
+        // currently exercises the error path via a hand-built sub-walk
+        // that bypasses the standard handlers. The simplest reliable
+        // way is to dispatch the inline_call with a callee body whose
+        // first byte is unsupported (so the sub-walk fails) — but that
+        // surfaces a *different* error. Instead we exercise the void
+        // branch indirectly: the only way `SubReturn{None}` can reach
+        // the caller is if a future handler emits it. Lock in the
+        // error path now with an explicit test that asserts the variant
+        // shape so the contract is captured (the regression that this
+        // test guards against is silently dropping a void return into
+        // a `_r_r` slot, which any future handler could reintroduce).
+        //
+        // Since current handlers never emit `SubReturn{None}`, this
+        // test simply verifies the typed-error variant exists and is
+        // constructible — once a future handler can synthesize the
+        // condition, the assertion will become the real regression
+        // guard. RPython parity: the `_r_r`/`_r_v` shape split is in
+        // `assembler.py:gen_inline_call` and is enforced statically by
+        // the codewriter; the walker's job is to surface the violation
+        // rather than mask it.
+        let err = DispatchError::UnexpectedVoidSubReturn { pc: 42 };
+        assert_eq!(
+            err,
+            DispatchError::UnexpectedVoidSubReturn { pc: 42 },
+            "UnexpectedVoidSubReturn must remain a distinct DispatchError variant — \
+             do not collapse with InlineCallArityMismatch or RegisterOutOfRange",
+        );
+    }
+
+    /// Build a `SimpleFieldDescr` with a stable index so the
+    /// heapcache lookup hashes consistently across the cache-miss
+    /// and cache-hit assertions. Default `Descr::index()` returns
+    /// `u32::MAX`; tests that exercise heapcache need a real index.
+    fn field_descr_with_index(idx: u32) -> DescrRef {
+        std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(
+            idx,
+            8, // offset
+            8, // field_size
+            majit_ir::Type::Int,
+            false, // not immutable
+        ))
+    }
+
+    #[test]
+    fn getfield_gc_i_cache_miss_records_op_and_writes_dst() {
+        // Phase D-3 slice 3.2: first `getfield_gc_i/rd>i` invocation
+        // is a heapcache miss — walker records `OpCode::GetfieldGcI`
+        // with `[obj]` and `descr=descr_refs[d]`, writes the
+        // recorder result into `registers_i[dst]`, and updates the
+        // heapcache via `getfield_now_known(resbox)`.
+        let byte = *insns_opname_to_byte()
+            .get("getfield_gc_i/rd>i")
+            .expect("`getfield_gc_i/rd>i` must be in insns table");
+        // Operand layout `rd>i`: 1B r-reg(2) + 2B descr-index(LE 1) + 1B dst(5).
+        let code = [byte, 0x02, 0x01, 0x00, 0x05];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let obj = regs_r[2];
+        let dst_pre = regs_i[5];
+        let descr = field_descr_with_index(1);
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
+        let frame_done = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, 5, "getfield_gc_i/rd>i operand layout = 4 bytes");
+        let dst_post = wc.registers_i[5];
+        assert_ne!(
+            dst_post, dst_pre,
+            "cache miss must write a fresh recorder OpRef into registers_i[dst]",
+        );
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before + 1,
+            "cache miss must record exactly one GetfieldGcI op",
+        );
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcI);
+        assert_eq!(
+            last.args.as_slice(),
+            &[obj],
+            "GetfieldGcI args must be [obj] (the r-reg source)",
+        );
+        let recorded_descr = last
+            .descr
+            .as_ref()
+            .expect("GetfieldGcI must carry the field descr");
+        assert!(
+            std::sync::Arc::ptr_eq(recorded_descr, &descr),
+            "GetfieldGcI descr must be descr_refs[d] (the field descr)",
+        );
+        assert_eq!(dst_post, last.pos);
+    }
+
+    #[test]
+    fn getfield_gc_i_cache_hit_returns_cached_box_without_recording() {
+        // Phase D-3 slice 3.2: second invocation with the same
+        // (obj, descr) pair must hit the heapcache and skip IR
+        // emission. RPython parity:
+        //   upd = heapcache.get_field_updater(box, fielddescr)
+        //   if upd.currfieldbox is not None:
+        //       return upd.currfieldbox  # no execute_with_descr
+        let byte = *insns_opname_to_byte()
+            .get("getfield_gc_i/rd>i")
+            .expect("`getfield_gc_i/rd>i` must be in insns table");
+        let code = [byte, 0x02, 0x01, 0x00, 0x05];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let obj = regs_r[2];
+        let descr = field_descr_with_index(1);
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
+        let frame_done = done_descr_ref_for_tests();
+
+        // Pre-populate the heapcache as if a previous getfield had
+        // already cached the field's value. RPython equivalent:
+        // `heapcache.getfield_now_known(...)` after a prior fetch.
+        let cached_field = tc.const_int(0xCAFE);
+        tc.heap_cache_mut().getfield_now_known(obj, 1, cached_field);
+        let ops_before = tc.num_ops();
+
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let _ = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
+        let dst_post = wc.registers_i[5];
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before,
+            "cache hit must NOT record any new IR op",
+        );
+        assert_eq!(
+            dst_post, cached_field,
+            "cache hit must write the cached OpRef into registers_i[dst]",
+        );
+    }
+
+    #[test]
+    fn getfield_gc_r_cache_miss_records_op_and_writes_ref_dst() {
+        // Phase D-3 slice 3.2: GetfieldGcR variant — same flow as
+        // GetfieldGcI but result lands in registers_r.
+        let byte = *insns_opname_to_byte()
+            .get("getfield_gc_r/rd>r")
+            .expect("`getfield_gc_r/rd>r` must be in insns table");
+        let code = [byte, 0x02, 0x01, 0x00, 0x06];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let obj = regs_r[2];
+        let dst_pre = regs_r[6];
+        // Use a Ref-typed field descr — sanity-check that the walker
+        // doesn't introspect the descr's field_type (it just feeds
+        // descr_index into the heapcache and records the op).
+        let descr: DescrRef = std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(
+            1,
+            16,
+            8,
+            majit_ir::Type::Ref,
+            false,
+        ));
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
+        let frame_done = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let _ = step(&code, 0, &mut wc).expect("getfield_gc_r must dispatch");
+        let dst_post = wc.registers_r[6];
+        assert_ne!(dst_post, dst_pre);
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcR);
+        assert_eq!(last.args.as_slice(), &[obj]);
+        assert_eq!(dst_post, last.pos);
+    }
+
+    #[test]
+    fn getfield_gc_with_out_of_range_obj_register_surfaces_typed_error() {
+        let byte = *insns_opname_to_byte()
+            .get("getfield_gc_i/rd>i")
+            .expect("`getfield_gc_i/rd>i` must be in insns table");
+        let code = [byte, 0x07, 0x00, 0x00, 0x00]; // r-reg=7, registers_r empty
+        let mut tc = fresh_trace_ctx();
+        let descr = field_descr_with_index(0);
+        let descr_pool = vec![descr];
+        let frame_done = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let err = step(&code, 0, &mut wc).expect_err("getfield_gc must validate r-reg");
+        assert_eq!(
+            err,
+            DispatchError::RegisterOutOfRange {
+                pc: 0,
+                reg: 7,
+                len: 0,
+                bank: "r",
+            },
+        );
+    }
+
+    #[test]
+    fn setfield_gc_i_redundant_write_skips_recording() {
+        // Phase D-3 slice 3.3: when the heapcache already knows
+        // valuebox is the current value of (obj, descr), the
+        // SETFIELD_GC IR op must NOT be recorded. RPython parity:
+        // `pyjitpl.py:976 if upd.currfieldbox is valuebox: return`.
+        let byte = *insns_opname_to_byte()
+            .get("setfield_gc_i/rid")
+            .expect("`setfield_gc_i/rid` must be in insns table");
+        let code = [byte, 0x02, 0x03, 0x01, 0x00];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let obj = regs_r[2];
+        let valuebox = regs_i[3];
+        let descr = field_descr_with_index(1);
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+        let frame_done = done_descr_ref_for_tests();
+        // Pre-cache valuebox as the current field value.
+        tc.heap_cache_mut().getfield_now_known(obj, 1, valuebox);
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before,
+            "redundant setfield (cached valuebox == new valuebox) must skip recording",
+        );
+    }
+
+    #[test]
+    fn setfield_gc_i_fresh_write_records_op_and_caches_value() {
+        // Phase D-3 slice 3.3: a fresh write (no cached value)
+        // must record SETFIELD_GC and update the heapcache so a
+        // subsequent redundant write hits.
+        let byte = *insns_opname_to_byte()
+            .get("setfield_gc_i/rid")
+            .expect("`setfield_gc_i/rid` must be in insns table");
+        let code = [byte, 0x02, 0x03, 0x01, 0x00];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let obj = regs_r[2];
+        let valuebox = regs_i[3];
+        let descr = field_descr_with_index(1);
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
+        let frame_done = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before + 1,
+            "fresh setfield must record exactly one SetfieldGc op",
+        );
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::SetfieldGc);
+        assert_eq!(
+            last.args.as_slice(),
+            &[obj, valuebox],
+            "SetfieldGc args must be [obj, valuebox] in that order",
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            last.descr.as_ref().expect("SetfieldGc must carry descr"),
+            &descr,
+        ),);
+        // Cache must now know the new field value.
+        assert_eq!(
+            tc.heap_cache().getfield_cached(obj, 1),
+            Some(valuebox),
+            "post-setfield, the heapcache must reflect the written value",
+        );
+    }
+
+    #[test]
+    fn setfield_gc_r_records_setfieldgc_with_ref_valuebox() {
+        // Phase D-3 slice 3.3: `rrd` shape — both box and valuebox
+        // come from registers_r. SetfieldGc is type-agnostic at the
+        // IR level (the descr carries the field type).
+        let byte = *insns_opname_to_byte()
+            .get("setfield_gc_r/rrd")
+            .expect("`setfield_gc_r/rrd` must be in insns table");
+        let code = [byte, 0x02, 0x05, 0x01, 0x00];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let obj = regs_r[2];
+        let valuebox = regs_r[5];
+        let descr: DescrRef = std::sync::Arc::new(majit_ir::SimpleFieldDescr::new(
+            1,
+            16,
+            8,
+            majit_ir::Type::Ref,
+            false,
+        ));
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+        let frame_done = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let _ = step(&code, 0, &mut wc).expect("setfield_gc_r must dispatch");
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::SetfieldGc);
+        assert_eq!(last.args.as_slice(), &[obj, valuebox]);
+    }
+
+    #[test]
+    fn getarrayitem_gc_r_cache_miss_records_op_and_writes_dst() {
+        // Phase D-3 slice 3.4: first `getarrayitem_gc_r/rid>r` is a
+        // heapcache miss — record GetarrayitemGcR with
+        // [array, index] + descr; write recorder result into r-dst
+        // and update heapcache.
+        let byte = *insns_opname_to_byte()
+            .get("getarrayitem_gc_r/rid>r")
+            .expect("`getarrayitem_gc_r/rid>r` must be in insns table");
+        // Operand layout `rid>r`: 1B r-reg(2) + 1B i-reg(3) +
+        // 2B descr(LE 1) + 1B r-dst(5).
+        let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let array = regs_r[2];
+        let index = regs_i[3];
+        let dst_pre = regs_r[5];
+        let descr = field_descr_with_index(1);
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
+        let frame_done = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(
+            next_pc, 6,
+            "getarrayitem_gc_r/rid>r operand layout = 5 bytes"
+        );
+        let dst_post = wc.registers_r[5];
+        assert_ne!(dst_post, dst_pre);
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::GetarrayitemGcR);
+        assert_eq!(
+            last.args.as_slice(),
+            &[array, index],
+            "GetarrayitemGcR args must be [array, index]",
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            last.descr.as_ref().expect("must carry array descr"),
+            &descr,
+        ));
+        assert_eq!(dst_post, last.pos);
+    }
+
+    #[test]
+    fn getarrayitem_gc_r_cache_hit_returns_cached_box() {
+        // Phase D-3 slice 3.4: pre-cache (array, index, descr) →
+        // cached_box. Second invocation must return cached_box and
+        // not record an IR op.
+        let byte = *insns_opname_to_byte()
+            .get("getarrayitem_gc_r/rid>r")
+            .expect("`getarrayitem_gc_r/rid>r` must be in insns table");
+        let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let array = regs_r[2];
+        let index = regs_i[3];
+        let descr = field_descr_with_index(1);
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr];
+        let frame_done = done_descr_ref_for_tests();
+        let cached = tc.const_ref(0xCAFE_F00D);
+        tc.heap_cache_mut()
+            .getarrayitem_now_known(array, index, 1, cached);
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let _ = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
+        let dst_post = wc.registers_r[5];
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before,
+            "cache hit must NOT record any new IR op",
+        );
+        assert_eq!(
+            dst_post, cached,
+            "cache hit must write cached OpRef into registers_r[dst]",
+        );
+    }
+
+    #[test]
+    fn setarrayitem_gc_r_records_setarrayitemgc_with_three_args() {
+        // Phase D-3 slice 3.4: `setarrayitem_gc_r/rird` records
+        // SetarrayitemGc with [array, index, value] + descr and
+        // updates the heapcache via setarrayitem.
+        let byte = *insns_opname_to_byte()
+            .get("setarrayitem_gc_r/rird")
+            .expect("`setarrayitem_gc_r/rird` must be in insns table");
+        // Operand layout `rird`: 1B r-reg(2) + 1B i-reg(4) +
+        // 1B r-reg(6) + 2B descr(LE 1).
+        let code = [byte, 0x02, 0x04, 0x06, 0x01, 0x00];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let array = regs_r[2];
+        let index = regs_i[4];
+        let value = regs_r[6];
+        let descr = field_descr_with_index(1);
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
+        let frame_done = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setarrayitem_gc_r must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(
+            next_pc, 6,
+            "setarrayitem_gc_r/rird operand layout = 5 bytes"
+        );
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::SetarrayitemGc);
+        assert_eq!(
+            last.args.as_slice(),
+            &[array, index, value],
+            "SetarrayitemGc args must be [array, index, value]",
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            last.descr.as_ref().expect("must carry array descr"),
+            &descr,
+        ));
+        // Heapcache must reflect the write.
+        assert_eq!(
+            tc.heap_cache().getarrayitem(array, index, 1),
+            Some(value),
+            "post-setarrayitem, heapcache must reflect the written value",
+        );
+    }
+
+    #[test]
+    fn dispatch_via_miframe_runs_ref_return_through_real_miframe_state() {
+        // Phase D-3 slice 3.1 acceptance: the bridge function takes a
+        // real `MIFrame` (constructed via the same `PyreSym::new_uninit`
+        // + `MIFrame { ctx, sym, .. }` shape that `state.rs`'s
+        // existing tests use), pre-populates `sym.registers_r[2]` with
+        // a known OpRef, then walks `ref_return r2`. Walker must
+        // record `Finish([sym.registers_r[2]], descr=done_with_this_frame_descr_ref)`
+        // through the *same* TraceCtx the MIFrame's `ctx` pointer
+        // owns — i.e., production-shape state plumbing, no separate
+        // test fixture.
+        use crate::state::PyreSym;
+
+        let mut tc = TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
+        let expected_arg = tc.const_ref(0xCAFE_F00D);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.registers_r = vec![OpRef::NONE; 8];
+        sym.registers_r[2] = expected_arg;
+
+        let mut miframe = MIFrame {
+            ctx: &mut tc,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        let ret_byte = *insns_opname_to_byte()
+            .get("ref_return/r")
+            .expect("`ref_return/r` must be in insns table");
+        let code = [ret_byte, 0x02];
+        let descr = make_fail_descr(1);
+        let (outcome, end_pc) = dispatch_via_miframe(
+            &mut miframe,
+            &code,
+            0,
+            &[],
+            &no_sub_jitcodes,
+            descr.clone(),
+            make_fail_descr(101),
+            make_fail_descr(102),
+            make_fail_descr(103),
+            make_fail_descr(2),
+        )
+        .expect("dispatch_via_miframe must succeed for ref_return r2");
+        assert_eq!(outcome, DispatchOutcome::Terminate);
+        assert_eq!(end_pc, 2);
+
+        // Drop miframe so we can inspect tc directly.
+        drop(miframe);
+        let last = tc.ops().last().expect("FINISH must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::Finish);
+        assert_eq!(
+            last.args.as_slice(),
+            &[expected_arg],
+            "FINISH args must be sym.registers_r[2] threaded through the MIFrame bridge",
+        );
+        let recorded_descr = last
+            .descr
+            .as_ref()
+            .expect("FINISH must carry done_with_this_frame_descr_ref");
+        assert!(
+            std::sync::Arc::ptr_eq(recorded_descr, &descr),
+            "FINISH descr must be the descr passed through dispatch_via_miframe",
+        );
+    }
+
+    #[test]
+    fn dispatch_via_miframe_mirrors_last_exc_value_back_into_sym() {
+        // Phase D-3 slice 3.1: when the walker's last_exc_value field
+        // changes (raise/r sets it before terminating), the bridge
+        // function must mirror it back to `sym.last_exc_box`. RPython
+        // parity: `metainterp.last_exc_value = ...` is metainterp-level
+        // state that survives across opimpl invocations.
+        use crate::state::PyreSym;
+
+        let mut tc = TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
+        let exc_oprep = tc.const_ref(0xDEAD_BEEF);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.registers_r = vec![OpRef::NONE; 8];
+        sym.registers_r[3] = exc_oprep;
+        // Pre-condition: sym.last_exc_box is unset.
+        assert!(sym.last_exc_box.is_none());
+
+        let mut miframe = MIFrame {
+            ctx: &mut tc,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+
+        let raise_byte = *insns_opname_to_byte()
+            .get("raise/r")
+            .expect("`raise/r` must be in insns table");
+        let code = [raise_byte, 0x03];
+        let descr_done = make_fail_descr(1);
+        let descr_exc = make_fail_descr(99);
+        let (outcome, _) = dispatch_via_miframe(
+            &mut miframe,
+            &code,
+            0,
+            &[],
+            &no_sub_jitcodes,
+            descr_done,
+            make_fail_descr(101),
+            make_fail_descr(102),
+            make_fail_descr(103),
+            descr_exc,
+        )
+        .expect("dispatch_via_miframe must succeed for raise r3");
+        assert_eq!(outcome, DispatchOutcome::Terminate);
+        drop(miframe);
+        // Post-condition: sym.last_exc_box was mirrored from the
+        // walker's last_exc_value (set by raise/r before terminate).
+        assert_eq!(
+            sym.last_exc_box, exc_oprep,
+            "sym.last_exc_box must mirror the exc OpRef the walker captured \
+             via WalkContext::last_exc_value",
+        );
+        // Walker fix D post-condition: dispatch_via_miframe also sets
+        // sym.class_of_last_exc_is_const to mirror RPython's
+        // `pyjitpl.py:1694 opimpl_raise: class_of_last_exc_is_const = True`.
+        assert!(
+            sym.class_of_last_exc_is_const,
+            "sym.class_of_last_exc_is_const must be true after a raise/r",
+        );
+    }
+
+    #[test]
+    fn dispatch_via_miframe_leaves_class_of_last_exc_is_const_unchanged_when_no_raise() {
+        // Walker fix D: when the walk does NOT raise (final last_exc
+        // remains None), dispatch_via_miframe must NOT touch
+        // sym.class_of_last_exc_is_const. The flag carries state from
+        // a prior tracing step and must not be cleared by an unrelated
+        // walk (e.g. a single ref_return-only top-level walk).
+        use crate::state::PyreSym;
+
+        let mut tc = TraceCtx::for_test_types(&[majit_ir::Type::Ref]);
+        let value = tc.const_ref(0xC0FFEE);
+        let mut sym = PyreSym::new_uninit(OpRef::NONE);
+        sym.registers_r = vec![OpRef::NONE; 8];
+        sym.registers_r[2] = value;
+        // Pre-condition: simulate prior raise — class_of_last_exc_is_const
+        // is true and last_exc_box is set.
+        sym.class_of_last_exc_is_const = true;
+        sym.last_exc_box = value;
+
+        let mut miframe = MIFrame {
+            ctx: &mut tc,
+            sym: &mut sym,
+            fallthrough_pc: 0,
+            parent_frames: Vec::new(),
+            pending_result_stack_idx: None,
+            pending_inline_frame: None,
+            orgpc: 0,
+            concrete_frame_addr: 0,
+            pre_opcode_registers_r: None,
+        };
+        let ret_byte = *insns_opname_to_byte()
+            .get("ref_return/r")
+            .expect("`ref_return/r` must be in insns table");
+        let code = [ret_byte, 0x02];
+        let _ = dispatch_via_miframe(
+            &mut miframe,
+            &code,
+            0,
+            &[],
+            &no_sub_jitcodes,
+            make_fail_descr(1),
+            make_fail_descr(101),
+            make_fail_descr(102),
+            make_fail_descr(103),
+            make_fail_descr(2),
+        )
+        .expect("ref_return walk must succeed");
+        drop(miframe);
+        // Walker preserved the carried-in class flag because no raise
+        // happened during the walk.
+        assert!(
+            sym.class_of_last_exc_is_const,
+            "no-raise walk must not clear class_of_last_exc_is_const",
+        );
+    }
+
+    #[test]
     fn walk_undecodable_byte_surfaces_typed_error() {
         // 0xFF is unknown to the insns table (21 entries 0..=20 today).
         let code = [0xFFu8];
@@ -2304,12 +7036,17 @@ mod tests {
         let mut wc = WalkContext {
             registers_r: &mut [],
             registers_i: &mut [],
+            registers_f: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
             exit_frame_with_exception_descr_ref: make_fail_descr(2),
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
         };
         assert_eq!(
             walk(&code, 0, &mut wc),

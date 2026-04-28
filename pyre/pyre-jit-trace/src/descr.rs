@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::sync::LazyLock;
 use std::sync::Weak;
 
-use majit_ir::{ArrayDescr, Descr, DescrRef, FieldDescr, SizeDescr, Type};
+use majit_ir::{ArrayDescr, Descr, DescrRef, FieldDescr, JitCodeDescr, SizeDescr, Type};
 
 // PRE-EXISTING-ADAPTATION: tag bits in the high nibble of the descr
 // index discriminate Field/Array/Size descrs. RPython stores all descrs
@@ -1310,6 +1310,63 @@ pub fn make_struct_array_descr(descr_index: u32, base_size: usize, item_size: us
         Type::Void,
         ArrayFlag::Struct,
     ))
+}
+
+/// Concrete `JitCodeDescr` adapter for `inline_call_*` opcodes.
+///
+/// RPython parity: `JitCode(AbstractDescr)` carries `fnaddr` +
+/// `calldescr` + the callee's bytecode body and is emitted directly as
+/// the descr operand of `inline_call_*`. The codewriter side surfaces
+/// this as `BhDescr::JitCode { jitcode_index, fnaddr, calldescr }`
+/// (`majit-translate/src/jit_codewriter/jitcode.rs:667`); the trace-side
+/// walker (`jitcode_dispatch.rs::WalkContext`) consumes
+/// `&[Arc<dyn Descr>]` and queries `as_jitcode_descr()` /
+/// `jitcode_index()`.
+///
+/// `PyreJitCodeDescr` bridges those two layers: production callers
+/// build a `Vec<DescrRef>` from the codewriter's `BhDescr` pool and
+/// wrap each `BhDescr::JitCode` in this struct so the walker's
+/// `as_jitcode_descr() -> Some(&self)` cast succeeds. Field/Array/Size
+/// slots stay `PyreFieldDescr`/`PyreArrayDescr`/`PyreSizeDescr`;
+/// `Call` slots use `SimpleCallDescr`.
+///
+/// Tests in `jitcode_dispatch.rs` previously used a `TestJitCodeDescr`
+/// duplicate of this shape — production code now goes through the same
+/// type so the test fixture can be progressively replaced without
+/// behaviour drift.
+#[derive(Debug)]
+pub struct PyreJitCodeDescr {
+    jitcode_index: usize,
+}
+
+impl PyreJitCodeDescr {
+    /// Build a `PyreJitCodeDescr` with the given runtime jitcode index.
+    /// `jitcode_index` indexes into the runtime's all-jitcodes table
+    /// (`pyre-jit-trace/src/jitcode_runtime.rs::ALL_JITCODES`); the
+    /// walker's `sub_jitcode_lookup` resolves it to the callee's body.
+    pub fn new(jitcode_index: usize) -> Self {
+        Self { jitcode_index }
+    }
+}
+
+impl Descr for PyreJitCodeDescr {
+    fn as_jitcode_descr(&self) -> Option<&dyn JitCodeDescr> {
+        Some(self)
+    }
+}
+
+impl JitCodeDescr for PyreJitCodeDescr {
+    fn jitcode_index(&self) -> usize {
+        self.jitcode_index
+    }
+}
+
+/// Build a `DescrRef` carrying a `PyreJitCodeDescr`. Production callers
+/// use this when materializing the descr pool from a codewriter
+/// `&[BhDescr]` (`BhDescr::JitCode { jitcode_index, .. }` → this
+/// adapter).
+pub fn make_jitcode_descr(jitcode_index: usize) -> DescrRef {
+    Arc::new(PyreJitCodeDescr::new(jitcode_index))
 }
 
 /// descr.py:384 InteriorFieldDescr for SETINTERIORFIELD_GC.

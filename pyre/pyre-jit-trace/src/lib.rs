@@ -17,6 +17,7 @@ pub mod jitcode_runtime;
 pub mod liveness;
 pub mod metainterp;
 pub mod pyjitcode;
+pub mod shadow_walker;
 pub mod state;
 pub mod super_inst_expand;
 mod trace_opcode;
