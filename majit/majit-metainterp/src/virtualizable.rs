@@ -646,6 +646,11 @@ impl VirtualizableInfo {
     /// Convert to optimizer-level config (byte offsets only).
     /// Bridges the descriptor-driven model (majit-meta) with the
     /// optimizer's offset-based tracking (majit-opt).
+    ///
+    /// `vable_input_offset` defaults to 0 here; callers that wire JitDriver
+    /// non-vable reds (e.g. `interp_jit.py:67 reds = ['frame', 'ec']`)
+    /// should patch the field after construction — see
+    /// `MetaInterp::current_virtualizable_optimizer_config`.
     pub fn to_optimizer_config(&self) -> crate::optimizeopt::virtualize::VirtualizableConfig {
         crate::optimizeopt::virtualize::VirtualizableConfig {
             static_field_offsets: self.static_fields.iter().map(|f| f.offset).collect(),
@@ -655,6 +660,7 @@ impl VirtualizableInfo {
             array_item_types: self.array_fields.iter().map(|a| a.item_type).collect(),
             array_field_descrs: self.array_field_descrs().to_vec(),
             array_lengths: vec![],
+            vable_input_offset: 0,
         }
     }
 

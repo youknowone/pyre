@@ -52,6 +52,15 @@ pub struct VirtualizableConfig {
     /// args back into VirtualizableFieldState without falling back to raw
     /// heap reads.
     pub array_lengths: Vec<usize>,
+    /// Number of input slots between `OpRef(0)` (frame) and the first vable
+    /// scalar slot. Equals `JitDriverStaticData::num_reds() - 1` after the
+    /// frame is excluded — typically `NUM_EXTRA_REDS` from the
+    /// virtualizable!{} macro (e.g. `1` for pyre's `extra_reds = { ec: Ref }`).
+    /// `0` means the legacy `[frame, vable_scalars..., array_items...]`
+    /// layout; nonzero shifts every input-derived OpRef by that count.
+    /// Mirrors `interp_jit.py:67 reds = ['frame', 'ec']` — the non-vable
+    /// extra reds occupy `OpRef(1..1+vable_input_offset)`.
+    pub vable_input_offset: usize,
 }
 
 /// JitVirtualRef field slot indices.
@@ -175,7 +184,9 @@ impl OptVirtualize {
             arrays: vec![],
             last_guard_pos: -1,
         };
-        let mut flat_input_idx = 1usize;
+        // virtualizable.py:90 read_boxes: vable scalars start AFTER frame
+        // and any non-vable extra reds (e.g. interp_jit.py:67 `ec`).
+        let mut flat_input_idx = 1usize + config.vable_input_offset;
 
         for (field_idx_in_vinfo, &offset) in config.static_field_offsets.iter().enumerate() {
             if flat_input_idx >= ctx.num_inputs() {
@@ -2239,6 +2250,7 @@ mod tests {
             array_item_types: vec![Type::Ref],
             array_field_descrs: vec![],
             array_lengths: vec![1],
+            vable_input_offset: 0,
         });
         pass.setup();
         ctx.set_ptr_info(
@@ -2270,6 +2282,7 @@ mod tests {
             array_item_types: vec![Type::Int],
             array_field_descrs: vec![],
             array_lengths: vec![1],
+            vable_input_offset: 0,
         });
         pass.setup();
 
@@ -2334,6 +2347,7 @@ mod tests {
             array_item_types: vec![],
             array_field_descrs: vec![],
             array_lengths: vec![],
+            vable_input_offset: 0,
         });
         pass.setup();
 
@@ -2368,6 +2382,7 @@ mod tests {
             array_item_types: vec![],
             array_field_descrs: vec![],
             array_lengths: vec![],
+            vable_input_offset: 0,
         });
         pass.setup();
 
@@ -2390,6 +2405,7 @@ mod tests {
             array_item_types: vec![],
             array_field_descrs: vec![],
             array_lengths: vec![],
+            vable_input_offset: 0,
         });
         pass.setup();
 
@@ -2473,6 +2489,7 @@ mod tests {
             array_item_types: vec![Type::Int],
             array_field_descrs: vec![],
             array_lengths: vec![1],
+            vable_input_offset: 0,
         });
         pass.setup();
 
@@ -2502,6 +2519,7 @@ mod tests {
             array_item_types: vec![Type::Int],
             array_field_descrs: vec![],
             array_lengths: vec![1],
+            vable_input_offset: 0,
         });
         pass.setup();
 
@@ -2532,6 +2550,7 @@ mod tests {
             array_item_types: vec![Type::Int],
             array_field_descrs: vec![],
             array_lengths: vec![1],
+            vable_input_offset: 0,
         });
         pass.setup();
 
@@ -2567,6 +2586,7 @@ mod tests {
             array_item_types: vec![Type::Int],
             array_field_descrs: vec![],
             array_lengths: vec![1],
+            vable_input_offset: 0,
         });
         let mut constants = HashMap::new();
         let mut ops = vec![

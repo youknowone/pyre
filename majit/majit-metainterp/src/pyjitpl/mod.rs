@@ -2151,6 +2151,19 @@ impl<M: Clone> MetaInterp<M> {
             self.virtualizable_info().map(|info| {
                 let mut config = info.to_optimizer_config();
                 config.array_lengths = ctx.virtualizable_array_lengths().unwrap_or(&[]).to_vec();
+                // virtualizable.py:90 read_boxes input layout = [frame,
+                // extra_reds..., vable_scalars..., array_items...]. The
+                // canonical source of `vable_input_offset` is the active
+                // jitdriver's `num_red_args - 1` (excluding frame).
+                // Today's slot-0 jitdriver carries empty reds (`wiggly-
+                // barto S3.1 Slice 1`) so `num_reds == 0` and the offset
+                // is `0` — matching the legacy `[frame, vable_scalars...]`
+                // layout. Once Task #24 populates the real reds spec
+                // (`['frame', 'ec']`) and the macro flip lands the
+                // `extra_reds = { ec: Ref }` block, this expression
+                // returns `1` automatically.
+                let num_reds = ctx.driver_descriptor().map(|d| d.num_reds()).unwrap_or(0);
+                config.vable_input_offset = num_reds.saturating_sub(1);
                 config
             })
         })

@@ -1452,13 +1452,37 @@ impl MIFrame {
             .portal_bridge_vable_vsd(resume_pc)
             .unwrap_or_else(|| self.sym().valuestackdepth as i64);
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
-        let s = self.sym_mut();
-        s.vable_last_instr = ctx.const_int(resume_pc as i64 - 1);
-        s.vable_pycode = ctx.const_ref(code_ptr as i64);
-        s.vable_valuestackdepth = ctx.const_int(vsd);
-        s.vable_debugdata = ctx.const_ref(debugdata as i64);
-        s.vable_lastblock = ctx.const_ref(lastblock as i64);
-        s.vable_w_globals = ctx.const_ref(ns_ptr);
+        let new_li = ctx.const_int(resume_pc as i64 - 1);
+        let new_pyc = ctx.const_ref(code_ptr as i64);
+        let new_vsd = ctx.const_int(vsd);
+        let new_dd = ctx.const_ref(debugdata as i64);
+        let new_lb = ctx.const_ref(lastblock as i64);
+        let new_wg = ctx.const_ref(ns_ptr);
+        let owns = {
+            let s = self.sym_mut();
+            s.vable_last_instr = new_li;
+            s.vable_pycode = new_pyc;
+            s.vable_valuestackdepth = new_vsd;
+            s.vable_debugdata = new_dd;
+            s.vable_lastblock = new_lb;
+            s.vable_w_globals = new_wg;
+            s.owns_virtualizable_shadow()
+        };
+        // Task #21 Slice 3 propagation gap #3: keep virtualizable_boxes
+        // [0..6] coherent with the freshly heap-derived sym.vable_*.
+        // Without propagation, gap #1's later override of
+        // virtualizable_boxes[0] in close_loop_args_at would leave
+        // virtualizable_boxes[1..6] stale, and the writeback (when its
+        // probe gate flips on) would emit mixed-vintage scalars.
+        // Slot ordering matches virtualizable_gen.rs:37-44.
+        if owns {
+            ctx.set_virtualizable_entry_at(0, new_li, Value::Int(resume_pc as i64 - 1));
+            ctx.set_virtualizable_entry_at(1, new_pyc, Value::Ref(GcRef(code_ptr)));
+            ctx.set_virtualizable_entry_at(2, new_vsd, Value::Int(vsd));
+            ctx.set_virtualizable_entry_at(3, new_dd, Value::Ref(GcRef(debugdata)));
+            ctx.set_virtualizable_entry_at(4, new_lb, Value::Ref(GcRef(lastblock)));
+            ctx.set_virtualizable_entry_at(5, new_wg, Value::Ref(GcRef(ns_ptr as usize)));
+        }
     }
 
     /// G.4.3a: For portal-bridge frames, derive the absolute
@@ -1535,13 +1559,35 @@ impl MIFrame {
                 .unwrap_or(s.valuestackdepth) as i64
         });
         // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
-        let s = self.sym_mut();
-        s.vable_last_instr = ctx.const_int(resume_pc as i64 - 1);
-        s.vable_pycode = ctx.const_ref(code_ptr as i64);
-        s.vable_valuestackdepth = ctx.const_int(vsd);
-        s.vable_debugdata = ctx.const_ref(debugdata as i64);
-        s.vable_lastblock = ctx.const_ref(lastblock as i64);
-        s.vable_w_globals = ctx.const_ref(ns_ptr);
+        let new_li = ctx.const_int(resume_pc as i64 - 1);
+        let new_pyc = ctx.const_ref(code_ptr as i64);
+        let new_vsd = ctx.const_int(vsd);
+        let new_dd = ctx.const_ref(debugdata as i64);
+        let new_lb = ctx.const_ref(lastblock as i64);
+        let new_wg = ctx.const_ref(ns_ptr);
+        let owns = {
+            let s = self.sym_mut();
+            s.vable_last_instr = new_li;
+            s.vable_pycode = new_pyc;
+            s.vable_valuestackdepth = new_vsd;
+            s.vable_debugdata = new_dd;
+            s.vable_lastblock = new_lb;
+            s.vable_w_globals = new_wg;
+            s.owns_virtualizable_shadow()
+        };
+        // Task #21 Slice 3 propagation gap #4: same shape as gap #3 in
+        // flush_to_frame; keep virtualizable_boxes[0..6] coherent so the
+        // writeback (when its probe gate flips on) does not emit mixed-
+        // vintage scalars at guard fail. Slot ordering matches
+        // virtualizable_gen.rs:37-44.
+        if owns {
+            ctx.set_virtualizable_entry_at(0, new_li, Value::Int(resume_pc as i64 - 1));
+            ctx.set_virtualizable_entry_at(1, new_pyc, Value::Ref(GcRef(code_ptr)));
+            ctx.set_virtualizable_entry_at(2, new_vsd, Value::Int(vsd));
+            ctx.set_virtualizable_entry_at(3, new_dd, Value::Ref(GcRef(debugdata)));
+            ctx.set_virtualizable_entry_at(4, new_lb, Value::Ref(GcRef(lastblock)));
+            ctx.set_virtualizable_entry_at(5, new_wg, Value::Ref(GcRef(ns_ptr as usize)));
+        }
     }
 
     /// pyjitpl.py:3317-3335 vable_and_vrefs_before_residual_call.
@@ -1858,9 +1904,22 @@ impl MIFrame {
         // interpreter's `next_instr() = last_instr + 1` returns the merge
         // point. flush_to_frame already stored `orgpc - 1`; override with
         // the merge target.
+        //
+        // Task #21 Slice 3 propagation gap #1: propagate the override
+        // into the virtualizable_boxes shadow so the writeback below
+        // emits the merge-target PC, not the orgpc placed by
+        // flush_to_frame. virtualizable_boxes[0] = vable_last_instr per
+        // virtualizable_gen.rs:37-44 inputargs ordering.
         if let Some(pc) = target_pc {
-            let s = self.sym_mut();
-            s.vable_last_instr = ctx.const_int(pc as i64 - 1);
+            let new_pc_opref = ctx.const_int(pc as i64 - 1);
+            let owns = {
+                let s = self.sym_mut();
+                s.vable_last_instr = new_pc_opref;
+                s.owns_virtualizable_shadow()
+            };
+            if owns {
+                ctx.set_virtualizable_entry_at(0, new_pc_opref, Value::Int(pc as i64 - 1));
+            }
         }
         // Task #21 fix path 3 — vable heap-writeback before JUMP.
         //
@@ -1885,24 +1944,17 @@ impl MIFrame {
         // entries: `[frame, 6 scalars, locals..., stack...]`) from
         // reduced (1-2 entries: `[frame]` or `[frame, ec]`).
         //
-        // **Probe-gated** behind `MAJIT_PROBE_VABLE_WRITEBACK=1`. When
-        // the gate fires AND the env var is set, the writeback emits.
-        // Empirical baseline run with the writeback unconditionally
-        // active regresses dynasm nested_loop (output printed twice —
-        // see implementation-plan note `task21_fix_implementation_plan
-        // .md` Slice 3): pyre's `self.virtualizable_boxes` is not yet
-        // guaranteed up-to-date with `sym.vable_*` / `sym.registers_r`
-        // at this emit point, so unconditional writeback writes stale
-        // values to the heap and corrupts compiled-loop state. Slice 3
-        // (audit + propagation of `sym.*` updates into
-        // `virtualizable_boxes`) is the prerequisite to flipping this
-        // env gate off.
-        //
-        // The dormant probe is the diagnostic surface for the next
-        // session: running `MAJIT_PROBE_VABLE_WRITEBACK=1 ./pyre/check
-        // .sh` lists every path that triggers the writeback, narrowing
-        // Slice 3's audit to the call sites that need
-        // `virtualizable_boxes` propagation.
+        // Slice 3 (propagation of every `sym.vable_*` mutation into
+        // `virtualizable_boxes`) closed the four propagation gaps that
+        // previously prevented the writeback from emitting fresh values
+        // (close_loop_args_at PC override, inline_call_helper parent
+        // capture, flush_to_frame, flush_to_frame_for_guard). With those
+        // gaps closed the writeback now reflects the current sym state,
+        // so the env gate is removed and the writeback fires whenever
+        // the target LABEL is reduced. Reds-only LABELs are not yet
+        // produced in production (the codewriter / pyjitpl reds-only
+        // flip is a separate epic), so this remains a no-op at runtime
+        // until that flip lands.
         {
             let target_inputarg_len: Option<usize> = {
                 let (driver, _) = crate::driver::driver_pair();
@@ -1925,15 +1977,7 @@ impl MIFrame {
                 // `[frame, ec]` (len=2).
                 let is_reduced_label =
                     len > 0 && len < crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-                if is_reduced_label && std::env::var_os("MAJIT_PROBE_VABLE_WRITEBACK").is_some() {
-                    eprintln!(
-                        "[probe-vable-writeback] target_inputarg_len={} bridge={} \
-                         orgpc={} target_pc={:?}",
-                        len,
-                        crate::driver::driver_pair().0.is_bridge_tracing(),
-                        self.orgpc,
-                        target_pc,
-                    );
+                if is_reduced_label {
                     if let Some(vable_box) = ctx.standard_virtualizable_box() {
                         ctx.gen_writeback_vable_to_heap(vable_box);
                     }
@@ -4545,12 +4589,30 @@ impl MIFrame {
         // Stack is post-dispatch (args consumed, no result yet).
         // last_instr = return_point_pc - 1 so the caller's next_instr()
         // returns the fallthrough PC when the blackhole restores the frame.
+        //
+        // Task #21 Slice 3 propagation gap #2: mirror the parent's
+        // sym.vable_last_instr + sym.vable_valuestackdepth into the
+        // virtualizable_boxes shadow when this sym owns it. Without
+        // propagation, the heap still carries the caller's pre-call PC
+        // and pre-call vsd, and once the writeback gate flips on, the
+        // patched-parent loop's GETFIELD preamble re-loads the stale
+        // values. virtualizable_boxes[0] = vable_last_instr,
+        // [2] = vable_valuestackdepth per virtualizable_gen.rs:37-44.
         let return_point_pc = self.fallthrough_pc;
         self.with_ctx(|this, ctx| {
             let ni = ctx.const_int(return_point_pc as i64 - 1);
-            let s = this.sym_mut();
-            s.vable_last_instr = ni;
-            s.vable_valuestackdepth = ctx.const_int(s.valuestackdepth as i64);
+            let new_vsd_concrete = this.sym().valuestackdepth as i64;
+            let vsd_opref = ctx.const_int(new_vsd_concrete);
+            let owns = {
+                let s = this.sym_mut();
+                s.vable_last_instr = ni;
+                s.vable_valuestackdepth = vsd_opref;
+                s.owns_virtualizable_shadow()
+            };
+            if owns {
+                ctx.set_virtualizable_entry_at(0, ni, Value::Int(return_point_pc as i64 - 1));
+                ctx.set_virtualizable_entry_at(2, vsd_opref, Value::Int(new_vsd_concrete));
+            }
         });
         // opencoder.py:819-834 parity: accumulate full parent chain.
         // Current frame becomes the newest parent; existing parents follow.

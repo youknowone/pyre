@@ -120,10 +120,9 @@ pub struct PyJitCodeMetadata {
     /// the map when JIT-traced PCs did not reach the static peak; the
     /// `co_stacksize` invariant restores parity with the runtime.
     ///
-    /// After Phase 2.1c (commit `3fd64d5b0f3`) the stack-slot
-    /// input-arg pinning that lived in `enforce_input_args` /
-    /// `perform_register_allocation` is gone, so this map is no
-    /// longer the identity `[stack_base, stack_base+1, …]`
+    /// After Phase 2.1c (commit `3fd64d5b0f3`, regalloc.rs:448-466 +
+    /// :527-535) the stack-slot input-arg pinning is gone, so this
+    /// map is no longer the identity `[stack_base, stack_base+1, …]`
     /// — entries are whatever color `apply_rename` produced. Decoders
     /// (`state.rs`, `trace_opcode.rs`, `codewriter.rs`) must read
     /// through the map; they cannot assume the old `nlocals + d`

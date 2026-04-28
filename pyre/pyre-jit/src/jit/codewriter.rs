@@ -837,40 +837,21 @@ fn update_catch_landing_state(
     target: &SpamBlockRef,
     edge_state: &FrameState,
 ) {
-    // PRE-EXISTING-ADAPTATION (Task #246).
-    //
-    // RPython `flowcontext.py:130-139 guessexception` separates
-    // `vars` (link.args, the link's `extravars` — `[last_exc,
+    // `flowcontext.py:130-139 guessexception` separates `vars`
+    // (link.args, the link's `extravars` — `[last_exc,
     // last_exc_value]`) from `vars2` (target.inputargs, fresh
-    // Variables on the EggBlock).  Pyre's first-source path here
-    // uses `Some(edge_state.clone())`, aliasing link.args and
-    // target.inputargs onto the same Variable IDs — a NEW-DEVIATION
-    // from upstream's two-Variable-set discipline.
-    //
-    // The mechanically-orthodox fix is `Some(edge_state.copy(&mut
-    // fresh))`, mirroring `initialize_spam_block` and
-    // `make_next_block`.  Probe (2026-04-27): on its own this
-    // produces an intermittent runtime regression — fannkuch /
-    // nbody / fib_recursive timeout >5s on every other check.sh
-    // run, while leaving lib tests green.  The smoking gun is the
-    // interaction with the bridge re-trace symbolic-state path
-    // tracked in MEMORY's "Task #21 root cause" /
-    // "task110_slice3a_landed" notes: forcing fresh inputargs
-    // routes catch-landing edges through `insert_renamings` +
-    // regalloc coalesce, which then leaks unstable register
-    // colorings into bridge dispatch.
-    //
-    // **Convergence path**: fix lands together with the
-    // bridge-shadow heap-writeback infra (Task #21 root cause
-    // hypothesis 3: `close_loop_args_at` SetfieldGc + SetarrayitemGc
-    // emit) so catch-landing fresh inputargs no longer carry stale
-    // bridge state across the JUMP.  Until that infra is in,
-    // keeping the alias is the lesser deviation.
+    // Variables on the EggBlock).  Both single-source and
+    // multi-source paths must allocate fresh inputargs so the
+    // landing block's `inputargs` Variable IDs are disjoint from
+    // the link's outgoing args.  `copy()` is the upstream-canonical
+    // shape — `framestate.py:80 copy(rename)` re-renames every
+    // FlowValue Variable through the closure.
     let new_state = if let Some(existing) = target.framestate() {
         let mut fresh = |kind| fresh_variable_for_state(graph, kind);
         existing.union(edge_state, &mut fresh)
     } else {
-        Some(edge_state.clone())
+        let mut fresh = |kind| fresh_variable_for_state(graph, kind);
+        Some(edge_state.copy(&mut fresh))
     };
     // `flowcontext.py:139` `egg = EggBlock(vars2, block, case)` — the
     // catch landing's inputargs receive the exception edge's incoming
@@ -1515,18 +1496,17 @@ fn emit_frontend_bool(
     // immediately-following `emit_residual_call(truth_fn_idx, ...,
     // ResKind::Int, Some(scratch_truth))` (consumed by `goto_if_not`).
     // The duplication exists because `FunctionGraph` Variables and
-    // `SSARepr` registers live in two regalloc colorings that have not
-    // been unified yet.
+    // `SSARepr` registers still live in two regalloc colorings even
+    // though Phase 3c (commit `bc0d6a06c4`) has already collapsed the
+    // dual emitter into a single walker-local `SSARepr`.
     //
-    // Convergence path: the Phase 3c switchover (see
-    // `emit_residual_call_shape` doc-block) moves the authoritative
-    // codewriter input from the runtime `SSAReprEmitter::ssarepr` to
-    // the walker-local `ssarepr` driven from `FunctionGraph`. At that
-    // point a single Variable can drive both the exitswitch and the
-    // flatten-emitted `goto_if_not`: lower `bool` as a residual_call to
-    // `truth_fn` in the same pass that lowers other graph ops to
-    // assembler Insns, dropping the second emit at the call sites
-    // below.
+    // Convergence path: Task #229 (TmpVarEnv) replaces the SSA-side
+    // `scratch_truth` slot with a `fresh_var(Kind::Int)` graph Variable so
+    // the same Variable drives both the front-end exitswitch and the
+    // flatten-emitted `goto_if_not`. Once that lands, lower `bool` as a
+    // residual_call to `truth_fn` in the same pass that lowers other
+    // graph ops to assembler Insns and drop the second emit at the
+    // call sites below.
     emit_graph_op_with_result(
         graph,
         block,
@@ -2247,7 +2227,8 @@ fn filter_liveness_in_place(
         // The Ref bank previously carried an `(in_locals || in_stack)`
         // pre-filter to keep portal/scratch indices out of `live_r`.
         // After Phase 2.2 routed every scratch through
-        // `SSARepr::fresh_var` and the LV∩SSA retain below
+        // `ssarepr.fresh_var(Kind::Ref, scratch_ref_base)` (placed
+        // above `portal_ec_reg + 1`) and the LV∩SSA retain below
         // (`live_r.retain(|idx| lv_live.contains(idx))`) settled in
         // as the authoritative narrowing step, the pre-filter became
         // algebraically redundant: any index that would have been
@@ -2480,8 +2461,7 @@ fn emit_residual_call(
     emit_residual_call_shape(ssarepr, flavor, fn_idx, call_args, reskind, dst);
 }
 
-/// Upstream-shape Insn builder for the walker-local `ssarepr`. See
-/// `emit_residual_call` for the dual-emit policy.
+/// Upstream-shape Insn builder for the walker-local `ssarepr`.
 ///
 /// `rpython/jit/codewriter/jtransform.py:414-435 rewrite_call` emits
 ///
@@ -2500,13 +2480,10 @@ fn emit_residual_call(
 /// `f`, `v`}. `namebase = 'residual_call'` for the direct-call helper
 /// (`jtransform.py:460-471 handle_residual_call`).
 ///
-/// This helper is the external-`SSARepr` side of the Phase 3b dual
-/// emission: every call site pairs a direct `assembler.call_*_typed(...)`
-/// (pushing a pyre-only `call_*` Insn into the runtime-consumed
-/// `SSAReprEmitter::ssarepr`) with one call here, which pushes the
-/// upstream-canonical shape into the walker-local `ssarepr` that
-/// Phase 3c will wire up as the authoritative `Assembler::assemble`
-/// input.
+/// Phase 3c (commit `bc0d6a06c4`) collapsed the earlier dual emitter,
+/// so this helper now pushes directly into the single walker-local
+/// `SSARepr` that `Assembler::assemble` consumes — there is no longer
+/// a paired `assembler.call_*_typed(...)` direct emission.
 ///
 /// PRE-EXISTING-ADAPTATION: upstream stores `calldescr` (an
 /// `AbstractDescr` carrying `EffectInfo`) in the trailing slot; pyre
@@ -2514,7 +2491,7 @@ fn emit_residual_call(
 /// `assembler.rs::dispatch_residual_call` can recover the (flavor,
 /// reskind, per-param kind) tuple statically today.
 ///
-/// Convergence path (Phase 3c switchover):
+/// Convergence path (calldescr interning):
 ///   1. Port `rpython/jit/codewriter/effectinfo.py::EffectInfo` and
 ///      `CallInfoCollection` (needed independently by the heap/pure
 ///      optimizer pass before `calldescr` interning is meaningful).
@@ -2554,7 +2531,7 @@ fn emit_residual_call_shape(
     // slots, and `assembler.py:181-196` distinguishes `Register` vs
     // `Constant` per item, encoding constants inline in the bytecode via
     // `emit_const(item, itemkind)`. Pyre's `JitCallArg` carries only
-    // `{kind, reg}` (see `majit_metainterp::jitcode::JitCallArg`),
+    // `{kind, reg}` (see `majit-metainterp/src/jitcode/mod.rs:861-888`),
     // so every constant must be materialized at the call site into a
     // fresh `ssarepr.fresh_var(Kind::Int|Ref|Float, base)` slot via an
     // emitter macro (`emit_load_const_i!`, `emit_ref_const_copy!`, etc.)
@@ -6399,77 +6376,92 @@ impl CodeWriter {
                 }
             }
 
-            // Phase 4 Session 18 slice 7 (Task #227 prerequisite) —
-            // debug-mode retirement-readiness invariant for
-            // `setfield_vable_i`.  Slice 6's `[phase4-flatten-family]`
-            // probe surfaced that on every portal-bound CodeObject the
-            // graph-flattened sequence's shape multiset is a
-            // sub-multiset of the inline ssarepr-filtered sequence
-            // (orphan inline emits OK, orphan graph emits not).
-            // Promote that observation to a debug-mode invariant —
-            // **multiset-only**, not positional.  RPython's
+            // Phase 4 Session 18 slice 7 + Session 20 (Task #227
+            // prerequisite) — debug-mode retirement-readiness invariant
+            // for the vable op families that carry a complete dual-write.
+            // Slice 6's `[phase4-flatten-family]` probe surfaced that on
+            // every portal-bound CodeObject the graph-flattened sequence's
+            // shape multiset is a sub-multiset of the inline
+            // ssarepr-filtered sequence (orphan inline emits OK, orphan
+            // graph emits not).  Promote that observation to a debug-mode
+            // invariant — **multiset-only**, not positional.  RPython's
             // `flatten.py:60-100 generate_ssa_form` walks
             // `block.operations` in graph DFS order, while pyre's
             // inline walker emits at bytecode dispatch time; the two
             // orderings can legitimately disagree on the position of
-            // a `setfield_vable_i` even when both sides emit the same
-            // shape multiset.  The surrounding `[phase4-flatten-family]`
-            // probe (codewriter.rs:5947+) already documents this
-            // divergence — the assert here MUST match the probe's
-            // tolerance, otherwise a debug build can panic on a graph
-            // that release builds accept (and that the probe correctly
-            // reports as `multiset_match == common`).  When this
-            // invariant holds across all production CodeObjects,
-            // retirement of `emit_vsd!`'s inline emit pair
-            // (`emit_load_const_i!` + `emit_vable_setfield_int!` at
-            // codewriter.rs:2902-2903) in favour of post-walk
-            // `flatten_graph(graph, regallocs)` emission becomes
-            // safe.  Release builds skip the check entirely.
+            // a member of these families even when both sides emit the
+            // same shape multiset.  The surrounding
+            // `[phase4-flatten-family]` probe (codewriter.rs:6155+)
+            // already documents this divergence — the assert here MUST
+            // match the probe's tolerance, otherwise a debug build can
+            // panic on a graph that release builds accept (and that the
+            // probe correctly reports as `multiset_match == common`).
+            // When this invariant holds across all production
+            // CodeObjects, retirement of the inline emit pair (e.g.
+            // `emit_vsd!`'s `emit_load_const_i!` + `emit_vable_setfield_int!`
+            // at codewriter.rs:2902-2903) in favour of post-walk
+            // `flatten_graph(graph, regallocs)` emission becomes safe.
+            // Release builds skip the check entirely.
+            //
+            // Session 20 expands the family list from `setfield_vable_i`
+            // alone to all three Session 18 probe families.  Per the
+            // Session 19 handoff, `setarrayitem_vable_r` is 10/11
+            // graph-paired (orphan inline emit at push_lasti is fine
+            // under sub-multiset), and `getarrayitem_vable_r` LOAD_FAST
+            // + StoreFastLoadFast LOAD halves are both paired
+            // (Session 19 slice 2).  Test-suite pass under this
+            // invariant cross-validates the convergence.
             if cfg!(debug_assertions) {
-                const FAMILY: &str = "setfield_vable_i";
-                let parallel = super::flatten::flatten_family_ops(
-                    &graph,
-                    FAMILY,
-                    |variable: super::flow::Variable| {
-                        let kind = variable.kind.unwrap_or(super::flatten::Kind::Ref);
-                        let color = graph_regallocs
-                            .get(&kind)
-                            .and_then(|r| r.coloring.get(&variable.id).copied())
-                            .unwrap_or(u16::MAX);
-                        super::flatten::Register::new(kind, color)
-                    },
-                );
-                let inline: Vec<&super::flatten::Insn> = ssarepr
-                    .insns
-                    .iter()
-                    .filter(|insn| {
-                        matches!(insn, super::flatten::Insn::Op { opname, .. } if opname == FAMILY)
-                    })
-                    .collect();
-                assert!(
-                    parallel.len() <= inline.len(),
-                    "{FAMILY} retirement-readiness invariant violated: graph emitted {} ops, \
-                     inline emitted {} ops (graph must be a sub-multiset of inline) for {}",
-                    parallel.len(),
-                    inline.len(),
-                    code.obj_name,
-                );
-                let mut inline_shape_counts: HashMap<String, usize> = HashMap::new();
-                for insn in &inline {
-                    *inline_shape_counts
-                        .entry(shape_descriptor(insn))
-                        .or_insert(0) += 1;
-                }
-                for parallel_op in &parallel {
-                    let key = shape_descriptor(parallel_op);
-                    let entry = inline_shape_counts.get_mut(&key);
-                    match entry {
-                        Some(count) if *count > 0 => *count -= 1,
-                        _ => panic!(
-                            "{FAMILY} retirement-readiness invariant violated: graph emitted \
-                             shape {key} for which inline has no remaining match in {}",
-                            code.obj_name,
-                        ),
+                const RETIREMENT_READY_FAMILIES: &[&str] = &[
+                    "setarrayitem_vable_r",
+                    "getarrayitem_vable_r",
+                    "setfield_vable_i",
+                ];
+                for &family in RETIREMENT_READY_FAMILIES {
+                    let parallel = super::flatten::flatten_family_ops(
+                        &graph,
+                        family,
+                        |variable: super::flow::Variable| {
+                            let kind = variable.kind.unwrap_or(super::flatten::Kind::Ref);
+                            let color = graph_regallocs
+                                .get(&kind)
+                                .and_then(|r| r.coloring.get(&variable.id).copied())
+                                .unwrap_or(u16::MAX);
+                            super::flatten::Register::new(kind, color)
+                        },
+                    );
+                    let inline: Vec<&super::flatten::Insn> = ssarepr
+                        .insns
+                        .iter()
+                        .filter(|insn| {
+                            matches!(insn, super::flatten::Insn::Op { opname, .. } if opname == family)
+                        })
+                        .collect();
+                    assert!(
+                        parallel.len() <= inline.len(),
+                        "{family} retirement-readiness invariant violated: graph emitted {} ops, \
+                         inline emitted {} ops (graph must be a sub-multiset of inline) for {}",
+                        parallel.len(),
+                        inline.len(),
+                        code.obj_name,
+                    );
+                    let mut inline_shape_counts: HashMap<String, usize> = HashMap::new();
+                    for insn in &inline {
+                        *inline_shape_counts
+                            .entry(shape_descriptor(insn))
+                            .or_insert(0) += 1;
+                    }
+                    for parallel_op in &parallel {
+                        let key = shape_descriptor(parallel_op);
+                        let entry = inline_shape_counts.get_mut(&key);
+                        match entry {
+                            Some(count) if *count > 0 => *count -= 1,
+                            _ => panic!(
+                                "{family} retirement-readiness invariant violated: graph emitted \
+                                 shape {key} for which inline has no remaining match in {}",
+                                code.obj_name,
+                            ),
+                        }
                     }
                 }
             }
@@ -6510,7 +6502,7 @@ impl CodeWriter {
         // do not reach the static peak; the bridge fallback at
         // `state.rs::setup_bridge_sym` (`stack_base + color_map.len()`)
         // requires the full PyFrame length, so this width is the
-        // contract `PyreJitCode::stack_slot_color_map` already documents.
+        // contract `pyjitcode.rs:97-110` already documents.
         let stack_map_len = max_stackdepth as u16;
         let mut stack_slot_color_map: Vec<u16> = Vec::with_capacity(stack_map_len as usize);
         for d in 0..stack_map_len {
