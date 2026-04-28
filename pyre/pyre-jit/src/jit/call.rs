@@ -462,9 +462,24 @@ impl CallControl {
     /// Reset the cached slot back to an empty skeleton — the state that
     /// follows `JitCode(graph.name, fnaddr, calldescr, ...)` at
     /// `call.py:168` before the drain re-runs `assembler.assemble`
-    /// (codewriter.py:67) on it. Mutates the cached object's payload
-    /// in place so any existing `Arc<PyJitCode>` clones keep observing
-    /// the same identity.
+    /// (codewriter.py:67) on it.
+    ///
+    /// PRE-EXISTING-ADAPTATION: this entry point exists only because
+    /// `get_jitcode` re-runs the drain when `merge_point_pc` is refined
+    /// — RPython has no analog because portal PCs are statically known
+    /// (call.py:155 `if graph in self.jitcodes: return self.jitcodes[graph]`
+    /// has no reset branch).
+    ///
+    /// This method must NOT use the in-place payload mutation that
+    /// `publish_jitcode` relies on: after the first drain, `jd.mainjitcode`
+    /// and any trace-side `MetaInterpStaticData.jitcodes` clone are
+    /// already pointing at the populated `Arc<PyJitCode>`. Replacing the
+    /// payload in place here would clobber those holders back to a
+    /// skeleton state, which RPython's "runtime reader never observes a
+    /// reset shell" invariant rules out. Instead we always insert a new
+    /// `Arc<PyJitCode>`; the previous Arc stays populated for any holder
+    /// that already cloned it, matching the pre-Slice-2 behavior that
+    /// fell back to `Arc::new(...)` on `Arc::get_mut` failure.
     pub fn reset_jitcode_skeleton(
         &mut self,
         key: usize,
@@ -472,10 +487,6 @@ impl CallControl {
         w_code: *const (),
         merge_point_pc: Option<usize>,
     ) {
-        if let Some(slot) = self.jitcodes.get_mut(&key) {
-            slot.replace_with(PyJitCode::skeleton(code_ptr, w_code, merge_point_pc));
-            return;
-        }
         self.jitcodes.insert(
             key,
             std::sync::Arc::new(PyJitCode::skeleton(code_ptr, w_code, merge_point_pc)),
@@ -497,7 +508,17 @@ impl CallControl {
     /// the outer `Arc<PyJitCode>` identity.
     pub fn publish_jitcode(&mut self, key: usize, pyjitcode: PyJitCode) -> *const PyJitCode {
         if let Some(slot) = self.jitcodes.get_mut(&key) {
-            slot.replace_with(pyjitcode);
+            // SAFETY: `publish_jitcode` runs on the JIT setup thread
+            // during the codewriter drain (codewriter.py:79-85). The
+            // cached `Arc<PyJitCode>` is only shared with `jd.mainjitcode`
+            // and any pre-bound `MetaInterpStaticData.jitcodes` clone,
+            // which were established by the same setup thread just
+            // before this call. No runtime tracing or blackhole resume
+            // can be observing the slot at this point — those paths
+            // only run after `make_jitcodes` returns.
+            unsafe {
+                slot.replace_with(pyjitcode);
+            }
             return std::sync::Arc::as_ptr(slot);
         }
         let arc = std::sync::Arc::new(pyjitcode);

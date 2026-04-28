@@ -259,9 +259,26 @@ impl PyJitCode {
     /// allocation. This is pyre's Rust-side stand-in for RPython
     /// `assembler.assemble(..., jitcode, ...)` mutating the existing
     /// `JitCode` object from `CallControl.jitcodes[graph]`.
-    pub fn replace_with(&self, next: PyJitCode) {
-        // SAFETY: see the `Sync` impl comment; this method is only for
-        // the codewriter publication path.
+    ///
+    /// # Safety
+    ///
+    /// The caller must guarantee no other thread is currently reading
+    /// the payload through any cloned `Arc<PyJitCode>`. RPython relies
+    /// on the implicit single-threaded semantics of the translation /
+    /// codewriter setup phase — the JitCode shell is filled in place
+    /// before any runtime reader observes it. Pyre cannot encode that
+    /// invariant in the Rust type system without a heavyweight lock,
+    /// so callers must check the precondition manually:
+    ///
+    /// * Only invoke this from the JIT setup / codewriter publication
+    ///   path, before runtime tracing or blackhole resume can dispatch
+    ///   on the same code.
+    /// * In particular, do NOT call this to roll a populated payload
+    ///   back to a skeleton — that breaks the "runtime reader never
+    ///   observes a reset shell" invariant. Skeleton resets must
+    ///   replace the outer `Arc` instead (see
+    ///   `CallControl::reset_jitcode_skeleton`).
+    pub unsafe fn replace_with(&self, next: PyJitCode) {
         unsafe {
             *self.payload.get() = next.payload.into_inner();
         }
