@@ -2270,14 +2270,14 @@ impl Optimizer {
                         continue;
                     }
                     let orig = *arg;
-                    // RPython parity: Box.type intrinsically carries i/r/f.
-                    // Pass-through; Type::Void surfaces via same_as_for_type's
-                    // own unreachable! arm rather than a duplicate guard here.
+                    // history.py:802-809 `record_same_as(box)` reads
+                    // `box.type` directly to pick `same_as_i/r/f` — there is
+                    // no guess-on-miss path in RPython. Match strict parity by
+                    // requiring `opref_type` to resolve; a None here is a
+                    // bookkeeping bug, not a recoverable case.
                     let arg_type = ctx
-                        .value_types
-                        .get(&orig.0)
-                        .copied()
-                        .unwrap_or(majit_ir::Type::Ref);
+                        .opref_type(orig)
+                        .expect("propagate_from_pass_range SameAs: source OpRef missing Box.type");
                     let same_as = OpCode::same_as_for_type(arg_type);
                     let fresh = ctx.alloc_op_position();
                     let mut op = Op::new(same_as, &[orig]);

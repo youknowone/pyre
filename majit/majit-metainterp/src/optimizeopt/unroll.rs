@@ -773,7 +773,6 @@ impl UnrollOptimizer {
             exported_short_inputargs,
             exported_short_boxes,
             exported_renamed_inputargs,
-            exported_renamed_inputarg_types,
         ) = {
             let es = opt_p2
                 .imported_loop_state
@@ -785,7 +784,6 @@ impl UnrollOptimizer {
                 es.short_inputargs.clone(),
                 es.exported_short_boxes.clone(),
                 es.renamed_inputargs.clone(),
-                es.renamed_inputarg_types.clone(),
             )
         };
         // RPython unroll.py:124-141 performs an extra end-of-preamble forcing
@@ -1249,7 +1247,10 @@ impl UnrollOptimizer {
                 .last()
                 .map(|target| target.as_jump_target_descr()),
             &exported_end_args,
-            &exported_renamed_inputarg_types,
+            opt_p2
+                .final_ctx
+                .as_ref()
+                .expect("assemble peeled trace requires Phase 2 OptContext for Box.type parity"),
         );
         // RPython Box parity: drop duplicate-position ops. In RPython
         // each Box is unique so collisions can't happen. Keep first.
@@ -3914,6 +3915,7 @@ fn build_imported_virtuals_from_state(
 }
 
 /// compile.py:310-338: [preamble_no_jump] + Label(label_args) + [body_with_jump]
+#[cfg(test)]
 fn assemble_peeled_trace(
     p1_ops: &[Op],
     p2_ops: &[Op],
@@ -3928,6 +3930,7 @@ fn assemble_peeled_trace(
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
 ) -> Vec<Op> {
+    let ctx = assemble_test_context(p1_ops, p2_ops, body_num_inputs);
     assemble_peeled_trace_with_jump_args(
         p1_ops,
         p2_ops,
@@ -3944,8 +3947,20 @@ fn assemble_peeled_trace(
         start_label_descr,
         loop_label_descr,
         &[], // no p1_end_args for simple assembly
-        &[], // no inputarg_types for simple assembly
+        &ctx,
     )
+}
+
+#[cfg(test)]
+fn assemble_test_context(p1_ops: &[Op], p2_ops: &[Op], body_num_inputs: usize) -> OptContext {
+    let mut ctx = OptContext::with_num_inputs(p1_ops.len() + p2_ops.len(), body_num_inputs);
+    for op in p1_ops.iter().chain(p2_ops.iter()) {
+        if op.pos.is_none() || op.result_type() == Type::Void {
+            continue;
+        }
+        ctx.value_types.entry(op.pos.0).or_insert(op.result_type());
+    }
+    ctx
 }
 
 fn assemble_peeled_trace_with_jump_args(
@@ -3964,7 +3979,7 @@ fn assemble_peeled_trace_with_jump_args(
     start_label_descr: Option<DescrRef>,
     loop_label_descr: Option<DescrRef>,
     p1_end_args: &[OpRef],
-    inputarg_types: &[Type],
+    ctx: &crate::optimizeopt::OptContext,
 ) -> Vec<Op> {
     let mut result =
         Vec::with_capacity(p1_ops.len() + p2_ops.len() + 1 + imported_short_aliases.len());
@@ -4013,20 +4028,15 @@ fn assemble_peeled_trace_with_jump_args(
         next
     };
 
-    // RPython Box.type parity: SameAs opcode must match the source Box's type.
-    // In the flat OpRef model, inputargs don't have a defining op in `result`,
-    // so consult `inputarg_types` first and only then fall back to the emitted op.
-    let derive_same_as_opcode = |source: OpRef, result: &[Op]| -> OpCode {
-        if source.0 >= inputarg_base && (source.0 - inputarg_base) < body_num_inputs as u32 {
-            if let Some(tp) = inputarg_types.get((source.0 - inputarg_base) as usize) {
-                return OpCode::same_as_for_type(*tp);
-            }
-        }
-        result
-            .iter()
-            .find(|op| op.pos == source)
-            .map(|op| OpCode::same_as_for_type(op.opcode.result_type()))
-            .unwrap_or(OpCode::SameAsI)
+    // history.py:802-809 `record_same_as(box)` reads `box.type` directly —
+    // there is no guess-on-miss path in RPython. Pyre's closest analogue is
+    // `ctx.opref_type` (constant -> value_types -> op result type). A failure
+    // to resolve is a bookkeeping bug.
+    let derive_same_as_opcode = |source: OpRef, _result: &[Op]| -> OpCode {
+        OpCode::same_as_for_type(
+            ctx.opref_type(source)
+                .expect("assemble_peeled_trace: source OpRef missing Box.type from OptContext"),
+        )
     };
 
     if let Some(start_label_descr) = start_label_descr {
@@ -6118,6 +6128,7 @@ mod tests {
             (OpRef::from_const(0).0, 2_i64),
         ]);
 
+        let ctx = assemble_test_context(&p1_ops, &p2_ops, 1);
         let combined = assemble_peeled_trace_with_jump_args(
             &p1_ops,
             &p2_ops,
@@ -6134,7 +6145,7 @@ mod tests {
             None,
             None,
             &[],
-            &[],
+            &ctx,
         );
 
         assert_eq!(combined[1].opcode, OpCode::Label);
