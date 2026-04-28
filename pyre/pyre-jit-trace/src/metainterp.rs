@@ -37,13 +37,32 @@ pub struct MetaInterpFrame {
     pub drop_frame_opref: Option<OpRef>,
     pub caller_result_stack_idx: Option<usize>,
     pub arg_state: pyre_interpreter::bytecode::OpArgState,
-    /// `virtualizable_boxes` static-slot snapshot taken when this inline
-    /// frame was pushed (Slice 3.0e').  Empty for the root frame and for
-    /// non-virtualizable traces.  At pop, each `Some((opref, value))`
-    /// entry is written back into `ctx.virtualizable_boxes` so the
-    /// outer frame's vable shadow returns to its pre-call state after
-    /// the callee's `flush_to_frame_for_guard` mirrors (Slice 3.0c)
-    /// have written callee values into the same shadow.
+    /// PRE-EXISTING-ADAPTATION (no upstream counterpart in
+    /// `pyjitpl.py:2421-2452 newframe` / `:2474 finishframe` /
+    /// `:2506-2531 finishframe_exception`): `virtualizable_boxes`
+    /// static-slot snapshot taken when this inline frame is pushed,
+    /// restored on pop / exception-pop.
+    ///
+    /// Why this is currently load-bearing: `flush_to_frame{,_for_guard}`
+    /// rewrites the canonical shadow from the active sym's heap-read
+    /// seed (`PyFrame.{last_instr,pycode,valuestackdepth,…}`).  Even
+    /// though the mirror sites are gated by
+    /// `owns_virtualizable_shadow()` so a non-owning callee sym never
+    /// publishes into the shadow, snapshot construction
+    /// (`materialize_parent_snapshot_state` →
+    /// `parent_frame.flush_to_frame_for_guard`) can still re-seed the
+    /// shadow from a parent frame mid-callee.  Restoring on pop keeps
+    /// the outer frame's pre-inline identity intact across the inline
+    /// run for downstream readers (writeback, JUMP-arg dedup, the next
+    /// guard's snapshot).
+    ///
+    /// Convergence path (multi-session): port the upstream
+    /// `metainterp.virtualizable_boxes` model where shadow mutation
+    /// is confined to `_opimpl_setfield_vable` / `synchronize_virtualizable`
+    /// and snapshot capture is a pure read.  When that lands the
+    /// guard-time heap re-seed will live in the snapshot only, not the
+    /// shared shadow, and this save/restore + the matching one in
+    /// `capture_resumedata` / `record_branch_guard` can drop together.
     pub saved_vable_static_box_entries: Vec<Option<(OpRef, Value)>>,
 }
 

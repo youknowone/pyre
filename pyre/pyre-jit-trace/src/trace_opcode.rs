@@ -201,17 +201,23 @@ use crate::frame_layout::{
 };
 use crate::helpers::TraceHelperAccess;
 
-/// pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity helper (Slice 3.0).
+/// pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity helper.
 ///
 /// `PyreSym.vable_*` is a pyre-only parallel symbolic cache that
 /// RPython does not have — RPython's `metainterp.virtualizable_boxes`
 /// is the single canonical source for vable static state.  Every
-/// direct `s.vable_X = opref` write must publish into the boxes
-/// shadow as well so that future readers
-/// (`gen_writeback_vable_to_heap`, snapshot construction, JUMP-arg
-/// dedup) observe the same identity.  Slice 3.4 removes
-/// `s.vable_*` entirely; until then this helper is the convergence
-/// surface.
+/// direct `s.vable_X = opref` write on the **owning** sym (root frame
+/// or bridge entry) must publish into the boxes shadow as well so
+/// future readers (`gen_writeback_vable_to_heap`, snapshot
+/// construction, JUMP-arg dedup) observe the same identity.  Callers
+/// gate on `s.owns_virtualizable_shadow()` before calling — upstream
+/// `_opimpl_setfield_vable` short-circuits on
+/// `_nonstandard_virtualizable` so callee inline frames never reach
+/// the `metainterp.virtualizable_boxes[index] = valuebox` write, and
+/// the call-site gate is pyre's analog (callee inline syms allocated
+/// via `PyreSym::new_uninit` keep `vable_array_base` /
+/// `bridge_local_oprefs` `None` so `owns_virtualizable_shadow()`
+/// returns false for them).
 ///
 /// `static_field_name` matches the canonical PyFrame virtualizable
 /// spec at `virtualizable_spec.rs:11-18`
@@ -237,15 +243,32 @@ fn mirror_vable_static_to_boxes(
     }
 }
 
-/// Snapshot a single virtualizable static slot for later restore (Slice 3.0d).
+/// PRE-EXISTING-ADAPTATION: snapshot a single virtualizable static
+/// slot of `ctx.virtualizable_boxes` for later restore.
 ///
-/// Mirrors the `s.vable_*` save half of pyjitpl.py:2594 `saved_pc =
-/// frame.pc` — pyre extends the save/restore over snapshot construction
-/// to also cover `vable_last_instr` / `vable_valuestackdepth`, so when
-/// `flush_to_frame_for_guard` re-seeds those slots from the heap (with
-/// `resume_pc - 1` as `last_instr`) the post-capture state can be put
-/// back in place. With Slice 3.0c mirroring sym→boxes, the boxes shadow
-/// must be saved/restored alongside or it diverges from `s.vable_*`.
+/// Upstream `pyjitpl.py:2586-2602 capture_resumedata` saves only
+/// `frame.pc`; `metainterp.virtualizable_boxes` is read but never
+/// mutated during capture, so RPython has no shadow save/restore.
+///
+/// Pyre needs both halves because `flush_to_frame_for_guard` (called
+/// inside `generate_guard_core` and `record_branch_guard` immediately
+/// before capture) re-seeds the active sym's `s.vable_*` from the
+/// PyFrame heap and mirrors that into `ctx.virtualizable_boxes` on
+/// owning syms.  Without the matching boxes save/restore, the shadow
+/// holds the guard's resume-PC heap-read seed after capture and
+/// downstream consumers (writeback at JUMP, the next guard's
+/// snapshot) read a stale identity until the next
+/// `_opimpl_setfield_vable` mirror fires.  Naively dropping the
+/// save/restore intermittently regresses nbody / fannkuch / fib_recursive
+/// at the 5-second timeout (empirically reproduced when
+/// `metainterp.rs::saved_vable_static_box_entries` was removed in
+/// isolation).
+///
+/// Convergence path: move the guard heap re-seed out of the shared
+/// shadow (capture it directly into the snapshot's vable_boxes
+/// section) so `flush_to_frame_for_guard` is shadow-pure and the
+/// save/restore pair becomes a no-op that can drop together with
+/// `metainterp.rs::saved_vable_static_box_entries`.
 fn save_vable_static_entry(
     ctx: &TraceCtx,
     static_field_name: &str,
@@ -2938,6 +2961,21 @@ impl MIFrame {
         // virtualizable.py:131-133 wraps each value with its declared
         // `FIELDTYPE`; pyre mirrors that by consulting
         // `VirtualizableInfo::static_fields[i].field_type`.
+        //
+        // PRE-EXISTING-ADAPTATION (split-brain): upstream
+        // `opencoder.py:718-726 _list_of_boxes_virtualizable` reads
+        // from `metainterp.virtualizable_boxes` — the canonical pyre
+        // analog is `ctx.virtualizable_boxes`.  pyre still reads from
+        // `sym.vable_field_oprefs()` here because the active sym is the
+        // top of the framestack at snapshot time and a probe replacement
+        // (`ctx.virtualizable_entry_at(idx)` first, sym fallback)
+        // intermittently regresses the heap-writeback identity for
+        // bridges resumed from inline-callee guards.  Convergence is
+        // multi-session and tied to the same shadow-mutation refactor
+        // tracked at `MetaInterpFrame::saved_vable_static_box_entries`
+        // (move guard-time heap re-seed out of the shared shadow); when
+        // that lands, both readers/writers can collapse onto
+        // `ctx.virtualizable_boxes` as the single source of truth.
         let vable_static_types: Vec<majit_ir::Type> = ctx
             .virtualizable_info()
             .map(|info| info.static_fields.iter().map(|f| f.field_type).collect())
