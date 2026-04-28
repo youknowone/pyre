@@ -1799,6 +1799,78 @@ impl TraceCtx {
         self.vable_setfield_descr(vable_opref, null, info.token_field_descr());
     }
 
+    /// Emit `SetfieldGc` for every static field and
+    /// `GetfieldGcR` + `SetarrayitemGc` for every array item of the
+    /// virtualizable referenced by `vable_opref`, mirroring
+    /// `pyjitpl.py:3479-3494` field/array writes but without the
+    /// `gen_store_back_in_vable` one-shot bookkeeping (no
+    /// `forced_virtualizable` guard, no terminating
+    /// `vable_token = NULL` write).
+    ///
+    /// Companion to `compile.py:425-461 patch_new_loop_to_load_
+    /// virtualizable_fields`: when a JUMP target's label is reduced to
+    /// reds-only, the patched loop preamble re-loads vable static and
+    /// array fields from the heap on every iteration, so the heap MUST
+    /// be source-of-truth before the JUMP. Tracing-time symbolic
+    /// updates (`sym.vable_*` / `sym.registers_r[..nlocals]`) do not
+    /// touch the heap; this helper closes the gap.
+    ///
+    /// Reads `self.virtualizable_boxes` for the values to write; that
+    /// vector mirrors `[static_field_0, ..., array_0_item_0, ...,
+    /// vable_box_identity]`. Caller is responsible for ensuring the
+    /// boxes vector is up-to-date with the trace's current state at the
+    /// point of the call (Slice 3 of the Task #21 fix plan).
+    ///
+    /// Skips emission when the active vable is non-standard or when
+    /// virtualizable infrastructure is absent. Safe to call multiple
+    /// times — unlike `gen_store_back_in_vable`, repeat calls re-emit
+    /// the writebacks rather than no-op'ing.
+    ///
+    /// Dormant — wired up by Slice 2 (`close_loop_args_at` invocation
+    /// behind the `inputarg_types.len() <= 1 + NUM_EXTRA_REDS` gate so
+    /// descriptor=None paths see no new emission).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn gen_writeback_vable_to_heap(&mut self, vable_opref: OpRef) {
+        let (info, boxes, lengths) = match (
+            self.virtualizable_info.clone(),
+            self.virtualizable_boxes.clone(),
+            self.virtualizable_array_lengths.clone(),
+        ) {
+            (Some(info), Some(boxes), Some(lengths)) => (info, boxes, lengths),
+            _ => return,
+        };
+
+        // pyjitpl.py:3469 `vbox = self.virtualizable_boxes[-1]` — same
+        // standard-vable filter as `gen_store_back_in_vable` so this
+        // helper is safe to call from a generic JUMP/exit emitter
+        // without the caller having to re-check the vbox identity.
+        if boxes.last().copied() != Some(vable_opref) {
+            return;
+        }
+
+        for field_index in 0..info.static_fields.len() {
+            if let Some(&value) = boxes.get(field_index) {
+                let descr = info.static_field_descr(field_index);
+                self.vable_setfield_descr(vable_opref, value, descr);
+            }
+        }
+
+        let mut flat_box_index = info.static_fields.len();
+        for array_index in 0..info.array_fields.len() {
+            let len = lengths.get(array_index).copied().unwrap_or(0);
+            let field_descr = info.array_pointer_field_descr(array_index);
+            let array_descr = info.array_item_descr(array_index);
+            let array_ref = self.vable_getfield_ref_descr(vable_opref, field_descr);
+            for item_index in 0..len {
+                if let Some(&value) = boxes.get(flat_box_index) {
+                    let index = self.const_int(item_index as i64);
+                    self.vable_setarrayitem_descr(array_ref, index, value, array_descr.clone());
+                }
+                flat_box_index += 1;
+            }
+        }
+    }
+
     /// `compile.py:425-461 patch_new_loop_to_load_virtualizable_fields`
     /// mirrored at the call site instead of the callee preamble.
     ///
@@ -5075,6 +5147,139 @@ mod tests {
         assert!(
             ops.is_empty(),
             "nonstandard virtualizable must not use standard store-back path"
+        );
+    }
+
+    #[test]
+    fn gen_writeback_vable_to_heap_emits_setfield_setarrayitem_no_token_null() {
+        // Same shape as gen_store_back_in_vable but stripped of:
+        //   - the forced_virtualizable one-shot guard (no `forced` set)
+        //   - the trailing `vable_token = NULL` SetfieldGc
+        // Ops emitted (4 total): SetfieldGc(pc), GetfieldGcR(locals_array),
+        // SetarrayitemGc(arr,0,...), SetarrayitemGc(arr,1,...).
+        let mut info = crate::virtualizable::VirtualizableInfo::new(0);
+        info.add_field("pc", Type::Int, 8);
+        info.add_array_field(
+            "locals",
+            Type::Ref,
+            24,
+            0,
+            0,
+            majit_ir::make_array_descr(0, 8, Type::Ref),
+        );
+        info.set_parent_descr(majit_ir::descr::make_size_descr(64));
+
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Ref);
+        let box_arr1 = recorder.record_input_arg(Type::Ref);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_arr0, box_arr1],
+            &[ph(Type::Int), ph(Type::Ref), ph(Type::Ref)],
+            &[2],
+        );
+
+        ctx.gen_writeback_vable_to_heap(vable);
+
+        // forced_virtualizable must NOT be set — caller may invoke again.
+        assert!(ctx.forced_virtualizable.is_none());
+
+        let ops = take_all_ops(ctx);
+        assert_eq!(ops.len(), 4, "no trailing token-NULL setfield");
+        assert_eq!(ops[0].opcode, OpCode::SetfieldGc);
+        assert_eq!(
+            ops[0].descr.as_ref().map(|d| d.index()),
+            Some(info.static_field_descr(0).index())
+        );
+        assert_eq!(ops[1].opcode, OpCode::GetfieldGcR);
+        assert_eq!(
+            ops[1].descr.as_ref().map(|d| d.index()),
+            Some(info.array_pointer_field_descr(0).index())
+        );
+        assert_eq!(ops[2].opcode, OpCode::SetarrayitemGc);
+        assert_eq!(
+            ops[2].descr.as_ref().map(|d| d.index()),
+            Some(info.array_item_descr(0).index())
+        );
+        assert_eq!(ops[3].opcode, OpCode::SetarrayitemGc);
+        assert_eq!(
+            ops[3].descr.as_ref().map(|d| d.index()),
+            Some(info.array_item_descr(0).index())
+        );
+    }
+
+    #[test]
+    fn gen_writeback_vable_to_heap_re_emits_on_repeat_calls() {
+        // gen_store_back_in_vable's forced_virtualizable guard would
+        // suppress the second call; gen_writeback_vable_to_heap must NOT.
+        let info = make_test_vable_info_with_array();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_arr0],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[1],
+        );
+
+        ctx.gen_writeback_vable_to_heap(vable);
+        let after_first = ctx.num_ops();
+        ctx.gen_writeback_vable_to_heap(vable);
+        let after_second = ctx.num_ops();
+
+        assert!(
+            after_second > after_first,
+            "second writeback must emit (no one-shot guard); after_first={after_first} \
+             after_second={after_second}"
+        );
+    }
+
+    #[test]
+    fn gen_writeback_vable_to_heap_skips_nonstandard_vable() {
+        let info = make_test_vable_info_with_array();
+        let mut recorder = Trace::new();
+        let vable = recorder.record_input_arg(Type::Ref);
+        let other_vable = recorder.record_input_arg(Type::Ref);
+        let box_pc = recorder.record_input_arg(Type::Int);
+        let box_arr0 = recorder.record_input_arg(Type::Int);
+        let mut ctx = TraceCtx::new(
+            recorder,
+            0,
+            std::sync::Arc::new(crate::MetaInterpStaticData::new()),
+        );
+        ctx.init_virtualizable_boxes(
+            &info,
+            vable,
+            ph(Type::Ref),
+            &[box_pc, box_arr0],
+            &[ph(Type::Int), ph(Type::Int)],
+            &[1],
+        );
+
+        ctx.gen_writeback_vable_to_heap(other_vable);
+
+        let ops = take_all_ops(ctx);
+        assert!(
+            ops.is_empty(),
+            "nonstandard virtualizable must not be written back"
         );
     }
 

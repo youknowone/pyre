@@ -2060,8 +2060,14 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
             }
             let exc_obj = err.exc_object;
             if exc_obj != pyre_object::PY_NULL {
+                // Symmetric with the regular-exception fall-through
+                // below (line 2120-2122) and with `lib.rs::jit_exc_raise`
+                // — every backend's blackhole resume publishes the
+                // pending exception, not just cranelift.
                 #[cfg(feature = "cranelift")]
                 majit_backend_cranelift::jit_exc_raise(exc_obj as i64);
+                #[cfg(feature = "dynasm")]
+                majit_backend_dynasm::jit_exc_raise(exc_obj as i64);
             }
             Some(0) // garbage return — GUARD_NO_EXCEPTION will fire
         }

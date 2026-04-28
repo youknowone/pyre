@@ -910,6 +910,24 @@ static PYFRAME_DESCR_GROUP: LazyLock<PyreObjectDescrGroup> = LazyLock::new(|| {
                 false,
                 false,
             ),
+            (
+                "PyFrame.debugdata",
+                crate::frame_layout::PYFRAME_DEBUGDATA_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
+            (
+                "PyFrame.lastblock",
+                crate::frame_layout::PYFRAME_LASTBLOCK_OFFSET,
+                8,
+                Type::Ref,
+                false,
+                false,
+                false,
+            ),
         ],
     )
 });
@@ -1235,6 +1253,18 @@ pub fn pyframe_code_descr() -> DescrRef {
 
 pub fn pyframe_dict_storage_descr() -> DescrRef {
     field_descr_from_group(&PYFRAME_DESCR_GROUP, 4)
+}
+
+/// rewrite.py:665-695 handle_call_assembler scalar field read for the
+/// `debugdata` slot of the virtualizable expansion (Phase D-1 prereq).
+pub fn pyframe_debugdata_descr() -> DescrRef {
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 5)
+}
+
+/// rewrite.py:665-695 handle_call_assembler scalar field read for the
+/// `lastblock` slot of the virtualizable expansion (Phase D-1 prereq).
+pub fn pyframe_lastblock_descr() -> DescrRef {
+    field_descr_from_group(&PYFRAME_DESCR_GROUP, 6)
 }
 
 #[cfg(test)]

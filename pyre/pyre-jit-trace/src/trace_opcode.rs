@@ -1862,6 +1862,84 @@ impl MIFrame {
             let s = self.sym_mut();
             s.vable_last_instr = ctx.const_int(pc as i64 - 1);
         }
+        // Task #21 fix path 3 — vable heap-writeback before JUMP.
+        //
+        // When `descriptor=Some` + `patch_new_loop_to_load_virtualizable_
+        // fields` (compile.py:425-461) reduces the target LABEL to
+        // reds-only inputargs (`[frame, ec]`), the patched body's
+        // GETFIELD_GC / GETARRAYITEM_GC preamble re-loads vable static
+        // and array fields from the heap on every iteration. Pyre's
+        // tracer updates symbolic `sym.vable_*` / `sym.registers_r`
+        // during opcode tracing but does not touch the heap; without
+        // this writeback, the bridge body re-reads stale state and
+        // ouroboroses on the first guard fail.
+        //
+        // Gate selects the target LABEL's inputarg_types length:
+        //   - root trace: ctx.inputarg_types() = own inputargs = LABEL types
+        //   - bridge with resolvable loop_token: target loop's
+        //     inputarg_types
+        //   - bridge without (current_trace_green_key missing or lookup
+        //     fails): None — gate stays off (target LABEL shape unknown)
+        //
+        // Threshold `< NUM_SCALAR_INPUTARGS` separates legacy (≥ 7
+        // entries: `[frame, 6 scalars, locals..., stack...]`) from
+        // reduced (1-2 entries: `[frame]` or `[frame, ec]`).
+        //
+        // **Probe-gated** behind `MAJIT_PROBE_VABLE_WRITEBACK=1`. When
+        // the gate fires AND the env var is set, the writeback emits.
+        // Empirical baseline run with the writeback unconditionally
+        // active regresses dynasm nested_loop (output printed twice —
+        // see implementation-plan note `task21_fix_implementation_plan
+        // .md` Slice 3): pyre's `self.virtualizable_boxes` is not yet
+        // guaranteed up-to-date with `sym.vable_*` / `sym.registers_r`
+        // at this emit point, so unconditional writeback writes stale
+        // values to the heap and corrupts compiled-loop state. Slice 3
+        // (audit + propagation of `sym.*` updates into
+        // `virtualizable_boxes`) is the prerequisite to flipping this
+        // env gate off.
+        //
+        // The dormant probe is the diagnostic surface for the next
+        // session: running `MAJIT_PROBE_VABLE_WRITEBACK=1 ./pyre/check
+        // .sh` lists every path that triggers the writeback, narrowing
+        // Slice 3's audit to the call sites that need
+        // `virtualizable_boxes` propagation.
+        {
+            let target_inputarg_len: Option<usize> = {
+                let (driver, _) = crate::driver::driver_pair();
+                if driver.is_bridge_tracing() {
+                    driver
+                        .current_trace_green_key()
+                        .and_then(|gk| driver.get_loop_token(gk))
+                        .map(|token| token.inputarg_types.len())
+                } else {
+                    Some(ctx.inputarg_types().len())
+                }
+            };
+            if let Some(len) = target_inputarg_len {
+                // `len > 0` excludes the bridge-target-loop-token-with-
+                // empty-inputarg_types edge case (probe captured 73
+                // such firings on dynasm nested_loop, all
+                // target_inputarg_len=0 — likely a freshly-allocated
+                // loop token whose types are not yet set). The
+                // reds-only LABEL always carries `[frame]` (len=1) or
+                // `[frame, ec]` (len=2).
+                let is_reduced_label =
+                    len > 0 && len < crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+                if is_reduced_label && std::env::var_os("MAJIT_PROBE_VABLE_WRITEBACK").is_some() {
+                    eprintln!(
+                        "[probe-vable-writeback] target_inputarg_len={} bridge={} \
+                         orgpc={} target_pc={:?}",
+                        len,
+                        crate::driver::driver_pair().0.is_bridge_tracing(),
+                        self.orgpc,
+                        target_pc,
+                    );
+                    if let Some(vable_box) = ctx.standard_virtualizable_box() {
+                        ctx.gen_writeback_vable_to_heap(vable_box);
+                    }
+                }
+            }
+        }
         debug_assert!(
             self.sym().nlocals > 0 || self.sym().vable_array_base.is_none(),
             "nlocals must be set by init_symbolic before close_loop_args_at"

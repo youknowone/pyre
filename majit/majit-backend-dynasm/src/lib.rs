@@ -460,8 +460,22 @@ fn handle_fail_done_with_this_frame(
 /// (`pyre/pyre-jit/src/eval.rs` handle_jit_outcome) routes the result
 /// into `PyError::from_exc_object` when the synthesized FailDescr
 /// carries `is_exit_frame_with_exception = true`.
+///
+/// Also publishes the exception via `jit_exc_raise` so a future
+/// `genop_guard_guard_no_exception` (assembler.py:1782) emitted by
+/// the caller sees the pending exception — symmetric with cranelift's
+/// CALL_ASSEMBLER trampoline path.  The caller's GUARD_NO_EXCEPTION
+/// stub today does not actually compare against `JIT_EXC_VALUE`, so
+/// the publish is a write-only invariant for now; flipping the stub
+/// to a real `mov rax, [pos_exc_value] / test rax, rax / jne fail`
+/// will close the loop without further changes here.
 fn handle_fail_exit_frame_with_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
-    unsafe { llmodel::get_ref_value_direct(frame_ptr, 0) as i64 }
+    let value = unsafe { llmodel::get_ref_value_direct(frame_ptr, 0) as i64 };
+    // warmspot.py:998-1005 + llsupport/assembler.py:345 —
+    // `assembler_helper_wrapper` invokes `handle_jitexception` which
+    // re-raises through `pos_exc_value`.
+    jit_exc_raise(value);
+    value
 }
 
 /// compile.py:1085-1098 `PropagateExceptionDescr.handle_fail`.
@@ -472,6 +486,12 @@ fn handle_fail_exit_frame_with_exception(frame_ptr: *mut jitframe::JitFrame) -> 
 /// when empty (`cast_instance_to_gcref(memory_error)`).  The caller
 /// observes `is_exit_frame_with_exception=true` on the synthesized
 /// FailDescr and re-raises the value through `jit_exc_value`.
+///
+/// Republishes the value via `jit_exc_raise` for the same
+/// caller-side GUARD_NO_EXCEPTION reason as
+/// `handle_fail_exit_frame_with_exception`; Layer 3's emit cleared
+/// the globals on transfer, so this is a fresh store of the resolved
+/// (possibly memory_error fallback) value.
 fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
     let exc_val = unsafe {
         let slot = &mut (*frame_ptr).jf_guard_exc;
@@ -479,11 +499,13 @@ fn handle_fail_propagate_exception(frame_ptr: *mut jitframe::JitFrame) -> i64 {
         *slot = 0;
         v
     };
-    if exc_val != 0 {
+    let value = if exc_val != 0 {
         exc_val as i64
     } else {
         majit_backend::memory_error_singleton_ref()
-    }
+    };
+    jit_exc_raise(value);
+    value
 }
 
 /// compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
