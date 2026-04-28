@@ -5503,6 +5503,48 @@ mod tests {
         (frame, jitcode_ptr, resume_pc)
     }
 
+    /// Stack-depth-based variant of `compiled_trace_fixture`. Locates the
+    /// first Python PC where the bytecode-level forward stack analysis
+    /// reports `target_depth`, independent of which Ref-bank colors land
+    /// in the encoded `-live-` set. Stable across Task #158 force-add
+    /// removal: the codewriter `live_r` is now SSA-driven only, so
+    /// stack-slot colors no longer always appear there even when those
+    /// slots are runtime-live (the consume_one_section heap-read
+    /// fallback fills them at decode time). Tests that need a PC with
+    /// a specific symbolic stack depth should use this helper.
+    fn compiled_trace_fixture_at_depth(
+        source: &str,
+        function_name: &str,
+        target_depth: u16,
+        init: impl FnOnce(&mut PyFrame),
+    ) -> (Box<PyFrame>, *const (), usize) {
+        use pyre_interpreter::compile_exec;
+        use pyre_jit_trace::state as trace_state;
+
+        let _ = crate::jit::codewriter::CodeWriter::instance();
+        let module = compile_exec(source).expect("test code should compile");
+        let code = function_code_from_module(&module, function_name);
+        let mut frame = Box::new(PyFrame::new(code.clone()));
+        init(&mut frame);
+        frame.fix_array_ptrs();
+
+        let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
+            .expect("real trace-side jitcode registration must succeed");
+        let _ = trace_state::ensure_jitcode_index(frame.pycode as *const ())
+            .expect("real trace-side jitcode index must exist");
+        let depth_table =
+            pyre_jit_trace::liveness::liveness_for(&code as *const _).depth_at_py_pc();
+        let resume_pc = depth_table
+            .iter()
+            .position(|&d| d == target_depth)
+            .unwrap_or_else(|| {
+                panic!(
+                    "test source should reach stack depth {target_depth}; depth_table={depth_table:?}"
+                )
+            });
+        (frame, jitcode_ptr, resume_pc)
+    }
+
     fn single_local_test_state(
         ctx: &mut majit_metainterp::TraceCtx,
         frame: &PyFrame,
@@ -6291,11 +6333,14 @@ mod tests {
 
         let _ = driver_pair();
         init_callbacks();
-        let (frame, jitcode_ptr, target_pc) = compiled_trace_fixture(
+        // Symbolic state below has nlocals=1 + 2 stack slots, so the
+        // target PC needs depth=2 (post-Task #158 force-add removal,
+        // stack-slot colors no longer always appear in `live_r`, so a
+        // depth-based locator is needed instead of `&[1, 2]` regs).
+        let (frame, jitcode_ptr, target_pc) = compiled_trace_fixture_at_depth(
             "def f(x):\n    return (x, x)\nf(1)\n",
             "f",
-            &[],
-            &[0, 1],
+            2,
             |frame| {
                 frame.locals_w_mut()[0] = w_int_new(7);
             },

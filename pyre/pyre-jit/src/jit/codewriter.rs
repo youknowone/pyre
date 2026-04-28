@@ -1940,6 +1940,15 @@ struct RegisterLayout {
     /// `co_stacksize`). Used directly without clamping so the per-CodeObject
     /// `stack_slot_color_map` length matches the runtime PyFrame allocation
     /// `nlocals + ncells + max_stackdepth` (`pyframe.rs:1576`).
+    ///
+    /// NOTE: this is the FRAME-LENGTH bound, not the regalloc PIN bound.
+    /// `ExternalInputs::max_stack_depth` (regalloc.rs:603) takes
+    /// `max_stack_depth_observed = max(depth_at_pc)` instead — only the
+    /// live prefix is forced into identity colors by `enforce_input_args`.
+    /// Tail entries `d >= max_stack_depth_observed` get identity colors
+    /// only by virtue of never appearing in any SSA op (regalloc skips
+    /// them, fallthrough to pre-rename pass-through). See
+    /// `pyjitcode.rs::stack_slot_color_map` "Color invariant" docstring.
     max_stackdepth: usize,
     /// Ref register index where the operand stack begins
     /// (`stack_base = nlocals` since locals occupy the first registers).
@@ -2075,11 +2084,35 @@ fn register_helper_fn_pointers(
 /// `LivenessIterator`, so the post-rename `-live-` marker is the
 /// sole source.
 ///
-/// The Ref bank carries a pyre-specific PRE-EXISTING-ADAPTATION
-/// (Python-frame index range + force-add in-depth stack slots +
-/// LV∩SSA intersection) required because pyre's pre-regalloc
-/// register space conflates Python frame slots with scratch Ref
-/// tmps; see `filter_liveness_in_place` for the full rationale.
+/// The Ref bank still carries one PRE-EXISTING-ADAPTATION — the
+/// LV∩SSA `live_r.retain(...)` intersection (Task #181 / parent
+/// #185 epic, blocked by Task #110 slice 3b + Task #158 graph
+/// regalloc). RPython's `liveness.py:19-76` produces a single
+/// SSA-driven alive set as the sole authority. The pyre retain
+/// compensates for the post-rename namespace conflation between
+/// scratch Variables and Python-frame Variables (chordal coloring
+/// places scratches on Python-frame colors when their live ranges
+/// don't overlap; see `MAJIT_PROBE_SCRATCH_COLLAPSE` data in
+/// `task158_scratch_collapse_probe_data_2026_04_28.md`).
+/// Convergence path: graph regalloc with separate scratch color
+/// space (Task #158 item 4) eliminates the conflation, after which
+/// the retain becomes provably dead and is removed.
+///
+/// The "all stack slots up to current depth hold a live box"
+/// runtime contract is now enforced consumer-side in
+/// `consume_one_section` (`call_jit.rs::resume_in_blackhole`),
+/// which copies any color in
+/// `stack_slot_color_map[..depth_at_py_pc[py_pc]]` not present in
+/// `live_r` from the heap PyFrame. This is itself a
+/// PRE-EXISTING-ADAPTATION compensating for pyre's heap-mirror
+/// stack model (every push emits `setarrayitem_vable_r` heap I/O
+/// rather than RPython's direct `_registers_r[stack_color]` SSA
+/// write); see the consumer-side block for the convergence path.
+/// The pyre-only force-add that previously widened `live_r` here
+/// was redundant against that fallback and has been removed; the
+/// historical Python-frame index-range pre-filter (its predecessor)
+/// was provably dead code (`lv_live = {LV-live-locals} ∪
+/// live_stack_colors` already absorbed it) and was removed earlier.
 /// Int/Float banks are emitted line-by-line parity with no filter.
 ///
 /// Unreachable PCs still get emptied in place via the bytecode
@@ -2163,6 +2196,7 @@ fn filter_liveness_in_place(
     nlocals: usize,
     stack_slot_color_map: &[u16],
     depth_at_pc: &[u16],
+    collapsed_scratch_colors: &std::collections::HashSet<u16>,
 ) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     super::liveness::compute_liveness(ssarepr);
@@ -2206,8 +2240,9 @@ fn filter_liveness_in_place(
         // liveness.py:67-75 `compute_liveness` adds every Register to
         // the alive set; assembler.py:150-152 splits the `-live-` args
         // into live_i / live_r / live_f by kind via
-        // `get_liveness_info(insn[1:], 'int'/'ref'/'float')`. The
-        // Int/Float banks mirror that shape exactly.
+        // `get_liveness_info(insn[1:], 'int'/'ref'/'float')`. All three
+        // banks mirror that shape — every alive Register of the kind is
+        // pushed in encounter order with seen-set deduplication.
         //
         // The Ref bank previously carried an `(in_locals || in_stack)`
         // pre-filter to keep portal/scratch indices out of `live_r`.
@@ -2241,11 +2276,16 @@ fn filter_liveness_in_place(
                 }
             }
         }
-        for &idx in &live_stack_colors {
-            if seen_r.insert(idx) {
-                live_r.push(idx);
-            }
-        }
+        // Force-add of `live_stack_colors` once lived here. Task #158
+        // slice B moved the "all stack slots up to current depth hold a
+        // live box" runtime contract to `consume_one_section`
+        // (`call_jit.rs::resume_in_blackhole`), which copies any color
+        // in `stack_slot_color_map[..depth_at_py_pc[py_pc]]` not in
+        // `live_r` from the heap PyFrame via `vable_read_array_item`.
+        // The codewriter `live_r` now mirrors RPython's
+        // `liveness.py:67-75` SSA-driven alive set alone — every alive
+        // Register pushed in encounter order with seen-set dedup, no
+        // pyre-only widening.
         // liveness.  RPython's `liveness.py:19-76` produces a single
         // SSA-driven alive set as the sole authority — there is no
         // per-bytecode local-liveness narrowing layered on top.  Pyre's
@@ -2269,13 +2309,13 @@ fn filter_liveness_in_place(
             s
         };
         // Phase 0.4 probe (Task #181 follow-up). When
-        // MAJIT_PROBE_LIVENESS is set, dump the indices that pass the
-        // `in_locals || in_stack` filter (above) but fail the LV∩SSA
-        // retain (below) — these are exactly the entries Phase 2.3
-        // would have widened live_r with. The 2026-04-27 attempt
-        // surfaced a bridge re-trace panic
-        // (`set_virtualizable_entry_at: index 21 out of range for 21
-        // slots`); this probe captures which indices are responsible.
+        // MAJIT_PROBE_LIVENESS is set, dump the indices that the
+        // SSA-driven scan above pushed into `live_r` but the LV∩SSA
+        // retain (below) drops — these are the entries Phase 2.3
+        // would have widened live_r with. Post-Task #158 slice B the
+        // pyre-only force-add and historical index-range pre-filter
+        // are both gone, so `live_r_pre` already equals the SSA-alive
+        // Ref set; `lv_drops = live_r_pre ∖ lv_live`.
         if std::env::var_os("MAJIT_PROBE_LIVENESS").is_some() {
             let lv_drops: Vec<u16> = live_r
                 .iter()
@@ -2298,6 +2338,36 @@ fn filter_liveness_in_place(
         // slice 4 cleanup.
         if std::env::var_os("MAJIT_PHASE06_DROP_LV").is_none() {
             live_r.retain(|idx| lv_live.contains(idx));
+        }
+
+        // Task #158 item 4 prep probe (`MAJIT_PROBE_SCRATCH_COLLAPSE=1`):
+        // dump live_r entries at this py_pc whose post-rename color is
+        // BOTH (a) reached by some scratch pre-index (>= scratch_ref_base
+        // pre-rename, mapped down via `apply_rename`) AND (b) currently
+        // LV-live at this PC. These are the silent-corruption candidates
+        // — chordal coloring let a scratch land on a Python-frame color,
+        // and the LV∩SSA retain kept it because the same color is
+        // LV-live as a Python local/stack at this PC. The encoder /
+        // BH decoder will treat the scratch's value as the local /
+        // stack value, producing wrong-value bugs without crashing.
+        // Static dump fires once per (jitcode, color) pair via
+        // collapse-set construction; this per-PC dump pinpoints the
+        // PCs that surface the conflation as a corruption event.
+        if std::env::var_os("MAJIT_PROBE_SCRATCH_COLLAPSE").is_some()
+            && !collapsed_scratch_colors.is_empty()
+        {
+            let live_collapsed: Vec<u16> = live_r
+                .iter()
+                .copied()
+                .filter(|idx| collapsed_scratch_colors.contains(idx) && lv_live.contains(idx))
+                .collect();
+            if !live_collapsed.is_empty() {
+                eprintln!(
+                    "[probe-C][scratch_collapse_per_pc] code={} py_pc={} depth={} \
+                     nlocals={} live_collapsed={:?}",
+                    code.obj_name, py_pc, depth, nlocals, live_collapsed,
+                );
+            }
         }
 
         existing.clear();
@@ -6484,6 +6554,57 @@ impl CodeWriter {
         // and chordal coloring guarantees uniqueness within any
         // simultaneously-live subset.
 
+        // Task #158 item 4 prep probe: identify which post-rename
+        // colors are reached by BOTH a Python-frame pre-rename Variable
+        // (locals 0..nlocals, stack stack_base..stack_base + max_stackdepth,
+        // portal red regs) AND a scratch pre-rename Variable
+        // (>= scratch_ref_base). These are the chordal-coloring
+        // namespace conflations that motivate the graph regalloc with
+        // separate scratch color space (Task #158 item 4 / option A).
+        // Computed once per jitcode; per-PC corruption events surface
+        // through `MAJIT_PROBE_SCRATCH_COLLAPSE` inside
+        // `filter_liveness_in_place`.
+        //
+        // The set is named "pinned" but `stack_slot_color_map` only
+        // forces identity over the live prefix (see the build site's
+        // PIN-vs-LENGTH split docstring above). Tail stack colors land
+        // identity by side effect, which means a scratch landing on a
+        // tail color is included here even though no PC would ever
+        // read that color from the heap mirror — a slight overcount.
+        // Acceptable for the audit; the per-PC dump in
+        // `filter_liveness_in_place` re-bounds via `lv_live` to the
+        // live prefix, so reported events stay precise.
+        let pinned_post_colors: std::collections::HashSet<u16> = {
+            let mut s = std::collections::HashSet::new();
+            s.extend(pyre_color_for_semantic_local.iter().copied());
+            s.extend(stack_slot_color_map.iter().copied());
+            s.insert(portal_frame_reg);
+            s.insert(portal_ec_reg);
+            s
+        };
+        let mut collapsed_scratch_colors: std::collections::HashSet<u16> =
+            std::collections::HashSet::new();
+        for ((kind, pre), &post) in alloc_result.rename.iter() {
+            if *kind == Kind::Ref && *pre >= scratch_ref_base && pinned_post_colors.contains(&post)
+            {
+                collapsed_scratch_colors.insert(post);
+            }
+        }
+        if std::env::var_os("MAJIT_PROBE_SCRATCH_COLLAPSE").is_some()
+            && !collapsed_scratch_colors.is_empty()
+        {
+            let mut sorted: Vec<u16> = collapsed_scratch_colors.iter().copied().collect();
+            sorted.sort();
+            eprintln!(
+                "[probe-C][scratch_collapse_static] code={} pinned_count={} \
+                 collapsed_count={} colors={:?}",
+                code.obj_name,
+                pinned_post_colors.len(),
+                collapsed_scratch_colors.len(),
+                sorted,
+            );
+        }
+
         // codewriter.py:55-56 parity: `compute_liveness(ssarepr)` runs
         // AFTER regalloc + flatten, so the live-register indices the
         // pass writes into each `-live-` marker are already the
@@ -6497,6 +6618,7 @@ impl CodeWriter {
             nlocals,
             &stack_slot_color_map,
             &depth_at_pc,
+            &collapsed_scratch_colors,
         );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC

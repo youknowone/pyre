@@ -128,6 +128,20 @@ pub struct PyJitCodeMetadata {
     /// (`state.rs`, `trace_opcode.rs`, `codewriter.rs`) must read
     /// through the map; they cannot assume the old `nlocals + d`
     /// invariant.
+    ///
+    /// Tail caveat: `regalloc::allocate_registers` only pins
+    /// `[0..nlocals)` plus the portal red args; pre-indices
+    /// `nlocals + d` for `d >= max(depth_at_py_pc)` never appear in
+    /// any SSA op, so `apply_rename` falls through with identity and
+    /// `stack_slot_color_map[d] == nlocals + d` by accident, not by
+    /// post-regalloc decision. Today every consumer reads only the
+    /// `[0..depth_at_py_pc[pc])` prefix for value recovery and uses
+    /// `len()` solely for frame-allocation length matching, so the
+    /// tail's identity-by-fallthrough is harmless. If a future
+    /// consumer needs full-range colors as real post-regalloc values,
+    /// extend `external` in `regalloc.rs:680-697` to cover
+    /// `(nlocals..nlocals + max_stackdepth)` so `enforce_input_args`
+    /// pins the tail too (parity with `flatten.py:88-100`).
     pub stack_slot_color_map: Vec<u16>,
     /// Task #110 slice 3a (parent #185 epic, plan
     /// `task110_ssa_authoritative_live_r_epic_plan.md`):
