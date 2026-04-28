@@ -194,6 +194,14 @@ impl Assembler {
             builder.ensure_r_regs(nr.ref_);
             builder.ensure_f_regs(nr.float);
         }
+        // Freeze num_regs at the regalloc-determined values: subsequent
+        // operand emission must not grow the register file (every real
+        // register slot is already inside `[0, num_regs_kind)` after
+        // regalloc, and `Const*` args inside `ListOfKind` route through
+        // the per-kind constants pool — see
+        // `expect_int_reg_or_pool` and `dispatch_residual_call` for the
+        // pool-byte synthesis that depends on stable `num_regs_kind`).
+        builder.freeze_num_regs();
         builder.set_name(ssarepr.name.clone());
 
         let mut state = AssemblyState {
@@ -1380,6 +1388,12 @@ fn dispatch_residual_call(
     };
 
     // Reassemble flat `&[JitCallArg]` in C-function parameter order.
+    // `ListOfKind` slots admit `Variable | Constant`
+    // (`rpython/jit/codewriter/jtransform.py:437-445` `make_three_lists`);
+    // route `Const*` through the per-kind constant pool to synthesize the
+    // `num_regs_kind + pool_idx` pseudo-register byte (mirrors
+    // `assembler.py:80-138 emit_const` and the `expect_list_regs_or_pool`
+    // helper used by `jit_merge_point` lowering).
     let mut call_args: Vec<JitCallArg> = Vec::with_capacity(stub.arg_kinds.len());
     let mut i_cursor = 0usize;
     let mut r_cursor = 0usize;
@@ -1387,17 +1401,17 @@ fn dispatch_residual_call(
     for &ak in &stub.arg_kinds {
         match ak {
             Kind::Int => {
-                let reg = expect_reg(&int_list[i_cursor], Kind::Int);
+                let reg = expect_int_reg_or_pool(state, &int_list[i_cursor]);
                 call_args.push(JitCallArg::int(reg));
                 i_cursor += 1;
             }
             Kind::Ref => {
-                let reg = expect_reg(&ref_list[r_cursor], Kind::Ref);
+                let reg = expect_ref_reg_or_pool(state, &ref_list[r_cursor]);
                 call_args.push(JitCallArg::reference(reg));
                 r_cursor += 1;
             }
             Kind::Float => {
-                let reg = expect_reg(&float_list[f_cursor], Kind::Float);
+                let reg = expect_float_reg_or_pool(state, &float_list[f_cursor]);
                 call_args.push(JitCallArg::float(reg));
                 f_cursor += 1;
             }
@@ -1695,6 +1709,40 @@ fn expect_int_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
         }
         other => panic!(
             "expected Int register or ConstInt routable through constant pool, got {:?}",
+            other
+        ),
+    }
+}
+
+fn expect_ref_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
+    match op {
+        Operand::Register(Register {
+            kind: Kind::Ref,
+            index,
+        }) => *index,
+        Operand::ConstRef(value) => {
+            let idx = state.builder.add_const_r(*value);
+            state.builder.num_regs_r() + idx
+        }
+        other => panic!(
+            "expected Ref register or ConstRef routable through constant pool, got {:?}",
+            other
+        ),
+    }
+}
+
+fn expect_float_reg_or_pool(state: &mut AssemblyState, op: &Operand) -> u16 {
+    match op {
+        Operand::Register(Register {
+            kind: Kind::Float,
+            index,
+        }) => *index,
+        Operand::ConstFloat(value) => {
+            let idx = state.builder.add_const_f(*value);
+            state.builder.num_regs_f() + idx
+        }
+        other => panic!(
+            "expected Float register or ConstFloat routable through constant pool, got {:?}",
             other
         ),
     }

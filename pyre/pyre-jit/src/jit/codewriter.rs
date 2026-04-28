@@ -2445,16 +2445,72 @@ fn decode_exception_catch_sites(
 // exceeds 256 — the same condition that crashes the RPython
 // translator.
 
-/// Entry point for residual calls. Pushes the upstream-canonical
-/// `residual_call_{kinds}_{reskind}` Insn into the walker-local
-/// `ssarepr`; `Assembler::assemble`'s `dispatch_residual_call` arm
-/// reconstructs the runtime `call_*_typed` path from the SSA operand
-/// shape (jtransform.py:414-435 `rewrite_call` parity).
+/// Codewriter-IR-level argument to a residual_call. Mirrors RPython's
+/// `Variable | Constant` admitted by `make_three_lists`
+/// (`rpython/jit/codewriter/jtransform.py:437-445`): each entry can be
+/// a runtime register or a literal constant, and `Assembler::assemble`
+/// resolves the `Const*` cases to `num_regs_kind + add_const_*(value)`
+/// pseudo-register indices at write time
+/// (`rpython/jit/codewriter/assembler.py:80-138` `emit_const`,
+/// `:181-196` `ListOfKind` Constant arm; pyre's
+/// `expect_list_regs_or_pool`
+/// (`pyre/pyre-jit/src/jit/assembler.rs:1736-1784`) is the same routing
+/// at bytecode-write time).
+///
+/// At runtime the BH register file is sized to `num_regs + len(constants)`
+/// and constants are pre-loaded into the high half by
+/// `init_register_files_from_runtime_jitcode`
+/// (`majit/majit-metainterp/src/blackhole.rs:1056-1075`,
+/// `rpython/jit/metainterp/blackhole.py:320-336` `copy_constants`),
+/// so the consumer reads `registers_*[byte]` uniformly without
+/// distinguishing register vs constant.
+#[derive(Clone, Copy, Debug)]
+#[allow(dead_code)] // ConstFloat variant wired in by a future float-arg migration slice
+pub(crate) enum CallArgInput {
+    Reg(majit_metainterp::jitcode::JitArgKind, u16),
+    ConstInt(i64),
+    ConstRef(i64),
+    ConstFloat(i64),
+}
+
+impl CallArgInput {
+    pub(crate) fn kind(&self) -> Kind {
+        use majit_metainterp::jitcode::JitArgKind;
+        match self {
+            Self::Reg(JitArgKind::Int, _) | Self::ConstInt(_) => Kind::Int,
+            Self::Reg(JitArgKind::Ref, _) | Self::ConstRef(_) => Kind::Ref,
+            Self::Reg(JitArgKind::Float, _) | Self::ConstFloat(_) => Kind::Float,
+        }
+    }
+
+    fn into_operand(self) -> Operand {
+        match self {
+            Self::Reg(jak, reg) => {
+                use majit_metainterp::jitcode::JitArgKind;
+                let kind = match jak {
+                    JitArgKind::Int => Kind::Int,
+                    JitArgKind::Ref => Kind::Ref,
+                    JitArgKind::Float => Kind::Float,
+                };
+                Operand::reg(kind, reg)
+            }
+            Self::ConstInt(v) => Operand::ConstInt(v),
+            Self::ConstRef(v) => Operand::ConstRef(v),
+            Self::ConstFloat(v) => Operand::ConstFloat(v),
+        }
+    }
+}
+
+/// Operand-level entry — accepts `CallArgInput` so callers can pass
+/// `ConstInt`/`ConstRef`/`ConstFloat` directly without a per-call
+/// `emit_load_const_*!` materialise + fresh-var dance. Mirrors RPython
+/// `make_three_lists` which admits `Variable | Constant` in any slot
+/// (`jtransform.py:437-445`).
 fn emit_residual_call(
     ssarepr: &mut SSARepr,
     flavor: CallFlavor,
     fn_idx: u16,
-    call_args: &[majit_metainterp::jitcode::JitCallArg],
+    call_args: &[CallArgInput],
     reskind: ResKind,
     dst: Option<u16>,
 ) {
@@ -2488,8 +2544,8 @@ fn emit_residual_call(
 /// PRE-EXISTING-ADAPTATION: upstream stores `calldescr` (an
 /// `AbstractDescr` carrying `EffectInfo`) in the trailing slot; pyre
 /// threads `DescrOperand::CallDescrStub{flavor, arg_kinds}` there so
-/// `assembler.rs::dispatch_residual_call` can recover the (flavor,
-/// reskind, per-param kind) tuple statically today.
+/// the assembler can recover the (flavor, reskind, per-param kind)
+/// tuple statically today.
 ///
 /// Convergence path (calldescr interning):
 ///   1. Port `rpython/jit/codewriter/effectinfo.py::EffectInfo` and
@@ -2499,7 +2555,7 @@ fn emit_residual_call(
 ///      flavor, kinds)` triple resolves to a stable `AbstractDescr`
 ///      handle the assembler can store in a `Box<JitDescr>` slot.
 ///   3. Replace `CallDescrStub` with `DescrOperand::Call(descr_id)` and
-///      shift `dispatch_residual_call` to look the (flavor, arg_kinds)
+///      shift the assembler dispatch to look the (flavor, arg_kinds)
 ///      pair off the descriptor table.
 /// Until step 1 lands the stub is the smallest faithful placeholder —
 /// expanding it in-place would just duplicate work the EffectInfo port
@@ -2508,62 +2564,32 @@ fn emit_residual_call_shape(
     ssarepr: &mut SSARepr,
     flavor: CallFlavor,
     fn_idx: u16,
-    // Arguments in the C function's parameter order. `JitCallArg` carries
-    // its own kind tag so pyre's runtime builder can interleave kinds on
-    // the machine-code call. The SSARepr side projects this list into
-    // kind-separated sublists to match upstream shape — upstream itself
-    // loses per-C-parameter order in the SSARepr and relies on
-    // `calldescr` at `bh_call_*` time to reconstruct it.
-    call_args: &[majit_metainterp::jitcode::JitCallArg],
+    // Arguments in the C function's parameter order, allowing both
+    // pre-coloured registers and raw constants per RPython's
+    // `make_three_lists` (`jtransform.py:437-445`). The SSARepr side
+    // projects them into kind-separated `ListOfKind` sublists; raw
+    // constants survive into the assembler's `expect_list_regs_or_pool`
+    // routing (`pyre/pyre-jit/src/jit/assembler.rs:1736-1784`) which
+    // interns into `JitCode.constants_*` and emits the
+    // `num_regs_kind + pool_idx` pseudo-register byte (`assembler.py:80-138`
+    // `emit_const`).
+    call_args: &[CallArgInput],
     reskind: ResKind,
     dst: Option<u16>,
 ) {
-    use majit_metainterp::jitcode::JitArgKind;
-
-    // `rpython/jit/codewriter/jtransform.py:437-445 make_three_lists` —
-    // project parameter-ordered `call_args` into per-kind sublists for the
-    // SSARepr shape. The original per-parameter kind sequence is preserved
-    // in `arg_kinds` below so the assembler dispatch can reassemble the
-    // flat `&[JitCallArg]` list pyre's builder expects.
-    //
-    // PRE-EXISTING-ADAPTATION: upstream `make_three_lists` is allowed to
-    // place a `Constant` directly in any of the per-kind `ListOfKind`
-    // slots, and `assembler.py:181-196` distinguishes `Register` vs
-    // `Constant` per item, encoding constants inline in the bytecode via
-    // `emit_const(item, itemkind)`. Pyre's `JitCallArg` carries only
-    // `{kind, reg}` (see `majit-metainterp/src/jitcode/mod.rs:861-888`),
-    // so every constant must be materialized at the call site into a
-    // fresh `ssarepr.fresh_var(Kind::Int|Ref|Float, base)` slot via an
-    // emitter macro (`emit_load_const_i!`, `emit_ref_const_copy!`, etc.)
-    // before it can ride a `JitCallArg::int(reg)` / `::reference(reg)`.
-    // Convergence path: extend `JitCallArg` to a sum type
-    // `Register(reg) | ConstInt(i64) | ConstRef(GcRef) | ConstFloat(f64)`,
-    // teach the residual-call encoder to emit either a register byte or
-    // a const-tag + value sequence, mirror the same fork in the BH
-    // dispatch decoder (`bhimpl_residual_call_*`), and update both
-    // backends (dynasm `assembler.rs::dispatch_residual_call`, cranelift
-    // `compiler.rs` residual-call lowering) to consume inline constants.
-    // Until that 4-layer migration lands, the scratch-materialise
-    // pattern at every call site is the smallest faithful adaptation.
-    let mut args_i: Vec<u16> = Vec::new();
-    let mut args_r: Vec<u16> = Vec::new();
-    let mut args_f: Vec<u16> = Vec::new();
+    let mut args_i: Vec<Operand> = Vec::new();
+    let mut args_r: Vec<Operand> = Vec::new();
+    let mut args_f: Vec<Operand> = Vec::new();
     let mut arg_kinds: Vec<Kind> = Vec::with_capacity(call_args.len());
     for arg in call_args {
-        match arg.kind {
-            JitArgKind::Int => {
-                args_i.push(arg.reg);
-                arg_kinds.push(Kind::Int);
-            }
-            JitArgKind::Ref => {
-                args_r.push(arg.reg);
-                arg_kinds.push(Kind::Ref);
-            }
-            JitArgKind::Float => {
-                args_f.push(arg.reg);
-                arg_kinds.push(Kind::Float);
-            }
-        }
+        let kind = arg.kind();
+        arg_kinds.push(kind);
+        let bucket = match kind {
+            Kind::Int => &mut args_i,
+            Kind::Ref => &mut args_r,
+            Kind::Float => &mut args_f,
+        };
+        bucket.push(arg.into_operand());
     }
 
     // `rewrite_call` kinds selection (jtransform.py:423-426).
@@ -2580,20 +2606,17 @@ fn emit_residual_call_shape(
     // SSARepr arg list: [Const(fn), ListI?, ListR, ListF?, Descr(flavor)].
     let mut args: Vec<Operand> = Vec::with_capacity(5);
     args.push(Operand::ConstInt(fn_idx as i64));
-    let reg_list = |kind: Kind, regs: &[u16]| {
-        Operand::ListOfKind(ListOfKind::new(
-            kind,
-            regs.iter().map(|&r| Operand::reg(kind, r)).collect(),
-        ))
+    let mut push_list = |kind: Kind, items: Vec<Operand>| {
+        args.push(Operand::ListOfKind(ListOfKind::new(kind, items)));
     };
     if kinds.contains('i') {
-        args.push(reg_list(Kind::Int, &args_i));
+        push_list(Kind::Int, args_i);
     }
     if kinds.contains('r') {
-        args.push(reg_list(Kind::Ref, &args_r));
+        push_list(Kind::Ref, args_r);
     }
     if kinds.contains('f') {
-        args.push(reg_list(Kind::Float, &args_f));
+        push_list(Kind::Float, args_f);
     }
     args.push(Operand::descr(DescrOperand::CallDescrStub(
         super::flatten::CallDescrStub { flavor, arg_kinds },
@@ -3058,9 +3081,10 @@ impl CodeWriter {
         // per-push/per-pop semantics.
         //
         // Task #229 Session 1 slice: record a matching graph op pair
-        // (`int_const` producing a fresh Int Variable + `setfield_vable_i`
-        // consuming it) alongside the SSA emission. The SSA side now
-        // mirrors that shape via `ssarepr.fresh_var(Kind::Int, ...)`,
+        // (constant-source `int_copy` producing a fresh Int Variable +
+        // `setfield_vable_i` consuming it) alongside the SSA emission.
+        // The SSA side now mirrors that shape via
+        // `ssarepr.fresh_var(Kind::Int, ...)`,
         // lifting `graph_num` toward `ssa_num` as Task #227 Phase 4
         // prepares to flip `flatten_graph(graph, regallocs)` as the
         // source of truth.
@@ -3069,8 +3093,8 @@ impl CodeWriter {
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // Graph-side shadow: produce a fresh Int Variable
-                    // from a `int_const` op and consume it in a matching
-                    // `setfield_vable_i` op. Mirrors jtransform.py:844 +
+                    // from a constant-source `int_copy` op and consume it
+                    // in a matching `setfield_vable_i` op. Mirrors jtransform.py:844 +
                     // jtransform.py:925 so graph regalloc observes the
                     // liverange of the VSD-sync scratch.
                     // Graph offsets for these synthetic shadow ops use -1
@@ -3082,7 +3106,7 @@ impl CodeWriter {
                     let v_depth = emit_graph_op_with_result(
                         &mut graph,
                         &current_block.block(),
-                        "int_const",
+                        "int_copy",
                         vec![super::flow::Constant::signed(depth_value).into()],
                         Kind::Int,
                         -1,
@@ -3883,7 +3907,7 @@ impl CodeWriter {
                     let v_idx = emit_graph_op_with_result(
                         &mut graph,
                         &current_block.block(),
-                        "int_const",
+                        "int_copy",
                         vec![super::flow::Constant::signed(depth_value).into()],
                         Kind::Int,
                         -1,
@@ -3935,7 +3959,7 @@ impl CodeWriter {
                     let v_idx = emit_graph_op_with_result(
                         &mut graph,
                         &current_block.block(),
-                        "int_const",
+                        "int_copy",
                         vec![super::flow::Constant::signed(depth_value).into()],
                         Kind::Int,
                         -1,
@@ -3984,7 +4008,7 @@ impl CodeWriter {
                     let v_idx = emit_graph_op_with_result(
                         &mut graph,
                         &current_block.block(),
-                        "int_const",
+                        "int_copy",
                         vec![super::flow::Constant::signed(depth_value).into()],
                         Kind::Int,
                         -1,
@@ -4061,7 +4085,7 @@ impl CodeWriter {
                     let v_local_idx = emit_graph_op_with_result(
                         &mut graph,
                         &current_block.block(),
-                        "int_const",
+                        "int_copy",
                         vec![super::flow::Constant::signed(local_slot).into()],
                         Kind::Int,
                         -1,
@@ -4078,7 +4102,7 @@ impl CodeWriter {
                     let v_stack_idx = emit_graph_op_with_result(
                         &mut graph,
                         &current_block.block(),
-                        "int_const",
+                        "int_copy",
                         vec![super::flow::Constant::signed(stack_slot).into()],
                         Kind::Int,
                         -1,
@@ -4415,7 +4439,7 @@ impl CodeWriter {
                             let v_idx = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
-                                "int_const",
+                                "int_copy",
                                 vec![super::flow::Constant::signed(local_slot).into()],
                                 Kind::Int,
                                 -1,
@@ -4439,18 +4463,20 @@ impl CodeWriter {
 
                     Instruction::LoadSmallInt { i } => {
                         let val = i.get(op_arg) as u32 as i64;
-                        let scratch_val = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        emit_load_const_i!(ssarepr, scratch_val, val);
                         // A-slice 1 (Task #224): call writes result directly
                         // to the target stack slot. Safe because the only
-                        // call input is the fresh int scratch (no Ref
-                        // conflict) and no post-call op reads from that
-                        // stack slot before the next opcode's frontend push.
+                        // call input is a literal constant (no Ref conflict)
+                        // and no post-call op reads from that stack slot
+                        // before the next opcode's frontend push.
+                        // `make_three_lists` (jtransform.py:437-445) admits
+                        // `Variable | Constant` directly, so the constant
+                        // reaches `expect_list_regs_or_pool`
+                        // (assembler.rs:1736-1784) without a scratch register.
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::Plain,
                             box_int_fn_idx,
-                            &[majit_metainterp::jitcode::JitCallArg::int(scratch_val)],
+                            &[CallArgInput::ConstInt(val)],
                             ResKind::Ref,
                             Some(stack_base + current_depth),
                         );
@@ -4490,15 +4516,16 @@ impl CodeWriter {
                         // opcode's pushvalue (LoadConst's existing A-slice 2
                         // elision documented at LoadGlobal's caveat).
                         emit_vable_getfield_ref!(ssarepr, dst_slot, VABLE_CODE_FIELD_IDX);
-                        let scratch_idx = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        emit_load_const_i!(ssarepr, scratch_idx, idx as i64);
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::Plain,
                             load_const_fn_idx,
                             &[
-                                majit_metainterp::jitcode::JitCallArg::reference(dst_slot),
-                                majit_metainterp::jitcode::JitCallArg::int(scratch_idx),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    dst_slot,
+                                ),
+                                CallArgInput::ConstInt(idx as i64),
                             ],
                             ResKind::Ref,
                             Some(dst_slot),
@@ -4604,7 +4631,7 @@ impl CodeWriter {
                             let v_store_idx = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
-                                "int_const",
+                                "int_copy",
                                 vec![super::flow::Constant::signed(store_slot).into()],
                                 Kind::Int,
                                 -1,
@@ -4680,7 +4707,7 @@ impl CodeWriter {
                             let v_load_idx = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
-                                "int_const",
+                                "int_copy",
                                 vec![super::flow::Constant::signed(load_slot).into()],
                                 Kind::Int,
                                 -1,
@@ -4697,7 +4724,7 @@ impl CodeWriter {
                             let v_stack_idx = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
-                                "int_const",
+                                "int_copy",
                                 vec![super::flow::Constant::signed(stack_slot).into()],
                                 Kind::Int,
                                 -1,
@@ -4778,9 +4805,18 @@ impl CodeWriter {
                             CallFlavor::MayForce,
                             store_subscr_fn_idx,
                             &[
-                                majit_metainterp::jitcode::JitCallArg::reference(obj_reg),
-                                majit_metainterp::jitcode::JitCallArg::reference(key_reg),
-                                majit_metainterp::jitcode::JitCallArg::reference(value_reg),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    obj_reg,
+                                ),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    key_reg,
+                                ),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    value_reg,
+                                ),
                             ],
                             ResKind::Void,
                             None,
@@ -4829,8 +4865,6 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        let scratch_op = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        emit_load_const_i!(ssarepr, scratch_op, op_val as i64);
                         let result_value = emit_frontend_binary(
                             &mut graph,
                             &current_block.block(),
@@ -4844,9 +4878,15 @@ impl CodeWriter {
                             CallFlavor::MayForce,
                             binary_op_fn_idx,
                             &[
-                                majit_metainterp::jitcode::JitCallArg::reference(lhs_reg),
-                                majit_metainterp::jitcode::JitCallArg::reference(rhs_reg),
-                                majit_metainterp::jitcode::JitCallArg::int(scratch_op),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    lhs_reg,
+                                ),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    rhs_reg,
+                                ),
+                                CallArgInput::ConstInt(op_val as i64),
                             ],
                             ResKind::Ref,
                             Some(stack_base + current_depth),
@@ -4871,8 +4911,6 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        let scratch_op = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        emit_load_const_i!(ssarepr, scratch_op, op_val as i64);
                         let result_value = emit_frontend_compare(
                             &mut graph,
                             &current_block.block(),
@@ -4886,9 +4924,15 @@ impl CodeWriter {
                             CallFlavor::MayForce,
                             compare_fn_idx,
                             &[
-                                majit_metainterp::jitcode::JitCallArg::reference(lhs_reg),
-                                majit_metainterp::jitcode::JitCallArg::reference(rhs_reg),
-                                majit_metainterp::jitcode::JitCallArg::int(scratch_op),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    lhs_reg,
+                                ),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    rhs_reg,
+                                ),
+                                CallArgInput::ConstInt(op_val as i64),
                             ],
                             ResKind::Ref,
                             Some(stack_base + current_depth),
@@ -4935,7 +4979,10 @@ impl CodeWriter {
                             &mut ssarepr,
                             CallFlavor::Plain,
                             truth_fn_idx,
-                            &[majit_metainterp::jitcode::JitCallArg::reference(cond_reg)],
+                            &[CallArgInput::Reg(
+                                majit_metainterp::jitcode::JitArgKind::Ref,
+                                cond_reg,
+                            )],
                             ResKind::Int,
                             Some(scratch_truth),
                         );
@@ -4980,7 +5027,10 @@ impl CodeWriter {
                             &mut ssarepr,
                             CallFlavor::Plain,
                             truth_fn_idx,
-                            &[majit_metainterp::jitcode::JitCallArg::reference(cond_reg)],
+                            &[CallArgInput::Reg(
+                                majit_metainterp::jitcode::JitArgKind::Ref,
+                                cond_reg,
+                            )],
                             ResKind::Int,
                             Some(scratch_truth),
                         );
@@ -5053,20 +5103,24 @@ impl CodeWriter {
                         let result_value = fresh_ref_value(&mut graph);
                         let scratch_ns = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         let scratch_code = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                        let scratch_namei = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
                         // jtransform.py: getfield_vable_r for w_globals (field 3)
                         // and pycode (field 1) — namespace for lookup, code for names.
                         emit_vable_getfield_ref!(ssarepr, scratch_ns, VABLE_NAMESPACE_FIELD_IDX);
                         emit_vable_getfield_ref!(ssarepr, scratch_code, VABLE_CODE_FIELD_IDX);
-                        emit_load_const_i!(ssarepr, scratch_namei, raw_namei);
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::MayForce,
                             load_global_fn_idx,
                             &[
-                                majit_metainterp::jitcode::JitCallArg::reference(scratch_ns),
-                                majit_metainterp::jitcode::JitCallArg::reference(scratch_code),
-                                majit_metainterp::jitcode::JitCallArg::int(scratch_namei),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    scratch_ns,
+                                ),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    scratch_code,
+                                ),
+                                CallArgInput::ConstInt(raw_namei),
                             ],
                             ResKind::Ref,
                             Some(scratch_ns),
@@ -5131,11 +5185,13 @@ impl CodeWriter {
                         // RPython: bhimpl_recursive_call_i(jdindex, greens, reds)
                         // call_fn(callable, arg0, ...) → result
                         // Parent frame accessed via BH_VABLE_PTR thread-local.
-                        let mut call_args = vec![majit_metainterp::jitcode::JitCallArg::reference(
+                        let mut call_args = vec![CallArgInput::Reg(
+                            majit_metainterp::jitcode::JitArgKind::Ref,
                             callable_reg,
                         )];
                         for i in 0..nargs {
-                            call_args.push(majit_metainterp::jitcode::JitCallArg::reference(
+                            call_args.push(CallArgInput::Reg(
+                                majit_metainterp::jitcode::JitArgKind::Ref,
                                 arg_regs[i],
                             ));
                         }
@@ -5204,8 +5260,6 @@ impl CodeWriter {
                             operand_value,
                             py_pc as i64,
                         );
-                        let scratch_zero_const = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        emit_load_const_i!(ssarepr, scratch_zero_const, 0);
                         let subtract_tag =
                             binary_op_tag(pyre_interpreter::bytecode::BinaryOperator::Subtract)
                                 .expect("subtract must have a jit binary-op tag");
@@ -5214,22 +5268,24 @@ impl CodeWriter {
                             &mut ssarepr,
                             CallFlavor::MayForce,
                             box_int_fn_idx,
-                            &[majit_metainterp::jitcode::JitCallArg::int(
-                                scratch_zero_const,
-                            )],
+                            &[CallArgInput::ConstInt(0)],
                             ResKind::Ref,
                             Some(scratch_zero),
                         );
-                        let scratch_op_tag = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        emit_load_const_i!(ssarepr, scratch_op_tag, subtract_tag);
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::MayForce,
                             binary_op_fn_idx,
                             &[
-                                majit_metainterp::jitcode::JitCallArg::reference(scratch_zero),
-                                majit_metainterp::jitcode::JitCallArg::reference(operand_reg),
-                                majit_metainterp::jitcode::JitCallArg::int(scratch_op_tag),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    scratch_zero,
+                                ),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    operand_reg,
+                                ),
+                                CallArgInput::ConstInt(subtract_tag),
                             ],
                             ResKind::Ref,
                             Some(stack_base + current_depth),
@@ -5289,9 +5345,14 @@ impl CodeWriter {
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph)),
                             );
                         }
-                        // build_list_fn(argc, item0, item1) → list
-                        let scratch_argc = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        emit_load_const_i!(ssarepr, scratch_argc, argc as i64);
+                        // build_list_fn(argc, item0, item1) → list. The C ABI is
+                        // `extern "C" fn(i64, i64, i64)`; the helper dispatches
+                        // internally by `argc`, so unused item slots may be any
+                        // bit pattern. Encode unused slots as `ConstInt(0)` —
+                        // routed through the int constants pool, matches
+                        // upstream `make_three_lists` Constant admit
+                        // (jtransform.py:437-445). Used item slots stay
+                        // Ref-typed so they read from `registers_r`.
                         let result_value = emit_frontend_newlist(
                             &mut graph,
                             &current_block.block(),
@@ -5299,24 +5360,26 @@ impl CodeWriter {
                             py_pc as i64,
                         );
                         let item0 = if argc >= 1 {
-                            majit_metainterp::jitcode::JitCallArg::reference(arg_regs[0])
+                            CallArgInput::Reg(
+                                majit_metainterp::jitcode::JitArgKind::Ref,
+                                arg_regs[0],
+                            )
                         } else {
-                            majit_metainterp::jitcode::JitCallArg::int(scratch_argc) // dummy
+                            CallArgInput::ConstInt(0) // dummy
                         };
                         let item1 = if argc >= 2 {
-                            majit_metainterp::jitcode::JitCallArg::reference(arg_regs[1])
+                            CallArgInput::Reg(
+                                majit_metainterp::jitcode::JitArgKind::Ref,
+                                arg_regs[1],
+                            )
                         } else {
-                            majit_metainterp::jitcode::JitCallArg::int(scratch_argc) // dummy
+                            CallArgInput::ConstInt(0) // dummy
                         };
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::MayForce,
                             build_list_fn_idx,
-                            &[
-                                majit_metainterp::jitcode::JitCallArg::int(scratch_argc),
-                                item0,
-                                item1,
-                            ],
+                            &[CallArgInput::ConstInt(argc as i64), item0, item1],
                             ResKind::Ref,
                             Some(stack_base + current_depth),
                         );
@@ -5344,18 +5407,21 @@ impl CodeWriter {
                                     .pop()
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                                 let cause_reg = emit_popvalue_ref!(ssarepr, current_depth);
-                                majit_metainterp::jitcode::JitCallArg::reference(cause_reg)
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    cause_reg,
+                                )
                             } else {
-                                // Tier 4 Epic A: lazy-materialize PY_NULL
-                                // into a fresh scratch slot instead of the
-                                // dropped null_ref_reg slot.
-                                let scratch_null = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                                emit_ref_const_copy!(
-                                    ssarepr,
-                                    scratch_null,
-                                    pyre_object::PY_NULL as i64
-                                );
-                                majit_metainterp::jitcode::JitCallArg::reference(scratch_null)
+                                // Tier 4 Epic A: PY_NULL flows directly through
+                                // the residual_call's ListOfKind(Ref) as a
+                                // raw constant — make_three_lists
+                                // (jtransform.py:437-445) admits Constant in
+                                // any slot, and the assembler's
+                                // dispatch_residual_call routes ConstRef
+                                // through the ref constants pool
+                                // (assembler.rs:1709-1724
+                                // expect_ref_reg_or_pool).
+                                CallArgInput::ConstRef(pyre_object::PY_NULL as i64)
                             };
                             // Drop the pre-normalization exception operand from
                             // the shadow stack. The residual call below may
@@ -5381,7 +5447,10 @@ impl CodeWriter {
                                 CallFlavor::Plain,
                                 normalize_raise_varargs_fn_idx,
                                 &[
-                                    majit_metainterp::jitcode::JitCallArg::reference(exc_reg),
+                                    CallArgInput::Reg(
+                                        majit_metainterp::jitcode::JitArgKind::Ref,
+                                        exc_reg,
+                                    ),
                                     cause,
                                 ],
                                 ResKind::Ref,
@@ -5433,7 +5502,10 @@ impl CodeWriter {
                             &mut ssarepr,
                             CallFlavor::Plain,
                             set_current_exception_fn_idx,
-                            &[majit_metainterp::jitcode::JitCallArg::reference(exc_reg)],
+                            &[CallArgInput::Reg(
+                                majit_metainterp::jitcode::JitArgKind::Ref,
+                                exc_reg,
+                            )],
                             ResKind::Void,
                             None,
                         );
@@ -5458,18 +5530,21 @@ impl CodeWriter {
                         let match_type_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let _ = current_state.stack.pop();
                         let exc_reg = stack_base + current_depth - 1;
-                        let scratch_isinstance_tag =
-                            ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        emit_load_const_i!(ssarepr, scratch_isinstance_tag, 10);
                         let scratch_match = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         emit_residual_call(
                             &mut ssarepr,
                             CallFlavor::MayForce,
                             compare_fn_idx,
                             &[
-                                majit_metainterp::jitcode::JitCallArg::reference(exc_reg),
-                                majit_metainterp::jitcode::JitCallArg::reference(match_type_reg),
-                                majit_metainterp::jitcode::JitCallArg::int(scratch_isinstance_tag),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    exc_reg,
+                                ),
+                                CallArgInput::Reg(
+                                    majit_metainterp::jitcode::JitArgKind::Ref,
+                                    match_type_reg,
+                                ),
+                                CallArgInput::ConstInt(10),
                             ],
                             ResKind::Ref,
                             Some(scratch_match),
@@ -5495,7 +5570,10 @@ impl CodeWriter {
                             &mut ssarepr,
                             CallFlavor::Plain,
                             set_current_exception_fn_idx,
-                            &[majit_metainterp::jitcode::JitCallArg::reference(prev_reg)],
+                            &[CallArgInput::Reg(
+                                majit_metainterp::jitcode::JitArgKind::Ref,
+                                prev_reg,
+                            )],
                             ResKind::Void,
                             None,
                         );
@@ -5638,7 +5716,7 @@ impl CodeWriter {
                                 let v_idx = emit_graph_op_with_result(
                                     &mut graph,
                                     &current_block.block(),
-                                    "int_const",
+                                    "int_copy",
                                     vec![super::flow::Constant::signed(local_slot).into()],
                                     Kind::Int,
                                     -1,
@@ -5826,7 +5904,7 @@ impl CodeWriter {
                     let v_idx = emit_graph_op_with_result(
                         &mut graph,
                         &current_block.block(),
-                        "int_const",
+                        "int_copy",
                         vec![super::flow::Constant::signed(depth_value).into()],
                         Kind::Int,
                         -1,
@@ -5865,13 +5943,11 @@ impl CodeWriter {
             if site.push_lasti {
                 // A-slice 6: box_int writes the lasti result directly to
                 // the exception slot, retiring obj_tmp0 → exc_slot copy.
-                let scratch_lasti = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                emit_load_const_i!(ssarepr, scratch_lasti, site.lasti_py_pc as i64);
                 emit_residual_call(
                     &mut ssarepr,
                     CallFlavor::Plain,
                     box_int_fn_idx,
-                    &[majit_metainterp::jitcode::JitCallArg::int(scratch_lasti)],
+                    &[CallArgInput::ConstInt(site.lasti_py_pc as i64)],
                     ResKind::Ref,
                     Some(exc_slot),
                 );
@@ -5899,7 +5975,7 @@ impl CodeWriter {
                 let v_idx = emit_graph_op_with_result(
                     &mut graph,
                     &current_block.block(),
-                    "int_const",
+                    "int_copy",
                     vec![super::flow::Constant::signed(depth_value).into()],
                     Kind::Int,
                     -1,
@@ -6183,6 +6259,130 @@ impl CodeWriter {
                 }
             }
 
+            // Phase 4 Slice 12 (Task #227 prerequisite) — all-families
+            // shape-multiset probe.  `flatten_all_graph_ops(graph)`
+            // produces the `Vec<Insn>` a future
+            // `flatten_graph(graph, regallocs)` driver would emit
+            // BEFORE Label/terminator/insert_renamings emission;
+            // compares its shape-multiset against the inline
+            // SSARepr's `Insn::Op` shape-multiset across the whole
+            // graph (not one family at a time).  Surfaces every
+            // remaining orphan-inline emit shape that still needs
+            // graph-side `record_graph_op` coverage before the
+            // walker → flatten_graph flip can land.  Observable-only,
+            // gated by `PYRE_PHASE1_REGALLOC_LOG=1` to keep release
+            // builds noise-free.
+            if log_enabled {
+                use std::collections::HashMap;
+                let parallel_all = super::flatten::flatten_all_graph_ops(
+                    &graph,
+                    |variable: super::flow::Variable| {
+                        let kind = variable.kind.unwrap_or(super::flatten::Kind::Ref);
+                        let color = graph_regallocs
+                            .get(&kind)
+                            .and_then(|r| r.coloring.get(&variable.id).copied())
+                            .unwrap_or(u16::MAX);
+                        super::flatten::Register::new(kind, color)
+                    },
+                );
+                // Split inline `Insn::Op` into "true walker emit"
+                // (must be matched by graph for retirement) and
+                // "expected SSA-only artifact" (`-live-`, link-rename
+                // push/pop, terminators — these are emitted by
+                // `flatten_graph` and have no `record_graph_op`
+                // counterpart by design). The split lets us measure
+                // the true walker→graph gap separate from artifacts
+                // that close naturally once `flatten_graph` becomes
+                // the canonical SSARepr source.
+                let mut inline_walker: Vec<&super::flatten::Insn> = Vec::new();
+                let mut inline_artifact_count: usize = 0;
+                for insn in ssarepr.insns.iter() {
+                    if !matches!(insn, super::flatten::Insn::Op { .. }) {
+                        continue;
+                    }
+                    if super::flatten::is_ssa_only_artifact(insn) {
+                        inline_artifact_count += 1;
+                    } else {
+                        inline_walker.push(insn);
+                    }
+                }
+
+                let mut graph_shape_counts: HashMap<String, usize> = HashMap::new();
+                for insn in &parallel_all {
+                    *graph_shape_counts
+                        .entry(shape_descriptor(insn))
+                        .or_insert(0) += 1;
+                }
+                let mut inline_shape_counts: HashMap<String, usize> = HashMap::new();
+                for insn in &inline_walker {
+                    *inline_shape_counts
+                        .entry(shape_descriptor(insn))
+                        .or_insert(0) += 1;
+                }
+                let mut multiset_match: usize = 0;
+                for (shape, &g_count) in &graph_shape_counts {
+                    let i_count = inline_shape_counts.get(shape).copied().unwrap_or(0);
+                    multiset_match += g_count.min(i_count);
+                }
+                eprintln!(
+                    "[phase4-graph-shape] {} parallel={} inline_walker={} \
+                     inline_artifact={} multiset_match={}",
+                    code.obj_name,
+                    parallel_all.len(),
+                    inline_walker.len(),
+                    inline_artifact_count,
+                    multiset_match,
+                );
+
+                // Top orphan-shape breakdown so the next retirement
+                // candidate is immediately visible. Computed against
+                // `inline_walker` only (artifacts excluded).
+                if !inline_walker.is_empty() {
+                    use std::collections::HashSet;
+                    let all_shapes: HashSet<&String> = graph_shape_counts
+                        .keys()
+                        .chain(inline_shape_counts.keys())
+                        .collect();
+                    let mut inline_only: Vec<(&String, usize)> = Vec::new();
+                    let mut graph_only: Vec<(&String, usize)> = Vec::new();
+                    for shape in all_shapes {
+                        let g = graph_shape_counts.get(shape).copied().unwrap_or(0);
+                        let i = inline_shape_counts.get(shape).copied().unwrap_or(0);
+                        if g == 0 && i > 0 {
+                            inline_only.push((shape, i));
+                        } else if g > 0 && i == 0 {
+                            graph_only.push((shape, g));
+                        }
+                    }
+                    inline_only.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                    graph_only.sort_by_key(|(_, c)| std::cmp::Reverse(*c));
+                    let format_inline_only = inline_only
+                        .iter()
+                        .take(8)
+                        .map(|(s, c)| format!("{s}={c}"))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    let format_graph_only = graph_only
+                        .iter()
+                        .take(8)
+                        .map(|(s, c)| format!("{s}={c}"))
+                        .collect::<Vec<_>>()
+                        .join(" | ");
+                    if !format_inline_only.is_empty() {
+                        eprintln!(
+                            "[phase4-graph-shape]   {} inline-only(top): {format_inline_only}",
+                            code.obj_name,
+                        );
+                    }
+                    if !format_graph_only.is_empty() {
+                        eprintln!(
+                            "[phase4-graph-shape]   {} graph-only(top): {format_graph_only}",
+                            code.obj_name,
+                        );
+                    }
+                }
+            }
+
             // Phase 4 Session 18 (Task #227 prerequisite) — single-family
             // structural diff probe.  Walks `graph.iterblocks()` for one
             // family (today: `setarrayitem_vable_r`, the family Session
@@ -6386,13 +6586,38 @@ impl CodeWriter {
             // + StoreFastLoadFast LOAD halves are both paired
             // (Session 19 slice 2).  Test-suite pass under this
             // invariant cross-validates the convergence.
-            if cfg!(debug_assertions) {
-                const RETIREMENT_READY_FAMILIES: &[&str] = &[
-                    "setarrayitem_vable_r",
-                    "getarrayitem_vable_r",
-                    "setfield_vable_i",
-                ];
-                for &family in RETIREMENT_READY_FAMILIES {
+            //
+            // Tiered families: a family graduates from
+            // SUB_MULTISET (graph ⊆ inline) to FULL_EQ (graph multiset
+            // == inline multiset) once `record_graph_op` coverage
+            // closes the orphan-inline gap.  FULL_EQ is the
+            // retirement-safe state — at that point an inline emit
+            // can be replaced with a post-walk `flatten_graph` call
+            // without changing the SSA shape multiset.  This is a
+            // phase probe, not an RPython runtime invariant, so its
+            // panics are opt-in under `PYRE_PHASE1_REGALLOC_LOG=1`.
+            if cfg!(debug_assertions) && log_enabled {
+                // Slice 11 (Task #227 prerequisite): `setarrayitem_vable_r`
+                // stays in SUB_MULTISET because the `push_lasti` portal
+                // path (codewriter.rs:5961 `emit_vable_setarrayitem_ref!`
+                // inside the `is_portal && site.push_lasti` block at
+                // codewriter.rs:5941-5965) still emits inline-only — no
+                // companion `record_graph_op("setarrayitem_vable_r", ...)`
+                // covers the lasti push.  Promotion would assert
+                // `parallel.len() == inline.len()` and trip on any
+                // raising-op site that arrives with `push_lasti = true`.
+                // Convergence: the `// TODO: graph dual-write` at the
+                // push_lasti block must land first, then promote.
+                const SUB_MULTISET_FAMILIES: &[&str] = &["setarrayitem_vable_r"];
+                // Slice 10 (Task #227 prerequisite): `setfield_vable_i`
+                // promoted to FULL_EQ — `[phase4-flatten-family]` probe
+                // surfaced no orphan inline emits across check.sh
+                // production CodeObjects (multiset_match == common).
+                // `getarrayitem_vable_r` (Session 19 slice 2) graduates
+                // because both LOAD_FAST + StoreFastLoadFast LOAD halves
+                // already record graph counterparts.
+                const FULL_EQ_FAMILIES: &[&str] = &["setfield_vable_i", "getarrayitem_vable_r"];
+                for &family in SUB_MULTISET_FAMILIES.iter().chain(FULL_EQ_FAMILIES.iter()) {
                     let parallel = super::flatten::flatten_family_ops(
                         &graph,
                         family,
@@ -6437,6 +6662,21 @@ impl CodeWriter {
                                 code.obj_name,
                             ),
                         }
+                    }
+                    // FULL_EQ additionally requires `parallel.len() ==
+                    // inline.len()`. Combined with the sub-multiset
+                    // shape-counts loop above, this proves the two
+                    // multisets are equal.
+                    if FULL_EQ_FAMILIES.contains(&family) {
+                        assert_eq!(
+                            parallel.len(),
+                            inline.len(),
+                            "{family} FULL_EQ retirement invariant violated: graph emitted {} \
+                             ops, inline emitted {} ops (equal multiset required) for {}",
+                            parallel.len(),
+                            inline.len(),
+                            code.obj_name,
+                        );
                     }
                 }
             }

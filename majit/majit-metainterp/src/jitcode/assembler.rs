@@ -53,6 +53,22 @@ pub struct JitCodeBuilder {
     /// (RPython `j`/`d` argcode → `descrs[idx]` dispatch).
     descrs: Vec<RuntimeBhDescr>,
     has_abort: bool,
+    /// Whether `num_regs_{i,r,f}` have been frozen at the regalloc-
+    /// final value. While set, `touch_reg`/`touch_ref_reg`/
+    /// `touch_float_reg` skip the `max` update so subsequent operand
+    /// emission cannot extend the register file past what regalloc
+    /// computed.
+    ///
+    /// This is the precondition for routing residual_call `Const*`
+    /// args through the constants pool: the encoded byte
+    /// `num_regs_kind + pool_idx` must remain stable from the moment
+    /// `add_const_*` returns through `finish()`'s constants-suffix
+    /// placement (`init_register_files_from_runtime_jitcode`,
+    /// `blackhole.rs:1056-1075`). RPython's assembler is naturally in
+    /// this regime — `assembler.py` runs after regalloc has fixed
+    /// `num_regs[kind]` — so freeze restores parity with the upstream
+    /// invariant.
+    num_regs_frozen: bool,
 }
 
 /// Register-file kind for const_patches entries.
@@ -1369,6 +1385,14 @@ impl JitCodeBuilder {
         self.num_regs_f = max(self.num_regs_f, count);
     }
 
+    /// Lock `num_regs_{i,r,f}` at their current values so subsequent
+    /// `touch_*_reg` calls cannot grow them. Callers that route
+    /// `Const*` args through the constants pool depend on this — see
+    /// the `num_regs_frozen` field comment for the invariant.
+    pub fn freeze_num_regs(&mut self) {
+        self.num_regs_frozen = true;
+    }
+
     // ── Ref-typed builder methods ─────────────────────────────
 
     pub fn load_const_r_value(&mut self, dst: u16, value: i64) {
@@ -1811,14 +1835,23 @@ impl JitCodeBuilder {
     }
 
     fn touch_reg(&mut self, reg: u16) {
+        if self.num_regs_frozen {
+            return;
+        }
         self.num_regs_i = max(self.num_regs_i, reg.saturating_add(1));
     }
 
     fn touch_ref_reg(&mut self, reg: u16) {
+        if self.num_regs_frozen {
+            return;
+        }
         self.num_regs_r = max(self.num_regs_r, reg.saturating_add(1));
     }
 
     fn touch_float_reg(&mut self, reg: u16) {
+        if self.num_regs_frozen {
+            return;
+        }
         self.num_regs_f = max(self.num_regs_f, reg.saturating_add(1));
     }
 

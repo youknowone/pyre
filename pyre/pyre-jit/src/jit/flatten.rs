@@ -570,6 +570,104 @@ impl Operand {
 /// `opname` field of `Insn::Op`, matching the tuple-shape exactly.
 pub const OPNAME_LIVE: &str = "-live-";
 
+/// Classify whether an `Insn::Op` is a flatten_graph-emitted artifact
+/// that has no walker-time `record_graph_op` counterpart by design.
+/// Used by the `[phase4-graph-shape]` probe in `codewriter.rs` to
+/// separate "true walker→graph gap" (closing requires
+/// `record_graph_op` coverage) from "expected SSA-only emit"
+/// (closes naturally once `flatten_graph(graph, regallocs)` becomes
+/// the canonical SSARepr source — Task #227 walker restructure).
+///
+/// Currently recognises:
+///   * `OPNAME_LIVE` (`-live-`) — `liveness.py:5-12`. **Transitional
+///     classification.** Upstream `-live-` is a *graph-level*
+///     `SpaceOperation` emitted from `jtransform` (e.g.
+///     `rpython/jit/codewriter/jtransform.py:845`
+///     `SpaceOperation('-live-', [], None)`); `flatten.py:126`
+///     serialises it through `serialize_op`; `liveness.py:18+
+///     compute_liveness` then expands its argument list with the
+///     surviving variables.  Pyre's graph does NOT emit `-live-`
+///     today (no `record_graph_op("-live-", ...)` call sites), so
+///     every inline `-live-` is currently walker-only and counting
+///     them as artifact matches the empirical graph state.  Once
+///     graph-side `-live-` emission lands (Task #227 or its
+///     prerequisite parity slice), this clause MUST be removed so
+///     the probe surfaces real graph→inline `-live-` gaps; otherwise
+///     a missing graph emission would hide silently.
+///   * Terminator ops emitted by `make_return` / `make_exception_link`
+///     (`flatten.py:236-303`):
+///     `int_return`, `ref_return`, `float_return`, `void_return`,
+///     `raise`, `reraise`.
+///   * Block-exit dispatch ops emitted by `insert_exits` /
+///     `insert_switch_exits` (`flatten.py:107-200` 1-exit / 2-exit /
+///     switch dispatch): `goto`, `goto_if_not`, `goto_if_not_<marker>`
+///     (overflow / int_lt / ...), `goto_if_exception_mismatch`,
+///     `switch`, `unreachable`, `catch_exception`.
+///   * Link-rename `*_push`/`*_pop` and link-driven
+///     `last_exception`/`last_exc_value` — `flatten.py:306-334
+///     insert_renamings` + `generate_last_exc`. `*_push` carries one
+///     register source (`int_push %iN`), `*_pop` carries one register
+///     result (`int_pop -> %iN`); both arise from
+///     `reorder_renaming_list` swap-cycle resolution.  `*_copy` is
+///     not classified here: pyre's walker also emits register-source
+///     copies for stack / local / call-argument movement, so
+///     treating all register-source copies as SSA-only would hide
+///     real walker→graph gaps until copy provenance is represented
+///     explicitly.
+pub fn is_ssa_only_artifact(insn: &Insn) -> bool {
+    let Insn::Op { opname, .. } = insn else {
+        return false;
+    };
+    // PRE-EXISTING-ADAPTATION: pyre graph never emits `-live-` (see
+    // docstring above). Remove this clause once graph-side `-live-`
+    // lands so the [phase4-graph-shape] probe can surface real gaps.
+    if opname == OPNAME_LIVE {
+        return true;
+    }
+    // Terminators: `flatten.py:236-303 make_return` /
+    // `make_exception_link`.
+    if matches!(
+        opname.as_str(),
+        "int_return" | "ref_return" | "float_return" | "void_return" | "raise" | "reraise"
+    ) {
+        return true;
+    }
+    // Block-exit dispatch: `insert_exits` 1-/2-exit / `insert_switch_exits`
+    // (`flatten.py:107-200`).
+    if matches!(
+        opname.as_str(),
+        "goto"
+            | "goto_if_not"
+            | "goto_if_exception_mismatch"
+            | "switch"
+            | "unreachable"
+            | "catch_exception"
+    ) {
+        return true;
+    }
+    // `goto_if_not_<marker>` from `flatten_tuple_exitswitch`
+    // (`flatten.py:118-144`): overflow / int_lt / etc.
+    if opname.starts_with("goto_if_not_") {
+        return true;
+    }
+    // Link-driven loads: `generate_last_exc` (`flatten.py:336-352`).
+    if matches!(opname.as_str(), "last_exception" | "last_exc_value") {
+        return true;
+    }
+    // `*_copy` is deliberately counted as walker-emitted unless the
+    // instruction carries explicit link-rename provenance. Pyre's walker
+    // emits register-source copies for stack/local/call argument shuffles.
+    // Link-rename `*_push %iN` / `*_pop -> %iN`
+    // (`flatten.py:325-330 reorder_renaming_list`): swap-cycle
+    // resolution. `*_push` carries a register source; `*_pop` carries
+    // a register result. Both are flatten-time emissions with no
+    // graph counterpart by design.
+    matches!(
+        opname.as_str(),
+        "int_push" | "ref_push" | "float_push" | "int_pop" | "ref_pop" | "float_pop"
+    )
+}
+
 /// Instruction tuple (`ssarepr.insns[i]`).
 ///
 /// The four RPython tuple shapes enumerated above (`Label`, `-live-`,
@@ -1283,6 +1381,28 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
     }
 }
 
+/// Probe-side lowering: same as [`flatten_constant_operand`] but
+/// returns a placeholder for `Opaque(Ref)` instead of panicking.
+///
+/// `flatten_arg_for_probe` runs from a debug-only shape comparison
+/// pass that walks every graph op; portal `jit_merge_point` carries an
+/// `Opaque(Ref)` pycode constant
+/// (`pyre/pyre-jit/src/jit/codewriter.rs:4351-4356`), and production
+/// emission threads a per-call `lower_constant` closure
+/// (`codewriter.rs:4381-4396`) to recover the real `w_code` pointer.
+/// The probe has no such closure available, so route `Opaque(Ref)` to
+/// `Operand::ConstRef(0)`. `shape_descriptor`
+/// (`codewriter.rs:1179-1215`) tags `Operand::ConstRef(_)` as
+/// `"const_ref"` regardless of value, so the placeholder still
+/// produces the same shape signature production emits when its
+/// closure lowers the same op to `Operand::ConstRef(real_ptr)`.
+fn flatten_constant_operand_for_probe(constant: &super::flow::Constant) -> Operand {
+    match (&constant.value, constant.kind) {
+        (ConstantValue::Opaque(_), Some(Kind::Ref)) => Operand::ConstRef(0),
+        _ => flatten_constant_operand(constant),
+    }
+}
+
 /// Block-level walker matching `rpython/jit/codewriter/flatten.py:60
 /// flatten_graph(graph, regallocs)`.  Walks every block in `graph`,
 /// emits a `Label` for each block and an `Insn` for each
@@ -1381,30 +1501,76 @@ where
             if op.opname != family_opname {
                 continue;
             }
-            let args: Vec<Operand> = op
-                .args
-                .iter()
-                .map(|arg| flatten_arg_for_probe(arg, &mut get_register))
-                .collect();
-            let insn = match &op.result {
-                None => Insn::op(op.opname.clone(), args),
-                Some(FlowValue::Variable(variable)) => {
-                    let reg = get_register(*variable);
-                    Insn::op_with_result(op.opname.clone(), args, reg)
-                }
-                Some(FlowValue::Constant(_)) => {
-                    // Same invariant as `flatten_space_operation`:
-                    // graph op results must be Variables.  Drop into
-                    // a no-result Op so the probe still produces a
-                    // comparable sequence rather than panicking on
-                    // unexpected graph shape.
-                    Insn::op(op.opname.clone(), args)
-                }
-            };
-            out.push(insn);
+            if let Some(insn) = flatten_op_to_insn(op, &mut get_register) {
+                out.push(insn);
+            }
         }
     }
     out
+}
+
+/// Walk every block in `graph.iterblocks()` DFS order and produce the
+/// `Vec<Insn>` that a future `flatten_graph(graph, regallocs)` driver
+/// would emit BEFORE `Label`/terminator/`insert_renamings` emission.
+/// All-families generalisation of [`flatten_family_ops`]; same caveats
+/// (`flatten_family_ops` docstring above) apply — this is NOT a full
+/// `flatten_graph` replacement, only the `block.operations` body walk.
+///
+/// Used by the `[phase4-graph-shape]` probe to surface every remaining
+/// orphan-inline emit family across the whole graph at once, not just
+/// the per-family `[phase4-flatten-family]` cover. Probe-positive
+/// answer ("graph multiset == inline multiset for ALL Op opnames") is
+/// the structural precondition for retiring the entire walker → SSA
+/// inline emit path in favour of post-walker `flatten_graph` (Task
+/// #227 walker restructure endgame).
+pub fn flatten_all_graph_ops<F>(
+    graph: &super::flow::FunctionGraph,
+    mut get_register: F,
+) -> Vec<Insn>
+where
+    F: FnMut(Variable) -> Register,
+{
+    let mut out = Vec::new();
+    for block in graph.iterblocks() {
+        let block = block.borrow();
+        for op in &block.operations {
+            if let Some(insn) = flatten_op_to_insn(op, &mut get_register) {
+                out.push(insn);
+            }
+        }
+    }
+    out
+}
+
+/// Lower one `SpaceOperation` to a single `Insn::Op` using probe-side
+/// argument flattening. Shared between [`flatten_family_ops`] and
+/// [`flatten_all_graph_ops`] so both paths agree on result-handling
+/// and argument lowering. Returns `None` only when the op is not
+/// representable as a single `Insn::Op` (currently never).
+fn flatten_op_to_insn<F>(op: &super::flow::SpaceOperation, get_register: &mut F) -> Option<Insn>
+where
+    F: FnMut(Variable) -> Register,
+{
+    let args: Vec<Operand> = op
+        .args
+        .iter()
+        .map(|arg| flatten_arg_for_probe(arg, get_register))
+        .collect();
+    let insn = match &op.result {
+        None => Insn::op(op.opname.clone(), args),
+        Some(FlowValue::Variable(variable)) => {
+            let reg = get_register(*variable);
+            Insn::op_with_result(op.opname.clone(), args, reg)
+        }
+        Some(FlowValue::Constant(_)) => {
+            // Same invariant as `flatten_space_operation`: graph op
+            // results must be Variables. Drop into a no-result Op so
+            // the probe still produces a comparable sequence rather
+            // than panicking on unexpected graph shape.
+            Insn::op(op.opname.clone(), args)
+        }
+    };
+    Some(insn)
 }
 
 fn flatten_arg_for_probe<F>(arg: &super::flow::SpaceOperationArg, get_register: &mut F) -> Operand
@@ -1416,7 +1582,7 @@ where
             Operand::Register(get_register(*v))
         }
         super::flow::SpaceOperationArg::Value(FlowValue::Constant(c)) => {
-            flatten_constant_operand(c)
+            flatten_constant_operand_for_probe(c)
         }
         super::flow::SpaceOperationArg::ListOfKind(list) => Operand::ListOfKind(ListOfKind::new(
             list.kind,
@@ -1424,7 +1590,7 @@ where
                 .iter()
                 .map(|value| match value {
                     FlowValue::Variable(v) => Operand::Register(get_register(*v)),
-                    FlowValue::Constant(c) => flatten_constant_operand(c),
+                    FlowValue::Constant(c) => flatten_constant_operand_for_probe(c),
                 })
                 .collect(),
         )),
