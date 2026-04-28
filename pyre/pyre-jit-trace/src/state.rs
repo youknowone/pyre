@@ -4365,39 +4365,34 @@ impl JitState for PyreJitState {
         let mut vable_array_values: Vec<majit_ir::Value> =
             Vec::with_capacity(vvals.len().saturating_sub(num_scalars));
         let mut vable_ref_value = majit_ir::Value::Void;
+        // `read_boxes` layout: `[vable_ref, static_fields..., array_items...]`.
+        // Boundary is `NUM_VABLE_SCALARS` (count of `_virtualizable_` static
+        // fields, excluding the leading vable_ref); slots `1..=NUM_VABLE_SCALARS`
+        // dispatch to `sym.vable_*` in macro-declared static-field order
+        // (`virtualizable_gen.rs::fields = { last_instr, pycode, valuestackdepth,
+        // debugdata, lastblock, w_globals }`). Read-boxes does not include
+        // `extra_reds` (those live only in the inputarg layout), so this
+        // dispatch is invariant under the Task #22 `extra_reds` macro flip.
+        let num_vable_scalars = crate::virtualizable_gen::NUM_VABLE_SCALARS;
         for (i, v) in vvals.iter().enumerate() {
             let resolved = resolve(ctx, &mut virtuals_cache, v);
             let concrete = decode_concrete(v);
-            match i {
-                0 => vable_ref_value = concrete, // frame_ptr — implicit OpRef, explicit concrete
-                1 => {
-                    sym.vable_last_instr = resolved;
-                    vable_scalar_values.push(concrete);
+            if i == 0 {
+                vable_ref_value = concrete; // frame_ptr — implicit OpRef, explicit concrete
+            } else if i <= num_vable_scalars {
+                match i - 1 {
+                    0 => sym.vable_last_instr = resolved,
+                    1 => sym.vable_pycode = resolved,
+                    2 => sym.vable_valuestackdepth = resolved,
+                    3 => sym.vable_debugdata = resolved,
+                    4 => sym.vable_lastblock = resolved,
+                    5 => sym.vable_w_globals = resolved,
+                    _ => {}
                 }
-                2 => {
-                    sym.vable_pycode = resolved;
-                    vable_scalar_values.push(concrete);
-                }
-                3 => {
-                    sym.vable_valuestackdepth = resolved;
-                    vable_scalar_values.push(concrete);
-                }
-                4 => {
-                    sym.vable_debugdata = resolved;
-                    vable_scalar_values.push(concrete);
-                }
-                5 => {
-                    sym.vable_lastblock = resolved;
-                    vable_scalar_values.push(concrete);
-                }
-                6 => {
-                    sym.vable_w_globals = resolved;
-                    vable_scalar_values.push(concrete);
-                }
-                _ => {
-                    vable_array_items.push(resolved);
-                    vable_array_values.push(concrete);
-                }
+                vable_scalar_values.push(concrete);
+            } else {
+                vable_array_items.push(resolved);
+                vable_array_values.push(concrete);
             }
         }
 

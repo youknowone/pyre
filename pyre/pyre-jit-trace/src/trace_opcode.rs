@@ -2193,18 +2193,42 @@ impl MIFrame {
         // reached_loop_header returns without closing. Harmless on the "close
         // loop" path since the frame won't be reused.
         {
+            // Inputarg layout (`pyjitpl.py:2957 redboxes`): `[frame,
+            // extra_reds..., vable_scalars..., array_items...]`. Indices
+            // resolve to PyreSym fields via the macro-emitted constants —
+            // no hardcoded position numbers — so a future `extra_reds`
+            // wiring (Task #22 `extra_reds = { ec: Ref }`) automatically
+            // routes idx=1 to `s.execution_context` without touching this
+            // dispatcher.
             let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
+            let first_vable = crate::virtualizable_gen::FIRST_VABLE_SCALAR_IDX as usize;
             let s = self.sym_mut();
             for &(idx, new_opref) in &dedup_changed {
-                if idx < num_scalars {
-                    match idx {
-                        0 => s.frame = new_opref,
-                        1 => s.vable_last_instr = new_opref,
-                        2 => s.vable_pycode = new_opref,
-                        3 => s.vable_valuestackdepth = new_opref,
-                        4 => s.vable_debugdata = new_opref,
-                        5 => s.vable_lastblock = new_opref,
-                        6 => s.vable_w_globals = new_opref,
+                if idx == 0 {
+                    s.frame = new_opref;
+                } else if idx < first_vable {
+                    // Extra reds occupy `[1, FIRST_VABLE_SCALAR_IDX)`.
+                    // Today `NUM_EXTRA_REDS == 0`, so this range is
+                    // empty; once `ec` wires in (`interp_jit.py:67 reds
+                    // = ['frame', 'ec']`), idx=1 maps to `ec`.
+                    if idx == 1 {
+                        s.execution_context = new_opref;
+                    }
+                } else if idx < num_scalars {
+                    // Vable scalars in static-field declaration order
+                    // (`virtualizable_gen.rs::fields = { last_instr,
+                    // pycode, valuestackdepth, debugdata, lastblock,
+                    // w_globals }`). The match-by-offset stays in sync
+                    // with the macro's `static_field_descrs` order — if
+                    // the declaration order changes, every `s.vable_*`
+                    // consumer must change with it.
+                    match idx - first_vable {
+                        0 => s.vable_last_instr = new_opref,
+                        1 => s.vable_pycode = new_opref,
+                        2 => s.vable_valuestackdepth = new_opref,
+                        3 => s.vable_debugdata = new_opref,
+                        4 => s.vable_lastblock = new_opref,
+                        5 => s.vable_w_globals = new_opref,
                         _ => {}
                     }
                 } else {
