@@ -36,7 +36,10 @@ pub struct BridgeData {
     ///   fn(inputs_ptr: *const i64, outputs_ptr: *mut i64, roots_ptr: *mut i64) -> i64
     pub code_ptr: *const u8,
     /// Fail descriptors within the bridge (guards + finish).
-    pub fail_descrs: Vec<Arc<CraneliftFailDescr>>,
+    /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
+    /// contract (compile.py:183-203 record_loop_or_bridge). Position
+    /// equals `descr.fail_index` by an invariant asserted at construction.
+    pub fail_descrs: Box<[Arc<CraneliftFailDescr>]>,
     /// Number of input arguments the bridge expects.
     /// Set to parent guard's fail_arg count (not optimizer-reduced count)
     /// so execute_bridge passes all parent outputs and indices align.
@@ -574,6 +577,26 @@ impl FailDescr for CraneliftFailDescr {
 
     fn is_compiling(&self) -> bool {
         self.is_compiling()
+    }
+
+    // resume.py:450-488 readers: expose the backend-side rd_* fields
+    // through the FailDescr trait so callers holding a `&dyn FailDescr`
+    // pointing at a CraneliftFailDescr observe the same payload that
+    // backend-side direct field reads observe.  Without these overrides,
+    // the trait default returns `None` even though `pub rd_numb` etc.
+    // are populated at compile time.  Setters keep their panic default —
+    // backend descrs are write-once during compile.
+    fn rd_numb(&self) -> Option<&[u8]> {
+        self.rd_numb.as_deref()
+    }
+    fn rd_consts(&self) -> Option<&[majit_ir::Const]> {
+        self.rd_consts.as_deref()
+    }
+    fn rd_virtuals(&self) -> Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]> {
+        self.rd_virtuals.as_deref()
+    }
+    fn rd_pendingfields(&self) -> Option<&[majit_ir::GuardPendingFieldEntry]> {
+        self.rd_pendingfields.as_deref()
     }
 }
 

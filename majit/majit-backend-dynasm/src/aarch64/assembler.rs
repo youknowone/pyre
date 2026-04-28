@@ -298,7 +298,11 @@ pub struct CompiledCode {
     /// Entry point offset within the buffer.
     pub entry_offset: AssemblyOffset,
     /// Fail descriptors for guards + FINISH ops.
-    pub fail_descrs: Vec<Arc<DynasmFailDescr>>,
+    /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
+    /// contract (compile.py:183-203 record_loop_or_bridge). Position
+    /// equals `descr.fail_index` by an invariant asserted at conversion
+    /// from the in-progress `AssemblerARM64.fail_descrs` Vec.
+    pub fail_descrs: Box<[Arc<DynasmFailDescr>]>,
     /// Input argument types.
     pub input_types: Vec<Type>,
     /// `compile.py:665-674` parity: `Arc` clone of the owning cpu's
@@ -1204,10 +1208,24 @@ impl AssemblerARM64 {
             }
         }
 
+        // Load-bearing identity invariant for runtime dispatch: pyre's
+        // guard-fail trampoline reads `jitframe.jf_descr_index` and indexes
+        // `compiled.fail_descrs[idx]` directly (runner.rs::find_descr_by_ptr
+        // fast path + assembler-emitted store of `fail_index` into
+        // `jf_descr` slot).  Promoting from `debug_assert!` so a release
+        // build catches the position/fail_index mismatch eagerly rather
+        // than dispatching to the wrong descr at runtime.
+        assert!(
+            self.fail_descrs
+                .iter()
+                .enumerate()
+                .all(|(i, d)| d.fail_index as usize == i),
+            "fail_descrs position must equal fail_index"
+        );
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
-            fail_descrs: self.fail_descrs,
+            fail_descrs: self.fail_descrs.into_boxed_slice(),
             input_types: self.input_types,
             cpu_attachments: self.cpu_handle,
             trace_id: self.trace_id,
@@ -1299,10 +1317,24 @@ impl AssemblerARM64 {
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
 
+        // Load-bearing identity invariant for runtime dispatch: pyre's
+        // guard-fail trampoline reads `jitframe.jf_descr_index` and indexes
+        // `compiled.fail_descrs[idx]` directly (runner.rs::find_descr_by_ptr
+        // fast path + assembler-emitted store of `fail_index` into
+        // `jf_descr` slot).  Promoting from `debug_assert!` so a release
+        // build catches the position/fail_index mismatch eagerly rather
+        // than dispatching to the wrong descr at runtime.
+        assert!(
+            self.fail_descrs
+                .iter()
+                .enumerate()
+                .all(|(i, d)| d.fail_index as usize == i),
+            "fail_descrs position must equal fail_index"
+        );
         Ok(CompiledCode {
             buffer,
             entry_offset: entry,
-            fail_descrs: self.fail_descrs,
+            fail_descrs: self.fail_descrs.into_boxed_slice(),
             input_types: self.input_types,
             cpu_attachments: self.cpu_handle,
             trace_id: self.trace_id,
@@ -2917,10 +2949,14 @@ impl AssemblerARM64 {
             descr_mut.fail_arg_locs = fail_arg_locs;
             descr_mut.rd_locs = rd_locs;
             descr_mut.source_op_index = Some(op_index);
-            descr_mut.rd_numb = op.rd_numb.clone();
-            descr_mut.rd_consts = op.rd_consts.clone();
-            descr_mut.rd_virtuals = op.rd_virtuals.clone();
-            descr_mut.rd_pendingfields = op.rd_pendingfields.clone();
+            // resume.py:450-488 parity: read rd_* through op.descr →
+            // ResumeGuardDescr (or chase prev for copied descrs).
+            let fd = op.descr.as_ref().and_then(|d| d.as_fail_descr());
+            descr_mut.rd_numb = fd.and_then(|fd| fd.rd_numb()).map(|s| s.to_vec());
+            descr_mut.rd_consts = fd.and_then(|fd| fd.rd_consts()).map(|s| s.to_vec());
+            descr_mut.rd_virtuals = fd.and_then(|fd| fd.rd_virtuals()).map(|s| s.to_vec());
+            descr_mut.rd_pendingfields =
+                fd.and_then(|fd| fd.rd_pendingfields()).map(|s| s.to_vec());
             *descr_mut.recovery_layout.get_mut() = Some(recovery_layout);
         }
         if std::env::var_os("MAJIT_LOG").is_some() {
@@ -3466,6 +3502,18 @@ impl AssemblerARM64 {
                 if !descr_types.is_empty() {
                     return descr_types;
                 }
+            }
+        } else if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            // Step A (43c64ee0bb) installs op.descr = ResumeGuardDescr
+            // with post-numbering fail_arg_types via
+            // store_final_boxes_in_guard (optimizeopt/mod.rs:3393-3404).
+            // Prefer the descr for guards too; fall through to
+            // op.fail_arg_types only for sharing-path guards
+            // (optimizeopt/mod.rs:3068-3088) where op.descr=None.
+            let dt = fd.fail_arg_types();
+            let expected_len = op.fail_args.as_ref().map(|fa| fa.len()).unwrap_or(0);
+            if dt.len() == expected_len && !dt.is_empty() {
+                return dt.to_vec();
             }
         }
         if let Some(ref ts) = op.fail_arg_types {

@@ -3711,7 +3711,7 @@ mod tests {
             .expect("guard should be emitted");
 
         assert!(
-            guard_op.rd_numb.is_some(),
+            guard_op.resolved_rd_numb().is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
 
@@ -3767,7 +3767,7 @@ mod tests {
             .expect("guard should be emitted");
 
         assert!(
-            guard_op.rd_numb.is_some(),
+            guard_op.resolved_rd_numb().is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
 
@@ -3847,7 +3847,7 @@ mod tests {
             .expect("guard should be emitted");
 
         assert!(
-            guard_op.rd_numb.is_some(),
+            guard_op.resolved_rd_numb().is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
         // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
@@ -3889,7 +3889,7 @@ mod tests {
             .expect("guard should be emitted");
 
         assert!(
-            guard_op.rd_numb.is_some(),
+            guard_op.resolved_rd_numb().is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
 
@@ -3934,7 +3934,7 @@ mod tests {
         let fa = guard_op.fail_args.as_ref().unwrap();
         // Nested virtual fields force the root fail_arg concrete.
         assert!(
-            guard_op.rd_numb.is_none() || guard_op.rd_virtuals.is_none(),
+            guard_op.resolved_rd_numb().is_none() || guard_op.resolved_rd_virtuals().is_none(),
             "nested virtual fields should force the root fail_arg concrete"
         );
         assert!(

@@ -292,4 +292,27 @@ impl FailDescr for DynasmFailDescr {
     fn is_compiling(&self) -> bool {
         self.status.load(Ordering::Acquire) & Self::ST_BUSY_FLAG != 0
     }
+
+    // resume.py:450-488 readers: expose the backend-side rd_* fields
+    // through the FailDescr trait so callers holding a `&dyn FailDescr`
+    // pointing at a DynasmFailDescr observe the same payload that
+    // `layout()` snapshots.  The metainterp-side
+    // `ResumeGuardDescr::rd_*()` returns the populated payload; without
+    // these overrides, the trait default returns `None` for backend
+    // descrs even though `pub rd_numb` etc. are populated at compile
+    // time.  Setters keep their panic default — backend descrs are
+    // write-once during compile (see `assembler.rs:2718-2722` for the
+    // single producer site).
+    fn rd_numb(&self) -> Option<&[u8]> {
+        self.rd_numb.as_deref()
+    }
+    fn rd_consts(&self) -> Option<&[majit_ir::Const]> {
+        self.rd_consts.as_deref()
+    }
+    fn rd_virtuals(&self) -> Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]> {
+        self.rd_virtuals.as_deref()
+    }
+    fn rd_pendingfields(&self) -> Option<&[majit_ir::GuardPendingFieldEntry]> {
+        self.rd_pendingfields.as_deref()
+    }
 }

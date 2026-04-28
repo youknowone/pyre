@@ -450,7 +450,10 @@ struct RegisteredLoopTarget {
     green_key: u64,
     caller_prefix_layout: Option<ExitRecoveryLayout>,
     code_ptr: *const u8,
-    fail_descrs: Vec<Arc<CraneliftFailDescr>>,
+    /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
+    /// contract (compile.py:183-203 record_loop_or_bridge).  Position
+    /// equals `descr.fail_index` by an invariant asserted at construction.
+    fail_descrs: Box<[Arc<CraneliftFailDescr>]>,
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
@@ -493,7 +496,9 @@ unsafe impl Sync for RegisteredLoopTarget {}
 #[derive(Clone)]
 struct LoopTargetEntry {
     code_ptr: *const u8,
-    fail_descrs: Vec<Arc<CraneliftFailDescr>>,
+    /// Frozen after compile — `Box<[T]>` reflects RPython's no-mutation
+    /// contract (compile.py:183-203 record_loop_or_bridge).
+    fail_descrs: Box<[Arc<CraneliftFailDescr>]>,
     num_inputs: usize,
     num_ref_roots: usize,
     max_output_slots: usize,
@@ -1316,7 +1321,15 @@ fn rebuild_state_after_failure(
                 if target_ptr == 0 {
                     continue;
                 }
-                let addr = target_ptr as usize + pf.field_offset;
+                // resume.py:1003-1007 _prepare_pendingfields parity:
+                //   if itemindex < 0: setfield → base + offset
+                //   else:             setarrayitem → base + offset + idx * size
+                let addr = if pf.is_array_item {
+                    let item_index = pf.item_index.unwrap_or(0);
+                    target_ptr as usize + pf.field_offset + item_index * pf.field_size
+                } else {
+                    target_ptr as usize + pf.field_offset
+                };
                 unsafe {
                     match pf.field_size {
                         8 => std::ptr::write(addr as *mut i64, value_raw),
@@ -2432,7 +2445,7 @@ pub(crate) fn register_pending_call_assembler_target(
         green_key: 0,
         caller_prefix_layout: None,
         code_ptr: std::ptr::null(),
-        fail_descrs: Vec::new(),
+        fail_descrs: Box::new([]),
         num_inputs,
         num_ref_roots: 0,
         max_output_slots: 1,
@@ -5137,7 +5150,7 @@ struct CompiledLoop {
     _func_id: FuncId,
     code_ptr: *const u8,
     code_size: usize,
-    fail_descrs: Vec<Arc<CraneliftFailDescr>>,
+    fail_descrs: Box<[Arc<CraneliftFailDescr>]>,
     terminal_exit_layouts: UnsafeCell<Vec<TerminalExitLayout>>,
     num_inputs: usize,
     num_ref_roots: usize,
@@ -6240,7 +6253,7 @@ impl CraneliftBackend {
     fn execute_with_inputs(compiled: &CompiledLoop, inputs: &[i64]) -> DeadFrame {
         // Current trace state (equivalent to LLFrame.lltrace)
         let mut cur_code_ptr = compiled.code_ptr;
-        let mut cur_fail_descrs: Vec<Arc<CraneliftFailDescr>> = compiled.fail_descrs.clone();
+        let mut cur_fail_descrs: Box<[Arc<CraneliftFailDescr>]> = compiled.fail_descrs.clone();
         let mut cur_num_ref_roots = compiled.num_ref_roots;
         let mut cur_max_output_slots = compiled.max_output_slots;
         let mut cur_inputs = inputs.to_vec();
@@ -11164,6 +11177,28 @@ impl CraneliftBackend {
         for descr in &fail_descrs {
             descr.set_trace_info(trace_info.clone());
         }
+        // Freeze the fail_descrs vector. The collect_guards loop assigns
+        // `fail_index = vec.len() as u32` immediately before pushing each
+        // descr, so position equals fail_index by construction; no later
+        // path mutates the vector. `Box<[T]>` reflects this contract in
+        // the type system (mirrors RPython compile.py:183-203's frozen
+        // descrs after record_loop_or_bridge).
+        //
+        // Load-bearing identity invariant for runtime dispatch: cranelift's
+        // guard-fail handler indexes `compiled.fail_descrs[idx]` by the
+        // descr-index slot stamped at compile time (compiler.rs guard
+        // emission writes the per-loop `fail_index` into the deadframe).
+        // Promoting from `debug_assert!` so a release build catches the
+        // position/fail_index mismatch eagerly rather than dispatching to
+        // the wrong descr at runtime.
+        assert!(
+            fail_descrs
+                .iter()
+                .enumerate()
+                .all(|(i, d)| d.fail_index as usize == i),
+            "fail_descrs position must equal fail_index"
+        );
+        let fail_descrs: Box<[Arc<CraneliftFailDescr>]> = fail_descrs.into_boxed_slice();
         // history.py:470-499 / x86/regalloc.py:1397 / x86/assembler.py:990-993
         // parity: set TargetToken._ll_loop_code on every Label in this
         // function, and register the entry in LOOP_TARGET_REGISTRY so that
@@ -11291,31 +11326,29 @@ fn collect_guards(
             (refs, types)
         } else if let Some(ref fa) = op.fail_args {
             let refs: Vec<OpRef> = fa.iter().copied().collect();
-            // store_final_boxes_in_guard sets op.fail_arg_types to match
-            // the reduced liveboxes. Prefer these over the FailDescr types
-            // (which reflect the pre-optimization fail_args count).
-            let types = if let Some(ref explicit) = op.fail_arg_types {
-                if explicit.len() == refs.len() {
-                    explicit.clone()
-                } else {
-                    resolve_fail_arg_types(
-                        &refs,
-                        op.descr.as_ref().and_then(|d| d.as_fail_descr()),
-                        &value_types,
-                        &inputarg_types,
-                        &op_def_positions,
-                        op_idx,
-                    )?
-                }
-            } else {
-                resolve_fail_arg_types(
+            let descr_fd = op.descr.as_ref().and_then(|d| d.as_fail_descr());
+            // store_final_boxes_in_guard (optimizeopt/mod.rs:3393-3404)
+            // sets op.descr to a fresh ResumeGuardDescr whose
+            // fail_arg_types match the reduced liveboxes — prefer the
+            // descr as the post-numbering source of truth. Sharing-path
+            // guards (optimizeopt/mod.rs:3068-3088) skip
+            // store_final_boxes_in_guard and leave op.descr = None,
+            // inheriting the donor's op.fail_arg_types instead; that is
+            // the only path left where op-level types are load-bearing.
+            let types = match (
+                descr_fd.map(|fd| fd.fail_arg_types()),
+                op.fail_arg_types.as_ref(),
+            ) {
+                (Some(dt), _) if dt.len() == refs.len() => dt.to_vec(),
+                (_, Some(explicit)) if explicit.len() == refs.len() => explicit.clone(),
+                _ => resolve_fail_arg_types(
                     &refs,
-                    op.descr.as_ref().and_then(|d| d.as_fail_descr()),
+                    descr_fd,
                     &value_types,
                     &inputarg_types,
                     &op_def_positions,
                     op_idx,
-                )?
+                )?,
             };
             (refs, types)
         } else {
@@ -11353,7 +11386,9 @@ fn collect_guards(
         // the backend has them. We pre-compute the PC at compile time so
         // the ExitFrameLayout doesn't need to decode rd_numb at resume.
         let guard_resume_pc: Option<u64> = if !is_finish && !is_external_jump {
-            if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
+            if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
+                (op.resolved_rd_numb(), op.resolved_rd_consts())
+            {
                 use majit_ir::resumedata::{get_frame_value_count_fn, rebuild_from_numbering};
                 let fvc = get_frame_value_count_fn();
                 let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
@@ -11387,8 +11422,10 @@ fn collect_guards(
         // rd_numb. rd_numb encodes ALL snapshot positions (including virtuals
         // as TAGVIRTUAL), while the identity recovery_layout only has
         // fail_args-count slots. The rd_numb-based layout is authoritative.
-        if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
-            let rd_vi = op.rd_virtuals.as_deref();
+        if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
+            (op.resolved_rd_numb(), op.resolved_rd_consts())
+        {
+            let rd_vi = op.resolved_rd_virtuals();
             use majit_ir::resumedata::{self, RebuiltValue, rebuild_from_numbering};
             let rd_consts_ref: &[majit_ir::Const] = rd_consts_data;
             let fvc = majit_ir::resumedata::get_frame_value_count_fn();
@@ -11770,14 +11807,18 @@ fn collect_guards(
         };
         descr.set_source_op_index(op_idx);
         descr.green_key = header_pc;
-        // resume.py:450-488 parity: propagate rd_* from op to descr so
-        // `compiled_exit_layout_from_backend` (pyjitpl/mod.rs:817-845) can
-        // reconstruct the blackhole chain even after the frontend's
-        // `CompiledTrace.exit_layouts` entry for this fail_index is evicted.
-        descr.rd_numb = op.rd_numb.clone();
-        descr.rd_consts = op.rd_consts.clone();
-        descr.rd_virtuals = op.rd_virtuals.clone();
-        descr.rd_pendingfields = op.rd_pendingfields.clone();
+        // resume.py:450-488 parity: propagate rd_* from op.descr to the
+        // backend `descr` layout so `compiled_exit_layout_from_backend`
+        // (pyjitpl/mod.rs:817-845) can reconstruct the blackhole chain
+        // even after the frontend's `CompiledTrace.exit_layouts` entry
+        // is evicted.  Read through op.descr → ResumeGuardDescr.rd_*
+        // (or chase prev for ResumeGuardCopiedDescr) — single source
+        // of truth, matching upstream `_attrs_` storage.
+        let fd = op.descr.as_ref().and_then(|d| d.as_fail_descr());
+        descr.rd_numb = fd.and_then(|fd| fd.rd_numb()).map(|s| s.to_vec());
+        descr.rd_consts = fd.and_then(|fd| fd.rd_consts()).map(|s| s.to_vec());
+        descr.rd_virtuals = fd.and_then(|fd| fd.rd_virtuals()).map(|s| s.to_vec());
+        descr.rd_pendingfields = fd.and_then(|fd| fd.rd_pendingfields()).map(|s| s.to_vec());
         let descr = Arc::new(descr);
         if std::env::var_os("MAJIT_LOG").is_some() && !is_finish && !is_external_jump {
             eprintln!(

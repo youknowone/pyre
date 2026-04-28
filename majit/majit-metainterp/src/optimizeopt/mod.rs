@@ -54,11 +54,11 @@ pub const INFO_UNKNOWN: i8 = 2;
 
 /// Create a ResumeAtPositionDescr for optimizer-generated guards.
 ///
-/// Delegates to fail_descr::make_resume_at_position_descr which wraps a
+/// Delegates to compile::make_resume_at_position_descr which wraps a
 /// real ResumeGuardDescr — clone_descr() preserves resume data (RPython
 /// ResumeAtPositionDescr is a plain subclass of ResumeGuardDescr).
 pub fn make_resume_at_position_descr() -> DescrRef {
-    crate::fail_descr::make_resume_at_position_descr()
+    crate::compile::make_resume_at_position_descr()
 }
 
 /// optimizer.py:47-54 OptimizationResult: result of an optimization pass.
@@ -377,6 +377,13 @@ pub struct OptContext {
     /// optimizer.py:644,679 _last_guard_op — index of the last guard in
     /// new_operations that had full resume data built. Consecutive guards
     /// share resume data via _copy_resume_data_from (ResumeGuardCopiedDescr).
+    ///
+    /// Production runs through `Optimizer::emit_operation`, which owns the
+    /// guard chain via its own `last_guard_op_idx` (optimizer.rs:3584).
+    /// This field tracks the chain for the standalone OptContext entry
+    /// (unit tests that drive `OptContext::emit` without an `Optimizer`);
+    /// `OptContext::emit` gates its guard handling on `!in_final_emission`
+    /// to avoid duplicating Optimizer's bookkeeping.
     last_guard_idx: Option<usize>,
     /// Last rd_resume_position with a valid snapshot. Used as fallback
     /// for optimizer-created guards that can't share from a previous guard.
@@ -1491,10 +1498,32 @@ impl OptContext {
 
         // RPython optimizer.py:652-686 emit_guard_operation — guard resume
         // data sharing via _copy_resume_data_from / ResumeGuardCopiedDescr.
+        //
+        // RPython has exactly one emit path (`Optimizer._emit_operation`,
+        // optimizer.py:614).  Pyre's `Optimizer::emit_operation`
+        // (optimizer.rs:3259) handles guard dispatch (force_box on args,
+        // emit_guard_operation, force_box on fail_args, _maybe_replace_guard_value)
+        // and then calls `ctx.emit(op.clone())` for the
+        // `_newoperations.append(op)` step (optimizer.py:646).  The
+        // OptContext-side emit_guard_operation is the standalone path
+        // used by unit tests that drive `OptContext::emit` directly
+        // without going through `Optimizer::emit_operation`.
+        //
+        // Skip the OptContext guard handling when the Optimizer is
+        // mid-flight (`in_final_emission == true`) so production runs
+        // through one emit_guard_operation (RPython parity).  The
+        // OptContext path remains the sole guard handler for the
+        // standalone test entry point.
+        //
+        // optimizer.py:639-644: side-effectful non-guard ops clear the
+        // sharing chain.  Only relevant for the OptContext-managed
+        // `last_guard_idx`; in_final_emission runs use
+        // `Optimizer::last_guard_op_idx` instead.
         if op.opcode.is_guard() {
-            self.emit_guard_operation(&mut op);
-        } else {
-            // optimizer.py:639-644: side-effectful non-guard ops clear sharing.
+            if !self.in_final_emission {
+                self.emit_guard_operation(&mut op);
+            }
+        } else if !self.in_final_emission {
             // optimizer.py:705-711: is_call_pure_pure_canraise — CallPure that
             // can_raise(ignore_memoryerror=True) counts as side-effectful even
             // though has_no_side_effect is true for call_pure opcodes.
@@ -3045,12 +3074,13 @@ impl OptContext {
         let opnum = op.opcode;
 
         // optimizer.py:655-664: GUARD_(NO_)EXCEPTION following a guard that
-        // is NOT GUARD_NOT_FORCED — give up sharing.
+        // is NOT GUARD_NOT_FORCED — give up sharing.  GUARD_NOT_FORCED_2
+        // is excluded for the same reason as in the Optimizer path:
+        // pyjitpl.py:3236 emits it at finish() only, so no exception
+        // guard can follow.
         if opnum == OpCode::GuardNoException || opnum == OpCode::GuardException {
             if let Some(idx) = self.last_guard_idx {
-                if self.new_operations[idx].opcode != OpCode::GuardNotForced
-                    && self.new_operations[idx].opcode != OpCode::GuardNotForced2
-                {
+                if self.new_operations[idx].opcode != OpCode::GuardNotForced {
                     self.last_guard_idx = None;
                 }
             }
@@ -3073,11 +3103,37 @@ impl OptContext {
 
         if can_share {
             let idx = self.last_guard_idx.unwrap();
-            // _copy_resume_data_from: share resume data from last guard.
-            op.rd_numb = self.new_operations[idx].rd_numb.clone();
-            op.rd_consts = self.new_operations[idx].rd_consts.clone();
-            op.rd_virtuals = self.new_operations[idx].rd_virtuals.clone();
-            op.rd_pendingfields = self.new_operations[idx].rd_pendingfields.clone();
+            // compile.py:832 ResumeGuardCopiedDescr(prev) parity: stamp
+            // a `ResumeGuardCopiedDescr` whose `prev` references the
+            // donor's descr.  Readers go through
+            // `FailDescr::rd_*()` which chases `prev` automatically
+            // (compile.py:849 `get_resumestorage(): return prev`).
+            // GUARD_EXCEPTION / GUARD_NO_EXCEPTION mint the exc variant.
+            //
+            // optimizer.py:691 `assert isinstance(last_descr,
+            // compile.ResumeGuardDescr)` — the donor must be a finalized
+            // ResumeGuardDescr (or subclass).  RPython enforces this on
+            // every sharing emit; pyre's standalone OptContext path
+            // matched the production Optimizer in name only and used to
+            // silently leave `op.descr = None` when the donor lacked a
+            // descr.  Tighten to RPython parity.
+            let donor_descr = self.new_operations[idx].descr.clone().expect(
+                "optimizer.py:691 assert isinstance(last_descr, \
+                     ResumeGuardDescr): donor guard has no descr",
+            );
+            assert!(
+                donor_descr.is_resume_guard(),
+                "optimizer.py:691 assert isinstance(last_descr, \
+                 ResumeGuardDescr): donor descr_index={} is not a \
+                 ResumeGuardDescr subclass",
+                donor_descr.index()
+            );
+            op.descr = Some(match opnum {
+                OpCode::GuardException | OpCode::GuardNoException => {
+                    crate::compile::make_resume_guard_copied_exc_descr(donor_descr)
+                }
+                _ => crate::compile::make_resume_guard_copied_descr(donor_descr),
+            });
             op.fail_args = self.new_operations[idx].fail_args.clone();
             // bridgeopt.py parity: fail_arg_types carry the types the
             // serializer used when writing the class-knowledge bitfield in
@@ -3093,8 +3149,12 @@ impl OptContext {
             }
             // Don't update last_guard_idx — copied guards don't become sources.
         } else {
-            // optimizer.py:678: store_final_boxes_in_guard
-            self.store_final_boxes_in_guard(op, None);
+            // optimizer.py:678: store_final_boxes_in_guard.  This is
+            // the standalone OptContext path (used by tests and the
+            // direct ctx.emit_guard hook); it has no `pending_for_guard`
+            // staging, so pass an empty Vec for the descr-side
+            // set_rd_pendingfields write.
+            self.store_final_boxes_in_guard(op, None, Vec::new());
             self.last_guard_idx = Some(self.new_operations.len());
             // optimizer.py:680-683: force_box on fail_args for unrolling.
             // Mirrors Optimizer.force_box contract: resolve replacement,
@@ -3199,24 +3259,60 @@ impl OptContext {
         &self,
         op: &mut Op,
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
+        pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) {
-        self.store_final_boxes_in_guard(op, knowledge);
+        self.store_final_boxes_in_guard(op, knowledge, pending_setfields);
     }
 
     fn store_final_boxes_in_guard(
         &self,
         op: &mut Op,
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
+        mut pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
     ) {
         use crate::resume::{ResumeDataLoopMemo, Snapshot};
 
-        // resume.py:397: assert not storage.rd_numb
-        // RPython's finish() is called exactly once per guard.
-        // If rd_numb is already set (from _copy_resume_data_from / shared
-        // guard path), the numbering is already correct — return immediately.
-        if op.rd_numb.is_some() {
-            return;
-        }
+        // optimizer.py:722-730 store_final_boxes_in_guard parity:
+        //   if op.getdescr() is not None:
+        //       descr = op.getdescr()
+        //       assert isinstance(descr, compile.ResumeGuardDescr)
+        //   else:
+        //       descr = compile.invent_fail_descr_for_op(op.getopnum(), self)
+        //       op.setdescr(descr)
+        //
+        // RPython has exactly one emit path, so this function never
+        // sees a `ResumeGuardCopiedDescr` (sibling, not subclass —
+        // compile.py:832) nor an already-finalized `ResumeGuardDescr`
+        // (resume.py:397 `assert not storage.rd_numb` ensures finish()
+        // runs at most once per descr).
+        //
+        // OptContext::emit gates its emit_guard_operation on
+        // `!in_final_emission` so production runs through
+        // `Optimizer::emit_guard_operation` once; the OptContext path is
+        // limited to the standalone test entry.  Either way only fresh
+        // descrs reach this function.
+        assert!(
+            op.descr.as_ref().map_or(true, |d| d.is_resume_guard()),
+            "optimizer.py:723 store_final_boxes_in_guard expects \
+             ResumeGuardDescr, got non-resume descr (kind={:?}, copied={})",
+            op.descr.as_ref().map(|d| d.index()),
+            op.descr
+                .as_ref()
+                .map_or(false, |d| d.is_resume_guard_copied())
+        );
+
+        // resume.py:397 `assert not storage.rd_numb` — finish() runs at
+        // most once per ResumeGuardDescr.  RPython makes this invariant
+        // load-bearing: a second call would clobber an already-numbered
+        // livebox set and break bridge attachment.
+        debug_assert!(
+            op.descr
+                .as_ref()
+                .and_then(|d| d.as_fail_descr())
+                .and_then(|fd| fd.rd_numb())
+                .is_none(),
+            "resume.py:397 finish() invoked twice on the same ResumeGuardDescr"
+        );
 
         // resume.py:396-397:
         //   resume_position = self.guard_op.rd_resume_position
@@ -3257,25 +3353,38 @@ impl OptContext {
                 // sections are serialized into rd_numb. RPython's finish()
                 // always serializes current optimizer knowledge regardless
                 // of which snapshot provides the frame boxes.
-                self.finalize_guard_resume_data(op, knowledge);
+                self.finalize_guard_resume_data(op, knowledge, pending_setfields);
                 return;
             }
-            // resume.py:396-397: RPython asserts resume_position >= 0.
-            // Without a snapshot AND without a patchguardop fallback, the
-            // guard has no resume context and the runtime guard-fail path
-            // cannot recover. Drop the guard's resume data so the backend
-            // emits a sentinel descr that triggers loop invalidation
-            // instead of running undefined resume code.
+            // resume.py:396-397 parity:
+            //   `resume_position = self.guard_op.rd_resume_position`
+            //   `assert resume_position >= 0`
+            // PRE-EXISTING-ADAPTATION: RPython asserts unconditionally.
+            // Pyre's optimizer unit tests (~86 fixtures across `OptGuard`
+            // dedup / `OptHeap` virtualize / `unroll::peel` etc.)
+            // construct synthetic guards via `Op::new` without going
+            // through `capture_resumedata`, so they reach this branch
+            // legitimately.  Production guards are MAJIT_LOG-verified
+            // (fib_loop / fib_recursive / nbody / fannkuch / spectral_norm
+            // / raise_catch / nested_loop / list_setslice / list_pop_append)
+            // to never hit this path; the silent return is gated on
+            // `cfg(test)` and production hard-panics.
             //
-            // Phase A (snapshot wiring through finish_and_compile) +
-            // patchguardop fallback should make this branch dead in
-            // practice; flag it via MAJIT_LOG so any regression surfaces.
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!(
-                    "[jit][drop] no-snapshot guard {:?} pos={:?} resume_pos={}",
-                    op.opcode, op.pos, op.rd_resume_position,
-                );
-            }
+            // Convergence path: migrate every test fixture to populate
+            // `snapshot_boxes[rd_resume_position]` (a thin helper that
+            // takes the same arguments as `capture_resumedata`), then
+            // remove the `cfg(test) return` so the assert fires
+            // unconditionally per RPython.  Multi-session task — out of
+            // scope for the current Codex stabilization round.
+            #[cfg(not(test))]
+            panic!(
+                "store_final_boxes_in_guard: guard {:?} (pos={:?}, \
+                 resume_pos={}) has no snapshot and no patchguardop \
+                 ancestor — RPython resume.py:397 \
+                 `assert resume_position >= 0` parity",
+                op.opcode, op.pos, op.rd_resume_position
+            );
+            #[cfg(test)]
             return;
         }
 
@@ -3364,10 +3473,8 @@ impl OptContext {
 
         // resume.py:428-445, 520-558: pending_setfields are passed to finish()
         // which handles register_box, visitor_walk_recursive, and tagging.
-        let mut pending_slice = op.rd_pendingfields.take().unwrap_or_default();
-
         let (rd_numb, rd_consts, rd_virtuals, liveboxes, livebox_types) =
-            memo.finish(numb_state, &env, &mut pending_slice, knowledge.as_ref());
+            memo.finish(numb_state, &env, &mut pending_setfields, knowledge.as_ref());
 
         if majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
             eprintln!(
@@ -3396,18 +3503,77 @@ impl OptContext {
             .collect();
 
         op.store_final_boxes(liveboxes);
-        op.fail_arg_types = Some(new_types);
-        if !rd_virtuals.is_empty() {
-            op.rd_virtuals = Some(rd_virtuals);
+        op.fail_arg_types = Some(new_types.clone());
+        // optimizer.py:722-730 `store_final_boxes_in_guard` parity:
+        //   if op.getdescr() is not None:
+        //       descr = op.getdescr()
+        //       assert isinstance(descr, compile.ResumeGuardDescr)
+        //   else:
+        //       descr = compile.invent_fail_descr_for_op(op.getopnum(), self)
+        //       op.setdescr(descr)
+        // RPython preserves the existing descr object (and its
+        // `fail_index`, subtype, vector_info) and only mutates its
+        // `fail_arg_types`. Pyre's MetaFailDescr / ResumeGuardDescr /
+        // ResumeAtPositionDescr / CompileLoopVersionDescr keep `types`
+        // in `UnsafeCell<Vec<Type>>`, exposed via
+        // `FailDescr::set_fail_arg_types`, so we mutate in place — the
+        // load-bearing contract that subtype markers
+        // (`is_resume_at_position()`, `loop_version()`) survive
+        // `store_final_boxes_in_guard` (compile.py:1035-1043, mirrored
+        // at pyjitpl/mod.rs:6799 `is_resume_at_position()`).
+        match op.descr.as_ref() {
+            Some(existing) => {
+                if let Some(fd) = existing.as_fail_descr() {
+                    fd.set_fail_arg_types(new_types);
+                }
+            }
+            None => {
+                // RPython compile.py:919-937 `invent_fail_descr_for_op`
+                // dispatches on opcode:
+                //   GUARD_NOT_FORCED / GUARD_NOT_FORCED_2 → ResumeGuardForcedDescr
+                //   GUARD_EXCEPTION  / GUARD_NO_EXCEPTION → ResumeGuardExcDescr
+                //   else                                  → ResumeGuardDescr
+                // The exception-flow / async-forcing special cases at
+                // `pyjitpl/mod.rs` opcode-check sites (e.g. the
+                // GUARD_EXCEPTION → `is_exception_guard` and
+                // GUARD_NOT_FORCED chains) can migrate to descr-keyed
+                // dispatch via `is_guard_exc()` / `is_guard_forced()`
+                // without reshaping this match arm.
+                use majit_ir::OpCode;
+                op.descr = Some(match op.opcode {
+                    OpCode::GuardNotForced | OpCode::GuardNotForced2 => {
+                        crate::compile::make_resume_guard_forced_descr_typed(new_types)
+                    }
+                    OpCode::GuardException | OpCode::GuardNoException => {
+                        crate::compile::make_resume_guard_exc_descr_typed(new_types)
+                    }
+                    _ => crate::compile::make_resume_guard_descr_typed(new_types),
+                });
+            }
         }
-
-        // Restore pending fields (now tagged by finish())
-        if !pending_slice.is_empty() {
-            op.rd_pendingfields = Some(pending_slice);
+        // compile.py:855 ResumeGuardDescr `_attrs_` parity: write the
+        // post-numbering resume payload onto the descr that
+        // store_final_boxes_in_guard just minted (or onto the existing
+        // ResumeGuardDescr / ResumeAtPositionDescr / ResumeGuardForcedDescr
+        // / ResumeGuardExcDescr that capture_resumedata stamped earlier).
+        // The descr is the single source of truth — readers go through
+        // FailDescr::rd_*().
+        let descr_rd_virtuals = if rd_virtuals.is_empty() {
+            None
+        } else {
+            Some(rd_virtuals)
+        };
+        let descr_pending = if pending_setfields.is_empty() {
+            None
+        } else {
+            Some(pending_setfields)
+        };
+        if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            fd.set_rd_numb(Some(rd_numb));
+            fd.set_rd_consts(Some(rd_consts));
+            fd.set_rd_virtuals(descr_rd_virtuals);
+            fd.set_rd_pendingfields(descr_pending);
         }
-
-        op.rd_numb = Some(rd_numb);
-        op.rd_consts = Some(rd_consts);
         // resume.py: RPython does NOT carry frame sizes out-of-band.
         // The decoder reads jitcode liveness (jitcode.position_info) at
         // each frame's resume pc. majit routes this through the global

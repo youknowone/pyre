@@ -3022,6 +3022,21 @@ mod tests {
         op
     }
 
+    /// Like `make_op` but stamps a fresh `ResumeGuardDescr` on the
+    /// resulting op — required for guards that act as sharing donors
+    /// (optimizer.py:691 `assert isinstance(last_descr, ResumeGuardDescr)`).
+    /// Sharer guards (descrless) keep using `make_op`.
+    #[allow(dead_code)]
+    fn make_guard_with_descr(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
+        let mut op = make_op(opcode, args, pos);
+        assert!(
+            opcode.is_guard(),
+            "make_guard_with_descr requires a guard opcode"
+        );
+        op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
+        op
+    }
+
     // ── Test: INT_ADD narrows bounds ──
 
     #[test]
@@ -3260,7 +3275,10 @@ mod tests {
             (OpRef(3), IntBound::unbounded()),
         ];
         let ops = vec![
-            make_op(OpCode::GuardTrue, &[OpRef(3)], 4),
+            // The first guard becomes the donor for the two descrless
+            // GuardNoOverflow sharers below — give it a real descr per
+            // optimizer.py:691.
+            make_guard_with_descr(OpCode::GuardTrue, &[OpRef(3)], 4),
             make_op(OpCode::IntSubOvf, &[OpRef(0), OpRef(1)], 5),
             make_op(OpCode::GuardNoOverflow, &[], 6),
             make_op(OpCode::IntMulOvf, &[OpRef(2), OpRef(1)], 7),

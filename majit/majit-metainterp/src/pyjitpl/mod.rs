@@ -1179,18 +1179,36 @@ impl<M: Clone> MetaInterp<M> {
             .compiled_trace_fail_descr_layouts(&compiled.token, trace_id)?
             .into_iter()
             .find(|layout| layout.fail_index == fail_index)
-            .map(|layout| CompiledExitLayout {
-                rd_loop_token: owning_key, // compile.py:186
-                trace_id,
-                fail_index: layout.fail_index,
-                source_op_index: layout.source_op_index,
-                exit_types: layout.fail_arg_types,
-                is_finish: layout.is_finish,
-                gc_ref_slots: layout.gc_ref_slots,
-                force_token_slots: layout.force_token_slots,
-                recovery_layout: layout.recovery_layout,
-                resume_layout: None,
-                storage: None,
+            .map(|layout| {
+                // compile.py:861 copy_all_attributes_from parity:
+                // when the compiled trace has been evicted but the
+                // backend still has rd_numb / rd_consts / rd_virtuals /
+                // rd_pendingfields propagated on the fail descriptor,
+                // reassemble a `ResumeStorage` so downstream consumers
+                // (force_from_resumedata, blackhole) see the same
+                // shared pool the frontend-primed path provides.
+                // Mirrors compile.rs:917-924 inside merge_backend_exit_layouts.
+                let storage = layout.rd_numb.clone().map(|numb| {
+                    crate::resume::ResumeStorage::new(
+                        numb,
+                        layout.rd_consts.clone().unwrap_or_default(),
+                        layout.rd_virtuals.clone().unwrap_or_default(),
+                        layout.rd_pendingfields.clone().unwrap_or_default(),
+                    )
+                });
+                CompiledExitLayout {
+                    rd_loop_token: owning_key, // compile.py:186
+                    trace_id,
+                    fail_index: layout.fail_index,
+                    source_op_index: layout.source_op_index,
+                    exit_types: layout.fail_arg_types,
+                    is_finish: layout.is_finish,
+                    gc_ref_slots: layout.gc_ref_slots,
+                    force_token_slots: layout.force_token_slots,
+                    recovery_layout: layout.recovery_layout,
+                    resume_layout: None,
+                    storage,
+                }
             })
     }
 
@@ -7547,12 +7565,15 @@ impl<M: Clone> MetaInterp<M> {
 
         // RPython compile.py:932 invent_fail_descr_for_op:
         // GUARD_EXCEPTION / GUARD_NO_EXCEPTION → ResumeGuardExcDescr.
-        // Check the guard's opcode to determine if this is an exception guard.
+        // Read the subtype tag off the descr stamped by
+        // `store_final_boxes_in_guard` (`is_guard_exc()` — equivalent to
+        // RPython's `isinstance(descr, ResumeGuardExcDescr)`).
         let norm_tid = Self::normalize_trace_id(compiled, trace_id);
         let is_exception_guard = Self::trace_for_exit(compiled, norm_tid)
             .and_then(|(_, trace)| {
                 let idx = *trace.guard_op_indices.get(&fail_index)?;
-                Some(trace.ops.get(idx)?.opcode.is_guard_exception())
+                let op = trace.ops.get(idx)?;
+                op.descr.as_ref().map(|d| d.is_guard_exc())
             })
             .unwrap_or(false);
 
@@ -7682,11 +7703,27 @@ impl<M: Clone> MetaInterp<M> {
         let _cc_guard = crate::CriticalCodeGuard::enter();
         // compile.py:994: force_from_resumedata(metainterp_sd, self, deadframe, vinfo, ginfo)
         // compile.py:853 `ResumeGuardDescr` storage — borrow rd_numb /
-        // rd_consts off the guard-owned Arc; no owned copy.
+        // rd_consts / rd_virtuals / rd_pendingfields off the guard-owned
+        // Arc.  resume.py:1345-1351 init the reader with the storage
+        // wholesale; missing rd_virtuals / rd_pendingfields here meant
+        // forced virtuals fell back to NullAllocator entries and pending
+        // heap writes were dropped on async forcing.
         let storage = exit_layout.storage.as_deref();
         let rd_numb = storage.map(|s| s.rd_numb.as_slice()).unwrap_or(&[]);
         let empty_consts: [Const; 0] = [];
         let rd_consts: &[Const] = storage.map(|s| s.rd_consts()).unwrap_or(&empty_consts);
+        // resume.py:1368 `_prepare(storage)` reads virtuals/pendingfields
+        // off the storage. RdVirtualInfo → VirtualInfo conversion mirrors
+        // the bridge path at jitdriver.rs:1561-1577.
+        let rd_virtuals_converted: Option<Vec<crate::resume::VirtualInfo>> = storage.map(|s| {
+            let count = fail_values.len() as i32;
+            s.rd_virtuals
+                .iter()
+                .map(|rd| crate::resume::rd_virtual_to_virtual_info(rd, rd_consts, count))
+                .collect()
+        });
+        let rd_virtuals_slice = rd_virtuals_converted.as_deref();
+        let rd_pendingfields_slice = storage.map(|s| s.rd_pendingfields.as_slice());
         // compile.py:990-991: vinfo = self.jitdriver_sd.virtualizable_info
         let vinfo = self.virtualizable_info();
         let allocator = crate::resume::NullAllocator;
@@ -7697,9 +7734,8 @@ impl<M: Clone> MetaInterp<M> {
             all_liveness,
             fail_values,
             None, // deadframe_types
-            None, // rd_virtuals — populated via descr-driven path
-            None, // rd_pendingfields
-            None, // rd_guard_pendingfields
+            rd_virtuals_slice,
+            rd_pendingfields_slice,
             Some(&self.virtualref_info as &dyn crate::resume::VRefInfo),
             vinfo.map(|v| v.as_ref() as &dyn crate::resume::VirtualizableInfo),
             None, // ginfo — pyre has no greenfield mechanism

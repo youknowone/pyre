@@ -3716,20 +3716,9 @@ mod tests {
     use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
-        Op {
-            opcode,
-            args: args.iter().copied().collect(),
-            descr: None,
-            pos: OpRef(pos),
-            fail_args: None,
-            fail_arg_types: None,
-            rd_pendingfields: None,
-            rd_resume_position: -1,
-            rd_numb: None,
-            rd_consts: None,
-            rd_virtuals: None,
-            vecinfo: None,
-        }
+        let mut op = Op::new(opcode, args);
+        op.pos = OpRef(pos);
+        op
     }
 
     fn make_guard(opcode: OpCode, pos: u32, args: &[OpRef], fail_args: &[OpRef]) -> Op {

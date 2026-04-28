@@ -1,5 +1,31 @@
-//! No direct RPython equivalent — unified trace recording context
-//! (RPython splits this across MetaInterp.history, compile.py, and Trace).
+//! No direct RPython equivalent — `TraceCtx` fuses three upstream
+//! concerns into a single struct that `MetaInterp` owns.  Each section
+//! below cites the upstream file:line it corresponds to so a future
+//! split-back can be done method-by-method:
+//!
+//! * **History role** (`pyjitpl.py:714 class History` —
+//!   `record_nospec` / `record_same_as` / `record_aborted`,
+//!   `pyjitpl.py:2455+ self.history.record2(...)` call sites).
+//!   `TraceCtx::record_*`, `into_recorder`, `cut_trace`,
+//!   `replace_box`, `get_trace_position`.
+//!
+//! * **Compile role** (`compile.py compile_loop` / `compile_bridge`
+//!   merge-point bookkeeping).  `MergePoint`, `add_merge_point`,
+//!   `clear_merge_points`, `get_merge_point*`, `has_merge_point*`,
+//!   inline-trace tracking (`push/pop_inline_trace_position`,
+//!   `recursive_depth`).
+//!
+//! * **Trace bytestream role** (`opencoder.py Trace` —
+//!   `cut_point()` snapshot tuples, encoded operation buffer).
+//!   `TracePosition`, `into_recorder`'s `Trace` return.
+//!
+//! Convergence path: split into three sub-modules — `history.rs`
+//! (record_*), folded merge-point methods into `compile.rs` (next
+//! to the descr classes already there), and a thin `trace.rs`
+//! wrapper around `opencoder.rs`.  Blocked on `MetaInterp` field
+//! reshape (currently `meta.trace_ctx`; upstream has `meta.history`
+//! + `meta.trace`); that reshape cascades into every call site of
+//! `TraceCtx::*`.
 
 use crate::opencoder::Box as OcBox;
 use crate::recorder::{Trace, TracePosition};
@@ -13,7 +39,10 @@ use crate::call_descr::{
     make_call_may_force_descr,
 };
 use crate::constant_pool::ConstantPool;
-use crate::fail_descr::{make_fail_descr, make_fail_descr_typed};
+// `make_resume_guard_descr*` is no longer needed at the tracer side —
+// guards record `descr=None` and the optimizer's
+// `store_final_boxes_in_guard` mints the descr (codex #3 / pyjitpl.py:2548
+// generate_guard parity).
 use crate::jitdriver::JitDriverStaticData;
 use crate::virtualizable::VirtualizableInfo;
 
@@ -867,29 +896,42 @@ impl TraceCtx {
         self.constants.as_ref().get(&opref.0).copied()
     }
 
+    /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage guards
+    /// carry `descr=None`. The optimizer's `store_final_boxes_in_guard`
+    /// (mod.rs:3417 with codex #1 fix) mints the descr via
+    /// `invent_fail_descr_for_op`-style dispatch. `num_live` was a
+    /// placeholder used by the prior `make_resume_guard_descr(num_live)`
+    /// stamping — kept on the signature for caller compatibility but
+    /// no longer used.
     pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], num_live: usize) -> OpRef {
-        let descr = make_fail_descr(num_live);
-        Self::do_record_guard(&mut self.recorder, &self.constants, opcode, args, descr)
+        let _ = num_live;
+        Self::do_record_guard(&mut self.recorder, &self.constants, opcode, args, None)
     }
 
-    /// Record a guard with a typed FailDescr but **no** inline
-    /// `op.fail_args` — the caller must attach a snapshot via
-    /// `capture_resumedata` + `set_last_guard_resume_position` before
-    /// the guard reaches the optimizer's `store_final_boxes_in_guard`
-    /// (`optimizeopt/mod.rs:3200`).  Mirrors RPython's
-    /// `pyjitpl.MetaInterp.generate_guard` (pyjitpl.py:2558-2602) where
-    /// the resume context lives entirely in the snapshot chain — not in
-    /// a parallel `op.fail_args` field — so the snapshot's frame boxes
-    /// supply the eventual `liveboxes` written back into `op.fail_args`
-    /// by `op.store_final_boxes(liveboxes)`.
+    /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage typed
+    /// guards carry `descr=None`. The `fail_arg_types` are stamped onto
+    /// `op.fail_arg_types` directly so the optimizer's
+    /// `store_final_boxes_in_guard` (mod.rs:3433) can mint a fresh
+    /// `ResumeGuardDescr` carrying those types via the
+    /// `op.descr.is_none()` branch (RPython
+    /// `invent_fail_descr_for_op`-style fallthrough,
+    /// compile.py:938-941).
+    ///
+    /// Like `record_guard_typed` predecessors, this records **no**
+    /// inline `op.fail_args` — the caller attaches a snapshot via
+    /// `capture_resumedata` + `set_last_guard_resume_position`; the
+    /// snapshot's frame boxes feed the eventual `liveboxes` written
+    /// into `op.fail_args` by `op.store_final_boxes(liveboxes)`
+    /// (`pyjitpl.py:2558-2602`).
     pub fn record_guard_typed(
         &mut self,
         opcode: OpCode,
         args: &[OpRef],
         fail_arg_types: Vec<Type>,
     ) -> OpRef {
-        let descr = make_fail_descr_typed(fail_arg_types);
-        Self::do_record_guard(&mut self.recorder, &self.constants, opcode, args, descr)
+        let opref = Self::do_record_guard(&mut self.recorder, &self.constants, opcode, args, None);
+        self.recorder.set_last_op_fail_arg_types(fail_arg_types);
+        opref
     }
 
     // ── Step 2e.2a: split-borrow helpers ──────────────────────────────
@@ -948,7 +990,7 @@ impl TraceCtx {
         _constants: &ConstantPool,
         opcode: OpCode,
         args: &[OpRef],
-        descr: DescrRef,
+        descr: Option<DescrRef>,
     ) -> OpRef {
         recorder.record_guard(opcode, args, descr)
     }
@@ -3714,7 +3756,7 @@ mod tests {
 
         fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
             for field in &self.fields {
-                let descr = crate::fail_descr::make_fail_descr(field.field_descr_idx as usize);
+                let descr = crate::compile::make_fail_descr(field.field_descr_idx as usize);
                 ctx.record_op_with_descr(OpCode::SetfieldGc, &[self.vable_ref, field.value], descr);
             }
         }
@@ -3734,7 +3776,7 @@ mod tests {
                 .iter()
                 .map(|field| {
                     let opcode = OpCode::getfield_for_type(field.field_type);
-                    let descr = crate::fail_descr::make_fail_descr(field.field_descr_idx as usize);
+                    let descr = crate::compile::make_fail_descr(field.field_descr_idx as usize);
                     let new_ref = ctx.record_op_with_descr(opcode, &[self.vable_ref], descr);
                     (field.field_descr_idx, new_ref)
                 })

@@ -13,7 +13,8 @@ use std::sync::Weak;
 use std::sync::atomic::{AtomicI32, Ordering};
 
 use crate::OpRef;
-use crate::value::Type;
+use crate::resoperation::{GuardPendingFieldEntry, RdVirtualInfo};
+use crate::value::{Const, Type};
 use serde::{Deserialize, Serialize};
 
 /// Opaque reference to a descriptor, shared across the JIT pipeline.
@@ -679,6 +680,69 @@ pub trait Descr: Send + Sync + std::fmt::Debug {
         false
     }
 
+    /// compile.py:919-920: `invent_fail_descr_for_op` mints
+    /// `ResumeGuardForcedDescr` for `GUARD_NOT_FORCED` /
+    /// `GUARD_NOT_FORCED_2`.  Allows descr-level dispatch in places
+    /// that today switch on opcode (e.g. `handle_fail` for forced
+    /// guards routes through `resume_in_blackhole` with the
+    /// virtualref/virtualizable cache attached at async-forcing time
+    /// — compile.py:953).
+    fn is_guard_forced(&self) -> bool {
+        false
+    }
+
+    /// compile.py:923-927: `invent_fail_descr_for_op` mints
+    /// `ResumeGuardExcDescr` (or `ResumeGuardCopiedExcDescr` on the
+    /// sharing path) for `GUARD_EXCEPTION` / `GUARD_NO_EXCEPTION`.
+    /// The exception-flow special-casing in `handle_fail`
+    /// (compile.py:932-937) keys off this subtype.
+    fn is_guard_exc(&self) -> bool {
+        false
+    }
+
+    /// compile.py:832-851: `ResumeGuardCopiedDescr(prev)` parity.  A
+    /// shared-resume guard whose `get_resumestorage()` (compile.py:849)
+    /// returns the donor `ResumeGuardDescr` rather than self.  Used by
+    /// `_copy_resume_data_from` (`optimizer.py:688-700`) to share
+    /// `rd_numb` / `rd_consts` / `rd_virtuals` / `rd_pendingfields`
+    /// with a previous guard.
+    fn is_resume_guard_copied(&self) -> bool {
+        false
+    }
+
+    /// optimizer.py:723 / compile.py:838 `assert isinstance(descr,
+    /// compile.ResumeGuardDescr)` parity.  Returns true on
+    /// `ResumeGuardDescr` and the subclasses that inherit it
+    /// (`ResumeAtPositionDescr`, `ResumeGuardForcedDescr`,
+    /// `ResumeGuardExcDescr`, `CompileLoopVersionDescr`).  Returns false
+    /// on `ResumeGuardCopiedDescr` (a sibling, not a subclass — its
+    /// resume reads chase `prev`) and on plain `MetaFailDescr` /
+    /// other non-resume `FailDescr` subtypes.  Callers that need to
+    /// store fresh resume data (`store_final_boxes_in_guard`,
+    /// `make_resume_guard_copied_descr`) must assert this before
+    /// touching `set_rd_numb` / `set_rd_consts` etc., otherwise the
+    /// default panicking setters fire late.
+    fn is_resume_guard(&self) -> bool {
+        false
+    }
+
+    /// compile.py:849: `ResumeGuardCopiedDescr.get_resumestorage(): return prev`.
+    /// Returns the donor descr for shared-resume guards; `None` for
+    /// non-copied descrs (RPython's default `get_resumestorage()`
+    /// returns `self` — pyre callers detect that case via
+    /// `is_resume_guard_copied()`).
+    fn prev_descr(&self) -> Option<DescrRef> {
+        None
+    }
+
+    /// `compile.py:840-842 ResumeGuardCopiedDescr.copy_all_attributes_from`:
+    /// `self.prev = other.prev`.  Overwrites the donor pointer in
+    /// place, preserving the receiver's `fail_index` / status.  Default
+    /// no-op for descrs that don't carry a `prev` slot — implementations
+    /// on `ResumeGuardCopiedDescr` / `ResumeGuardCopiedExcDescr`
+    /// override.
+    fn set_prev_descr(&self, _prev: DescrRef) {}
+
     /// intbounds.py: descr.is_integer_bounded() / get_integer_min/max.
     /// Returns (field_size_bytes, is_signed) if this is a field descriptor.
     /// Used by intbounds to narrow GETFIELD result bounds.
@@ -700,6 +764,166 @@ pub trait FailDescr: Descr {
 
     /// The types of the fail arguments.
     fn fail_arg_types(&self) -> &[Type];
+
+    /// In-place update of the descr's per-slot type vector after
+    /// `store_final_boxes_in_guard` has computed `livebox_types` from
+    /// numbering.
+    ///
+    /// PYRE-ADAPTATION: RPython `Box`es carry their own `.type`, so
+    /// `ResumeGuardDescr.store_final_boxes` only writes
+    /// `guard_op.setfailargs(boxes)` and `store_hash` (compile.py:869);
+    /// no per-slot type vector lives on the descr. Pyre's `OpRef` is
+    /// untyped, so we cache `Vec<Type>` on the descr and refresh it
+    /// here. Concrete `MetaFailDescr` / `ResumeGuardDescr` /
+    /// `ResumeAtPositionDescr` / `CompileLoopVersionDescr` use
+    /// `UnsafeCell<Vec<Type>>` so the existing `Arc<dyn FailDescr>`
+    /// identity (fail_index, vector_info, subtype) is preserved across
+    /// the optimizer pass — matching the load-bearing contract that
+    /// subtype markers (`is_resume_at_position()`, `loop_version()`)
+    /// survive `store_final_boxes_in_guard`.
+    ///
+    /// Default impl panics: matches RPython's
+    /// `assert isinstance(descr, ResumeGuardDescr)` at
+    /// optimizer.py:724 — non-guard descrs must never reach
+    /// `store_final_boxes_in_guard`. Callers in non-guard paths must
+    /// not invoke this method.
+    fn set_fail_arg_types(&self, _types: Vec<Type>) {
+        panic!(
+            "set_fail_arg_types invoked on a FailDescr that does not \
+             carry a mutable type vector (RPython optimizer.py:724 \
+             `assert isinstance(descr, ResumeGuardDescr)`)"
+        );
+    }
+
+    // ──────────────────────────────────────────────────────────────────
+    // compile.py:855 ResumeGuardDescr._attrs_ = ('rd_numb', 'rd_consts',
+    //   'rd_virtuals', 'rd_pendingfields', 'status')
+    //
+    // Resume payload accessors. `ResumeGuardDescr` (and its tag-only
+    // newtype subtypes — Forced / Exc / AtPosition / CompileLoopVersion)
+    // store these in `UnsafeCell<Option<Vec<…>>>` so the optimizer can
+    // mutate them in place without breaking the `Arc<dyn FailDescr>`
+    // identity stamped on the op. `ResumeGuardCopiedDescr(prev)` chases
+    // through `prev.rd_*()` (compile.py:849
+    // `get_resumestorage(): return prev`).
+    //
+    // Default impls return `None` / panic for non-resume FailDescrs
+    // (e.g. `BridgeFailDescrProxy`, `_DoneWithThisFrameDescr` family,
+    // `ExitFrameWithExceptionDescrRef`) — these never carry resume
+    // data, matching RPython where the `_attrs_` only live on
+    // `AbstractResumeGuardDescr` subclasses.
+    // ──────────────────────────────────────────────────────────────────
+
+    /// resume.py:450 — compact resume numbering bytes.
+    fn rd_numb(&self) -> Option<&[u8]> {
+        None
+    }
+
+    /// `compile.py:864 self.rd_numb = other.rd_numb` parity: the
+    /// reference-share variant of `rd_numb()`.  `Arc<[u8]>` lets
+    /// `copy_all_attributes_from` clone the donor's payload with a
+    /// single refcount bump rather than allocating a fresh buffer.
+    /// Returns `None` for non-resume descrs.
+    fn rd_numb_arc(&self) -> Option<std::sync::Arc<[u8]>> {
+        None
+    }
+
+    /// resume.py:450 — write-through. Default panics: a setter call on
+    /// a non-resume FailDescr is a soundness bug (the optimizer should
+    /// never ask a `_DoneWithThisFrameDescr` to carry resume data).
+    fn set_rd_numb(&self, _value: Option<Vec<u8>>) {
+        panic!(
+            "set_rd_numb invoked on a FailDescr that does not carry \
+             rd_numb (compile.py:855 `_attrs_` only on \
+             AbstractResumeGuardDescr subclasses)"
+        );
+    }
+
+    /// `compile.py:864 self.rd_numb = other.rd_numb` reference-share
+    /// setter.  Default panics for non-resume descrs (same contract as
+    /// `set_rd_numb`).
+    fn set_rd_numb_arc(&self, _value: Option<std::sync::Arc<[u8]>>) {
+        panic!(
+            "set_rd_numb_arc invoked on a FailDescr that does not \
+             carry rd_numb (compile.py:855 `_attrs_` only on \
+             AbstractResumeGuardDescr subclasses)"
+        );
+    }
+
+    /// resume.py:451 — shared constant pool referenced by `rd_numb`.
+    fn rd_consts(&self) -> Option<&[Const]> {
+        None
+    }
+
+    fn rd_consts_arc(&self) -> Option<std::sync::Arc<[Const]>> {
+        None
+    }
+
+    fn set_rd_consts(&self, _value: Option<Vec<Const>>) {
+        panic!(
+            "set_rd_consts invoked on a FailDescr that does not carry \
+             rd_consts (compile.py:855 `_attrs_` only on \
+             AbstractResumeGuardDescr subclasses)"
+        );
+    }
+
+    fn set_rd_consts_arc(&self, _value: Option<std::sync::Arc<[Const]>>) {
+        panic!(
+            "set_rd_consts_arc invoked on a FailDescr that does not \
+             carry rd_consts (compile.py:855 `_attrs_` only on \
+             AbstractResumeGuardDescr subclasses)"
+        );
+    }
+
+    /// resume.py:488 — virtual object field info referenced by `rd_numb`.
+    fn rd_virtuals(&self) -> Option<&[std::rc::Rc<RdVirtualInfo>]> {
+        None
+    }
+
+    fn rd_virtuals_arc(&self) -> Option<std::sync::Arc<[std::rc::Rc<RdVirtualInfo>]>> {
+        None
+    }
+
+    fn set_rd_virtuals(&self, _value: Option<Vec<std::rc::Rc<RdVirtualInfo>>>) {
+        panic!(
+            "set_rd_virtuals invoked on a FailDescr that does not carry \
+             rd_virtuals (compile.py:855 `_attrs_` only on \
+             AbstractResumeGuardDescr subclasses)"
+        );
+    }
+
+    fn set_rd_virtuals_arc(&self, _value: Option<std::sync::Arc<[std::rc::Rc<RdVirtualInfo>]>>) {
+        panic!(
+            "set_rd_virtuals_arc invoked on a FailDescr that does not \
+             carry rd_virtuals (compile.py:855 `_attrs_` only on \
+             AbstractResumeGuardDescr subclasses)"
+        );
+    }
+
+    /// resume.py: rd_pendingfields — deferred heap writes.
+    fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
+        None
+    }
+
+    fn rd_pendingfields_arc(&self) -> Option<std::sync::Arc<[GuardPendingFieldEntry]>> {
+        None
+    }
+
+    fn set_rd_pendingfields(&self, _value: Option<Vec<GuardPendingFieldEntry>>) {
+        panic!(
+            "set_rd_pendingfields invoked on a FailDescr that does not \
+             carry rd_pendingfields (compile.py:855 `_attrs_` only on \
+             AbstractResumeGuardDescr subclasses)"
+        );
+    }
+
+    fn set_rd_pendingfields_arc(&self, _value: Option<std::sync::Arc<[GuardPendingFieldEntry]>>) {
+        panic!(
+            "set_rd_pendingfields_arc invoked on a FailDescr that does \
+             not carry rd_pendingfields (compile.py:855 `_attrs_` only \
+             on AbstractResumeGuardDescr subclasses)"
+        );
+    }
 
     /// Whether this fail descriptor represents a FINISH exit.
     fn is_finish(&self) -> bool {
@@ -827,6 +1051,15 @@ pub trait FailDescr: Descr {
     fn vector_info(&self) -> Vec<AccumInfo> {
         Vec::new()
     }
+
+    /// `compile.py:869-870 ResumeGuardDescr.copy_all_attributes_from`:
+    /// `self.rd_vector_info = other.rd_vector_info.clone()`. Receiver
+    /// replaces its own chain in place; identity (descr's
+    /// `fail_index` / `status`) is preserved.  `chain` is the donor's
+    /// flattened chain (head at index 0).  Implementations rebuild
+    /// the linked list and write it through their internal cell.
+    /// Non-guard fail descriptors ignore this.
+    fn replace_vector_info(&self, _chain: Vec<AccumInfo>) {}
 }
 
 /// resume.py:65-85 AccumInfo — metadata attached to guard descriptors

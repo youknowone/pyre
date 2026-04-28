@@ -3531,10 +3531,19 @@ mod tests {
         ))
     }
 
-    /// Helper: assign sequential positions to ops.
+    /// Helper: assign sequential positions to ops.  Also attaches a
+    /// fresh `ResumeGuardDescr` to every guard op that lacks one, mirroring
+    /// RPython's `optimizer.py:691 assert isinstance(last_descr,
+    /// compile.ResumeGuardDescr)` invariant — every guard reaching the
+    /// optimizer carries a head-of-chain descr, so `_copy_resume_data_from`
+    /// can share via `make_resume_guard_copied_descr(prev)` without panicking
+    /// on a missing donor.
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos = OpRef(i as u32);
+            if op.opcode.is_guard() && op.descr.is_none() {
+                op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
+            }
         }
     }
 
@@ -3907,7 +3916,7 @@ mod tests {
         let d = descr(0);
         let mut ops = vec![
             Op::with_descr(OpCode::SetfieldGc, &[OpRef(100), OpRef(101)], d.clone()),
-            Op::with_descr(OpCode::GuardTrue, &[OpRef(200)], descr(99)),
+            Op::new(OpCode::GuardTrue, &[OpRef(200)]),
             Op::with_descr(OpCode::GetfieldGcI, &[OpRef(100)], d.clone()),
             Op::new(OpCode::Jump, &[]),
         ];
@@ -3928,11 +3937,10 @@ mod tests {
 
     #[test]
     fn test_guard_not_invalidated_dedup() {
-        let d = descr(99);
         let mut ops = vec![
-            Op::with_descr(OpCode::GuardNotInvalidated, &[], d.clone()),
-            Op::with_descr(OpCode::GuardNotInvalidated, &[], d.clone()),
-            Op::with_descr(OpCode::GuardNotInvalidated, &[], d.clone()),
+            Op::new(OpCode::GuardNotInvalidated, &[]),
+            Op::new(OpCode::GuardNotInvalidated, &[]),
+            Op::new(OpCode::GuardNotInvalidated, &[]),
             Op::new(OpCode::Jump, &[]),
         ];
         let result = run_heap_opt(&mut ops);

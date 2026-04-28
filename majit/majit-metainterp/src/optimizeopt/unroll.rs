@@ -718,7 +718,7 @@ impl UnrollOptimizer {
         if std::env::var_os("MAJIT_LOG").is_some() {
             for op in &p2_ops {
                 if op.opcode.is_guard() {
-                    let rd_numb_len = op.rd_numb.as_ref().map(|v| v.len()).unwrap_or(0);
+                    let rd_numb_len = op.resolved_rd_numb().map(|s| s.len()).unwrap_or(0);
                     if let Some(ref fa) = op.fail_args {
                         let fa_raw: Vec<String> =
                             fa.iter().map(|a| format!("OpRef({})", a.0)).collect();
@@ -2937,13 +2937,13 @@ impl OptUnroll {
                 // RPython: both guards and non-guards follow the same path:
                 //   copy_and_change → mapping[sop] = op → send_extra_operation(op)
                 if new_op.opcode.is_guard() {
-                    // unroll.py:406-409: copy_and_change with ResumeAtPositionDescr
+                    // unroll.py:406-409: copy_and_change with ResumeAtPositionDescr.
+                    // The fresh ResumeAtPositionDescr has an empty RdPayload, so
+                    // the new guard reads None for every rd_* until
+                    // store_final_boxes_in_guard repopulates them from the live
+                    // snapshot.
                     new_op.descr = Some(crate::optimizeopt::make_resume_at_position_descr());
                     new_op.fail_args = None;
-                    new_op.rd_numb = None;
-                    new_op.rd_consts = None;
-                    new_op.rd_virtuals = None;
-                    new_op.rd_pendingfields = None;
                     new_op.fail_arg_types = None;
                     // unroll.py:409: op.rd_resume_position = patchguardop.rd_resume_position
                     // RPython: patchguardop is always set (from GUARD_FUTURE_CONDITION).
@@ -4741,23 +4741,16 @@ fn assemble_peeled_trace_with_jump_args(
                 );
             }
         }
-        // RPython parity: each guard in the assembled trace must have a
-        // unique fail_descr. In RPython, the unroll optimizer creates fresh
-        // ResumeGuardDescr objects for body guards during Phase 2, giving
-        // each a globally unique index. pyre's body ops inherit the original
-        // tracing-time descrs with the same fail_indices as the preamble
-        // copies. Clone the descr here to assign a new fail_index, preventing
-        // fail_index collisions between preamble and body guards. Without
-        // this, HashMap<fail_index, ...> lookups (exit_layouts, fail_descrs)
-        // confuse preamble and body guards, causing bridge attachment and
-        // resume data to target the wrong guard.
-        if new_op.opcode.is_guard() {
-            if let Some(ref descr) = new_op.descr {
-                if let Some(cloned) = descr.clone_descr() {
-                    new_op.descr = Some(cloned);
-                }
-            }
-        }
+        // RPython parity: each guard in the assembled trace owns a
+        // distinct ResumeGuardDescr with a globally unique fail_index.
+        // optimizeopt::store_final_boxes_in_guard (mod.rs:3392-3404,
+        // commit 43c64ee0bb) installs a fresh ResumeGuardDescr on every
+        // optimizer-routed guard, and Optimizer::_copy_resume_data_from /
+        // OptContext::emit_guard_operation share-branch (commit
+        // 329297b38a) call Descr::clone_descr to allocate a fresh
+        // fail_index for the sharing-path guard. Both phases of the
+        // unroll optimizer therefore emit body guards with unique
+        // descrs already; no post-process re-stamping is needed.
         result.push(new_op);
         if op.opcode == OpCode::Label {
             current_inner_label_index = Some(result.len() - 1);
@@ -5459,19 +5452,10 @@ mod tests {
 
     #[test]
     fn test_unroll_preserves_descr() {
-        // Descriptors on ops should be preserved in both copies.
-        use majit_ir::{Descr, DescrRef};
-        use std::sync::Arc;
-
-        #[derive(Debug)]
-        struct TestDescr(u32);
-        impl Descr for TestDescr {
-            fn index(&self) -> u32 {
-                self.0
-            }
-        }
-
-        let descr: DescrRef = Arc::new(TestDescr(42));
+        // Guard descriptors must be ResumeGuardDescr subclasses; RPython
+        // optimizer.py:723 asserts this before storing resume data.
+        let descr = crate::compile::make_resume_guard_descr_typed(Vec::new());
+        let descr_index = descr.index();
         let mut ops = vec![
             Op::with_descr(OpCode::GuardTrue, &[OpRef(100)], descr.clone()),
             Op::new(OpCode::Jump, &[]),
@@ -5488,7 +5472,7 @@ mod tests {
         assert_eq!(guards.len(), 2);
         for guard in &guards {
             assert!(guard.descr.is_some(), "guard should have a descriptor");
-            assert_eq!(guard.descr.as_ref().unwrap().index(), 42);
+            assert_eq!(guard.descr.as_ref().unwrap().index(), descr_index);
         }
     }
 

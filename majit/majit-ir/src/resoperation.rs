@@ -421,32 +421,39 @@ impl RdVirtualInfo {
     }
 }
 
-/// resume.py: _add_pending_fields — a deferred SETFIELD_GC/SETARRAYITEM_GC
-/// where the stored value is virtual. Encoded into the guard's resume data
-/// and replayed on guard failure after virtual materialization.
+/// resume.py:87-92 PENDINGFIELDSTRUCT parity: a deferred
+/// SETFIELD_GC/SETARRAYITEM_GC where the stored value is virtual.
+/// Encoded into the guard's resume data and replayed on guard failure
+/// after virtual materialization.
+///
+/// Fields mirror PENDINGFIELDSTRUCT (lldescr / num / fieldnum / itemindex).
+/// `target` / `value` are pyre-only (SSA position before resume numbering);
+/// `descr_index` is a stable handle for serialization paths
+/// (`PendingFieldLayoutSummary`, `ExitPendingFieldLayout`) that travel
+/// through layers without an `Arc<dyn Descr>` slot.
 #[derive(Clone, Debug)]
 pub struct GuardPendingFieldEntry {
-    /// Descriptor index of the field/array descriptor.
+    /// resume.py:88 `lldescr`: the field/array descriptor itself. Carries
+    /// `field_offset` / `field_size` / `field_type` via the trait, so the
+    /// consumer never needs a precomputed cache.
+    pub descr: Option<DescrRef>,
+    /// Stable u32 handle for serialization sinks
+    /// (`ExitPendingFieldLayout`, `PendingFieldLayoutSummary`).
+    /// Equals `descr.as_ref().map_or(0, |d| d.index())` when both are set.
     pub descr_index: u32,
-    /// For SETARRAYITEM_GC: the constant array index. -1 for SETFIELD_GC.
+    /// resume.py:91 `itemindex` — for SETARRAYITEM_GC the constant array
+    /// index, -1 for SETFIELD_GC.
     pub item_index: i32,
-    /// OpRef of the target struct/array (compile-time SSA position).
+    /// OpRef of the target struct/array (compile-time SSA position,
+    /// pyre-only — RPython resolves this via Box identity).
     pub target: OpRef,
     /// OpRef of the value being stored (compile-time SSA position).
     pub value: OpRef,
-    /// resume.py:554 — tagged target (TAGBOX/TAGCONST/TAGVIRTUAL).
+    /// resume.py:89 `num` — tagged target (TAGBOX/TAGCONST/TAGVIRTUAL).
     /// Set by store_final_boxes_in_guard when resume numbering is available.
-    /// Used by prepare_guard_pendingfields for RPython decode_ref parity.
     pub target_tagged: i16,
-    /// resume.py:555 — tagged value (TAGBOX/TAGCONST/TAGVIRTUAL).
+    /// resume.py:90 `fieldnum` — tagged value (TAGBOX/TAGCONST/TAGVIRTUAL).
     pub value_tagged: i16,
-    /// Byte offset of the field on the struct (from FieldDescr/ArrayDescr).
-    /// For array items: base_size + item_index * item_size (precomputed).
-    pub field_offset: usize,
-    /// Size of the field in bytes.
-    pub field_size: usize,
-    /// Type of the stored value.
-    pub field_type: Type,
 }
 
 /// resume.py:419-426 — virtual object field info discovered by
@@ -531,25 +538,11 @@ pub struct Op {
     /// Types of fail_args, set by the optimizer from constant_types.
     /// When present, the backend uses these instead of inferring types.
     pub fail_arg_types: Option<Vec<Type>>,
-    /// Deferred heap writes (SETFIELD_GC/SETARRAYITEM_GC with virtual values)
-    /// to replay on guard failure after virtual materialization.
-    /// resume.py: rd_pendingfields
-    pub rd_pendingfields: Option<Vec<GuardPendingFieldEntry>>,
     /// resoperation.py: GuardResOp.rd_resume_position — index of the
     /// guard in the trace for resume data lookup. Set by unroll when
     /// creating extra guards from short preamble / virtual state.
     /// -1 means unset.
     pub rd_resume_position: i32,
-    /// resume.py:450 — compact resume numbering (varint-encoded tagged values).
-    pub rd_numb: Option<Vec<u8>>,
-    /// resume.py:451 — shared constant pool referenced by rd_numb.
-    pub rd_consts: Option<Vec<Const>>,
-    /// resume.py:488 — virtual object field info.
-    /// Each entry describes a virtual's type, field descriptors, and fieldnums.
-    /// Entries are `Rc<RdVirtualInfo>` so two guards that reference the same
-    /// virtual with the same fieldnums store the SAME object (matching
-    /// RPython's `info._cached_vinfo` identity dedup at resume.py:307-315).
-    pub rd_virtuals: Option<Vec<std::rc::Rc<RdVirtualInfo>>>,
     /// resoperation.py:156-200: VectorizationInfo — per-op vector metadata.
     /// Set by the vectorizer to track SIMD lane count, byte size, signedness.
     pub vecinfo: Option<Box<VectorizationInfo>>,
@@ -630,13 +623,7 @@ impl Op {
             pos: OpRef::NONE,
             fail_args: None,
             fail_arg_types: None,
-
-            rd_pendingfields: None,
-
             rd_resume_position: -1,
-            rd_numb: None,
-            rd_consts: None,
-            rd_virtuals: None,
             vecinfo: None,
         }
     }
@@ -649,13 +636,7 @@ impl Op {
             pos: OpRef::NONE,
             fail_args: None,
             fail_arg_types: None,
-
-            rd_pendingfields: None,
-
             rd_resume_position: -1,
-            rd_numb: None,
-            rd_consts: None,
-            rd_virtuals: None,
             vecinfo: None,
         }
     }
@@ -677,10 +658,10 @@ impl Op {
     ///
     /// "shallow copy: the returned operation is meant to be used in place
     /// of self". For guard ops, copies fail_args AND rd_resume_position.
-    /// majit additionally carries fail_arg_types/rd_numb/rd_consts/
-    /// rd_virtuals/rd_pendingfields on Op (instead of on a separate
-    /// GuardDescr); they're propagated here too so that synthetic guard
-    /// rewrites do not strip resume metadata.
+    /// `fail_arg_types` is the only resume-related cache still on `Op`;
+    /// `rd_numb / rd_consts / rd_virtuals / rd_pendingfields` live on
+    /// the descr (compile.py:855 `_attrs_`) and follow `descr` automatically
+    /// when the same DescrRef is reused.
     ///
     /// `args=None` → reuse self.args (matches getarglist_copy()).
     /// `descr=None` → reuse self.descr.
@@ -705,29 +686,44 @@ impl Op {
             pos: self.pos,
             fail_args: None,
             fail_arg_types: None,
-            rd_pendingfields: None,
             rd_resume_position: -1,
-            rd_numb: None,
-            rd_consts: None,
-            rd_virtuals: None,
             vecinfo: None,
         };
         // resoperation.py:498-503 GuardResOp.copy_and_change:
         //   newop.setfailargs(self.getfailargs())
         //   newop.rd_resume_position = self.rd_resume_position
         // The check is on opcode.is_guard() because in RPython this lives
-        // on the GuardResOp class hierarchy. majit stores guard metadata
-        // on Op directly, but only guard opcodes ever populate them.
+        // on the GuardResOp class hierarchy.  rd_* live on the descr
+        // (compile.py:855 `_attrs_`); the descr Arc was already copied
+        // above, so newop reads the same payload through descr.fail_descr().
         if opcode.is_guard() || self.opcode.is_guard() {
             newop.fail_args = self.fail_args.clone();
             newop.fail_arg_types = self.fail_arg_types.clone();
-            newop.rd_pendingfields = self.rd_pendingfields.clone();
             newop.rd_resume_position = self.rd_resume_position;
-            newop.rd_numb = self.rd_numb.clone();
-            newop.rd_consts = self.rd_consts.clone();
-            newop.rd_virtuals = self.rd_virtuals.clone();
         }
         newop
+    }
+
+    /// `compile.py:849 ResumeGuardCopiedDescr.get_resumestorage(): return prev`
+    /// parity. Reads `rd_numb` from `op.descr` — `ResumeGuardCopiedDescr`
+    /// chases `prev` automatically.
+    pub fn resolved_rd_numb(&self) -> Option<&[u8]> {
+        self.descr.as_ref()?.as_fail_descr()?.rd_numb()
+    }
+
+    /// Same as `resolved_rd_numb` but for the `rd_consts` const pool.
+    pub fn resolved_rd_consts(&self) -> Option<&[Const]> {
+        self.descr.as_ref()?.as_fail_descr()?.rd_consts()
+    }
+
+    /// Same as `resolved_rd_numb` but for the `rd_virtuals` table.
+    pub fn resolved_rd_virtuals(&self) -> Option<&[std::rc::Rc<RdVirtualInfo>]> {
+        self.descr.as_ref()?.as_fail_descr()?.rd_virtuals()
+    }
+
+    /// Same as `resolved_rd_numb` but for the `rd_pendingfields` table.
+    pub fn resolved_rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
+        self.descr.as_ref()?.as_fail_descr()?.rd_pendingfields()
     }
     /// compile.py: ResumeGuardDescr.store_final_boxes(guard_op, boxes, metainterp_sd)
     ///   guard_op.setfailargs(boxes)
@@ -2614,9 +2610,6 @@ mod tests {
         ($($field:tt)*) => {
             Op {
                 $($field)*
-                rd_numb: None,
-                rd_consts: None,
-                rd_virtuals: None,
                 vecinfo: None,
             }
         };
@@ -3664,7 +3657,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3675,7 +3667,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3687,7 +3678,6 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];
@@ -3709,7 +3699,6 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_pendingfields: None,
             rd_resume_position: -1,
         };
         let s = format!("{op}");
@@ -3726,7 +3715,6 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_pendingfields: None,
             rd_resume_position: -1,
         };
         let s = format!("{op}");
@@ -3744,7 +3732,6 @@ mod tests {
 
 
             fail_arg_types: None,
-            rd_pendingfields: None,
             rd_resume_position: -1,
         };
         let s = format!("{op}");
@@ -3761,7 +3748,6 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_pendingfields: None,
             rd_resume_position: -1,
         };
         let s = format!("{op}");
@@ -3778,7 +3764,6 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_pendingfields: None,
             rd_resume_position: -1,
         }];
         let mut constants = std::collections::HashMap::new();
@@ -3799,7 +3784,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3810,7 +3794,6 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3822,7 +3805,6 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];
@@ -3843,7 +3825,6 @@ mod tests {
 
 
             fail_arg_types: None,
-            rd_pendingfields: None,
             rd_resume_position: -1,
         }];
         let mut constants = std::collections::HashMap::new();
@@ -3875,7 +3856,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3886,7 +3866,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3897,7 +3876,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3909,7 +3887,6 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];
@@ -3942,7 +3919,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3953,7 +3929,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3964,7 +3939,6 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(1)]),
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -3976,7 +3950,6 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];
@@ -4006,7 +3979,6 @@ mod tests {
             fail_args: None,
 
             fail_arg_types: None,
-            rd_pendingfields: None,
             rd_resume_position: -1,
         }];
         let constants = std::collections::HashMap::new();
@@ -4038,7 +4010,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -4049,7 +4020,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -4060,7 +4030,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -4071,7 +4040,6 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef(0), OpRef(2)]),
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -4082,7 +4050,6 @@ mod tests {
                 fail_args: None,
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -4094,7 +4061,6 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];
@@ -4127,7 +4093,6 @@ mod tests {
                 fail_args: Some(smallvec::smallvec![OpRef(0)]),
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
             op! {
@@ -4139,7 +4104,6 @@ mod tests {
 
 
                 fail_arg_types: None,
-                rd_pendingfields: None,
                 rd_resume_position: -1,
             },
         ];

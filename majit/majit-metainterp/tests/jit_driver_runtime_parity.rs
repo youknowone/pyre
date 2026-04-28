@@ -2,10 +2,28 @@ use majit_ir::{GcRef, GreenKey, OpCode, OpRef, Type, Value};
 use majit_macros::jit_driver;
 use majit_metainterp::{
     DeclarativeJitDriver, DriverRunOutcome, JitDriver, JitState, PendingFieldWriteLayout,
-    TraceAction,
+    TraceAction, TraceCtx,
+    recorder::{Snapshot, SnapshotFrame, SnapshotTagged},
     resume::{MaterializedValue, MaterializedVirtual, ResumeDataVirtualAdder},
     virtualizable::VirtualizableInfo,
 };
+
+#[allow(dead_code)]
+fn attach_single_frame_snapshot(ctx: &mut TraceCtx, pc: u32, boxes: &[(OpRef, Type)]) {
+    let snapshot_id = ctx.capture_resumedata(Snapshot {
+        frames: vec![SnapshotFrame {
+            jitcode_index: 0,
+            pc,
+            boxes: boxes
+                .iter()
+                .map(|(opref, tp)| SnapshotTagged::Box(opref.0, *tp))
+                .collect(),
+        }],
+        vable_boxes: Vec::new(),
+        vref_boxes: Vec::new(),
+    });
+    ctx.set_last_guard_resume_position(snapshot_id);
+}
 
 macro_rules! close_loop_with_increment_guard_failure {
     ($ctx:expr, $sym:expr) => {{
@@ -17,12 +35,17 @@ macro_rules! close_loop_with_increment_guard_failure {
             vec![Type::Ref, Type::Int],
         );
         $ctx.set_fail_args(g1, &[$sym[0], $sym[1]]);
+        // resume.py:396-397 `assert resume_position >= 0`: every guard
+        // must have a snapshot-backed rd_resume_position before the
+        // optimizer's store_final_boxes_in_guard runs (mod.rs:3376).
+        attach_single_frame_snapshot($ctx, 0, &[($sym[0], Type::Ref), ($sym[1], Type::Int)]);
         let one = $ctx.const_int(1);
         let incremented = $ctx.record_op(OpCode::IntAdd, &[$sym[1], one]);
         let two = $ctx.const_int(2);
         let reached_second_guard = $ctx.record_op(OpCode::IntEq, &[incremented, two]);
         let g2 = $ctx.record_guard(OpCode::GuardFalse, &[reached_second_guard], 1);
         $ctx.set_fail_args(g2, &[incremented]);
+        attach_single_frame_snapshot($ctx, 1, &[(incremented, Type::Int)]);
         let finish_args = $sym.clone();
         let finish_arg_types = finish_args
             .iter()

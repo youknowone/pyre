@@ -1,10 +1,22 @@
 //! Trace compilation helpers.
 //!
 //! Mirrors RPython's `compile.py`: guard metadata building, exit layout
-//! management, backend layout merging, and trace post-processing (unboxing).
+//! management, backend layout merging, trace post-processing (unboxing),
+//! and the ResumeGuard-descriptor class hierarchy
+//! (`compile.py:730-940 AbstractResumeGuardDescr` →
+//! `ResumeGuardDescr` → `{ResumeAtPositionDescr, ResumeGuardForcedDescr,
+//! ResumeGuardExcDescr, CompileLoopVersionDescr}`,
+//! `ResumeGuardCopiedDescr` / `ResumeGuardCopiedExcDescr`,
+//! `invent_fail_descr_for_op`).  Pyre wraps upstream's direct attribute
+//! assignments in `UnsafeCell` so the optimizer can mutate the descr
+//! through `Arc<dyn Descr>` shared ownership; the only structural
+//! difference vs upstream is the use of cells, not a separate module.
 
+use std::cell::UnsafeCell;
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use smallvec::smallvec;
 
@@ -13,14 +25,15 @@ use majit_backend::{
     JitCellToken, TerminalExitLayout,
 };
 use majit_ir::{
-    Const, Descr, DescrRef, FailDescr, GcRef, InputArg, Op, OpCode, OpRef, Type, Value,
+    AccumInfo, Const, Descr, DescrRef, FailDescr, GcRef, GuardPendingFieldEntry, InputArg, Op,
+    OpCode, OpRef, RdVirtualInfo, Type, Value,
 };
 
 use crate::blackhole::ExceptionState;
 use crate::pyjitpl::{CompiledTrace, StoredExitLayout, StoredResumeData};
 use crate::resume::{
-    ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary, ResumeLayoutSummary,
-    ResumeValueSource,
+    ResumeData, ResumeDataLoopMemo, ResumeDataVirtualAdder, ResumeFrameLayoutSummary,
+    ResumeLayoutSummary, ResumeValueSource,
 };
 
 /// Resolve the type of an OpRef in guard fail_args.
@@ -207,23 +220,82 @@ pub(crate) fn build_guard_metadata(
             guard_op_indices.insert(fail_index, op_idx);
         }
 
-        // RPython Box.type parity: exit_types from fail_args (liveboxes).
-        // Prefer fail_arg_types when it already matches fail_args length.
-        // Otherwise reconstruct per-arg types from the current OpRefs,
-        // consulting constant_types for constant Ref boxes.
+        // RPython Box.type parity: each fail-arg's type is `livebox.type`,
+        // captured at numbering time inside `store_final_boxes_in_guard`
+        // (resume.py:520, optimizer.py:728). majit stores that snapshot on
+        // the descr's `fail_arg_types()` (post-numbering, post-virtual-
+        // materialization) and mirrors it to `op.fail_arg_types` for
+        // sharing-path guards (mod.rs:3068-3088). After the codex #3 fix
+        // (tracer-stage descr=None, dbd452a640c), every guard's descr is
+        // minted by `store_final_boxes_in_guard` carrying the
+        // post-numbering type vector, so descr-first priority no longer
+        // exposes stale tracer types. Fall back to `op.fail_arg_types`
+        // and finally `value_types`/constant pool.
+        let descr_types = op
+            .descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map(|fd| fd.fail_arg_types());
         let exit_types: Vec<Type> = if is_finish {
-            op.args
-                .iter()
-                .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
-                .collect()
+            // FINISH ops are always emitted with one of the
+            // `_DoneWithThisFrameDescr` family (compile.py:623-672) or
+            // `ExitFrameWithExceptionDescrRef`, all of which carry a
+            // fixed `fail_arg_types` (Void → empty, Int → [Int],
+            // Ref → [Ref], Float → [Float]). Prefer the descr's
+            // typing — it matches RPython where `handle_fail` reads
+            // `cpu.get_*_value(deadframe, 0)` keyed by the descr
+            // class, not by per-arg inference.
+            if let Some(types) = descr_types {
+                if types.len() == op.args.len() {
+                    types.to_vec()
+                } else {
+                    // Arity mismatch (synthetic test ops without a
+                    // type-shaped descr): reconstruct per-arg from
+                    // value_types. Production FINISH always matches.
+                    op.args
+                        .iter()
+                        .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                        .collect()
+                }
+            } else {
+                // No descr — synthetic test FINISH only.
+                op.args
+                    .iter()
+                    .map(|opref| value_types.get(&opref.0).copied().unwrap_or(Type::Int))
+                    .collect()
+            }
         } else if let Some(ref fail_args) = op.fail_args {
             // `store_final_boxes_in_guard` (resume.py:397) writes the
-            // reduced liveboxes' types authoritatively; prefer them
-            // verbatim when available and matching arity. Otherwise
-            // fall back to reconstructing per-arg via `value_types`
-            // (which may be stale for OpRefs the optimizer retyped).
+            // reduced liveboxes' types authoritatively. Prefer the descr's
+            // fail_arg_types (single source of truth, matches RPython
+            // `ResumeGuardDescr.fail_arg_types`); fall back to op-level
+            // `fail_arg_types` on sharing-path (no descr); fall back to
+            // per-arg reconstruction via value_types when arity mismatches.
             let fa_types = op.fail_arg_types.as_ref();
-            if let Some(types) = fa_types {
+            if let Some(types) = descr_types {
+                if types.len() == fail_args.len() {
+                    types.to_vec()
+                } else {
+                    fail_args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, opref)| {
+                            if let Some(&tp) = types.get(i) {
+                                return tp;
+                            }
+                            if let Some(fa) = fa_types {
+                                if let Some(&tp) = fa.get(i) {
+                                    return tp;
+                                }
+                            }
+                            if let Some(&tp) = value_types.get(&opref.0) {
+                                return tp;
+                            }
+                            fail_arg_type(opref, &value_types, constant_types)
+                        })
+                        .collect()
+                }
+            } else if let Some(types) = fa_types {
                 if types.len() == fail_args.len() {
                     types.clone()
                 } else {
@@ -231,10 +303,10 @@ pub(crate) fn build_guard_metadata(
                         .iter()
                         .enumerate()
                         .map(|(i, opref)| {
-                            if let Some(&tp) = value_types.get(&opref.0) {
+                            if let Some(&tp) = types.get(i) {
                                 return tp;
                             }
-                            if let Some(&tp) = types.get(i) {
+                            if let Some(&tp) = value_types.get(&opref.0) {
                                 return tp;
                             }
                             fail_arg_type(opref, &value_types, constant_types)
@@ -252,6 +324,8 @@ pub(crate) fn build_guard_metadata(
                     })
                     .collect()
             }
+        } else if let Some(dt) = descr_types {
+            dt.to_vec()
         } else if let Some(ref types) = op.fail_arg_types {
             types.clone()
         } else {
@@ -266,7 +340,13 @@ pub(crate) fn build_guard_metadata(
             // Build resume_layout from rd_numb so that TAGCONST/TAGINT
             // slots produce Constant entries in the reconstructed state.
             // Multi-frame: push_frame per frame with correct pc.
-            if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
+            //
+            // `resolved_rd_*` chases `descr.prev` (compile.py:849
+            // ResumeGuardCopiedDescr.get_resumestorage) so a shared guard
+            // reads the donor's resume data without an owned copy.
+            if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
+                (op.resolved_rd_numb(), op.resolved_rd_consts())
+            {
                 use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
                 let fvc = majit_ir::resumedata::get_frame_value_count_fn();
                 let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
@@ -333,12 +413,22 @@ pub(crate) fn build_guard_metadata(
             // Arc once from the guard op's `rd_*` fields so every reader
             // (StoredResumeData, StoredExitLayout, bridge retrace,
             // blackhole resume, GC root walker) observes the same pool.
-            let storage_for_guard = if let Some(numb) = op.rd_numb.clone() {
+            // Resolve through descr.prev (`resolved_rd_*` chases the
+            // copied-descr chain) so a sharing-path guard's
+            // ResumeStorage points at the same byte stream the donor was
+            // built from (RPython compile.py:832 ResumeGuardCopiedDescr).
+            let storage_for_guard = if let Some(numb) = op.resolved_rd_numb() {
                 Some(crate::resume::ResumeStorage::new(
-                    numb,
-                    op.rd_consts.clone().unwrap_or_default(),
-                    op.rd_virtuals.clone().unwrap_or_default(),
-                    op.rd_pendingfields.clone().unwrap_or_default(),
+                    numb.to_vec(),
+                    op.resolved_rd_consts()
+                        .map(<[Const]>::to_vec)
+                        .unwrap_or_default(),
+                    op.resolved_rd_virtuals()
+                        .map(<[std::rc::Rc<majit_ir::RdVirtualInfo>]>::to_vec)
+                        .unwrap_or_default(),
+                    op.resolved_rd_pendingfields()
+                        .map(<[majit_ir::GuardPendingFieldEntry]>::to_vec)
+                        .unwrap_or_default(),
                 ))
             } else {
                 None
@@ -354,12 +444,18 @@ pub(crate) fn build_guard_metadata(
         // rd_* values are now carried inside `storage` (an
         // `Arc<ResumeStorage>` installed above). They still feed into
         // `recovery_layout` below via the guard op's rd_numb / rd_consts.
-        let recovery_layout = if op.rd_numb.is_some() {
+        // Sharing-path guards (mod.rs::sharing-guard) own a
+        // ResumeGuardCopiedDescr whose `prev` points at the donor;
+        // the `resolved_rd_*` helpers chase that descr-side pointer
+        // (compile.py:849 get_resumestorage).
+        let recovery_layout = if op.resolved_rd_numb().is_some() {
             // Consumer switchover path: rd_numb contains the full frame encoding.
             // Build recovery_layout from rd_numb + rd_virtuals.
             use majit_backend::{ExitRecoveryLayout, ExitValueSourceLayout};
             let (num_failargs, vable_layout, vref_layout, frames_layout) =
-                if let (Some(rd_numb_bytes), Some(rd_consts_data)) = (&op.rd_numb, &op.rd_consts) {
+                if let (Some(rd_numb_bytes), Some(rd_consts_data)) =
+                    (op.resolved_rd_numb(), op.resolved_rd_consts())
+                {
                     use majit_ir::resumedata::{RebuiltValue, rebuild_from_numbering};
                     let fvc = majit_ir::resumedata::get_frame_value_count_fn();
                     let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
@@ -412,7 +508,9 @@ pub(crate) fn build_guard_metadata(
                 .flat_map(|frame| frame.slots.iter().cloned())
                 .collect();
             // resume.py:576-860 parity: resolve fieldnums tags for recovery.
-            let rd_consts_ref = op.rd_consts.as_deref().unwrap_or(&[]);
+            // Follow `descr.prev` so sharing-path guards see the donor's
+            // const pool (compile.py:849 get_resumestorage).
+            let rd_consts_ref = op.resolved_rd_consts().unwrap_or(&[]);
             let resolve_tagged_source = |tagged: i16| -> ExitValueSourceLayout {
                 let (val, tagbits) = majit_ir::resumedata::untag(tagged);
                 match tagbits {
@@ -448,9 +546,10 @@ pub(crate) fn build_guard_metadata(
                     })
                     .collect()
             };
+            // Sharing-path follows `descr.prev` to read the donor's
+            // virtual table (compile.py:849 get_resumestorage parity).
             let virtual_layouts: Vec<majit_backend::ExitVirtualLayout> = op
-                .rd_virtuals
-                .as_ref()
+                .resolved_rd_virtuals()
                 .map(|entries| {
                     entries
                         .iter()
@@ -686,28 +785,67 @@ pub(crate) fn build_guard_metadata(
                 })
                 .unwrap_or_default();
             // resume.py:926,993: rd_pendingfields → pending_field_layouts.
+            // PENDINGFIELDSTRUCT.lldescr parity: derive field_offset /
+            // field_size / field_type from `pf.descr` (FieldDescr or
+            // ArrayDescr) at consume time. The cache used to live on
+            // GuardPendingFieldEntry; dropping it matches the RPython
+            // struct shape (lldescr / num / fieldnum / itemindex).
+            //
+            // resume.py:993 _prepare_pendingfields parity:
+            //   if itemindex < 0: setfield(struct, fieldnum, descr)
+            //   else:             setarrayitem(struct, itemindex, fieldnum, descr)
+            // The layout carries the RPython shape verbatim — `field_offset`
+            // is the descr's base offset (struct field offset for FieldDescr,
+            // array base offset for ArrayDescr), `is_array_item` mirrors
+            // RPython's `itemindex >= 0` test, and `item_index` is the array
+            // index when present.  Consumers (eval.rs:5009-5016 dynasm,
+            // compiler.rs:1314 cranelift) reconstruct the address per
+            // resume.py:1509-1530 (`base + offset + item_index * item_size`
+            // for arrays, `base + offset` for fields).
             let pending_field_layouts: Vec<majit_backend::ExitPendingFieldLayout> = op
-                .rd_pendingfields
-                .as_ref()
+                .resolved_rd_pendingfields()
                 .map(|entries| {
                     entries
                         .iter()
                         .map(|pf| {
-                            // field_offset is precomputed for array items
-                            // (base_size + item_index * item_size), so do NOT
-                            // pass item_index to the consumer — it would
-                            // double-count the index. Consumer uses plain
-                            // target_ptr + field_offset for both struct and
-                            // array paths.
+                            // resume.py:1000 PENDINGFIELDSTRUCT.lldescr is
+                            // always present in RPython — the descr is
+                            // captured directly off the Setfield_gc /
+                            // Setarrayitem_gc op that produced the pending
+                            // field (heap.py force_lazy_sets_for_guard).
+                            // Pyre's producer at optimizer.rs:3389 mirrors
+                            // this: `pf.descr = pf_op.descr.clone()` where
+                            // pf_op is always a descr-bearing setfield op.
+                            let descr = pf
+                                .descr
+                                .as_ref()
+                                .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
+                            let (field_offset, field_size, field_type, item_index) =
+                                if let Some(fd) = descr.as_field_descr() {
+                                    // setfield: itemindex < 0 in RPython.
+                                    (fd.offset(), fd.field_size(), fd.field_type(), None)
+                                } else if let Some(ad) = descr.as_array_descr() {
+                                    // setarrayitem: itemindex >= 0.  Carry
+                                    // base_size as the offset and item_index
+                                    // separately; consumers add
+                                    // `item_index * item_size`.
+                                    let idx = pf.item_index.max(0) as usize;
+                                    (ad.base_size(), ad.item_size(), ad.item_type(), Some(idx))
+                                } else {
+                                    panic!(
+                                        "pending field descr must be FieldDescr or ArrayDescr (descr_index={})",
+                                        pf.descr_index,
+                                    );
+                                };
                             majit_backend::ExitPendingFieldLayout {
                                 descr_index: pf.descr_index,
-                                item_index: None,
-                                is_array_item: false,
+                                is_array_item: item_index.is_some(),
+                                item_index,
                                 target: resolve_tagged_source(pf.target_tagged),
                                 value: resolve_tagged_source(pf.value_tagged),
-                                field_offset: pf.field_offset,
-                                field_size: pf.field_size,
-                                field_type: pf.field_type,
+                                field_offset,
+                                field_size,
+                                field_type,
                             }
                         })
                         .collect()
@@ -2321,7 +2459,7 @@ pub fn compile_tmp_callback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::fail_descr::make_fail_descr_with_index;
+    use crate::compile::make_fail_descr_with_index;
     use crate::resume::{ResumeDataLoopMemo, SimpleBoxEnv, Snapshot, SnapshotFrame};
     use majit_ir::{Op, OpCode, OpRef};
 
@@ -2362,11 +2500,14 @@ mod tests {
 
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(1)]);
-        guard.descr = Some(make_fail_descr_with_index(0, 2));
+        let descr = crate::compile::make_resume_guard_descr_typed(vec![Type::Ref, Type::Int]);
+        if let Some(fd) = descr.as_fail_descr() {
+            fd.set_rd_numb(Some(rd_numb));
+            fd.set_rd_consts(Some(rd_consts));
+        }
+        guard.descr = Some(descr);
         guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1)]);
         guard.fail_arg_types = Some(vec![Type::Ref, Type::Int]);
-        guard.rd_numb = Some(rd_numb);
-        guard.rd_consts = Some(rd_consts);
 
         let (_resume_data, _guard_indices, exit_layouts) =
             build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new(), None);
@@ -2404,9 +2545,15 @@ mod tests {
             InputArg::new_ref(3),
         ];
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(0)]);
-        guard.descr = Some(make_fail_descr_with_index(0, 4));
+        let fail_arg_types = vec![Type::Ref, Type::Ref, Type::Int, Type::Int];
+        let descr = make_fail_descr_with_index(0, fail_arg_types.len());
+        descr
+            .as_fail_descr()
+            .unwrap()
+            .set_fail_arg_types(fail_arg_types.clone());
+        guard.descr = Some(descr);
         guard.fail_args = Some(smallvec::smallvec![OpRef(0), OpRef(1), OpRef(2), OpRef(3)]);
-        guard.fail_arg_types = Some(vec![Type::Ref, Type::Ref, Type::Int, Type::Int]);
+        guard.fail_arg_types = Some(fail_arg_types);
 
         let (_resume_data, _guard_indices, exit_layouts) =
             build_guard_metadata(&inputargs, &[guard], 0, &HashMap::new(), None);
@@ -2415,6 +2562,1728 @@ mod tests {
         assert_eq!(
             exit.exit_types,
             vec![Type::Ref, Type::Ref, Type::Int, Type::Int]
+        );
+    }
+}
+/// `compile.py:855` ResumeGuardDescr `_attrs_ = ('rd_numb', 'rd_consts',
+/// 'rd_virtuals', 'rd_pendingfields', 'status')` — the per-guard
+/// resume payload shared by every concrete `AbstractResumeGuardDescr`
+/// subclass.  Pyre stores them in `UnsafeCell` so the optimizer can
+/// mutate the descr in place via `FailDescr::set_rd_*` without
+/// breaking the `Arc<dyn FailDescr>` identity stamped on the op.
+///
+/// Each slot wraps `Arc<[T]>` so `copy_all_attributes_from`
+/// (compile.py:861-867) — `self.rd_consts = other.rd_consts` etc. —
+/// can mirror RPython's reference-share semantics with a single
+/// `Arc::clone()` rather than a `Vec::clone()` that would deep-copy
+/// the bytes.  External setters still accept `Option<Vec<T>>`; the
+/// conversion to `Arc<[T]>` is one move per (rare) write.
+#[derive(Debug)]
+struct RdPayload {
+    rd_numb: UnsafeCell<Option<Arc<[u8]>>>,
+    rd_consts: UnsafeCell<Option<Arc<[Const]>>>,
+    rd_virtuals: UnsafeCell<Option<Arc<[Rc<RdVirtualInfo>]>>>,
+    rd_pendingfields: UnsafeCell<Option<Arc<[GuardPendingFieldEntry]>>>,
+}
+
+impl RdPayload {
+    fn empty() -> Self {
+        Self {
+            rd_numb: UnsafeCell::new(None),
+            rd_consts: UnsafeCell::new(None),
+            rd_virtuals: UnsafeCell::new(None),
+            rd_pendingfields: UnsafeCell::new(None),
+        }
+    }
+
+    /// `clone()` shares every field — used by `clone_descr()`, which
+    /// mirrors RPython's `ResumeGuardDescr.clone()` (compile.py:844-846).
+    ///
+    /// RPython `copy_all_attributes_from` (compile.py:861-867) does
+    /// `self.rd_consts = other.rd_consts` etc. — list reference share.
+    /// `Arc<[T]>` provides the equivalent: `Arc::clone()` only bumps a
+    /// refcount.  In-place mutation never happens (the only writer is
+    /// `set_rd_*` which swap-replaces the whole slot), so sharing is
+    /// safe and observably identical to RPython.
+    fn deep_clone(&self) -> Self {
+        Self {
+            rd_numb: UnsafeCell::new(unsafe { (*self.rd_numb.get()).clone() }),
+            rd_consts: UnsafeCell::new(unsafe { (*self.rd_consts.get()).clone() }),
+            rd_virtuals: UnsafeCell::new(unsafe { (*self.rd_virtuals.get()).clone() }),
+            rd_pendingfields: UnsafeCell::new(unsafe { (*self.rd_pendingfields.get()).clone() }),
+        }
+    }
+
+    fn rd_numb(&self) -> Option<&[u8]> {
+        unsafe { (*self.rd_numb.get()).as_deref() }
+    }
+    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+        unsafe { (*self.rd_numb.get()).clone() }
+    }
+    fn set_rd_numb(&self, value: Option<Vec<u8>>) {
+        unsafe { *self.rd_numb.get() = value.map(Arc::from) }
+    }
+    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+        unsafe { *self.rd_numb.get() = value }
+    }
+
+    fn rd_consts(&self) -> Option<&[Const]> {
+        unsafe { (*self.rd_consts.get()).as_deref() }
+    }
+    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+        unsafe { (*self.rd_consts.get()).clone() }
+    }
+    fn set_rd_consts(&self, value: Option<Vec<Const>>) {
+        unsafe { *self.rd_consts.get() = value.map(Arc::from) }
+    }
+    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+        unsafe { *self.rd_consts.get() = value }
+    }
+
+    fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
+        unsafe { (*self.rd_virtuals.get()).as_deref() }
+    }
+    fn rd_virtuals_arc(&self) -> Option<Arc<[Rc<RdVirtualInfo>]>> {
+        unsafe { (*self.rd_virtuals.get()).clone() }
+    }
+    fn set_rd_virtuals(&self, value: Option<Vec<Rc<RdVirtualInfo>>>) {
+        unsafe { *self.rd_virtuals.get() = value.map(Arc::from) }
+    }
+    fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
+        unsafe { *self.rd_virtuals.get() = value }
+    }
+
+    fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
+        unsafe { (*self.rd_pendingfields.get()).as_deref() }
+    }
+    fn rd_pendingfields_arc(&self) -> Option<Arc<[GuardPendingFieldEntry]>> {
+        unsafe { (*self.rd_pendingfields.get()).clone() }
+    }
+    fn set_rd_pendingfields(&self, value: Option<Vec<GuardPendingFieldEntry>>) {
+        unsafe { *self.rd_pendingfields.get() = value.map(Arc::from) }
+    }
+    fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
+        unsafe { *self.rd_pendingfields.get() = value }
+    }
+}
+
+fn push_vector_info(head: &mut Option<Box<AccumInfo>>, mut info: AccumInfo) {
+    info.prev = head.take();
+    *head = Some(Box::new(info));
+}
+
+fn flatten_vector_info(head: Option<&AccumInfo>) -> Vec<AccumInfo> {
+    let mut result = Vec::new();
+    let mut current = head;
+    while let Some(info) = current {
+        result.push(info.clone());
+        current = info.prev.as_deref();
+    }
+    result
+}
+
+/// `compile.py:869 self.rd_vector_info = other.rd_vector_info.clone()`
+/// rebuild helper: takes the donor's flattened chain (head at index 0)
+/// and assembles the equivalent linked-list head suitable for writing
+/// through `vector_info: UnsafeCell<Option<Box<AccumInfo>>>`.
+fn build_vector_info_chain(chain: Vec<AccumInfo>) -> Option<Box<AccumInfo>> {
+    let mut current: Option<Box<AccumInfo>> = None;
+    for mut info in chain.into_iter().rev() {
+        info.prev = current;
+        current = Some(Box::new(info));
+    }
+    current
+}
+
+/// Global counter for unique fail_index allocation.
+///
+/// Mirrors RPython's ResumeGuardDescr numbering — each guard in every
+/// compiled trace receives a unique fail_index so the backend can
+/// report exactly which guard failed.
+static NEXT_FAIL_INDEX: AtomicU32 = AtomicU32::new(1);
+
+/// Reset the global fail_index counter (for testing).
+#[cfg(test)]
+pub fn reset_fail_index_counter() {
+    NEXT_FAIL_INDEX.store(1, Ordering::SeqCst);
+}
+
+/// Allocate the next unique fail_index.
+fn alloc_fail_index() -> u32 {
+    NEXT_FAIL_INDEX.fetch_add(1, Ordering::SeqCst)
+}
+
+/// Per-guard FailDescr carrying a unique index and type information.
+///
+/// Mirrors RPython's ResumeGuardDescr — each guard operation gets its
+/// own descriptor with a unique `fail_index` so the backend can identify
+/// exactly which guard failed after execution.
+#[derive(Debug)]
+struct MetaFailDescr {
+    fail_index: u32,
+    /// `compile.py:869 store_final_boxes` mutates the descr's types in
+    /// place. Pyre uses `UnsafeCell` so the optimizer's
+    /// `store_final_boxes_in_guard` can rewrite types after numbering
+    /// without replacing the `Arc<dyn FailDescr>` (preserving identity
+    /// and `fail_index`). Single-threaded JIT, no atomic needed.
+    types: UnsafeCell<Vec<Type>>,
+    /// schedule.py:654: vector accumulation info attached during vectorization.
+    /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
+    vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
+}
+
+// Safety: JIT is single-threaded. UnsafeCell replaces Mutex for rd_vector_info.
+unsafe impl Send for MetaFailDescr {}
+unsafe impl Sync for MetaFailDescr {}
+
+impl majit_ir::Descr for MetaFailDescr {
+    fn index(&self) -> u32 {
+        self.fail_index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn clone_descr(&self) -> Option<DescrRef> {
+        // RPython: clone() preserves the concrete subtype.
+        // MetaFailDescr.clone() → MetaFailDescr (same type, new fail_index).
+        Some(Arc::new(MetaFailDescr {
+            fail_index: alloc_fail_index(),
+            types: UnsafeCell::new(unsafe { (&*self.types.get()).clone() }),
+            vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
+        }))
+    }
+}
+
+impl FailDescr for MetaFailDescr {
+    fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        // Safety: single-threaded JIT, no concurrent writers.
+        unsafe { &*self.types.get() }
+    }
+    fn set_fail_arg_types(&self, types: Vec<Type>) {
+        // Safety: single-threaded JIT, no concurrent readers.
+        unsafe { *self.types.get() = types }
+    }
+    fn attach_vector_info(&self, info: AccumInfo) {
+        push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
+    }
+    fn vector_info(&self) -> Vec<AccumInfo> {
+        flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
+    }
+    fn replace_vector_info(&self, chain: Vec<AccumInfo>) {
+        unsafe { *self.vector_info.get() = build_vector_info_chain(chain) }
+    }
+}
+
+/// Per-guard FailDescr that also carries resume data for deoptimization.
+///
+/// Mirrors RPython's ResumeGuardDescr with snapshot information.
+/// When a guard fails, the backend uses the resume data to reconstruct
+/// the interpreter state (virtual objects, frame variables, etc.).
+#[derive(Debug)]
+struct ResumeGuardDescr {
+    fail_index: u32,
+    /// `compile.py:869 store_final_boxes` mutates types in place; pyre
+    /// uses `UnsafeCell` so identity is preserved across the optimizer.
+    types: UnsafeCell<Vec<Type>>,
+    /// Pyre keeps `resume_data` (the RPython-style ResumeValueSource
+    /// payload used by `prepare_pendingfields` for the
+    /// `PendingFieldInfo` path) on the descr alongside the RPython
+    /// `_attrs_` rd_* slots — both representations co-exist while
+    /// the runtime resume reader is being aligned with upstream.
+    resume_data: ResumeData,
+    /// `compile.py:855` `_attrs_ = ('rd_numb', 'rd_consts',
+    /// 'rd_virtuals', 'rd_pendingfields', 'status')`.
+    payload: RdPayload,
+    /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
+    vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
+}
+
+unsafe impl Send for ResumeGuardDescr {}
+unsafe impl Sync for ResumeGuardDescr {}
+
+impl majit_ir::Descr for ResumeGuardDescr {
+    fn index(&self) -> u32 {
+        self.fail_index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn is_resume_guard(&self) -> bool {
+        true
+    }
+    /// compile.py:844-846: ResumeGuardDescr.clone()
+    fn clone_descr(&self) -> Option<DescrRef> {
+        Some(Arc::new(ResumeGuardDescr {
+            fail_index: alloc_fail_index(),
+            types: UnsafeCell::new(unsafe { (&*self.types.get()).clone() }),
+            resume_data: self.resume_data.clone(),
+            payload: self.payload.deep_clone(),
+            vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
+        }))
+    }
+}
+
+impl FailDescr for ResumeGuardDescr {
+    fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        unsafe { &*self.types.get() }
+    }
+    fn set_fail_arg_types(&self, types: Vec<Type>) {
+        unsafe { *self.types.get() = types }
+    }
+    fn attach_vector_info(&self, info: AccumInfo) {
+        push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
+    }
+    fn vector_info(&self) -> Vec<AccumInfo> {
+        flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
+    }
+    fn replace_vector_info(&self, chain: Vec<AccumInfo>) {
+        unsafe { *self.vector_info.get() = build_vector_info_chain(chain) }
+    }
+
+    fn rd_numb(&self) -> Option<&[u8]> {
+        self.payload.rd_numb()
+    }
+    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+        self.payload.rd_numb_arc()
+    }
+    fn set_rd_numb(&self, value: Option<Vec<u8>>) {
+        self.payload.set_rd_numb(value)
+    }
+    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+        self.payload.set_rd_numb_arc(value)
+    }
+    fn rd_consts(&self) -> Option<&[Const]> {
+        self.payload.rd_consts()
+    }
+    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+        self.payload.rd_consts_arc()
+    }
+    fn set_rd_consts(&self, value: Option<Vec<Const>>) {
+        self.payload.set_rd_consts(value)
+    }
+    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+        self.payload.set_rd_consts_arc(value)
+    }
+    fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
+        self.payload.rd_virtuals()
+    }
+    fn rd_virtuals_arc(&self) -> Option<Arc<[Rc<RdVirtualInfo>]>> {
+        self.payload.rd_virtuals_arc()
+    }
+    fn set_rd_virtuals(&self, value: Option<Vec<Rc<RdVirtualInfo>>>) {
+        self.payload.set_rd_virtuals(value)
+    }
+    fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
+        self.payload.set_rd_virtuals_arc(value)
+    }
+    fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
+        self.payload.rd_pendingfields()
+    }
+    fn rd_pendingfields_arc(&self) -> Option<Arc<[GuardPendingFieldEntry]>> {
+        self.payload.rd_pendingfields_arc()
+    }
+    fn set_rd_pendingfields(&self, value: Option<Vec<GuardPendingFieldEntry>>) {
+        self.payload.set_rd_pendingfields(value)
+    }
+    fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
+        self.payload.set_rd_pendingfields_arc(value)
+    }
+}
+
+/// Create a FailDescr for `num_live` integer values with an auto-assigned
+/// unique fail_index.
+///
+/// Each call produces a distinct fail_index so the backend can identify
+/// which guard failed.
+pub fn make_fail_descr(num_live: usize) -> DescrRef {
+    Arc::new(MetaFailDescr {
+        fail_index: alloc_fail_index(),
+        types: UnsafeCell::new(vec![Type::Int; num_live]),
+        vector_info: UnsafeCell::new(None),
+    })
+}
+
+/// Create a FailDescr with an explicit fail_index. Tests only — see
+/// `compile.rs::tests` for the invocation that needs a fixed fail_index
+/// to align against a synthesised bridge descr.
+#[cfg(test)]
+pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef {
+    Arc::new(MetaFailDescr {
+        fail_index,
+        types: UnsafeCell::new(vec![Type::Int; num_live]),
+        vector_info: UnsafeCell::new(None),
+    })
+}
+
+/// Create a FailDescr with explicit types and auto-assigned fail_index.
+pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
+    Arc::new(MetaFailDescr {
+        fail_index: alloc_fail_index(),
+        types: UnsafeCell::new(types),
+        vector_info: UnsafeCell::new(None),
+    })
+}
+
+/// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr
+/// carrying the post-numbering `fail_arg_types`. Used by
+/// `store_final_boxes_in_guard` to replace the tracer-stamped
+/// `MetaFailDescr` (whose `types` reflect the pre-numbering snapshot)
+/// with a descr whose `fail_arg_types()` matches `op.fail_arg_types`
+/// exactly.
+///
+/// `payload` is initialized empty here; `store_final_boxes_in_guard`
+/// at optimizeopt/mod.rs:3508 fills `rd_numb / rd_consts / rd_virtuals
+/// / rd_pendingfields` post-numbering through the descr-side
+/// `set_rd_*` setters (compile.py:855 `_attrs_`).  The legacy
+/// `ResumeData` field is kept only for tests that still mint synthetic
+/// guards; production reads route through `payload`.
+pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
+    Arc::new(ResumeGuardDescr {
+        fail_index: alloc_fail_index(),
+        types: UnsafeCell::new(types),
+        resume_data: ResumeData {
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
+            frames: Vec::new(),
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        },
+        payload: RdPayload::empty(),
+        vector_info: UnsafeCell::new(None),
+    })
+}
+
+/// compile.py:892: ResumeAtPositionDescr(ResumeGuardDescr) — subclass
+/// with no additional fields or method overrides. Type tag only.
+///
+/// In RPython, ResumeAtPositionDescr inherits all of ResumeGuardDescr's
+/// fields (rd_numb, rd_consts, rd_virtuals, rd_pendingfields) and its
+/// clone() method (which calls copy_all_attributes_from). The only
+/// difference is the type tag used by compile_trace to decide
+/// inline_short_preamble.
+///
+/// We model this as a newtype wrapping ResumeGuardDescr so that
+/// clone_descr() produces a plain ResumeGuardDescr with resume data
+/// preserved — matching RPython's inherited clone() behavior exactly.
+#[derive(Debug)]
+pub struct ResumeAtPositionDescr {
+    inner: ResumeGuardDescr,
+}
+
+// Safety: same as ResumeGuardDescr (single-threaded JIT).
+unsafe impl Send for ResumeAtPositionDescr {}
+unsafe impl Sync for ResumeAtPositionDescr {}
+
+impl majit_ir::Descr for ResumeAtPositionDescr {
+    fn index(&self) -> u32 {
+        self.inner.fail_index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn is_resume_at_position(&self) -> bool {
+        true
+    }
+    fn is_resume_guard(&self) -> bool {
+        true
+    }
+    // compile.py:878-881: inherited ResumeGuardDescr.clone() →
+    // plain ResumeGuardDescr with copy_all_attributes_from(self).
+    // Marker lost, resume data preserved.
+    fn clone_descr(&self) -> Option<DescrRef> {
+        self.inner.clone_descr()
+    }
+}
+
+impl FailDescr for ResumeAtPositionDescr {
+    fn fail_index(&self) -> u32 {
+        self.inner.fail_index
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        unsafe { &*self.inner.types.get() }
+    }
+    fn set_fail_arg_types(&self, types: Vec<Type>) {
+        unsafe { *self.inner.types.get() = types }
+    }
+    fn attach_vector_info(&self, info: AccumInfo) {
+        push_vector_info(unsafe { &mut *self.inner.vector_info.get() }, info);
+    }
+    fn vector_info(&self) -> Vec<AccumInfo> {
+        flatten_vector_info(unsafe { (&*self.inner.vector_info.get()).as_deref() })
+    }
+    fn replace_vector_info(&self, chain: Vec<AccumInfo>) {
+        unsafe { *self.inner.vector_info.get() = build_vector_info_chain(chain) }
+    }
+    fn rd_numb(&self) -> Option<&[u8]> {
+        self.inner.payload.rd_numb()
+    }
+    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+        self.inner.payload.rd_numb_arc()
+    }
+    fn set_rd_numb(&self, value: Option<Vec<u8>>) {
+        self.inner.payload.set_rd_numb(value)
+    }
+    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+        self.inner.payload.set_rd_numb_arc(value)
+    }
+    fn rd_consts(&self) -> Option<&[Const]> {
+        self.inner.payload.rd_consts()
+    }
+    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+        self.inner.payload.rd_consts_arc()
+    }
+    fn set_rd_consts(&self, value: Option<Vec<Const>>) {
+        self.inner.payload.set_rd_consts(value)
+    }
+    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+        self.inner.payload.set_rd_consts_arc(value)
+    }
+    fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
+        self.inner.payload.rd_virtuals()
+    }
+    fn rd_virtuals_arc(&self) -> Option<Arc<[Rc<RdVirtualInfo>]>> {
+        self.inner.payload.rd_virtuals_arc()
+    }
+    fn set_rd_virtuals(&self, value: Option<Vec<Rc<RdVirtualInfo>>>) {
+        self.inner.payload.set_rd_virtuals(value)
+    }
+    fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
+        self.inner.payload.set_rd_virtuals_arc(value)
+    }
+    fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
+        self.inner.payload.rd_pendingfields()
+    }
+    fn rd_pendingfields_arc(&self) -> Option<Arc<[GuardPendingFieldEntry]>> {
+        self.inner.payload.rd_pendingfields_arc()
+    }
+    fn set_rd_pendingfields(&self, value: Option<Vec<GuardPendingFieldEntry>>) {
+        self.inner.payload.set_rd_pendingfields(value)
+    }
+    fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
+        self.inner.payload.set_rd_pendingfields_arc(value)
+    }
+}
+
+/// Create a ResumeAtPositionDescr with auto-assigned fail_index, the
+/// supplied `types`, and empty resume data.
+pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
+    Arc::new(ResumeAtPositionDescr {
+        inner: ResumeGuardDescr {
+            fail_index: alloc_fail_index(),
+            types: UnsafeCell::new(types),
+            resume_data: ResumeData {
+                vable_array: Vec::new(),
+                vref_array: Vec::new(),
+                frames: Vec::new(),
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            },
+            payload: RdPayload::empty(),
+            vector_info: UnsafeCell::new(None),
+        },
+    })
+}
+
+/// Create a ResumeAtPositionDescr with auto-assigned fail_index and
+/// empty resume data + empty types. The optimizer's
+/// `store_final_boxes_in_guard` mutates `types` in place via
+/// `FailDescr::set_fail_arg_types` (preserving subtype + fail_index).
+pub fn make_resume_at_position_descr() -> DescrRef {
+    make_resume_at_position_descr_typed(Vec::new())
+}
+
+/// compile.py:945-948: ResumeGuardForcedDescr(ResumeGuardDescr) — subtype
+/// minted by `invent_fail_descr_for_op` for `GUARD_NOT_FORCED` /
+/// `GUARD_NOT_FORCED_2`. Upstream attaches `metainterp_sd` /
+/// `jitdriver_sd` via `_init` (compile.py:946-948) so
+/// `handle_async_forcing` (compile.py:986) can call back into resume
+/// during a residual call.
+///
+/// PYRE-ADAPTATION: pyre's forced-guard handling currently routes
+/// through opcode checks (`pyjitpl/mod.rs` GUARD_NOT_FORCED chain),
+/// not the descr's `handle_fail`, so this subtype is tag-only.
+/// `is_guard_forced()` returns true so descr-keyed dispatch can
+/// migrate later without reshaping the optimizer call site.
+#[derive(Debug)]
+pub struct ResumeGuardForcedDescr {
+    inner: ResumeGuardDescr,
+}
+
+unsafe impl Send for ResumeGuardForcedDescr {}
+unsafe impl Sync for ResumeGuardForcedDescr {}
+
+impl majit_ir::Descr for ResumeGuardForcedDescr {
+    fn index(&self) -> u32 {
+        self.inner.fail_index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn is_guard_forced(&self) -> bool {
+        true
+    }
+    fn is_resume_guard(&self) -> bool {
+        true
+    }
+    /// compile.py:873-876 ResumeGuardDescr.clone() — `ResumeGuardForcedDescr`
+    /// inherits the base implementation (no override at compile.py:939+),
+    /// so cloning produces a plain `ResumeGuardDescr` with resume attributes
+    /// copied over via `copy_all_attributes_from`. The Forced subtype tag
+    /// is intentionally dropped.
+    fn clone_descr(&self) -> Option<DescrRef> {
+        self.inner.clone_descr()
+    }
+}
+
+impl FailDescr for ResumeGuardForcedDescr {
+    fn fail_index(&self) -> u32 {
+        self.inner.fail_index
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        unsafe { &*self.inner.types.get() }
+    }
+    fn set_fail_arg_types(&self, types: Vec<Type>) {
+        unsafe { *self.inner.types.get() = types }
+    }
+    fn attach_vector_info(&self, info: AccumInfo) {
+        push_vector_info(unsafe { &mut *self.inner.vector_info.get() }, info);
+    }
+    fn vector_info(&self) -> Vec<AccumInfo> {
+        flatten_vector_info(unsafe { (&*self.inner.vector_info.get()).as_deref() })
+    }
+    fn replace_vector_info(&self, chain: Vec<AccumInfo>) {
+        unsafe { *self.inner.vector_info.get() = build_vector_info_chain(chain) }
+    }
+    fn rd_numb(&self) -> Option<&[u8]> {
+        self.inner.payload.rd_numb()
+    }
+    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+        self.inner.payload.rd_numb_arc()
+    }
+    fn set_rd_numb(&self, value: Option<Vec<u8>>) {
+        self.inner.payload.set_rd_numb(value)
+    }
+    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+        self.inner.payload.set_rd_numb_arc(value)
+    }
+    fn rd_consts(&self) -> Option<&[Const]> {
+        self.inner.payload.rd_consts()
+    }
+    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+        self.inner.payload.rd_consts_arc()
+    }
+    fn set_rd_consts(&self, value: Option<Vec<Const>>) {
+        self.inner.payload.set_rd_consts(value)
+    }
+    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+        self.inner.payload.set_rd_consts_arc(value)
+    }
+    fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
+        self.inner.payload.rd_virtuals()
+    }
+    fn rd_virtuals_arc(&self) -> Option<Arc<[Rc<RdVirtualInfo>]>> {
+        self.inner.payload.rd_virtuals_arc()
+    }
+    fn set_rd_virtuals(&self, value: Option<Vec<Rc<RdVirtualInfo>>>) {
+        self.inner.payload.set_rd_virtuals(value)
+    }
+    fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
+        self.inner.payload.set_rd_virtuals_arc(value)
+    }
+    fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
+        self.inner.payload.rd_pendingfields()
+    }
+    fn rd_pendingfields_arc(&self) -> Option<Arc<[GuardPendingFieldEntry]>> {
+        self.inner.payload.rd_pendingfields_arc()
+    }
+    fn set_rd_pendingfields(&self, value: Option<Vec<GuardPendingFieldEntry>>) {
+        self.inner.payload.set_rd_pendingfields(value)
+    }
+    fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
+        self.inner.payload.set_rd_pendingfields_arc(value)
+    }
+}
+
+/// Create a ResumeGuardForcedDescr with auto-assigned fail_index, the
+/// supplied `types`, and empty resume data.
+pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
+    Arc::new(ResumeGuardForcedDescr {
+        inner: ResumeGuardDescr {
+            fail_index: alloc_fail_index(),
+            types: UnsafeCell::new(types),
+            resume_data: ResumeData {
+                vable_array: Vec::new(),
+                vref_array: Vec::new(),
+                frames: Vec::new(),
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            },
+            payload: RdPayload::empty(),
+            vector_info: UnsafeCell::new(None),
+        },
+    })
+}
+
+/// compile.py:888-889: ResumeGuardExcDescr(ResumeGuardDescr) — subtype
+/// minted by `invent_fail_descr_for_op` for `GUARD_EXCEPTION` /
+/// `GUARD_NO_EXCEPTION`. Upstream uses `pass` to make it a tag-only
+/// subclass; `handle_fail` routes the exception path off this tag.
+#[derive(Debug)]
+pub struct ResumeGuardExcDescr {
+    inner: ResumeGuardDescr,
+}
+
+unsafe impl Send for ResumeGuardExcDescr {}
+unsafe impl Sync for ResumeGuardExcDescr {}
+
+impl majit_ir::Descr for ResumeGuardExcDescr {
+    fn index(&self) -> u32 {
+        self.inner.fail_index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn is_guard_exc(&self) -> bool {
+        true
+    }
+    fn is_resume_guard(&self) -> bool {
+        true
+    }
+    /// compile.py:881-882 `class ResumeGuardExcDescr(ResumeGuardDescr): pass`
+    /// — no clone() override, so inheriting compile.py:873-876
+    /// `ResumeGuardDescr.clone()` produces a plain `ResumeGuardDescr` with
+    /// resume attributes copied via `copy_all_attributes_from`. The Exc
+    /// subtype tag is intentionally dropped.
+    fn clone_descr(&self) -> Option<DescrRef> {
+        self.inner.clone_descr()
+    }
+}
+
+impl FailDescr for ResumeGuardExcDescr {
+    fn fail_index(&self) -> u32 {
+        self.inner.fail_index
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        unsafe { &*self.inner.types.get() }
+    }
+    fn set_fail_arg_types(&self, types: Vec<Type>) {
+        unsafe { *self.inner.types.get() = types }
+    }
+    fn attach_vector_info(&self, info: AccumInfo) {
+        push_vector_info(unsafe { &mut *self.inner.vector_info.get() }, info);
+    }
+    fn vector_info(&self) -> Vec<AccumInfo> {
+        flatten_vector_info(unsafe { (&*self.inner.vector_info.get()).as_deref() })
+    }
+    fn replace_vector_info(&self, chain: Vec<AccumInfo>) {
+        unsafe { *self.inner.vector_info.get() = build_vector_info_chain(chain) }
+    }
+    fn rd_numb(&self) -> Option<&[u8]> {
+        self.inner.payload.rd_numb()
+    }
+    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+        self.inner.payload.rd_numb_arc()
+    }
+    fn set_rd_numb(&self, value: Option<Vec<u8>>) {
+        self.inner.payload.set_rd_numb(value)
+    }
+    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+        self.inner.payload.set_rd_numb_arc(value)
+    }
+    fn rd_consts(&self) -> Option<&[Const]> {
+        self.inner.payload.rd_consts()
+    }
+    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+        self.inner.payload.rd_consts_arc()
+    }
+    fn set_rd_consts(&self, value: Option<Vec<Const>>) {
+        self.inner.payload.set_rd_consts(value)
+    }
+    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+        self.inner.payload.set_rd_consts_arc(value)
+    }
+    fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
+        self.inner.payload.rd_virtuals()
+    }
+    fn rd_virtuals_arc(&self) -> Option<Arc<[Rc<RdVirtualInfo>]>> {
+        self.inner.payload.rd_virtuals_arc()
+    }
+    fn set_rd_virtuals(&self, value: Option<Vec<Rc<RdVirtualInfo>>>) {
+        self.inner.payload.set_rd_virtuals(value)
+    }
+    fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
+        self.inner.payload.set_rd_virtuals_arc(value)
+    }
+    fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
+        self.inner.payload.rd_pendingfields()
+    }
+    fn rd_pendingfields_arc(&self) -> Option<Arc<[GuardPendingFieldEntry]>> {
+        self.inner.payload.rd_pendingfields_arc()
+    }
+    fn set_rd_pendingfields(&self, value: Option<Vec<GuardPendingFieldEntry>>) {
+        self.inner.payload.set_rd_pendingfields(value)
+    }
+    fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
+        self.inner.payload.set_rd_pendingfields_arc(value)
+    }
+}
+
+/// Create a ResumeGuardExcDescr with auto-assigned fail_index, the
+/// supplied `types`, and empty resume data.
+pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
+    Arc::new(ResumeGuardExcDescr {
+        inner: ResumeGuardDescr {
+            fail_index: alloc_fail_index(),
+            types: UnsafeCell::new(types),
+            resume_data: ResumeData {
+                vable_array: Vec::new(),
+                vref_array: Vec::new(),
+                frames: Vec::new(),
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            },
+            payload: RdPayload::empty(),
+            vector_info: UnsafeCell::new(None),
+        },
+    })
+}
+
+/// compile.py:832-851: `ResumeGuardCopiedDescr(prev)` —
+/// shared-resume subtype minted by `invent_fail_descr_for_op` when
+/// `_copy_resume_data_from` shares a donor guard's resume data.
+/// `get_resumestorage()` (compile.py:849) returns the donor
+/// `ResumeGuardDescr` so reads chase through to the original
+/// `rd_numb` / `rd_consts` / `rd_virtuals` / `rd_pendingfields`.
+///
+/// Reads route through `prev_descr()` (compile.py:849
+/// `get_resumestorage(): return prev`); every `rd_*` getter on
+/// `FailDescr` chases the donor stored in `prev` so a copied descr
+/// has no owned resume payload of its own.
+#[derive(Debug)]
+pub struct ResumeGuardCopiedDescr {
+    fail_index: u32,
+    /// compile.py:836: `assert isinstance(prev, ResumeGuardDescr)`.
+    /// pyre keeps the donor as a `DescrRef` so chained sharing
+    /// (`prev.prev` etc.) can be walked uniformly through
+    /// `prev_descr()` until a non-copied descr is reached.
+    ///
+    /// `compile.py:840-842 ResumeGuardCopiedDescr.copy_all_attributes_from`
+    /// mutates `self.prev = other.prev` in place, preserving the
+    /// receiver's identity (`fail_index` / status).  Pyre wraps it in
+    /// `UnsafeCell` so the optimizer-side helper can swap the donor
+    /// pointer through `&self` without minting a new Arc — same
+    /// single-threaded contract used for the `rd_*` cells.
+    prev: UnsafeCell<DescrRef>,
+    /// history.py:125 `_attrs_ = ('adr_jump_offset', 'rd_locs',
+    /// 'rd_loop_token', 'rd_vector_info')` — `rd_vector_info` lives on
+    /// `AbstractFailDescr` itself, not on the resume storage.  Copied
+    /// descrs share their donor's resume payload via `prev`, but each
+    /// guard owns its own vector-info chain (history.py:143
+    /// `attach_vector_info` writes `self.rd_vector_info`).
+    vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
+}
+
+unsafe impl Send for ResumeGuardCopiedDescr {}
+unsafe impl Sync for ResumeGuardCopiedDescr {}
+
+impl ResumeGuardCopiedDescr {
+    /// Read the current `prev` Arc.
+    fn prev(&self) -> &DescrRef {
+        // Safety: single-threaded JIT, no concurrent writers.
+        unsafe { &*self.prev.get() }
+    }
+    /// `compile.py:842 self.prev = other.prev` — overwrite the donor
+    /// pointer in place. Identity (`fail_index` / subtype tag) stays.
+    fn set_prev(&self, prev: DescrRef) {
+        // Safety: single-threaded JIT, no concurrent readers.
+        unsafe { *self.prev.get() = prev }
+    }
+}
+
+impl majit_ir::Descr for ResumeGuardCopiedDescr {
+    fn index(&self) -> u32 {
+        self.fail_index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn is_resume_guard_copied(&self) -> bool {
+        true
+    }
+    fn prev_descr(&self) -> Option<DescrRef> {
+        Some(self.prev().clone())
+    }
+    fn set_prev_descr(&self, prev: DescrRef) {
+        self.set_prev(prev);
+    }
+    /// compile.py:843-846: `clone()` constructs a fresh
+    /// `ResumeGuardCopiedDescr(self.prev)` — identity on `prev` is
+    /// preserved (Arc share), only `fail_index` is fresh.
+    fn clone_descr(&self) -> Option<DescrRef> {
+        // history.py:127 `rd_vector_info = None` is the class default;
+        // `clone()` does not copy it (compile.py:843-846 only forwards
+        // `prev`).  Mint a fresh empty chain.
+        Some(Arc::new(ResumeGuardCopiedDescr {
+            fail_index: alloc_fail_index(),
+            prev: UnsafeCell::new(self.prev().clone()),
+            vector_info: UnsafeCell::new(None),
+        }))
+    }
+}
+
+impl FailDescr for ResumeGuardCopiedDescr {
+    fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+    /// compile.py:849 `get_resumestorage(): return prev`: reads chase
+    /// to the donor.  The `fail_arg_types` slot is shared too —
+    /// upstream stores the type list on the donor `ResumeGuardDescr`,
+    /// which `prev` references.
+    fn fail_arg_types(&self) -> &[Type] {
+        self.prev()
+            .as_fail_descr()
+            .map(|fd| fd.fail_arg_types())
+            .unwrap_or(&[])
+    }
+    /// `_copy_resume_data_from` does not call
+    /// `store_final_boxes_in_guard`, so the optimizer never invokes
+    /// `set_fail_arg_types` on a copied descr.  Match RPython's
+    /// implicit invariant by panicking — a setter that wrote
+    /// through to `prev` would silently mutate the donor's type
+    /// vector and is never the desired behavior.
+    fn set_fail_arg_types(&self, _types: Vec<Type>) {
+        panic!(
+            "set_fail_arg_types invoked on a ResumeGuardCopiedDescr — \
+             RPython optimizer.py:724 only allows ResumeGuardDescr; \
+             copied descrs share their donor's type vector via prev"
+        );
+    }
+    /// history.py:143 `AbstractFailDescr.attach_vector_info`: writes
+    /// `self.rd_vector_info`, never `self.prev`.  `prev` is for resume
+    /// storage only (compile.py:849 `get_resumestorage`); vector info
+    /// lives on the copied descr itself.
+    fn attach_vector_info(&self, info: AccumInfo) {
+        push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
+    }
+    fn vector_info(&self) -> Vec<AccumInfo> {
+        flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
+    }
+    fn replace_vector_info(&self, chain: Vec<AccumInfo>) {
+        unsafe { *self.vector_info.get() = build_vector_info_chain(chain) }
+    }
+
+    // compile.py:849 `get_resumestorage(): return prev` — every rd_*
+    // read chases through to the donor descr.  Setters panic for the
+    // same reason `set_fail_arg_types` does: `_copy_resume_data_from`
+    // never finalizes a copied descr; mutation must go through the
+    // donor's own `ResumeGuardDescr`.
+    fn rd_numb(&self) -> Option<&[u8]> {
+        self.prev().as_fail_descr().and_then(|fd| fd.rd_numb())
+    }
+    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+        self.prev().as_fail_descr().and_then(|fd| fd.rd_numb_arc())
+    }
+    fn set_rd_numb(&self, _value: Option<Vec<u8>>) {
+        panic!(
+            "set_rd_numb invoked on a ResumeGuardCopiedDescr — \
+             upstream optimizer.py:728 only finalizes ResumeGuardDescr"
+        );
+    }
+    fn rd_consts(&self) -> Option<&[Const]> {
+        self.prev().as_fail_descr().and_then(|fd| fd.rd_consts())
+    }
+    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+        self.prev()
+            .as_fail_descr()
+            .and_then(|fd| fd.rd_consts_arc())
+    }
+    fn set_rd_consts(&self, _value: Option<Vec<Const>>) {
+        panic!(
+            "set_rd_consts invoked on a ResumeGuardCopiedDescr — \
+             upstream optimizer.py:728 only finalizes ResumeGuardDescr"
+        );
+    }
+    fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
+        self.prev().as_fail_descr().and_then(|fd| fd.rd_virtuals())
+    }
+    fn rd_virtuals_arc(&self) -> Option<Arc<[Rc<RdVirtualInfo>]>> {
+        self.prev()
+            .as_fail_descr()
+            .and_then(|fd| fd.rd_virtuals_arc())
+    }
+    fn set_rd_virtuals(&self, _value: Option<Vec<Rc<RdVirtualInfo>>>) {
+        panic!(
+            "set_rd_virtuals invoked on a ResumeGuardCopiedDescr — \
+             upstream optimizer.py:728 only finalizes ResumeGuardDescr"
+        );
+    }
+    fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
+        self.prev()
+            .as_fail_descr()
+            .and_then(|fd| fd.rd_pendingfields())
+    }
+    fn rd_pendingfields_arc(&self) -> Option<Arc<[GuardPendingFieldEntry]>> {
+        self.prev()
+            .as_fail_descr()
+            .and_then(|fd| fd.rd_pendingfields_arc())
+    }
+    fn set_rd_pendingfields(&self, _value: Option<Vec<GuardPendingFieldEntry>>) {
+        panic!(
+            "set_rd_pendingfields invoked on a ResumeGuardCopiedDescr — \
+             upstream optimizer.py:728 only finalizes ResumeGuardDescr"
+        );
+    }
+}
+
+/// compile.py:891-892: `class ResumeGuardCopiedExcDescr(ResumeGuardCopiedDescr): pass`
+/// — exception variant of the shared-resume descr, minted by
+/// `invent_fail_descr_for_op` for `GUARD_EXCEPTION` /
+/// `GUARD_NO_EXCEPTION` on the sharing path.
+#[derive(Debug)]
+pub struct ResumeGuardCopiedExcDescr {
+    inner: ResumeGuardCopiedDescr,
+}
+
+unsafe impl Send for ResumeGuardCopiedExcDescr {}
+unsafe impl Sync for ResumeGuardCopiedExcDescr {}
+
+impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
+    fn index(&self) -> u32 {
+        self.inner.fail_index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn is_resume_guard_copied(&self) -> bool {
+        true
+    }
+    fn is_guard_exc(&self) -> bool {
+        true
+    }
+    fn prev_descr(&self) -> Option<DescrRef> {
+        Some(self.inner.prev().clone())
+    }
+    fn set_prev_descr(&self, prev: DescrRef) {
+        self.inner.set_prev(prev);
+    }
+    fn clone_descr(&self) -> Option<DescrRef> {
+        Some(Arc::new(ResumeGuardCopiedExcDescr {
+            inner: ResumeGuardCopiedDescr {
+                fail_index: alloc_fail_index(),
+                prev: UnsafeCell::new(self.inner.prev().clone()),
+                vector_info: UnsafeCell::new(None),
+            },
+        }))
+    }
+}
+
+impl FailDescr for ResumeGuardCopiedExcDescr {
+    fn fail_index(&self) -> u32 {
+        self.inner.fail_index
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        self.inner.fail_arg_types()
+    }
+    fn set_fail_arg_types(&self, types: Vec<Type>) {
+        self.inner.set_fail_arg_types(types)
+    }
+    fn attach_vector_info(&self, info: AccumInfo) {
+        self.inner.attach_vector_info(info)
+    }
+    fn vector_info(&self) -> Vec<AccumInfo> {
+        self.inner.vector_info()
+    }
+    fn replace_vector_info(&self, chain: Vec<AccumInfo>) {
+        self.inner.replace_vector_info(chain)
+    }
+    fn rd_numb(&self) -> Option<&[u8]> {
+        self.inner.rd_numb()
+    }
+    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+        self.inner.rd_numb_arc()
+    }
+    fn set_rd_numb(&self, value: Option<Vec<u8>>) {
+        self.inner.set_rd_numb(value)
+    }
+    fn rd_consts(&self) -> Option<&[Const]> {
+        self.inner.rd_consts()
+    }
+    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+        self.inner.rd_consts_arc()
+    }
+    fn set_rd_consts(&self, value: Option<Vec<Const>>) {
+        self.inner.set_rd_consts(value)
+    }
+    fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
+        self.inner.rd_virtuals()
+    }
+    fn rd_virtuals_arc(&self) -> Option<Arc<[Rc<RdVirtualInfo>]>> {
+        self.inner.rd_virtuals_arc()
+    }
+    fn set_rd_virtuals(&self, value: Option<Vec<Rc<RdVirtualInfo>>>) {
+        self.inner.set_rd_virtuals(value)
+    }
+    fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
+        self.inner.rd_pendingfields()
+    }
+    fn rd_pendingfields_arc(&self) -> Option<Arc<[GuardPendingFieldEntry]>> {
+        self.inner.rd_pendingfields_arc()
+    }
+    fn set_rd_pendingfields(&self, value: Option<Vec<GuardPendingFieldEntry>>) {
+        self.inner.set_rd_pendingfields(value)
+    }
+}
+
+/// Mint a `ResumeGuardCopiedDescr` whose `get_resumestorage()` chases
+/// back to `prev`.  `prev` must already carry the donor's
+/// `fail_arg_types` (RPython invariant: copied descrs share the
+/// donor's type vector via `get_resumestorage`).
+///
+/// compile.py:835-838 `ResumeGuardCopiedDescr.__init__`:
+///   `assert isinstance(prev, ResumeGuardDescr)` —
+/// the donor must be a head-of-chain ResumeGuardDescr (or its
+/// subclasses), never another ResumeGuardCopiedDescr.  Two-hop
+/// chasing would be silent in pyre (`prev.prev` returns the head
+/// anyway) but masks real bugs in the optimizer's sharing path.
+pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
+    // compile.py:837-838 ResumeGuardCopiedDescr.__init__:
+    //   assert isinstance(prev, ResumeGuardDescr)
+    // The donor must be a head-of-chain ResumeGuardDescr (or any
+    // subclass thereof: ResumeAtPositionDescr / ResumeGuardForcedDescr /
+    // ResumeGuardExcDescr / CompileLoopVersionDescr).  Reject siblings
+    // (ResumeGuardCopiedDescr itself) and unrelated FailDescr subtypes
+    // (MetaFailDescr) — the descr-side rd_* readers chase `prev` at
+    // resume time and would observe garbage if prev cannot carry resume
+    // data.
+    assert!(
+        prev.is_resume_guard(),
+        "compile.py:838 assert isinstance(prev, ResumeGuardDescr): \
+         donor must be a ResumeGuardDescr subclass (got descr_index={:?})",
+        prev.index()
+    );
+    Arc::new(ResumeGuardCopiedDescr {
+        fail_index: alloc_fail_index(),
+        prev: UnsafeCell::new(prev),
+        vector_info: UnsafeCell::new(None),
+    })
+}
+
+/// Mint a `ResumeGuardCopiedExcDescr` for the GUARD_EXCEPTION /
+/// GUARD_NO_EXCEPTION sharing path.
+///
+/// compile.py:889-890 `ResumeGuardCopiedExcDescr` inherits
+/// `ResumeGuardCopiedDescr.__init__`, so the same
+/// `isinstance(prev, ResumeGuardDescr)` invariant applies.
+pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
+    // compile.py:889-890 `class ResumeGuardCopiedExcDescr(...)` inherits
+    // `ResumeGuardCopiedDescr.__init__`; same `isinstance(prev,
+    // ResumeGuardDescr)` invariant.
+    assert!(
+        prev.is_resume_guard(),
+        "compile.py:838 assert isinstance(prev, ResumeGuardDescr): \
+         ResumeGuardCopiedExcDescr donor must be a ResumeGuardDescr \
+         subclass (got descr_index={:?})",
+        prev.index()
+    );
+    Arc::new(ResumeGuardCopiedExcDescr {
+        inner: ResumeGuardCopiedDescr {
+            fail_index: alloc_fail_index(),
+            prev: UnsafeCell::new(prev),
+            vector_info: UnsafeCell::new(None),
+        },
+    })
+}
+
+/// `compile.py:861-867 ResumeGuardDescr.copy_all_attributes_from` +
+/// `compile.py:840-842 ResumeGuardCopiedDescr.copy_all_attributes_from`
+/// dispatched on the receiver's variant.  Mutates `my_descr` in place;
+/// the receiver's identity (`fail_index` / status / subtype tag) is
+/// always preserved.
+///
+/// Used by `optimizer.py:713-720 replace_guard_op` and
+/// `guard.py:120-121 inhert_attributes` — both call
+/// `new_descr.copy_all_attributes_from(old_descr)` on a guard whose
+/// own descr is already in place.
+///
+/// `Plain` self (default `ResumeGuardDescr`, including subclasses
+/// `ResumeGuardExcDescr` / `ResumeAtPositionDescr` / `CompileLoopVersionDescr`
+/// / `ResumeGuardForcedDescr`): copy `rd_numb` / `rd_consts` / `rd_virtuals`
+/// / `rd_pendingfields` / `rd_vector_info` from the donor onto self via
+/// descr-side setters.  `donor.rd_*()` chases through
+/// `ResumeGuardCopiedDescr.prev` automatically (`compile.py:861 other =
+/// other.get_resumestorage()`).
+///
+/// `Copied` self (`ResumeGuardCopiedDescr` / `ResumeGuardCopiedExcDescr`):
+/// `compile.py:840-842` overwrites `self.prev = other.prev` in place.
+/// Pyre stores `prev` in `UnsafeCell<DescrRef>` and exposes
+/// `set_prev_descr(&self, prev)` so the swap preserves the receiver's
+/// `fail_index` and subtype tag — observable from guard failure tables
+/// / status / bridge attachment.
+///
+/// Panics if either descr lacks a `FailDescr`, or if `Copied`-self path
+/// is hit but the donor is not itself a `ResumeGuardCopiedDescr`
+/// (matches RPython's `compile.py:841 assert isinstance(other,
+/// ResumeGuardCopiedDescr)`).
+pub fn copy_all_attributes_from(my_descr: &DescrRef, donor_descr: &DescrRef) {
+    if my_descr.is_resume_guard_copied() {
+        // compile.py:840-842 ResumeGuardCopiedDescr.copy_all_attributes_from:
+        //     assert isinstance(other, ResumeGuardCopiedDescr)
+        //     self.prev = other.prev
+        let donor_prev = donor_descr
+            .prev_descr()
+            .expect("compile.py:841 other must be a ResumeGuardCopiedDescr with a prev");
+        my_descr.set_prev_descr(donor_prev);
+    } else {
+        // compile.py:861-872 ResumeGuardDescr.copy_all_attributes_from:
+        //     other = other.get_resumestorage()
+        //     assert isinstance(other, ResumeGuardDescr)
+        //     self.rd_consts = other.rd_consts
+        //     self.rd_pendingfields = other.rd_pendingfields
+        //     self.rd_virtuals = other.rd_virtuals
+        //     self.rd_numb = other.rd_numb
+        //     # we don't copy status
+        //     if other.rd_vector_info:
+        //         self.rd_vector_info = other.rd_vector_info.clone()
+        // compile.py:862 `other = other.get_resumestorage()`: copied
+        // donors route reads through `prev`. Resolve the chain so we
+        // never deep-copy from a copied descr's empty payload.
+        let resolved_donor = if donor_descr.is_resume_guard_copied() {
+            donor_descr
+                .prev_descr()
+                .expect("compile.py:849 ResumeGuardCopiedDescr.get_resumestorage requires prev")
+        } else {
+            donor_descr.clone()
+        };
+        // compile.py:863 `assert isinstance(other, ResumeGuardDescr)` —
+        // post-resolution donor must be a ResumeGuardDescr (or subclass).
+        assert!(
+            resolved_donor.is_resume_guard(),
+            "compile.py:863 copy_all_attributes_from: \
+             resolved donor must be a ResumeGuardDescr (got descr_index={:?})",
+            resolved_donor.index()
+        );
+        let my_fd = my_descr
+            .as_fail_descr()
+            .expect("copy_all_attributes_from: my_descr must be a FailDescr");
+        let donor_fd = resolved_donor
+            .as_fail_descr()
+            .expect("copy_all_attributes_from: donor must be a FailDescr after get_resumestorage");
+        // RPython compile.py:864-867 does reference-share (`self.rd_consts
+        // = other.rd_consts` etc.).  Pyre stores rd_* as `Arc<[T]>` so
+        // the share is a single refcount bump per slot.  Reads still
+        // get `&[T]` slices via the Deref impl; swap-replacement
+        // through `set_rd_*` (Vec input) just builds a fresh Arc.
+        my_fd.set_rd_numb_arc(donor_fd.rd_numb_arc());
+        my_fd.set_rd_consts_arc(donor_fd.rd_consts_arc());
+        my_fd.set_rd_virtuals_arc(donor_fd.rd_virtuals_arc());
+        my_fd.set_rd_pendingfields_arc(donor_fd.rd_pendingfields_arc());
+        // compile.py:869-870 — chain.clone() preserves the donor's
+        // (already-flattened) accumulator chain on self, identity-stable.
+        let donor_chain = donor_fd.vector_info();
+        if !donor_chain.is_empty() {
+            my_fd.replace_vector_info(donor_chain);
+        }
+    }
+}
+
+/// compile.py:895-908: CompileLoopVersionDescr(ResumeGuardDescr)
+///
+/// A guard descriptor for loop-version guards. These guards must never
+/// fail at runtime — they exist only to mark where a specialized loop
+/// version should be compiled and stitched.
+#[derive(Debug)]
+pub struct CompileLoopVersionDescr {
+    fail_index: u32,
+    types: UnsafeCell<Vec<Type>>,
+    resume_data: ResumeData,
+    payload: RdPayload,
+    vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
+}
+
+unsafe impl Send for CompileLoopVersionDescr {}
+unsafe impl Sync for CompileLoopVersionDescr {}
+
+impl majit_ir::Descr for CompileLoopVersionDescr {
+    fn index(&self) -> u32 {
+        self.fail_index
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+    fn is_loop_version(&self) -> bool {
+        true
+    }
+    fn is_resume_guard(&self) -> bool {
+        true
+    }
+    /// compile.py:905-908: CompileLoopVersionDescr.clone()
+    fn clone_descr(&self) -> Option<DescrRef> {
+        Some(Arc::new(CompileLoopVersionDescr {
+            fail_index: alloc_fail_index(),
+            types: UnsafeCell::new(unsafe { (&*self.types.get()).clone() }),
+            resume_data: self.resume_data.clone(),
+            payload: self.payload.deep_clone(),
+            vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
+        }))
+    }
+}
+
+impl FailDescr for CompileLoopVersionDescr {
+    fn fail_index(&self) -> u32 {
+        self.fail_index
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        unsafe { &*self.types.get() }
+    }
+    fn set_fail_arg_types(&self, types: Vec<Type>) {
+        unsafe { *self.types.get() = types }
+    }
+    /// compile.py:899-900
+    fn exits_early(&self) -> bool {
+        true
+    }
+    /// compile.py:902-903
+    fn loop_version(&self) -> bool {
+        true
+    }
+    fn attach_vector_info(&self, info: AccumInfo) {
+        push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
+    }
+    fn vector_info(&self) -> Vec<AccumInfo> {
+        flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
+    }
+    fn replace_vector_info(&self, chain: Vec<AccumInfo>) {
+        unsafe { *self.vector_info.get() = build_vector_info_chain(chain) }
+    }
+    fn rd_numb(&self) -> Option<&[u8]> {
+        self.payload.rd_numb()
+    }
+    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
+        self.payload.rd_numb_arc()
+    }
+    fn set_rd_numb(&self, value: Option<Vec<u8>>) {
+        self.payload.set_rd_numb(value)
+    }
+    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
+        self.payload.set_rd_numb_arc(value)
+    }
+    fn rd_consts(&self) -> Option<&[Const]> {
+        self.payload.rd_consts()
+    }
+    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
+        self.payload.rd_consts_arc()
+    }
+    fn set_rd_consts(&self, value: Option<Vec<Const>>) {
+        self.payload.set_rd_consts(value)
+    }
+    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
+        self.payload.set_rd_consts_arc(value)
+    }
+    fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
+        self.payload.rd_virtuals()
+    }
+    fn rd_virtuals_arc(&self) -> Option<Arc<[Rc<RdVirtualInfo>]>> {
+        self.payload.rd_virtuals_arc()
+    }
+    fn set_rd_virtuals(&self, value: Option<Vec<Rc<RdVirtualInfo>>>) {
+        self.payload.set_rd_virtuals(value)
+    }
+    fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
+        self.payload.set_rd_virtuals_arc(value)
+    }
+    fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
+        self.payload.rd_pendingfields()
+    }
+    fn rd_pendingfields_arc(&self) -> Option<Arc<[GuardPendingFieldEntry]>> {
+        self.payload.rd_pendingfields_arc()
+    }
+    fn set_rd_pendingfields(&self, value: Option<Vec<GuardPendingFieldEntry>>) {
+        self.payload.set_rd_pendingfields(value)
+    }
+    fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
+        self.payload.set_rd_pendingfields_arc(value)
+    }
+}
+
+/// guard.py:89-91:
+///   descr = CompileLoopVersionDescr()
+///   descr.copy_all_attributes_from(self.op.getdescr())
+///   descr.rd_vector_info = None
+///
+/// Creates a fresh CompileLoopVersionDescr.  rd_* (compile.py:855
+/// `_attrs_`) are reference-shared from the source descr via the
+/// `_arc` getters — same semantics as `copy_all_attributes_from`
+/// (compile.py:861-867).  `rd_vector_info` is reset to None per
+/// guard.py:91.  The descr also carries fail_arg types from the
+/// source so the backend layout matches the donor guard.
+///
+/// Panics if source_op has no descr or the resolved donor (after
+/// `get_resumestorage()`) is not a `ResumeGuardDescr` — matching
+/// RPython's invariant at compile.py:861-863
+/// (`other = other.get_resumestorage(); assert isinstance(other,
+/// ResumeGuardDescr)`).
+pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRef {
+    let src_descr = source_op
+        .descr
+        .as_ref()
+        .expect("guard.py:90: self.op.getdescr() must exist");
+    // compile.py:862 `other = other.get_resumestorage()`: if the source
+    // is a `ResumeGuardCopiedDescr`, resolve to its `prev` so we read
+    // resume data from the canonical donor.  ResumeGuardDescr's
+    // `get_resumestorage` returns self, so direct sources pass through
+    // unchanged.
+    let resolved_descr = if src_descr.is_resume_guard_copied() {
+        src_descr
+            .prev_descr()
+            .expect("compile.py:849 ResumeGuardCopiedDescr.prev must be set")
+    } else {
+        src_descr.clone()
+    };
+    // compile.py:863 `assert isinstance(other, ResumeGuardDescr)`:
+    // reject non-resume FailDescr (e.g. MetaFailDescr) that would
+    // otherwise yield an empty rd_* payload on the loop-version descr.
+    assert!(
+        resolved_descr.is_resume_guard(),
+        "compile.py:863 assert isinstance(other, ResumeGuardDescr): \
+         loop-version donor descr_index={} is not a ResumeGuardDescr \
+         subclass",
+        resolved_descr.index()
+    );
+    let src_fd = resolved_descr
+        .as_fail_descr()
+        .expect("compile.py:863 ResumeGuardDescr is also a FailDescr");
+    let types = src_fd.fail_arg_types().to_vec();
+    // compile.py:861-872 copy_all_attributes_from copies rd_*; mirror
+    // RPython's reference-share by reusing the donor's `Arc<[T]>`
+    // slots — `Arc::clone` only bumps a refcount.
+    let payload = RdPayload {
+        rd_numb: UnsafeCell::new(src_fd.rd_numb_arc()),
+        rd_consts: UnsafeCell::new(src_fd.rd_consts_arc()),
+        rd_virtuals: UnsafeCell::new(src_fd.rd_virtuals_arc()),
+        rd_pendingfields: UnsafeCell::new(src_fd.rd_pendingfields_arc()),
+    };
+    Arc::new(CompileLoopVersionDescr {
+        fail_index: alloc_fail_index(),
+        types: UnsafeCell::new(types),
+        resume_data: ResumeData {
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
+            frames: Vec::new(),
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        },
+        payload,
+        // guard.py:91: descr.rd_vector_info = None
+        vector_info: UnsafeCell::new(None),
+    })
+}
+
+/// Extract resume data from a guard's FailDescr + MetaInterp's resume_data map.
+///
+/// The recommended pattern for resume data lookup:
+/// 1. The guard's FailDescr carries a unique `fail_index`
+/// 2. The MetaInterp stores `ResumeData` in a `HashMap<u32, ResumeData>`
+///    keyed by `fail_index`
+/// 3. On guard failure, look up `fail_index` in the map
+///
+/// This matches RPython's approach where `ResumeGuardDescr` points to
+/// snapshot data stored alongside the compiled loop.
+
+#[cfg(test)]
+mod fail_descr_tests {
+    use super::*;
+
+    #[test]
+    fn test_attach_vector_info_builds_prev_chain() {
+        let descr = make_fail_descr(2);
+        let fail_descr = descr.as_fail_descr().unwrap();
+        fail_descr.attach_vector_info(AccumInfo {
+            prev: None,
+            failargs_pos: 0,
+            variable: majit_ir::OpRef(10),
+            location: majit_ir::OpRef(20),
+            accum_operation: '+',
+            scalar: majit_ir::OpRef::NONE,
+        });
+        fail_descr.attach_vector_info(AccumInfo {
+            prev: None,
+            failargs_pos: 1,
+            variable: majit_ir::OpRef(11),
+            location: majit_ir::OpRef(21),
+            accum_operation: '*',
+            scalar: majit_ir::OpRef::NONE,
+        });
+
+        let vector_info = fail_descr.vector_info();
+        assert_eq!(vector_info.len(), 2);
+        assert_eq!(vector_info[0].failargs_pos, 1);
+        assert_eq!(vector_info[1].failargs_pos, 0);
+        assert_eq!(
+            vector_info[0].prev.as_ref().map(|info| info.failargs_pos),
+            Some(0)
+        );
+        assert!(vector_info[1].prev.is_none());
+
+        let cloned = descr.clone_descr().unwrap();
+        let cloned_vector_info = cloned.as_fail_descr().unwrap().vector_info();
+        assert_eq!(cloned_vector_info.len(), 2);
+        assert_eq!(cloned_vector_info[0].failargs_pos, 1);
+        assert_eq!(
+            cloned_vector_info[0]
+                .prev
+                .as_ref()
+                .map(|info| info.failargs_pos),
+            Some(0)
+        );
+    }
+
+    #[test]
+    fn test_fail_descr_unique_indices() {
+        reset_fail_index_counter();
+        let d1 = make_fail_descr(2);
+        let d2 = make_fail_descr(3);
+        let d3 = make_fail_descr(1);
+
+        let fi1 = d1.as_fail_descr().unwrap().fail_index();
+        let fi2 = d2.as_fail_descr().unwrap().fail_index();
+        let fi3 = d3.as_fail_descr().unwrap().fail_index();
+
+        // All indices must be unique
+        assert_ne!(fi1, fi2);
+        assert_ne!(fi2, fi3);
+        assert_ne!(fi1, fi3);
+    }
+
+    #[test]
+    fn test_fail_descr_with_explicit_index() {
+        let d = make_fail_descr_with_index(42, 3);
+        assert_eq!(d.as_fail_descr().unwrap().fail_index(), 42);
+        assert_eq!(d.as_fail_descr().unwrap().fail_arg_types().len(), 3);
+    }
+
+    #[test]
+    fn test_fail_descr_typed() {
+        let types = vec![Type::Int, Type::Ref, Type::Float];
+        let d = make_fail_descr_typed(types.clone());
+        assert_eq!(d.as_fail_descr().unwrap().fail_arg_types(), &types);
+    }
+
+    /// `compile.py:869 ResumeGuardDescr.store_final_boxes` parity:
+    /// `store_final_boxes_in_guard` mutates types in place, preserving
+    /// the descr's `Arc` identity, `fail_index`, and concrete subtype.
+    #[test]
+    fn test_set_fail_arg_types_preserves_identity_and_subtype() {
+        // ResumeAtPositionDescr (unroll extra_guards path).
+        let descr = make_resume_at_position_descr_typed(vec![Type::Int]);
+        let original_fail_index = descr.as_fail_descr().unwrap().fail_index();
+        let original_ptr = Arc::as_ptr(&descr);
+        assert!(descr.is_resume_at_position());
+
+        descr
+            .as_fail_descr()
+            .unwrap()
+            .set_fail_arg_types(vec![Type::Ref, Type::Float]);
+
+        // Identity preserved: same Arc, same fail_index, same subtype tag.
+        assert_eq!(Arc::as_ptr(&descr), original_ptr);
+        assert_eq!(
+            descr.as_fail_descr().unwrap().fail_index(),
+            original_fail_index
+        );
+        assert!(descr.is_resume_at_position());
+        // Types updated.
+        assert_eq!(
+            descr.as_fail_descr().unwrap().fail_arg_types(),
+            &[Type::Ref, Type::Float]
+        );
+
+        // CompileLoopVersionDescr.
+        let lv = Arc::new(CompileLoopVersionDescr {
+            fail_index: alloc_fail_index(),
+            types: UnsafeCell::new(vec![Type::Int]),
+            resume_data: ResumeData {
+                vable_array: Vec::new(),
+                vref_array: Vec::new(),
+                frames: Vec::new(),
+                virtuals: Vec::new(),
+                pending_fields: Vec::new(),
+            },
+            payload: RdPayload::empty(),
+            vector_info: UnsafeCell::new(None),
+        }) as DescrRef;
+        let lv_fi = lv.as_fail_descr().unwrap().fail_index();
+        assert!(lv.as_fail_descr().unwrap().loop_version());
+
+        lv.as_fail_descr()
+            .unwrap()
+            .set_fail_arg_types(vec![Type::Ref]);
+
+        assert_eq!(lv.as_fail_descr().unwrap().fail_index(), lv_fi);
+        assert!(lv.as_fail_descr().unwrap().loop_version());
+        assert_eq!(lv.as_fail_descr().unwrap().fail_arg_types(), &[Type::Ref]);
+
+        // MetaFailDescr / plain ResumeGuardDescr factory.
+        let plain = make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
+        let plain_fi = plain.as_fail_descr().unwrap().fail_index();
+        assert!(!plain.is_resume_at_position());
+
+        plain
+            .as_fail_descr()
+            .unwrap()
+            .set_fail_arg_types(vec![Type::Float]);
+
+        assert_eq!(plain.as_fail_descr().unwrap().fail_index(), plain_fi);
+        assert!(!plain.is_resume_at_position());
+        assert!(!plain.is_guard_forced());
+        assert!(!plain.is_guard_exc());
+        assert_eq!(
+            plain.as_fail_descr().unwrap().fail_arg_types(),
+            &[Type::Float]
+        );
+
+        // ResumeGuardForcedDescr — `is_guard_forced()` survives
+        // `set_fail_arg_types`, identity preserved.
+        let forced = make_resume_guard_forced_descr_typed(vec![Type::Int]);
+        let forced_fi = forced.as_fail_descr().unwrap().fail_index();
+        let forced_ptr = Arc::as_ptr(&forced);
+        assert!(forced.is_guard_forced());
+        assert!(!forced.is_guard_exc());
+
+        forced
+            .as_fail_descr()
+            .unwrap()
+            .set_fail_arg_types(vec![Type::Ref]);
+
+        assert_eq!(Arc::as_ptr(&forced), forced_ptr);
+        assert_eq!(forced.as_fail_descr().unwrap().fail_index(), forced_fi);
+        assert!(forced.is_guard_forced());
+        assert_eq!(
+            forced.as_fail_descr().unwrap().fail_arg_types(),
+            &[Type::Ref]
+        );
+
+        // ResumeGuardExcDescr — `is_guard_exc()` survives, identity preserved.
+        let exc = make_resume_guard_exc_descr_typed(vec![Type::Ref, Type::Int]);
+        let exc_fi = exc.as_fail_descr().unwrap().fail_index();
+        let exc_ptr = Arc::as_ptr(&exc);
+        assert!(exc.is_guard_exc());
+        assert!(!exc.is_guard_forced());
+
+        exc.as_fail_descr()
+            .unwrap()
+            .set_fail_arg_types(vec![Type::Float]);
+
+        assert_eq!(Arc::as_ptr(&exc), exc_ptr);
+        assert_eq!(exc.as_fail_descr().unwrap().fail_index(), exc_fi);
+        assert!(exc.is_guard_exc());
+        assert_eq!(
+            exc.as_fail_descr().unwrap().fail_arg_types(),
+            &[Type::Float]
+        );
+
+        // compile.py:873-876 ResumeGuardDescr.clone() returns a plain
+        // ResumeGuardDescr — both `ResumeGuardForcedDescr` (compile.py:939+,
+        // no clone override) and `ResumeGuardExcDescr` (compile.py:881-882
+        // `pass`) inherit this base implementation, so the subtype tag is
+        // intentionally dropped on clone. Resume attributes / fail_arg_types
+        // are copied; fail_index is fresh.
+        let forced_clone = forced.clone_descr().unwrap();
+        assert!(!forced_clone.is_guard_forced());
+        assert!(!forced_clone.is_guard_exc());
+        assert_ne!(
+            forced_clone.as_fail_descr().unwrap().fail_index(),
+            forced_fi
+        );
+        assert_eq!(
+            forced_clone.as_fail_descr().unwrap().fail_arg_types(),
+            &[Type::Ref]
+        );
+
+        let exc_clone = exc.clone_descr().unwrap();
+        assert!(!exc_clone.is_guard_exc());
+        assert!(!exc_clone.is_guard_forced());
+        assert_ne!(exc_clone.as_fail_descr().unwrap().fail_index(), exc_fi);
+        assert_eq!(
+            exc_clone.as_fail_descr().unwrap().fail_arg_types(),
+            &[Type::Float]
+        );
+    }
+
+    /// compile.py:832-851 ResumeGuardCopiedDescr(prev) parity:
+    /// `get_resumestorage()` chases to `prev`, `fail_arg_types`
+    /// shares the donor's vector, `is_resume_guard_copied()` flags
+    /// the subtype, and the exc variant additionally reports
+    /// `is_guard_exc() = true` while tracking the same `prev`.
+    #[test]
+    fn test_resume_guard_copied_descr_delegates_to_prev() {
+        // Plain copied descr over a ResumeGuardDescr donor.
+        let donor = make_resume_guard_descr_typed(vec![Type::Int, Type::Ref]);
+        let donor_fi = donor.as_fail_descr().unwrap().fail_index();
+        let donor_ptr = Arc::as_ptr(&donor);
+
+        let copied = make_resume_guard_copied_descr(donor.clone());
+        assert!(copied.is_resume_guard_copied());
+        assert!(!copied.is_guard_exc());
+        assert!(!copied.is_guard_forced());
+        assert_ne!(copied.as_fail_descr().unwrap().fail_index(), donor_fi);
+        assert_eq!(
+            copied.as_fail_descr().unwrap().fail_arg_types(),
+            &[Type::Int, Type::Ref]
+        );
+        // get_resumestorage() chases to prev — same Arc ptr.
+        let prev = copied.prev_descr().unwrap();
+        assert_eq!(Arc::as_ptr(&prev), donor_ptr);
+
+        // clone_descr() preserves prev identity, allocates fresh fail_index.
+        let copied_clone = copied.clone_descr().unwrap();
+        assert!(copied_clone.is_resume_guard_copied());
+        assert_eq!(Arc::as_ptr(&copied_clone.prev_descr().unwrap()), donor_ptr);
+        assert_ne!(
+            copied_clone.as_fail_descr().unwrap().fail_index(),
+            copied.as_fail_descr().unwrap().fail_index()
+        );
+
+        // Exc-copied subtype carries the same prev and additionally
+        // reports is_guard_exc() = true.
+        let exc_donor = make_resume_guard_exc_descr_typed(vec![Type::Float]);
+        let exc_donor_ptr = Arc::as_ptr(&exc_donor);
+        let copied_exc = make_resume_guard_copied_exc_descr(exc_donor);
+        assert!(copied_exc.is_resume_guard_copied());
+        assert!(copied_exc.is_guard_exc());
+        assert!(!copied_exc.is_guard_forced());
+        assert_eq!(
+            copied_exc.as_fail_descr().unwrap().fail_arg_types(),
+            &[Type::Float]
+        );
+        assert_eq!(
+            Arc::as_ptr(&copied_exc.prev_descr().unwrap()),
+            exc_donor_ptr
+        );
+
+        // set_fail_arg_types must NOT mutate the donor through a copied
+        // descr — `_copy_resume_data_from` never calls
+        // store_final_boxes_in_guard, so any invocation indicates an
+        // upstream invariant violation.
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            copied
+                .as_fail_descr()
+                .unwrap()
+                .set_fail_arg_types(vec![Type::Float])
+        }));
+        assert!(
+            result.is_err(),
+            "set_fail_arg_types on ResumeGuardCopiedDescr must panic"
+        );
+        // Donor's types unchanged.
+        assert_eq!(
+            donor.as_fail_descr().unwrap().fail_arg_types(),
+            &[Type::Int, Type::Ref]
         );
     }
 }

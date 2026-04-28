@@ -286,20 +286,23 @@ impl Guard {
         // then copy resume attributes from the source guard's descr.
         // compile.py:861-872 copy_all_attributes_from copies:
         //   rd_consts, rd_pendingfields, rd_virtuals, rd_numb
-        // In majit these live on Op fields; the descr-level copy is done
-        // via copy_resume_from_descr which extracts what it can.
-        let fresh_descr = crate::fail_descr::make_compile_loop_version_descr_from(&self.op);
+        // In pyre these live on the FailDescr (compile.py:855 `_attrs_`);
+        // make_compile_loop_version_descr_from reference-shares each
+        // Arc<[T]> slot from the donor onto the fresh descr.
+        let fresh_descr = crate::compile::make_compile_loop_version_descr_from(&self.op);
         let mut guard_op = Op::new(self.op.opcode, &[compare.pos]);
         guard_op.descr = Some(fresh_descr);
         // guard.py:94: guard.setfailargs(loop.label.getarglist_copy())
         guard_op.fail_args = Some(label_args.into());
-        // copy_all_attributes_from parity: Op-level resume fields.
+        // copy_all_attributes_from parity: compile.py:861-872 copies
+        // rd_consts / rd_pendingfields / rd_virtuals / rd_numb.  In
+        // pyre these live on the FailDescr (compile.py:855 `_attrs_`)
+        // and `make_compile_loop_version_descr_from` (called above)
+        // reference-shares the donor's payload onto the fresh descr,
+        // so `guard_op.descr.fail_descr().rd_*()` returns the donor's
+        // values automatically.
         guard_op.fail_arg_types = self.op.fail_arg_types.clone();
         guard_op.rd_resume_position = self.op.rd_resume_position;
-        guard_op.rd_numb = self.op.rd_numb.clone();
-        guard_op.rd_consts = self.op.rd_consts.clone();
-        guard_op.rd_virtuals = self.op.rd_virtuals.clone();
-        guard_op.rd_pendingfields = self.op.rd_pendingfields.clone();
         // guard.py:95: opt.emit_operation(guard)
         new_ops.push(guard_op.clone());
         Some(guard_op)
@@ -316,18 +319,41 @@ impl Guard {
 
     /// guard.py:113-124: inhert_attributes(other)
     ///
-    /// Copy index, descr, and fail_args from other to self.
+    /// Copy index and resume attributes from `other` onto self's existing
+    /// descr, preserving `myop.descr` identity (fail_index / status /
+    /// subtype tag).  Mirrors RPython's:
+    ///   descr = myop.getdescr()
+    ///   descr.copy_all_attributes_from(other.op.getdescr())
+    ///   myop.setfailargs(otherop.getfailargs()[:])
+    /// where `descr` is the strengthened guard's *own* ResumeGuardDescr.
     pub fn inhert_attributes(&mut self, other: &Guard) {
         // guard.py:118
         self.index = other.index;
         // guard.py:120-121: descr.copy_all_attributes_from(other.op.getdescr())
-        // compile.py:861-872: copies rd_consts, rd_pendingfields, rd_virtuals, rd_numb
-        self.op.descr = other.op.descr.clone();
+        // compile.py:861-872 ResumeGuardDescr.copy_all_attributes_from:
+        //     other = other.get_resumestorage()
+        //     assert isinstance(other, ResumeGuardDescr)
+        //     self.rd_consts = other.rd_consts
+        //     self.rd_pendingfields = other.rd_pendingfields
+        //     self.rd_virtuals = other.rd_virtuals
+        //     self.rd_numb = other.rd_numb
+        // i.e. the strengthened guard keeps its own descr identity; only
+        // the resume payload is copied from the donor (chasing through
+        // ResumeGuardCopiedDescr.prev via get_resumestorage()).
+        let my_descr = self
+            .op
+            .descr
+            .as_ref()
+            .expect("guard.py:120 myop.getdescr() must exist");
+        let donor_descr = other
+            .op
+            .descr
+            .as_ref()
+            .expect("guard.py:121 otherop.getdescr() must exist");
+        // compile.py:861-872 / 840-842: in-place copy preserving
+        // myop.descr identity (`fail_index` / status / subtype tag).
+        crate::compile::copy_all_attributes_from(my_descr, donor_descr);
         self.op.rd_resume_position = other.op.rd_resume_position;
-        self.op.rd_numb = other.op.rd_numb.clone();
-        self.op.rd_consts = other.op.rd_consts.clone();
-        self.op.rd_virtuals = other.op.rd_virtuals.clone();
-        self.op.rd_pendingfields = other.op.rd_pendingfields.clone();
         // guard.py:123: myop.setfailargs(otherop.getfailargs()[:])
         self.op.fail_args = other.op.fail_args.clone();
         self.op.fail_arg_types = other.op.fail_arg_types.clone();
@@ -370,10 +396,7 @@ impl Guard {
         guard.fail_args = self.op.fail_args.clone();
         guard.fail_arg_types = self.op.fail_arg_types.clone();
         guard.rd_resume_position = self.op.rd_resume_position;
-        guard.rd_numb = self.op.rd_numb.clone();
-        guard.rd_consts = self.op.rd_consts.clone();
-        guard.rd_virtuals = self.op.rd_virtuals.clone();
-        guard.rd_pendingfields = self.op.rd_pendingfields.clone();
+        // compile.py:855 _attrs_ on descr; Arc-clone above shares them.
         new_ops.push(guard.clone());
         // guard.py:145-147
         self.setindex(new_ops.len() - 1);
@@ -971,10 +994,19 @@ mod tests {
     use crate::optimizeopt::optimizer::Optimizer;
 
     /// Helper: assign sequential positions to ops starting from a high base
-    /// to avoid colliding with argument OpRefs.
+    /// to avoid colliding with argument OpRefs.  Also attaches a fresh
+    /// `ResumeGuardDescr` to every guard op that lacks one, mirroring
+    /// RPython's invariant (`optimizer.py:691 assert isinstance(last_descr,
+    /// compile.ResumeGuardDescr)`) that every guard reaching the optimizer
+    /// has a head-of-chain ResumeGuardDescr — this lets `_copy_resume_data_from`
+    /// share via `make_resume_guard_copied_descr(prev)` without panicking on
+    /// a missing donor.
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos = OpRef(base + i as u32);
+            if op.opcode.is_guard() && op.descr.is_none() {
+                op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
+            }
         }
     }
 

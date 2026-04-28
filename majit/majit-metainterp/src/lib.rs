@@ -20,7 +20,6 @@ pub mod call_descr;
 pub(crate) mod compile;
 mod constant_pool;
 pub(crate) mod executor;
-mod fail_descr;
 pub mod greenfield;
 pub mod history;
 pub mod io_buffer;
@@ -49,8 +48,8 @@ pub use call_descr::{
     make_call_assembler_descr, make_call_assembler_descr_with_vable, make_call_descr,
     make_call_descr_with_effect,
 };
+pub use compile::{make_fail_descr, make_fail_descr_typed};
 pub use constant_pool::ConstantPool;
-pub use fail_descr::{make_fail_descr, make_fail_descr_typed};
 pub use io_buffer::{
     emit_commit_io, encode_decimal_i64, io_buffer_commit, io_buffer_discard, io_buffer_write,
     io_buffer_write_fmt, jit_write_number_i64, jit_write_utf8_codepoint,

@@ -1841,7 +1841,6 @@ pub fn blackhole_resume_via_rd_numb(
             deadframe,
             deadframe_types,        // deadframe_types: decode_ref boxes TAGBOX ints
             rd_virtuals_slice,      // rd_virtuals
-            None,                   // rd_pendingfields
             rd_guard_pendingfields, // rd_guard_pendingfields
             Some(vrefinfo_dyn),     // resume.py:1314 metainterp_sd.virtualref_info
             Some(vinfo_dyn),        // resume.py:1312 self.jitdriver_sd.virtualizable_info

@@ -4,7 +4,10 @@
 /// When tracing is active, every interpreter operation is fed to the
 /// recorder, which builds a linear sequence of IR operations (a trace).
 ///
-/// Reference: rpython/jit/metainterp/pyjitpl.py MetaInterp.record()
+/// Upstream counterpart: `rpython/jit/metainterp/history.py:714 class History`
+/// (`record_nospec` / `record_same_as` / `record_aborted` etc.).  Pyre
+/// callers reach the recorder via `MetaInterp.history.record*` mirroring
+/// `pyjitpl.py:2455+ self.history.record2(...)`.
 use majit_ir::{DescrRef, InputArg, Op, OpCode, OpRef, Type};
 
 use crate::history::TreeLoop;
@@ -186,12 +189,24 @@ impl Trace {
     }
 
     /// Record a guard operation.
-    /// Guards carry a FailDescr that describes what happens when the guard fails.
+    /// `pyjitpl.py:2548 generate_guard()` parity: tracer-stage guards
+    /// carry `descr=None`. The optimizer creates the FailDescr later in
+    /// `store_final_boxes_in_guard` / `invent_fail_descr_for_op`
+    /// (compile.py:722-730 / 924-942). Tests that need a pre-stamped
+    /// descr pass `Some(descr)`.
     /// Returns the OpRef for this guard.
-    pub fn record_guard(&mut self, opcode: OpCode, args: &[OpRef], descr: DescrRef) -> OpRef {
+    pub fn record_guard(
+        &mut self,
+        opcode: OpCode,
+        args: &[OpRef],
+        descr: Option<DescrRef>,
+    ) -> OpRef {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         let opref = OpRef(self.op_count);
-        let mut op = Op::with_descr(opcode, args, descr);
+        let mut op = match descr {
+            Some(d) => Op::with_descr(opcode, args, d),
+            None => Op::new(opcode, args),
+        };
         op.pos = opref;
         self.ops.push(op);
         self.op_count += 1;
@@ -203,16 +218,20 @@ impl Trace {
 
     /// Record a guard with explicit fail_args — values stored in the dead
     /// frame on guard failure. Mirrors rpython setfailargs().
+    /// See `record_guard` for the descr=None convention.
     pub fn record_guard_with_fail_args(
         &mut self,
         opcode: OpCode,
         args: &[OpRef],
-        descr: DescrRef,
+        descr: Option<DescrRef>,
         fail_args: &[OpRef],
     ) -> OpRef {
         assert!(opcode.is_guard(), "opcode {:?} is not a guard", opcode);
         let opref = OpRef(self.op_count);
-        let mut op = Op::with_descr(opcode, args, descr);
+        let mut op = match descr {
+            Some(d) => Op::with_descr(opcode, args, d),
+            None => Op::new(opcode, args),
+        };
         op.pos = opref;
         op.fail_args = Some(smallvec::SmallVec::from_slice(fail_args));
         self.ops.push(op);
@@ -249,6 +268,16 @@ impl Trace {
             .find(|op| op.pos == opref)
             .unwrap_or_else(|| panic!("set_op_fail_args: no op with pos {:?}", opref));
         op.fail_args = Some(smallvec::SmallVec::from_slice(fail_args));
+    }
+
+    /// Set `fail_arg_types` on the last recorded op. Used by
+    /// `trace_ctx::record_guard_typed` to record types for fail args
+    /// without stamping a tracer-stage descr (codex #3 /
+    /// pyjitpl.py:2548 generate_guard parity).
+    pub fn set_last_op_fail_arg_types(&mut self, types: Vec<Type>) {
+        if let Some(op) = self.ops.last_mut() {
+            op.fail_arg_types = Some(types);
+        }
     }
 
     /// Close the loop: add a JUMP operation back to the start.
@@ -435,7 +464,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         let descr = make_fail_descr(0);
-        let _g = rec.record_guard(OpCode::GuardTrue, &[i0], descr);
+        let _g = rec.record_guard(OpCode::GuardTrue, &[i0], Some(descr));
 
         let i1 = rec.record_op(OpCode::IntAdd, &[i0, i0]);
         rec.close_loop(&[i1]);
@@ -495,7 +524,7 @@ mod tests {
         assert_eq!(i2, OpRef(2));
 
         let descr = make_fail_descr(0);
-        let g0 = rec.record_guard(OpCode::GuardTrue, &[i2], descr);
+        let g0 = rec.record_guard(OpCode::GuardTrue, &[i2], Some(descr));
         assert_eq!(g0, OpRef(3));
 
         let i3 = rec.record_op(OpCode::IntSub, &[i2, i0]);
@@ -553,7 +582,7 @@ mod tests {
         let i2 = rec.record_op(OpCode::IntLt, &[i0, i1]);
 
         let descr = make_fail_descr(0);
-        rec.record_guard(OpCode::GuardTrue, &[i2], descr);
+        rec.record_guard(OpCode::GuardTrue, &[i2], Some(descr));
 
         let i3 = rec.record_op(OpCode::IntAdd, &[i0, i1]);
 
@@ -650,7 +679,7 @@ mod tests {
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         let descr = make_fail_descr(0);
         let guard =
-            rec.record_guard_with_fail_args(OpCode::GuardTrue, &[add], descr, &[i0, i1, add]);
+            rec.record_guard_with_fail_args(OpCode::GuardTrue, &[add], Some(descr), &[i0, i1, add]);
 
         let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
         rec.close_loop(&[sub, i1]);
@@ -675,12 +704,12 @@ mod tests {
         let i1 = rec.record_input_arg(Type::Int);
 
         let descr0 = make_fail_descr(0);
-        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], descr0, &[i0, i1]);
+        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], Some(descr0), &[i0, i1]);
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
 
         let descr1 = make_fail_descr(1);
-        rec.record_guard_with_fail_args(OpCode::GuardFalse, &[add], descr1, &[i0, add]);
+        rec.record_guard_with_fail_args(OpCode::GuardFalse, &[add], Some(descr1), &[i0, add]);
 
         let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
         rec.close_loop(&[sub, i1]);
@@ -757,7 +786,7 @@ mod tests {
         assert_eq!(rec.num_ops(), 2);
 
         let descr = make_fail_descr(0);
-        rec.record_guard(OpCode::GuardTrue, &[OpRef(2)], descr);
+        rec.record_guard(OpCode::GuardTrue, &[OpRef(2)], Some(descr));
         assert_eq!(rec.num_ops(), 3);
 
         rec.close_loop(&[OpRef(2)]);
@@ -775,7 +804,7 @@ mod tests {
         assert_eq!(before_guard._index, 2);
 
         let descr = make_fail_descr(0);
-        rec.record_guard(OpCode::GuardTrue, &[i1], descr);
+        rec.record_guard(OpCode::GuardTrue, &[i1], Some(descr));
         rec.close_loop(&[i1]);
         rec.finish(&[i1], make_fail_descr(1));
 
@@ -814,7 +843,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         let descr = make_fail_descr(77);
-        rec.record_guard(OpCode::GuardNoException, &[], descr);
+        rec.record_guard(OpCode::GuardNoException, &[], Some(descr));
 
         rec.close_loop(&[i0]);
         let trace = rec.get_trace();
@@ -848,7 +877,7 @@ mod tests {
         let i0 = rec.record_input_arg(Type::Int);
 
         let descr = make_fail_descr(0);
-        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], descr, &[]);
+        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[i0], Some(descr), &[]);
 
         rec.close_loop(&[i0]);
         let trace = rec.get_trace();
@@ -864,7 +893,7 @@ mod tests {
         let mut rec = Trace::new();
         rec.record_input_arg(Type::Int);
         let descr = make_fail_descr(0);
-        rec.record_guard(OpCode::IntAdd, &[OpRef(0)], descr);
+        rec.record_guard(OpCode::IntAdd, &[OpRef(0)], Some(descr));
     }
 
     #[test]
@@ -917,7 +946,7 @@ mod tests {
 
         let cmp = rec.record_op(OpCode::IntLt, &[i0, i1]);
         let descr = make_fail_descr(0);
-        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], descr, &[i0, i1]);
+        rec.record_guard_with_fail_args(OpCode::GuardTrue, &[cmp], Some(descr), &[i0, i1]);
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         rec.close_loop(&[add, i1]);
@@ -1113,7 +1142,8 @@ mod tests {
         fail_args.push(add);
 
         let descr = make_fail_descr(0);
-        let guard = rec.record_guard_with_fail_args(OpCode::GuardTrue, &[add], descr, &fail_args);
+        let guard =
+            rec.record_guard_with_fail_args(OpCode::GuardTrue, &[add], Some(descr), &fail_args);
 
         rec.close_loop(&inputs);
         let trace = rec.get_trace();
@@ -1140,9 +1170,9 @@ mod tests {
         let d1 = make_fail_descr(200);
         let d2 = make_fail_descr(300);
 
-        rec.record_guard(OpCode::GuardTrue, &[i0], d0);
-        rec.record_guard(OpCode::GuardFalse, &[i0], d1);
-        rec.record_guard(OpCode::GuardNoException, &[], d2);
+        rec.record_guard(OpCode::GuardTrue, &[i0], Some(d0));
+        rec.record_guard(OpCode::GuardFalse, &[i0], Some(d1));
+        rec.record_guard(OpCode::GuardNoException, &[], Some(d2));
 
         rec.close_loop(&[i0]);
         let trace = rec.get_trace();
@@ -1163,10 +1193,10 @@ mod tests {
 
         let add = rec.record_op(OpCode::IntAdd, &[i0, i1]);
         let d0 = make_fail_descr(0);
-        rec.record_guard(OpCode::GuardTrue, &[add], d0);
+        rec.record_guard(OpCode::GuardTrue, &[add], Some(d0));
         let sub = rec.record_op(OpCode::IntSub, &[add, i0]);
         let d1 = make_fail_descr(1);
-        rec.record_guard(OpCode::GuardFalse, &[sub], d1);
+        rec.record_guard(OpCode::GuardFalse, &[sub], Some(d1));
         let mul = rec.record_op(OpCode::IntMul, &[sub, i1]);
 
         rec.close_loop(&[mul, i1]);
@@ -1264,7 +1294,7 @@ mod tests {
         assert_eq!(pos_after_add._index, 2);
 
         let descr = make_fail_descr(1);
-        rec.record_guard(OpCode::GuardTrue, &[OpRef(1)], descr);
+        rec.record_guard(OpCode::GuardTrue, &[OpRef(1)], Some(descr));
         let pos_after_guard = rec.get_position();
         assert_eq!(pos_after_guard._pos, 2);
         assert_eq!(pos_after_guard._count, 3);
