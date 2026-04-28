@@ -99,11 +99,16 @@ pub struct PyJitCodeMetadata {
     /// Phase 2 commit 2.1 (Tasks #158/#159/#122 epic, plan
     /// `~/.claude/plans/staged-sauteeing-koala.md`): post-regalloc
     /// color of each Python-semantic stack slot.
-    /// `stack_slot_color_map[d]` = `apply_rename(Kind::Ref, stack_base + d)`
+    /// `stack_slot_color_map[d]` = `apply_rename(Kind::Ref, nlocals + d)`
     /// for `d in 0..code.max_stackdepth` (= CPython `co_stacksize`).
-    /// Populated in `finalize_jitcode` after `apply_rename` runs;
-    /// portal-bridge installs (`canonical_bridge::install_portal_for`)
-    /// populate it as identity over the same range.
+    /// The `+ nlocals` here is the register-space stack base used by
+    /// the codewriter (`RegisterLayout::stack_base`, which
+    /// `RegisterLayout::compute` sets to `nlocals as u16`), NOT the
+    /// `stack_base` field above (which is the PyFrame absolute
+    /// `varnames.len() + ncells`). Populated in `finalize_jitcode`
+    /// after `apply_rename` runs; portal-bridge installs
+    /// (`canonical_bridge::install_portal_for`) populate it as
+    /// identity over the same range.
     ///
     /// Length invariant: `stack_slot_color_map.len() == code.max_stackdepth`,
     /// so the bridge fallback at `state.rs::setup_bridge_sym`
@@ -115,11 +120,14 @@ pub struct PyJitCodeMetadata {
     /// the map when JIT-traced PCs did not reach the static peak; the
     /// `co_stacksize` invariant restores parity with the runtime.
     ///
-    /// Currently with stack-slot input-arg pinning (regalloc.rs:455-466),
-    /// this is identical to `[stack_base, stack_base+1, ..., stack_base+max-1]`
-    /// — i.e. `stack_slot_color_map[d] == nlocals + d`. The map exists as
-    /// a side channel so the decoder can stop assuming this invariant
-    /// before commit 2.1 step C removes the pinning.
+    /// After Phase 2.1c (commit `3fd64d5b0f3`) the stack-slot
+    /// input-arg pinning that lived in `enforce_input_args` /
+    /// `perform_register_allocation` is gone, so this map is no
+    /// longer the identity `[stack_base, stack_base+1, …]`
+    /// — entries are whatever color `apply_rename` produced. Decoders
+    /// (`state.rs`, `trace_opcode.rs`, `codewriter.rs`) must read
+    /// through the map; they cannot assume the old `nlocals + d`
+    /// invariant.
     pub stack_slot_color_map: Vec<u16>,
     /// Task #110 slice 3a (parent #185 epic, plan
     /// `task110_ssa_authoritative_live_r_epic_plan.md`):
@@ -133,8 +141,8 @@ pub struct PyJitCodeMetadata {
     /// Length invariant: `pyre_color_for_semantic_local.len() == nlocals`,
     /// matching the locals prefix of the runtime PyFrame allocation.
     ///
-    /// Today `enforce_input_args` (regalloc.rs:524-563, flatten.py:88-100
-    /// parity) pins each local-i inputarg color to identity (`color = i`),
+    /// Today `enforce_input_args` (`flatten.py:88-100` parity)
+    /// pins each local-i inputarg color to identity (`color = i`),
     /// so this map is `[0, 1, ..., nlocals-1]` for every populated jitcode.
     /// The map exists as a side channel so the encoder
     /// (`get_list_of_active_boxes` / `setup_kind_register_banks`) can

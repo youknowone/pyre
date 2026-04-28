@@ -38,6 +38,25 @@ pub enum Kind {
     Float,
 }
 
+/// Type-level marker for a fresh `Variable` produced by
+/// `SSARepr::fresh_var`. RPython's `flowspace/model.py:Variable()` ctor
+/// returns object identity; pyre's codewriter walker emits against
+/// pre-regalloc indices, so a u16 stands in for the identity. Wrapping
+/// it in `VariableId` keeps the index/color distinction visible in
+/// types — Phase 1 minimal slice (plan staged-sauteeing-koala). Until
+/// later phases can fold the index into the post-regalloc color
+/// derivation, callers extract the raw `u16` via `.0` at the consumer
+/// boundary (`Register::new(Kind, u16)`, `Operand::reg(Kind, u16)`,
+/// `JitCallArg::int/reference(u16)`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct VariableId(pub u16);
+
+impl From<VariableId> for u16 {
+    fn from(v: VariableId) -> u16 {
+        v.0
+    }
+}
+
 impl Kind {
     pub const ALL: [Kind; 3] = [Kind::Int, Kind::Ref, Kind::Float];
 
@@ -80,6 +99,20 @@ pub struct SSARepr {
     /// `assembler.py:41` populates this with the byte position of each
     /// instruction after `assemble()`.
     pub insns_pos: Option<Vec<usize>>,
+    /// Phase 2.2a (plan staged-sauteeing-koala, Tasks #158/#159/#122
+    /// epic): per-kind fresh-Variable counter. RPython has no analog
+    /// because RPython's `Variable()` constructor produces objects with
+    /// implicit identity and `regalloc.py` numbers them densely after
+    /// the FunctionGraph is final. Pyre's codewriter walks a CodeObject
+    /// directly (no FunctionGraph + jtransform layer), so each fresh
+    /// scratch-temp Variable needs an explicit u16 index at emit time.
+    /// `fresh_var(kind, base)` returns and bumps the counter, ensuring
+    /// scratches occupy indices distinct from Python locals/stack and
+    /// from any hardcoded scratch slots still living in
+    /// `RegisterLayout`. Once Phase 2.2 fully migrates the dispatcher,
+    /// the counter becomes the sole source of scratch indices and
+    /// `RegisterLayout`'s scratch fields can be retired.
+    next_var_idx: [u16; 3],
 }
 
 impl SSARepr {
@@ -88,7 +121,34 @@ impl SSARepr {
             name: name.into(),
             insns: Vec::new(),
             insns_pos: None,
+            next_var_idx: [0; 3],
         }
+    }
+
+    /// Allocate a fresh `(kind, index)` Variable for this SSARepr.
+    ///
+    /// `base` is the minimum index — the counter clamps up to `base` on
+    /// first call, so callers can reserve a low index range for
+    /// inputargs (`0..nlocals`) and stack slots while still getting a
+    /// unique scratch index above. Each subsequent `fresh_var` for the
+    /// same kind returns a strictly larger index. The returned index is
+    /// safe to use directly in `Register::new(kind, idx)` /
+    /// `Operand::reg(kind, idx)` without further bookkeeping —
+    /// `regalloc::allocate_registers` will pick it up via the standard
+    /// SSARepr scan and color it.
+    pub fn fresh_var(&mut self, kind: Kind, base: u16) -> VariableId {
+        let slot = match kind {
+            Kind::Int => 0,
+            Kind::Ref => 1,
+            Kind::Float => 2,
+        };
+        let counter = &mut self.next_var_idx[slot];
+        if *counter < base {
+            *counter = base;
+        }
+        let idx = *counter;
+        *counter += 1;
+        VariableId(idx)
     }
 }
 

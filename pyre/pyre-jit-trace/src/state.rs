@@ -1000,6 +1000,26 @@ pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
     })
 }
 
+/// Return the post-regalloc Ref-bank color of each Python-semantic stack
+/// slot for the registered jitcode at `jitcode_index`. Mirrors the
+/// `metadata.stack_slot_color_map` Vec stored on `PyJitCode` (sized
+/// `max_stackdepth`), and returns an empty Vec if the index is unknown.
+///
+/// Used by tests + tooling that need to translate "stack depth `d`" into
+/// the post-rename register color the dispatcher would touch — Phase 2.1c
+/// removed the `nlocals + d` identity, so direct slot arithmetic no
+/// longer works.
+pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(jitcode_index as usize)
+            .map(|jc| jc.payload.metadata.stack_slot_color_map.clone())
+            .unwrap_or_default()
+    })
+}
+
 /// Map a post-regalloc Ref-bank color back to the semantic
 /// `locals_cells_stack_w` slot it denotes at the current PC.
 ///

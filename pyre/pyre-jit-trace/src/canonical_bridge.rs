@@ -588,7 +588,7 @@ pub fn install_portal_for(
     // (`stack_base + stack_slot_color_map.len()`) reconstructs the full
     // `len(locals_cells_stack_w)` virtualizable shape rather than
     // collapsing to `stack_base + 0`. The contract is documented at
-    // `pyjitcode.rs:97-110`. With no regalloc the color of each slot is
+    // `PyreJitCode::stack_slot_color_map`. With no regalloc the color of each slot is
     // its own pre-color, hence the identity fill.
     let (stack_base, depth_at_py_pc, stack_slot_color_map, pyre_color_for_semantic_local) =
         if code_ptr.is_null() {

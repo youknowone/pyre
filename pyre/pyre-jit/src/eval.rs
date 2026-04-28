@@ -5420,6 +5420,26 @@ mod tests {
             .unwrap_or_else(|| panic!("test source should contain function code {name}"))
     }
 
+    /// Translate Python-stack depths into the post-regalloc Ref-bank
+    /// colors the dispatcher would actually touch. Phase 2.1c removed the
+    /// `register_color = nlocals + depth` identity (chordal coloring may
+    /// coalesce disjointly-live slots), so callers must consult
+    /// `metadata.stack_slot_color_map` before checking liveness.
+    fn stack_slot_colors_for_depths(jitcode_index: i32, depths: &[usize]) -> Vec<u32> {
+        let map = pyre_jit_trace::state::stack_slot_color_map_at(jitcode_index);
+        depths
+            .iter()
+            .map(|&d| {
+                u32::from(*map.get(d).unwrap_or_else(|| {
+                    panic!(
+                        "stack_slot_color_map for jitcode_index={jitcode_index} \
+                         lacks entry for depth {d}; got {map:?}"
+                    )
+                }))
+            })
+            .collect()
+    }
+
     fn live_pc_containing_all(
         jitcode_index: i32,
         code: &pyre_interpreter::CodeObject,
@@ -5450,7 +5470,8 @@ mod tests {
     fn compiled_trace_fixture(
         source: &str,
         function_name: &str,
-        live_regs: &[u32],
+        live_locals: &[u32],
+        live_stack_depths: &[usize],
         init: impl FnOnce(&mut PyFrame),
     ) -> (Box<PyFrame>, *const (), usize) {
         use pyre_interpreter::compile_exec;
@@ -5467,7 +5488,18 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, live_regs);
+        // Phase 2.1c removed `register_color = nlocals + depth` identity:
+        // stack-slot colors come from `stack_slot_color_map_at`. Locals
+        // remain at colors `0..nlocals` (input-arg pinning kept that
+        // half).
+        let mut live_regs: Vec<u32> = live_locals.to_vec();
+        if !live_stack_depths.is_empty() {
+            live_regs.extend_from_slice(&stack_slot_colors_for_depths(
+                jitcode_index,
+                live_stack_depths,
+            ));
+        }
+        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &live_regs);
         (frame, jitcode_ptr, resume_pc)
     }
 
@@ -5646,7 +5678,11 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+        let (resume_pc, live_regs) = live_pc_containing_all(
+            jitcode_index,
+            &code,
+            &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
+        );
 
         let mut ctx = TraceCtx::for_test(2);
         let frame_ref = ctx.const_ref(frame_ptr as i64);
@@ -5713,7 +5749,8 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+        let stack_colors = stack_slot_colors_for_depths(jitcode_index, &[0, 1]);
+        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &stack_colors);
 
         let mut ctx = TraceCtx::for_test(2);
         let frame_ref = ctx.const_ref(frame_ptr as i64);
@@ -5740,8 +5777,9 @@ mod tests {
 
         let fail_args = state.capture_current_fail_args();
 
-        assert!(live_regs.contains(&2));
-        assert!(live_regs.contains(&3));
+        for &color in &stack_colors {
+            assert!(live_regs.contains(&color));
+        }
         assert_eq!(
             fail_args.len(),
             pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS + live_regs.len(),
@@ -5751,6 +5789,10 @@ mod tests {
             fail_args.iter().all(|arg| !arg.is_none()),
             "materialized fail args should not contain OpRef::NONE holes"
         );
+        // `registers_r` is keyed by semantic slot index (locals 0..nlocals,
+        // stack nlocals..nlocals+stack_only) — `load_local_value` writes
+        // there.  Phase 2.1c only changed the post-rename color landscape,
+        // not the semantic indexing.
         assert!(
             state.symbolic_registers_r()[2..4]
                 .iter()
@@ -5858,7 +5900,11 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+        let (resume_pc, _) = live_pc_containing_all(
+            jitcode_index,
+            &code,
+            &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
+        );
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
         let obj = OpRef(0);
@@ -5920,7 +5966,11 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, _) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+        let (resume_pc, _) = live_pc_containing_all(
+            jitcode_index,
+            &code,
+            &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
+        );
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref]);
         let int_obj = OpRef(0);
@@ -6004,7 +6054,11 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+        let (resume_pc, live_regs) = live_pc_containing_all(
+            jitcode_index,
+            &code,
+            &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
+        );
 
         let run_case = |record_branch_guard: bool| {
             let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int]);
@@ -6080,13 +6134,27 @@ mod tests {
                 .map(|f| f.boxes.as_slice())
                 .unwrap_or(&[]);
             assert_eq!(active_boxes.len(), live_regs.len());
+            // Task #134 restored kind-segregated liveness emission
+            // (Int regs first, then Ref); Phase 2.1c further removed
+            // the `register_color = nlocals + depth` identity, so the
+            // active_boxes order no longer reflects Python stack
+            // depth. Verify both stack OpRefs are present without
+            // asserting an order that the protocol no longer
+            // guarantees.
             assert!(
-                active_boxes.windows(2).any(|pair| matches!(
-                    pair,
-                    [SnapshotTagged::Box(li, _), SnapshotTagged::Box(ti, _)]
-                        if *li == lower_stack.0 && *ti == truth.0
+                active_boxes.iter().any(|b| matches!(
+                    b,
+                    SnapshotTagged::Box(li, _) if *li == lower_stack.0
                 )),
-                "pre-pop stack order should preserve lower stack slot before truth: {:?}",
+                "pre-pop snapshot must capture lower stack slot: {:?}",
+                active_boxes
+            );
+            assert!(
+                active_boxes.iter().any(|b| matches!(
+                    b,
+                    SnapshotTagged::Box(ti, _) if *ti == truth.0
+                )),
+                "pre-pop snapshot must capture truth slot: {:?}",
                 active_boxes
             );
         };
@@ -6123,7 +6191,11 @@ mod tests {
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode index must exist");
-        let (resume_pc, live_regs) = live_pc_containing_all(jitcode_index, &code, &[2, 3]);
+        let (resume_pc, live_regs) = live_pc_containing_all(
+            jitcode_index,
+            &code,
+            &stack_slot_colors_for_depths(jitcode_index, &[0, 1]),
+        );
 
         let mut ctx = TraceCtx::for_test_types(&[Type::Ref, Type::Int]);
         let lower_stack = OpRef(0);
@@ -6186,13 +6258,25 @@ mod tests {
             .map(|f| f.boxes.as_slice())
             .unwrap_or(&[]);
         assert_eq!(active_boxes.len(), live_regs.len());
+        // See note on the sibling test
+        // `test_branch_guard_preserves_pre_pop_stack_shape_*`: kind
+        // segregation (Task #134) + Phase 2.1c color reassignment mean
+        // active_boxes order is dictated by liveness format, not by
+        // stack depth.
         assert!(
-            active_boxes.windows(2).any(|pair| matches!(
-                pair,
-                [SnapshotTagged::Box(li, _), SnapshotTagged::Box(ti, _)]
-                    if *li == lower_stack.0 && *ti == truth.0
+            active_boxes.iter().any(|b| matches!(
+                b,
+                SnapshotTagged::Box(li, _) if *li == lower_stack.0
             )),
-            "mixed-bank guard should preserve the Ref+Int stack pair order: {:?}",
+            "mixed-bank guard must capture lower stack slot: {:?}",
+            active_boxes
+        );
+        assert!(
+            active_boxes.iter().any(|b| matches!(
+                b,
+                SnapshotTagged::Box(ti, _) if *ti == truth.0
+            )),
+            "mixed-bank guard must capture truth slot: {:?}",
             active_boxes
         );
     }
@@ -6210,7 +6294,8 @@ mod tests {
         let (frame, jitcode_ptr, target_pc) = compiled_trace_fixture(
             "def f(x):\n    return (x, x)\nf(1)\n",
             "f",
-            &[1, 2],
+            &[],
+            &[0, 1],
             |frame| {
                 frame.locals_w_mut()[0] = w_int_new(7);
             },
@@ -6269,7 +6354,7 @@ mod tests {
         use pyre_object::w_int_new;
 
         let (frame, jitcode_ptr, resume_pc) =
-            compiled_trace_fixture("def f(b):\n    return b\nf(1)\n", "f", &[0], |frame| {
+            compiled_trace_fixture("def f(b):\n    return b\nf(1)\n", "f", &[0], &[], |frame| {
                 frame.locals_w_mut()[0] = w_int_new(2);
             });
         let frame_ptr = (&*frame) as *const PyFrame as usize;
@@ -6326,6 +6411,7 @@ mod tests {
             "def f(x):\n    return len(x)\nf([1, 2, 3])\n",
             "f",
             &[0],
+            &[],
             |frame| {
                 frame.locals_w_mut()[0] = list;
             },
@@ -6397,6 +6483,7 @@ mod tests {
             "def f(x):\n    return x[2]\nf([1.5, 2.5, 3.5])\n",
             "f",
             &[0],
+            &[],
             |frame| {
                 frame.locals_w_mut()[0] = float_list;
             },
@@ -6455,10 +6542,15 @@ mod tests {
                         concrete_value: pyre_object::PyObjectRef,
                         expected_len_descr_idx: u32,
                         expect_box_alloc: bool| {
-            let (frame, jitcode_ptr, resume_pc) =
-                compiled_trace_fixture("def f(x):\n    return x\nf([1])\n", "f", &[0], |frame| {
+            let (frame, jitcode_ptr, resume_pc) = compiled_trace_fixture(
+                "def f(x):\n    return x\nf([1])\n",
+                "f",
+                &[0],
+                &[],
+                |frame| {
                     frame.locals_w_mut()[0] = concrete_list;
-                });
+                },
+            );
             let frame_ptr = (&*frame) as *const PyFrame as usize;
 
             let mut ctx = TraceCtx::for_test_types(&[Type::Ref, symbolic_value_type]);
@@ -6562,6 +6654,7 @@ mod tests {
             "def f(it):\n    return it\nf(range(2))\n",
             "f",
             &[0],
+            &[],
             |frame| {
                 frame.locals_w_mut()[0] = range_iter;
             },

@@ -366,6 +366,65 @@ pub(super) fn perform_graph_register_allocation_all_kinds(
     regallocs
 }
 
+/// Mirrors `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args`.
+///
+/// Walks the startblock's inputargs in source order; for each inputarg
+/// of kind `K` whose current color in `regallocs[K]` does not equal
+/// the next "real" color for that kind (`0, 1, 2, ...` per appearance),
+/// invokes `swapcolors(realcol, curcol)` over the entire
+/// `coloring` map (`rpython/tool/algo/regalloc.py:138-143`).
+///
+/// Upstream `flatten_graph` runs this immediately after
+/// `regallocs[kind] = perform_register_allocation(graph, kind)` and
+/// before `generate_ssa_form` walks links, so every downstream
+/// observer sees the post-swap coloring. Pyre's pipeline currently
+/// bypasses `flatten_graph`; callers that want
+/// `count_link_renamings_per_kind` (or any future graph-driven
+/// `*_copy` emitter) to match what `flatten_graph` would produce must
+/// run this simulation explicitly first.
+///
+/// Tracks the production-wiring follow-up in Task #214.
+pub(super) fn enforce_input_args_simulation(
+    graph: &FlowGraph,
+    regallocs: &mut HashMap<Kind, GraphAllocationResult>,
+) {
+    let inputargs = graph.startblock.borrow().inputargs.clone();
+    let mut numkinds: HashMap<Kind, u16> = HashMap::new();
+    for arg in &inputargs {
+        let Some(v) = arg.as_variable() else { continue };
+        let Some(kind) = v.kind else { continue };
+        let realcol = *numkinds.get(&kind).unwrap_or(&0);
+        numkinds.insert(kind, realcol + 1);
+        let alloc = regallocs
+            .get_mut(&kind)
+            .expect("regallocs must contain an entry for every Kind seen in inputargs");
+        // Inputarg never appeared in any instruction — coloring
+        // skipped it. Swap is unnecessary because no register refers
+        // to its color (mirrors the SSARepr-side `enforce_input_args`
+        // shortcut).
+        let Some(&curcol) = alloc.coloring.get(&v.id) else {
+            continue;
+        };
+        if curcol == realcol {
+            continue;
+        }
+        assert!(
+            curcol > realcol,
+            "enforce_input_args_simulation: inputarg color {} must be >= realcol {} \
+             (regalloc.py invariant)",
+            curcol,
+            realcol,
+        );
+        for color in alloc.coloring.values_mut() {
+            if *color == curcol {
+                *color = realcol;
+            } else if *color == realcol {
+                *color = curcol;
+            }
+        }
+    }
+}
+
 /// Count the `*_copy` / `*_push` / `*_pop` ops that `insert_renamings`
 /// (`rpython/jit/codewriter/flatten.py:306-334`) would emit per `Kind`
 /// across every Link in `graph`, using `regallocs[kind].coloring` to
@@ -391,18 +450,16 @@ pub(super) fn count_link_renamings_per_kind(
 ) -> HashMap<Kind, usize> {
     // PRE-EXISTING-ADAPTATION: the `regallocs` passed in come from
     // `perform_graph_register_allocation_all_kinds`, which runs the
-    // chordal coloring directly without simulating
-    // `enforce_input_args` (`flatten.py:88-100`).  Upstream
-    // `flatten_graph` swaps inputarg colors so the startblock's
-    // inputargs land at colors `0, 1, 2, …` per kind before
-    // `generate_ssa_form` walks links.  Pyre's probe sees the
-    // pre-swap colors, so the per-link step count it reports is a
-    // lower bound on what `flatten_graph` would actually emit when
-    // the swap shifts inputarg colors and re-introduces previously
-    // coalesced renamings.  Convergence: run `enforce_input_args`
-    // simulation here (it permutes `regallocs[kind].coloring`
-    // pairwise per `swapcolors`).  Tracked as Task #214 production
-    // wiring follow-up.
+    // chordal coloring directly. Upstream `flatten_graph` follows
+    // that with `enforce_input_args` (`flatten.py:88-100`), swapping
+    // inputarg colors so the startblock's inputargs land at colors
+    // `0, 1, 2, …` per kind before `generate_ssa_form` walks links.
+    // Callers that want this probe's output to match
+    // `flatten_graph`'s post-swap reality should invoke
+    // `enforce_input_args_simulation(graph, &mut regallocs)` first;
+    // otherwise the per-link step count is a lower bound, since the
+    // swap can shift inputarg colors and re-introduce previously
+    // coalesced renamings. Production wiring is Task #214.
     let mut counts: HashMap<Kind, usize> = HashMap::new();
     for block in graph.iterblocks() {
         let block_borrow = block.borrow();
@@ -584,23 +641,6 @@ pub(super) struct ExternalInputs {
     pub portal_frame_reg: u16,
     pub portal_ec_reg: u16,
     pub portal_inputs: bool,
-    /// Pre-rename stack base (== `nlocals` in the walker's layout).
-    ///
-    /// PRE-EXISTING-ADAPTATION. The trace-side decoder in
-    /// `pyre/pyre-jit-trace/src/trace_opcode.rs` reads
-    /// `register_idx >= nlocals` as "register holds stack slot
-    /// `register_idx - nlocals`", so post-regalloc stack colors must
-    /// equal `stack_base + slot_index`. Without pinning, the chordal
-    /// coloring is free to place stack regs at any color, which breaks
-    /// the tracer's `stack_values[idx - nlocals]` lookup — see
-    /// `memory/phase1_step_d1_regalloc_rename_finding.md`.
-    pub stack_base: u16,
-    /// Number of stack slots to pin (clamp of `depth_at_pc.iter().max()`).
-    ///
-    /// RPython has no analog: its FunctionGraph decode reads PyFrame
-    /// slots via `enumerate_vars` and never reuses Python-semantic
-    /// stack indices as register names.
-    pub max_stack_depth: u16,
 }
 
 /// Result of `allocate_registers`.
@@ -642,14 +682,11 @@ pub(super) fn allocate_registers(
             for i in 0..nlocals as u16 {
                 external.push(i);
             }
-            // Pin stack slots to colors `stack_base..stack_base + max_stack_depth`.
-            // The trace-side decoder reads `register_idx >= nlocals` as
-            // "register holds stack slot `idx - nlocals`", so post-regalloc
-            // stack colors must equal `stack_base + slot_index`. See
-            // `ExternalInputs::stack_base` PRE-EXISTING-ADAPTATION docstring.
-            for d in 0..inputs.max_stack_depth {
-                external.push(inputs.stack_base + d);
-            }
+            // Phase 2.1c (plan staged-sauteeing-koala): stack slots are
+            // no longer pinned to colors `nlocals..nlocals+max_stackdepth`.
+            // `stack_slot_color_map` (PyJitCodeMetadata) records the
+            // post-rename color so decoders / blackhole resume can
+            // translate slot → color without assuming identity.
             if inputs.portal_inputs {
                 if inputs.portal_frame_reg != u16::MAX {
                     external.push(inputs.portal_frame_reg);
@@ -724,9 +761,9 @@ fn enforce_input_args(
         .get_mut(&Kind::Ref)
         .expect("Ref allocator must exist");
     let mut input_indices: Vec<u16> = (0..nlocals as u16).collect();
-    for d in 0..inputs.max_stack_depth {
-        input_indices.push(inputs.stack_base + d);
-    }
+    // Phase 2.1c (plan staged-sauteeing-koala): stack slots no longer
+    // rotated into fixed colors. The decoder consults
+    // `stack_slot_color_map` to recover the post-rename color.
     if inputs.portal_inputs {
         if inputs.portal_frame_reg != u16::MAX {
             input_indices.push(inputs.portal_frame_reg);
@@ -1319,6 +1356,56 @@ mod tests {
         assert_eq!(result.num_colors, 2);
     }
 
+    /// `flatten.py:88-100 enforce_input_args` parity at the graph
+    /// allocator level: after the simulation, every kind's startblock
+    /// inputargs occupy colors `0, 1, 2, …` in source order.
+    #[test]
+    fn enforce_input_args_simulation_normalises_graph_inputarg_colors() {
+        // 2 Ref inputargs + 1 Int inputarg, all live across an op
+        // that defines fresh Variables of each kind so the chordal
+        // coloring has to place every node on its own color.
+        let a = flow_var(0, Kind::Ref);
+        let b = flow_var(1, Kind::Ref);
+        let i = flow_var(2, Kind::Int);
+        let r0 = flow_var(10, Kind::Ref);
+        let i0 = flow_var(11, Kind::Int);
+        let start = Block::shared(vec![a.into(), b.into(), i.into()]);
+        let mut graph = FunctionGraph::new("enforce_sim", start.clone(), None);
+        push_op(
+            &start,
+            SpaceOperation::new("consume_ref", vec![a.into(), b.into()], Some(r0.into()), 0),
+        );
+        push_op(
+            &start,
+            SpaceOperation::new("consume_int", vec![i.into()], Some(i0.into()), 0),
+        );
+        let next = graph.new_block(vec![r0.into(), i0.into()]);
+        start.closeblock(vec![
+            Link::new(vec![r0.into(), i0.into()], Some(next), None).into_ref(),
+        ]);
+
+        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        enforce_input_args_simulation(&graph, &mut regallocs);
+
+        let ref_colors = &regallocs[&Kind::Ref].coloring;
+        let int_colors = &regallocs[&Kind::Int].coloring;
+        assert_eq!(
+            ref_colors.get(&a.id).copied(),
+            Some(0),
+            "first Ref inputarg must occupy color 0 post-simulation"
+        );
+        assert_eq!(
+            ref_colors.get(&b.id).copied(),
+            Some(1),
+            "second Ref inputarg must occupy color 1 post-simulation"
+        );
+        assert_eq!(
+            int_colors.get(&i.id).copied(),
+            Some(0),
+            "first Int inputarg must occupy color 0 post-simulation"
+        );
+    }
+
     /// (a) inputargs land on consecutive colors `0..n-1` regardless
     /// of how the chordal coloring picks initial colors.
     #[test]
@@ -1347,8 +1434,6 @@ mod tests {
             portal_frame_reg: 100,
             portal_ec_reg: 101,
             portal_inputs: true,
-            stack_base: 2,
-            max_stack_depth: 0,
         };
         let result = allocate_registers(&ssarepr, 2, inputs, &[]);
         let mut new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
@@ -1380,8 +1465,6 @@ mod tests {
             portal_frame_reg: u16::MAX,
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
-            stack_base: 1,
-            max_stack_depth: 0,
         };
         let result = allocate_registers(&ssarepr, 1, inputs, &[]);
         let mut new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
@@ -1420,8 +1503,6 @@ mod tests {
             portal_frame_reg: u16::MAX,
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
-            stack_base: 0,
-            max_stack_depth: 0,
         };
         let result = allocate_registers(&ssarepr, 0, inputs, &[]);
         assert_eq!(result.num_regs.get(&Kind::Ref).copied(), Some(3));
@@ -1470,8 +1551,6 @@ mod tests {
             portal_frame_reg: u16::MAX,
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
-            stack_base: 0,
-            max_stack_depth: 0,
         };
         let result = allocate_registers(&ssarepr, 0, inputs, &[]);
         let new5 = result.rename.get(&(Kind::Ref, 5)).copied().unwrap_or(5);
@@ -1514,8 +1593,6 @@ mod tests {
             portal_frame_reg: u16::MAX,
             portal_ec_reg: u16::MAX,
             portal_inputs: false,
-            stack_base: 1,
-            max_stack_depth: 0,
         };
         let result = allocate_registers(&ssarepr, 1, inputs, &[]);
         let new50 = result.rename.get(&(Kind::Ref, 50)).copied().unwrap_or(50);
