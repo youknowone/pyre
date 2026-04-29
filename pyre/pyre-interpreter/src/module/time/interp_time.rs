@@ -99,7 +99,7 @@ fn _c_gmtime(seconds: time_t) -> Option<c_tm> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn _c_gmtime(seconds: time_t) -> Option<c_tm> {
     // Windows MSVC CRT: _gmtime64_s(struct tm *result, const __time64_t *time)
     // Returns 0 on success.  The libc crate on Windows does not expose
@@ -132,7 +132,7 @@ fn _c_localtime(seconds: time_t) -> Option<c_tm> {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn _c_localtime(seconds: time_t) -> Option<c_tm> {
     unsafe extern "C" {
         fn _localtime64_s(result: *mut MsvcTm, time: *const i64) -> i32;
@@ -184,7 +184,7 @@ fn c_tm_to_libc_tm(tm: &c_tm) -> libc::tm {
 
 // ── Windows helpers ─────────────────────────────────────────────────
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 #[repr(C)]
 #[allow(non_camel_case_types)]
 struct MsvcTm {
@@ -199,7 +199,7 @@ struct MsvcTm {
     tm_isdst: i32,
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn msvc_tm_to_c_tm(tm: &MsvcTm) -> c_tm {
     c_tm {
         tm_sec: tm.tm_sec,
@@ -214,7 +214,7 @@ fn msvc_tm_to_c_tm(tm: &MsvcTm) -> c_tm {
     }
 }
 
-#[cfg(not(unix))]
+#[cfg(windows)]
 fn c_tm_to_msvc_tm(tm: &c_tm) -> MsvcTm {
     MsvcTm {
         tm_sec: tm.tm_sec,
@@ -378,8 +378,8 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     &libc_tm,
                 );
                 if n != 0 {
-                    let s = std::str::from_utf8_unchecked(&buf[..n]);
-                    return Ok(w_str_new(s));
+                    let s = String::from_utf8_lossy(&buf[..n]);
+                    return Ok(w_str_new(&s));
                 }
                 if buf.len() > 16384 {
                     return Ok(w_str_new(""));
@@ -388,7 +388,7 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
             }
         }
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         unsafe extern "C" {
             fn strftime(
@@ -409,8 +409,8 @@ pub fn strftime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
                     &msvc_tm,
                 );
                 if n != 0 {
-                    let s = std::str::from_utf8_unchecked(&buf[..n]);
-                    return Ok(w_str_new(s));
+                    let s = String::from_utf8_lossy(&buf[..n]);
+                    return Ok(w_str_new(&s));
                 }
                 if buf.len() > 16384 {
                     return Ok(w_str_new(""));
@@ -433,7 +433,7 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         tm.tm_wday = libc_tm.tm_wday;
         result as i64
     };
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     let tt = {
         unsafe extern "C" {
             fn _mktime64(timeptr: *mut MsvcTm) -> i64;
@@ -463,13 +463,11 @@ pub fn asctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if p.is_null() {
             return Err(crate::PyError::value_error("unconvertible time"));
         }
-        let s = unsafe { std::ffi::CStr::from_ptr(p) }
-            .to_str()
-            .unwrap_or("")
-            .trim_end_matches('\n');
+        let lossy = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+        let s = lossy.trim_end_matches('\n');
         Ok(w_str_new(s))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         unsafe extern "C" {
             fn asctime(timeptr: *const MsvcTm) -> *const libc::c_char;
@@ -479,10 +477,8 @@ pub fn asctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if p.is_null() {
             return Err(crate::PyError::value_error("unconvertible time"));
         }
-        let s = unsafe { std::ffi::CStr::from_ptr(p) }
-            .to_str()
-            .unwrap_or("")
-            .trim_end_matches('\n');
+        let lossy = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+        let s = lossy.trim_end_matches('\n');
         Ok(w_str_new(s))
     }
 }
@@ -499,13 +495,11 @@ pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if p.is_null() {
             return Err(crate::PyError::value_error("unconvertible time"));
         }
-        let s = unsafe { std::ffi::CStr::from_ptr(p) }
-            .to_str()
-            .unwrap_or("")
-            .trim_end_matches('\n');
+        let lossy = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+        let s = lossy.trim_end_matches('\n');
         Ok(w_str_new(s))
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
     {
         unsafe extern "C" {
             fn _ctime64(time: *const i64) -> *const libc::c_char;
@@ -514,10 +508,8 @@ pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
         if p.is_null() {
             return Err(crate::PyError::value_error("unconvertible time"));
         }
-        let s = unsafe { std::ffi::CStr::from_ptr(p) }
-            .to_str()
-            .unwrap_or("")
-            .trim_end_matches('\n');
+        let lossy = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+        let s = lossy.trim_end_matches('\n');
         Ok(w_str_new(s))
     }
 }
