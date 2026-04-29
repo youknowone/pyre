@@ -3553,10 +3553,11 @@ fn materialize_virtual_from_rd(
             assert_eq!(offsets.len(), fieldnums.len());
             // resume.py:701-703: buffer = decoder.allocate_raw_buffer(func, size)
             let (driver, _) = driver_pair();
-            let calldescr = majit_translate::jitcode::BhCallDescr {
-                arg_classes: "i".into(),
-                result_type: 'i',
-            };
+            let calldescr = majit_translate::jitcode::BhCallDescr::from_arg_classes(
+                "i".into(),
+                'i',
+                majit_ir::descr::EffectInfo::MOST_GENERAL,
+            );
             let buffer = driver.meta_interp().backend().bh_call_i(
                 *func,
                 Some(&[*size as i64]),
@@ -3734,6 +3735,14 @@ fn materialize_virtual_from_rd(
             let bh_calldescr = majit_translate::jitcode::BhCallDescr {
                 arg_classes: cd.arg_classes(),
                 result_type: cd.result_class(),
+                result_signed: cd.is_result_signed(),
+                result_size: cd.result_size(),
+                result_erased: majit_translate::jitcode::CallResultErasedKey::from_ir_layout(
+                    cd.result_type(),
+                    cd.is_result_signed(),
+                    cd.result_size(),
+                ),
+                extra_info: cd.get_extra_info().clone(),
             };
             // resume.py:1462-1470 concat_strings / resume.py:1489-1497
             // concat_unicodes — cpu.bh_call_r(func, [left, right], descr).
@@ -3812,6 +3821,14 @@ fn materialize_virtual_from_rd(
             let bh_calldescr = majit_translate::jitcode::BhCallDescr {
                 arg_classes: cd.arg_classes(),
                 result_type: cd.result_class(),
+                result_signed: cd.is_result_signed(),
+                result_size: cd.result_size(),
+                result_erased: majit_translate::jitcode::CallResultErasedKey::from_ir_layout(
+                    cd.result_type(),
+                    cd.is_result_signed(),
+                    cd.result_size(),
+                ),
+                extra_info: cd.get_extra_info().clone(),
             };
             // resume.py:1472-1480 slice_string / resume.py:1499-1507
             // slice_unicode — cpu.bh_call_r(func, [str, start, stop], descr).
@@ -5313,10 +5330,11 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     /// Concrete reader: cpu.bh_call_i(func, [size], None, None, calldescr)
     fn allocate_raw_buffer(&self, func: i64, size: usize) -> i64 {
         let (driver, _) = driver_pair();
-        let calldescr = majit_translate::jitcode::BhCallDescr {
-            arg_classes: "i".into(),
-            result_type: 'i',
-        };
+        let calldescr = majit_translate::jitcode::BhCallDescr::from_arg_classes(
+            "i".into(),
+            'i',
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
         driver
             .meta_interp()
             .backend()

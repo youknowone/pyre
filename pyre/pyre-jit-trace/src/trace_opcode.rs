@@ -5292,7 +5292,17 @@ impl MIFrame {
                 return action;
             }
             Some(Err(e)) => Err(e),
-            None => execute_opcode_step(self, code, instruction, op_arg, pc + 1),
+            None => {
+                let shadow_outcome =
+                    crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
+                let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+                if result.is_ok() {
+                    if let Some(outcome) = shadow_outcome {
+                        crate::shadow_walker::shadow_validate_post(self, outcome);
+                    }
+                }
+                result
+            }
         };
         // Clear pre-opcode snapshot immediately after opcode execution.
         // RPython: capture_resumedata is called at each guard; there is
@@ -5697,7 +5707,17 @@ impl MIFrame {
                 return InlineTraceStepAction::Trace(action);
             }
             Some(Err(e)) => Err(e),
-            None => execute_opcode_step(self, code, instruction, op_arg, pc + 1),
+            None => {
+                let shadow_outcome =
+                    crate::shadow_walker::shadow_validate_pre(self, &instruction, op_arg);
+                let result = execute_opcode_step(self, code, instruction, op_arg, pc + 1);
+                if result.is_ok() {
+                    if let Some(outcome) = shadow_outcome {
+                        crate::shadow_walker::shadow_validate_post(self, outcome);
+                    }
+                }
+                result
+            }
         };
         if needs_pre_opcode_snapshot {
             self.clear_pre_opcode_state();

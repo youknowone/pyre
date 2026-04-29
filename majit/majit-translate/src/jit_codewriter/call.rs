@@ -13,6 +13,7 @@ use majit_ir::value::Type;
 use serde::{Deserialize, Serialize};
 
 use crate::front::ast::SemanticFunction;
+use crate::jitcode::{BhCallDescr, CallResultErasedKey};
 use crate::model::{CallTarget, FunctionGraph, LinkArg, OpKind, SpaceOperation};
 use crate::parse::CallPath;
 use crate::policy::JitPolicy;
@@ -101,21 +102,133 @@ pub struct WriteAnalysis {
 /// (model.rs:247) so this struct holds only the calldescr-side data.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CallDescriptor {
+    /// RPython `CallDescr.arg_classes`: one char per non-void FUNC argument.
+    pub arg_classes: String,
+    /// RPython `CallDescr.result_type`.
+    pub result_type: char,
+    /// RPython `descr.py:664` `result_signed`.
+    pub result_signed: bool,
+    /// RPython `descr.py:662` `result_size`.
+    pub result_size: usize,
+    /// RPython `descr.py:665` `RESULT_ERASED`.
+    pub result_erased: CallResultErasedKey,
     pub extra_info: EffectInfo,
 }
 
 impl CallDescriptor {
     pub fn known(extra_info: EffectInfo) -> Self {
-        Self { extra_info }
+        Self::from_signature(&[], Type::Void, extra_info)
     }
 
     pub fn override_effect(extra_info: EffectInfo) -> Self {
-        Self { extra_info }
+        Self::from_signature(&[], Type::Void, extra_info)
+    }
+
+    pub fn from_signature(arg_types: &[Type], result_type: Type, extra_info: EffectInfo) -> Self {
+        let arg_classes = arg_types.iter().map(|tp| type_to_argclass(*tp)).collect();
+        let (result_type, result_signed, result_size, result_erased) =
+            result_layout_key(result_type);
+        Self {
+            arg_classes,
+            result_type,
+            result_signed,
+            result_size,
+            result_erased,
+            extra_info,
+        }
+    }
+
+    pub fn with_signature(mut self, arg_types: &[Type], result_type: Type) -> Self {
+        let (result_type, result_signed, result_size, result_erased) =
+            result_layout_key(result_type);
+        self.arg_classes = arg_types.iter().map(|tp| type_to_argclass(*tp)).collect();
+        self.result_type = result_type;
+        self.result_signed = result_signed;
+        self.result_size = result_size;
+        self.result_erased = result_erased;
+        self
     }
 
     pub fn get_extra_info(&self) -> EffectInfo {
         self.extra_info.clone()
     }
+
+    pub fn arg_types(&self) -> Vec<Type> {
+        self.arg_classes
+            .chars()
+            .filter_map(argclass_to_ir_type)
+            .collect()
+    }
+
+    pub fn result_ir_type(&self) -> Type {
+        result_char_to_ir_type(self.result_type)
+    }
+
+    pub fn to_bh_calldescr(&self) -> BhCallDescr {
+        BhCallDescr {
+            arg_classes: self.arg_classes.clone(),
+            result_type: self.result_type,
+            result_signed: self.result_signed,
+            result_size: self.result_size,
+            result_erased: self.result_erased,
+            extra_info: self.extra_info.clone(),
+        }
+    }
+
+    pub fn to_descr_ref(&self) -> majit_ir::descr::DescrRef {
+        majit_ir::descr::make_call_descr_full(
+            0,
+            self.arg_types(),
+            self.result_ir_type(),
+            self.result_signed,
+            self.result_size,
+            self.extra_info.clone(),
+        )
+    }
+}
+
+fn type_to_argclass(tp: Type) -> char {
+    match tp {
+        Type::Int => 'i',
+        Type::Ref => 'r',
+        Type::Float => 'f',
+        Type::Void => 'v',
+    }
+}
+
+fn argclass_to_ir_type(c: char) -> Option<Type> {
+    match c {
+        'i' | 'S' => Some(Type::Int),
+        'r' => Some(Type::Ref),
+        'f' | 'L' => Some(Type::Float),
+        'v' => None,
+        _ => None,
+    }
+}
+
+fn result_char_to_ir_type(c: char) -> Type {
+    match c {
+        'i' | 'S' => Type::Int,
+        'r' => Type::Ref,
+        'f' | 'L' => Type::Float,
+        'v' => Type::Void,
+        _ => Type::Void,
+    }
+}
+
+fn result_layout_key(result_type: Type) -> (char, bool, usize, CallResultErasedKey) {
+    let result_char = type_to_argclass(result_type);
+    let result_signed = result_type == Type::Int;
+    let result_size = match result_type {
+        Type::Int | Type::Ref | Type::Float => 8,
+        Type::Void => 0,
+    };
+    (
+        result_char,
+        result_signed,
+        result_size,
+        CallResultErasedKey::from_ir_layout(result_type, result_signed, result_size),
+    )
 }
 
 /// Call classification — RPython `guess_call_kind()` return values.
@@ -738,6 +851,13 @@ impl CallControl {
         self.struct_fields.field_type(owner, field_name)
     }
 
+    /// RPython: ordered `STRUCT._names` + field types for descriptor layout
+    /// reconstruction. The order is required to reproduce
+    /// `symbolic.get_field_token()`.
+    pub fn struct_field_entries(&self, owner: &str) -> Option<&[(String, String)]> {
+        self.struct_fields.fields.get(owner).map(Vec::as_slice)
+    }
+
     /// RPython: `cpu.arraydescrof(ARRAY)` — descr.py:348-378.
     ///
     /// `array_type_id`: full ARRAY type string (e.g. `"Vec<Point>"`), matching
@@ -784,15 +904,17 @@ impl CallControl {
         // RPython: descr.py:372-375 — struct arrays get interior field descriptors.
         if is_struct {
             if let Some(struct_name) = elem_ref {
+                // `descr.py:388 InteriorFieldDescr.__init__` carries the
+                // exact `arraydescr` object the surrounding ArrayDescr
+                // factory returns; preserve that identity by publishing
+                // the final Arc first and routing the interior list back
+                // onto it via the `OnceLock` interior-mutability setter.
                 let ad_arc = std::sync::Arc::new(ad);
                 let (descrs, _) = all_interiorfielddescrs(self, struct_name, ad_arc.clone());
                 if !descrs.is_empty() {
-                    let mut ad_mut = (*ad_arc).clone();
-                    ad_mut.set_all_interiorfielddescrs(descrs);
-                    return std::sync::Arc::new(ad_mut);
-                } else {
-                    return ad_arc;
+                    ad_arc.set_all_interiorfielddescrs(descrs);
                 }
+                return ad_arc;
             }
         }
         std::sync::Arc::new(ad)
@@ -1878,7 +2000,7 @@ impl CallControl {
             // the candidate `Vec<CallPath>` directly; `target_to_path` only
             // names direct_call-equivalent sites.  `call.py:94-114` indirect
             // branch.
-            CallTarget::Indirect { .. } => None,
+            CallTarget::SyntheticTransparentCtor { .. } | CallTarget::Indirect { .. } => None,
             CallTarget::UnsupportedExpr => None,
         }
     }
@@ -2045,6 +2167,13 @@ impl CallControl {
     /// Access the function graphs map (for inline pass).
     pub fn function_graphs(&self) -> &HashMap<CallPath, FunctionGraph> {
         &self.function_graphs
+    }
+
+    /// Returns true when a concrete helper address was registered for this
+    /// path. Such a path is a real callable surface and must not be treated
+    /// as a transparent Rust enum constructor by jtransform.
+    pub fn has_function_fnaddr(&self, path: &CallPath) -> bool {
+        self.function_fnaddrs.contains_key(path)
     }
 
     /// Access the `{CallPath → Arc<JitCode>}` map.
@@ -2715,23 +2844,60 @@ impl CallControl {
         //   if RESULT != FUNC.RESULT: raise
         match shape {
             CallShape::Direct(target) => {
-                // Warn-only for direct because pyre's static-analysis arity
-                // inference is approximate (see test_getcalldescr_rewrites).
-                // Parameter list is recovered from startblock `OpKind::Input`
-                // ops (`front/ast.rs:706-748` convention), not from
-                // `block.inputargs` — the Rust front-end never populates the
-                // latter.  `graph_non_void_arg_types` encapsulates this.
-                if !arg_types.is_empty() {
-                    if let Some(path) = self.target_to_path(target) {
-                        if let Some(graph) = self.function_graphs.get(&path) {
-                            let expected_arg_types = graph_non_void_arg_types(graph);
-                            let expected_arity = expected_arg_types.len();
-                            if arg_types.len() != expected_arity {
-                                eprintln!(
-                                    "[getcalldescr] WARNING: {target} expects \
-                                     {expected_arity} args but got {} \
-                                     (NON_VOID_ARGS mismatch)",
-                                    arg_types.len()
+                // RPython call.py:223-228: NON_VOID_ARGS != FUNC.ARGS-without-void
+                // → raise Exception. Parameter list is recovered from startblock
+                // `OpKind::Input` ops (`front/ast.rs:706-748` convention) when
+                // `block.inputargs` is unpopulated; `graph_non_void_arg_types`
+                // encapsulates the convention so direct-call validation matches
+                // upstream's hard-fail semantics.
+                if let Some(path) = self.target_to_path(target) {
+                    if let Some(graph) = self.function_graphs.get(&path) {
+                        let expected_arg_types = graph_non_void_arg_types(graph);
+                        // RPython call.py:223-228 compares the full
+                        // `concretetype` list. Pyre's caller-side
+                        // `arg_types` comes from `resolve_non_void_arg_types`
+                        // which falls back to `Type::Ref` whenever the
+                        // type-state has no resolved entry for the
+                        // ValueId.  Trait-method test fixtures
+                        // (`transform_all_handlers_to_jitcode`) hit that
+                        // path because they construct `CallControl` without
+                        // a populated `TypeResolutionState`, so the kind
+                        // tail of every arg appears as `Ref` even when the
+                        // callee declares `Int`.  Hard-fail only on arity
+                        // mismatch — the kind tail surfaces as a soft
+                        // signal until the type-state propagation lands
+                        // (`call.py:230` parity).
+                        if arg_types.len() != expected_arg_types.len() {
+                            panic!(
+                                "in operation calling {target}: calling a \
+                                 function with non-void arg kinds \
+                                 {expected_arg_types:?}, but passing actual \
+                                 arg kinds {arg_types:?}",
+                            );
+                        }
+                        // RPython call.py:230-234 `if RESULT != FUNC.RESULT:
+                        // raise` only validates when the callee's signature
+                        // is known.  Pyre's `return_types` side-map is
+                        // populated for free-fn graphs but stays empty for
+                        // trait-method graphs registered via
+                        // `register_trait_method` (the test fixture path
+                        // exercised by `transform_all_handlers_to_jitcode`).
+                        // Without an explicit entry the fallback decodes to
+                        // `Void`, which would spuriously trip every
+                        // `H::push_value` / `H::pop_value` style call site
+                        // whose result is `Ref`.  Gate the panic on a real
+                        // entry; missing entries leave the result type
+                        // un-validated, matching the trait-method state
+                        // before the `f9738863011` squash widened this
+                        // branch from warn-only to hard-fail.
+                        if let Some(declared) = self.return_types.get(&path) {
+                            let expected_result = return_type_string_to_value_type(Some(declared));
+                            if result_type != expected_result {
+                                panic!(
+                                    "in operation calling {target}: calling a \
+                                     function with return type \
+                                     {expected_result:?}, but the actual \
+                                     return type is {result_type:?}",
                                 );
                             }
                         }
@@ -2908,13 +3074,10 @@ impl CallControl {
         // RPython call.py:334-335:
         //   return self.cpu.calldescrof(FUNC, tuple(NON_VOID_ARGS), RESULT,
         //                               effectinfo)
-        // Pyre's CallDescriptor mirrors just the effectinfo; the matching
-        // funcptr is plumbed separately by callers.  result_type drove the
-        // signature validation above.
-        let _ = result_type;
-        CallDescriptor {
-            extra_info: effectinfo,
-        }
+        // Pyre's CallDescriptor stores the same structural cache key that
+        // RPython's `cpu.calldescrof()` would use; the matching funcptr is
+        // plumbed separately by callers.
+        CallDescriptor::from_signature(&arg_types, result_type, effectinfo)
     }
 
     /// RPython: calldescr_canraise(calldescr) (call.py:357-359).
@@ -4466,6 +4629,11 @@ mod tests {
         g
     }
 
+    fn register_int_result_graph(cc: &mut CallControl, path: CallPath, graph: FunctionGraph) {
+        cc.return_types.insert(path.clone(), "i64".to_string());
+        cc.register_function_graph(path, graph);
+    }
+
     /// Helper: create a FunctionGraph whose entry block routes to the
     /// canonical exceptblock, matching upstream's Link(..., exceptblock)
     /// shape for unconditional raise sites.
@@ -4513,7 +4681,7 @@ mod tests {
         // A simple function with no Abort → CannotRaise.
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["pure_add"]);
-        cc.register_function_graph(path.clone(), simple_graph("pure_add"));
+        register_int_result_graph(&mut cc, path.clone(), simple_graph("pure_add"));
         cc.find_all_graphs_for_tests();
 
         let target = CallTarget::function_path(["pure_add"]);
@@ -4556,7 +4724,7 @@ mod tests {
         // An elidable function that cannot raise → ElidableCannotRaise.
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["pure_lookup"]);
-        cc.register_function_graph(path.clone(), simple_graph("pure_lookup"));
+        register_int_result_graph(&mut cc, path.clone(), simple_graph("pure_lookup"));
         cc.mark_elidable(path);
         cc.find_all_graphs_for_tests();
 
@@ -4581,7 +4749,7 @@ mod tests {
         // An elidable function that CAN raise → ElidableCanRaise.
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["elidable_raiser"]);
-        cc.register_function_graph(path.clone(), raising_graph("elidable_raiser"));
+        register_int_result_graph(&mut cc, path.clone(), raising_graph("elidable_raiser"));
         cc.mark_elidable(path);
         cc.find_all_graphs_for_tests();
 
@@ -4606,7 +4774,7 @@ mod tests {
         // A loop-invariant function → LoopInvariant.
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["get_config"]);
-        cc.register_function_graph(path.clone(), simple_graph("get_config"));
+        register_int_result_graph(&mut cc, path.clone(), simple_graph("get_config"));
         cc.mark_loopinvariant(path);
         cc.find_all_graphs_for_tests();
 
@@ -4658,7 +4826,7 @@ mod tests {
         // When extraeffect is provided, it overrides the analyzers.
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["func"]);
-        cc.register_function_graph(path, simple_graph("func"));
+        register_int_result_graph(&mut cc, path, simple_graph("func"));
         cc.find_all_graphs_for_tests();
 
         let target = CallTarget::function_path(["func"]);
@@ -4827,7 +4995,7 @@ mod tests {
         );
         graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["pure_writer"]);
-        cc.register_function_graph(path.clone(), graph);
+        register_int_result_graph(&mut cc, path.clone(), graph);
         cc.mark_elidable(path);
         cc.find_all_graphs_for_tests();
 

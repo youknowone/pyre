@@ -7,11 +7,12 @@
 //! **Status: partial port.** `write_insn`, `fix_labels`, the
 //! `all_liveness` shared table, and the `IndirectCallTargets` sidecar
 //! merge for `residual_call` are implemented in the pyre-relevant
-//! subset.  `SwitchDictDescr` and full RPython parity for the
-//! remaining descriptor kinds are still pending.
+//! subset. Descriptor operands are deduplicated through the RPython
+//! `_descr_dict` shape before bytecode emission.
 
 use std::collections::HashMap;
 
+use crate::call::CallControl;
 use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody};
@@ -31,6 +32,12 @@ pub struct Assembler {
     /// descriptors keep the callee JitCode object until the final
     /// snapshot, where `jitcode.index` is guaranteed to be assigned.
     descrs: Vec<AssemblerDescr>,
+    /// RPython: Assembler._descr_dict — descriptor to descrs[] index.
+    ///
+    /// This is one of the few legitimate HashMaps in the port: upstream
+    /// assembler.py keeps a real dict at lines 26 and 197-203 to deduplicate
+    /// AbstractDescr objects before emitting the two-byte 'd' operand.
+    descr_dict: HashMap<AssemblerDescrKey, usize>,
     /// RPython: `Assembler.indirectcalltargets` — merged `IndirectCallTargets`
     /// sidecars from every `residual_call` emitted during assembly
     /// (`assembler.py:208-209`).  RPython stores `JitCode` objects; we
@@ -78,6 +85,7 @@ impl Assembler {
         Self {
             insns: HashMap::new(),
             descrs: Vec::new(),
+            descr_dict: HashMap::new(),
             indirectcalltargets: std::collections::HashSet::new(),
             list_of_addr2name: Vec::new(),
             count_jitcodes: 0,
@@ -91,8 +99,29 @@ impl Assembler {
         }
     }
 
-    fn push_ready_descr(&mut self, descr: crate::jitcode::BhDescr) {
-        self.descrs.push(AssemblerDescr::Ready(descr));
+    /// RPython: `Assembler.assemble` descriptor operand path
+    /// (`assembler.py:197-207`).
+    ///
+    /// A descriptor is inserted into `descrs` only once and every later bytecode
+    /// operand reuses the same two-byte index from `_descr_dict`.
+    fn emit_descr(&mut self, descr: AssemblerDescr) -> usize {
+        let key = AssemblerDescrKey::from_descr(&descr);
+        if let Some(index) = self.descr_dict.get(&key) {
+            return *index;
+        }
+        let index = self.descrs.len();
+        assert!(index <= 0xFFFF, "too many AbstractDescrs!");
+        self.descrs.push(descr);
+        self.descr_dict.insert(key, index);
+        index
+    }
+
+    fn emit_ready_descr(&mut self, descr: crate::jitcode::BhDescr) -> usize {
+        self.emit_descr(AssemblerDescr::Ready(descr))
+    }
+
+    fn emit_pending_jitcode_descr(&mut self, jitcode: crate::jitcode::JitCodeHandle) -> usize {
+        self.emit_descr(AssemblerDescr::PendingJitCode { jitcode })
     }
 
     /// RPython: `Assembler.assemble(ssarepr, jitcode, num_regs)`.
@@ -112,6 +141,15 @@ impl Assembler {
         &mut self,
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
+    ) -> JitCodeBody {
+        self.assemble_with_callcontrol(ssarepr, regallocs, None)
+    }
+
+    pub fn assemble_with_callcontrol(
+        &mut self,
+        ssarepr: &mut SSARepr,
+        regallocs: &HashMap<RegKind, RegAllocResult>,
+        callcontrol: Option<&CallControl>,
     ) -> JitCodeBody {
         // RPython codewriter.py:56: compute_liveness(ssarepr)
         // Must run BEFORE assembly so -live- markers carry the full
@@ -167,7 +205,7 @@ impl Assembler {
             if debug_enabled {
                 self.current_flatop_debug = Some(format!("{op:?}"));
             }
-            self.write_insn(op, regallocs, &mut state);
+            self.write_insn(op, regallocs, &mut state, callcontrol);
         }
         self.current_flatop_debug = None;
         ssarepr.insns_pos = Some(insns_pos);
@@ -230,6 +268,7 @@ impl Assembler {
         op: &FlatOp,
         regallocs: &HashMap<RegKind, RegAllocResult>,
         state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
     ) {
         match op {
             // RPython assembler.py:143-144: Label → record bytecode position
@@ -277,7 +316,7 @@ impl Assembler {
 
             // RPython assembler.py:159-223: regular operation
             FlatOp::Op(inner_op) => {
-                self.encode_op(inner_op, regallocs, state);
+                self.encode_op(inner_op, regallocs, state, callcontrol);
             }
 
             // RPython flatten.py: 'goto' + TLabel
@@ -619,6 +658,7 @@ impl Assembler {
         op: &crate::model::SpaceOperation,
         regallocs: &HashMap<RegKind, RegAllocResult>,
         state: &mut AssemblyState,
+        callcontrol: Option<&CallControl>,
     ) {
         use crate::model::OpKind;
 
@@ -645,17 +685,7 @@ impl Assembler {
             } => {
                 // RPython assembler.py:197-207: jitcode → descrs[index]
                 // The JitCode object IS the descriptor for inline_call.
-                let descr_idx = self.descrs.len();
-                let calldescr = crate::jitcode::BhCallDescr {
-                    arg_classes: self
-                        .kinds_suffix(args_i, args_r, args_f, *result_kind)
-                        .to_string(),
-                    result_type: *result_kind,
-                };
-                self.descrs.push(AssemblerDescr::PendingJitCode {
-                    jitcode: jitcode.clone(),
-                    calldescr,
-                });
+                let descr_idx = self.emit_pending_jitcode_descr(jitcode.clone());
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -677,15 +707,13 @@ impl Assembler {
                 // Result — see residual_call note below: derive the
                 // key-level `reskind` from regalloc so `_r_i` / `_r_r`
                 // match the actual `>X` argcode suffix.
-                let result_key_kind = if let Some(result) = op.result {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
-                    kc
-                } else {
-                    *result_kind
-                };
+                let result_key_kind = self.emit_call_result_arg(
+                    op.result,
+                    *result_kind,
+                    regallocs,
+                    state,
+                    &mut argcodes,
+                );
                 // RPython jtransform.py:434: inline_call_{kinds}_{reskind}
                 let key = format!("inline_call_{kinds}_{result_key_kind}/{argcodes}");
                 let opnum = self.get_opnum(&key);
@@ -729,13 +757,14 @@ impl Assembler {
                 argcodes.push('R');
                 self.emit_list_of_kind(reds_f, RegKind::Float, regallocs, state);
                 argcodes.push('F');
-                if let Some(result) = op.result {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
-                }
-                let key = format!("recursive_call_{result_kind}/{argcodes}");
+                let result_key_kind = self.emit_call_result_arg(
+                    op.result,
+                    *result_kind,
+                    regallocs,
+                    state,
+                    &mut argcodes,
+                );
+                let key = format!("recursive_call_{result_key_kind}/{argcodes}");
                 let opnum = self.get_opnum(&key);
                 state.code[startposition] = opnum;
             }
@@ -746,7 +775,7 @@ impl Assembler {
             // by kind via make_three_lists.
             OpKind::CallResidual {
                 funcptr,
-                descriptor: _,
+                descriptor,
                 args_i,
                 args_r,
                 args_f,
@@ -755,7 +784,7 @@ impl Assembler {
             }
             | OpKind::CallMayForce {
                 funcptr,
-                descriptor: _,
+                descriptor,
                 args_i,
                 args_r,
                 args_f,
@@ -764,7 +793,7 @@ impl Assembler {
             }
             | OpKind::CallElidable {
                 funcptr,
-                descriptor: _,
+                descriptor,
                 args_i,
                 args_r,
                 args_f,
@@ -806,19 +835,12 @@ impl Assembler {
                         panic!("call op reached assembler without materialized funcptr: {target}");
                     }
                 }
-                // Reserve the descr slot up front — the index is allocated
-                // here so the `arg_classes` suffix below can reference it,
-                // but the two bytes are written AFTER the I/R/F lists to
-                // match `jtransform.py:422-431` ordering: `iIRFd` /
-                // `iIRd` / `iRd`.
-                let descr_idx = self.descrs.len();
-                let calldescr = crate::jitcode::BhCallDescr {
-                    arg_classes: self
-                        .kinds_suffix(args_i, args_r, args_f, *result_kind)
-                        .to_string(),
-                    result_type: *result_kind,
-                };
-                self.push_ready_descr(crate::jitcode::BhDescr::Call { calldescr });
+                // RPython `assembler.py:197-203`: resolve the descriptor
+                // through `_descr_dict` before writing the two bytes. The
+                // bytes are still written AFTER the I/R/F lists to match
+                // `jtransform.py:422-431` ordering: `iIRFd` / `iIRd` / `iRd`.
+                let calldescr = descriptor.to_bh_calldescr();
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Call { calldescr });
                 // RPython jtransform.py:422-431: kind-separated sublists
                 let kinds = self.kinds_suffix(args_i, args_r, args_f, *result_kind);
                 if kinds.contains('i') {
@@ -852,15 +874,13 @@ impl Assembler {
                 // name suffix from the regalloc-determined class so
                 // `base_{kinds}_{reskind}` stays consistent with the
                 // argcode `>X` suffix. If no result, fall back to `v`.
-                let result_key_kind = if let Some(result) = op.result {
-                    argcodes.push('>');
-                    let (reg, kc) = self.lookup_reg_with_kind(result, regallocs);
-                    argcodes.push(kc);
-                    state.code.push(reg);
-                    kc
-                } else {
-                    *result_kind
-                };
+                let result_key_kind = self.emit_call_result_arg(
+                    op.result,
+                    *result_kind,
+                    regallocs,
+                    state,
+                    &mut argcodes,
+                );
                 // RPython jtransform.py:434: {base}_{kinds}_{reskind}
                 let key = format!("{base}_{kinds}_{result_key_kind}/{argcodes}");
                 let opnum = self.get_opnum(&key);
@@ -900,17 +920,15 @@ impl Assembler {
             // Field operations: register + descriptor.
             // RPython assembler.py:197-207: AbstractDescr → 2-byte index.
             OpKind::FieldRead {
-                base, field, pure, ..
+                base,
+                field,
+                ty,
+                pure,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let descr_idx = self.descrs.len();
-                self.push_ready_descr(crate::jitcode::BhDescr::Field {
-                    offset: 0,
-                    name: field.name.clone(),
-                    owner: field.owner_root.clone().unwrap_or_default(),
-                });
+                let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -958,8 +976,7 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind(*receiver, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let descr_idx = self.descrs.len();
-                self.push_ready_descr(crate::jitcode::BhDescr::VtableMethod {
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VtableMethod {
                     trait_root: trait_root.clone(),
                     method_name: method_name.clone(),
                 });
@@ -992,12 +1009,11 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 for fd in [field, mutate_field] {
-                    let descr_idx = self.descrs.len();
-                    self.push_ready_descr(crate::jitcode::BhDescr::Field {
-                        offset: 0,
-                        name: fd.name.clone(),
-                        owner: fd.owner_root.clone().unwrap_or_default(),
-                    });
+                    let descr_idx = self.emit_ready_descr(fielddescrof(
+                        fd,
+                        &crate::model::ValueType::Unknown,
+                        callcontrol,
+                    ));
                     state.code.push((descr_idx & 0xFF) as u8);
                     state.code.push((descr_idx >> 8) as u8);
                     argcodes.push('d');
@@ -1008,7 +1024,10 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
             OpKind::FieldWrite {
-                base, value, field, ..
+                base,
+                value,
+                field,
+                ty,
             } => {
                 let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
                 state.code.push(reg);
@@ -1016,12 +1035,7 @@ impl Assembler {
                 let (reg, value_kind) = self.lookup_reg_with_kind(*value, regallocs);
                 state.code.push(reg);
                 argcodes.push(value_kind);
-                let descr_idx = self.descrs.len();
-                self.push_ready_descr(crate::jitcode::BhDescr::Field {
-                    offset: 0,
-                    name: field.name.clone(),
-                    owner: field.owner_root.clone().unwrap_or_default(),
-                });
+                let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -1047,14 +1061,8 @@ impl Assembler {
                 let (reg, kc) = self.lookup_reg_with_kind(*index, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (itemsize, is_item_signed) = arraydescrof(item_ty, array_type_id.as_deref());
-                let descr_idx = self.descrs.len();
-                self.push_ready_descr(crate::jitcode::BhDescr::Array {
-                    itemsize,
-                    is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
-                    is_array_of_structs: false,
-                    is_item_signed,
-                });
+                let descr_idx =
+                    self.emit_ready_descr(arraydescrof(item_ty, array_type_id, callcontrol));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -1090,14 +1098,8 @@ impl Assembler {
                 let (reg, value_kind) = self.lookup_reg_with_kind(*value, regallocs);
                 state.code.push(reg);
                 argcodes.push(value_kind);
-                let (itemsize, is_item_signed) = arraydescrof(item_ty, array_type_id.as_deref());
-                let descr_idx = self.descrs.len();
-                self.push_ready_descr(crate::jitcode::BhDescr::Array {
-                    itemsize,
-                    is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
-                    is_array_of_structs: false,
-                    is_item_signed,
-                });
+                let descr_idx =
+                    self.emit_ready_descr(arraydescrof(item_ty, array_type_id, callcontrol));
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
@@ -1117,8 +1119,7 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 // RPython: vable field → VableField descriptor (index, not byte offset).
-                let descr_idx = self.descrs.len();
-                self.push_ready_descr(crate::jitcode::BhDescr::VableField {
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VableField {
                     index: *field_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
@@ -1155,8 +1156,7 @@ impl Assembler {
                 let (reg, value_kind) = self.lookup_reg_with_kind(*value, regallocs);
                 state.code.push(reg);
                 argcodes.push(value_kind);
-                let descr_idx = self.descrs.len();
-                self.push_ready_descr(crate::jitcode::BhDescr::VableField {
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VableField {
                     index: *field_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
@@ -1185,21 +1185,18 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 // RPython: two descriptors — fielddescr (vable array field) + arraydescr.
-                let descr_idx = self.descrs.len();
-                self.push_ready_descr(crate::jitcode::BhDescr::VableArray {
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VableArray {
                     index: *array_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
                 // Second descriptor: arraydescr from VirtualizableInfo.array_descrs.
-                let descr_idx2 = self.descrs.len();
-                self.push_ready_descr(crate::jitcode::BhDescr::Array {
-                    itemsize: *array_itemsize,
-                    is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
-                    is_array_of_structs: false,
-                    is_item_signed: *array_is_signed,
-                });
+                let descr_idx2 = self.emit_ready_descr(vable_arraydescrof(
+                    item_ty,
+                    *array_itemsize,
+                    *array_is_signed,
+                ));
                 state.code.push((descr_idx2 & 0xFF) as u8);
                 state.code.push((descr_idx2 >> 8) as u8);
                 argcodes.push('d');
@@ -1233,21 +1230,18 @@ impl Assembler {
                 state.code.push(reg);
                 argcodes.push(kc);
                 // RPython: two descriptors — fielddescr (vable array field) + arraydescr.
-                let descr_idx = self.descrs.len();
-                self.push_ready_descr(crate::jitcode::BhDescr::VableArray {
+                let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VableArray {
                     index: *array_index,
                 });
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
                 argcodes.push('d');
                 // Second descriptor: arraydescr from VirtualizableInfo.array_descrs.
-                let descr_idx2 = self.descrs.len();
-                self.push_ready_descr(crate::jitcode::BhDescr::Array {
-                    itemsize: *array_itemsize,
-                    is_array_of_pointers: matches!(item_ty, crate::model::ValueType::Ref),
-                    is_array_of_structs: false,
-                    is_item_signed: *array_is_signed,
-                });
+                let descr_idx2 = self.emit_ready_descr(vable_arraydescrof(
+                    item_ty,
+                    *array_itemsize,
+                    *array_is_signed,
+                ));
                 state.code.push((descr_idx2 & 0xFF) as u8);
                 state.code.push((descr_idx2 >> 8) as u8);
                 argcodes.push('d');
@@ -1397,6 +1391,32 @@ impl Assembler {
         } else {
             "r"
         }
+    }
+
+    /// RPython `flatten.py` emits the trailing `-> result` only for
+    /// non-Void result variables. `jtransform.py:433` still computes
+    /// `reskind = getkind(op.result.concretetype)[0]`, so a call op may
+    /// carry a Void result placeholder while the bytecode opcode must be
+    /// `*_v` with no `>` argcode.
+    fn emit_call_result_arg(
+        &self,
+        result: Option<ValueId>,
+        declared_result_kind: char,
+        regallocs: &HashMap<RegKind, RegAllocResult>,
+        state: &mut AssemblyState,
+        argcodes: &mut String,
+    ) -> char {
+        if declared_result_kind == 'v' {
+            return 'v';
+        }
+        let Some(result) = result else {
+            return declared_result_kind;
+        };
+        argcodes.push('>');
+        let (reg, kind_char) = self.lookup_reg_with_kind(result, regallocs);
+        argcodes.push(kind_char);
+        state.code.push(reg);
+        kind_char
     }
 
     /// RPython: opcode key → opcode number.
@@ -1776,38 +1796,548 @@ fn value_type_to_itemsize(ty: &crate::model::ValueType) -> usize {
     }
 }
 
+fn value_type_to_ir_type_for_descr(ty: &crate::model::ValueType) -> majit_ir::value::Type {
+    match ty {
+        crate::model::ValueType::Int => majit_ir::value::Type::Int,
+        crate::model::ValueType::Float => majit_ir::value::Type::Float,
+        crate::model::ValueType::Void => majit_ir::value::Type::Void,
+        _ => majit_ir::value::Type::Ref,
+    }
+}
+
+fn type_flag_from_str(
+    type_str: &str,
+) -> (majit_ir::descr::ArrayFlag, majit_ir::value::Type, usize) {
+    use majit_ir::descr::ArrayFlag;
+    match type_str {
+        s if s.starts_with('&')
+            || s.starts_with("Box<")
+            || s.starts_with("Arc<")
+            || s.starts_with("Rc<")
+            || s.starts_with("Vec<")
+            || s.starts_with("Option<")
+            || s == "String" =>
+        {
+            (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 8)
+        }
+        "f64" => (ArrayFlag::Float, majit_ir::value::Type::Float, 8),
+        "f32" => (ArrayFlag::Float, majit_ir::value::Type::Float, 4),
+        "i64" | "isize" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 8),
+        "i32" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 4),
+        "i16" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 2),
+        "i8" => (ArrayFlag::Signed, majit_ir::value::Type::Int, 1),
+        "u64" | "usize" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 8),
+        "u32" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 4),
+        "u16" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 2),
+        "u8" | "bool" => (ArrayFlag::Unsigned, majit_ir::value::Type::Int, 1),
+        "()" => (ArrayFlag::Void, majit_ir::value::Type::Void, 0),
+        _ => (ArrayFlag::Pointer, majit_ir::value::Type::Ref, 8),
+    }
+}
+
+fn fallback_field_layout(
+    ty: &crate::model::ValueType,
+) -> (
+    usize,
+    majit_ir::value::Type,
+    majit_ir::descr::ArrayFlag,
+    bool,
+) {
+    let field_type = value_type_to_ir_type_for_descr(ty);
+    let field_size = value_type_to_itemsize(ty);
+    let field_flag = majit_ir::descr::ArrayFlag::from_field_type(field_type);
+    let is_signed = field_flag == majit_ir::descr::ArrayFlag::Signed;
+    (field_size, field_type, field_flag, is_signed)
+}
+
+fn bh_field_name(owner: &str, field_name: &str) -> String {
+    if owner.is_empty() || field_name.contains('.') {
+        field_name.to_string()
+    } else {
+        format!("{owner}.{field_name}")
+    }
+}
+
+fn bh_field_spec_from_parts(
+    index: u32,
+    owner: &str,
+    field_name: &str,
+    offset: usize,
+    field_size: usize,
+    field_type: majit_ir::value::Type,
+    field_flag: majit_ir::descr::ArrayFlag,
+    is_immutable: bool,
+    is_quasi_immutable: bool,
+    index_in_parent: usize,
+) -> crate::jitcode::BhFieldSpec {
+    crate::jitcode::BhFieldSpec {
+        index,
+        name: bh_field_name(owner, field_name),
+        offset,
+        field_size,
+        field_type,
+        field_flag,
+        is_field_signed: field_flag == majit_ir::descr::ArrayFlag::Signed,
+        is_immutable,
+        is_quasi_immutable,
+        index_in_parent,
+    }
+}
+
+fn bh_size_spec_from_callcontrol(
+    cc: &CallControl,
+    owner: &str,
+) -> Option<crate::jitcode::BhSizeSpec> {
+    if owner.is_empty() {
+        return None;
+    }
+    let size = cc
+        .struct_layouts
+        .get(owner)
+        .map(|layout| layout.size)
+        .or_else(|| heuristic_struct_size_for_bh(cc, owner))?;
+    Some(crate::jitcode::BhSizeSpec {
+        size,
+        type_id: 0,
+        vtable: 0,
+        all_fielddescrs: bh_all_field_specs_for_struct(cc, owner),
+    })
+}
+
+fn bh_all_field_specs_for_struct(
+    cc: &CallControl,
+    owner: &str,
+) -> Vec<crate::jitcode::BhFieldSpec> {
+    let mut specs = Vec::new();
+    bh_all_field_specs_for_struct_into(cc, owner, &mut specs);
+    specs
+}
+
+/// RPython `heaptracker.all_fielddescrs(STRUCT, res=...)` parity port:
+/// recursively walks `STRUCT._names`, skipping `Void` / `typeptr` /
+/// `c__pad`, and recursing into nested-struct fields so their leaf
+/// fielddescrs land in the same flat `res` list with `index_in_parent`
+/// matching `heaptracker.get_fielddescr_index_in()` (`heaptracker.py:51`).
+///
+/// Pyre keeps both a structured `struct_layouts` cache and a textual
+/// `struct_field_entries` registry; the layout path doesn't carry the
+/// nested-struct type name, so we cross-reference the entries registry
+/// to recover the inner owner string before recursing.
+fn bh_all_field_specs_for_struct_into(
+    cc: &CallControl,
+    owner: &str,
+    specs: &mut Vec<crate::jitcode::BhFieldSpec>,
+) {
+    if let Some(layout) = cc.struct_layouts.get(owner) {
+        // The textual entries registry carries the inner-struct type name
+        // for nested fields; match by field name to recover the owner
+        // string when recursing.  Cloned out of `cc` so the immutable
+        // borrow does not collide with the recursive call below.
+        let entries: Vec<(String, String)> = cc
+            .struct_field_entries(owner)
+            .map(|fs| fs.to_vec())
+            .unwrap_or_default();
+        for fl in &layout.fields {
+            if fl.field_type == majit_ir::value::Type::Void
+                || fl.name == "typeptr"
+                || fl.name.starts_with("c__pad")
+            {
+                continue;
+            }
+            if fl.flag == majit_ir::descr::ArrayFlag::Struct {
+                // `heaptracker.py:68-69 isinstance(FIELD, lltype.Struct):
+                //  all_fielddescrs(gccache, FIELD, only_gc, res, get_field_descr)`.
+                if let Some(inner_owner) = entries
+                    .iter()
+                    .find(|(name, _)| name == &fl.name)
+                    .map(|(_, ty)| ty.as_str())
+                {
+                    bh_all_field_specs_for_struct_into(cc, inner_owner, specs);
+                }
+                continue;
+            }
+            let index_in_parent = specs.len();
+            specs.push(bh_field_spec_from_parts(
+                index_in_parent as u32,
+                owner,
+                &fl.name,
+                fl.offset,
+                fl.size,
+                fl.field_type,
+                fl.flag,
+                fl.is_immutable(),
+                fl.is_quasi_immutable(),
+                index_in_parent,
+            ));
+        }
+        return;
+    }
+
+    let Some(fields) = cc.struct_field_entries(owner).map(|fs| fs.to_vec()) else {
+        return;
+    };
+    let mut offset = 0usize;
+    for (field_name, field_type_str) in &fields {
+        let (field_flag, field_type, field_size) = if cc.is_known_struct(field_type_str) {
+            (
+                majit_ir::descr::ArrayFlag::Struct,
+                majit_ir::value::Type::Ref,
+                cc.struct_layouts
+                    .get(field_type_str.as_str())
+                    .map(|layout| layout.size)
+                    .unwrap_or(std::mem::size_of::<usize>()),
+            )
+        } else {
+            type_flag_from_str(field_type_str)
+        };
+        if field_type == majit_ir::value::Type::Void || field_size == 0 {
+            continue;
+        }
+        let align = field_size.min(std::mem::size_of::<usize>());
+        offset = (offset + align - 1) & !(align - 1);
+        let is_skipped_field = field_name == "typeptr" || field_name.starts_with("c__pad");
+        if !is_skipped_field {
+            if field_flag == majit_ir::descr::ArrayFlag::Struct {
+                // `heaptracker.py:68-69` recursive flatten for nested
+                // structs.  `field_type_str` is the inner owner name in
+                // this textual path.
+                bh_all_field_specs_for_struct_into(cc, field_type_str, specs);
+            } else {
+                let index_in_parent = specs.len();
+                let rank = cc.field_immutability(Some(owner), field_name);
+                specs.push(bh_field_spec_from_parts(
+                    index_in_parent as u32,
+                    owner,
+                    field_name,
+                    offset,
+                    field_size,
+                    field_type,
+                    field_flag,
+                    rank.is_some(),
+                    rank.map(|r| r.is_quasi_immutable()).unwrap_or(false),
+                    index_in_parent,
+                ));
+            }
+        }
+        offset += field_size;
+    }
+}
+
+fn heuristic_struct_size_for_bh(cc: &CallControl, owner: &str) -> Option<usize> {
+    let fields = cc.struct_field_entries(owner)?;
+    let mut offset = 0usize;
+    let mut max_align = 0usize;
+    for (_, field_type_str) in fields {
+        let field_size = if cc.is_known_struct(field_type_str) {
+            cc.struct_layouts
+                .get(field_type_str.as_str())
+                .map(|layout| layout.size)
+                .unwrap_or(std::mem::size_of::<usize>())
+        } else {
+            let (_, field_type, size) = type_flag_from_str(field_type_str);
+            if field_type == majit_ir::value::Type::Void || size == 0 {
+                continue;
+            }
+            size
+        };
+        let align = field_size.min(std::mem::size_of::<usize>());
+        max_align = max_align.max(align);
+        offset = (offset + align - 1) & !(align - 1);
+        offset += field_size;
+    }
+    if offset == 0 {
+        return Some(0);
+    }
+    let align = max_align.max(1);
+    Some((offset + align - 1) & !(align - 1))
+}
+
+fn fielddescrof(
+    field: &crate::model::FieldDescriptor,
+    ty: &crate::model::ValueType,
+    callcontrol: Option<&CallControl>,
+) -> crate::jitcode::BhDescr {
+    let (mut offset, mut field_size, mut field_type, mut field_flag, mut is_field_signed) = {
+        let (field_size, field_type, field_flag, signed) = fallback_field_layout(ty);
+        (0, field_size, field_type, field_flag, signed)
+    };
+    let mut is_immutable = false;
+    let mut is_quasi_immutable = false;
+    let mut index_in_parent = 0usize;
+    let mut parent = None;
+
+    if let (Some(cc), Some(owner)) = (callcontrol, field.owner_root.as_deref()) {
+        parent = bh_size_spec_from_callcontrol(cc, owner);
+        if let Some(parent_spec) = parent.as_ref() {
+            let full_name = bh_field_name(owner, &field.name);
+            if let Some(spec) = parent_spec
+                .all_fielddescrs
+                .iter()
+                .find(|spec| spec.name == full_name)
+            {
+                offset = spec.offset;
+                field_size = spec.field_size;
+                field_type = spec.field_type;
+                field_flag = spec.field_flag;
+                is_field_signed = spec.is_field_signed;
+                is_immutable = spec.is_immutable;
+                is_quasi_immutable = spec.is_quasi_immutable;
+                index_in_parent = spec.index_in_parent;
+            }
+        }
+        if let Some(layout_field) = cc
+            .struct_layouts
+            .get(owner)
+            .and_then(|layout| layout.fields.iter().find(|fl| fl.name == field.name))
+        {
+            offset = layout_field.offset;
+            field_size = layout_field.size;
+            field_type = layout_field.field_type;
+            field_flag = layout_field.flag;
+            is_field_signed = field_flag == majit_ir::descr::ArrayFlag::Signed;
+            is_immutable = layout_field.is_immutable();
+            is_quasi_immutable = layout_field.is_quasi_immutable();
+        } else if let Some((
+            computed_offset,
+            computed_size,
+            computed_type,
+            computed_flag,
+            computed_signed,
+        )) = heuristic_field_layout(cc, owner, &field.name)
+        {
+            offset = computed_offset;
+            field_size = computed_size;
+            field_type = computed_type;
+            field_flag = computed_flag;
+            is_field_signed = computed_signed;
+        }
+
+        if let Some(rank) = cc.field_immutability(Some(owner), &field.name) {
+            is_immutable = rank.is_immutable();
+            is_quasi_immutable = rank.is_quasi_immutable();
+        }
+    }
+
+    crate::jitcode::BhDescr::Field {
+        offset,
+        field_size,
+        field_type,
+        field_flag,
+        is_field_signed,
+        is_immutable,
+        is_quasi_immutable,
+        index_in_parent,
+        parent,
+        name: field.name.clone(),
+        owner: field.owner_root.clone().unwrap_or_default(),
+    }
+}
+
+fn heuristic_field_layout(
+    cc: &CallControl,
+    owner: &str,
+    field_name: &str,
+) -> Option<(
+    usize,
+    usize,
+    majit_ir::value::Type,
+    majit_ir::descr::ArrayFlag,
+    bool,
+)> {
+    let fields = cc.struct_field_entries(owner)?;
+    let mut offset = 0usize;
+    for (name, type_str) in fields {
+        let (flag, field_type, mut field_size) = if cc.is_known_struct(type_str) {
+            (
+                majit_ir::descr::ArrayFlag::Struct,
+                majit_ir::value::Type::Ref,
+                cc.struct_layouts
+                    .get(type_str)
+                    .map(|layout| layout.size)
+                    .unwrap_or(std::mem::size_of::<usize>()),
+            )
+        } else {
+            type_flag_from_str(type_str)
+        };
+        if field_type == majit_ir::value::Type::Void || field_size == 0 {
+            continue;
+        }
+        let align = field_size.min(std::mem::size_of::<usize>());
+        offset = (offset + align - 1) & !(align - 1);
+        if name == field_name {
+            return Some((
+                offset,
+                field_size,
+                field_type,
+                flag,
+                flag == majit_ir::descr::ArrayFlag::Signed,
+            ));
+        }
+        field_size = field_size.max(1);
+        offset += field_size;
+    }
+    None
+}
+
+fn bh_field_flag_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> majit_ir::descr::ArrayFlag {
+    if fd.is_pointer_field() {
+        majit_ir::descr::ArrayFlag::Pointer
+    } else if fd.is_float_field() {
+        majit_ir::descr::ArrayFlag::Float
+    } else if fd.field_type() == majit_ir::value::Type::Void {
+        majit_ir::descr::ArrayFlag::Void
+    } else if fd.is_field_signed() {
+        majit_ir::descr::ArrayFlag::Signed
+    } else {
+        majit_ir::descr::ArrayFlag::Unsigned
+    }
+}
+
+fn bh_field_spec_from_descr(fd: &dyn majit_ir::descr::FieldDescr) -> crate::jitcode::BhFieldSpec {
+    let field_flag = bh_field_flag_from_descr(fd);
+    crate::jitcode::BhFieldSpec {
+        index: fd.index(),
+        name: fd.field_name().to_string(),
+        offset: fd.offset(),
+        field_size: fd.field_size(),
+        field_type: fd.field_type(),
+        field_flag,
+        is_field_signed: fd.is_field_signed(),
+        is_immutable: fd.is_immutable(),
+        is_quasi_immutable: fd.is_quasi_immutable(),
+        index_in_parent: fd.index_in_parent(),
+    }
+}
+
+fn bh_size_spec_from_descr(sd: &dyn majit_ir::descr::SizeDescr) -> crate::jitcode::BhSizeSpec {
+    crate::jitcode::BhSizeSpec {
+        size: sd.size(),
+        type_id: sd.type_id(),
+        vtable: sd.vtable(),
+        all_fielddescrs: sd
+            .all_fielddescrs()
+            .iter()
+            .map(|fd| bh_field_spec_from_descr(fd.as_ref()))
+            .collect(),
+    }
+}
+
+fn bh_interior_field_specs_from_array_descr(
+    array_descr: &dyn majit_ir::descr::ArrayDescr,
+) -> Vec<crate::jitcode::BhInteriorFieldSpec> {
+    array_descr
+        .get_all_interiorfielddescrs()
+        .unwrap_or(&[])
+        .iter()
+        .filter_map(|descr| {
+            let interior = descr.as_interior_field_descr()?;
+            let field = bh_field_spec_from_descr(interior.field_descr());
+            let owner = interior
+                .field_descr()
+                .get_parent_descr()
+                .and_then(|parent| parent.as_size_descr().map(bh_size_spec_from_descr))
+                .unwrap_or_else(|| crate::jitcode::BhSizeSpec {
+                    size: array_descr.item_size(),
+                    type_id: 0,
+                    vtable: 0,
+                    all_fielddescrs: vec![field.clone()],
+                });
+            Some(crate::jitcode::BhInteriorFieldSpec {
+                index: descr.index(),
+                field,
+                owner,
+            })
+        })
+        .collect()
+}
+
 /// jtransform.py:773,802 cpu.arraydescrof(ARRAY) equivalent.
 ///
-/// Determines (itemsize, is_item_signed) from the array element type.
+/// Determines the full ArrayDescr shape from the array element type.
 /// When `array_type_id` is available (e.g. `Vec<i32>` → element `i32`),
 /// the result is exact. Fallback uses descr.py:241-254 get_type_flag()
 /// semantics: Int → FLAG_SIGNED, Float/Ref → FLAG_UNSIGNED/FLAG_FLOAT.
-fn arraydescrof(ty: &crate::model::ValueType, array_type_id: Option<&str>) -> (usize, bool) {
-    // Primary path: extract element type from the array type identity
-    // (our equivalent of `ARRAY.OF` in RPython).
-    if let Some(elem) = array_type_id.and_then(extract_element_type_from_str) {
-        return match elem.as_str() {
-            "i8" => (1, true),
-            "i16" => (2, true),
-            "i32" => (4, true),
-            "i64" | "isize" => (8, true),
-            "u8" | "bool" => (1, false),
-            "u16" => (2, false),
-            "u32" => (4, false),
-            "u64" | "usize" => (8, false),
-            "f32" => (4, false),
-            "f64" => (8, false),
-            _ => (value_type_to_itemsize(ty), false),
+fn arraydescrof(
+    ty: &crate::model::ValueType,
+    array_type_id: &Option<String>,
+    callcontrol: Option<&CallControl>,
+) -> crate::jitcode::BhDescr {
+    let ir_type = value_type_to_ir_type_for_descr(ty);
+    if let Some(cc) = callcontrol {
+        let descr = cc.arraydescrof(0, array_type_id, ir_type);
+        let array_descr = descr
+            .as_array_descr()
+            .expect("CallControl::arraydescrof must return an ArrayDescr");
+        return crate::jitcode::BhDescr::Array {
+            base_size: array_descr.base_size(),
+            itemsize: array_descr.item_size(),
+            type_id: array_descr.type_id(),
+            item_type: array_descr.item_type(),
+            is_array_of_pointers: array_descr.is_array_of_pointers(),
+            is_array_of_structs: array_descr.is_array_of_structs(),
+            is_item_signed: array_descr.is_item_signed(),
+            interior_fields: bh_interior_field_specs_from_array_descr(array_descr),
         };
     }
-    // Fallback: descr.py:241-254 get_type_flag(ARRAY.OF).
-    // Int (lltype.Signed) → FLAG_SIGNED, Float → FLAG_FLOAT,
-    // Ref (gc pointer) → FLAG_POINTER. Only FLAG_SIGNED → is_item_signed=true.
-    match ty {
-        crate::model::ValueType::Int => (8, true),
-        crate::model::ValueType::Float => (8, false),
-        crate::model::ValueType::Ref => (8, false),
-        _ => (8, false),
+
+    // Primary path: extract element type from the array type identity
+    // (our equivalent of `ARRAY.OF` in RPython).
+    let (flag, item_type, itemsize) = if let Some(elem) = array_type_id
+        .as_deref()
+        .and_then(extract_element_type_from_str)
+    {
+        type_flag_from_str(elem.as_str())
+    } else {
+        match ty {
+            crate::model::ValueType::Int => (
+                majit_ir::descr::ArrayFlag::Signed,
+                majit_ir::value::Type::Int,
+                8,
+            ),
+            crate::model::ValueType::Float => (
+                majit_ir::descr::ArrayFlag::Float,
+                majit_ir::value::Type::Float,
+                8,
+            ),
+            crate::model::ValueType::Ref => (
+                majit_ir::descr::ArrayFlag::Pointer,
+                majit_ir::value::Type::Ref,
+                8,
+            ),
+            _ => (
+                majit_ir::descr::ArrayFlag::Unsigned,
+                majit_ir::value::Type::Int,
+                8,
+            ),
+        }
+    };
+    crate::jitcode::BhDescr::Array {
+        base_size: std::mem::size_of::<usize>(),
+        itemsize,
+        type_id: 0,
+        item_type,
+        is_array_of_pointers: flag == majit_ir::descr::ArrayFlag::Pointer,
+        is_array_of_structs: flag == majit_ir::descr::ArrayFlag::Struct,
+        is_item_signed: flag == majit_ir::descr::ArrayFlag::Signed,
+        interior_fields: Vec::new(),
+    }
+}
+
+fn vable_arraydescrof(
+    ty: &crate::model::ValueType,
+    itemsize: usize,
+    is_item_signed: bool,
+) -> crate::jitcode::BhDescr {
+    let item_type = value_type_to_ir_type_for_descr(ty);
+    crate::jitcode::BhDescr::Array {
+        base_size: std::mem::size_of::<usize>(),
+        itemsize,
+        type_id: 0,
+        item_type,
+        is_array_of_pointers: matches!(item_type, majit_ir::value::Type::Ref),
+        is_array_of_structs: false,
+        is_item_signed,
+        interior_fields: Vec::new(),
     }
 }
 
@@ -2020,13 +2550,11 @@ impl Assembler {
             .iter()
             .map(|descr| match descr {
                 AssemblerDescr::Ready(descr) => descr.clone(),
-                AssemblerDescr::PendingJitCode { jitcode, calldescr } => {
-                    crate::jitcode::BhDescr::JitCode {
-                        jitcode_index: jitcode.index(),
-                        fnaddr: jitcode.fnaddr,
-                        calldescr: calldescr.clone(),
-                    }
-                }
+                AssemblerDescr::PendingJitCode { jitcode } => crate::jitcode::BhDescr::JitCode {
+                    jitcode_index: jitcode.index(),
+                    fnaddr: jitcode.fnaddr,
+                    calldescr: jitcode.calldescr().clone(),
+                },
             })
             .collect()
     }
@@ -2048,12 +2576,212 @@ impl Assembler {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct EffectInfoKey {
+    extraeffect: majit_ir::descr::ExtraEffect,
+    oopspecindex: majit_ir::descr::OopSpecIndex,
+    readonly_descrs_fields: u64,
+    write_descrs_fields: u64,
+    readonly_descrs_arrays: u64,
+    write_descrs_arrays: u64,
+    readonly_descrs_interiorfields: u64,
+    write_descrs_interiorfields: u64,
+    can_invalidate: bool,
+    can_collect: bool,
+    call_release_gil_target: (u64, i32),
+}
+
+impl EffectInfoKey {
+    fn from_effect_info(effect: &majit_ir::descr::EffectInfo) -> Self {
+        Self {
+            extraeffect: effect.extraeffect,
+            oopspecindex: effect.oopspecindex,
+            readonly_descrs_fields: effect.readonly_descrs_fields,
+            write_descrs_fields: effect.write_descrs_fields,
+            readonly_descrs_arrays: effect.readonly_descrs_arrays,
+            write_descrs_arrays: effect.write_descrs_arrays,
+            readonly_descrs_interiorfields: effect.readonly_descrs_interiorfields,
+            write_descrs_interiorfields: effect.write_descrs_interiorfields,
+            can_invalidate: effect.can_invalidate,
+            can_collect: effect.can_collect,
+            call_release_gil_target: effect.call_release_gil_target,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+enum AssemblerDescrKey {
+    Field {
+        offset: usize,
+        field_size: usize,
+        field_type: majit_ir::value::Type,
+        field_flag: majit_ir::descr::ArrayFlag,
+        is_field_signed: bool,
+        is_immutable: bool,
+        is_quasi_immutable: bool,
+        index_in_parent: usize,
+        parent: Option<crate::jitcode::BhSizeSpec>,
+        name: String,
+        owner: String,
+    },
+    Array {
+        base_size: usize,
+        itemsize: usize,
+        type_id: u32,
+        item_type: majit_ir::value::Type,
+        is_array_of_pointers: bool,
+        is_array_of_structs: bool,
+        is_item_signed: bool,
+        interior_fields: Vec<crate::jitcode::BhInteriorFieldSpec>,
+    },
+    Size {
+        size: usize,
+        type_id: u32,
+        vtable: usize,
+    },
+    Call {
+        arg_classes: String,
+        result_type: char,
+        result_signed: bool,
+        result_size: usize,
+        result_erased: crate::jitcode::CallResultErasedKey,
+        effect: EffectInfoKey,
+    },
+    /// RPython uses the JitCode object itself as an AbstractDescr for
+    /// inline_call. The Rust key is therefore the identity-keyed handle, not
+    /// the callsite-local `BhCallDescr`.
+    JitCode(crate::jitcode::JitCodeHandle),
+    SnapshotJitCode {
+        jitcode_index: usize,
+        fnaddr: i64,
+        arg_classes: String,
+        result_type: char,
+        result_signed: bool,
+        result_size: usize,
+        result_erased: crate::jitcode::CallResultErasedKey,
+        effect: EffectInfoKey,
+    },
+    Switch(Vec<(i64, usize)>),
+    VableField {
+        index: usize,
+    },
+    VableArray {
+        index: usize,
+    },
+    VtableMethod {
+        trait_root: String,
+        method_name: String,
+    },
+}
+
+impl AssemblerDescrKey {
+    fn from_descr(descr: &AssemblerDescr) -> Self {
+        match descr {
+            AssemblerDescr::Ready(descr) => Self::from_ready(descr),
+            AssemblerDescr::PendingJitCode { jitcode } => Self::JitCode(jitcode.clone()),
+        }
+    }
+
+    fn from_ready(descr: &crate::jitcode::BhDescr) -> Self {
+        match descr {
+            crate::jitcode::BhDescr::Field {
+                offset,
+                field_size,
+                field_type,
+                field_flag,
+                is_field_signed,
+                is_immutable,
+                is_quasi_immutable,
+                index_in_parent,
+                parent,
+                name,
+                owner,
+            } => Self::Field {
+                offset: *offset,
+                field_size: *field_size,
+                field_type: *field_type,
+                field_flag: *field_flag,
+                is_field_signed: *is_field_signed,
+                is_immutable: *is_immutable,
+                is_quasi_immutable: *is_quasi_immutable,
+                index_in_parent: *index_in_parent,
+                parent: parent.clone(),
+                name: name.clone(),
+                owner: owner.clone(),
+            },
+            crate::jitcode::BhDescr::Array {
+                base_size,
+                itemsize,
+                type_id,
+                item_type,
+                is_array_of_pointers,
+                is_array_of_structs,
+                is_item_signed,
+                interior_fields,
+            } => Self::Array {
+                base_size: *base_size,
+                itemsize: *itemsize,
+                type_id: *type_id,
+                item_type: *item_type,
+                is_array_of_pointers: *is_array_of_pointers,
+                is_array_of_structs: *is_array_of_structs,
+                is_item_signed: *is_item_signed,
+                interior_fields: interior_fields.clone(),
+            },
+            crate::jitcode::BhDescr::Size {
+                size,
+                type_id,
+                vtable,
+            } => Self::Size {
+                size: *size,
+                type_id: *type_id,
+                vtable: *vtable,
+            },
+            crate::jitcode::BhDescr::Call { calldescr } => Self::Call {
+                arg_classes: calldescr.arg_classes.clone(),
+                result_type: calldescr.result_type,
+                result_signed: calldescr.result_signed,
+                result_size: calldescr.result_size,
+                result_erased: calldescr.result_erased,
+                effect: EffectInfoKey::from_effect_info(&calldescr.extra_info),
+            },
+            crate::jitcode::BhDescr::JitCode {
+                jitcode_index,
+                fnaddr,
+                calldescr,
+            } => Self::SnapshotJitCode {
+                jitcode_index: *jitcode_index,
+                fnaddr: *fnaddr,
+                arg_classes: calldescr.arg_classes.clone(),
+                result_type: calldescr.result_type,
+                result_signed: calldescr.result_signed,
+                result_size: calldescr.result_size,
+                result_erased: calldescr.result_erased,
+                effect: EffectInfoKey::from_effect_info(&calldescr.extra_info),
+            },
+            crate::jitcode::BhDescr::Switch { dict } => {
+                let mut items: Vec<_> = dict.iter().map(|(key, value)| (*key, *value)).collect();
+                items.sort_unstable_by_key(|(key, _)| *key);
+                Self::Switch(items)
+            }
+            crate::jitcode::BhDescr::VableField { index } => Self::VableField { index: *index },
+            crate::jitcode::BhDescr::VableArray { index } => Self::VableArray { index: *index },
+            crate::jitcode::BhDescr::VtableMethod {
+                trait_root,
+                method_name,
+            } => Self::VtableMethod {
+                trait_root: trait_root.clone(),
+                method_name: method_name.clone(),
+            },
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 enum AssemblerDescr {
     Ready(crate::jitcode::BhDescr),
     PendingJitCode {
         jitcode: crate::jitcode::JitCodeHandle,
-        calldescr: crate::jitcode::BhCallDescr,
     },
 }
 
@@ -2094,6 +2822,114 @@ mod tests {
             },
         );
         regallocs
+    }
+
+    #[test]
+    fn emit_descr_reuses_rpython_descr_dict_index() {
+        let mut asm = Assembler::new();
+
+        let first = asm.emit_ready_descr(crate::jitcode::BhDescr::Field {
+            offset: 0,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            parent: None,
+            name: "value".into(),
+            owner: "Cell".into(),
+        });
+        let repeated = asm.emit_ready_descr(crate::jitcode::BhDescr::Field {
+            offset: 0,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            parent: None,
+            name: "value".into(),
+            owner: "Cell".into(),
+        });
+        let other = asm.emit_ready_descr(crate::jitcode::BhDescr::Field {
+            offset: 0,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 1,
+            parent: None,
+            name: "mutate_value".into(),
+            owner: "Cell".into(),
+        });
+
+        assert_eq!(first, repeated);
+        assert_ne!(first, other);
+        assert_eq!(asm.snapshot_descrs().len(), 2);
+    }
+
+    #[test]
+    fn emit_call_descr_key_uses_full_rpython_calldescr_shape() {
+        let mut asm = Assembler::new();
+        let effect = majit_ir::descr::EffectInfo::MOST_GENERAL;
+
+        let signed_int =
+            crate::jitcode::BhCallDescr::from_arg_classes("i".to_string(), 'i', effect.clone());
+        let signed_int_repeat =
+            crate::jitcode::BhCallDescr::from_arg_classes("i".to_string(), 'i', effect.clone());
+        let single_float =
+            crate::jitcode::BhCallDescr::from_arg_classes("i".to_string(), 'S', effect.clone());
+        let unsigned_int = crate::jitcode::BhCallDescr {
+            arg_classes: "i".to_string(),
+            result_type: 'i',
+            result_signed: false,
+            result_size: 8,
+            result_erased: crate::jitcode::CallResultErasedKey::Unsigned,
+            extra_info: effect.clone(),
+        };
+        let raw_address = crate::jitcode::BhCallDescr {
+            arg_classes: "i".to_string(),
+            result_type: 'i',
+            result_signed: false,
+            result_size: 8,
+            result_erased: crate::jitcode::CallResultErasedKey::Address,
+            extra_info: effect,
+        };
+
+        assert_eq!(single_float.result_type, 'S');
+        assert_eq!(single_float.result_size, 4);
+        assert!(!single_float.result_signed);
+        assert_eq!(
+            single_float.result_erased,
+            crate::jitcode::CallResultErasedKey::SingleFloat,
+        );
+
+        let signed_idx = asm.emit_ready_descr(crate::jitcode::BhDescr::Call {
+            calldescr: signed_int,
+        });
+        let signed_repeat_idx = asm.emit_ready_descr(crate::jitcode::BhDescr::Call {
+            calldescr: signed_int_repeat,
+        });
+        let single_idx = asm.emit_ready_descr(crate::jitcode::BhDescr::Call {
+            calldescr: single_float,
+        });
+        let unsigned_idx = asm.emit_ready_descr(crate::jitcode::BhDescr::Call {
+            calldescr: unsigned_int,
+        });
+        let address_idx = asm.emit_ready_descr(crate::jitcode::BhDescr::Call {
+            calldescr: raw_address,
+        });
+
+        assert_eq!(signed_idx, signed_repeat_idx);
+        assert_ne!(signed_idx, single_idx);
+        assert_ne!(signed_idx, unsigned_idx);
+        assert_ne!(unsigned_idx, address_idx);
+        assert_eq!(asm.snapshot_descrs().len(), 4);
     }
 
     #[test]

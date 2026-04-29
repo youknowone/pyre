@@ -249,10 +249,26 @@ impl CallControl {
             let code = unsafe { &*portal_graph };
             // call.py:147 `jd.mainjitcode = self.get_jitcode(jd.portal_graph)`.
             // Inserts an empty PyJitCode skeleton into `jitcodes`, pushes
-            // the graph onto `unfinished_graphs`, and stores the same Arc
-            // on the JitDriverStaticData immediately.
-            let mainjitcode = self.get_jitcode(code, w_code, merge_point_pc);
-            self.jitdrivers_sd[i].mainjitcode = Some(mainjitcode);
+            // the graph onto `unfinished_graphs`. Drop the returned
+            // clone immediately so the cached slot is uniquely owned for
+            // the call.py:148 stamp below.
+            drop(self.get_jitcode(code, w_code, merge_point_pc));
+            // call.py:148 `jd.mainjitcode.jitdriver_sd = jd` — stamp the
+            // skeleton's `jitdriver_sd` while the outer `Arc<PyJitCode>`
+            // and inner `Arc<JitCode>` still have refcount 1 (only the
+            // jitcodes slot holds them). Then bind `jd.mainjitcode` to
+            // that same Arc so consumers reading `cc.jitcodes[key]` and
+            // `jd.mainjitcode` see byte-identical Arc identity per the
+            // upstream invariant.
+            let key = Self::jitcode_key(portal_graph);
+            if let Some(slot) = self.jitcodes.get_mut(&key) {
+                if let Some(pyjitcode) = std::sync::Arc::get_mut(slot) {
+                    if let Some(inner) = std::sync::Arc::get_mut(&mut pyjitcode.jitcode) {
+                        inner.jitdriver_sd = Some(i);
+                    }
+                }
+                self.jitdrivers_sd[i].mainjitcode = Some(std::sync::Arc::clone(slot));
+            }
         }
     }
 
@@ -387,10 +403,11 @@ impl CallControl {
     /// even though both values are constants here.
     pub fn get_jitcode_calldescr(&self, _graph: *const CodeObject) -> (i64, BhCallDescr) {
         let fnaddr = crate::call_jit::bh_portal_runner as *const () as usize as i64;
-        let calldescr = BhCallDescr {
-            arg_classes: "r".to_string(),
-            result_type: 'r',
-        };
+        let calldescr = BhCallDescr::from_arg_classes(
+            "r".to_string(),
+            'r',
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        );
         (fnaddr, calldescr)
     }
 

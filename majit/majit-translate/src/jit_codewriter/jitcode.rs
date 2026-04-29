@@ -616,18 +616,159 @@ impl std::fmt::Display for SwitchDictDescr {
 /// `JitCode(AbstractDescr)`, `SwitchDictDescr`). pyre uses an enum to
 /// represent the same heterogeneous list, shared between the codewriter
 /// assembler and the metainterp blackhole.
+/// RPython `descr.py:665` `RESULT_ERASED` component of the call-descr cache
+/// key. The Rust port still collapses most low-level pointer shapes to
+/// `Type::Ref`, but the field is kept explicit so the descriptor table has the
+/// same structural slot as upstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum CallResultErasedKey {
+    Void,
+    Signed,
+    Unsigned,
+    SingleFloat,
+    Float,
+    SignedLongLong,
+    GcRef,
+    Address,
+}
+
+impl CallResultErasedKey {
+    pub fn from_ir_type(result_type: majit_ir::value::Type) -> Self {
+        Self::from_ir_layout(result_type, result_type == majit_ir::value::Type::Int, 8)
+    }
+
+    pub fn from_ir_layout(
+        result_type: majit_ir::value::Type,
+        result_signed: bool,
+        _result_size: usize,
+    ) -> Self {
+        match result_type {
+            majit_ir::value::Type::Void => Self::Void,
+            majit_ir::value::Type::Int if result_signed => Self::Signed,
+            majit_ir::value::Type::Int => Self::Unsigned,
+            majit_ir::value::Type::Ref => Self::GcRef,
+            majit_ir::value::Type::Float => Self::Float,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct BhCallDescr {
+    /// RPython `CallDescr.arg_classes`: one char per non-void FUNC argument.
+    /// This is not the assembler `I/R/F` list-marker suffix.
     pub arg_classes: String,
     pub result_type: char,
+    /// RPython `descr.py:664` `result_signed`.
+    pub result_signed: bool,
+    /// RPython `descr.py:662` `symbolic.get_size(RESULT_ERASED, ...)`.
+    pub result_size: usize,
+    /// RPython `descr.py:665` `RESULT_ERASED`.
+    pub result_erased: CallResultErasedKey,
+    /// RPython `CallDescr.extrainfo` (`descr.py:453`,
+    /// `effectinfo.py:13-263`).
+    pub extra_info: majit_ir::descr::EffectInfo,
+}
+
+impl BhCallDescr {
+    pub fn from_arg_classes(
+        arg_classes: String,
+        result_type: char,
+        extra_info: majit_ir::descr::EffectInfo,
+    ) -> Self {
+        let (result_signed, result_size, result_erased) = result_type_char_layout_key(result_type);
+        Self {
+            arg_classes,
+            result_type,
+            result_signed,
+            result_size,
+            result_erased,
+            extra_info,
+        }
+    }
+
+    pub fn from_signature(
+        arg_classes: String,
+        result_type: majit_ir::value::Type,
+        extra_info: majit_ir::descr::EffectInfo,
+    ) -> Self {
+        let result_size = match result_type {
+            majit_ir::value::Type::Int
+            | majit_ir::value::Type::Ref
+            | majit_ir::value::Type::Float => 8,
+            majit_ir::value::Type::Void => 0,
+        };
+        Self {
+            arg_classes,
+            result_type: ir_type_to_result_char(result_type),
+            result_signed: result_type == majit_ir::value::Type::Int,
+            result_size,
+            result_erased: CallResultErasedKey::from_ir_layout(
+                result_type,
+                result_type == majit_ir::value::Type::Int,
+                result_size,
+            ),
+            extra_info,
+        }
+    }
 }
 
 impl Default for BhCallDescr {
     fn default() -> Self {
-        Self {
-            arg_classes: String::new(),
-            result_type: 'v',
-        }
+        Self::from_signature(
+            String::new(),
+            majit_ir::value::Type::Void,
+            majit_ir::descr::EffectInfo::MOST_GENERAL,
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BhFieldSpec {
+    pub index: u32,
+    pub name: String,
+    pub offset: usize,
+    pub field_size: usize,
+    pub field_type: majit_ir::value::Type,
+    pub field_flag: majit_ir::descr::ArrayFlag,
+    pub is_field_signed: bool,
+    pub is_immutable: bool,
+    pub is_quasi_immutable: bool,
+    pub index_in_parent: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BhSizeSpec {
+    pub size: usize,
+    pub type_id: u32,
+    pub vtable: usize,
+    pub all_fielddescrs: Vec<BhFieldSpec>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct BhInteriorFieldSpec {
+    pub index: u32,
+    pub field: BhFieldSpec,
+    pub owner: BhSizeSpec,
+}
+
+fn result_type_char_layout_key(result_type: char) -> (bool, usize, CallResultErasedKey) {
+    match result_type {
+        'i' => (true, 8, CallResultErasedKey::Signed),
+        'S' => (false, 4, CallResultErasedKey::SingleFloat),
+        'r' => (false, 8, CallResultErasedKey::GcRef),
+        'f' => (false, 8, CallResultErasedKey::Float),
+        'L' => (false, 8, CallResultErasedKey::SignedLongLong),
+        'v' => (false, 0, CallResultErasedKey::Void),
+        _ => (false, 0, CallResultErasedKey::Void),
+    }
+}
+
+fn ir_type_to_result_char(result_type: majit_ir::value::Type) -> char {
+    match result_type {
+        majit_ir::value::Type::Int => 'i',
+        majit_ir::value::Type::Ref => 'r',
+        majit_ir::value::Type::Float => 'f',
+        majit_ir::value::Type::Void => 'v',
     }
 }
 
@@ -639,6 +780,14 @@ pub enum BhDescr {
     /// `offset` is populated when known (0 = unresolved placeholder).
     Field {
         offset: usize,
+        field_size: usize,
+        field_type: majit_ir::value::Type,
+        field_flag: majit_ir::descr::ArrayFlag,
+        is_field_signed: bool,
+        is_immutable: bool,
+        is_quasi_immutable: bool,
+        index_in_parent: usize,
+        parent: Option<BhSizeSpec>,
         name: String,
         owner: String,
     },
@@ -646,11 +795,17 @@ pub enum BhDescr {
     /// RPython: `ArrayDescr` with `itemsize`, `basesize` attributes.
     /// `itemsize` is populated when known (8 = default placeholder).
     Array {
+        base_size: usize,
         itemsize: usize,
+        type_id: u32,
+        item_type: majit_ir::value::Type,
         is_array_of_pointers: bool,
         is_array_of_structs: bool,
         /// descr.py ArrayDescr.is_item_signed() — FLAG_SIGNED vs FLAG_UNSIGNED.
         is_item_signed: bool,
+        /// descr.py:372-375 `arraydescr.all_interiorfielddescrs` for
+        /// arrays whose item type is an inline struct.
+        interior_fields: Vec<BhInteriorFieldSpec>,
     },
     Size {
         size: usize,
@@ -758,10 +913,18 @@ impl BhDescr {
     /// Used at resume/materialization boundaries where only the summary is available.
     pub fn from_array_descr_info(info: &majit_ir::ArrayDescrInfo) -> Self {
         BhDescr::Array {
+            base_size: info.base_size,
             itemsize: info.item_size,
+            type_id: 0,
+            item_type: match info.item_type {
+                0 => majit_ir::value::Type::Ref,
+                2 => majit_ir::value::Type::Float,
+                _ => majit_ir::value::Type::Int,
+            },
             is_array_of_pointers: info.item_type == 0,
             is_array_of_structs: false,
             is_item_signed: info.is_signed,
+            interior_fields: Vec::new(),
         }
     }
 

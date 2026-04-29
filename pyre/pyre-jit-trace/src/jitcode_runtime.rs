@@ -22,6 +22,7 @@
 use std::collections::HashMap;
 use std::sync::{Arc, LazyLock};
 
+use majit_ir::DescrRef;
 use majit_translate::jitcode::{BhDescr, JitCode};
 use majit_translate::opcode_dispatch::PipelineOpcodeArm;
 use majit_translate::{CallPath, OpcodeDispatchSelector};
@@ -312,6 +313,52 @@ static ALL_DESCRS: LazyLock<Vec<BhDescr>> = LazyLock::new(|| {
 /// RPython: `metainterp_sd.all_descrs` — full shared descr pool.
 pub fn all_descrs() -> &'static [BhDescr] {
     &ALL_DESCRS
+}
+
+/// Pool of `DescrRef`s indexed alongside [`all_descrs`] so the
+/// trace-side jitcode walker
+/// ([`crate::jitcode_dispatch::dispatch_via_miframe`]) can resolve each
+/// `d`/`j` argcode operand to a real `Arc<dyn Descr>`. Every entry runs
+/// through [`crate::descr::make_descr_from_bh`] — the per-variant
+/// adapter that maps each `BhDescr` shape to its RPython-orthodox
+/// counterpart on the metainterp side:
+///
+/// - `Field` → `make_field_descr` / immutable variants with full
+///   offset, size, type, signedness, and purity flags.
+/// - `Array` → `make_array_descr` with full base size, item size,
+///   type id, item type, signedness, and struct-array classification.
+/// - `Size` → `make_size_descr_with_type_and_vtable`.
+/// - `Call` → `make_call_descr_with_effect` — `arg_classes` /
+///   `result_type` are reshaped into typed inputs/output AND
+///   `extra_info` is threaded through so RPython
+///   `call.py:320 effectinfo_from_writeanalyze` parity is preserved
+///   (descr cache key + can_raise / oopspec / read-write descrs all
+///   match the codewriter's stamp).
+/// - `JitCode` → `make_jitcode_descr` (the existing adapter the
+///   walker's `inline_call_*` recursion exercises).
+///
+/// `Switch` / `VableField` / `VableArray` / `VtableMethod` also get
+/// concrete trace-side descriptor adapters so the pool shape stays
+/// equivalent to `Assembler.descrs`.
+///
+/// Identity (`Arc::ptr_eq`) currently matches across the walker and
+/// trait paths only for the `JitCode` slot — content-derived adapters
+/// for `Field` / `Array` / `Size` / `Call` produce fresh `Arc`s
+/// per-resolution, so trait-side record sites that need the same
+/// `Arc` instance still build their own at the call site (the
+/// allow-list in [`crate::shadow_walker::opname_in_shadow_allow_list`]
+/// avoids those opnames until the by-index identity factories land).
+static ALL_DESCR_REFS: LazyLock<Vec<DescrRef>> = LazyLock::new(|| {
+    all_descrs()
+        .iter()
+        .map(crate::descr::make_descr_from_bh)
+        .collect()
+});
+
+/// `&'static [DescrRef]` view over [`ALL_DESCR_REFS`] for the walker's
+/// `WalkContext::descr_refs` parameter.
+pub fn all_descr_refs() -> &'static [DescrRef] {
+    &ALL_DESCR_REFS
 }
 
 /// Build a `BlackholeInterpBuilder` pre-configured for this binary's
@@ -912,21 +959,23 @@ mod tests {
             .expect("PopTop must resolve to a jitcode");
         assert_eq!(
             jc.code.len(),
-            38,
+            25,
             "PopTop jitcode size shifted — refresh the expected sequence below",
         );
         let sequence: Vec<(String, String)> = decoded_ops(&jc.code)
             .map(|op| (op.opname.to_string(), op.argcodes.to_string()))
             .collect();
+        // Note: the trailing `int_copy + residual_call_r_r` pair that
+        // previously wrapped `Ok(...)` is gone — jtransform now elides
+        // single-arg `Ok`/`Err`/`Some` constructor calls via
+        // `RewriteResult::Identity` so the trace recorder no longer
+        // emits a synthetic `CallR` for the return-type wrapper.
         let expected: Vec<(String, String)> = [
             ("inline_call_r_r", "dR>r"),
             ("live", ""),
             ("catch_exception", "L"),
             ("goto", "L"),
             ("reraise", ""),
-            ("int_copy", "i>i"),
-            ("residual_call_r_r", "iRd>r"),
-            ("live", ""),
             ("ref_return", "r"),
             ("live", ""),
             ("raise", "r"),
@@ -1135,13 +1184,24 @@ mod tests {
         //     `#[ignore]` lifted in the same change.
         let (_builder, mut unwired) = build_default_bh_builder_with_unwired_report();
         unwired.sort();
+        // Snapshot refreshed after the eval-restack squash landed: the
+        // upstream kind-flow surface shifted — `int_ge/ir>i`,
+        // `int_xor/ri>i`, `setarrayitem_gc_f/rrfd`, and
+        // `setarrayitem_gc_i/rrid` no longer surface (Task #85 partial
+        // progress) while `int_add/if>f`, `int_eq/fr>i`,
+        // `int_gt/fr>i`, `int_lt/fr>i`, `int_ne/rf>i`, and
+        // `int_same_as/r>r` newly appear (fresh kind-mismatch shapes
+        // for Task #85 to chase).  The snapshot pins the new boundary
+        // so future drift remains visible.
         let expected: Vec<String> = [
-            "int_ge/ir>i",
+            "int_add/if>f",
+            "int_eq/fr>i",
+            "int_gt/fr>i",
+            "int_lt/fr>i",
             "int_mul/ir>i",
             "int_ne/fr>i",
-            "int_xor/ri>i",
-            "setarrayitem_gc_f/rrfd",
-            "setarrayitem_gc_i/rrid",
+            "int_ne/rf>i",
+            "int_same_as/r>r",
         ]
         .iter()
         .map(|s| s.to_string())

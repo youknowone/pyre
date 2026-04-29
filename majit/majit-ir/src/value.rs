@@ -1,9 +1,10 @@
 /// Value types and constants for the JIT IR.
 ///
 /// Translated from rpython/jit/metainterp/history.py.
+use serde::{Deserialize, Serialize};
 
 /// The type of a value in the JIT IR.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Type {
     /// Machine-word signed integer (i64).
     Int,

@@ -356,6 +356,16 @@ impl TraceCtx {
         self.recorder.cut(pos);
     }
 
+    /// opencoder.py:472 `self.metainterp_sd` — shared static data the
+    /// recorder was constructed with. Read-only handle for callers that
+    /// need to reach the per-process descr pools and terminal descrs
+    /// (`done_with_this_frame_descr_*`,
+    /// `exit_frame_with_exception_descr_ref`) without owning a separate
+    /// reference.
+    pub fn metainterp_sd(&self) -> &std::sync::Arc<crate::MetaInterpStaticData> {
+        &self.metainterp_sd
+    }
+
     /// pyjitpl.py:2398: access the tracing-time heap cache.
     pub fn heap_cache(&self) -> &HeapCache {
         &self.heap_cache

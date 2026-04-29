@@ -1566,6 +1566,14 @@ fn materialize_str_call_for_cranelift(
     let bh_calldescr = majit_translate::jitcode::BhCallDescr {
         arg_classes: cd.arg_classes(),
         result_type: cd.result_class(),
+        result_signed: cd.is_result_signed(),
+        result_size: cd.result_size(),
+        result_erased: majit_translate::jitcode::CallResultErasedKey::from_ir_layout(
+            cd.result_type(),
+            cd.is_result_signed(),
+            cd.result_size(),
+        ),
+        extra_info: cd.get_extra_info().clone(),
     };
     let result = backend.bh_call_r(
         func,

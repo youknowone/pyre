@@ -1194,10 +1194,26 @@ impl BlackholeInterpreter {
                 offset,
                 name,
                 owner,
+                parent,
+                ..
             } = descr
             {
                 if *offset == 0 && !name.is_empty() {
                     *offset = resolver(owner, name);
+                    if let Some(parent) = parent {
+                        let full_name = if owner.is_empty() || name.contains('.') {
+                            name.clone()
+                        } else {
+                            format!("{owner}.{name}")
+                        };
+                        if let Some(field) = parent
+                            .all_fielddescrs
+                            .iter_mut()
+                            .find(|field| field.name == full_name)
+                        {
+                            field.offset = *offset;
+                        }
+                    }
                 }
             }
         }
@@ -3126,10 +3142,26 @@ impl BlackholeInterpBuilder {
                 offset,
                 name,
                 owner,
+                parent,
+                ..
             } = descr
             {
                 if *offset == 0 && !name.is_empty() {
                     *offset = resolver(owner, name);
+                    if let Some(parent) = parent {
+                        let full_name = if owner.is_empty() || name.contains('.') {
+                            name.clone()
+                        } else {
+                            format!("{owner}.{name}")
+                        };
+                        if let Some(field) = parent
+                            .all_fielddescrs
+                            .iter_mut()
+                            .find(|field| field.name == full_name)
+                        {
+                            field.offset = *offset;
+                        }
+                    }
                 }
             }
         }
@@ -5644,6 +5676,14 @@ fn read_descr_vable_field(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
     (
         BhDescr::Field {
             offset,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            parent: None,
             name: String::new(),
             owner: String::new(),
         },
@@ -5672,6 +5712,14 @@ fn read_descr_vable_array(bh: &BlackholeInterpreter, code: &[u8], pos: usize) ->
     (
         BhDescr::Field {
             offset,
+            field_size: 8,
+            field_type: majit_ir::value::Type::Ref,
+            field_flag: majit_ir::descr::ArrayFlag::Pointer,
+            is_field_signed: false,
+            is_immutable: false,
+            is_quasi_immutable: false,
+            index_in_parent: 0,
+            parent: None,
             name: String::new(),
             owner: String::new(),
         },

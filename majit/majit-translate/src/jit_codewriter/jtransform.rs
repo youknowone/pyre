@@ -748,10 +748,11 @@ impl<'a> Transformer<'a> {
                     result: op.result,
                     kind: OpKind::CallResidual {
                         funcptr: CallFuncPtr::Value(funcptr),
-                        descriptor: CallDescriptor::known(EffectInfo::new(
-                            ExtraEffect::ElidableCanRaise,
-                            OopSpecIndex::None,
-                        )),
+                        descriptor: CallDescriptor::from_signature(
+                            &[majit_ir::value::Type::Float, majit_ir::value::Type::Float],
+                            majit_ir::value::Type::Float,
+                            EffectInfo::new(ExtraEffect::ElidableCanRaise, OopSpecIndex::None),
+                        ),
                         args_i: vec![],
                         args_r: vec![],
                         args_f: vec![lhs, rhs],
@@ -1260,6 +1261,31 @@ impl<'a> Transformer<'a> {
                 return RewriteResult::Replace(ops);
             }
         }
+        // STRUCTURAL-ADAPTATION (Rust-frontend → RPython rtyper gap).
+        // RPython's rtyper resolves `Result`/`Option`-style tagged-union
+        // construction to malloc + setfield at lowering time, so by the
+        // time a graph reaches jtransform there are no `Ok(_)`-wrapper
+        // SpaceOperations left to classify. Pyre's Rust frontend
+        // (`front/ast.rs:1471 syn::Expr::Call`) lowers every `Path(args)`
+        // expression to `OpKind::Call` uniformly — `Ok(StepResult::Continue)`
+        // becomes a residual call to a `(r) → r` funcptr, and the trace
+        // recorder emits a `CallR` op for it. The trait-dispatch path
+        // executes the same constructor as zero-cost native code and
+        // emits NO IR ops, so shadow-walker validation diverges by one
+        // synthetic `CallR` per opcode arm. Recognise that single known
+        // family of transparent Rust wrappers here and elide it via the
+        // existing alias mechanism — same orthodoxy as RPython
+        // `_noop_rewrite` (jtransform.py:399-401), just at the call-shape
+        // surface that pyre still needs because its frontend skips the
+        // rtyper step.
+        //
+        // Identity check is delegated to
+        // [`Self::is_synthetic_result_option_ctor`]. The frontend must
+        // already have resolved this to `CallTarget::SyntheticTransparentCtor`;
+        // jtransform does not perform name-only matching.
+        if self.is_synthetic_result_option_ctor(target, args, result_ty) {
+            return RewriteResult::Identity(args[0]);
+        }
         // RPython: guess_call_kind(op) → dispatch to handle_*_call
         if let Some(cc) = self.callcontrol.as_mut() {
             let kind = cc.guess_call_kind(op);
@@ -1275,24 +1301,22 @@ impl<'a> Transformer<'a> {
                     // RPython ALWAYS produces residual_call_* for residual
                     // calls — the effect is only in the calldescr, NOT in
                     // the opcode name. No dispatch_by_effect.
-                    let descriptor =
-                        if let Some((d, _)) = classify_call(target, &self.config.call_effects) {
-                            d
-                        } else {
-                            // RPython call.py:220-222: NON_VOID_ARGS + RESULT
-                            let non_void_args = resolve_non_void_arg_types(args, self.type_state);
-                            let result_ir_type = value_type_to_ir_type(result_ty);
-                            let cc_ref: &crate::call::CallControl =
-                                self.callcontrol.as_deref().unwrap();
-                            cc_ref.getcalldescr(
-                                op,
-                                non_void_args,
-                                result_ir_type,
-                                OopSpecIndex::None,
-                                None,
-                                &mut self.analysis_cache,
-                            )
-                        };
+                    // RPython call.py:220-222: NON_VOID_ARGS + RESULT. Even
+                    // for a configured effect override, keep the signature from
+                    // getcalldescr() instead of accepting an effect-only descr.
+                    let non_void_args = resolve_non_void_arg_types(args, self.type_state);
+                    let result_ir_type = value_type_to_ir_type(result_ty);
+                    let extraeffect = classify_call(target, &self.config.call_effects)
+                        .map(|(d, _)| d.extra_info.extraeffect);
+                    let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
+                    let descriptor = cc_ref.getcalldescr(
+                        op,
+                        non_void_args,
+                        result_ir_type,
+                        OopSpecIndex::None,
+                        extraeffect,
+                        &mut self.analysis_cache,
+                    );
                     self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
                 }
                 crate::call::CallKind::Builtin => {
@@ -1307,6 +1331,9 @@ impl<'a> Transformer<'a> {
         // Fallback when no CallControl: effect-only classification (legacy path).
         // RPython: always residual_call_*, effect only in calldescr.
         if let Some((descriptor, _effect)) = classify_call(target, &self.config.call_effects) {
+            let non_void_args = resolve_non_void_arg_types(args, self.type_state);
+            let descriptor =
+                descriptor.with_signature(&non_void_args, value_type_to_ir_type(result_ty));
             self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
         } else {
             RewriteResult::Keep
@@ -1385,7 +1412,6 @@ impl<'a> Transformer<'a> {
         // We compute arg types once and clone for the collection.
         let non_void_args = resolve_non_void_arg_types(args, self.type_state);
         let result_ir_type = value_type_to_ir_type(result_ty);
-        let non_void_args_for_collection = non_void_args.clone();
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
@@ -1413,16 +1439,10 @@ impl<'a> Transformer<'a> {
         // it carries the real NON_VOID_ARGS and RESULT types from call.py:334.
         if oopspecindex != OopSpecIndex::None {
             if let Some(cc) = self.callcontrol.as_mut() {
-                let calldescr: majit_ir::descr::DescrRef = majit_ir::descr::make_call_descr(
-                    non_void_args_for_collection,
-                    result_ir_type,
-                    descriptor.extra_info.clone(),
-                );
-
                 let func_as_int = cc.fnaddr_for_target(target) as u64;
 
                 cc.callinfocollection
-                    .add(oopspecindex, calldescr, func_as_int);
+                    .add(oopspecindex, descriptor.to_descr_ref(), func_as_int);
                 cc.callinfocollection
                     .register_func_name(func_as_int, format!("{target}"));
             }
@@ -1734,7 +1754,6 @@ impl<'a> Transformer<'a> {
         // jtransform.py:1990-1993
         let non_void_args = resolve_non_void_arg_types(args, self.type_state);
         let result_ir_type = value_type_to_ir_type(result_ty);
-        let non_void_args_for_collection = non_void_args.clone();
         let descriptor = {
             let cc_ref: &crate::call::CallControl = self.callcontrol.as_deref().unwrap();
             cc_ref.getcalldescr(
@@ -1754,14 +1773,9 @@ impl<'a> Transformer<'a> {
         // jtransform.py:1999-2002: callinfocollection.add
         if oopspecindex != OopSpecIndex::None {
             if let Some(cc) = self.callcontrol.as_mut() {
-                let calldescr = majit_ir::descr::make_call_descr(
-                    non_void_args_for_collection,
-                    result_ir_type,
-                    descriptor.extra_info.clone(),
-                );
                 let func_as_int = cc.fnaddr_for_target(target) as u64;
                 cc.callinfocollection
-                    .add(oopspecindex, calldescr, func_as_int);
+                    .add(oopspecindex, descriptor.to_descr_ref(), func_as_int);
                 cc.callinfocollection
                     .register_func_name(func_as_int, format!("{target}"));
             }
@@ -2414,6 +2428,47 @@ impl<'a> Transformer<'a> {
             },
         ])
     }
+
+    /// Decide whether a `direct_call` is a transparent Rust prelude
+    /// constructor that the frontend has already proved is not a real
+    /// callable. Returns `true` iff every requirement holds, so the caller can
+    /// safely emit `RewriteResult::Identity(args[0])`.
+    ///
+    /// Requirements:
+    /// 1. Target is `CallTarget::SyntheticTransparentCtor`.
+    /// 2. `args.len() == 1`.
+    /// 3. The arg's resolved IR kind equals the result's IR kind. A
+    ///    transparent wrapper preserves representation (`r → r`,
+    ///    `i → i`, …); a kind mismatch (e.g. `i → r`) means the
+    ///    Rust call is doing real boxing and must not be elided.
+    fn is_synthetic_result_option_ctor(
+        &self,
+        target: &CallTarget,
+        args: &[ValueId],
+        result_ty: &ValueType,
+    ) -> bool {
+        if args.len() != 1 {
+            return false;
+        }
+        let CallTarget::SyntheticTransparentCtor { name } = target else {
+            return false;
+        };
+        if !matches!(name.as_str(), "Ok" | "Err" | "Some") {
+            return false;
+        }
+        // arg/result IR-kind parity. `resolve_non_void_arg_types`
+        // returns `Type::Ref` when type_state is missing or the
+        // value is unknown — that's the same default
+        // `value_type_to_kind` applies for an `Unknown` result, so
+        // the comparison stays sound under partial type info.
+        let arg_types = resolve_non_void_arg_types(args, self.type_state);
+        let arg_ir = arg_types
+            .first()
+            .copied()
+            .unwrap_or(majit_ir::value::Type::Ref);
+        let result_ir = value_type_to_ir_type(result_ty);
+        arg_ir == result_ir
+    }
 }
 
 /// RPython: `getkind(concretetype)[0]` → 'i', 'r', 'f', or 'v'.
@@ -2492,6 +2547,9 @@ fn target_to_call_path(target: &CallTarget) -> crate::parse::CallPath {
             crate::parse::CallPath::from_segments(segments.iter().map(String::as_str))
         }
         CallTarget::Method { name, .. } => crate::parse::CallPath::from_segments([name.as_str()]),
+        CallTarget::SyntheticTransparentCtor { name } => {
+            crate::parse::CallPath::from_segments([name.as_str()])
+        }
         // RPython: an indirect_call has no single jitcode-lookup path —
         // the family is handled via the op-based `graphs_from(op)` +
         // `IndirectCallTargets` sidecar.  This fallback returns a stub
@@ -4905,5 +4963,103 @@ mod tests {
             ops[5].result.is_none(),
             "jit_merge_point produces no result"
         );
+    }
+
+    /// Synthetic Rust-wrapper elision must accept a single-arg `Ok(_)`
+    /// whose result type matches the arg type and whose frontend target was
+    /// resolved as a synthetic transparent constructor.
+    #[test]
+    fn synthetic_result_ctor_identity_accepts_prelude_ok() {
+        let config = GraphTransformConfig::default();
+        let mut ts = TypeResolutionState::new();
+        let arg = ValueId(1);
+        ts.concrete_types.insert(arg, ConcreteType::GcRef);
+        let transformer = Transformer::new(&config).with_type_state(&ts);
+        assert!(transformer.is_synthetic_result_option_ctor(
+            &CallTarget::synthetic_transparent_ctor("Ok"),
+            &[arg],
+            &ValueType::Ref,
+        ));
+    }
+
+    /// Reject a normal function call named `Ok`; user-function protection now
+    /// lives in the frontend resolver, so jtransform only trusts the explicit
+    /// synthetic target variant.
+    #[test]
+    fn synthetic_result_ctor_identity_rejects_function_path_ok() {
+        let config = GraphTransformConfig::default();
+        let mut ts = TypeResolutionState::new();
+        let arg = ValueId(1);
+        ts.concrete_types.insert(arg, ConcreteType::GcRef);
+        let transformer = Transformer::new(&config).with_type_state(&ts);
+        assert!(!transformer.is_synthetic_result_option_ctor(
+            &CallTarget::function_path(["Ok"]),
+            &[arg],
+            &ValueType::Ref,
+        ));
+    }
+
+    /// Reject when the target is not the explicit synthetic variant even if
+    /// the spelling looks like a prelude constructor.
+    #[test]
+    fn synthetic_result_ctor_identity_rejects_name_only_matching() {
+        let config = GraphTransformConfig::default();
+        let mut ts = TypeResolutionState::new();
+        let arg = ValueId(1);
+        ts.concrete_types.insert(arg, ConcreteType::GcRef);
+        let transformer = Transformer::new(&config).with_type_state(&ts);
+        assert!(!transformer.is_synthetic_result_option_ctor(
+            &CallTarget::function_path(["Ok"]),
+            &[arg],
+            &ValueType::Ref,
+        ));
+    }
+
+    /// Reject when arg/result IR kinds disagree — that means the
+    /// callee is doing real boxing work, not a transparent wrapper.
+    #[test]
+    fn synthetic_result_ctor_identity_rejects_kind_mismatch() {
+        let config = GraphTransformConfig::default();
+        let mut ts = TypeResolutionState::new();
+        let arg = ValueId(1);
+        ts.concrete_types.insert(arg, ConcreteType::Signed);
+        let transformer = Transformer::new(&config).with_type_state(&ts);
+        assert!(!transformer.is_synthetic_result_option_ctor(
+            &CallTarget::synthetic_transparent_ctor("Ok"),
+            &[arg],
+            &ValueType::Ref,
+        ));
+    }
+
+    /// Reject names not in the narrow allow-list and reject name-only
+    /// matching for qualified paths. The frontend maps approved qualified
+    /// constructors to `SyntheticTransparentCtor` with the final segment.
+    #[test]
+    fn synthetic_result_ctor_identity_rejects_other_names() {
+        let config = GraphTransformConfig::default();
+        let mut ts = TypeResolutionState::new();
+        let arg = ValueId(1);
+        ts.concrete_types.insert(arg, ConcreteType::GcRef);
+        let transformer = Transformer::new(&config).with_type_state(&ts);
+        assert!(!transformer.is_synthetic_result_option_ctor(
+            &CallTarget::function_path(["Result", "Ok"]),
+            &[arg],
+            &ValueType::Ref,
+        ));
+        assert!(!transformer.is_synthetic_result_option_ctor(
+            &CallTarget::synthetic_transparent_ctor("Foo"),
+            &[arg],
+            &ValueType::Ref,
+        ));
+        assert!(transformer.is_synthetic_result_option_ctor(
+            &CallTarget::synthetic_transparent_ctor("Err"),
+            &[arg],
+            &ValueType::Ref,
+        ));
+        assert!(transformer.is_synthetic_result_option_ctor(
+            &CallTarget::synthetic_transparent_ctor("Some"),
+            &[arg],
+            &ValueType::Ref,
+        ));
     }
 }

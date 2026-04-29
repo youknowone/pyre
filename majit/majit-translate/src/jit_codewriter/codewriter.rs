@@ -198,7 +198,9 @@ impl CodeWriter {
         // In majit, assemble() calls compute_liveness() internally and now
         // returns the body so the codewriter can fill calldescr before
         // committing the shell via `set_body`.
-        let mut body = self.assembler.assemble(&mut ssarepr, &regallocs);
+        let mut body =
+            self.assembler
+                .assemble_with_callcontrol(&mut ssarepr, &regallocs, Some(callcontrol));
 
         // call.py:174-187 get_jitcode_calldescr:
         //   FUNC = lltype.typeOf(fnptr).TO
@@ -252,10 +254,11 @@ impl CodeWriter {
                 declared_kind.unwrap(),
                 cfg_kind,
             );
-            body.calldescr = crate::jitcode::BhCallDescr {
+            body.calldescr = crate::jitcode::BhCallDescr::from_arg_classes(
                 arg_classes,
                 result_type,
-            };
+                majit_ir::descr::EffectInfo::MOST_GENERAL,
+            );
         }
 
         // Commit the body to the pre-allocated `Arc<JitCode>` shell.

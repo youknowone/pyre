@@ -892,13 +892,29 @@ fn binop_int_record(
 ///   `crate::jitcode_runtime::all_descrs()` + a JitCode-resolving
 ///   closure over `crate::jitcode_runtime::all_jitcodes()`.
 ///
-/// `is_top_level` is forced `true` here — this is the outermost
-/// frame entry. Sub-walks happen automatically inside
-/// `inline_call_r_r/dR>r`'s recursion (which constructs its own
-/// `is_top_level=false` `WalkContext`).
+/// `is_top_level` selects the outer-frame semantic:
 ///
-/// **No production caller wires this yet** (slice 3.1 = entry +
-/// test; production wiring lands in subsequent Phase D-3 slices).
+/// * `true` — outermost trace entry. `*_return/*` arms record
+///   `Finish(value, done_with_this_frame_descr_<kind>)` and a `raise/r`
+///   that is never caught records
+///   `Finish(exc, exit_frame_with_exception_descr_ref)`.
+/// * `false` — sub-frame entry: `*_return/*` arms surface
+///   `SubReturn { result }` and uncaught `raise/r` arms surface
+///   `SubRaise { exc }` to the caller. The shadow validator (Phase
+///   D-3) drives this for per-Python-opcode arms — a Python-opcode arm
+///   compiled by the codewriter ends with `*_return/*` (since each arm
+///   is a self-contained sub-jitcode invoked from the outer dispatcher
+///   via `inline_call_r_r/dR>r`), and the trait dispatch path emits
+///   no FINISH per Python opcode, so shadow mode must NOT emit one
+///   either.
+///
+/// Sub-walks driven by `inline_call_r_r/dR>r` recursion always set
+/// `is_top_level=false` regardless of this caller-side flag (the
+/// recursion constructs its own `WalkContext`).
+///
+/// **Production wiring**: `crate::shadow_walker::shadow_validate_pre`
+/// is the first caller; it passes `is_top_level: false` for per-opcode
+/// shadow validation.
 pub fn dispatch_via_miframe(
     miframe: &mut MIFrame,
     jitcode_code: &[u8],
@@ -910,6 +926,7 @@ pub fn dispatch_via_miframe(
     done_with_this_frame_descr_float: DescrRef,
     done_with_this_frame_descr_void: DescrRef,
     exit_frame_with_exception_descr_ref: DescrRef,
+    is_top_level: bool,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
     // Extract raw pointers before any borrow. `miframe.ctx` and
     // `miframe.sym` are `*mut`, distinct objects (the trace
@@ -946,7 +963,7 @@ pub fn dispatch_via_miframe(
             done_with_this_frame_descr_float,
             done_with_this_frame_descr_void,
             exit_frame_with_exception_descr_ref,
-            is_top_level: true,
+            is_top_level,
             sub_jitcode_lookup,
             last_exc_value: initial_last_exc_value,
         };
@@ -4074,6 +4091,131 @@ mod tests {
     }
 
     #[test]
+    #[ignore]
+    fn dump_pop_top_arm_bytes() {
+        use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
+        let jc = jitcode_for_instruction(&Instruction::PopTop)
+            .expect("PopTop must resolve to an arm jitcode");
+        let code = jc.code.as_slice();
+        eprintln!("PopTop arm: code_len={}", code.len());
+        let descrs = all_descrs();
+        for op in decoded_ops(code) {
+            let operand_bytes = &code[op.pc + 1..op.next_pc];
+            eprintln!(
+                "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
+                op.pc, op.next_pc, op.key, operand_bytes,
+            );
+            let mut cursor = 0usize;
+            let mut chars = op.argcodes.chars();
+            while let Some(c) = chars.next() {
+                match c {
+                    'i' | 'c' | 'r' | 'f' => cursor += 1,
+                    'L' => cursor += 2,
+                    'd' | 'j' => {
+                        let idx =
+                            u16::from_le_bytes([operand_bytes[cursor], operand_bytes[cursor + 1]])
+                                as usize;
+                        let info = descrs
+                            .get(idx)
+                            .map(|d| format!("{:?}", d))
+                            .unwrap_or_else(|| "<oor>".to_string());
+                        eprintln!("      descr[{idx}] = {info}");
+                        cursor += 2;
+                    }
+                    'I' | 'R' | 'F' => {
+                        let n = operand_bytes[cursor] as usize;
+                        cursor += 1 + n;
+                    }
+                    '>' => {
+                        chars.next();
+                        cursor += 1;
+                    }
+                    _ => break,
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore]
+    fn dump_nop_arm_bytes() {
+        // Phase D-3 Blocker #2 diagnostic: decode `Instruction::Nop`'s
+        // arm jitcode by following per-opname argcode arity (NOT a
+        // byte-by-byte table lookup, which mistakes operand bytes for
+        // opcode bytes). Surfaces the exact op sequence so we can map
+        // each residual_call back to its source in the codewriter.
+        use crate::jitcode_runtime::{all_descrs, decoded_ops, jitcode_for_instruction};
+        let jc =
+            jitcode_for_instruction(&Instruction::Nop).expect("Nop must resolve to an arm jitcode");
+        let code = jc.code.as_slice();
+        eprintln!(
+            "Nop arm: name={} num_regs_r={} num_regs_i={} num_regs_f={} code_len={}",
+            jc.name,
+            jc.num_regs_r(),
+            jc.num_regs_i(),
+            jc.num_regs_f(),
+            code.len(),
+        );
+        eprintln!("Raw bytes: {:02x?}", code);
+        let descrs = all_descrs();
+        for op in decoded_ops(code) {
+            let operand_bytes = &code[op.pc + 1..op.next_pc];
+            // Decode descr operands inline so we can see *which* residual
+            // call this is (the descr carries arg_classes + result_type
+            // + funcptr identity).
+            if op.argcodes.contains('d') || op.argcodes.contains('j') {
+                // Find the descr 2-byte operand. argcode parser
+                // sequences `i` then `R` then `d` then `>r` in the
+                // residual_call_r_r case — so the descr is the
+                // 2 bytes immediately preceding `>r` if present.
+                eprintln!(
+                    "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
+                    op.pc, op.next_pc, op.key, operand_bytes,
+                );
+                // Try to find a 'd' position. For residual_call_r_r/iRd>r:
+                //   operands = [funcptr_int(1), R-len(1), R[0..n](n), descr_lo(1), descr_hi(1), dst_r(1)]
+                // For getfield_gc_r/rd>r:
+                //   operands = [src_r(1), descr_lo(1), descr_hi(1), dst_r(1)]
+                // We re-walk the argcode to locate `d` precisely.
+                let mut cursor = 0usize;
+                let mut chars = op.argcodes.chars();
+                while let Some(c) = chars.next() {
+                    match c {
+                        'i' | 'c' | 'r' | 'f' => cursor += 1,
+                        'L' => cursor += 2,
+                        'd' | 'j' => {
+                            let idx = u16::from_le_bytes([
+                                operand_bytes[cursor],
+                                operand_bytes[cursor + 1],
+                            ]) as usize;
+                            let info = descrs
+                                .get(idx)
+                                .map(|d| format!("{:?}", d))
+                                .unwrap_or_else(|| "<out-of-range>".to_string());
+                            eprintln!("      descr[{idx}] = {info}");
+                            cursor += 2;
+                        }
+                        'I' | 'R' | 'F' => {
+                            let n = operand_bytes[cursor] as usize;
+                            cursor += 1 + n;
+                        }
+                        '>' => {
+                            chars.next();
+                            cursor += 1;
+                        }
+                        _ => break,
+                    }
+                }
+            } else {
+                eprintln!(
+                    "  pc={:>3}..{:<3} key={:>30}  operands={:02x?}",
+                    op.pc, op.next_pc, op.key, operand_bytes,
+                );
+            }
+        }
+    }
+
+    #[test]
     fn dump_rvmprof_code_presence() {
         // Throw-away check: rvmprof_code/ii presence in pyre's insns
         // table. Used to decide whether `try_catch_exception_at` needs
@@ -6881,6 +7023,7 @@ mod tests {
             make_fail_descr(102),
             make_fail_descr(103),
             make_fail_descr(2),
+            true,
         )
         .expect("dispatch_via_miframe must succeed for ref_return r2");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -6951,6 +7094,7 @@ mod tests {
             make_fail_descr(102),
             make_fail_descr(103),
             descr_exc,
+            true,
         )
         .expect("dispatch_via_miframe must succeed for raise r3");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -7016,6 +7160,7 @@ mod tests {
             make_fail_descr(102),
             make_fail_descr(103),
             make_fail_descr(2),
+            true,
         )
         .expect("ref_return walk must succeed");
         drop(miframe);

@@ -1489,6 +1489,16 @@ impl<M: Clone> MetaInterp<M> {
              RPython warmspot.py:289 invariant requires a single owner at finish_setup time",
         );
         staticdata.finish_setup(codewriter, callcontrol);
+        // pyjitpl.py:2268 `self.callinfocollection = codewriter.callcontrol
+        //                                  .callinfocollection`. Upstream
+        // exposes the populated collection through `metainterp.staticdata
+        // .callinfocollection`; pyre's distribution path threads it as the
+        // `Option<Arc<…>>` field on `MetaInterp` (consumed by optimizer /
+        // unroll / cranelift / pyre-jit eval guard-exit). Seeding the Arc
+        // here means every later `self.callinfocollection.clone()` shares
+        // identity through `Arc::clone` and the `vstring`/`Concat` resume
+        // paths see a populated table instead of `None`.
+        self.callinfocollection = Some(std::sync::Arc::new(staticdata.callinfocollection.clone()));
     }
 
     /// Narrow lifecycle hook for state-field JIT: install the canonical

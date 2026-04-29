@@ -9256,10 +9256,55 @@ mod tests {
             mainjitcode: None,
         });
 
+        let skeleton_ptr = {
+            let cc = writer.callcontrol();
+            assert_eq!(cc.jitdrivers_sd.len(), 1);
+            assert_eq!(cc.jitdrivers_sd[0].portal_graph, raw_code);
+            assert_eq!(cc.jitdrivers_sd[0].merge_point_pc, Some(7));
+            assert_eq!(cc.jitdriver_sd_from_portal_graph(raw_code), Some(0));
+
+            cc.grab_initial_jitcodes();
+            let cached = cc
+                .jitcodes
+                .get(&(raw_code as usize))
+                .expect("grab_initial_jitcodes inserts portal jitcode skeleton");
+            let mainjitcode = cc.jitdrivers_sd[0]
+                .mainjitcode
+                .as_ref()
+                .expect("call.py:147 binds jd.mainjitcode immediately");
+            assert!(
+                std::sync::Arc::ptr_eq(cached, mainjitcode),
+                "jd.mainjitcode must share the same PyJitCode Arc as CallControl.jitcodes"
+            );
+            assert_eq!(
+                mainjitcode.jitcode.jitdriver_sd,
+                Some(0),
+                "call.py:148 stamps jd.mainjitcode.jitdriver_sd immediately"
+            );
+            std::sync::Arc::as_ptr(cached)
+        };
+
+        let all_jitcodes = writer.drain_unfinished_graphs();
         let cc = writer.callcontrol();
-        assert_eq!(cc.jitdrivers_sd.len(), 1);
-        assert_eq!(cc.jitdrivers_sd[0].portal_graph, raw_code);
-        assert_eq!(cc.jitdrivers_sd[0].merge_point_pc, Some(7));
-        assert_eq!(cc.jitdriver_sd_from_portal_graph(raw_code), Some(0));
+        let cached = cc
+            .jitcodes
+            .get(&(raw_code as usize))
+            .expect("drain keeps the portal jitcode cached");
+        let mainjitcode = cc.jitdrivers_sd[0]
+            .mainjitcode
+            .as_ref()
+            .expect("drain rebinds jd.mainjitcode to the populated portal");
+        assert_eq!(all_jitcodes, vec![std::sync::Arc::as_ptr(cached)]);
+        assert_eq!(
+            std::sync::Arc::as_ptr(cached),
+            skeleton_ptr,
+            "portal skeleton Arc should be filled in place despite jd.mainjitcode"
+        );
+        assert!(
+            std::sync::Arc::ptr_eq(cached, mainjitcode),
+            "populated jd.mainjitcode must remain the same Arc as CallControl.jitcodes"
+        );
+        assert!(mainjitcode.is_populated());
+        assert_eq!(mainjitcode.jitcode.jitdriver_sd, Some(0));
     }
 }

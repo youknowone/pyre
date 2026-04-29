@@ -256,7 +256,7 @@ fn collect_trait_impls_from_items(
                                         known_trait_names,
                                     )
                                 }
-                                syn::ReturnType::Default => None,
+                                syn::ReturnType::Default => Some("()".to_string()),
                             };
                             methods.push(MethodInfo {
                                 name: method.sig.ident.to_string(),
@@ -309,7 +309,7 @@ fn collect_trait_impls_from_items(
                                         known_trait_names,
                                     )
                                 }
-                                syn::ReturnType::Default => None,
+                                syn::ReturnType::Default => Some("()".to_string()),
                             };
                             methods.push(MethodInfo {
                                 name: method.sig.ident.to_string(),
@@ -455,7 +455,7 @@ fn collect_inherent_methods_from_items(
                                     &std::collections::HashSet::new(),
                                 )
                             }
-                            syn::ReturnType::Default => None,
+                            syn::ReturnType::Default => Some("()".to_string()),
                         };
                         methods.push(InherentMethodInfo {
                             for_type: for_type.clone(),

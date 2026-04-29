@@ -2276,11 +2276,22 @@ pub struct SimpleArrayDescr {
     pub concrete_type: char,
     /// descr.py:280: ArrayDescr.all_interiorfielddescrs.
     /// For array-of-structs, contains interior field descriptors.
-    all_interiorfielddescrs: Option<Vec<DescrRef>>,
+    /// `OnceLock` keeps the field write-once after construction so the
+    /// builder can publish a single `Arc<SimpleArrayDescr>` to the
+    /// `SimpleInteriorFieldDescr` constructors AND set the interior list
+    /// on the same Arc afterwards — RPython
+    /// `descr.py:388 InteriorFieldDescr.__init__` carries the exact
+    /// arraydescr object, so `interior.array_descr is final.array_descr`
+    /// must hold by Arc identity.
+    all_interiorfielddescrs: std::sync::OnceLock<Vec<DescrRef>>,
 }
 
 impl Clone for SimpleArrayDescr {
     fn clone(&self) -> Self {
+        let interior = std::sync::OnceLock::new();
+        if let Some(existing) = self.all_interiorfielddescrs.get() {
+            let _ = interior.set(existing.clone());
+        }
         SimpleArrayDescr {
             index: self.index,
             descr_index: AtomicI32::new(self.descr_index.load(Ordering::Relaxed)),
@@ -2292,7 +2303,7 @@ impl Clone for SimpleArrayDescr {
             flag: self.flag,
             is_pure: self.is_pure,
             concrete_type: self.concrete_type,
-            all_interiorfielddescrs: self.all_interiorfielddescrs.clone(),
+            all_interiorfielddescrs: interior,
         }
     }
 }
@@ -2317,7 +2328,7 @@ impl SimpleArrayDescr {
             flag,
             is_pure: false,
             concrete_type: '\x00',
-            all_interiorfielddescrs: None,
+            all_interiorfielddescrs: std::sync::OnceLock::new(),
         }
     }
 
@@ -2341,13 +2352,18 @@ impl SimpleArrayDescr {
             flag,
             is_pure: false,
             concrete_type: '\x00',
-            all_interiorfielddescrs: None,
+            all_interiorfielddescrs: std::sync::OnceLock::new(),
         }
     }
 
     /// RPython: arraydescr.all_interiorfielddescrs = descrs
-    pub fn set_all_interiorfielddescrs(&mut self, descrs: Vec<DescrRef>) {
-        self.all_interiorfielddescrs = Some(descrs);
+    /// Settable through `&self` so the publication can target the same
+    /// `Arc<SimpleArrayDescr>` the `InteriorFieldDescr` constructors
+    /// already cloned into their `array_descr` field.  Subsequent calls
+    /// silently ignore the new list (matching RPython's "set once" use
+    /// at `descr.py:373` inside `get_array_descr`).
+    pub fn set_all_interiorfielddescrs(&self, descrs: Vec<DescrRef>) {
+        let _ = self.all_interiorfielddescrs.set(descrs);
     }
 
     /// gc.py:548: descr.tid = llop.combine_ushort(lltype.Signed, type_id, 0)
@@ -2417,7 +2433,7 @@ impl ArrayDescr for SimpleArrayDescr {
     }
     /// RPython: descr.py ArrayDescr.get_all_interiorfielddescrs()
     fn get_all_interiorfielddescrs(&self) -> Option<&[DescrRef]> {
-        self.all_interiorfielddescrs.as_deref()
+        self.all_interiorfielddescrs.get().map(Vec::as_slice)
     }
 }
 

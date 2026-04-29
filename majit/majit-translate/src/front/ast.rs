@@ -427,7 +427,7 @@ fn collect_fields_and_returns(
                         known_struct_names,
                         known_trait_names,
                     ),
-                    syn::ReturnType::Default => None,
+                    syn::ReturnType::Default => Some("()".to_string()),
                 };
                 if let Some(ret_ty) = ret_ty {
                     let key = if prefix.is_empty() {
@@ -449,7 +449,7 @@ fn collect_fields_and_returns(
                                 known_struct_names,
                                 known_trait_names,
                             ),
-                            syn::ReturnType::Default => None,
+                            syn::ReturnType::Default => Some("()".to_string()),
                         };
                         if let Some(ret_ty) = ret_ty {
                             if let Some(ref ty_root) = self_ty_root {
@@ -766,6 +766,7 @@ pub fn collect_jit_hints_pub(attrs: &[syn::Attribute]) -> Vec<String> {
 #[derive(Debug, Clone)]
 struct GraphBuildContext<'a> {
     local_type_roots: HashMap<String, String>,
+    local_value_types: HashMap<String, ValueType>,
     /// RPython: ARRAY element type identity — maps variable name to the
     /// element type of its array (e.g. "arr" → "Point" for `arr: Vec<Point>`).
     /// This is the Rust equivalent of RPython's `GcArray(T)` where T is the
@@ -819,6 +820,7 @@ impl<'a> GraphBuildContext<'a> {
     ) -> Self {
         Self {
             local_type_roots: HashMap::new(),
+            local_value_types: HashMap::new(),
             local_array_types: HashMap::new(),
             local_dyn_trait_roots: HashMap::new(),
             struct_fields,
@@ -904,6 +906,8 @@ fn build_function_graph(
                 // an `lltype.Ptr(<Self>)` register in RPython, so the
                 // formal parameter always lands in the Ref class.
                 let self_ty = classify_fn_arg_ty(&recv.ty);
+                ctx.local_value_types
+                    .insert("self".to_string(), self_ty.clone());
                 if let Some(vid) = graph.push_op(
                     entry,
                     OpKind::Input {
@@ -950,6 +954,7 @@ fn build_function_graph(
                 // `lookup_reg_with_kind` — the source of the pyre-only
                 // `getfield_gc_*/id>*` `_intbase` aliases.
                 let arg_ty = classify_fn_arg_ty(&pat_type.ty);
+                ctx.local_value_types.insert(name.clone(), arg_ty.clone());
                 if let Some(vid) = graph.push_op(
                     entry,
                     OpKind::Input {
@@ -991,7 +996,7 @@ fn build_function_graph(
         syn::ReturnType::Type(_, ty) => {
             qualified_full_type_string(ty, module_prefix, known_struct_names, known_trait_names)
         }
-        syn::ReturnType::Default => None,
+        syn::ReturnType::Default => Some("()".to_string()),
     };
 
     // RPython: function-level hints from decorators / GC transformer.
@@ -1151,6 +1156,8 @@ fn lower_stmt(
                     let qualified = qualify_type_name(&type_root, &ctx.module_prefix);
                     ctx.local_type_roots.insert(name.clone(), qualified);
                 }
+                ctx.local_value_types
+                    .insert(name.clone(), classify_fn_arg_ty(&pat_type.ty));
                 if let Some(full_type) = qualified_full_type_string(
                     &pat_type.ty,
                     &ctx.module_prefix,
@@ -1174,11 +1181,23 @@ fn lower_stmt(
                 }
                 // Record variable name (RPython Variable._name)
                 if let Some(vid) = lowered.value {
+                    let name = if let syn::Pat::Ident(pat_ident) = &local.pat {
+                        Some(pat_ident.ident.to_string())
+                    } else if let syn::Pat::Type(pat_type) = &local.pat {
+                        Some(canonical_pat_name(&pat_type.pat))
+                    } else {
+                        None
+                    };
                     if let syn::Pat::Ident(pat_ident) = &local.pat {
                         graph.name_value(vid, pat_ident.ident.to_string());
                     } else if let syn::Pat::Type(pat_type) = &local.pat {
                         let name = canonical_pat_name(&pat_type.pat);
                         graph.name_value(vid, name);
+                    }
+                    if let Some(name) = name
+                        && let Some(ty) = graph_result_value_type(graph, vid)
+                    {
+                        ctx.local_value_types.insert(name, ty);
                     }
                 }
             }
@@ -1474,7 +1493,7 @@ fn lower_expr(
                 let v = get_value!(lower_expr(graph, block, a, options, ctx)?);
                 args.push(v);
             }
-            let target = canonical_call_target(&call.func, &ctx.module_prefix);
+            let target = canonical_call_target(&call.func, ctx);
             // RPython parity: same rationale as the MethodCall arm above
             // — `op.result.concretetype` is set from the registered
             // FuncDesc.  Look up the qualified function path in
@@ -1544,13 +1563,11 @@ fn lower_expr(
             // integer ops (otherwise `value_type_to_kind` defaults to
             // `'r'` and the result reaches the assembler as a Ref-kind
             // operand, surfacing as `int_ge/ir>i` etc.).
-            let result_ty = receiver_root
-                .as_ref()
-                .and_then(|root| {
-                    let key = format!("{}::{}", root, mc.method);
-                    ctx.fn_return_types.get(&key)
+            let result_ty = transparent_option_method_result_type(graph, &args, &mc.method)
+                .or_else(|| {
+                    lookup_method_return_type(ctx, receiver_root.as_deref(), &mc.method)
+                        .map(|s| type_string_to_value_type(s))
                 })
-                .map(|s| type_string_to_value_type(s))
                 .unwrap_or(ValueType::Unknown);
             Ok(Lowered {
                 value: graph.push_op(
@@ -1804,15 +1821,13 @@ fn lower_expr(
                 .map(|seg| seg.ident.to_string())
                 .collect::<Vec<_>>()
                 .join("::");
+            let ty = ctx
+                .local_value_types
+                .get(&name)
+                .cloned()
+                .unwrap_or(ValueType::Unknown);
             Ok(Lowered {
-                value: graph.push_op(
-                    *block,
-                    OpKind::Input {
-                        name,
-                        ty: ValueType::Unknown,
-                    },
-                    true,
-                ),
+                value: graph.push_op(*block, OpKind::Input { name, ty }, true),
                 path_closed: false,
             })
         }
@@ -1872,7 +1887,30 @@ fn lower_expr(
         }
 
         // ── cast: expr as T ──
-        syn::Expr::Cast(cast) => lower_expr(graph, block, &cast.expr, options, ctx),
+        syn::Expr::Cast(cast) => {
+            let operand = get_value!(lower_expr(graph, block, &cast.expr, options, ctx)?);
+            let result_ty = classify_fn_arg_ty(&cast.ty);
+            if result_ty == ValueType::Unknown {
+                return Ok(Lowered::value(operand));
+            }
+            if result_ty == ValueType::Void {
+                return Ok(Lowered::no_value());
+            }
+            let source_ty = graph_result_value_type(graph, operand);
+            let op = cast_op_name(source_ty.as_ref(), &result_ty).to_string();
+            Ok(Lowered {
+                value: graph.push_op(
+                    *block,
+                    OpKind::UnaryOp {
+                        op,
+                        operand,
+                        result_ty,
+                    },
+                    true,
+                ),
+                path_closed: false,
+            })
+        }
 
         // ── match expr { arms } → multi-block (RPython switch) ──
         syn::Expr::Match(m) => {
@@ -2819,7 +2857,7 @@ fn member_name(member: &syn::Member) -> String {
 /// Qualify single-segment bare function names with module prefix so that
 /// `helper()` inside `mod a` produces `["a", "helper"]`, matching the
 /// registered graph path.
-fn canonical_call_target(expr: &syn::Expr, module_prefix: &str) -> CallTarget {
+fn canonical_call_target(expr: &syn::Expr, ctx: &GraphBuildContext) -> CallTarget {
     match expr {
         syn::Expr::Path(path) => {
             let mut segments: Vec<String> = path
@@ -2828,8 +2866,19 @@ fn canonical_call_target(expr: &syn::Expr, module_prefix: &str) -> CallTarget {
                 .iter()
                 .map(|seg| seg.ident.to_string())
                 .collect();
-            if segments.len() == 1 && !module_prefix.is_empty() {
-                let mut qualified = module_prefix
+            if is_transparent_result_option_ctor(&segments)
+                && !registered_function_path(&segments, ctx)
+            {
+                return CallTarget::synthetic_transparent_ctor(
+                    segments
+                        .last()
+                        .expect("transparent ctor path is non-empty")
+                        .clone(),
+                );
+            }
+            if segments.len() == 1 && !ctx.module_prefix.is_empty() {
+                let mut qualified = ctx
+                    .module_prefix
                     .split("::")
                     .map(|s| s.to_string())
                     .collect::<Vec<_>>();
@@ -2840,6 +2889,40 @@ fn canonical_call_target(expr: &syn::Expr, module_prefix: &str) -> CallTarget {
         }
         _ => CallTarget::UnsupportedExpr,
     }
+}
+
+fn is_transparent_result_option_ctor(segments: &[String]) -> bool {
+    let path: Vec<&str> = segments.iter().map(String::as_str).collect();
+    matches!(
+        path.as_slice(),
+        ["Ok"]
+            | ["Err"]
+            | ["Some"]
+            | ["Result", "Ok"]
+            | ["Result", "Err"]
+            | ["Option", "Some"]
+            | ["result", "Result", "Ok"]
+            | ["result", "Result", "Err"]
+            | ["option", "Option", "Some"]
+            | ["std", "result", "Result", "Ok"]
+            | ["std", "result", "Result", "Err"]
+            | ["std", "option", "Option", "Some"]
+            | ["core", "result", "Result", "Ok"]
+            | ["core", "result", "Result", "Err"]
+            | ["core", "option", "Option", "Some"]
+    )
+}
+
+fn registered_function_path(segments: &[String], ctx: &GraphBuildContext) -> bool {
+    let unqualified = segments.join("::");
+    if ctx.fn_return_types.contains_key(&unqualified) {
+        return true;
+    }
+    if segments.len() == 1 && !ctx.module_prefix.is_empty() {
+        let qualified = format!("{}::{}", ctx.module_prefix, segments[0]);
+        return ctx.fn_return_types.contains_key(&qualified);
+    }
+    false
 }
 
 fn receiver_type_root(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<String> {
@@ -2860,6 +2943,124 @@ fn receiver_type_root(expr: &syn::Expr, ctx: &GraphBuildContext) -> Option<Strin
         syn::Expr::Field(field) => receiver_type_root(&field.base, ctx),
         syn::Expr::Index(index) => receiver_type_root(&index.expr, ctx),
         _ => None,
+    }
+}
+
+fn graph_result_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
+    graph
+        .blocks
+        .iter()
+        .flat_map(|block| block.operations.iter())
+        .find_map(|op| {
+            if op.result == Some(value) {
+                op_result_value_type(&op.kind)
+            } else {
+                None
+            }
+        })
+}
+
+fn op_result_value_type(kind: &OpKind) -> Option<ValueType> {
+    match kind {
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. }
+        | OpKind::BinOp { result_ty: ty, .. }
+        | OpKind::UnaryOp { result_ty: ty, .. }
+        | OpKind::Call { result_ty: ty, .. }
+        | OpKind::IndirectCall { result_ty: ty, .. } => {
+            if *ty == ValueType::Unknown {
+                None
+            } else {
+                Some(ty.clone())
+            }
+        }
+        OpKind::ConstInt(_) | OpKind::VtableMethodPtr { .. } | OpKind::CurrentTraceLength => {
+            Some(ValueType::Int)
+        }
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. } => {
+            if *item_ty == ValueType::Unknown {
+                None
+            } else {
+                Some(item_ty.clone())
+            }
+        }
+        OpKind::CallElidable { result_kind, .. }
+        | OpKind::CallResidual { result_kind, .. }
+        | OpKind::CallMayForce { result_kind, .. }
+        | OpKind::InlineCall { result_kind, .. }
+        | OpKind::RecursiveCall { result_kind, .. } => kind_char_to_value_type(*result_kind),
+        OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => Some(ValueType::Int),
+        _ => None,
+    }
+}
+
+fn transparent_option_method_result_type(
+    graph: &FunctionGraph,
+    args: &[ValueId],
+    method: &syn::Ident,
+) -> Option<ValueType> {
+    match method.to_string().as_str() {
+        "as_usize" | "len" | "is_empty" | "is_null" | "wrapping_mul" => Some(ValueType::Int),
+        "unwrap_or" => args
+            .get(1)
+            .and_then(|&default| graph_result_value_type(graph, default)),
+        _ => None,
+    }
+}
+
+fn kind_char_to_value_type(kind: char) -> Option<ValueType> {
+    match kind {
+        'i' => Some(ValueType::Int),
+        'r' => Some(ValueType::Ref),
+        'f' => Some(ValueType::Float),
+        'v' => Some(ValueType::Void),
+        _ => None,
+    }
+}
+
+fn cast_op_name(source_ty: Option<&ValueType>, target_ty: &ValueType) -> &'static str {
+    match (source_ty, target_ty) {
+        (Some(ValueType::Int), ValueType::Float) => "cast_int_to_float",
+        (Some(ValueType::Float), ValueType::Int) => "cast_float_to_int",
+        (Some(ValueType::Ref), ValueType::Int) => "cast_ptr_to_int",
+        (Some(ValueType::Int), ValueType::Ref) => "cast_int_to_ptr",
+        _ => "same_as",
+    }
+}
+
+fn lookup_method_return_type<'a>(
+    ctx: &'a GraphBuildContext,
+    receiver_root: Option<&str>,
+    method: &syn::Ident,
+) -> Option<&'a String> {
+    let receiver_root = receiver_root?;
+    let exact = format!("{}::{}", receiver_root, method);
+    if let Some(ret) = ctx.fn_return_types.get(&exact) {
+        return Some(ret);
+    }
+
+    let receiver_leaf = receiver_root.rsplit("::").next().unwrap_or(receiver_root);
+    let method_name = method.to_string();
+    // Rust imports can make the call-site owner path shorter or longer
+    // than the impl key. Use the leaf owner only when it is unambiguous.
+    let mut matches = ctx.fn_return_types.iter().filter_map(|(key, ret)| {
+        let (owner, candidate_method) = key.rsplit_once("::")?;
+        if candidate_method == method_name.as_str()
+            && owner.rsplit("::").next().unwrap_or(owner) == receiver_leaf
+        {
+            Some(ret)
+        } else {
+            None
+        }
+    });
+    let first = matches.next()?;
+    if matches.next().is_none() {
+        Some(first)
+    } else {
+        None
     }
 }
 
@@ -3261,6 +3462,15 @@ pub fn full_type_string(ty: &syn::Type) -> Option<String> {
             Some(segments.join("::"))
         }
         syn::Type::Reference(r) => full_type_string(&r.elem),
+        syn::Type::Ptr(p) => {
+            let inner = full_type_string(&p.elem)?;
+            let mutability = if p.mutability.is_some() {
+                "*mut"
+            } else {
+                "*const"
+            };
+            Some(format!("{mutability} {inner}"))
+        }
         syn::Type::Paren(p) => full_type_string(&p.elem),
         syn::Type::Group(g) => full_type_string(&g.elem),
         syn::Type::Slice(s) => full_type_string(&s.elem).map(|t| format!("[{}]", t)),
@@ -3284,6 +3494,11 @@ pub fn full_type_string(ty: &syn::Type) -> Option<String> {
                 _ => "N".to_string(),
             };
             Some(format!("[{};{}]", elem, len_str))
+        }
+        syn::Type::Tuple(t) if t.elems.is_empty() => Some("()".to_string()),
+        syn::Type::Tuple(t) => {
+            let elems: Option<Vec<String>> = t.elems.iter().map(full_type_string).collect();
+            elems.map(|elems| format!("({})", elems.join(",")))
         }
         _ => None,
     }
@@ -3352,6 +3567,16 @@ pub(crate) fn qualified_full_type_string(
         syn::Type::Reference(r) => {
             qualified_full_type_string(&r.elem, prefix, known_struct_names, known_trait_names)
         }
+        syn::Type::Ptr(p) => {
+            let inner =
+                qualified_full_type_string(&p.elem, prefix, known_struct_names, known_trait_names)?;
+            let mutability = if p.mutability.is_some() {
+                "*mut"
+            } else {
+                "*const"
+            };
+            Some(format!("{mutability} {inner}"))
+        }
         syn::Type::Paren(p) => {
             qualified_full_type_string(&p.elem, prefix, known_struct_names, known_trait_names)
         }
@@ -3373,6 +3598,17 @@ pub(crate) fn qualified_full_type_string(
                 _ => "N".to_string(),
             };
             Some(format!("[{};{}]", elem, len_str))
+        }
+        syn::Type::Tuple(t) if t.elems.is_empty() => Some("()".to_string()),
+        syn::Type::Tuple(t) => {
+            let elems: Option<Vec<String>> = t
+                .elems
+                .iter()
+                .map(|elem| {
+                    qualified_full_type_string(elem, prefix, known_struct_names, known_trait_names)
+                })
+                .collect();
+            elems.map(|elems| format!("({})", elems.join(",")))
         }
         syn::Type::TraitObject(obj) => {
             trait_object_root_name_qualified(&obj.bounds, prefix, known_trait_names)
@@ -3813,6 +4049,115 @@ mod tests {
             "expected canonical Call target path, got {:?}",
             ops
         );
+    }
+
+    #[test]
+    fn lowers_unregistered_ok_call_to_synthetic_transparent_ctor() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn call_example(x: i64) -> i64 {
+                Ok(x)
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let graph = &program.functions[0].graph;
+        let ops = &graph.block(graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call { target, .. }
+                    if target == &CallTarget::synthetic_transparent_ctor("Ok")
+            )),
+            "expected synthetic transparent Ok ctor, got {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn registered_function_named_ok_does_not_lower_to_synthetic_ctor() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn Ok(x: i64) -> i64 { x }
+            fn call_example(x: i64) -> i64 {
+                Ok(x)
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        let func = program
+            .functions
+            .iter()
+            .find(|func| func.name == "call_example")
+            .expect("call_example present");
+        let ops = &func.graph.block(func.graph.startblock).operations;
+        assert!(
+            ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::FunctionPath { segments },
+                    ..
+                } if segments.last().map(String::as_str) == Some("Ok")
+            )),
+            "expected registered Ok function path, got {:?}",
+            ops
+        );
+        assert!(
+            !ops.iter().any(|op| matches!(
+                &op.kind,
+                OpKind::Call {
+                    target: CallTarget::SyntheticTransparentCtor { .. },
+                    ..
+                }
+            )),
+            "registered Ok must not be treated as a synthetic ctor: {:?}",
+            ops
+        );
+    }
+
+    #[test]
+    fn err_and_some_calls_lower_to_synthetic_transparent_ctors() {
+        let parsed = crate::parse::parse_source(
+            r#"
+            fn call_err(x: i64) -> i64 {
+                Err(x)
+            }
+            fn call_some(x: i64) -> i64 {
+                Some(x)
+            }
+            fn call_qualified_ok(x: i64) -> i64 {
+                Result::Ok(x)
+            }
+            fn call_std_some(x: i64) -> i64 {
+                std::option::Option::Some(x)
+            }
+        "#,
+        );
+        let program = build_semantic_program(&parsed).expect("source must lower");
+        for func_name in [
+            "call_err",
+            "call_some",
+            "call_qualified_ok",
+            "call_std_some",
+        ] {
+            let func = program
+                .functions
+                .iter()
+                .find(|func| func.name == func_name)
+                .expect("function present");
+            let ops = &func.graph.block(func.graph.startblock).operations;
+            assert!(
+                ops.iter().any(|op| matches!(
+                    &op.kind,
+                    OpKind::Call {
+                        target: CallTarget::SyntheticTransparentCtor { .. },
+                        ..
+                    }
+                )),
+                "{func_name} must lower to a synthetic transparent ctor: {:?}",
+                ops
+            );
+        }
     }
 
     #[test]

@@ -78,6 +78,7 @@ pub struct PyreFieldDescr {
 pub struct PyreArrayDescr {
     base_size: usize,
     item_size: usize,
+    type_id: u32,
     item_type: Type,
     signed: bool,
 }
@@ -147,7 +148,7 @@ impl ArrayDescr for PyreArrayDescr {
     }
 
     fn type_id(&self) -> u32 {
-        0
+        self.type_id
     }
 
     fn item_type(&self) -> Type {
@@ -994,6 +995,20 @@ pub fn make_size_descr_with_type(obj_size: usize, type_id: u32) -> DescrRef {
     })
 }
 
+pub fn make_size_descr_with_type_and_vtable(
+    obj_size: usize,
+    type_id: u32,
+    vtable: usize,
+) -> DescrRef {
+    Arc::new(PyreSizeDescr {
+        obj_size,
+        type_id,
+        vtable,
+        all_fielddescrs: Vec::new(),
+        gc_fielddescrs: Vec::new(),
+    })
+}
+
 /// Create an array descriptor for a pointer-backed array field.
 pub fn make_array_descr(
     base_size: usize,
@@ -1004,6 +1019,23 @@ pub fn make_array_descr(
     Arc::new(PyreArrayDescr {
         base_size,
         item_size,
+        type_id: 0,
+        item_type,
+        signed,
+    })
+}
+
+pub fn make_array_descr_with_type(
+    base_size: usize,
+    item_size: usize,
+    type_id: u32,
+    item_type: Type,
+    signed: bool,
+) -> DescrRef {
+    Arc::new(PyreArrayDescr {
+        base_size,
+        item_size,
+        type_id,
         item_type,
         signed,
     })
@@ -1290,6 +1322,218 @@ mod tests {
         assert_eq!(a.index(), b.index());
         assert_ne!(a.index(), c.index());
     }
+
+    #[test]
+    fn make_call_descr_from_bh_round_trips_most_general_effectinfo() {
+        use majit_ir::EffectInfo;
+        use majit_translate::jitcode::BhCallDescr;
+
+        let bh = BhCallDescr::from_arg_classes("r".to_string(), 'r', EffectInfo::MOST_GENERAL);
+
+        let descr = make_call_descr_from_bh(&bh);
+        let call = descr
+            .as_call_descr()
+            .expect("make_call_descr_from_bh must produce a CallDescr-shaped descr");
+
+        assert_eq!(call.arg_types(), &[Type::Ref]);
+        assert_eq!(call.result_type(), Type::Ref);
+        assert_eq!(call.result_size(), 8);
+        assert!(!call.is_result_signed());
+        assert_eq!(call.get_extra_info(), &EffectInfo::MOST_GENERAL);
+        assert!(call.get_extra_info().check_can_raise(false));
+    }
+
+    #[test]
+    fn make_call_descr_from_bh_round_trips_cannot_raise_effectinfo() {
+        use majit_ir::{EffectInfo, ExtraEffect, OopSpecIndex};
+        use majit_translate::jitcode::BhCallDescr;
+
+        let extra_info = EffectInfo::const_new(ExtraEffect::CannotRaise, OopSpecIndex::None);
+        let bh = BhCallDescr::from_arg_classes("ir".to_string(), 'v', extra_info.clone());
+
+        let descr = make_call_descr_from_bh(&bh);
+        let call = descr
+            .as_call_descr()
+            .expect("make_call_descr_from_bh must produce a CallDescr-shaped descr");
+
+        assert_eq!(call.arg_types(), &[Type::Int, Type::Ref]);
+        assert_eq!(call.result_type(), Type::Void);
+        assert_eq!(call.result_size(), 0);
+        assert_eq!(call.get_extra_info(), &extra_info);
+        assert!(!call.get_extra_info().check_can_raise(false));
+    }
+
+    #[test]
+    fn make_call_descr_from_bh_preserves_singlefloat_result_layout() {
+        use majit_ir::EffectInfo;
+        use majit_translate::jitcode::{BhCallDescr, CallResultErasedKey};
+
+        let bh = BhCallDescr::from_arg_classes("S".to_string(), 'S', EffectInfo::MOST_GENERAL);
+
+        assert_eq!(bh.arg_classes, "S");
+        assert_eq!(bh.result_type, 'S');
+        assert_eq!(bh.result_size, 4);
+        assert!(!bh.result_signed);
+        assert_eq!(bh.result_erased, CallResultErasedKey::SingleFloat);
+
+        let descr = make_call_descr_from_bh(&bh);
+        let call = descr
+            .as_call_descr()
+            .expect("make_call_descr_from_bh must produce a CallDescr-shaped descr");
+
+        assert_eq!(call.arg_types(), &[Type::Int]);
+        assert_eq!(call.result_type(), Type::Int);
+        assert_eq!(call.result_size(), 4);
+        assert!(!call.is_result_signed());
+    }
+
+    #[test]
+    fn make_descr_from_bh_field_preserves_parent_name_index() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::{BhDescr, BhFieldSpec, BhSizeSpec};
+
+        let parent = BhSizeSpec {
+            size: 24,
+            type_id: 7,
+            vtable: 0,
+            all_fielddescrs: vec![
+                BhFieldSpec {
+                    index: 0,
+                    name: "Cell.next".into(),
+                    offset: 8,
+                    field_size: 8,
+                    field_type: Type::Ref,
+                    field_flag: ArrayFlag::Pointer,
+                    is_field_signed: false,
+                    is_immutable: false,
+                    is_quasi_immutable: false,
+                    index_in_parent: 0,
+                },
+                BhFieldSpec {
+                    index: 1,
+                    name: "Cell.value".into(),
+                    offset: 16,
+                    field_size: 8,
+                    field_type: Type::Int,
+                    field_flag: ArrayFlag::Signed,
+                    is_field_signed: true,
+                    is_immutable: true,
+                    is_quasi_immutable: false,
+                    index_in_parent: 1,
+                },
+            ],
+        };
+
+        let descr = make_descr_from_bh(&BhDescr::Field {
+            offset: 16,
+            field_size: 8,
+            field_type: Type::Int,
+            field_flag: ArrayFlag::Signed,
+            is_field_signed: true,
+            is_immutable: true,
+            is_quasi_immutable: false,
+            index_in_parent: 1,
+            parent: Some(parent),
+            name: "value".into(),
+            owner: "Cell".into(),
+        });
+        let field = descr.as_field_descr().expect("Field BhDescr -> FieldDescr");
+
+        assert_eq!(field.field_name(), "Cell.value");
+        assert_eq!(field.index_in_parent(), 1);
+        assert_eq!(field.offset(), 16);
+        assert!(field.is_immutable());
+        let parent = field
+            .get_parent_descr()
+            .expect("FieldDescr.parent_descr must be preserved");
+        let size = parent
+            .as_size_descr()
+            .expect("parent_descr must be a SizeDescr");
+        assert_eq!(size.size(), 24);
+        assert_eq!(size.type_id(), 7);
+        assert_eq!(size.all_fielddescrs().len(), 2);
+        assert_eq!(size.all_fielddescrs()[1].field_name(), "Cell.value");
+    }
+
+    #[test]
+    fn make_descr_from_bh_struct_array_preserves_type_and_interior_fields() {
+        use majit_ir::descr::ArrayFlag;
+        use majit_translate::jitcode::{BhDescr, BhFieldSpec, BhInteriorFieldSpec, BhSizeSpec};
+
+        let fields = vec![
+            BhFieldSpec {
+                index: 0,
+                name: "Point.x".into(),
+                offset: 0,
+                field_size: 8,
+                field_type: Type::Int,
+                field_flag: ArrayFlag::Signed,
+                is_field_signed: true,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 0,
+            },
+            BhFieldSpec {
+                index: 1,
+                name: "Point.y".into(),
+                offset: 8,
+                field_size: 8,
+                field_type: Type::Float,
+                field_flag: ArrayFlag::Float,
+                is_field_signed: false,
+                is_immutable: false,
+                is_quasi_immutable: false,
+                index_in_parent: 1,
+            },
+        ];
+        let owner = BhSizeSpec {
+            size: 16,
+            type_id: 11,
+            vtable: 0,
+            all_fielddescrs: fields.clone(),
+        };
+        let interior_fields = vec![
+            BhInteriorFieldSpec {
+                index: 0,
+                field: fields[0].clone(),
+                owner: owner.clone(),
+            },
+            BhInteriorFieldSpec {
+                index: 1,
+                field: fields[1].clone(),
+                owner,
+            },
+        ];
+
+        let descr = make_descr_from_bh(&BhDescr::Array {
+            base_size: 8,
+            itemsize: 16,
+            type_id: 42,
+            item_type: Type::Ref,
+            is_array_of_pointers: false,
+            is_array_of_structs: true,
+            is_item_signed: false,
+            interior_fields,
+        });
+        let array = descr.as_array_descr().expect("Array BhDescr -> ArrayDescr");
+
+        assert!(array.is_array_of_structs());
+        assert_eq!(array.type_id(), 42);
+        assert_eq!(array.item_type(), Type::Ref);
+        let interior = array
+            .get_all_interiorfielddescrs()
+            .expect("struct array must preserve interior field descrs");
+        assert_eq!(interior.len(), 2);
+        let second = interior[1]
+            .as_interior_field_descr()
+            .expect("interior field descr shape");
+        assert_eq!(second.field_descr().field_name(), "Point.y");
+        let parent = second
+            .field_descr()
+            .get_parent_descr()
+            .expect("interior field parent_descr must be preserved");
+        assert_eq!(parent.as_size_descr().unwrap().size(), 16);
+    }
 }
 
 /// resume.py:1124-1132: allocate_raw_buffer uses
@@ -1301,15 +1545,194 @@ pub fn make_raw_malloc_calldescr() -> DescrRef {
 /// descr.py:273 ArrayDescr for array-of-structs (FLAG_STRUCT).
 /// resume.py:749: allocate_array(self.size, self.arraydescr, clear=True).
 pub fn make_struct_array_descr(descr_index: u32, base_size: usize, item_size: usize) -> DescrRef {
+    make_struct_array_descr_full(descr_index, base_size, item_size, 0, Type::Void, &[])
+}
+
+fn simple_field_spec_from_bh(
+    spec: &majit_translate::jitcode::BhFieldSpec,
+) -> majit_ir::descr::SimpleFieldDescrSpec {
+    majit_ir::descr::SimpleFieldDescrSpec {
+        index: spec.index,
+        name: spec.name.clone(),
+        offset: spec.offset,
+        field_size: spec.field_size,
+        field_type: spec.field_type,
+        is_immutable: spec.is_immutable,
+        is_quasi_immutable: spec.is_quasi_immutable,
+        flag: spec.field_flag,
+        virtualizable: false,
+        index_in_parent: spec.index_in_parent,
+    }
+}
+
+fn simple_descr_group_from_bh_size(
+    spec: &majit_translate::jitcode::BhSizeSpec,
+) -> majit_ir::descr::SimpleDescrGroup {
+    let field_specs: Vec<_> = spec
+        .all_fielddescrs
+        .iter()
+        .map(simple_field_spec_from_bh)
+        .collect();
+    majit_ir::descr::make_simple_descr_group(
+        u32::MAX,
+        spec.size,
+        spec.type_id,
+        spec.vtable,
+        &field_specs,
+    )
+}
+
+#[derive(Debug)]
+struct ParentBackedFieldDescr {
+    field: Arc<majit_ir::descr::SimpleFieldDescr>,
+    parent: Arc<majit_ir::descr::SimpleSizeDescr>,
+}
+
+impl Descr for ParentBackedFieldDescr {
+    fn index(&self) -> u32 {
+        self.field.index()
+    }
+    fn get_descr_index(&self) -> i32 {
+        self.field.get_descr_index()
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.field.set_descr_index(index);
+    }
+    fn is_always_pure(&self) -> bool {
+        self.field.is_always_pure()
+    }
+    fn is_quasi_immutable(&self) -> bool {
+        self.field.is_quasi_immutable()
+    }
+    fn is_virtualizable(&self) -> bool {
+        self.field.is_virtualizable()
+    }
+    fn as_field_descr(&self) -> Option<&dyn FieldDescr> {
+        Some(self)
+    }
+}
+
+impl FieldDescr for ParentBackedFieldDescr {
+    fn offset(&self) -> usize {
+        self.field.offset()
+    }
+    fn field_size(&self) -> usize {
+        self.field.field_size()
+    }
+    fn field_type(&self) -> Type {
+        self.field.field_type()
+    }
+    fn is_pointer_field(&self) -> bool {
+        self.field.is_pointer_field()
+    }
+    fn is_float_field(&self) -> bool {
+        self.field.is_float_field()
+    }
+    fn is_field_signed(&self) -> bool {
+        self.field.is_field_signed()
+    }
+    fn is_immutable(&self) -> bool {
+        self.field.is_immutable()
+    }
+    fn field_name(&self) -> &str {
+        self.field.field_name()
+    }
+    fn index_in_parent(&self) -> usize {
+        self.field.index_in_parent()
+    }
+    fn get_parent_descr(&self) -> Option<DescrRef> {
+        Some(self.parent.clone() as DescrRef)
+    }
+    fn get_vinfo(&self) -> Option<Arc<dyn majit_ir::descr::VinfoMarker>> {
+        self.field.get_vinfo()
+    }
+}
+
+fn field_descr_from_bh_field(
+    field: &majit_translate::jitcode::BhFieldSpec,
+    parent: Option<&majit_translate::jitcode::BhSizeSpec>,
+) -> DescrRef {
+    if let Some(parent) = parent {
+        let group = simple_descr_group_from_bh_size(parent);
+        if let Some((pos, _)) = parent.all_fielddescrs.iter().enumerate().find(|(_, spec)| {
+            spec.index_in_parent == field.index_in_parent && spec.name == field.name
+        }) {
+            if let Some(descr) = group.field_descrs.get(pos) {
+                return Arc::new(ParentBackedFieldDescr {
+                    field: descr.clone(),
+                    parent: group.size_descr.clone(),
+                });
+            }
+        }
+    }
+
+    let descr = majit_ir::descr::SimpleFieldDescr::new_with_name(
+        field.index,
+        field.offset,
+        field.field_size,
+        field.field_type,
+        field.is_immutable,
+        field.field_flag,
+        field.name.clone(),
+    )
+    .with_quasi_immutable(field.is_quasi_immutable);
+    Arc::new(descr)
+}
+
+pub fn make_struct_array_descr_full(
+    descr_index: u32,
+    base_size: usize,
+    item_size: usize,
+    type_id: u32,
+    item_type: Type,
+    interior_fields: &[majit_translate::jitcode::BhInteriorFieldSpec],
+) -> DescrRef {
     use majit_ir::descr::{ArrayFlag, SimpleArrayDescr};
-    Arc::new(SimpleArrayDescr::with_flag(
+    // RPython `descr.py:388 InteriorFieldDescr.__init__(arraydescr,
+    // fielddescr)` keeps the exact `arraydescr` object passed in.
+    // Publish the final `Arc<SimpleArrayDescr>` first so every
+    // `SimpleInteriorFieldDescr` clones the same Arc, then push the
+    // interior list back onto that Arc through the `OnceLock`-backed
+    // setter — `Arc::ptr_eq(interior.array_descr,
+    // returned_array_descr)` now holds, matching the upstream
+    // identity invariant.
+    let array_descr = Arc::new(SimpleArrayDescr::with_flag(
         descr_index,
         base_size,
         item_size,
-        0,
-        Type::Void,
+        type_id,
+        item_type,
         ArrayFlag::Struct,
-    ))
+    ));
+    if interior_fields.is_empty() {
+        return array_descr;
+    }
+
+    let mut descrs = Vec::new();
+    for interior in interior_fields {
+        let owner_group = simple_descr_group_from_bh_size(&interior.owner);
+        let field_pos = interior
+            .owner
+            .all_fielddescrs
+            .iter()
+            .position(|field| {
+                field.index_in_parent == interior.field.index_in_parent
+                    && field.name == interior.field.name
+            })
+            .unwrap_or(interior.field.index_in_parent);
+        if let Some(field_descr) = owner_group.field_descrs.get(field_pos) {
+            let ifd = majit_ir::descr::SimpleInteriorFieldDescr::new_with_owner(
+                interior.index,
+                array_descr.clone(),
+                field_descr.clone(),
+                owner_group.size_descr.clone(),
+            );
+            descrs.push(Arc::new(ifd) as DescrRef);
+        }
+    }
+
+    array_descr.set_all_interiorfielddescrs(descrs);
+    array_descr
 }
 
 /// Concrete `JitCodeDescr` adapter for `inline_call_*` opcodes.
@@ -1324,11 +1747,12 @@ pub fn make_struct_array_descr(descr_index: u32, base_size: usize, item_size: us
 /// `jitcode_index()`.
 ///
 /// `PyreJitCodeDescr` bridges those two layers: production callers
-/// build a `Vec<DescrRef>` from the codewriter's `BhDescr` pool and
-/// wrap each `BhDescr::JitCode` in this struct so the walker's
-/// `as_jitcode_descr() -> Some(&self)` cast succeeds. Field/Array/Size
-/// slots stay `PyreFieldDescr`/`PyreArrayDescr`/`PyreSizeDescr`;
-/// `Call` slots use `SimpleCallDescr`.
+/// build a `Vec<DescrRef>` from the codewriter's `BhDescr` pool via
+/// [`make_descr_from_bh`] (each `BhDescr::JitCode` wraps in this
+/// struct so the walker's `as_jitcode_descr() -> Some(&self)` cast
+/// succeeds; Field/Array/Size become `PyreFieldDescr` /
+/// `PyreArrayDescr` / `PyreSizeDescr`; `Call` becomes a
+/// `MetaCallDescr` carrying the codewriter's `EffectInfo`).
 ///
 /// Tests in `jitcode_dispatch.rs` previously used a `TestJitCodeDescr`
 /// duplicate of this shape — production code now goes through the same
@@ -1367,6 +1791,218 @@ impl JitCodeDescr for PyreJitCodeDescr {
 /// adapter).
 pub fn make_jitcode_descr(jitcode_index: usize) -> DescrRef {
     Arc::new(PyreJitCodeDescr::new(jitcode_index))
+}
+
+/// Trace-side `SwitchDictDescr` adapter. The bytecode blackhole keeps
+/// `BhDescr::Switch` directly; the MIFrame walker needs an `Arc<dyn Descr>`
+/// slot for the same `Assembler.descrs` index.
+#[derive(Debug)]
+pub struct PyreSwitchDescr {
+    dict: std::collections::HashMap<i64, usize>,
+}
+
+impl PyreSwitchDescr {
+    pub fn new(dict: std::collections::HashMap<i64, usize>) -> Self {
+        Self { dict }
+    }
+}
+
+impl Descr for PyreSwitchDescr {
+    fn repr(&self) -> String {
+        let mut keys: Vec<_> = self.dict.keys().copied().collect();
+        keys.sort_unstable();
+        format!("SwitchDictDescr({keys:?})")
+    }
+}
+
+/// Trace-side adapter for pyre's Rust-vtable method descriptor.
+#[derive(Debug)]
+pub struct PyreVtableMethodDescr {
+    trait_root: String,
+    method_name: String,
+}
+
+impl PyreVtableMethodDescr {
+    pub fn new(trait_root: String, method_name: String) -> Self {
+        Self {
+            trait_root,
+            method_name,
+        }
+    }
+}
+
+impl Descr for PyreVtableMethodDescr {
+    fn repr(&self) -> String {
+        format!(
+            "VtableMethodDescr({}::{})",
+            self.trait_root, self.method_name
+        )
+    }
+}
+
+/// `assembler.py:23 Assembler.descrs` parity adapter — translate one
+/// codewriter-side `BhDescr` slot (`majit-translate/src/jit_codewriter/jitcode.rs`)
+/// into the matching trace-side `Arc<dyn Descr>` so trace ops emitted
+/// by both the walker (`crate::jitcode_dispatch::dispatch_via_miframe`)
+/// and the trait dispatch (`MIFrame::execute_opcode_step`) can carry
+/// real-content descrs instead of `make_fail_descr` placeholders.
+///
+/// RPython parity: in upstream the metainterp + blackhole interpreter
+/// share one `metainterp_sd.all_descrs` list — the same Python object
+/// is the field/array/call descr regardless of which path is reading
+/// it. pyre carries the codewriter-side typed list (`BhDescr`) and the
+/// trait-side `Arc<dyn Descr>` view (`DescrRef`) as separate Rust
+/// types because `Arc<dyn Descr>` cannot be downcast safely; this
+/// adapter is the single point that bridges them.
+///
+/// Every branch builds the same descriptor kind carried by the
+/// codewriter-side `BhDescr`:
+/// * `Field` — `offset`, `field_size`, `field_type`, signedness, and
+///   immutable/quasi-immutable flags are preserved.
+/// * `Array` — `base_size`, `itemsize`, `type_id`, item type, signedness,
+///   and array-of-structs classification are preserved.
+/// * `Size` — `size`, `type_id`, and `vtable` are preserved.
+/// * `Call` — `BhCallDescr.arg_classes` (e.g. `"iR"`) maps to
+///   `Vec<Type>` per char (`i`->Int, `r`->Ref, `f`->Float; `R`/`I`/`F`
+///   var-list markers split into the per-arg base type), and
+///   `result_type` (one of `'i','r','f','v'`) maps to the `Type` of
+///   the call result. `extra_info` is threaded into
+///   `make_call_descr_with_effect`, preserving RPython `call.py:320`
+///   effectinfo_from_writeanalyze parity for descr cache keys and
+///   residual-call classification.
+/// * `Switch` / `VableField` / `VableArray` / `VtableMethod` — trace-side
+///   adapters preserve the descriptor slot instead of substituting a
+///   fail-descr placeholder.
+pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
+    use majit_translate::jitcode::BhDescr;
+    match bh {
+        BhDescr::Field {
+            offset,
+            field_size,
+            field_type,
+            field_flag,
+            is_field_signed,
+            is_immutable,
+            is_quasi_immutable,
+            index_in_parent,
+            parent,
+            name,
+            owner,
+            ..
+        } => {
+            let full_name = if owner.is_empty() || name.contains('.') {
+                name.clone()
+            } else {
+                format!("{owner}.{name}")
+            };
+            // RPython `descr.py:214 FieldDescr.get_index()` returns
+            // the value `heaptracker.get_fielddescr_index_in(STRUCT,
+            // name)` recorded into `FieldDescr.index` at construction
+            // time (`descr.py:200`).  Pyre's `BhDescr::Field` carries
+            // that as `index_in_parent`; thread it through as
+            // `BhFieldSpec.index` so the `parent` matching fallback
+            // produces a `SimpleFieldDescr` whose `index()` matches the
+            // upstream value rather than a `u32::MAX` sentinel.
+            let field = majit_translate::jitcode::BhFieldSpec {
+                index: *index_in_parent as u32,
+                name: full_name,
+                offset: *offset,
+                field_size: *field_size,
+                field_type: *field_type,
+                field_flag: *field_flag,
+                is_field_signed: *is_field_signed,
+                is_immutable: *is_immutable,
+                is_quasi_immutable: *is_quasi_immutable,
+                index_in_parent: *index_in_parent,
+            };
+            field_descr_from_bh_field(&field, parent.as_ref())
+        }
+        BhDescr::Array {
+            base_size,
+            itemsize,
+            type_id,
+            item_type,
+            is_array_of_structs,
+            is_item_signed,
+            interior_fields,
+            ..
+        } => {
+            if *is_array_of_structs {
+                make_struct_array_descr_full(
+                    u32::MAX,
+                    *base_size,
+                    *itemsize,
+                    *type_id,
+                    *item_type,
+                    interior_fields,
+                )
+            } else {
+                make_array_descr_with_type(
+                    *base_size,
+                    *itemsize,
+                    *type_id,
+                    *item_type,
+                    *is_item_signed,
+                )
+            }
+        }
+        BhDescr::Size {
+            size,
+            type_id,
+            vtable,
+        } => make_size_descr_with_type_and_vtable(*size, *type_id, *vtable),
+        BhDescr::Call { calldescr } => make_call_descr_from_bh(calldescr),
+        BhDescr::JitCode { jitcode_index, .. } => make_jitcode_descr(*jitcode_index),
+        BhDescr::Switch { dict } => Arc::new(PyreSwitchDescr::new(dict.clone())),
+        BhDescr::VableField { index } => majit_ir::descr::vable_static_field_descr(*index as u16),
+        BhDescr::VableArray { index } => majit_ir::descr::vable_array_field_descr(*index as u16),
+        BhDescr::VtableMethod {
+            trait_root,
+            method_name,
+        } => Arc::new(PyreVtableMethodDescr::new(
+            trait_root.clone(),
+            method_name.clone(),
+        )),
+    }
+}
+
+/// `BhCallDescr` -> `CallDescr` adapter. RPython parity: codewriter
+/// `Assembler.descrs` carries the same `CallDescr` instance the
+/// metainterp pulls during op recording. pyre keeps the codewriter-side
+/// call descr as serializable fields and rebuilds a `MetaCallDescr` on
+/// demand here, preserving the per-call-site `EffectInfo`.
+///
+/// `arg_classes` is RPython `CallDescr.arg_classes`: one char per non-void
+/// function argument. Uppercase `I/R/F` are assembler list markers and must not
+/// appear here.
+pub fn make_call_descr_from_bh(bh: &majit_translate::jitcode::BhCallDescr) -> DescrRef {
+    let arg_types: Vec<Type> = bh
+        .arg_classes
+        .chars()
+        .filter_map(|c| match c {
+            'i' | 'S' => Some(Type::Int),
+            'r' => Some(Type::Ref),
+            'f' | 'L' => Some(Type::Float),
+            _ => None,
+        })
+        .collect();
+    let result_type = match bh.result_type {
+        'i' | 'S' => Type::Int,
+        'r' => Type::Ref,
+        'f' | 'L' => Type::Float,
+        _ => Type::Void,
+    };
+    // call.py:320 effectinfo_from_writeanalyze parity: the descr consumed
+    // by pyjitpl/residual-call recording must expose the same EffectInfo
+    // that the codewriter classified for this call site.
+    majit_ir::descr::make_call_descr_full(
+        u32::MAX,
+        arg_types,
+        result_type,
+        bh.result_signed,
+        bh.result_size,
+        bh.extra_info.clone(),
+    )
 }
 
 /// descr.py:384 InteriorFieldDescr for SETINTERIORFIELD_GC.

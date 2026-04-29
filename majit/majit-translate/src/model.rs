@@ -149,6 +149,12 @@ pub enum CallTarget {
     FunctionPath {
         segments: Vec<String>,
     },
+    /// Rust frontend adaptation for constructors that RPython's rtyper erases
+    /// before jtransform. This variant must only be produced after frontend
+    /// resolution proves the call is not a user-defined function.
+    SyntheticTransparentCtor {
+        name: String,
+    },
     /// RPython: `indirect_call` opname. Receiver's static type is a
     /// `dyn Trait` (Rust fat pointer); at JIT time the actual callee
     /// is resolved via vtable.  `trait_root` + `method_name` together
@@ -185,6 +191,10 @@ impl CallTarget {
         }
     }
 
+    pub fn synthetic_transparent_ctor(name: impl Into<String>) -> Self {
+        Self::SyntheticTransparentCtor { name: name.into() }
+    }
+
     pub fn receiver_root(&self) -> Option<&str> {
         match self {
             CallTarget::Method { receiver_root, .. } => receiver_root.as_deref(),
@@ -198,6 +208,7 @@ impl CallTarget {
             CallTarget::FunctionPath { segments } => {
                 Some(segments.iter().map(String::as_str).collect())
             }
+            CallTarget::SyntheticTransparentCtor { name } => Some(vec![name.as_str()]),
             CallTarget::Indirect { method_name, .. } => Some(vec![method_name.as_str()]),
             CallTarget::UnsupportedExpr => None,
         }
@@ -216,6 +227,9 @@ impl fmt::Display for CallTarget {
                 receiver_root: None,
             } => f.write_str(name),
             CallTarget::FunctionPath { segments } => f.write_str(&segments.join("::")),
+            CallTarget::SyntheticTransparentCtor { name } => {
+                write!(f, "<synthetic-transparent-ctor {name}>")
+            }
             CallTarget::Indirect {
                 trait_root,
                 method_name,

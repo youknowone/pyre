@@ -380,6 +380,9 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
         CallTarget::FunctionPath { segments } => {
             format!("$<* function '{}'>", segments.join("."))
         }
+        CallTarget::SyntheticTransparentCtor { name } => {
+            format!("$<* synthetic-transparent-ctor '{name}'>")
+        }
         CallTarget::Indirect {
             trait_root,
             method_name,

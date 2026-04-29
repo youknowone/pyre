@@ -5518,10 +5518,11 @@ fn materialize_virtual_raw_buffer(
 
     // resume.py:703: buffer = decoder.allocate_raw_buffer(func, size)
     let (driver, _) = crate::driver::driver_pair();
-    let calldescr = majit_translate::jitcode::BhCallDescr {
-        arg_classes: "i".into(),
-        result_type: 'i',
-    };
+    let calldescr = majit_translate::jitcode::BhCallDescr::from_arg_classes(
+        "i".into(),
+        'i',
+        majit_ir::descr::EffectInfo::MOST_GENERAL,
+    );
     let buffer = driver.meta_interp().backend().bh_call_i(
         func,
         Some(&[size as i64]),
