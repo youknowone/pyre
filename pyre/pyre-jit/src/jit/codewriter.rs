@@ -6992,18 +6992,18 @@ impl CodeWriter {
     /// ```
     ///
     /// Each freshly-compiled `PyJitCode` is `Arc`-wrapped before being
-    /// inserted into `CallControl.jitcodes`; the next trace-side
-    /// `state::jitcode_for(w_code)` callback hands the same `Arc`
-    /// to `MetaInterpStaticData.jitcodes`, so both stores reference
-    /// one allocation — the Rust analog of RPython's two stores
-    /// referencing the same Python `JitCode` via refcount semantics.
+    /// inserted into `CallControl.jitcodes`; callers publish the whole
+    /// returned list into trace-side `MetaInterpStaticData.jitcodes`,
+    /// so both stores reference one allocation — the Rust analog of
+    /// RPython's two stores referencing the same Python `JitCode` via
+    /// refcount semantics.
     ///
     /// `grab_initial_jitcodes` reads its seed list from
     /// [`super::call::CallControl::jitdrivers_sd`]; callers register
     /// portals with [`Self::setup_jitdriver`] before invoking this
     /// method (matching codewriter.py:74 — `setup_jitdriver` followed
     /// by `make_jitcodes` is the upstream order).
-    pub fn make_jitcodes(&self) -> Vec<*const PyJitCode> {
+    pub fn make_jitcodes(&self) -> Vec<std::sync::Arc<PyJitCode>> {
         // codewriter.py:75 `log.info("making JitCodes...")` — pyre has no
         // codewriter.py log channel, intentionally elided.
 
@@ -7030,8 +7030,8 @@ impl CodeWriter {
     /// run the same drain so each batch ends with `assembler.finished()`
     /// and the matching `setup_indirectcalltargets(asm.indirectcalltargets)`
     /// publish, matching `codewriter.py:85` plus `pyjitpl.py:2262`.
-    pub(crate) fn drain_unfinished_graphs(&self) -> Vec<*const PyJitCode> {
-        let mut all_jitcodes: Vec<*const PyJitCode> = Vec::new();
+    pub(crate) fn drain_unfinished_graphs(&self) -> Vec<std::sync::Arc<PyJitCode>> {
+        let mut all_jitcodes: Vec<std::sync::Arc<PyJitCode>> = Vec::new();
         // codewriter.py:79 `for graph, jitcode in enum_pending_graphs():`.
         loop {
             let popped = self.callcontrol().enum_pending_graphs();
@@ -7053,9 +7053,9 @@ impl CodeWriter {
             let pyjitcode =
                 self.transform_graph_to_jitcode(unsafe { &*code_ptr }, w_code, merge_point_pc);
             let key = code_ptr as usize;
-            let raw_ptr = self.callcontrol().publish_jitcode(key, pyjitcode);
+            let pyjitcode = self.callcontrol().publish_jitcode(key, pyjitcode);
             // codewriter.py:81 `all_jitcodes.append(jitcode)`.
-            all_jitcodes.push(raw_ptr);
+            all_jitcodes.push(pyjitcode);
         }
         // codewriter.py:85 `self.assembler.finished(self.callcontrol.callinfocollection)`.
         self.assembler
@@ -7215,7 +7215,22 @@ pub fn register_portal_jitdriver(
     // (G.4.3b stack-box capture + G.4.4 reader unification) to first
     // teach every per-CodeObject reader to consume the canonical portal
     // metadata instead.
-    writer.make_jitcodes();
+    let jitcodes = writer.make_jitcodes();
+    // RPython warmspot.py:281-282 stores the complete
+    // `make_jitcodes()` result on MetaInterpStaticData before tracing
+    // can observe it. Pyre keeps trace-side SD in a separate crate
+    // keyed by W_CodeObject, so install the whole just-drained list at
+    // this codewriter boundary. A missing portal entry after the drain
+    // is an impossible postcondition and must fail loudly.
+    pyre_jit_trace::state::install_jitcodes(jitcodes);
+    let portal_jitcode = writer
+        .callcontrol()
+        .find_compiled_jitcode_arc(code as *const pyre_interpreter::CodeObject)
+        .expect("make_jitcodes must populate the registered portal jitcode");
+    assert_eq!(
+        portal_jitcode.w_code, w_code,
+        "registered portal jitcode must preserve the W_CodeObject identity"
+    );
 }
 
 /// Callee compile path: `CallControl.get_jitcode(graph)` followed by
@@ -7247,7 +7262,19 @@ pub fn compile_jitcode_for_callee(code: &pyre_interpreter::CodeObject, w_code: *
     // codewriter.py:79-85 drain + assembler.finished() for the
     // newly-queued entry. No portal-jitdriver assignment because
     // this code is a callee, not a portal.
-    writer.drain_unfinished_graphs();
+    //
+    // Trace-side `MetaInterpStaticData.jitcodes` publish is the
+    // single-payload `install_jitcode_for(w_code, pyjit)` that
+    // `ensure_trace_jitcode_for_w_code` issues after this returns.
+    // RPython has no runtime/lazy callee publish: the warmspot drain
+    // (`warmspot.py:281-282`) is the only authoritative bulk publish.
+    // Pyre keeps the lazy single-payload path because Rust-side callee
+    // discovery is per-tracer-miss; nested callees discovered inside
+    // this drain reach trace-side SD when the next `state::jitcode_for`
+    // miss revisits `ensure_trace_jitcode_for_w_code`. Documented
+    // PRE-EXISTING-ADAPTATION (Rust lazy callee discovery vs RPython
+    // setup-time graph closure).
+    let _ = writer.drain_unfinished_graphs();
 }
 
 /// Ensure the writer-owned `PyJitCode` for `w_code` exists and publish
@@ -7352,7 +7379,14 @@ fn portal_redirect_jitcode_via_w_code(
         .unwrap_or(true);
     if needs_drain {
         // codewriter.py:79-85 fills the shell before runtime sees it.
-        writer.drain_unfinished_graphs();
+        // Trace-side bulk publish belongs to the setup-time
+        // `register_portal_jitdriver` site (warmspot.py:281-282
+        // analog); the runtime redirect path relies on the
+        // single-payload `install_jitcode_for(w_code, mainjitcode)`
+        // that `ensure_trace_jitcode_for_w_code` issues after this
+        // returns. PRE-EXISTING-ADAPTATION (Rust lazy redirect path
+        // — RPython has no runtime portal-bridge synthesis).
+        let _ = writer.drain_unfinished_graphs();
         writer.assign_portal_jitdriver_indices();
     }
 
@@ -8399,6 +8433,26 @@ mod tests {
                 .expect("skeleton jitcode must be cached");
             Arc::as_ptr(slot)
         };
+        let skeleton_runtime_ptr = {
+            let slot = writer
+                .callcontrol()
+                .jitcodes
+                .get(&key)
+                .expect("skeleton jitcode must be cached");
+            Arc::as_ptr(&slot.jitcode)
+        };
+        let descriptor_view = {
+            let slot = writer
+                .callcontrol()
+                .jitcodes
+                .get(&key)
+                .expect("skeleton jitcode must be cached");
+            slot.jitcode.clone()
+        };
+        assert!(
+            descriptor_view.code.is_empty(),
+            "setup-time descriptor clone starts from the unassembled shell"
+        );
 
         let all_jitcodes = writer.drain_unfinished_graphs();
         let populated_ptr = {
@@ -8409,11 +8463,34 @@ mod tests {
                 .expect("populated jitcode must remain cached");
             Arc::as_ptr(slot)
         };
+        let populated_runtime_ptr = {
+            let slot = writer
+                .callcontrol()
+                .jitcodes
+                .get(&key)
+                .expect("populated jitcode must remain cached");
+            Arc::as_ptr(&slot.jitcode)
+        };
 
-        assert_eq!(all_jitcodes, vec![populated_ptr]);
+        let all_ptrs: Vec<*const PyJitCode> =
+            all_jitcodes.iter().map(std::sync::Arc::as_ptr).collect();
+        assert_eq!(all_ptrs, vec![populated_ptr]);
         assert_eq!(
             populated_ptr, skeleton_ptr,
             "unique skeleton Arc should be filled in place"
+        );
+        assert_eq!(
+            populated_runtime_ptr, skeleton_runtime_ptr,
+            "runtime JitCode allocation must also be filled in place so inline_call descrs keep parity with RPython"
+        );
+        assert_eq!(
+            Arc::as_ptr(&descriptor_view),
+            skeleton_runtime_ptr,
+            "setup-time inline_call descriptors must keep pointing at the same runtime JitCode shell"
+        );
+        assert!(
+            !descriptor_view.code.is_empty(),
+            "filling the runtime JitCode shell in place must update pre-existing descriptor clones"
         );
         let pyjit = writer.callcontrol().find_jitcode(raw_code).unwrap();
         assert!(
@@ -9294,7 +9371,9 @@ mod tests {
             .mainjitcode
             .as_ref()
             .expect("drain rebinds jd.mainjitcode to the populated portal");
-        assert_eq!(all_jitcodes, vec![std::sync::Arc::as_ptr(cached)]);
+        let all_ptrs: Vec<*const PyJitCode> =
+            all_jitcodes.iter().map(std::sync::Arc::as_ptr).collect();
+        assert_eq!(all_ptrs, vec![std::sync::Arc::as_ptr(cached)]);
         assert_eq!(
             std::sync::Arc::as_ptr(cached),
             skeleton_ptr,

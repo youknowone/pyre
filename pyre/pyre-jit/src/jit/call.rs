@@ -521,9 +521,16 @@ impl CallControl {
     ///
     /// Pyre's `transform_graph_to_jitcode` returns a fresh `PyJitCode`
     /// instead of mutating the skeleton, so this helper bridges the
-    /// split by replacing the cached object's payload without changing
-    /// the outer `Arc<PyJitCode>` identity.
-    pub fn publish_jitcode(&mut self, key: usize, pyjitcode: PyJitCode) -> *const PyJitCode {
+    /// split by filling the cached object in place. Both the outer
+    /// `Arc<PyJitCode>` and the inner runtime `Arc<JitCode>` allocation
+    /// stay stable; the latter is required before the orthodox
+    /// `jtransform.handle_regular_call -> inline_call_*` port can store
+    /// callee JitCode descriptors in callers.
+    pub fn publish_jitcode(
+        &mut self,
+        key: usize,
+        pyjitcode: PyJitCode,
+    ) -> std::sync::Arc<PyJitCode> {
         if let Some(slot) = self.jitcodes.get_mut(&key) {
             // SAFETY: `publish_jitcode` runs on the JIT setup thread
             // during the codewriter drain (codewriter.py:79-85). The
@@ -536,12 +543,11 @@ impl CallControl {
             unsafe {
                 slot.replace_with(pyjitcode);
             }
-            return std::sync::Arc::as_ptr(slot);
+            return std::sync::Arc::clone(slot);
         }
         let arc = std::sync::Arc::new(pyjitcode);
-        let raw_ptr = std::sync::Arc::as_ptr(&arc);
         self.jitcodes.insert(key, arc);
-        raw_ptr
+        std::sync::Arc::clone(self.jitcodes.get(&key).unwrap())
     }
 
     pub(crate) fn jitcode_key(code: *const CodeObject) -> usize {

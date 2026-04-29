@@ -22,8 +22,10 @@
 //! `Arc<PyJitCode>` instances. RPython's `MetaInterpStaticData.jitcodes`
 //! list and `CallControl.jitcodes` dict reference identical
 //! `JitCode` Python objects via Python's reference semantics; pyre
-//! mirrors the shared-identity part with `Arc<PyJitCode>`, but still
-//! keeps the extra runtime adapter split described above.
+//! mirrors the shared-identity part with `Arc<PyJitCode>`. The wrapped
+//! runtime `JitCode` allocation is also kept stable when the codewriter
+//! fills a shell, because `inline_call_*` descriptors hold the callee
+//! `JitCode` object itself in the RPython model.
 //!
 //! ## Discriminator: 3-state mode mapping
 //!
@@ -201,10 +203,14 @@ pub struct PyJitCodePayload {
 /// when `assembler.assemble(..., jitcode, ...)` runs in
 /// `codewriter.py:67`. Pyre's assembler still returns a fresh payload,
 /// so the outer `PyJitCode` uses interior mutability to preserve the
-/// same object identity while replacing the payload during the writer
-/// drain. Production mutation is confined to the single-threaded
-/// codewriter publication path before runtime readers observe the
-/// populated object.
+/// same object identity while filling the payload during the writer
+/// drain. The inner runtime `JitCode` allocation is filled in place as
+/// well, so any caller-side `RuntimeBhDescr::JitCode(Arc<JitCode>)`
+/// created by a future orthodox `inline_call_*` rewrite keeps pointing
+/// at the populated callee object after the drain.
+///
+/// Production mutation is confined to the single-threaded codewriter
+/// publication path before runtime readers observe the populated object.
 pub struct PyJitCode {
     payload: UnsafeCell<PyJitCodePayload>,
 }
@@ -255,15 +261,18 @@ impl PyJitCode {
         })
     }
 
-    /// Replace the payload without changing the outer `PyJitCode`
-    /// allocation. This is pyre's Rust-side stand-in for RPython
+    /// Fill the cached payload without changing the outer `PyJitCode`
+    /// allocation or the inner runtime `JitCode` allocation, even if
+    /// setup-time call descriptors have already cloned the inner
+    /// `Arc<JitCode>` shell. This is pyre's Rust-side stand-in for RPython
     /// `assembler.assemble(..., jitcode, ...)` mutating the existing
     /// `JitCode` object from `CallControl.jitcodes[graph]`.
     ///
     /// # Safety
     ///
-    /// The caller must guarantee no other thread is currently reading
-    /// the payload through any cloned `Arc<PyJitCode>`. RPython relies
+    /// The caller must guarantee no runtime thread is currently reading
+    /// the payload through any cloned `Arc<PyJitCode>` or cloned inner
+    /// `Arc<JitCode>`. RPython relies
     /// on the implicit single-threaded semantics of the translation /
     /// codewriter setup phase — the JitCode shell is filled in place
     /// before any runtime reader observes it. Pyre cannot encode that
@@ -279,8 +288,31 @@ impl PyJitCode {
     ///   replace the outer `Arc` instead (see
     ///   `CallControl::reset_jitcode_skeleton`).
     pub unsafe fn replace_with(&self, next: PyJitCode) {
+        let PyJitCodePayload {
+            jitcode: next_jitcode,
+            metadata,
+            code_ptr,
+            w_code,
+            has_abort,
+            merge_point_pc,
+        } = next.payload.into_inner();
+        let next_jitcode = std::sync::Arc::try_unwrap(next_jitcode)
+            .expect("freshly assembled PyJitCode must uniquely own its runtime JitCode");
         unsafe {
-            *self.payload.get() = next.payload.into_inner();
+            let current = &mut *self.payload.get();
+            // RPython's call descriptors keep the callee JitCode object itself.
+            // During setup, an inline_call descr may therefore already point at
+            // this shell before assembler.assemble() fills it. Rust's Arc cannot
+            // express "shared for setup identity, exclusively mutated before
+            // runtime publication", so we write through the stable allocation
+            // under the setup-phase precondition documented above.
+            let current_jitcode = std::sync::Arc::as_ptr(&current.jitcode) as *mut RuntimeJitCode;
+            *current_jitcode = next_jitcode;
+            current.metadata = metadata;
+            current.code_ptr = code_ptr;
+            current.w_code = w_code;
+            current.has_abort = has_abort;
+            current.merge_point_pc = merge_point_pc;
         }
     }
 

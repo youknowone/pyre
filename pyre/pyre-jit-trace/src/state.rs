@@ -613,6 +613,46 @@ pub fn install_jitcode_for(
     METAINTERP_SD.with(|r| r.borrow_mut().jitcode_for(code, Some(payload)) as *const ())
 }
 
+/// Install the complete `CodeWriter.make_jitcodes()` result into
+/// `MetaInterpStaticData.jitcodes`. Setup-time bulk publish only.
+///
+/// RPython warmspot.py:281-282 stores the list returned by
+/// `codewriter.make_jitcodes()` directly on `metainterp_sd.jitcodes`.
+/// This function is the pyre-side analog and is invoked exclusively
+/// from `register_portal_jitdriver` after the JitDriver-rooted
+/// `make_jitcodes()` drain. Runtime/lazy callee paths
+/// (`compile_jitcode_for_callee`, `portal_redirect_jitcode_via_w_code`)
+/// must NOT call this — they rely on the per-payload
+/// `install_jitcode_for(w_code, pyjit)` published by
+/// `ensure_trace_jitcode_for_w_code` after the lazy drain returns.
+///
+/// Pyre's trace-side staticdata is keyed by `W_CodeObject`, so the
+/// writer-owned `PyJitCode` carries the wrapper identity needed to
+/// create each SD slot. A missing wrapper or skeleton payload here is
+/// an impossible post-`make_jitcodes` state, not a cache miss. Calling
+/// this for a second JitDriver registration extends the per-key map;
+/// per-W_CodeObject SD indices are stable across calls, which differs
+/// from RPython's authoritative list assignment because pyre allows
+/// multiple JitDriver registrations to incrementally extend the map.
+pub fn install_jitcodes(jitcodes: Vec<std::sync::Arc<crate::PyJitCode>>) {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let mut sd = r.borrow_mut();
+        for payload in jitcodes {
+            let code = payload.w_code;
+            assert!(
+                !code.is_null(),
+                "make_jitcodes returned a JitCode without W_CodeObject identity"
+            );
+            assert!(
+                !payload.is_skeleton(),
+                "make_jitcodes returned an unpopulated JitCode skeleton"
+            );
+            sd.jitcode_for(code, Some(payload));
+        }
+    });
+}
+
 /// Ensure the trace-side staticdata has a JitCode slot for this
 /// `W_CodeObject` and return its SD-local `jitcode.index`.
 ///
