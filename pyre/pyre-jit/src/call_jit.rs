@@ -989,62 +989,6 @@ pub fn resume_in_blackhole(
             ec,
         );
 
-        // PRE-EXISTING-ADAPTATION: consumer-side enforcement of the "all
-        // stack slots up to current depth hold a live box" runtime
-        // contract. RPython's `resume.py:1017-1026 _prepare_next_section`
-        // has no heap-read step — its SSA `_registers_r[stack_color]`
-        // model already covers stack slots through the dataflow because
-        // every push/pop is a direct register-file SSA op. Pyre routes
-        // pushes through `setarrayitem_vable_r` (heap I/O) so the SSA
-        // dataflow does not see push→pop as a register chain, and stack
-        // colors only enter `live_r` when an op directly references them.
-        // For unreferenced (but runtime-on-stack) slots this fallback
-        // re-fills `bh.registers_r[stack_color]` from the heap PyFrame —
-        // the same dual-write source the trace kept in sync via
-        // `setarrayitem_vable_r`. Together with the codewriter `live_r`
-        // (now SSA-only, mirroring `rpython/jit/codewriter/liveness.py`
-        // :67-75), the contract still holds at every guard fail.
-        //
-        // Convergence path: replace pyre's heap-mirror stack model with
-        // RPython's register-file SSA model (push/pop emit direct
-        // `_registers_r[stack_color]` SSA writes/reads instead of
-        // `setarrayitem_vable_r` / `getarrayitem_vable_r`). Multi-session
-        // architectural change — multiple bytecode handlers in
-        // `pyre/pyre-jit/src/jit/codewriter.rs` would need to switch
-        // emit form, and the runtime PyFrame heap mirror would shrink
-        // to "snapshot only at force_now" (matching `pyjitpl.py`'s
-        // `force_virtualizable` semantics). After that conversion,
-        // `live_r` from the SSA dataflow alone covers stack colors and
-        // this fallback can be removed.
-        let depth_at_pc = &pyjitcode.metadata.depth_at_py_pc;
-        let stack_color_map = &pyjitcode.metadata.stack_slot_color_map;
-        let depth = if py_pc < depth_at_pc.len() {
-            depth_at_pc[py_pc] as usize
-        } else {
-            0
-        };
-        if depth > 0 && !bh.virtualizable_info.is_null() && bh.virtualizable_ptr != 0 {
-            let vinfo = unsafe { &*bh.virtualizable_info };
-            if let Some(ainfo) = vinfo.array_fields.first() {
-                let live_r_set: std::collections::HashSet<u32> = live_r.iter().copied().collect();
-                let stack_base = bh.virtualizable_stack_base;
-                for stack_idx in 0..depth.min(stack_color_map.len()) {
-                    let stack_color = stack_color_map[stack_idx];
-                    if live_r_set.contains(&(stack_color as u32)) {
-                        continue;
-                    }
-                    let heap_val = unsafe {
-                        majit_metainterp::virtualizable::vable_read_array_item(
-                            bh.virtualizable_ptr as *const u8,
-                            ainfo,
-                            stack_base + stack_idx,
-                        )
-                    };
-                    bh.setarg_r(stack_color as usize, heap_val);
-                }
-            }
-        }
-
         // resume.py:1342 `curbh.handle_rvmprof_enter()` — runs the rvmprof
         // `entering=0` hook immediately after consume_one_section. For the
         // generic `blackhole_from_resumedata` path majit-metainterp already
