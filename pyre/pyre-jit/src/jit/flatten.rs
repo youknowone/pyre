@@ -391,21 +391,257 @@ pub enum DescrOperand {
 /// `args_f` pools (`rpython/jit/backend/llsupport/llmodel.py:816-839
 /// bh_call_*` + `calldescr.call_stub_*`). pyre needs both pieces at
 /// dispatch time.
+///
+/// Slice 1 of the EffectInfo wire-up epic: `effect_info` carries the
+/// upstream-shape `EffectInfo` derived from the producer's
+/// [`CallFlavor`] at emit time via [`effect_info_for_call_flavor`].
+/// Slice 3 flipped `dispatch_residual_call` to derive its branch from
+/// [`dispatch_kind_for_effect_info`] applied to `effect_info`. Slice 3b
+/// dropped the redundant `flavor` field: codewriter sites still take a
+/// `CallFlavor` parameter as construction-site shorthand, but the stub
+/// stores only the canonical `EffectInfo` form. `arg_kinds` stays for
+/// the per-arg `JitCallArg` reassembly until upstream `descr.arg_types()`
+/// (`majit-ir/src/descr.rs::SimpleCallDescr.arg_types`) becomes the
+/// canonical source — that flip waits until pyre's residual_call SSARepr
+/// trailing slot stores `Arc<SimpleCallDescr>` in place of this stub.
 #[derive(Debug, Clone)]
 pub struct CallDescrStub {
-    pub flavor: CallFlavor,
+    /// Upstream-shape `EffectInfo` — the canonical dispatch source read
+    /// by `dispatch_residual_call` via [`dispatch_kind_for_effect_info`]
+    /// (`pyre/pyre-jit/src/jit/assembler.rs:1437`).
+    pub effect_info: majit_ir::EffectInfo,
     /// Per-arg kind sequence in C-function parameter order. Exact length
     /// equals the sum of the int/ref/float `ListOfKind` sublists for the
     /// same residual_call Insn.
     pub arg_kinds: Vec<Kind>,
 }
 
+/// Map a [`CallFlavor`] to the upstream-shape `EffectInfo` carrying the
+/// equivalent `extraeffect` (and `call_release_gil_target` sentinel for
+/// `ReleaseGil`). The mapping mirrors
+/// `rpython/jit/metainterp/optimizeopt/rewrite.py optimize_CALL_*`'s
+/// branch selection: each pyre `CallFlavor` corresponds to the
+/// `EffectInfo.extraeffect` value upstream's optimizer would have read
+/// off the calldescr to pick the same `call_*_*` rewrite.
+///
+/// Slice 1 of the EffectInfo wire-up epic. `effect_info_for_call_flavor`
+/// is the foundation for future slices that flip dispatch consumers
+/// (assembler / blackhole / trace recorder) from reading `flavor`
+/// directly to reading `effect_info.extraeffect`.
+///
+/// **Stub limitations (PRE-EXISTING-ADAPTATION on every variant).**
+/// RPython `call.py:296-326 getcalldescr` constructs the EffectInfo
+/// from four static analyzers run over the callee graph:
+///
+/// | EI field                       | RPython source                        |
+/// |--------------------------------|---------------------------------------|
+/// | `oopspecindex`                 | `jtransform.py:_handle_oopspec_call`  |
+/// | `readonly_descrs_*` (bitsets)  | `readwrite_analyzer.analyze(op, ...)` |
+/// | `write_descrs_*` (bitsets)     | `readwrite_analyzer.analyze(op, ...)` |
+/// | `can_invalidate`               | `quasiimmut_analyzer.analyze(op)` OR  |
+/// |                                | `randomeffects_analyzer.analyze(op)`  |
+/// | `extraeffect` (elidable 3-way) | `_canraise(op)` (call.py:294-299)     |
+/// | `call_release_gil_target`      | `_call_aroundstate_target_` decorator |
+/// | `extradescrs`                  | `_jit_oopspec_extra_` decorator       |
+/// | `can_collect`                  | `collect_analyzer.analyze(op)`        |
+///
+/// None of those analyzers are ported to pyre yet — the entire
+/// `majit-translate/src/{annotator,rtyper,translator}` infrastructure
+/// (and the `readwrite_analyzer` / `quasiimmut_analyzer` /
+/// `randomeffects_analyzer` / `collect_analyzer` callees in
+/// `rpython/jit/codewriter/`) is on the unported roadmap.  In
+/// consequence, every variant below leaves the analyzer-derived
+/// fields at `EffectInfo::default()` (`oopspecindex = None`,
+/// `*_descrs_*` = 0, `can_invalidate = false`, `extradescrs = None`,
+/// `can_collect = true` per the Default impl).
+///
+/// Implications for the optimizer (audited in
+/// `majit-metainterp/src/optimizeopt/`):
+///   - `oopspecindex == None` → every `match ei.oopspecindex { ... }`
+///     site (vstring.rs:759, intbounds.rs:2825, rewrite.rs:2774/2915,
+///     virtualize.rs:1397/1450/1493/1512/1531, earlyforce.rs:31,
+///     heap.rs:1416-1429) takes the default arm and skips the
+///     OS_*-specialized rewrite.  Functionally safe (default arm is
+///     conservative; missing the rewrite costs trace quality, not
+///     correctness) but means pyre never benefits from `OS_STR_CONCAT`,
+///     `OS_DICT_LOOKUP`, `OS_RAW_MALLOC_VARSIZE_CHAR`,
+///     `OS_JIT_FORCE_VIRTUALIZABLE` etc. specialization.
+///   - `write_descrs_arrays == 0` → `rewrite.rs:1993` heap
+///     invalidation reads "this call writes no arrays".  Currently
+///     load-bearing only when the trace records both an array
+///     write-in-callee and a subsequent reader of the same array;
+///     pyre's active callees (`box_int`, `load_const`, etc.) don't
+///     hit this pattern, but a future LoopInvariant or Pure callee
+///     that mutates arrays could trigger an incorrect cached read.
+///   - `can_invalidate == false` → quasiimmut invalidation guards
+///     are conservatively elided (not currently load-bearing because
+///     pyre's quasi-immutable layer is itself unported).
+///   - `extradescrs == None` → `heap.rs:712 rordereddict` descriptor
+///     specialization unreachable (also unported on the consumer
+///     side; matches by missing).
+///
+/// Convergence: porting `majit-translate/src/jit_codewriter/call.rs`'s
+/// analyzer trio (a multi-session epic — depends on annotator/rtyper/
+/// translator) replaces the stub with real per-callee EI values.
+/// Until then, this function is the producer-side stub that future
+/// EI-aware optimizations must be careful not to rely on.  When a
+/// concrete callee needs a specific EI field set (e.g. an
+/// oopspec-specialized helper), construct the `EffectInfo` directly
+/// at the call site rather than extending this `CallFlavor` mnemonic.
+pub fn effect_info_for_call_flavor(flavor: CallFlavor) -> majit_ir::EffectInfo {
+    use majit_ir::{EffectInfo, ExtraEffect};
+    match flavor {
+        // EF_CAN_RAISE — default normal call (`effectinfo.py:22`).
+        CallFlavor::Plain => EffectInfo::default(),
+        // EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE — `effectinfo.py:23`.
+        // `optimize_CALL_MAY_FORCE_*` branch.
+        CallFlavor::MayForce => EffectInfo {
+            extraeffect: ExtraEffect::ForcesVirtualOrVirtualizable,
+            ..EffectInfo::default()
+        },
+        // EF_LOOPINVARIANT — `effectinfo.py:18`.
+        // `optimize_CALL_LOOPINVARIANT_*` branch.
+        CallFlavor::LoopInvariant => EffectInfo {
+            extraeffect: ExtraEffect::LoopInvariant,
+            ..EffectInfo::default()
+        },
+        // RPython `call.py:292-299 getcalldescr` chooses one of three
+        // elidable extraeffects based on the callee's static raise
+        // analysis:
+        //
+        //     elif elidable:
+        //         cr = self._canraise(op)
+        //         if cr == "mem":
+        //             extraeffect = EF_ELIDABLE_OR_MEMORYERROR
+        //         elif cr:
+        //             extraeffect = EF_ELIDABLE_CAN_RAISE
+        //         else:
+        //             extraeffect = EF_ELIDABLE_CANNOT_RAISE
+        //
+        // The three differ in `check_can_raise(False)`:
+        // `ElidableCannotRaise (0) < CannotRaise (2)` → false (no
+        // GUARD_NO_EXCEPTION),
+        // `ElidableOrMemoryError (3) > CannotRaise (2)` → true,
+        // `ElidableCanRaise (4) > CannotRaise (2)` → true.  Picking the
+        // wrong one drops a guard the trace needs.
+        //
+        // Pyre has no static-raise analyzer (RPython
+        // `randomeffects_analyzer` / `quasiimmut_analyzer` /
+        // `_canraise` infrastructure is unported — see
+        // `majit-translate` roadmap), so a producer-side `CallFlavor`
+        // mnemonic cannot pick the correct EF_ELIDABLE_* variant.
+        // Hardcoding to `ElidableCannotRaise` was a NEW-DEVIATION:
+        // any future caller marking a raise-capable elidable callee
+        // would silently get an under-strength EI and the dispatcher
+        // would skip GUARD_NO_EXCEPTION.
+        //
+        // No production `emit_residual_call(_, CallFlavor::Pure, ...)`
+        // site exists today (verified: every codewriter emit_residual_call
+        // call passes `Plain` or `MayForce`).  Panic so future callers
+        // are forced to construct an `EffectInfo` directly with the
+        // correct elidable variant — or add a precise `CallFlavor`
+        // sub-variant per `call.py:294-299` — instead of inheriting
+        // this stub.  The reverse mapper
+        // `dispatch_kind_for_effect_info` and the dispatcher
+        // `dispatch_residual_call` (`assembler.rs:1491-1505`) keep
+        // their `Pure` arms intact so they remain ready to consume
+        // a properly-formed elidable EI from such a future producer.
+        CallFlavor::Pure => panic!(
+            "effect_info_for_call_flavor: CallFlavor::Pure has no production \
+             producer in pyre, and the EF_ELIDABLE_* extraeffect cannot be \
+             chosen correctly without static raise analysis (call.py:292-299). \
+             Construct EffectInfo directly with the correct \
+             ElidableCannotRaise / ElidableOrMemoryError / ElidableCanRaise \
+             variant, or add a precise CallFlavor sub-variant before routing \
+             through this mnemonic."
+        ),
+        // EF_RANDOM_EFFECTS — `effectinfo.py:24`. Upstream's
+        // `call.py:282-289 getcalldescr` upgrades release-gil callees
+        // to `EF_RANDOM_EFFECTS` whenever the analyzer flags random
+        // effects on the target (and the orthodox case for a
+        // `_call_aroundstate_target_`-decorated callee always does, by
+        // virtue of the host-call boundary). With
+        // `extraeffect = EF_RANDOM_EFFECTS = 7`,
+        // `check_forces_virtual_or_virtualizable()` (>= 6) and
+        // `has_random_effects()` (>= 7) both return true — matching
+        // `pyjitpl.py:2007-2068`'s outer forces branch (which release-gil
+        // shares with `EF_FORCES_VIRTUAL_OR_VIRTUALIZABLE`) where
+        // `:2063 effectinfo.is_call_release_gil()` selects the
+        // `direct_call_release_gil` sub-case.
+        //
+        // PRE-EXISTING-ADAPTATION: pyre's producer-side `CallFlavor`
+        // does not carry the real `(target_fn_addr, save_err)` pair
+        // that `effectinfo.py:114, 197 call_release_gil_target`
+        // demands; pyre uses a non-zero sentinel `(1, 0)` solely to
+        // make `is_call_release_gil()`
+        // (`majit-ir/src/effectinfo.rs:292-295`) return true.  Real
+        // target plumbing is deferred to whatever lands the
+        // release-gil callee path; no production caller today.
+        //
+        // The round-trip property
+        // `dispatch_kind_for_effect_info(effect_info_for_call_flavor(ReleaseGil)) == ReleaseGil`
+        // holds because `dispatch_kind_for_effect_info` checks
+        // `is_call_release_gil()` first (`flatten.rs:487`), short-
+        // circuiting the `check_forces_virtual_or_virtualizable()`
+        // arm which would otherwise return `MayForce`.
+        CallFlavor::ReleaseGil => EffectInfo {
+            extraeffect: ExtraEffect::RandomEffects,
+            call_release_gil_target: (1, 0),
+            ..EffectInfo::default()
+        },
+    }
+}
+
+/// Inverse of [`effect_info_for_call_flavor`]: derive the dispatch branch
+/// `dispatch_residual_call` should pick from a calldescr's `EffectInfo`.
+/// Mirrors `rpython/jit/metainterp/pyjitpl.py:1995-2126 do_residual_call`'s
+/// branch precedence — `forces_virtual_or_virtualizable` (with the
+/// `is_call_release_gil()` sub-case) wins first, then `EF_LOOPINVARIANT`,
+/// then `check_is_elidable()`, else the plain `CALL_*` branch.
+///
+/// Precedence note: `is_call_release_gil()` is checked **before**
+/// `check_forces_virtual_or_virtualizable()` because
+/// [`effect_info_for_call_flavor`] tags `CallFlavor::ReleaseGil`
+/// with `EF_RANDOM_EFFECTS` (mirroring `call.py:282-289 getcalldescr`'s
+/// `random_effects` upgrade for release-gil callees), which makes
+/// `check_forces_virtual_or_virtualizable()` (`>= 6`) also return
+/// true on those EI values.  The early `is_call_release_gil()` check
+/// keeps the round-trip property
+/// `dispatch_kind_for_effect_info(effect_info_for_call_flavor(f)) == f`
+/// AND mirrors `pyjitpl.py:2063`'s structure where the release-gil
+/// sub-case is selected inside the outer forces branch.
+pub fn dispatch_kind_for_effect_info(ei: &majit_ir::EffectInfo) -> CallFlavor {
+    use majit_ir::ExtraEffect;
+    if ei.is_call_release_gil() {
+        return CallFlavor::ReleaseGil;
+    }
+    if ei.check_forces_virtual_or_virtualizable() {
+        return CallFlavor::MayForce;
+    }
+    if ei.extraeffect == ExtraEffect::LoopInvariant {
+        return CallFlavor::LoopInvariant;
+    }
+    if ei.check_is_elidable() {
+        return CallFlavor::Pure;
+    }
+    CallFlavor::Plain
+}
+
 /// `rpython/jit/metainterp/optimizeopt/rewrite.py` `Rewrite.optimize_CALL_XXX`
 /// branches on `op.getdescr().effectinfo.extraeffect` to select between
-/// `call_may_force`, `call_release_gil`, `call_loopinvariant`, `call_pure`,
-/// and `call_assembler`. In pyre the codewriter knows statically which
-/// branch applies for each per-PC helper, so the enum is emitted directly
-/// into the calldescr slot rather than derived from `EffectInfo`.
+/// `call_may_force`, `call_release_gil`, `call_loopinvariant`, and
+/// `call_pure`. In pyre the codewriter knows statically which branch
+/// applies for each per-PC helper, so the enum names the branch the
+/// codewriter wants and [`effect_info_for_call_flavor`] expands it to
+/// the `EffectInfo` that drives dispatch.
+///
+/// `CALL_ASSEMBLER` is intentionally not represented here — upstream
+/// `rop.CALL_ASSEMBLER_*` is a separate operation chosen via
+/// `OpHelpers.call_assembler_for_descr` (`resoperation.py:1251-1260`),
+/// not derived from `EffectInfo`. pyre's portal-call lowering follows
+/// the same split (`majit-ir/src/resoperation.rs:1120-1123
+/// CallAssembler{I,R,F,N}`); reintroducing an `Assembler` flavor here
+/// would push the wrong path back into the residual_call shape.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CallFlavor {
     /// Plain residual call with no extra effect
@@ -423,9 +659,6 @@ pub enum CallFlavor {
     ReleaseGil,
     /// `EF_ELIDABLE_*`. Maps to `JitCodeBuilder::call_pure_*_typed`.
     Pure,
-    /// `jit.dont_look_inside` portal call — `bhimpl_call_assembler_*`.
-    /// Maps to `JitCodeBuilder::call_assembler_*_typed`.
-    Assembler,
 }
 
 /// `rpython/jit/codewriter/jtransform.py:423` `reskind =
@@ -579,21 +812,6 @@ pub const OPNAME_LIVE: &str = "-live-";
 /// the canonical SSARepr source — Task #227 walker restructure).
 ///
 /// Currently recognises:
-///   * `OPNAME_LIVE` (`-live-`) — `liveness.py:5-12`. **Transitional
-///     classification.** Upstream `-live-` is a *graph-level*
-///     `SpaceOperation` emitted from `jtransform` (e.g.
-///     `rpython/jit/codewriter/jtransform.py:845`
-///     `SpaceOperation('-live-', [], None)`); `flatten.py:126`
-///     serialises it through `serialize_op`; `liveness.py:18+
-///     compute_liveness` then expands its argument list with the
-///     surviving variables.  Pyre's graph does NOT emit `-live-`
-///     today (no `record_graph_op("-live-", ...)` call sites), so
-///     every inline `-live-` is currently walker-only and counting
-///     them as artifact matches the empirical graph state.  Once
-///     graph-side `-live-` emission lands (Task #227 or its
-///     prerequisite parity slice), this clause MUST be removed so
-///     the probe surfaces real graph→inline `-live-` gaps; otherwise
-///     a missing graph emission would hide silently.
 ///   * Terminator ops emitted by `make_return` / `make_exception_link`
 ///     (`flatten.py:236-303`):
 ///     `int_return`, `ref_return`, `float_return`, `void_return`,
@@ -614,13 +832,57 @@ pub const OPNAME_LIVE: &str = "-live-";
 ///     treating all register-source copies as SSA-only would hide
 ///     real walker→graph gaps until copy provenance is represented
 ///     explicitly.
+///
+///   * `OPNAME_LIVE` (`-live-`) — `liveness.py:5-12`. **Walker-shape
+///     adaptation, not orthodox.** Upstream `-live-` placement comes
+///     from two distinct producers:
+///       1. **Graph-side, per raising/virtualizable/inline-call op**:
+///          `jtransform.py:469-471 handle_residual_call` (post-call,
+///          if `may_call_jitcodes` or `calldescr_canraise`),
+///          `jtransform.py:481 handle_regular_call` (post inline_call),
+///          `jtransform.py:845` (pre `getfield_vable_<kind>`).  These
+///          end up in the SSARepr via `flatten.py:126 serialize_op`.
+///       2. **SSA-only, per branch / raise / switch boundary**:
+///          `flatten.py:142` (raise non-Variable),
+///          `flatten.py:259` (before `goto_if_not`),
+///          `flatten.py:285` (before `switch`),
+///          `flatten.py:303` (per switch case label).  These have no
+///          graph counterpart by design.
+///     Pyre's renderer-side `flatten_graph` (`FlattenGraph::insert_exits`
+///     / `make_return`) already mirrors group-2 line-for-line at
+///     `flatten.rs:1000, 1139, 1208, 1228`.  Pyre's *codewriter walker*
+///     (`emit_live_placeholder!` in
+///     `codewriter.rs::transform_graph_to_jitcode`) is a different
+///     producer: it runs 1:1 against the Python bytecode and pushes
+///     `Insn::live(Vec::new())` at every PC entry to seed the
+///     post-regalloc `all_liveness` table (`assembler.py:146-158`)
+///     under pyre's bytecode-1:1 walker model.  That per-PC emission
+///     intentionally has **no `record_graph_op` companion** — recording
+///     it graph-side would create a `-live-` cluster the upstream
+///     graph never holds and would mask real graph→inline gaps in the
+///     `[phase4-graph-shape]` probe.  Classifying walker-emitted
+///     per-PC `-live-` as an SSA-only artifact here is the matching
+///     probe-side carveout.
+///
+///     **Convergence path back to RPython orthodox emission**:
+///     when pyre's walker is restructured to drop per-PC `-live-` in
+///     favour of group-2 emission only (mirror `flatten.py:142, 259,
+///     285, 303` exactly the way `flatten_graph` already does) and
+///     gain a graph-side group-1 emission (mirror jtransform's
+///     residual_call / inline_call / vable getfield decomposition),
+///     this clause must be removed so the probe surfaces real
+///     graph→inline `-live-` gaps.  Until then it is a *known*
+///     adaptation rather than a silent one — the docstring above
+///     names the orthodox positions that pyre is not yet emitting.
 pub fn is_ssa_only_artifact(insn: &Insn) -> bool {
     let Insn::Op { opname, .. } = insn else {
         return false;
     };
-    // PRE-EXISTING-ADAPTATION: pyre graph never emits `-live-` (see
-    // docstring above). Remove this clause once graph-side `-live-`
-    // lands so the [phase4-graph-shape] probe can surface real gaps.
+    // Walker-shape adaptation: the codewriter walker emits a `-live-`
+    // placeholder at every PC entry (no `record_graph_op` companion),
+    // unlike RPython's per-raising-op + per-branch emission. See the
+    // docstring above for the orthodox emission sites and convergence
+    // path.
     if opname == OPNAME_LIVE {
         return true;
     }
@@ -1562,12 +1824,18 @@ where
             let reg = get_register(*variable);
             Insn::op_with_result(op.opname.clone(), args, reg)
         }
-        Some(FlowValue::Constant(_)) => {
-            // Same invariant as `flatten_space_operation`: graph op
-            // results must be Variables. Drop into a no-result Op so
-            // the probe still produces a comparable sequence rather
-            // than panicking on unexpected graph shape.
-            Insn::op(op.opname.clone(), args)
+        Some(FlowValue::Constant(constant)) => {
+            // Same invariant as `flatten_space_operation` (line ~1271):
+            // graph op results must be Variables. Panic with the same
+            // message so a probe-side hit surfaces the broken graph
+            // exactly the way the production path would, instead of
+            // silently emitting a no-result Op that would falsely
+            // shape-match an inline-walker entry with a `dst` register.
+            panic!(
+                "GraphFlattener probe: op {} has Constant result {:?}; \
+                 flow graph results must be Variables",
+                op.opname, constant
+            );
         }
     };
     Some(insn)

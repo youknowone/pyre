@@ -2519,23 +2519,47 @@ fn emit_residual_call(
 ///
 /// PRE-EXISTING-ADAPTATION: upstream stores `calldescr` (an
 /// `AbstractDescr` carrying `EffectInfo`) in the trailing slot; pyre
-/// threads `DescrOperand::CallDescrStub{flavor, arg_kinds}` there so
-/// the assembler can recover the (flavor, reskind, per-param kind)
-/// tuple statically today.
+/// threads `DescrOperand::CallDescrStub{effect_info, arg_kinds}`
+/// there so the assembler can recover the (dispatch kind, reskind,
+/// per-param kind) tuple statically today.
 ///
 /// Convergence path (calldescr interning):
-///   1. Port `rpython/jit/codewriter/effectinfo.py::EffectInfo` and
-///      `CallInfoCollection` (needed independently by the heap/pure
-///      optimizer pass before `calldescr` interning is meaningful).
-///   2. Add a descr-id registry on `CodeWriter` so each `(fn_idx,
-///      flavor, kinds)` triple resolves to a stable `AbstractDescr`
-///      handle the assembler can store in a `Box<JitDescr>` slot.
-///   3. Replace `CallDescrStub` with `DescrOperand::Call(descr_id)` and
-///      shift the assembler dispatch to look the (flavor, arg_kinds)
-///      pair off the descriptor table.
-/// Until step 1 lands the stub is the smallest faithful placeholder —
-/// expanding it in-place would just duplicate work the EffectInfo port
-/// will redo.
+///   1. ✓ Port `rpython/jit/codewriter/effectinfo.py::EffectInfo` and
+///      `CallInfoCollection` — landed at `majit-ir/src/effectinfo.rs`
+///      (521 lines, full upstream parity for `EffectInfo` /
+///      `ExtraEffect` / `OopSpecIndex` / `CallInfoCollection`).
+///   2. ✓ (Slice 1): `CallDescrStub` carries `effect_info: EffectInfo`
+///      derived from `flavor` at emit time via
+///      `flatten::effect_info_for_call_flavor`; the SSARepr trailing
+///      slot exposes upstream-shape data downstream consumers can read
+///      off `stub.effect_info.extraeffect`.
+///   3. ✓ (Slice 2): `pyre-jit-trace/jitcode_dispatch.rs` routes
+///      forces-virtual / EF_LOOPINVARIANT / elidable / default through
+///      the canonical `CallMayForce*+GuardNotForced` /
+///      `CallLoopinvariant*` / `CallPure*` / `Call*` opcode emission.
+///   4. ✓ (Slice 3): `assembler::dispatch_residual_call` derives its
+///      builder-method choice from
+///      `flatten::dispatch_kind_for_effect_info(&stub.effect_info)`
+///      instead of matching on `stub.flavor`. The canonical dispatch
+///      source is `effect_info`. The `CallFlavor::Assembler` variant
+///      was dropped — pyre's portal-call lowering uses
+///      `CallAssembler{I,R,F,N}`
+///      (`majit-ir/src/resoperation.rs:1120-1123`) per RPython's
+///      `OpHelpers.call_assembler_for_descr` split.
+///   4b. ✓ (Slice 3b): `CallDescrStub.flavor` field dropped; codewriter
+///      sites still take a `CallFlavor` parameter as construction-site
+///      shorthand and `effect_info_for_call_flavor` expands it to the
+///      stored `EffectInfo` at emit time.
+///   5. (Slices 4-6, future) — collapse the per-flavor `BC_CALL_*`
+///      bytecode opcodes (`BC_CALL_MAY_FORCE_*`, `BC_CALL_PURE_*`,
+///      `BC_CALL_LOOPINVARIANT_*`, `BC_CALL_RELEASE_GIL_*`) into a
+///      single `BC_CALL_<reskind>` per result kind (the BH already
+///      treats them identically — see `majit-metainterp/src/blackhole.rs:2264-2287`),
+///      then drop `CallFlavor` itself, then store
+///      `Arc<SimpleCallDescr>` in the SSARepr trailing slot in place
+///      of the stub.
+/// Slices 1-3b landed; Slices 4-6 touch the call hot path bytecode and
+/// warrant a benchmark sweep per slice.
 fn emit_residual_call_shape(
     ssarepr: &mut SSARepr,
     flavor: CallFlavor,
@@ -2569,6 +2593,16 @@ fn emit_residual_call_shape(
     }
 
     // `rewrite_call` kinds selection (jtransform.py:423-426).
+    //
+    // PRE-EXISTING-ADAPTATION: `jtransform.py:425, 427` admits a
+    // `force_ir=True` flag that pins `kinds = 'ir'` even when `lst_i`
+    // is empty (and asserts no float result). No pyre caller exercises
+    // it today — the only upstream use sites pass `force_ir=True`
+    // through `rewrite_call` from helpers we have not ported yet.
+    // Plumb a `force_ir: bool` parameter through this function the
+    // moment the first such caller lands; the missing branch would
+    // be `else if !args_i.is_empty() || force_ir { "ir" }` plus the
+    // matching `assert!(!matches!(reskind, ResKind::Float))` guard.
     let kinds: &str = if !args_f.is_empty() || reskind == ResKind::Float {
         "irf"
     } else if !args_i.is_empty() {
@@ -2579,7 +2613,7 @@ fn emit_residual_call_shape(
     let reskind_ch = reskind.as_char();
     let opname = format!("residual_call_{kinds}_{reskind_ch}");
 
-    // SSARepr arg list: [Const(fn), ListI?, ListR, ListF?, Descr(flavor)].
+    // SSARepr arg list: [Const(fn), ListI?, ListR, ListF?, Descr(stub)].
     let mut args: Vec<Operand> = Vec::with_capacity(5);
     args.push(Operand::ConstInt(fn_idx as i64));
     let mut push_list = |kind: Kind, items: Vec<Operand>| {
@@ -2594,8 +2628,12 @@ fn emit_residual_call_shape(
     if kinds.contains('f') {
         push_list(Kind::Float, args_f);
     }
+    let effect_info = super::flatten::effect_info_for_call_flavor(flavor);
     args.push(Operand::descr(DescrOperand::CallDescrStub(
-        super::flatten::CallDescrStub { flavor, arg_kinds },
+        super::flatten::CallDescrStub {
+            effect_info,
+            arg_kinds,
+        },
     )));
 
     let insn = match (reskind.to_kind(), dst) {
@@ -3522,12 +3560,31 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for `-live-`. RPython parity:
-        // `flatten.py` inserts `self.emitline('-live-')` at every block
-        // entry and at every point with a live resume set; `assembler.py:146-158`
-        // allocates an `all_liveness` slot and encodes the live-register
-        // triple. pyre emits the same placeholder here, then fills it
-        // after regalloc by rescanning the final SSARepr's PcAnchor ranges.
+        // RPython `-live-` placement is *not* per-PC: `jtransform.py`
+        // emits `SpaceOperation('-live-', [], None)` graph-side only at
+        // raising / virtualizable / inline-call decision points (e.g.
+        // `jtransform.py:469-471 handle_residual_call`,
+        // `jtransform.py:481 handle_regular_call`,
+        // `jtransform.py:845` before `getfield_vable_<kind>`); flatten
+        // serialises those graph ops via `serialize_op` and additionally
+        // emits SSA-only `-live-` at branch / raise / switch boundaries
+        // (`flatten.py:142, 259, 285, 303`) — those four SSA-only sites
+        // are mirrored line-for-line by pyre's renderer-side
+        // `flatten_graph` (`super::flatten::FlattenGraph::insert_exits` /
+        // `make_return` at `flatten.rs:1000, 1139, 1208, 1228`).
+        //
+        // pyre's walker, by contrast, runs 1:1 against the Python
+        // bytecode and emits `-live-` at every PC entry to seed the
+        // post-regalloc `all_liveness` table (`assembler.py:146-158`).
+        // That per-PC emission is a walker-shape adaptation, not an
+        // orthodox graph emission, and intentionally has no
+        // `record_graph_op` companion — recording it graph-side at
+        // every PC would create a `-live-` cluster the upstream graph
+        // never holds and would mask real walker→graph gaps in the
+        // `[phase4-graph-shape]` probe.  See
+        // `super::flatten::is_ssa_only_artifact`'s `OPNAME_LIVE`
+        // clause for the matching probe-side carveout and the
+        // convergence path back to RPython orthodox emission.
         macro_rules! emit_live_placeholder {
             ($ssarepr:expr) => {{
                 $ssarepr.insns.push(Insn::live(Vec::new()));

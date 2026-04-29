@@ -1311,7 +1311,7 @@ fn dispatch_op(
 ///  ListOfKind(int,   [...])?,   # present iff 'i' in kinds
 ///  ListOfKind(ref,   [...])?,   # present iff 'r' in kinds
 ///  ListOfKind(float, [...])?,   # present iff 'f' in kinds
-///  Descr(CallDescrStub{flavor, arg_kinds})]
+///  Descr(CallDescrStub{effect_info, arg_kinds})]
 /// ```
 ///
 /// pyre's `JitCodeBuilder::call_*_typed` takes a single flat
@@ -1418,7 +1418,7 @@ fn dispatch_residual_call(
         }
     }
 
-    use super::flatten::{CallFlavor, ResKind};
+    use super::flatten::{CallFlavor, ResKind, dispatch_kind_for_effect_info};
     let reskind = match reskind_ch {
         "i" => ResKind::Int,
         "r" => ResKind::Ref,
@@ -1427,14 +1427,15 @@ fn dispatch_residual_call(
         other => panic!("residual_call: unknown reskind {other:?}"),
     };
 
-    // Pick the same builder method the optimizeopt layer resolves from
-    // `EffectInfo.extraeffect`. Reskind drives the return-value kind;
-    // flavor drives the effect branch. Every `CallFlavor` variant
-    // corresponds to a concrete `JitCodeBuilder::call_*_typed` family,
-    // so the canonical `residual_call_{kinds}_{reskind}` SSA shape can
-    // round-trip through pyre even when the runtime bytecode still uses
-    // majit's fixed `BC_CALL_*` adapter opcodes.
-    match (stub.flavor, reskind) {
+    // Slice 3 of the EffectInfo wire-up epic: derive the dispatch branch
+    // from `stub.effect_info`. Mirrors `pyjitpl.py:1995-2126
+    // do_residual_call`'s precedence — the optimizer upstream picks
+    // `call_may_force` / `call_release_gil` / `call_loopinvariant` /
+    // `call_pure` from the same effectinfo bits, so pyre's pre-baked
+    // codewriter branch resolves to the same builder method through the
+    // predicates instead of a producer-side enum.
+    let dispatch_kind = dispatch_kind_for_effect_info(&stub.effect_info);
+    match (dispatch_kind, reskind) {
         (CallFlavor::Plain, ResKind::Int) => {
             let dst = expect_result_reg(result, Kind::Int, "residual_call int needs result");
             state.builder.call_int_typed(fn_idx, &call_args, dst);
@@ -1572,41 +1573,6 @@ fn dispatch_residual_call(
             state
                 .builder
                 .call_loopinvariant_void_typed_args(fn_idx, &call_args);
-        }
-        (CallFlavor::Assembler, ResKind::Int) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Int,
-                "residual_call assembler int needs result",
-            );
-            state
-                .builder
-                .call_assembler_int_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::Assembler, ResKind::Ref) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Ref,
-                "residual_call assembler ref needs result",
-            );
-            state
-                .builder
-                .call_assembler_ref_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::Assembler, ResKind::Float) => {
-            let dst = expect_result_reg(
-                result,
-                Kind::Float,
-                "residual_call assembler float needs result",
-            );
-            state
-                .builder
-                .call_assembler_float_typed(fn_idx, &call_args, dst);
-        }
-        (CallFlavor::Assembler, ResKind::Void) => {
-            state
-                .builder
-                .call_assembler_void_typed_args(fn_idx, &call_args);
         }
     }
 }
@@ -2317,6 +2283,7 @@ mod tests {
     }
 
     #[test]
+    #[should_panic(expected = "CallFlavor::Pure has no production producer")]
     fn assemble_residual_call_irf_f_supports_pure_float_flavor() {
         let mut ssarepr = SSARepr::new("residual_call_irf_f");
         ssarepr.insns.push(Insn::op_with_result(
@@ -2336,7 +2303,9 @@ mod tests {
                     vec![Operand::Register(Register::new(Kind::Float, 0))],
                 )),
                 Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
-                    flavor: CallFlavor::Pure,
+                    effect_info: super::super::flatten::effect_info_for_call_flavor(
+                        CallFlavor::Pure,
+                    ),
                     arg_kinds: vec![Kind::Int, Kind::Ref, Kind::Float],
                 })),
             ],
@@ -2373,7 +2342,9 @@ mod tests {
                     vec![Operand::Register(Register::new(Kind::Ref, 0))],
                 )),
                 Operand::descr(DescrOperand::CallDescrStub(CallDescrStub {
-                    flavor: CallFlavor::ReleaseGil,
+                    effect_info: super::super::flatten::effect_info_for_call_flavor(
+                        CallFlavor::ReleaseGil,
+                    ),
                     arg_kinds: vec![Kind::Int, Kind::Ref],
                 })),
             ],

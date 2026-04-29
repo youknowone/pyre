@@ -37,9 +37,9 @@
 //! | `setfield_gc_i/rid`, `setfield_gc_r/rrd` | PARITY (heapcache-aware, alias-clearing) | r-bank box + (i\|r)-bank valuebox + descr. If `getfield_cached(obj,descr) == Some(valuebox)` skip recording (RPython `if upd.currfieldbox is valuebox: return`); otherwise record `OpCode::SetfieldGc(obj, valuebox)` + `setfield_cached` write-through (Walker fix F: alias-clearing — when obj is escaped, retain only unescaped-object cache entries for this field_index, mirroring RPython `FieldUpdater.setfield → do_write_with_aliasing`). RPython `pyjitpl.py:973-988 _opimpl_setfield_gc_any`. The disabled is_unescaped branch (`pyjitpl.py:981-988`) is intentionally not ported — RPython itself has it commented out. `iid` / `ird` (int box) shapes stay unsupported (Task #85 territory). |
 //! | `getarrayitem_gc_r/rid>r` | PARITY (heapcache-aware) | r-bank array + i-bank index + descr → heapcache `getarrayitem` lookup. Cache hit returns cached OpRef without IR; cache miss records `OpCode::GetarrayitemGcR(array, index)` + `getarrayitem_now_known` writeback. RPython `pyjitpl.py:639-688 _do_getarrayitem_gc_any`. `_i` / `_f` shapes don't appear in pyre's insns table today; would land mechanically when emitted. |
 //! | `setarrayitem_gc_r/rird` | PARITY (heapcache-aware) | r-bank array + i-bank index + r-bank value + descr. Always records `OpCode::SetarrayitemGc(array, index, value)` + `heapcache.setarrayitem(...)` write. RPython `pyjitpl.py:736-744 _opimpl_setarrayitem_gc_any` — no skip-on-redundant short-circuit because `setarrayitem` does aliasing-aware invalidation. `rrid` / `rrrd` / `rrfd` (Ref index) shapes stay unsupported (Task #85). |
-//! | `residual_call_r_r/iRd>r` | PRE-EXISTING-ADAPTATION (multi-session epic) | records EffectInfo-classified `CallR/CallPureR` + optional `GuardNoException`. Missing per `pyjitpl.py:1995 do_residual_or_indirect_call`: `CALL_MAY_FORCE` / `GUARD_NOT_FORCED` for forces-virtual paths, `CALL_LOOPINVARIANT_R` for `EF_LOOPINVARIANT`, `vable_and_vrefs_before/after_residual_call` for virtualizable bookkeeping (`pyjitpl.py:2055-2080`), `heapcache.invalidate_caches_varargs` for write effects (`pyjitpl.py:2042`), `call_loopinvariant_known_result_cache` short-circuit (`pyjitpl.py:1999-2011`), `direct_libffi_call` / `direct_call_release_gil` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990`), and `num_live` accounting on `GUARD_NO_EXCEPTION` (`pyjitpl.py:2082 → capture_resumedata`). Convergence: Phase D-3 + dedicated multi-session port. |
-//! | `residual_call_r_i/iRd>i` | PARITY (kind sibling of `_r_r`) | same EffectInfo classification + GUARD_NO_EXCEPTION emission as `_r_r`; only the result OpCode (`OpCode::CallI` / `CallPureI`) and dst writeback bank (`registers_i`) differ. RPython parity: `pyjitpl.py:1346 opimpl_residual_call_r_i = _opimpl_residual_call1`; `do_residual_call`'s `descr.get_normalized_result_type()` dispatch (pyjitpl.py:2022-2044) selects the int-result CALL op. Argboxes pass through [`build_allboxes`] same as `_r_r` (R-list-only argboxes → identity permutation when arg_types is ref-only). |
-//! | `residual_call_ir_r/iIRd>r` | PARITY (shape sibling of `_r_r`) | adds an i-bank list between funcptr and the R-list. RPython parity: `pyjitpl.py:1349 opimpl_residual_call_ir_r = _opimpl_residual_call2`; `boxes2` argcode (`pyjitpl.py:3750-3760`) decodes the two count-prefixed lists into `argboxes = [i_args..., r_args...]`. Walker passes that flat list through [`build_allboxes`] (line-by-line port of `pyjitpl.py:1960-1993 _build_allboxes`) which permutes argboxes by `descr.get_arg_types()` so the recorded `Call*` arglist matches the callee's actual ABI even for mixed orderings like `[REF, INT, REF, INT]`. Same EffectInfo classification + GUARD_NO_EXCEPTION emission as `_r_r`. |
+//! | `residual_call_r_r/iRd>r` | PRE-EXISTING-ADAPTATION (multi-session epic) | classifies the call by `EffectInfo`. Wired sub-cases: (1) release-gil via [`direct_call_release_gil`] — `CallReleaseGilI` + arglist `[savebox, funcbox] + argboxes[1:]` reshape per `pyjitpl.py:3675-3681`, plus the outer forces-branch `GUARD_NOT_FORCED` (`:2079`) + `GUARD_NO_EXCEPTION` (`:2082`); (2) loop-invariant heapcache via [`loopinvariant_lookup`] / [`loopinvariant_now_known`] per `pyjitpl.py:2088 + 2109`. The remaining branches go through [`select_residual_call_opcode`]: `CallMayForce*` + `GuardNotForced` on the rest of the forces-virtual path (`pyjitpl.py:2017-2082`), `CallLoopinvariant*` on `EF_LOOPINVARIANT` (`pyjitpl.py:2087-2110`), `CallPure*` on elidable, otherwise `Call*`. `GuardNoException` follows whenever `effectinfo.check_can_raise(False)` is true (`pyjitpl.py:2082 handle_possible_exception`). Still missing relative to `do_residual_call`: `vable_and_vrefs_before/after_residual_call` virtualizable bookkeeping (`pyjitpl.py:2055-2080`), `heapcache.invalidate_caches_varargs` for write effects (`pyjitpl.py:2042`), `OS_NOT_IN_TRACE` early return via `do_not_in_trace_call` (`pyjitpl.py:2003-2006 + 3683-3697`) — pyre's `effect_info_for_call_flavor` stub never sets `oopspecindex` (see `flatten.rs:431` audit table) so the dead path is unreachable today, `direct_libffi_call` / `direct_assembler_call` specialization (`pyjitpl.py:1908-1990`), KEEPALIVE for vablebox, and `num_live` accounting on the guards (`pyjitpl.py:2082 → capture_resumedata(after_residual_call=True)`). Convergence: Phase D-3 + dedicated multi-session port (depends on `majit-translate` analyzer trio). |
+//! | `residual_call_r_i/iRd>i` | PARITY (kind sibling of `_r_r`) | same EffectInfo classification + guard emission as `_r_r` — `select_residual_call_opcode('i', ...)` returns the int-typed `Call*` family (`CallReleaseGilI` / `CallMayForceI` / `CallLoopinvariantI` / `CallPureI` / `CallI`); only the dst writeback bank (`registers_i`) differs. RPython parity: `pyjitpl.py:1346 opimpl_residual_call_r_i = _opimpl_residual_call1`; `do_residual_call`'s `descr.get_normalized_result_type()` dispatch (pyjitpl.py:2022-2044) selects the int-result CALL op. Argboxes pass through [`build_allboxes`] same as `_r_r` (R-list-only argboxes → identity permutation when arg_types is ref-only). |
+//! | `residual_call_ir_r/iIRd>r` | PARITY (shape sibling of `_r_r`) | adds an i-bank list between funcptr and the R-list. RPython parity: `pyjitpl.py:1349 opimpl_residual_call_ir_r = _opimpl_residual_call2`; `boxes2` argcode (`pyjitpl.py:3750-3760`) decodes the two count-prefixed lists into `argboxes = [i_args..., r_args...]`. Walker passes that flat list through [`build_allboxes`] (line-by-line port of `pyjitpl.py:1960-1993 _build_allboxes`) which permutes argboxes by `descr.get_arg_types()` so the recorded `Call*` arglist matches the callee's actual ABI even for mixed orderings like `[REF, INT, REF, INT]`. Same EffectInfo classification + guard emission as `_r_r` via [`select_residual_call_opcode`]. |
 //! | `raise/r`           | PRE-EXISTING-ADAPTATION (Walker fix H deferred) | sets `ctx.last_exc_value` (`pyjitpl.py:1695`); top-level records `Finish(exc) descr=exit_frame_with_exception_descr_ref` (`pyjitpl.py:3238-3242 compile_exit_frame_with_exception`); sub-walk surfaces `SubRaise{exc}`. Caller-side handler scan (`finishframe_exception`) lives on `inline_call`'s SubRaise arm (above). RPython `pyjitpl.py:1690-1693` also emits `GUARD_CLASS(exc, cls_of_box(exc))` when `heapcache.is_class_known(exc) == false`; the symbolic walker can't derive `cls_of_box(exc)` without runtime access to the box. Convergence path: Walker fix A (production `dispatch_via_miframe` wiring) supplies the MIFrame.cls_of_box resolver; only then can walker emit the guard. |
 //! | `reraise/`          | PARITY        | reads `ctx.last_exc_value` (asserts via `ReraiseWithoutLastExcValue` matching `pyjitpl.py:1702 assert`); same dual top-level/sub-walk routing as `raise/r` (`pyjitpl.py:1700-1704 popframe + finishframe_exception`). |
 //! | `last_exc_value/>r` | PARITY        | reads `ctx.last_exc_value`, writes the OpRef into `registers_r[dst]` — pure SSA rename, no IR op recorded. RPython `pyjitpl.py:1716-1719 opimpl_last_exc_value` returns `self.metainterp.last_exc_box` after asserting `last_exc_value` is non-null; missing slot surfaces `LastExcValueWithoutActiveException` (codewriter invariant: only emits inside `catch_exception/L` body). |
@@ -62,28 +62,34 @@
 //!
 //! Production fidelity gaps (ranked by priority for follow-on work):
 //!
-//! 1. `residual_call_r_r/iRd>r` 8-branch port (`pyjitpl.py:1995-2127`).
-//!    Walker emits the EffectInfo-classified record + optional
-//!    `GUARD_NO_EXCEPTION` only. Each missing branch needs MIFrame
-//!    state pyre-jit-trace doesn't yet expose:
-//!    a. `CALL_MAY_FORCE` / `GUARD_NOT_FORCED` (forces-virtual path)
-//!       — needs `vable_and_vrefs_before_residual_call` + after.
-//!    b. `CALL_LOOPINVARIANT_R` opcode (currently absent from
-//!       `majit-ir`'s `OpCode`); plus
-//!       `call_loopinvariant_known_result_cache` short-circuit
-//!       (`pyjitpl.py:1999-2011`) requires `metainterp.history`.
+//! 1. `residual_call_r_r/iRd>r` `do_residual_call` port
+//!    (`pyjitpl.py:1995-2127`). Walker selects the IR opcode via
+//!    [`select_residual_call_opcode`] (`CallReleaseGil*` /
+//!    `CallMayForce*` / `CallLoopinvariant*` / `CallPure*` / `Call*`),
+//!    unconditionally emits `GuardNotForced` on the forces and
+//!    release-gil branches, and emits `GuardNoException` whenever
+//!    `effectinfo.check_can_raise(False)` is true. Remaining MIFrame-state
+//!    dependencies:
+//!    a. `vable_and_vrefs_before/after_residual_call` virtualizable
+//!       bookkeeping (`pyjitpl.py:2017, 2078`), KEEPALIVE on vablebox
+//!       (`pyjitpl.py:2080-2081`).
+//!    b. `call_loopinvariant_known_result_cache` short-circuit
+//!       (`pyjitpl.py:1999-2011, 2088-2090`) requires
+//!       `metainterp.heapcache.call_loopinvariant_known_result`.
 //!    c. `heapcache.invalidate_caches_varargs` for write effects
-//!       (`pyjitpl.py:2042`); needs MIFrame `heapcache`.
+//!       (`pyjitpl.py:2042, 2072`); needs MIFrame `heapcache`.
 //!    d. `direct_libffi_call` / `direct_call_release_gil` /
-//!       `direct_assembler_call` specialization (`pyjitpl.py:1908-1990`)
-//!       — needs descr-type discrimination + dedicated emit paths.
-//!    e. `GUARD_NO_EXCEPTION num_live=0` is a known under-approx —
-//!       parity is `capture_resumedata(orgpc, after_residual_call=True)`
-//!       which needs the symbolic frame state. (`pyjitpl.py:2082-2086`)
-//!    Multi-session epic; not in scope for slice 2i. Cannot be closed
-//!    incrementally without the listed prereq state. (Item f from the
-//!    earlier audit — `_build_allboxes` ABI re-ordering — landed in
-//!    slice 4.x: see [`build_allboxes`].)
+//!       `direct_assembler_call` specialization (`pyjitpl.py:1908-1990,
+//!       2057-2068`) — needs descr-type discrimination + dedicated emit
+//!       paths.
+//!    e. `GUARD_NOT_FORCED` / `GUARD_NO_EXCEPTION num_live=0` is a known
+//!       under-approx — parity is `capture_resumedata(orgpc,
+//!       after_residual_call=True)` which needs the symbolic frame state
+//!       (`pyjitpl.py:2082-2086`).
+//!    Multi-session epic; the IR-emission slice landed and is no longer
+//!    blocking opname coverage. (Item f from the earlier audit —
+//!    `_build_allboxes` ABI re-ordering — landed in slice 4.x: see
+//!    [`build_allboxes`].)
 //! 2. `raise/r`'s `GUARD_CLASS` (Walker fix H) is deferred until
 //!    Walker fix A (production `dispatch_via_miframe` caller) lands.
 //!    RPython `pyjitpl.py:1690-1693 opimpl_raise` emits the guard via
@@ -1522,10 +1528,273 @@ fn decode_descr_index(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usi
     lo | (hi << 8)
 }
 
+/// EffectInfo-driven opcode selector shared by `dispatch_residual_call_*`
+/// dispatchers. Mirrors `pyjitpl.py:1995-2126 do_residual_call`'s
+/// precedence:
+///   1. **forces branch** (`pyjitpl.py:2007-2082`): outer check on
+///      `assembler_call or check_forces_virtual_or_virtualizable()`
+///      records `CALL_MAY_FORCE_*` at step 2 and unconditionally fires
+///      `GUARD_NOT_FORCED` (`:2079`).  The release-gil sub-case
+///      (`pyjitpl.py:2063 if effectinfo.is_call_release_gil()`) is
+///      handled by [`direct_call_release_gil`] **before** this
+///      selector is called — the dispatcher early-returns on
+///      `ei.is_call_release_gil()` so this function only ever sees
+///      EI values where the sub-case is not active.
+///   2. `EF_LOOPINVARIANT` (`:2087-2110`): `CALL_LOOPINVARIANT_*`.
+///   3. `check_is_elidable()` (`:2112-2126`): `CALL_PURE_*`.
+///   4. default (`:2126`): plain `CALL_*`.
+///
+/// Returns the `Call*` opcode for the call itself, whether
+/// `handle_possible_exception` should emit `GUARD_NO_EXCEPTION`
+/// (`check_can_raise(False)`), and whether the unconditional
+/// `GUARD_NOT_FORCED` from the forces branch (`pyjitpl.py:2079`)
+/// should fire.
+fn select_residual_call_opcode(
+    ei: &majit_ir::EffectInfo,
+    dst_bank: char,
+    caller: &'static str,
+) -> (OpCode, bool, bool) {
+    // Release-gil sub-case is handled by `direct_call_release_gil`
+    // before this selector runs.  Any `is_call_release_gil()` EI
+    // reaching here is a dispatcher bug.
+    debug_assert!(
+        !ei.is_call_release_gil(),
+        "{caller}: select_residual_call_opcode received an is_call_release_gil() EI; \
+         dispatcher should have routed via direct_call_release_gil first"
+    );
+    let (call_op, pure_op, may_force_op, loopinvariant_op): (OpCode, OpCode, OpCode, OpCode) =
+        match dst_bank {
+            'r' => (
+                OpCode::CallR,
+                OpCode::CallPureR,
+                OpCode::CallMayForceR,
+                OpCode::CallLoopinvariantR,
+            ),
+            'i' => (
+                OpCode::CallI,
+                OpCode::CallPureI,
+                OpCode::CallMayForceI,
+                OpCode::CallLoopinvariantI,
+            ),
+            _ => panic!("{caller}: unsupported dst_bank '{dst_bank}'"),
+        };
+    if ei.check_forces_virtual_or_virtualizable() {
+        // pyjitpl.py:2017-2082 forces-virtual-or-virtualizable branch
+        // proper: CALL_MAY_FORCE_* + GUARD_NOT_FORCED.
+        // `handle_possible_exception` also fires (forces always
+        // satisfies check_can_raise).
+        (may_force_op, ei.check_can_raise(false), true)
+    } else if ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant {
+        // pyjitpl.py:2087-2110 EF_LOOPINVARIANT branch: CALL_LOOPINVARIANT_*
+        // via miframe_execute_varargs(..., exc=False). LoopInvariant
+        // never raises (extraeffect=1 < CannotRaise=2 → check_can_raise=False).
+        //
+        // The `pyjitpl.py:2088 call_loopinvariant_known_result` lookup
+        // and `pyjitpl.py:2109 call_loopinvariant_now_known` cache
+        // update are wired at the dispatcher level via
+        // [`loopinvariant_lookup`] and [`loopinvariant_now_known`]
+        // around the `record_op_with_descr` call — they require the
+        // dispatcher's `descr_index` and `arg0_int` so this opcode
+        // selector cannot perform them on its own.
+        (loopinvariant_op, ei.check_can_raise(false), false)
+    } else if ei.check_is_elidable() {
+        // pyjitpl.py:2112 + 2126 elidable branch: CALL_PURE_*.
+        (pure_op, ei.check_can_raise(false), false)
+    } else {
+        // pyjitpl.py:2126 default branch: CALL_*.
+        (call_op, ei.check_can_raise(false), false)
+    }
+}
+
+/// `pyjitpl.py:2088-2090 heapcache.call_loopinvariant_known_result`
+/// short-circuit: when the EffectInfo's extraeffect is `EF_LOOPINVARIANT`
+/// AND the heapcache has a cached result for `(descr_index, allboxes[0])`,
+/// the trace skips re-recording the `CALL_LOOPINVARIANT_*` op and the
+/// caller reuses the cached OpRef.  Returns `None` for non-loopinvariant
+/// EI or a cache miss; the caller then falls through to the normal record
+/// path and follows up with [`loopinvariant_now_known`] to populate the
+/// cache for subsequent matching calls.
+///
+/// RPython upstream (`heapcache.py:629-634`) keys the lookup by descr
+/// **identity** and `allboxes[0].getint()`.  pyre-jit-trace doesn't
+/// thread the funcbox's concrete int alongside its symbolic OpRef
+/// (cf. `majit-metainterp/src/pyjitpl/mod.rs:11103 funcbox.2`), so the
+/// caller passes `funcptr.0 as i64` — the OpRef raw u32 — as the
+/// `arg0_int` key, matching `trace_ctx.rs:3383
+/// call_loopinvariant_impl`'s established convention.  This is
+/// observationally equivalent: identical OpRefs always denote
+/// identical concrete funcptrs within a single trace, and distinct
+/// OpRefs never collide on the cache key even if they happen to alias
+/// the same concrete address (a stricter equivalence than upstream's
+/// concrete-int key).  `descr_index` is the per-trace CallDescr slot
+/// index emitted by the codewriter (`decode_descr_index`) — pyre's
+/// stand-in for upstream's identity comparison.
+#[inline]
+fn loopinvariant_lookup(
+    ctx: &WalkContext<'_, '_>,
+    ei: &majit_ir::EffectInfo,
+    descr_index: usize,
+    arg0_int: i64,
+) -> Option<OpRef> {
+    if ei.extraeffect != majit_ir::ExtraEffect::LoopInvariant {
+        return None;
+    }
+    ctx.trace_ctx
+        .heap_cache()
+        .call_loopinvariant_known_result(descr_index as u32, arg0_int)
+        .map(|(opref, _resvalue)| opref)
+}
+
+/// `pyjitpl.py:2109 heapcache.call_loopinvariant_now_known`: after
+/// recording a fresh `CALL_LOOPINVARIANT_*` op, remember the
+/// `(descr_index, arg0_int) -> result` mapping so the next matching
+/// call short-circuits via [`loopinvariant_lookup`].  No-op for non-
+/// loopinvariant EI.
+///
+/// `resvalue` is stored as `0` because pyre-jit-trace's residual_call
+/// dispatchers do not yet thread the concrete result alongside the
+/// symbolic OpRef (mirroring `trace_ctx.rs::call_loopinvariant_impl`'s
+/// legacy `0` placeholder).  RPython's upstream caller stores the
+/// concrete `res` from `execute_varargs`; pyre's `record_op_with_descr`
+/// only returns the symbolic OpRef.  The cached `_resvalue` is unused
+/// by [`loopinvariant_lookup`]'s consumer (the OpRef alone is enough
+/// for register writeback), so the placeholder is observationally
+/// equivalent until a concrete-result-returning record helper lands.
+#[inline]
+fn loopinvariant_now_known(
+    ctx: &mut WalkContext<'_, '_>,
+    ei: &majit_ir::EffectInfo,
+    descr_index: usize,
+    arg0_int: i64,
+    result: OpRef,
+) {
+    if ei.extraeffect != majit_ir::ExtraEffect::LoopInvariant {
+        return;
+    }
+    ctx.trace_ctx.heap_cache_mut().call_loopinvariant_now_known(
+        descr_index as u32,
+        arg0_int,
+        result,
+        0,
+    );
+}
+
+/// `pyjitpl.py:3671-3681 MetaInterp.direct_call_release_gil` port.
+/// Sub-case of the forces-virtual-or-virtualizable branch
+/// (`pyjitpl.py:2063` `if effectinfo.is_call_release_gil()`): when the
+/// descr's `call_release_gil_target` is a non-NULL `(realfuncaddr,
+/// saveerr)` pair, the recorded trace op is `CALL_RELEASE_GIL_*`
+/// with a re-shaped arglist:
+///
+/// ```text
+///     realfuncaddr, saveerr = effectinfo.call_release_gil_target
+///     funcbox = ConstInt(adr2int(realfuncaddr))
+///     savebox = ConstInt(saveerr)
+///     opnum   = rop.call_release_gil_for_descr(calldescr)
+///     return self.history.record_nospec(
+///         opnum, [savebox, funcbox] + argboxes[1:], ..., calldescr)
+/// ```
+///
+/// `argboxes[0]` (the original funcbox) is replaced by the descr's real
+/// target address, with `savebox` (`saveerr`) prepended.  The pyre-jit-
+/// trace `allboxes` from [`build_allboxes`] starts with `funcptr` at
+/// index 0 and the user-side arguments from index 1 onwards, matching
+/// upstream's `argboxes[0] = funcbox` convention, so the slice rebuild
+/// is `[savebox, funcbox_real] + allboxes[1..]`.
+///
+/// Mirror of `majit-metainterp/src/pyjitpl/mod.rs:10437-10477
+/// direct_call_release_gil` for the pyre-jit-trace dispatcher layer.
+/// The two-frame-layer parity (majit `do_residual_call` and
+/// pyre-jit-trace `dispatch_residual_call_*`) both implement the same
+/// `pyjitpl.py:3671-3681` sub-case independently because the layers
+/// receive different argument shapes.  `descr` is consumed (move) into
+/// `record_op_with_descr` so the caller must `clone()` it before
+/// calling if it needs the original after this returns.
+///
+/// Also emits the two guards the outer forces branch demands
+/// (`pyjitpl.py:2079 GUARD_NOT_FORCED` unconditionally,
+/// `pyjitpl.py:2082 GUARD_NO_EXCEPTION` when
+/// `check_can_raise(False)` is true) — keeping guard emission inside
+/// this helper means the dispatcher early-returns after a single call.
+///
+/// **`'r'` bank not supported.**  RPython
+/// `resoperation.py:1238 call_release_gil_for_descr` has no
+/// `CALL_RELEASE_GIL_R` arm (commented out as `# no such thing`),
+/// and `:1462 is_call_release_gil` excludes `CALL_RELEASE_GIL_R`
+/// from the predicate.  This helper panics on `dst_bank == 'r'` —
+/// the closest behaviour to upstream's missing branch is fail-fast,
+/// since silently routing to a non-existent OpCode would record an
+/// IR op the optimizer / backend cannot consume.  No production
+/// caller reaches this path today (every codewriter
+/// `emit_residual_call` site uses `CallFlavor::Plain` /
+/// `CallFlavor::MayForce`; `CallFlavor::ReleaseGil` is dead in
+/// production per `flatten.rs:486` docstring), so the panic is
+/// defensive against a future producer that introduces a
+/// `'r'`-result release-gil callee without first wiring an upstream
+/// `CALL_RELEASE_GIL_R` opcode.
+///
+/// `'f'` (Float) bank is not currently dispatched through
+/// [`dispatch_residual_call_iRd_kind`] / `_iIRd_kind` either —
+/// codewriter does not emit a float-result `iRd>X` shape today.  An
+/// `unreachable!` covers that residual case.
+fn direct_call_release_gil(
+    ctx: &mut WalkContext<'_, '_>,
+    ei: &majit_ir::EffectInfo,
+    allboxes: &[OpRef],
+    descr: DescrRef,
+    dst_bank: char,
+    caller: &'static str,
+) -> OpRef {
+    // pyjitpl.py:3675: realfuncaddr, saveerr = effectinfo.call_release_gil_target
+    let (realfuncaddr, saveerr) = ei.call_release_gil_target;
+    // pyjitpl.py:3676-3677: funcbox/savebox ConstInt
+    let savebox = ctx.trace_ctx.const_int(saveerr as i64);
+    let funcbox_real = ctx.trace_ctx.const_int(realfuncaddr as i64);
+    // pyjitpl.py:3678: opnum = rop.call_release_gil_for_descr(calldescr)
+    let opcode = match dst_bank {
+        'i' => OpCode::CallReleaseGilI,
+        'r' => panic!(
+            "{caller}: CALL_RELEASE_GIL_R has no upstream counterpart \
+             (resoperation.py:1238 `# no such thing`); a 'r'-result \
+             release-gil callee cannot be lowered to an IR op the \
+             optimizer/backend can consume."
+        ),
+        // Float / Void bank not dispatched through this helper today.
+        _ => unreachable!(
+            "{caller}: dst_bank '{dst_bank}' not supported by direct_call_release_gil \
+             (callers validate 'i'/'r' before reaching here)"
+        ),
+    };
+    // pyjitpl.py:3679-3681: history.record_nospec(opnum,
+    //                          [savebox, funcbox] + argboxes[1:], ..., calldescr)
+    let mut new_args = Vec::with_capacity(allboxes.len() + 1);
+    new_args.push(savebox);
+    new_args.push(funcbox_real);
+    if allboxes.len() > 1 {
+        new_args.extend_from_slice(&allboxes[1..]);
+    }
+    let result = ctx.trace_ctx.record_op_with_descr(opcode, &new_args, descr);
+    // pyjitpl.py:2079 GUARD_NOT_FORCED — unconditional on the outer
+    // forces-virtual-or-virtualizable branch (the release-gil sub-case
+    // is inside that branch, so the guard fires regardless of which
+    // sub-branch ran).
+    ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+    // pyjitpl.py:2082 handle_possible_exception — emits
+    // GUARD_NO_EXCEPTION whenever the EffectInfo can raise.
+    // `num_live=0` is the same under-approx the rest of this
+    // dispatcher uses (capture_resumedata not yet wired).
+    if ei.check_can_raise(false) {
+        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+    }
+    result
+}
+
 /// `residual_call` shape `iRd>X` dispatcher. Reads `funcptr (i)`,
 /// R-list args, and `descr`, runs `_build_allboxes` to produce the
-/// callee's ABI-ordered arglist, classifies the call by `EffectInfo`,
-/// records the matching kind-coded `Call*` / `CallPure*` op, emits
+/// callee's ABI-ordered arglist, classifies the call by `EffectInfo`
+/// via [`select_residual_call_opcode`], records the matching
+/// kind-coded `CallMayForce*` / `CallLoopinvariant*` / `CallPure*` /
+/// `Call*` op, emits `GUARD_NOT_FORCED` on the forces branch, emits
 /// `GUARD_NO_EXCEPTION` if the classification says `can_raise`, and
 /// writes the recorded result OpRef into the dst register chosen by
 /// `dst_bank`.
@@ -1537,24 +1806,56 @@ fn decode_descr_index(code: &[u8], op: &DecodedOp, operand_offset: usize) -> usi
 /// _opimpl_residual_call1` confirm both kind variants share the
 /// `_call1` body. The `_X` suffix is the *call's return kind* — mapping
 /// comes from `do_residual_call`'s `descr.get_normalized_result_type()`
-/// dispatch (pyjitpl.py:2022-2044): `'i' → CALL_MAY_FORCE_I`,
-/// `'r' → CALL_MAY_FORCE_R`, etc. Walker selects the simpler
-/// non-forces branch (`OpCode::CallI` / `CallR`) per kind via
-/// `dst_bank`.
+/// dispatch (pyjitpl.py:2022-2044) and `select_residual_call_opcode`'s
+/// kind-keyed opcode tables.
 ///
 /// `dst_bank` selects where the call's result lands:
-/// * `'r'`: caller's `registers_r[dst]` — `OpCode::CallR` / `CallPureR`.
-/// * `'i'`: caller's `registers_i[dst]` — `OpCode::CallI` / `CallPureI`.
+/// * `'r'`: caller's `registers_r[dst]` — Ref-typed `Call*` family.
+/// * `'i'`: caller's `registers_i[dst]` — Int-typed `Call*` family.
 /// (Float not currently emitted by codewriter; convergence with the
 /// dispatch-table-codegen renderer would land alongside `_r_f` if /
 /// when it appears.)
 ///
-/// PRE-EXISTING-ADAPTATION (Walker fix J 8-branch port): walker emits
-/// only the EffectInfo-classified `Call*` / `CallPure*` + optional
-/// `GUARD_NO_EXCEPTION`. Missing branches (`CALL_MAY_FORCE`/
-/// `GUARD_NOT_FORCED`, `CALL_LOOPINVARIANT_*`, vable bookkeeping,
-/// libffi/release_gil/assembler_call specialization, `num_live` on the
-/// guard) need MIFrame state pyre-jit-trace doesn't yet expose.
+/// PRE-EXISTING-ADAPTATION: walker selects the IR opcode by EffectInfo
+/// branch (`CallMayForce*` for forces, `CallLoopinvariant*` for
+/// loop-invariant, `CallPure*` for elidable, otherwise `Call*`) via
+/// [`select_residual_call_opcode`]. Two sub-cases route through
+/// dedicated helpers before the selector:
+///   - **release-gil** ([`direct_call_release_gil`], `pyjitpl.py:3671-
+///     3681`) — early-return when `ei.is_call_release_gil()`,
+///     reshapes the arglist to `[savebox, funcbox] + argboxes[1:]`
+///     and records `CALL_RELEASE_GIL_*` instead of `CALL_MAY_FORCE_*`.
+///   - **loop-invariant heapcache** ([`loopinvariant_lookup`] /
+///     [`loopinvariant_now_known`], `pyjitpl.py:2088 + 2109`) —
+///     short-circuits the record on a heapcache hit and populates
+///     the cache after a fresh record.
+///
+/// Emits `GUARD_NOT_FORCED` on the forces path plus
+/// `GUARD_NO_EXCEPTION` whenever `check_can_raise(False)` is true,
+/// matching `pyjitpl.py:2078-2082`. Still missing relative to upstream
+/// `do_residual_call`:
+///   - `vable_and_vrefs_before/after_residual_call` virtualizable
+///     bookkeeping (`pyjitpl.py:2055-2080`).
+///   - `heapcache.invalidate_caches_varargs` for write effects
+///     (`pyjitpl.py:2042`).
+///   - `OS_NOT_IN_TRACE` early return via `do_not_in_trace_call`
+///     (`pyjitpl.py:2003-2006 + 3683-3697`) — the dead path is
+///     unreachable today because `effect_info_for_call_flavor` stub
+///     never sets `oopspecindex` (see `flatten.rs:431` audit table).
+///   - `direct_libffi_call` / `direct_assembler_call` specialization
+///     (`pyjitpl.py:1908-1990`).
+///   - KEEPALIVE for vablebox (`pyjitpl.py:2080-2081`).
+///   - `num_live`-aware `capture_resumedata(after_residual_call=True)`
+///     on the guards (`pyjitpl.py:2078-2082 → capture_resumedata`).
+///     `record_guard(..., 0)` passes a stub `num_live = 0`; the
+///     guard's resume data is therefore empty and a real bailout
+///     would observe an under-populated frame.  Affects every
+///     guard-emitting site in this file, not just the residual-call
+///     dispatchers; convergence is the broader `capture_resumedata`
+///     wire-up epic.
+///
+/// All of the above need MIFrame state pyre-jit-trace doesn't yet
+/// expose.
 #[allow(non_snake_case)]
 fn dispatch_residual_call_iRd_kind(
     code: &[u8],
@@ -1582,41 +1883,64 @@ fn dispatch_residual_call_iRd_kind(
     let argbox_types: Vec<Type> = vec![Type::Ref; r_args.len()];
     let allboxes = build_allboxes(funcptr, &r_args, &argbox_types, call_descr.arg_types());
 
-    // EffectInfo classification (pyjitpl.py:2085-2126). The kind-dependent
-    // bit is the choice of `Call*` / `CallPure*` opcode per `dst_bank`.
-    let (call_op, pure_op): (OpCode, OpCode) = match dst_bank {
-        'r' => (OpCode::CallR, OpCode::CallPureR),
-        'i' => (OpCode::CallI, OpCode::CallPureI),
-        _ => panic!(
-            "dispatch_residual_call_iRd_kind: unsupported dst_bank '{}'",
-            dst_bank
-        ),
-    };
     let ei = call_descr.get_extra_info();
-    let (call_opcode, can_raise, _classification): (OpCode, bool, &'static str) =
-        if ei.check_forces_virtual_or_virtualizable() {
-            // PRE-EXISTING-ADAPTATION (Walker fix J): forces path
-            // needs CALL_MAY_FORCE + GUARD_NOT_FORCED + vable bookkeeping.
-            (call_op, true, "forces-fallback")
-        } else if ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant {
-            // PRE-EXISTING-ADAPTATION (Walker fix J): CALL_LOOPINVARIANT_*
-            // missing from majit-ir's OpCode enum.
-            (call_op, false, "loopinvariant-fallback")
-        } else if ei.check_is_elidable() {
-            (pure_op, ei.check_can_raise(false), "elidable")
-        } else {
-            (call_op, ei.check_can_raise(false), "default")
-        };
-    let result = ctx
-        .trace_ctx
-        .record_op_with_descr(call_opcode, &allboxes, descr);
 
-    // RPython `metainterp.handle_possible_exception()` (pyjitpl.py:2082)
-    // emits `GUARD_NO_EXCEPTION` after every raising call. `num_live=0`
-    // is a known under-approx (Walker fix J).
-    if can_raise {
-        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-    }
+    // pyjitpl.py:2063 forces-branch sub-case: when the descr's
+    // `call_release_gil_target` is a non-NULL `(realfuncaddr, saveerr)`
+    // pair, route through `direct_call_release_gil` which records
+    // `CALL_RELEASE_GIL_*` with the upstream-shape arglist
+    // `[savebox, funcbox] + argboxes[1:]` (pyjitpl.py:3675-3681).  All
+    // other forces-branch paths (CALL_MAY_FORCE_*, the loopinvariant
+    // sub-case below, the elidable branch, the default branch) come
+    // out of `select_residual_call_opcode`.
+    let result = if ei.is_call_release_gil() {
+        direct_call_release_gil(
+            ctx,
+            ei,
+            &allboxes,
+            descr.clone(),
+            dst_bank,
+            "dispatch_residual_call_iRd_kind",
+        )
+    } else {
+        let (call_opcode, can_raise, emit_guard_not_forced) =
+            select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iRd_kind");
+
+        // pyjitpl.py:2087-2110 EF_LOOPINVARIANT branch: short-circuit
+        // via heapcache before recording.  `loopinvariant_lookup`
+        // returns `Some(cached)` only when `ei.extraeffect ==
+        // LoopInvariant` AND the `(descr_index, funcptr)` pair matches
+        // the heapcache; for all other EI branches it falls through
+        // and the normal record path runs.
+        if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_index, funcptr.0 as i64) {
+            cached
+        } else {
+            let recorded =
+                ctx.trace_ctx
+                    .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+
+            // pyjitpl.py:2079 `metainterp.generate_guard(rop.GUARD_NOT_FORCED)`
+            // — unconditionally on the forces-virtual-or-virtualizable branch.
+            if emit_guard_not_forced {
+                ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            }
+            // pyjitpl.py:2082 `metainterp.handle_possible_exception()` emits
+            // `GUARD_NO_EXCEPTION` whenever the EffectInfo can raise.
+            // `num_live=0` is a known under-approx
+            // (`capture_resumedata` not yet wired).
+            if can_raise {
+                ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+            }
+
+            // pyjitpl.py:2109 `heapcache.call_loopinvariant_now_known`:
+            // populate the cache so a subsequent matching call short-
+            // circuits via the lookup above.  No-op for non-loopinvariant
+            // EI per `loopinvariant_now_known`'s extraeffect check.
+            loopinvariant_now_known(ctx, ei, descr_index, funcptr.0 as i64, recorded);
+
+            recorded
+        }
+    };
 
     // dst writeback (`>X`).
     let dst = code[op.pc + 1 + descr_offset + 2] as usize;
@@ -1669,9 +1993,23 @@ fn dispatch_residual_call_iRd_kind(
 ///   1B funcptr (i) + 1B i-list count + N×1B i-regs + 1B r-list count
 ///   + M×1B r-regs + 2B descr + 1B `>X` dst.
 ///
-/// EffectInfo classification + GUARD_NO_EXCEPTION emission match
-/// `dispatch_residual_call_iRd_kind`. PRE-EXISTING-ADAPTATION coverage
-/// matches `iRd_kind` (Walker fix J 8-branch port).
+/// EffectInfo classification + guard emission match
+/// `dispatch_residual_call_iRd_kind` via [`select_residual_call_opcode`],
+/// and the same release-gil ([`direct_call_release_gil`]) +
+/// loop-invariant heapcache ([`loopinvariant_lookup`] /
+/// [`loopinvariant_now_known`]) sub-cases route through dedicated
+/// helpers ahead of the selector.
+///
+/// PRE-EXISTING-ADAPTATION coverage matches `iRd_kind`: vable
+/// bookkeeping (`vable_and_vrefs_before/after_residual_call`),
+/// heapcache invalidation (`heapcache.invalidate_caches_varargs`),
+/// `OS_NOT_IN_TRACE` early return (unreachable until
+/// `effect_info_for_call_flavor` plumbs `oopspecindex`),
+/// libffi / assembler specialization, KEEPALIVE for vablebox, and
+/// `num_live`-aware `capture_resumedata(after_residual_call=True)`
+/// on the guards remain absent. Convergence: the broader
+/// `capture_resumedata` wire-up epic + `majit-translate` analyzer
+/// trio (see `flatten.rs:431` audit table).
 #[allow(non_snake_case)]
 fn dispatch_residual_call_iIRd_kind(
     code: &[u8],
@@ -1703,32 +2041,46 @@ fn dispatch_residual_call_iIRd_kind(
     argbox_types.extend(std::iter::repeat(Type::Ref).take(r_args.len()));
     let allboxes = build_allboxes(funcptr, &argboxes, &argbox_types, call_descr.arg_types());
 
-    let (call_op, pure_op): (OpCode, OpCode) = match dst_bank {
-        'r' => (OpCode::CallR, OpCode::CallPureR),
-        'i' => (OpCode::CallI, OpCode::CallPureI),
-        _ => panic!(
-            "dispatch_residual_call_iIRd_kind: unsupported dst_bank '{}'",
-            dst_bank
-        ),
-    };
     let ei = call_descr.get_extra_info();
-    let (call_opcode, can_raise, _classification): (OpCode, bool, &'static str) =
-        if ei.check_forces_virtual_or_virtualizable() {
-            (call_op, true, "forces-fallback")
-        } else if ei.extraeffect == majit_ir::ExtraEffect::LoopInvariant {
-            (call_op, false, "loopinvariant-fallback")
-        } else if ei.check_is_elidable() {
-            (pure_op, ei.check_can_raise(false), "elidable")
-        } else {
-            (call_op, ei.check_can_raise(false), "default")
-        };
-    let result = ctx
-        .trace_ctx
-        .record_op_with_descr(call_opcode, &allboxes, descr);
 
-    if can_raise {
-        ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
-    }
+    // pyjitpl.py:2063 forces-branch sub-case: route release-gil through
+    // `direct_call_release_gil`.  Mirrors `dispatch_residual_call_iRd_kind`.
+    let result = if ei.is_call_release_gil() {
+        direct_call_release_gil(
+            ctx,
+            ei,
+            &allboxes,
+            descr.clone(),
+            dst_bank,
+            "dispatch_residual_call_iIRd_kind",
+        )
+    } else {
+        let (call_opcode, can_raise, emit_guard_not_forced) =
+            select_residual_call_opcode(ei, dst_bank, "dispatch_residual_call_iIRd_kind");
+
+        // pyjitpl.py:2087-2110 EF_LOOPINVARIANT branch: heapcache
+        // short-circuit. See [`loopinvariant_lookup`] /
+        // [`loopinvariant_now_known`] for the upstream citation; the
+        // structure mirrors `dispatch_residual_call_iRd_kind`.
+        if let Some(cached) = loopinvariant_lookup(ctx, ei, descr_index, funcptr.0 as i64) {
+            cached
+        } else {
+            let recorded =
+                ctx.trace_ctx
+                    .record_op_with_descr(call_opcode, &allboxes, descr.clone());
+
+            if emit_guard_not_forced {
+                ctx.trace_ctx.record_guard(OpCode::GuardNotForced, &[], 0);
+            }
+            if can_raise {
+                ctx.trace_ctx.record_guard(OpCode::GuardNoException, &[], 0);
+            }
+
+            loopinvariant_now_known(ctx, ei, descr_index, funcptr.0 as i64, recorded);
+
+            recorded
+        }
+    };
 
     let dst = code[op.pc + 1 + descr_offset + 2] as usize;
     match dst_bank {
