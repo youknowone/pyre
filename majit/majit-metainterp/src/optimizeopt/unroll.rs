@@ -4857,6 +4857,13 @@ impl OptUnroll {
                     }
                 }
             }
+            if peeled.opcode.is_guard() {
+                clone_guard_snapshot_remapped(ctx, &mut peeled, &ref_map);
+                // opencoder.py:391-401 parity: trace iteration strips guard
+                // descrs, keeping only rd_resume_position. optimizer.py then
+                // invents a fresh opcode-appropriate descr at emission time.
+                peeled.descr = None;
+            }
             ctx.emit(peeled);
         }
 
@@ -4891,10 +4898,71 @@ impl OptUnroll {
                     }
                 }
             }
+            if body_op.opcode.is_guard() {
+                clone_guard_snapshot_remapped(ctx, &mut body_op, &orig_ref_map);
+                // Same opencoder.py guard-descr stripping as the peeled copy.
+                // ResumeAtPositionDescr is inline_short_preamble-only
+                // (unroll.py:406-409), not normal peeled body guard state.
+                body_op.descr = None;
+            }
             ctx.emit(body_op);
         }
         orig_ref_map
     }
+}
+
+fn fresh_snapshot_key(ctx: &OptContext) -> i32 {
+    let mut key = ctx
+        .snapshot_boxes
+        .keys()
+        .copied()
+        .max()
+        .unwrap_or(-1)
+        .saturating_add(1);
+    while ctx.snapshot_boxes.contains_key(&key) {
+        key = key.saturating_add(1);
+    }
+    key
+}
+
+fn remap_snapshot_boxes(boxes: &[OpRef], ref_map: &HashMap<OpRef, OpRef>) -> Vec<OpRef> {
+    boxes
+        .iter()
+        .map(|&opref| ref_map.get(&opref).copied().unwrap_or(opref))
+        .collect()
+}
+
+fn clone_guard_snapshot_remapped(
+    ctx: &mut OptContext,
+    guard: &mut Op,
+    ref_map: &HashMap<OpRef, OpRef>,
+) {
+    let old_pos = guard.rd_resume_position;
+    if old_pos < 0 {
+        return;
+    }
+    let Some(snapshot_boxes) = ctx.snapshot_boxes.get(&old_pos).cloned() else {
+        return;
+    };
+
+    // RPython TraceIterator decodes snapshot box references against the
+    // current iteration's box cache.  Majit keeps snapshots in side tables,
+    // so cloned guards need a cloned snapshot table entry with the same
+    // raw-box -> cloned-box mapping used for op args.
+    let new_pos = fresh_snapshot_key(ctx);
+    ctx.snapshot_boxes
+        .insert(new_pos, remap_snapshot_boxes(&snapshot_boxes, ref_map));
+    if let Some(vable_boxes) = ctx.snapshot_vable_boxes.get(&old_pos).cloned() {
+        ctx.snapshot_vable_boxes
+            .insert(new_pos, remap_snapshot_boxes(&vable_boxes, ref_map));
+    }
+    if let Some(frame_pcs) = ctx.snapshot_frame_pcs.get(&old_pos).cloned() {
+        ctx.snapshot_frame_pcs.insert(new_pos, frame_pcs);
+    }
+    if let Some(frame_sizes) = ctx.snapshot_frame_sizes.get(&old_pos).cloned() {
+        ctx.snapshot_frame_sizes.insert(new_pos, frame_sizes);
+    }
+    guard.rd_resume_position = new_pos;
 }
 
 impl Default for OptUnroll {
@@ -4994,7 +5062,21 @@ mod tests {
         // for every renamed inputarg, which production derives from
         // the recorder's trace_inputarg_types.
         opt.trace_inputarg_types = vec![majit_ir::Type::Ref; 1024];
-        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
+        // Production trace iteration gets rd_resume_position from
+        // opencoder.py:399-401.  Direct unit-test guards must seed the
+        // corresponding snapshot explicitly before store_final_boxes_in_guard.
+        let (ops, snapshots) = super::super::seed_guard_snapshots_with(ops, |guard| {
+            // Direct unroll tests use guard brackets as the explicit active
+            // snapshot so remapping can verify the TraceIterator cache
+            // semantics that RPython gets from opencoder.py.
+            guard
+                .fail_args
+                .as_deref()
+                .map(|fail_args| fail_args.iter().copied().collect())
+                .unwrap_or_default()
+        });
+        opt.snapshot_boxes = snapshots;
+        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     // ── Basic peeling ─────────────────────────────────────────────────
@@ -5424,6 +5506,8 @@ mod tests {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptUnroll::new()));
         opt.trace_inputarg_types = vec![majit_ir::Type::Ref; 1024];
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
             &mut std::collections::HashMap::new(),
@@ -5444,11 +5528,14 @@ mod tests {
     }
 
     #[test]
-    fn test_unroll_preserves_descr() {
-        // Guard descriptors must be ResumeGuardDescr subclasses; RPython
-        // optimizer.py:723 asserts this before storing resume data.
+    fn test_unroll_mints_fresh_guard_descrs() {
+        // RPython parity: normal trace guards do not keep their encoded descr.
+        //
+        // opencoder.py:391 strips guard descrs to None during trace iteration;
+        // optimizer.py:724-729 invents a fresh opcode-specific descr at guard
+        // emission. ResumeAtPositionDescr is only for inline_short_preamble().
         let descr = crate::compile::make_resume_guard_descr_typed(Vec::new());
-        let descr_index = descr.index();
+        let original_index = descr.index();
         let mut ops = vec![
             Op::with_descr(OpCode::GuardTrue, &[OpRef(100)], descr.clone()),
             Op::new(OpCode::Jump, &[]),
@@ -5457,7 +5544,6 @@ mod tests {
 
         let result = run_unroll_pass(&ops);
 
-        // Both guards (peeled and body) should have the descriptor.
         let guards: Vec<&Op> = result
             .iter()
             .filter(|o| o.opcode == OpCode::GuardTrue)
@@ -5465,8 +5551,21 @@ mod tests {
         assert_eq!(guards.len(), 2);
         for guard in &guards {
             assert!(guard.descr.is_some(), "guard should have a descriptor");
-            assert_eq!(guard.descr.as_ref().unwrap().index(), descr_index);
+            assert!(
+                guard.descr.as_ref().unwrap().is_resume_guard(),
+                "optimizer.py:723: descr must be a ResumeGuardDescr subtype"
+            );
         }
+        let peel_index = guards[0].descr.as_ref().unwrap().index();
+        let body_index = guards[1].descr.as_ref().unwrap().index();
+        assert_ne!(peel_index, original_index);
+        assert_ne!(body_index, original_index);
+        assert_ne!(
+            peel_index, body_index,
+            "peeled and body guards must own distinct freshly invented descrs"
+        );
+        assert!(!guards[0].descr.as_ref().unwrap().is_resume_at_position());
+        assert!(!guards[1].descr.as_ref().unwrap().is_resume_at_position());
     }
 
     // ── Chain of references ───────────────────────────────────────────

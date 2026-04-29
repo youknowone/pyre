@@ -1001,18 +1001,20 @@ impl<S: JitState> JitDriver<S> {
                 // SwitchToBlackhole`.  When
                 // `JitState::populate_frame_for_guard` is overridden
                 // (state-field-JIT macro consumers), pair the guard with
-                // the bridge snapshot.  When the default no-op returns
-                // `None`, still emit the segment without a snapshot —
-                // the optimizer's `store_final_boxes_in_guard`
-                // (`optimizeopt/mod.rs:3200`) drops the resume data and
-                // emits a sentinel descr that triggers loop
-                // invalidation on guard fail, mirroring the
-                // SwitchToBlackhole bailout.  PRE-EXISTING-ADAPTATION:
-                // the snapshot-less path is bounded; convergence is
-                // Task #89 (lift `S::Sym` into MIFrame framestack
-                // populate) so every consumer captures uniformly via
-                // the standard `MIFrame::get_list_of_active_boxes`
-                // walk.
+                // the bridge snapshot.
+                //
+                // PRE-EXISTING-ADAPTATION: when the default no-op
+                // returns `None`, this low-level driver has no MIFrame
+                // to walk — it only knows the active jump boxes from
+                // `S::collect_jump_args`.  We feed those into
+                // `capture_snapshot_for_last_guard`, which records a
+                // single placeholder frame in lieu of the RPython
+                // `framestack` walk (`pyjitpl.py:2586
+                // capture_resumedata`).  Bounded scope: this branch is
+                // only reached on the segmented-loop force path of the
+                // low-level driver and dissolves once Task #89 lifts
+                // `S::Sym` into `MIFrame::populate_for_guard` so every
+                // path captures uniformly via the framestack walk.
                 let pre_snapshot = self.sym.as_ref().and_then(|sym| {
                     let frame = self.meta.framestack.current_mut();
                     S::populate_frame_for_guard(sym, frame)
@@ -1027,9 +1029,15 @@ impl<S: JitState> JitDriver<S> {
                     // (= frame.pc at the guard point), not header_pc.
                     let pc_opref = ctx.const_int(ctx.last_traced_pc as i64);
                     current_live.push(pc_opref);
+                    // history.py:802 strict-types parity: every active
+                    // OpRef must resolve to a known Box.type; a miss is
+                    // a tracer bookkeeping bug, not a recoverable case.
                     let live_types: Vec<majit_ir::Type> = current_live
                         .iter()
-                        .map(|opref| ctx.get_opref_type(*opref).unwrap_or(majit_ir::Type::Int))
+                        .map(|opref| {
+                            ctx.get_opref_type(*opref)
+                                .expect("force_finish_trace: active OpRef missing Box.type")
+                        })
                         .collect();
                     let guard_opref =
                         ctx.record_guard_typed(majit_ir::OpCode::GuardAlwaysFails, &[], live_types);
@@ -1037,21 +1045,12 @@ impl<S: JitState> JitDriver<S> {
                         let snapshot_id = ctx.capture_resumedata(snapshot);
                         ctx.set_last_guard_resume_position(snapshot_id);
                     } else {
-                        // No framestack-lift override: pre_snapshot is
-                        // None, so the optimizer's
-                        // `store_final_boxes_in_guard`
-                        // (`optimizeopt/mod.rs:3200`) cannot derive
-                        // `op.fail_args` from a snapshot.  Fall back to
-                        // setting fail_args inline via
-                        // `Op.setfailargs([...])` (RPython
-                        // `resoperation.py`) — the production path used
-                        // for guards constructed outside the standard
-                        // `capture_resumedata` flow (`trace_ctx.rs:861`
-                        // `set_fail_args` doc).  Mirrors main's pre-Task
-                        // #91 inline fail_args data flow until Task #89
-                        // lifts `S::Sym` into MIFrame framestack
-                        // populate, after which this branch dissolves
-                        // and the `pre_snapshot` arm is unconditional.
+                        // PRE-EXISTING-ADAPTATION: see header comment.
+                        // No framestack-lift override available, so
+                        // capture the active low-level boxes via the
+                        // segmented-driver placeholder helper instead
+                        // of inventing a fail_args-only fallback.
+                        ctx.capture_snapshot_for_last_guard(&current_live);
                         ctx.set_fail_args(guard_opref, &current_live);
                     }
                     let dummy = ctx.const_int(0);
@@ -3710,6 +3709,7 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
             let i0 = OpRef(0); // input arg
             let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[i0]);
             ctx.set_fail_args(g, &[i0]);
         };
         driver.meta.compile_loop(&[OpRef(0)], ());
@@ -3763,6 +3763,7 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
             let i0 = OpRef(0);
             let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[OpRef(0), OpRef(1), OpRef(2)]);
             ctx.set_fail_args(g, &[OpRef(0), OpRef(1), OpRef(2)]);
         };
         driver
@@ -3814,6 +3815,7 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("trace ctx should exist");
             let i0 = OpRef(0);
             let g = ctx.record_guard(OpCode::GuardFalse, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[OpRef(0), OpRef(1), OpRef(2)]);
             ctx.set_fail_args(g, &[OpRef(0), OpRef(1), OpRef(2)]);
         };
         driver
@@ -3915,6 +3917,7 @@ mod tests {
             let i0 = OpRef(0);
             ctx.const_int(42);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[i0]);
             ctx.set_fail_args(g, &[i0]);
         }
         driver.meta.compile_loop(&[OpRef(0)], ());
@@ -4031,6 +4034,7 @@ mod tests {
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum]);
             ctx.set_fail_args(g, &[sum]);
             sum
         };
@@ -4071,6 +4075,7 @@ mod tests {
                 let c1 = ctx.const_int(1);
                 let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
                 let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+                ctx.capture_snapshot_for_last_guard(&[sum]);
                 ctx.set_fail_args(g, &[sum]);
             }
             driver.meta.compile_loop(&[OpRef(0)], ());
@@ -4111,6 +4116,7 @@ mod tests {
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum]);
             ctx.set_fail_args(g, &[sum]);
             sum
         };
@@ -4175,6 +4181,7 @@ mod tests {
             let ctx = driver.meta.trace_ctx().expect("should be tracing");
             let i0 = OpRef(0);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[]);
             ctx.set_fail_args(g, &[]);
         }
         driver.meta.compile_loop(&[OpRef(0)], ());
@@ -4264,6 +4271,7 @@ mod tests {
             let c1 = ctx.const_int(1);
             let sum = ctx.record_op(OpCode::IntAdd, &[i0, c1]);
             let g = ctx.record_guard(OpCode::GuardTrue, &[i0], 0);
+            ctx.capture_snapshot_for_last_guard(&[sum]);
             ctx.set_fail_args(g, &[sum]);
             sum
         };

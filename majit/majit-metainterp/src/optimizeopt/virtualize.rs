@@ -2158,6 +2158,24 @@ mod tests {
         }
     }
 
+    use super::super::seed_guard_snapshots_with;
+
+    fn seed_virtualize_guard_snapshots(
+        ops: &[Op],
+    ) -> (Vec<Op>, std::collections::HashMap<i32, Vec<OpRef>>) {
+        // These direct optimizer tests do not build MIFrame objects.  Their
+        // guard bracket list is the explicit active-box snapshot input that
+        // RPython would get from capture_resumedata(); store_final_boxes then
+        // overwrites guard.fail_args with the numbered liveboxes.
+        seed_guard_snapshots_with(ops, |guard| {
+            guard
+                .fail_args
+                .as_deref()
+                .map(|fail_args| fail_args.iter().copied().collect())
+                .unwrap_or_default()
+        })
+    }
+
     fn run_pass(ops: &[Op]) -> Vec<Op> {
         run_pass_typed(ops, &[])
     }
@@ -2180,13 +2198,17 @@ mod tests {
             types[idx as usize] = Type::Int;
         }
         opt.trace_inputarg_types = types;
-        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
+        let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
+        opt.snapshot_boxes = snapshots;
+        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     fn run_default_pipeline(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::default_pipeline();
         opt.trace_inputarg_types = vec![Type::Ref; 1024];
-        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
+        let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
+        opt.snapshot_boxes = snapshots;
+        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     fn run_default_pipeline_typed(ops: &[Op], int_slots: &[u32], float_slots: &[u32]) -> Vec<Op> {
@@ -2199,11 +2221,15 @@ mod tests {
             types[idx as usize] = Type::Float;
         }
         opt.trace_inputarg_types = types;
-        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
+        let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
+        opt.snapshot_boxes = snapshots;
+        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     fn run_pass_with_constants(ops: &[Op], constants: &[(OpRef, Value)]) -> Vec<Op> {
+        let (ops, snapshots) = seed_virtualize_guard_snapshots(ops);
         let mut ctx = OptContext::new(ops.len());
+        ctx.snapshot_boxes = snapshots;
         for &(opref, ref val) in constants {
             ctx.make_constant(opref, val.clone());
         }
@@ -2211,7 +2237,7 @@ mod tests {
         let mut pass = OptVirtualize::new();
         pass.setup();
 
-        for op in ops {
+        for op in &ops {
             // Resolve forwarded arguments
             let mut resolved_op = op.clone();
             for arg in &mut resolved_op.args {
@@ -2597,6 +2623,8 @@ mod tests {
         ops[1].fail_args = Some(Default::default());
         assign_positions(&mut ops);
 
+        let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
         let jump = result
             .iter()
@@ -2828,6 +2856,8 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::default_pipeline();
+        let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, 42i64); // expected class ptr matches vtable
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -3041,6 +3071,8 @@ mod tests {
         assign_positions(&mut ops);
 
         let mut opt = Optimizer::default_pipeline();
+        let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, 42i64); // class ptr constant
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -3687,7 +3719,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // consumer switchover: test setup doesn't trigger inline guard numbering
     fn test_guard_fail_args_virtual_not_forced() {
         // resume.py parity: virtual objects in guard fail_args should NOT be
         // forced (no allocation emitted). rd_numb with TAGVIRTUAL is set.
@@ -3696,8 +3727,8 @@ mod tests {
         // setfield_gc(p0, i10, descr=field1)
         // guard_true(i20) [p0]
         //
-        // Expected: no NEW_WITH_VTABLE emitted. Guard has rd_numb.
-        // fail_args expanded: OpRef::NONE + field values.
+        // Expected: no NEW_WITH_VTABLE emitted. Guard has rd_numb and
+        // rd_virtuals; liveboxes contain TAGBOX field values only.
         let sd = size_descr(1);
         let fd = field_descr(10);
 
@@ -3735,21 +3766,27 @@ mod tests {
             "guard should have rd_numb (compact resume numbering)"
         );
 
-        // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
+        // resume.py:411-412 parity: liveboxes_from_env contains TAGBOX entries
+        // for the virtual's field values; the virtual itself is encoded via
+        // TAGVIRTUAL into rd_virtuals (no slot in liveboxes).
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
-            fa.iter().any(|a| a.is_none()),
-            "virtual slot should be OpRef::NONE placeholder in fail_args"
+            fa.iter().all(|a| !a.is_none()),
+            "RPython liveboxes are TAGBOX-only; got {:?}",
+            fa
         );
-        // Field value (OpRef(10)) should be appended as extra fail_arg
         assert!(
-            fa.len() > 1,
-            "fail_args should be expanded with virtual field values"
+            fa.iter().any(|&a| a == OpRef(10)),
+            "virtual's int field (OpRef(10)) should appear in liveboxes; got {:?}",
+            fa
+        );
+        assert!(
+            guard_op.resolved_rd_virtuals().is_some(),
+            "virtual structure should be encoded into rd_virtuals tree"
         );
     }
 
     #[test]
-    #[ignore] // consumer switchover: test setup doesn't trigger inline guard numbering
     fn test_guard_fail_args_mixed_virtual_and_non_virtual() {
         // Guard with both virtual and non-virtual fail_args.
         //
@@ -3757,8 +3794,10 @@ mod tests {
         // setfield_gc(p0, i10, descr=field1)
         // guard_true(i20) [i30, p0, i40]
         //
-        // rd_numb set. fail_args expanded:
-        // [i30, NONE, i40, i10] — virtual slot replaced with NONE, field appended.
+        // RPython resume.py:411-417 parity: liveboxes is TAGBOX-only — virtual
+        // p0 is encoded into rd_virtuals; the surviving liveboxes are the
+        // concrete TAGBOX boxes (OpRef(30), OpRef(40), and the virtual's
+        // field value OpRef(10)).
         let sd = size_descr(1);
         let fd = field_descr(10);
 
@@ -3791,25 +3830,31 @@ mod tests {
             "guard should have rd_numb (compact resume numbering)"
         );
 
-        // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
+        // resume.py:411-417 parity: liveboxes is TAGBOX-only.
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
-            fa.iter().any(|a| a.is_none()),
-            "virtual slot should be OpRef::NONE placeholder in fail_args"
-        );
-        // Non-virtual boxes should still be present
-        assert!(
-            fa.iter().any(|a| *a == OpRef(30)),
-            "non-virtual OpRef(30) should be in fail_args"
+            fa.iter().all(|a| !a.is_none()),
+            "RPython liveboxes are TAGBOX-only; got {:?}",
+            fa
         );
         assert!(
-            fa.iter().any(|a| *a == OpRef(40)),
-            "non-virtual OpRef(40) should be in fail_args"
+            fa.iter().any(|&a| a == OpRef(30)),
+            "non-virtual OpRef(30) should remain in liveboxes; got {:?}",
+            fa
         );
-        // fail_args expanded: original 3 + field value(s) for the virtual
         assert!(
-            fa.len() > 3,
-            "fail_args should be expanded with virtual field values"
+            fa.iter().any(|&a| a == OpRef(40)),
+            "non-virtual OpRef(40) should remain in liveboxes; got {:?}",
+            fa
+        );
+        assert!(
+            fa.iter().any(|&a| a == OpRef(10)),
+            "virtual's field (OpRef(10)) should appear in liveboxes; got {:?}",
+            fa
+        );
+        assert!(
+            guard_op.resolved_rd_virtuals().is_some(),
+            "virtual structure should be encoded into rd_virtuals tree"
         );
     }
 
@@ -3837,7 +3882,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // consumer switchover: test setup doesn't trigger inline guard numbering
     fn test_guard_fail_args_virtual_struct_not_forced() {
         // VirtualStruct (New) in guard fail_args should also use resume data.
         let sd = size_descr(1);
@@ -3870,20 +3914,25 @@ mod tests {
             guard_op.resolved_rd_numb().is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
-        // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
+        // resume.py:411-417 parity: liveboxes is TAGBOX-only.
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
-            fa.iter().any(|a| a.is_none()),
-            "virtual slot should be OpRef::NONE placeholder in fail_args"
+            fa.iter().all(|a| !a.is_none()),
+            "RPython liveboxes are TAGBOX-only; got {:?}",
+            fa
         );
         assert!(
-            fa.len() > 1,
-            "fail_args should be expanded with virtual field values"
+            fa.iter().any(|&a| a == OpRef(10)),
+            "virtual struct's int field should appear in liveboxes; got {:?}",
+            fa
+        );
+        assert!(
+            guard_op.resolved_rd_virtuals().is_some(),
+            "virtual struct should be encoded into rd_virtuals tree"
         );
     }
 
     #[test]
-    #[ignore] // consumer switchover: test setup doesn't trigger inline guard numbering
     fn test_guard_fail_args_virtual_with_multiple_fields() {
         // Virtual with two fields in guard fail_args.
         let sd = size_descr(1);
@@ -3913,22 +3962,38 @@ mod tests {
             "guard should have rd_numb (compact resume numbering)"
         );
 
-        // fail_args has EXPANDED length: virtual slot = OpRef::NONE, field values appended
+        // resume.py:411-417 parity: liveboxes is TAGBOX-only.
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
-            fa.iter().any(|a| a.is_none()),
-            "virtual slot should be OpRef::NONE placeholder in fail_args"
+            fa.iter().all(|a| !a.is_none()),
+            "RPython liveboxes are TAGBOX-only; got {:?}",
+            fa
         );
-        // Two fields means at least 2 extra fail_args beyond the original 1
+        // Both field values must appear in liveboxes.
         assert!(
-            fa.len() >= 3,
-            "fail_args should be expanded with 2 virtual field values (got {})",
-            fa.len()
+            fa.iter().any(|&a| a == OpRef(10)),
+            "first field value (OpRef(10)) should appear in liveboxes; got {:?}",
+            fa
+        );
+        assert!(
+            fa.iter().any(|&a| a == OpRef(20)),
+            "second field value (OpRef(20)) should appear in liveboxes; got {:?}",
+            fa
+        );
+        assert!(
+            guard_op.resolved_rd_virtuals().is_some(),
+            "virtual structure should be encoded into rd_virtuals tree"
         );
     }
 
     #[test]
-    fn test_guard_fail_args_nested_virtual_field_is_forced_to_concrete() {
+    fn test_guard_fail_args_nested_virtual_field_encodes_into_rd_virtuals() {
+        // Nested virtual: outer.field = inner_virtual (Ref), inner.field = OpRef(40) (Int).
+        // RPython resume.py:_number_virtuals (resume.py:454-475 _number_virtuals;
+        // visitor_walk_recursive at resume.py:426) recursively encodes nested
+        // virtuals as TAGVIRTUAL inside rd_virtuals; no New/NewWithVtable is
+        // materialized at numbering time.  Liveboxes only carry the leaf
+        // TAGBOX values.
         let outer_sd = size_descr(1);
         let inner_sd = size_descr(2);
         let outer_fd = ref_field_descr(10);
@@ -3951,26 +4016,47 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::GuardTrue)
             .expect("guard should be emitted");
-        let fa = guard_op.fail_args.as_ref().unwrap();
-        // Nested virtual fields force the root fail_arg concrete.
-        assert!(
-            guard_op.resolved_rd_numb().is_none() || guard_op.resolved_rd_virtuals().is_none(),
-            "nested virtual fields should force the root fail_arg concrete"
-        );
-        assert!(
-            !fa[0].is_none(),
-            "root fail_arg should be forced concrete when nested virtual fields are present"
-        );
-        assert!(
+
+        // No concrete allocations emitted — both virtuals stay TAGVIRTUAL.
+        assert_eq!(
             result
                 .iter()
-                .any(|op| matches!(op.opcode, OpCode::New | OpCode::NewWithVtable)),
-            "forcing the root virtual should emit concrete allocation ops"
+                .filter(|op| matches!(op.opcode, OpCode::New | OpCode::NewWithVtable))
+                .count(),
+            0,
+            "nested virtuals should stay virtual; got ops: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+
+        assert!(
+            guard_op.resolved_rd_numb().is_some(),
+            "guard should have rd_numb after RPython numbering"
+        );
+        assert!(
+            guard_op.resolved_rd_virtuals().is_some(),
+            "rd_virtuals should encode the nested virtual tree"
+        );
+
+        // Liveboxes are TAGBOX-only — only the leaf int OpRef(40) survives.
+        let fa = guard_op.fail_args.as_ref().unwrap();
+        assert!(
+            fa.iter().all(|a| !a.is_none()),
+            "RPython liveboxes are TAGBOX-only; got {:?}",
+            fa
+        );
+        assert!(
+            fa.iter().any(|&a| a == OpRef(40)),
+            "leaf int field (OpRef(40)) should appear in liveboxes; got {:?}",
+            fa
         );
     }
 
     #[test]
-    fn test_guard_fail_args_unsupported_virtual_array_is_forced() {
+    fn test_guard_fail_args_virtual_array_encodes_into_rd_virtuals() {
+        // Virtual array: NewArray(len=1), set item 0 = OpRef(12).
+        // RPython resume.py:_number_virtuals encodes the array virtually;
+        // the array's elements are added to liveboxes as TAGBOX, the array
+        // identity stays TAGVIRTUAL inside rd_virtuals.
         let ad = array_descr(30);
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(20)]);
         guard.fail_args = Some(vec![OpRef(0)].into());
@@ -3992,17 +4078,30 @@ mod tests {
             (OpRef(12), Value::Int(99)),
         ];
         let result = run_pass_with_constants(&ops, constants);
+
+        // No concrete NewArray allocation — virtual array stays virtual.
+        assert_eq!(
+            result
+                .iter()
+                .filter(|op| op.opcode == OpCode::NewArray)
+                .count(),
+            0,
+            "virtual array should stay virtual; got ops: {:?}",
+            result.iter().map(|o| o.opcode).collect::<Vec<_>>()
+        );
+
         let guard_op = result
             .iter()
             .find(|o| o.opcode == OpCode::GuardTrue)
             .expect("guard should be emitted");
 
-        // Unsupported virtual arrays should fall back to concrete fail_args.
-
-        let fa = guard_op.fail_args.as_ref().unwrap();
         assert!(
-            !fa[0].is_none(),
-            "virtual array fail_arg should be forced to a concrete value"
+            guard_op.resolved_rd_numb().is_some(),
+            "guard should have rd_numb after RPython numbering"
+        );
+        assert!(
+            guard_op.resolved_rd_virtuals().is_some(),
+            "rd_virtuals should encode the virtual array"
         );
     }
 }

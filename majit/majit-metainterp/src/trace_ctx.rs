@@ -883,6 +883,61 @@ impl TraceCtx {
         self.recorder.set_last_op_resume_position(snapshot_id);
     }
 
+    /// PRE-EXISTING-ADAPTATION: low-level / test snapshot helper used by
+    /// callers that record guards without an MIFrame to walk.
+    ///
+    /// RPython's `pyjitpl.py:2586 capture_resumedata` walks the
+    /// `framestack`, encoding one `SnapshotFrame` per `MIFrame` (with the
+    /// real `jitcode_index`, `pc`, plus `virtualizable_boxes` and
+    /// `virtualref_boxes` when configured).  Pyre's segmented low-level
+    /// driver (`jitdriver.rs::force_finish_trace`) and the
+    /// recorder-level unit tests in `jitdriver.rs::tests` /
+    /// `pyjitpl::tests` don't have a populated MIFrame at the guard
+    /// point — they only know the live `OpRef` set.  This helper builds
+    /// a single placeholder `SnapshotFrame { jitcode_index: 0, pc: 0,
+    /// boxes }` so the optimizer's `store_final_boxes_in_guard` has the
+    /// snapshot it requires (`resume.py:397`).  `vable_boxes` and
+    /// `vref_boxes` are empty: callers using this path don't manage
+    /// virtualizables or virtual refs.
+    ///
+    /// Convergence (Task #89): once `S::Sym` is lifted into
+    /// `MIFrame::populate_for_guard`, both call sites can route through
+    /// the standard `capture_resumedata(snapshot)` flow built from the
+    /// live framestack and this helper dissolves.
+    ///
+    /// Strict-types parity (`history.py:802`): every `OpRef` must
+    /// resolve to a known `Box.type`; constants must have a recorded
+    /// value.  Misses are bookkeeping bugs and panic, not silent
+    /// fallbacks.
+    pub fn capture_snapshot_for_last_guard(&mut self, active_boxes: &[OpRef]) {
+        let boxes: Vec<crate::recorder::SnapshotTagged> = active_boxes
+            .iter()
+            .map(|opref| {
+                let tp = self
+                    .get_opref_type(*opref)
+                    .expect("capture_snapshot_for_last_guard: active OpRef missing Box.type");
+                if opref.is_constant() {
+                    let value = self.constant_value(*opref).expect(
+                        "capture_snapshot_for_last_guard: constant OpRef missing recorded value",
+                    );
+                    crate::recorder::SnapshotTagged::Const(value, tp)
+                } else {
+                    crate::recorder::SnapshotTagged::Box(opref.0, tp)
+                }
+            })
+            .collect();
+        let snapshot_id = self.capture_resumedata(crate::recorder::Snapshot {
+            frames: vec![crate::recorder::SnapshotFrame {
+                jitcode_index: 0,
+                pc: 0,
+                boxes,
+            }],
+            vable_boxes: Vec::new(),
+            vref_boxes: Vec::new(),
+        });
+        self.set_last_guard_resume_position(snapshot_id);
+    }
+
     /// Mutate `op.fail_args` on a recorded op identified by `opref`.
     ///
     /// 1:1 port of RPython's `Op.setfailargs([...])`

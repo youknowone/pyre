@@ -1013,7 +1013,9 @@ mod tests {
     fn run_guard_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptGuard::new()));
-        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
+        opt.snapshot_boxes = snapshots;
+        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     // ── Redundant Guard Removal ─────────────────────────────────────────
@@ -1345,6 +1347,8 @@ mod tests {
         // Overflow guards and IntMulOvf work on Int-typed args — override
         // the test default so renamed_inputarg_types sees Int, not Ref.
         opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
             &mut std::collections::HashMap::new(),
@@ -1403,6 +1407,8 @@ mod tests {
         opt.add_pass(Box::new(crate::optimizeopt::rewrite::OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, 1i64);
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         // GUARD_VALUE should be replaced with GUARD_TRUE

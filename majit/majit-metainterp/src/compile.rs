@@ -2748,11 +2748,18 @@ fn alloc_fail_index() -> u32 {
     NEXT_FAIL_INDEX.fetch_add(1, Ordering::SeqCst)
 }
 
-/// Per-guard FailDescr carrying a unique index and type information.
+/// Per-guard backend FailDescr carrying a unique `fail_index`, the
+/// runtime fail-arg `Type` vector, and a vectorization accumulator
+/// chain.  Pyre-only adaptation: this is the bare backend descr used
+/// when a guard does not yet carry resume data
+/// (`ResumeGuardDescr` in this module is the resume-bearing variant).
 ///
-/// Mirrors RPython's ResumeGuardDescr — each guard operation gets its
-/// own descriptor with a unique `fail_index` so the backend can identify
-/// exactly which guard failed after execution.
+/// **NOT** a port of RPython `history.py:156 BasicFailDescr`, which
+/// is a test-only identifier descr.  The closest RPython analogue is
+/// the abstract `AbstractFailDescr` (`history.py:131`) — pyre keeps
+/// the `fail_arg_types` and `vector_info` slots that RPython would
+/// otherwise host on `ResumeGuardDescr` so the bare and resume
+/// variants share the same backend interface.
 #[derive(Debug)]
 struct MetaFailDescr {
     fail_index: u32,

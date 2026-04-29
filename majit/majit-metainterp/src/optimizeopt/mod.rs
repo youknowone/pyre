@@ -3256,7 +3256,7 @@ impl OptContext {
     /// Called from store_final_boxes_in_guard in optimizer.rs.
     /// Uses snapshot data (vable_boxes, frame_pcs, multi-frame) when available.
     pub fn finalize_guard_resume_data(
-        &self,
+        &mut self,
         op: &mut Op,
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
         pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
@@ -3265,7 +3265,7 @@ impl OptContext {
     }
 
     fn store_final_boxes_in_guard(
-        &self,
+        &mut self,
         op: &mut Op,
         knowledge: Option<crate::resume::OptimizerKnowledgeForResume>,
         mut pending_setfields: Vec<majit_ir::GuardPendingFieldEntry>,
@@ -3304,8 +3304,9 @@ impl OptContext {
         // resume.py:397 `assert not storage.rd_numb` — finish() runs at
         // most once per ResumeGuardDescr.  RPython makes this invariant
         // load-bearing: a second call would clobber an already-numbered
-        // livebox set and break bridge attachment.
-        debug_assert!(
+        // livebox set and break bridge attachment.  Promoted from
+        // debug_assert! so release builds catch double-finish too.
+        assert!(
             op.descr
                 .as_ref()
                 .and_then(|d| d.as_fail_descr())
@@ -3359,24 +3360,9 @@ impl OptContext {
             // resume.py:396-397 parity:
             //   `resume_position = self.guard_op.rd_resume_position`
             //   `assert resume_position >= 0`
-            // PRE-EXISTING-ADAPTATION: RPython asserts unconditionally.
-            // Pyre's optimizer unit tests (~86 fixtures across `OptGuard`
-            // dedup / `OptHeap` virtualize / `unroll::peel` etc.)
-            // construct synthetic guards via `Op::new` without going
-            // through `capture_resumedata`, so they reach this branch
-            // legitimately.  Production guards are MAJIT_LOG-verified
-            // (fib_loop / fib_recursive / nbody / fannkuch / spectral_norm
-            // / raise_catch / nested_loop / list_setslice / list_pop_append)
-            // to never hit this path; the silent return is gated on
-            // `cfg(test)` and production hard-panics.
-            //
-            // Convergence path: migrate every test fixture to populate
-            // `snapshot_boxes[rd_resume_position]` (a thin helper that
-            // takes the same arguments as `capture_resumedata`), then
-            // remove the `cfg(test) return` so the assert fires
-            // unconditionally per RPython.  Multi-session task — out of
-            // scope for the current Codex stabilization round.
-            #[cfg(not(test))]
+            // RPython asserts unconditionally here.  Tests that construct
+            // guards directly must seed snapshot_boxes explicitly instead of
+            // inventing a fail_args-derived fallback in this path.
             panic!(
                 "store_final_boxes_in_guard: guard {:?} (pos={:?}, \
                  resume_pos={}) has no snapshot and no patchguardop \
@@ -3384,8 +3370,6 @@ impl OptContext {
                  `assert resume_position >= 0` parity",
                 op.opcode, op.pos, op.rd_resume_position
             );
-            #[cfg(test)]
-            return;
         }
 
         // RPython parity: snapshot path handles ALL guards with snapshots,
@@ -3854,6 +3838,30 @@ impl OptContext {
         }
         // 3. Producing op result type.
         self.get_op_result_type(resolved)
+    }
+
+    /// `Box.type` strict accessor. Panics when no source carries a type for
+    /// `opref`, matching `history.py:802 record_same_as(box.type)`'s
+    /// no-guess-on-miss policy: RPython Boxes always have an intrinsic type,
+    /// so a missing type is a structural bug.
+    ///
+    /// Use this whenever the call site previously read a HashMap with
+    /// `unwrap_or(Type::Int|Ref)` — those defaults silently absorbed bugs
+    /// that would have been audible under the upstream invariant.  Sites
+    /// that legitimately need a fallback (e.g. inputarg-stub harnesses,
+    /// out-of-process compile.rs paths without an `OptContext`) should
+    /// stay on `opref_type` and document the deviation.
+    #[track_caller]
+    pub fn op_type_strict(&self, opref: OpRef) -> majit_ir::Type {
+        self.opref_type(opref).unwrap_or_else(|| {
+            panic!(
+                "op_type_strict: no Box.type for {:?} (resolved={:?}); \
+                 every OpRef must have a type via constant / value_types / \
+                 producer-op result_type. history.py:802 parity.",
+                opref,
+                self.get_box_replacement(opref),
+            )
+        })
     }
 
     /// info.py:865-878 `getrawptrinfo(op)` parity (line-by-line port).
@@ -4859,6 +4867,46 @@ pub trait Optimization {
     /// starting AFTER the current pass. In majit, pass this index to
     /// `emit_extra` to achieve the same behavior.
     fn emitting_operation(&mut self, _op: &Op, _ctx: &mut OptContext, _self_pass_idx: usize) {}
+}
+
+#[cfg(test)]
+pub(crate) fn seed_guard_snapshots_with<F>(
+    ops: &[Op],
+    mut snapshot_for_guard: F,
+) -> (Vec<Op>, HashMap<i32, Vec<OpRef>>)
+where
+    F: FnMut(&Op) -> Vec<OpRef>,
+{
+    let mut seeded = ops.to_vec();
+    let mut snapshots: HashMap<i32, Vec<OpRef>> = HashMap::new();
+    let mut next_resume_pos = 0i32;
+    for op in seeded.iter_mut().filter(|op| op.opcode.is_guard()) {
+        let snapshot_boxes = snapshot_for_guard(op);
+        let resume_pos =
+            if op.rd_resume_position >= 0 && !snapshots.contains_key(&op.rd_resume_position) {
+                op.rd_resume_position
+            } else {
+                while snapshots.contains_key(&next_resume_pos) {
+                    next_resume_pos += 1;
+                }
+                let resume_pos = next_resume_pos;
+                next_resume_pos += 1;
+                resume_pos
+            };
+        op.rd_resume_position = resume_pos;
+        snapshots.insert(resume_pos, snapshot_boxes);
+    }
+    (seeded, snapshots)
+}
+
+/// Test fixture helper for optimizer tests whose guard resume state is
+/// intentionally irrelevant.  RPython would still have a
+/// `capture_resumedata()` entry for such a guard; the explicit empty list
+/// models an empty active frame snapshot rather than deriving anything from
+/// `guard.fail_args`.
+#[cfg(test)]
+pub(crate) fn seed_empty_guard_snapshots(ops: &[Op]) -> (Vec<Op>, HashMap<i32, Vec<OpRef>>) {
+    seed_guard_snapshots_with(ops, |_| Vec::new())
 }
 
 #[cfg(test)]

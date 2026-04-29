@@ -3581,7 +3581,9 @@ mod tests {
             types[idx as usize] = Type::Int;
         }
         opt.trace_inputarg_types = types;
-        opt.optimize_with_constants_and_inputs(ops, &mut std::collections::HashMap::new(), 1024)
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
+        opt.snapshot_boxes = snapshots;
+        opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 1024)
     }
 
     // ── Test 1: SETFIELD then GETFIELD → read from cache ──
@@ -5024,6 +5026,8 @@ mod tests {
         ];
         let mut ctx = OptContext::new(ops.len() + 64);
         assign_positions(&mut ops);
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        ctx.snapshot_boxes = snapshots;
         let mut pass = OptHeap::new();
         pass.setup();
 
@@ -5081,6 +5085,8 @@ mod tests {
         ];
         let mut ctx = OptContext::new(ops.len() + 64);
         assign_positions(&mut ops);
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        ctx.snapshot_boxes = snapshots;
         let mut pass = OptHeap::new();
         pass.setup();
 

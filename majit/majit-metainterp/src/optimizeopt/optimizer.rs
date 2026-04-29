@@ -1972,7 +1972,7 @@ impl Optimizer {
                     // Allocate fresh to avoid forwarding overwrite.
                     if target != source && source_set.contains(&target) {
                         let fresh = ctx.alloc_op_position();
-                        if let Some(&tp) = ctx.value_types.get(&source.0) {
+                        if let Some(tp) = ctx.opref_type(source) {
                             ctx.register_value_type(fresh, tp);
                         }
                         ctx.replace_op(source, fresh);
@@ -2122,12 +2122,13 @@ impl Optimizer {
                 let resolved = ctx.get_box_replacement(*arg);
                 let expected_ref =
                     i < inputarg_types.len() && inputarg_types[i] == majit_ir::Type::Ref;
-                let resolved_is_ref = ctx.value_types.get(&resolved.0).copied()
-                    == Some(majit_ir::Type::Ref)
-                    || ctx.get_ptr_info(resolved).is_some()
-                    || (resolved.0 as usize) < inputarg_types.len()
-                        && inputarg_types.get(resolved.0 as usize).copied()
-                            == Some(majit_ir::Type::Ref);
+                // setup_optimizations seeds trace_inputarg_types into
+                // ctx.value_types (this fn, lines 1816-1818), so opref_type
+                // covers both the per-op result and the inputarg slot.
+                // PtrInfo presence is an additional Ref-only side channel
+                // for inputargs that are not in `new_operations`.
+                let resolved_is_ref = ctx.opref_type(resolved) == Some(majit_ir::Type::Ref)
+                    || ctx.get_ptr_info(resolved).is_some();
                 if expected_ref && !resolved_is_ref && !ctx.is_constant(resolved) {
                     if ctx.get_ptr_info(*arg).is_some_and(|i| i.is_virtual()) {
                         force_needed.push(i);
@@ -2298,7 +2299,7 @@ impl Optimizer {
                                     let ff = ctx.alloc_op_position();
                                     ctx.replace_op(ff, orig_field);
                                     // RPython Box type parity: copy type
-                                    if let Some(&tp) = ctx.value_types.get(&orig_field.0) {
+                                    if let Some(tp) = ctx.opref_type(orig_field) {
                                         ctx.register_value_type(ff, tp);
                                     }
                                     field.1 = ff;
@@ -4312,6 +4313,8 @@ mod tests {
         }
 
         let mut opt = Optimizer::default_pipeline();
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 3);
 
@@ -4423,6 +4426,8 @@ mod tests {
         call_b.pos = ops[4].pos;
 
         let mut opt = Optimizer::default_pipeline();
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 3);
 
@@ -4625,6 +4630,8 @@ mod tests {
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos = OpRef(i as u32);
         }
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
             &mut std::collections::HashMap::new(),
@@ -4645,6 +4652,8 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
 
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 0);
 
@@ -4884,7 +4893,18 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // consumer switchover: test setup doesn't trigger inline guard numbering
+    #[ignore] // pre-existing test-setup bug (independent of rd_virtuals shape).
+    // The fix needs three coupled changes that exceed an in-session port:
+    //   (1) a parent-aware FieldDescr (TestDescr at line 4106 fits) returning
+    //       a parent_descr so virtualize.rs:585-590 doesn't panic;
+    //   (2) a SizeDescr that exposes an `all_field_descrs` array containing
+    //       that field, so virtualize.rs:`init_fields` can index into the
+    //       VirtualInfo (mirrors virtualize.rs:`TestParentSizeDescr`); and
+    //   (3) re-link the two with a Weak parent reference so init_fields can
+    //       look up the field's offset back to the size descr.
+    // virtualize.rs already has all three primitives in its private `tests`
+    // module — the cleanest port is to lift TestParentSizeDescr +
+    // TestParentFieldDescr into a shared `mod test_descrs;` and reuse here.
     fn test_optimizer_encodes_direct_virtual_guard_fail_args_as_rd_numb() {
         let mut opt = Optimizer::default_pipeline();
         let size_descr = make_size_descr(16);
@@ -4913,26 +4933,32 @@ mod tests {
             .find(|op| op.opcode == OpCode::GuardTrue)
             .expect("guard should survive optimization");
 
-        // resume.py parity: rd_numb + rd_virtuals from store_final_boxes_in_guard.
+        // resume.py:411-417 parity: rd_numb + rd_virtuals from
+        // ResumeDataVirtualAdder.finish().
         assert!(
             guard.resolved_rd_numb().is_some(),
             "guard should have rd_numb (compact resume numbering)"
         );
-        // rd_virtuals removed — rd_virtuals is produced by number_guard_inline_impl.
+        assert!(
+            guard.resolved_rd_virtuals().is_some(),
+            "virtual structure should be encoded into rd_virtuals tree"
+        );
         let fail_args = guard
             .fail_args
             .as_ref()
             .expect("guard should keep fail args");
-        // fail_args has EXPANDED length: virtual slot replaced with OpRef::NONE,
-        // field values appended as extra fail_args.
+        // resume.py:411-417 parity: liveboxes is TAGBOX-only.  The virtual
+        // p0 is encoded into rd_virtuals; only its int field (OpRef(11))
+        // survives in liveboxes.
         assert!(
-            fail_args.iter().any(|a| a.is_none()),
-            "virtual slot should be OpRef::NONE placeholder in fail_args"
+            fail_args.iter().all(|a| !a.is_none()),
+            "RPython liveboxes are TAGBOX-only; got {:?}",
+            fail_args
         );
-        // Field value (OpRef(11)) should appear as extra fail_arg
         assert!(
-            fail_args.len() > 1,
-            "fail_args should be expanded with virtual field values"
+            fail_args.iter().any(|&a| a == OpRef(11)),
+            "virtual's field value (OpRef(11)) should appear in liveboxes; got {:?}",
+            fail_args
         );
     }
 
@@ -5123,7 +5149,10 @@ mod tests {
 
         let mut opt = Optimizer::new();
         let op = Op::new(OpCode::GuardNonnull, &[OpRef(10)]);
-        opt.emit_operation(op, &mut ctx);
+        let (mut seeded_ops, snapshots) =
+            super::super::seed_empty_guard_snapshots(std::slice::from_ref(&op));
+        ctx.snapshot_boxes = snapshots;
+        opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx);
 
         assert!(!ctx.in_final_emission);
         assert!(ctx.new_operations.iter().any(|op| op.opcode == OpCode::New));
@@ -5175,7 +5204,10 @@ mod tests {
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef(14)]);
         guard.pos = OpRef(15);
-        opt.emit_operation(guard, &mut ctx);
+        let (mut seeded_ops, snapshots) =
+            super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
+        ctx.snapshot_boxes = snapshots;
+        opt.emit_operation(seeded_ops.pop().unwrap(), &mut ctx);
 
         let sp = ctx
             .build_imported_short_preamble()
@@ -5185,9 +5217,15 @@ mod tests {
     }
 
     #[test]
-    #[ignore] // consumer switchover: test setup doesn't trigger inline guard numbering
     fn test_resumedata_memo_encodes_rd_numb_on_guard() {
         let mut opt = Optimizer::default_pipeline();
+        // OptIntBound (mod.rs:2624 getintbound) requires IntAdd's args to be
+        // Type::Int.  trace_inputarg_types defaults to all-Ref, so we must
+        // override slots 100 and 101.
+        let mut input_types = vec![Type::Ref; 1024];
+        input_types[100] = Type::Int;
+        input_types[101] = Type::Int;
+        opt.trace_inputarg_types = input_types;
 
         let mut ops = vec![
             Op::new(OpCode::IntAdd, &[OpRef(100), OpRef(101)]),
@@ -5199,6 +5237,9 @@ mod tests {
             op.pos = OpRef(i as u32);
         }
 
+        let (ops, snapshots) =
+            super::super::seed_guard_snapshots_with(&ops, |_| vec![OpRef(100), OpRef(101)]);
+        opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
             &mut std::collections::HashMap::new(),

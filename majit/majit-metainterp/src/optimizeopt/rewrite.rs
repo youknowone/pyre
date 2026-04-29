@@ -1750,20 +1750,15 @@ impl OptRewrite {
 
     /// Check if an OpRef is Ref-typed.
     /// optimizer.py:128: op.type == 'r'
+    ///
+    /// Routes through the canonical `OptContext::opref_type` accessor
+    /// (constant → value_types → producer op result_type) and falls back
+    /// to PtrInfo presence — a Ref-only side channel populated for input
+    /// args that do not appear in `new_operations`.
     fn is_ref_typed(&self, opref: OpRef, ctx: &OptContext) -> bool {
-        // Check constant type.
-        if let Some(val) = ctx.get_constant(opref) {
-            return val.get_type() == majit_ir::Type::Ref;
+        if ctx.opref_type(opref) == Some(majit_ir::Type::Ref) {
+            return true;
         }
-        // Check value_types (populated by emit).
-        if let Some(&tp) = ctx.value_types.get(&opref.0) {
-            return tp == majit_ir::Type::Ref;
-        }
-        // Check producing op result type.
-        if let Some(tp) = ctx.get_op_result_type(opref) {
-            return tp == majit_ir::Type::Ref;
-        }
-        // Check PtrInfo existence as a Ref indicator.
         ctx.get_ptr_info(opref).is_some()
     }
 
@@ -4484,6 +4479,8 @@ mod tests {
         opt.add_pass(Box::new(OptRewrite::new()));
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, 0i64);
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         assert!(

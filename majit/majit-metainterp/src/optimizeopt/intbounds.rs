@@ -2931,7 +2931,9 @@ mod tests {
     fn run_pass(ops: &[Op]) -> Vec<Op> {
         let mut opt = Optimizer::new();
         opt.add_pass(Box::new(OptIntBounds::new()));
-        opt.propagate_all_forward(ops)
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
+        opt.snapshot_boxes = snapshots;
+        opt.propagate_all_forward(&ops)
     }
 
     /// Create an OptIntBounds with specific bounds pre-set and run it on ops.
@@ -2962,6 +2964,14 @@ mod tests {
         let max_initial = initial_bounds.iter().map(|(r, _)| r.0).max().unwrap_or(0);
         let num_inputs = (max_arg.max(max_pos).max(max_initial) as usize) + 1;
         let mut ctx = OptContext::with_num_inputs(ops.len(), num_inputs);
+
+        // resume.py:397 parity: each guard must have a snapshot indexed
+        // by `rd_resume_position`.  This helper drives the optimizer
+        // without going through `Optimizer::optimize_with_constants_and_inputs`,
+        // so seed the snapshots manually.
+        let (seeded_ops, snapshots) = super::super::seed_empty_guard_snapshots(ops);
+        ctx.snapshot_boxes = snapshots;
+        let ops = &seeded_ops;
 
         pass.setup();
         for (opref, bound) in initial_bounds {
@@ -3932,6 +3942,8 @@ mod tests {
         opt.trace_inputarg_types = vec![majit_ir::Type::Int; 1024];
         let mut constants = std::collections::HashMap::new();
         constants.insert(200, 1i64);
+        let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
+        opt.snapshot_boxes = snapshots;
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
 
         let opcodes: Vec<_> = result.iter().map(|op| op.opcode).collect();
