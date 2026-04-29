@@ -869,74 +869,33 @@ impl MIFrame {
         let length_f = all_liveness[off + 2] as u32;
         let mut cursor = off + 3;
         let mut boxes = Vec::with_capacity((length_i + length_r + length_f) as usize);
-        // RPython reads each live register out of its kind-specific bank:
-        // `registers_i[reg_i]`, `registers_r[reg_r]`, `registers_f[reg_f]`.
-        // Pyre still keeps Python semantic locals/stack in the prefix of
-        // `registers_r`, so Ref registers prefer the semantic-color view
-        // and then fall back to the full Ref bank.
-        // Int/Float registers now read their real banks first and fall back
-        // only when that bank slot is still unpopulated by the current tracer
-        // surface. This closes the first slice of the 3-bank parity gap
-        // without removing the older semantic stack model in the same patch.
-        let probe_live_r = std::env::var_os("MAJIT_PROBE_LIVE_R").is_some();
-        let snapshot_ref = |reg: usize| -> OpRef {
-            let Some(slot_idx) = crate::state::semantic_ref_slot_for_reg_color(
-                nlocals,
-                valid_stack_only,
-                &stack_slot_color_map,
-                reg,
-            ) else {
-                if probe_live_r {
-                    eprintln!(
-                        "[probe-E][snapshot] live_pc={} reg={} slot=NONE (no semantic mapping)",
-                        live_pc, reg
-                    );
-                }
-                return OpRef::NONE;
-            };
-            let opref = registers_r_semantic
-                .get(slot_idx)
-                .copied()
-                .unwrap_or(OpRef::NONE);
-            if probe_live_r {
-                eprintln!(
-                    "[probe-E][snapshot] live_pc={} reg={} slot={} opref={:?}",
-                    live_pc, reg, slot_idx, opref,
-                );
-            }
-            opref
-        };
-        let snapshot_bank = |bank: &[OpRef], reg: usize| -> Option<OpRef> {
-            bank.get(reg).copied().filter(|op| !op.is_none())
-        };
+        // RPython `pyjitpl.py:218-225` reads each live register out of its
+        // kind-specific bank: `registers_i[reg_i]`, `registers_r[reg_r]`,
+        // `registers_f[reg_f]` — no semantic fallback. Match that contract
+        // exactly: a missing bank slot at a liveness-listed register index
+        // is an encoder/codewriter mismatch and surfaces as `OpRef::NONE`
+        // for the consumer to handle, not a silent semantic-prefix read.
+        let snapshot_bank =
+            |bank: &[OpRef], reg: usize| -> OpRef { bank.get(reg).copied().unwrap_or(OpRef::NONE) };
         use majit_translate::liveness::LivenessIterator;
         if length_i != 0 {
             let mut it = LivenessIterator::new(cursor, length_i, &all_liveness);
             while let Some(reg_idx) = it.next() {
-                boxes.push(
-                    snapshot_bank(&registers_i, reg_idx as usize)
-                        .unwrap_or_else(|| snapshot_ref(reg_idx as usize)),
-                );
+                boxes.push(snapshot_bank(&registers_i, reg_idx as usize));
             }
             cursor = it.offset;
         }
         if length_r != 0 {
             let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
             while let Some(reg_idx) = it.next() {
-                boxes.push(
-                    snapshot_bank(&registers_r_bank, reg_idx as usize)
-                        .unwrap_or_else(|| snapshot_ref(reg_idx as usize)),
-                );
+                boxes.push(snapshot_bank(&registers_r_bank, reg_idx as usize));
             }
             cursor = it.offset;
         }
         if length_f != 0 {
             let mut it = LivenessIterator::new(cursor, length_f, &all_liveness);
             while let Some(reg_idx) = it.next() {
-                boxes.push(
-                    snapshot_bank(&registers_f, reg_idx as usize)
-                        .unwrap_or_else(|| snapshot_ref(reg_idx as usize)),
-                );
+                boxes.push(snapshot_bank(&registers_f, reg_idx as usize));
             }
         }
         boxes
