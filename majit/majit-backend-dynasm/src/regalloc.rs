@@ -16,6 +16,7 @@ use std::collections::HashMap;
 
 use crate::arch::*;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
+use crate::j2plan::{GuardKind, IntBinKind, IntUnaryKind, LirOp, LoadKind, StoreKind};
 use crate::regloc::*;
 use majit_ir::{InputArg, Op, OpCode, OpRef, Type, descr_identity};
 
@@ -1575,6 +1576,14 @@ pub struct RegAlloc {
     /// closing JUMP, used by `_compute_hint_locations_from_descr` to pin
     /// reg hints via `longevity.fixed_register(position, reg, box)`.
     final_jump_op_position: i32,
+    /// j2-style deopt-only fail args, indexed by original operation index.
+    /// These values are needed by guard recovery but not by the fast path
+    /// after the guard, so keeping them in registers only increases pressure.
+    j2_deopt_spill_args: Vec<Vec<OpRef>>,
+    /// j2-lowered operations, indexed by original operation index. The main
+    /// dispatch path consumes these; legacy opcode dispatch is a guard rail
+    /// only if a plan entry is missing.
+    j2_ops: Vec<LirOp>,
 }
 
 impl RegAlloc {
@@ -1597,6 +1606,8 @@ impl RegAlloc {
             jump_target_descr: None,
             final_jump_args: None,
             final_jump_op_position: -1,
+            j2_deopt_spill_args: Vec::new(),
+            j2_ops: Vec::new(),
         }
     }
 
@@ -1643,6 +1654,9 @@ impl RegAlloc {
         self.jump_target_descr = None;
         self.final_jump_args = None;
         self.final_jump_op_position = -1;
+        let j2_plan = crate::j2plan::TracePlan::build(inputargs, operations);
+        self.j2_deopt_spill_args = j2_plan.deopt_spill_args_by_index(operations.len());
+        self.j2_ops = j2_plan.ops;
         self.rm.constant_types = self.constant_types.clone();
         self.xrm.constant_types = self.constant_types.clone();
         for (&const_opref, &tp) in &self.constant_types {
@@ -2045,6 +2059,7 @@ impl RegAlloc {
         result_loc: Option<Loc>,
         output: &mut Vec<RegAllocOp>,
     ) {
+        self.spill_j2_deopt_args(op_index);
         self.flush_moves(output);
         let faillocs = self.locs_for_fail(op);
         output.push(RegAllocOp::PerformGuard {
@@ -2053,6 +2068,75 @@ impl RegAlloc {
             result_loc,
             faillocs,
         });
+    }
+
+    fn perform_guard_j2(
+        &mut self,
+        fail_args: &[OpRef],
+        op_index: usize,
+        arglocs: Vec<Loc>,
+        result_loc: Option<Loc>,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.spill_j2_deopt_args(op_index);
+        self.flush_moves(output);
+        let faillocs = self.locs_for_fail_args(fail_args);
+        output.push(RegAllocOp::PerformGuard {
+            op_index,
+            arglocs,
+            result_loc,
+            faillocs,
+        });
+    }
+
+    fn spill_j2_deopt_args(&mut self, op_index: usize) {
+        let Some(args) = self.j2_deopt_spill_args.get(op_index).cloned() else {
+            return;
+        };
+        for arg in args {
+            if arg.is_none() || arg.is_constant() {
+                continue;
+            }
+            let tp = self.tp(arg);
+            if tp == Type::Float {
+                Self::spill_deopt_arg_from_manager(
+                    &mut self.xrm,
+                    arg,
+                    tp,
+                    &mut self.longevity,
+                    &mut self.fm,
+                );
+            } else {
+                Self::spill_deopt_arg_from_manager(
+                    &mut self.rm,
+                    arg,
+                    tp,
+                    &mut self.longevity,
+                    &mut self.fm,
+                );
+            }
+        }
+    }
+
+    fn spill_deopt_arg_from_manager(
+        mgr: &mut RegisterManager,
+        arg: OpRef,
+        tp: Type,
+        longevity: &mut LifetimeManager,
+        fm: &mut FrameManager,
+    ) {
+        let Some(reg) = mgr.reg_bindings_get(arg, longevity) else {
+            return;
+        };
+        mgr._sync_var_to_stack(arg, tp, longevity, fm);
+        mgr.reg_bindings_del(arg, longevity);
+        mgr.free_regs.push(reg);
+        if std::env::var_os("MAJIT_LOG").is_some() {
+            eprintln!(
+                "[dynasm:j2plan] spill deopt-only failarg {:?} from {:?}",
+                arg, reg
+            );
+        }
     }
 
     /// aarch64/regalloc.py:1089 get_gcmap.
@@ -2101,8 +2185,12 @@ impl RegAlloc {
             Some(fa) => fa,
             None => return Vec::new(),
         };
+        self.locs_for_fail_args(fail_args)
+    }
+
+    fn locs_for_fail_args(&mut self, fail_args: &[OpRef]) -> Vec<Option<Loc>> {
         let mut locs = Vec::with_capacity(fail_args.len());
-        for &arg in fail_args.iter() {
+        for &arg in fail_args {
             if arg.is_none() {
                 locs.push(None);
                 continue;
@@ -2161,11 +2249,17 @@ impl RegAlloc {
                 continue;
             }
 
-            // x86/regalloc.py:390 dispatch to consider_* method
-            self._dispatch(op, i, &mut output);
-
-            // x86/regalloc.py:391 possibly_free_vars_for_op
-            self._free_op_vars(op);
+            // x86/regalloc.py:390 dispatch to consider_* method.
+            // The dynasm backend now enters through the j2-style lowered
+            // operation. The legacy opcode dispatch below is only a guard
+            // rail if `_prepare` did not produce a matching plan entry.
+            if let Some(j2_op) = self.j2_ops.get(i).cloned() {
+                self._dispatch_j2(&j2_op, op, i, &mut output);
+                self._free_j2_op_vars(&j2_op, op);
+            } else {
+                self._dispatch_legacy(op, i, &mut output);
+                self._free_op_vars(op);
+            }
         }
 
         // x86/regalloc.py:400-401 free inputargs
@@ -2202,8 +2296,550 @@ impl RegAlloc {
         }
     }
 
-    /// x86/regalloc.py oplist dispatch
-    fn _dispatch(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+    fn _free_j2_op_vars(&mut self, j2_op: &LirOp, raw_op: &Op) {
+        let mut uses = Vec::new();
+        let mut fail_uses = Vec::new();
+        let mut def = None;
+        let mut def_tp = raw_op.opcode.result_type();
+
+        match j2_op {
+            LirOp::Label { args } | LirOp::Jump { args } | LirOp::Finish { args } => {
+                uses.extend(args.iter().copied());
+            }
+            LirOp::IntBin { dst, lhs, rhs, .. } | LirOp::IntCmp { dst, lhs, rhs, .. } => {
+                uses.push(*lhs);
+                uses.push(*rhs);
+                def = Some(*dst);
+                def_tp = Type::Int;
+            }
+            LirOp::IntUnary { dst, arg, .. } => {
+                uses.push(*arg);
+                def = Some(*dst);
+                def_tp = Type::Int;
+            }
+            LirOp::Guard {
+                args, fail_args, ..
+            } => {
+                uses.extend(args.iter().copied());
+                fail_uses.extend(fail_args.iter().copied());
+            }
+            LirOp::Load {
+                dst,
+                base,
+                offset,
+                index,
+                scale,
+                size,
+                ..
+            } => {
+                uses.push(*base);
+                uses.extend(offset.iter().copied());
+                uses.extend(index.iter().copied());
+                uses.extend(scale.iter().copied());
+                uses.extend(size.iter().copied());
+                def = Some(*dst);
+            }
+            LirOp::Store {
+                base,
+                offset,
+                index,
+                scale,
+                value,
+                size,
+                ..
+            } => {
+                uses.push(*base);
+                uses.extend(offset.iter().copied());
+                uses.extend(index.iter().copied());
+                uses.extend(scale.iter().copied());
+                uses.push(*value);
+                uses.extend(size.iter().copied());
+            }
+            LirOp::Call { dst, args, .. } => {
+                uses.extend(args.iter().copied());
+                def = *dst;
+            }
+            LirOp::Opcode {
+                dst,
+                args,
+                fail_args,
+                ..
+            } => {
+                uses.extend(args.iter().copied());
+                fail_uses.extend(fail_args.iter().copied());
+                def = *dst;
+            }
+        }
+
+        for arg in uses.into_iter().chain(fail_uses) {
+            if !arg.is_constant() && !arg.is_none() {
+                let tp = self.tp(arg);
+                self.possibly_free_var(arg, tp);
+            }
+        }
+        if let Some(dst) = def {
+            if !dst.is_none() && !dst.is_constant() && def_tp != Type::Void {
+                self.possibly_free_var(dst, def_tp);
+            }
+        }
+    }
+
+    fn _dispatch_j2(&mut self, j2_op: &LirOp, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        match j2_op {
+            LirOp::Label { args } => self.consider_label_j2(args, op, i, output),
+            LirOp::Jump { args } => self.consider_jump_j2(args, op, i, output),
+            LirOp::Finish { args } => self.consider_finish_j2(args, i, output),
+            LirOp::IntBin {
+                kind,
+                dst,
+                lhs,
+                rhs,
+            } => self._dispatch_j2_int_bin(*kind, *dst, *lhs, *rhs, i, output),
+            LirOp::IntUnary { kind, dst, arg } => {
+                self._dispatch_j2_int_unary(*kind, *dst, *arg, i, output)
+            }
+            LirOp::IntCmp { dst, lhs, rhs, .. } => {
+                self.consider_compop_j2(*dst, *lhs, *rhs, i, output)
+            }
+            LirOp::Guard {
+                kind,
+                args,
+                fail_args,
+            } => self._dispatch_j2_guard(*kind, args, fail_args, op, i, output),
+            LirOp::Load {
+                kind,
+                dst,
+                base,
+                offset,
+                index,
+                scale,
+                size,
+            } => self._dispatch_j2_load(
+                *kind, *dst, *base, *offset, *index, *scale, *size, op, i, output,
+            ),
+            LirOp::Store {
+                kind,
+                base,
+                offset,
+                index,
+                scale,
+                value,
+                size,
+            } => self._dispatch_j2_store(
+                *kind, *base, *offset, *index, *scale, *value, *size, op, i, output,
+            ),
+            LirOp::Call { opcode, dst, args } => {
+                self._dispatch_j2_call(*opcode, *dst, args, op, i, output)
+            }
+            LirOp::Opcode {
+                opcode,
+                dst,
+                args,
+                fail_args,
+            } => self._dispatch_j2_opcode(*opcode, *dst, args, fail_args, op, i, output),
+        }
+    }
+
+    fn _dispatch_j2_int_bin(
+        &mut self,
+        kind: IntBinKind,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        match kind {
+            IntBinKind::Add => self.consider_int_add_j2(dst, lhs, rhs, i, output),
+            IntBinKind::Sub => self.consider_int_sub_j2(dst, lhs, rhs, i, output),
+            IntBinKind::AddOvf
+            | IntBinKind::Mul
+            | IntBinKind::MulOvf
+            | IntBinKind::And
+            | IntBinKind::Or
+            | IntBinKind::Xor => self.consider_binop_symm_j2(dst, lhs, rhs, i, output),
+            IntBinKind::SubOvf => self.consider_binop_j2(dst, lhs, rhs, i, output),
+            IntBinKind::LShift | IntBinKind::RShift | IntBinKind::URShift => {
+                self.consider_int_lshift_j2(dst, lhs, rhs, i, output)
+            }
+        }
+    }
+
+    fn _dispatch_j2_int_unary(
+        &mut self,
+        kind: IntUnaryKind,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        match kind {
+            IntUnaryKind::Neg
+            | IntUnaryKind::Invert
+            | IntUnaryKind::IsTrue
+            | IntUnaryKind::IsZero => self.consider_unary_int_j2(dst, arg, i, output),
+        }
+    }
+
+    fn _dispatch_j2_guard(
+        &mut self,
+        kind: GuardKind,
+        args: &[OpRef],
+        fail_args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        match kind {
+            GuardKind::True | GuardKind::False | GuardKind::NonNull | GuardKind::IsNull => {
+                if let Some(&arg) = args.first() {
+                    self.consider_guard_cc_j2(arg, fail_args, i, output);
+                } else {
+                    output.push(RegAllocOp::Skip);
+                }
+            }
+            GuardKind::Value => {
+                if args.len() >= 2 {
+                    self.consider_guard_value_j2(args[0], args[1], fail_args, i, output);
+                } else {
+                    output.push(RegAllocOp::Skip);
+                }
+            }
+            GuardKind::Class
+            | GuardKind::GcType
+            | GuardKind::Subclass
+            | GuardKind::NonNullClass => {
+                if args.len() >= 2 {
+                    self.consider_guard_class_j2(args[0], args[1], fail_args, i, output);
+                } else {
+                    output.push(RegAllocOp::Skip);
+                }
+            }
+            GuardKind::IsObject => {
+                if let Some(&arg) = args.first() {
+                    self.consider_guard_is_object_j2(arg, fail_args, i, output);
+                } else {
+                    output.push(RegAllocOp::Skip);
+                }
+            }
+            GuardKind::NoException
+            | GuardKind::NoOverflow
+            | GuardKind::Overflow
+            | GuardKind::NotInvalidated
+            | GuardKind::FutureCondition
+            | GuardKind::NotForced
+            | GuardKind::AlwaysFails => self.consider_guard_no_args_j2(fail_args, i, output),
+            GuardKind::Exception => {
+                self.consider_guard_exception_j2(args, fail_args, op, i, output)
+            }
+            GuardKind::Other(_) => self.consider_guard_no_args_j2(fail_args, i, output),
+        }
+    }
+
+    fn _dispatch_j2_load(
+        &mut self,
+        kind: LoadKind,
+        dst: OpRef,
+        base: OpRef,
+        offset: Option<OpRef>,
+        index: Option<OpRef>,
+        scale: Option<OpRef>,
+        size: Option<OpRef>,
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        match kind {
+            LoadKind::Gc | LoadKind::Raw => {
+                if let Some(offset) = offset {
+                    self.consider_gc_load_j2(dst, base, offset, size, op, i, output);
+                } else {
+                    output.push(RegAllocOp::Skip);
+                }
+            }
+            LoadKind::GcIndexed => {
+                if let (Some(index), Some(scale), Some(offset), Some(size)) =
+                    (index, scale, offset, size)
+                {
+                    self.consider_gc_load_indexed_j2(
+                        dst, base, index, scale, offset, size, op, i, output,
+                    );
+                } else {
+                    output.push(RegAllocOp::Skip);
+                }
+            }
+        }
+    }
+
+    fn _dispatch_j2_store(
+        &mut self,
+        kind: StoreKind,
+        base: OpRef,
+        offset: Option<OpRef>,
+        index: Option<OpRef>,
+        scale: Option<OpRef>,
+        value: OpRef,
+        size: Option<OpRef>,
+        _op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        match kind {
+            StoreKind::Gc | StoreKind::Raw => {
+                if let Some(offset) = offset {
+                    self.consider_gc_store_j2(base, offset, value, size, i, output);
+                } else {
+                    output.push(RegAllocOp::Skip);
+                }
+            }
+            StoreKind::GcIndexed => {
+                if let (Some(index), Some(scale), Some(offset), Some(size)) =
+                    (index, scale, offset, size)
+                {
+                    self.consider_gc_store_indexed_j2(
+                        base, index, value, scale, offset, size, i, output,
+                    );
+                } else {
+                    output.push(RegAllocOp::Skip);
+                }
+            }
+        }
+    }
+
+    fn _dispatch_j2_call(
+        &mut self,
+        opcode: OpCode,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        match opcode {
+            OpCode::CallI
+            | OpCode::CallR
+            | OpCode::CallF
+            | OpCode::CallN
+            | OpCode::CallPureI
+            | OpCode::CallPureR
+            | OpCode::CallPureF
+            | OpCode::CallPureN
+            | OpCode::CallLoopinvariantI
+            | OpCode::CallLoopinvariantR
+            | OpCode::CallLoopinvariantF
+            | OpCode::CallLoopinvariantN
+            | OpCode::CallMayForceI
+            | OpCode::CallMayForceR
+            | OpCode::CallMayForceF
+            | OpCode::CallMayForceN => {
+                self.consider_call_j2(dst, args, op, i, output, opcode.is_call_may_force(), 1);
+            }
+            OpCode::CallReleaseGilI
+            | OpCode::CallReleaseGilR
+            | OpCode::CallReleaseGilF
+            | OpCode::CallReleaseGilN => {
+                self.consider_call_j2(dst, args, op, i, output, true, 2);
+            }
+            OpCode::CallAssemblerI
+            | OpCode::CallAssemblerR
+            | OpCode::CallAssemblerF
+            | OpCode::CallAssemblerN => {
+                self.consider_call_assembler_j2(dst, args, op, i, output);
+            }
+            OpCode::CondCallN => self.consider_discard_nargs_j2(args, i, output),
+            OpCode::CondCallValueI | OpCode::CondCallValueR => {
+                self.consider_raw_call_like_j2(dst, args, op, i, output, SAVE_DEFAULT_REGS);
+            }
+            OpCode::CallMallocNursery => self.consider_call_malloc_nursery_j2(dst, args, i, output),
+            OpCode::CallMallocNurseryVarsizeFrame => {
+                self.consider_call_malloc_nursery_varsize_frame_j2(dst, args, i, output);
+            }
+            OpCode::CallMallocNurseryVarsize => {
+                self.consider_call_malloc_nursery_varsize_j2(dst, args, i, output);
+            }
+            OpCode::CheckMemoryError => self.consider_check_memory_error_j2(args, i, output),
+            OpCode::RecordKnownResult => output.push(RegAllocOp::Skip),
+            OpCode::New
+            | OpCode::NewWithVtable
+            | OpCode::NewArray
+            | OpCode::NewArrayClear
+            | OpCode::Newstr
+            | OpCode::Newunicode => {
+                self.consider_raw_call_like_j2(dst, args, op, i, output, SAVE_DEFAULT_REGS);
+            }
+            _ => output.push(RegAllocOp::Skip),
+        }
+    }
+
+    fn _dispatch_j2_opcode(
+        &mut self,
+        opcode: OpCode,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        _fail_args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        match opcode {
+            OpCode::NurseryPtrIncrement if args.len() >= 2 => {
+                self.consider_int_add_j2(dst.unwrap_or(op.pos), args[0], args[1], i, output);
+            }
+            OpCode::IntForceGeZero if !args.is_empty() => {
+                self.consider_unary_int_j2(dst.unwrap_or(op.pos), args[0], i, output);
+            }
+            OpCode::IntFloorDiv | OpCode::IntMod if args.len() >= 2 => {
+                self.consider_binop_j2(dst.unwrap_or(op.pos), args[0], args[1], i, output);
+            }
+            OpCode::UintMulHigh if args.len() >= 2 => {
+                self.consider_uint_mul_high_j2(dst.unwrap_or(op.pos), args[0], args[1], i, output);
+            }
+            OpCode::IntSignext if args.len() >= 2 => {
+                self.consider_int_signext_j2(dst.unwrap_or(op.pos), args[0], args[1], i, output);
+            }
+            OpCode::FloatAdd | OpCode::FloatSub | OpCode::FloatMul | OpCode::FloatTrueDiv
+                if args.len() >= 2 =>
+            {
+                self.consider_float_op_j2(dst.unwrap_or(op.pos), args[0], args[1], i, output);
+            }
+            OpCode::FloatNeg
+            | OpCode::FloatAbs
+            | OpCode::CastFloatToSinglefloat
+            | OpCode::CastSinglefloatToFloat
+                if !args.is_empty() =>
+            {
+                self.consider_float_unary_j2(dst.unwrap_or(op.pos), args[0], i, output);
+            }
+            OpCode::FloatLt
+            | OpCode::FloatLe
+            | OpCode::FloatEq
+            | OpCode::FloatNe
+            | OpCode::FloatGt
+            | OpCode::FloatGe
+                if args.len() >= 2 =>
+            {
+                self.consider_float_cmp_j2(dst.unwrap_or(op.pos), args[0], args[1], i, output);
+            }
+            OpCode::CastIntToFloat if !args.is_empty() => {
+                self.consider_cast_int_to_float_j2(dst.unwrap_or(op.pos), args[0], i, output);
+            }
+            OpCode::CastFloatToInt if !args.is_empty() => {
+                self.consider_cast_float_to_int_j2(dst.unwrap_or(op.pos), args[0], i, output);
+            }
+            OpCode::ConvertFloatBytesToLonglong
+            | OpCode::ConvertLonglongBytesToFloat
+            | OpCode::CastPtrToInt
+            | OpCode::CastIntToPtr
+            | OpCode::CastOpaquePtr
+            | OpCode::SameAsI
+            | OpCode::SameAsR
+            | OpCode::SameAsF
+            | OpCode::LoadFromGcTable
+            | OpCode::VirtualRefR
+                if !args.is_empty() =>
+            {
+                self.consider_same_as_j2(dst.unwrap_or(op.pos), args[0], op, i, output);
+            }
+            OpCode::GetfieldGcI
+            | OpCode::GetfieldGcR
+            | OpCode::GetfieldGcF
+            | OpCode::GetfieldGcPureI
+            | OpCode::GetfieldGcPureR
+            | OpCode::GetfieldGcPureF
+            | OpCode::GetfieldRawI
+            | OpCode::GetfieldRawR
+            | OpCode::GetfieldRawF
+            | OpCode::ArraylenGc
+            | OpCode::Strlen
+            | OpCode::Unicodelen
+                if !args.is_empty() =>
+            {
+                self.consider_getfield_j2(dst.unwrap_or(op.pos), args[0], op, i, output);
+            }
+            OpCode::GetarrayitemGcI
+            | OpCode::GetarrayitemGcR
+            | OpCode::GetarrayitemGcF
+            | OpCode::GetarrayitemGcPureI
+            | OpCode::GetarrayitemGcPureR
+            | OpCode::GetarrayitemGcPureF
+            | OpCode::GetarrayitemRawI
+            | OpCode::GetarrayitemRawR
+            | OpCode::GetarrayitemRawF
+            | OpCode::Strgetitem
+            | OpCode::Unicodegetitem
+            | OpCode::GetinteriorfieldGcI
+            | OpCode::GetinteriorfieldGcR
+            | OpCode::GetinteriorfieldGcF
+                if args.len() >= 2 =>
+            {
+                self.consider_getarrayitem_j2(
+                    dst.unwrap_or(op.pos),
+                    args[0],
+                    args[1],
+                    op,
+                    i,
+                    output,
+                );
+            }
+            OpCode::SetfieldGc | OpCode::SetfieldRaw if args.len() >= 2 => {
+                self.consider_setfield_j2(args[0], args[1], i, output);
+            }
+            OpCode::SetarrayitemGc
+            | OpCode::SetarrayitemRaw
+            | OpCode::SetinteriorfieldGc
+            | OpCode::SetinteriorfieldRaw
+                if args.len() >= 3 =>
+            {
+                self.consider_setarrayitem_j2(args[0], args[1], args[2], i, output);
+            }
+            OpCode::ZeroArray | OpCode::Strsetitem | OpCode::Unicodesetitem if args.len() >= 3 => {
+                self.consider_discard_3args_j2(args, i, output);
+            }
+            OpCode::Copystrcontent | OpCode::Copyunicodecontent => {
+                self.consider_discard_nargs_j2(args, i, output);
+            }
+            OpCode::New
+            | OpCode::NewWithVtable
+            | OpCode::NewArray
+            | OpCode::NewArrayClear
+            | OpCode::Newstr
+            | OpCode::Newunicode => {
+                self.consider_raw_call_like_j2(dst, args, op, i, output, SAVE_DEFAULT_REGS);
+            }
+            OpCode::ForceToken => self.consider_force_token_j2(dst.unwrap_or(op.pos), i, output),
+            OpCode::LoadEffectiveAddress if args.len() >= 4 => {
+                self.consider_load_effective_address_j2(dst.unwrap_or(op.pos), args, i, output);
+            }
+            OpCode::SaveException | OpCode::SaveExcClass => {
+                self.consider_no_arg_result_j2(dst.unwrap_or(op.pos), op, i, output);
+            }
+            OpCode::RestoreException if args.len() >= 2 => {
+                self.consider_restore_exception_j2(args, i, output);
+            }
+            OpCode::CondCallGcWb | OpCode::CondCallGcWbArray => {
+                self.consider_cond_call_gc_wb_j2(args, i, output);
+            }
+            OpCode::JitDebug
+            | OpCode::DebugMergePoint
+            | OpCode::RecordExactClass
+            | OpCode::RecordExactValueR
+            | OpCode::RecordExactValueI
+            | OpCode::RecordKnownResult
+            | OpCode::QuasiimmutField
+            | OpCode::AssertNotNone
+            | OpCode::Keepalive
+            | OpCode::EnterPortalFrame
+            | OpCode::LeavePortalFrame
+            | OpCode::IncrementDebugCounter
+            | OpCode::VirtualRefFinish
+            | OpCode::ForceSpill => output.push(RegAllocOp::Skip),
+            _ => output.push(RegAllocOp::Skip),
+        }
+    }
+
+    /// x86/regalloc.py oplist dispatch. Used only as a guard rail if the
+    /// j2 plan is unexpectedly missing an operation.
+    fn _dispatch_legacy(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         match op.opcode {
             // ── Integer binary (symmetric) ──
             OpCode::IntMul
@@ -2548,6 +3184,256 @@ impl RegAlloc {
 
     // ── consider_* methods ──
 
+    fn _consider_binop_part_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        symm: bool,
+    ) -> (Loc, Loc) {
+        let mut x = lhs;
+        let mut y = rhs;
+        let xloc = self.loc(x, self.tp(x));
+        let mut argloc = self.loc(y, self.tp(y));
+
+        if symm && !xloc.is_reg() && argloc.is_reg() {
+            let x_lives_longer = !self.longevity.contains(x)
+                || self.longevity.get(x).unwrap().last_usage > self.rm.position;
+            let y_dies = self
+                .longevity
+                .get(y)
+                .map(|lt| lt.last_usage == self.rm.position)
+                .unwrap_or(false);
+            if x_lives_longer && y_dies {
+                std::mem::swap(&mut x, &mut y);
+                argloc = self.loc(y, self.tp(y));
+            }
+        }
+
+        let tp = self.tp(x);
+        let args = [lhs, rhs];
+        let loc = self.rm.force_result_in_reg(
+            dst,
+            x,
+            tp,
+            &args,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        (loc, argloc)
+    }
+
+    fn consider_binop_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let (loc, argloc) = self._consider_binop_part_j2(dst, lhs, rhs, false);
+        self.perform(i, vec![loc, argloc], Some(loc), output);
+    }
+
+    fn consider_binop_symm_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let (loc, argloc) = self._consider_binop_part_j2(dst, lhs, rhs, true);
+        self.perform(i, vec![loc, argloc], Some(loc), output);
+    }
+
+    fn _consider_lea_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let loc = self.make_sure_var_in_reg(lhs, self.tp(lhs), &[], None, false);
+        self.possibly_free_var(lhs, self.tp(lhs));
+        let argloc = self.loc(rhs, self.tp(rhs));
+        let resloc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        self.perform(i, vec![loc, argloc], Some(resloc), output);
+    }
+
+    fn consider_int_add_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        if rhs.is_constant() {
+            let val = self.const_value(rhs);
+            if fits_in_32bits(val) {
+                return self._consider_lea_j2(dst, lhs, rhs, i, output);
+            }
+        }
+        self.consider_binop_symm_j2(dst, lhs, rhs, i, output);
+    }
+
+    fn consider_int_sub_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        if rhs.is_constant() {
+            let val = self.const_value(rhs);
+            if fits_in_32bits(-val) {
+                return self._consider_lea_j2(dst, lhs, rhs, i, output);
+            }
+        }
+        self.consider_binop_j2(dst, lhs, rhs, i, output);
+    }
+
+    fn consider_int_lshift_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            return self.consider_binop_j2(dst, lhs, rhs, i, output);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let loc2 = if rhs.is_constant() {
+                self.rm.convert_to_imm(rhs, &self.constants)
+            } else {
+                self.make_sure_var_in_reg(rhs, Type::Int, &[], Some(ECX), false)
+            };
+            let args = [lhs, rhs];
+            let loc1 = self.rm.force_result_in_reg(
+                dst,
+                lhs,
+                Type::Int,
+                &args,
+                &mut self.longevity,
+                &mut self.fm,
+                &self.constants,
+                &mut self.pending_moves,
+            );
+            self.perform(i, vec![loc1, loc2], Some(loc1), output);
+        }
+    }
+
+    fn consider_unary_int_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [arg];
+        let loc = self.rm.force_result_in_reg(
+            dst,
+            arg,
+            Type::Int,
+            &args,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        self.perform(i, vec![loc], Some(loc), output);
+    }
+
+    fn consider_compop_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let mut arglocs = vec![self.loc(lhs, self.tp(lhs)), self.loc(rhs, self.tp(rhs))];
+        let lhs_in_reg = self.rm.reg_bindings_contains(lhs, &self.longevity);
+        let rhs_in_reg = self.rm.reg_bindings_contains(rhs, &self.longevity);
+        if !lhs_in_reg && !rhs_in_reg && !lhs.is_constant() && !rhs.is_constant() {
+            arglocs[0] = self.make_sure_var_in_reg(lhs, Type::Int, &[], None, false);
+        }
+        let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        self.perform(i, arglocs, Some(result_loc), output);
+    }
+
+    fn consider_uint_mul_high_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        #[cfg(target_arch = "aarch64")]
+        {
+            return self.consider_binop_symm_j2(dst, lhs, rhs, i, output);
+        }
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut arg1 = lhs;
+            let mut arg2 = rhs;
+            if arg1.is_constant() {
+                std::mem::swap(&mut arg1, &mut arg2);
+            }
+            self.make_sure_var_in_reg(arg2, Type::Int, &[], Some(EAX), false);
+            let l1 = self.loc(arg1, Type::Int);
+            self.possibly_free_var(arg2, Type::Int);
+            let tmp = OpRef(u32::MAX - 1);
+            if !self.longevity.contains(tmp) {
+                self.longevity
+                    .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+            }
+            self.rm.force_allocate_reg(
+                tmp,
+                &[],
+                Some(EAX),
+                false,
+                &mut self.longevity,
+                &mut self.fm,
+            );
+            self.rm
+                .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
+            self.rm.force_allocate_reg(
+                dst,
+                &[],
+                Some(EDX),
+                false,
+                &mut self.longevity,
+                &mut self.fm,
+            );
+            self.perform(i, vec![l1], Some(Loc::Reg(EDX)), output);
+        }
+    }
+
+    fn consider_int_signext_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        numbytes: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let argloc = self.loc(arg, Type::Int);
+        let numbytesloc = self.loc(numbytes, Type::Int);
+        let resloc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        self.perform(i, vec![argloc, numbytesloc], Some(resloc), output);
+    }
+
     /// x86/regalloc.py:527 _consider_binop_part
     fn _consider_binop_part(&mut self, op: &Op, symm: bool) -> (Loc, Loc) {
         let mut x = op.args[0];
@@ -2755,6 +3641,131 @@ impl RegAlloc {
         self.perform(i, arglocs, Some(result_loc), output);
     }
 
+    fn consider_guard_cc_j2(
+        &mut self,
+        arg: OpRef,
+        fail_args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let loc = self.make_sure_var_in_reg(arg, self.tp(arg), &[], None, false);
+        self.perform_guard_j2(fail_args, i, vec![loc], None, output);
+    }
+
+    fn consider_guard_value_j2(
+        &mut self,
+        lhs: OpRef,
+        rhs: OpRef,
+        fail_args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let x = self.make_sure_var_in_reg(lhs, self.tp(lhs), &[], None, false);
+        let y = self.loc(rhs, self.tp(rhs));
+        self.perform_guard_j2(fail_args, i, vec![x, y], None, output);
+    }
+
+    fn consider_guard_class_j2(
+        &mut self,
+        value: OpRef,
+        class: OpRef,
+        fail_args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let x = self.make_sure_var_in_reg(value, Type::Ref, &[], None, false);
+        let y = self.loc(class, Type::Int);
+        self.perform_guard_j2(fail_args, i, vec![x, y], None, output);
+    }
+
+    fn consider_guard_is_object_j2(
+        &mut self,
+        value: OpRef,
+        fail_args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let x = self.make_sure_var_in_reg(value, Type::Ref, &[], None, false);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let tmp = OpRef(u32::MAX - 3);
+            if !self.longevity.contains(tmp) {
+                self.longevity
+                    .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+            }
+            let loc_tmp = Loc::Reg(self.rm.force_allocate_reg(
+                tmp,
+                &[value],
+                None,
+                false,
+                &mut self.longevity,
+                &mut self.fm,
+            ));
+            self.rm
+                .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
+            self.perform_guard_j2(fail_args, i, vec![x, loc_tmp], None, output);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.perform_guard_j2(fail_args, i, vec![x], None, output);
+        }
+    }
+
+    fn consider_guard_exception_j2(
+        &mut self,
+        args: &[OpRef],
+        fail_args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let Some(&exception_class) = args.first() else {
+            return self.consider_guard_no_args_j2(fail_args, i, output);
+        };
+        let loc = self.make_sure_var_in_reg(exception_class, Type::Ref, &[], None, false);
+        // x86/regalloc.py:470-471 TempVar for scratch register
+        let tmp = OpRef(u32::MAX - 2);
+        if !self.longevity.contains(tmp) {
+            self.longevity
+                .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+        }
+        let guard_args: Vec<OpRef> = args.to_vec();
+        let loc1 = Loc::Reg(self.rm.force_allocate_reg(
+            tmp,
+            &guard_args,
+            None,
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        ));
+        let resloc = if self.longevity.contains(op.pos) {
+            let mut forbidden = guard_args;
+            forbidden.push(tmp);
+            Some(Loc::Reg(self.rm.force_allocate_reg(
+                op.pos,
+                &forbidden,
+                None,
+                false,
+                &mut self.longevity,
+                &mut self.fm,
+            )))
+        } else {
+            None
+        };
+        self.perform_guard_j2(fail_args, i, vec![loc, loc1], resloc, output);
+        self.rm
+            .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
+    }
+
+    fn consider_guard_no_args_j2(
+        &mut self,
+        fail_args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.perform_guard_j2(fail_args, i, vec![], None, output);
+    }
+
     /// x86/regalloc.py:435 _consider_guard_cc
     fn consider_guard_cc(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let arg = op.args[0];
@@ -2822,6 +3833,17 @@ impl RegAlloc {
         self.perform_discard(i, vec![loc0, loc1], output);
     }
 
+    fn consider_restore_exception_j2(
+        &mut self,
+        args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let loc0 = self.make_sure_var_in_reg(args[0], Type::Ref, args, None, false);
+        let loc1 = self.make_sure_var_in_reg(args[1], Type::Ref, args, None, false);
+        self.perform_discard(i, vec![loc0, loc1], output);
+    }
+
     /// Guards with no arguments (guard_no_exception, guard_not_forced, etc.)
     fn consider_guard_no_args(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         self.perform_guard(op, i, vec![], None, output);
@@ -2839,11 +3861,35 @@ impl RegAlloc {
         self.perform(i, vec![loc], None, output);
     }
 
+    fn consider_check_memory_error_j2(
+        &mut self,
+        args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let Some(&arg) = args.first() else {
+            return self.perform(i, vec![], None, output);
+        };
+        let tp = self.tp(arg);
+        let loc = self.make_sure_var_in_reg(arg, tp, &[], None, false);
+        self.perform(i, vec![loc], None, output);
+    }
+
     /// x86/regalloc.py:445 consider_finish
     fn consider_finish(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let locs = if !op.args.is_empty() {
             let tp = self.tp(op.args[0]);
             vec![self.make_sure_var_in_reg(op.args[0], tp, &[], None, false)]
+        } else {
+            vec![]
+        };
+        self.perform(i, locs, None, output);
+    }
+
+    fn consider_finish_j2(&mut self, args: &[OpRef], i: usize, output: &mut Vec<RegAllocOp>) {
+        let locs = if let Some(&arg) = args.first() {
+            let tp = self.tp(arg);
+            vec![self.make_sure_var_in_reg(arg, tp, &[], None, false)]
         } else {
             vec![]
         };
@@ -2875,6 +3921,30 @@ impl RegAlloc {
         self.perform(i, vec![argloc], Some(resloc), output);
     }
 
+    fn consider_same_as_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let tp = op.opcode.result_type();
+        let args = [arg];
+        let argloc = if arg.is_constant() {
+            self.rm.convert_to_imm(arg, &self.constants)
+        } else {
+            self.make_sure_var_in_reg(arg, tp, &args, None, false)
+        };
+        if !arg.is_constant() && !arg.is_none() {
+            self.possibly_free_var(arg, tp);
+        }
+        self.rm.free_temp_vars(&mut self.longevity, &mut self.fm);
+        self.xrm.free_temp_vars(&mut self.longevity, &mut self.fm);
+        let resloc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
+        self.perform(i, vec![argloc], Some(resloc), output);
+    }
+
     /// x86/regalloc.py:661 _consider_float_op
     fn consider_float_op(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc1 = self.xrm.loc(
@@ -2889,6 +3959,36 @@ impl RegAlloc {
         let loc0 = self.xrm.force_result_in_reg(
             op.pos,
             op.args[0],
+            Type::Float,
+            &args,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        self.perform(i, vec![loc0, loc1], Some(loc0), output);
+    }
+
+    fn consider_float_op_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let loc1 = self.xrm.loc(
+            rhs,
+            Type::Float,
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+        );
+        let args = [lhs, rhs];
+        let loc0 = self.xrm.force_result_in_reg(
+            dst,
+            lhs,
             Type::Float,
             &args,
             &mut self.longevity,
@@ -2915,6 +4015,27 @@ impl RegAlloc {
         self.perform(i, vec![loc], Some(loc), output);
     }
 
+    fn consider_float_unary_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [arg];
+        let loc = self.xrm.force_result_in_reg(
+            dst,
+            arg,
+            Type::Float,
+            &args,
+            &mut self.longevity,
+            &mut self.fm,
+            &self.constants,
+            &mut self.pending_moves,
+        );
+        self.perform(i, vec![loc], Some(loc), output);
+    }
+
     /// x86/regalloc.py:672 _consider_float_cmp
     fn consider_float_cmp(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let vx = op.args[0];
@@ -2929,10 +4050,40 @@ impl RegAlloc {
         self.perform(i, arglocs, Some(result_loc), output);
     }
 
+    fn consider_float_cmp_j2(
+        &mut self,
+        dst: OpRef,
+        lhs: OpRef,
+        rhs: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let mut arglocs = vec![self.loc(lhs, Type::Float), self.loc(rhs, Type::Float)];
+        let lhs_in_reg = self.xrm.reg_bindings_contains(lhs, &self.longevity);
+        let rhs_in_reg = self.xrm.reg_bindings_contains(rhs, &self.longevity);
+        if !lhs_in_reg && !rhs_in_reg && !lhs.is_constant() {
+            arglocs[0] = self.make_sure_var_in_reg(lhs, Type::Float, &[], None, false);
+        }
+        let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        self.perform(i, arglocs, Some(result_loc), output);
+    }
+
     /// x86/regalloc.py cast_int_to_float
     fn consider_cast_int_to_float(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let loc0 = self.make_sure_var_in_reg(op.args[0], Type::Int, &[], None, false);
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos, Type::Float, &[], None, false));
+        self.perform(i, vec![loc0], Some(result_loc), output);
+    }
+
+    fn consider_cast_int_to_float_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let loc0 = self.make_sure_var_in_reg(arg, Type::Int, &[], None, false);
+        let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Float, &[], None, false));
         self.perform(i, vec![loc0], Some(result_loc), output);
     }
 
@@ -2943,11 +4094,37 @@ impl RegAlloc {
         self.perform(i, vec![loc0], Some(result_loc), output);
     }
 
+    fn consider_cast_float_to_int_j2(
+        &mut self,
+        dst: OpRef,
+        arg: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let loc0 = self.make_sure_var_in_reg(arg, Type::Float, &[], None, false);
+        let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        self.perform(i, vec![loc0], Some(result_loc), output);
+    }
+
     /// Memory load: getfield pattern (1 arg → result)
     fn consider_getfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let base_loc = self.make_sure_var_in_reg(op.args[0], Type::Ref, &[], None, false);
         let tp = op.opcode.result_type();
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos, tp, &[], None, false));
+        self.perform(i, vec![base_loc], Some(result_loc), output);
+    }
+
+    fn consider_getfield_j2(
+        &mut self,
+        dst: OpRef,
+        base: OpRef,
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &[], None, false);
+        let tp = op.opcode.result_type();
+        let result_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
         self.perform(i, vec![base_loc], Some(result_loc), output);
     }
 
@@ -2961,6 +4138,23 @@ impl RegAlloc {
         self.perform(i, vec![base_loc, index_loc], Some(result_loc), output);
     }
 
+    fn consider_getarrayitem_j2(
+        &mut self,
+        dst: OpRef,
+        base: OpRef,
+        index: OpRef,
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [base, index];
+        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        let index_loc = self.make_sure_var_in_reg(index, Type::Int, &args, None, false);
+        let tp = op.opcode.result_type();
+        let result_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
+        self.perform(i, vec![base_loc, index_loc], Some(result_loc), output);
+    }
+
     /// Memory load: getinteriorfield (3 args → result)
     fn consider_getinteriorfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.args.iter().copied().collect();
@@ -2969,6 +4163,101 @@ impl RegAlloc {
         let tp = op.opcode.result_type();
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos, tp, &[], None, false));
         self.perform(i, vec![base_loc, index_loc], Some(result_loc), output);
+    }
+
+    fn gc_load_nsize(&self, op: &Op, size: Option<OpRef>) -> i64 {
+        if let Some(size) = size {
+            return self.const_value(size);
+        }
+        op.descr
+            .as_ref()
+            .and_then(|d| d.as_field_descr())
+            .map(|fd| {
+                let s = fd.field_size() as i64;
+                if fd.is_field_signed() { -s } else { s }
+            })
+            .or_else(|| {
+                op.descr
+                    .as_ref()
+                    .and_then(|d| d.as_array_descr())
+                    .map(|ad| {
+                        let s = ad.item_size() as i64;
+                        if ad.is_item_signed() { -s } else { s }
+                    })
+            })
+            .unwrap_or(8)
+    }
+
+    fn gc_offset_loc(&mut self, ofs: i64) -> Loc {
+        if check_imm_arg(ofs) {
+            Loc::Immed(ImmedLoc::new(ofs))
+        } else {
+            self.pending_moves
+                .push((Loc::Immed(ImmedLoc::new(ofs)), Loc::Reg(LARGE_IMM_SCRATCH)));
+            Loc::Reg(LARGE_IMM_SCRATCH)
+        }
+    }
+
+    fn consider_gc_load_j2(
+        &mut self,
+        dst: OpRef,
+        base: OpRef,
+        offset: OpRef,
+        size: Option<OpRef>,
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [base, offset];
+        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        let ofs_loc = self.gc_offset_loc(self.const_value(offset));
+        let nsize = self.gc_load_nsize(op, size);
+        let tp = op.opcode.result_type();
+        let res_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
+        self.perform(
+            i,
+            vec![base_loc, ofs_loc, res_loc, Loc::Immed(ImmedLoc::new(nsize))],
+            Some(res_loc),
+            output,
+        );
+    }
+
+    fn consider_gc_load_indexed_j2(
+        &mut self,
+        dst: OpRef,
+        base: OpRef,
+        index: OpRef,
+        scale: OpRef,
+        offset: OpRef,
+        size: OpRef,
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [base, index, scale, offset, size];
+        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        let index_loc = self.make_sure_var_in_reg(index, Type::Int, &args, None, false);
+        let scale_value = self.const_value(scale);
+        assert_eq!(
+            scale_value, 1,
+            "aarch64 GcLoadIndexed requires factor == 1 (got {scale_value})"
+        );
+        let ofs = self.const_value(offset);
+        let nsize = self.const_value(size);
+        let tp = op.opcode.result_type();
+        let res_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
+        self.perform(
+            i,
+            vec![
+                res_loc,
+                base_loc,
+                index_loc,
+                Loc::Immed(ImmedLoc::new(nsize)),
+                Loc::Immed(ImmedLoc::new(ofs)),
+            ],
+            Some(res_loc),
+            output,
+        );
     }
 
     /// x86/regalloc.py:1154 _consider_gc_load
@@ -3075,6 +4364,20 @@ impl RegAlloc {
         self.perform_discard(i, vec![base_loc, val_loc], output);
     }
 
+    fn consider_setfield_j2(
+        &mut self,
+        base: OpRef,
+        value: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [base, value];
+        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        let tp_val = self.tp(value);
+        let val_loc = self.make_sure_var_in_reg(value, tp_val, &args, None, false);
+        self.perform_discard(i, vec![base_loc, val_loc], output);
+    }
+
     /// Memory store: setarrayitem pattern (3 args: base, index, value)
     fn consider_setarrayitem(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.args.iter().copied().collect();
@@ -3085,9 +4388,130 @@ impl RegAlloc {
         self.perform_discard(i, vec![base_loc, index_loc, val_loc], output);
     }
 
+    fn consider_setarrayitem_j2(
+        &mut self,
+        base: OpRef,
+        index: OpRef,
+        value: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [base, index, value];
+        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        let index_loc = self.make_sure_var_in_reg(index, Type::Int, &args, None, false);
+        let tp_val = self.tp(value);
+        let val_loc = self.make_sure_var_in_reg(value, tp_val, &args, None, false);
+        self.perform_discard(i, vec![base_loc, index_loc, val_loc], output);
+    }
+
     /// Memory store: setinteriorfield
     fn consider_setinteriorfield(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         self.consider_setarrayitem(op, i, output);
+    }
+
+    fn consider_gc_store_j2(
+        &mut self,
+        base: OpRef,
+        offset: OpRef,
+        value: OpRef,
+        size: Option<OpRef>,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [base, offset, value];
+        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        let tp_val = self.tp(value);
+        let value_loc = self.make_sure_var_in_reg(value, tp_val, &args, None, false);
+        let size = size.map(|arg| self.const_value(arg)).unwrap_or(8);
+        let ofs_loc = self.gc_offset_loc(self.const_value(offset));
+        self.perform_discard(
+            i,
+            vec![
+                value_loc,
+                base_loc,
+                ofs_loc,
+                Loc::Immed(ImmedLoc::new(size)),
+            ],
+            output,
+        );
+    }
+
+    /// aarch64/regalloc.py:552 prepare_op_gc_store_indexed parity.
+    #[cfg(target_arch = "aarch64")]
+    fn consider_gc_store_indexed_j2(
+        &mut self,
+        base: OpRef,
+        index: OpRef,
+        value: OpRef,
+        scale: OpRef,
+        offset: OpRef,
+        size: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [base, index, value, scale, offset, size];
+        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        let tp_val = self.tp(value);
+        let value_loc = self.make_sure_var_in_reg(value, tp_val, &args, None, false);
+        let index_loc = self.make_sure_var_in_reg(index, Type::Int, &args, None, false);
+        let scale_value = self.const_value(scale);
+        assert_eq!(
+            scale_value, 1,
+            "aarch64 GcStoreIndexed requires factor == 1 (got {scale_value})"
+        );
+        let ofs = self.const_value(offset);
+        let size = self.const_value(size);
+        self.perform_discard(
+            i,
+            vec![
+                value_loc,
+                base_loc,
+                index_loc,
+                Loc::Immed(ImmedLoc::new(size)),
+                Loc::Immed(ImmedLoc::new(ofs)),
+            ],
+            output,
+        );
+    }
+
+    /// x86/regalloc.py:1127 consider_gc_store_indexed parity.
+    #[cfg(target_arch = "x86_64")]
+    fn consider_gc_store_indexed_j2(
+        &mut self,
+        base: OpRef,
+        index: OpRef,
+        value: OpRef,
+        scale: OpRef,
+        offset: OpRef,
+        size: OpRef,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [base, index, value, scale, offset, size];
+        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        let factor = self.const_value(scale);
+        let offset = self.const_value(offset);
+        let size = self.const_value(size);
+        assert!(
+            size >= 1,
+            "x86 GcStoreIndexed size must be >= 1 (got {size})"
+        );
+        let need_lower_byte = size == 1;
+        let tp_val = self.tp(value);
+        let value_loc = self.make_sure_var_in_reg(value, tp_val, &args, None, need_lower_byte);
+        let ofs_loc = self.make_sure_var_in_reg(index, Type::Int, &args, None, false);
+        self.perform_discard(
+            i,
+            vec![
+                base_loc,
+                ofs_loc,
+                value_loc,
+                Loc::Immed(ImmedLoc::new(factor)),
+                Loc::Immed(ImmedLoc::new(offset)),
+                Loc::Immed(ImmedLoc::new(size)),
+            ],
+            output,
+        );
     }
 
     /// aarch64/regalloc.py:520 prepare_op_gc_store parity.
@@ -3310,6 +4734,81 @@ impl RegAlloc {
         self.perform(i, arglocs, result_loc, output);
     }
 
+    fn consider_call_j2(
+        &mut self,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+        save_all_regs: bool,
+        first_arg_index: usize,
+    ) {
+        let calldescr = op
+            .descr
+            .as_ref()
+            .and_then(|descr| descr.as_call_descr())
+            .expect("call op without CallDescr");
+        assert_eq!(calldescr.arg_types().len(), args.len() - first_arg_index);
+
+        let mut arglocs = Vec::with_capacity(args.len() + 3);
+        arglocs.push(Loc::Immed(ImmedLoc::new(0)));
+        arglocs.push(Loc::Immed(ImmedLoc::new(calldescr.result_size() as i64)));
+        arglocs.push(Loc::Immed(ImmedLoc::new(if calldescr.is_result_signed() {
+            1
+        } else {
+            0
+        })));
+        for (arg_index, &arg) in args.iter().enumerate() {
+            let tp = if arg_index >= first_arg_index {
+                calldescr.arg_types()[arg_index - first_arg_index]
+            } else {
+                self.tp(arg)
+            };
+            arglocs.push(self.loc(arg, tp));
+        }
+
+        let save_regs = if save_all_regs {
+            SAVE_ALL_REGS
+        } else if calldescr.get_extra_info().check_can_collect() {
+            SAVE_GCREF_REGS
+        } else {
+            SAVE_DEFAULT_REGS
+        };
+        self.rm.before_call(
+            &[],
+            save_regs,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+        self.xrm.before_call(
+            &[],
+            save_regs,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+
+        let result_tp = op.opcode.result_type();
+        let result_loc = if result_tp != Type::Void {
+            let dst = dst.unwrap_or(op.pos);
+            let r = if result_tp == Type::Float {
+                self.xrm.after_call(dst, &mut self.longevity)
+            } else {
+                self.rm.after_call(dst, &mut self.longevity)
+            };
+            Some(Loc::Reg(r))
+        } else {
+            None
+        };
+        arglocs[0] = result_loc.unwrap_or(Loc::Immed(ImmedLoc::new(0)));
+
+        self.perform(i, arglocs, result_loc, output);
+    }
+
     /// llsupport/regalloc.py:894 locs_for_call_assembler parity.
     /// RPython syncs args to stack, then before_call spills everything.
     /// We force-sync register args to frame first via _sync_var_to_stack,
@@ -3370,6 +4869,66 @@ impl RegAlloc {
         self.perform(i, arglocs, result_loc, output);
     }
 
+    fn consider_call_assembler_j2(
+        &mut self,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        for &arg in args {
+            if arg.is_constant() {
+                continue;
+            }
+            let tp = self.tp(arg);
+            if tp == Type::Float {
+                self.xrm
+                    ._sync_var_to_stack(arg, tp, &mut self.longevity, &mut self.fm);
+            } else {
+                self.rm
+                    ._sync_var_to_stack(arg, tp, &mut self.longevity, &mut self.fm);
+            }
+        }
+
+        self.rm.before_call(
+            &[],
+            SAVE_ALL_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+        self.xrm.before_call(
+            &[],
+            SAVE_ALL_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+
+        let mut arglocs: Vec<Loc> = Vec::new();
+        for &arg in args {
+            let tp = self.tp(arg);
+            arglocs.push(self.loc_must_exist(arg, tp));
+        }
+
+        let result_tp = op.opcode.result_type();
+        let result_loc = if result_tp != Type::Void {
+            let dst = dst.unwrap_or(op.pos);
+            let r = if result_tp == Type::Float {
+                self.xrm.after_call(dst, &mut self.longevity)
+            } else {
+                self.rm.after_call(dst, &mut self.longevity)
+            };
+            Some(Loc::Reg(r))
+        } else {
+            None
+        };
+        self.perform(i, arglocs, result_loc, output);
+    }
+
     fn consider_raw_call_like(
         &mut self,
         op: &Op,
@@ -3414,6 +4973,53 @@ impl RegAlloc {
         self.perform(i, arglocs, result_loc, output);
     }
 
+    fn consider_raw_call_like_j2(
+        &mut self,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+        save_regs: u8,
+    ) {
+        self.rm.before_call(
+            &[],
+            save_regs,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+        self.xrm.before_call(
+            &[],
+            save_regs,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+
+        let mut arglocs = Vec::new();
+        for &arg in args {
+            let tp = self.tp(arg);
+            arglocs.push(self.loc(arg, tp));
+        }
+
+        let result_tp = op.opcode.result_type();
+        let result_loc = if result_tp != Type::Void {
+            let dst = dst.unwrap_or(op.pos);
+            let r = if result_tp == Type::Float {
+                self.xrm.after_call(dst, &mut self.longevity)
+            } else {
+                self.rm.after_call(dst, &mut self.longevity)
+            };
+            Some(Loc::Reg(r))
+        } else {
+            None
+        };
+        self.perform(i, arglocs, result_loc, output);
+    }
+
     /// aarch64/regalloc.py:958 prepare_op_call_malloc_nursery parity.
     /// Spill ALL registers: the nursery bump path clobbers x0-x3 (aarch64)
     /// or ecx/edx/rax (x86). The slow path may trigger GC.
@@ -3447,6 +5053,39 @@ impl RegAlloc {
         self.perform_with_gcmap(i, arglocs, Some(Loc::Reg(result_reg)), output);
     }
 
+    fn consider_call_malloc_nursery_j2(
+        &mut self,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.rm.spill_or_move_registers_before_call(
+            &MALLOC_NURSERY_CLOBBER,
+            &[],
+            SAVE_ALL_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+        let result_reg = self.rm.force_allocate_reg(
+            dst.unwrap_or(OpRef(u32::MAX)),
+            &[],
+            Some(MALLOC_NURSERY_RESULT),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        let size_val = args.first().map(|&arg| self.const_value(arg)).unwrap_or(0);
+        self.perform_with_gcmap(
+            i,
+            vec![Loc::Immed(ImmedLoc::new(size_val))],
+            Some(Loc::Reg(result_reg)),
+            output,
+        );
+    }
+
     /// aarch64/regalloc.py:979 prepare_op_call_malloc_nursery_varsize_frame parity.
     fn consider_call_malloc_nursery_varsize_frame(
         &mut self,
@@ -3469,6 +5108,38 @@ impl RegAlloc {
         // aarch64/regalloc.py:988
         let result_reg = self.rm.force_allocate_reg(
             op.pos,
+            &[],
+            Some(MALLOC_NURSERY_RESULT),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        self.perform_with_gcmap(i, vec![sizeloc], Some(Loc::Reg(result_reg)), output);
+    }
+
+    fn consider_call_malloc_nursery_varsize_frame_j2(
+        &mut self,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let Some(&size_arg) = args.first() else {
+            output.push(RegAllocOp::Skip);
+            return;
+        };
+        let sizeloc = self.make_sure_var_in_reg(size_arg, Type::Int, &[], None, false);
+        self.rm.spill_or_move_registers_before_call(
+            &MALLOC_NURSERY_CLOBBER,
+            &[],
+            SAVE_ALL_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+        let result_reg = self.rm.force_allocate_reg(
+            dst.unwrap_or(OpRef(u32::MAX)),
             &[],
             Some(MALLOC_NURSERY_RESULT),
             false,
@@ -3522,6 +5193,48 @@ impl RegAlloc {
         );
     }
 
+    fn consider_call_malloc_nursery_varsize_j2(
+        &mut self,
+        dst: Option<OpRef>,
+        args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        self.rm.spill_or_move_registers_before_call(
+            &MALLOC_NURSERY_CLOBBER,
+            &[],
+            SAVE_ALL_REGS,
+            &mut self.longevity,
+            &mut self.fm,
+            &mut self.pending_moves,
+            &self.value_types,
+        );
+        let result_reg = self.rm.force_allocate_reg(
+            dst.unwrap_or(OpRef(u32::MAX)),
+            &[],
+            Some(MALLOC_NURSERY_RESULT),
+            false,
+            &mut self.longevity,
+            &mut self.fm,
+        );
+        let lengthloc = args
+            .get(2)
+            .map(|&arg| self.loc(arg, Type::Int))
+            .unwrap_or_else(|| Loc::Immed(ImmedLoc::new(0)));
+        let itemsize = args.get(1).map(|&arg| self.const_value(arg)).unwrap_or(0);
+        let kind = args.first().map(|&arg| self.const_value(arg)).unwrap_or(0);
+        self.perform_with_gcmap(
+            i,
+            vec![
+                lengthloc,
+                Loc::Immed(ImmedLoc::new(itemsize)),
+                Loc::Immed(ImmedLoc::new(kind)),
+            ],
+            Some(Loc::Reg(result_reg)),
+            output,
+        );
+    }
+
     /// x86/regalloc.py:1303 consider_jump
     fn consider_jump(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         // x86/regalloc.py:1306-1309: descr = op.getdescr(); self.jump_target_descr = descr
@@ -3530,6 +5243,24 @@ impl RegAlloc {
         self.jump_target_descr = descr_id;
         let mut locs = Vec::new();
         for &arg in &op.args {
+            let tp = self.tp(arg);
+            locs.push(self.loc_must_exist(arg, tp));
+        }
+        self.perform(i, locs, None, output);
+    }
+
+    fn consider_jump_j2(
+        &mut self,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let descr_id = op.descr.as_ref().map(descr_identity);
+        self.final_jump_args = descr_id.map(|id| (id, args.to_vec()));
+        self.jump_target_descr = descr_id;
+        let mut locs = Vec::new();
+        for &arg in args {
             let tp = self.tp(arg);
             locs.push(self.loc_must_exist(arg, tp));
         }
@@ -3614,9 +5345,79 @@ impl RegAlloc {
         self.perform(i, locs, None, output);
     }
 
+    fn consider_label_j2(
+        &mut self,
+        args: &[OpRef],
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let position = self.rm.position;
+        for &arg in args {
+            let tp = self.tp(arg);
+            if self
+                .longevity
+                .get(arg)
+                .is_some_and(|lt| lt.is_last_real_use_before(position))
+            {
+                self.force_spill_var(arg, tp);
+            }
+        }
+
+        let mut locs = Vec::new();
+        for &arg in args {
+            let tp = self.tp(arg);
+            let loc = self.loc(arg, tp);
+            match loc {
+                Loc::Reg(_) => self.fm.mark_as_free(arg, tp, &mut self.longevity),
+                _ => {}
+            }
+            locs.push(loc);
+        }
+
+        if let Some(label_id) = op.descr.as_ref().map(descr_identity) {
+            if self
+                .final_jump_args
+                .as_ref()
+                .is_some_and(|(jump_id, _)| *jump_id == label_id)
+            {
+                let jump_args = self.final_jump_args.as_ref().unwrap().1.clone();
+                #[cfg(target_arch = "x86_64")]
+                let position = self.final_jump_op_position;
+                #[cfg(target_arch = "x86_64")]
+                let mut hinted: Vec<OpRef> = Vec::new();
+                for (iarg, target_loc) in jump_args.iter().zip(locs.iter()) {
+                    if iarg.is_constant() {
+                        continue;
+                    }
+                    match *target_loc {
+                        Loc::Frame(frame_loc) => {
+                            self.fm
+                                .add_frame_pos_hint(*iarg, frame_loc, &mut self.longevity);
+                        }
+                        #[cfg(target_arch = "x86_64")]
+                        Loc::Reg(r) => {
+                            if !hinted.contains(iarg) {
+                                hinted.push(*iarg);
+                                self.longevity.fixed_register(position, r, Some(*iarg));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        self.perform(i, locs, None, output);
+    }
+
     /// force_token: result = frame pointer (EBP)
     fn consider_force_token(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos, Type::Ref, &[], None, false));
+        self.perform(i, vec![], Some(result_loc), output);
+    }
+
+    fn consider_force_token_j2(&mut self, dst: OpRef, i: usize, output: &mut Vec<RegAllocOp>) {
+        let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Ref, &[], None, false));
         self.perform(i, vec![], Some(result_loc), output);
     }
 
@@ -3630,10 +5431,37 @@ impl RegAlloc {
         self.perform(i, locs, Some(result_loc), output);
     }
 
+    fn consider_load_effective_address_j2(
+        &mut self,
+        dst: OpRef,
+        args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let mut locs = Vec::new();
+        for &arg in args {
+            locs.push(self.loc(arg, Type::Int));
+        }
+        let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        self.perform(i, locs, Some(result_loc), output);
+    }
+
     /// No-arg result (save_exception, save_exc_class)
     fn consider_no_arg_result(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let tp = op.opcode.result_type();
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos, tp, &[], None, false));
+        self.perform(i, vec![], Some(result_loc), output);
+    }
+
+    fn consider_no_arg_result_j2(
+        &mut self,
+        dst: OpRef,
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let tp = op.opcode.result_type();
+        let result_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
         self.perform(i, vec![], Some(result_loc), output);
     }
 
@@ -3648,6 +5476,20 @@ impl RegAlloc {
         self.perform_discard(i, locs, output);
     }
 
+    fn consider_discard_3args_j2(
+        &mut self,
+        args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let mut locs = Vec::new();
+        for &arg in args {
+            let tp = self.tp(arg);
+            locs.push(self.make_sure_var_in_reg(arg, tp, args, None, false));
+        }
+        self.perform_discard(i, locs, output);
+    }
+
     /// Generic discard with N args
     fn consider_discard_nargs(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let mut locs = Vec::new();
@@ -3656,6 +5498,34 @@ impl RegAlloc {
             locs.push(self.loc(arg, tp));
         }
         self.perform_discard(i, locs, output);
+    }
+
+    fn consider_discard_nargs_j2(
+        &mut self,
+        args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let mut locs = Vec::new();
+        for &arg in args {
+            let tp = self.tp(arg);
+            locs.push(self.loc(arg, tp));
+        }
+        self.perform_discard(i, locs, output);
+    }
+
+    fn consider_cond_call_gc_wb_j2(
+        &mut self,
+        args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let mut arglocs = Vec::new();
+        for (idx, &arg) in args.iter().enumerate() {
+            let tp = if idx == 0 { Type::Ref } else { Type::Int };
+            arglocs.push(self.make_sure_var_in_reg(arg, tp, args, None, false));
+        }
+        self.perform_discard(i, arglocs, output);
     }
 
     /// Advance position in both register managers.
@@ -3713,6 +5583,7 @@ fn loc_eq(a: &Loc, b: &Loc) -> bool {
 mod tests {
     use super::*;
     use majit_ir::{InputArg, Op, OpCode, OpRef, Type};
+    use std::collections::HashMap;
 
     fn make_op(opcode: OpCode, pos: u32, args: &[OpRef]) -> Op {
         let mut op = Op::new(opcode, args);
@@ -3724,6 +5595,16 @@ mod tests {
         let mut op = make_op(opcode, pos, args);
         op.fail_args = Some(fail_args.iter().copied().collect());
         op
+    }
+
+    fn has_move_from(ra_ops: &[RegAllocOp], expected: &Loc) -> bool {
+        ra_ops.iter().any(|ra_op| {
+            if let RegAllocOp::Move { src, .. } = ra_op {
+                loc_eq(src, expected)
+            } else {
+                false
+            }
+        })
     }
 
     #[test]
@@ -3854,6 +5735,338 @@ mod tests {
         assert!(reg2 == reg0 || reg2 == reg1);
         // The spilled variable should now be in the frame
         assert!(fm.get_frame_depth() >= 1);
+    }
+
+    #[test]
+    fn test_j2_deopt_only_failarg_spilled_before_guard() {
+        let i0 = OpRef(0);
+        let i1 = OpRef(1);
+        let i2 = OpRef(2);
+        let c1 = OpRef::from_const(0);
+
+        let inputargs = vec![InputArg {
+            index: i0.0,
+            tp: Type::Int,
+        }];
+
+        let mut add = Op::new(OpCode::IntAdd, &[i0, c1]);
+        add.pos = i1;
+        let mut is_true = Op::new(OpCode::IntIsTrue, &[i1]);
+        is_true.pos = i2;
+        let mut guard = Op::new(OpCode::GuardTrue, &[i2]);
+        guard.pos = OpRef(3);
+        guard.fail_args = Some(vec![i1].into());
+        let mut finish = Op::new(OpCode::Finish, &[]);
+        finish.pos = OpRef(4);
+        finish.fail_args = Some(vec![].into());
+        finish.fail_arg_types = Some(vec![]);
+
+        let mut constants = HashMap::new();
+        constants.insert(c1.0, 1);
+
+        let ops = vec![add, is_true, guard, finish];
+        let mut ra = RegAlloc::new(constants, HashMap::new());
+        ra.prepare_loop(&inputargs, &ops);
+        let ra_ops = ra.walk_operations(&inputargs, &ops);
+
+        let guard_faillocs = ra_ops.iter().find_map(|ra_op| {
+            if let RegAllocOp::PerformGuard {
+                op_index, faillocs, ..
+            } = ra_op
+            {
+                if *op_index == 2 {
+                    return Some(faillocs);
+                }
+            }
+            None
+        });
+
+        let Some(faillocs) = guard_faillocs else {
+            panic!("guard op was not lowered through RegAllocOp::PerformGuard");
+        };
+        assert!(
+            matches!(faillocs.as_slice(), [Some(Loc::Frame(_))]),
+            "deopt-only failarg should be captured from a frame slot: {:?}",
+            faillocs
+        );
+    }
+
+    #[test]
+    fn test_walk_operations_dispatches_from_j2_lir() {
+        let i0 = OpRef(0);
+        let c0 = OpRef::from_const(0);
+        let inputargs = vec![InputArg {
+            index: i0.0,
+            tp: Type::Ref,
+        }];
+
+        let store = Op::new(OpCode::GcStore, &[i0, c0, i0]);
+        let ops = vec![store];
+
+        let mut ra = RegAlloc::new(HashMap::new(), HashMap::new());
+        ra.prepare_loop(&inputargs, &ops);
+        ra.j2_ops[0] = crate::j2plan::LirOp::Finish { args: vec![i0] };
+
+        let ra_ops = ra.walk_operations(&inputargs, &ops);
+        let dispatched = ra_ops.iter().find_map(|ra_op| {
+            if let RegAllocOp::Perform {
+                op_index,
+                arglocs,
+                result_loc,
+                ..
+            } = ra_op
+            {
+                if *op_index == 0 {
+                    return Some((arglocs, result_loc));
+                }
+            }
+            None
+        });
+
+        let Some((arglocs, result_loc)) = dispatched else {
+            panic!("j2 LIR dispatch did not produce a Perform op");
+        };
+        assert_eq!(
+            arglocs.len(),
+            1,
+            "walk_operations should dispatch from j2 LIR, not raw GcStore opcode"
+        );
+        assert!(result_loc.is_none());
+    }
+
+    #[test]
+    fn test_j2_integer_dispatch_uses_lir_operands() {
+        let i0 = OpRef(0);
+        let i1 = OpRef(1);
+        let i2 = OpRef(2);
+
+        let inputargs = vec![
+            InputArg {
+                index: i0.0,
+                tp: Type::Int,
+            },
+            InputArg {
+                index: i1.0,
+                tp: Type::Int,
+            },
+        ];
+
+        let mut raw = Op::new(OpCode::IntIsTrue, &[i0]);
+        raw.pos = i2;
+        let mut finish = Op::new(OpCode::Finish, &[i1]);
+        finish.pos = OpRef(3);
+        let ops = vec![raw, finish];
+
+        let mut ra = RegAlloc::new(HashMap::new(), HashMap::new());
+        ra.prepare_loop(&inputargs, &ops);
+        let expected_argloc = ra.loc(i1, Type::Int);
+        ra.j2_ops[0] = crate::j2plan::LirOp::IntUnary {
+            kind: crate::j2plan::IntUnaryKind::IsTrue,
+            dst: i2,
+            arg: i1,
+        };
+
+        let ra_ops = ra.walk_operations(&inputargs, &ops);
+        let move_src = ra_ops.iter().find_map(|ra_op| {
+            if let RegAllocOp::Move { src, .. } = ra_op {
+                return Some(*src);
+            }
+            None
+        });
+
+        let Some(move_src) = move_src else {
+            panic!("j2 integer dispatch did not materialize the LIR operand");
+        };
+        assert!(
+            loc_eq(&move_src, &expected_argloc),
+            "integer dispatch should materialize the LIR operand, not the raw Op arg: {:?} vs {:?}",
+            move_src,
+            expected_argloc
+        );
+    }
+
+    #[test]
+    fn test_j2_guard_dispatch_uses_lir_operands() {
+        let i0 = OpRef(0);
+        let i1 = OpRef(1);
+
+        let inputargs = vec![
+            InputArg {
+                index: i0.0,
+                tp: Type::Int,
+            },
+            InputArg {
+                index: i1.0,
+                tp: Type::Int,
+            },
+        ];
+
+        let mut raw = Op::new(OpCode::GuardTrue, &[i0]);
+        raw.pos = OpRef(2);
+        raw.fail_args = Some(vec![].into());
+        let mut finish = Op::new(OpCode::Finish, &[i1]);
+        finish.pos = OpRef(3);
+        let ops = vec![raw, finish];
+
+        let mut ra = RegAlloc::new(HashMap::new(), HashMap::new());
+        ra.prepare_loop(&inputargs, &ops);
+        let expected_argloc = ra.loc(i1, Type::Int);
+        ra.j2_ops[0] = crate::j2plan::LirOp::Guard {
+            kind: crate::j2plan::GuardKind::True,
+            args: vec![i1],
+            fail_args: vec![],
+        };
+
+        let ra_ops = ra.walk_operations(&inputargs, &ops);
+        assert!(
+            has_move_from(&ra_ops, &expected_argloc),
+            "guard dispatch should materialize the LIR condition, not the raw Op arg: {:?}",
+            ra_ops
+        );
+    }
+
+    #[test]
+    fn test_j2_load_dispatch_uses_lir_operands() {
+        let i0 = OpRef(0);
+        let i1 = OpRef(1);
+        let i2 = OpRef(2);
+        let c0 = OpRef::from_const(0);
+        let c8 = OpRef::from_const(8);
+
+        let inputargs = vec![
+            InputArg {
+                index: i0.0,
+                tp: Type::Ref,
+            },
+            InputArg {
+                index: i1.0,
+                tp: Type::Ref,
+            },
+        ];
+
+        let mut raw = Op::new(OpCode::GcLoadI, &[i0, c0, c8]);
+        raw.pos = i2;
+        let mut finish = Op::new(OpCode::Finish, &[i1]);
+        finish.pos = OpRef(3);
+        let ops = vec![raw, finish];
+
+        let mut constants = HashMap::new();
+        constants.insert(c0.0, 0);
+        constants.insert(c8.0, 8);
+
+        let mut ra = RegAlloc::new(constants, HashMap::new());
+        ra.prepare_loop(&inputargs, &ops);
+        let expected_argloc = ra.loc(i1, Type::Ref);
+        ra.j2_ops[0] = crate::j2plan::LirOp::Load {
+            kind: crate::j2plan::LoadKind::Gc,
+            dst: i2,
+            base: i1,
+            offset: Some(c0),
+            index: None,
+            scale: None,
+            size: Some(c8),
+        };
+
+        let ra_ops = ra.walk_operations(&inputargs, &ops);
+        assert!(
+            has_move_from(&ra_ops, &expected_argloc),
+            "load dispatch should materialize the LIR base, not the raw Op base: {:?}",
+            ra_ops
+        );
+    }
+
+    #[test]
+    fn test_j2_store_dispatch_uses_lir_operands() {
+        let i0 = OpRef(0);
+        let i1 = OpRef(1);
+        let i2 = OpRef(2);
+        let c0 = OpRef::from_const(0);
+        let c8 = OpRef::from_const(8);
+
+        let inputargs = vec![
+            InputArg {
+                index: i0.0,
+                tp: Type::Ref,
+            },
+            InputArg {
+                index: i1.0,
+                tp: Type::Ref,
+            },
+            InputArg {
+                index: i2.0,
+                tp: Type::Int,
+            },
+        ];
+
+        let raw = Op::new(OpCode::GcStore, &[i0, c0, i2, c8]);
+        let mut finish = Op::new(OpCode::Finish, &[i1]);
+        finish.pos = OpRef(3);
+        let ops = vec![raw, finish];
+
+        let mut constants = HashMap::new();
+        constants.insert(c0.0, 0);
+        constants.insert(c8.0, 8);
+
+        let mut ra = RegAlloc::new(constants, HashMap::new());
+        ra.prepare_loop(&inputargs, &ops);
+        let expected_argloc = ra.loc(i1, Type::Ref);
+        ra.j2_ops[0] = crate::j2plan::LirOp::Store {
+            kind: crate::j2plan::StoreKind::Gc,
+            base: i1,
+            offset: Some(c0),
+            index: None,
+            scale: None,
+            value: i2,
+            size: Some(c8),
+        };
+
+        let ra_ops = ra.walk_operations(&inputargs, &ops);
+        assert!(
+            has_move_from(&ra_ops, &expected_argloc),
+            "store dispatch should materialize the LIR base, not the raw Op base: {:?}",
+            ra_ops
+        );
+    }
+
+    #[test]
+    fn test_j2_opcode_dispatch_uses_lir_operands() {
+        let i0 = OpRef(0);
+        let i1 = OpRef(1);
+        let i2 = OpRef(2);
+
+        let inputargs = vec![
+            InputArg {
+                index: i0.0,
+                tp: Type::Int,
+            },
+            InputArg {
+                index: i1.0,
+                tp: Type::Int,
+            },
+        ];
+
+        let mut raw = Op::new(OpCode::SameAsI, &[i0]);
+        raw.pos = i2;
+        let mut finish = Op::new(OpCode::Finish, &[i1]);
+        finish.pos = OpRef(3);
+        let ops = vec![raw, finish];
+
+        let mut ra = RegAlloc::new(HashMap::new(), HashMap::new());
+        ra.prepare_loop(&inputargs, &ops);
+        let expected_argloc = ra.loc(i1, Type::Int);
+        ra.j2_ops[0] = crate::j2plan::LirOp::Opcode {
+            opcode: OpCode::SameAsI,
+            dst: Some(i2),
+            args: vec![i1],
+            fail_args: vec![],
+        };
+
+        let ra_ops = ra.walk_operations(&inputargs, &ops);
+        assert!(
+            has_move_from(&ra_ops, &expected_argloc),
+            "generic j2 opcode dispatch should materialize the LIR arg, not the raw Op arg: {:?}",
+            ra_ops
+        );
     }
 
     #[test]

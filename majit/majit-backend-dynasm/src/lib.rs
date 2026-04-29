@@ -21,6 +21,7 @@ pub mod codebuf;
 pub mod frame;
 pub mod gcmap;
 pub mod guard;
+pub(crate) mod j2plan;
 pub use majit_backend::jitframe;
 pub use majit_backend::llmodel;
 pub mod jump;

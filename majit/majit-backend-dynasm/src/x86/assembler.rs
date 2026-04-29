@@ -1294,6 +1294,11 @@ impl Assembler386 {
 
         // ── Run register allocator ──
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
+        if std::env::var_os("MAJIT_J2PLAN_LOG").is_some() {
+            let plan = crate::j2plan::TracePlan::build(inputargs, ops);
+            eprintln!("[dynasm:j2plan] {}", plan.summary());
+        }
+
         let mut ra = RegAlloc::new(self.constants.clone(), self.constant_types.clone());
         if let Some(ref arglocs) = self.bridge_input_locs {
             ra.prepare_bridge(inputargs, arglocs, ops);
