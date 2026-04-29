@@ -103,6 +103,23 @@ fn with_dynasm_active_gc<R>(f: impl FnOnce(&dyn majit_gc::GcAllocator) -> R) -> 
     })
 }
 
+/// TYPE_INFO / CLASSTYPE constants read by the dynasm assemblers for
+/// `GUARD_IS_OBJECT` and `GUARD_SUBCLASS`.
+///
+/// RPython reads these from `self.cpu.gc_ll_descr` at codegen time
+/// (`x86/assembler.py:1934-1939`, `1946-1969`). The Rust assembler is a
+/// transient emitter without a borrow of `DynasmBackend`, so the runner
+/// pre-fetches the same values once per trace and passes them in.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct GuardGcTypeInfo {
+    pub base_type_info: usize,
+    pub shift_by: u8,
+    pub sizeof_ti: usize,
+    pub infobits_offset: usize,
+    pub is_object_flag: u8,
+    pub subclassrange_min_offset: usize,
+}
+
 fn dynasm_check_is_object(gcref: GcRef) -> bool {
     with_dynasm_active_gc(|gc| gc.check_is_object(gcref)).unwrap_or(false)
 }
@@ -858,6 +875,28 @@ impl DynasmBackend {
             .flatten()
     }
 
+    /// Pre-fetch the GC TYPE_INFO constants that RPython's assembler reads
+    /// from `cpu.gc_ll_descr` while emitting `GUARD_IS_OBJECT` and
+    /// `GUARD_SUBCLASS`.
+    fn collect_guard_gc_type_info(&self) -> Option<GuardGcTypeInfo> {
+        with_dynasm_active_gc(|gc| {
+            if !gc.supports_guard_gc_type() {
+                return None;
+            }
+            let (base_type_info, shift_by, sizeof_ti) = gc.get_translated_info_for_typeinfo();
+            let (infobits_offset, is_object_flag) = gc.get_translated_info_for_guard_is_object();
+            Some(GuardGcTypeInfo {
+                base_type_info,
+                shift_by,
+                sizeof_ti,
+                infobits_offset,
+                is_object_flag,
+                subclassrange_min_offset: gc.subclassrange_min_offset(),
+            })
+        })
+        .flatten()
+    }
+
     /// Pre-compute classptr → expected_typeid pairs for every GuardClass /
     /// GuardNonnullClass operand seen in `ops`. RPython resolves these on
     /// demand inside `_cmp_guard_class` (assembler.py:1887-1890); pyre's
@@ -883,6 +922,36 @@ impl DynasmBackend {
                 if let Some(&classptr) = constants.get(&op.args[1].0) {
                     if let Some(tid) = self.lookup_typeid_from_classptr(classptr as usize) {
                         table.insert(classptr, tid);
+                    }
+                }
+            }
+        }
+        table
+    }
+
+    /// Pre-compute classptr → `(subclassrange_min, subclassrange_max)` for
+    /// every constant `GuardSubclass` expected-class operand.
+    ///
+    /// RPython reads these fields from `loc_check_against_class.getint()` at
+    /// codegen time (`x86/assembler.py:1971-1974`). This table is the
+    /// smallest dynasm-side equivalent of that object-field read; it is not a
+    /// per-box side table.
+    fn collect_classptr_subclass_range_table(
+        &self,
+        ops: &[Op],
+        constants: &std::collections::HashMap<u32, i64>,
+    ) -> std::collections::HashMap<i64, (i64, i64)> {
+        let mut table = std::collections::HashMap::new();
+        if DYNASM_ACTIVE_GC.with(|cell| cell.borrow().is_none()) {
+            return table;
+        }
+        for op in ops {
+            if op.opcode == majit_ir::OpCode::GuardSubclass && op.args.len() >= 2 {
+                if let Some(&classptr) = constants.get(&op.args[1].0) {
+                    if let Some(range) =
+                        with_dynasm_active_gc(|gc| gc.subclass_range(classptr as usize)).flatten()
+                    {
+                        table.insert(classptr, range);
                     }
                 }
             }
@@ -1250,6 +1319,9 @@ impl Backend for DynasmBackend {
         let constants = std::mem::take(&mut self.constants);
         let constant_types = std::mem::take(&mut self.constant_types);
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
+        let guard_gc_type_info = self.collect_guard_gc_type_info();
+        let subclass_range_table =
+            self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         let mut asm = Asm::new(
@@ -1258,6 +1330,8 @@ impl Backend for DynasmBackend {
             constants,
             self.vtable_offset,
             typeid_table,
+            guard_gc_type_info,
+            subclass_range_table,
             attached_descrs,
             cpu_handle,
         );
@@ -1394,6 +1468,9 @@ impl Backend for DynasmBackend {
             );
         }
         let typeid_table = self.collect_classptr_typeid_table(&prepared_ops, &constants);
+        let guard_gc_type_info = self.collect_guard_gc_type_info();
+        let subclass_range_table =
+            self.collect_classptr_subclass_range_table(&prepared_ops, &constants);
         let attached_descrs = self.attached_descr_ptrs();
         let cpu_handle = self.cpu_handle();
         let mut asm = Asm::new(
@@ -1402,6 +1479,8 @@ impl Backend for DynasmBackend {
             constants,
             self.vtable_offset,
             typeid_table,
+            guard_gc_type_info,
+            subclass_range_table,
             attached_descrs,
             cpu_handle,
         );

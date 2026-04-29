@@ -29,6 +29,7 @@ use crate::jitframe::{
 };
 use crate::regalloc::{RegAlloc, RegAllocOp};
 use crate::regloc::Loc;
+use crate::runner::GuardGcTypeInfo;
 
 /// x86/assembler.py: managed general-purpose registers.
 const X86_GEN_REGS: [crate::regloc::RegLoc; 16] = [
@@ -275,6 +276,13 @@ pub struct Assembler386 {
     /// via gc_ll_descr.get_typeid_from_classptr_if_gcremovetypeptr. Used by
     /// the gcremovetypeptr branch of `_cmp_guard_class`.
     classptr_to_typeid: HashMap<i64, u32>,
+    /// TYPE_INFO / CLASSTYPE constants for `GUARD_IS_OBJECT` and
+    /// `GUARD_SUBCLASS`, fetched by the runner from the active gc_ll_descr.
+    guard_gc_type_info: Option<GuardGcTypeInfo>,
+    /// Constant classptr → `(subclassrange_min, subclassrange_max)`, matching
+    /// `loc_check_against_class.getint()` field reads in
+    /// `x86/assembler.py:1971-1974`.
+    classptr_to_subclass_range: HashMap<i64, (i64, i64)>,
     /// Dynamic label at the function entry for self-recursive CALL_ASSEMBLER.
     self_entry_label: Option<DynamicLabel>,
     /// Leaked pointer holding the resolved entry address for self-recursive
@@ -366,12 +374,14 @@ pub struct CompiledCode {
 
 impl Assembler386 {
     /// assembler.py:54 __init__
-    pub fn new(
+    pub(crate) fn new(
         trace_id: u64,
         header_pc: u64,
         constants: HashMap<u32, i64>,
         vtable_offset: Option<usize>,
         classptr_to_typeid: HashMap<i64, u32>,
+        guard_gc_type_info: Option<GuardGcTypeInfo>,
+        classptr_to_subclass_range: HashMap<i64, (i64, i64)>,
         attached_descrs: crate::guard::AttachedDescrPtrs,
         cpu_handle: crate::guard::CpuDescrHandle,
     ) -> Self {
@@ -395,6 +405,8 @@ impl Assembler386 {
             compiled_target_tokens: Vec::new(),
             vtable_offset,
             classptr_to_typeid,
+            guard_gc_type_info,
+            classptr_to_subclass_range,
             self_entry_label: None,
             self_entry_addr_ptr: Box::into_raw(Box::new(0usize)),
             call_assembler_targets: HashMap::new(),
@@ -2440,12 +2452,41 @@ impl Assembler386 {
                 }
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
-            OpCode::GuardClass | OpCode::GuardGcType => {
+            OpCode::GuardClass => {
                 if arglocs.len() >= 2 {
                     self._cmp_guard_class(&arglocs[0], &arglocs[1]);
                     self.guard_success_cc = Some(CC_E);
                 }
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+            }
+            OpCode::GuardGcType => {
+                if arglocs.len() >= 2 {
+                    self._cmp_guard_gc_type(&arglocs[0], &arglocs[1]);
+                    self.guard_success_cc = Some(CC_E);
+                }
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+            }
+            OpCode::GuardIsObject => {
+                if arglocs.len() >= 2 {
+                    self.emit_guard_is_object(&arglocs[0], &arglocs[1]);
+                    self.guard_success_cc = Some(CC_NE);
+                }
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+            }
+            OpCode::GuardSubclass => {
+                if arglocs.len() >= 3 {
+                    self.emit_guard_subclass(&arglocs[0], &arglocs[1], &arglocs[2]);
+                    self.guard_success_cc = Some(CC_B);
+                }
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+            }
+            OpCode::GuardException => {
+                if arglocs.len() >= 2 {
+                    self.emit_guard_exception(&arglocs[0], &arglocs[1]);
+                    self.guard_success_cc = Some(CC_E);
+                }
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
+                self.emit_store_and_reset_exception(result_loc);
             }
             OpCode::GuardNonnullClass => {
                 if arglocs.len() >= 2 {
@@ -2459,7 +2500,9 @@ impl Assembler386 {
                 }
             }
             OpCode::GuardNoException => {
-                self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
+                self.emit_cmp_no_exception();
+                self.guard_success_cc = Some(CC_E);
+                self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardNoOverflow | OpCode::GuardOverflow => {
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
@@ -2471,6 +2514,9 @@ impl Assembler386 {
             }
             OpCode::GuardNotInvalidated => {
                 self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
+            }
+            OpCode::GuardAlwaysFails => {
+                self.implement_guard_always_fails_with_faillocs(op, op_index, fail_index, faillocs);
             }
             _ => {
                 self.implement_guard_nojump_with_faillocs(op, op_index, fail_index, faillocs);
@@ -2498,10 +2544,214 @@ impl Assembler386 {
                 let expected_typeid = self
                     .lookup_typeid_from_classptr(i.value as usize)
                     .expect("GuardClass: missing typeid for classptr");
-                let typeid_i32 = expected_typeid as i32;
-                dynasm!(self.mc ; .arch x64 ; cmp DWORD [Rq(obj.value)], typeid_i32);
+                self._cmp_guard_gc_type(
+                    &Loc::Reg(*obj),
+                    &Loc::Immed(crate::regloc::ImmedLoc::new(expected_typeid as i64)),
+                );
             }
         }
+    }
+
+    fn require_guard_gc_type_info(&self, guard_name: &'static str) -> GuardGcTypeInfo {
+        self.guard_gc_type_info.unwrap_or_else(|| {
+            panic!(
+                "{} requires cpu.supports_guard_gc_type and a TYPE_INFO layout",
+                guard_name
+            )
+        })
+    }
+
+    fn lookup_subclass_range(&self, classptr: usize) -> Option<(i64, i64)> {
+        self.classptr_to_subclass_range
+            .get(&(classptr as i64))
+            .copied()
+    }
+
+    fn emit_load_gc_typeid_into_reg(&mut self, obj_reg: u8, dst_reg: u8) {
+        let tid_ofs = -(majit_gc::header::GcHeader::SIZE as i32);
+        dynasm!(self.mc ; .arch x64 ; mov Rd(dst_reg), [Rq(obj_reg) + tid_ofs]);
+    }
+
+    /// x86/assembler.py:1893-1901 `_cmp_guard_gc_type`, adjusted for
+    /// majit's object pointer: the GC header word lives at
+    /// `obj - GcHeader::SIZE`, and a 32-bit load zero-extends the type id.
+    fn _cmp_guard_gc_type(&mut self, obj_loc: &Loc, expected_typeid_loc: &Loc) {
+        let Loc::Reg(obj) = obj_loc else {
+            return;
+        };
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        self.emit_load_gc_typeid_into_reg(obj.value, scratch);
+        match expected_typeid_loc {
+            Loc::Reg(expected) => {
+                dynasm!(self.mc ; .arch x64 ; cmp Rq(scratch), Rq(expected.value));
+            }
+            Loc::Frame(frame) => {
+                let ofs = frame.ebp_loc.value;
+                dynasm!(self.mc ; .arch x64 ; cmp Rq(scratch), [rbp + ofs]);
+            }
+            Loc::Immed(expected) => {
+                let expected_i32 = expected.value as i32;
+                dynasm!(self.mc ; .arch x64 ; cmp Rq(scratch), expected_i32);
+            }
+            _ => {}
+        }
+    }
+
+    /// x86/assembler.py:1924-1943 `genop_guard_guard_is_object`.
+    fn emit_guard_is_object(&mut self, obj_loc: &Loc, typeid_loc: &Loc) {
+        let info = self.require_guard_gc_type_info("GUARD_IS_OBJECT");
+        let (Loc::Reg(obj), Loc::Reg(typeid)) = (obj_loc, typeid_loc) else {
+            return;
+        };
+        self.emit_load_gc_typeid_into_reg(obj.value, typeid.value);
+        if info.shift_by > 0 {
+            let shift = info.shift_by as i8;
+            dynasm!(self.mc ; .arch x64 ; shl Rq(typeid.value), shift);
+        }
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        let base_type_info = info.base_type_info as i64;
+        let infobits_offset = info.infobits_offset as i32;
+        let is_object_flag = info.is_object_flag as i8;
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD base_type_info
+            ; add Rq(typeid.value), Rq(scratch)
+            ; test BYTE [Rq(typeid.value) + infobits_offset], is_object_flag
+        );
+    }
+
+    /// x86/assembler.py:1945-1980 `genop_guard_guard_subclass`.
+    fn emit_guard_subclass(&mut self, obj_loc: &Loc, class_loc: &Loc, tmp_loc: &Loc) {
+        let info = self.require_guard_gc_type_info("GUARD_SUBCLASS");
+        let (Loc::Reg(obj), Loc::Immed(classptr), Loc::Reg(tmp)) = (obj_loc, class_loc, tmp_loc)
+        else {
+            panic!(
+                "GUARD_SUBCLASS expects [Reg object, Immed classptr, Reg tmp] \
+                 like x86/assembler.py:1947"
+            );
+        };
+        let (check_min, check_max) = self
+            .lookup_subclass_range(classptr.value as usize)
+            .unwrap_or_else(|| {
+                panic!(
+                    "GUARD_SUBCLASS missing subclassrange_min/max for classptr {:#x}",
+                    classptr.value
+                )
+            });
+        if let Some(vtable_offset) = self.vtable_offset {
+            let offset = vtable_offset as i32;
+            let offset2 = info.subclassrange_min_offset as i32;
+            dynasm!(self.mc ; .arch x64
+                ; mov Rq(tmp.value), [Rq(obj.value) + offset]
+                ; mov Rq(tmp.value), [Rq(tmp.value) + offset2]
+            );
+        } else {
+            self.emit_load_gc_typeid_into_reg(obj.value, tmp.value);
+            if info.shift_by > 0 {
+                let shift = info.shift_by as i8;
+                dynasm!(self.mc ; .arch x64 ; shl Rq(tmp.value), shift);
+            }
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            let base =
+                (info.base_type_info + info.sizeof_ti + info.subclassrange_min_offset) as i64;
+            dynasm!(self.mc ; .arch x64
+                ; mov Rq(scratch), QWORD base
+                ; add Rq(tmp.value), Rq(scratch)
+                ; mov Rq(tmp.value), [Rq(tmp.value)]
+            );
+        }
+        self.emit_sub_imm64(tmp.value, check_min);
+        self.emit_cmp_imm64(tmp.value, check_max - check_min);
+    }
+
+    fn emit_sub_imm64(&mut self, reg: u8, value: i64) {
+        if let Ok(v) = i32::try_from(value) {
+            dynasm!(self.mc ; .arch x64 ; sub Rq(reg), v);
+        } else {
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            dynasm!(self.mc ; .arch x64
+                ; mov Rq(scratch), QWORD value
+                ; sub Rq(reg), Rq(scratch)
+            );
+        }
+    }
+
+    fn emit_cmp_imm64(&mut self, reg: u8, value: i64) {
+        if let Ok(v) = i32::try_from(value) {
+            dynasm!(self.mc ; .arch x64 ; cmp Rq(reg), v);
+        } else {
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+            dynasm!(self.mc ; .arch x64
+                ; mov Rq(scratch), QWORD value
+                ; cmp Rq(reg), Rq(scratch)
+            );
+        }
+    }
+
+    fn emit_cmp_reg_loc_i64(&mut self, reg: u8, loc: &Loc) {
+        match loc {
+            Loc::Reg(other) => {
+                dynasm!(self.mc ; .arch x64 ; cmp Rq(reg), Rq(other.value));
+            }
+            Loc::Frame(frame) => {
+                let ofs = frame.ebp_loc.value;
+                dynasm!(self.mc ; .arch x64 ; cmp Rq(reg), [rbp + ofs]);
+            }
+            Loc::Immed(value) => self.emit_cmp_imm64(reg, value.value),
+            _ => {}
+        }
+    }
+
+    /// x86/assembler.py:1808-1815 `genop_guard_guard_exception`.
+    fn emit_guard_exception(&mut self, expected_loc: &Loc, tmp_loc: &Loc) {
+        let Loc::Reg(tmp) = tmp_loc else {
+            return;
+        };
+        let exc_type_addr = crate::jit_exc_type_addr() as i64;
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(tmp.value), QWORD exc_type_addr
+            ; mov Rq(tmp.value), [Rq(tmp.value)]
+        );
+        self.emit_cmp_reg_loc_i64(tmp.value, expected_loc);
+    }
+
+    /// `_store_and_reset_exception`: result = pos_exc_value; clear both
+    /// pos_exception and pos_exc_value on the success fallthrough.
+    fn emit_store_and_reset_exception(&mut self, result_loc: Option<&Loc>) {
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        let exc_value_addr = crate::jit_exc_value_addr() as i64;
+        let exc_type_addr = crate::jit_exc_type_addr() as i64;
+        if let Some(loc) = result_loc {
+            dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), QWORD exc_value_addr);
+            match loc {
+                Loc::Reg(dst) => {
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(scratch)]);
+                }
+                Loc::Frame(frame) => {
+                    let ofs = frame.ebp_loc.value;
+                    dynasm!(self.mc ; .arch x64
+                        ; mov Rq(scratch), [Rq(scratch)]
+                        ; mov [rbp + ofs], Rq(scratch)
+                    );
+                }
+                _ => {}
+            }
+        }
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD exc_value_addr
+            ; mov QWORD [Rq(scratch)], 0
+            ; mov Rq(scratch), QWORD exc_type_addr
+            ; mov QWORD [Rq(scratch)], 0
+        );
+    }
+
+    /// x86/assembler.py:1797-1801 `generate_guard_no_exception`.
+    fn emit_cmp_no_exception(&mut self) {
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        let exc_value_addr = crate::jit_exc_value_addr() as i64;
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD exc_value_addr
+            ; cmp QWORD [Rq(scratch)], 0
+        );
     }
 
     /// Emit SETcc into a register (zero-extend to 64-bit).
@@ -2612,6 +2862,18 @@ impl Assembler386 {
         faillocs: &[Option<Loc>],
     ) {
         let fail_label = self.mc.new_dynamic_label();
+        self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
+    }
+
+    fn implement_guard_always_fails_with_faillocs(
+        &mut self,
+        op: &Op,
+        op_index: usize,
+        fail_index: u32,
+        faillocs: &[Option<Loc>],
+    ) {
+        let fail_label = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch x64 ; jmp =>fail_label);
         self.append_guard_token_with_faillocs(op, op_index, fail_index, fail_label, faillocs);
     }
 

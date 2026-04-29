@@ -8,6 +8,7 @@
 ///   jump(i1)        → label
 ///   finish(i1)      [on guard failure]
 use std::collections::HashMap;
+use std::sync::{LazyLock, Mutex};
 
 use majit_backend::{Backend, JitCellToken};
 use majit_ir::{
@@ -15,6 +16,8 @@ use majit_ir::{
 };
 
 use majit_backend_dynasm::runner::DynasmBackend;
+
+static EXCEPTION_TEST_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
 #[test]
 fn test_just_finish() {
@@ -416,4 +419,285 @@ fn test_float_loop_carried_across_jump() {
         sum
     );
     assert_eq!(index, 5, "expected guard failure at i=5");
+}
+
+#[test]
+fn test_gc_typeinfo_guards_use_dynasm_emit() {
+    let mut gc = majit_gc::collector::MiniMarkGC::new();
+    let root_tid = gc.register_type(majit_gc::TypeInfo::object(16));
+    let child_tid = gc.register_type(majit_gc::TypeInfo::object_subclass(16, root_tid));
+    let root_vtable: usize = 0x1234_5000;
+    let child_vtable: usize = 0x1234_6000;
+    majit_gc::GcAllocator::register_vtable_for_type(&mut gc, root_vtable, root_tid);
+    majit_gc::GcAllocator::register_vtable_for_type(&mut gc, child_vtable, child_tid);
+    let child_obj = gc.alloc_with_type(child_tid, 16);
+
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    backend.set_gc_allocator(Box::new(gc));
+    let mut token = JitCellToken::new(41);
+
+    let const_child_tid = OpRef::from_const(1);
+    let const_root_vtable = OpRef::from_const(2);
+    let mut constants = HashMap::new();
+    constants.insert(const_child_tid.0, child_tid as i64);
+    constants.insert(const_root_vtable.0, root_vtable as i64);
+    backend.set_constants(constants);
+
+    let inputargs = vec![InputArg {
+        tp: Type::Ref,
+        index: 0,
+    }];
+
+    let mut guard_gc_type = Op::new(OpCode::GuardGcType, &[OpRef(0), const_child_tid]);
+    guard_gc_type.pos = OpRef(1);
+    guard_gc_type.fail_arg_types = Some(vec![]);
+    guard_gc_type.fail_args = Some(vec![].into());
+
+    let mut guard_is_object = Op::new(OpCode::GuardIsObject, &[OpRef(0)]);
+    guard_is_object.pos = OpRef(2);
+    guard_is_object.fail_arg_types = Some(vec![]);
+    guard_is_object.fail_args = Some(vec![].into());
+
+    let mut guard_subclass = Op::new(OpCode::GuardSubclass, &[OpRef(0), const_root_vtable]);
+    guard_subclass.pos = OpRef(3);
+    guard_subclass.fail_arg_types = Some(vec![]);
+    guard_subclass.fail_args = Some(vec![].into());
+
+    let mut finish_op = Op::new(OpCode::Finish, &[]);
+    finish_op.pos = OpRef(4);
+    finish_op.fail_arg_types = Some(vec![]);
+    finish_op.fail_args = Some(vec![].into());
+
+    let ops = vec![guard_gc_type, guard_is_object, guard_subclass, finish_op];
+    let result = backend.compile_loop(&inputargs, &ops, &mut token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let frame = backend.execute_token(&token, &[Value::Ref(child_obj)]);
+    let descr = backend.get_latest_descr(&frame);
+    assert!(descr.is_finish(), "all GC type-info guards should pass");
+}
+
+#[test]
+fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
+    {
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let root_tid = gc.register_type(majit_gc::TypeInfo::object(16));
+        let child_tid = gc.register_type(majit_gc::TypeInfo::object_subclass(16, root_tid));
+        let child_vtable: usize = 0x1235_6000;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, child_vtable, child_tid);
+        let root_obj = gc.alloc_with_type(root_tid, 16);
+
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        backend.set_gc_allocator(Box::new(gc));
+        let mut token = JitCellToken::new(45);
+
+        let const_child_tid = OpRef::from_const(1);
+        let mut constants = HashMap::new();
+        constants.insert(const_child_tid.0, child_tid as i64);
+        backend.set_constants(constants);
+
+        let inputargs = vec![InputArg {
+            tp: Type::Ref,
+            index: 0,
+        }];
+        let mut guard_gc_type = Op::new(OpCode::GuardGcType, &[OpRef(0), const_child_tid]);
+        guard_gc_type.pos = OpRef(1);
+        guard_gc_type.fail_arg_types = Some(vec![Type::Ref]);
+        guard_gc_type.fail_args = Some(vec![OpRef(0)].into());
+        let mut finish_op = Op::new(OpCode::Finish, &[]);
+        finish_op.pos = OpRef(2);
+        finish_op.fail_arg_types = Some(vec![]);
+        finish_op.fail_args = Some(vec![].into());
+
+        let result = backend.compile_loop(&inputargs, &[guard_gc_type, finish_op], &mut token);
+        assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+        let frame = backend.execute_token(&token, &[Value::Ref(root_obj)]);
+        assert!(
+            !backend.get_latest_descr(&frame).is_finish(),
+            "GUARD_GC_TYPE should side-exit on typeid mismatch"
+        );
+        assert_eq!(backend.get_ref_value(&frame, 0), root_obj);
+    }
+
+    {
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let raw_tid = gc.register_type(majit_gc::TypeInfo::simple(16));
+        let raw_obj = gc.alloc_with_type(raw_tid, 16);
+
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        backend.set_gc_allocator(Box::new(gc));
+        let mut token = JitCellToken::new(46);
+
+        let inputargs = vec![InputArg {
+            tp: Type::Ref,
+            index: 0,
+        }];
+        let mut guard_is_object = Op::new(OpCode::GuardIsObject, &[OpRef(0)]);
+        guard_is_object.pos = OpRef(1);
+        guard_is_object.fail_arg_types = Some(vec![Type::Ref]);
+        guard_is_object.fail_args = Some(vec![OpRef(0)].into());
+        let mut finish_op = Op::new(OpCode::Finish, &[]);
+        finish_op.pos = OpRef(2);
+        finish_op.fail_arg_types = Some(vec![]);
+        finish_op.fail_args = Some(vec![].into());
+
+        let result = backend.compile_loop(&inputargs, &[guard_is_object, finish_op], &mut token);
+        assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+        let frame = backend.execute_token(&token, &[Value::Ref(raw_obj)]);
+        assert!(
+            !backend.get_latest_descr(&frame).is_finish(),
+            "GUARD_IS_OBJECT should side-exit for non-rclass object types"
+        );
+        assert_eq!(backend.get_ref_value(&frame, 0), raw_obj);
+    }
+
+    {
+        let mut gc = majit_gc::collector::MiniMarkGC::new();
+        let root_a_tid = gc.register_type(majit_gc::TypeInfo::object(16));
+        let root_b_tid = gc.register_type(majit_gc::TypeInfo::object(16));
+        let root_a_vtable: usize = 0x1236_5000;
+        let root_b_vtable: usize = 0x1236_7000;
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, root_a_vtable, root_a_tid);
+        majit_gc::GcAllocator::register_vtable_for_type(&mut gc, root_b_vtable, root_b_tid);
+        let root_b_obj = gc.alloc_with_type(root_b_tid, 16);
+
+        let mut backend = DynasmBackend::new();
+        backend.attach_default_test_descrs();
+        backend.set_gc_allocator(Box::new(gc));
+        let mut token = JitCellToken::new(47);
+
+        let const_root_a_vtable = OpRef::from_const(1);
+        let mut constants = HashMap::new();
+        constants.insert(const_root_a_vtable.0, root_a_vtable as i64);
+        backend.set_constants(constants);
+
+        let inputargs = vec![InputArg {
+            tp: Type::Ref,
+            index: 0,
+        }];
+        let mut guard_subclass = Op::new(OpCode::GuardSubclass, &[OpRef(0), const_root_a_vtable]);
+        guard_subclass.pos = OpRef(1);
+        guard_subclass.fail_arg_types = Some(vec![Type::Ref]);
+        guard_subclass.fail_args = Some(vec![OpRef(0)].into());
+        let mut finish_op = Op::new(OpCode::Finish, &[]);
+        finish_op.pos = OpRef(2);
+        finish_op.fail_arg_types = Some(vec![]);
+        finish_op.fail_args = Some(vec![].into());
+
+        let result = backend.compile_loop(&inputargs, &[guard_subclass, finish_op], &mut token);
+        assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+        let frame = backend.execute_token(&token, &[Value::Ref(root_b_obj)]);
+        assert!(
+            !backend.get_latest_descr(&frame).is_finish(),
+            "GUARD_SUBCLASS should side-exit outside the expected subclass range"
+        );
+        assert_eq!(backend.get_ref_value(&frame, 0), root_b_obj);
+    }
+}
+
+#[test]
+fn test_exception_guards_use_dynasm_emit() {
+    let _guard = EXCEPTION_TEST_LOCK.lock().unwrap();
+    majit_backend_dynasm::jit_exc_clear();
+
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let mut token = JitCellToken::new(42);
+
+    let expected_class = 0x5151_0000_i64;
+    let const_expected_class = OpRef::from_const(1);
+    let mut constants = HashMap::new();
+    constants.insert(const_expected_class.0, expected_class);
+    backend.set_constants(constants);
+
+    let inputargs = vec![];
+
+    let mut guard_exception = Op::new(OpCode::GuardException, &[const_expected_class]);
+    guard_exception.pos = OpRef(0);
+    guard_exception.fail_arg_types = Some(vec![]);
+    guard_exception.fail_args = Some(vec![].into());
+
+    let mut finish_op = Op::new(OpCode::Finish, &[OpRef(0)]);
+    finish_op.pos = OpRef(1);
+    finish_op.fail_arg_types = Some(vec![Type::Ref]);
+    finish_op.fail_args = Some(vec![OpRef(0)].into());
+
+    let ops = vec![guard_exception, finish_op];
+    let result = backend.compile_loop(&inputargs, &ops, &mut token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let mut exc_obj = vec![expected_class as usize, 0usize];
+    let exc_ref = GcRef(exc_obj.as_mut_ptr() as usize);
+    majit_backend_dynasm::jit_exc_raise(exc_ref.0 as i64);
+
+    let frame = backend.execute_token(&token, &[]);
+    let descr = backend.get_latest_descr(&frame);
+    assert!(descr.is_finish(), "matching GUARD_EXCEPTION should pass");
+    assert_eq!(backend.get_ref_value(&frame, 0), exc_ref);
+    assert!(!majit_backend_dynasm::jit_exc_is_pending());
+
+    majit_backend_dynasm::jit_exc_clear();
+}
+
+#[test]
+fn test_guard_no_exception_and_always_fails_emit_side_exits() {
+    let _guard = EXCEPTION_TEST_LOCK.lock().unwrap();
+    majit_backend_dynasm::jit_exc_clear();
+
+    let mut backend = DynasmBackend::new();
+    backend.attach_default_test_descrs();
+    let mut token = JitCellToken::new(43);
+
+    let inputargs = vec![];
+    let mut guard_no_exception = Op::new(OpCode::GuardNoException, &[]);
+    guard_no_exception.pos = OpRef(0);
+    guard_no_exception.fail_arg_types = Some(vec![]);
+    guard_no_exception.fail_args = Some(vec![].into());
+
+    let mut finish_op = Op::new(OpCode::Finish, &[]);
+    finish_op.pos = OpRef(1);
+    finish_op.fail_arg_types = Some(vec![]);
+    finish_op.fail_args = Some(vec![].into());
+
+    let ops = vec![guard_no_exception, finish_op];
+    let result = backend.compile_loop(&inputargs, &ops, &mut token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+
+    let frame = backend.execute_token(&token, &[]);
+    assert!(
+        backend.get_latest_descr(&frame).is_finish(),
+        "GUARD_NO_EXCEPTION should pass with clear exception state"
+    );
+
+    let mut exc_obj = vec![0x6161_0000_usize, 0usize];
+    majit_backend_dynasm::jit_exc_raise(exc_obj.as_mut_ptr() as i64);
+    let frame = backend.execute_token(&token, &[]);
+    assert!(
+        !backend.get_latest_descr(&frame).is_finish(),
+        "GUARD_NO_EXCEPTION should side-exit with pending exception"
+    );
+    majit_backend_dynasm::jit_exc_clear();
+
+    let mut always_backend = DynasmBackend::new();
+    always_backend.attach_default_test_descrs();
+    let mut always_token = JitCellToken::new(44);
+    let mut guard_always_fails = Op::new(OpCode::GuardAlwaysFails, &[]);
+    guard_always_fails.pos = OpRef(0);
+    guard_always_fails.fail_arg_types = Some(vec![]);
+    guard_always_fails.fail_args = Some(vec![].into());
+    let mut finish_op = Op::new(OpCode::Finish, &[]);
+    finish_op.pos = OpRef(1);
+    finish_op.fail_arg_types = Some(vec![]);
+    finish_op.fail_args = Some(vec![].into());
+    let ops = vec![guard_always_fails, finish_op];
+    let result = always_backend.compile_loop(&[], &ops, &mut always_token);
+    assert!(result.is_ok(), "compile_loop failed: {:?}", result.err());
+    let frame = always_backend.execute_token(&always_token, &[]);
+    assert!(
+        !always_backend.get_latest_descr(&frame).is_finish(),
+        "GUARD_ALWAYS_FAILS should side-exit unconditionally"
+    );
 }

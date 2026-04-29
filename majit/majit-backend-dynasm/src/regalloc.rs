@@ -2505,12 +2505,16 @@ impl RegAlloc {
                     output.push(RegAllocOp::Skip);
                 }
             }
-            GuardKind::Class
-            | GuardKind::GcType
-            | GuardKind::Subclass
-            | GuardKind::NonNullClass => {
+            GuardKind::Class | GuardKind::GcType | GuardKind::NonNullClass => {
                 if args.len() >= 2 {
                     self.consider_guard_class_j2(args[0], args[1], fail_args, i, output);
+                } else {
+                    output.push(RegAllocOp::Skip);
+                }
+            }
+            GuardKind::Subclass => {
+                if args.len() >= 2 {
+                    self.consider_guard_subclass_j2(args[0], args[1], fail_args, i, output);
                 } else {
                     output.push(RegAllocOp::Skip);
                 }
@@ -3708,6 +3712,41 @@ impl RegAlloc {
         #[cfg(not(target_arch = "x86_64"))]
         {
             self.perform_guard_j2(fail_args, i, vec![x], None, output);
+        }
+    }
+
+    fn consider_guard_subclass_j2(
+        &mut self,
+        value: OpRef,
+        class: OpRef,
+        fail_args: &[OpRef],
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let x = self.make_sure_var_in_reg(value, Type::Ref, &[], None, false);
+        let y = self.loc(class, Type::Int);
+        #[cfg(target_arch = "x86_64")]
+        {
+            let tmp = OpRef(u32::MAX - 4);
+            if !self.longevity.contains(tmp) {
+                self.longevity
+                    .set(tmp, Lifetime::new(self.rm.position, self.rm.position));
+            }
+            let loc_tmp = Loc::Reg(self.rm.force_allocate_reg(
+                tmp,
+                &[value],
+                None,
+                false,
+                &mut self.longevity,
+                &mut self.fm,
+            ));
+            self.rm
+                .possibly_free_var(tmp, &mut self.longevity, &mut self.fm, Type::Int);
+            self.perform_guard_j2(fail_args, i, vec![x, y, loc_tmp], None, output);
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            self.perform_guard_j2(fail_args, i, vec![x, y], None, output);
         }
     }
 
