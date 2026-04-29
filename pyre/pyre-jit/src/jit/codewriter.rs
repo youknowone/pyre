@@ -2249,30 +2249,14 @@ fn filter_liveness_in_place(
                 }
             }
         }
-        // Force-add of `live_stack_colors` once lived here. Task #158
-        // slice B moved the "all stack slots up to current depth hold a
-        // live box" runtime contract to `consume_one_section`
-        // (`call_jit.rs::resume_in_blackhole`), which copies any color
-        // in `stack_slot_color_map[..depth_at_py_pc[py_pc]]` not in
-        // `live_r` from the heap PyFrame via `vable_read_array_item`.
-        // The codewriter `live_r` now mirrors RPython's
-        // `liveness.py:67-75` SSA-driven alive set alone — every alive
-        // Register pushed in encounter order with seen-set dedup, no
-        // pyre-only widening.
-        // liveness.  RPython's `liveness.py:19-76` produces a single
-        // SSA-driven alive set as the sole authority — there is no
-        // per-bytecode local-liveness narrowing layered on top.  Pyre's
-        // tracer + blackhole register-file decode (the
-        // `semantic_ref_slot_for_reg_color` path at
-        // `pyre-jit-trace/src/state.rs`) is still wired to the Python
-        // LV answer for locals (which omits function parameters at pc=0
-        // and dead locals); SSA-only widening here would make those
-        // decode sites read uninitialised slots.  Convergence path:
-        // SSA-authoritative live_r — Task #110 +
-        // `phase4_ssa_liveness_blocker_2026_04_18.md`.  Multi-session
-        // epic; remove this `live_r.retain` only when both the tracer
-        // encoder and the BH decoder consume the SSA-driven liveness
-        // directly.
+        // The codewriter `live_r` mirrors RPython's `liveness.py:19-76`
+        // SSA-driven alive set — every alive Register pushed in encounter
+        // order with seen-set dedup, no pyre-only widening. The LV∩SSA
+        // `live_r.retain` below is a PRE-EXISTING-ADAPTATION that
+        // compensates for chordal regalloc collapsing scratch colors onto
+        // pinned Python-frame colors (file-top doc explains the failure
+        // mode); convergence path is graph regalloc with separate scratch
+        // color space (Task #158 item 4).
         let lv_live: std::collections::BTreeSet<u16> = {
             let mut s: std::collections::BTreeSet<u16> = (0..nlocals)
                 .filter(|&idx| live_vars.is_local_live(py_pc, idx))
