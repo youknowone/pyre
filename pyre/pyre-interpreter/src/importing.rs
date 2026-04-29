@@ -2213,7 +2213,7 @@ fn init_posix(ns: &mut DictStorage) {
                 .map_err(|_| crate::PyError::value_error("embedded null in path"))?;
             #[cfg(unix)]
             let ret = unsafe { libc::mkdir(c_path.as_ptr(), _mode as libc::mode_t) };
-            #[cfg(not(unix))]
+            #[cfg(windows)]
             let ret = unsafe { libc::mkdir(c_path.as_ptr()) };
             if ret < 0 {
                 return Err(io_err(std::io::Error::last_os_error(), &path));
@@ -2434,14 +2434,16 @@ fn init_posix(ns: &mut DictStorage) {
                 meta.ctime() * 1_000_000_000 + meta.ctime_nsec(),
             )
         };
-        #[cfg(not(unix))]
+        #[cfg(windows)]
         let (st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid, st_size,
              st_atime, st_mtime, st_ctime, st_atime_ns, st_mtime_ns, st_ctime_ns) = {
             use std::os::windows::fs::MetadataExt;
-            // Synthesize a Unix-like st_mode from file attributes.
+            let ft = meta.file_type();
             let attrs = meta.file_attributes();
-            let mode: i64 = if attrs & 0x10 != 0 {
-                // FILE_ATTRIBUTE_DIRECTORY
+            let mode: i64 = if ft.is_symlink() {
+                // S_IFLNK | 0o777
+                0o120777
+            } else if ft.is_dir() {
                 0o40755
             } else if attrs & 0x1 != 0 {
                 // FILE_ATTRIBUTE_READONLY
