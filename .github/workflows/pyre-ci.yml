@@ -28,11 +28,12 @@ permissions:
 
 jobs:
   cargo-test:
-    name: cargo test (${{ matrix.backend }})
-    runs-on: ubuntu-24.04
+    name: cargo test (${{ matrix.os }}, ${{ matrix.backend }})
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
         backend: [dynasm, cranelift]
 
     steps:
@@ -40,27 +41,32 @@ jobs:
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
     - name: Run cargo test for ${{ matrix.backend }}
-      run: |
-        case "${{ matrix.backend }}" in
-          dynasm)
-            cargo test --all --no-default-features --features dynasm
-            ;;
-          cranelift)
-            cargo test --all --no-default-features --features cranelift
-            ;;
-        esac
+      run: cargo test --all --no-default-features --features ${{ matrix.backend }}
 
   pyre-check:
-    name: pyre/check.py
-    runs-on: ubuntu-24.04
+    name: pyre/check.py (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, macos-latest, windows-latest]
 
     steps:
     - uses: actions/checkout@v4
     - uses: dtolnay/rust-toolchain@stable
+    - name: Set up CPython
+      id: cpython
+      uses: actions/setup-python@v5
+      with:
+        python-version: "3.14"
+    - name: Set up PyPy
+      id: pypy
+      uses: actions/setup-python@v5
+      with:
+        python-version: "pypy3.11"
     - uses: Swatinem/rust-cache@v2
-    - name: Install PyPy
-      run: |
-        sudo apt-get update
-        sudo apt-get install -y pypy3
     - name: Run pyre/check.py
-      run: python3 pyre/check.py
+      env:
+        PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}
+        PYRE_CHECK_PYPY3: ${{ steps.pypy.outputs.python-path }}
+      run: ${{ steps.cpython.outputs.python-path }} pyre/check.py

@@ -13,8 +13,12 @@ import time
 from pathlib import Path
 
 EXE = ".exe" if sys.platform == "win32" else ""
-PYTHON3 = "python3" if shutil.which("python3") else "python"
-PYPY3 = "pypy3" if shutil.which("pypy3") else "pypy"
+PYTHON3 = os.environ.get("PYRE_CHECK_PYTHON3") or (
+    "python3" if shutil.which("python3") else "python"
+)
+PYPY3 = os.environ.get("PYRE_CHECK_PYPY3") or (
+    "pypy3" if shutil.which("pypy3") else "pypy"
+)
 
 BENCH_DIR = "pyre/bench"
 SNAP_DIR = "pyre/check.snap"
