@@ -28,29 +28,33 @@ pub fn with_writable<F: FnOnce()>(addr: *mut u8, len: usize, f: F) {
         let page_ptr = page_start as *mut libc::c_void;
 
         let rc1 = unsafe { libc::mprotect(page_ptr, mprotect_len, libc::PROT_READ | libc::PROT_WRITE) };
-        if rc1 != 0 {
-            eprintln!(
-                "[dynasm] mprotect RW failed: addr={:?} len={} errno={}",
-                page_ptr,
-                mprotect_len,
-                std::io::Error::last_os_error()
-            );
-        }
-        f();
-        let rc2 = unsafe { libc::mprotect(page_ptr, mprotect_len, libc::PROT_READ | libc::PROT_EXEC) };
-        if rc2 != 0 {
-            eprintln!(
-                "[dynasm] mprotect RX failed: addr={:?} len={} errno={}",
-                page_ptr,
-                mprotect_len,
-                std::io::Error::last_os_error()
-            );
-        }
+        assert!(
+            rc1 == 0,
+            "[dynasm] mprotect RW failed: addr={:?} len={} errno={}",
+            page_ptr,
+            mprotect_len,
+            std::io::Error::last_os_error()
+        );
 
-        #[cfg(target_arch = "aarch64")]
-        {
-            flush_icache_range(page_start as *const u8, mprotect_len);
+        struct RestoreRx { ptr: *mut libc::c_void, len: usize }
+        impl Drop for RestoreRx {
+            fn drop(&mut self) {
+                let rc = unsafe { libc::mprotect(self.ptr, self.len, libc::PROT_READ | libc::PROT_EXEC) };
+                assert!(
+                    rc == 0,
+                    "[dynasm] mprotect RX failed: addr={:?} len={} errno={}",
+                    self.ptr,
+                    self.len,
+                    std::io::Error::last_os_error()
+                );
+                #[cfg(target_arch = "aarch64")]
+                {
+                    flush_icache_range(self.ptr as *const u8, self.len);
+                }
+            }
         }
+        let _guard = RestoreRx { ptr: page_ptr, len: mprotect_len };
+        f();
     }
 
     #[cfg(windows)]
@@ -79,20 +83,30 @@ pub fn with_writable<F: FnOnce()>(addr: *mut u8, len: usize, f: F) {
 
         let mut old_protect: u32 = 0;
         let rc1 = unsafe { VirtualProtect(page_ptr, region_len, PAGE_READWRITE, &mut old_protect) };
-        if rc1 == 0 {
-            eprintln!(
-                "[dynasm] VirtualProtect RW failed: addr={:?} len={} err={}",
-                page_ptr, region_len, std::io::Error::last_os_error()
-            );
+        assert!(
+            rc1 != 0,
+            "[dynasm] VirtualProtect RW failed: addr={:?} len={} err={}",
+            page_ptr, region_len, std::io::Error::last_os_error()
+        );
+
+        struct RestoreRx { ptr: *mut u8, len: usize }
+        impl Drop for RestoreRx {
+            fn drop(&mut self) {
+                const PAGE_EXECUTE_READ: u32 = 0x20;
+                unsafe extern "system" {
+                    fn VirtualProtect(addr: *mut u8, size: usize, new: u32, old: *mut u32) -> i32;
+                }
+                let mut old: u32 = 0;
+                let rc = unsafe { VirtualProtect(self.ptr, self.len, PAGE_EXECUTE_READ, &mut old) };
+                assert!(
+                    rc != 0,
+                    "[dynasm] VirtualProtect RX failed: addr={:?} len={} err={}",
+                    self.ptr, self.len, std::io::Error::last_os_error()
+                );
+            }
         }
+        let _guard = RestoreRx { ptr: page_ptr, len: region_len };
         f();
-        let rc2 = unsafe { VirtualProtect(page_ptr, region_len, PAGE_EXECUTE_READ, &mut old_protect) };
-        if rc2 == 0 {
-            eprintln!(
-                "[dynasm] VirtualProtect RX failed: addr={:?} len={} err={}",
-                page_ptr, region_len, std::io::Error::last_os_error()
-            );
-        }
     }
 }
 
