@@ -205,12 +205,12 @@ use crate::helpers::TraceHelperAccess;
 ///
 /// `PyreSym.vable_*` is a pyre-only parallel symbolic cache that
 /// RPython does not have — RPython's `metainterp.virtualizable_boxes`
-/// is the single canonical source for vable static state.  Every
-/// direct `s.vable_X = opref` write on the **owning** sym (root frame
-/// or bridge entry) must publish into the boxes shadow as well so
-/// future readers (`gen_writeback_vable_to_heap`, snapshot
-/// construction, JUMP-arg dedup) observe the same identity.  Callers
-/// gate on `s.owns_virtualizable_shadow()` before calling — upstream
+/// is the single canonical source for vable static state.  Setfield-
+/// vable opcodes (`_opimpl_setfield_vable`) and the JUMP-time
+/// writeback path (`flush_to_frame`) publish into the boxes shadow so
+/// future readers (`gen_writeback_vable_to_heap`, JUMP-arg dedup)
+/// observe the same identity as `s.vable_*`.  Callers gate on
+/// `s.owns_virtualizable_shadow()` before calling — upstream
 /// `_opimpl_setfield_vable` short-circuits on
 /// `_nonstandard_virtualizable` so callee inline frames never reach
 /// the `metainterp.virtualizable_boxes[index] = valuebox` write, and
@@ -218,6 +218,14 @@ use crate::helpers::TraceHelperAccess;
 /// via `PyreSym::new_uninit` keep `vable_array_base` /
 /// `bridge_local_oprefs` `None` so `owns_virtualizable_shadow()`
 /// returns false for them).
+///
+/// Snapshot capture (`flush_to_frame_for_guard`) intentionally does
+/// NOT mirror — its only consumer is `list_of_boxes_virtualizable`
+/// which reads from `s.vable_*` directly (Issue #2 PRE-EXISTING-
+/// ADAPTATION reader), so a shadow write would only pollute parent
+/// frames mid-callee snapshot via
+/// `materialize_parent_snapshot_state`.  See
+/// `vable_shadow_split_brain_load_bearing_2026_04_28` memo.
 ///
 /// `static_field_name` matches the canonical PyFrame virtualizable
 /// spec at `virtualizable_spec.rs:11-18`
@@ -240,51 +248,6 @@ fn mirror_vable_static_to_boxes(
         .and_then(|info| info.static_field_index_by_name(static_field_name));
     if let Some(idx) = idx {
         ctx.set_virtualizable_entry_at(idx, opref, concrete);
-    }
-}
-
-/// PRE-EXISTING-ADAPTATION: snapshot a single virtualizable static
-/// slot of `ctx.virtualizable_boxes` for later restore.
-///
-/// Upstream `pyjitpl.py:2586-2602 capture_resumedata` saves only
-/// `frame.pc`; `metainterp.virtualizable_boxes` is read but never
-/// mutated during capture, so RPython has no shadow save/restore.
-///
-/// Pyre needs both halves because `flush_to_frame_for_guard` (called
-/// inside `generate_guard_core` and `record_branch_guard` immediately
-/// before capture) re-seeds the active sym's `s.vable_*` from the
-/// PyFrame heap and mirrors that into `ctx.virtualizable_boxes` on
-/// owning syms.  Without the matching boxes save/restore, the shadow
-/// holds the guard's resume-PC heap-read seed after capture and
-/// downstream consumers (writeback at JUMP, the next guard's
-/// snapshot) read a stale identity until the next
-/// `_opimpl_setfield_vable` mirror fires.  Naively dropping the
-/// save/restore intermittently regresses nbody / fannkuch / fib_recursive
-/// at the 5-second timeout (empirically reproduced when
-/// `metainterp.rs::saved_vable_static_box_entries` was removed in
-/// isolation).
-///
-/// Convergence path: move the guard heap re-seed out of the shared
-/// shadow (capture it directly into the snapshot's vable_boxes
-/// section) so `flush_to_frame_for_guard` is shadow-pure and the
-/// save/restore pair becomes a no-op that can drop together with
-/// `metainterp.rs::saved_vable_static_box_entries`.
-fn save_vable_static_entry(
-    ctx: &TraceCtx,
-    static_field_name: &str,
-) -> Option<(usize, OpRef, Value)> {
-    let idx = ctx
-        .virtualizable_info()?
-        .static_field_index_by_name(static_field_name)?;
-    let (opref, value) = ctx.virtualizable_entry_at(idx)?;
-    Some((idx, opref, value))
-}
-
-/// Companion of `save_vable_static_entry` — write the captured pair back
-/// into `virtualizable_boxes` if it was populated at save time.
-fn restore_vable_static_entry(ctx: &mut TraceCtx, saved: Option<(usize, OpRef, Value)>) {
-    if let Some((idx, opref, value)) = saved {
-        ctx.set_virtualizable_entry_at(idx, opref, value);
     }
 }
 
@@ -1048,7 +1011,7 @@ impl MIFrame {
             Type::Float => wrapfloat(ctx, value),
             _ => value,
         };
-        let (has_vable, reg_idx) = {
+        let (has_vable, reg_idx, new_vsd) = {
             let s = self.sym_mut();
             let stack_idx = s.valuestackdepth.saturating_sub(s.nlocals);
             let reg_idx = s.nlocals + stack_idx;
@@ -1065,7 +1028,8 @@ impl MIFrame {
             }
             s.concrete_stack[stack_idx] = concrete;
             s.valuestackdepth += 1;
-            (s.owns_virtualizable_shadow(), reg_idx)
+            let new_vsd = s.valuestackdepth;
+            (s.owns_virtualizable_shadow(), reg_idx, new_vsd)
         };
         // pyjitpl.py:1242-1247 `_opimpl_setarrayitem_vable` parity:
         //     self.metainterp.virtualizable_boxes[flat_idx] = valuebox
@@ -1118,6 +1082,22 @@ impl MIFrame {
                     ctx.set_virtualizable_box_at(flat_idx, boxed);
                 }
             }
+            // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity (Slice 2,
+            // Task #114). Each `setarrayitem_vable` advances the frame's
+            // valuestackdepth by one (`pyframe.pushvalue`); upstream emits a
+            // following `setfield_vable_i(virtualizable, vsd_descr, depth+1)`
+            // through the metainterp's vable shadow.  Mirror the same advance
+            // here so `s.vable_valuestackdepth` and the shadow's vsd scalar
+            // slot stay current between flushes instead of lagging behind
+            // until the next `flush_to_frame_for_guard` heap re-seed.
+            let vsd_op = ctx.const_int(new_vsd as i64);
+            self.sym_mut().vable_valuestackdepth = vsd_op;
+            mirror_vable_static_to_boxes(
+                ctx,
+                "valuestackdepth",
+                vsd_op,
+                Value::Int(new_vsd as i64),
+            );
         }
     }
 
@@ -1132,7 +1112,7 @@ impl MIFrame {
     }
 
     pub(crate) fn pop_value(&mut self, ctx: &mut TraceCtx) -> Result<OpRef, PyError> {
-        let (value, has_vable, reg_idx) = {
+        let (value, has_vable, owns_vable, reg_idx, new_vsd) = {
             let s = self.sym_mut();
             let nlocals = s.nlocals;
             let stack_idx = s
@@ -1151,6 +1131,7 @@ impl MIFrame {
             }
             let value = s.registers_r[reg_idx];
             s.valuestackdepth -= 1;
+            let new_vsd = s.valuestackdepth;
             // Task #136 partial: gating on `is_active_vable_owner`
             // intentionally does NOT cover bridges here. Unlike the other
             // four mirror sites (push_typed_value / swap_values /
@@ -1186,7 +1167,13 @@ impl MIFrame {
             // the vable shadow (multi-session) or teaching the bridge
             // optimizer to recognise cleared-stack-slot sentinels
             // separately from real null heap bases.
-            (value, s.is_active_vable_owner, reg_idx)
+            (
+                value,
+                s.is_active_vable_owner,
+                s.owns_virtualizable_shadow(),
+                reg_idx,
+                new_vsd,
+            )
         };
         // pyframe.py:411-417 `popvalue_maybe_none` parity: the popped slot
         // is cleared to None in `locals_cells_stack_w`. Upstream lowers
@@ -1200,6 +1187,26 @@ impl MIFrame {
             let null_opref = ctx.const_ref(pyre_object::PY_NULL as i64);
             let null_value = majit_ir::Value::Ref(majit_ir::GcRef(pyre_object::PY_NULL as usize));
             ctx.set_virtualizable_entry_at(flat_idx, null_opref, null_value);
+        }
+        // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity (Slice 2,
+        // Task #114). `pyframe.popvalue_maybe_none` decrements vsd as part
+        // of the same sequence that clears the array slot; upstream emits a
+        // `setfield_vable_i(virtualizable, vsd_descr, depth-1)` after the
+        // setarrayitem_vable_r clear.  The bridge NULL-base issue
+        // (Task #136 comment above) is specific to writing a const_ref(NULL)
+        // into a Ref-typed array slot; vsd is an Int scalar, so the bridge
+        // optimizer is unaffected and the gate stays at
+        // `owns_virtualizable_shadow()` to keep parity with
+        // `push_typed_value`.
+        if owns_vable {
+            let vsd_op = ctx.const_int(new_vsd as i64);
+            self.sym_mut().vable_valuestackdepth = vsd_op;
+            mirror_vable_static_to_boxes(
+                ctx,
+                "valuestackdepth",
+                vsd_op,
+                Value::Int(new_vsd as i64),
+            );
         }
         Ok(value)
     }
@@ -1545,6 +1552,53 @@ impl MIFrame {
     /// All guards within this opcode will use orgpc as their resume PC.
     pub(crate) fn set_orgpc(&mut self, pc: usize) {
         self.orgpc = pc;
+        self.publish_last_instr_to_vable(pc);
+    }
+
+    /// pyopcode.py:170-172 `dispatch_bytecode` parity (Slice 3a, Task #115):
+    ///
+    /// ```python
+    /// while True:
+    ///     self.last_instr = intmask(next_instr)   # explicit setattr at every
+    ///                                             # dispatch top
+    /// ```
+    ///
+    /// RPython's source-level setattr is picked up by the codewriter and
+    /// emitted as a `setfield_vable_i(virtualizable, last_instr_descr, ...)`
+    /// jitcode op; metainterp's `_opimpl_setfield_vable` (pyjitpl.py:1188-
+    /// 1199) updates `metainterp.virtualizable_boxes[last_instr_index]` and
+    /// `synchronize_virtualizable()`s the heap.  pyre's tracer is itself
+    /// the dispatch loop, so the explicit publish happens here at the
+    /// orgpc anchor — every `set_orgpc(pc)` call is the analogue of one
+    /// `self.last_instr = next_instr` setattr.
+    ///
+    /// Semantic mismatch (PRE-EXISTING-ADAPTATION until Slice 3b lands):
+    /// pyre's `PyFrame.last_instr` carries "PC of the last completed
+    /// opcode" (= `orgpc - 1`), whereas RPython's carries "PC of the
+    /// opcode now starting" (= `orgpc`).  Slice 3a publishes
+    /// `orgpc - 1` to keep every existing reader (`flush_to_frame_for_guard`
+    /// re-seed, `get_last_lineno`, `fget_f_lasti`, blackhole resume,
+    /// guard fail_args) seeing the same value they always did.  Slice 3b
+    /// flips the semantic to RPython's "current opcode PC" and removes
+    /// the `-1` adjustment from this publish + the four other vable-side
+    /// sites (`flush_to_frame`, `flush_to_frame_for_guard`,
+    /// `close_loop_args_at` target override, `build_pending_inline_frame`
+    /// after-call return-point).
+    fn publish_last_instr_to_vable(&mut self, pc: usize) {
+        if !self.sym().owns_virtualizable_shadow() {
+            return;
+        }
+        let last_instr_value = pc as i64 - 1;
+        self.with_ctx(|frame, ctx| {
+            let last_instr_op = ctx.const_int(last_instr_value);
+            frame.sym_mut().vable_last_instr = last_instr_op;
+            mirror_vable_static_to_boxes(
+                ctx,
+                "last_instr",
+                last_instr_op,
+                Value::Int(last_instr_value),
+            );
+        });
     }
 
     /// Update virtualizable last_instr and valuestackdepth.
@@ -1683,19 +1737,6 @@ impl MIFrame {
         // RPython capture_resumedata(resumepc=orgpc) parity:
         // Always use orgpc (opcode start PC) as the resume PC.
         let resume_pc = self.orgpc;
-        let frame_addr = self.concrete_frame_addr;
-        let (code_ptr, debugdata, lastblock) = if frame_addr != 0 {
-            unsafe {
-                (
-                    *((frame_addr + PYFRAME_PYCODE_OFFSET) as *const usize),
-                    *((frame_addr + PYFRAME_DEBUGDATA_OFFSET) as *const usize),
-                    *((frame_addr + PYFRAME_LASTBLOCK_OFFSET) as *const usize),
-                )
-            }
-        } else {
-            (0, 0, 0)
-        };
-        let ns_ptr = self.sym().concrete_namespace as i64;
         let vsd = self.portal_bridge_vable_vsd(resume_pc).unwrap_or_else(|| {
             let s = self.sym();
             self.pre_opcode_registers_r
@@ -1703,57 +1744,35 @@ impl MIFrame {
                 .map(|pre_r| pre_r.len())
                 .unwrap_or(s.valuestackdepth) as i64
         });
-        // virtualizable.py:86-93 read_boxes: ALL static fields from the heap.
+        // pyjitpl.py:2586-2602 `capture_resumedata` parity: upstream reads
+        // `metainterp.virtualizable_boxes` without mutating it; the snapshot's
+        // vable section comes from that shadow.  pyre's snapshot reader
+        // (`list_of_boxes_virtualizable`) consults `s.vable_*` instead
+        // (Issue #2 PRE-EXISTING-ADAPTATION) so we still need to publish the
+        // guard-time-correct values for the two fields that advance per-opcode:
+        // `last_instr` (orgpc - 1) and `valuestackdepth` (pre-opcode depth via
+        // `pre_opcode_registers_r` / `portal_bridge_vable_vsd`).  The other
+        // four scalars (`pycode`, `debugdata`, `lastblock`, `w_globals`) keep
+        // whatever OpRef they were seeded with at trace start (inputarg for
+        // root traces, resume-restored value for bridges) — pyre has no
+        // per-opcode handler that mutates them mid-trace, and the previous
+        // heap re-seed here was a NEW-DEVIATION compensating for the missing
+        // `_opimpl_setfield_vable` calls (which RPython's pyopcode handlers
+        // emit and pyre's tracer never reaches).  Slice 4 (Task #116).
         let last_instr_value = resume_pc as i64 - 1;
         let last_instr_op = ctx.const_int(last_instr_value);
-        let pycode_op = ctx.const_ref(code_ptr as i64);
         let vsd_op = ctx.const_int(vsd);
-        let debugdata_op = ctx.const_ref(debugdata as i64);
-        let lastblock_op = ctx.const_ref(lastblock as i64);
-        let w_globals_op = ctx.const_ref(ns_ptr);
-        let owns = {
-            let s = self.sym_mut();
-            s.vable_last_instr = last_instr_op;
-            s.vable_pycode = pycode_op;
-            s.vable_valuestackdepth = vsd_op;
-            s.vable_debugdata = debugdata_op;
-            s.vable_lastblock = lastblock_op;
-            s.vable_w_globals = w_globals_op;
-            s.owns_virtualizable_shadow()
-        };
-        // pyjitpl.py:1188-1199 `_opimpl_setfield_vable` parity (Slice 3.0c):
-        // mirror the heap-read seed into the canonical
-        // `metainterp.virtualizable_boxes` shadow so subsequent guard
-        // resume / writeback readers see the same identity as
-        // `s.vable_*`.
-        if owns {
-            mirror_vable_static_to_boxes(
-                ctx,
-                "last_instr",
-                last_instr_op,
-                Value::Int(last_instr_value),
-            );
-            mirror_vable_static_to_boxes(ctx, "pycode", pycode_op, Value::Ref(GcRef(code_ptr)));
-            mirror_vable_static_to_boxes(ctx, "valuestackdepth", vsd_op, Value::Int(vsd));
-            mirror_vable_static_to_boxes(
-                ctx,
-                "debugdata",
-                debugdata_op,
-                Value::Ref(GcRef(debugdata)),
-            );
-            mirror_vable_static_to_boxes(
-                ctx,
-                "lastblock",
-                lastblock_op,
-                Value::Ref(GcRef(lastblock)),
-            );
-            mirror_vable_static_to_boxes(
-                ctx,
-                "w_globals",
-                w_globals_op,
-                Value::Ref(GcRef(ns_ptr as usize)),
-            );
-        }
+        let s = self.sym_mut();
+        s.vable_last_instr = last_instr_op;
+        s.vable_valuestackdepth = vsd_op;
+        // The shared `ctx.virtualizable_boxes` shadow is intentionally NOT
+        // mirrored here — earlier `_opimpl_setfield_vable` parity comment
+        // (Slice 3.0c) said it should be, but the mirror polluted shadow
+        // when `materialize_parent_snapshot_state` invoked
+        // `parent_frame.flush_to_frame_for_guard` mid-callee snapshot,
+        // forcing band-aid save/restore in `capture_resumedata`,
+        // `record_branch_guard`, and around inline frame push/pop.  See
+        // `vable_shadow_split_brain_load_bearing_2026_04_28` memo.
     }
 
     /// pyjitpl.py:3317-3335 vable_and_vrefs_before_residual_call.
@@ -2673,13 +2692,6 @@ impl MIFrame {
         let saved_orgpc = self.orgpc;
         let saved_ni = self.sym().vable_last_instr;
         let saved_vsd = self.sym().vable_valuestackdepth;
-        // Slice 3.0d: snapshot construction may invoke parent
-        // `flush_to_frame_for_guard`, which (post Slice 3.0c) mirrors
-        // its heap re-seed into `virtualizable_boxes`. Save the
-        // shadow alongside `s.vable_*` so the restore keeps both
-        // halves in sync.
-        let saved_vb_li = save_vable_static_entry(ctx, "last_instr");
-        let saved_vb_vsd = save_vable_static_entry(ctx, "valuestackdepth");
         self.orgpc = resume_pc;
 
         // The snapshot's frame.pc must match the liveness PC used by
@@ -2707,8 +2719,6 @@ impl MIFrame {
         let s = self.sym_mut();
         s.vable_last_instr = saved_ni;
         s.vable_valuestackdepth = saved_vsd;
-        restore_vable_static_entry(ctx, saved_vb_li);
-        restore_vable_static_entry(ctx, saved_vb_vsd);
     }
 
     /// Extend a single-frame callee's `(fail_args, fail_arg_types)` with
@@ -2980,18 +2990,18 @@ impl MIFrame {
         //
         // PRE-EXISTING-ADAPTATION (split-brain): upstream
         // `opencoder.py:718-726 _list_of_boxes_virtualizable` reads
-        // from `metainterp.virtualizable_boxes` — the canonical pyre
-        // analog is `ctx.virtualizable_boxes`.  pyre still reads from
-        // `sym.vable_field_oprefs()` here because the active sym is the
-        // top of the framestack at snapshot time and a probe replacement
-        // (`ctx.virtualizable_entry_at(idx)` first, sym fallback)
-        // intermittently regresses the heap-writeback identity for
-        // bridges resumed from inline-callee guards.  Convergence is
-        // multi-session and tied to the same shadow-mutation refactor
-        // tracked at `MetaInterpFrame::saved_vable_static_box_entries`
-        // (move guard-time heap re-seed out of the shared shadow); when
-        // that lands, both readers/writers can collapse onto
-        // `ctx.virtualizable_boxes` as the single source of truth.
+        // from `metainterp.virtualizable_boxes` — pyre's canonical
+        // analog is `ctx.virtualizable_boxes`.  pyre reads from
+        // `sym.vable_field_oprefs()` because guard-snapshot capture
+        // calls `flush_to_frame_for_guard` which re-seeds `s.vable_*`
+        // from the PyFrame heap WITHOUT mirroring into the shared
+        // shadow (see `mirror_vable_static_to_boxes` doc).  The shadow
+        // tracks JUMP-time writeback values — using it here would
+        // pick up the wrong PC / vsd for the guard's snapshot.
+        // Convergence to a shadow-only reader is multi-session and
+        // requires pyre's vable-touching opcodes to emit
+        // `_opimpl_setfield_vable` properly so the shadow stays
+        // current without the heap re-seed crutch.
         let vable_static_types: Vec<majit_ir::Type> = ctx
             .virtualizable_info()
             .map(|info| info.static_fields.iter().map(|f| f.field_type).collect())
@@ -3261,12 +3271,6 @@ impl MIFrame {
         let saved_orgpc = self.orgpc;
         let saved_ni = self.sym().vable_last_instr;
         let saved_vsd = self.sym().vable_valuestackdepth;
-        // Slice 3.0d: `flush_to_frame_for_guard` below mirrors its
-        // heap re-seed into `virtualizable_boxes` (Slice 3.0c). Save
-        // the boxes shadow so the post-capture restore keeps sym
-        // and boxes synchronized.
-        let saved_vb_li = save_vable_static_entry(ctx, "last_instr");
-        let saved_vb_vsd = save_vable_static_entry(ctx, "valuestackdepth");
         self.orgpc = resume_pc;
 
         // Branch guards resume at `other_target` (the runtime jump destination,
@@ -3336,8 +3340,6 @@ impl MIFrame {
         let s = self.sym_mut();
         s.vable_last_instr = saved_ni;
         s.vable_valuestackdepth = saved_vsd;
-        restore_vable_static_entry(ctx, saved_vb_li);
-        restore_vable_static_entry(ctx, saved_vb_vsd);
     }
 
     /// pyjitpl.py:541-556 opimpl_goto_if_not_<op>_<type> parity.

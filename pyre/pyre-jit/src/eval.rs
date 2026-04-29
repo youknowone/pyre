@@ -5774,12 +5774,18 @@ mod tests {
             pyre_jit_trace::virtualizable_gen::NUM_SCALAR_INPUTARGS + live_regs.len(),
         );
         assert_eq!(fail_args[0], frame_ref);
+        // last_instr and valuestackdepth are re-seeded by `flush_to_frame_for_guard`
+        // (the two fields that advance per-opcode).
         assert_eq!(fail_args[1], ctx.const_int(resume_pc as i64 - 1));
-        assert_eq!(fail_args[2], ctx.const_ref(frame.pycode as usize as i64));
         assert_eq!(fail_args[3], ctx.const_int(4));
-        assert_eq!(fail_args[4], ctx.const_ref(frame.debugdata as usize as i64));
-        assert_eq!(fail_args[5], ctx.const_ref(frame.lastblock as usize as i64));
-        assert_eq!(fail_args[6], ctx.const_ref(frame.w_globals as usize as i64));
+        // pycode / debugdata / lastblock / w_globals keep their seed values —
+        // Slice 4 (Task #116) dropped the heap re-seed for these invariant
+        // scalars; sym is now expected to carry the trace-start OpRef
+        // (inputarg for root traces, resume-restored value for bridges).
+        assert_eq!(fail_args[2], ctx.const_ref(0xdead));
+        assert_eq!(fail_args[4], ctx.const_ref(0xbeef));
+        assert_eq!(fail_args[5], ctx.const_ref(0xcafe));
+        assert_eq!(fail_args[6], ctx.const_ref(0xfeed));
     }
 
     #[test]
