@@ -455,15 +455,20 @@ pub fn mktime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// time.asctime([tuple]) — interp_time.asctime
 pub fn asctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let tm = _gettmarg(args, true)?;
+    _asctime_from_tm(&tm)
+}
 
+fn _asctime_from_tm(tm: &c_tm) -> Result<PyObjectRef, crate::PyError> {
     #[cfg(unix)]
     {
         let libc_tm = c_tm_to_libc_tm(&tm);
-        let p = unsafe { libc::asctime(&libc_tm) };
+        let mut buf = [0 as libc::c_char; 26];
+        let p = unsafe { libc::asctime_r(&libc_tm, buf.as_mut_ptr()) };
         if p.is_null() {
             return Err(crate::PyError::value_error("unconvertible time"));
         }
-        let lossy = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
+        let lossy =
+            unsafe { std::ffi::CStr::from_ptr(p as *const libc::c_char) }.to_string_lossy();
         let s = lossy.trim_end_matches('\n');
         Ok(w_str_new(s))
     }
@@ -486,24 +491,19 @@ pub fn asctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
 /// time.ctime([seconds]) — interp_time.ctime
 pub fn ctime(args: &[PyObjectRef]) -> Result<PyObjectRef, crate::PyError> {
     let seconds = _get_seconds(args);
-    let mut t = seconds;
 
     #[cfg(unix)]
     {
-        let mut secs = t as libc::time_t;
-        let p = unsafe { libc::ctime(&mut secs) };
-        if p.is_null() {
-            return Err(crate::PyError::value_error("unconvertible time"));
-        }
-        let lossy = unsafe { std::ffi::CStr::from_ptr(p) }.to_string_lossy();
-        let s = lossy.trim_end_matches('\n');
-        Ok(w_str_new(s))
+        let tm = _c_localtime(seconds)
+            .ok_or_else(|| crate::PyError::value_error("unconvertible time"))?;
+        _asctime_from_tm(&tm)
     }
     #[cfg(windows)]
     {
         unsafe extern "C" {
             fn _ctime64(time: *const i64) -> *const libc::c_char;
         }
+        let t = seconds;
         let p = unsafe { _ctime64(&t) };
         if p.is_null() {
             return Err(crate::PyError::value_error("unconvertible time"));
