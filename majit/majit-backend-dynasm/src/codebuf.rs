@@ -19,37 +19,80 @@ use dynasmrt::ExecutableBuffer;
 /// which maps executable pages as PROT_READ|PROT_EXEC after finalize,
 /// so we must use mprotect to toggle.
 pub fn with_writable<F: FnOnce()>(addr: *mut u8, len: usize, f: F) {
-    let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
-    let page_start = (addr as usize) & !(page_size - 1);
-    let page_end = ((addr as usize + len) + page_size - 1) & !(page_size - 1);
-    let mprotect_len = page_end - page_start;
-    let page_ptr = page_start as *mut libc::c_void;
-
-    // macOS aarch64 disallows W+X. Switch to RW, patch, then RX.
-    let rc1 = unsafe { libc::mprotect(page_ptr, mprotect_len, libc::PROT_READ | libc::PROT_WRITE) };
-    if rc1 != 0 {
-        eprintln!(
-            "[dynasm] mprotect RW failed: addr={:?} len={} errno={}",
-            page_ptr,
-            mprotect_len,
-            std::io::Error::last_os_error()
-        );
-    }
-    f();
-    let rc2 = unsafe { libc::mprotect(page_ptr, mprotect_len, libc::PROT_READ | libc::PROT_EXEC) };
-    if rc2 != 0 {
-        eprintln!(
-            "[dynasm] mprotect RX failed: addr={:?} len={} errno={}",
-            page_ptr,
-            mprotect_len,
-            std::io::Error::last_os_error()
-        );
-    }
-
-    #[cfg(target_arch = "aarch64")]
+    #[cfg(unix)]
     {
-        // Flush instruction cache after patching.
-        flush_icache_range(page_start as *const u8, mprotect_len);
+        let page_size = unsafe { libc::sysconf(libc::_SC_PAGESIZE) } as usize;
+        let page_start = (addr as usize) & !(page_size - 1);
+        let page_end = ((addr as usize + len) + page_size - 1) & !(page_size - 1);
+        let mprotect_len = page_end - page_start;
+        let page_ptr = page_start as *mut libc::c_void;
+
+        let rc1 = unsafe { libc::mprotect(page_ptr, mprotect_len, libc::PROT_READ | libc::PROT_WRITE) };
+        if rc1 != 0 {
+            eprintln!(
+                "[dynasm] mprotect RW failed: addr={:?} len={} errno={}",
+                page_ptr,
+                mprotect_len,
+                std::io::Error::last_os_error()
+            );
+        }
+        f();
+        let rc2 = unsafe { libc::mprotect(page_ptr, mprotect_len, libc::PROT_READ | libc::PROT_EXEC) };
+        if rc2 != 0 {
+            eprintln!(
+                "[dynasm] mprotect RX failed: addr={:?} len={} errno={}",
+                page_ptr,
+                mprotect_len,
+                std::io::Error::last_os_error()
+            );
+        }
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            flush_icache_range(page_start as *const u8, mprotect_len);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        use std::os::windows::raw::HANDLE;
+
+        let page_size = {
+            #[repr(C)]
+            struct SystemInfo { _pad: [u8; 4], dw_page_size: u32, _rest: [u8; 60] }
+            let mut si = std::mem::MaybeUninit::<SystemInfo>::zeroed();
+            unsafe { GetSystemInfo(si.as_mut_ptr() as *mut u8) };
+            unsafe { si.assume_init().dw_page_size as usize }
+        };
+        let page_start = (addr as usize) & !(page_size - 1);
+        let page_end = ((addr as usize + len) + page_size - 1) & !(page_size - 1);
+        let region_len = page_end - page_start;
+        let page_ptr = page_start as *mut u8;
+
+        const PAGE_READWRITE: u32 = 0x04;
+        const PAGE_EXECUTE_READ: u32 = 0x20;
+
+        unsafe extern "system" {
+            fn VirtualProtect(addr: *mut u8, size: usize, new: u32, old: *mut u32) -> i32;
+            fn GetSystemInfo(info: *mut u8);
+        }
+
+        let mut old_protect: u32 = 0;
+        let rc1 = unsafe { VirtualProtect(page_ptr, region_len, PAGE_READWRITE, &mut old_protect) };
+        if rc1 == 0 {
+            eprintln!(
+                "[dynasm] VirtualProtect RW failed: addr={:?} len={} err={}",
+                page_ptr, region_len, std::io::Error::last_os_error()
+            );
+        }
+        f();
+        let rc2 = unsafe { VirtualProtect(page_ptr, region_len, PAGE_EXECUTE_READ, &mut old_protect) };
+        if rc2 == 0 {
+            eprintln!(
+                "[dynasm] VirtualProtect RX failed: addr={:?} len={} err={}",
+                page_ptr, region_len, std::io::Error::last_os_error()
+            );
+        }
     }
 }
 

@@ -2028,7 +2028,7 @@ impl RegAlloc {
         // bitmap prevents the collector from reading garbage out of
         // jitframe slots 0/1 during `do_collect_nursery`.
         let gcmap =
-            self.get_gcmap(&crate::aarch64::regalloc::MALLOC_NURSERY_CLOBBER, false) as usize;
+            self.get_gcmap(&MALLOC_NURSERY_CLOBBER, false) as usize;
         output.push(RegAllocOp::Perform {
             op_index,
             arglocs,
