@@ -3736,18 +3736,7 @@ fn materialize_virtual_from_rd(
             let cd = calldescr
                 .as_call_descr()
                 .expect("VStr/VUni Concat calldescr must downcast to CallDescr");
-            let bh_calldescr = majit_translate::jitcode::BhCallDescr {
-                arg_classes: cd.arg_classes(),
-                result_type: cd.result_class(),
-                result_signed: cd.is_result_signed(),
-                result_size: cd.result_size(),
-                result_erased: majit_translate::jitcode::CallResultErasedKey::from_ir_layout(
-                    cd.result_type(),
-                    cd.is_result_signed(),
-                    cd.result_size(),
-                ),
-                extra_info: cd.get_extra_info().clone(),
-            };
+            let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
             // resume.py:1462-1470 concat_strings / resume.py:1489-1497
             // concat_unicodes — cpu.bh_call_r(func, [left, right], descr).
             let backend = driver.meta_interp().backend();
@@ -3822,18 +3811,7 @@ fn materialize_virtual_from_rd(
             let cd = calldescr
                 .as_call_descr()
                 .expect("VStr/VUni Slice calldescr must downcast to CallDescr");
-            let bh_calldescr = majit_translate::jitcode::BhCallDescr {
-                arg_classes: cd.arg_classes(),
-                result_type: cd.result_class(),
-                result_signed: cd.is_result_signed(),
-                result_size: cd.result_size(),
-                result_erased: majit_translate::jitcode::CallResultErasedKey::from_ir_layout(
-                    cd.result_type(),
-                    cd.is_result_signed(),
-                    cd.result_size(),
-                ),
-                extra_info: cd.get_extra_info().clone(),
-            };
+            let bh_calldescr = majit_translate::jitcode::BhCallDescr::from_call_descr(cd);
             // resume.py:1472-1480 slice_string / resume.py:1499-1507
             // slice_unicode — cpu.bh_call_r(func, [str, start, stop], descr).
             let backend = driver.meta_interp().backend();

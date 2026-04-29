@@ -244,6 +244,16 @@ pub struct MergePoint {
 }
 
 impl TraceCtx {
+    /// opencoder.py:472 `self.metainterp_sd` — shared static data the
+    /// recorder was constructed with. Read-only handle for callers that
+    /// need to reach the per-process descr pools and terminal descrs
+    /// (`done_with_this_frame_descr_*`,
+    /// `exit_frame_with_exception_descr_ref`) without owning a separate
+    /// reference.
+    pub fn metainterp_sd(&self) -> &std::sync::Arc<crate::MetaInterpStaticData> {
+        &self.metainterp_sd
+    }
+
     /// pyjitpl.py:2991 — check if a loop header was already visited.
     ///
     /// PRE-EXISTING-ADAPTATION: clean Rust extraction of the inline scan
@@ -354,16 +364,6 @@ impl TraceCtx {
     /// regresses bench (tested under Task #70).
     pub fn cut_trace(&mut self, pos: TracePosition) {
         self.recorder.cut(pos);
-    }
-
-    /// opencoder.py:472 `self.metainterp_sd` — shared static data the
-    /// recorder was constructed with. Read-only handle for callers that
-    /// need to reach the per-process descr pools and terminal descrs
-    /// (`done_with_this_frame_descr_*`,
-    /// `exit_frame_with_exception_descr_ref`) without owning a separate
-    /// reference.
-    pub fn metainterp_sd(&self) -> &std::sync::Arc<crate::MetaInterpStaticData> {
-        &self.metainterp_sd
     }
 
     /// pyjitpl.py:2398: access the tracing-time heap cache.

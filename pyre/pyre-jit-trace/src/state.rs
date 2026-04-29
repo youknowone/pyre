@@ -2222,6 +2222,24 @@ pub(crate) fn concrete_stack_depth(frame: usize) -> Option<usize> {
     Some(unsafe { *(frame_ptr.add(PYFRAME_VALUESTACKDEPTH_OFFSET) as *const usize) })
 }
 
+/// Derive `(num_locals, num_locals + max_stackdepth)` from a `CodeObject`.
+///
+/// Mirrors the `(callee_nlocals, callee_vsd)` pair the trace-side reads
+/// from `driver.get_compiled_meta(callee_key)` for CALL_ASSEMBLER
+/// emission (`trace_opcode.rs:4448-4450`). The second value is sized to
+/// match `pyframe.rs:1576` (`alloc_fixed_array_with_header(num_locals +
+/// num_cells + max_stack, ...)`) — i.e. heap capacity rather than live
+/// depth. Used as the fallback shape when no `compiled_meta` exists yet
+/// (e.g. tmp_callback target where `compile_tmp_callback` produced a
+/// JCT but no compiled-loop metadata).
+pub(crate) fn callee_layout_for_call_assembler(
+    code: &pyre_interpreter::CodeObject,
+) -> (usize, usize) {
+    let nlocals = code.varnames.len() + pyre_interpreter::pyframe::ncells(code);
+    let stack_only = code.max_stackdepth as usize;
+    (nlocals, nlocals + stack_only)
+}
+
 pub(crate) fn dict_storage_slot_direct(ns: *mut DictStorage, name: &str) -> Option<usize> {
     if ns.is_null() {
         return None;

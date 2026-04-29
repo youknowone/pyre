@@ -1347,7 +1347,9 @@ impl<S: JitState> JitDriver<S> {
                 // + pyjitpl.py:1673 SwitchToBlackhole(ABORT_SEGMENTED_TRACE)
                 let meta = self.meta.take_trace_meta().unwrap();
                 if let Some(green_key) = self.meta.compile_simple_loop(meta) {
-                    // pyjitpl.py:1662-1663
+                    // PRE-EXISTING-ADAPTATION: see pyjitpl/mod.rs compile_loop
+                    // site for the RPython citation and convergence path.
+                    // Segmented loop mirrors `pyjitpl.py:1662-1663`.
                     let install_num = self.meta.warm_state.alloc_token_number();
                     let install_token = majit_backend::JitCellToken::new(install_num);
                     self.meta

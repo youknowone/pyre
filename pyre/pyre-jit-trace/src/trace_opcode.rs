@@ -545,8 +545,24 @@ impl MIFrame {
         // op_live)` at `jitcode.py:82-93`) that resume.py uses at
         // decode time — pyjitpl.py:218-225 `get_list_of_active_boxes`
         // analog, walking the full live register-file set.
+        #[derive(Clone, Copy)]
+        enum LiveBank {
+            Int,
+            Ref,
+            Float,
+        }
+        impl LiveBank {
+            fn ty(self) -> Type {
+                match self {
+                    LiveBank::Int => Type::Int,
+                    LiveBank::Ref => Type::Ref,
+                    LiveBank::Float => Type::Float,
+                }
+            }
+        }
+
         let jitcode_ptr_pre = self.sym().jitcode;
-        let live_reg_idxs: Vec<usize> = unsafe {
+        let live_regs_for_banks: Vec<(LiveBank, usize)> = unsafe {
             let jc = &*jitcode_ptr_pre;
             // Skeleton payload (no `pc_map` yet) → skip the lazy-load
             // preamble; the main path's skeleton-fallback branch
@@ -578,15 +594,18 @@ impl MIFrame {
                         .get(live_pc)
                         .copied()
                         .unwrap_or(0) as usize;
-                    (0..stack_base + depth).collect()
+                    (0..stack_base + depth)
+                        .map(|idx| (LiveBank::Ref, idx))
+                        .collect()
                 } else {
                     Vec::new()
                 }
             } else {
                 // RPython `pyjitpl.py:218-225` reads each liveness bank
-                // from its matching register file. This lazy vable read is
-                // therefore restricted to Ref liveness; Int/Float values are
-                // read from registers_i/registers_f in the snapshot below.
+                // from its matching register file. Pyre's unified semantic
+                // stack can hold an OpRef before the kind bank has been
+                // populated, so collect every listed bank/index and complete
+                // the matching bank immediately before the direct snapshot.
                 let jit_pc = jc.payload.metadata.pc_map[live_pc];
                 let op_live = crate::state::op_live();
                 let off = jc.payload.jitcode.get_live_vars_info(jit_pc, op_live);
@@ -596,18 +615,29 @@ impl MIFrame {
                 } else {
                     let length_i = all_liveness[off] as u32;
                     let length_r = all_liveness[off + 1] as u32;
+                    let length_f = all_liveness[off + 2] as u32;
                     let mut cursor = off + 3;
-                    let mut out: Vec<usize> = Vec::with_capacity(length_r as usize);
+                    let mut out: Vec<(LiveBank, usize)> =
+                        Vec::with_capacity((length_i + length_r + length_f) as usize);
                     use majit_translate::liveness::LivenessIterator;
                     if length_i != 0 {
                         let mut it = LivenessIterator::new(cursor, length_i, &all_liveness);
-                        while it.next().is_some() {}
+                        while let Some(reg_idx) = it.next() {
+                            out.push((LiveBank::Int, reg_idx as usize));
+                        }
                         cursor = it.offset;
                     }
                     if length_r != 0 {
                         let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
                         while let Some(reg_idx) = it.next() {
-                            out.push(reg_idx as usize);
+                            out.push((LiveBank::Ref, reg_idx as usize));
+                        }
+                        cursor = it.offset;
+                    }
+                    if length_f != 0 {
+                        let mut it = LivenessIterator::new(cursor, length_f, &all_liveness);
+                        while let Some(reg_idx) = it.next() {
+                            out.push((LiveBank::Float, reg_idx as usize));
                         }
                     }
                     out
@@ -640,7 +670,9 @@ impl MIFrame {
                 is_portal_bridge,
             )
         };
-        for idx in live_reg_idxs {
+        let mut bank_materializations: Vec<(LiveBank, usize, OpRef)> =
+            Vec::with_capacity(live_regs_for_banks.len());
+        for (bank, idx) in live_regs_for_banks {
             // G.4.4-encoder.3: portal-bridge has no regalloc, so
             // colors == slot indices (identity).  Bypass
             // `semantic_ref_slot_for_reg_color`'s color-map search
@@ -678,6 +710,25 @@ impl MIFrame {
             if cur == OpRef::NONE {
                 let _ = MIFrame::load_local_value(self, ctx, slot_idx);
             }
+            let semantic_value = self
+                .pre_opcode_registers_r
+                .as_ref()
+                .and_then(|pre_r| pre_r.get(slot_idx).copied())
+                .filter(|value| !value.is_none())
+                .or_else(|| self.sym().registers_r.get(slot_idx).copied())
+                .unwrap_or(OpRef::NONE);
+            let bank_value = match bank {
+                LiveBank::Ref => {
+                    self.materialize_fail_arg_slot(ctx, semantic_value, Type::Ref, slot_idx)
+                }
+                LiveBank::Int | LiveBank::Float if self.value_type(semantic_value) == bank.ty() => {
+                    semantic_value
+                }
+                LiveBank::Int | LiveBank::Float => {
+                    self.materialize_fail_arg_slot(ctx, OpRef::NONE, bank.ty(), slot_idx)
+                }
+            };
+            bank_materializations.push((bank, idx, bank_value));
         }
         let (registers_i, registers_r_bank, registers_r_semantic, registers_f) = {
             let s = self.sym();
@@ -726,7 +777,31 @@ impl MIFrame {
             } else {
                 (s.nlocals + valid_stack_only).min(source_len)
             };
-            let registers_r_bank = s.registers_r.clone();
+            let mut registers_i = s.registers_i.clone();
+            let mut registers_r_bank = s.registers_r.clone();
+            let mut registers_f = s.registers_f.clone();
+            for &(bank, reg_idx, value) in &bank_materializations {
+                match bank {
+                    LiveBank::Int => {
+                        if reg_idx >= registers_i.len() {
+                            registers_i.resize(reg_idx + 1, OpRef::NONE);
+                        }
+                        registers_i[reg_idx] = value;
+                    }
+                    LiveBank::Ref => {
+                        if reg_idx >= registers_r_bank.len() {
+                            registers_r_bank.resize(reg_idx + 1, OpRef::NONE);
+                        }
+                        registers_r_bank[reg_idx] = value;
+                    }
+                    LiveBank::Float => {
+                        if reg_idx >= registers_f.len() {
+                            registers_f.resize(reg_idx + 1, OpRef::NONE);
+                        }
+                        registers_f[reg_idx] = value;
+                    }
+                }
+            }
             let mut registers_r_semantic: Vec<OpRef> =
                 if let Some(ref pre_r) = self.pre_opcode_registers_r {
                     pre_r[..valid_len.min(pre_r.len())].to_vec()
@@ -742,10 +817,10 @@ impl MIFrame {
                 }
             }
             (
-                s.registers_i.clone(),
+                registers_i,
                 registers_r_bank,
                 registers_r_semantic,
-                s.registers_f.clone(),
+                registers_f,
             )
         };
         // pyjitpl.py:202-203: read the 2-byte offset from JitCode.code
@@ -4239,13 +4314,18 @@ impl MIFrame {
                     );
                 }
                 if let Some(token_number) = driver.get_pending_token_number(callee_key) {
-                    let callee_nlocals = {
-                        let code_ptr =
-                            pyre_interpreter::get_pycode(concrete_callable) as *const CodeObject;
-                        let code = &*code_ptr;
-                        // pyframe.py:111: nlocals + ncellvars + nfreevars
-                        code.varnames.len() + pyre_interpreter::pyframe::ncells(code)
-                    };
+                    // pyframe.py:107 locals_cells_stack_w =
+                    //   nlocals + ncellvars + nfreevars + co_stacksize.
+                    // virtualizable.py:95-98 read_boxes walks len(lst) —
+                    // the full heap capacity. Match the compiled-meta path
+                    // at L4474 (`callee_nlocals + callee_stack_only`) so
+                    // both pre-compiled and pending-token CALL_ASSEMBLER
+                    // emissions size num_array_items the same.
+                    let code_ptr =
+                        pyre_interpreter::get_pycode(concrete_callable) as *const CodeObject;
+                    let code = &*code_ptr;
+                    let (_callee_nlocals, callee_array_capacity) =
+                        crate::state::callee_layout_for_call_assembler(code);
                     if nargs == 1 || (crate::callbacks::get().callee_frame_helper)(nargs).is_some()
                     {
                         return self.with_ctx(|this, ctx| {
@@ -4322,7 +4402,7 @@ impl MIFrame {
                                 array_struct_offset:
                                     crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
                                 array_ptr_offset: pyre_object::FIXED_ARRAY_ITEMS_OFFSET,
-                                num_array_items: callee_nlocals,
+                                num_array_items: callee_array_capacity,
                                 const_overrides: vec![],
                                 arg_overrides,
                             };
@@ -4405,13 +4485,21 @@ impl MIFrame {
                         };
 
                         {
-                            let callee_meta = driver.get_compiled_meta(callee_key).unwrap_or_else(|| {
-                                panic!(
-                                    "compiled loop for callee_key={callee_key} is missing compiled meta"
-                                )
-                            });
-                            let callee_nlocals = callee_meta.num_locals;
-                            let callee_vsd = callee_meta.valuestackdepth;
+                            // pyre adaptation: when a `compiled_meta` entry
+                            // exists (callee already compiled), read the
+                            // shape from it; otherwise (tmp_callback target
+                            // or pending-only) fall back to the layout
+                            // derived from `concrete_callable`'s CodeObject.
+                            // Slice 4.5a prep — the fallback is dead code
+                            // until Slice 4.5c removes the L4424 None
+                            // short-circuit, but lifting the panic is the
+                            // architectural unblock for that step.
+                            let (callee_nlocals, callee_vsd) = match driver
+                                .get_compiled_meta(callee_key)
+                            {
+                                Some(m) => (m.num_locals, m.valuestackdepth),
+                                None => crate::state::callee_layout_for_call_assembler(callee_code),
+                            };
                             let callee_stack_only = callee_vsd.saturating_sub(callee_nlocals);
                             let target_num_inputs =
                                 driver.get_compiled_num_inputs(callee_key).unwrap_or(1);
@@ -4913,11 +5001,17 @@ impl MIFrame {
                         let boxed_arg = wrapint(ctx, raw_arg);
                         let callee_code_ptr =
                             unsafe { pyre_interpreter::get_pycode(concrete_callable) };
-                        let callee_nlocals = unsafe {
-                            let code = &*(callee_code_ptr as *const pyre_interpreter::CodeObject);
-                            // pyframe.py:111: nlocals + ncellvars + nfreevars
-                            code.varnames.len() + pyre_interpreter::pyframe::ncells(code)
-                        };
+                        let callee_code =
+                            unsafe { &*(callee_code_ptr as *const pyre_interpreter::CodeObject) };
+                        // pyframe.py:107 locals_cells_stack_w =
+                        //   nlocals + ncellvars + nfreevars + co_stacksize.
+                        // virtualizable.py:95-98 read_boxes walks len(lst) — full
+                        // heap capacity. Match L4316 pending-token + L4474 compiled-
+                        // meta paths so callee receives the same number of inputargs
+                        // independent of which CALL_ASSEMBLER emission site emitted
+                        // the op.
+                        let (callee_nlocals, callee_array_capacity) =
+                            crate::state::callee_layout_for_call_assembler(callee_code);
                         let callee_ns_ptr = unsafe { function_get_globals(concrete_callable) };
                         // interp_jit.py:25-31: 6 scalar fields + frame = 7 slots
                         let first_array_slot = 1 + 6; // frame + 6 scalars
@@ -4934,6 +5028,20 @@ impl MIFrame {
                             const_overrides.push((2, callee_code_ptr as i64)); // slot 2 = pycode
                             const_overrides.push((6, callee_ns_ptr as i64)); // slot 6 = w_globals
                         }
+                        // Site 2 reads slot 0 from caller frame, not callee
+                        // frame — array_struct_offset points at caller's
+                        // locals_cells_stack array. Without callee-frame
+                        // allocation, the only known-safe values for callee
+                        // inputarg slots [first_array_slot+1 .. capacity] are
+                        // None (uninit locals[1..nlocals]) and 0 (empty stack
+                        // [0..max_stackdepth] at portal entry). NULL-pad them
+                        // so the backend does not leak caller frame items into
+                        // the callee.
+                        for slot in
+                            (first_array_slot + 1)..(first_array_slot + callee_array_capacity)
+                        {
+                            const_overrides.push((slot, 0));
+                        }
                         let expansion = majit_ir::VableExpansion {
                             scalar_fields: vec![
                                 (crate::frame_layout::PYFRAME_LAST_INSTR_OFFSET, Type::Int),
@@ -4949,7 +5057,7 @@ impl MIFrame {
                             array_struct_offset:
                                 crate::frame_layout::PYFRAME_LOCALS_CELLS_STACK_OFFSET,
                             array_ptr_offset: pyre_object::FIXED_ARRAY_ITEMS_OFFSET,
-                            num_array_items: callee_nlocals,
+                            num_array_items: callee_array_capacity,
                             const_overrides,
                             // locals[0] = boxed_arg (CALL_ASSEMBLER arg[1])
                             arg_overrides: vec![(first_array_slot, 1)],

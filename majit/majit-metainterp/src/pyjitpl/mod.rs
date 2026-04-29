@@ -3914,6 +3914,9 @@ impl<M: Clone> MetaInterp<M> {
             Ok(_) => {
                 // compile.py:826-830 store_hash: assign jitcounter hashes.
                 self.assign_guard_hashes(&token);
+                // compile.py:213 record_loop_or_bridge — record this loop's
+                // CALL_ASSEMBLER / JUMP keepalive targets.
+                Self::record_loop_or_bridge(&mut token, &compiled_ops);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled loop at key={}, num_inputs={}",
@@ -4028,7 +4031,32 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref: unroll_opt.next_global_opref.max(inputargs.len() as u32),
                     },
                 );
-                // RPython warmstate.py:342: attach_procedure_to_interp(greenkey, token)
+                // PRE-EXISTING-ADAPTATION: pass a freshly-allocated
+                // uncompiled `JitCellToken` to `attach_procedure_to_interp`
+                // instead of the actual compiled `CompiledEntry::token`.
+                //
+                // RPython `warmstate.py:339-348` and the call sites at
+                // `compile.py:1019` (ResumeFromInterpDescr.compile_and_attach),
+                // `pyjitpl.py:1662-1663` (segmented loop) and
+                // `pyjitpl.py:3171-3174` (compile_loop) all pass the
+                // actual compiled jitcell_token, so `cell.loop_token`
+                // shares object identity with the compiled procedure
+                // token. Pyre cannot do the same here:
+                // `CompiledEntry::token` is a plain `JitCellToken` (not
+                // Arc) and `JitCellToken` owns a `Box<dyn Any + Send>`
+                // of compiled code that is not `Clone`, so the
+                // compiled token cannot be shared with
+                // `BaseJitCell::loop_token`.
+                //
+                // Convergence requires re-introducing
+                // `Arc<JitCellToken>` for `CompiledEntry::token` so
+                // the procedure token can be `Arc::clone`d into
+                // `cell.loop_token`. The atomic-fix attempt at all 5
+                // attach sites empirically produces wrong nbody output
+                // on dynasm even when `redirect_call_assembler` does
+                // not fire, so convergence also requires investigating
+                // the dynasm-side observability of `cell.loop_token`
+                // Arc identity.
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = JitCellToken::new(install_num);
                 self.warm_state
@@ -4619,6 +4647,8 @@ impl<M: Clone> MetaInterp<M> {
         match compile_result {
             Ok(_) => {
                 self.assign_guard_hashes(&token);
+                // compile.py:213 record_loop_or_bridge.
+                Self::record_loop_or_bridge(&mut token, &combined_ops);
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[jit] compiled retrace at key={}, num_inputs={}",
@@ -4718,6 +4748,9 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref: unroll_opt.next_global_opref.max(inputargs.len() as u32),
                     },
                 );
+                // PRE-EXISTING-ADAPTATION: see compile_loop site for the
+                // RPython citation and convergence path. Retrace path
+                // mirrors `pyjitpl.py:3171-3174 attach_procedure_to_interp`.
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = JitCellToken::new(install_num);
                 self.warm_state
@@ -5086,6 +5119,8 @@ impl<M: Clone> MetaInterp<M> {
         {
             Ok(_) => {
                 self.assign_guard_hashes(&token);
+                // compile.py:213 record_loop_or_bridge.
+                Self::record_loop_or_bridge(&mut token, &optimized_ops);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
@@ -5178,6 +5213,9 @@ impl<M: Clone> MetaInterp<M> {
                         },
                     );
                 }
+                // PRE-EXISTING-ADAPTATION: see compile_loop site for the
+                // RPython citation and convergence path. finish_and_compile
+                // mirrors `pyjitpl.py:3171-3174 attach_procedure_to_interp`.
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = JitCellToken::new(install_num);
                 self.warm_state
@@ -5381,6 +5419,8 @@ impl<M: Clone> MetaInterp<M> {
         {
             Ok(_) => {
                 self.assign_guard_hashes(&token);
+                // compile.py:213 record_loop_or_bridge.
+                Self::record_loop_or_bridge(&mut token, &compiled_ops);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         &inputargs,
@@ -6377,6 +6417,65 @@ impl<M: Clone> MetaInterp<M> {
         }
     }
 
+    /// PARTIAL PORT of `compile.py:172-211 record_loop_or_bridge` — only
+    /// the CALL_ASSEMBLER keepalive walker is implemented here. For each
+    /// freshly compiled CALL_ASSEMBLER op
+    /// (`compile.py:187 isinstance(descr, JitCellToken)`), if the descr's
+    /// `loop_token_number()` (`history.py:443 JitCellToken.number`)
+    /// differs from `original.number`, call `original.record_jump_to(target)`
+    /// so the target is held in `_keepalive_jitcell_tokens`
+    /// (`history.py:451`) while this loop is alive.
+    ///
+    /// JUMP branch is NOT ported. Upstream (`compile.py:192 isinstance(descr,
+    /// TargetToken)`, `:198 record_jump_to(descr.original_jitcell_token)`)
+    /// keepalives the *owning* `JitCellToken` of the target `TargetToken`,
+    /// but pyre's `LoopTargetDescr.token_id()` is the in-list identity
+    /// (preamble=0, peeled-body=`target_tokens.len()` at finalize time —
+    /// see `optimizeopt/unroll.rs:894`), not a `JitCellToken.number`.
+    /// Recording it here would inject list-indexes (0, 1, …) into
+    /// `_keepalive_jitcell_tokens`, which collide with real
+    /// `JitCellToken.number` values. Re-enabling JUMP keepalive requires
+    /// `LoopTargetDescr` to carry the owning JitCellToken number
+    /// separately (Task #146).
+    ///
+    /// NOT PORTED (handled elsewhere or pending):
+    ///   * `compile.py:180-181 clt.loop_token_wref = weakref` — pyre has no
+    ///     weakref-keyed memmgr generation tracking yet.
+    ///   * `compile.py:185-186 descr.rd_loop_token = clt` — pyre's resume
+    ///     descrs reach the source compiled-loop-token through the runtime
+    ///     descr classifier instead of a direct field link.
+    ///   * `compile.py:189/197 op.cleardescr()` — Rust `Op` keeps the descr
+    ///     reference; the Python tests this serves (`history.Stats`
+    ///     liveness) have no pyre counterpart.
+    ///   * `compile.py:204-207 quasi_immutable_deps.register_loop_token` —
+    ///     pyre's QuasiImmut tracking is still TODO.
+    ///   * `compile.py:210 loop.original_jitcell_token = None` — pyre's
+    ///     `Loop` value is dropped at end-of-compile, so the explicit
+    ///     break-cycle is implicit.
+    ///
+    /// PRE-EXISTING-ADAPTATION: target identity is stored as `u64`
+    /// rather than the upstream token-object reference because
+    /// `CompiledEntry::token` is a non-`Clone` plain `JitCellToken`
+    /// and pyre cannot share Arc identity with the warm cell. The
+    /// number-keyed adaptation tracks the same membership relation at
+    /// coarser granularity.
+    fn record_loop_or_bridge(original: &mut JitCellToken, ops: &[majit_ir::Op]) {
+        let original_number = original.number;
+        for op in ops {
+            let Some(descr) = op.descr.as_ref() else {
+                continue;
+            };
+            if op.opcode.is_call_assembler() {
+                if let Some(loop_descr) = descr.as_loop_token_descr() {
+                    let target = loop_descr.loop_token_number();
+                    if target != original_number {
+                        original.record_jump_to(target);
+                    }
+                }
+            }
+        }
+    }
+
     /// Check whether a compiled loop exists for a given green key.
     ///
     /// PRE-EXISTING-ADAPTATION: short-circuits the two-step upstream
@@ -7088,6 +7187,8 @@ impl<M: Clone> MetaInterp<M> {
         match compile_result {
             Ok(_) => {
                 self.assign_guard_hashes(&token);
+                // compile.py:213 record_loop_or_bridge.
+                Self::record_loop_or_bridge(&mut token, &optimized_ops);
                 let (resume_data, guard_op_indices, mut exit_layouts) =
                     compile::build_guard_metadata(
                         bridge_inputargs,
@@ -7188,6 +7289,10 @@ impl<M: Clone> MetaInterp<M> {
                         next_global_opref: 0,
                     },
                 );
+                // PRE-EXISTING-ADAPTATION: see compile_loop site for the
+                // RPython citation and convergence path. Entry-bridge
+                // mirrors `compile.py:1019 ResumeFromInterpDescr.
+                // compile_and_attach`.
                 let install_num = self.warm_state.alloc_token_number();
                 let install_token = JitCellToken::new(install_num);
                 self.warm_state
@@ -7525,6 +7630,10 @@ impl<M: Clone> MetaInterp<M> {
                             trace_id
                         }
                     };
+                    // compile.py:213 record_loop_or_bridge — bridges share
+                    // their original loop's token, so we record onto
+                    // `compiled.token` rather than a fresh one.
+                    Self::record_loop_or_bridge(&mut compiled.token, &optimized_ops);
                     let (resume_data, guard_op_indices, mut exit_layouts) =
                         compile::build_guard_metadata(
                             bridge_inputargs,

@@ -157,16 +157,25 @@ impl BaseJitCell {
 
     /// Set the procedure token and update ownership state.
     /// If `tmp` is true, sets the TEMPORARY flag (CALL_ASSEMBLER fallback).
-    pub fn set_procedure_token(&mut self, loop_token: impl Into<Arc<JitCellToken>>, tmp: bool) {
+    ///
+    /// Returns the previous procedure token (if any), so the caller can
+    /// implement `warmstate.py:343-348`'s `redirect_call_assembler` +
+    /// `old_token.record_jump_to(procedure_token)` chain.
+    pub fn set_procedure_token(
+        &mut self,
+        loop_token: impl Into<Arc<JitCellToken>>,
+        tmp: bool,
+    ) -> Option<Arc<JitCellToken>> {
         let loop_token = loop_token.into();
         self.token = Some(loop_token.number);
-        self.loop_token = Some(loop_token);
+        let old = self.loop_token.replace(loop_token);
         if tmp {
             self.flags |= jc_flags::TEMPORARY;
         } else {
             self.flags &= !jc_flags::TEMPORARY;
             self.state = BaseJitCellState::Compiled;
         }
+        old
     }
 
     /// Check whether we have ever had a procedure token assigned
@@ -687,14 +696,14 @@ impl WarmEnterState {
         &mut self,
         green_key_hash: u64,
         token: impl Into<Arc<JitCellToken>>,
-    ) {
+    ) -> Option<Arc<JitCellToken>> {
         let token = token.into();
         let cell = self
             .cells
             .entry(green_key_hash)
             .or_insert_with(BaseJitCell::new);
         cell.flags &= !jc_flags::TRACING;
-        cell.set_procedure_token(token, false);
+        cell.set_procedure_token(token, false)
     }
 
     /// warmstate.py:716-723 `cell.set_procedure_token(procedure_token, tmp=True)`.
@@ -711,7 +720,7 @@ impl WarmEnterState {
             .cells
             .entry(green_key_hash)
             .or_insert_with(BaseJitCell::new);
-        cell.set_procedure_token(token, true);
+        let _old = cell.set_procedure_token(token, true);
     }
 
     /// warmstate.py:444 `finally: cell.flags &= ~JC_TRACING` parity —

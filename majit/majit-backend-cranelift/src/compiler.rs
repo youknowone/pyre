@@ -8374,10 +8374,12 @@ impl CraneliftBackend {
                         // Slots N+1..: array items from frame
                         let num_scalars_with_frame = 1 + expansion.scalar_fields.len();
                         // Only load array data pointer if at least one item
-                        // needs to be read from the frame (not all arg_overrides).
+                        // needs to be read from the frame (not covered by
+                        // const_overrides or arg_overrides).
                         let needs_array_load = (0..expansion.num_array_items).any(|i| {
                             let slot = num_scalars_with_frame + i;
-                            !expansion.arg_overrides.iter().any(|(s, _)| *s == slot)
+                            !expansion.const_overrides.iter().any(|(s, _)| *s == slot)
+                                && !expansion.arg_overrides.iter().any(|(s, _)| *s == slot)
                         });
                         let arr_data_ptr_val = if needs_array_load {
                             let arr_struct_addr = builder
@@ -8396,8 +8398,15 @@ impl CraneliftBackend {
                         for i in 0..expansion.num_array_items {
                             let slot = num_scalars_with_frame + i;
                             let ofs = JF_FRAME_ITEM0_OFS + (slot as i32) * 8;
-                            // Check for arg override
-                            if let Some(&(_, arg_idx)) =
+                            // Match dynasm x86 assembler.rs:4544 / aarch64
+                            // assembler.rs:4673: const_overrides take precedence
+                            // for any slot, including array items.
+                            if let Some(&(_, cval)) =
+                                expansion.const_overrides.iter().find(|(s, _)| *s == slot)
+                            {
+                                let cv = builder.ins().iconst(cl_types::I64, cval);
+                                builder.ins().stack_store(cv, args_slot, ofs);
+                            } else if let Some(&(_, arg_idx)) =
                                 expansion.arg_overrides.iter().find(|(s, _)| *s == slot)
                             {
                                 let val = resolve_opref(&mut builder, &constants, op.args[arg_idx]);
