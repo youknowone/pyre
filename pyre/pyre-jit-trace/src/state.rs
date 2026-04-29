@@ -232,15 +232,26 @@ impl MetaInterpStaticData {
 
     /// codewriter.py:67-68 parity — stamp the SD-local `idx` onto the
     /// shared `Arc<majit_metainterp::jitcode::JitCode>` carried by the
-    /// payload. The atomic store works regardless of the outer
-    /// Arc<PyJitCode> refcount; without interior mutability the
-    /// back-stamp would require Arc::get_mut which fails as soon as
-    /// CallControl.jitcodes also holds the same allocation.
+    /// payload, but **only when the inner `JitCode` has not been
+    /// stamped yet**.  Build-time `make_jitcodes()` already calls
+    /// `set_index` on every drained `Arc<JitCode>`
+    /// (`codewriter.rs:279`), so a re-stamp here would violate the
+    /// canonical RPython `OnceLock` single-set invariant.  Skipping
+    /// the second stamp preserves the build-time index, which is what
+    /// snapshot encoders read via `frame.jitcode.try_index()`
+    /// (`opencoder.rs:2086`).
     fn stamp_payload_index(idx: i32, payload: &std::sync::Arc<crate::PyJitCode>) {
-        payload
-            .jitcode
-            .index
-            .store(idx as i64, std::sync::atomic::Ordering::Relaxed);
+        if payload.jitcode.try_index().is_some() {
+            // Pre-stamped at build time: leave the canonical index
+            // intact.  The SD wrapper's own `index` field continues to
+            // record the SD-local position for callers that need it.
+            return;
+        }
+        // First-set path: pyre-only fresh runtime jitcodes (skeletons,
+        // portal-bridge installs) reach here without a build-time
+        // stamp.  The SD-local position is the only meaningful index
+        // they have.
+        payload.jitcode.set_index(idx as usize);
     }
 
     /// warmspot.py:281-282:
@@ -7351,12 +7362,12 @@ mod tests {
     #[test]
     fn test_setup_kind_register_banks_sizes_per_num_regs_and_consts() {
         let mut runtime_jc = majit_metainterp::jitcode::JitCode::default();
-        runtime_jc.c_num_regs_i = 3;
-        runtime_jc.c_num_regs_r = 4;
-        runtime_jc.c_num_regs_f = 2;
-        runtime_jc.constants_i = vec![100, 200];
-        runtime_jc.constants_r = vec![0xAABB_CCDD_u64 as i64];
-        runtime_jc.constants_f = vec![3.14_f64.to_bits() as i64];
+        runtime_jc.body_mut().c_num_regs_i = 3;
+        runtime_jc.body_mut().c_num_regs_r = 4;
+        runtime_jc.body_mut().c_num_regs_f = 2;
+        runtime_jc.body_mut().constants_i = vec![100, 200];
+        runtime_jc.body_mut().constants_r = vec![0xAABB_CCDD_u64 as i64];
+        runtime_jc.body_mut().constants_f = vec![3.14_f64.to_bits() as i64];
 
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
         pyjit.jitcode = std::sync::Arc::new(runtime_jc);

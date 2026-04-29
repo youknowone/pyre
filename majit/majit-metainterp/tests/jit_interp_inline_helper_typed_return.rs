@@ -1,4 +1,5 @@
 use majit_macros::{dont_look_inside, jit_inline};
+use majit_metainterp::jitcode::JitCodeRuntimeExt;
 
 fn assert_single_return_opcode(jitcode: &majit_metainterp::JitCode, key: &str) {
     let opcode = *majit_metainterp::jitcode::wellknown_bh_insns()

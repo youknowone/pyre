@@ -9,7 +9,9 @@ use majit_backend::JitCellToken;
 use majit_ir::{OpCode, OpRef, Value};
 
 use super::{MIFrame, MIFrameStack};
-use crate::jitcode::{self, JitArgKind, JitCallArg, JitCallTarget, JitCode, MAX_HOST_CALL_ARITY};
+use crate::jitcode::{
+    self, JitArgKind, JitCallArg, JitCallTarget, JitCode, JitCodeRuntimeExt, MAX_HOST_CALL_ARITY,
+};
 use crate::{TraceAction, TraceCtx};
 
 thread_local! {
@@ -3808,7 +3810,7 @@ mod tests {
             builder.load_const_i_value(i, 0);
         }
         let jitcode = std::sync::Arc::new(builder.finish());
-        jitcode.index.store(7, std::sync::atomic::Ordering::Relaxed);
+        jitcode.set_index(7);
         let mut frame = MIFrame::new(jitcode, 3);
         frame.int_regs[0] = Some(majit_ir::OpRef(10));
         frame.int_regs[1] = Some(majit_ir::OpRef(11));

@@ -64,6 +64,21 @@ impl SSAReprEmitter {
         self.builder.ensure_r_regs(count);
     }
 
+    /// Stage `(fnaddr, calldescr)` from `CallControl::get_jitcode_calldescr`
+    /// (`call.py:167`) so the values land on the constructed `JitCode`
+    /// **before** `Assembler::assemble` runs `set_body`.  RPython
+    /// `call.py:167-169` builds `JitCode(name, fnaddr, calldescr)` ahead of
+    /// `assembler.assemble(...)`; pyre stages on the builder so
+    /// `JitCodeBuilder::finish()` can stamp the body atomically.
+    pub fn set_fnaddr_and_calldescr(
+        &mut self,
+        fnaddr: i64,
+        calldescr: majit_translate::jitcode::BhCallDescr,
+    ) {
+        self.builder.set_fnaddr(fnaddr);
+        self.builder.set_calldescr(calldescr);
+    }
+
     fn add_const_i(&mut self, value: i64) -> u16 {
         self.builder.add_const_i(value)
     }

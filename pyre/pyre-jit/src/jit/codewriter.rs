@@ -6932,7 +6932,7 @@ impl CodeWriter {
     ///     `merge_point_pc` fields into the returned `PyJitCode`.
     fn finalize_jitcode(
         &self,
-        assembler: SSAReprEmitter,
+        mut assembler: SSAReprEmitter,
         ssarepr: SSARepr,
         code: &CodeObject,
         w_code: *const (),
@@ -6946,6 +6946,18 @@ impl CodeWriter {
         stack_slot_color_map: Vec<u16>,
         pyre_color_for_semantic_local: Vec<u16>,
     ) -> PyJitCode {
+        // call.py:167-169 — `(fnaddr, calldescr) = get_jitcode_calldescr(graph);
+        // jitcode = JitCode(name, fnaddr, calldescr)`.  Stage the values
+        // before assembly so `JitCodeBuilder::finish()` can stamp them
+        // alongside the body in a single object construction step,
+        // matching the upstream constructor order.  See
+        // [`super::call::CallControl::get_jitcode_calldescr`] for the
+        // PRE-EXISTING-ADAPTATION rationale of the constant return value.
+        let (fnaddr, calldescr) = self
+            .callcontrol()
+            .get_jitcode_calldescr(code as *const CodeObject);
+        assembler.set_fnaddr_and_calldescr(fnaddr, calldescr);
+
         // pc_map[py_pc] currently holds SSARepr insn indices (returned by
         // SSAReprEmitter::current_pos()). Translate them to JitCode byte
         // offsets via ssarepr.insns_pos, populated during
@@ -6966,18 +6978,17 @@ impl CodeWriter {
         // builds the populated `JitCode` as the final codewriter step, so
         // stamp the exact jdindex while constructing that populated object.
         // Non-portals keep the JitCode constructor default of `None`.
-        jitcode.jitdriver_sd = self
+        if let Some(idx) = self
             .callcontrol()
-            .jitdriver_sd_from_portal_graph(code as *const CodeObject);
-        // call.py:167 `(fnaddr, calldescr) = self.get_jitcode_calldescr(graph)`.
-        // The values are constant across CodeObjects in pyre — see
-        // [`super::call::CallControl::get_jitcode_calldescr`] for the
-        // PRE-EXISTING-ADAPTATION rationale.
-        let (fnaddr, calldescr) = self
-            .callcontrol()
-            .get_jitcode_calldescr(code as *const CodeObject);
-        jitcode.fnaddr = fnaddr;
-        jitcode.calldescr = calldescr;
+            .jitdriver_sd_from_portal_graph(code as *const CodeObject)
+        {
+            // OnceLock semantics: only the first portal grab sets the
+            // index. RPython sets it once at call.py:148 then leaves it
+            // for the lifetime of the jitcode.
+            if jitcode.jitdriver_sd().is_none() {
+                jitcode.set_jitdriver_sd(idx);
+            }
+        }
         // Per-code stack base in `locals_cells_stack_w`. RPython's JitCode
         // does not carry PyFrame layout data; keep it in PyJitCodeMetadata
         // and attach it to BlackholeInterpreter setup when pyre needs it.
@@ -8829,7 +8840,7 @@ mod tests {
             "jd.mainjitcode and CallControl.jitcodes[portal_graph] must share the populated Arc"
         );
         assert_eq!(
-            mainjitcode.jitcode.jitdriver_sd,
+            mainjitcode.jitcode.jitdriver_sd(),
             Some(0),
             "call.py:148 requires the portal jitcode to carry its jd index"
         );
@@ -9147,7 +9158,7 @@ mod tests {
                 "jd.mainjitcode must share the same PyJitCode Arc as CallControl.jitcodes"
             );
             assert_eq!(
-                mainjitcode.jitcode.jitdriver_sd,
+                mainjitcode.jitcode.jitdriver_sd(),
                 Some(0),
                 "call.py:148 stamps jd.mainjitcode.jitdriver_sd immediately"
             );
@@ -9177,6 +9188,6 @@ mod tests {
             "populated jd.mainjitcode must remain the same Arc as CallControl.jitcodes"
         );
         assert!(mainjitcode.is_populated());
-        assert_eq!(mainjitcode.jitcode.jitdriver_sd, Some(0));
+        assert_eq!(mainjitcode.jitcode.jitdriver_sd(), Some(0));
     }
 }

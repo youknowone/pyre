@@ -230,23 +230,15 @@ impl Assembler {
             "too many registers (i={num_regs_i} r={num_regs_r} f={num_regs_f})"
         );
         // RPython assembler.py:49 `jitcode._ssarepr = ssarepr`
-        // RPython `longlong.FLOATSTORAGE` stores floats as 64-bit ints in
-        // `constants_f`; pyre's `JitCodeBody.constants_f` holds `f64`, so
-        // bit-cast each pool entry back at commit time.
-        let constants_f_f64: Vec<f64> = state
-            .constants_f
-            .iter()
-            .map(|&bits| f64::from_bits(bits as u64))
-            .collect();
         let body = JitCodeBody {
             calldescr: BhCallDescr::default(),
             code: state.code,
             constants_i: state.constants_i,
             constants_r: state.constants_r,
-            constants_f: constants_f_f64,
-            c_num_regs_i: num_regs_i as u8,
-            c_num_regs_r: num_regs_r as u8,
-            c_num_regs_f: num_regs_f as u8,
+            constants_f: state.constants_f,
+            c_num_regs_i: num_regs_i as u16,
+            c_num_regs_r: num_regs_r as u16,
+            c_num_regs_f: num_regs_f as u16,
             startpoints: state.startpoints,
             alllabels: state.alllabels,
             resulttypes: state.resulttypes,
@@ -1724,7 +1716,7 @@ impl Assembler {
 
     fn emit_const_r(&mut self, value: &ConstValue, state: &mut AssemblyState) -> u8 {
         let bits = match value {
-            ConstValue::HostObject(obj) => obj.identity_id() as u64,
+            ConstValue::HostObject(obj) => obj.identity_id() as i64,
             other => panic!("raise/r constant pool does not support {other:?}"),
         };
         if let Some(index) = state
@@ -1759,7 +1751,7 @@ impl Assembler {
 struct AssemblyState {
     code: Vec<u8>,
     constants_i: Vec<i64>,
-    constants_r: Vec<u64>,
+    constants_r: Vec<i64>,
     constants_f: Vec<i64>,
     num_regs_i: usize,
     num_regs_r: usize,
@@ -2996,7 +2988,7 @@ mod tests {
         let mut asm = Assembler::new();
         let body = asm.assemble(&mut flat, &regallocs);
 
-        assert_eq!(body.constants_r, vec![module.identity_id() as u64]);
+        assert_eq!(body.constants_r, vec![module.identity_id() as i64]);
         assert!(asm.insns.contains_key("ref_return/r"));
     }
 

@@ -268,10 +268,14 @@ impl CallControl {
             // upstream invariant.
             let key = Self::jitcode_key(portal_graph);
             if let Some(slot) = self.jitcodes.get_mut(&key) {
-                if let Some(pyjitcode) = std::sync::Arc::get_mut(slot) {
-                    if let Some(inner) = std::sync::Arc::get_mut(&mut pyjitcode.jitcode) {
-                        inner.jitdriver_sd = Some(i);
-                    }
+                // RPython call.py:148 — `jd.mainjitcode.jitdriver_sd =
+                // jd`.  Canonical's `jitdriver_sd` is an OnceLock with
+                // interior mutability, so the write succeeds through
+                // `&Arc<JitCode>` even when the surrounding Arc is
+                // shared (e.g. `cc.jitcodes` and `jd.mainjitcode`).
+                let pyjitcode = std::sync::Arc::clone(slot);
+                if pyjitcode.jitcode.jitdriver_sd().is_none() {
+                    pyjitcode.jitcode.set_jitdriver_sd(i);
                 }
                 self.jitdrivers_sd[i].mainjitcode = Some(std::sync::Arc::clone(slot));
             }

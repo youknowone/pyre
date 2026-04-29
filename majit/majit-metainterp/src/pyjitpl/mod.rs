@@ -9752,7 +9752,7 @@ impl<M: Clone> MetaInterp<M> {
     /// back to `false` when the jitcode does not point at a registered
     /// driver slot — matches the `jitdriver_sd is not None` guard.
     pub fn is_main_jitcode(&self, jitcode: &crate::jitcode::JitCode) -> bool {
-        match jitcode.jitdriver_sd {
+        match jitcode.jitdriver_sd() {
             Some(idx) => self
                 .staticdata
                 .jitdrivers_sd
@@ -9796,7 +9796,7 @@ impl<M: Clone> MetaInterp<M> {
         greenkey: Option<u64>,
     ) -> usize {
         // pyjitpl.py:2433: if jitcode.jitdriver_sd: portal_call_depth += 1
-        if let Some(jd_no) = jitcode.jitdriver_sd {
+        if let Some(jd_no) = jitcode.jitdriver_sd() {
             self.portal_call_depth += 1;
             // pyjitpl.py:2435: self.call_ids.append(self.current_call_id)
             self.call_ids.push(self.current_call_id);
@@ -9810,7 +9810,7 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2443-2445: `if greenkey is not None and
         // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
         //     (jitcode.jitdriver_sd, greenkey, self.history.get_trace_position()))`.
-        if let (Some(gk), Some(jd_no)) = (greenkey, jitcode.jitdriver_sd) {
+        if let (Some(gk), Some(jd_no)) = (greenkey, jitcode.jitdriver_sd()) {
             if self.is_main_jitcode(&jitcode) {
                 if let (Some(positions), Some(ctx)) =
                     (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
@@ -9882,7 +9882,7 @@ impl<M: Clone> MetaInterp<M> {
         // pyjitpl.py:2463: frame = self.framestack.pop()
         if let Some(mut frame) = self.framestack.pop() {
             // pyjitpl.py:2465-2469: jitdriver_sd → portal_call_depth/leave_portal_frame/call_ids.
-            if let Some(jd_no) = frame.jitcode.jitdriver_sd {
+            if let Some(jd_no) = frame.jitcode.jitdriver_sd() {
                 self.portal_call_depth -= 1;
                 if leave_portal_frame {
                     self.leave_portal_frame(jd_no);
@@ -9893,7 +9893,7 @@ impl<M: Clone> MetaInterp<M> {
             // pyjitpl.py:2470-2472: `if frame.greenkey is not None and
             // self.is_main_jitcode(jitcode): self.portal_trace_positions.append(
             //     (jitcode.jitdriver_sd, None, self.history.get_trace_position()))`.
-            if let (Some(_gk), Some(jd_no)) = (frame.greenkey, frame.jitcode.jitdriver_sd) {
+            if let (Some(_gk), Some(jd_no)) = (frame.greenkey, frame.jitcode.jitdriver_sd()) {
                 if self.is_main_jitcode(&frame.jitcode) {
                     if let (Some(positions), Some(ctx)) =
                         (self.portal_trace_positions.as_mut(), self.tracing.as_ref())
@@ -9965,7 +9965,7 @@ impl<M: Clone> MetaInterp<M> {
             .framestack
             .frames
             .last()
-            .and_then(|f| f.jitcode.jitdriver_sd);
+            .and_then(|f| f.jitcode.jitdriver_sd());
         // pyjitpl.py:2482: self.popframe(leave_portal_frame=...)
         self.popframe(leave_portal_frame);
         // pyjitpl.py:2483: if self.framestack:
@@ -10427,7 +10427,7 @@ impl<M: Clone> MetaInterp<M> {
             (frame.jitcode.clone(), frame.pc, frame._result_argcode)
         };
         // pyjitpl.py:1279-1280: if self.jitcode.jitdriver_sd: return
-        if jitcode_arc.jitdriver_sd.is_some() {
+        if jitcode_arc.jitdriver_sd().is_some() {
             return;
         }
         let bytecode = &jitcode_arc.code;
@@ -13033,8 +13033,8 @@ mod metainterp_static_data_tests {
         use crate::jitcode::{JitArgKind, JitCodeBuilder};
         let mut builder = JitCodeBuilder::new();
         builder.load_const_i_value(0, 0);
-        let mut jitcode = builder.finish();
-        jitcode.jitdriver_sd = Some(0);
+        let jitcode = builder.finish();
+        jitcode.set_jitdriver_sd(0);
         let mut meta = MetaInterp::<()>::new(0);
         let driver = crate::jitdriver::JitDriverStaticData {
             index: None,
@@ -13168,11 +13168,11 @@ mod metainterp_static_data_tests {
         use crate::jitcode::{JitArgKind, JitCodeBuilder};
         let mut builder = JitCodeBuilder::new();
         builder.load_const_i_value(0, 0);
-        let mut mainjitcode = builder.finish();
+        let mainjitcode = builder.finish();
         // pyjitpl.py:3268-3272 — the mainjitcode is the portal jitcode
         // and must carry jitdriver_sd so portal_call_depth bumps from
         // -1 to 0 inside newframe (matching the upstream assert).
-        mainjitcode.jitdriver_sd = Some(0);
+        mainjitcode.set_jitdriver_sd(0);
         let mainjitcode = std::sync::Arc::new(mainjitcode);
 
         let mut meta = MetaInterp::<()>::new(0);
@@ -13242,7 +13242,7 @@ mod metainterp_static_data_tests {
 
         // Push a portal frame on top: counter += 1.
         let mut portal = JitCodeBuilder::new().finish();
-        portal.jitdriver_sd = Some(0);
+        portal.replace_jitdriver_sd(Some(0));
         let portal = std::sync::Arc::new(portal);
         meta.perform_call(portal, &[], None).unwrap_err();
         assert_eq!(meta.portal_call_depth, initial + 1);
@@ -13904,7 +13904,7 @@ mod metainterp_static_data_tests {
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let mut portal = JitCodeBuilder::new().finish();
-        portal.jitdriver_sd = Some(0);
+        portal.replace_jitdriver_sd(Some(0));
         let portal = std::sync::Arc::new(portal);
         meta.perform_call(portal, &[], None).unwrap_err();
         let pre_len = meta.framestack.frames.len();
@@ -14609,7 +14609,7 @@ mod metainterp_static_data_tests {
     fn finishframe_exception_jumps_to_catch_handler() {
         let mut meta = MetaInterp::<()>::new(0);
         let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        jitcode.code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 3, 0];
+        jitcode.body_mut().code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 3, 0];
         let jitcode = std::sync::Arc::new(jitcode);
 
         meta.framestack
@@ -14628,7 +14628,7 @@ mod metainterp_static_data_tests {
     fn finishframe_exception_skips_live_prefix_before_catch_handler() {
         let mut meta = MetaInterp::<()>::new(0);
         let mut jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        jitcode.code = vec![
+        jitcode.body_mut().code = vec![
             crate::jitcode::BC_LIVE,
             0,
             0,
@@ -14680,14 +14680,14 @@ mod metainterp_static_data_tests {
         // Expected: popframe() drops the callee, then BC_CATCH_EXCEPTION
         // in the caller routes control to the handler target.
         let mut caller_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        caller_jitcode.code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 5, 0];
+        caller_jitcode.body_mut().code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 5, 0];
         let caller_jitcode = std::sync::Arc::new(caller_jitcode);
 
         // Callee: non-CATCH opcode at pc 0. Use BC_LIVE (skip prefix)
         // chased by a non-CATCH byte so finishframe_exception's LIVE
         // skip lands on something that isn't a handler.
         let mut callee_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        callee_jitcode.code = vec![0xff, 0, 0];
+        callee_jitcode.body_mut().code = vec![0xff, 0, 0];
         let callee_jitcode = std::sync::Arc::new(callee_jitcode);
 
         let mut meta = MetaInterp::<()>::new(0);
@@ -14725,10 +14725,10 @@ mod metainterp_static_data_tests {
         use crate::BackEdgeAction;
 
         let mut caller_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        caller_jitcode.code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 9, 0];
+        caller_jitcode.body_mut().code = vec![crate::jitcode::BC_CATCH_EXCEPTION, 9, 0];
         let caller_jitcode = std::sync::Arc::new(caller_jitcode);
         let mut callee_jitcode = crate::jitcode::JitCodeBuilder::new().finish();
-        callee_jitcode.code = vec![0xff, 0, 0];
+        callee_jitcode.body_mut().code = vec![0xff, 0, 0];
         let callee_jitcode = std::sync::Arc::new(callee_jitcode);
 
         let mut meta = MetaInterp::<()>::new(0);
@@ -14793,7 +14793,7 @@ mod metainterp_static_data_tests {
 
         let mut meta = MetaInterp::<()>::new(0);
         let mut portal = JitCodeBuilder::new().finish();
-        portal.jitdriver_sd = Some(0);
+        portal.replace_jitdriver_sd(Some(0));
         let portal = std::sync::Arc::new(portal);
 
         // Push portal: current_call_id stamped onto call_ids, then
@@ -14838,7 +14838,7 @@ mod metainterp_static_data_tests {
         // portal mainjitcode (which bumps it to 0), then assert == 0.
         use crate::jitcode::JitCodeBuilder;
         let mut mainjitcode = JitCodeBuilder::new().finish();
-        mainjitcode.jitdriver_sd = Some(0);
+        mainjitcode.replace_jitdriver_sd(Some(0));
         let mainjitcode = std::sync::Arc::new(mainjitcode);
 
         let mut meta = MetaInterp::<()>::new(0);
@@ -14852,10 +14852,10 @@ mod metainterp_static_data_tests {
     fn is_main_jitcode_returns_false_for_non_portal_jitcode() {
         let mut meta = MetaInterp::<()>::new(0);
         let mut jc = crate::jitcode::JitCodeBuilder::new().finish();
-        jc.jitdriver_sd = None;
+        jc.replace_jitdriver_sd(None);
         assert!(!meta.is_main_jitcode(&jc));
         // jitdriver_sd Some but no slot registered → still false.
-        jc.jitdriver_sd = Some(0);
+        jc.replace_jitdriver_sd(Some(0));
         assert!(!meta.is_main_jitcode(&jc));
 
         // Register a non-recursive jitdriver: still false.
@@ -14871,7 +14871,7 @@ mod metainterp_static_data_tests {
                 .unwrap()
                 .register_jitdriver_sd(jd, backend)
         };
-        jc.jitdriver_sd = Some(idx);
+        jc.replace_jitdriver_sd(Some(idx));
         assert!(!meta.is_main_jitcode(&jc));
     }
 
@@ -14892,7 +14892,7 @@ mod metainterp_static_data_tests {
         };
 
         let mut jc = crate::jitcode::JitCodeBuilder::new().finish();
-        jc.jitdriver_sd = Some(idx);
+        jc.replace_jitdriver_sd(Some(idx));
         assert!(meta.is_main_jitcode(&jc));
     }
 
@@ -14960,7 +14960,7 @@ mod metainterp_static_data_tests {
         assert!(matches!(action, BackEdgeAction::StartedTracing));
 
         let mut jc = JitCodeBuilder::new().finish();
-        jc.jitdriver_sd = Some(5);
+        jc.replace_jitdriver_sd(Some(5));
         let jc = std::sync::Arc::new(jc);
 
         meta.newframe(jc, Some(0xfeed));
@@ -15017,7 +15017,7 @@ mod metainterp_static_data_tests {
         };
 
         let mut jc = JitCodeBuilder::new().finish();
-        jc.jitdriver_sd = Some(idx);
+        jc.replace_jitdriver_sd(Some(idx));
         let jc = std::sync::Arc::new(jc);
 
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);
@@ -15067,7 +15067,7 @@ mod metainterp_static_data_tests {
         };
 
         let mut jc = JitCodeBuilder::new().finish();
-        jc.jitdriver_sd = Some(idx);
+        jc.replace_jitdriver_sd(Some(idx));
         let jc = std::sync::Arc::new(jc);
 
         let action = meta.force_start_tracing(0, (0, 0), None, &[]);

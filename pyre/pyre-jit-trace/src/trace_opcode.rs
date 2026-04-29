@@ -6713,12 +6713,20 @@ mod tests {
         insns.insert("live/".to_string(), majit_metainterp::jitcode::BC_LIVE);
         crate::assembler::publish_state(&insns, &all_liveness, all_liveness.len(), 1);
 
-        let runtime_jc = majit_metainterp::jitcode::JitCode {
-            code: vec![majit_metainterp::jitcode::BC_LIVE, 0, 0],
-            c_num_regs_i: 4,
-            c_num_regs_r: 4,
-            c_num_regs_f: 4,
-            ..Default::default()
+        let runtime_jc = {
+            let inner = majit_metainterp::jitcode::JitCode::new("get_list_of_active_boxes_test");
+            inner.set_body(majit_translate::jitcode::JitCodeBody {
+                code: vec![majit_metainterp::jitcode::BC_LIVE, 0, 0],
+                c_num_regs_i: 4,
+                c_num_regs_r: 4,
+                c_num_regs_f: 4,
+                // RPython `jitcode.py:85-90` `assert pc in self._startpoints`:
+                // hand-crafted bodies must declare each opcode's offset.  The
+                // single BC_LIVE here sits at byte 0.
+                startpoints: [0_usize].into_iter().collect(),
+                ..Default::default()
+            });
+            inner
         };
         let mut pyjit = crate::PyJitCode::skeleton(std::ptr::null(), std::ptr::null(), None);
         pyjit.jitcode = Arc::new(runtime_jc);

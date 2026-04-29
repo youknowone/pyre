@@ -738,13 +738,13 @@ mod tests {
         // 1 int reg + 1 ref reg + 0 float regs live at pc=0.
         let mut builder = JitCodeBuilder::new();
         let mut jitcode = builder.finish();
-        jitcode.c_num_regs_i = 1;
-        jitcode.c_num_regs_r = 1;
-        jitcode.c_num_regs_f = 0;
+        jitcode.body_mut().c_num_regs_i = 1;
+        jitcode.body_mut().c_num_regs_r = 1;
+        jitcode.body_mut().c_num_regs_f = 0;
         const LIVE_OP: u8 = 0x42;
         // bytecode: [LIVE_OP, offset_lo, offset_hi] at pc 0..3.
         // decode_offset reads 2 bytes → liveness info at offset 0.
-        jitcode.code = vec![LIVE_OP, 0x00, 0x00];
+        jitcode.body_mut().code = vec![LIVE_OP, 0x00, 0x00];
         let jitcode = Arc::new(jitcode);
 
         // all_liveness at offset 0:
@@ -823,7 +823,7 @@ mod tests {
         let jitcode_arc = {
             let mut jc = make_jitcode_with_regs(1, 0, 0);
             let jc_mut = Arc::get_mut(&mut jc).expect("fresh Arc");
-            jc_mut.code = code;
+            jc_mut.body_mut().code = code;
             jc
         };
 
@@ -886,7 +886,7 @@ mod tests {
         let jitcode_arc = {
             let mut jc = make_jitcode_with_regs(1, 0, 0);
             let jc_mut = Arc::get_mut(&mut jc).expect("fresh Arc");
-            jc_mut.code = code;
+            jc_mut.body_mut().code = code;
             jc
         };
 
@@ -938,7 +938,7 @@ mod tests {
         let jitcode_arc = {
             let mut jc = make_jitcode_with_regs(2, 0, 0);
             let jc_mut = Arc::get_mut(&mut jc).expect("fresh Arc");
-            jc_mut.code = code;
+            jc_mut.body_mut().code = code;
             jc
         };
 
@@ -994,10 +994,10 @@ mod tests {
         let jitcode_arc = {
             let mut jc = make_jitcode_with_regs(1, 0, 0);
             let jc_mut = Arc::get_mut(&mut jc).expect("fresh Arc");
-            jc_mut.code = code;
+            jc_mut.body_mut().code = code;
             // `num_regs_i == 1`; constants_i has a single entry at
             // "register" index 1 (= num_regs_i).
-            jc_mut.constants_i = vec![1234];
+            jc_mut.body_mut().constants_i = vec![1234];
             jc
         };
 
@@ -1154,9 +1154,9 @@ mod tests {
         let mut jitcode = make_jitcode_with_regs(1, 1, 1);
         {
             let jc = Arc::get_mut(&mut jitcode).expect("fresh Arc");
-            jc.constants_i = vec![123];
-            jc.constants_r = vec![0x1234];
-            jc.constants_f = vec![1.5f64.to_bits() as i64];
+            jc.body_mut().constants_i = vec![123];
+            jc.body_mut().constants_r = vec![0x1234];
+            jc.body_mut().constants_f = vec![1.5f64.to_bits() as i64];
         }
         let sd = Arc::new(crate::MetaInterpStaticData::new());
         let mut recorder = crate::recorder::Trace::new();

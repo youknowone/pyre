@@ -21,6 +21,14 @@ pub struct JitCodeBuilder {
     /// caller provides the source function name via `set_name`.
     name: String,
     code: Vec<u8>,
+    /// RPython `jitcode.py:40` `self._startpoints = startpoints` —
+    /// populated as a sibling of every opcode-byte push so
+    /// `JitCode.get_live_vars_info` (RPython `jitcode.py:85-90`) can
+    /// fire its non-translated `assert pc in self._startpoints` check
+    /// against runtime-emitted bytecode.  Recording happens through
+    /// `start_instr` / `write_insn`; every helper that pushes an opcode
+    /// byte goes through one of those.
+    startpoints: std::collections::HashSet<usize>,
     num_regs_i: u16,
     num_regs_r: u16,
     num_regs_f: u16,
@@ -53,6 +61,21 @@ pub struct JitCodeBuilder {
     /// (RPython `j`/`d` argcode → `descrs[idx]` dispatch).
     descrs: Vec<RuntimeBhDescr>,
     has_abort: bool,
+    /// RPython `jitcode.py:16` `self.fnaddr = fnaddr`. RPython hands
+    /// `fnaddr` to `JitCode.__init__` *before* the assembler fills the
+    /// body; pyre stages it here through `set_fnaddr` so `finish()` can
+    /// commit it alongside the body in a single object construction step.
+    fnaddr: i64,
+    /// RPython `jitcode.py:17` `self.calldescr = calldescr`. RPython
+    /// hands the calldescr to `JitCode.__init__` *before* the assembler
+    /// fills the body, so the field is committed alongside the
+    /// `setup()` body.  Callers stage the value here through
+    /// `set_calldescr` so `finish()` can stamp it into the body atomically;
+    /// the post-assemble `body_mut().calldescr = ...` write the previous
+    /// implementation used violated the upstream order
+    /// (`call.py:167-169` constructs `JitCode(name, fnaddr, calldescr)`
+    /// before `assembler.assemble`).
+    calldescr: majit_translate::jitcode::BhCallDescr,
     /// Whether `num_regs_{i,r,f}` have been frozen at the regalloc-
     /// final value. While set, `touch_reg`/`touch_ref_reg`/
     /// `touch_float_reg` skip the `max` update so subsequent operand
@@ -89,6 +112,22 @@ impl JitCodeBuilder {
     /// function name should call this before `finish()`.
     pub fn set_name(&mut self, name: impl Into<String>) {
         self.name = name.into();
+    }
+
+    /// Stage `fnaddr` (RPython `jitcode.py:16`) so `finish()` can
+    /// commit it onto the constructed `JitCode` alongside the body —
+    /// matching `JitCode(name, fnaddr, calldescr)` constructor order
+    /// (`call.py:167-169`).
+    pub fn set_fnaddr(&mut self, fnaddr: i64) {
+        self.fnaddr = fnaddr;
+    }
+
+    /// Stage the calldescr returned by `get_jitcode_calldescr`
+    /// (`call.py:167`) so `finish()` can stamp it into the body alongside
+    /// the bytecode/constants pool, matching the upstream
+    /// `JitCode(name, fnaddr, calldescr)` constructor order.
+    pub fn set_calldescr(&mut self, calldescr: majit_translate::jitcode::BhCallDescr) {
+        self.calldescr = calldescr;
     }
 
     /// Whether `abort()` was called on this builder.
@@ -250,42 +289,42 @@ impl JitCodeBuilder {
 
     pub fn vable_getfield_int(&mut self, dest: u16, field_idx: u16) {
         self.touch_reg(dest);
-        self.push_u8(jitcode::BC_GETFIELD_VABLE_I);
+        self.start_instr(jitcode::BC_GETFIELD_VABLE_I);
         self.push_u16(field_idx);
         self.push_u16(dest);
     }
 
     pub fn vable_getfield_ref(&mut self, dest: u16, field_idx: u16) {
         self.touch_ref_reg(dest);
-        self.push_u8(jitcode::BC_GETFIELD_VABLE_R);
+        self.start_instr(jitcode::BC_GETFIELD_VABLE_R);
         self.push_u16(field_idx);
         self.push_u16(dest);
     }
 
     pub fn vable_getfield_float(&mut self, dest: u16, field_idx: u16) {
         self.touch_float_reg(dest);
-        self.push_u8(jitcode::BC_GETFIELD_VABLE_F);
+        self.start_instr(jitcode::BC_GETFIELD_VABLE_F);
         self.push_u16(field_idx);
         self.push_u16(dest);
     }
 
     pub fn vable_setfield_int(&mut self, field_idx: u16, src: u16) {
         self.touch_reg(src);
-        self.push_u8(jitcode::BC_SETFIELD_VABLE_I);
+        self.start_instr(jitcode::BC_SETFIELD_VABLE_I);
         self.push_u16(field_idx);
         self.push_u16(src);
     }
 
     pub fn vable_setfield_ref(&mut self, field_idx: u16, src: u16) {
         self.touch_ref_reg(src);
-        self.push_u8(jitcode::BC_SETFIELD_VABLE_R);
+        self.start_instr(jitcode::BC_SETFIELD_VABLE_R);
         self.push_u16(field_idx);
         self.push_u16(src);
     }
 
     pub fn vable_setfield_float(&mut self, field_idx: u16, src: u16) {
         self.touch_float_reg(src);
-        self.push_u8(jitcode::BC_SETFIELD_VABLE_F);
+        self.start_instr(jitcode::BC_SETFIELD_VABLE_F);
         self.push_u16(field_idx);
         self.push_u16(src);
     }
@@ -293,7 +332,7 @@ impl JitCodeBuilder {
     pub fn vable_getarrayitem_int(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
         self.touch_reg(dest);
         self.touch_reg(index_reg);
-        self.push_u8(jitcode::BC_GETARRAYITEM_VABLE_I);
+        self.start_instr(jitcode::BC_GETARRAYITEM_VABLE_I);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
@@ -302,7 +341,7 @@ impl JitCodeBuilder {
     pub fn vable_getarrayitem_ref(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
         self.touch_ref_reg(dest);
         self.touch_reg(index_reg);
-        self.push_u8(jitcode::BC_GETARRAYITEM_VABLE_R);
+        self.start_instr(jitcode::BC_GETARRAYITEM_VABLE_R);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
@@ -311,7 +350,7 @@ impl JitCodeBuilder {
     pub fn vable_getarrayitem_float(&mut self, dest: u16, array_idx: u16, index_reg: u16) {
         self.touch_float_reg(dest);
         self.touch_reg(index_reg);
-        self.push_u8(jitcode::BC_GETARRAYITEM_VABLE_F);
+        self.start_instr(jitcode::BC_GETARRAYITEM_VABLE_F);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(dest);
@@ -320,7 +359,7 @@ impl JitCodeBuilder {
     pub fn vable_setarrayitem_int(&mut self, array_idx: u16, index_reg: u16, src: u16) {
         self.touch_reg(index_reg);
         self.touch_reg(src);
-        self.push_u8(jitcode::BC_SETARRAYITEM_VABLE_I);
+        self.start_instr(jitcode::BC_SETARRAYITEM_VABLE_I);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(src);
@@ -329,7 +368,7 @@ impl JitCodeBuilder {
     pub fn vable_setarrayitem_ref(&mut self, array_idx: u16, index_reg: u16, src: u16) {
         self.touch_reg(index_reg);
         self.touch_ref_reg(src);
-        self.push_u8(jitcode::BC_SETARRAYITEM_VABLE_R);
+        self.start_instr(jitcode::BC_SETARRAYITEM_VABLE_R);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(src);
@@ -355,7 +394,7 @@ impl JitCodeBuilder {
     ) {
         let const_idx = self.add_const_r(value);
         self.touch_reg(index_reg);
-        self.push_u8(jitcode::BC_SETARRAYITEM_VABLE_R);
+        self.start_instr(jitcode::BC_SETARRAYITEM_VABLE_R);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         let src_offset = self.code.len();
@@ -367,7 +406,7 @@ impl JitCodeBuilder {
     pub fn vable_setarrayitem_float(&mut self, array_idx: u16, index_reg: u16, src: u16) {
         self.touch_reg(index_reg);
         self.touch_float_reg(src);
-        self.push_u8(jitcode::BC_SETARRAYITEM_VABLE_F);
+        self.start_instr(jitcode::BC_SETARRAYITEM_VABLE_F);
         self.push_u16(array_idx);
         self.push_u16(index_reg);
         self.push_u16(src);
@@ -375,13 +414,13 @@ impl JitCodeBuilder {
 
     pub fn vable_arraylen(&mut self, dest: u16, array_idx: u16) {
         self.touch_reg(dest);
-        self.push_u8(jitcode::BC_ARRAYLEN_VABLE);
+        self.start_instr(jitcode::BC_ARRAYLEN_VABLE);
         self.push_u16(array_idx);
         self.push_u16(dest);
     }
 
     pub fn vable_force(&mut self) {
-        self.push_u8(jitcode::BC_HINT_FORCE_VIRTUALIZABLE);
+        self.start_instr(jitcode::BC_HINT_FORCE_VIRTUALIZABLE);
     }
 
     /// Load from a virtualizable state array: emit GETARRAYITEM_RAW_I.
@@ -1088,7 +1127,7 @@ impl JitCodeBuilder {
         if let Some(caller_dst) = return_f {
             self.touch_float_reg(caller_dst);
         }
-        self.push_u8(jitcode::BC_INLINE_CALL);
+        self.start_instr(jitcode::BC_INLINE_CALL);
         self.push_u16(sub_jitcode_idx);
         self.push_u16(args.len() as u16);
         for &(kind, caller_src, callee_dst) in args {
@@ -1746,27 +1785,43 @@ impl JitCodeBuilder {
         self.patch_labels();
         self.patch_const_refs();
         self.patch_const_u8_refs();
-        JitCode {
-            name: self.name,
+        let body = majit_translate::jitcode::JitCodeBody {
+            // RPython `jitcode.py:17 self.calldescr = calldescr` — the
+            // value was stored on the builder via `set_calldescr` (the
+            // analog of upstream's constructor argument).  Without an
+            // explicit stage call the field remains at the
+            // `BhCallDescr::default()` zero, matching the pre-set state
+            // RPython's constructor shows when `calldescr=None`.
+            calldescr: self.calldescr,
             code: self.code,
-            c_num_regs_i: self.num_regs_i,
-            c_num_regs_r: self.num_regs_r,
-            c_num_regs_f: self.num_regs_f,
             constants_i: self.constants_i,
             constants_r: self.constants_r,
             constants_f: self.constants_f,
-            jitdriver_sd: None,
-            fnaddr: 0,
-            calldescr: majit_translate::jitcode::BhCallDescr::default(),
-            // codewriter.py:68 `jitcode.index = index` — defaults to 0
-            // here; `state::jitcode_for` back-stamps the canonical
-            // `metainterp_sd.jitcodes` position via the AtomicI64
-            // store at registration time.
-            index: std::sync::atomic::AtomicI64::new(0),
-            exec: super::JitCodeExecState {
-                descrs: self.descrs,
-            },
-        }
+            c_num_regs_i: self.num_regs_i,
+            c_num_regs_r: self.num_regs_r,
+            c_num_regs_f: self.num_regs_f,
+            startpoints: self.startpoints,
+            alllabels: Default::default(),
+            resulttypes: Default::default(),
+            _ssarepr: None,
+        };
+        let mut jc = JitCode::new(self.name);
+        // RPython `JitCode(name, fnaddr, calldescr)` (`call.py:167-169`)
+        // writes `fnaddr` at construction time before the assembler fills
+        // the body. Stage it on the builder via `set_fnaddr` and stamp it
+        // here so callers do not need a post-`set_body` mutation.
+        jc.fnaddr = self.fnaddr;
+        jc.set_body(body);
+        jc.exec = super::JitCodeExecState {
+            descrs: self.descrs,
+        };
+        // codewriter.py:68 `jitcode.index = index` — back-stamped by
+        // `state::jitcode_for` at registration time. JitCode::new
+        // leaves the OnceLock unset; runtime call sites that
+        // previously expected `index = 0` from the flat-struct
+        // Default consume `try_index()` instead, which correctly
+        // returns `None` until the back-stamp lands.
+        jc
     }
 
     fn push_u8(&mut self, value: u8) {
@@ -1784,7 +1839,18 @@ impl JitCodeBuilder {
     /// per-BC operand layouts do not yet match the 1-byte `emit_reg` /
     /// `emit_const` encoding on the RPython side.
     fn write_insn(&mut self, key: &'static str) {
-        self.push_u8(jitcode::insn_byte(key));
+        self.start_instr(jitcode::insn_byte(key));
+    }
+
+    /// Record the current bytecode offset as an instruction start
+    /// (RPython `assembler.py:200-208` writes `self.startpoints.add(pos)`
+    /// just before each opcode-byte push) and emit the opcode byte.
+    /// Every helper that pushes a `BC_*` opcode goes through this so
+    /// `JitCode.get_live_vars_info` (RPython `jitcode.py:85-90`) can
+    /// fire its non-translated `assert pc in self._startpoints` check.
+    fn start_instr(&mut self, opcode: u8) {
+        self.startpoints.insert(self.code.len());
+        self.push_u8(opcode);
     }
 
     fn call_int_like(&mut self, opcode: u8, fn_ptr_idx: u16, arg_regs: &[JitCallArg], dst: u16) {
@@ -1792,7 +1858,7 @@ impl JitCodeBuilder {
         for &arg in arg_regs {
             self.touch_call_arg(arg);
         }
-        self.push_u8(opcode);
+        self.start_instr(opcode);
         self.push_u16(fn_ptr_idx);
         self.push_u16(dst);
         self.push_u16(arg_regs.len() as u16);
@@ -1806,7 +1872,7 @@ impl JitCodeBuilder {
         for &arg in arg_regs {
             self.touch_call_arg(arg);
         }
-        self.push_u8(opcode);
+        self.start_instr(opcode);
         self.push_u16(fn_ptr_idx);
         self.push_u16(arg_regs.len() as u16);
         for &arg in arg_regs {
@@ -1819,7 +1885,7 @@ impl JitCodeBuilder {
         for &arg in arg_regs {
             self.touch_call_arg(arg);
         }
-        self.push_u8(opcode);
+        self.start_instr(opcode);
         self.push_u16(target_idx);
         self.push_u16(arg_regs.len() as u16);
         for &arg in arg_regs {
@@ -1860,7 +1926,7 @@ impl JitCodeBuilder {
         for &arg in arg_regs {
             self.touch_call_arg(arg);
         }
-        self.push_u8(opcode);
+        self.start_instr(opcode);
         self.push_u16(fn_ptr_idx);
         self.push_u16(dst);
         self.push_u16(arg_regs.len() as u16);
@@ -1881,7 +1947,7 @@ impl JitCodeBuilder {
         for &arg in arg_regs {
             self.touch_call_arg(arg);
         }
-        self.push_u8(opcode);
+        self.start_instr(opcode);
         self.push_u16(target_idx);
         self.push_u16(dst);
         self.push_u16(arg_regs.len() as u16);
@@ -1902,7 +1968,7 @@ impl JitCodeBuilder {
         for &arg in arg_regs {
             self.touch_call_arg(arg);
         }
-        self.push_u8(opcode);
+        self.start_instr(opcode);
         self.push_u16(target_idx);
         self.push_u16(dst);
         self.push_u16(arg_regs.len() as u16);
@@ -1917,7 +1983,7 @@ impl JitCodeBuilder {
         for &arg in arg_regs {
             self.touch_call_arg(arg);
         }
-        self.push_u8(opcode);
+        self.start_instr(opcode);
         self.push_u16(fn_ptr_idx);
         self.push_u16(dst);
         self.push_u16(arg_regs.len() as u16);
@@ -1938,7 +2004,7 @@ impl JitCodeBuilder {
         for &arg in arg_regs {
             self.touch_call_arg(arg);
         }
-        self.push_u8(opcode);
+        self.start_instr(opcode);
         self.push_u16(target_idx);
         self.push_u16(dst);
         self.push_u16(arg_regs.len() as u16);

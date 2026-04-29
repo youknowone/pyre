@@ -1706,12 +1706,16 @@ mod tests {
             0x00,
         ];
 
-        let jc = std::sync::Arc::new(majit_metainterp::jitcode::JitCode {
-            c_num_regs_i: 1,
-            constants_i: vec![42],
-            code: code.clone(),
-            ..Default::default()
-        });
+        let jc = {
+            let inner = majit_metainterp::jitcode::JitCode::new("test_setposition");
+            inner.set_body(majit_translate::jitcode::JitCodeBody {
+                c_num_regs_i: 1,
+                constants_i: vec![42],
+                code: code.clone(),
+                ..Default::default()
+            });
+            std::sync::Arc::new(inner)
+        };
 
         let mut bh = builder.acquire_interp();
         bh.setposition(jc.clone(), 0);

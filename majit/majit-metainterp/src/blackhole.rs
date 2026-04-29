@@ -794,7 +794,7 @@ fn blackhole_with_recovery_layout(
 // (unlike trace IR which only has the traced path).
 // ============================================================================
 
-use crate::jitcode::{self, JitArgKind, JitCode};
+use crate::jitcode::{self, JitArgKind, JitCode, JitCodeRuntimeExt};
 use crate::pyjitpl::{MIFrame, MIFrameStack};
 use crate::pyjitpl::{
     call_int_function, call_void_function, eval_binop_f, eval_binop_i, eval_unary_f, eval_unary_i,
@@ -1099,13 +1099,13 @@ impl BlackholeInterpreter {
             &mut self.registers_r,
             jitcode.num_regs_and_consts_r(),
             jitcode.num_regs_r(),
-            body.constants_r.iter().map(|&c| c as i64),
+            body.constants_r.iter().copied(),
         );
         Self::init_register_file_from_i64s(
             &mut self.registers_f,
             jitcode.num_regs_and_consts_f(),
             jitcode.num_regs_f(),
-            body.constants_f.iter().map(|&c| c.to_bits() as i64),
+            body.constants_f.iter().copied(),
         );
         self.reset_position_state(position);
     }
@@ -3409,7 +3409,7 @@ fn handle_jitexception(
     portal_runner: Option<&dyn Fn(&JitException) -> Result<(BhReturnType, i64), JitException>>,
 ) -> Result<(BlackholeInterpreter, i64), JitException> {
     // blackhole.py:1764: while blackholeinterp.jitcode.jitdriver_sd is None
-    while bh.jitcode.jitdriver_sd.is_none() {
+    while bh.jitcode.jitdriver_sd().is_none() {
         let next = bh.nextblackholeinterp.take();
         builder.release_interp(bh);
         match next.map(|b| *b) {

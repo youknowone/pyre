@@ -2083,10 +2083,7 @@ impl TraceRecordBuffer {
         let vref_array = self._list_of_boxes_from_boxes(vref_boxes);
         self.append_snapshot_data_int(vable_array);
         self.append_snapshot_data_int(vref_array);
-        let jitcode_index = frame
-            .jitcode
-            .index
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let jitcode_index = frame.jitcode.try_index().map(|i| i as i64).unwrap_or(-1);
         let pc = frame.pc as i64;
         self._encode_snapshot(jitcode_index, pc, array, is_last);
         self.patch_last_guard_descr_slot(s);
@@ -2126,10 +2123,7 @@ impl TraceRecordBuffer {
             /* after_residual_call */ false,
         );
         self.snapshot_add_prev(SNAPSHOT_PREV_COMES_NEXT);
-        let jitcode_index = frame
-            .jitcode
-            .index
-            .load(std::sync::atomic::Ordering::Relaxed);
+        let jitcode_index = frame.jitcode.try_index().map(|i| i as i64).unwrap_or(-1);
         let pc = frame.pc as i64;
         self._encode_snapshot(jitcode_index, pc, array, is_last)
     }
@@ -4154,12 +4148,15 @@ mod tests {
         // Build a minimal jitcode with 1 int reg and a LIVE op at pc 0.
         let mut builder = crate::jitcode::JitCodeBuilder::new();
         let mut jc = builder.finish();
-        jc.c_num_regs_i = 1;
-        jc.c_num_regs_r = 0;
-        jc.c_num_regs_f = 0;
         const LIVE_OP: u8 = 0x42;
-        jc.code = vec![LIVE_OP, 0x00, 0x00];
-        jc.index.store(11, std::sync::atomic::Ordering::Relaxed);
+        {
+            let body = jc.body_mut();
+            body.c_num_regs_i = 1;
+            body.c_num_regs_r = 0;
+            body.c_num_regs_f = 0;
+            body.code = vec![LIVE_OP, 0x00, 0x00];
+        }
+        jc.set_index(11);
         let jc = Arc::new(jc);
 
         // all_liveness: len_i=1 len_r=0 len_f=0, bitmask = 0b1.

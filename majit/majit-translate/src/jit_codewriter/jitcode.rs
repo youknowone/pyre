@@ -70,21 +70,28 @@ pub struct JitCodeBody {
     pub code: Vec<u8>,
     /// RPython `jitcode.py:32` `self.constants_i`.
     pub constants_i: Vec<i64>,
-    /// RPython `jitcode.py:33` `self.constants_r`.
-    /// RPython uses GCREF (opaque pointer); pyre uses `u64` until lltype
-    /// is ported.
-    pub constants_r: Vec<u64>,
+    /// RPython `jitcode.py:33` `self.constants_r` — GCREF constant pool.
+    /// RPython uses `lltype.cast_opaque_ptr(GCREF, ...)`; pyre stores the
+    /// raw 64-bit address as `i64` to match the runtime jitcode/blackhole
+    /// register file (where `r` registers also flow through `i64`).
+    pub constants_r: Vec<i64>,
     /// RPython `jitcode.py:34` `self.constants_f`.
-    /// RPython packs the float as `longlong.FLOATSTORAGE`; pyre uses `f64`.
-    pub constants_f: Vec<f64>,
+    /// RPython packs the float as `longlong.FLOATSTORAGE` (a 64-bit int
+    /// reinterpretation); pyre stores the same bitwise representation as
+    /// `i64` so the runtime register file can consume the pool entries
+    /// without a re-bitcast.
+    pub constants_f: Vec<i64>,
     /// RPython `jitcode.py:37-39` `self.c_num_regs_i = chr(num_regs_i)`.
-    /// RPython packs into a single chr because of `assert num_regs_i < 256`;
-    /// majit uses u8 directly with the same range.
-    pub c_num_regs_i: u8,
+    /// RPython packs into a single chr (`assert num_regs_i < 256`); pyre
+    /// uses `u16` to keep CPython 3.13 codes that legitimately exceed 255
+    /// registers per kind reachable.  The codewriter still asserts
+    /// `< 256` for now (assembler.rs); widening the field is a parity
+    /// preparation for that limit being lifted.
+    pub c_num_regs_i: u16,
     /// RPython `jitcode.py:38` `self.c_num_regs_r = chr(num_regs_r)`.
-    pub c_num_regs_r: u8,
+    pub c_num_regs_r: u16,
     /// RPython `jitcode.py:39` `self.c_num_regs_f = chr(num_regs_f)`.
-    pub c_num_regs_f: u8,
+    pub c_num_regs_f: u16,
     /// RPython `jitcode.py:40` `self._startpoints = startpoints` —
     /// debug-only set of bytecode offsets where instructions start.
     pub startpoints: HashSet<usize>,
@@ -223,6 +230,20 @@ impl JitCode {
         self.body.get()
     }
 
+    /// Mutable accessor for late post-assembly mutation of body fields.
+    /// Required by callers (e.g. pyre's `finalize_jitcode`) that fetch
+    /// `calldescr` from `CallControl` *after* the assembler has already
+    /// committed the body via `set_body`. RPython mutates `JitCode`
+    /// fields directly post-`setup()`; pyre routes the mutation through
+    /// `OnceLock::get_mut` so the same in-place semantics work on
+    /// canonical JitCode shells. Panics if the body has not been
+    /// committed yet.
+    pub fn body_mut(&mut self) -> &mut JitCodeBody {
+        self.body
+            .get_mut()
+            .expect("JitCode body not yet set — call set_body() before body_mut()")
+    }
+
     /// Commit the body once assembly has produced it. Panics on second
     /// call (RPython equivalent: `JitCode.setup` is also called once per
     /// jitcode lifetime).
@@ -255,10 +276,33 @@ impl JitCode {
         self.index.get().copied()
     }
 
-    /// Set `jitcode.index` once, at the moment the finished jitcode is
-    /// appended to `all_jitcodes[]`.
+    /// RPython `codewriter.py:68 jitcode.index = index` — assigned once,
+    /// at the moment the finished jitcode is appended to
+    /// `all_jitcodes[]`.  Matches upstream `JitCode` Python-object
+    /// identity semantics: a second `set_index` with a *different*
+    /// value is a parity violation and panics.  A second `set_index`
+    /// with the *same* value is treated as a no-op so concurrent
+    /// readers and writers along the codewriter →
+    /// `metainterp_sd.jitcodes` boundary can converge on the same
+    /// value without forcing every caller to inspect `try_index`
+    /// first (this matches the upstream observation that
+    /// `jitcode.index = N; jitcode.index = N` is an idempotent write
+    /// in Python).
     pub fn set_index(&self, idx: usize) {
-        self.index.set(idx).expect("JitCode index already set");
+        match self.index.set(idx) {
+            Ok(()) => {}
+            Err(_) => {
+                let existing = *self
+                    .index
+                    .get()
+                    .expect("OnceLock::set returned Err but get() is empty");
+                assert_eq!(
+                    existing, idx,
+                    "JitCode index already set to {existing}, cannot reassign to {idx} \
+                     — RPython codewriter.py:68 sets it exactly once",
+                );
+            }
+        }
     }
 
     /// Set `jitdriver_sd` once. Panics on second call.
@@ -266,6 +310,21 @@ impl JitCode {
         self.jitdriver_sd
             .set(idx)
             .expect("JitCode jitdriver_sd already set");
+    }
+
+    /// Replace `jitdriver_sd` (or clear it).  Requires `&mut self` so it
+    /// cannot race with the `set_jitdriver_sd` interior-mutability path
+    /// that production callers use.  Permissive so test fixtures can
+    /// cycle a JitCode through several portal/non-portal states without
+    /// allocating a fresh `JitCodeBuilder`. `set_jitdriver_sd` (single
+    /// shot, `&self`) remains the only supported path in production
+    /// because it matches RPython's `call.py:148` "set once at portal
+    /// grab time" pattern.
+    pub fn replace_jitdriver_sd(&mut self, value: Option<usize>) {
+        self.jitdriver_sd = OnceLock::new();
+        if let Some(idx) = value {
+            let _ = self.jitdriver_sd.set(idx);
+        }
     }
 
     /// RPython `jitcode.py:17` reader. Convenience for callers that
@@ -377,6 +436,11 @@ impl JitCode {
     /// `blackhole.py:72`). The result is the offset into the metainterp's
     /// `all_liveness` table.
     pub fn get_live_vars_info(&self, pc: usize, op_live: u8) -> usize {
+        // RPython `jitcode.py:85-90`: `if not we_are_translated(): assert
+        // pc in self._startpoints`. Pyre is "non-translated" today so the
+        // assertion fires in both canonical and runtime jitcodes — the
+        // runtime `JitCodeBuilder` populates `startpoints` from each
+        // opcode emit position.
         debug_assert!(self.startpoints.contains(&pc), "pc not in startpoints");
         let mut pc = pc;
         if self.code[pc] != op_live {
@@ -408,6 +472,36 @@ impl JitCode {
 impl std::fmt::Display for JitCode {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "<JitCode {:?}>", self.name)
+    }
+}
+
+impl Default for JitCode {
+    fn default() -> Self {
+        // Default placeholders (e.g. `Arc<JitCode>::default()` used by
+        // `BlackholeInterpreter::new` before the first `setposition`)
+        // need readable zero-size body fields.  Pre-collapse the
+        // runtime `JitCode::default()` derived `Default` and
+        // therefore returned all-zero numeric fields with empty Vecs;
+        // we preserve that observable behaviour by committing an empty
+        // `JitCodeBody` upfront so callers like `cleanup_registers`
+        // (which reads `num_regs_r()`) keep working without a
+        // `setposition` first.
+        let jc = Self::new(String::new());
+        jc.set_body(JitCodeBody::default());
+        jc
+    }
+}
+
+impl Clone for JitCode {
+    fn clone(&self) -> Self {
+        Self {
+            name: self.name.clone(),
+            fnaddr: self.fnaddr,
+            jitdriver_sd: self.jitdriver_sd.clone(),
+            index: self.index.clone(),
+            _called_from: self._called_from.clone(),
+            body: self.body.clone(),
+        }
     }
 }
 

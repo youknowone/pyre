@@ -4770,9 +4770,14 @@ mod tests {
         let rd_numb = writer.create_numbering();
 
         let mut runtime = JitCodeBuilder::default().finish();
-        runtime.code = vec![BC_LIVE, 0, 0, BC_ABORT];
-        runtime.c_num_regs_i = 1;
-        runtime.constants_i = vec![321];
+        runtime.body_mut().code = vec![BC_LIVE, 0, 0, BC_ABORT];
+        runtime.body_mut().c_num_regs_i = 1;
+        runtime.body_mut().constants_i = vec![321];
+        // Hand-crafted body bypasses the builder's `start_instr` path,
+        // so populate `startpoints` explicitly: BC_LIVE at 0,
+        // BC_ABORT at 3.  RPython `jitcode.py:85-90` asserts
+        // `pc in self._startpoints`.
+        runtime.body_mut().startpoints = [0_usize, 3].into_iter().collect();
         let runtime = std::sync::Arc::new(runtime);
 
         let mut builder = BlackholeInterpBuilder::new();

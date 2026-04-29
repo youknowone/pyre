@@ -2099,6 +2099,14 @@ mod tests {
             ],
         ));
         ssarepr.insns.push(Insn::Label(Label::new("L1")));
+        // Append a trailing return so `L1` is not at end-of-code.
+        // RPython `jitcode.py:108-112 follow_jump` asserts
+        // `labelvalue < len(code)` strictly, so the label must not
+        // resolve to `len(code)` itself.
+        ssarepr.insns.push(Insn::op(
+            "ref_return",
+            vec![Operand::Register(r(Kind::Ref, 0))],
+        ));
 
         let jitcode = assemble(
             &mut ssarepr,

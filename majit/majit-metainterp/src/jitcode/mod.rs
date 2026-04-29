@@ -458,344 +458,31 @@ impl LivenessInfo {
 /// definition lives in `majit_translate::jitcode::enumerate_vars`.
 pub use majit_translate::jitcode::enumerate_vars;
 
-/// Runtime descriptor entry — heterogeneous pool element indexed by
-/// `j` / `d` argcodes at dispatch time. Equivalent of RPython
-/// `self.descrs[idx]` where each entry is an instance of one of the
-/// `AbstractDescr` subclasses (`FieldDescr`, `ArrayDescr`, `JitCode`,
-/// ...). RPython uses `isinstance(value, JitCode)` to discriminate at
-/// runtime; pyre encodes the same discrimination in the enum tag
-/// because `majit_translate::jitcode::BhDescr` (build-time) cannot
-/// carry an `Arc<majit_metainterp::jitcode::JitCode>` without a
-/// layering inversion between the two crates.
-#[derive(Clone, Debug)]
-pub enum RuntimeBhDescr {
-    /// Target JitCode for a `j` argcode (`BC_INLINE_CALL`). RPython:
-    /// `blackhole.py:150-157` — `argtype == 'j' → descrs[idx]` asserted
-    /// `isinstance(value, JitCode)`. pyre's runtime carries the `Arc`
-    /// inline because the runtime-generated JitCodes have no global
-    /// allocation index into `metainterp_sd.all_jitcodes`.
-    JitCode(std::sync::Arc<JitCode>),
-    /// Target function for `BC_CALL_*` / `BC_RESIDUAL_CALL_*`.
-    /// RPython `blackhole.py:1225-1256` reads the function address
-    /// from an int register (`i` argcode) and the calling convention
-    /// from a descr (`d` argcode); pyre keeps the two together in
-    /// `JitCallTarget` because the runtime emitter wires trace-side
-    /// and blackhole-side function pointers in a single indirection
-    /// slot. Once pyre emits the function address via an int register
-    /// this variant can split into the RPython-shaped pair.
-    Call(JitCallTarget),
-    /// Compiled-assembler target for `BC_CALL_ASSEMBLER_*`. The
-    /// `token_number` identifies a `CompiledLoopToken` (RPython
-    /// `compile.py CompiledLoopToken.number`) that the tracer hands to
-    /// `ctx.call_assembler_*_typed` so the metainterp can chain this
-    /// trace into an already-compiled one.
-    AssemblerToken(JitCallAssemblerTarget),
-}
+// ──────────────────────────────────────────────────────────────────
+// Runtime descr pool types — RPython
+// `BlackholeInterpBuilder.descrs` / `BlackholeInterpreter.descrs`
+// (`blackhole.py:103`, `blackhole.py:288`).
+//
+// RPython keeps the descr pool on the blackhole interpreter, NOT on
+// the JitCode object.  In majit the canonical
+// `majit_translate::jitcode::JitCode` mirrors that — it is a
+// source-only RPython parity type with no descrs field.  The runtime
+// adapter state (descrs pool + call/assembler targets) lives here
+// alongside the wrapper `JitCode` defined below, which carries
+// `pub exec: JitCodeExecState` as a sibling of the canonical core.
+//
+// These types are runtime-only — they reference raw `*const ()`
+// trampoline addresses and live `Arc<JitCode>` callee handles, neither
+// of which has a representation in the codewriter source layer.
+// ──────────────────────────────────────────────────────────────────
 
-impl RuntimeBhDescr {
-    /// RPython parity: `isinstance(value, JitCode)` assertion at
-    /// `blackhole.py:156`. Returns the callee JitCode for `BC_INLINE_CALL`.
-    pub fn as_jitcode(&self) -> Option<&std::sync::Arc<JitCode>> {
-        match self {
-            Self::JitCode(arc) => Some(arc),
-            _ => None,
-        }
-    }
-
-    /// Extract the `Call` target for `BC_CALL_*` / `BC_RESIDUAL_CALL_*`.
-    pub fn as_call(&self) -> Option<&JitCallTarget> {
-        match self {
-            Self::Call(target) => Some(target),
-            _ => None,
-        }
-    }
-
-    /// Extract the assembler-call target for `BC_CALL_ASSEMBLER_*`.
-    pub(crate) fn as_assembler_token(&self) -> Option<&JitCallAssemblerTarget> {
-        match self {
-            Self::AssemblerToken(target) => Some(target),
-            _ => None,
-        }
-    }
-}
-
-/// Runtime adapter state — pyre-only descriptor pool not present on
-/// canonical RPython `JitCode`. RPython keeps descriptors in a single
-/// shared `BlackholeInterpBuilder.descrs` list keyed by the `d`/`j`
-/// argcodes (blackhole.py:59, 154); pyre's runtime jitcodes are
-/// generated per-Python-frame and cannot index into that shared pool
-/// because they lack a global allocation index, so the list lives
-/// per-JitCode here.
-///
-/// Phase I2 Step 2 moved the four pyre-only adapter fields
-/// (`sub_jitcodes`, `fn_ptrs`, `assembler_targets`, `opcodes`) off the
-/// canonical `JitCode` into this container. Step 3 collapsed three of
-/// those pools (`sub_jitcodes` → `RuntimeBhDescr::JitCode`, `fn_ptrs` →
-/// `RuntimeBhDescr::Call`, `assembler_targets` →
-/// `RuntimeBhDescr::AssemblerToken`) into the unified `descrs` list.
-/// Slice 3c dissolved the remaining `opcodes` pool by splitting
-/// `BC_RECORD_BINOP_*` / `BC_RECORD_UNARY_*` into per-opname `BC_*`
-/// bytes (`BC_INT_ADD`, `BC_FLOAT_MUL`, …), so the struct now holds
-/// only `descrs`, mirroring `BlackholeInterpBuilder.descrs` /
-/// `BlackholeInterpreter.descrs`
-/// (`blackhole.py:103, 288`).
-#[derive(Clone, Debug, Default)]
-pub struct JitCodeExecState {
-    /// Descriptor pool — indexed by the 2-byte `j`/`d` argcode operand.
-    /// Naming mirrors RPython `BlackholeInterpBuilder.descrs`
-    /// (blackhole.py:103) / `BlackholeInterpreter.descrs`
-    /// (blackhole.py:288). Build-time pyre routes the shared pool via
-    /// `BlackholeInterpBuilder.descrs`; runtime pyre keeps the
-    /// equivalent list per-JitCode because each Python-frame JitCode is
-    /// generated on demand. Heterogeneous entries discriminated by the
-    /// `RuntimeBhDescr` variant tag:
-    /// - `JitCode(Arc<JitCode>)` for `j` argcode (`BC_INLINE_CALL`).
-    /// - `Call(JitCallTarget)` for `d` argcode (`BC_CALL_*` /
-    ///   `BC_RESIDUAL_CALL_*`) — pyre bundles trace + concrete fn
-    ///   pointers in one slot; RPython keeps the function address in
-    ///   an int register and only the calling convention in the descr.
-    pub descrs: Vec<RuntimeBhDescr>,
-}
-
-/// Serialized interpreter step description, mirroring RPython's `JitCode`
-/// at a much smaller subset for the current proc-macro tracing surface.
-///
-/// Field names follow `rpython/jit/codewriter/jitcode.py` (`c_num_regs_i`
-/// etc). RPython packs each count into `chr(int)` for a 0..=255 range;
-/// pyre needs u16 because some Python codes legitimately exceed 255
-/// registers per kind (see pyre/pyre-jit/src/jit/codewriter.rs
-/// `liveness_regs_to_u8_sorted` for the companion fallback). The name
-/// matches RPython even though the representation is wider.
-///
-/// PRE-EXISTING-ADAPTATION: `index` uses `AtomicI64` interior mutability
-/// because pyre's runtime registration path (`state::jitcode_for`) needs
-/// to back-stamp the canonical `metainterp_sd.jitcodes` position onto
-/// the inner `JitCode` after the surrounding `Arc<PyJitCode>` is already
-/// shared (refcount > 1).  RPython mutates the `JitCode` Python object
-/// in place via `jitcode.index = index` (codewriter.py:68); the atomic
-/// field gives Rust the same in-place semantics under shared ownership
-/// without forcing a deep clone or restructuring the `Arc` plumbing.
-#[derive(Debug, Default)]
-pub struct JitCode {
-    // rpython/jit/codewriter/jitcode.py:14-43 canonical fields.
-    /// RPython `jitcode.py:15` `self.name = name` — symbolic name for
-    /// debugging/logging. RPython takes this as the first `__init__`
-    /// argument; pyre's runtime JitCodeBuilder currently leaves it
-    /// empty until each compile site wires it through.
-    pub name: String,
-    /// Encoded bytecode stream.
-    pub code: Vec<u8>,
-    /// RPython `jitcode.py:37` `self.c_num_regs_i = chr(num_regs_i)`.
-    pub c_num_regs_i: u16,
-    /// RPython `jitcode.py:38` `self.c_num_regs_r = chr(num_regs_r)`.
-    pub c_num_regs_r: u16,
-    /// RPython `jitcode.py:39` `self.c_num_regs_f = chr(num_regs_f)`.
-    pub c_num_regs_f: u16,
-    /// RPython: `jitcode.constants_i` — integer constant pool.
-    pub constants_i: Vec<i64>,
-    /// RPython: `jitcode.constants_r` — reference constant pool.
-    pub constants_r: Vec<i64>,
-    /// RPython: `jitcode.constants_f` — float constant pool (bits as i64).
-    pub constants_f: Vec<i64>,
-    /// jitcode.py:18 `jitdriver_sd` — index into jitdrivers_sd array.
-    /// `Some(index)` for portal jitcodes, `None` for helpers.
-    /// Set by call.py:148 grab_initial_jitcodes parity:
-    /// `jd.mainjitcode.jitdriver_sd = jd`.
-    /// Used by `_handle_jitexception` to find the portal level in the BH chain.
-    pub jitdriver_sd: Option<usize>,
-    /// RPython `jitcode.py:16` `self.fnaddr` — function address for `bh_call_*`.
-    /// Set by warmspot.py/call.py from `getfunctionptr(graph)`.
-    pub fnaddr: i64,
-    /// RPython `jitcode.py:17` `self.calldescr` — calling convention descriptor.
-    /// Set by `call.py:get_jitcode_calldescr(graph)` from the function's type.
-    pub calldescr: majit_translate::jitcode::BhCallDescr,
-    /// RPython `codewriter.py:68` `jitcode.index = index` — the
-    /// zero-based index of this jitcode in `metainterp_sd.jitcodes`.
-    /// Snapshot records encode this value as the caller's `jitcode`
-    /// identity (`opencoder.py:777 frame.jitcode.index`). Defaults to
-    /// `0` until the owning codewriter/setup path assigns it; the -1
-    /// sentinel for "empty snapshot" is handled on the snapshot side
-    /// (see `create_empty_top_snapshot`).
-    ///
-    /// `AtomicI64` so `state::jitcode_for` can back-stamp the wrapper's
-    /// allocated position onto an already-`Arc`-shared inner JitCode.
-    pub index: std::sync::atomic::AtomicI64,
-
-    // majit bytecode adapter extension.
-    // These fields have no RPython JitCode counterpart. RPython's
-    // bytecode operand stream references external dispatch tables
-    // maintained by the blackhole builder / metainterp_sd; majit's
-    // runtime JitCodeBuilder inlines the equivalent pools directly
-    // on each JitCode for straight-line dispatch. Future parity work
-    // is to lift these back out to a separate per-adapter structure.
-    /// Runtime adapter pools not present on canonical `JitCode`
-    /// (Phase I2 Step 2). Holds `opcodes`, `fn_ptrs`, `sub_jitcodes`,
-    /// `assembler_targets` ordered by access frequency (hottest first)
-    /// so the tight-loop benchmarks keep their cache locality.
-    pub exec: JitCodeExecState,
-}
-
-impl Clone for JitCode {
-    fn clone(&self) -> Self {
-        use std::sync::atomic::Ordering;
-        Self {
-            name: self.name.clone(),
-            code: self.code.clone(),
-            c_num_regs_i: self.c_num_regs_i,
-            c_num_regs_r: self.c_num_regs_r,
-            c_num_regs_f: self.c_num_regs_f,
-            constants_i: self.constants_i.clone(),
-            constants_r: self.constants_r.clone(),
-            constants_f: self.constants_f.clone(),
-            jitdriver_sd: self.jitdriver_sd,
-            fnaddr: self.fnaddr,
-            calldescr: self.calldescr.clone(),
-            index: std::sync::atomic::AtomicI64::new(self.index.load(Ordering::Relaxed)),
-            exec: self.exec.clone(),
-        }
-    }
-}
-
-// -- RPython jitcode.py parity methods --
-
-impl JitCode {
-    /// RPython `jitcode.py:47-48` `def num_regs_i(self): return ord(self.c_num_regs_i)`.
-    pub fn num_regs_i(&self) -> u16 {
-        self.c_num_regs_i
-    }
-
-    /// RPython `jitcode.py:50-51` `def num_regs_r(self): return ord(self.c_num_regs_r)`.
-    pub fn num_regs_r(&self) -> u16 {
-        self.c_num_regs_r
-    }
-
-    /// RPython `jitcode.py:53-54` `def num_regs_f(self): return ord(self.c_num_regs_f)`.
-    pub fn num_regs_f(&self) -> u16 {
-        self.c_num_regs_f
-    }
-
-    /// Transitional CALL_ASSEMBLER target lookup for the hardcoded
-    /// JitCodeBuilder bytecode. RPython stores the callee loop token in
-    /// descriptor data threaded through the shared `descrs` pool; pyre
-    /// mirrors the shape via the `AssemblerToken` variant.
-    pub(crate) fn call_assembler_target(&self, index: usize) -> (u64, *const ()) {
-        let target = self
-            .exec
-            .descrs
-            .get(index)
-            .and_then(RuntimeBhDescr::as_assembler_token)
-            .unwrap_or_else(|| {
-                panic!("BC_CALL_ASSEMBLER_*: descrs[{index}] is not an AssemblerToken entry",)
-            });
-        (target.token_number, target.concrete_ptr)
-    }
-
-    /// Resolve `BC_CALL_*` / `BC_RESIDUAL_CALL_*` function-target
-    /// descr. Mirrors RPython `blackhole.py:1225-1256` where the
-    /// calling-convention descr travels through `descrs[idx]`; pyre
-    /// additionally bundles the trace and concrete fn pointers in
-    /// the `Call` variant because the call encoding pre-dates the
-    /// RPython-orthodox register-fed function address.
-    pub fn call_target(&self, index: usize) -> &JitCallTarget {
-        match self.exec.descrs.get(index) {
-            Some(RuntimeBhDescr::Call(target)) => target,
-            other => {
-                panic!("BC_CALL_*/RESIDUAL_CALL_*: descrs[{index}] is not a Call entry: {other:?}",)
-            }
-        }
-    }
-
-    /// RPython `jitcode.py:56-57` `def num_regs_and_consts_i(self): return ord(self.c_num_regs_i) + len(self.constants_i)`.
-    pub fn num_regs_and_consts_i(&self) -> usize {
-        self.c_num_regs_i as usize + self.constants_i.len()
-    }
-
-    /// RPython `jitcode.py:59-60` `def num_regs_and_consts_r(self): return ord(self.c_num_regs_r) + len(self.constants_r)`.
-    pub fn num_regs_and_consts_r(&self) -> usize {
-        self.c_num_regs_r as usize + self.constants_r.len()
-    }
-
-    /// RPython `jitcode.py:62-63` `def num_regs_and_consts_f(self): return ord(self.c_num_regs_f) + len(self.constants_f)`.
-    pub fn num_regs_and_consts_f(&self) -> usize {
-        self.c_num_regs_f as usize + self.constants_f.len()
-    }
-
-    /// Inspect the trailing typed return opcode of a helper jitcode.
-    ///
-    /// RPython does not thread inline-helper result metadata through a
-    /// side-table; callers recover the return type from the callee bytecode
-    /// itself. `#[jit_inline]` helpers now terminate in the same typed
-    /// `*_return` opcode, so consumers should read that trailing instruction
-    /// instead of depending on an out-of-band `(return_reg, return_kind)` pair.
-    pub fn trailing_return_info(&self) -> Option<(JitArgKind, u16)> {
-        if self.code.last().copied() == Some(BC_VOID_RETURN) || self.code.len() < 3 {
-            return None;
-        }
-        let opcode_pos = self.code.len() - 3;
-        let opcode = self.code[opcode_pos];
-        let src = u16::from_le_bytes([self.code[opcode_pos + 1], self.code[opcode_pos + 2]]);
-        match opcode {
-            BC_INT_RETURN => Some((JitArgKind::Int, src)),
-            BC_REF_RETURN => Some((JitArgKind::Ref, src)),
-            BC_FLOAT_RETURN => Some((JitArgKind::Float, src)),
-            _ => None,
-        }
-    }
-
-    /// RPython jitcode.py:82-93 `get_live_vars_info(self, pc, op_live)`.
-    pub fn get_live_vars_info(&self, pc: usize, op_live: u8) -> usize {
-        let mut pc = pc;
-        if self.code.get(pc).copied() != Some(op_live) {
-            let step = majit_translate::liveness::OFFSET_SIZE + 1;
-            if pc < step {
-                self._missing_liveness(pc);
-            }
-            pc -= step;
-            if self.code.get(pc).copied() != Some(op_live) {
-                self._missing_liveness(pc);
-            }
-        }
-        majit_translate::liveness::decode_offset(&self.code, pc + 1)
-    }
-
-    /// RPython jitcode.py:95-100 `_missing_liveness(self, pc)`.
-    pub fn _missing_liveness(&self, pc: usize) -> ! {
-        panic!(
-            "missing liveness[{}] in JitCode {:?} (code_len={})",
-            pc,
-            self.name,
-            self.code.len()
-        )
-    }
-
-    /// RPython: `JitCode.follow_jump(position)` -- follow a label at position.
-    pub fn follow_jump(&self, position: usize) -> usize {
-        if position < 2 || position - 2 + 1 >= self.code.len() {
-            return 0;
-        }
-        let pos = position - 2;
-        (self.code[pos] as usize) | ((self.code[pos + 1] as usize) << 8)
-    }
-
-    /// RPython `jitcode.py:114-119` `def dump(self)`.
-    pub fn dump(&self) -> String {
-        format!(
-            "<JitCode {:?}: {} bytes, {} int regs, {} consts>",
-            self.name,
-            self.code.len(),
-            self.c_num_regs_i,
-            self.constants_i.len()
-        )
-    }
-}
-
-// RPython `jitcode.py:121-122` `def __repr__(self): return '<JitCode %r>' % self.name`.
-impl std::fmt::Display for JitCode {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "<JitCode {:?}>", self.name)
-    }
-}
-
+/// Trace-side function target descriptor for `BC_CALL_*` /
+/// `BC_RESIDUAL_CALL_*`.  RPython `blackhole.py:1225-1256` reads the
+/// callee function address from an int register (`i` argcode) and the
+/// calling convention from a descr (`d` argcode); pyre bundles the
+/// trace-side and concrete (non-JIT) function pointers into a single
+/// descriptor slot because the runtime emitter wires both pointers
+/// through one indirection.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitCallTarget {
     pub trace_ptr: *const (),
@@ -811,14 +498,20 @@ impl JitCallTarget {
     }
 }
 
+/// Compiled-loop target for `BC_CALL_ASSEMBLER_*`.  The `token_number`
+/// names a `CompiledLoopToken` (RPython `compile.py
+/// CompiledLoopToken.number`) that the tracer hands to
+/// `ctx.call_assembler_*_typed`; `concrete_ptr` is the pointer the
+/// blackhole interpreter calls when the trace bails out before the
+/// loop is compiled.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-struct JitCallAssemblerTarget {
-    token_number: u64,
-    concrete_ptr: *const (),
+pub struct JitCallAssemblerTarget {
+    pub token_number: u64,
+    pub concrete_ptr: *const (),
 }
 
 impl JitCallAssemblerTarget {
-    fn new(token_number: u64, concrete_ptr: *const ()) -> Self {
+    pub fn new(token_number: u64, concrete_ptr: *const ()) -> Self {
         Self {
             token_number,
             concrete_ptr,
@@ -826,6 +519,9 @@ impl JitCallAssemblerTarget {
     }
 }
 
+/// Per-arg kind tag for typed call argument streams.  Mirrors the
+/// `i`/`r`/`f` register-bank chars RPython carries in
+/// `BlackholeInterpBuilder.descrs` argcode bytes (`blackhole.py:154`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum JitArgKind {
     Int = 0,
@@ -834,11 +530,11 @@ pub enum JitArgKind {
 }
 
 impl JitArgKind {
-    fn encode(self) -> u8 {
+    pub fn encode(self) -> u8 {
         self as u8
     }
 
-    pub(crate) fn decode(byte: u8) -> Self {
+    pub fn decode(byte: u8) -> Self {
         match byte {
             0 => Self::Int,
             1 => Self::Ref,
@@ -863,6 +559,7 @@ impl JitArgKind {
     }
 }
 
+/// Typed call argument: a register index plus its kind tag.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct JitCallArg {
     pub kind: JitArgKind,
@@ -892,9 +589,268 @@ impl JitCallArg {
     }
 }
 
-// SAFETY: call targets are function pointers to immutable code.
+/// Runtime descriptor entry — heterogeneous pool element indexed by
+/// `j` / `d` argcodes at dispatch time.  Equivalent of RPython
+/// `self.descrs[idx]` where each entry is an instance of one of the
+/// `AbstractDescr` subclasses (`FieldDescr`, `ArrayDescr`, `JitCode`,
+/// ...).  RPython uses `isinstance(value, JitCode)` to discriminate at
+/// runtime; pyre encodes the same discrimination in the enum tag.
+#[derive(Clone, Debug)]
+pub enum RuntimeBhDescr {
+    /// Target JitCode for a `j` argcode (`BC_INLINE_CALL`).  RPython:
+    /// `blackhole.py:150-157` — `argtype == 'j' → descrs[idx]` asserted
+    /// `isinstance(value, JitCode)`.
+    JitCode(std::sync::Arc<JitCode>),
+    /// Target function for `BC_CALL_*` / `BC_RESIDUAL_CALL_*`.
+    /// RPython `blackhole.py:1225-1256` reads the function address
+    /// from an int register (`i` argcode) and the calling convention
+    /// from a descr (`d` argcode); pyre keeps the two together in
+    /// `JitCallTarget` because the runtime emitter wires trace-side
+    /// and blackhole-side function pointers in a single indirection
+    /// slot.  Once pyre emits the function address via an int register
+    /// this variant can split into the RPython-shaped pair.
+    Call(JitCallTarget),
+    /// Compiled-assembler target for `BC_CALL_ASSEMBLER_*`.  The
+    /// `token_number` identifies a `CompiledLoopToken` (RPython
+    /// `compile.py CompiledLoopToken.number`) that the tracer hands
+    /// to `ctx.call_assembler_*_typed` so the metainterp can chain
+    /// this trace into an already-compiled one.
+    AssemblerToken(JitCallAssemblerTarget),
+}
+
+impl RuntimeBhDescr {
+    /// RPython parity: `isinstance(value, JitCode)` assertion at
+    /// `blackhole.py:156`.  Returns the callee JitCode for `BC_INLINE_CALL`.
+    pub fn as_jitcode(&self) -> Option<&std::sync::Arc<JitCode>> {
+        match self {
+            Self::JitCode(arc) => Some(arc),
+            _ => None,
+        }
+    }
+
+    /// Extract the `Call` target for `BC_CALL_*` / `BC_RESIDUAL_CALL_*`.
+    pub fn as_call(&self) -> Option<&JitCallTarget> {
+        match self {
+            Self::Call(target) => Some(target),
+            _ => None,
+        }
+    }
+
+    /// Extract the assembler-call target for `BC_CALL_ASSEMBLER_*`.
+    pub fn as_assembler_token(&self) -> Option<&JitCallAssemblerTarget> {
+        match self {
+            Self::AssemblerToken(target) => Some(target),
+            _ => None,
+        }
+    }
+}
+
+/// Per-`JitCode` descrs.  Pyre's analog of
+/// `BlackholeInterpBuilder.descrs` (`blackhole.py:103`) /
+/// `BlackholeInterpreter.descrs` (`blackhole.py:288`).  RPython has a
+/// single shared global pool because translation-time JitCodes are
+/// produced eagerly; pyre's runtime jitcodes are emitted on demand
+/// per-Python-frame and lack a global allocation index, so the pool
+/// is per-`JitCode` here as a sibling of the canonical `core`.
+#[derive(Clone, Debug, Default)]
+pub struct JitCodeExecState {
+    /// Descriptor pool — indexed by the 2-byte `j`/`d` argcode operand.
+    pub descrs: Vec<RuntimeBhDescr>,
+}
+
+// ──────────────────────────────────────────────────────────────────
+// Wrapper `JitCode` — runtime jitcode = canonical core + descr pool.
+//
+// RPython parity:
+//   * `core` is the source-only `rpython/jit/codewriter/jitcode.py`
+//     `JitCode` analog (`majit_translate::jitcode::JitCode`).  It
+//     holds `name`, `fnaddr`, `jitdriver_sd`, `index`, body
+//     (`code`, `constants_*`, `c_num_regs_*`, ...) — exactly the
+//     fields RPython's `JitCode` carries.
+//   * `exec` mirrors the descr pool RPython keeps on the
+//     `BlackholeInterpBuilder` (`blackhole.py:103`).  In RPython the
+//     pool is shared globally; pyre keeps it per-jitcode for the lazy
+//     emit reasons described above on `JitCodeExecState`.
+//
+// Existing `jitcode.code`, `jitcode.set_body(...)`, `jitcode.body()`,
+// `jitcode.fnaddr` etc. continue to work via `Deref<Target=core>` —
+// the wrapper is transparent to read-side callers.  Only writers
+// that require `&mut core` need `DerefMut`.
+//
+// Serde: the wrapper itself is intentionally NOT
+// `Serialize`/`Deserialize`.  The build-time bincode embed in
+// `pyre-jit-trace::jitcode_runtime` serializes
+// `Vec<Arc<majit_translate::jitcode::JitCode>>` (canonical core)
+// because build-time jitcodes never carry descrs.  Wrappers are
+// constructed at the runtime ingress (where the canonical Arc enters
+// dispatch) via `JitCode::from_canonical`.  Per-CodeObject runtime
+// jitcodes are produced directly as wrappers by
+// `JitCodeBuilder::finish()`.
+// ──────────────────────────────────────────────────────────────────
+
+/// Runtime JitCode = canonical RPython parity core + descr pool.
+#[derive(Debug)]
+pub struct JitCode {
+    /// Canonical source-only `JitCode` (RPython
+    /// `rpython/jit/codewriter/jitcode.py:9 class JitCode`).
+    core: majit_translate::jitcode::JitCode,
+    /// Per-jitcode descr pool — pyre's analog of
+    /// `BlackholeInterpBuilder.descrs` (RPython
+    /// `blackhole.py:103`).  Empty for build-time canonical jitcodes
+    /// (descrs resolved through the global `ALL_DESCRS` table); the
+    /// `JitCodeBuilder` populates this during runtime per-CodeObject
+    /// emission.
+    pub exec: JitCodeExecState,
+}
+
+// SAFETY: `JitCallTarget` / `JitCallAssemblerTarget` carry `*const ()`
+// JIT-emitted code addresses; `RuntimeBhDescr::JitCode` carries
+// `Arc<JitCode>` which is itself Send+Sync.  The pool is mutated only
+// during `JitCodeBuilder::finish()` (single-threaded) and read
+// thereafter; matches RPython's translation-time blackhole-builder
+// publication flow.
 unsafe impl Send for JitCode {}
 unsafe impl Sync for JitCode {}
+
+impl JitCode {
+    /// Construct a fresh runtime jitcode wrapping a canonical
+    /// `majit_translate::jitcode::JitCode::new(name)` core with an
+    /// empty descr pool.  RPython `jitcode.py:14-20`
+    /// `JitCode.__init__(name, fnaddr=None, calldescr=None, called_from=None)`.
+    pub fn new(name: impl Into<String>) -> Self {
+        Self {
+            core: majit_translate::jitcode::JitCode::new(name),
+            exec: JitCodeExecState::default(),
+        }
+    }
+
+    /// Wrap a pre-built canonical `JitCode` (e.g. one produced by
+    /// `CodeWriter::make_jitcodes()` at build time) with an empty
+    /// descr pool.  Build-time jitcodes resolve their `'d'`/`'j'`
+    /// argcodes through the global `ALL_DESCRS` table and never
+    /// populate `exec.descrs`.
+    pub fn from_canonical(core: majit_translate::jitcode::JitCode) -> Self {
+        Self {
+            core,
+            exec: JitCodeExecState::default(),
+        }
+    }
+
+    /// Borrow the canonical core (e.g. for serialization that
+    /// re-serializes only the canonical fields).
+    pub fn core(&self) -> &majit_translate::jitcode::JitCode {
+        &self.core
+    }
+
+    /// Mutable canonical core access for in-place mutation (used by
+    /// post-`set_body` `body_mut()` etc.).  RPython mutates `JitCode`
+    /// fields directly post-`setup()`; pyre routes the mutation
+    /// through this accessor so the wrapper stays transparent.
+    pub fn core_mut(&mut self) -> &mut majit_translate::jitcode::JitCode {
+        &mut self.core
+    }
+}
+
+impl Default for JitCode {
+    fn default() -> Self {
+        Self::from_canonical(majit_translate::jitcode::JitCode::default())
+    }
+}
+
+impl Clone for JitCode {
+    fn clone(&self) -> Self {
+        Self {
+            core: self.core.clone(),
+            exec: self.exec.clone(),
+        }
+    }
+}
+
+impl std::ops::Deref for JitCode {
+    type Target = majit_translate::jitcode::JitCode;
+    fn deref(&self) -> &majit_translate::jitcode::JitCode {
+        &self.core
+    }
+}
+
+impl std::ops::DerefMut for JitCode {
+    fn deref_mut(&mut self) -> &mut majit_translate::jitcode::JitCode {
+        &mut self.core
+    }
+}
+
+impl std::fmt::Display for JitCode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.core, f)
+    }
+}
+
+/// Helper preserved from the runtime jitcode era so callers that
+/// expected the runtime `JitCode` body fields at the top level keep
+/// working through `Deref<Target=JitCodeBody>`.
+///
+/// `trailing_return_info` is wired here because it depends on the
+/// runtime BC_* opcode bytes (`BC_VOID_RETURN`, `BC_INT_RETURN`,
+/// `BC_REF_RETURN`, `BC_FLOAT_RETURN`) which are runtime-defined; the
+/// canonical jitcode crate does not import them. Provided as a free
+/// function so the call sites can keep `jitcode.trailing_return_info()`
+/// syntax via the existing trait impl below.
+pub trait JitCodeRuntimeExt {
+    /// Inspect the trailing typed return opcode of a helper jitcode.
+    fn trailing_return_info(&self) -> Option<(JitArgKind, u16)>;
+}
+
+impl JitCode {
+    /// Resolve `BC_CALL_*` / `BC_RESIDUAL_CALL_*` function-target
+    /// descr.  Mirrors RPython `blackhole.py:1225-1256` where the
+    /// calling-convention descr travels through `descrs[idx]`; pyre
+    /// additionally bundles the trace and concrete fn pointers in
+    /// the `Call` variant because the call encoding pre-dates the
+    /// RPython-orthodox register-fed function address.
+    pub fn call_target(&self, index: usize) -> &JitCallTarget {
+        match self.exec.descrs.get(index) {
+            Some(RuntimeBhDescr::Call(target)) => target,
+            other => {
+                panic!("BC_CALL_*/RESIDUAL_CALL_*: descrs[{index}] is not a Call entry: {other:?}",)
+            }
+        }
+    }
+
+    /// Transitional CALL_ASSEMBLER target lookup for the hardcoded
+    /// JitCodeBuilder bytecode.  RPython stores the callee loop token
+    /// in descriptor data threaded through the shared `descrs` pool;
+    /// pyre mirrors the shape via the `AssemblerToken` variant.
+    pub fn call_assembler_target(&self, index: usize) -> (u64, *const ()) {
+        let target = self
+            .exec
+            .descrs
+            .get(index)
+            .and_then(RuntimeBhDescr::as_assembler_token)
+            .unwrap_or_else(|| {
+                panic!("BC_CALL_ASSEMBLER_*: descrs[{index}] is not an AssemblerToken entry",)
+            });
+        (target.token_number, target.concrete_ptr)
+    }
+}
+
+impl JitCodeRuntimeExt for JitCode {
+    fn trailing_return_info(&self) -> Option<(JitArgKind, u16)> {
+        let body = self.try_body()?;
+        let code = &body.code;
+        if code.last().copied() == Some(BC_VOID_RETURN) || code.len() < 3 {
+            return None;
+        }
+        let opcode_pos = code.len() - 3;
+        let opcode = code[opcode_pos];
+        let src = u16::from_le_bytes([code[opcode_pos + 1], code[opcode_pos + 2]]);
+        match opcode {
+            BC_INT_RETURN => Some((JitArgKind::Int, src)),
+            BC_REF_RETURN => Some((JitArgKind::Ref, src)),
+            BC_FLOAT_RETURN => Some((JitArgKind::Float, src)),
+            _ => None,
+        }
+    }
+}
 
 pub(crate) fn read_u8(code: &[u8], cursor: &mut usize) -> u8 {
     let value = *code.get(*cursor).expect("truncated jitcode");
@@ -1037,8 +993,11 @@ mod tests {
             c_num_regs_r: 2,
             c_num_regs_f: 1,
             constants_i: vec![100, 200, 300],
-            constants_r: vec![0xAABB_CCDD_EEFF_0011_u64, 0x2233_4455_6677_8899_u64],
-            constants_f: vec![1.25_f64],
+            constants_r: vec![
+                0xAABB_CCDD_EEFF_0011_u64 as i64,
+                0x2233_4455_6677_8899_u64 as i64,
+            ],
+            constants_f: vec![f64::to_bits(1.25_f64) as i64],
             ..Default::default()
         };
         let bt = BuildJitCode::new("slice2/test");

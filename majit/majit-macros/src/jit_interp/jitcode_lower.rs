@@ -2474,8 +2474,8 @@ impl<'c> Lowerer<'c> {
                                 let __builder_fn: fn() -> majit_metainterp::JitCode =
                                     unsafe { std::mem::transmute(__inline_builder) };
                                 let __sub_jitcode = __builder_fn();
-                                let (__sub_return_kind, _) = __sub_jitcode
-                                    .trailing_return_info()
+                                let (__sub_return_kind, _) =
+                                    <majit_metainterp::JitCode as majit_metainterp::jitcode::JitCodeRuntimeExt>::trailing_return_info(&__sub_jitcode)
                                     .expect("inline helper jitcode must end in a typed return opcode");
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
                                 #inline_call
@@ -2519,8 +2519,8 @@ impl<'c> Lowerer<'c> {
                                 let __builder_fn: fn() -> majit_metainterp::JitCode =
                                     unsafe { std::mem::transmute(__inline_builder) };
                                 let __sub_jitcode = __builder_fn();
-                                let (__sub_return_kind, _) = __sub_jitcode
-                                    .trailing_return_info()
+                                let (__sub_return_kind, _) =
+                                    <majit_metainterp::JitCode as majit_metainterp::jitcode::JitCodeRuntimeExt>::trailing_return_info(&__sub_jitcode)
                                     .expect("inline helper jitcode must end in a typed return opcode");
                                 let __sub_idx = __builder.add_sub_jitcode(__sub_jitcode);
                                 #inline_call
