@@ -975,6 +975,39 @@ impl<'c> Lowerer<'c> {
                         });
                     }
                 }
+                // Stmt-form variants of result-returning policies discard
+                // the value but still need the IR call op recorded so the
+                // compiled trace runs the side effect (e.g. aheui OP_POP's
+                // `lj::stack_pop(state.selected_ref);` discards the popped
+                // value but the pop side effect must reach compiled code).
+                // Allocate a throwaway destination register; never read it.
+                crate::jit_interp::CallPolicyKind::ResidualInt
+                | crate::jit_interp::CallPolicyKind::ElidableInt => {
+                    let throwaway_reg = self.alloc_reg();
+                    let is_pure = matches!(kind, crate::jit_interp::CallPolicyKind::ElidableInt,);
+                    if let Some(arg_regs) = int_arg_regs(&arg_bindings) {
+                        let builder_call = if is_pure {
+                            quote! { __builder.call_pure_int(__fn_idx, &[#(#arg_regs),*], #throwaway_reg); }
+                        } else {
+                            quote! { __builder.call_int(__fn_idx, &[#(#arg_regs),*], #throwaway_reg); }
+                        };
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            #builder_call
+                        });
+                    } else {
+                        let typed_args = typed_call_arg_tokens(&arg_bindings);
+                        let builder_call = if is_pure {
+                            quote! { __builder.call_pure_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        } else {
+                            quote! { __builder.call_int_typed(__fn_idx, #typed_args, #throwaway_reg); }
+                        };
+                        self.statements.push(quote! {
+                            let __fn_idx = __builder.add_fn_ptr(#func as *const ());
+                            #builder_call
+                        });
+                    }
+                }
                 crate::jit_interp::CallPolicyKind::ResidualVoidWrapped => {
                     let policy_path = helper_policy_path(&call.func)?;
                     let typed_args = typed_call_arg_tokens(&arg_bindings);
@@ -1394,6 +1427,18 @@ impl<'c> Lowerer<'c> {
         self.statements.push(quote! {
             let #end_label = __builder.new_label();
         });
+        // RPython `flatten.py:259` `-live-` convention: every guard-bearing
+        // instruction is *preceded* by a `live` marker (byte order:
+        // `BC_LIVE+offset` then the guard op). The recorded `orgpc` (=
+        // RPython `pyjitpl.py:3713 orgpc = position`, copied to the guard's
+        // `resumepc` via `record_state_guard`) is the byte position of the
+        // guard op itself, so the BC_LIVE marker sits at `orgpc - SIZE_LIVE_OP`
+        // and blackhole's `get_current_position_info` reads liveness from
+        // there.  Without this preceding marker, blackhole panics with
+        // `missing liveness[N] in JitCode`.
+        self.statements.push(quote! {
+            let _ = __builder.live_placeholder();
+        });
         self.statements.push(quote! {
             __builder.goto_if_not_int_is_true(#cond_reg, #else_label);
         });
@@ -1473,6 +1518,9 @@ impl<'c> Lowerer<'c> {
                     __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
                 });
                 self.statements.push(quote! {
+                    let _ = __builder.live_placeholder();
+                });
+                self.statements.push(quote! {
                     __builder.goto_if_not_int_is_true(#eq_reg, #next_label);
                 });
             } else {
@@ -1502,6 +1550,9 @@ impl<'c> Lowerer<'c> {
                     });
                     or_reg = new_or_reg;
                 }
+                self.statements.push(quote! {
+                    let _ = __builder.live_placeholder();
+                });
                 self.statements.push(quote! {
                     __builder.goto_if_not_int_is_true(#or_reg, #next_label);
                 });
@@ -1557,6 +1608,9 @@ impl<'c> Lowerer<'c> {
         // Evaluate the condition
         let cond = self.lower_value_expr(&expr_while.cond)?;
         let cond_reg = cond.reg;
+        self.statements.push(quote! {
+            let _ = __builder.live_placeholder();
+        });
         self.statements.push(quote! {
             __builder.goto_if_not_int_is_true(#cond_reg, #loop_end);
         });
@@ -1709,6 +1763,9 @@ impl<'c> Lowerer<'c> {
             let #end_label = __builder.new_label();
         });
         self.statements.push(quote! {
+            let _ = __builder.live_placeholder();
+        });
+        self.statements.push(quote! {
             __builder.goto_if_not_int_is_true(#cond_reg, #else_label);
         });
 
@@ -1790,6 +1847,9 @@ impl<'c> Lowerer<'c> {
                     __builder.record_binop_i(#eq_reg, majit_ir::OpCode::IntEq, #disc_reg, #const_reg);
                 });
                 self.statements.push(quote! {
+                    let _ = __builder.live_placeholder();
+                });
+                self.statements.push(quote! {
                     __builder.goto_if_not_int_is_true(#eq_reg, #next_label);
                 });
             } else {
@@ -1817,6 +1877,9 @@ impl<'c> Lowerer<'c> {
                     });
                     or_reg = new_or_reg;
                 }
+                self.statements.push(quote! {
+                    let _ = __builder.live_placeholder();
+                });
                 self.statements.push(quote! {
                     __builder.goto_if_not_int_is_true(#or_reg, #next_label);
                 });
@@ -2521,6 +2584,9 @@ impl<'c> Lowerer<'c> {
         });
         self.statements.push(quote! {
             let #end_label = __builder.new_label();
+        });
+        self.statements.push(quote! {
+            let _ = __builder.live_placeholder();
         });
         self.statements.push(quote! {
             __builder.goto_if_not_int_is_true(#cond_reg, #else_label);

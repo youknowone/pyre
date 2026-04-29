@@ -1779,6 +1779,17 @@ pub(crate) fn trace_arraylen_gc(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef)
 /// `list_length`, typed list `int_items.len`).
 pub(crate) fn opimpl_arraylen_gc(ctx: &mut TraceCtx, array: OpRef, descr: DescrRef) -> OpRef {
     if let Some(cached) = ctx.heap_cache().arraylen(array) {
+        // pyjitpl.py:756-764 `opimpl_arraylen_gc` cache hit:
+        //     lengthbox = self.metainterp.heapcache.arraylen(arraybox)
+        //     if lengthbox is None:
+        //         ...
+        //     else:
+        //         self.metainterp.staticdata.profiler.count_ops(rop.ARRAYLEN_GC, Counters.HEAPCACHED_OPS)
+        //     return lengthbox
+        ctx.profiler().count_ops(
+            OpCode::ArraylenGc,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
         return cached;
     }
     let result = ctx.record_op_with_descr(OpCode::ArraylenGc, &[array], descr);
@@ -1796,6 +1807,14 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     // heapcache.py: check if this field was already read/written in this trace
     let field_index = descr.index();
     if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
+        // pyjitpl.py:929-947 `_opimpl_getfield_gc_any_pureornot` cache hit:
+        //   if upd.currfieldbox is not None:
+        //       self.metainterp.staticdata.profiler.count_ops(rop.GETFIELD_GC_I, Counters.HEAPCACHED_OPS)
+        //       return upd.currfieldbox
+        ctx.profiler().count_ops(
+            OpCode::GetfieldGcI,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
         return cached;
     }
     // pyjitpl.py:1074-1089: quasi-immutable field handling.
@@ -1805,11 +1824,22 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
     // PyreSym.generate_guard for proper snapshot/fail_args (pyjitpl.py:1087
     // generate_guard parity). Instead, set a flag on ctx so the caller
     // (PyreSym with_ctx block) can emit it with full resume data.
-    if descr.is_quasi_immutable() && !ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
-        ctx.heap_cache_mut().quasi_immut_now_known(obj, field_index);
-        ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
-        if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
-            ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
+    if descr.is_quasi_immutable() {
+        if ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
+            // pyjitpl.py:1077-1080 cache hit:
+            //   if heapcache.is_quasi_immut_known(fielddescr, box):
+            //       profiler.count_ops(rop.QUASIIMMUT_FIELD, HEAPCACHED_OPS)
+            //       return
+            ctx.profiler().count_ops(
+                OpCode::QuasiimmutField,
+                majit_metainterp::counters::HEAPCACHED_OPS,
+            );
+        } else {
+            ctx.heap_cache_mut().quasi_immut_now_known(obj, field_index);
+            ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
+            if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+                ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
+            }
         }
     }
     let opcode = if descr.is_always_pure() {
@@ -1830,13 +1860,28 @@ pub(crate) fn opimpl_getfield_gc_i(ctx: &mut TraceCtx, obj: OpRef, descr: DescrR
 pub(crate) fn opimpl_getfield_gc_r(ctx: &mut TraceCtx, obj: OpRef, descr: DescrRef) -> OpRef {
     let field_index = descr.index();
     if let Some(cached) = ctx.heap_cache().getfield_cached(obj, field_index) {
+        // pyjitpl.py:929-947 `_opimpl_getfield_gc_any_pureornot` cache hit.
+        // RPython hardcodes `GETFIELD_GC_I` regardless of the rop variant
+        // (`_i` / `_r` / `_f`); pyre matches the hardcode for parity.
+        ctx.profiler().count_ops(
+            OpCode::GetfieldGcI,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
         return cached;
     }
-    if descr.is_quasi_immutable() && !ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
-        ctx.heap_cache_mut().quasi_immut_now_known(obj, field_index);
-        ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
-        if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
-            ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
+    if descr.is_quasi_immutable() {
+        if ctx.heap_cache().is_quasi_immut_known(obj, field_index) {
+            // pyjitpl.py:1077-1080 cache hit (see opimpl_getfield_gc_i above).
+            ctx.profiler().count_ops(
+                OpCode::QuasiimmutField,
+                majit_metainterp::counters::HEAPCACHED_OPS,
+            );
+        } else {
+            ctx.heap_cache_mut().quasi_immut_now_known(obj, field_index);
+            ctx.record_op_with_descr(OpCode::QuasiimmutField, &[obj], descr.clone());
+            if ctx.heap_cache_mut().check_and_clear_guard_not_invalidated() {
+                ctx.set_pending_guard_not_invalidated(Some(ctx.last_traced_pc));
+            }
         }
     }
     let opcode = if descr.is_always_pure() {

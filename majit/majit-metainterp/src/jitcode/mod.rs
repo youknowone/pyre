@@ -760,7 +760,12 @@ impl JitCode {
 
     /// RPython jitcode.py:95-100 `_missing_liveness(self, pc)`.
     pub fn _missing_liveness(&self, pc: usize) -> ! {
-        panic!("missing liveness[{}] in JitCode", pc)
+        panic!(
+            "missing liveness[{}] in JitCode {:?} (code_len={})",
+            pc,
+            self.name,
+            self.code.len()
+        )
     }
 
     /// RPython: `JitCode.follow_jump(position)` -- follow a label at position.

@@ -2141,7 +2141,8 @@ fn init_posix(ns: &mut DictStorage) {
                     ));
                 }
             };
-            let ret = unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len() as _) };
+            let ret =
+                unsafe { libc::write(fd, data.as_ptr() as *const libc::c_void, data.len() as _) };
             if ret < 0 {
                 return Err(io_err(std::io::Error::last_os_error(), ""));
             }
@@ -2415,8 +2416,21 @@ fn init_posix(ns: &mut DictStorage) {
     fn make_stat_result(meta: &std::fs::Metadata) -> pyre_object::PyObjectRef {
         // Extract stat fields in a cross-platform way.
         #[cfg(unix)]
-        let (st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid, st_size,
-             st_atime, st_mtime, st_ctime, st_atime_ns, st_mtime_ns, st_ctime_ns) = {
+        let (
+            st_mode,
+            st_ino,
+            st_dev,
+            st_nlink,
+            st_uid,
+            st_gid,
+            st_size,
+            st_atime,
+            st_mtime,
+            st_ctime,
+            st_atime_ns,
+            st_mtime_ns,
+            st_ctime_ns,
+        ) = {
             use std::os::unix::fs::MetadataExt;
             (
                 meta.mode() as i64,
@@ -2435,8 +2449,21 @@ fn init_posix(ns: &mut DictStorage) {
             )
         };
         #[cfg(windows)]
-        let (st_mode, st_ino, st_dev, st_nlink, st_uid, st_gid, st_size,
-             st_atime, st_mtime, st_ctime, st_atime_ns, st_mtime_ns, st_ctime_ns) = {
+        let (
+            st_mode,
+            st_ino,
+            st_dev,
+            st_nlink,
+            st_uid,
+            st_gid,
+            st_size,
+            st_atime,
+            st_mtime,
+            st_ctime,
+            st_atime_ns,
+            st_mtime_ns,
+            st_ctime_ns,
+        ) = {
             use std::os::windows::fs::MetadataExt;
             let ft = meta.file_type();
             let attrs = meta.file_attributes();
@@ -2458,26 +2485,19 @@ fn init_posix(ns: &mut DictStorage) {
             let atime_secs = (meta.last_access_time() as i64 / 10_000_000) - EPOCH_DIFF;
             let mtime_secs = (meta.last_write_time() as i64 / 10_000_000) - EPOCH_DIFF;
             let ctime_secs = (meta.creation_time() as i64 / 10_000_000) - EPOCH_DIFF;
-            let atime_ns = ((meta.last_access_time() as i64 % 10_000_000) * 100)
-                + atime_secs * 1_000_000_000;
-            let mtime_ns = ((meta.last_write_time() as i64 % 10_000_000) * 100)
-                + mtime_secs * 1_000_000_000;
-            let ctime_ns = ((meta.creation_time() as i64 % 10_000_000) * 100)
-                + ctime_secs * 1_000_000_000;
+            let atime_ns =
+                ((meta.last_access_time() as i64 % 10_000_000) * 100) + atime_secs * 1_000_000_000;
+            let mtime_ns =
+                ((meta.last_write_time() as i64 % 10_000_000) * 100) + mtime_secs * 1_000_000_000;
+            let ctime_ns =
+                ((meta.creation_time() as i64 % 10_000_000) * 100) + ctime_secs * 1_000_000_000;
             (
-                mode,
-                0i64,         // st_ino — not available on Windows
-                0i64,         // st_dev
+                mode, 0i64, // st_ino — not available on Windows
+                0i64, // st_dev
                 1i64, // nlink — not easily available on stable Windows
-                0i64,         // st_uid
-                0i64,         // st_gid
-                size,
-                atime_secs,
-                mtime_secs,
-                ctime_secs,
-                atime_ns,
-                mtime_ns,
-                ctime_ns,
+                0i64, // st_uid
+                0i64, // st_gid
+                size, atime_secs, mtime_secs, ctime_secs, atime_ns, mtime_ns, ctime_ns,
             )
         };
 
@@ -2496,41 +2516,13 @@ fn init_posix(ns: &mut DictStorage) {
         // Attach st_* attributes via a wrapping instance.
         let wrapper = pyre_object::w_instance_new(stat_result_type());
         let _ = crate::baseobjspace::setattr(wrapper, "__tuple__", tuple);
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_mode",
-            pyre_object::w_int_new(st_mode),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_ino",
-            pyre_object::w_int_new(st_ino),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_dev",
-            pyre_object::w_int_new(st_dev),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_nlink",
-            pyre_object::w_int_new(st_nlink),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_uid",
-            pyre_object::w_int_new(st_uid),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_gid",
-            pyre_object::w_int_new(st_gid),
-        );
-        let _ = crate::baseobjspace::setattr(
-            wrapper,
-            "st_size",
-            pyre_object::w_int_new(st_size),
-        );
+        let _ = crate::baseobjspace::setattr(wrapper, "st_mode", pyre_object::w_int_new(st_mode));
+        let _ = crate::baseobjspace::setattr(wrapper, "st_ino", pyre_object::w_int_new(st_ino));
+        let _ = crate::baseobjspace::setattr(wrapper, "st_dev", pyre_object::w_int_new(st_dev));
+        let _ = crate::baseobjspace::setattr(wrapper, "st_nlink", pyre_object::w_int_new(st_nlink));
+        let _ = crate::baseobjspace::setattr(wrapper, "st_uid", pyre_object::w_int_new(st_uid));
+        let _ = crate::baseobjspace::setattr(wrapper, "st_gid", pyre_object::w_int_new(st_gid));
+        let _ = crate::baseobjspace::setattr(wrapper, "st_size", pyre_object::w_int_new(st_size));
         let _ = crate::baseobjspace::setattr(
             wrapper,
             "st_atime",

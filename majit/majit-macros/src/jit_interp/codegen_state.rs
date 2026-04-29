@@ -723,6 +723,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             #(#sym_array_value_fields)*
             #(#sym_virt_array_fields)*
             loop_header_pc: usize,
+            current_portal_pc: usize,
             trace_started: bool,
         }
 
@@ -733,6 +734,10 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
 
             fn loop_header_pc(&self) -> usize {
                 self.loop_header_pc
+            }
+
+            fn begin_portal_op(&mut self, pc: usize) {
+                self.current_portal_pc = pc;
             }
 
             fn state_field_ref(&self, field_idx: usize) -> Option<majit_ir::OpRef> {
@@ -873,6 +878,7 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
                     #(#create_sym_virt_array_ptr_value_names,)*
                     #(#create_sym_virt_array_len_value_names,)*
                     loop_header_pc: header_pc,
+                    current_portal_pc: header_pc,
                     trace_started: false,
                 }
             }
@@ -917,14 +923,34 @@ fn generate_state_fields_jit_state(config: &JitInterpConfig) -> TokenStream {
             // single-frame snapshot via the canonical helper.
             fn populate_frame_for_guard(
                 sym: &__JitSym,
-                frame: &mut majit_metainterp::MIFrame,
+                frames: &mut majit_metainterp::MIFrameStack,
             ) -> Option<majit_metainterp::recorder::Snapshot> {
                 use majit_metainterp::JitCodeSym as _;
-                sym.populate_frame_int_regs(frame);
-                Some(majit_metainterp::build_state_field_snapshot(
-                    frame,
-                    sym.total_slots(),
-                ))
+                if frames.frames.is_empty() {
+                    return None;
+                }
+                let __total_slots = sym.total_slots();
+                let __root = &mut frames.frames[0];
+                let __n = __total_slots.min(__root.int_regs.len());
+                let __saved_int_regs: Vec<Option<majit_ir::OpRef>> =
+                    __root.int_regs[..__n].to_vec();
+                let __saved_int_values: Vec<Option<i64>> =
+                    __root.int_values[..__n].to_vec();
+                sym.populate_frame_int_regs(__root);
+                // Fallback path (jitdriver-level GuardAlwaysFails): no
+                // resume_pc swap has happened, so use the stable portal
+                // pc captured by `begin_portal_op`, in the same factory-key
+                // convention as dispatch-level state guards.
+                let program_pc = (sym.current_portal_pc + 1) as u32;
+                let __snapshot = majit_metainterp::build_state_field_snapshot(
+                    frames,
+                    __total_slots,
+                    program_pc,
+                );
+                let __root = &mut frames.frames[0];
+                __root.int_regs[..__n].copy_from_slice(&__saved_int_regs);
+                __root.int_values[..__n].copy_from_slice(&__saved_int_values);
+                Some(__snapshot)
             }
         }
     }

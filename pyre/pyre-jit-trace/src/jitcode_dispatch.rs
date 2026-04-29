@@ -1042,6 +1042,18 @@ fn getarrayitem_gc_r_via_heapcache(
             .heap_cache()
             .getarrayitem(array, index, descr_index)
     {
+        // pyjitpl.py:639-673 `_do_getarrayitem_gc_any` cache hit:
+        //   tobox = heapcache.getarrayitem(...)
+        //   if tobox:
+        //       profiler.count_ops(rop.GETARRAYITEM_GC_I, HEAPCACHED_OPS)
+        //       return tobox
+        // RPython hardcodes `GETARRAYITEM_GC_I` regardless of the
+        // recorded `typ` ('i' / 'r' / 'f'); pyre matches the hardcode
+        // for profiling parity.
+        ctx.trace_ctx.profiler().count_ops(
+            OpCode::GetarrayitemGcI,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
         cached
     } else {
         let resbox =
@@ -1155,11 +1167,18 @@ fn setfield_gc_via_heapcache(
 
     // Cache hit: if the heapcache already records `valuebox` as the
     // current value of `(obj, descr)`, the SETFIELD_GC is redundant —
-    // skip recording. RPython:
-    //   if upd.currfieldbox is valuebox: return
+    // skip recording. RPython pyjitpl.py:973-979 _opimpl_setfield_gc_any:
+    //   if upd.currfieldbox is valuebox:
+    //       self.metainterp.staticdata.profiler.count_ops(rop.SETFIELD_GC, Counters.HEAPCACHED_OPS)
+    //       return
     let is_redundant =
         ctx.trace_ctx.heap_cache().getfield_cached(obj, descr_index) == Some(valuebox);
-    if !is_redundant {
+    if is_redundant {
+        ctx.trace_ctx.profiler().count_ops(
+            OpCode::SetfieldGc,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
+    } else {
         ctx.trace_ctx
             .record_op_with_descr(OpCode::SetfieldGc, &[obj, valuebox], descr);
         // Walker fix F: write-through with alias-clearing semantics.
@@ -1216,7 +1235,17 @@ fn getfield_gc_via_heapcache(
 
     let result = if let Some(cached) = ctx.trace_ctx.heap_cache().getfield_cached(obj, descr_index)
     {
-        // Cache hit (RPython `if upd.currfieldbox is not None: return`).
+        // Cache hit (RPython pyjitpl.py:929-947 _opimpl_getfield_gc_any_pureornot):
+        //   if upd.currfieldbox is not None:
+        //       self.metainterp.staticdata.profiler.count_ops(rop.GETFIELD_GC_I, Counters.HEAPCACHED_OPS)
+        //       return upd.currfieldbox
+        // RPython hardcodes `GETFIELD_GC_I` for the count regardless of
+        // the actual rop variant (`_i` / `_r` / `_f`); match the
+        // hardcode for profiling parity.
+        ctx.trace_ctx.profiler().count_ops(
+            OpCode::GetfieldGcI,
+            majit_metainterp::counters::HEAPCACHED_OPS,
+        );
         cached
     } else {
         // Cache miss — record op + write through.

@@ -104,6 +104,23 @@ pub struct MIFrame {
     pub parent_snapshot: i64,
     /// pyjitpl.py:95 `self.unroll_iterations = 1`.
     pub unroll_iterations: usize,
+    /// State-field-JIT multi-frame snapshot wiring.
+    ///
+    /// For frames pushed by `BC_INLINE_CALL` this holds the index into
+    /// the *parent* frame's `jitcode.descrs` array that the dispatcher
+    /// resolved into the sub-jitcode for this frame
+    /// (`pyjitpl/dispatch.rs` line ~1317 `descrs.get(sub_idx)`). Root
+    /// frames (`trace_jitcode` portal entry) carry `u32::MAX`. The
+    /// snapshot-side `build_state_field_snapshot` packs this into
+    /// `SnapshotFrame.jitcode_index` for non-root frames, and the
+    /// resume-side `register_jitcode_factory` callback uses it to walk
+    /// `parent.descrs[idx].as_jitcode()` instead of re-invoking the
+    /// factory.  RPython's equivalent is `frame.jitcode.index` —
+    /// resolvable through `metainterp_sd.jitcodes[idx]` because RPython
+    /// pre-registers every jitcode globally; per-opcode majit has no
+    /// such global registry, so the parent-relative index threads the
+    /// chain together.
+    pub parent_descr_idx: u32,
 }
 
 impl MIFrame {
@@ -147,6 +164,7 @@ impl MIFrame {
             pushed_box: None,
             parent_snapshot: -1,
             unroll_iterations: 1,
+            parent_descr_idx: u32::MAX,
         }
     }
 

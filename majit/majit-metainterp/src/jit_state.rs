@@ -441,7 +441,7 @@ pub trait JitState: Sized {
     /// `JitCodeSym` method directly.
     fn populate_frame_for_guard(
         _sym: &Self::Sym,
-        _frame: &mut crate::pyjitpl::MIFrame,
+        _frames: &mut crate::pyjitpl::MIFrameStack,
     ) -> Option<crate::recorder::Snapshot> {
         None
     }

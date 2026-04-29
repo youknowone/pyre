@@ -1001,24 +1001,25 @@ impl<S: JitState> JitDriver<S> {
                 // SwitchToBlackhole`.  When
                 // `JitState::populate_frame_for_guard` is overridden
                 // (state-field-JIT macro consumers), pair the guard with
-                // the bridge snapshot.
+                // the bridge snapshot.  When the default no-op returns
+                // `None`, still emit the segment without a snapshot —
+                // the optimizer's `store_final_boxes_in_guard`
+                // (`optimizeopt/mod.rs:3200`) drops the resume data and
+                // emits a sentinel descr that triggers loop
+                // invalidation on guard fail, mirroring the
+                // SwitchToBlackhole bailout.
                 //
-                // PRE-EXISTING-ADAPTATION: when the default no-op
-                // returns `None`, this low-level driver has no MIFrame
-                // to walk — it only knows the active jump boxes from
-                // `S::collect_jump_args`.  We feed those into
-                // `capture_snapshot_for_last_guard`, which records a
-                // single placeholder frame in lieu of the RPython
-                // `framestack` walk (`pyjitpl.py:2586
-                // capture_resumedata`).  Bounded scope: this branch is
-                // only reached on the segmented-loop force path of the
-                // low-level driver and dissolves once Task #89 lifts
-                // `S::Sym` into `MIFrame::populate_for_guard` so every
-                // path captures uniformly via the framestack walk.
-                let pre_snapshot = self.sym.as_ref().and_then(|sym| {
-                    let frame = self.meta.framestack.current_mut();
-                    S::populate_frame_for_guard(sym, frame)
-                });
+                // PRE-EXISTING-ADAPTATION: this branch is only reached
+                // on the segmented-loop force path of the low-level
+                // driver and dissolves once Task #89 lifts `S::Sym`
+                // into `MIFrame::populate_for_guard` so every consumer
+                // captures uniformly via the standard
+                // `MIFrame::get_list_of_active_boxes` walk
+                // (`pyjitpl.py:2586 capture_resumedata`).
+                let pre_snapshot = self
+                    .sym
+                    .as_ref()
+                    .and_then(|sym| S::populate_frame_for_guard(sym, &mut self.meta.framestack));
                 let mut current_live = self
                     .sym
                     .as_ref()
@@ -1730,13 +1731,54 @@ impl<S: JitState> JitDriver<S> {
                 };
                 let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
-                // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
+                // resume.py:1339: resolve jitcode from (jitcode_pos, pc).
+                //
+                // Only state-field-JIT users (e.g., aheui via
+                // `register_jitcode_factory`) reach this path; pyre does not
+                // register a factory so `as_ref()?` short-circuits to None.
+                //
+                // Multi-frame state-field-JIT chain reconstruction
+                // (RPython `resume.py:1334-1340` parity): the root frame's
+                // `jitcode_index` holds the outer program pc (from
+                // `build_state_field_snapshot`'s `program_pc` argument);
+                // subsequent frames' `jitcode_index` holds
+                // `parent_descr_idx` (set by `BC_INLINE_CALL` at the
+                // sub-frame setup, `dispatch.rs ~1370`).  We thread the
+                // most-recently-resolved jitcode through `last_resolved`
+                // so `resolve_jitcode(parent_descr_idx, pc)` can walk
+                // `parent.descrs[idx].as_jitcode()` without re-invoking
+                // the factory.
+                let last_resolved: std::cell::RefCell<
+                    Option<std::sync::Arc<majit_metainterp::JitCode>>,
+                > = std::cell::RefCell::new(None);
                 let resolve_jitcode =
-                    |_pos: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
-                        let factory = self.jitcode_factory.as_ref()?;
-                        let jitcode = factory(env, pc as usize, 0)?;
+                    |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
+                        let resolved_jitcode = if last_resolved.borrow().is_none() {
+                            // Root frame: build via factory(program_pc).
+                            let factory = self.jitcode_factory.as_ref()?;
+                            let jitcode = factory(env, jitcode_index as usize, 0)?;
+                            std::sync::Arc::new(jitcode)
+                        } else {
+                            // Sub-frame: index into the parent's
+                            // `descrs` array.  Mirrors RPython
+                            // `BC_INLINE_CALL` operand decoding
+                            // (`blackhole.py:150-157`) where the `j`
+                            // argcode resolves through `descrs[idx]`.
+                            let parent = last_resolved
+                                .borrow()
+                                .as_ref()
+                                .expect("parent exists")
+                                .clone();
+                            parent
+                                .exec
+                                .descrs
+                                .get(jitcode_index as usize)
+                                .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)?
+                                .clone()
+                        };
+                        *last_resolved.borrow_mut() = Some(resolved_jitcode.clone());
                         Some(crate::resume::ResolvedJitCode::new(
-                            std::sync::Arc::new(jitcode),
+                            resolved_jitcode,
                             pc as usize,
                         ))
                     };
@@ -3386,14 +3428,36 @@ impl<S: JitState> JitDriver<S> {
                 };
                 let rd_virtuals_slice = rd_virtuals_converted.as_deref();
 
-                // resume.py:1339: resolve jitcode from (jitcode_pos, pc)
+                // resume.py:1339: resolve jitcode from (jitcode_pos, pc).
+                // Same multi-frame state-field-JIT wiring as the
+                // back_edge_internal path above — see that comment for
+                // the chain-walk rationale.
                 let jitcode_factory_ref = self.jitcode_factory.as_ref();
+                let last_resolved: std::cell::RefCell<
+                    Option<std::sync::Arc<majit_metainterp::JitCode>>,
+                > = std::cell::RefCell::new(None);
                 let resolve_jitcode =
-                    |_pos: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
-                        let factory = jitcode_factory_ref?;
-                        let jitcode = factory(env, pc as usize, 0)?;
+                    |jitcode_index: i32, pc: i32| -> Option<crate::resume::ResolvedJitCode> {
+                        let resolved_jitcode = if last_resolved.borrow().is_none() {
+                            let factory = jitcode_factory_ref?;
+                            let jitcode = factory(env, jitcode_index as usize, 0)?;
+                            std::sync::Arc::new(jitcode)
+                        } else {
+                            let parent = last_resolved
+                                .borrow()
+                                .as_ref()
+                                .expect("parent exists")
+                                .clone();
+                            parent
+                                .exec
+                                .descrs
+                                .get(jitcode_index as usize)
+                                .and_then(crate::jitcode::RuntimeBhDescr::as_jitcode)?
+                                .clone()
+                        };
+                        *last_resolved.borrow_mut() = Some(resolved_jitcode.clone());
                         Some(crate::resume::ResolvedJitCode::new(
-                            std::sync::Arc::new(jitcode),
+                            resolved_jitcode,
                             pc as usize,
                         ))
                     };

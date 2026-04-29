@@ -3142,16 +3142,23 @@ impl MIFrame {
     }
 
     pub(crate) fn guard_nonnull(&mut self, ctx: &mut TraceCtx, value: OpRef) {
-        // heapcache.py:561-565: skip if nullity or class already known
+        // pyjitpl.py:558-563 `_establish_nullity` cache hit:
+        //     if heapcache.is_nullity_known(box):
+        //         self.metainterp.staticdata.profiler.count_ops(rop.GUARD_NONNULL, Counters.HEAPCACHED_OPS)
+        //         return value
         if ctx
             .heap_cache()
             .is_nullity_known(value, |op| ctx.const_value(op))
             == Some(true)
         {
+            ctx.profiler().count_ops(
+                OpCode::GuardNonnull,
+                majit_metainterp::counters::HEAPCACHED_OPS,
+            );
             return;
         }
         if ctx.heap_cache().is_class_known(value) {
-            return; // class known implies nonnull
+            return; // class known implies nonnull (pyre-only short-circuit, no RPython count)
         }
         self.generate_guard(ctx, OpCode::GuardNonnull, &[value]);
         ctx.heap_cache_mut().nullity_now_known(value, true);

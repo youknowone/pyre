@@ -467,8 +467,7 @@ fn _asctime_from_tm(tm: &c_tm) -> Result<PyObjectRef, crate::PyError> {
         if p.is_null() {
             return Err(crate::PyError::value_error("unconvertible time"));
         }
-        let lossy =
-            unsafe { std::ffi::CStr::from_ptr(p as *const libc::c_char) }.to_string_lossy();
+        let lossy = unsafe { std::ffi::CStr::from_ptr(p as *const libc::c_char) }.to_string_lossy();
         let s = lossy.trim_end_matches('\n');
         Ok(w_str_new(s))
     }

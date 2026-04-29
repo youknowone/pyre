@@ -11,7 +11,7 @@ mod codegen_trace;
 pub(crate) mod jitcode_lower;
 
 use proc_macro2::TokenStream;
-use quote::quote;
+use quote::{format_ident, quote};
 use syn::{
     Expr, Ident, ItemFn, LitBool, Path, Token, braced, bracketed,
     ext::IdentExt,
@@ -717,7 +717,13 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
     let merge_fn_name = quote::format_ident!("__merge_{}", fn_name);
 
     // Rewrite the function body, replacing marker macros
-    let body = rewrite_body(&func.block, &merge_fn_name, &config.greens);
+    let body = rewrite_body(
+        &func.block,
+        &merge_fn_name,
+        &config.greens,
+        &config.calls,
+        &config.io_shims,
+    );
 
     quote! {
         #(#attrs)*
@@ -728,7 +734,13 @@ fn transform_function(config: &JitInterpConfig, func: &ItemFn) -> TokenStream {
 }
 
 /// Rewrite function body: replace jit_merge_point!() and can_enter_jit!() calls.
-fn rewrite_body(block: &syn::Block, merge_fn_name: &Ident, default_greens: &[Expr]) -> TokenStream {
+fn rewrite_body(
+    block: &syn::Block,
+    merge_fn_name: &Ident,
+    default_greens: &[Expr],
+    call_policies: &[(Path, Option<CallPolicyKind>)],
+    io_shims: &[(Path, Ident)],
+) -> TokenStream {
     use syn::visit_mut::VisitMut;
 
     #[derive(Default, Clone)]
@@ -824,9 +836,176 @@ fn rewrite_body(block: &syn::Block, merge_fn_name: &Ident, default_greens: &[Exp
         }
     }
 
+    #[derive(Clone)]
+    enum ObserverReplayKind {
+        Void,
+        Int,
+    }
+
+    #[derive(Clone)]
+    struct ObserverReplay {
+        kind: ObserverReplayKind,
+        observed_func: TokenStream,
+        observed_arg_indices: Vec<usize>,
+        unwrap_observed_refs: bool,
+    }
+
+    fn path_segments(path: &Path) -> Vec<String> {
+        path.segments
+            .iter()
+            .map(|segment| segment.ident.to_string())
+            .collect()
+    }
+
+    fn call_expr_segments(expr: &Expr) -> Option<Vec<String>> {
+        match expr {
+            Expr::Path(expr_path) => Some(path_segments(&expr_path.path)),
+            _ => None,
+        }
+    }
+
+    fn unwrap_observer_ref_expr(expr: &Expr) -> &Expr {
+        match expr {
+            Expr::Reference(reference) => unwrap_observer_ref_expr(&reference.expr),
+            Expr::Paren(paren) => unwrap_observer_ref_expr(&paren.expr),
+            _ => expr,
+        }
+    }
+
+    fn replay_kind_for_policy(kind: CallPolicyKind) -> Option<ObserverReplayKind> {
+        // Mirror the metainterp's recording sites in
+        // `pyjitpl/dispatch.rs::run_one_step` for *plain* residual
+        // policies. The outer Rust call site uses the helper symbol
+        // (`#func as *const ()`) as its replay key, which matches the
+        // jitcode's `concrete_ptr` only when the codewriter installed
+        // the helper symbol directly into the fn-ptr table — i.e. for
+        // plain (non-`_wrapped`) policies.
+        //
+        // KNOWN GAP: `_wrapped` variants install a generated wrapper
+        // (`__concrete_target` from the policy's
+        // `(__policy, _, __trace_target, __concrete_target)` tuple at
+        // `jitcode_lower.rs ~2409`). The metainterp records the
+        // wrapper pointer onto OBSERVED_CALLS, but the outer side has
+        // no portable way to recover that wrapper's address from the
+        // helper symbol alone. Wrapping the outer call here would
+        // produce a func-pointer mismatch in `consume_observed_*_call`
+        // (panic) or leave a dangling queue entry that breaks the next
+        // plain helper's replay. Until the wrapper-key plumbing lands
+        // we leave wrapped variants un-wrapped on the outer side; the
+        // metainterp continues to record onto the queue, but the queue
+        // entry is consumed harmlessly only when a subsequent plain
+        // helper with matching (func, args) lands first. No current
+        // `#[jit_interp]` user (aheui-jit) exercises a wrapped policy.
+        //
+        // Elidable: not recorded (CALL_PURE_INT is exempt in dispatch),
+        // pure re-execution is harmless. Inline: pushes a metainterp
+        // frame, never reaches call_*_function. Float wrapped: no
+        // float observer-record site in dispatch.rs today.
+        match kind {
+            CallPolicyKind::ResidualVoid
+            | CallPolicyKind::MayForceVoid
+            | CallPolicyKind::ReleaseGilVoid
+            | CallPolicyKind::LoopInvariantVoid => Some(ObserverReplayKind::Void),
+            CallPolicyKind::ResidualInt
+            | CallPolicyKind::MayForceInt
+            | CallPolicyKind::ReleaseGilInt
+            | CallPolicyKind::LoopInvariantInt => Some(ObserverReplayKind::Int),
+            _ => None,
+        }
+    }
+
+    fn observer_replay_for_call(
+        func: &Expr,
+        call_policies: &[(Vec<String>, Option<CallPolicyKind>)],
+        io_shims: &[(Vec<String>, Ident)],
+    ) -> Option<ObserverReplay> {
+        let segments = call_expr_segments(func)?;
+        for (io_path, shim) in io_shims {
+            if *io_path == segments {
+                let observed_func = quote! { #shim as *const () };
+                return Some(ObserverReplay {
+                    kind: ObserverReplayKind::Void,
+                    observed_func,
+                    observed_arg_indices: vec![0],
+                    unwrap_observed_refs: true,
+                });
+            }
+        }
+        for (path, policy) in call_policies {
+            if *path == segments {
+                let kind = replay_kind_for_policy((*policy)?)?;
+                let observed_func = quote! { #func as *const () };
+                return Some(ObserverReplay {
+                    kind,
+                    observed_func,
+                    observed_arg_indices: Vec::new(),
+                    unwrap_observed_refs: false,
+                });
+            }
+        }
+        None
+    }
+
+    fn observer_replay_expr(call: &syn::ExprCall, replay: ObserverReplay) -> Expr {
+        let func = &call.func;
+        let arg_exprs: Vec<Expr> = call.args.iter().cloned().collect();
+        let arg_names: Vec<Ident> = (0..arg_exprs.len())
+            .map(|idx| format_ident!("__majit_observer_arg{idx}"))
+            .collect();
+        let arg_binds = arg_names.iter().zip(arg_exprs.iter()).map(|(name, arg)| {
+            quote! {
+                let #name = #arg;
+            }
+        });
+        let observed_indices: Vec<usize> = if replay.observed_arg_indices.is_empty() {
+            (0..arg_names.len()).collect()
+        } else {
+            replay.observed_arg_indices.clone()
+        };
+        let observed_args = observed_indices.iter().map(|idx| {
+            if replay.unwrap_observed_refs {
+                let expr = unwrap_observer_ref_expr(&arg_exprs[*idx]);
+                quote! { majit_metainterp::observer_arg_to_i64(&(#expr)) }
+            } else {
+                let name = &arg_names[*idx];
+                quote! { majit_metainterp::observer_arg_to_i64(&#name) }
+            }
+        });
+        let observed_func = replay.observed_func;
+
+        let tokens = match replay.kind {
+            ObserverReplayKind::Void => quote! {{
+                #(#arg_binds)*
+                let __majit_observer_args = [#(#observed_args),*];
+                if !majit_metainterp::consume_observed_void_call(
+                    #observed_func,
+                    &__majit_observer_args,
+                ) {
+                    #func(#(#arg_names),*);
+                }
+            }},
+            ObserverReplayKind::Int => quote! {{
+                #(#arg_binds)*
+                let __majit_observer_args = [#(#observed_args),*];
+                match majit_metainterp::consume_observed_int_call(
+                    #observed_func,
+                    &__majit_observer_args,
+                ) {
+                    Some(__majit_observer_result) => unsafe {
+                        majit_metainterp::observer_i64_to_value(__majit_observer_result)
+                    },
+                    None => #func(#(#arg_names),*),
+                }
+            }},
+        };
+        syn::parse2(tokens).expect("failed to parse observer replay expression")
+    }
+
     struct MarkerRewriter {
         merge_fn_name: Ident,
         default_greens: Vec<Expr>,
+        call_policies: Vec<(Vec<String>, Option<CallPolicyKind>)>,
+        io_shims: Vec<(Vec<String>, Ident)>,
     }
 
     impl VisitMut for MarkerRewriter {
@@ -867,8 +1046,13 @@ fn rewrite_body(block: &syn::Block, merge_fn_name: &Ident, default_greens: &[Exp
             // First recurse
             syn::visit_mut::visit_expr_mut(self, expr);
 
-            // Check for can_enter_jit!(...) macro calls within expressions
-            // can_enter_jit! is used as a statement, handled below
+            if let Expr::Call(call) = expr {
+                if let Some(replay) =
+                    observer_replay_for_call(&call.func, &self.call_policies, &self.io_shims)
+                {
+                    *expr = observer_replay_expr(call, replay);
+                }
+            }
         }
 
         fn visit_block_mut(&mut self, block: &mut syn::Block) {
@@ -956,6 +1140,14 @@ fn rewrite_body(block: &syn::Block, merge_fn_name: &Ident, default_greens: &[Exp
     let mut rewriter = MarkerRewriter {
         merge_fn_name: merge_fn_name.clone(),
         default_greens: default_greens.to_vec(),
+        call_policies: call_policies
+            .iter()
+            .map(|(path, policy)| (path_segments(path), *policy))
+            .collect(),
+        io_shims: io_shims
+            .iter()
+            .map(|(path, shim)| (path_segments(path), shim.clone()))
+            .collect(),
     };
     rewriter.visit_block_mut(&mut cloned_block);
 

@@ -2344,30 +2344,57 @@ impl OptContext {
                 // across compilations via GC tracing. In majit, we must
                 // snapshot the constant pool so build_short_preamble_struct
                 // can capture referenced constants.
-                let loop_constants: HashMap<u32, i64> = self
-                    .const_pool
-                    .iter()
-                    .map(|(&i, val)| {
-                        let raw = match val {
-                            majit_ir::Value::Int(v) => *v,
-                            majit_ir::Value::Float(f) => f.to_bits() as i64,
-                            majit_ir::Value::Ref(r) => r.0 as i64,
-                            majit_ir::Value::Void => 0,
-                        };
-                        (OpRef::from_const(i).0, raw)
-                    })
-                    .collect();
-                let mut loop_constant_types = self.constant_types_for_numbering.clone();
-                for (&i, val) in &self.const_pool {
-                    let tp = match val {
+                let value_to_raw = |val: &majit_ir::Value| -> i64 {
+                    match val {
+                        majit_ir::Value::Int(v) => *v,
+                        majit_ir::Value::Float(f) => f.to_bits() as i64,
+                        majit_ir::Value::Ref(r) => r.0 as i64,
+                        majit_ir::Value::Void => 0,
+                    }
+                };
+                let value_to_type = |val: &majit_ir::Value| -> majit_ir::Type {
+                    match val {
                         majit_ir::Value::Int(_) => majit_ir::Type::Int,
                         majit_ir::Value::Float(_) => majit_ir::Type::Float,
                         majit_ir::Value::Ref(_) => majit_ir::Type::Ref,
                         majit_ir::Value::Void => majit_ir::Type::Void,
-                    };
+                    }
+                };
+                let mut loop_constants: HashMap<u32, i64> = self
+                    .const_pool
+                    .iter()
+                    .map(|(&i, val)| (OpRef::from_const(i).0, value_to_raw(val)))
+                    .collect();
+                // `initialize_imported_short_preamble_builder_from_exported_ops`
+                // (mod.rs:1693) imports cross-trace constants by allocating a
+                // fresh local OpRef via `alloc_op_position()` and seeding it
+                // with `make_constant`, which stores the value in
+                // `self.constants` (Vec) rather than `self.const_pool` (the
+                // CONST_BIT namespace). Those positions are still constants
+                // for the purposes of short-preamble inlining, so include
+                // them in `loop_constants` so `build_short_preamble_struct`'s
+                // arg scan can recognise the seeded value and the downstream
+                // `ExtendedShortPreambleBuilder::setup` `constants_set` check
+                // accepts them as resolved deps.
+                for (idx, slot) in self.constants.iter().enumerate() {
+                    if let Some(val) = slot {
+                        loop_constants
+                            .entry(idx as u32)
+                            .or_insert(value_to_raw(val));
+                    }
+                }
+                let mut loop_constant_types = self.constant_types_for_numbering.clone();
+                for (&i, val) in &self.const_pool {
                     loop_constant_types
                         .entry(OpRef::from_const(i).0)
-                        .or_insert(tp);
+                        .or_insert(value_to_type(val));
+                }
+                for (idx, slot) in self.constants.iter().enumerate() {
+                    if let Some(val) = slot {
+                        loop_constant_types
+                            .entry(idx as u32)
+                            .or_insert(value_to_type(val));
+                    }
                 }
                 builder.build_short_preamble_struct(&loop_constants, &loop_constant_types)
             })

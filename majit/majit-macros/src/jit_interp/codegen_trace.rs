@@ -72,7 +72,17 @@ pub fn generate_trace_fn(config: &JitInterpConfig, func: &ItemFn) -> TokenStream
                 return TraceAction::AbortPermanent;
             };
 
-            let __result = majit_metainterp::trace_jitcode(
+            // Observer mode: the outer Rust mainloop runs the same opcode
+            // body alongside this metainterp pass. The metainterp executes
+            // each residual function-pointer call (BC_CALL_INT /
+            // BC_RESIDUAL_CALL_VOID etc.) and pushes (func, args[, result])
+            // onto OBSERVED_CALLS; the outer body, rewritten by `rewrite_body`
+            // so each registered helper is wrapped in `consume_observed_*_call`,
+            // replays the queued result instead of invoking the helper a
+            // second time. The IR call op recorded above runs at compiled-
+            // trace runtime; the outer/metainterp pair stays single-execution
+            // per recording iter.
+            let __result = majit_metainterp::trace_jitcode_observer(
                 __ctx,
                 __sym,
                 &__jitcode,

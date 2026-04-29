@@ -2136,11 +2136,15 @@ impl TraceCtx {
     ) -> bool {
         // Step 1: heapcache short-circuit.
         //     if self.metainterp.heapcache.is_known_nonstandard_virtualizable(box):
+        //         self.metainterp.staticdata.profiler.count_ops(rop.PTR_EQ, Counters.HEAPCACHED_OPS)
         //         return True
         if self
             .heap_cache
             .is_known_nonstandard_virtualizable(vable_opref)
         {
+            // pyjitpl.py:1124 profiler.count_ops(rop.PTR_EQ, Counters.HEAPCACHED_OPS).
+            self.profiler()
+                .count_ops(OpCode::PtrEq, crate::pyjitpl::counters::HEAPCACHED_OPS);
             return true;
         }
         // Step 2: forced_virtualizable reset on identity.
