@@ -95,6 +95,8 @@ pub fn with_writable<F: FnOnce()>(addr: *mut u8, len: usize, f: F) {
                 const PAGE_EXECUTE_READ: u32 = 0x20;
                 unsafe extern "system" {
                     fn VirtualProtect(addr: *mut u8, size: usize, new: u32, old: *mut u32) -> i32;
+                    fn FlushInstructionCache(process: isize, addr: *const u8, size: usize) -> i32;
+                    fn GetCurrentProcess() -> isize;
                 }
                 let mut old: u32 = 0;
                 let rc = unsafe { VirtualProtect(self.ptr, self.len, PAGE_EXECUTE_READ, &mut old) };
@@ -103,6 +105,7 @@ pub fn with_writable<F: FnOnce()>(addr: *mut u8, len: usize, f: F) {
                     "[dynasm] VirtualProtect RX failed: addr={:?} len={} err={}",
                     self.ptr, self.len, std::io::Error::last_os_error()
                 );
+                unsafe { FlushInstructionCache(GetCurrentProcess(), self.ptr, self.len) };
             }
         }
         let _guard = RestoreRx { ptr: page_ptr, len: region_len };
