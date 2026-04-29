@@ -870,13 +870,15 @@ impl MIFrame {
         let mut cursor = off + 3;
         let mut boxes = Vec::with_capacity((length_i + length_r + length_f) as usize);
         // RPython `pyjitpl.py:218-225` reads each live register out of its
-        // kind-specific bank: `registers_i[reg_i]`, `registers_r[reg_r]`,
-        // `registers_f[reg_f]` — no semantic fallback. Match that contract
-        // exactly: a missing bank slot at a liveness-listed register index
-        // is an encoder/codewriter mismatch and surfaces as `OpRef::NONE`
-        // for the consumer to handle, not a silent semantic-prefix read.
-        let snapshot_bank =
-            |bank: &[OpRef], reg: usize| -> OpRef { bank.get(reg).copied().unwrap_or(OpRef::NONE) };
+        // kind-specific bank via direct list indexing:
+        // `registers_i[reg_i]`, `registers_r[reg_r]`, `registers_f[reg_f]`.
+        // The bank is expected to be complete (the codewriter only emits
+        // a register index when the SSA-alive set says it holds a value
+        // at this PC), so a liveness-listed index out of bank range is
+        // an encoder/codewriter invariant violation. Use Rust's slice
+        // indexing — it bounds-checks and panics on OOB, mirroring
+        // Python's IndexError.
+        let snapshot_bank = |bank: &[OpRef], reg: usize| -> OpRef { bank[reg] };
         use majit_translate::liveness::LivenessIterator;
         if length_i != 0 {
             let mut it = LivenessIterator::new(cursor, length_i, &all_liveness);
