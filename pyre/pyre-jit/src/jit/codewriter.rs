@@ -2062,35 +2062,29 @@ fn register_helper_fn_pointers(
 /// `LivenessIterator`, so the post-rename `-live-` marker is the
 /// sole source.
 ///
-/// The Ref bank still carries one PRE-EXISTING-ADAPTATION — the
-/// LV∩SSA `live_r.retain(...)` intersection (Task #181 / parent
-/// #185 epic, blocked by Task #110 slice 3b + Task #158 graph
-/// regalloc). RPython's `liveness.py:19-76` produces a single
-/// SSA-driven alive set as the sole authority. The pyre retain
-/// compensates for the post-rename namespace conflation between
-/// scratch Variables and Python-frame Variables (chordal coloring
-/// places scratches on Python-frame colors when their live ranges
-/// don't overlap; see `MAJIT_PROBE_SCRATCH_COLLAPSE` data in
-/// `task158_scratch_collapse_probe_data_2026_04_28.md`).
-/// Convergence path: graph regalloc with separate scratch color
-/// space (Task #158 item 4) eliminates the conflation, after which
-/// the retain becomes provably dead and is removed.
+/// The Ref bank still carries the LV∩SSA `live_r.retain(...)` intersect
+/// as a PRE-EXISTING-ADAPTATION (Task #181 / parent #185 epic, blocked
+/// by Task #110 slice 3b + Task #158 graph regalloc). RPython's
+/// `liveness.py:19-76 compute_liveness` produces a single SSA-driven
+/// alive set as the sole authority. The encoder at
+/// `pyre-jit-trace/src/trace_opcode.rs:get_list_of_active_boxes` now
+/// reads `registers_r_bank[reg]` directly per `pyjitpl.py:218-225` (no
+/// semantic-prefix fallback) and the blackhole decoder
+/// (`call_jit.rs::resume_in_blackhole` / `consume_one_section`)
+/// restores only liveness-listed colors per `resume.py:1017-1026` (no
+/// heap-mirror fallback). RPython's flat `_registers_r` register file
+/// makes encoder and decoder indices agree by construction. Pyre's
+/// retain still compensates for chordal regalloc collapsing scratch
+/// colors onto pinned Python-frame colors: dropping the retain alone
+/// leaves the scratch value visible at the encoded color and the BH
+/// decoder writes it back as if it were the local/stack value
+/// (verified empirically — fannkuch(9) and nbody SIGSEGV on cranelift
+/// when the retain was removed in isolation at b72cf1d743d, nbody and
+/// fannkuch timeout under MAJIT_PHASE06_DROP_LV=1 once those crashes
+/// were closed). Convergence path: graph regalloc with separate
+/// scratch color space (Task #158 item 4) eliminates the conflation,
+/// after which the retain becomes provably dead.
 ///
-/// The "all stack slots up to current depth hold a live box"
-/// runtime contract is now enforced consumer-side in
-/// `consume_one_section` (`call_jit.rs::resume_in_blackhole`),
-/// which copies any color in
-/// `stack_slot_color_map[..depth_at_py_pc[py_pc]]` not present in
-/// `live_r` from the heap PyFrame. This is itself a
-/// PRE-EXISTING-ADAPTATION compensating for pyre's heap-mirror
-/// stack model (every push emits `setarrayitem_vable_r` heap I/O
-/// rather than RPython's direct `_registers_r[stack_color]` SSA
-/// write); see the consumer-side block for the convergence path.
-/// The pyre-only force-add that previously widened `live_r` here
-/// was redundant against that fallback and has been removed; the
-/// historical Python-frame index-range pre-filter (its predecessor)
-/// was provably dead code (`lv_live = {LV-live-locals} ∪
-/// live_stack_colors` already absorbed it) and was removed earlier.
 /// Int/Float banks are emitted line-by-line parity with no filter.
 ///
 /// Unreachable PCs still get emptied in place via the bytecode
