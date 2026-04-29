@@ -2,7 +2,9 @@
 
 #[cfg(test)]
 mod tests {
-    use crate::jit::descr::{make_field_descr, make_immutable_field_descr, make_size_descr};
+    use crate::jit::descr::{
+        make_field_descr, make_immutable_field_descr, make_size_descr_with_type_and_vtable,
+    };
     use majit_ir::{OpCode, OpRef};
     use majit_metainterp::TraceCtx;
 
@@ -25,10 +27,10 @@ mod tests {
         make_immutable_field_descr(8, 8, majit_ir::Type::Float, false)
     }
     fn w_int_size_descr() -> majit_ir::DescrRef {
-        make_size_descr(16)
+        make_size_descr_with_type_and_vtable(16, 0, 0)
     }
     fn w_float_size_descr() -> majit_ir::DescrRef {
-        make_size_descr(16)
+        make_size_descr_with_type_and_vtable(16, 0, 0)
     }
     const FAKE_INT_TYPE: i64 = 0x1234_5678;
     const FAKE_FLOAT_TYPE: i64 = 0x1234_9876;
@@ -36,7 +38,7 @@ mod tests {
     /// Get ops from TraceCtx, excluding the dummy Finish we add for finalization.
     fn get_ops(ctx: TraceCtx) -> Vec<OpCode> {
         let mut recorder = ctx.into_recorder();
-        let dummy_descr = make_size_descr(0);
+        let dummy_descr = make_size_descr_with_type_and_vtable(0, 0, 0);
         recorder.finish(&[], dummy_descr);
         let trace = recorder.get_trace();
         trace

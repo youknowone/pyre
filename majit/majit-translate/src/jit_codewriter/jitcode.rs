@@ -736,6 +736,48 @@ pub struct BhFieldSpec {
     pub index_in_parent: usize,
 }
 
+impl BhFieldSpec {
+    /// Mirror an `Arc<dyn FieldDescr>` into the serializable
+    /// `BhFieldSpec` shape so producers outside the codewriter
+    /// (e.g. blackhole-allocator dispatch in `pyre-jit`) can build
+    /// `BhDescr::Size.all_fielddescrs` matching `descr.py:188
+    /// init_size_descr` parity.
+    pub fn from_field_descr(fd: &dyn majit_ir::descr::FieldDescr) -> Self {
+        let field_flag = if fd.is_pointer_field() {
+            majit_ir::descr::ArrayFlag::Unsigned
+        } else if fd.is_float_field() {
+            majit_ir::descr::ArrayFlag::Float
+        } else if fd.field_type() == majit_ir::value::Type::Void {
+            majit_ir::descr::ArrayFlag::Void
+        } else if fd.is_field_signed() {
+            majit_ir::descr::ArrayFlag::Signed
+        } else {
+            majit_ir::descr::ArrayFlag::Unsigned
+        };
+        Self {
+            index: fd.index(),
+            name: fd.field_name().to_string(),
+            offset: fd.offset(),
+            field_size: fd.field_size(),
+            field_type: fd.field_type(),
+            field_flag,
+            is_field_signed: fd.is_field_signed(),
+            is_immutable: fd.is_immutable(),
+            is_quasi_immutable: fd.is_quasi_immutable(),
+            index_in_parent: fd.index_in_parent(),
+        }
+    }
+}
+
+/// Mirror `SizeDescr.all_fielddescrs` (`descr.py:122-126`) onto a
+/// fresh `Vec<BhFieldSpec>`.
+pub fn bh_field_specs_from_size_descr(sd: &dyn majit_ir::descr::SizeDescr) -> Vec<BhFieldSpec> {
+    sd.all_fielddescrs()
+        .iter()
+        .map(|fd| BhFieldSpec::from_field_descr(fd.as_ref()))
+        .collect()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct BhSizeSpec {
     pub size: usize,
@@ -807,10 +849,28 @@ pub enum BhDescr {
         /// arrays whose item type is an inline struct.
         interior_fields: Vec<BhInteriorFieldSpec>,
     },
+    /// Plain `SizeDescr` (no vtable / NEW_WITH_VTABLE descr).
+    ///
+    /// `descr.py:120 get_size_descr` + `:188 init_size_descr` populate
+    /// the `SizeDescr.all_fielddescrs` and `gc_fielddescrs` lists from
+    /// `heaptracker.all_fielddescrs(STRUCT)` at descr-creation time so
+    /// downstream consumers (`info.py:180 init_fields`, virtualized
+    /// struct fan-out) read the full per-struct layout off the descr.
+    /// `owner` carries the upstream `STRUCT._name` so a producer that
+    /// only has the size + type_id can re-resolve the layout via
+    /// `bh_all_field_specs_for_struct`.
     Size {
         size: usize,
         type_id: u32,
         vtable: usize,
+        /// RPython `STRUCT._name` identity (empty when the size descr
+        /// is built transiently for `bh_new` / `bh_new_with_vtable`
+        /// dispatch and the struct identity is already encoded in the
+        /// caller-supplied `DescrRef`).
+        owner: String,
+        /// `heaptracker.all_fielddescrs(STRUCT)` snapshot; empty when
+        /// the size descr is purely transient (no struct context).
+        all_fielddescrs: Vec<BhFieldSpec>,
     },
     /// Call descriptor: for residual_call. Carries calling convention.
     /// RPython: `CallDescr`.

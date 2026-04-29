@@ -2638,6 +2638,8 @@ enum AssemblerDescrKey {
         size: usize,
         type_id: u32,
         vtable: usize,
+        owner: String,
+        all_fielddescrs: Vec<crate::jitcode::BhFieldSpec>,
     },
     Call {
         arg_classes: String,
@@ -2732,10 +2734,14 @@ impl AssemblerDescrKey {
                 size,
                 type_id,
                 vtable,
+                owner,
+                all_fielddescrs,
             } => Self::Size {
                 size: *size,
                 type_id: *type_id,
                 vtable: *vtable,
+                owner: owner.clone(),
+                all_fielddescrs: all_fielddescrs.clone(),
             },
             crate::jitcode::BhDescr::Call { calldescr } => Self::Call {
                 arg_classes: calldescr.arg_classes.clone(),

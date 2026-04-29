@@ -1219,8 +1219,7 @@ pub fn load_const_concrete(constant: &pyre_interpreter::bytecode::ConstantData) 
 use pyre_interpreter::{DictStorage, decode_instruction_at};
 
 use crate::descr::{
-    float_floatval_descr, int_intval_descr, make_array_descr, make_size_descr, w_float_size_descr,
-    w_int_size_descr,
+    float_floatval_descr, int_intval_descr, make_array_descr, w_float_size_descr, w_int_size_descr,
 };
 use crate::frame_layout::{
     PYFRAME_DEBUGDATA_OFFSET, PYFRAME_LASTBLOCK_OFFSET, PYFRAME_LOCALS_CELLS_STACK_OFFSET,

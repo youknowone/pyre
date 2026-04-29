@@ -974,27 +974,13 @@ impl SizeDescr for PyreSizeDescr {
     }
 }
 
-/// Create a size descriptor for a fixed-size object.
-pub fn make_size_descr(obj_size: usize) -> DescrRef {
-    Arc::new(PyreSizeDescr {
-        obj_size,
-        type_id: 0,
-        vtable: 0,
-        all_fielddescrs: Vec::new(),
-        gc_fielddescrs: Vec::new(),
-    })
-}
-
-pub fn make_size_descr_with_type(obj_size: usize, type_id: u32) -> DescrRef {
-    Arc::new(PyreSizeDescr {
-        obj_size,
-        type_id,
-        vtable: 0,
-        all_fielddescrs: Vec::new(),
-        gc_fielddescrs: Vec::new(),
-    })
-}
-
+/// Empty-struct fallback for `BhDescr::Size` decode (`make_descr_from_bh`).
+/// RPython `descr.py:188 init_size_descr` records an empty
+/// `all_fielddescrs` list when the underlying STRUCT has no GC fields, so
+/// the consumer-side decoder still needs a constructor that produces a
+/// `PyreSizeDescr` with an empty field-list rather than refusing to build
+/// one. Producers carrying a populated field-list go through
+/// `simple_descr_group_from_bh_size` instead.
 pub fn make_size_descr_with_type_and_vtable(
     obj_size: usize,
     type_id: u32,
@@ -1950,7 +1936,36 @@ pub fn make_descr_from_bh(bh: &majit_translate::jitcode::BhDescr) -> DescrRef {
             size,
             type_id,
             vtable,
-        } => make_size_descr_with_type_and_vtable(*size, *type_id, *vtable),
+            all_fielddescrs,
+            ..
+        } => {
+            // RPython `descr.py:120 get_size_descr` → `:188 init_size_descr`
+            // populates `SizeDescr.all_fielddescrs` (and the
+            // `gc_fielddescrs` subset) from
+            // `heaptracker.all_fielddescrs(STRUCT)` so consumers like
+            // `info.py:180 init_fields` (`optimizeopt/info.rs:1989`)
+            // see the full struct field list off the descr without a
+            // round-trip through the codewriter.  When the producer
+            // shipped a non-empty `all_fielddescrs`, build the parent
+            // `SimpleSizeDescr` via the cyclic `make_simple_descr_group`
+            // path so `Arc<SimpleFieldDescr>` parents back-reference
+            // the same `SimpleSizeDescr` (`descr.py:200` parent slot).
+            // The transient short-lived `BhDescr::Size` constructed in
+            // `pyre-jit/src/eval.rs` (`bh_new` / `bh_new_with_vtable`
+            // dispatch) carries an empty list and falls through to the
+            // bare ctor, which is the existing test-helper shape.
+            if all_fielddescrs.is_empty() {
+                make_size_descr_with_type_and_vtable(*size, *type_id, *vtable)
+            } else {
+                let spec = majit_translate::jitcode::BhSizeSpec {
+                    size: *size,
+                    type_id: *type_id,
+                    vtable: *vtable,
+                    all_fielddescrs: all_fielddescrs.clone(),
+                };
+                simple_descr_group_from_bh_size(&spec).size_descr.clone()
+            }
+        }
         BhDescr::Call { calldescr } => make_call_descr_from_bh(calldescr),
         BhDescr::JitCode { jitcode_index, .. } => make_jitcode_descr(*jitcode_index),
         BhDescr::Switch { dict } => Arc::new(PyreSwitchDescr::new(dict.clone())),
