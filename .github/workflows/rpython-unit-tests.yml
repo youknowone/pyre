@@ -1,13 +1,7 @@
 name: Rpython Unit Tests
-# === Implementation notes ===
-# Since the test suite is too large to run in a reasonable amount of time
-# we split this into tests by sub-folder within the rpython folder
-
-# Note: this action will only run if there are changes to one of:
-#  - rpython folder
-#  - .github folder
-#  - pytest.py
-# add more items to `paths` if we missed some!
+# Suppressed in automatic CI: this project now maintains pyre/majit
+# independently from upstream PyPy. Jobs stay defined so existing required
+# checks can resolve as skipped; maintainers can opt in via manual dispatch.
 
 on:
   push:
@@ -23,6 +17,12 @@ on:
       - "pytest.py"
       - ".github/**/*"
   workflow_dispatch:
+    inputs:
+      run_legacy_rpython_tests:
+        description: "Run the suppressed legacy RPython test suite"
+        required: false
+        default: false
+        type: boolean
 
 # Limit tests to latest commit on branches other than main
 concurrency:
@@ -35,6 +35,7 @@ permissions:
 
 jobs:
   test-misc:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_rpython_tests }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -100,6 +101,7 @@ jobs:
   #     run: pypy2 pytest.py -v rpython/jit --ignore=rpython/jit/backend/x86
 
   test-memory:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_rpython_tests }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -119,6 +121,7 @@ jobs:
       run: pypy2 pytest.py rpython/memory
 
   test-rlib:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_rpython_tests }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -138,6 +141,7 @@ jobs:
       run: pypy2 pytest.py rpython/rlib -v -m "not flaky"
 
   test-rtyper:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_rpython_tests }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -162,6 +166,7 @@ jobs:
           pypy2 pytest.py -v rpython/rtyper/test/test_rlist.py
 
   test-translator:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_rpython_tests }}
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false

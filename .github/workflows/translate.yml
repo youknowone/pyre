@@ -1,4 +1,7 @@
 name: Translate PyPy
+# Suppressed in automatic CI: this project now maintains pyre/majit
+# independently from upstream PyPy. The job stays defined so existing required
+# checks can resolve as skipped; maintainers can opt in via manual dispatch.
 
 on:
   push:
@@ -6,12 +9,19 @@ on:
   pull_request:
     branches: [ "main", "py3.[0-9]+"]
   workflow_dispatch:
+    inputs:
+      run_legacy_translation:
+        description: "Run the suppressed legacy PyPy translation job"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
 
 jobs:
   build:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.run_legacy_translation }}
 
     name: build on ${{ matrix.os }}${{ matrix.revdb && ' (with RevDB)' || '' }}
     runs-on: ${{ matrix.os }}
