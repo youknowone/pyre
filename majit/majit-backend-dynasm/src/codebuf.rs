@@ -61,11 +61,13 @@ pub fn with_writable<F: FnOnce()>(addr: *mut u8, len: usize, f: F) {
     {
         use std::os::windows::raw::HANDLE;
 
+        // Win64 SYSTEM_INFO is 48 bytes; we only read dwPageSize at offset 4.
+        #[repr(C)]
+        struct SystemInfo { _arch: u32, dw_page_size: u32, _rest: [u8; 40] }
+
         let page_size = {
-            #[repr(C)]
-            struct SystemInfo { _pad: [u8; 4], dw_page_size: u32, _rest: [u8; 60] }
             let mut si = std::mem::MaybeUninit::<SystemInfo>::zeroed();
-            unsafe { GetSystemInfo(si.as_mut_ptr() as *mut u8) };
+            unsafe { GetSystemInfo(si.as_mut_ptr()) };
             unsafe { si.assume_init().dw_page_size as usize }
         };
         let page_start = (addr as usize) & !(page_size - 1);
@@ -78,7 +80,7 @@ pub fn with_writable<F: FnOnce()>(addr: *mut u8, len: usize, f: F) {
 
         unsafe extern "system" {
             fn VirtualProtect(addr: *mut u8, size: usize, new: u32, old: *mut u32) -> i32;
-            fn GetSystemInfo(info: *mut u8);
+            fn GetSystemInfo(info: *mut SystemInfo);
         }
 
         let mut old_protect: u32 = 0;
