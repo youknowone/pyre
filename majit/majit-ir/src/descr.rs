@@ -5,6 +5,85 @@
 ///
 /// Descriptors carry type metadata needed by the optimizer and backend
 /// for field access, array access, function calls, and guard failures.
+///
+/// # Identity model — RPython vs Pyre
+///
+/// **RPython.** `AbstractDescr` (history.py:95) is a heap-allocated
+/// Python object. Each `ResOperation` stores a direct reference to its
+/// descr (`op.getdescr()` returns the live object), and identity is
+/// pointer comparison: `op1.getdescr() is op2.getdescr()` decides
+/// CSE / alias / OptHeap merge eligibility (rewrite.py:_optimize_CALL_*,
+/// heap.py:_seen_alias). Method dispatch on a descr is plain virtual
+/// dispatch through the Python class hierarchy
+/// (`AbstractDescr → SizeDescr / FieldDescr / ArrayDescr / CallDescr / …`).
+/// Canonicalization is per-cache (`GcCache.cache[STRUCT]`,
+/// `get_call_descr`'s structural key — descr.py:109/350/665) so the
+/// "one descr per type" invariant holds without involving the IR
+/// representation.
+///
+/// **Pyre.** The trait object infrastructure exists (`pub trait Descr`
+/// below + `as_field_descr / as_array_descr / as_size_descr /
+/// as_call_descr` virtual dispatch, `DescrRef = Arc<dyn Descr>`) and
+/// matches the RPython class hierarchy method-for-method. What differs
+/// is what `ResOperation` carries: not `DescrRef` directly, but a
+/// `descr_index: u32` pool handle (resoperation.rs:100/112/121/130/
+/// 139/443). The pool (`descr.rs` `LLType`-keyed caches) canonicalizes
+/// — one descr per `LLType::Struct(type_id) / Array(type_id) / Func{…}`
+/// key — so `descr_index` equality on the IR side is **identity-equivalent
+/// to RPython's pointer equality**: two ops carry the same `u32` iff
+/// they would carry the same `AbstractDescr` pointer in RPython. Method
+/// dispatch reaches the trait object via `pool.resolve(descr_index)
+/// .as_field_descr() / …`, one indirection beyond `op.descr.foo()`.
+///
+/// # Why the divergence is currently advantageous
+///
+/// Several Pyre design constraints are easier to satisfy with the
+/// `u32` handle than with `Arc<dyn Descr>` embedded in ops:
+///
+/// 1. **Deterministic serialization.** Trace dumps and the build-time
+///    `opcode_insns.bin` artifact (see the build-time HashMap
+///    determinism work, 2026-04-23) need byte-stable output across
+///    runs. A `u32` pool index is stable as long as the pool is built
+///    deterministically. `Arc<dyn Descr>` carries a `*const ()`
+///    identity that varies per process and would force a parallel
+///    "stable id" registry to be designed and maintained.
+/// 2. **Cheap clone / move.** ResOps are cloned/moved heavily by the
+///    optimizer (`Box<dyn Optimization>` chains, unrolling, virtual
+///    materialization). A `u32` is 4 bytes and `Copy`; `Arc<dyn Descr>`
+///    is two pointers (data + vtable) plus an atomic refcount bump on
+///    every clone. The hot-path cost is real and was a partial
+///    motivation for the current shape.
+/// 3. **Borrow-checker ergonomics.** Many optimizer passes hold a
+///    `&mut Optimizer` while inspecting an op; pulling a `&dyn Descr`
+///    out of `op.descr` would either re-borrow the IR (blocked by the
+///    `&mut` on the parent op) or force every consumer to clone the
+///    `Arc` defensively. The pool is owned outside the IR, so
+///    `pool.resolve(idx)` returns an independent borrow.
+/// 4. **No Arc cycles by construction.** Descrs reference other
+///    descrs (FieldDescr → parent SizeDescr, CallDescr → effectinfo's
+///    field/array descr lists). With `Arc<dyn Descr>` embedded in IR
+///    ops, accidental cycles between the IR graph and the descr graph
+///    become possible and require auditing every new descr field.
+///    Index handles cannot form cycles.
+///
+/// Functionally these are wins; semantically the model loses nothing
+/// because the pool already canonicalizes to RPython's "one descr per
+/// type identity" invariant.
+///
+/// # When to revisit
+///
+/// The pool-handle model has been sufficient through every parity
+/// audit so far. If a future requirement makes it actually impossible
+/// to express the equivalent of RPython's behavior — for example a
+/// pass that needs to mutate a descr in-place mid-trace, or a place
+/// where `pool.resolve()` becomes a measured perf hot spot, or an
+/// optimizer that needs structural sharing across pool generations —
+/// then **do not hesitate to migrate**. Convert `descr_index: u32`
+/// to `descr: DescrRef` (Arc<dyn Descr>) directly on `ResOperation`,
+/// design the stable-id registry that replaces the pool's
+/// determinism guarantee, and accept the clone/borrow costs above.
+/// The decision today is "the current shape pays for itself"; that is
+/// not a permanent verdict.
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::Mutex;
