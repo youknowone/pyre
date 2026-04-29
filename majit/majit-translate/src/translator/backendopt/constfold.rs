@@ -7,6 +7,7 @@ use crate::flowspace::model::{
     LinkRef, SpaceOperation, Variable,
 };
 use crate::translator::rtyper::lltypesystem::lloperation::ll_operations;
+use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
 use crate::translator::simplify;
 use crate::translator::unsimplify::{insert_empty_block, split_block};
 
@@ -15,9 +16,10 @@ use crate::translator::unsimplify::{insert_empty_block, split_block};
 /// fold-result Constants (added by `fold_op_list`), link-arg Hlvalues
 /// (added by `complete_constants`), or fresh Variables (added by
 /// `prepare_constant_fold_link`'s indirect-call rewrite). Python's
-/// untyped `dict` admits this; the Rust port widens the value type to
-/// `Hlvalue` so the same map can carry every shape upstream encounters.
-pub(crate) type LinkConstants = HashMap<Variable, Hlvalue>;
+/// untyped `dict` admits this; upstream `:161 constants[v2] = v1` also
+/// permits `v1 is None` to land in the dict. The Rust port carries
+/// `LinkArg` (= `Option<Hlvalue>`) so the None case is preserved.
+pub(crate) type LinkConstants = HashMap<Variable, LinkArg>;
 
 /// Per-(block, link) split entry collected by `prepare_constant_fold_link`
 /// and consumed by `rewire_links`. Mirrors upstream's tuple
@@ -73,6 +75,13 @@ fn fold_op_list(
             if !op_desc.sideeffects && args.len() == vargs.len() {
                 if let Some(result) = eval_llop(&spaceop.opname, &args) {
                     if let Hlvalue::Variable(result_var) = &spaceop.result {
+                        // Upstream `constfold.py:46-47`: opnames in
+                        // `fixup_op_result` post-process the folded
+                        // result (currently only `fixup_solid` for the
+                        // four `getsubstruct` / `getarraysubstruct` /
+                        // `direct_fieldptr` / `direct_arrayitems` ops,
+                        // pinning the parent for keepalive).
+                        let result = fixup_op_result(&spaceop.opname, result);
                         let constant = constant_for_result(result, &spaceop.result);
                         constants.insert(result_var.clone(), constant);
                         folded_count += 1;
@@ -129,7 +138,7 @@ fn fold_op_list(
                         drop(b);
                         {
                             let mut l = exc_link.borrow_mut();
-                            debug_assert_eq!(
+                            assert_eq!(
                                 match l.exitcase.as_ref() {
                                     Some(Hlvalue::Constant(c)) =>
                                         c.value.host_class_name().map(str::to_owned),
@@ -306,19 +315,56 @@ pub fn constant_fold_block(block: &BlockRef) {
 /// — different lltypes with the same Python value must NOT diffuse,
 /// because they flow into different storage. Upstream then special-
 /// cases `lltype.Ptr` GC pointers (compares by `value` only) and
-/// otherwise compares Constant identity (`c1 == c2` over Constant).
+/// otherwise compares Constant equality (`c1 == c2` — `Hashable.__eq__`
+/// at `rpython/tool/uid.py:41`, which is `same class + same key`, where
+/// `key = (type(value), value)` for hashable immutable values; falls
+/// back to `id(self.value)` for unhashable values like `list` / `dict`).
 ///
 /// The local port enforces the concretetype-equality precondition.
 /// When either side has no recorded concretetype the call returns
-/// false, matching upstream's "must agree" rule rather than upstream's
-/// assert (the assert is only safe when annotations have run; the
-/// pyre-side caller may run pre-anno).
+/// false: real upstream Constants always carry a concretetype, so
+/// `c.concretetype` would either succeed or AttributeError there;
+/// untyped Constants are therefore never diffused. The non-GC branch
+/// dispatches to `Constant`'s own `PartialEq` (`flowspace/model.rs`),
+/// which already routes hashable-value pairs through `value` equality
+/// and unhashable-value pairs (`Dict` / `List` / `Graphs` / `Tuple`
+/// containing any of those) through `Constant.id`-keyed identity —
+/// matching the `key = id(self.value)` fallback line-for-line.
 fn same_constant(c1: &Hlvalue, c2: &Hlvalue) -> bool {
     let (Hlvalue::Constant(a), Hlvalue::Constant(b)) = (c1, c2) else {
         return false;
     };
-    match (a.concretetype.as_ref(), b.concretetype.as_ref()) {
-        (Some(ta), Some(tb)) if ta == tb => a.value == b.value,
+    let (Some(ta), Some(tb)) = (a.concretetype.as_ref(), b.concretetype.as_ref()) else {
+        return false;
+    };
+    if ta != tb {
+        return false;
+    }
+    // Upstream `:312 if isinstance(TYPE, lltype.Ptr) and TYPE.TO._gckind == 'gc'`
+    // — explicit value comparison for GC pointers (so two distinct
+    // `Constant(<gcptr>, Ptr(GC...))` instances pointing at the same
+    // gc object DO diffuse).
+    if let LowLevelType::Ptr(ptr) = ta {
+        if ptr.TO._gckind() == GcKind::Gc {
+            return a.value == b.value;
+        }
+    }
+    // Upstream `:314 return c1 == c2` — `Constant`'s `PartialEq`
+    // implements `Hashable.__eq__` directly (value-keyed for hashable
+    // values, id-keyed for `list` / `dict` / Graphs / Tuple-of-unhashable).
+    a == b
+}
+
+/// Python `a is b` over `LinkArg`.
+///
+/// `Variable` identity is the per-instance `id()` slot; `Constant`
+/// identity is the per-instance `id` slot. Matches upstream
+/// `complete_constants`'s `assert constants[v2] is v1` semantic.
+fn linkarg_is(a: &LinkArg, b: &LinkArg) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(Hlvalue::Variable(va)), Some(Hlvalue::Variable(vb))) => va.id() == vb.id(),
+        (Some(Hlvalue::Constant(ca)), Some(Hlvalue::Constant(cb))) => ca.id == cb.id,
         _ => false,
     }
 }
@@ -328,13 +374,10 @@ fn same_constant(c1: &Hlvalue, c2: &Hlvalue) -> bool {
 ///
 /// Walks `zip(link.args, link.target.inputargs)` and, for each
 /// target inputarg `v2` not yet present in `constants`, records the
-/// link-side value (`v1`) under that key. Pre-existing entries are
-/// asserted to match (upstream's `assert constants[v2] is v1` —
-/// Python `is`). The local port narrows that to value-equality on
-/// `Hlvalue`, which is a tightening only for Constant entries (any
-/// two equal-valued Constants compare equal here, but upstream would
-/// have allowed two non-identical `Constant(0, Signed)` instances —
-/// the constfold pipeline never produces such pairs in practice).
+/// link-side value (`v1`) under that key. Pre-existing entries must
+/// match by Python identity (upstream's `assert constants[v2] is v1`).
+/// The Rust port mirrors that with [`linkarg_is`] — Variable identity
+/// via `Variable.id()`, Constant identity via `Constant.id`.
 pub(crate) fn complete_constants(link: &LinkRef, constants: &mut LinkConstants) {
     let l = link.borrow();
     let target = l
@@ -343,31 +386,25 @@ pub(crate) fn complete_constants(link: &LinkRef, constants: &mut LinkConstants) 
         .expect("complete_constants: link must have a target")
         .clone();
     let target_inputargs = target.borrow().inputargs.clone();
-    assert_eq!(
-        l.args.len(),
-        target_inputargs.len(),
-        "complete_constants: link.args / target.inputargs arity mismatch",
-    );
+    // Upstream `:160 zip(link.args, link.target.inputargs)` stops at the
+    // shorter sequence rather than asserting equal length.
     for (v1, v2) in l.args.iter().zip(target_inputargs.iter()) {
         let Hlvalue::Variable(v2_var) = v2 else {
             // Upstream `block.inputargs` is exclusively Variables;
             // skip defensively.
             continue;
         };
-        let Some(v1_value) = v1 else {
-            // Transient `None` arg — the constfold caller always
-            // supplies fully-materialised links, so just skip.
-            continue;
-        };
         match constants.get(v2_var) {
             Some(existing) => {
-                assert_eq!(
-                    existing, v1_value,
+                assert!(
+                    linkarg_is(existing, v1),
                     "complete_constants: conflicting entry for target inputarg",
                 );
             }
             None => {
-                constants.insert(v2_var.clone(), v1_value.clone());
+                // Upstream `:161 constants[v2] = v1` stores `v1`
+                // verbatim — `LinkArg::None` lands in the map too.
+                constants.insert(v2_var.clone(), v1.clone());
             }
         }
     }
@@ -489,7 +526,7 @@ fn prepare_constant_fold_link(
             _ => None,
         };
         if let Some(v) = exitswitch_var {
-            if let Some(Hlvalue::Constant(c)) = constants.get(&v) {
+            if let Some(Some(Hlvalue::Constant(c))) = constants.get(&v) {
                 let llexitvalue = c.value.clone();
                 rewire_link_for_known_exitswitch(link, &llexitvalue);
             }
@@ -504,7 +541,7 @@ fn prepare_constant_fold_link(
     let mut narrow: HashMap<Variable, Constant> = constants
         .iter()
         .filter_map(|(k, v)| match v {
-            Hlvalue::Constant(c) => Some((k.clone(), c.clone())),
+            Some(Hlvalue::Constant(c)) => Some((k.clone(), c.clone())),
             _ => None,
         })
         .collect();
@@ -518,7 +555,7 @@ fn prepare_constant_fold_link(
     // single dict gets these by direct mutation; the Rust port's
     // narrow→wide bridge mirrors that effect.
     for (k, c) in narrow {
-        constants.insert(k, Hlvalue::Constant(c));
+        constants.insert(k, Some(Hlvalue::Constant(c)));
     }
 
     let n_total = block.borrow().operations.len();
@@ -543,7 +580,7 @@ fn prepare_constant_fold_link(
                 _ => None,
             };
             if let Some(arg0_var) = nextop_arg0_var {
-                if let Some(arg0_value) = constants.get(&arg0_var).cloned() {
+                if let Some(Some(arg0_value)) = constants.get(&arg0_var).cloned() {
                     // Build callargs: resolved function constant, then
                     // `nextop.args[1:-1]` mapped through `constants1`
                     // (a copy widened with `complete_constants`).
@@ -565,6 +602,7 @@ fn prepare_constant_fold_link(
                                     constants1
                                         .get(var)
                                         .cloned()
+                                        .flatten()
                                         .unwrap_or_else(|| Hlvalue::Variable(var.clone())),
                                 );
                             }
@@ -582,7 +620,10 @@ fn prepare_constant_fold_link(
                     // the same concretetype. `Variable::copy` matches
                     // both invariants.
                     let v_result = orig_result.copy();
-                    constants.insert(orig_result.clone(), Hlvalue::Variable(v_result.clone()));
+                    constants.insert(
+                        orig_result.clone(),
+                        Some(Hlvalue::Variable(v_result.clone())),
+                    );
 
                     let callop =
                         SpaceOperation::new("direct_call", callargs, Hlvalue::Variable(v_result));
@@ -594,7 +635,7 @@ fn prepare_constant_fold_link(
                         "insert_empty_block should leave exactly one exit"
                     );
                     let new_link = exits.into_iter().next().unwrap();
-                    debug_assert!(matches!(
+                    assert!(matches!(
                         new_link.borrow().target.as_ref(),
                         Some(t) if std::rc::Rc::ptr_eq(t, &block)
                     ));
@@ -637,7 +678,7 @@ fn rewire_links(splitblocks: SplitBlocks) {
             mut constants,
         } in splits
         {
-            debug_assert!(matches!(
+            assert!(matches!(
                 link.borrow().target.as_ref(),
                 Some(t) if std::rc::Rc::ptr_eq(t, &block)
             ));
@@ -653,16 +694,16 @@ fn rewire_links(splitblocks: SplitBlocks) {
             } else {
                 // Upstream `:249-251`.
                 let l = split_block(&block, position, None);
-                debug_assert_eq!(block.borrow().exits.len(), 1);
+                assert_eq!(block.borrow().exits.len(), 1);
                 l
             };
 
             // Upstream `:252-253` invariants.
-            debug_assert!(matches!(
+            assert!(matches!(
                 link.borrow().target.as_ref(),
                 Some(t) if std::rc::Rc::ptr_eq(t, &block)
             ));
-            debug_assert!(matches!(
+            assert!(matches!(
                 splitlink.borrow().prevblock.as_ref().and_then(|w| w.upgrade()),
                 Some(p) if std::rc::Rc::ptr_eq(&p, &block)
             ));
@@ -670,17 +711,17 @@ fn rewire_links(splitblocks: SplitBlocks) {
             complete_constants(&link, &mut constants);
 
             // Upstream `:255 args = [constants.get(v, v) for v in splitlink.args]`.
+            // The map's value is `LinkArg`, so a stored `None` flows
+            // through verbatim, while a missing entry falls back to the
+            // original Variable.
             let splitlink_args = splitlink.borrow().args.clone();
             let new_args: Vec<LinkArg> = splitlink_args
                 .into_iter()
                 .map(|arg| match arg {
-                    Some(Hlvalue::Variable(v)) => {
-                        if let Some(c) = constants.get(&v).cloned() {
-                            Some(c)
-                        } else {
-                            Some(Hlvalue::Variable(v))
-                        }
-                    }
+                    Some(Hlvalue::Variable(v)) => match constants.get(&v).cloned() {
+                        Some(la) => la,
+                        None => Some(Hlvalue::Variable(v)),
+                    },
                     other => other,
                 })
                 .collect();
@@ -715,7 +756,7 @@ fn constant_diffuse(graph: &FunctionGraph) -> usize {
             continue;
         };
         for link in exits {
-            let (carries_vexit, is_default, llexitcase, exitcase_concrete) = {
+            let (carries_vexit, is_default, llexitcase) = {
                 let l = link.borrow();
                 let is_default = matches!(
                     &l.exitcase,
@@ -726,11 +767,7 @@ fn constant_diffuse(graph: &FunctionGraph) -> usize {
                     .iter()
                     .any(|arg| matches!(arg, Some(Hlvalue::Variable(v)) if v == &vexit));
                 let llexitcase = l.llexitcase.clone();
-                let exitcase_concrete = match &l.llexitcase {
-                    Some(Hlvalue::Constant(c)) => c.concretetype.clone(),
-                    _ => None,
-                };
-                (carries_vexit, is_default, llexitcase, exitcase_concrete)
+                (carries_vexit, is_default, llexitcase)
             };
             if !carries_vexit || is_default {
                 continue;
@@ -742,8 +779,10 @@ fn constant_diffuse(graph: &FunctionGraph) -> usize {
             // link.llexitcase, vexit.concretetype)}`. The Rust port
             // re-wraps the constant so the resulting `Constant` carries
             // `vexit.concretetype` rather than the raw exitcase
-            // concretetype, mirroring the upstream substitution.
-            let concretetype = vexit.concretetype().or(exitcase_concrete);
+            // concretetype. Upstream uses `vexit.concretetype` directly
+            // (no fallback) — when the variable lacks a concretetype we
+            // mirror by emitting an untyped `Constant`.
+            let concretetype = vexit.concretetype();
             let remapped = match concretetype {
                 Some(t) => Constant::with_concretetype(case_const.value.clone(), t),
                 None => Constant::new(case_const.value.clone()),
@@ -752,9 +791,11 @@ fn constant_diffuse(graph: &FunctionGraph) -> usize {
             for arg in l.args.iter_mut() {
                 if matches!(arg, Some(Hlvalue::Variable(v)) if v == &vexit) {
                     *arg = Some(Hlvalue::Constant(remapped.clone()));
-                    count += 1;
                 }
             }
+            // Upstream `:272 count += 1` increments per link, regardless
+            // of how many args the remap touched.
+            count += 1;
         }
     }
 
@@ -821,10 +862,10 @@ fn constant_diffuse(graph: &FunctionGraph) -> usize {
             ));
             count += 1;
         }
-        // Upstream `:301`: `block.operations = same_as + block.operations`.
-        // Insert in original (pre-reverse) order so the prefix shape
-        // matches `[same_as_for_low_index, ..., same_as_for_high_index]`.
-        same_as_ops.reverse();
+        // Upstream `:301 block.operations = same_as + block.operations`.
+        // `same_as` was built in the post-`diffuse.reverse()` order
+        // (high index first), and that order is preserved when the list
+        // is prepended to `block.operations`.
         let mut b = block.borrow_mut();
         let mut new_ops = same_as_ops;
         new_ops.extend(b.operations.drain(..));
@@ -875,7 +916,7 @@ pub fn constant_fold_graph(graph: &FunctionGraph) {
                     continue;
                 };
                 if let Some(Hlvalue::Constant(c)) = v1 {
-                    constants.insert(v2_var.clone(), Hlvalue::Constant(c.clone()));
+                    constants.insert(v2_var.clone(), Some(Hlvalue::Constant(c.clone())));
                 }
             }
             if constants.is_empty() {
@@ -909,7 +950,7 @@ pub fn constant_fold_graph(graph: &FunctionGraph) {
                 match arg {
                     Hlvalue::Constant(c) => constargs.push(c.value.clone()),
                     Hlvalue::Variable(v) => {
-                        if let Some(Hlvalue::Constant(c)) = constants.get(v) {
+                        if let Some(Some(Hlvalue::Constant(c))) = constants.get(v) {
                             constargs.push(c.value.clone());
                         } else {
                             all_const = false;
@@ -934,7 +975,7 @@ pub fn constant_fold_graph(graph: &FunctionGraph) {
                     // `:355-356`: always overflows. Upstream
                     // `assert targetlink.exitcase is OverflowError`.
                     let exit1 = target_exits[1].clone();
-                    debug_assert_eq!(
+                    assert_eq!(
                         exit1.borrow().exitcase.as_ref().and_then(|hv| match hv {
                             Hlvalue::Constant(c) => c.value.host_class_name().map(str::to_owned),
                             _ => None,
@@ -948,14 +989,17 @@ pub fn constant_fold_graph(graph: &FunctionGraph) {
                     // `:358-361`: doesn't overflow. Upstream
                     // `assert targetlink.exitcase is None`.
                     let exit0 = target_exits[0].clone();
-                    debug_assert!(
+                    assert!(
                         exit0.borrow().exitcase.is_none(),
                         "constfold.py:360 ovf normal link expected exitcase=None",
                     );
                     if let Hlvalue::Variable(result_var) = &lastop.result {
                         constants.insert(
                             result_var.clone(),
-                            Hlvalue::Constant(constant_for_result(value, &lastop.result)),
+                            Some(Hlvalue::Constant(constant_for_result(
+                                value,
+                                &lastop.result,
+                            ))),
                         );
                     }
                     exit0
@@ -969,13 +1013,10 @@ pub fn constant_fold_graph(graph: &FunctionGraph) {
             let new_args: Vec<LinkArg> = targetlink_args
                 .into_iter()
                 .map(|arg| match arg {
-                    Some(Hlvalue::Variable(v)) => {
-                        if let Some(c) = constants.get(&v).cloned() {
-                            Some(c)
-                        } else {
-                            Some(Hlvalue::Variable(v))
-                        }
-                    }
+                    Some(Hlvalue::Variable(v)) => match constants.get(&v).cloned() {
+                        Some(la) => la,
+                        None => Some(Hlvalue::Variable(v)),
+                    },
                     other => other,
                 })
                 .collect();
@@ -1009,7 +1050,7 @@ pub fn constant_fold_graph(graph: &FunctionGraph) {
 /// or any other user-reachable variant would be **NEW-DEVIATION** —
 /// any same-valued constant in user code would be silently rewritten.
 pub fn replace_symbolic(graph: &FunctionGraph, symbolic: &ConstValue, value: Constant) -> bool {
-    debug_assert!(
+    assert!(
         matches!(symbolic, ConstValue::SpecTag(_) | ConstValue::Atom(_)),
         "replace_symbolic: caller must supply an identity-bearing ConstValue \
          (SpecTag/Atom) so user-reachable values cannot collide; got {symbolic:?}"
@@ -1094,44 +1135,88 @@ fn constant_for_result(value: ConstValue, result: &Hlvalue) -> Constant {
     }
 }
 
+/// RPython `fixup_op_result` registry at `constfold.py:148-153`.
+///
+/// Upstream maps `getsubstruct`, `getarraysubstruct`, `direct_fieldptr`,
+/// and `direct_arrayitems` to `fixup_solid`, which pins the parent of
+/// the inlined sub-pointer so the parent keeps the inlined part alive
+/// (`constfold.py:131-145 fixup_solid`). The four pointer-into-parent
+/// ops are not yet matched by [`eval_llop`] (verified by
+/// `rg '"getsubstruct"|"getarraysubstruct"|"direct_fieldptr"|
+/// "direct_arrayitems"' rtyper/lltypesystem/opimpl.rs` — zero
+/// matches), so the lookup routes every actual fold result through
+/// the identity arm.  The registry surface is in place for the day
+/// those ops grow opimpl coverage.
+fn fixup_op_result(opname: &str, result: ConstValue) -> ConstValue {
+    match opname {
+        "getsubstruct" | "getarraysubstruct" | "direct_fieldptr" | "direct_arrayitems" => {
+            fixup_solid(result)
+        }
+        _ => result,
+    }
+}
+
+/// RPython `fixup_solid(p)` at `constfold.py:131-145`.
+///
+/// Upstream:
+/// ```python
+/// def fixup_solid(p):
+///     container = p._obj
+///     assert isinstance(container, lltype._parentable)
+///     container._keepparent = container._parentstructure()
+///     return container._as_ptr()
+/// ```
+///
+/// PRE-EXISTING-ADAPTATION (`lltype._parentable` / `_keepparent` /
+/// `_parentstructure()` not yet ported — see
+/// `rtyper/lltypesystem/lltype.rs:1209` "structured error pending a
+/// `_parent_link` port"). Until the parent-link infra lands, the
+/// body of `fixup_solid` cannot be expressed faithfully.
+///
+/// The function is gated by [`fixup_op_result`], whose match arms
+/// fire only for `getsubstruct` / `getarraysubstruct` /
+/// `direct_fieldptr` / `direct_arrayitems`. None of those four
+/// opnames have an opimpl in
+/// `rtyper/lltypesystem/opimpl.rs` (verified empty by grep on the
+/// four literal opname strings), so [`eval_llop`] never returns
+/// `Some(...)` for them and `fixup_op_result` never invokes
+/// `fixup_solid` in production. The `unimplemented!` is therefore a
+/// loud-fail gate: it surfaces the day either (a) the
+/// `_parent_link` port lands (real implementation replaces the
+/// gate) or (b) `eval_llop` grows a `getsubstruct`-class arm
+/// without the keepalive (regression — fail loudly so the parity
+/// gap is visible at the first call).
+///
+/// **Convergence path**: port `lltype._parentable.{_keepparent,
+/// _parentstructure}` (mirroring upstream `lltype.py` ~`:550-700`),
+/// then replace this stub with the literal four-line body above.
+fn fixup_solid(_p: ConstValue) -> ConstValue {
+    unimplemented!(
+        "constfold.py:131-145 fixup_solid: needs lltype._parentable / \
+         _parentstructure() / _keepparent (rtyper/lltypesystem/lltype.rs:1209 \
+         marks _parent_link port pending). Reachable only if eval_llop \
+         grows a getsubstruct/getarraysubstruct/direct_fieldptr/\
+         direct_arrayitems arm before the parent-link infra lands.",
+    )
+}
+
+/// Local subset of upstream `LLOp.__call__` (lloperation.py) at
+/// `constfold.py:36 op(RESTYPE, *args)` dispatch. Upstream looks up
+/// `getattr(opimpls, opname)` to invoke the per-op fold callable; the
+/// Rust port carries metadata-only `LLOp` (sideeffects/canfold/
+/// canraise/...) plus the per-op `op_<name>` table in
+/// `rtyper::lltypesystem::opimpl`. The mapping `opname → fold
+/// callable` mirrors upstream's `getattr(opimpls, 'op_' + opname)`.
+///
+/// Ops not yet folded here either (a) require lltype-runtime carriers
+/// (`r_uint`, `r_longlong`, `llmemory.AddressOffset`, `_parentable`)
+/// that are still unported, or (b) have side effects and are
+/// excluded by `LLOp.sideeffects=true` in `constfold.py:34`. The
+/// `_ovf` family lives in [`fold_ovf_op`] because the surrounding
+/// pattern (`c_last_exception` plus exit rewiring) is constfold-
+/// specific.
 fn eval_llop(opname: &str, args: &[ConstValue]) -> Option<ConstValue> {
-    Some(match (opname, args) {
-        ("same_as", [value]) => value.clone(),
-        ("bool_not", [ConstValue::Bool(value)]) => ConstValue::Bool(!value),
-        ("int_is_true", [ConstValue::Int(value)]) => ConstValue::Bool(*value != 0),
-        ("int_neg", [ConstValue::Int(value)]) => ConstValue::Int(value.checked_neg()?),
-        ("int_abs", [ConstValue::Int(value)]) => ConstValue::Int(value.checked_abs()?),
-        ("int_invert", [ConstValue::Int(value)]) => ConstValue::Int(!value),
-        ("int_add", [ConstValue::Int(a), ConstValue::Int(b)]) => {
-            ConstValue::Int(a.checked_add(*b)?)
-        }
-        ("int_sub", [ConstValue::Int(a), ConstValue::Int(b)]) => {
-            ConstValue::Int(a.checked_sub(*b)?)
-        }
-        ("int_mul", [ConstValue::Int(a), ConstValue::Int(b)]) => {
-            ConstValue::Int(a.checked_mul(*b)?)
-        }
-        ("int_floordiv", [ConstValue::Int(_), ConstValue::Int(0)]) => return None,
-        ("int_floordiv", [ConstValue::Int(a), ConstValue::Int(b)]) => {
-            ConstValue::Int(a.checked_div(*b)?)
-        }
-        ("int_mod", [ConstValue::Int(_), ConstValue::Int(0)]) => return None,
-        ("int_mod", [ConstValue::Int(a), ConstValue::Int(b)]) => {
-            ConstValue::Int(a.checked_rem(*b)?)
-        }
-        ("int_lt", [ConstValue::Int(a), ConstValue::Int(b)]) => ConstValue::Bool(a < b),
-        ("int_le", [ConstValue::Int(a), ConstValue::Int(b)]) => ConstValue::Bool(a <= b),
-        ("int_eq", [ConstValue::Int(a), ConstValue::Int(b)]) => ConstValue::Bool(a == b),
-        ("int_ne", [ConstValue::Int(a), ConstValue::Int(b)]) => ConstValue::Bool(a != b),
-        ("int_gt", [ConstValue::Int(a), ConstValue::Int(b)]) => ConstValue::Bool(a > b),
-        ("int_ge", [ConstValue::Int(a), ConstValue::Int(b)]) => ConstValue::Bool(a >= b),
-        ("int_and", [ConstValue::Int(a), ConstValue::Int(b)]) => ConstValue::Int(a & b),
-        ("int_or", [ConstValue::Int(a), ConstValue::Int(b)]) => ConstValue::Int(a | b),
-        ("int_xor", [ConstValue::Int(a), ConstValue::Int(b)]) => ConstValue::Int(a ^ b),
-        ("ptr_eq", [a, b]) => ConstValue::Bool(a == b),
-        ("ptr_ne", [a, b]) => ConstValue::Bool(a != b),
-        _ => return None,
-    })
+    crate::translator::rtyper::lltypesystem::opimpl::get_op_impl(opname).and_then(|f| f(args))
 }
 
 /// Port of upstream `fold_ovf_op(spaceop, args)` (`constfold.py:102-114`).
@@ -1190,25 +1275,28 @@ mod tests {
         assert_eq!(constants.len(), 2);
         assert!(matches!(
             constants.get(&v_target_0),
-            Some(Hlvalue::Variable(v)) if v.id() == v_link_0.id()
+            Some(Some(Hlvalue::Variable(v))) if v.id() == v_link_0.id()
         ));
         assert!(matches!(
             constants.get(&v_target_1),
-            Some(Hlvalue::Constant(c)) if c.value == ConstValue::Int(42)
+            Some(Some(Hlvalue::Constant(c))) if c.value == ConstValue::Int(42)
         ));
     }
 
-    /// Pre-existing entries in `constants` that match the link's value
-    /// are tolerated; mismatches panic per upstream's `assert
-    /// constants[v2] is v1`.
+    /// Pre-existing entries in `constants` whose `LinkArg` is the
+    /// SAME object (`is`) as the link's are tolerated; mismatches panic
+    /// per upstream's `assert constants[v2] is v1`. Sharing the
+    /// `Constant` via clone preserves the per-instance `id` slot, so
+    /// the cloned copy compares identity-equal to the original.
     #[test]
     fn complete_constants_tolerates_matching_preexisting_entry() {
         let v_target = var("t0");
         let target = Block::shared(vec![hv(&v_target)]);
-        let link = Link::new(vec![const_int(7)], Some(target), None).into_ref();
+        let shared = const_int(7);
+        let link = Link::new(vec![shared.clone()], Some(target), None).into_ref();
 
         let mut constants: LinkConstants = HashMap::new();
-        constants.insert(v_target.clone(), const_int(7));
+        constants.insert(v_target.clone(), Some(shared));
         complete_constants(&link, &mut constants);
 
         assert_eq!(constants.len(), 1);
@@ -1222,8 +1310,49 @@ mod tests {
         let link = Link::new(vec![const_int(7)], Some(target), None).into_ref();
 
         let mut constants: LinkConstants = HashMap::new();
-        constants.insert(v_target.clone(), const_int(99));
+        constants.insert(v_target.clone(), Some(const_int(99)));
         complete_constants(&link, &mut constants);
+    }
+
+    /// `same_constant` over two distinct `Constant([], List(Signed))`
+    /// instances — Python's `Hashable.__eq__` falls back to
+    /// `id(self.value)` for unhashable values, so two list constants
+    /// are NEVER equal even if their contents structurally match.
+    /// `Constant::PartialEq` mirrors that fallback.
+    #[test]
+    fn same_constant_uses_id_fallback_for_unhashable_list_values() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let a = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::List(vec![]),
+            LowLevelType::Signed,
+        ));
+        let b = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::List(vec![]),
+            LowLevelType::Signed,
+        ));
+        // Distinct Constant instances — different `Constant.id`, both
+        // unhashable values, so `Hashable.__eq__` returns False.
+        assert!(!same_constant(&a, &b));
+        // Same instance via clone — `Constant.id` is preserved by
+        // `derive(Clone)`, mirroring upstream's `c is c` identity.
+        assert!(same_constant(&a, &a.clone()));
+    }
+
+    /// `same_constant` over two distinct `Constant(0, Signed)`
+    /// instances — Int is hashable, so the value-keyed branch runs
+    /// and the constants DO diffuse.
+    #[test]
+    fn same_constant_uses_value_equality_for_hashable_int_values() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        let a = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int(0),
+            LowLevelType::Signed,
+        ));
+        let b = Hlvalue::Constant(Constant::with_concretetype(
+            ConstValue::Int(0),
+            LowLevelType::Signed,
+        ));
+        assert!(same_constant(&a, &b));
     }
 
     /// `rewire_link_for_known_exitswitch` jumps `link1` directly to
@@ -1425,5 +1554,83 @@ mod tests {
             l.target.as_ref(),
             Some(t) if std::rc::Rc::ptr_eq(t, &link1_target_orig)
         ));
+    }
+
+    /// `int_add(MAX, 1)` upstream wraps to `MIN`; the prior port used
+    /// `checked_add` which returned `None` and refused to fold.
+    #[test]
+    fn eval_llop_int_add_wraps_on_overflow() {
+        let r = eval_llop("int_add", &[ConstValue::Int(i64::MAX), ConstValue::Int(1)]);
+        assert_eq!(r, Some(ConstValue::Int(i64::MIN)));
+    }
+
+    /// `int_sub(MIN, 1)` upstream wraps to `MAX`.
+    #[test]
+    fn eval_llop_int_sub_wraps_on_underflow() {
+        let r = eval_llop("int_sub", &[ConstValue::Int(i64::MIN), ConstValue::Int(1)]);
+        assert_eq!(r, Some(ConstValue::Int(i64::MAX)));
+    }
+
+    /// `int_mul(MAX, 2)` upstream wraps to `-2` (`(MAX * 2) & u64_mask`
+    /// reinterpreted as signed).
+    #[test]
+    fn eval_llop_int_mul_wraps_on_overflow() {
+        let r = eval_llop("int_mul", &[ConstValue::Int(i64::MAX), ConstValue::Int(2)]);
+        assert_eq!(r, Some(ConstValue::Int(-2)));
+    }
+
+    /// `int_neg(MIN)` upstream wraps to `MIN` (intmask of `-MIN`).
+    #[test]
+    fn eval_llop_int_neg_wraps_on_min() {
+        let r = eval_llop("int_neg", &[ConstValue::Int(i64::MIN)]);
+        assert_eq!(r, Some(ConstValue::Int(i64::MIN)));
+    }
+
+    /// `int_abs(MIN)` upstream wraps to `MIN`.
+    #[test]
+    fn eval_llop_int_abs_wraps_on_min() {
+        let r = eval_llop("int_abs", &[ConstValue::Int(i64::MIN)]);
+        assert_eq!(r, Some(ConstValue::Int(i64::MIN)));
+    }
+
+    /// `int_floordiv(MIN, -1)` upstream raises `OverflowError` from
+    /// `lltype.enforce(Signed, 2**63)` and `constfold` catches it
+    /// → refuses to fold. `i64::checked_div` returning `None` mirrors
+    /// the same observable: the op stays in the graph.
+    #[test]
+    fn eval_llop_int_floordiv_refuses_to_fold_on_min_div_neg_one() {
+        let r = eval_llop(
+            "int_floordiv",
+            &[ConstValue::Int(i64::MIN), ConstValue::Int(-1)],
+        );
+        assert_eq!(r, None);
+    }
+
+    /// `int_mod(MIN, -1)` upstream returns `0` (Python int mod);
+    /// `enforce(Signed, 0)` succeeds → folds to `0`. Mirror with
+    /// `i64::wrapping_rem` so the op is removed from the graph.
+    #[test]
+    fn eval_llop_int_mod_folds_min_mod_neg_one_to_zero() {
+        let r = eval_llop("int_mod", &[ConstValue::Int(i64::MIN), ConstValue::Int(-1)]);
+        assert_eq!(r, Some(ConstValue::Int(0)));
+    }
+
+    /// `fixup_op_result` is identity for opnames not in upstream's
+    /// 4-entry registry.
+    #[test]
+    fn fixup_op_result_identity_for_unrelated_opnames() {
+        let v = ConstValue::Int(42);
+        assert_eq!(fixup_op_result("int_add", v.clone()), v);
+    }
+
+    /// `fixup_op_result` for `getsubstruct` would route to
+    /// `fixup_solid` — currently unimplemented (panics with the
+    /// upstream-citing message). The panic is unreachable from
+    /// production today since `eval_llop` does not match
+    /// `getsubstruct`, but the registry surface is in place.
+    #[test]
+    #[should_panic(expected = "fixup_solid")]
+    fn fixup_op_result_routes_getsubstruct_to_fixup_solid_stub() {
+        let _ = fixup_op_result("getsubstruct", ConstValue::Int(0));
     }
 }

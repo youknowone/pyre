@@ -5,6 +5,16 @@
 //! Each file name matches upstream (e.g. `ssa.py` → `ssa.rs`).
 
 pub mod all;
+pub mod canraise;
+pub mod collectanalyze;
 pub mod constfold;
+pub mod finalizer;
+pub mod gilanalysis;
+pub mod graphanalyze;
+pub mod inline;
+pub mod merge_if_blocks;
 pub mod removenoops;
 pub mod ssa;
+pub mod stat;
+pub mod storesink;
+pub mod support;

@@ -1181,26 +1181,55 @@ fn branch_link_args(
 }
 
 // ____________________________________________________________
-// `match` — n-way jump table with FrameState-style locals merge.
+// `match` — two structurally distinct lowerings depending on arm
+// shape:
 //
-// Upstream basis: `rpython/flowspace/model.py:643-666`. The model
-// accepts either (a) a 2-arm boolean switch with `Bool(False)` then
-// `Bool(True)` exitcases or (b) an n-arm primitive switch with
-// `is_valid_int(n)` exitcases ending optionally in a
-// `Constant::Str("default")` catch-all — exactly the shape this
-// routine emits depending on the arm set.
+// 1. **Literal switch** — every arm is a primitive literal pattern
+//    (`Pat::Lit` of int/bool/single-char str/byte) optionally ending
+//    in a wildcard. Lowered as a single fork block with
+//    `exitswitch=scrutinee` and one Link per arm carrying a primitive
+//    exitcase. Upstream basis: `rpython/flowspace/model.py:643-666`,
+//    which admits either (a) a 2-arm boolean switch with `Bool(False)`
+//    then `Bool(True)` exitcases or (b) an n-arm primitive switch with
+//    `is_valid_int(n)` exitcases ending optionally in a
+//    `Constant::Str("default")` catch-all.
 //
-// Arm → exitcase mapping:
+//    Arm → exitcase mapping:
 //
-// | Rust pattern      | Link.exitcase                                |
-// |-------------------|----------------------------------------------|
-// | `N` (int literal) | `Constant::Int(N)`                           |
-// | `true` / `false`  | `Constant::Bool(_)`                          |
-// | `_`               | `Constant::Str("default")` (must be last)    |
+//    | Rust pattern      | Link.exitcase                                |
+//    |-------------------|----------------------------------------------|
+//    | `N` (int literal) | `Constant::Int(N)`                           |
+//    | `true` / `false`  | `Constant::Bool(_)`                          |
+//    | `_`               | `Constant::Str("default")` (must be last)    |
 //
-// Patterns outside that subset (`Pat::Or`, `Pat::TupleStruct`,
-// `Pat::Range`, identifier-binding, guards, …) reject via
-// `AdapterError::Unsupported` — they land in M2.5c / M2.5d.
+// 2. **Variant cascade** (slices 2c + 2d) — any arm has a variant
+//    sub-pattern that `variant_match_path_str` recognises:
+//    - `Pat::Path`            — unit variant (slice 2c).
+//    - `Pat::Struct { .. }`   — rest-only struct variant (slice 2d).
+//    - `Pat::TupleStruct(..)` — rest-only tuple variant (slice 2d).
+//
+//    Lowered as a chain of 2-exit boolean forks, each emitting
+//    `cond = isinstance(scrutinee, Constant::ByteStr(<path>))`.
+//    Upstream basis: `rpython/flowspace/flowcontext.py` lowering of
+//    `if isinstance(x, A): … elif isinstance(x, B): …` — the same
+//    isinstance-cascade shape Python source produces. The variant-
+//    class operand to `isinstance` is emitted as
+//    `Constant(ConstValue::ByteStr(<full variant path>))` —
+//    PRE-EXISTING-ADAPTATION pending HostObject::Class registration
+//    per Rust enum variant; upstream emits the actual class object
+//    (`flowspace/operation.py:474 isinstance` arg 2). Convergence path:
+//    register each variant as `HostObject::Class` via
+//    `Bookkeeper::register_rust_function`-style intake (M2.5d slice 3).
+//    Multi-session.
+//
+// Patterns outside both subsets reject via `AdapterError::Unsupported`:
+// - `Pat::Range`                          — no upstream analogue.
+// - `Pat::Struct { field, .. }`           — field-binding extraction
+//                                           lands in slice 2e.
+// - `Pat::TupleStruct(a, b)`              — same as above.
+// - Mixed literal + variant arms          — homogeneous sets only.
+// - `match` arm guards (`if COND`)        — lands with annotator
+//                                           short-circuit logic.
 
 /// Dispatch a match-arm body across the control-flow-bearing
 /// expression kinds so termination (via `return`) threads up through
@@ -1219,13 +1248,41 @@ fn lower_arm_body(b: &mut Builder, body: &Expr) -> Result<BlockExit, AdapterErro
 
 fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<BlockExit, AdapterError> {
     // 1. Evaluate the scrutinee into the current block. Becomes the
-    //    block's `exitswitch` when we close the fork.
+    //    block's `exitswitch` when we close the fork (literal-switch
+    //    path) or the operand to per-step `isinstance` ops (variant-
+    //    cascade path).
     let scrutinee = lower_expr(b, &match_expr.expr)?;
 
     if match_expr.arms.is_empty() {
         return Err(AdapterError::Unsupported {
             reason: "match with zero arms".into(),
         });
+    }
+
+    // Validate guards before either dispatch path; lifted from the
+    // per-arm classify loop so cascade lowering shares the check.
+    for arm in &match_expr.arms {
+        validate_arm(arm)?;
+    }
+
+    // Dispatch: any arm whose sub-pattern looks like an enum variant
+    // (multi-segment path inside `Pat::Path`/`Pat::Struct`/
+    // `Pat::TupleStruct`) routes through the isinstance-cascade
+    // lowering. The detection here is intentionally MORE permissive
+    // than `extract_variant_arm_info`: shapes whose specific cascade
+    // support has not landed yet (e.g. tuple-variant element bindings,
+    // slice 2f) still route through the cascade so the user gets the
+    // precise "lands in slice 2f" diagnostic instead of the literal-
+    // switch path's generic "composite pattern" message. Pure literal
+    // matches (every arm is `Pat::Lit` or wildcard) keep the upstream
+    // `model.py:648-692` primitive-switch shape.
+    let needs_cascade = match_expr.arms.iter().any(|arm| {
+        let mut sub_pats: Vec<&Pat> = Vec::new();
+        flatten_or_pattern(&arm.pat, &mut sub_pats);
+        sub_pats.iter().any(|p| pat_has_variant_shape(p))
+    });
+    if needs_cascade {
+        return lower_match_variant_cascade(b, match_expr, scrutinee);
     }
 
     // 2. Validate every arm up-front so the fork block is only closed
@@ -1242,7 +1299,8 @@ fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<BlockExit, Ada
     let mut arm_sub_exitcases: Vec<Vec<Option<Hlvalue>>> =
         Vec::with_capacity(match_expr.arms.len());
     for (idx, arm) in match_expr.arms.iter().enumerate() {
-        validate_arm(arm)?;
+        // Guards already validated by the dispatch-shared
+        // `validate_arm` loop above.
         let is_last_arm = idx + 1 == match_expr.arms.len();
         let mut sub_pats: Vec<&Pat> = Vec::new();
         flatten_or_pattern(&arm.pat, &mut sub_pats);
@@ -1382,6 +1440,637 @@ fn lower_match(b: &mut Builder, match_expr: &ExprMatch) -> Result<BlockExit, Ada
     }
 
     // 10. Continue lowering into the join block.
+    b.open_new_block(BlockBuilder {
+        block: join_block,
+        ops: Vec::new(),
+        locals: join_locals,
+    });
+    Ok(BlockExit::FallThrough(tail_var))
+}
+
+/// One named-field binding extracted from a struct-variant pattern
+/// (slice 2e). The cascade emits
+/// `local_name = getattr(scrutinee, "<field_name>")` at the arm body
+/// block's entry.
+///
+/// Upstream basis: `rpython/flowspace/operation.py:618 getattr`
+/// arity=2. The same op Python source produces for `obj.field`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StructFieldBinding {
+    /// Source-side field name — supplied as the second operand of the
+    /// emitted `getattr` op (`Constant::byte_str`).
+    field_name: String,
+    /// User identifier the arm body sees as a local. For shorthand
+    /// patterns like `{ pc, .. }` this equals `field_name`; for
+    /// renaming bindings `{ pc: orig_pc }` it is the right-hand side.
+    local_name: String,
+}
+
+/// Match-arm classification produced by [`extract_variant_arm_info`].
+struct VariantPatInfo {
+    /// Joined `"::"` path string used as the `isinstance` second-
+    /// operand sentinel. Same encoding for unit, rest-only struct,
+    /// rest-only tuple, and binding-carrying struct variants.
+    path: String,
+    /// Per-field bindings the cascade must materialise at arm-body
+    /// entry. Empty for unit variants, rest-only struct/tuple
+    /// variants, and `Pat::Wild` field skips. One entry per named-
+    /// Ident field binding (slice 2e).
+    bindings: Vec<StructFieldBinding>,
+}
+
+/// Validate the multi-segment, no-generics, no-qself shape every
+/// cascade-recognised variant path must obey, and return the joined
+/// `"::"` string for use as the `isinstance` sentinel.
+///
+/// Single-segment paths (`CONST_MAX` / `Foo`) reject — without
+/// resolution context the adapter cannot distinguish a const
+/// reference from a top-level type. Paths with generics
+/// (`Foo::<T>::Bar`), `qself` (`<T as Foo>::Bar`), or a leading `::`
+/// (global path) reject for the same reason.
+fn variant_path_string(qself: Option<&syn::QSelf>, path: &syn::Path) -> Option<String> {
+    if qself.is_some() || path.leading_colon.is_some() || path.segments.len() < 2 {
+        return None;
+    }
+    let mut joined = String::new();
+    for (i, seg) in path.segments.iter().enumerate() {
+        if !matches!(seg.arguments, syn::PathArguments::None) {
+            return None;
+        }
+        if i > 0 {
+            joined.push_str("::");
+        }
+        joined.push_str(&seg.ident.to_string());
+    }
+    Some(joined)
+}
+
+/// Walk a `Pat::Struct`'s `FieldPat` list and extract the per-field
+/// `Ident`-binding shapes the cascade can lower as a `getattr` at
+/// arm-body entry. `Pat::Wild` (field skip) is admitted with no
+/// binding emission. Any other field-pattern shape (literal, nested
+/// struct/tuple, sub-pattern, by_ref/mut binding) returns `None`,
+/// which routes the parent variant pattern through the cascade's
+/// rejection arm with the correct slice-boundary diagnostic.
+///
+/// No upstream counterpart — RPython source uses `getattr(obj, name)`
+/// per `rpython/flowspace/operation.py:618`, which the arm-body
+/// emitter mirrors line-for-line.
+fn extract_struct_field_bindings(
+    fields: &syn::punctuated::Punctuated<syn::FieldPat, syn::Token![,]>,
+) -> Option<Vec<StructFieldBinding>> {
+    let mut out: Vec<StructFieldBinding> = Vec::with_capacity(fields.len());
+    for field_pat in fields {
+        let field_name = match &field_pat.member {
+            Member::Named(ident) => ident.to_string(),
+            // Tuple-struct numeric members (`{ 0: a }`) reach this
+            // helper only via `Pat::Struct`; tuple-variant patterns
+            // (`Pat::TupleStruct`) lower through their own arm. Reject
+            // here so the parent classifier surfaces the slice-2f
+            // tuple-binding diagnostic.
+            Member::Unnamed(_) => return None,
+        };
+        match &*field_pat.pat {
+            Pat::Ident(PatIdent {
+                ident,
+                by_ref: None,
+                subpat: None,
+                mutability: None,
+                ..
+            }) => {
+                out.push(StructFieldBinding {
+                    field_name,
+                    local_name: ident.to_string(),
+                });
+            }
+            Pat::Wild(_) => {
+                // `{ field: _ }` — the variant arm does not bind
+                // this field. No `getattr` emitted; the field is
+                // matched but its value is discarded.
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
+/// Classify a match-arm sub-pattern as a variant pattern the cascade
+/// can lower. Returns `Some(VariantPatInfo)` for shapes the current
+/// slice supports:
+///
+/// 1. `Foo::Bar` (`Pat::Path`)            — unit variant (slice 2c).
+/// 2. `Foo::Bar { .. }` (`Pat::Struct`)   — rest-only struct
+///                                          (slice 2d).
+/// 3. `Foo::Bar(..)` (`Pat::TupleStruct`) — rest-only tuple
+///                                          (slice 2d).
+/// 4. `Foo::Bar { f, .. }` / `{ f: i, .. }` (`Pat::Struct`) —
+///    named-Ident struct fields (slice 2e). `Pat::Wild` field skip
+///    is allowed; any other field-pattern shape returns `None`.
+///
+/// Returns `None` for non-variant shapes and for variant shapes that
+/// the current slice does not yet support (e.g. tuple-variant element
+/// bindings, pending slice 2f). The caller routes `None` through the
+/// cascade's per-shape rejection diagnostic.
+///
+/// No upstream counterpart — this is the Position-2 adapter's
+/// substitute for upstream's class/instance checks; see the
+/// HostObject::Class convergence path noted in `lower_match`'s
+/// dispatch comment.
+fn extract_variant_arm_info(pat: &Pat) -> Option<VariantPatInfo> {
+    match pat {
+        Pat::Path(p) => {
+            let path = variant_path_string(p.qself.as_ref(), &p.path)?;
+            Some(VariantPatInfo {
+                path,
+                bindings: Vec::new(),
+            })
+        }
+        Pat::Struct(p) => {
+            let path = variant_path_string(p.qself.as_ref(), &p.path)?;
+            // Rest-only struct (`Foo::Bar { .. }`) — empty fields
+            // with PatRest. Treat as unit-equivalent.
+            if p.fields.is_empty() && p.rest.is_some() {
+                return Some(VariantPatInfo {
+                    path,
+                    bindings: Vec::new(),
+                });
+            }
+            let bindings = extract_struct_field_bindings(&p.fields)?;
+            Some(VariantPatInfo { path, bindings })
+        }
+        Pat::TupleStruct(p) => {
+            let path = variant_path_string(p.qself.as_ref(), &p.path)?;
+            // Rest-only tuple (`Foo::Bar(..)`) — exactly one
+            // `Pat::Rest`. Element-binding form lands in slice 2f.
+            if p.elems.len() == 1 && matches!(p.elems.first().unwrap(), Pat::Rest(_)) {
+                return Some(VariantPatInfo {
+                    path,
+                    bindings: Vec::new(),
+                });
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// Lenient sibling of `extract_variant_arm_info` used by the dispatch
+/// peek in `lower_match`. Returns `true` for any pattern shape whose
+/// path could plausibly name an enum variant — including those whose
+/// field-binding details a future slice will support.
+///
+/// The peek uses this so a match that mixes accepted slice-2c/2d/2e
+/// shapes with future-slice shapes still routes through the cascade
+/// lowering, where the exact "lands in slice 2f" diagnostic lives.
+/// Without this lenient predicate, a match like
+/// `match x { Foo::Bar(a, b) => …, _ => … }` would fall through to
+/// the literal-switch path and surface the generic "composite
+/// pattern" message from `classify_pattern`.
+fn pat_has_variant_shape(pat: &Pat) -> bool {
+    let path = match pat {
+        Pat::Path(p) => &p.path,
+        Pat::Struct(p) => &p.path,
+        Pat::TupleStruct(p) => &p.path,
+        _ => return false,
+    };
+    path.leading_colon.is_none() && path.segments.len() >= 2
+}
+
+/// Per-arm classification consumed by `lower_match_variant_cascade`.
+enum CascadeArm {
+    /// Variant arm. `paths` holds one path per or-pattern sub-arm —
+    /// each entry produces an isinstance cascade step pointing at the
+    /// same arm body block. `field_bindings` is extracted from the
+    /// FIRST sub-pattern; or-pattern siblings are validated to bind
+    /// the same `field_name → local_name` set before this arm
+    /// classifies as `Variant`.
+    Variant {
+        paths: Vec<String>,
+        field_bindings: Vec<StructFieldBinding>,
+    },
+    /// `_` arm — must be last. No binding into the body's locals.
+    Wildcard,
+    /// `name` arm — must be last. Binds the scrutinee to `name` in the
+    /// body's locals scope.
+    BindWildcard(String),
+}
+
+/// True when `a` and `b` describe the same set of `field_name →
+/// local_name` bindings (order-independent). Used to validate that
+/// or-pattern siblings of a single arm bind the same identifiers, so
+/// the shared arm-body block sees a consistent locals view regardless
+/// of which sub-pattern matched.
+fn struct_field_bindings_match(a: &[StructFieldBinding], b: &[StructFieldBinding]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a_sorted: Vec<&StructFieldBinding> = a.iter().collect();
+    let mut b_sorted: Vec<&StructFieldBinding> = b.iter().collect();
+    a_sorted.sort_by(|x, y| x.field_name.cmp(&y.field_name));
+    b_sorted.sort_by(|x, y| x.field_name.cmp(&y.field_name));
+    a_sorted
+        .iter()
+        .zip(b_sorted.iter())
+        .all(|(x, y)| x.field_name == y.field_name && x.local_name == y.local_name)
+}
+
+/// Lower `match enum_val { Variant => body, …, _ => body }` where at
+/// least one arm references a unit enum variant. Each variant arm
+/// produces an `isinstance(scrutinee, Constant::ByteStr(<path>))`
+/// boolean fork; or-pattern arms unfold into multiple forks all
+/// pointing at the same arm-body block. The cascade terminates at a
+/// user-provided wildcard arm — exhaustive matches without a catch-all
+/// are rejected pending HostObject::Class registration.
+///
+/// Upstream analogue: the if-cascade `flowcontext.py` produces from
+/// Python source `if isinstance(x, A): … elif isinstance(x, B): …`.
+/// Each arm's `isinstance` op is `operation.py:474 isinstance` arity=2.
+fn lower_match_variant_cascade(
+    b: &mut Builder,
+    match_expr: &ExprMatch,
+    scrutinee: Hlvalue,
+) -> Result<BlockExit, AdapterError> {
+    let n_arms = match_expr.arms.len();
+
+    // 1. Pre-classify every arm. Or-pattern sub-patterns flatten;
+    //    every sub-pattern must be a variant pattern recognized by
+    //    `variant_match_path_str` (unit `Pat::Path`, rest-only
+    //    `Pat::Struct { .. }`, or rest-only `Pat::TupleStruct(..)`),
+    //    a wildcard `_`, or a `Pat::Ident` binding-wildcard.
+    //    Wildcards (`_` / `name`) must be the standalone last arm.
+    let mut arm_kinds: Vec<CascadeArm> = Vec::with_capacity(n_arms);
+    for (idx, arm) in match_expr.arms.iter().enumerate() {
+        let is_last_arm = idx + 1 == n_arms;
+        let mut sub_pats: Vec<&Pat> = Vec::new();
+        flatten_or_pattern(&arm.pat, &mut sub_pats);
+
+        // A single sub-pattern that's a wildcard or bind-wildcard is
+        // the cascade's catch-all. Inside an or-pattern (`_ | Foo::A`)
+        // the wildcard intent collides with the variant intent — same
+        // policy as the literal-switch `lower_match` enforces at
+        // `model.py:652`.
+        if sub_pats.len() == 1 {
+            match sub_pats[0] {
+                Pat::Wild(_) => {
+                    if !is_last_arm {
+                        return Err(AdapterError::Unsupported {
+                            reason: "wildcard arm must be the last arm of a variant-cascade \
+                                match (upstream `model.py:652` invariant)"
+                                .into(),
+                        });
+                    }
+                    arm_kinds.push(CascadeArm::Wildcard);
+                    continue;
+                }
+                Pat::Ident(PatIdent {
+                    by_ref: None,
+                    subpat: None,
+                    mutability: None,
+                    ident,
+                    ..
+                }) => {
+                    if !is_last_arm {
+                        return Err(AdapterError::Unsupported {
+                            reason: "binding-wildcard arm (e.g. `other => …`) must be the \
+                                last arm of a variant-cascade match"
+                                .into(),
+                        });
+                    }
+                    arm_kinds.push(CascadeArm::BindWildcard(ident.to_string()));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+
+        // Otherwise every sub-pattern must be a variant pattern that
+        // `extract_variant_arm_info` recognises (unit / rest-only
+        // struct / rest-only tuple / struct with named-Ident field
+        // bindings). Or-pattern siblings of the same arm must agree
+        // on the bindings shape so the shared arm-body block sees a
+        // consistent locals view.
+        let mut paths: Vec<String> = Vec::with_capacity(sub_pats.len());
+        let mut arm_field_bindings: Option<Vec<StructFieldBinding>> = None;
+        for sub_pat in &sub_pats {
+            if let Some(info) = extract_variant_arm_info(sub_pat) {
+                if let Some(prev) = &arm_field_bindings {
+                    if !struct_field_bindings_match(prev, &info.bindings) {
+                        return Err(AdapterError::Unsupported {
+                            reason: "or-pattern variant arms with inconsistent field \
+                                bindings — the cascade lowers a single arm body block \
+                                whose locals must agree across or-pattern siblings"
+                                .into(),
+                        });
+                    }
+                } else {
+                    arm_field_bindings = Some(info.bindings.clone());
+                }
+                paths.push(info.path);
+                continue;
+            }
+            // Specific diagnostics matching the categories the M2.5e
+            // probe test pins. After slice 2e: `Pat::Struct` field
+            // bindings reach `extract_variant_arm_info` and accept
+            // when every field pattern is `Pat::Ident` or `Pat::Wild`.
+            // The `Pat::Struct` arm here fires only when at least one
+            // field pattern is something else (literal, nested
+            // composite, by_ref binding, etc.).
+            let reason = match sub_pat {
+                Pat::Struct(_) => "match arm struct-variant pattern with non-Ident field \
+                        sub-pattern (literal / nested composite / by_ref binding) — \
+                        complex destructuring lands after slice 2e"
+                    .to_string(),
+                Pat::TupleStruct(_) => "match arm tuple-variant pattern with element \
+                        bindings (`Foo::Bar(a, b)`) — tuple-variant element extraction \
+                        lands in M2.5d slice 2f"
+                    .to_string(),
+                Pat::Tuple(_) => "match arm tuple pattern (`(a, b)`) — non-variant \
+                        composite patterns are out of scope of variant-cascade lowering"
+                    .to_string(),
+                Pat::Wild(_) => "wildcard sub-pattern inside or-pattern — upstream \
+                        `model.py:652` reserves the wildcard for a standalone default \
+                        arm at match-level"
+                    .to_string(),
+                Pat::Lit(_) => "match cannot mix literal and variant patterns in the same \
+                        match (variant-cascade lowering requires homogeneous variant arms)"
+                    .to_string(),
+                _ => "match arm pattern not in M2.5b/d/e subset (only variant-path, \
+                        rest-only struct/tuple, named-Ident struct fields, or wildcard \
+                        supported in variant cascade)"
+                    .to_string(),
+            };
+            return Err(AdapterError::Unsupported { reason });
+        }
+        arm_kinds.push(CascadeArm::Variant {
+            paths,
+            field_bindings: arm_field_bindings.unwrap_or_default(),
+        });
+    }
+
+    // 2. Require a wildcard last. The annotator cannot infer Rust-enum
+    //    exhaustiveness without HostObject::Class registration per
+    //    variant — that arrives in M2.5d slice 3. Until then, the
+    //    cascade must terminate at a user-provided catch-all.
+    //    PRE-EXISTING-ADAPTATION; convergence path same as the cascade
+    //    sentinel encoding above.
+    let last_is_wildcard = matches!(
+        arm_kinds.last(),
+        Some(CascadeArm::Wildcard | CascadeArm::BindWildcard(_))
+    );
+    if !last_is_wildcard {
+        return Err(AdapterError::Unsupported {
+            reason: "variant-cascade match must end with a wildcard arm (`_` or `name`) — \
+                exhaustive variant matches without a catch-all land alongside \
+                HostObject::Class registration in M2.5d slice 3"
+                .into(),
+        });
+    }
+
+    // 3. Stash the scrutinee into a synthetic local so the standard
+    //    merged-names machinery threads it through every cascade
+    //    fork-block via Link.args. Use the same `#`-prefixed slot
+    //    convention as `lower_for`'s `#for_iter_{depth}` — `#` cannot
+    //    appear in `syn::Ident::to_string()` output, so collisions
+    //    with user-source names are impossible. The slot id derives
+    //    from the scrutinee Variable's identity so nested matches
+    //    pick distinct names.
+    let scrutinee_var = match scrutinee {
+        Hlvalue::Variable(v) => v,
+        Hlvalue::Constant(c) => {
+            // Wrap constant scrutinees in `same_as` so the cascade
+            // always operates on a Variable. Upstream's
+            // `flowcontext.py` `IS_OP` / `COMPARE_OP` paths likewise
+            // bind the value to a Variable before forking on it.
+            let v = Variable::new();
+            b.emit_op(SpaceOperation::new(
+                "same_as",
+                vec![Hlvalue::Constant(c)],
+                Hlvalue::Variable(v.clone()),
+            ));
+            v
+        }
+    };
+    let scrutinee_slot = format!("#match_scrutinee_{}", scrutinee_var.id());
+    b.set_local(scrutinee_slot.clone(), Hlvalue::Variable(scrutinee_var));
+
+    // 4. Snapshot pre-cascade locals (now including the scrutinee
+    //    slot) and fix the merged_names ordering. Sorted ordering
+    //    gives deterministic Link.args layout across runs.
+    let pre_fork_locals = b.locals().clone();
+    let mut merged_names: Vec<String> = pre_fork_locals.keys().cloned().collect();
+    merged_names.sort();
+
+    // 5. Allocate one body block per arm. The wildcard arm's body
+    //    block doubles as the cascade's terminal "false" target.
+    let mut arm_body_blocks: Vec<(BlockRef, HashMap<String, Hlvalue>)> = Vec::with_capacity(n_arms);
+    for _ in 0..n_arms {
+        arm_body_blocks.push(branch_block_with_inputargs(&merged_names));
+    }
+    let wildcard_arm_idx = n_arms - 1;
+
+    // 6. Emit the cascade. One step per `(arm_idx, variant_path)` —
+    //    or-pattern arms unfold into multiple steps targeting the
+    //    same arm body. The wildcard arm (always last per step 2) is
+    //    NOT a step; it receives the final cascade step's "false"
+    //    Link.
+    let cascade_steps: Vec<(usize, &str)> = arm_kinds
+        .iter()
+        .enumerate()
+        .filter_map(|(arm_idx, kind)| match kind {
+            CascadeArm::Variant { paths, .. } => Some((arm_idx, paths.as_slice())),
+            _ => None,
+        })
+        .flat_map(|(arm_idx, paths)| paths.iter().map(move |p| (arm_idx, p.as_str())))
+        .collect();
+    let n_steps = cascade_steps.len();
+    if n_steps == 0 {
+        // No variant arms means the dispatch peek mis-fired — every
+        // arm is a wildcard, which is structurally a no-op match.
+        // Defensive: this shape should never reach the cascade because
+        // `lower_match`'s peek requires at least one `Pat::Path` to
+        // route here.
+        return Err(AdapterError::Unsupported {
+            reason: "variant-cascade match with no variant arms (defensive — caller \
+                dispatch should not route here)"
+                .into(),
+        });
+    }
+
+    for (step_idx, (arm_idx, variant_path)) in cascade_steps.iter().enumerate() {
+        let is_last_step = step_idx + 1 == n_steps;
+
+        // Read the scrutinee through the current block's locals view —
+        // for the FIRST step it's the original Variable; for
+        // subsequent steps it's the fresh inputarg of the cascade
+        // fork-block opened by the previous iteration.
+        let scrutinee_now = b
+            .locals()
+            .get(&scrutinee_slot)
+            .cloned()
+            .expect("scrutinee_slot threads through cascade fork-blocks");
+        let cond_var = Hlvalue::Variable(Variable::new());
+        b.emit_op(SpaceOperation::new(
+            "isinstance",
+            vec![
+                scrutinee_now,
+                Hlvalue::Constant(Constant::new(ConstValue::ByteStr(
+                    variant_path.as_bytes().to_vec(),
+                ))),
+            ],
+            cond_var.clone(),
+        ));
+
+        let arm_body_block = arm_body_blocks[*arm_idx].0.clone();
+        // Final step's "false" target IS the wildcard arm's body
+        // block; intermediate steps allocate a fresh fork block.
+        let (next_block, next_locals) = if is_last_step {
+            arm_body_blocks[wildcard_arm_idx].clone()
+        } else {
+            branch_block_with_inputargs(&merged_names)
+        };
+
+        // Link.args carry every merged-name's current SSA value into
+        // BOTH the true and false targets — same convention as
+        // `lower_if` (`branch_link_args` reads `b.locals()` per name).
+        let cur_locals = b.locals().clone();
+        let cur_args: Vec<Hlvalue> = merged_names
+            .iter()
+            .map(|name| {
+                cur_locals
+                    .get(name)
+                    .cloned()
+                    .expect("merged_names is a subset of cascade-step entry locals")
+            })
+            .collect();
+
+        let false_link = Rc::new(RefCell::new(Link::new(
+            cur_args.clone(),
+            Some(next_block.clone()),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))),
+        )));
+        let true_link = Rc::new(RefCell::new(Link::new(
+            cur_args,
+            Some(arm_body_block),
+            Some(Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))),
+        )));
+        b.finalize_current(vec![false_link, true_link], Some(cond_var));
+
+        // Open the next cascade fork-block (intermediate steps) — the
+        // wildcard arm's body block opens later in step 7 alongside
+        // every other arm body, so we leave it untouched here.
+        if !is_last_step {
+            b.open_new_block(BlockBuilder {
+                block: next_block,
+                ops: Vec::new(),
+                locals: next_locals,
+            });
+        }
+    }
+
+    // 7. Lower each arm's body. Before the user body lowers:
+    //    - `Variant` arms emit one `getattr(scrutinee, "<field>")` op
+    //      per declared field binding and bind the resulting value to
+    //      the user-named local. Mirrors upstream
+    //      `rpython/flowspace/operation.py:618 getattr` arity=2; same
+    //      shape `flowcontext.py` produces for an attribute access
+    //      (`obj.field`) read at the start of an isinstance arm.
+    //    - `BindWildcard` arms surface the scrutinee under the
+    //      user-supplied identifier.
+    let mut arm_captures: Vec<Option<ArmCapture>> = Vec::with_capacity(n_arms);
+    for ((branch_block, branch_locals), (kind, arm)) in arm_body_blocks
+        .into_iter()
+        .zip(arm_kinds.iter().zip(&match_expr.arms))
+    {
+        b.open_new_block(BlockBuilder {
+            block: branch_block,
+            ops: Vec::new(),
+            locals: branch_locals,
+        });
+        match kind {
+            CascadeArm::Variant { field_bindings, .. } if !field_bindings.is_empty() => {
+                let scrutinee_now = b
+                    .locals()
+                    .get(&scrutinee_slot)
+                    .cloned()
+                    .expect("variant arm body inherits scrutinee slot via merged_names");
+                for binding in field_bindings {
+                    let value = Hlvalue::Variable(Variable::new());
+                    b.emit_op(SpaceOperation::new(
+                        "getattr",
+                        vec![
+                            scrutinee_now.clone(),
+                            Hlvalue::Constant(Constant::new(ConstValue::byte_str(
+                                &binding.field_name,
+                            ))),
+                        ],
+                        value.clone(),
+                    ));
+                    b.set_local(binding.local_name.clone(), value);
+                }
+            }
+            CascadeArm::BindWildcard(name) => {
+                let scrutinee_now = b
+                    .locals()
+                    .get(&scrutinee_slot)
+                    .cloned()
+                    .expect("wildcard body inherits scrutinee slot via merged_names");
+                b.set_local(name.clone(), scrutinee_now);
+            }
+            _ => {}
+        }
+        let exit = lower_arm_body(b, &arm.body)?;
+        arm_captures.push(capture_arm_exit(b, exit));
+    }
+
+    // 8. If every arm terminated, the post-match PC is unreachable —
+    //    same convention as `lower_match`'s literal-switch path.
+    if arm_captures.iter().all(|c| c.is_none()) {
+        return Ok(BlockExit::Terminated);
+    }
+
+    // 9. Build the join block. The synthetic scrutinee slot is
+    //    filtered out of the exit-visible name set — post-match code
+    //    must not see it (mirrors `lower_for`'s `exit_merged_names`
+    //    treatment of the iterator slot).
+    let exit_merged_names: Vec<String> = merged_names
+        .iter()
+        .filter(|n| **n != scrutinee_slot)
+        .cloned()
+        .collect();
+
+    let tail_var = Hlvalue::Variable(Variable::new());
+    let mut join_inputargs: Vec<Hlvalue> = Vec::with_capacity(exit_merged_names.len() + 1);
+    join_inputargs.push(tail_var.clone());
+    let mut join_locals: HashMap<String, Hlvalue> = HashMap::new();
+    for name in &exit_merged_names {
+        let fresh = Hlvalue::Variable(Variable::named(name));
+        join_inputargs.push(fresh.clone());
+        join_locals.insert(name.clone(), fresh);
+    }
+    let join_block = Block::shared(join_inputargs);
+
+    // 10. Close every surviving arm's tail block with a Link into the
+    //     join.
+    for cap in arm_captures.into_iter().flatten() {
+        let mut link_args: Vec<Hlvalue> = Vec::with_capacity(exit_merged_names.len() + 1);
+        link_args.push(cap.tail.clone());
+        for name in &exit_merged_names {
+            let value = cap
+                .locals
+                .get(name)
+                .cloned()
+                .expect("merged_names is a subset of arm entry locals");
+            link_args.push(value);
+        }
+        let link = Rc::new(RefCell::new(Link::new(
+            link_args,
+            Some(join_block.clone()),
+            None,
+        )));
+        cap.block.borrow_mut().operations = cap.ops;
+        cap.block.closeblock(vec![link]);
+    }
+
     b.open_new_block(BlockBuilder {
         block: join_block,
         ops: Vec::new(),
@@ -3584,6 +4273,602 @@ mod tests {
                 assert!(reason.contains("wildcard"), "reason: {reason}");
             }
             other => panic!("expected Unsupported(wildcard-not-last), got {other:?}"),
+        }
+    }
+
+    // ---- M2.5d slice 2c: variant-cascade tests -------------------
+
+    /// `match` over a unit enum variant routes through the
+    /// isinstance-cascade path. Each variant emits one `isinstance` op
+    /// and one boolean fork; the wildcard arm is the cascade's terminal
+    /// "false" target. The graph layer no longer carries an n-way
+    /// switch — the entry block has exactly one `isinstance` op and a
+    /// 2-exit Bool fork, structurally identical to upstream's
+    /// `if isinstance(x, A): … else: …` lowering.
+    #[test]
+    fn match_unit_variant_two_arms_emits_isinstance_cascade() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::A => 1,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        // First-step block: one `isinstance` op + 2-exit Bool fork.
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "isinstance");
+        assert_eq!(start.exits.len(), 2);
+        let ec_false = start.exits[0].borrow().exitcase.clone().unwrap();
+        let ec_true = start.exits[1].borrow().exitcase.clone().unwrap();
+        assert_eq!(
+            ec_false,
+            Hlvalue::Constant(Constant::new(ConstValue::Bool(false)))
+        );
+        assert_eq!(
+            ec_true,
+            Hlvalue::Constant(Constant::new(ConstValue::Bool(true)))
+        );
+        // The variant-class operand to isinstance is the path-string
+        // sentinel `Foo::A` (PRE-EXISTING-ADAPTATION pending
+        // HostObject::Class registration).
+        let path_arg = match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => c.value.clone(),
+            other => panic!("expected Constant operand, got {other:?}"),
+        };
+        match path_arg {
+            ConstValue::ByteStr(bytes) => {
+                assert_eq!(bytes, b"Foo::A");
+            }
+            other => panic!("expected ByteStr operand, got {other:?}"),
+        }
+    }
+
+    /// Three variant arms produce three cascade steps. Each step is a
+    /// 2-exit boolean fork — total entry-reachable blocks should
+    /// include the start, two intermediate cascade fork blocks, three
+    /// arm body blocks, one join, and the returnblock.
+    #[test]
+    fn match_three_unit_variants_chain_three_isinstance_forks() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::A => 1,
+                    Foo::B => 2,
+                    Foo::C => 3,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Count blocks that emit an `isinstance` op — exactly one per
+        // cascade step, three total.
+        let isinstance_blocks = g
+            .iterblocks()
+            .iter()
+            .filter(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .any(|op| op.opname == "isinstance")
+            })
+            .count();
+        assert_eq!(isinstance_blocks, 3, "one cascade step per variant");
+    }
+
+    /// Or-pattern `Foo::A | Foo::B => body` produces TWO cascade steps
+    /// pointing at the SAME arm body block — the structural shape that
+    /// upstream `model.py:648-692` admits (multiple Links with distinct
+    /// exitcases sharing a target). Plus the wildcard arm.
+    #[test]
+    fn match_or_variant_pattern_shares_arm_body_block() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::A | Foo::B => 1,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // 2 cascade steps × 1 isinstance op each = 2 isinstance ops
+        // total.
+        let isinstance_count = g
+            .iterblocks()
+            .iter()
+            .map(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .filter(|op| op.opname == "isinstance")
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(isinstance_count, 2, "or-pattern unfolds to 2 steps");
+
+        // Find the two true-target Block IDs — they should be
+        // identical (the shared arm body block).
+        let mut true_targets: Vec<*const _> = Vec::new();
+        for blk in g.iterblocks() {
+            for exit in &blk.borrow().exits {
+                let ex = exit.borrow();
+                if let Some(Hlvalue::Constant(c)) = &ex.exitcase {
+                    if matches!(&c.value, ConstValue::Bool(true)) {
+                        if let Some(target) = &ex.target {
+                            true_targets.push(target.as_ptr() as *const _);
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(true_targets.len(), 2, "two cascade-step true exits");
+        assert_eq!(
+            true_targets[0], true_targets[1],
+            "or-pattern sub-cases share the arm body block"
+        );
+    }
+
+    /// Binding-wildcard `name => body` makes `name` available as a
+    /// local inside the arm body, bound to the scrutinee value.
+    #[test]
+    fn match_binding_wildcard_threads_scrutinee_into_arm_body() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::A => 1,
+                    other => other,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // The arm body for `other => other` reads the scrutinee back
+        // out — there should be no extra `getattr` op required to
+        // surface it. The graph remains structurally simple (no
+        // operations beyond the cascade's isinstance).
+        let isinstance_count = g
+            .iterblocks()
+            .iter()
+            .map(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .filter(|op| op.opname == "isinstance")
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(isinstance_count, 1, "single variant arm = 1 cascade step");
+    }
+
+    /// Variant-cascade matches REQUIRE a wildcard last. Without one,
+    /// the adapter rejects with a reason that names the constraint —
+    /// PRE-EXISTING-ADAPTATION pending HostObject::Class registration.
+    #[test]
+    fn rejects_variant_match_without_wildcard() {
+        match lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::A => 1,
+                    Foo::B => 2,
+                }
+            }",
+        )
+        .unwrap_err()
+        {
+            AdapterError::Unsupported { reason } => {
+                assert!(
+                    reason.contains("wildcard"),
+                    "reason should cite wildcard requirement: {reason}"
+                );
+            }
+            other => panic!("expected Unsupported(wildcard-required), got {other:?}"),
+        }
+    }
+
+    /// Mixed literal + variant arms reject — the cascade lowering is
+    /// homogeneous-variant only.
+    #[test]
+    fn rejects_match_mixing_literal_and_variant_arms() {
+        match lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::A => 1,
+                    1 => 2,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap_err()
+        {
+            AdapterError::Unsupported { reason } => {
+                assert!(
+                    reason.contains("mix") || reason.contains("homogeneous"),
+                    "reason should cite mixed-pattern rejection: {reason}"
+                );
+            }
+            other => panic!("expected Unsupported(mixed), got {other:?}"),
+        }
+    }
+
+    /// Slice 2d accept: rest-only struct-variant pattern
+    /// `Foo::Bar { .. }` lowers to a single `isinstance` cascade step
+    /// — structurally identical to the unit-variant case (slice 2c).
+    /// The field-binding extraction is deliberately deferred so this
+    /// slice carries zero new SpaceOperations.
+    #[test]
+    fn match_rest_only_struct_variant_emits_isinstance_cascade() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::Resume { .. } => 1,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "isinstance");
+        assert_eq!(start.exits.len(), 2);
+        let path_arg = match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => c.value.clone(),
+            other => panic!("expected Constant operand, got {other:?}"),
+        };
+        match path_arg {
+            ConstValue::ByteStr(bytes) => assert_eq!(bytes, b"Foo::Resume"),
+            other => panic!("expected ByteStr operand, got {other:?}"),
+        }
+    }
+
+    /// Slice 2d accept: rest-only tuple-variant pattern
+    /// `Foo::Bar(..)` lowers to a single `isinstance` cascade step.
+    #[test]
+    fn match_rest_only_tuple_variant_emits_isinstance_cascade() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::Pair(..) => 1,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let start = g.startblock.borrow();
+        assert_eq!(start.operations.len(), 1);
+        assert_eq!(start.operations[0].opname, "isinstance");
+        let path_arg = match &start.operations[0].args[1] {
+            Hlvalue::Constant(c) => c.value.clone(),
+            other => panic!("expected Constant operand, got {other:?}"),
+        };
+        match path_arg {
+            ConstValue::ByteStr(bytes) => assert_eq!(bytes, b"Foo::Pair"),
+            other => panic!("expected ByteStr operand, got {other:?}"),
+        }
+    }
+
+    /// Slice 2d accept: heterogeneous variant arms in the same match
+    /// — `Foo::A` (unit), `Foo::B { .. }` (rest-only struct), and
+    /// `Foo::C(..)` (rest-only tuple) all share the cascade lowering
+    /// since they all classify via `variant_match_path_str`.
+    #[test]
+    fn match_mixed_unit_struct_rest_tuple_rest_variants_share_cascade() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::A => 1,
+                    Foo::B { .. } => 2,
+                    Foo::C(..) => 3,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Three cascade steps total.
+        let isinstance_count = g
+            .iterblocks()
+            .iter()
+            .map(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .filter(|op| op.opname == "isinstance")
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(
+            isinstance_count, 3,
+            "one cascade step per variant arm, regardless of variant kind"
+        );
+    }
+
+    /// Slice 2e accept: struct-variant arm with a single named-Ident
+    /// field binding emits exactly one `getattr` op at the arm body
+    /// block's entry, plus the cascade's single `isinstance` step.
+    /// The bound local is reachable from the arm body — the test
+    /// returns it as the arm's tail value.
+    #[test]
+    fn match_struct_variant_field_binding_emits_getattr_at_arm_entry() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::Resume { pc, .. } => pc,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Locate the arm body block — has exactly one `getattr` op
+        // whose second arg is the byte-string `pc`.
+        let getattr_pc_blocks = g
+            .iterblocks()
+            .iter()
+            .filter(|b| {
+                b.borrow().operations.iter().any(|op| {
+                    op.opname == "getattr"
+                        && matches!(
+                            &op.args[1],
+                            Hlvalue::Constant(c) if matches!(&c.value, ConstValue::ByteStr(bs) if bs == b"pc"),
+                        )
+                })
+            })
+            .count();
+        assert_eq!(
+            getattr_pc_blocks, 1,
+            "exactly one arm body block emits the `getattr(scrutinee, \"pc\")` op"
+        );
+    }
+
+    /// Slice 2e accept: multiple named-Ident bindings from one arm
+    /// produce one `getattr` per binding, in declaration order, at
+    /// the arm body block's entry.
+    #[test]
+    fn match_struct_variant_multiple_field_bindings_emit_getattrs_in_order() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::Pair { lhs, rhs, .. } => lhs + rhs,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Locate the arm body block. It must carry getattr ops in the
+        // declared order, followed by the `add` op.
+        let arm_block = g
+            .iterblocks()
+            .iter()
+            .find(|b| b.borrow().operations.iter().any(|op| op.opname == "add"))
+            .cloned()
+            .expect("arm body block emits the add op");
+        let block_ref = arm_block.borrow();
+        let getattr_ops: Vec<_> = block_ref
+            .operations
+            .iter()
+            .filter(|op| op.opname == "getattr")
+            .collect();
+        assert_eq!(getattr_ops.len(), 2);
+        let names: Vec<&[u8]> = getattr_ops
+            .iter()
+            .map(|op| match &op.args[1] {
+                Hlvalue::Constant(c) => match &c.value {
+                    ConstValue::ByteStr(bs) => bs.as_slice(),
+                    _ => panic!("expected ByteStr"),
+                },
+                _ => panic!("expected Constant"),
+            })
+            .collect();
+        assert_eq!(names, vec![b"lhs" as &[u8], b"rhs" as &[u8]]);
+    }
+
+    /// Slice 2e accept: explicit-rename binding `{ field: ident }`
+    /// produces the `getattr` against the FIELD name and binds the
+    /// LOCAL identifier in the arm body. The arm body reads the
+    /// renamed identifier, so a missing rename would surface as an
+    /// `UnboundLocal`.
+    #[test]
+    fn match_struct_variant_renaming_field_binding_uses_local_name() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::Resume { pc: orig_pc, .. } => orig_pc,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // The getattr op's second arg is the field name `pc`, NOT the
+        // local name `orig_pc` — same op upstream `flowcontext.py`
+        // emits for `obj.pc`.
+        let getattr_block = g
+            .iterblocks()
+            .iter()
+            .find(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .any(|op| op.opname == "getattr")
+            })
+            .cloned()
+            .expect("arm body block emits getattr");
+        let block_ref = getattr_block.borrow();
+        let getattr_op = block_ref
+            .operations
+            .iter()
+            .find(|op| op.opname == "getattr")
+            .unwrap();
+        match &getattr_op.args[1] {
+            Hlvalue::Constant(c) => match &c.value {
+                ConstValue::ByteStr(bs) => assert_eq!(bs, b"pc"),
+                other => panic!("expected ByteStr(pc), got {other:?}"),
+            },
+            other => panic!("expected Constant operand, got {other:?}"),
+        }
+    }
+
+    /// Slice 2e accept: `{ field: _ }` is a field-skip pattern — the
+    /// field is matched but its value is discarded, no `getattr`
+    /// emitted. The arm body doesn't reference the field's name.
+    #[test]
+    fn match_struct_variant_wildcard_field_skip_emits_no_getattr() {
+        let g = lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::Resume { pc: _, .. } => 1,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        let total_getattrs = g
+            .iterblocks()
+            .iter()
+            .map(|b| {
+                b.borrow()
+                    .operations
+                    .iter()
+                    .filter(|op| op.opname == "getattr")
+                    .count()
+            })
+            .sum::<usize>();
+        assert_eq!(
+            total_getattrs, 0,
+            "`{{ field: _ }}` skip emits no getattr — only the cascade isinstance step"
+        );
+    }
+
+    /// Slice 2f boundary: tuple-variant arms with element bindings
+    /// continue to reject with the slice-2f diagnostic.
+    #[test]
+    fn rejects_match_tuple_variant_with_element_bindings() {
+        match lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::Pair(a, b) => a + b,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap_err()
+        {
+            AdapterError::Unsupported { reason } => {
+                assert!(
+                    reason.contains("tuple-variant") && reason.contains("slice 2f"),
+                    "reason should cite slice-2f tuple-variant rejection: {reason}"
+                );
+            }
+            other => panic!("expected Unsupported(tuple-variant bindings), got {other:?}"),
+        }
+    }
+
+    /// Slice 2e boundary: or-pattern siblings whose field bindings
+    /// disagree must reject — Rust enforces this at the language
+    /// level, but the adapter re-validates so a malformed or-pattern
+    /// surfaces a precise error rather than a confusing arm-body
+    /// `UnboundLocal`.
+    #[test]
+    fn rejects_or_pattern_with_inconsistent_field_bindings() {
+        // Note: rustc rejects this, but `syn::parse_str` accepts it
+        // without semantic checks. The adapter's re-validation
+        // surfaces the inconsistency as a precise error.
+        match lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::A { x } | Foo::B { y } => 1,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap_err()
+        {
+            AdapterError::Unsupported { reason } => {
+                assert!(
+                    reason.contains("inconsistent field bindings"),
+                    "reason should cite or-pattern binding mismatch: {reason}"
+                );
+            }
+            other => panic!("expected Unsupported(or-pattern inconsistent), got {other:?}"),
+        }
+    }
+
+    /// Slice 2e boundary: non-Ident / non-Wild field sub-patterns
+    /// (literal, nested struct, etc.) reject with a complex-
+    /// destructuring diagnostic.
+    #[test]
+    fn rejects_match_struct_variant_with_literal_field_pattern() {
+        match lower(
+            "fn f(x: Foo) -> i64 {
+                match x {
+                    Foo::Resume { pc: 0, .. } => 1,
+                    _ => 0,
+                }
+            }",
+        )
+        .unwrap_err()
+        {
+            AdapterError::Unsupported { reason } => {
+                assert!(
+                    reason.contains("non-Ident") || reason.contains("complex destructuring"),
+                    "reason should cite non-Ident field-pattern rejection: {reason}"
+                );
+            }
+            other => panic!("expected Unsupported(non-Ident field), got {other:?}"),
+        }
+    }
+
+    /// Variant cascade preserves locals merging across arms — every
+    /// arm rebinding `y` produces a join block whose inputargs include
+    /// the merged `y` slot. The synthetic `#match_scrutinee_*` slot
+    /// must NOT leak into the post-match join.
+    #[test]
+    fn match_variant_cascade_merges_locals_into_join() {
+        let g = lower(
+            "fn f(x: Foo, y: i64) -> i64 {
+                let y = match x {
+                    Foo::A => y + 1,
+                    _ => y - 1,
+                };
+                y
+            }",
+        )
+        .unwrap();
+        checkgraph(&g);
+        // Find the join block (zero ops, multiple inputargs, multiple
+        // arm predecessors). Its inputargs must NOT contain a
+        // `#match_scrutinee_*` synthetic slot — that's strictly a
+        // cascade-internal sidecar and post-match code must not see
+        // it.
+        let join = g
+            .iterblocks()
+            .iter()
+            .find(|b| {
+                let bref = b.borrow();
+                bref.operations.is_empty() && bref.inputargs.len() == 3 && bref.exits.len() == 1
+            })
+            .cloned()
+            .expect("expected match-join block with 3 inputargs (tail + x + y)");
+        // None of the join's inputargs should be named with the
+        // synthetic prefix — the filter at `lower_match_variant_cascade`
+        // step 9 strips it.
+        for arg in &join.borrow().inputargs {
+            if let Hlvalue::Variable(v) = arg {
+                let nm = v.name();
+                assert!(
+                    !nm.starts_with("#match_scrutinee_"),
+                    "synthetic scrutinee slot leaked into join inputargs: {nm}"
+                );
+            }
         }
     }
 

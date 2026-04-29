@@ -7167,6 +7167,10 @@ pub fn register_portal_jitdriver(
         portal_graph: code as *const pyre_interpreter::CodeObject,
         w_code,
         merge_point_pc,
+        // call.py:147 LHS — initial `None` matches RPython's
+        // `jd.mainjitcode = None` before `grab_initial_jitcodes`
+        // fires; `grab_initial_jitcodes` itself stores the
+        // `Arc<PyJitCode>` from `get_jitcode(jd.portal_graph)`.
         mainjitcode: None,
     });
     // codewriter.py:74 `make_jitcodes()` — drain everything pending.

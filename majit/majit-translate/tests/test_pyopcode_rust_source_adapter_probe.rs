@@ -66,10 +66,27 @@ fn adapter_rejects_execute_opcode_step_on_composite_match_pattern() {
     //   is a unit enum variant (`Pat::Path`), rejected today via the
     //   `_` catch-all of `classify_pattern` with
     //   "match arm pattern not in M2.5b subset".
-    // - After M2.5d slice 2 (future — `Pat::Path` as exitcase): the
-    //   first rejection will be on `Pat::Struct` (struct-variant
-    //   patterns like `Instruction::Resume {..}`) with
+    // - After M2.5d slice 2c (`Pat::Path` accepted): the first
+    //   rejection moves to `Pat::Struct {..}` (e.g.
+    //   `Instruction::Resume {..}`) with
     //   "composite pattern (enum/tuple/struct — lands in M2.5d)".
+    // - After M2.5d slice 2d (rest-only `Pat::Struct {..}` and
+    //   `Pat::TupleStruct(..)` accepted): the first rejection moves
+    //   to `Pat::Struct { field, .. }` (a struct variant whose match
+    //   arm binds at least one field, e.g.
+    //   `Instruction::LoadConst { consti }`) with
+    //   "match arm struct-variant pattern with field bindings (…) —
+    //   field-binding extraction lands in M2.5d slice 2e".
+    // - After M2.5d slice 2e (struct-variant named-Ident field
+    //   bindings accepted): the cascade lowers every match-arm
+    //   pattern in `execute_opcode_step`. Lowering then progresses
+    //   INTO the arm bodies and rejects on the first un-resolved
+    //   identifier — the `Result::Ok(...)` constructor reference at
+    //   `Ok(StepResult::Continue)`. Surfaces as
+    //   `AdapterError::UnboundLocal { name: "Ok" }` because the
+    //   adapter has no host-environment registry for the standard
+    //   library `Result` constructors. Resolving these is a separate
+    //   M2.5g intake task.
     //
     // The assertion accepts any of these states so the probe
     // continues to pin the "rejection depth" even as slices land. A
@@ -80,18 +97,31 @@ fn adapter_rejects_execute_opcode_step_on_composite_match_pattern() {
         .expect("adapter is expected to reject today — see M2.5d/e");
     match err {
         AdapterError::Unsupported { reason } => {
-            eprintln!("adapter rejection at M2.5e probe: {reason}");
+            eprintln!("adapter rejection at M2.5e probe: Unsupported: {reason}");
             let accepts_or = reason.contains("or-pattern");
             let accepts_variant_path =
                 reason.contains("not in M2.5b subset") || reason.contains("unit variant");
             let accepts_composite =
                 reason.contains("composite pattern") || reason.contains("enum/tuple/struct");
+            let accepts_field_bindings =
+                reason.contains("field bindings") || reason.contains("slice 2e");
             assert!(
-                accepts_or || accepts_variant_path || accepts_composite,
+                accepts_or || accepts_variant_path || accepts_composite || accepts_field_bindings,
                 "unexpected rejection category — did a new M2.5d slice land? reason: {reason}"
             );
         }
-        other => panic!("expected AdapterError::Unsupported, got {other:?}"),
+        AdapterError::UnboundLocal { name } => {
+            // Slice 2e landed: the adapter walked every match arm and
+            // is now rejecting on a body-level identifier. The
+            // expected first hit is `Ok` (the `Result::Ok` ctor used
+            // by every `Ok(StepResult::Continue)` arm tail). Other
+            // unresolved standard-library identifiers (`Err`, etc.)
+            // are equally valid milestones — they all signal that the
+            // pattern lowering is fully covered and the next epic is
+            // the M2.5g host-environment intake for stdlib ctors.
+            eprintln!("adapter rejection at M2.5e probe: UnboundLocal({name})");
+        }
+        other => panic!("expected AdapterError::Unsupported or UnboundLocal, got {other:?}"),
     }
 }
 

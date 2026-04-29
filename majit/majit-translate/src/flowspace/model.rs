@@ -230,14 +230,18 @@ impl HostObject {
         &self.inner.qualname
     }
 
-    fn simple_name(&self) -> &str {
+    /// RPython `cls.__name__` parity — the short name without the
+    /// dotted module prefix. Falls back to `qualname` when the inner
+    /// `name` slot is empty (matches upstream's "no `__name__` attribute"
+    /// case where `qualname` is the only available label).
+    pub fn simple_name(&self) -> &str {
         self.inner
             .name
             .as_deref()
             .unwrap_or_else(|| self.qualname())
     }
 
-    fn module_name(&self) -> Option<&str> {
+    pub fn module_name(&self) -> Option<&str> {
         self.inner.module_name.as_deref().or_else(|| {
             if self.is_class()
                 && HOST_ENV
@@ -558,7 +562,15 @@ impl HostObject {
             .as_ref()
             .map(|code| code.co_name.clone())
             .unwrap_or_else(|| split_attr_name_module(&qualname).0);
-        let module_name = split_attr_name_module(&qualname).1;
+        // Upstream `func.__module__` lives on the function object —
+        // `GraphFunc::module` carries it directly. Fall back to the
+        // qualname split only when the GraphFunc was built without a
+        // `__module__` slot (synthetic-globals fixtures, descriptor-
+        // class helpers).
+        let module_name = graph_func
+            .module
+            .clone()
+            .or_else(|| split_attr_name_module(&qualname).1);
         HostObject {
             inner: Arc::new(HostObjectInner {
                 qualname,
@@ -1203,7 +1215,14 @@ pub fn const_runtime_getattr(obj: &ConstValue, name: &str) -> Result<Option<Cons
                 Ok(Some(ConstValue::byte_str(simple_name)))
             }
             "__module__" => {
-                let (_, module_name) = split_attr_name_module(&func.name);
+                // Upstream `func.__module__` lives on the function
+                // object directly; GraphFunc carries it in
+                // `module`. Fall back to the qualname split only
+                // when the slot is empty (synthetic fixtures).
+                let module_name = func
+                    .module
+                    .clone()
+                    .or_else(|| split_attr_name_module(&func.name).1);
                 Ok(module_name.map(ConstValue::byte_str))
             }
             "__globals__" => Ok(Some(func.globals.value.clone())),
@@ -3155,6 +3174,54 @@ pub struct GraphFunc {
     /// for graphs that contain a `jit_merge_point`. `false` mirrors the
     /// "attribute absent" upstream default.
     pub _dont_reach_me_in_del_: bool,
+    /// Upstream `func._always_inline_`, consumed by
+    /// `translator/backendopt/inline.py:604-606 always_inline`.
+    /// Set by the `@always_inline` decorator at upstream
+    /// `rpython/rlib/objectmodel.py`. `false` mirrors the
+    /// "attribute absent" upstream default.
+    pub _always_inline_: bool,
+    /// Upstream `func._dont_inline_` (read off the live Python
+    /// callable via `getattr(funcobj._callable, '_dont_inline_',
+    /// False)` at `inline.py:563-564` /
+    /// `:617-618`). Set by the `@dont_inline` decorator. `false`
+    /// mirrors the "attribute absent" upstream default. Pyre's
+    /// callable carrier is the `GraphFunc` itself; the flag rides
+    /// along here so the inliner does not have to look through a
+    /// `_callable` string.
+    pub _dont_inline_: bool,
+    /// Upstream `func._no_release_gil_`, consumed by
+    /// `translator/backendopt/gilanalysis.py`.
+    ///
+    /// majit/pyre is freethreaded and has no process-wide GIL to
+    /// release. The port still carries the upstream attribute name:
+    /// `gilanalysis` interprets it as a stricter "no thread
+    /// safepoint / no blocking / no close-stack boundary below this
+    /// graph" contract.
+    pub _no_release_gil_: bool,
+    /// Upstream `func._gctransformer_hint_close_stack_`, consumed by
+    /// `gilanalysis.py:11-15`. In the freethreaded runtime this is a
+    /// safepoint-like boundary because closing the stack can expose
+    /// roots and scheduling/collection state.
+    pub _gctransformer_hint_close_stack_: bool,
+    /// Upstream `func._gctransformer_hint_cannot_collect_`, consumed
+    /// by `collectanalyze.py:15-16` and the JIT codewriter
+    /// (`call.py`). When set, `CollectAnalyzer` short-circuits to
+    /// `bottom_result` for `direct_call` into this graph regardless
+    /// of what the body does. `false` mirrors the "attribute absent"
+    /// upstream default.
+    pub _gctransformer_hint_cannot_collect_: bool,
+    /// Upstream `func._must_be_light_finalizer_`, consumed by
+    /// `finalizer.py:30 analyze_light_finalizer`. When set on a
+    /// `__del__` method's graph, `FinalizerAnalyzer` rejects any
+    /// non-light operation with `FinalizerError`. `false` mirrors the
+    /// "attribute absent" upstream default.
+    pub _must_be_light_finalizer_: bool,
+    /// Upstream `func._transaction_break_`, consumed by
+    /// `gilanalysis.py:16-18`. pyre does not currently model STM
+    /// transactions, but preserving the attribute keeps the analyzer
+    /// structurally aligned with RPython and gives future callers the
+    /// same hazard hook.
+    pub _transaction_break_: bool,
     /// Upstream `func.exported_symbol` attribute set by
     /// `rpython/rlib/entrypoint.py:10-12 export_symbol(func)` —
     /// `func.exported_symbol = True; return func`. Consumed only by
@@ -3192,6 +3259,12 @@ pub struct GraphFunc {
     pub firstlineno: Option<u32>,
     /// `func.__code__.co_filename`.
     pub filename: Option<String>,
+    /// `func.__module__`. Upstream sets this from the surrounding
+    /// `def` site's containing module. Populated at ingest where
+    /// known; left `None` when the bookkeeper has only a synthetic
+    /// function (e.g. flowspace-test fixtures), in which case
+    /// downstream consumers fall back to the filename basename.
+    pub module: Option<String>,
     /// Upstream `func._not_rpython_` attribute (objspace.py:21). Set
     /// to `true` by RPython's `@not_rpython` decorator to mark a
     /// function as flow-space-ineligible.
@@ -3210,6 +3283,13 @@ impl GraphFunc {
             _jit_look_inside_: None,
             relax_sig_check: None,
             _dont_reach_me_in_del_: false,
+            _always_inline_: false,
+            _dont_inline_: false,
+            _no_release_gil_: false,
+            _gctransformer_hint_close_stack_: false,
+            _gctransformer_hint_cannot_collect_: false,
+            _must_be_light_finalizer_: false,
+            _transaction_break_: false,
             exported_symbol: Arc::new(AtomicBool::new(false)),
             _llfnobjattrs_: HashMap::new(),
             globals,
@@ -3219,6 +3299,7 @@ impl GraphFunc {
             source: None,
             firstlineno: None,
             filename: None,
+            module: None,
             not_rpython: false,
         }
     }
@@ -3238,9 +3319,25 @@ impl GraphFunc {
     }
 
     pub fn from_host_code(code: HostCode, globals: Constant, defaults: Vec<Constant>) -> Self {
+        // CPython sets `function.__module__` from
+        // `globals.get('__name__')` at function-creation time
+        // (`Objects/funcobject.c PyFunction_NewWithQualName`); RPython
+        // reads it back through `fn.__module__`. Mirror by extracting
+        // the byte-string value of `'__name__'` from the globals Dict
+        // when present. Synthetic callers that pass an empty Dict get
+        // `module = None`, which keeps the existing fallback path in
+        // [`crate::tool::sourcetools::nice_repr_for_func`].
+        let module = match &globals.value {
+            ConstValue::Dict(items) => items
+                .get(&ConstValue::byte_str(b"__name__"))
+                .and_then(ConstValue::as_byte_str)
+                .map(|bytes| String::from_utf8_lossy(bytes).into_owned()),
+            _ => None,
+        };
         let mut func = GraphFunc::new(code.co_name.clone(), globals);
         func.filename = Some(code.co_filename.clone());
         func.firstlineno = Some(code.co_firstlineno);
+        func.module = module;
         func.defaults = defaults;
         func.code = Some(Box::new(code));
         func

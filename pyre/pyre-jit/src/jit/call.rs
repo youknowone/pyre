@@ -73,6 +73,12 @@ impl CallInfoCollection {
 /// the Python PC of the `MERGE_POINT` opcode the first trace through
 /// the portal reveals (RPython has no analog because portal PCs are
 /// statically known at flow-graph time).
+///
+/// `Copy` was previously derived because every field was `Copy` /
+/// `Option<Copy>`; restoring `mainjitcode` (`Option<Arc<PyJitCode>>`
+/// per `call.py:147`) takes that away. Only `Clone` remains —
+/// per-field reads inside `grab_initial_jitcodes` snapshot the
+/// `Copy` fields explicitly to keep the iteration cheap.
 #[derive(Clone)]
 pub struct JitDriverStaticData {
     /// RPython: `JitDriverStaticData.portal_graph`. The CodeObject

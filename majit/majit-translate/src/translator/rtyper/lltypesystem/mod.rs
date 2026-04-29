@@ -3,4 +3,5 @@
 
 pub mod lloperation;
 pub mod lltype;
+pub mod opimpl;
 pub mod rstr;

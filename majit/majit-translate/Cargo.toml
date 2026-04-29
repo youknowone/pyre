@@ -36,6 +36,12 @@ libc = "0.2"
 # Critically this is NOT a dependency on pyre: rustpython-compiler-core is
 # external to both majit and pyre. The `rpython/` ⊥ `pypy/` boundary holds.
 rustpython-compiler-core = { workspace = true }
+# `md-5` mirrors upstream `hashlib.md5(...).hexdigest()` used by
+# `rpython/translator/backendopt/stat.py:48` to fingerprint each
+# graph's `co_code` when `print_statistics(save_per_graph_details=...)`
+# emits the per-graph file. Debug-only (gated by
+# `config.translation.backendopt.print_statistics`).
+md-5 = "0.10"
 
 [dev-dependencies]
 tempfile = "3"

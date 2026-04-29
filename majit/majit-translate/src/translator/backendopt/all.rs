@@ -1,11 +1,14 @@
 //! Port of `rpython/translator/backendopt/all.py`.
 
+use std::path::Path;
 use std::rc::Rc;
 
 use crate::config::config::{Config, ConfigValue, OptionValue};
 use crate::config::translationoption::get_combined_translation_config;
 use crate::flowspace::model::GraphRef;
-use crate::translator::backendopt::{constfold, removenoops};
+use crate::translator::backendopt::{
+    constfold, gilanalysis, inline, merge_if_blocks, removenoops, stat, storesink,
+};
 use crate::translator::simplify;
 use crate::translator::tool::taskengine::TaskError;
 use crate::translator::translator::TranslationContext;
@@ -37,8 +40,6 @@ pub fn backend_optimizations(
     kwds: Vec<(String, OptionValue)>,
     live_config: Option<&Rc<Config>>,
 ) -> Result<(), TaskError> {
-    let _ = inline_graph_from_anywhere;
-
     // Upstream `all.py:43-44`:
     // `config = translator.config.translation.backendopt.copy(as_default=True)`
     // then `config.set(**kwds)`.
@@ -72,11 +73,15 @@ pub fn backend_optimizations(
     // front" was a NEW-DEVIATION that skipped the ported passes
     // entirely.
 
-    // Upstream `:51-53 print_statistics`. Stub helper retained so the
-    // call site mirrors upstream; the body is a no-op until the real
-    // statistics module lands.
+    // Upstream `:51-53 print_statistics`. The first emission carries
+    // the literal `"per-graph.txt"` save-details path (only the
+    // pre-optimisation summary, never the post-pass calls below).
     if boolopt(&config, "print_statistics")? {
-        print_statistics_stub("before optimizations");
+        print_statistics(
+            &translator,
+            "before optimizations",
+            Some(Path::new("per-graph.txt")),
+        );
     }
 
     // Upstream `:55-57 replace_we_are_jitted`.
@@ -95,10 +100,12 @@ pub fn backend_optimizations(
     }
 
     // Upstream `:63-66 really_remove_asserts → removenoops.remove_debug_assert`.
+    // Comment at upstream `:66`: "the dead operations will be killed
+    // by the remove_obvious_noops below".
     if boolopt(&config, "really_remove_asserts")? {
-        return Err(TaskError {
-            message: "all.py:65 removenoops.remove_debug_assert not yet ported".to_string(),
-        });
+        for graph in &graphs {
+            removenoops::remove_debug_assert(&graph.borrow());
+        }
     }
 
     // Upstream `:69-80 remove_obvious_noops()` (first invocation).
@@ -108,24 +115,54 @@ pub fn backend_optimizations(
     let inline_on = boolopt(&config, "inline")?;
     let mallocs_on = boolopt(&config, "mallocs")?;
     if inline_on || mallocs_on {
-        let _threshold = if inline_on {
+        // Upstream `:83 heuristic = get_function(config.inline_heuristic)`.
+        // Pyre has no Python-style dotted-name `__import__` resolver
+        // (`get_function` at upstream `:19-33`); the only heuristic
+        // ever shipped by upstream is
+        // `"rpython.translator.backendopt.inline.inlining_heuristic"`,
+        // so the port matches that literal and falls through to the
+        // ported `inlining_heuristic` callable.  Any other dotted
+        // name would be a NEW-DEVIATION at the call site upstream
+        // never exercises, so it surfaces as a `TaskError` rather
+        // than getting silently mapped.
+        let heuristic_name = stropt(&config, "inline_heuristic")?.unwrap_or_else(|| {
+            "rpython.translator.backendopt.inline.inlining_heuristic".to_string()
+        });
+        if heuristic_name != "rpython.translator.backendopt.inline.inlining_heuristic" {
+            return Err(TaskError {
+                message: format!(
+                    "all.py:83 inline_heuristic={heuristic_name:?} not ported \
+                     (only rpython.translator.backendopt.inline.inlining_heuristic \
+                     is wired)"
+                ),
+            });
+        }
+        // Upstream `:84-87 if config.inline: threshold =
+        // config.inline_threshold else: threshold = 0`.
+        let threshold = if inline_on {
             floatopt(&config, "inline_threshold")?
         } else {
             0.0
         };
-        return Err(TaskError {
-            message: "all.py:88 inline_malloc_removal_phase \
-                 (inline.auto_inline_graphs + remove_mallocs) not yet ported"
-                .to_string(),
-        });
+        // Upstream `:88-91 inline_malloc_removal_phase(...)`.
+        inline_malloc_removal_phase(
+            &config,
+            &translator,
+            &graphs,
+            threshold,
+            inline::inlining_heuristic,
+            inline_graph_from_anywhere,
+        )?;
+        // Upstream `:92 constfold(config, graphs)`.
+        constfold_pass(&config, &graphs)?;
     }
 
     // Upstream `:94-97 storesink phase`.
     if boolopt(&config, "storesink")? {
         remove_obvious_noops(&config, &translator, &graphs)?;
-        return Err(TaskError {
-            message: "all.py:97 storesink_graph not yet ported".to_string(),
-        });
+        for graph in &graphs {
+            storesink::storesink_graph(&graph.borrow());
+        }
     }
 
     // Upstream `:99-113 profile_based_inline`.
@@ -139,15 +176,33 @@ pub fn backend_optimizations(
     // (gated only by config.constfold inside `constfold_pass`).
     constfold_pass(&config, &graphs)?;
 
-    // Upstream `:116-119 merge_if_blocks`.
+    // Upstream `:116-119 merge_if_blocks`. The `verbose` flag
+    // tracks `translator.config.translation.verbose`; when this
+    // entry is invoked without a live root config (synthetic test
+    // path), fall back to `False` — matching upstream's default
+    // for `translation.verbose`.
     if boolopt(&config, "merge_if_blocks")? {
-        return Err(TaskError {
-            message: "all.py:119 merge_if_blocks not yet ported".to_string(),
-        });
+        let verbose = match live_config {
+            Some(root) => match root.get("translation.verbose").map_err(task_error)? {
+                ConfigValue::Value(OptionValue::Bool(b)) => b,
+                ConfigValue::Value(OptionValue::None) => false,
+                other => {
+                    return Err(TaskError {
+                        message: format!(
+                            "all.py:119 translation.verbose: expected bool, got {other:?}"
+                        ),
+                    });
+                }
+            },
+            None => false,
+        };
+        for graph in &graphs {
+            merge_if_blocks::merge_if_blocks(&graph.borrow(), verbose);
+        }
     }
 
     if boolopt(&config, "print_statistics")? {
-        print_statistics_stub("after if-to-switch");
+        print_statistics(&translator, "after if-to-switch", None);
     }
 
     // Upstream `:125 remove_obvious_noops()` (second invocation).
@@ -159,9 +214,70 @@ pub fn backend_optimizations(
     }
 
     // Upstream `:130 gilanalysis.analyze(graphs, translator)`.
-    Err(TaskError {
-        message: "all.py:130 gilanalysis.analyze not yet ported".to_string(),
-    })
+    //
+    // `gilanalysis::analyze` constructs a `GilAnalyzer`
+    // (`graphanalyze::GraphAnalyzer<bool, ()>`) and invokes
+    // `analyze_direct_call` for every graph carrying
+    // `_no_release_gil_`. Pyre is freethreaded, so this is not a
+    // literal GIL-release check: the analyzer treats the upstream
+    // flag as a no-thread-safepoint contract and rejects transitive
+    // callees that close the stack, break transactions, or cross an
+    // unresolved external-call boundary.
+    gilanalysis::analyze(&graphs, &translator)
+}
+
+/// RPython `inline_malloc_removal_phase(config, translator, graphs,
+/// inline_threshold, inline_heuristic, call_count_pred=None,
+/// inline_graph_from_anywhere=False)` at `all.py:138-164`.
+///
+/// `call_count_pred` is pinned to `None` to match
+/// [`inline::auto_inline_graphs`]'s current shape — see the
+/// PRE-EXISTING-ADAPTATION on [`inline::auto_inlining`] for the
+/// `Rc<RefCell<dyn FnMut>>` carrier work that would unblock threading
+/// it. Upstream's only `call_count_pred=...` caller is the
+/// `profile_based_inline` branch, which is itself still gated as
+/// `TaskError` at `:141-145` of [`backend_optimizations`], so the
+/// pin is observationally complete.
+pub(crate) fn inline_malloc_removal_phase(
+    config: &Rc<Config>,
+    translator: &Rc<TranslationContext>,
+    graphs: &[GraphRef],
+    inline_threshold: f64,
+    inline_heuristic: fn(&GraphRef) -> (f64, bool),
+    inline_graph_from_anywhere: bool,
+) -> Result<(), TaskError> {
+    // Upstream `:143-151 if inline_threshold: log.inlining(...) ;
+    // inline.auto_inline_graphs(...)`. `log.inlining` is a
+    // verbose-only log call (`support.py:21-26`); skipping it is the
+    // same convention as everywhere else in this module.
+    if inline_threshold != 0.0 {
+        inline::auto_inline_graphs(
+            translator,
+            graphs,
+            inline_threshold,
+            inline_heuristic,
+            None,
+            inline_graph_from_anywhere,
+        )
+        .map_err(|e| TaskError {
+            message: format!("all.py:148 auto_inline_graphs: {}", e.0),
+        })?;
+
+        // Upstream `:153-155 if config.print_statistics: print_statistics(...)`.
+        if boolopt(config, "print_statistics")? {
+            print_statistics(translator, "after inlining", None);
+        }
+    }
+
+    // Upstream `:158-164 if config.mallocs: log.malloc(...) ;
+    // remove_mallocs(translator, graphs); ...`.
+    if boolopt(config, "mallocs")? {
+        return Err(TaskError {
+            message: "all.py:160 remove_mallocs (malloc.py) not yet ported".to_string(),
+        });
+    }
+
+    Ok(())
 }
 
 /// RPython `constfold(config, graphs)` at `all.py:133-136`.
@@ -188,9 +304,28 @@ pub(crate) fn remove_obvious_noops(
         removenoops::remove_duplicate_casts(&graph, translator);
     }
     if boolopt(config, "print_statistics")? {
-        print_statistics_stub("after no-op removal");
+        print_statistics(translator, "after no-op removal", None);
     }
     Ok(())
+}
+
+/// Upstream `print("after %s:" % phase); print_statistics(translator.graphs[0],
+/// translator, ...)` at `all.py:51-53` / `:76-78` / `:121-123` /
+/// `:153-155` / `:162-164`. Only the first call (pre-optimisation)
+/// takes a non-default `save_per_graph_details = "per-graph.txt"` —
+/// every later call defaults to `None`.
+fn print_statistics(
+    translator: &TranslationContext,
+    phase: &str,
+    save_per_graph_details: Option<&Path>,
+) {
+    println!("{phase}:");
+    let graphs = translator.graphs.borrow();
+    if let Some(entry) = graphs.first() {
+        // Upstream call sites pass `ignore_stack_checks=False` (the
+        // default) at every call site in `all.py`.
+        stat::print_statistics(entry, translator, save_per_graph_details, false);
+    }
 }
 
 fn backendopt_config(
@@ -255,8 +390,6 @@ fn stropt(config: &Rc<Config>, name: &str) -> Result<Option<String>, TaskError> 
     }
 }
 
-fn print_statistics_stub(_phase: &str) {}
-
 fn task_error(error: impl std::fmt::Debug) -> TaskError {
     TaskError {
         message: format!("all.py backend_optimizations config error: {error:?}"),
@@ -280,18 +413,15 @@ mod tests {
         Rc::new(RefCell::new(graph))
     }
 
-    /// Default backendopt config has `inline`, `mallocs`, `merge_if_blocks`,
-    /// `storesink` all True. None of those subpasses are ported; pass kwds
-    /// that disable them so the structural shell tests exercise only the
-    /// ported subset (replace_we_are_jitted / removenoops / simplify /
-    /// constfold).
+    /// Default backendopt config has `inline`, `mallocs` True.
+    /// `mallocs` remains unported locally — the malloc.py port has
+    /// not landed, so `inline_malloc_removal_phase` surfaces it as a
+    /// `TaskError` at upstream `:160`. Tests disable `mallocs` so the
+    /// structural shell exercises every other pass — including the
+    /// now-ported `inline.auto_inline_graphs`, `storesink`, and
+    /// `merge_if_blocks`.
     fn ported_only_kwds() -> Vec<(String, OptionValue)> {
-        vec![
-            ("inline".to_string(), OptionValue::Bool(false)),
-            ("mallocs".to_string(), OptionValue::Bool(false)),
-            ("merge_if_blocks".to_string(), OptionValue::Bool(false)),
-            ("storesink".to_string(), OptionValue::Bool(false)),
-        ]
+        vec![("mallocs".to_string(), OptionValue::Bool(false))]
     }
 
     fn make_int_constfold_graph() -> (Variable, GraphRef) {
@@ -318,11 +448,14 @@ mod tests {
     }
 
     #[test]
-    fn backendopt_fails_fast_with_unported_leaf_listing() {
-        // Upstream `all.py:35-130` either runs the full pipeline or
-        // raises before any mutation. Several passes are unported
-        // locally (`gilanalysis.analyze` runs unconditionally at
-        // `:130`), so the call must fail before mutating any graph.
+    fn backendopt_runs_to_terminal_gilanalysis() {
+        // Upstream `all.py:35-130` runs the full pipeline. The
+        // local port has `inline` / `mallocs` /
+        // `profile_based_inline` gated off via config kwds in
+        // `ported_only_kwds`; every other pass — including
+        // `gilanalysis::analyze` at the tail (`:130`) — is ported.
+        // This fixture carries no `_no_release_gil_` marker, so the
+        // freethreaded safepoint analysis has no roots to reject.
         let start = Block::shared(vec![]);
         let graph = FunctionGraph::new("f", start.clone());
         start.closeblock(vec![
@@ -335,32 +468,15 @@ mod tests {
         ]);
         let graph = graph_ref(graph);
 
-        let snapshot_ops_before = graph.borrow().startblock.borrow().operations.clone();
-        let err = backend_optimizations(
+        backend_optimizations(
             fixture_translator(),
-            Some(vec![graph.clone()]),
+            Some(vec![graph]),
             false,
             false,
             ported_only_kwds(),
             None,
         )
-        .expect_err("backendopt with any unported leaf must fail without mutation");
-
-        // The reported message must enumerate the unported leaves the
-        // current call would have needed to honour, so callers can see
-        // which specific leaves are still pending.
-        assert!(
-            err.message.contains("all.py:130 gilanalysis.analyze"),
-            "expected gilanalysis citation, got: {}",
-            err.message
-        );
-
-        // No graph mutation must have happened before the error fired.
-        let snapshot_ops_after = graph.borrow().startblock.borrow().operations.clone();
-        assert_eq!(
-            snapshot_ops_before, snapshot_ops_after,
-            "backend_optimizations must not mutate graphs before failing"
-        );
+        .expect("backendopt should run cleanly through the gilanalysis tail");
     }
 
     #[test]
@@ -419,5 +535,125 @@ mod tests {
                 ..
             })
         ));
+    }
+
+    #[test]
+    fn inline_malloc_phase_runs_auto_inline_graphs_then_constfold() {
+        // `inline=true, mallocs=false` exercises the wired
+        // `inline_malloc_removal_phase` (upstream `:88-91`) followed
+        // by the `constfold(config, graphs)` cleanup at upstream
+        // `:92`. The fixture has no inter-graph calls, so
+        // `auto_inline_graphs`'s callgraph is empty and the pass is
+        // a no-op — the `int_add(1, 2)` is folded by the trailing
+        // `constfold_pass`.
+        let (_r, graph) = make_int_constfold_graph();
+        backend_optimizations(
+            fixture_translator(),
+            Some(vec![graph.clone()]),
+            false,
+            false,
+            ported_only_kwds(),
+            None,
+        )
+        .expect("backendopt with inline=true should run cleanly");
+
+        let borrowed = graph.borrow();
+        assert!(borrowed.startblock.borrow().operations.is_empty());
+        let link_arg = borrowed.startblock.borrow().exits[0].borrow().args[0]
+            .clone()
+            .expect("link arg");
+        assert!(matches!(
+            link_arg,
+            Hlvalue::Constant(Constant {
+                value: ConstValue::Int(3),
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn inline_malloc_phase_surfaces_mallocs_taskerror_when_enabled() {
+        // `mallocs=true` (the upstream default) is unported because
+        // `malloc.py::remove_mallocs` has not landed.
+        // `inline_malloc_removal_phase` surfaces a `TaskError` when
+        // the gate runs, matching the convention of every other
+        // unported pass in this module.
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("f", start.clone());
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Constant(Constant::new(ConstValue::None))],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let graph = graph_ref(graph);
+
+        let result = backend_optimizations(
+            fixture_translator(),
+            Some(vec![graph]),
+            false,
+            false,
+            // Default `mallocs=true`, default `inline=true`.
+            Vec::new(),
+            None,
+        );
+
+        match result {
+            Err(e) => assert!(
+                e.message.contains("remove_mallocs"),
+                "expected remove_mallocs TaskError, got {:?}",
+                e.message
+            ),
+            Ok(()) => panic!("expected TaskError when mallocs=true is enabled"),
+        }
+    }
+
+    #[test]
+    fn inline_heuristic_other_than_default_returns_taskerror() {
+        // `inline_heuristic` is structurally a dotted name resolved
+        // by upstream's `get_function`. Pyre does not have a
+        // Python-style import resolver, so any value other than the
+        // single shipped default should surface a `TaskError`
+        // instead of being silently mapped — matching the
+        // closed-world parity contract documented at the call site.
+        let start = Block::shared(vec![]);
+        let graph = FunctionGraph::new("f", start.clone());
+        start.closeblock(vec![
+            Link::new(
+                vec![Hlvalue::Constant(Constant::new(ConstValue::None))],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let graph = graph_ref(graph);
+
+        let kwds = vec![
+            ("mallocs".to_string(), OptionValue::Bool(false)),
+            (
+                "inline_heuristic".to_string(),
+                OptionValue::Str("custom.heuristic.path".to_string()),
+            ),
+        ];
+
+        let result = backend_optimizations(
+            fixture_translator(),
+            Some(vec![graph]),
+            false,
+            false,
+            kwds,
+            None,
+        );
+
+        match result {
+            Err(e) => assert!(
+                e.message.contains("inline_heuristic"),
+                "expected inline_heuristic TaskError, got {:?}",
+                e.message
+            ),
+            Ok(()) => panic!("expected TaskError on non-default inline_heuristic"),
+        }
     }
 }

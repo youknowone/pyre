@@ -368,7 +368,7 @@ fn can_remove_builtins() -> Vec<HostObject> {
 ///         return None
 /// ```
 ///
-fn get_graph_for_call(arg: &Hlvalue, translator: &TranslationContext) -> Option<GraphRef> {
+pub fn get_graph_for_call(arg: &Hlvalue, translator: &TranslationContext) -> Option<GraphRef> {
     // upstream: `if isinstance(arg, Variable): return None`.
     let Hlvalue::Constant(c) = arg else {
         return None;
