@@ -2064,19 +2064,32 @@ fn register_helper_fn_pointers(
 /// `LivenessIterator`, so the post-rename `-live-` marker is the
 /// sole source.
 ///
-/// The Ref bank still carries one PRE-EXISTING-ADAPTATION — the
-/// LV∩SSA `live_r.retain(...)` intersection (Task #181 / parent
-/// #185 epic, blocked by Task #110 slice 3b + Task #158 graph
-/// regalloc). RPython's `liveness.py:19-76` produces a single
-/// SSA-driven alive set as the sole authority. The pyre retain
-/// compensates for the post-rename namespace conflation between
-/// scratch Variables and Python-frame Variables (chordal coloring
-/// places scratches on Python-frame colors when their live ranges
-/// don't overlap; see `MAJIT_PROBE_SCRATCH_COLLAPSE` data in
-/// `task158_scratch_collapse_probe_data_2026_04_28.md`).
-/// Convergence path: graph regalloc with separate scratch color
-/// space (Task #158 item 4) eliminates the conflation, after which
-/// the retain becomes provably dead and is removed.
+/// The Ref bank still carries the LV∩SSA `live_r.retain(...)` intersect
+/// as a PRE-EXISTING-ADAPTATION (Task #181 / parent #185 epic, blocked
+/// by Task #110 slice 3b + Task #158 graph regalloc). RPython's
+/// `liveness.py:19-76 compute_liveness` produces a single SSA-driven
+/// alive set as the sole authority; pyre's retain compensates for a
+/// matching consumer-side adaptation. The encoder at
+/// `pyre-jit-trace/src/trace_opcode.rs:get_list_of_active_boxes`
+/// already carries every live-ref color end-to-end: a semantic-prefix
+/// hit (`semantic_ref_slot_for_reg_color`) returns the local/stack
+/// OpRef, and a miss falls back to `registers_r_bank[reg]` so scratch
+/// colors are emitted into the active-box stream. The blackhole
+/// decoder (`call_jit.rs::resume_in_blackhole` / `consume_one_section`)
+/// however restores only post-rename Python-frame colors; scratch
+/// colors that survived the encoder land in `registers_r[scratch]` as
+/// uninitialised slots when blackhole resumes. RPython's flat
+/// `_registers_r` register file makes encoder and decoder indices
+/// agree by construction. Pyre's retain shrinks the producer side so
+/// the asymmetric consumer never sees a color it cannot restore —
+/// dropping the retain alone leaves scratch live refs visible to the
+/// consumer (verified empirically — fannkuch(9) and nbody SIGSEGV on
+/// cranelift when the retain was removed in isolation at
+/// b72cf1d743d). Convergence path: graph regalloc with separate
+/// scratch color space (Task #158 item 4) eliminates the conflation,
+/// after which the decoder can address scratch refs as their own
+/// register-file slot and both the retain and the producer's
+/// fallback path become provably dead together.
 ///
 /// The "all stack slots up to current depth hold a live box"
 /// runtime contract is now enforced consumer-side in
@@ -2263,21 +2276,20 @@ fn filter_liveness_in_place(
         // (`call_jit.rs::resume_in_blackhole`), which copies any color
         // in `stack_slot_color_map[..depth_at_py_pc[py_pc]]` not in
         // `live_r` from the heap PyFrame via `vable_read_array_item`.
-        // The codewriter `live_r` now mirrors RPython's
-        // `liveness.py:67-75` SSA-driven alive set alone — every alive
-        // Register pushed in encounter order with seen-set dedup, no
-        // pyre-only widening.
-        // liveness.  RPython's `liveness.py:19-76` produces a single
-        // SSA-driven alive set as the sole authority — there is no
-        // per-bytecode local-liveness narrowing layered on top.  Pyre's
-        // tracer + blackhole register-file decode (the
+        //
+        // PRE-EXISTING-ADAPTATION: the LV∩SSA retain below narrows
+        // `live_r` to colors that map to a currently LV-live Python
+        // local or stack slot. RPython `liveness.py:19-76` produces
+        // a single SSA-driven alive set as the sole authority — there
+        // is no per-bytecode local-liveness narrowing layered on top.
+        // Pyre's tracer + blackhole register-file decode (the
         // `semantic_ref_slot_for_reg_color` path at
         // `pyre-jit-trace/src/state.rs`) is still wired to the Python
-        // LV answer for locals (which omits function parameters at pc=0
-        // and dead locals); SSA-only widening here would make those
-        // decode sites read uninitialised slots.  Convergence path:
-        // SSA-authoritative live_r — Task #110 +
-        // `phase4_ssa_liveness_blocker_2026_04_18.md`.  Multi-session
+        // LV answer for locals (which omits function parameters at
+        // pc=0 and dead locals); SSA-only widening here would make
+        // those decode sites read uninitialised slots. Convergence
+        // path: SSA-authoritative live_r — Task #110 +
+        // `phase4_ssa_liveness_blocker_2026_04_18.md`. Multi-session
         // epic; remove this `live_r.retain` only when both the tracer
         // encoder and the BH decoder consume the SSA-driven liveness
         // directly.

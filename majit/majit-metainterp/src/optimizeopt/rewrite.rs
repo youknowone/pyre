@@ -1657,19 +1657,42 @@ impl OptRewrite {
                 if let Some(old_idx) = old_guard_idx
                     && !ctx.is_resume_at_position_guard(old_idx as i32)
                 {
-                    // rewrite.py:417-420 + resoperation.py:498-503
-                    // GuardResOp.copy_and_change parity: preserves
-                    // fail_args, fail_arg_types, rd_resume_position,
-                    // rd_numb, rd_consts, rd_virtuals, rd_pendingfields
-                    // that majit's inline store_final_boxes_in_guard
-                    // populated on the old guard. descr is cleared
-                    // (Some(None)) per rewrite.py:417 fresh ResumeGuardDescr,
-                    // dropping any RAPD marker so codegen produces a
-                    // fresh CraneliftFailDescr.
+                    // rewrite.py:417-420 fresh descr + replace_guard +
+                    // emit chain → optimizer.py:713-720 replace_guard_op
+                    // copy_all_attributes_from(new_descr, old_descr).
+                    //
+                    //   descr = compile.ResumeGuardDescr()
+                    //   op = old_guard_op.copy_and_change(...,
+                    //                                     descr=descr)
+                    //   self.optimizer.replace_guard(op, info)
+                    //   return self.emit(op)
+                    //   # → _emit_operation → replaces_guard hit →
+                    //   #   replace_guard_op(old_pos, new_op):
+                    //   #       new_descr.copy_all_attributes_from(
+                    //   #           old_descr)
+                    //   #       _newoperations[old_pos] = new_op
+                    //
+                    // Pyre writes the combined op directly into the slot
+                    // (no replaces_guard registry trip), so we mint the
+                    // fresh ResumeGuardDescr inline and call
+                    // copy_all_attributes_from explicitly to populate
+                    // rd_numb / rd_consts / rd_virtuals / rd_pendingfields
+                    // / rd_vector_info from the old descr. The
+                    // RAPD-skip gate at
+                    // `is_resume_at_position_guard(old_idx)` above
+                    // ensures the donor is a real ResumeGuardDescr.
+                    let new_descr = crate::compile::make_resume_guard_descr_typed(
+                        old_guard.fail_arg_types.clone().unwrap_or_default(),
+                    );
+                    let old_descr = old_guard
+                        .descr
+                        .as_ref()
+                        .expect("strengthened GUARD_CLASS donor must carry a descr");
+                    crate::compile::copy_all_attributes_from(&new_descr, old_descr);
                     let combined = old_guard.copy_and_change(
                         OpCode::GuardNonnullClass,
                         Some(&[old_guard.arg(0), op.arg(1)]),
-                        Some(None),
+                        Some(Some(new_descr)),
                     );
                     ctx.new_operations[old_idx] = combined;
                     // rewrite.py:430-436 postprocess_GUARD_CLASS parity

@@ -995,32 +995,45 @@ pub fn resume_in_blackhole(
         );
 
         // PRE-EXISTING-ADAPTATION: consumer-side enforcement of the "all
-        // stack slots up to current depth hold a live box" runtime
-        // contract. RPython's `resume.py:1017-1026 _prepare_next_section`
+        // Python frame slots the blackhole may read hold a live box"
+        // runtime contract. RPython's `resume.py:1017-1026 _prepare_next_section`
         // has no heap-read step — its SSA `_registers_r[stack_color]`
-        // model already covers stack slots through the dataflow because
-        // every push/pop is a direct register-file SSA op. Pyre routes
-        // pushes through `setarrayitem_vable_r` (heap I/O) so the SSA
-        // dataflow does not see push→pop as a register chain, and stack
-        // colors only enter `live_r` when an op directly references them.
-        // For unreferenced (but runtime-on-stack) slots this fallback
-        // re-fills `bh.registers_r[stack_color]` from the heap PyFrame —
-        // the same dual-write source the trace kept in sync via
-        // `setarrayitem_vable_r`. Together with the codewriter `live_r`
-        // (now SSA-only, mirroring `rpython/jit/codewriter/liveness.py`
-        // :67-75), the contract still holds at every guard fail.
+        // model already covers locals/stack through the dataflow because
+        // Python frame reads and pushes are direct register-file SSA ops.
+        // Pyre keeps a virtualizable heap mirror and narrows `live_r` with
+        // the Python LiveVars result, so a local color may be absent from the
+        // compact resume section even though the next BH opcode will read it.
+        // Pyre also routes pushes through `setarrayitem_vable_r` (heap I/O),
+        // so the SSA dataflow does not see push→pop as a register chain, and
+        // stack colors only enter `live_r` when an op directly references
+        // them. For such absent locals/stack slots this fallback re-fills
+        // `bh.registers_r[color]` from the heap PyFrame — the same dual-write
+        // source the trace kept in sync via `setarrayitem_vable_r`.
         //
         // Convergence path: replace pyre's heap-mirror stack model with
         // RPython's register-file SSA model (push/pop emit direct
-        // `_registers_r[stack_color]` SSA writes/reads instead of
-        // `setarrayitem_vable_r` / `getarrayitem_vable_r`). Multi-session
-        // architectural change — multiple bytecode handlers in
+        // `_registers_r[color]` SSA writes/reads instead of relying on the
+        // virtualizable heap mirror). Multi-session architectural change —
+        // multiple bytecode handlers in
         // `pyre/pyre-jit/src/jit/codewriter.rs` would need to switch
         // emit form, and the runtime PyFrame heap mirror would shrink
         // to "snapshot only at force_now" (matching `pyjitpl.py`'s
         // `force_virtualizable` semantics). After that conversion,
-        // `live_r` from the SSA dataflow alone covers stack colors and
-        // this fallback can be removed.
+        // `live_r` from the SSA dataflow alone covers these colors and this
+        // fallback can be removed.
+        //
+        // The locals-side variant of this fallback was REMOVED 2026-04-28:
+        // a `for local_idx in 0..nlocals` loop wrote
+        // `bh.registers_r[local_idx] = vable.values[local_idx]`, but that
+        // conflates Python frame slot index with abstract register color.
+        // Post-chordal-coloring those namespaces diverge — `local_idx=2`
+        // can be a scratch color for an intermediate ref while
+        // `vable.values[2]` is the Python local `q`. Filling it out from
+        // heap clobbered the scratch slot the codewriter expected to read
+        // post-resume (e.g. fannkuch BC_MOVE_R src=2 dst=10), poisoning
+        // the trace with a list-ref where it expected a temporary.  The
+        // stack tail below still uses `stack_color_map[stack_idx]` which
+        // IS the post-regalloc color, so it is correct.
         let depth_at_pc = &pyjitcode.metadata.depth_at_py_pc;
         let stack_color_map = &pyjitcode.metadata.stack_slot_color_map;
         let depth = if py_pc < depth_at_pc.len() {

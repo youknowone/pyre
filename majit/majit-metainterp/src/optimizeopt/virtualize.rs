@@ -1853,6 +1853,16 @@ fn virtualizable_field_index(offset: usize) -> u32 {
 ///
 /// Field descriptor indices encode offset, size, and type. This extracts
 /// just the byte offset for matching against VirtualizableConfig offsets.
+///
+/// PRE-EXISTING-ADAPTATION: RPython Descr objects are heap-allocated
+/// `FieldDescr` / `ArrayDescr` instances (`rpython/jit/backend/llsupport/descr.py`)
+/// referenced through Box pointer identity. Pyre's `Op.descr` is a `u32`
+/// index instead of `Box<dyn Descr>`, so the encoding `FIELD_DESCR_TAG |
+/// (offset << 4) | (size << 1) | type_bits` packs the descriptor's
+/// distinguishing fields into the index itself. The tag bit `0x1000_0000`
+/// in the high nibble distinguishes field descriptors from other descr
+/// kinds sharing the same `u32` namespace. Convergence requires landing
+/// the proper Descr-as-trait-object infrastructure in `majit-ir`.
 fn extract_field_offset(descr_idx: u32) -> Option<usize> {
     const FIELD_DESCR_TAG: u32 = 0x1000_0000;
     if descr_idx & 0xF000_0000 != FIELD_DESCR_TAG {

@@ -569,10 +569,14 @@ pub fn portal_redirect_enabled() -> bool {
 /// drain populate `MetaInterpStaticData.jitcodes` — both holding the
 /// same Python object.
 ///
-/// G.3c — when `PYRE_PORTAL_REDIRECT` env is set, pyre-jit's ensure path
-/// publishes a writer-owned portal jitcode for registered portals instead
-/// of letting the trace crate construct a bridge itself. Existing cached entries
-/// (per-CodeObject or portal-bridge) are still served by
+/// G.3c — when `PYRE_PORTAL_REDIRECT` env is set, the writer-side
+/// `compile_jitcode_via_w_code` (codewriter.rs) routes registered
+/// portal codes through `portal_redirect_jitcode_via_w_code` so the
+/// returned `Arc<PyJitCode>` shares identity with
+/// `CallControl.jitcodes[portal_graph]` and `jd.mainjitcode`
+/// (call.py:145-148). The trace side just calls the
+/// `ensure_majit_jitcode` callback like any other miss; existing cached
+/// entries (per-CodeObject or portal-bridge) are still served by
 /// `compiled_jitcode_lookup`. The flag is OFF by default — flag-OFF
 /// behavior is byte-for-byte identical to pre-G.3c.
 pub(crate) fn jitcode_for(code: *const ()) -> *const JitCode {
@@ -912,19 +916,43 @@ fn value_for_slot(ty: Type, bits: i64) -> majit_ir::Value {
     }
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FrameLivenessRegIndices {
+    pub int: Vec<u32>,
+    pub ref_: Vec<u32>,
+    pub float: Vec<u32>,
+}
+
+impl FrameLivenessRegIndices {
+    pub fn total_len(&self) -> usize {
+        self.int.len() + self.ref_.len() + self.float.len()
+    }
+
+    pub fn flattened(&self) -> Vec<u32> {
+        let mut out = Vec::with_capacity(self.total_len());
+        out.extend_from_slice(&self.int);
+        out.extend_from_slice(&self.ref_);
+        out.extend_from_slice(&self.float);
+        out
+    }
+}
+
 /// resume.py:1054 consume_boxes(info, boxes_i, boxes_r, boxes_f) parity:
-/// Returns the register indices for live values at (jitcode_index, pc) in
-/// the same order the encoder wrote them — [int bank..., ref bank..., float
-/// bank...]. Each entry is the frame register/slot number that the decoded
-/// frames[0].values[j] should be written to, matching RPython's per-bank
-/// callback walk.
-pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
+/// Returns the live register indices at (jitcode_index, pc), split by the
+/// same three banks the liveness header stores. RPython writes decoded values
+/// through `_callback_i/_callback_r/_callback_f` into `registers_i/r/f[index]`;
+/// keeping the banks separate prevents Ref-only semantic-slot remapping from
+/// swallowing Int/Float slots or Ref scratch colors.
+pub fn frame_liveness_reg_indices_by_bank_at(
+    jitcode_index: i32,
+    pc: i32,
+) -> FrameLivenessRegIndices {
     ensure_finish_setup();
     METAINTERP_SD.with(|r| {
         let sd = r.borrow();
         let idx = jitcode_index as usize;
         let Some(jc) = sd.jitcodes.get(idx) else {
-            return Vec::new();
+            return FrameLivenessRegIndices::default();
         };
         let payload = &jc.payload;
         // G.4.4 portal-bridge fallback (symmetric with frame_value_count_at:803
@@ -945,34 +973,51 @@ pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
                 .copied()
                 .unwrap_or(0) as usize;
             let total = payload.metadata.stack_base + depth;
-            return (0..total as u32).collect();
+            return FrameLivenessRegIndices {
+                int: Vec::new(),
+                ref_: (0..total as u32).collect(),
+                float: Vec::new(),
+            };
         }
         let Some(&jit_pc) = payload.metadata.pc_map.get(pc as usize) else {
-            return Vec::new();
+            return FrameLivenessRegIndices::default();
         };
         let off = payload.jitcode.get_live_vars_info(jit_pc, sd.op_live);
         let all_liveness = &sd.liveness_info;
         if off + 2 >= all_liveness.len() {
-            return Vec::new();
+            return FrameLivenessRegIndices::default();
         }
         let length_i = all_liveness[off] as u32;
         let length_r = all_liveness[off + 1] as u32;
         let length_f = all_liveness[off + 2] as u32;
         let mut cursor = off + 3;
-        let mut out: Vec<u32> = Vec::with_capacity((length_i + length_r + length_f) as usize);
         use majit_translate::liveness::LivenessIterator;
-        for length in [length_i, length_r, length_f] {
+
+        fn read_bank(cursor: &mut usize, length: u32, all_liveness: &[u8]) -> Vec<u32> {
             if length == 0 {
-                continue;
+                return Vec::new();
             }
-            let mut it = LivenessIterator::new(cursor, length, all_liveness);
+            let mut it = LivenessIterator::new(*cursor, length, all_liveness);
+            let mut out = Vec::with_capacity(length as usize);
             while let Some(reg_idx) = it.next() {
                 out.push(reg_idx);
             }
-            cursor = it.offset;
+            *cursor = it.offset;
+            out
         }
-        out
+
+        let int = read_bank(&mut cursor, length_i, all_liveness);
+        let ref_ = read_bank(&mut cursor, length_r, all_liveness);
+        let float = read_bank(&mut cursor, length_f, all_liveness);
+        FrameLivenessRegIndices { int, ref_, float }
     })
+}
+
+/// Backward-compatible flattened view for tests and call sites that only need
+/// the compact active-box order. Prefer `frame_liveness_reg_indices_by_bank_at`
+/// when writing values back into MIFrame register banks.
+pub fn frame_liveness_reg_indices_at(jitcode_index: i32, pc: i32) -> Vec<u32> {
+    frame_liveness_reg_indices_by_bank_at(jitcode_index, pc).flattened()
 }
 
 /// Return the post-regalloc Ref-bank color of each Python-semantic stack
@@ -2513,7 +2558,7 @@ impl PyreSym {
     /// lock-step. Call this everywhere `init_vable_indices()` was
     /// previously invoked directly.
     pub(crate) fn become_active_vable_owner(&mut self) {
-        self.init_vable_indices();
+        self.init_vable_indices(crate::virtualizable_gen::FIRST_VABLE_SCALAR_IDX);
         self.is_active_vable_owner = true;
         debug_assert!(
             self.vable_array_base.is_some(),
@@ -2551,27 +2596,6 @@ impl PyreSym {
         sym.vable_lastblock = state.vable_lastblock;
         sym.vable_w_globals = state.vable_w_globals;
         sym
-    }
-
-    #[allow(dead_code)]
-    pub(crate) fn shift_virtualizable_input_indices(&mut self, extra_reds: u32) {
-        if extra_reds == 0 {
-            return;
-        }
-        let shift = |opref: &mut OpRef| {
-            if !opref.is_none() {
-                *opref = OpRef(opref.0 + extra_reds);
-            }
-        };
-        shift(&mut self.vable_last_instr);
-        shift(&mut self.vable_pycode);
-        shift(&mut self.vable_valuestackdepth);
-        shift(&mut self.vable_debugdata);
-        shift(&mut self.vable_lastblock);
-        shift(&mut self.vable_w_globals);
-        if let Some(base) = self.vable_array_base.as_mut() {
-            *base += extra_reds;
-        }
     }
 
     /// Initialize symbolic tracking state. Called once when the owning
@@ -3000,85 +3024,6 @@ impl PyreJitState {
         args.push((sym.execution_context, Type::Ref));
         args.extend_from_slice(&base[1..]);
         args
-    }
-
-    #[cfg_attr(not(test), allow(dead_code))]
-    fn pypyjit_create_sym(meta: &PyreMeta, _header_pc: usize) -> PyreSym {
-        let mut sym = PyreSym::new_uninit(OpRef(0));
-        sym.execution_context = OpRef(1);
-        sym.become_active_vable_owner();
-        sym.shift_virtualizable_input_indices(1);
-        sym.nlocals = meta.num_locals;
-        sym.valuestackdepth = meta.valuestackdepth;
-        sym.symbolic_local_types = vec![Type::Ref; meta.num_locals];
-        sym.symbolic_stack_types = vec![Type::Ref; meta.vable_stack_only_depth()];
-        let stack_only = meta.vable_stack_only_depth();
-        sym.concrete_stack = vec![ConcreteValue::Null; stack_only];
-        sym
-    }
-
-    #[allow(dead_code)]
-    fn restore_expanded_virtualizable_values_with_extra_reds(
-        &mut self,
-        meta: &PyreMeta,
-        values: &[Value],
-        extra_reds: usize,
-    ) {
-        let Some(frame) = values.first() else {
-            return;
-        };
-        self.frame = value_to_usize(frame);
-        if values.len() <= 1 + extra_reds {
-            return;
-        }
-
-        if meta.has_virtualizable {
-            self.set_valuestackdepth(meta.valuestackdepth);
-            let nlocals = self.local_count();
-            let stack_only = meta.valuestackdepth.saturating_sub(nlocals);
-            let mut idx = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + extra_reds;
-            for local_idx in 0..nlocals {
-                if let Some(value) = values.get(idx) {
-                    let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
-                    let _ =
-                        self.set_local_at(local_idx, boxed_slot_value_for_type(slot_type, value));
-                }
-                idx += 1;
-            }
-            for i in 0..stack_only {
-                if let Some(value) = values.get(idx) {
-                    let slot_type = meta
-                        .slot_types
-                        .get(nlocals + i)
-                        .copied()
-                        .unwrap_or(Type::Ref);
-                    let _ = self.set_stack_at(i, boxed_slot_value_for_type(slot_type, value));
-                }
-                idx += 1;
-            }
-        } else {
-            let nlocals = self.local_count();
-            let stack_only_depth = meta.valuestackdepth.saturating_sub(nlocals);
-            let mut idx = 1 + extra_reds;
-            for local_idx in 0..nlocals {
-                let slot_type = meta.slot_types.get(local_idx).copied().unwrap_or(Type::Ref);
-                let _ = self.set_local_at(
-                    local_idx,
-                    boxed_slot_value_for_type(slot_type, &values[idx]),
-                );
-                idx += 1;
-            }
-            for i in 0..stack_only_depth {
-                let slot_type = meta
-                    .slot_types
-                    .get(nlocals + i)
-                    .copied()
-                    .unwrap_or(Type::Ref);
-                let _ = self.set_stack_at(i, boxed_slot_value_for_type(slot_type, &values[idx]));
-                idx += 1;
-            }
-            self.set_valuestackdepth(meta.valuestackdepth);
-        }
     }
 
     /// virtualizable.py:126-137 write_from_resume_data_partial parity.
@@ -4393,56 +4338,47 @@ impl JitState for PyreJitState {
         // prefix for init_virtualizable_boxes below. Matches
         // virtualizable.py:86 `read_boxes` layout
         //   [vable_ptr, static_fields..., array_items...].
+        // Resume virtualizable payload mirrors RPython
+        // opencoder.py:718-725 + virtualizable.py:139-154:
+        //   [vable, vable_static_fields..., array_items...]
+        // Non-vable extra reds (e.g. `ec` from interp_jit.py:67) are part of
+        // root trace inputargs, not this virtualizable payload. Keep this
+        // boundary on `NUM_VABLE_SCALARS`, not `NUM_SCALAR_INPUTARGS`, so
+        // enabling extra reds does not skip the first vable static field.
         let vvals = &resume_data.virtualizable_values;
-        let num_scalars = crate::virtualizable_gen::NUM_SCALAR_INPUTARGS;
-        let mut vable_array_items: Vec<OpRef> =
-            Vec::with_capacity(vvals.len().saturating_sub(num_scalars));
-        let mut vable_scalar_values: Vec<majit_ir::Value> =
-            Vec::with_capacity(num_scalars.saturating_sub(1));
-        let mut vable_array_values: Vec<majit_ir::Value> =
-            Vec::with_capacity(vvals.len().saturating_sub(num_scalars));
-        let mut vable_ref_value = majit_ir::Value::Void;
-        for (i, v) in vvals.iter().enumerate() {
-            let resolved = resolve(ctx, &mut virtuals_cache, v);
-            let concrete = decode_concrete(v);
-            match i {
-                0 => vable_ref_value = concrete, // frame_ptr — implicit OpRef, explicit concrete
-                1 => {
-                    sym.vable_last_instr = resolved;
-                    vable_scalar_values.push(concrete);
-                }
-                2 => {
-                    sym.vable_pycode = resolved;
-                    vable_scalar_values.push(concrete);
-                }
-                3 => {
-                    sym.vable_valuestackdepth = resolved;
-                    vable_scalar_values.push(concrete);
-                }
-                4 => {
-                    sym.vable_debugdata = resolved;
-                    vable_scalar_values.push(concrete);
-                }
-                5 => {
-                    sym.vable_lastblock = resolved;
-                    vable_scalar_values.push(concrete);
-                }
-                6 => {
-                    sym.vable_w_globals = resolved;
-                    vable_scalar_values.push(concrete);
-                }
-                _ => {
-                    vable_array_items.push(resolved);
-                    vable_array_values.push(concrete);
-                }
-            }
+        let first_vable_scalar_idx = 1usize;
+        let vable_array_start =
+            first_vable_scalar_idx + crate::virtualizable_gen::NUM_VABLE_SCALARS;
+        let mut oprefs: Vec<OpRef> = Vec::with_capacity(vvals.len());
+        let mut concrete_values: Vec<majit_ir::Value> = Vec::with_capacity(vvals.len());
+        for v in vvals {
+            oprefs.push(resolve(ctx, &mut virtuals_cache, v));
+            concrete_values.push(decode_concrete(v));
         }
+        sym.restore_inputarg_oprefs(&oprefs, first_vable_scalar_idx);
+        let vable_ref_value = concrete_values
+            .first()
+            .copied()
+            .unwrap_or(majit_ir::Value::Void);
+        let vable_scalar_values: Vec<majit_ir::Value> = concrete_values
+            .iter()
+            .skip(first_vable_scalar_idx)
+            .take(crate::virtualizable_gen::NUM_VABLE_SCALARS)
+            .copied()
+            .collect();
+        let vable_array_items: Vec<OpRef> =
+            oprefs.iter().skip(vable_array_start).copied().collect();
+        let vable_array_values: Vec<majit_ir::Value> = concrete_values
+            .iter()
+            .skip(vable_array_start)
+            .copied()
+            .collect();
 
         // Part 2 — frame registers (consume_boxes): walk the frame section
-        // in liveness enumeration order ([int..., ref..., float...]), map
-        // each decoded value back to its register slot via
-        // `frame_liveness_reg_indices_at`, and write it into the unified
-        // abstract register file (`registers_r`). This mirrors
+        // in liveness enumeration order ([int..., ref..., float...]), keep
+        // each bank's register indices separate via
+        // `frame_liveness_reg_indices_by_bank_at`, and write each decoded
+        // value into the corresponding MIFrame register bank. This mirrors
         // resume.py:1054 `consume_boxes`
         // (`_callback_i/_r/_f(register_index)` writing to
         // `f.registers_i/_r/_f[index]` at the exact slot liveness
@@ -4451,15 +4387,8 @@ impl JitState for PyreJitState {
         // there is no `idx < nlocals` decode.
         let frame0 = &resume_data.frames[0];
         let reg_indices =
-            crate::state::frame_liveness_reg_indices_at(frame0.jitcode_index, frame0.pc);
+            crate::state::frame_liveness_reg_indices_by_bank_at(frame0.jitcode_index, frame0.pc);
         let stack_only = sym.valuestackdepth.saturating_sub(sym.nlocals);
-        let stack_color_map = METAINTERP_SD.with(|r| {
-            let sd = r.borrow();
-            sd.jitcodes
-                .get(frame0.jitcode_index as usize)
-                .map(|jc| jc.payload.metadata.stack_slot_color_map.clone())
-                .unwrap_or_default()
-        });
         let bridge_reg_len = nlocals + stack_only;
         let mut bridge_registers_r = vec![OpRef::NONE; bridge_reg_len];
         // RPython parity: after A.1 the guard-recovery path calls
@@ -4473,32 +4402,74 @@ impl JitState for PyreJitState {
         // local live past the `-live-` marker) and must be surfaced by
         // the assert rather than papered over with a vable-mirror read.
         assert!(
-            reg_indices.len() == frame0.values.len(),
+            reg_indices.total_len() == frame0.values.len(),
             "setup_bridge_sym: reg_indices len={} != frame.values len={} at pc={}",
-            reg_indices.len(),
+            reg_indices.total_len(),
             frame0.values.len(),
             frame0.pc,
         );
-        for (value, &reg_idx) in frame0.values.iter().zip(reg_indices.iter()) {
+        let mut value_cursor = 0usize;
+        for &reg_idx in &reg_indices.int {
+            let value = &frame0.values[value_cursor];
             let resolved = resolve(ctx, &mut virtuals_cache, value);
-            let Some(idx) = semantic_ref_slot_for_reg_color(
-                nlocals,
-                stack_only,
-                &stack_color_map,
-                reg_idx as usize,
-            ) else {
-                continue;
-            };
-            if idx < bridge_registers_r.len() {
-                bridge_registers_r[idx] = resolved;
+            let reg_idx = reg_idx as usize;
+            if reg_idx >= sym.registers_i.len() {
+                sym.registers_i.resize(reg_idx + 1, OpRef::NONE);
             }
+            sym.registers_i[reg_idx] = resolved;
+            value_cursor += 1;
         }
-        for (idx, slot) in bridge_registers_r.iter_mut().enumerate() {
+        for &reg_idx in &reg_indices.ref_ {
+            let value = &frame0.values[value_cursor];
+            let resolved = resolve(ctx, &mut virtuals_cache, value);
+            let reg_idx = reg_idx as usize;
+            if reg_idx >= bridge_registers_r.len() {
+                bridge_registers_r.resize(reg_idx + 1, OpRef::NONE);
+            }
+            // RPython resume.py:1077-1081 `_callback_r(register_index)`
+            // writes only `registers_r[reg_idx]`. Mirroring to the
+            // semantic local/stack prefix would inject a scratch
+            // register's payload into a Python-frame slot whenever the
+            // chordal coloring assigned that scratch the same color as
+            // a local — the producer/consumer color conflation tracked
+            // by the codewriter retain. Single direct write only;
+            // LOAD_FAST/stack reads consult the same Ref bank the
+            // encoder reads (`get_list_of_active_boxes`).
+            bridge_registers_r[reg_idx] = resolved;
+            value_cursor += 1;
+        }
+        for &reg_idx in &reg_indices.float {
+            let value = &frame0.values[value_cursor];
+            let resolved = resolve(ctx, &mut virtuals_cache, value);
+            let reg_idx = reg_idx as usize;
+            if reg_idx >= sym.registers_f.len() {
+                sym.registers_f.resize(reg_idx + 1, OpRef::NONE);
+            }
+            sym.registers_f[reg_idx] = resolved;
+            value_cursor += 1;
+        }
+        // PRE-EXISTING-ADAPTATION: RPython resume.py:1077
+        // `_callback_r(register_index)` writes ONLY the liveness-listed
+        // slots in `registers_r[reg_idx]` and never falls back to a vable
+        // mirror. pyre still does because of the same producer/consumer
+        // color conflation that justifies the codewriter
+        // `live_r.retain(LV∩SSA)`: removing the fallback regresses
+        // fib_recursive (callee bridge reads an empty ref slot) and
+        // nested_loop (outer-loop local cleared by a writer-side liveness
+        // gap). Scope it to the semantic prefix (`nlocals + stack_only`)
+        // so a scratch-color slot grown into bridge_registers_r by the
+        // ref-bank loop above never absorbs a vable array item — only
+        // local/stack positions that legitimately correspond to
+        // `vable_array_items[idx]` get filled. Track full removal
+        // alongside the codewriter retain and the consume_one_section
+        // widening — see Task #158 graph regalloc convergence.
+        let semantic_prefix_len = nlocals + stack_only;
+        for (idx, slot) in bridge_registers_r
+            .iter_mut()
+            .enumerate()
+            .take(semantic_prefix_len)
+        {
             if slot.is_none() {
-                // Fallback retained only for slots genuinely outside the
-                // liveness coverage (stack-only depth ahead of the local
-                // prefix). vable_array_items is now A.1-synchronized so
-                // the read is authoritative.
                 *slot = vable_array_items.get(idx).copied().unwrap_or(OpRef::NONE);
             }
         }

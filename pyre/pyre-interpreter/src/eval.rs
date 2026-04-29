@@ -157,6 +157,19 @@ pub fn normalize_raise_value(value: PyObjectRef) -> PyObjectRef {
     value
 }
 
+/// Normalize the `from` cause of a `raise X from Y` statement: instantiate
+/// the cause if it is an exception class, validate that the result is
+/// `None` / a `BaseException` instance, and return a `PyError::type_error`
+/// otherwise.
+///
+/// PRE-EXISTING-ADAPTATION: RPython performs this validation inline inside
+/// `RAISE_VARARGS` (`pypy/interpreter/pyopcode.py:704-707` —
+/// `space.call_function(w_cause)` when `w_cause` is an exception class)
+/// without a named helper, then defers the BaseException check to
+/// `OperationError.set_cause` (`pypy/interpreter/error.py`). Pyre extracts
+/// this pre-step into a standalone helper so the JIT raise/r BH path
+/// (`pyre-jit/src/call_jit.rs::bh_normalize_raise_varargs_fn`) and the
+/// interpreter raise path can share the same validation.
 pub fn normalize_raise_cause(cause: PyObjectRef) -> Result<PyObjectRef, PyError> {
     let cause = normalize_raise_value(cause);
     unsafe {
