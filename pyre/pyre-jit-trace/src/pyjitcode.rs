@@ -41,9 +41,8 @@
 //! install ([`crate::canonical_bridge::install_portal_for`]) reuses
 //! the canonical portal `JitCode.code` byte stream but skips the
 //! per-Python-PC mapping (the portal dispatches via its own arms on
-//! `pycode.instructions[pc]`). Per-CodeObject installs
-//! ([`crate::canonical_bridge::compile_jitcode_for_callee`]) do both:
-//! drain real instructions into `code` and stamp `pc_map` to
+//! `pycode.instructions[pc]`). Drained CodeWriter installs do both:
+//! fill real instructions into `code` and stamp `pc_map` to
 //! `code.instructions.len()`. Skeletons have neither because they are
 //! placeholder slots inserted by `CallControl::get_jitcode` before the
 //! assembler drain runs.
@@ -355,9 +354,9 @@ impl PyJitCode {
     ///   * `jitcode.code` non-empty (rules out `PyJitCode::skeleton`,
     ///     which clones `Arc::new(RuntimeJitCode::default())` whose
     ///     `code` is empty).
-    ///   * `metadata.pc_map` empty (rules out per-CodeObject installs
-    ///     produced by `compile_jitcode_for_callee`, whose drain
-    ///     populates `pc_map` to `code.instructions.len()`).
+    ///   * `metadata.pc_map` empty (rules out drained CodeWriter
+    ///     installs, whose setup-time drain populates `pc_map` to
+    ///     `code.instructions.len()`).
     ///
     /// Used by readers that have to branch on portal-mode semantics —
     /// portal entry has no per-Python-PC `pc_map` because the portal

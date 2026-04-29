@@ -677,11 +677,6 @@ pub fn resume_in_blackhole(
         return BlackholeResult::Failed;
     }
 
-    // codewriter.py:20-23 parity: the CodeWriter-owned Assembler lives
-    // on the thread-local singleton so each `get_jitcode` call below
-    // shares the same accumulator.
-    let writer = crate::jit::codewriter::CodeWriter::instance();
-
     thread_local! {
         static BH_BUILDER3: std::cell::UnsafeCell<majit_metainterp::blackhole::BlackholeInterpBuilder> =
             std::cell::UnsafeCell::new(majit_metainterp::blackhole::BlackholeInterpBuilder::new());
@@ -802,7 +797,7 @@ pub fn resume_in_blackhole(
         // call.py:148: jitcode via jitcodes dict lookup (jitdriver_sd
         // set on portal). virtualizable.py:126-137: code from resume
         // data, not heap. Lookup-only: trace setup already compiled.
-        let pyjitcode = match writer.callcontrol().find_jitcode(code as *const _) {
+        let pyjitcode = match pyre_jit_trace::state::pyjitcode_for_code(section.code) {
             Some(pjc) => pjc,
             None => {
                 if nbody_debug {
@@ -815,8 +810,8 @@ pub fn resume_in_blackhole(
                 return BlackholeResult::Failed;
             }
         };
-        let jitcode_pc = if py_pc < pyjitcode.metadata.pc_map.len() {
-            pyjitcode.metadata.pc_map[py_pc]
+        let jitcode_pc = if let Some(jitcode_pc) = pyjitcode.metadata.pc_map.get(py_pc).copied() {
+            jitcode_pc
         } else {
             if nbody_debug {
                 eprintln!(
@@ -995,45 +990,32 @@ pub fn resume_in_blackhole(
         );
 
         // PRE-EXISTING-ADAPTATION: consumer-side enforcement of the "all
-        // Python frame slots the blackhole may read hold a live box"
-        // runtime contract. RPython's `resume.py:1017-1026 _prepare_next_section`
+        // stack slots up to current depth hold a live box" runtime
+        // contract. RPython's `resume.py:1017-1026 _prepare_next_section`
         // has no heap-read step — its SSA `_registers_r[stack_color]`
-        // model already covers locals/stack through the dataflow because
-        // Python frame reads and pushes are direct register-file SSA ops.
-        // Pyre keeps a virtualizable heap mirror and narrows `live_r` with
-        // the Python LiveVars result, so a local color may be absent from the
-        // compact resume section even though the next BH opcode will read it.
-        // Pyre also routes pushes through `setarrayitem_vable_r` (heap I/O),
-        // so the SSA dataflow does not see push→pop as a register chain, and
-        // stack colors only enter `live_r` when an op directly references
-        // them. For such absent locals/stack slots this fallback re-fills
-        // `bh.registers_r[color]` from the heap PyFrame — the same dual-write
-        // source the trace kept in sync via `setarrayitem_vable_r`.
+        // model already covers stack slots through the dataflow because
+        // every push/pop is a direct register-file SSA op. Pyre routes
+        // pushes through `setarrayitem_vable_r` (heap I/O) so the SSA
+        // dataflow does not see push→pop as a register chain, and stack
+        // colors only enter `live_r` when an op directly references them.
+        // For unreferenced (but runtime-on-stack) slots this fallback
+        // re-fills `bh.registers_r[stack_color]` from the heap PyFrame —
+        // the same dual-write source the trace kept in sync via
+        // `setarrayitem_vable_r`. Together with the codewriter `live_r`
+        // (now SSA-only, mirroring `rpython/jit/codewriter/liveness.py`
+        // :67-75), the contract still holds at every guard fail.
         //
         // Convergence path: replace pyre's heap-mirror stack model with
         // RPython's register-file SSA model (push/pop emit direct
-        // `_registers_r[color]` SSA writes/reads instead of relying on the
-        // virtualizable heap mirror). Multi-session architectural change —
-        // multiple bytecode handlers in
+        // `_registers_r[stack_color]` SSA writes/reads instead of
+        // `setarrayitem_vable_r` / `getarrayitem_vable_r`). Multi-session
+        // architectural change — multiple bytecode handlers in
         // `pyre/pyre-jit/src/jit/codewriter.rs` would need to switch
         // emit form, and the runtime PyFrame heap mirror would shrink
         // to "snapshot only at force_now" (matching `pyjitpl.py`'s
         // `force_virtualizable` semantics). After that conversion,
-        // `live_r` from the SSA dataflow alone covers these colors and this
-        // fallback can be removed.
-        //
-        // The locals-side variant of this fallback was REMOVED 2026-04-28:
-        // a `for local_idx in 0..nlocals` loop wrote
-        // `bh.registers_r[local_idx] = vable.values[local_idx]`, but that
-        // conflates Python frame slot index with abstract register color.
-        // Post-chordal-coloring those namespaces diverge — `local_idx=2`
-        // can be a scratch color for an intermediate ref while
-        // `vable.values[2]` is the Python local `q`. Filling it out from
-        // heap clobbered the scratch slot the codewriter expected to read
-        // post-resume (e.g. fannkuch BC_MOVE_R src=2 dst=10), poisoning
-        // the trace with a list-ref where it expected a temporary.  The
-        // stack tail below still uses `stack_color_map[stack_idx]` which
-        // IS the post-regalloc color, so it is correct.
+        // `live_r` from the SSA dataflow alone covers stack colors and
+        // this fallback can be removed.
         let depth_at_pc = &pyjitcode.metadata.depth_at_py_pc;
         let stack_color_map = &pyjitcode.metadata.stack_slot_color_map;
         let depth = if py_pc < depth_at_pc.len() {
@@ -1844,21 +1826,12 @@ pub fn blackhole_resume_via_rd_numb(
     };
 
     // resume.py:1339 jitcodes[jitcode_pos]: resolve jitcode_index + pc
-    // to a pyre JitCode via CodeWriter.
-    // codewriter.py:20-23 parity: each resolve_jitcode invocation uses
-    // the thread-local CodeWriter singleton so the Assembler keeps
-    // accumulating.
-    let writer = crate::jit::codewriter::CodeWriter::instance();
+    // through the trace-side MetaInterpStaticData.jitcodes store.
     let resolve_jitcode = |jitcode_index: i32, pc: i32| -> Option<resume::ResolvedJitCode> {
         if pc < 0 {
             return None;
         }
-        let raw_code = pyre_jit_trace::state::raw_code_for_jitcode_index(jitcode_index)?;
-        if raw_code.is_null() {
-            return None;
-        }
-        let code = unsafe { &*raw_code };
-        let pyjitcode = writer.callcontrol().find_jitcode(code as *const _)?;
+        let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
         if pyjitcode.has_abort_opcode() {
             return None;
         }
@@ -1963,7 +1936,7 @@ pub fn blackhole_resume_via_rd_numb(
     // Walk the chain and fill them explicitly until the codewriter
     // change lands; chains are short (typically 1–3 frames) so the
     // O(jitcodes) scan per frame is inexpensive.
-    let callcontrol = writer.callcontrol();
+    let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
     let mut cur: Option<&mut majit_metainterp::blackhole::BlackholeInterpreter> = Some(&mut bh);
     while let Some(bh_ref) = cur {
         let jitcode_ptr = std::sync::Arc::as_ptr(&bh_ref.jitcode);

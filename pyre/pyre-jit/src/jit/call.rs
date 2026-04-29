@@ -293,21 +293,12 @@ impl CallControl {
             .map(std::sync::Arc::clone)
     }
 
-    /// Compiled-entry variant used by the trace-side callback: return
-    /// the shared `Arc<PyJitCode>` only when the entry is fully
-    /// populated by the codewriter drain (`PyJitCode::is_populated`
-    /// — `pc_map` non-empty).
-    ///
-    /// PRE-EXISTING-ADAPTATION: RPython has no equivalent gate because
-    /// `make_jitcodes` (codewriter.py:74-89) drains every unfinished
-    /// graph synchronously before any trace runs, so no caller of
-    /// `self.jitcodes[graph]` (call.py:158) ever observes a skeleton.
-    /// Pyre compiles lazily from pyre-jit's ensure path
-    /// (`ensure_trace_jitcode_for_w_code` / `state::jitcode_for`), so a
-    /// cached entry here can still be an unassembled `JitCode(name,
-    /// fnaddr, calldescr, ...)` (call.py:168) waiting for the drain.
-    /// Returning `None` on a skeleton routes the caller through the
-    /// compile path first.
+    /// Compiled-entry variant used by setup-time publishers and tests:
+    /// return the shared `Arc<PyJitCode>` only when the entry is fully
+    /// populated by the `make_jitcodes()` drain (`PyJitCode::is_populated`
+    /// — `pc_map` non-empty). RPython never exposes skeleton entries to
+    /// runtime readers; a `None` here means the caller is still in setup
+    /// and must finish draining before publishing to trace-side SD.
     pub fn find_compiled_jitcode_arc(
         &self,
         code: *const CodeObject,

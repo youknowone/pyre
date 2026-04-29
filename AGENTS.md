@@ -70,6 +70,7 @@ Add as a top-level section in CLAUDE.md, above any general coding guidelines.\n\
 - If a parity fix causes regressions, investigate root cause before reverting. Do not declare success if structural alignment was skipped, even if benchmarks pass.
 - Always verify which worktree/repo you're in (`git rev-parse --show-toplevel`) before editing. Common worktrees: pypy/main, pypy-pyre, pypy-stdlib, pypy-side.
 Add under a ## Git Workflow or ## Testing section.\n\n## Before Committing
+- Always run `cargo check` and `cargo test` with `--features dynasm`.
 - Run full benchmark suite (all 8 benchmarks) after JIT changes - do not commit if any regress.
 - Check `git status` and `git rev-parse --show-toplevel` before staging to confirm correct worktree.
 - When rebasing/cherry-picking, verify the fix isn't already on main first (`git log main --grep=...`).

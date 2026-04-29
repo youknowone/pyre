@@ -1657,30 +1657,12 @@ impl OptRewrite {
                 if let Some(old_idx) = old_guard_idx
                     && !ctx.is_resume_at_position_guard(old_idx as i32)
                 {
-                    // rewrite.py:417-420 fresh descr + replace_guard +
-                    // emit chain → optimizer.py:713-720 replace_guard_op
-                    // copy_all_attributes_from(new_descr, old_descr).
-                    //
-                    //   descr = compile.ResumeGuardDescr()
-                    //   op = old_guard_op.copy_and_change(...,
-                    //                                     descr=descr)
-                    //   self.optimizer.replace_guard(op, info)
-                    //   return self.emit(op)
-                    //   # → _emit_operation → replaces_guard hit →
-                    //   #   replace_guard_op(old_pos, new_op):
-                    //   #       new_descr.copy_all_attributes_from(
-                    //   #           old_descr)
-                    //   #       _newoperations[old_pos] = new_op
-                    //
-                    // Pyre writes the combined op directly into the slot
-                    // (no replaces_guard registry trip), so we mint the
-                    // fresh ResumeGuardDescr inline and call
-                    // copy_all_attributes_from explicitly to populate
-                    // rd_numb / rd_consts / rd_virtuals / rd_pendingfields
-                    // / rd_vector_info from the old descr. The
-                    // RAPD-skip gate at
-                    // `is_resume_at_position_guard(old_idx)` above
-                    // ensures the donor is a real ResumeGuardDescr.
+                    // rewrite.py:417-426 + optimizer.py:713-718:
+                    // RPython creates a fresh ResumeGuardDescr for the
+                    // strengthened guard, then replace_guard_op copies the
+                    // resume payload from the old guard descr into the new
+                    // one. This path writes directly into new_operations, so
+                    // perform the descr copy inline before replacing the op.
                     let new_descr = crate::compile::make_resume_guard_descr_typed(
                         old_guard.fail_arg_types.clone().unwrap_or_default(),
                     );

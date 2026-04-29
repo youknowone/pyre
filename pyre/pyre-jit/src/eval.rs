@@ -5446,6 +5446,25 @@ mod tests {
         let _ = crate::jit::codewriter::CodeWriter::instance();
     }
 
+    /// Drive the codewriter `register_portal_jitdriver` setup path so
+    /// `pyre_jit_trace::state::ensure_jitcode_ptr` can resolve the
+    /// installed entry. Mirrors RPython warmspot.py:281-282 — the
+    /// trace-side staticdata is populated only by the make_jitcodes
+    /// drain.
+    ///
+    /// The portal must be registered using the canonical `CodeObject*`
+    /// that backs `w_code` (the inner pointer obtained by
+    /// `w_code_get_ptr`), not an arbitrary copy of the same source —
+    /// `CallControl.jitcodes` is keyed by raw pointer identity.
+    fn register_test_portal(_unused: &pyre_interpreter::CodeObject, w_code: *const ()) {
+        let raw_code = unsafe {
+            pyre_interpreter::w_code_get_ptr(w_code as pyre_object::PyObjectRef)
+                as *const pyre_interpreter::CodeObject
+        };
+        let canonical_code = unsafe { &*raw_code };
+        crate::jit::codewriter::register_portal_jitdriver(canonical_code, w_code, None);
+    }
+
     /// Translate Python-stack depths into the post-regalloc Ref-bank
     /// colors the dispatcher would actually touch. Phase 2.1c removed the
     /// `register_color = nlocals + depth` identity (chordal coloring may
@@ -5510,6 +5529,7 @@ mod tests {
         init(&mut frame);
         frame.fix_array_ptrs();
 
+        register_test_portal(&code, frame.pycode as *const ());
         let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
@@ -5554,6 +5574,7 @@ mod tests {
         init(&mut frame);
         frame.fix_array_ptrs();
 
+        register_test_portal(&code, frame.pycode as *const ());
         let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
         let _ = trace_state::ensure_jitcode_index(frame.pycode as *const ())
@@ -5632,6 +5653,7 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
+        register_test_portal(&code, frame.pycode as *const ());
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
         let resume_pc = (0..code.instructions.len())
@@ -5742,6 +5764,7 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
+        register_test_portal(&code, frame.pycode as *const ());
         let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
@@ -5819,6 +5842,7 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
+        register_test_portal(&code, frame.pycode as *const ());
         let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
@@ -5894,6 +5918,7 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
+        register_test_portal(&code, frame.pycode as *const ());
         let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
@@ -5970,6 +5995,7 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
+        register_test_portal(&code, frame.pycode as *const ());
         let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
@@ -6036,6 +6062,7 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
+        register_test_portal(&code, frame.pycode as *const ());
         let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
@@ -6124,6 +6151,7 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
+        register_test_portal(&code, frame.pycode as *const ());
         let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())
@@ -6261,6 +6289,7 @@ mod tests {
         frame.fix_array_ptrs();
         let frame_ptr = (&mut *frame) as *mut PyFrame as usize;
 
+        register_test_portal(&code, frame.pycode as *const ());
         let jitcode_ptr = trace_state::ensure_jitcode_ptr(frame.pycode as *const ())
             .expect("real trace-side jitcode registration must succeed");
         let jitcode_index = trace_state::ensure_jitcode_index(frame.pycode as *const ())

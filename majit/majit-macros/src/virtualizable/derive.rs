@@ -241,12 +241,9 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
     };
 
     // init_from_meta: assign OpRef indices to INPUTARG fields only.
-    // Inputarg fields start at `first_vable_scalar_idx`, which the caller
-    // supplies (= `FIRST_VABLE_SCALAR_IDX = 1 + NUM_EXTRA_REDS` from the
-    // companion `virtualizable!` macro). The derive macro cannot read
-    // that constant directly because the standalone `virtualizable!`
-    // macro lives in a sibling expansion site and the two do not share
-    // a symbol table.
+    // The caller supplies the start because root inputargs are
+    // [frame, extra_reds..., vable_scalars..., array...], while resume
+    // virtualizable payloads are [vable, vable_scalars..., array...].
     let init_inputarg_fields: Vec<TokenStream> = inputarg_fields
         .iter()
         .enumerate()
@@ -262,19 +259,6 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
         quote! { self.#f = majit_ir::OpRef(0); }
     });
 
-    // restore_inputarg_oprefs: write inputarg fields from a slice in
-    // declaration order. Counterpart to virt_restore_scalars (mod.rs:604)
-    // for the symbolic OpRef side; lets call sites drop hardcoded match
-    // arms when consuming either root inputargs or a virtualizable resume
-    // stream.
-    //
-    // The caller supplies the start index because the two RPython layouts
-    // differ:
-    //   * root trace inputargs: [frame, extra_reds..., vable_scalars..., ...]
-    //   * resume virtualizable payload: [vable, vable_scalars..., array...]
-    // In both cases the first slot is intentionally NOT written: the frame /
-    // vable identity is consumed separately by the caller, while
-    // `sym.<frame>` remains the inputarg OpRef seeded by `init_vable_indices`.
     let restore_inputarg_writes: Vec<TokenStream> = inputarg_fields
         .iter()
         .enumerate()
@@ -288,21 +272,14 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
     let restore_inputarg_method = if frame_field.is_some() {
         let inputarg_count = inputarg_fields.len();
         quote! {
-            /// Restore inputarg OpRefs (vable static fields) from a slice.
+            /// Restore vable static-field OpRefs from an input slice.
             ///
-            /// `first_vable_scalar_idx` is the offset into `oprefs` where
-            /// the vable scalar block begins. Use `FIRST_VABLE_SCALAR_IDX`
-            /// for root inputargs and `1` for the RPython resume
-            /// virtualizable payload (`[vable, static_fields..., array...]`).
-            /// `oprefs[0]` (frame / vable identity) is left untouched: the
-            /// trace-side `sym.<frame>` is the input-arg OpRef set by
-            /// `init_vable_indices`, while the caller consumes the concrete
-            /// identity value separately. Counterpart to the macro-generated
-            /// `virt_restore_scalars` (concrete-value side,
-            /// `virtualizable/mod.rs:604`).
-            ///
-            /// Returns the number of OpRefs consumed (= the inputarg
-            /// block; does not include frame or extra reds).
+            /// Use `FIRST_VABLE_SCALAR_IDX` for root inputargs
+            /// (`[frame, extra_reds..., vable_scalars..., array...]`) and
+            /// `1` for resume virtualizable payloads
+            /// (`[vable, vable_scalars..., array...]`). The frame/vable
+            /// identity in slot 0 is consumed by the caller and left
+            /// untouched here, matching virtualizable.py:139-154.
             pub fn restore_inputarg_oprefs(
                 &mut self,
                 oprefs: &[majit_ir::OpRef],
@@ -448,16 +425,7 @@ pub fn expand_sym(input: DeriveInput) -> TokenStream {
                 [#(#field_value_reads),*]
             }
 
-            /// Initialize virtualizable OpRef indices from layout constants.
-            ///
-            /// `first_vable_scalar_idx` is the offset where the vable
-            /// scalar block starts (= `FIRST_VABLE_SCALAR_IDX` from the
-            /// companion `virtualizable!` macro, `1 + NUM_EXTRA_REDS`).
-            /// Frame goes to `OpRef(0)`, extra reds (if any) occupy
-            /// `OpRef(1..first_vable_scalar_idx)` and are seeded by the
-            /// caller, the vable inputargs land at
-            /// `OpRef(first_vable_scalar_idx..)`, and the array base
-            /// follows immediately after the inputargs.
+            /// Initialize virtualizable OpRef indices from a layout offset.
             pub fn init_vable_indices(&mut self, first_vable_scalar_idx: u32) {
                 #init_frame
                 #(#init_inputarg_fields)*

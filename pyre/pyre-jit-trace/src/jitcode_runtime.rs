@@ -133,10 +133,9 @@ static PORTAL_JITCODE_INDEX: LazyLock<Option<usize>> = LazyLock::new(|| {
 /// Phase G consumers route trace-side user-function calls
 /// (`callee_frame_helper`, `jit_create_callee_frame_*`,
 /// `jit_force_callee_frame`) through this accessor instead of emitting
-/// per-CodeObject jitcodes via `state::jitcode_for(code)` +
-/// `compile_jitcode_for_callee` callback. The orthodox model treats
-/// every user CodeObject as the portal's `pycode` input argument and
-/// reuses the single portal JitCode for every call — see RPython
+/// runtime per-CodeObject jitcodes. The orthodox model treats every
+/// user CodeObject as the portal's `pycode` input argument and reuses
+/// the single portal JitCode for every call — see RPython
 /// `pypy/module/pypyjit/interp_jit.py portal_runner` and
 /// `rpython/jit/codewriter/jtransform.py:473` `inline_call_*` emit.
 ///

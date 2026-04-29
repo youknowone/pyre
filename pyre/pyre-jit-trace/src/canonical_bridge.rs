@@ -63,9 +63,8 @@
 //! `portal_jitcode()` + `bridge_canonical_jitcode_basic` and wraps the
 //! result in a `PyJitCode` whose pyre-specific `metadata` is empty.
 //! Empty metadata is the marker that distinguishes a portal-bridged
-//! `PyJitCode` from a per-CodeObject one produced by
-//! `compile_jitcode_for_callee`. See the function docstring for the
-//! full reader-site audit (G.3a).
+//! `PyJitCode` from a drained CodeWriter result. See the function
+//! docstring for the full reader-site audit (G.3a).
 //!
 //! Redirect production path: `pyre_jit::jit::codewriter` now routes
 //! registered portals through its own `grab_initial_jitcodes()` + drain
@@ -443,12 +442,12 @@ fn collect_referenced_descr_indices(code: &[u8]) -> Vec<usize> {
 ///     lives at register 0; ec is read from frame on demand so its
 ///     fill is skipped via `u16::MAX` sentinel).
 ///   * `stack_base` from `code.varnames.len() + ncells(code)` to match
-///     the per-CodeObject `compile_jitcode_for_callee` derivation.
+///     the setup-time CodeWriter derivation.
 ///
 /// The empty metadata is **not** an oversight — it is the marker that
-/// distinguishes a portal-bridged `PyJitCode` from a per-CodeObject one
-/// produced by `compile_jitcode_for_callee`. Per-CodeObject jitcodes
-/// own a `pc_map` mapping Python PCs to JitCode byte offsets because
+/// distinguishes a portal-bridged `PyJitCode` from a drained CodeWriter
+/// result. Drained jitcodes own a `pc_map` mapping Python PCs to
+/// JitCode byte offsets because
 /// their bytecode IS the linear translation of one Python function.
 /// The portal jitcode (`execute_opcode_step` /eventually `eval_loop_jit`)
 /// dispatches on `pycode.instructions[pc]` *at runtime* via its own
@@ -467,21 +466,21 @@ fn collect_referenced_descr_indices(code: &[u8]) -> Vec<usize> {
 ///
 /// | Site | Behavior |
 /// |---|---|
-/// | `pyre-jit-trace/src/state.rs:712-720` `frame_value_count_at` | G.3e/G.3f ✅ portal-mode-aware: `is_portal_bridge()` → return 0. Decoder consumes zero items for that frame; encoder side (`get_list_of_active_boxes` below) also returns an empty list, so the encoder/decoder counts match (RPython invariant). Guards trip → empty fail_args → graceful Failed. |
-/// | `pyre-jit-trace/src/trace_opcode.rs:634-639` `get_list_of_active_boxes` skeleton check | G.3d/G.3f ✅ portal-mode-aware: `is_portal_bridge()` → empty `Vec`. G.3d initially emitted a conservative non-NONE register set here, which broke encoder/decoder symmetry against G.3e's 0-return; G.3f restored that invariant by emitting an empty list. Non-portal skeleton still panics. |
-/// | `pyre-jit-trace/src/trace_opcode.rs:649-661` `pc_map.get(live_pc).copied().unwrap_or_else(panic!)` | `panic!("no pc_map entry …")` |
-/// | `pyre-jit/src/call_jit.rs:807-820` resume blackhole `pc_map[py_pc]` | bounds-checked: returns `BlackholeResult::Failed` on miss. Diagnostic-only — no jit run. |
+/// | `pyre-jit-trace/src/state.rs` `frame_value_count_at` | portal-mode-aware: `is_portal_bridge()` → `stack_base + depth_at_py_pc[pc]`. |
+/// | `pyre-jit-trace/src/trace_opcode.rs` `get_list_of_active_boxes` skeleton check | portal-mode-aware: `is_portal_bridge()` uses positional Ref boxes; non-portal skeleton still panics. |
+/// | `pyre-jit-trace/src/trace_opcode.rs` `pc_map.get(live_pc).copied().unwrap_or_else(panic!)` | per-CodeObject path only; portal branch returns before this lookup. |
+/// | `pyre-jit/src/call_jit.rs` resume blackhole `pc_map[py_pc]` | per-CodeObject populated jitcodes use `pc_map[py_pc]` directly, matching `resume.py:1340`; portal-bridge wrappers are not the production resume path. |
 ///
 /// **Category B — graceful empty `pc_map`** (return `None`, empty `Vec`,
 /// or boolean `false`):
 ///
 /// | Site | Behavior |
 /// |---|---|
-/// | `pyre-jit-trace/src/state.rs:822-824` `frame_liveness_reg_indices_at` | `pc_map.get(pc)?` → returns empty `Vec`. |
+/// | `pyre-jit-trace/src/state.rs` `frame_liveness_reg_indices_at` | portal-mode-aware: identity Ref register range. |
 /// | `pyre-jit-trace/src/state.rs:4176-4178` (`is_stack_live` lookup) | `pc_map.get(live_pc)?` → returns `false`. |
 /// | `pyre-jit-trace/src/trace_opcode.rs:506-541` mid-trace lazy-load preamble | `if pc_map.is_empty() { Vec::new() }` — graceful skip. |
 /// | `pyre-jit-trace/src/pyjitcode.rs:93` `is_populated()` predicate | boolean — caller decides. |
-/// | `pyre-jit/src/call_jit.rs:1674` `pc_map.get(pc as usize).copied()?` | returns `None` → resume falls back. |
+/// | `pyre-jit/src/call_jit.rs` rd_numb resolver `pc_map.get(pc as usize).copied()?` | direct RPython-parity lookup; no portal-bridge `pc -> 0` rewrite. |
 ///
 /// **Category C — portal_frame_reg / portal_ec_reg / stack_base reads**
 /// (zero placeholder is silently wrong; readers consume them as register
@@ -495,7 +494,7 @@ fn collect_referenced_descr_indices(code: &[u8]) -> Vec<usize> {
 /// | `pyre-jit/src/call_jit.rs:1787-1791` (`fill_portal_registers` chain walk) | `portal_frame_reg`, `portal_ec_reg` |
 ///
 /// **Category D — writers / test fixtures** (out of scope for portal mode
-/// — these only fire under `compile_jitcode_for_callee` or unit tests):
+/// — these only fire during setup-time CodeWriter drains or unit tests):
 ///
 /// | Site | Use |
 /// |---|---|
@@ -518,17 +517,15 @@ fn collect_referenced_descr_indices(code: &[u8]) -> Vec<usize> {
 ///    are not portal PCs.
 ///
 /// G.3b chooses per-category based on what semantics the reader actually
-/// requires. G.3c then flips the writer-side ensure path to use
-/// `install_portal_for` instead of the existing per-CodeObject path,
-/// gated by env var so dynasm/cranelift baselines can A/B compare.
+/// requires. G.3c then flips the writer-side setup path to use
+/// `install_portal_for` instead of a drained CodeWriter result.
 ///
 /// ### Caller (G.3c)
 ///
-/// Pyre-jit's `ensure_majit_jitcode` path now drives the codewriter-owned
-/// `grab_initial_jitcodes()` + drain path for registered portals when
-/// `PYRE_PORTAL_REDIRECT` is set. `install_portal_for` remains the low-level
-/// bridge constructor used by focused tests and reader-audit probes; it is
-/// not the orthodox `jd.mainjitcode` binding path.
+/// Pyre-jit's CodeWriter setup path drives `grab_initial_jitcodes()` +
+/// drain for registered portals. `install_portal_for` remains the
+/// low-level bridge constructor used by focused tests and reader-audit
+/// probes; it is not the orthodox `jd.mainjitcode` binding path.
 pub fn install_portal_for(
     code_ptr: *const pyre_interpreter::CodeObject,
     w_code: *const (),
@@ -566,9 +563,8 @@ pub fn install_portal_for(
     let portal_ec_reg = u16::MAX;
 
     // `stack_base` is the absolute index of the operand stack within
-    // `PyFrame.locals_cells_stack_w`, matching the per-CodeObject
-    // `compile_jitcode_for_callee` derivation
-    // (`pyre-jit/src/jit/codewriter.rs:5233`).
+    // `PyFrame.locals_cells_stack_w`, matching the setup-time
+    // CodeWriter derivation.
     //
     // G.4.2 also derives `depth_at_py_pc` from the same user
     // `CodeObject` via the cached `LiveVars` forward stack analysis
@@ -1066,9 +1062,8 @@ def f(x, y):
     /// * Portal-bridge: `jitcode.code` non-empty + `pc_map` empty.
     /// * Skeleton: `jitcode.code` empty (RuntimeJitCode::default()) +
     ///   `pc_map` empty.
-    /// * Drained per-CodeObject: `jitcode.code` non-empty +
-    ///   `pc_map` populated by `compile_jitcode_for_callee`'s
-    ///   drain.
+    /// * Drained CodeWriter result: `jitcode.code` non-empty +
+    ///   `pc_map` populated by the setup-time drain.
     ///
     /// The discriminator must be true for portal-bridge and false for
     /// the other two states.
@@ -1086,10 +1081,10 @@ def f(x, y):
             "skeleton has empty jitcode.code — must NOT report portal-bridge"
         );
 
-        // Drained per-CodeObject simulation: clone the portal jitcode
+        // Drained CodeWriter simulation: clone the portal jitcode
         // (so `code` is non-empty) and stamp a synthesized `pc_map`
-        // entry. This mirrors what `compile_jitcode_for_callee`'s
-        // drain produces — both fields populated.
+        // entry. This mirrors a setup-time drain result — both fields
+        // populated.
         let drained_runtime = (*portal.jitcode).clone();
         // Defensively assert the precondition the discriminator relies
         // on — if a future refactor empties `code` here, the

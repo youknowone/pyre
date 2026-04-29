@@ -28,9 +28,8 @@ pub struct CallJitCallbacks {
     // eval.rs driver access (opaque pointer to JitDriverPair)
     pub driver_pair: fn() -> *mut u8,
     /// codewriter.py:make_jitcodes parity: build the majit JitCode for
-    /// `code` (with full liveness) so that get_list_of_active_boxes uses
-    /// the same liveness data as resume.py:1022 enumerate_vars at decode
-    /// time. Idempotent: no-op when already built.
+    /// `code` through CallControl.get_jitcode + the pending-graph drain, then
+    /// publish the same populated PyJitCode Arc into trace-side staticdata.
     pub ensure_majit_jitcode: fn(*const CodeObject, *const ()),
 }
 

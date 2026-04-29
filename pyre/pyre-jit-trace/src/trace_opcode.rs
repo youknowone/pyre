@@ -546,7 +546,7 @@ impl MIFrame {
         // decode time — pyjitpl.py:218-225 `get_list_of_active_boxes`
         // analog, walking the full live register-file set.
         let jitcode_ptr_pre = self.sym().jitcode;
-        let live_ref_reg_idxs: Vec<usize> = unsafe {
+        let live_reg_idxs: Vec<usize> = unsafe {
             let jc = &*jitcode_ptr_pre;
             // Skeleton payload (no `pc_map` yet) → skip the lazy-load
             // preamble; the main path's skeleton-fallback branch
@@ -583,12 +583,10 @@ impl MIFrame {
                     Vec::new()
                 }
             } else {
-                // RPython `pyjitpl.py:218-225` analog for Ref boxes: every
-                // live Ref register that denotes a Python frame slot must
-                // resolve to an OpRef by encoder time. Int/Float live banks
-                // are consumed from `registers_i` / `registers_f` directly
-                // below and must not be passed through Ref semantic-slot
-                // recovery.
+                // RPython `pyjitpl.py:218-225` reads each liveness bank
+                // from its matching register file. This lazy vable read is
+                // therefore restricted to Ref liveness; Int/Float values are
+                // read from registers_i/registers_f in the snapshot below.
                 let jit_pc = jc.payload.metadata.pc_map[live_pc];
                 let op_live = crate::state::op_live();
                 let off = jc.payload.jitcode.get_live_vars_info(jit_pc, op_live);
@@ -642,7 +640,7 @@ impl MIFrame {
                 is_portal_bridge,
             )
         };
-        for idx in live_ref_reg_idxs {
+        for idx in live_reg_idxs {
             // G.4.4-encoder.3: portal-bridge has no regalloc, so
             // colors == slot indices (identity).  Bypass
             // `semantic_ref_slot_for_reg_color`'s color-map search
@@ -683,12 +681,15 @@ impl MIFrame {
         }
         let (registers_i, registers_r_bank, registers_r_semantic, registers_f) = {
             let s = self.sym();
-            // RPython `pyjitpl.py:177-234` parity: the active-box encoder
-            // reads each liveness bank from the matching MIFrame register
-            // file. Ref slots still expose a semantic prefix for legacy
-            // Python-opcode handlers; keep a bounded prefix view only for
-            // that transitional fallback, while the primary Ref read below
-            // indexes `registers_r[color]` directly.
+            // Stage 3.4 Phase B: unified abstract register file view.
+            // When a guard is being captured mid-opcode, read from
+            // `pre_opcode_registers_r` (the full snapshot of
+            // `registers_r` at opcode start). Otherwise read the live
+            // `registers_r`. Both variants share a single indexing rule
+            // so `live_{i,r,f}_regs` indices (which live in the
+            // stack_base=nlocals register space) can be resolved with
+            // one lookup instead of the legacy
+            // `idx < nlocals ? locals : stack` split.
             //
             // Phase A dual-writes grow `registers_r` monotonically on
             // stack pushes; pop does not shrink it. Bound the view to
@@ -725,11 +726,6 @@ impl MIFrame {
             } else {
                 (s.nlocals + valid_stack_only).min(source_len)
             };
-            // Bank view: the full RPython-orthodox `registers_r[color]`
-            // per-bank read. Do not overlay `pre_opcode_registers_r` here:
-            // RPython `pyjitpl.py:222-225` reads the current ref register
-            // file directly, and scratch colors below the semantic-prefix
-            // length must not be replaced by stale opcode-entry values.
             let registers_r_bank = s.registers_r.clone();
             let mut registers_r_semantic: Vec<OpRef> =
                 if let Some(ref pre_r) = self.pre_opcode_registers_r {
@@ -843,10 +839,9 @@ impl MIFrame {
         // op_live)` (`jitcode.py:82-93`), read the `[len_i][len_r]
         // [len_f]` header in `all_liveness`, then iterate per-bank
         // register indices with `LivenessIterator` (`liveness.py:168-
-        // 201`). Register indices snapshot from the corresponding
-        // `registers_i` / `registers_r` / `registers_f` bank in int → ref →
-        // float order, matching resume.py's `consume_boxes` callbacks and the
-        // blackhole decoder's value consumption order.
+        // 201`). Register indices snapshot into `registers_r` in
+        // int → ref → float bank order to match the encoder/decoder
+        // contract (`all_liveness` byte layout).
         let jit_pc = jc
             .payload
             .metadata
@@ -874,18 +869,15 @@ impl MIFrame {
         let length_f = all_liveness[off + 2] as u32;
         let mut cursor = off + 3;
         let mut boxes = Vec::with_capacity((length_i + length_r + length_f) as usize);
-        // RPython `pyjitpl.py:218-225` reads each live register out of its
-        // kind-specific bank: `registers_i[reg_i]`, `registers_r[reg_r]`,
-        // `registers_f[reg_f]`.  All three banks now read the bank slot
-        // first and fall back to the Ref-semantic view only when the bank
-        // slot is still unpopulated by the current tracer surface.  The
-        // semantic fallback persists because pyre still keeps Python
-        // locals/stack in the prefix of `registers_r` and some opcode
-        // handlers update the semantic prefix without simultaneously
-        // touching the post-rename `registers_r_bank` slot.  Removing
-        // the fallback altogether is gated on the codewriter
-        // `live_r.retain(LV∩SSA)` widening (Task #158 graph regalloc
-        // separate scratch color space).
+        // RPython reads each live register out of its kind-specific bank:
+        // `registers_i[reg_i]`, `registers_r[reg_r]`, `registers_f[reg_f]`.
+        // Pyre still keeps Python semantic locals/stack in the prefix of
+        // `registers_r`, so Ref registers prefer the semantic-color view
+        // and then fall back to the full Ref bank.
+        // Int/Float registers now read their real banks first and fall back
+        // only when that bank slot is still unpopulated by the current tracer
+        // surface. This closes the first slice of the 3-bank parity gap
+        // without removing the older semantic stack model in the same patch.
         let probe_live_r = std::env::var_os("MAJIT_PROBE_LIVE_R").is_some();
         let snapshot_ref = |reg: usize| -> OpRef {
             let Some(slot_idx) = crate::state::semantic_ref_slot_for_reg_color(
@@ -896,7 +888,7 @@ impl MIFrame {
             ) else {
                 if probe_live_r {
                     eprintln!(
-                        "[probe-E][snapshot-r] live_pc={} reg={} slot=NONE (no semantic mapping)",
+                        "[probe-E][snapshot] live_pc={} reg={} slot=NONE (no semantic mapping)",
                         live_pc, reg
                     );
                 }
@@ -908,7 +900,7 @@ impl MIFrame {
                 .unwrap_or(OpRef::NONE);
             if probe_live_r {
                 eprintln!(
-                    "[probe-E][snapshot-r] live_pc={} reg={} slot={} fallback opref={:?}",
+                    "[probe-E][snapshot] live_pc={} reg={} slot={} opref={:?}",
                     live_pc, reg, slot_idx, opref,
                 );
             }
