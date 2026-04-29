@@ -104,7 +104,7 @@ impl RegisterHints {
             OpCode::FloatAdd
             | OpCode::FloatSub
             | OpCode::FloatMul
-            | OpCode::FloatTruediv
+            | OpCode::FloatTrueDiv
             | OpCode::FloatNeg
             | OpCode::FloatAbs => {
                 self._consider_float_op(longevity, op, position);

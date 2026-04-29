@@ -82,9 +82,14 @@ pub fn restartable_point_nofork(auto: Option<&str>) -> Result<(), TaskError> {
     )
 }
 
+#[cfg(unix)]
+type Pid = libc::pid_t;
+#[cfg(not(unix))]
+type Pid = i32;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ForkResult {
-    Parent(libc::pid_t),
+    Parent(Pid),
     Child,
     NotSupported,
 }
@@ -99,7 +104,7 @@ enum WaitStatus {
 trait CheckpointRuntime {
     fn restart_process(&self) -> Result<(), TaskError>;
     fn fork(&self) -> Result<ForkResult, TaskError>;
-    fn waitpid(&self, pid: libc::pid_t) -> Result<WaitStatus, WaitError>;
+    fn waitpid(&self, pid: Pid) -> Result<WaitStatus, WaitError>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -142,7 +147,7 @@ impl CheckpointRuntime for RealRuntime {
         }
     }
 
-    fn waitpid(&self, pid: libc::pid_t) -> Result<WaitStatus, WaitError> {
+    fn waitpid(&self, pid: Pid) -> Result<WaitStatus, WaitError> {
         #[cfg(unix)]
         {
             let mut status = 0;
@@ -178,7 +183,7 @@ impl CheckpointRuntime for NoForkRuntime<'_> {
         Ok(ForkResult::NotSupported)
     }
 
-    fn waitpid(&self, _pid: libc::pid_t) -> Result<WaitStatus, WaitError> {
+    fn waitpid(&self, _pid: Pid) -> Result<WaitStatus, WaitError> {
         Ok(WaitStatus::Other(0))
     }
 }
@@ -404,7 +409,7 @@ mod tests {
             Ok(self.forks.borrow_mut().remove(0))
         }
 
-        fn waitpid(&self, _pid: libc::pid_t) -> Result<WaitStatus, WaitError> {
+        fn waitpid(&self, _pid: Pid) -> Result<WaitStatus, WaitError> {
             self.waits.borrow_mut().remove(0)
         }
     }

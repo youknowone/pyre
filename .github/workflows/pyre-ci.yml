@@ -51,7 +51,7 @@ jobs:
         esac
 
   pyre-check:
-    name: pyre/check.sh
+    name: pyre/check.py
     runs-on: ubuntu-24.04
 
     steps:
@@ -62,5 +62,5 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install -y pypy3
-    - name: Run pyre/check.sh
-      run: ./pyre/check.sh
+    - name: Run pyre/check.py
+      run: python3 pyre/check.py
