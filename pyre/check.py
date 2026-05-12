@@ -97,8 +97,13 @@ def run_timed(args, timeout_s=None):
     returncode 124 = timeout (matching coreutils convention).
     """
     if sys.platform == "win32":
-        return _run_timed_win32(args, timeout_s)
-    return _run_timed_unix(args, timeout_s)
+        out, t, rc = _run_timed_win32(args, timeout_s)
+    else:
+        out, t, rc = _run_timed_unix(args, timeout_s)
+    # PyPy/CPython on Windows emit CRLF in stdout text mode; Rust's println!
+    # emits LF on all platforms. Normalize so output comparisons aren't
+    # platform-sensitive (and snapshots stay portable).
+    return out.replace("\r\n", "\n"), t, rc
 
 # ── Helpers ──────────────────────────────────────────────────────────
 
@@ -597,18 +602,18 @@ def main():
     #             name              script                          timeout  d_vs_cp  d_vs_py  c_vs_cp  c_vs_py  skip
     chk.run_bench("int_loop",       f"{B}/int_loop.py",             5,       None,    1.5,     None,    1.5)
     chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    1.0,     None,    2.5)
-    chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       None,    1.5,     1.0,     None)
+    chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       None,    1.5,     1.2,     None)
     chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.0,     None,    1.0)
     chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       1.5,     None,    1.2,       8)
     chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    2)
     chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     6,       None,    None,    None,    None)
     chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       10,       10,      None,    10,      None)
-    chk.run_bench("nbody",          f"{B}/nbody_50k.py",           10,       15,      None,    15,      None)
+    chk.run_bench("nbody",          f"{B}/nbody_50k.py",           10,       30,      None,    30,      None)
     chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            10,       None,    None,    None,    None)
     chk.run_bench("list_reverse",   f"{B}/list_reverse.py",         5,       10,      None,    10,      None)
     chk.run_bench("list_pop_append",f"{B}/list_pop_append.py",      5,       15,      None,    15,      None)
     chk.run_bench("list_insert",    f"{B}/list_insert.py",          5,       None,    1.5,     None,    1.5)
-    chk.run_bench("list_setslice",  f"{B}/list_setslice.py",        5,       7,       None,    7,       None)
+    chk.run_bench("list_setslice",  f"{B}/list_setslice.py",        5,       10,      None,    10,      None)
 
     rc = chk.print_summary()
     sys.exit(rc)
