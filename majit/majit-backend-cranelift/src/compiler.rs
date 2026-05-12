@@ -18786,7 +18786,9 @@ mod tests {
         let mut token = JitCellToken::new(99);
         backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
 
-        let mut data = vec![0u8; 8];
+        // 8-byte f64 write at offset 2 needs at least 10 bytes; round up so
+        // the buffer also satisfies stricter heap-block layouts on Windows.
+        let mut data = vec![0u8; 16];
         let ptr = data.as_mut_ptr() as usize;
 
         let frame = backend.execute_token(&token, &[Value::Ref(GcRef(ptr)), Value::Float(6.25)]);

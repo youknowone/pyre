@@ -826,6 +826,7 @@ pub(crate) mod tests {
         lower_indirect_calls(&mut graph, &mut type_state, &cc);
 
         // Post-lowering: invariant — zero Indirect targets.
+        #[cfg(debug_assertions)]
         assert_no_indirect_call_targets(&graph);
 
         // Post-lowering: exactly one VtableMethodPtr and one IndirectCall.

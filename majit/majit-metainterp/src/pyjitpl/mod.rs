@@ -15560,6 +15560,7 @@ mod metainterp_static_data_tests {
     /// caller that forgets to wire `portal_runner_adr` fails fast in
     /// dev/test builds (the bench harness runs in dev profile).
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "portal_runner_adr is 0")]
     fn do_recursive_call_panics_when_portal_runner_adr_is_zero() {
         use crate::BackEdgeAction;
@@ -16359,6 +16360,7 @@ mod metainterp_static_data_tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "MetaInterp.assert_no_exception")]
     fn assert_no_exception_panics_when_value_set() {
         let mut meta = MetaInterp::<()>::new(0);

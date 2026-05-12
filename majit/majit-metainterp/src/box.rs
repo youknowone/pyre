@@ -625,6 +625,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic]
     fn set_forwarded_to_self_panics_in_debug() {
         let a = BoxRef::new_resop(Type::Int, 0);

@@ -1505,6 +1505,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(debug_assertions)]
     #[should_panic(expected = "_resulttypes")]
     fn make_result_of_lastop_panics_on_recorded_resulttype_mismatch() {
         // Same writer setup as the matching variant — but the reader
