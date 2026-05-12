@@ -6207,12 +6207,17 @@ impl MIFrame {
         let concrete_frame_addr = self.concrete_frame_addr;
 
         // pyjitpl.py:2510-2520: scan for catch_exception handler
-        // (Python 3.11+ exception table replaces RPython's op_catch_exception)
-        if let Some(entry) =
-            pyre_interpreter::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
+        // (Python 3.11+ exception table replaces RPython's op_catch_exception).
+        // `lookup_exceptiontable` takes byte offsets; pyre tracks `pc` as
+        // a code-unit index, so multiply/divide by 2 at the boundary.
+        if let Some((target_bytes, depth, lasti)) =
+            pyre_interpreter::exception_table::lookup_exceptiontable(
+                &code.exceptiontable,
+                (pc * 2) as u32,
+            )
         {
-            let handler_pc = entry.target as usize;
-            let handler_depth = entry.depth as usize;
+            let handler_pc = target_bytes as usize / 2;
+            let handler_depth = depth as usize;
             if majit_metainterp::majit_log_enabled() {
                 eprintln!(
                     "[jit][finishframe_exception] pc={} handler={} depth={}",
@@ -6255,7 +6260,7 @@ impl MIFrame {
                     }
                 });
             }
-            let lasti_obj = if entry.push_lasti {
+            let lasti_obj = if lasti {
                 // Python 3.11 exception-table adaptation: `push_lasti`
                 // pushes a real W_Int object onto `locals_cells_stack_w`.
                 // Mirror it through the same stack/vable helper as every
@@ -7234,7 +7239,15 @@ impl OpcodeStepExecutor for MIFrame {
     }
 
     /// RPython opimpl_reraise (pyjitpl.py:1701).
-    fn reraise(&mut self) -> Result<(), Self::Error> {
+    ///
+    /// `oparg` is the RERAISE N depth — when non-zero the original raise-
+    /// site lasti integer sits `oparg` slots below TOS.  The trace path
+    /// reads the same symbolic stack as the interpreter `reraise`
+    /// (`eval.rs:reraise`) so any preserved lasti would have to be
+    /// extracted from there.  At the trace-bridge layer we currently only
+    /// surface the exception object; full reraise_lasti propagation is
+    /// inherited via the concrete-frame fallback in `metainterp.rs`.
+    fn reraise(&mut self, _oparg: u32) -> Result<(), Self::Error> {
         let exc = self.sym().last_exc_value;
         unsafe {
             if pyre_object::is_exception(exc) {

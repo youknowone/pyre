@@ -23,8 +23,20 @@ pub struct Return;
 
 pub struct Yield;
 
+/// pypy/interpreter/pyopcode.py:91-94 — `RaiseWithExplicitTraceback(operr, lasti)`.
+///
+/// Carries the original raise-site `lasti` (instruction byte offset) from a
+/// `RERAISE N` so the next exception-table dispatch can push that offset as
+/// the handler's `lasti` value instead of the RERAISE instruction itself.
+/// `lasti == -1` means no reraise lasti (default for primary raises).
+///
+/// pyre also routes this value through `PyError.reraise_lasti` because the
+/// interpreter dispatch loop uses a single `Err(PyError)` channel rather
+/// than two distinct exception classes; this struct exists for line-by-line
+/// parity surface.
 pub struct RaiseWithExplicitTraceback {
     pub operr: crate::error::OperationError,
+    pub lasti: i32,
 }
 
 pub struct SuspendedUnroller {
@@ -1080,7 +1092,14 @@ pub trait OpcodeStepExecutor: SharedOpcodeHandler {
     fn check_exc_match(&mut self) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("check_exc_match not implemented").into())
     }
-    fn reraise(&mut self) -> Result<(), Self::Error> {
+    /// `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
+    ///
+    /// `oparg` is the depth (0..) at which the original raise-site lasti
+    /// integer sits on the value stack.  When `oparg > 0` the handler
+    /// peeks lasti at `peekvalue(oparg)` and carries it through
+    /// `RaiseWithExplicitTraceback(operr, reraise_lasti=...)`.  When
+    /// `oparg == 0` no lasti is attached (default `-1`).
+    fn reraise(&mut self, _oparg: u32) -> Result<(), Self::Error> {
         Err(crate::PyError::type_error("reraise not implemented").into())
     }
 
@@ -1732,8 +1751,8 @@ where
             executor.raise_varargs(raise_kind_as_usize(argc.get(op_arg)))?;
             Ok(StepResult::Continue)
         }
-        Instruction::Reraise { .. } => {
-            executor.reraise()?;
+        Instruction::Reraise { depth } => {
+            executor.reraise(depth.get(op_arg))?;
             Ok(StepResult::Continue)
         }
 

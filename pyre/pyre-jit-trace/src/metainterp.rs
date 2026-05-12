@@ -618,12 +618,18 @@ impl PyreMetaInterp {
             let sym = unsafe { &*top.sym };
             let pc = top.pc;
 
-            // RPython: if opcode == op_catch_exception → handler found
-            if let Some(entry) =
-                pyre_interpreter::bytecode::find_exception_handler(&code.exceptiontable, pc as u32)
+            // RPython: if opcode == op_catch_exception → handler found.
+            // `lookup_exceptiontable` takes byte offsets and returns byte
+            // offsets; pyre's JIT trace uses code-unit indices for `pc`
+            // and handler PC, so multiply/divide by 2 at the boundary.
+            if let Some((target_bytes, depth, lasti)) =
+                pyre_interpreter::exception_table::lookup_exceptiontable(
+                    &code.exceptiontable,
+                    (pc * 2) as u32,
+                )
             {
-                let handler_pc = entry.target as usize;
-                let handler_depth = entry.depth as usize;
+                let handler_pc = target_bytes as usize / 2;
+                let handler_depth = depth as usize;
                 let exc_opref = sym.last_exc_box;
                 let exc_obj = sym.last_exc_value;
 
@@ -681,7 +687,7 @@ impl PyreMetaInterp {
                     }
                 }
 
-                let lasti_obj = if entry.push_lasti {
+                let lasti_obj = if lasti {
                     // Python 3.11 exception-table adaptation: `push_lasti`
                     // pushes a real W_Int object onto `locals_cells_stack_w`.
                     // Route it through the common stack/vable mirror so the

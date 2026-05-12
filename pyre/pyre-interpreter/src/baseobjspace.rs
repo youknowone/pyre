@@ -7465,6 +7465,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 message: "".to_string(),
                 exc_object: std::ptr::null_mut(),
                 attach_tb: true,
+                reraise_lasti: -1,
             });
         }
         // Range iterator
@@ -7487,6 +7488,7 @@ pub fn next(obj: PyObjectRef) -> PyResult {
                 message: "".to_string(),
                 exc_object: std::ptr::null_mut(),
                 attach_tb: true,
+                reraise_lasti: -1,
             });
         }
         // Generator __next__ — PyPy: generator.py GeneratorIterator.next
@@ -7856,6 +7858,7 @@ fn generator_close_method(args: &[PyObjectRef]) -> PyResult {
         message: String::new(),
         exc_object: std::ptr::null_mut(),
         attach_tb: true,
+        reraise_lasti: -1,
     };
     match generator_send_ex(gen_obj, w_none(), Some(err)) {
         Ok(_) => {
@@ -7900,6 +7903,7 @@ fn normalize_throw_args(w_type: PyObjectRef, w_val: PyObjectRef) -> PyError {
                     message: msg,
                     exc_object: std::ptr::null_mut(),
                     attach_tb: true,
+                    reraise_lasti: -1,
                 };
             }
         }

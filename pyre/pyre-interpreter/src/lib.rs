@@ -19,6 +19,7 @@ pub mod baseobjspace;
 pub mod builtins;
 pub mod display;
 pub mod error;
+pub mod exception_table;
 pub mod executioncontext;
 pub mod frame_array;
 pub mod function;

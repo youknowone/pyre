@@ -164,15 +164,27 @@ fn frame_blocks_for_offset(code: &CodeObject, next_offset: usize) -> Vec<FrameBl
         return Vec::new();
     }
 
-    pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable)
-        .into_iter()
-        .filter(|entry| next_offset >= entry.start as usize && next_offset < entry.end as usize)
-        .map(|entry| FrameBlock {
-            start_offset: entry.start as usize,
-            end_offset: entry.end as usize,
-            handler_offset: entry.target as usize,
-            stack_depth: entry.depth as u16,
-            push_lasti: entry.push_lasti,
+    // `exception_table::decode_exceptiontable` yields byte offsets; pyre's
+    // JIT codewriter tracks instruction-index offsets (`next_offset` is a
+    // code-unit index into `code.instructions`), so divide by 2 at the
+    // boundary.  Entries are emitted in ascending `start` order so we walk
+    // the whole list rather than break early — multiple ranges may cover
+    // the same PC (`pypy/interpreter/pycode.py:250-253` last-matching-wins).
+    pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
+        .filter_map(|entry| {
+            let start = entry.start as usize / 2;
+            let end = entry.end as usize / 2;
+            if next_offset >= start && next_offset < end {
+                Some(FrameBlock {
+                    start_offset: start,
+                    end_offset: end,
+                    handler_offset: entry.target as usize / 2,
+                    stack_depth: entry.depth as u16,
+                    push_lasti: entry.lasti,
+                })
+            } else {
+                None
+            }
         })
         .collect()
 }
@@ -2509,18 +2521,41 @@ fn decode_exception_catch_sites(
     Vec<ExceptionCatchSite>,
     std::collections::HashMap<usize, u16>,
 ) {
-    let exception_entries =
-        pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
+    // `decode_exceptiontable` yields byte offsets; codewriter operates in
+    // instruction-index units.  Convert at the boundary.
+    let exception_entries: Vec<_> =
+        pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
+            .map(|e| {
+                (
+                    e.start as usize / 2,
+                    e.end as usize / 2,
+                    e.target as usize / 2,
+                    e.depth as u16,
+                    e.lasti,
+                )
+            })
+            .collect();
     let mut catch_for_pc: Vec<Option<u16>> = vec![None; num_instrs];
     let mut catch_sites: Vec<ExceptionCatchSite> = Vec::new();
     for py_pc in 0..num_instrs {
-        let Some(entry) = exception_entries
-            .iter()
-            .find(|entry| py_pc >= entry.start as usize && py_pc < entry.end as usize)
-        else {
+        // `pypy/interpreter/pycode.py:250-253` last-matching-wins: walk the
+        // entries in encoding order, keep the *last* match for this PC.
+        // Multiple ranges may cover one PC (nested try/finally/with), and
+        // CPython's emission order puts the innermost (most-specific) entry
+        // last.  Earlier pyre used `.find(...)` which returned the first
+        // match — divergence from PyPy in nested cases.
+        let mut chosen: Option<&(usize, usize, usize, u16, bool)> = None;
+        for entry in &exception_entries {
+            let (start, end, _target, _depth, _lasti) = *entry;
+            if py_pc >= start && py_pc < end {
+                chosen = Some(entry);
+            } else if start > py_pc {
+                break;
+            }
+        }
+        let Some(&(_start, _end, handler_py_pc, depth, push_lasti)) = chosen else {
             continue;
         };
-        let handler_py_pc = entry.target as usize;
         if handler_py_pc >= num_instrs {
             continue;
         }
@@ -2529,16 +2564,16 @@ fn decode_exception_catch_sites(
         catch_sites.push(ExceptionCatchSite {
             landing_label,
             handler_py_pc,
-            stack_depth: entry.depth,
-            push_lasti: entry.push_lasti,
+            stack_depth: depth,
+            push_lasti,
             lasti_py_pc: py_pc,
         });
     }
     let handler_depth_at: std::collections::HashMap<usize, u16> = exception_entries
         .iter()
-        .map(|e| {
-            let extra = if e.push_lasti { 1u16 } else { 0 };
-            (e.target as usize, e.depth as u16 + extra + 1)
+        .map(|(_start, _end, target, depth, lasti)| {
+            let extra = if *lasti { 1u16 } else { 0 };
+            (*target, *depth + extra + 1)
         })
         .collect();
     (catch_for_pc, catch_sites, handler_depth_at)
@@ -9666,18 +9701,23 @@ mod tests {
         let code = first_nested_function_code(
             "def f(a):\n    try:\n        return a\n    except Exception:\n        return 0\n",
         );
-        let entries = pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
+        // `exception_table::decode_exceptiontable` yields byte offsets;
+        // codewriter operates in code-unit indices (offset/2).
+        let entries: Vec<_> =
+            pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
+                .collect();
         assert!(!entries.is_empty());
 
         let first = &entries[0];
-        let blocks = frame_blocks_for_offset(&code, first.start as usize);
+        let first_start_units = first.start as usize / 2;
+        let blocks = frame_blocks_for_offset(&code, first_start_units);
 
         assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0].start_offset, first.start as usize);
-        assert_eq!(blocks[0].end_offset, first.end as usize);
-        assert_eq!(blocks[0].handler_offset, first.target as usize);
+        assert_eq!(blocks[0].start_offset, first_start_units);
+        assert_eq!(blocks[0].end_offset, first.end as usize / 2);
+        assert_eq!(blocks[0].handler_offset, first.target as usize / 2);
         assert_eq!(blocks[0].stack_depth, first.depth as u16);
-        assert_eq!(blocks[0].push_lasti, first.push_lasti);
+        assert_eq!(blocks[0].push_lasti, first.lasti);
     }
 
     #[test]

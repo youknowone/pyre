@@ -275,6 +275,7 @@ impl From<OperationError> for PyError {
             message,
             exc_object: value.w_value,
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 }
@@ -308,6 +309,15 @@ pub struct PyError {
     /// `record_application_traceback`.  Default `true` for any
     /// normally-constructed PyError; reraise flips it off.
     pub attach_tb: bool,
+    /// `pypy/interpreter/pyopcode.py:122 handle_operation_error(..., reraise_lasti=-1)`
+    /// parity.  RERAISE N reads the original raise-site lasti from the
+    /// value stack and carries it through `RaiseWithExplicitTraceback`
+    /// so the next exception-table dispatch can push the original
+    /// raise-site offset (not the RERAISE instruction itself) as the
+    /// `lasti` value, and so the no-handler propagation path can
+    /// restore `last_instr` for correct `f_lineno`.  `-1` means "no
+    /// reraise lasti carried" (default for primary raises).
+    pub reraise_lasti: i32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -381,6 +391,7 @@ impl PyError {
             message: message.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -390,6 +401,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -399,6 +411,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -408,6 +421,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -417,6 +431,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -426,6 +441,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -435,6 +451,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -444,6 +461,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -453,6 +471,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -469,6 +488,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -480,6 +500,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -489,6 +510,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -502,6 +524,7 @@ impl PyError {
             message: msg.into(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -511,6 +534,7 @@ impl PyError {
             message: String::new(),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         }
     }
 
@@ -588,6 +612,7 @@ impl PyError {
                 message,
                 exc_object: obj,
                 attach_tb: true,
+                reraise_lasti: -1,
             }
         }
     }

@@ -71,13 +71,18 @@ impl LiveVars {
         // control flow. Any instruction in [start, end) can jump to
         // target on exception — the target's live set must be unioned
         // into every PC in the range.
-        let exc_handlers: Vec<(usize, usize, usize)> = {
-            let entries = pyre_interpreter::bytecode::decode_exception_table(&code.exceptiontable);
-            entries
-                .iter()
-                .map(|e| (e.start as usize, e.end as usize, e.target as usize))
-                .collect()
-        };
+        // `decode_exceptiontable` yields byte offsets; liveness operates
+        // in code-unit indices (offset/2).
+        let exc_handlers: Vec<(usize, usize, usize)> =
+            pyre_interpreter::exception_table::decode_exceptiontable(&code.exceptiontable)
+                .map(|e| {
+                    (
+                        e.start as usize / 2,
+                        e.end as usize / 2,
+                        e.target as usize / 2,
+                    )
+                })
+                .collect();
 
         // Fixed-point backward analysis for local liveness.
         let mut changed = true;

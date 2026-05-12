@@ -572,6 +572,7 @@ pub fn init(ns: &mut DictStorage) {
                 message: code.to_string(),
                 exc_object: std::ptr::null_mut(),
                 attach_tb: true,
+                reraise_lasti: -1,
             })
         }),
     );

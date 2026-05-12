@@ -6398,7 +6398,7 @@ mod tests {
             pre_opcode_semantic_depth: None,
         };
 
-        let err = OpcodeStepExecutor::reraise(&mut state).expect_err("reraise should raise");
+        let err = OpcodeStepExecutor::reraise(&mut state, 0).expect_err("reraise should raise");
         assert_eq!(err.to_exc_object(), exc);
     }
 
@@ -6704,12 +6704,14 @@ mod tests {
                 )
             })
             .expect("test bytecode should contain RAISE_VARARGS");
-        let handler_pc = pyre_interpreter::bytecode::find_exception_handler(
-            &code.exceptiontable,
-            raise_pc as u32,
-        )
-        .expect("raise should be covered by exception table")
-        .target as usize;
+        // Byte offsets in/out; pyre PC is a code-unit index.
+        let (target_bytes, _depth, _lasti) =
+            pyre_interpreter::exception_table::lookup_exceptiontable(
+                &code.exceptiontable,
+                (raise_pc * 2) as u32,
+            )
+            .expect("raise should be covered by exception table");
+        let handler_pc = target_bytes as usize / 2;
         let code_ref =
             pyre_interpreter::w_code_new(Box::into_raw(Box::new(code.clone())) as *const ())
                 as *const ();

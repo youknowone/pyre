@@ -4502,6 +4502,31 @@ fn init_code_type(ns: &mut DictStorage) {
             Ok(args.first().copied().unwrap_or(pyre_object::w_none()))
         }),
     );
+    // `pypy/interpreter/typedef.py:720`
+    // `co_exceptiontable = interp_attrproperty('co_exceptiontable', cls=PyCode,
+    //                                          wrapfn="newbytes")`.
+    //
+    // Read-only attribute exposing the raw varint-packed table.  The
+    // matching getset descriptor wraps the field as a `bytes` object
+    // (PyPy `wrapfn="newbytes"`).  `args[0]` is the descriptor itself,
+    // `args[1]` is the W_CodeObject instance (typedef.py:467-470 calling
+    // convention via `descr_property_get`).
+    dict_storage_store(
+        ns,
+        "co_exceptiontable",
+        make_getset_descriptor(make_builtin_function_with_arity(
+            "co_exceptiontable",
+            |args| {
+                let w_self = args.get(1).copied().unwrap_or(pyre_object::PY_NULL);
+                if w_self.is_null() {
+                    return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
+                }
+                let bytes = unsafe { crate::pycode::w_code_exceptiontable(w_self) };
+                Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
+            },
+            2,
+        )),
+    );
 }
 
 /// typedef.py:492-500 Member.typedef

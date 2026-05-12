@@ -250,42 +250,91 @@ impl HostCode {
 
     /// Find the exception-table handler covering the given byte offset.
     ///
-    /// RustPython stores exception-table offsets in code-unit indices.
-    /// `HostCode.read` and flowspace operate in byte offsets for
-    /// parity with RPython's `co_code` walk, so the adapter converts
-    /// to/from byte offsets here.
+    /// `pypy/interpreter/pycode.py:229-254 lookup_exceptiontable` parity:
+    /// last-matching-wins, byte-offset I/O.  `HostCode.read` and flowspace
+    /// operate in byte offsets (RPython's `co_code` walk convention), so
+    /// the result is byte-offset natively.
+    ///
+    /// Mirrors `pyre_interpreter::exception_table::lookup_exceptiontable`
+    /// but lives here because `majit-translate` does not depend on
+    /// `pyre-interpreter`; the varint decoder is small and the entry
+    /// format is frozen by CPython 3.11 bytecode.
     pub fn find_exception_handler(&self, offset: u32) -> Option<ExceptionTableEntry> {
         if !offset.is_multiple_of(2) {
             return None;
         }
-        let unit_offset = offset / 2;
-        rustpython_compiler_core::bytecode::find_exception_handler(
-            &self.exceptiontable,
-            unit_offset,
-        )
-        .map(|entry| ExceptionTableEntry {
-            start: entry.start * 2,
-            end: entry.end * 2,
-            target: entry.target * 2,
-            depth: entry.depth,
-            push_lasti: entry.push_lasti,
-        })
+        let table = &self.exceptiontable;
+        let n = table.len();
+        let mut best: Option<ExceptionTableEntry> = None;
+        let mut i = 0;
+        while i < n {
+            let (start_raw, ni) = decode_table_varint(table, i);
+            let start = start_raw * 2;
+            let (length_raw, ni) = decode_table_varint(table, ni);
+            let length = length_raw * 2;
+            let (target_raw, ni) = decode_table_varint(table, ni);
+            let target = target_raw * 2;
+            let (dl, ni) = decode_table_varint(table, ni);
+            i = ni;
+            if start <= offset && offset < start + length {
+                best = Some(ExceptionTableEntry {
+                    start,
+                    end: start + length,
+                    target,
+                    depth: (dl >> 1) as u16,
+                    push_lasti: (dl & 1) != 0,
+                });
+            } else if start > offset {
+                break;
+            }
+        }
+        best
     }
 
     /// Decode the entire exception table into byte-offset entries.
     pub fn decode_exception_table(&self) -> Vec<ExceptionTableEntry> {
-        rustpython_compiler_core::bytecode::decode_exception_table(&self.exceptiontable)
-            .into_iter()
-            .map(|entry| ExceptionTableEntry {
-                start: entry.start * 2,
-                end: entry.end * 2,
-                target: entry.target * 2,
-                depth: entry.depth,
-                push_lasti: entry.push_lasti,
-            })
-            .collect()
+        let table = &self.exceptiontable;
+        let n = table.len();
+        let mut entries = Vec::new();
+        let mut i = 0;
+        while i < n {
+            let (start_raw, ni) = decode_table_varint(table, i);
+            let start = start_raw * 2;
+            let (length_raw, ni) = decode_table_varint(table, ni);
+            let length = length_raw * 2;
+            let (target_raw, ni) = decode_table_varint(table, ni);
+            let target = target_raw * 2;
+            let (dl, ni) = decode_table_varint(table, ni);
+            i = ni;
+            entries.push(ExceptionTableEntry {
+                start,
+                end: start + length,
+                target,
+                depth: (dl >> 1) as u16,
+                push_lasti: (dl & 1) != 0,
+            });
+        }
+        entries
     }
+}
 
+/// `pypy/interpreter/pycode.py:683-695 _decode_varint`.  Reads 6 bits per
+/// byte, MSB first; bit 6 is the continuation flag, bit 7 is the start-of-
+/// entry marker (ignored — masked along with continuation via `& 63`).
+#[inline]
+fn decode_table_varint(table: &[u8], mut i: usize) -> (u32, usize) {
+    let mut b = table[i] as u32;
+    i += 1;
+    let mut value = b & 63;
+    while b & 64 != 0 {
+        b = table[i] as u32;
+        i += 1;
+        value = (value << 6) | (b & 63);
+    }
+    (value, i)
+}
+
+impl HostCode {
     /// Decode the instruction starting at byte position `offset`.
     ///
     /// Returns `(next_offset, op, oparg)` where `next_offset` is the byte

@@ -4663,6 +4663,7 @@ fn load_part(
             message: format!("builtin module '{modulename}' failed to initialize"),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         })?;
         set_sys_module(modulename, m);
         return Ok(Some(m));
@@ -4693,6 +4694,7 @@ fn load_part(
                 message: format!("builtin module '{modulename}' failed to initialize"),
                 exc_object: std::ptr::null_mut(),
                 attach_tb: true,
+                reraise_lasti: -1,
             })?;
             // Store builtin modules in cache immediately
             set_sys_module(modulename, m);
@@ -4795,6 +4797,7 @@ fn relative_import(
         message: "attempted relative import with no known parent package".to_string(),
         exc_object: std::ptr::null_mut(),
         attach_tb: true,
+        reraise_lasti: -1,
     })?;
 
     // Strip (level - 1) trailing components from package
@@ -4809,6 +4812,7 @@ fn relative_import(
             ),
             exc_object: std::ptr::null_mut(),
             attach_tb: true,
+            reraise_lasti: -1,
         });
     }
     for _ in 0..strips {

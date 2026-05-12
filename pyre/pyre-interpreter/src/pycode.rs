@@ -311,6 +311,45 @@ pub unsafe fn code_get_fast_natural_arity(obj: PyObjectRef) -> u16 {
     }
 }
 
+/// pycode.py:229-254 `PyCode.lookup_exceptiontable`.
+///
+/// Search the wrapped code object's exception table for a handler
+/// covering `instr_offset` (byte offset into `co_code`).  Returns
+/// `Some((target, depth, lasti))` with byte-offset `target` when found.
+///
+/// # Safety
+/// `obj` must point to a valid `W_CodeObject`.
+#[inline]
+pub unsafe fn w_code_lookup_exceptiontable(
+    obj: PyObjectRef,
+    instr_offset: u32,
+) -> Option<(u32, u32, bool)> {
+    if obj.is_null() {
+        return None;
+    }
+    let code = unsafe { &*((*(obj as *const W_CodeObject)).code_ptr as *const crate::CodeObject) };
+    crate::exception_table::lookup_exceptiontable(&code.exceptiontable, instr_offset)
+}
+
+/// pycode.py:145 `self.co_exceptiontable = exceptiontable` — copy the
+/// varint-packed table bytes out of the wrapped `CodeObject`.
+///
+/// The bytes are owned by the inner `CodeObject` (`Box<[u8]>` field), so
+/// returning a reference would tie the lifetime to the obj's heap
+/// allocation.  Callers that need to hand the bytes to Python (where
+/// they get copied into a `W_BytesObject`) take the owned `Vec<u8>`.
+///
+/// # Safety
+/// `obj` must point to a valid `W_CodeObject`.
+#[inline]
+pub unsafe fn w_code_exceptiontable(obj: PyObjectRef) -> Vec<u8> {
+    if obj.is_null() {
+        return Vec::new();
+    }
+    let code = unsafe { &*((*(obj as *const W_CodeObject)).code_ptr as *const crate::CodeObject) };
+    code.exceptiontable.to_vec()
+}
+
 /// Check if an object is a code object.
 ///
 /// # Safety
