@@ -3216,19 +3216,16 @@ impl CodeWriter {
         // backedge produces link args aligned with the appended
         // startblock slots.  Non-portal graphs populate neither side
         // and behave exactly as before.
-        // Phase 4 walker-orthodoxy: every CodeWriter graph now carries
-        // `frame_var` / `ec_var` in `startblock.inputargs` regardless
-        // of `is_portal`.  Upstream RPython builds a full flow graph
-        // for every function and lets `flatten_graph` run on each;
-        // pyre's prior `portal_inputs=is_portal` shortcut left non-
-        // portal startblocks without the frame/ec inputs, so every
-        // `frame_var` reference in a non-portal graph op was a
-        // dangling Variable.  Adding them unconditionally lets the
-        // is_portal gates retire (graph ops in non-portal CodeWriters
-        // now reference well-formed inputargs) and brings non-portal
-        // CodeWriters one step closer to upstream's "every function
-        // has a full graph" contract.
-        let mut graph = new_shadow_graph_with_portal_inputs(code, true);
+        // `rpython/jit/codewriter/codewriter.py:37 portal_jd = self
+        // .callcontrol.jitdriver_sd_from_portal_graph(graph)` —
+        // upstream copies each source graph's actual `inputargs` and
+        // routes the portal-only extras through transformation, not
+        // by appending synthetic `(frame, ec)` to every non-portal
+        // graph.  Pyre matches by gating the portal-input append on
+        // `is_portal` (the prior unconditional shortcut introduced
+        // upstream non-orthodoxy by adding unused inputargs to non-
+        // portal graphs).
+        let mut graph = new_shadow_graph_with_portal_inputs(code, is_portal);
         let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
         // Step 6A slice S4a: snapshot the walker's `currentstate` at
         // every terminator emission so `collect_link_slot_pairs` can
@@ -3239,12 +3236,7 @@ impl CodeWriter {
         // ADAPTATION) reads the source state per-link to project back
         // onto slots.  Keyed on `LinkRef` (Rc-pointer identity).
         let mut link_exit_states: HashMap<super::flow::LinkRef, FrameState> = HashMap::new();
-        // Phase 4 walker-orthodoxy: match the unconditional
-        // `portal_inputs=true` graph build above so the FrameState's
-        // `portal_extras` carry `frame_var` / `ec_var` through every
-        // block transition, keeping `getoutputargs()` aligned with
-        // the startblock's extra slots regardless of `is_portal`.
-        let start_state = entry_frame_state(code, true);
+        let start_state = entry_frame_state(code, is_portal);
         if num_instrs > 0 {
             let start_block =
                 SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
@@ -3387,11 +3379,7 @@ impl CodeWriter {
         // source of truth.
         macro_rules! emit_vsd {
             ($depth:expr) => {
-                // Phase 4 walker-orthodoxy: emit the vable depth sync
-                // graph dual-write for every CodeWriter (frame_var is
-                // now in startblock.inputargs unconditionally —
-                // `new_shadow_graph_with_portal_inputs(code, true)`).
-                {
+                if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // Graph-side shadow: produce a fresh Int Variable
                     // from a constant-source `int_copy` op and consume it
@@ -4119,31 +4107,27 @@ impl CodeWriter {
                     Register::new(Kind::Ref, dst),
                 );
                 $ssarepr.insns.push(insn.clone());
-                // Phase 4 walker-orthodoxy: graph `getfield_vable_r`
-                // dual-write fires for every CodeWriter, not just the
-                // portal.  Upstream RPython builds a full flow graph
-                // for every function and lets `flatten_graph` run on
-                // each; pyre's prior is_portal gate was a pyre-specific
-                // shortcut that dropped graph coverage for inner
-                // helpers, leaving the `[phase4-graph-shape]` probe
-                // surfacing them as inline-only.
-                //
-                // `frame_var` / `ec_var` are stable Variable IDs
-                // (`portal_graph_inputvars`) regardless of `is_portal`;
-                // the graph still records the read even when the
-                // startblock.inputargs doesn't list them (the
-                // PRE-EXISTING-ADAPTATION at `graph_entry_inputargs`).
-                // Phase 4+ walker restructure extends non-portal
-                // startblock.inputargs too so the graph is fully
-                // well-formed.
-                Some(emit_graph_op_with_result(
-                    &mut graph,
-                    &current_block.block(),
-                    "getfield_vable_r",
-                    vable_getfield_ref_graph_args(frame_var.into(), field_idx),
-                    Kind::Ref,
-                    -1,
-                ))
+                // Graph dual-write threads `frame_var.into()` which is
+                // only a startblock inputarg when `is_portal` (per
+                // `graph_entry_inputargs(code, is_portal)`).  Non-portal
+                // graphs would record an op reading a Variable that has
+                // no producer, violating upstream's well-formedness; gate
+                // accordingly.  Returns `Option<Variable>` so callsites
+                // that need the graph identity for downstream
+                // dual-writes can thread the same Variable; non-portal
+                // callees skip the graph emit and return `None`.
+                if is_portal {
+                    Some(emit_graph_op_with_result(
+                        &mut graph,
+                        &current_block.block(),
+                        "getfield_vable_r",
+                        vable_getfield_ref_graph_args(frame_var.into(), field_idx),
+                        Kind::Ref,
+                        -1,
+                    ))
+                } else {
+                    None
+                }
             }};
         }
         macro_rules! emit_vable_setfield_int {
@@ -4350,10 +4334,7 @@ impl CodeWriter {
                 let src_reg = $src;
                 let src_value: super::flow::FlowValue = $src_value;
                 emit_ref_copy!($ssarepr, stack_base + $depth, src_reg);
-                // Phase 4 walker-orthodoxy: vable mirror emit runs for
-                // every CodeWriter (`frame_var` is unconditionally in
-                // startblock.inputargs).
-                {
+                if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // `pyframe.py:389 pushvalue` lowers to
                     // `setarrayitem_vable_r(locals_cells_stack_w,
@@ -4422,8 +4403,7 @@ impl CodeWriter {
                      graph shadow uses Constant::none() per assembler.py:109",
                 );
                 emit_ref_const_copy!($ssarepr, stack_base + $depth, value);
-                // Phase 4 walker-orthodoxy.
-                {
+                if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     let v_idx = emit_graph_op_with_result(
                         &mut graph,
@@ -4485,8 +4465,7 @@ impl CodeWriter {
                 // --synthetic-pattern comprehensions.py`).
                 $depth = $depth.saturating_sub(1);
                 let popped_reg = stack_base + $depth;
-                // Phase 4 walker-orthodoxy.
-                {
+                if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     let v_idx = emit_graph_op_with_result(
                         &mut graph,
@@ -4926,32 +4905,33 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        // Phase 4 walker-orthodoxy: graph dual-write of
-                        // jtransform.py:1898 `do_fixed_list_setitem` —
-                        // STORE_FAST → setarrayitem_vable_r(
-                        // locals_cells_stack_w, local_slot, w_value).
-                        // Fires for every CodeWriter now (frame_var is
-                        // unconditionally in startblock.inputargs).
-                        let local_slot = local_to_vable_slot(reg as usize) as i64;
-                        let v_idx = emit_graph_op_with_result(
-                            &mut graph,
-                            &current_block.block(),
-                            "int_copy",
-                            vec![super::flow::Constant::signed(local_slot).into()],
-                            Kind::Int,
-                            -1,
-                        );
-                        record_graph_op(
-                            &current_block.block(),
-                            "setarrayitem_vable_r",
-                            vable_setarrayitem_ref_graph_args(
-                                frame_var.into(),
-                                v_idx.into(),
-                                stored.clone().into(),
-                            ),
-                            None,
-                            -1,
-                        );
+                        if is_portal {
+                            // Graph dual-write of jtransform.py:1898
+                            // `do_fixed_list_setitem` — STORE_FAST →
+                            // `setarrayitem_vable_r(locals_cells_stack_w,
+                            // local_slot, w_value)`.  `frame_var` is a
+                            // startblock inputarg only when `is_portal`.
+                            let local_slot = local_to_vable_slot(reg as usize) as i64;
+                            let v_idx = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "int_copy",
+                                vec![super::flow::Constant::signed(local_slot).into()],
+                                Kind::Int,
+                                -1,
+                            );
+                            record_graph_op(
+                                &current_block.block(),
+                                "setarrayitem_vable_r",
+                                vable_setarrayitem_ref_graph_args(
+                                    frame_var.into(),
+                                    v_idx.into(),
+                                    stored.clone().into(),
+                                ),
+                                None,
+                                -1,
+                            );
+                        }
                         emit_store_local_with_mirror!(ssarepr, reg, stored_reg);
                         if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                             *slot = Some(stored);
@@ -5171,29 +5151,30 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        // Phase 4 walker-orthodoxy: STORE_FAST half graph
-                        // dual-write (jtransform.py:1898
-                        // `do_fixed_list_setitem`) fires for every CodeWriter.
-                        let store_slot = local_to_vable_slot(store_reg as usize) as i64;
-                        let v_store_idx = emit_graph_op_with_result(
-                            &mut graph,
-                            &current_block.block(),
-                            "int_copy",
-                            vec![super::flow::Constant::signed(store_slot).into()],
-                            Kind::Int,
-                            -1,
-                        );
-                        record_graph_op(
-                            &current_block.block(),
-                            "setarrayitem_vable_r",
-                            vable_setarrayitem_ref_graph_args(
-                                frame_var.into(),
-                                v_store_idx.into(),
-                                stored.clone().into(),
-                            ),
-                            None,
-                            -1,
-                        );
+                        if is_portal {
+                            // STORE_FAST half graph dual-write
+                            // (jtransform.py:1898 `do_fixed_list_setitem`).
+                            let store_slot = local_to_vable_slot(store_reg as usize) as i64;
+                            let v_store_idx = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "int_copy",
+                                vec![super::flow::Constant::signed(store_slot).into()],
+                                Kind::Int,
+                                -1,
+                            );
+                            record_graph_op(
+                                &current_block.block(),
+                                "setarrayitem_vable_r",
+                                vable_setarrayitem_ref_graph_args(
+                                    frame_var.into(),
+                                    v_store_idx.into(),
+                                    stored.clone().into(),
+                                ),
+                                None,
+                                -1,
+                            );
+                        }
                         // STORE_FAST half: same dual-write as Instruction::StoreFast.
                         // Non-portal popvalue places `stored_reg` at
                         // `stack_base + current_depth` post-decrement, so the
@@ -6630,30 +6611,32 @@ impl CodeWriter {
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            // Phase 4 walker-orthodoxy: graph-side
-                            // dual-write — same shape as the StoreFast
-                            // handler.  SSA emission is delegated to
-                            // `emit_store_local_with_mirror!` below.
-                            let local_slot = local_to_vable_slot(reg as usize) as i64;
-                            let v_idx = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "int_copy",
-                                vec![super::flow::Constant::signed(local_slot).into()],
-                                Kind::Int,
-                                -1,
-                            );
-                            record_graph_op(
-                                &current_block.block(),
-                                "setarrayitem_vable_r",
-                                vable_setarrayitem_ref_graph_args(
-                                    frame_var.into(),
-                                    v_idx.into(),
-                                    stored.clone().into(),
-                                ),
-                                None,
-                                -1,
-                            );
+                            if is_portal {
+                                // Graph-side dual-write — same shape as
+                                // the StoreFast handler.  SSA emission
+                                // is delegated to
+                                // `emit_store_local_with_mirror!` below.
+                                let local_slot = local_to_vable_slot(reg as usize) as i64;
+                                let v_idx = emit_graph_op_with_result(
+                                    &mut graph,
+                                    &current_block.block(),
+                                    "int_copy",
+                                    vec![super::flow::Constant::signed(local_slot).into()],
+                                    Kind::Int,
+                                    -1,
+                                );
+                                record_graph_op(
+                                    &current_block.block(),
+                                    "setarrayitem_vable_r",
+                                    vable_setarrayitem_ref_graph_args(
+                                        frame_var.into(),
+                                        v_idx.into(),
+                                        stored.clone().into(),
+                                    ),
+                                    None,
+                                    -1,
+                                );
+                            }
                             emit_store_local_with_mirror!(ssarepr, reg, stored_reg);
                             if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                                 *slot = Some(stored);

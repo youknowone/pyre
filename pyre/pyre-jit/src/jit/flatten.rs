@@ -1691,39 +1691,21 @@ where
                 .flatten()
                 .cloned()
                 .collect::<Vec<_>>();
-            // RPython `flatten.py:130-160`: a final-target Link (target
-            // has empty exits, i.e. returnblock or exceptblock) carries
-            // exactly 1 or 2 args.  Any other arg count for a final
-            // target is a walker NEW-DEVIATION (orphan join-point with
-            // FrameState-merge inputargs).
-            //
-            // **Walker non-orthodoxy adaptation**: pyre's bytecode-1:1
-            // walker creates "orphan join-points" — blocks with empty
-            // `exits` that aren't the canonical `returnblock` /
-            // `exceptblock` and carry the full FrameState slot vector as
-            // `inputargs`.  These violate upstream's contract that only
-            // `returnblock` (1 arg) and `exceptblock` (2 args) have
-            // empty exits.  Until the walker is restructured to either
-            // (a) attach proper successor links to such blocks or
-            // (b) avoid creating them, the driver treats them as "not
-            // final": fall through to `insert_renamings` +
-            // `make_bytecode_block`, which then recurses into the
-            // empty-exits block.  The recursive `make_bytecode_block`
-            // hits its own dedicated 1/2-arg invariant on the empty-
-            // exits leaf, so the legality check still happens — only
-            // the `make_return` shortcut is skipped.
-            //
-            // This converges naturally once Phase 3+ walker restructure
-            // (Task #227) ensures every non-portal CodeWriter walker
-            // emits orthodox final-block links.
-            let target_is_orthodox_final = target_is_final
-                && matches!(collected_args.len(), 1 | 2);
+            // `rpython/jit/codewriter/flatten.py:148-155 make_link`:
+            // when the target has empty `exits` and the link's args do
+            // not reference `last_exception` / `last_exc_value`, call
+            // `make_return(link.args)` directly.  `make_return`
+            // (`flatten.py:130-145`) only accepts 1 or 2 args and
+            // raises `Exception("?")` otherwise — pyre keeps the
+            // upstream behavior: malformed final-target links surface
+            // the fail-loud message via `make_return`'s assert at
+            // emission time, not via a separate gate here.
             (
                 target,
                 collected_args,
                 link_borrow.last_exception,
                 link_borrow.last_exc_value,
-                target_is_orthodox_final && !uses_last_exception && !uses_last_exc_value,
+                target_is_final && !uses_last_exception && !uses_last_exc_value,
             )
         };
         if can_return_directly {
@@ -2245,53 +2227,15 @@ where
 
     fn make_bytecode_block(&mut self, block: BlockRef, handling_ovf: bool) {
         if block.borrow().exits.is_empty() {
+            // `rpython/jit/codewriter/flatten.py:107-109`: empty-exits
+            // blocks are `returnblock` (1 arg) or `exceptblock` (2 args)
+            // and `make_return` handles both shapes.  Any other arg
+            // count is a walker non-orthodoxy that fails fail-loud
+            // inside `make_return` (upstream raises `Exception("?")` at
+            // `flatten.py:145`).  Pyre keeps the upstream behavior:
+            // delegate to `make_return` directly.
             let args = block.borrow().inputargs.clone();
-            // RPython `flatten.py:130-160`: empty-exits blocks are
-            // exclusively `returnblock` (1 arg) or `exceptblock`
-            // (2 args), and both are handled by `make_return`.  Any
-            // other empty-exits block shape is a walker NEW-DEVIATION
-            // (orphan join-point left by the PC-sequential walker
-            // creating a fresh `joinpoints[pc]` entry with FrameState-
-            // merge inputargs and no incoming fall-through edge).
-            //
-            // **Walker non-orthodoxy adaptation**: until the walker is
-            // restructured to either avoid orphan join-points or
-            // attach proper successors, the driver still walks the
-            // block's operations (mirroring the non-empty-exits arm
-            // below) before emitting an `unreachable` terminator.
-            // This preserves the per-op output for retired-family
-            // probes; production paths use inline `ssarepr` emit, not
-            // `flatten_graph`, so the emitted terminator shape is
-            // informational only.  Convergence: Phase 3+ walker
-            // restructure (Task #227) closes the orphan join-point
-            // case so this branch reduces to the orthodox
-            // `make_return(args)` path.
-            if matches!(args.len(), 1 | 2) {
-                // Orthodox final block: no operations to emit, just
-                // the return terminator.  `flatten.py:107-109`.
-                self.make_return(&args);
-                return;
-            }
-            // Orphan-final: emit the block's body before the
-            // unreachable terminator so the probe's per-op
-            // comparison sees every walker-emitted residual_call_*
-            // (FrameState-merge sites can carry binary_op_fn /
-            // box_int_fn calls that the walker emits inline).
-            if self.seen_blocks.contains_key(&block) {
-                let target = self.tlabel_for_block(&block);
-                self.emitline(Insn::op("goto", vec![target]));
-                self.emitline(Insn::Unreachable);
-                return;
-            }
-            self.seen_blocks.insert(block.clone(), true);
-            let block_label = self.label_for_block(&block);
-            self.emitline(block_label);
-            let operations = block.borrow().operations.clone();
-            for op in &operations {
-                self.emit_space_operation(op);
-            }
-            self.emitline(Insn::op("unreachable", Vec::new()));
-            self.emitline(Insn::Unreachable);
+            self.make_return(&args);
             return;
         }
         if self.seen_blocks.contains_key(&block) {
@@ -2438,8 +2382,11 @@ fn switch_llexitcase_key(llexitcase: &Option<FlowValue>) -> i64 {
     match llexitcase {
         // `flatten.py:296 lltype.cast_primitive(lltype.Signed, switch.llexitcase)`.
         // RPython's `lltype.cast_primitive` accepts any primitive type
-        // castable to `Signed`; `Signed` is the identity cast and `Bool`
-        // widens to 0 / 1.
+        // castable to `Signed`; `Signed` is the identity cast and
+        // `Bool` widens to 0 / 1.  Any other shape violates upstream's
+        // `assert kind == 'int'` contract at `flatten.py:276` and
+        // panics fail-loud — pyre keeps the upstream behavior so
+        // malformed switch links surface immediately at the probe.
         Some(FlowValue::Constant(Constant {
             value: ConstantValue::Signed(value),
             ..
@@ -2448,22 +2395,10 @@ fn switch_llexitcase_key(llexitcase: &Option<FlowValue>) -> i64 {
             value: ConstantValue::Bool(value),
             ..
         })) => i64::from(*value),
-        // **Walker non-orthodoxy adaptation**: pyre's bytecode-1:1
-        // walker can leave switch-link `llexitcase` unset on links it
-        // synthesises for orphan join-points and non-canraise multi-
-        // exit dispatch shapes that upstream does not produce.  The
-        // driver-only `[phase4-flatten-graph]` probe wraps the whole
-        // run in `catch_unwind` (`codewriter.rs:7694`) so production
-        // is unaffected.  Until the walker is restructured to either
-        // synthesise valid `llexitcase` constants or avoid the shape,
-        // hash these to `0` and continue: production paths use inline
-        // `ssarepr` emit, not `flatten_graph`, so the emitted output
-        // is informational.  Convergence: Phase 3+ walker restructure
-        // (Task #227) closes this site.
-        other => {
-            let _ = other;
-            0
-        }
+        other => panic!(
+            "flatten_graph: switch link requires Signed/Bool llexitcase per \
+             flatten.py:296 (`cast_primitive(Signed, ...)`); got {other:?}"
+        ),
     }
 }
 
@@ -2644,13 +2579,22 @@ pub fn flatten_graph_with_lowering<'a, F, C>(
 /// the SSARepr — useful for tests against structural-only graphs.
 pub fn flatten_graph<'a>(
     graph: &super::flow::FunctionGraph,
-    regallocs: &'a std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
-    _include_all_exc_links: bool,
+    regallocs: &'a mut std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
+    include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
+    // `flatten.py:68 flattener.enforce_input_args()` — rotate
+    // startblock input colors to the canonical `0..n-1` per kind
+    // before `generate_ssa_form` walks the graph.  Pyre's port lives
+    // in `super::regalloc::enforce_input_args_simulation` since the
+    // walker computes `regallocs` outside the driver today; the
+    // canonical entry calls it before constructing the flattener so
+    // every downstream `getcolor()` read sees the post-swap shape.
+    super::regalloc::enforce_input_args_simulation(graph, regallocs);
     let lowering_ctx = cpu
         .and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
+    // `flatten.py:382-391 getcolor(v)` reads `regallocs[kind].getcolor(v)`.
     let get_register = |variable: Variable| -> Register {
         let kind = variable.kind.unwrap_or(Kind::Ref);
         let color = regallocs
@@ -2659,24 +2603,32 @@ pub fn flatten_graph<'a>(
             .unwrap_or(u16::MAX);
         Register::new(kind, color)
     };
+    // PRE-EXISTING-ADAPTATION: pyre's canonical entry currently uses
+    // the probe-side constant lowering, which folds `Opaque(Ref)`
+    // constants down to `ConstRef(0)`.  Upstream's flatten preserves
+    // `Constant(ll_ovf, concretetype=...)` directly because rpython's
+    // assembler resolves the LL pointer at descrification time.  Pyre
+    // production callers that need real PyObject pointers still go
+    // through `flatten_graph_with_lowering` with a production
+    // closure that resolves opaque constants from the per-`CodeWriter`
+    // pycode / jitdriver tables.  Phase 5 unifies that resolution into
+    // the canonical entry once pyre's constant pool exposes the same
+    // upstream lookups.
     let lower_constant = flatten_constant_operand_for_probe;
-    if let Some(ctx) = lowering_ctx {
-        flatten_graph_with_lowering(
-            graph,
-            &mut ssarepr,
-            ctx,
-            cpu,
-            get_register,
-            lower_constant,
-        );
+    let mut flattener = if let Some(ctx) = lowering_ctx {
+        GraphFlattener::new_with_full_lowering(&mut ssarepr, get_register, lower_constant, ctx)
     } else {
-        let mut flattener =
-            GraphFlattener::new_with_constant_lowering(&mut ssarepr, get_register, lower_constant);
-        if let Some(cpu) = cpu {
-            flattener = flattener.with_cpu(cpu);
-        }
-        flattener.make_bytecode_block(graph.startblock.clone(), false);
+        GraphFlattener::new_with_constant_lowering(&mut ssarepr, get_register, lower_constant)
+    };
+    if let Some(cpu) = cpu {
+        flattener = flattener.with_cpu(cpu);
     }
+    // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
+    // _include_all_exc_links`.
+    flattener.include_all_exc_links = include_all_exc_links;
+    // `flatten.py:69 flattener.generate_ssa_form()` —
+    // `make_bytecode_block(graph.startblock)`.
+    flattener.make_bytecode_block(graph.startblock.clone(), false);
     ssarepr
 }
 
@@ -7342,9 +7294,9 @@ mod tests {
             )
             .into_ref(),
         ]);
-        let regallocs =
+        let mut regallocs =
             super::super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
-        let ssarepr = flatten_graph(&graph, &regallocs, false, None);
+        let ssarepr = flatten_graph(&graph, &mut regallocs, false, None);
         assert_eq!(ssarepr.name, "orthodox4arg");
         assert!(
             ssarepr
