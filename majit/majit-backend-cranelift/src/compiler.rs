@@ -3069,6 +3069,7 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 if bridge_descr.is_external_jump() {
                     let target_entry = bridge_descr
                         .target_descr()
+                        .as_ref()
                         .and_then(lookup_loop_target)
                         .expect("external JUMP target must be a registered LoopTargetDescr");
                     current_inputs = raw_values_from_deadframe_typed(
@@ -7216,9 +7217,9 @@ impl CraneliftBackend {
             // assembler.py:2456-2462 closing_jump: raw JMP to
             // `target_token._ll_loop_code`. Cranelift can't emit inter-
             // function JMPs, so we return and re-enter the target loop here.
-            if fail_descr.is_external_jump {
+            if fail_descr.is_external_jump() {
                 let target_entry = fail_descr
-                    .target_descr
+                    .target_descr()
                     .as_ref()
                     .and_then(lookup_loop_target)
                     .expect("external JUMP target must be a registered LoopTargetDescr");
@@ -13171,23 +13172,30 @@ fn collect_guards(
             }
             bits
         };
+        // assembler.py:2456-2462 closing_jump parity for the external-JUMP
+        // branch: the TargetToken descr referenced by `op.descr` is captured
+        // separately and registered against the freshly-allocated descr's
+        // Arc address below — the registration cannot live inside the
+        // constructor because the callsite still mutates the descr in place
+        // (`set_source_op_index`, `is_exit_frame_with_exception`,
+        // `meta_descr`) before wrapping it in `Arc::new`.
+        let external_jump_target: Option<majit_ir::DescrRef> = if is_external_jump {
+            Some(
+                op.descr
+                    .as_ref()
+                    .cloned()
+                    .expect("external JUMP must carry a TargetToken descr"),
+            )
+        } else {
+            None
+        };
         let mut descr = if is_external_jump {
-            // assembler.py:2456-2462 closing_jump parity: JUMP whose target
-            // TargetToken lives in a different compiled function. The op.descr
-            // is the target TargetToken (history.py:470) — the dispatcher
-            // reads it to re-enter the target via lookup_loop_target.
-            let target_descr = op
-                .descr
-                .as_ref()
-                .cloned()
-                .expect("external JUMP must carry a TargetToken descr");
             CraneliftFailDescr::new_external_jump(
                 fail_index,
                 trace_id,
                 fail_arg_types,
                 force_token_slots,
                 recovery_layout,
-                target_descr,
             )
         } else {
             CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
@@ -13221,6 +13229,9 @@ fn collect_guards(
         // through this Arc to the metainterp side.
         descr.meta_descr = op.descr.clone();
         let descr = Arc::new(descr);
+        if let Some(target) = external_jump_target {
+            crate::guard::register_external_jump_target(Arc::as_ptr(&descr) as usize, target);
+        }
         if std::env::var_os("MAJIT_LOG").is_some() && !is_finish && !is_external_jump {
             eprintln!(
                 "[cl-guard-token] fail_index={} op_index={} opcode={:?} fail_args={:?} fail_arg_types={:?}",
@@ -13647,7 +13658,7 @@ impl majit_backend::Backend for CraneliftBackend {
             // the `execute_bridge` entry marshaling path; derive it from
             // the compiled fail_descrs' is_external_jump flag rather than
             // re-scanning ops + mutating descrs after the fact.
-            let loop_reentry = compiled.fail_descrs.iter().any(|d| d.is_external_jump);
+            let loop_reentry = compiled.fail_descrs.iter().any(|d| d.is_external_jump());
             sd.attach_bridge(BridgeData {
                 trace_id: compiled.trace_id,
                 input_types: compiled.input_types.clone(),
@@ -14064,9 +14075,9 @@ impl majit_backend::Backend for CraneliftBackend {
             // llgraph/runner.py:1130-1140 closing_jump: cross-loop JUMP
             // re-enters the target loop trace identified by the
             // TargetToken on the fail descriptor.
-            if fail_descr.is_external_jump {
+            if fail_descr.is_external_jump() {
                 let target_entry = fail_descr
-                    .target_descr
+                    .target_descr()
                     .as_ref()
                     .and_then(lookup_loop_target)
                     .expect("external JUMP target must be a registered LoopTargetDescr");

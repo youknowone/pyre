@@ -1279,7 +1279,11 @@ pub trait FailDescr: Descr {
 
     /// history.py:470 TargetToken descriptor identifying the JUMP target.
     /// Present only when `is_external_jump()` is true.
-    fn target_descr(&self) -> Option<&DescrRef> {
+    ///
+    /// Returns an owned `DescrRef` (cloned `Arc`) — Session 5i-cl moved
+    /// the cranelift implementation to a backend-static side-table that
+    /// cannot hand out a borrow under a lock.
+    fn target_descr(&self) -> Option<DescrRef> {
         None
     }
 

@@ -19,6 +19,48 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
+/// `Arc::as_ptr` address to its external-JUMP target `DescrRef`.
+///
+/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) does not
+/// carry `is_external_jump` / `target_descr` slots; upstream
+/// `assembler.py:2456-2462 closing_jump` emits a raw inter-function
+/// JMP to `target_token._ll_loop_code`.  Cranelift can't emit raw
+/// inter-function JMPs, so the exit returns to the dispatcher which
+/// reads the target descr to re-enter via the registered
+/// `JitCellToken.number → RegisteredLoopTarget` metadata.  Pyre
+/// keeps the per-descr target as a backend-static side-table entry
+/// keyed on `Arc::as_ptr(&descr)`.  Membership in the table is the
+/// canonical `is_external_jump` predicate.
+static EXTERNAL_JUMP_TARGETS: OnceLock<Mutex<HashMap<usize, DescrRef>>> = OnceLock::new();
+
+fn external_jump_targets() -> &'static Mutex<HashMap<usize, DescrRef>> {
+    EXTERNAL_JUMP_TARGETS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Codegen-time write: invoked from `CraneliftFailDescr::new_external_jump`
+/// once the descr is wrapped in its owning `Arc`.  The Arc address is
+/// stable for the descr's lifetime; the table entry remains until the
+/// descr is dropped (matching the previous in-descr `target_descr:
+/// Option<DescrRef>` semantics — no explicit cleanup).
+pub fn register_external_jump_target(descr_ptr: usize, target: DescrRef) {
+    external_jump_targets()
+        .lock()
+        .expect("EXTERNAL_JUMP_TARGETS mutex poisoned")
+        .insert(descr_ptr, target);
+}
+
+/// Runtime read: returns the registered target descr, or `None` for
+/// descrs that are not external JUMP exits.  Membership equates to
+/// the previous `is_external_jump: true` predicate.
+pub fn lookup_external_jump_target(descr_ptr: usize) -> Option<DescrRef> {
+    external_jump_targets()
+        .lock()
+        .expect("EXTERNAL_JUMP_TARGETS mutex poisoned")
+        .get(&descr_ptr)
+        .cloned()
+}
+
+/// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to a `AtomicU32` failure counter.
 ///
 /// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) does not
@@ -166,13 +208,13 @@ pub struct CraneliftFailDescr {
     /// which reads `target_descr` and re-enters the target loop via the
     /// registered `JitCellToken.number -> RegisteredLoopTarget` metadata.
     /// Mutually exclusive with is_finish.
-    pub is_external_jump: bool,
-    /// The TargetToken descriptor this JUMP targets, used by the dispatcher
-    /// to look up the target loop. Present only when is_external_jump=true.
-    /// (history.py:470 TargetToken — identity is the Arc's allocation address,
-    /// matching PyPy's `target_tokens_currently_compiling[descr] = None` dict
-    /// keyed by descriptor identity.)
-    pub target_descr: Option<DescrRef>,
+    // is_external_jump / target_descr removed (Session 5i-cl): neither
+    // is in PyPy `AbstractFailDescr._attrs_` (`history.py:132`).  PyPy
+    // emits a raw inter-function JMP at `assembler.py:2456-2462
+    // closing_jump`; the cranelift backend's dispatcher-mediated
+    // equivalent now consults the `EXTERNAL_JUMP_TARGETS` side-table
+    // (keyed on `Arc::as_ptr(&descr)`).  Membership = external-JUMP
+    // predicate; lookup value = target `DescrRef`.
     pub force_token_slots: Vec<usize>,
     /// Write-once during compilation, read-only after.
     /// No lock — RPython ResumeGuardDescr has no lock (GIL).
@@ -258,6 +300,27 @@ pub struct CraneliftFailDescr {
     pub meta_descr: Option<DescrRef>,
 }
 
+impl Drop for CraneliftFailDescr {
+    /// Backend-static side-tables (`EXTERNAL_JUMP_TARGETS`,
+    /// `FAIL_COUNT_TABLE`) are keyed on the descr's inner address.
+    /// Without cleanup the entry would outlive the descr and, since the
+    /// allocator may reuse the freed address for a future descr, that
+    /// new descr would observe stale side-table state (e.g. an
+    /// unintended `is_external_jump()` true result).  Wipe the entries
+    /// here so the lifecycle stays scoped to `CraneliftFailDescr`.
+    fn drop(&mut self) {
+        let ptr = self as *const Self as usize;
+        external_jump_targets()
+            .lock()
+            .expect("EXTERNAL_JUMP_TARGETS mutex poisoned")
+            .remove(&ptr);
+        fail_count_table()
+            .lock()
+            .expect("FAIL_COUNT_TABLE mutex poisoned")
+            .remove(&ptr);
+    }
+}
+
 impl std::fmt::Debug for CraneliftFailDescr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CraneliftFailDescr")
@@ -267,10 +330,9 @@ impl std::fmt::Debug for CraneliftFailDescr {
             .field("fail_arg_types", &self.fail_arg_types)
             .field("gc_map", &self.gc_map)
             .field("is_finish", &self.is_finish)
-            .field("is_external_jump", &self.is_external_jump)
             .field(
-                "target_descr",
-                &self.target_descr.as_ref().map(|d| d.repr()),
+                "external_jump_target",
+                &lookup_external_jump_target(self as *const Self as usize).map(|d| d.repr()),
             )
             .field("force_token_slots", &self.force_token_slots)
             .field("trace_info", unsafe { &*self.trace_info.get() })
@@ -359,8 +421,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             is_finish,
             is_exit_frame_with_exception: false,
-            is_external_jump: false,
-            target_descr: None,
             force_token_slots,
             trace_info: UnsafeCell::new(None),
             recovery_layout: UnsafeCell::new(recovery_layout),
@@ -384,8 +444,14 @@ impl CraneliftFailDescr {
         fail_arg_types: Vec<Type>,
         mut force_token_slots: Vec<usize>,
         recovery_layout: Option<ExitRecoveryLayout>,
-        target_descr: DescrRef,
     ) -> Self {
+        // Caller is expected to wrap the returned descr in `Arc::new(...)`
+        // and immediately register the external-JUMP target via
+        // `register_external_jump_target(Arc::as_ptr(&descr) as usize,
+        // target_descr)`.  The constructor cannot do this itself because
+        // the callsite needs to perform additional in-place mutations
+        // (`set_source_op_index`, `is_exit_frame_with_exception`,
+        // `meta_descr`) before sealing the descr behind `Arc`.
         force_token_slots.sort_unstable();
         force_token_slots.dedup();
         CraneliftFailDescr {
@@ -396,8 +462,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             is_finish: false,
             is_exit_frame_with_exception: false,
-            is_external_jump: true,
-            target_descr: Some(target_descr),
             force_token_slots,
             trace_info: UnsafeCell::new(None),
             recovery_layout: UnsafeCell::new(recovery_layout),
@@ -687,7 +751,7 @@ impl majit_ir::Descr for CraneliftFailDescr {
     /// cranelift's external-JUMP descrs are backend-only synthetic
     /// objects with no metainterp counterpart.
     fn is_resume_guard(&self) -> bool {
-        if self.is_external_jump {
+        if lookup_external_jump_target(self as *const Self as usize).is_some() {
             return false;
         }
         // When meta_descr is a ResumeDescr family member, return true.
@@ -757,12 +821,14 @@ impl FailDescr for CraneliftFailDescr {
     fn is_external_jump(&self) -> bool {
         // Backend-only flag, no metainterp counterpart — external-JUMP
         // descrs are synthesized at the cranelift backend for
-        // cross-loop JUMP targets and have meta_descr == None.
-        self.is_external_jump
+        // cross-loop JUMP targets and have meta_descr == None.  Session
+        // 5i-cl moved the per-descr target to `EXTERNAL_JUMP_TARGETS`;
+        // table membership is the canonical predicate.
+        lookup_external_jump_target(self as *const Self as usize).is_some()
     }
 
-    fn target_descr(&self) -> Option<&DescrRef> {
-        self.target_descr.as_ref()
+    fn target_descr(&self) -> Option<DescrRef> {
+        lookup_external_jump_target(self as *const Self as usize)
     }
 
     fn trace_id(&self) -> u64 {
