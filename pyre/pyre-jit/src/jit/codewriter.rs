@@ -7232,13 +7232,15 @@ impl CodeWriter {
                 // Task #48 micro-slice 10: box_int_fn factor refactor
                 // (exception lasti site).  See LoadSmallInt site for
                 // the shared rationale.
-                ssarepr
-                    .insns
-                    .push(super::flatten::build_box_int_fn_residual_call_ir_r_insn(
+                push_walker_emit(
+                    &mut ssarepr,
+                    &current_block,
+                    super::flatten::build_box_int_fn_residual_call_ir_r_insn(
                         box_int_fn_idx,
                         site.lasti_py_pc as i64,
                         exc_slot,
-                    ));
+                    ),
+                );
                 // Graph-side `residual_call_ir_r` for
                 // `box_int_fn(lasti:Int) → Ref` followed by the
                 // matching `setarrayitem_vable_r(frame, lasti_depth,
