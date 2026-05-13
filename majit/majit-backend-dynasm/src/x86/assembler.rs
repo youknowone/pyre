@@ -4095,11 +4095,13 @@ impl<'a> Assembler386<'a> {
             descr_mut.fail_arg_locs = fail_arg_locs;
             descr_mut.source_op_index = Some(op_index);
             *descr_mut.recovery_layout.get_mut() = Some(recovery_layout);
-            // Unified-Descr Port Epic Session 5a: capture the metainterp
-            // ResumeGuardDescr Arc as a back-pointer.  rd_numb/rd_consts/
-            // rd_virtuals/rd_pendingfields readers (Session 5b) forward
-            // through this Arc to the resume.py:450-488 storage on the
-            // metainterp side, so no separate local copy is kept here.
+            // Capture the metainterp `AbstractFailDescr` Arc as a
+            // back-pointer.  Backend accessors for `_attrs_` fields
+            // (`history.py:132`: adr_jump_offset / rd_locs /
+            // rd_loop_token / rd_vector_info) and resume payload
+            // (`compile.py:855` rd_numb / rd_consts / rd_virtuals /
+            // rd_pendingfields / status) forward through this Arc to
+            // the metainterp side.
             descr_mut.meta_descr = op.descr.clone();
         }
         // `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`

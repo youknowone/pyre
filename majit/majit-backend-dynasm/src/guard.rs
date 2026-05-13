@@ -415,13 +415,13 @@ impl FailDescr for DynasmFailDescr {
     }
 
     fn fail_arg_types(&self) -> &[Type] {
-        // Session 5b + post-audit: gate forwarding on
-        // `meta_resume_fd()` (`isinstance(descr, ResumeDescr)`).  For
-        // ResumeDescr-family meta descrs the metainterp stamp via
-        // `store_final_boxes_in_guard` (compile.py:869) is the single
-        // source of truth; for FINISH / `ExitFrameWithExceptionDescr` /
-        // `PropagateExceptionDescr` and synthetic descrs the backend
-        // local field set at construction is canonical.
+        // `compile.py:185 isinstance(descr, ResumeDescr)` gate forwarding
+        // via `meta_resume_fd()`.  For ResumeDescr-family meta descrs the
+        // metainterp stamp via `store_final_boxes_in_guard`
+        // (compile.py:869) is the single source of truth; for FINISH /
+        // `ExitFrameWithExceptionDescr` / `PropagateExceptionDescr` and
+        // synthetic descrs the backend local field set at construction is
+        // canonical.
         self.meta_resume_fd()
             .map_or(&*self.fail_arg_types, |fd| fd.fail_arg_types())
     }
