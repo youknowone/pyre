@@ -581,20 +581,21 @@ fn overlay_deadframe_fail_descr(
     base_layout: &FailDescrLayout,
     recovery_layout: ExitRecoveryLayout,
 ) -> Arc<CraneliftFailDescr> {
-    let mut descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+    let descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
         base_layout.fail_index,
         base_layout.trace_id,
         base_layout.fail_arg_types.clone(),
         base_layout.is_finish,
         base_layout.force_token_slots.clone(),
     );
+    let descr = Arc::new(descr);
+    // `set_source_op_index` / `set_recovery_layout` / `set_trace_info`
+    // write to the backend-static side-tables keyed on
+    // `Arc::as_ptr(&descr)`, so they must follow Arc materialisation
+    // (Session 5i-cl).
     if let Some(source_op_index) = base_layout.source_op_index {
         descr.set_source_op_index(source_op_index);
     }
-    let descr = Arc::new(descr);
-    // `set_recovery_layout` / `set_trace_info` write to the backend-static
-    // side-tables keyed on `Arc::as_ptr(&descr)`, so they must follow Arc
-    // materialisation (Session 5i-cl).
     descr.set_recovery_layout(recovery_layout);
     if let Some(trace_info) = base_layout.trace_info.clone() {
         descr.set_trace_info(trace_info);
@@ -13217,7 +13218,6 @@ fn collect_guards(
         } else {
             Vec::new()
         };
-        descr.set_source_op_index(op_idx);
         // Capture the metainterp `AbstractFailDescr` Arc as a
         // back-pointer.  Backend accessors for `_attrs_` fields
         // (`history.py:132`: adr_jump_offset / rd_locs / rd_loop_token
@@ -13226,10 +13226,11 @@ fn collect_guards(
         // through this Arc to the metainterp side.
         descr.meta_descr = op.descr.clone();
         let descr = Arc::new(descr);
+        // Session 5i-cl: source_op_index / recovery_layout writes go to
+        // backend-static side-tables keyed on `Arc::as_ptr(&descr)`, so
+        // they must follow Arc materialisation.
+        descr.set_source_op_index(op_idx);
         if let Some(layout) = recovery_layout {
-            // Session 5i-cl: recovery_layout writes to the backend-static
-            // `RECOVERY_LAYOUT_TABLE` keyed on `Arc::as_ptr(&descr)`, so
-            // it must follow Arc materialisation.
             descr.set_recovery_layout(layout);
         }
         if let Some(target) = external_jump_target {

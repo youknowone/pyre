@@ -19,6 +19,37 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
+/// `Arc::as_ptr` address to its codegen-time `source_op_index`.
+///
+/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) carries no
+/// `source_op_index` slot — RPython's `assembler.py` does not need
+/// to remember the trace-op index post codegen because the metainterp
+/// `pyjitpl` driver carries the same identity via the live op object
+/// passed to `_compile_one_block`.  Pyre's `FailDescrLayout` keeps
+/// the index for the backend→metainterp interop boundary; storing it
+/// off the descr keeps the descr struct aligned with PyPy.
+static SOURCE_OP_INDEX_TABLE: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+
+fn source_op_index_table() -> &'static Mutex<HashMap<usize, usize>> {
+    SOURCE_OP_INDEX_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn register_source_op_index(descr_ptr: usize, op_index: usize) {
+    source_op_index_table()
+        .lock()
+        .expect("SOURCE_OP_INDEX_TABLE mutex poisoned")
+        .insert(descr_ptr, op_index);
+}
+
+pub fn lookup_source_op_index(descr_ptr: usize) -> Option<usize> {
+    source_op_index_table()
+        .lock()
+        .expect("SOURCE_OP_INDEX_TABLE mutex poisoned")
+        .get(&descr_ptr)
+        .copied()
+}
+
+/// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to its `ExitRecoveryLayout`.
 ///
 /// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) carries no
@@ -262,7 +293,10 @@ impl std::fmt::Debug for BridgeData {
 /// should be executed instead of returning to the interpreter.
 pub struct CraneliftFailDescr {
     pub fail_index: u32,
-    pub source_op_index: Option<usize>,
+    // source_op_index removed (Session 5i-cl): not in PyPy
+    // `AbstractFailDescr._attrs_` (`history.py:132`).  The codegen-
+    // time trace-op index lives in `SOURCE_OP_INDEX_TABLE` keyed on
+    // `Arc::as_ptr(&descr)`.
     pub trace_id: u64,
     pub fail_arg_types: Vec<Type>,
     pub gc_map: GcMap,
@@ -404,6 +438,10 @@ impl Drop for CraneliftFailDescr {
             .lock()
             .expect("RECOVERY_LAYOUT_TABLE mutex poisoned")
             .remove(&ptr);
+        source_op_index_table()
+            .lock()
+            .expect("SOURCE_OP_INDEX_TABLE mutex poisoned")
+            .remove(&ptr);
     }
 }
 
@@ -411,7 +449,10 @@ impl std::fmt::Debug for CraneliftFailDescr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CraneliftFailDescr")
             .field("fail_index", &self.fail_index)
-            .field("source_op_index", &self.source_op_index)
+            .field(
+                "source_op_index",
+                &lookup_source_op_index(self as *const Self as usize),
+            )
             .field("trace_id", &self.trace_id)
             .field("fail_arg_types", &self.fail_arg_types)
             .field("gc_map", &self.gc_map)
@@ -510,7 +551,6 @@ impl CraneliftFailDescr {
         force_token_slots.dedup();
         CraneliftFailDescr {
             fail_index,
-            source_op_index: None,
             trace_id,
             gc_map: Self::gc_map_for_types(&fail_arg_types, &force_token_slots),
             fail_arg_types,
@@ -548,7 +588,6 @@ impl CraneliftFailDescr {
         force_token_slots.dedup();
         CraneliftFailDescr {
             fail_index,
-            source_op_index: None,
             trace_id,
             gc_map: Self::gc_map_for_types(&fail_arg_types, &force_token_slots),
             fail_arg_types,
@@ -730,8 +769,14 @@ impl CraneliftFailDescr {
         register_recovery_layout(self as *const Self as usize, recovery_layout);
     }
 
-    pub fn set_source_op_index(&mut self, source_op_index: usize) {
-        self.source_op_index = Some(source_op_index);
+    /// Backend-static side-table write (Session 5i-cl).  Takes
+    /// `self: &Arc<Self>` because the table is keyed on
+    /// `Arc::as_ptr(&descr)` — that is, the address of the heap-pinned
+    /// inner `Self`.  Callers must wrap the descr in `Arc::new(...)`
+    /// before invoking; writing with a stack-allocated `Self` key would
+    /// leave a stale entry once the descr is moved into the Arc.
+    pub fn set_source_op_index(self: &Arc<Self>, source_op_index: usize) {
+        register_source_op_index(Arc::as_ptr(self) as usize, source_op_index);
     }
 
     /// Backend-static side-table write (Session 5i-cl).  Callers are
@@ -806,7 +851,7 @@ impl CraneliftFailDescr {
         let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
         FailDescrLayout {
             fail_index: self.fail_index,
-            source_op_index: self.source_op_index,
+            source_op_index: lookup_source_op_index(self as *const Self as usize),
             trace_id: <Self as FailDescr>::trace_id(self),
             trace_info: lookup_trace_info(self as *const Self as usize),
             fail_arg_types: fail_arg_types.to_vec(),

@@ -3452,9 +3452,11 @@ impl<'a> AssemblerARM64<'a> {
                 pending_field_layouts: vec![],
             }
         };
+        // Session 5i-cl parity: source_op_index moved to a backend-static
+        // side-table keyed on the descr Arc address.
+        crate::guard::register_source_op_index(Arc::as_ptr(&descr) as usize, op_index);
         unsafe {
             let descr_mut = &mut *(Arc::as_ptr(&descr) as *mut DynasmFailDescr);
-            descr_mut.source_op_index = Some(op_index);
             *descr_mut.recovery_layout.get_mut() = Some(recovery_layout);
             // Capture the metainterp `AbstractFailDescr` Arc as a
             // back-pointer.  Backend accessors for `_attrs_` fields

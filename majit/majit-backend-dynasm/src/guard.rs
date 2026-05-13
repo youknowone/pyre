@@ -7,6 +7,39 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+/// Backend-static side-table mapping a `DynasmFailDescr` Arc's
+/// `Arc::as_ptr` address to the codegen-time `source_op_index`
+/// (the index of the trace op that produced this exit).
+///
+/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) does not
+/// carry this slot — RPython's `assembler.py` never re-fetches the
+/// op index after codegen.  Pyre keeps it because backend layouts
+/// (`FailDescrLayout::source_op_index`) cross the backend→metainterp
+/// boundary and the metainterp consumer needs to align deadframe
+/// metadata with the trace it came from.  Sharing the same shape
+/// as the cranelift counterpart (`majit-backend-cranelift/src/
+/// guard.rs::SOURCE_OP_INDEX_TABLE`).
+static SOURCE_OP_INDEX_TABLE: OnceLock<Mutex<HashMap<usize, usize>>> = OnceLock::new();
+
+fn source_op_index_table() -> &'static Mutex<HashMap<usize, usize>> {
+    SOURCE_OP_INDEX_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn register_source_op_index(descr_ptr: usize, op_index: usize) {
+    source_op_index_table()
+        .lock()
+        .expect("SOURCE_OP_INDEX_TABLE mutex poisoned")
+        .insert(descr_ptr, op_index);
+}
+
+pub fn lookup_source_op_index(descr_ptr: usize) -> Option<usize> {
+    source_op_index_table()
+        .lock()
+        .expect("SOURCE_OP_INDEX_TABLE mutex poisoned")
+        .get(&descr_ptr)
+        .copied()
+}
+
 use majit_backend::ExitRecoveryLayout;
 use majit_ir::{Descr, DescrRef, FailDescr, Type};
 
@@ -123,8 +156,10 @@ pub struct DynasmFailDescr {
     /// metainterp descr.  Session 7 removes this slot.
     pub rd_locs: UnsafeCell<Vec<u16>>,
 
-    /// Trace op index of the guard that produced this exit.
-    pub source_op_index: Option<usize>,
+    // source_op_index removed (Session 5i-cl parity): not in PyPy
+    // `AbstractFailDescr._attrs_` (`history.py:132`).  The codegen-
+    // time trace-op index lives in `SOURCE_OP_INDEX_TABLE` keyed on
+    // the descr's inner address.
 
     /// Backend-origin recovery layout, built at compile time from fail_arg_types.
     pub recovery_layout: UnsafeCell<Option<ExitRecoveryLayout>>,
@@ -177,6 +212,26 @@ pub struct DynasmFailDescr {
 unsafe impl Send for DynasmFailDescr {}
 unsafe impl Sync for DynasmFailDescr {}
 
+impl Drop for DynasmFailDescr {
+    /// Backend-static side-tables (`FAIL_ARG_LOCS_TABLE`,
+    /// `SOURCE_OP_INDEX_TABLE`) are keyed on the descr's inner address.
+    /// Without cleanup the entry would outlive the descr and a future
+    /// descr at the same reused address would observe stale state.
+    /// Same lifecycle discipline as `CraneliftFailDescr` (see its
+    /// `Drop` impl).
+    fn drop(&mut self) {
+        let ptr = self as *const Self as usize;
+        fail_arg_locs_table()
+            .lock()
+            .expect("FAIL_ARG_LOCS_TABLE mutex poisoned")
+            .remove(&ptr);
+        source_op_index_table()
+            .lock()
+            .expect("SOURCE_OP_INDEX_TABLE mutex poisoned")
+            .remove(&ptr);
+    }
+}
+
 impl DynasmFailDescr {
     // compile.py:687-696 status encoding constants.
     pub const ST_BUSY_FLAG: u64 = 0x01;
@@ -203,7 +258,6 @@ impl DynasmFailDescr {
             is_resume_guard,
             is_exit_frame_with_exception: false,
             rd_locs: UnsafeCell::new(Vec::new()),
-            source_op_index: None,
             recovery_layout: UnsafeCell::new(None),
             status: AtomicU64::new(0),
             adr_jump_offset: UnsafeCell::new(0),
@@ -365,7 +419,7 @@ impl DynasmFailDescr {
             fail_arg_types: fail_arg_types.to_vec(),
             is_finish: self.is_finish,
             trace_id: <Self as FailDescr>::trace_id(self),
-            source_op_index: self.source_op_index,
+            source_op_index: lookup_source_op_index(self as *const Self as usize),
             gc_ref_slots: fail_arg_types
                 .iter()
                 .enumerate()
