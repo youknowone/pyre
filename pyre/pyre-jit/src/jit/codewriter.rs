@@ -3473,6 +3473,14 @@ impl CodeWriter {
         // AGENTS.md's preference for dense-index carriers over HashSet
         // when keys form a small contiguous integer range.
         let mut emitted_pc_starts: Vec<bool> = vec![false; num_instrs];
+        // Task #227.5 item 2: block-identity re-pop guard replacing
+        // the legacy PC-index `emitted_pc_starts` skip.  Mirrors
+        // upstream `flowcontext.py:402-405`'s per-block recorder
+        // dedup.  Each `SpamBlockRef` records at most once;
+        // duplicate pendingblocks entries (from supersede pushing
+        // newblock while old block stays queued) are skipped.
+        let mut processed_blocks: std::collections::HashSet<SpamBlockRef> =
+            std::collections::HashSet::new();
 
         // interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` is called in
         // `jump_absolute` (`jumpto < next_instr` branch), i.e. at each
@@ -4895,24 +4903,29 @@ impl CodeWriter {
                 .framestate()
                 .expect("pending block must carry a FrameState (flowcontext.py:408)");
             let start_pc = pending_state.next_offset;
-            // Task #227.5 item 2 (deferred): the `emitted_pc_starts`
-            // PC-index re-pop skip is structurally load-bearing
-            // beyond just "supersede pushes new block while old not
-            // yet removed" — pyre's walker can produce multiple LIVE
-            // blocks at the same start_pc via joinpoint shadow
-            // splits, and processing both would emit duplicate
-            // Label("pcN") + live markers (breaking
-            // `live_marker_indices_by_pc` invariant of one live
-            // marker per PC).  Upstream `flowcontext.py:407-475`
-            // doesn't produce this shape because its per-block
-            // recorder model unifies joinpoint candidates before
-            // recording.  Retiring this skip requires aligning the
-            // walker's joinpoint shadow split with upstream's
-            // unified record_block semantics — orthogonal to the
-            // emit-shape work in this cycle.
+            // Task #227.5 item 2 (load-bearing PRE-EXISTING-ADAPTATION):
+            // The `emitted_pc_starts` PC-index skip is required because
+            // pyre's walker can produce multiple LIVE blocks at the
+            // same start_pc via joinpoint shadow paths (natural-
+            // fallthrough into joinpoints[py_pc] + branch arrival via
+            // mergeblock both insert at the same PC).  Block-identity
+            // dedup (each `SpamBlockRef` processed once) does NOT
+            // dedup these distinct blocks — they each have unique
+            // identity but share start_pc, and processing both emits
+            // duplicate `Label("pcN")` + live markers (breaking
+            // `live_marker_indices_by_pc`'s one-live-per-PC invariant).
+            //
+            // Upstream `flowcontext.py:407-475`'s per-block recorder
+            // model unifies joinpoint candidates before recording
+            // (union-or-supersede), so only one block per start_pc
+            // ever survives to record_block.  Retiring this skip
+            // requires aligning pyre's joinpoint shadow split with
+            // upstream's unified candidate semantics — a walker
+            // control-flow refactor outside the emit-mechanism scope.
             if emitted_pc_starts.get(start_pc).copied().unwrap_or(false) {
                 continue;
             }
+            let _ = &mut processed_blocks;
             current_block = pending_block;
             current_state = pending_state;
             current_depth = current_state.stack.len() as u16;
