@@ -690,6 +690,12 @@ impl PartialEq for SpamBlockRef {
 
 impl Eq for SpamBlockRef {}
 
+impl std::hash::Hash for SpamBlockRef {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        Rc::as_ptr(&self.0).hash(state);
+    }
+}
+
 /// Task #227.2 walker emit helper — pushes `insn` into the program-
 /// wide `ssarepr.insns` AND mirrors it into `current_block`'s per-
 /// block accumulator.  Used by every walker emit site so a future
@@ -4889,21 +4895,21 @@ impl CodeWriter {
                 .framestate()
                 .expect("pending block must carry a FrameState (flowcontext.py:408)");
             let start_pc = pending_state.next_offset;
-            // Task #227.5 follow-up: the `emitted_pc_starts` re-pop
-            // skip is retained as a guard against pendingblocks
-            // containing two blocks with the same `start_pc`
-            // (mergeblock supersede path creates a fresh newblock
-            // when the joinpoint candidate's framestate widens; the
-            // old block is marked dead but the queue still holds
-            // both).  Under the per-block contiguous walker model,
-            // each pop processes exactly one block per start_pc;
-            // double-pop would push duplicate Label("pcN") + emits
-            // into ssarepr.insns.  Upstream `flowcontext.py:455-463`
-            // supersede explicitly does `candidates.remove(block)`
-            // before queueing the new one, so the queue never holds
-            // both — pyre's PRE-EXISTING-ADAPTATION inverted that
-            // (mark instead of remove).  Convergence: align with
-            // upstream's remove-on-supersede in a follow-up.
+            // Task #227.5 item 2 (deferred): the `emitted_pc_starts`
+            // PC-index re-pop skip is structurally load-bearing
+            // beyond just "supersede pushes new block while old not
+            // yet removed" — pyre's walker can produce multiple LIVE
+            // blocks at the same start_pc via joinpoint shadow
+            // splits, and processing both would emit duplicate
+            // Label("pcN") + live markers (breaking
+            // `live_marker_indices_by_pc` invariant of one live
+            // marker per PC).  Upstream `flowcontext.py:407-475`
+            // doesn't produce this shape because its per-block
+            // recorder model unifies joinpoint candidates before
+            // recording.  Retiring this skip requires aligning the
+            // walker's joinpoint shadow split with upstream's
+            // unified record_block semantics — orthogonal to the
+            // emit-shape work in this cycle.
             if emitted_pc_starts.get(start_pc).copied().unwrap_or(false) {
                 continue;
             }
