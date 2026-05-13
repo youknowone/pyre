@@ -3929,12 +3929,13 @@ impl CodeWriter {
         macro_rules! emit_mark_label_pc {
             ($ssarepr:expr, $py_pc:expr) => {{
                 let py_pc = $py_pc;
-                $ssarepr
-                    .insns
-                    .push(Insn::Label(super::flatten::Label::new(format!(
-                        "pc{}",
-                        py_pc
-                    ))));
+                // NOTE: the program-wide `ssarepr.insns` Label push is
+                // DEFERRED until the switch check below.  When the
+                // gate is on and a switch is detected, both ssarepr
+                // and per_block_ssarepr stay un-pushed at this PC —
+                // the new block's outer iter will emit its own Label
+                // at PC=py_pc.  When no switch (gate off or same
+                // block), push Label to ssarepr + per_block.
                 // Step 6.1 Phase 2d: if the previous block still needs
                 // a fallthrough edge AND we're not already standing in
                 // the block for `py_pc`, attach one before switching
@@ -4048,6 +4049,12 @@ impl CodeWriter {
                 // switch inline as before, preserving the PC-
                 // sequential walker's behaviour.
                 if task_227_5_per_block_walker && new_block != current_block {
+                    // Yield without pushing Label — the new block's
+                    // outer iter at start_pc=py_pc will emit its
+                    // own Label via its own `emit_mark_label_pc!(
+                    // py_pc)` call (which will see no-switch since
+                    // joinpoints[py_pc] now points at new_block ==
+                    // current_block at that point).
                     block_switch_pending = true;
                 } else {
                     current_block = new_block;
@@ -4055,14 +4062,15 @@ impl CodeWriter {
                         .framestate()
                         .expect("block state should exist at label");
                     needs_fallthrough = true;
-                    // Task #227.1 per-block accumulator dual-write: record
-                    // the block-entry Label on the new `current_block` so a
-                    // post-walk `flatten_graph(graph, regallocs, cpu)`
-                    // pass can drain each block's emit sequence in graph-
-                    // DFS order (matching `codewriter.py:53` upstream).
-                    // The program-wide push above stays in place until
-                    // Task #227.3 flips production to consume the per-
-                    // block accumulator instead.
+                    // Push Label to program-wide ssarepr.insns and
+                    // to current_block's per-block accumulator (both
+                    // sources for production / drain probe).
+                    $ssarepr
+                        .insns
+                        .push(Insn::Label(super::flatten::Label::new(format!(
+                            "pc{}",
+                            py_pc
+                        ))));
                     current_block.push_insn(Insn::Label(super::flatten::Label::new(format!(
                         "pc{}",
                         py_pc
