@@ -2500,8 +2500,28 @@ fn register_helper_fn_pointers(
 /// `PcAnchor`/`-live-` pair per Python PC, including dead bytecodes
 /// that never execute, whereas upstream RPython only flattens
 /// reachable flow-graph blocks.
+/// Parse `Label("pc{N}")` and return Some(N), else None.  Used by
+/// the post-walk PC-anchor reconstruction (Task #227 PcAnchor
+/// retirement) — upstream RPython has no per-PC anchor concept; pyre
+/// derives the PC index from the `pc{X}` Label naming scheme that
+/// `emit_mark_label_pc!` already emits per Python PC.
+fn label_pc_index(insn: &Insn) -> Option<usize> {
+    if let Insn::Label(label) = insn {
+        if let Some(rest) = label.name.strip_prefix("pc") {
+            return rest.parse().ok();
+        }
+    }
+    None
+}
+
 fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    let mut positions = vec![usize::MAX; num_pcs];
+    // Scan once collecting both PcAnchor-derived and Label-derived
+    // positions.  Prefer PcAnchor when present (current production);
+    // fall back to Label("pc{N}") for the Task #227 PcAnchor retirement
+    // scaffolding so future walker changes that drop PcAnchor still
+    // resolve anchor positions from the per-PC Label naming scheme.
+    let mut anchor_positions = vec![usize::MAX; num_pcs];
+    let mut label_positions = vec![usize::MAX; num_pcs];
     for (insn_idx, insn) in ssarepr.insns.iter().enumerate() {
         if let Insn::PcAnchor(py_pc) = insn {
             assert!(
@@ -2509,30 +2529,54 @@ fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec
                 "pc_anchor_positions: py_pc {py_pc} out of range {num_pcs}"
             );
             assert_eq!(
-                positions[*py_pc],
+                anchor_positions[*py_pc],
                 usize::MAX,
                 "pc_anchor_positions: duplicate PcAnchor for py_pc {py_pc}"
             );
-            positions[*py_pc] = insn_idx;
+            anchor_positions[*py_pc] = insn_idx;
+        } else if let Some(py_pc) = label_pc_index(insn) {
+            assert!(
+                py_pc < num_pcs,
+                "pc_anchor_positions: Label pc{py_pc} out of range {num_pcs}"
+            );
+            if label_positions[py_pc] == usize::MAX {
+                label_positions[py_pc] = insn_idx;
+            }
         }
     }
-    for (py_pc, &insn_idx) in positions.iter().enumerate() {
+    let mut positions = vec![usize::MAX; num_pcs];
+    for py_pc in 0..num_pcs {
+        positions[py_pc] = if anchor_positions[py_pc] != usize::MAX {
+            anchor_positions[py_pc]
+        } else {
+            label_positions[py_pc]
+        };
         assert_ne!(
-            insn_idx,
+            positions[py_pc],
             usize::MAX,
-            "pc_anchor_positions: missing PcAnchor for py_pc {py_pc}"
+            "pc_anchor_positions: missing PcAnchor / Label('pc{py_pc}') for py_pc {py_pc}"
         );
     }
     positions
 }
 
 fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    let mut anchors: Vec<(usize, usize)> = Vec::with_capacity(num_pcs);
+    // Map py_pc → anchor insn_idx.  Prefer `Insn::PcAnchor(py_pc)` if
+    // present (current production), fall back to `Label("pc{py_pc}")`
+    // (Task #227 PcAnchor retirement scaffolding).
+    let mut anchor_for_pc: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for (insn_idx, insn) in ssarepr.insns.iter().enumerate() {
         if let Insn::PcAnchor(py_pc) = insn {
-            anchors.push((insn_idx, *py_pc));
+            anchor_for_pc.insert(*py_pc, insn_idx);
+        } else if let Some(py_pc) = label_pc_index(insn) {
+            anchor_for_pc.entry(py_pc).or_insert(insn_idx);
         }
     }
+    let mut anchors: Vec<(usize, usize)> = anchor_for_pc
+        .into_iter()
+        .map(|(py_pc, insn_idx)| (insn_idx, py_pc))
+        .collect();
+    anchors.sort_by_key(|(insn_idx, _)| *insn_idx);
     assert_eq!(
         anchors.len(),
         num_pcs,
@@ -4845,6 +4889,18 @@ impl CodeWriter {
                 // docstring in `flatten.rs`): emit a stable anchor at every
                 // Python PC start so the post-compute_liveness /
                 // post-remove_repeated_live SSARepr position is recoverable.
+                //
+                // Task #227 PcAnchor retirement scaffolding: the consumer
+                // helpers `pc_anchor_positions` / `live_marker_indices_by_pc`
+                // also accept `Label("pc{N}")` as the per-PC anchor when
+                // the explicit `Insn::PcAnchor` is absent.  Walker still
+                // emits `Insn::PcAnchor(py_pc)` until upstream-orthodox
+                // per-PC `-live-` retirement (only at flatten-time
+                // decision points per `flatten.py:142, 259, 285, 303`)
+                // makes the per-Label boundary unnecessary; PcAnchor's
+                // residual role at that point is to prevent
+                // `remove_repeated_live` from merging consecutive
+                // per-PC `-live-` markers across PC boundaries.
                 ssarepr.insns.push(Insn::PcAnchor(py_pc));
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(Insn::PcAnchor(py_pc));
