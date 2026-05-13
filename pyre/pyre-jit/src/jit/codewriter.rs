@@ -4910,13 +4910,6 @@ impl CodeWriter {
             // `record_block` + post-walk `flatten_graph(graph,
             // regallocs)` per `codewriter.py:44-67`).
             for py_pc in start_pc..num_instrs {
-                // Mark this PC as emitted before processing so
-                // `mergeblock`'s own pendingblocks push within
-                // `emit_mark_label_pc!` (next_offset = py_pc) is safely
-                // deduped on re-pop.
-                if let Some(slot) = emitted_pc_starts.get_mut(py_pc) {
-                    *slot = true;
-                }
                 // Exception handler entry: Python resets stack depth to the
                 // handler's specified depth and arrives only from
                 // `catch_exception` edges, not from sequential fallthrough.
@@ -4941,10 +4934,20 @@ impl CodeWriter {
                 // detected a block boundary at this PC and queued the
                 // new block to `pendingblocks`, break the inner loop
                 // and let the outer walker pop the new block in its
-                // own iteration.  Production with gate off: this is
-                // a dead branch (`block_switch_pending` never set).
+                // own iteration.  The new block's outer iter sees
+                // `emitted_pc_starts[py_pc] = false` (we haven't
+                // marked it yet) so it'll process PC=py_pc fresh
+                // including its own `emit_mark_label_pc!(py_pc)`
+                // which now resolves to the new current_block.
+                // Production with gate off: dead branch.
                 if block_switch_pending {
                     break;
+                }
+                // Mark this PC as emitted (AFTER the switch check so
+                // a yielded PC stays unmarked for the next outer
+                // iter to process from start_pc).
+                if let Some(slot) = emitted_pc_starts.get_mut(py_pc) {
+                    *slot = true;
                 }
                 // pyre PRE-EXISTING-ADAPTATION (see `Insn::PcAnchor`
                 // docstring in `flatten.rs`): emit a stable anchor at every
