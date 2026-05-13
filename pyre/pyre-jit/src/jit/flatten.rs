@@ -1115,6 +1115,19 @@ pub fn is_ssa_only_artifact(insn: &Insn) -> bool {
     if matches!(opname.as_str(), "last_exception" | "last_exc_value") {
         return true;
     }
+    // PRE-EXISTING-ADAPTATION: `abort_permanent` is a pyre-only runtime
+    // construct (`BC_ABORT_PERMANENT`) emitted by the walker's
+    // `emit_abort_permanent!` macro (`codewriter.rs:3391`) to short-
+    // circuit translation of unsupported bytecode handlers and permanent
+    // guard-fail edges.  Upstream RPython sidesteps the equivalent
+    // problem via `rpython/jit/metainterp/policy.py`-driven whitelisting
+    // and has no corresponding SSA opname or `SpaceOperation` shape.
+    // The walker emits it directly into `ssarepr` with no graph
+    // counterpart — flag as ssa-only so the `[phase4-graph-shape]`
+    // probe doesn't surface it as a coverage gap.
+    if opname == "abort_permanent" {
+        return true;
+    }
     // `*_copy` is deliberately counted as walker-emitted unless the
     // instruction carries explicit link-rename provenance. Pyre's walker
     // emits register-source copies for stack/local/call argument shuffles.

@@ -7140,6 +7140,142 @@ impl CodeWriter {
                         .entry(shape_descriptor(insn))
                         .or_insert(0) += 1;
                 }
+                // Phase 2 pairing: each retired HLOp family has a graph
+                // counterpart (`add`/`lt`/`bool`/`setitem`) that is
+                // already classified out as `is_graph_only_artifact`, and
+                // an inline counterpart (`residual_call_*` filtered by
+                // fn_idx) that surfaces in `inline_shape_counts`.  Pair
+                // them at the count level so the `[phase4-graph-shape]`
+                // probe stops counting the same logical operation twice
+                // (once as graph-only HLOp via `graph_artifact`, once as
+                // inline-only `residual_call_*`).  The dispatcher in
+                // `flatten::try_flatten_retired_family_hlop_to_insn`
+                // realises the same pairing at flatten time; mirroring
+                // it here matches the future end-state of the
+                // `[phase4-flatten-graph]` byte-equivalence check.
+                let count_hlop_family = |opnames: &[&str]| -> usize {
+                    parallel_all
+                        .iter()
+                        .filter(|insn| match insn {
+                            super::flatten::Insn::Op { opname, .. } => {
+                                opnames.iter().any(|o| *o == opname.as_str())
+                            }
+                            _ => false,
+                        })
+                        .count()
+                };
+                let count_residual_call_by_fn_idx =
+                    |insns: &[&super::flatten::Insn], expected_opname: &str, fn_idx: u16| -> usize {
+                        insns
+                            .iter()
+                            .filter(|insn| match insn {
+                                super::flatten::Insn::Op { opname, args, .. } => {
+                                    opname == expected_opname
+                                        && matches!(
+                                            args.first(),
+                                            Some(super::flatten::Operand::ConstInt(v))
+                                                if *v == fn_idx as i64
+                                        )
+                                }
+                                _ => false,
+                            })
+                            .count()
+                    };
+                let pair_family = |inline_shape_counts: &mut HashMap<String, usize>,
+                                   hlop_opnames: &[&str],
+                                   residual_opname: &str,
+                                   fn_idx: u16| {
+                    let hlop_count = count_hlop_family(hlop_opnames);
+                    let residual_count = count_residual_call_by_fn_idx(
+                        inline_walker.as_slice(),
+                        residual_opname,
+                        fn_idx,
+                    );
+                    let paired = hlop_count.min(residual_count);
+                    if paired > 0 {
+                        // The shape_descriptor for a residual_call_* with
+                        // `(ConstInt(fn_idx), ListI/ListR(...), Descr)`
+                        // args.  Build it once to match the key
+                        // shape_descriptor used.
+                        let shape_keys: Vec<String> = inline_walker
+                            .iter()
+                            .filter(|insn| match insn {
+                                super::flatten::Insn::Op { opname, args, .. } => {
+                                    opname == residual_opname
+                                        && matches!(
+                                            args.first(),
+                                            Some(super::flatten::Operand::ConstInt(v))
+                                                if *v == fn_idx as i64
+                                        )
+                                }
+                                _ => false,
+                            })
+                            .map(|insn| shape_descriptor(insn))
+                            .collect();
+                        // All matching residual_call_* insns share the
+                        // same shape_descriptor (same opname + same arg
+                        // shape), so taking the first one suffices.
+                        if let Some(shape) = shape_keys.first() {
+                            if let Some(count) = inline_shape_counts.get_mut(shape) {
+                                let dec = paired.min(*count);
+                                *count -= dec;
+                                if *count == 0 {
+                                    inline_shape_counts.remove(shape);
+                                }
+                            }
+                        }
+                    }
+                };
+                pair_family(
+                    &mut inline_shape_counts,
+                    &[
+                        "add",
+                        "sub",
+                        "mul",
+                        "floordiv",
+                        "mod",
+                        "truediv",
+                        "pow",
+                        "lshift",
+                        "rshift",
+                        "and_",
+                        "or_",
+                        "xor",
+                        "inplace_add",
+                        "inplace_sub",
+                        "inplace_mul",
+                        "inplace_floordiv",
+                        "inplace_mod",
+                        "inplace_truediv",
+                        "inplace_pow",
+                        "inplace_lshift",
+                        "inplace_rshift",
+                        "inplace_and",
+                        "inplace_or",
+                        "inplace_xor",
+                        "getitem",
+                    ],
+                    "residual_call_ir_r",
+                    binary_op_fn_idx,
+                );
+                pair_family(
+                    &mut inline_shape_counts,
+                    &["lt", "le", "eq", "ne", "gt", "ge"],
+                    "residual_call_ir_r",
+                    compare_fn_idx,
+                );
+                pair_family(
+                    &mut inline_shape_counts,
+                    &["bool"],
+                    "residual_call_r_i",
+                    truth_fn_idx,
+                );
+                pair_family(
+                    &mut inline_shape_counts,
+                    &["setitem"],
+                    "residual_call_r_v",
+                    store_subscr_fn_idx,
+                );
                 let mut multiset_match: usize = 0;
                 for (shape, &g_count) in &graph_shape_counts {
                     let i_count = inline_shape_counts.get(shape).copied().unwrap_or(0);
