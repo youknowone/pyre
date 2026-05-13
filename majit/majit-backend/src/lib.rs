@@ -547,8 +547,13 @@ impl PartialEq for ExitVirtualLayout {
 impl Eq for ExitVirtualLayout {}
 
 /// Backend-neutral deferred heap write recovered from an exit.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct ExitPendingFieldLayout {
+    /// `resume.py:88 lldescr` — identity-compared via `Arc::ptr_eq`
+    /// (`history.py:125`).
+    pub descr: Option<majit_ir::DescrRef>,
+    /// Stable u32 handle for serialization sinks.  Equals
+    /// `descr.as_ref().map_or(0, |d| d.index())` when both are set.
     pub descr_index: u32,
     pub item_index: Option<usize>,
     pub is_array_item: bool,
@@ -562,9 +567,24 @@ pub struct ExitPendingFieldLayout {
     pub field_type: majit_ir::Type,
 }
 
+impl PartialEq for ExitPendingFieldLayout {
+    fn eq(&self, other: &Self) -> bool {
+        opt_descr_ptr_eq(&self.descr, &other.descr)
+            && self.item_index == other.item_index
+            && self.is_array_item == other.is_array_item
+            && self.target == other.target
+            && self.value == other.value
+            && self.field_offset == other.field_offset
+            && self.field_size == other.field_size
+            && self.field_type == other.field_type
+    }
+}
+impl Eq for ExitPendingFieldLayout {}
+
 impl ExitPendingFieldLayout {
     pub fn shifted_virtuals(&self, virtual_offset: usize) -> Self {
         Self {
+            descr: self.descr.clone(),
             descr_index: self.descr_index,
             item_index: self.item_index,
             is_array_item: self.is_array_item,

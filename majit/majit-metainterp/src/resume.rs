@@ -1066,6 +1066,7 @@ impl PendingFieldLayoutSummary {
 
     fn to_exit_pending_field_layout(&self, virtual_offset: usize) -> ExitPendingFieldLayout {
         ExitPendingFieldLayout {
+            descr: self.descr.clone(),
             descr_index: self.descr_index,
             item_index: self.item_index,
             is_array_item: self.is_array_item,
