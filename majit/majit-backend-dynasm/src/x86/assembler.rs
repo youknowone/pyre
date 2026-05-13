@@ -5653,9 +5653,21 @@ impl<'a> Assembler386<'a> {
     /// We use malloc for parity: the callee's frame-slot model needs
     /// frame_depth slots (not just num_args), and heap allocation avoids
     /// stack overflow on deep recursion.
-    /// assembler.py:295-360 call_assembler parity.
-    /// Uses regalloc-provided arglocs to load callee arguments instead of
-    /// resolve_opref(), which drops register-carried values to Const(0).
+    /// llsupport/assembler.py:295 `call_assembler` + x86/assembler.py:2267
+    /// `_call_assembler_emit_call` parity. Line-by-line port:
+    /// 1. simple_call(target, [jf, threadlocal_loc])
+    /// 2. CMP [eax + jf_descr_ofs], done_descr_imm
+    /// 3. je fast_path
+    /// 4. simple_call(asm_helper, [eax, vloc], result_loc)   ← slow path
+    /// 5. jmp merge
+    /// 6. fast_path: mov rax, [rax + first_item_ofs]
+    /// 7. merge:
+    ///
+    /// Caller's rbp is preserved by the callee's _call_header/_call_footer
+    /// (which push/pop it). After the call we still need
+    /// `reload_frame_if_necessary` because a minor GC during the callee
+    /// may have moved the caller jitframe; the popped rbp is the
+    /// pre-GC address while the shadow stack carries the updated one.
     fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
         let call_descr = op.descr.as_ref().and_then(|d| d.as_call_descr());
         let expansion = call_descr.and_then(|d| d.vable_expansion());
@@ -5665,13 +5677,6 @@ impl<'a> Assembler386<'a> {
                 .copied()
                 .expect("call_assembler missing rewritten jitframe arg");
             let vable_loc = arglocs.get(1).copied();
-            dynasm!(self.mc ; .arch x64
-                ; mov r12, rbp
-            );
-            self.emit_load_to_rax(frame_loc);
-            dynasm!(self.mc ; .arch x64
-                ; mov rdx, rax
-            );
 
             let target_addr: Option<usize> = op
                 .descr
@@ -5687,10 +5692,12 @@ impl<'a> Assembler386<'a> {
             let green_key = self.header_pc as i64;
 
             if !is_resolved {
+                // Unresolved target: emit force-fn dispatch through
+                // r12-saved rbp (kept as-is — this path is rare and not
+                // on the recursive hot path).
+                self.emit_load_to_rax(frame_loc);
+                dynasm!(self.mc ; .arch x64 ; mov rdx, rax);
                 let force_addr = crate::call_assembler_force_fn_addr() as i64;
-                dynasm!(self.mc ; .arch x64
-                    ; mov rbp, r12
-                );
                 if force_addr != 0 {
                     if let Some(vloc) = vable_loc {
                         self.emit_load_to_rax(vloc);
@@ -5706,9 +5713,7 @@ impl<'a> Assembler386<'a> {
                     self.emit_abi_call_rax_aligned();
                     self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
                 } else {
-                    dynasm!(self.mc ; .arch x64
-                        ; xor eax, eax
-                    );
+                    dynasm!(self.mc ; .arch x64 ; xor eax, eax);
                 }
                 if !op.pos.is_none() {
                     self.store_rax_to_result(op.pos);
@@ -5716,15 +5721,22 @@ impl<'a> Assembler386<'a> {
                 return;
             }
 
+            // ── x86/assembler.py:2267 _call_assembler_emit_call ──
+            // simple_call(target, [argloc, threadlocal_loc]). The
+            // trampoline takes (callee_jf_ptr, callee_entry_addr) — the
+            // second arg is the resolved entry, NOT the threadlocal,
+            // because pyre routes the call through
+            // `call_assembler_execute_trampoline` instead of branching
+            // straight at descr._ll_function_addr.
             let trampoline_addr = crate::call_assembler_execute_addr() as i64;
             let pushed_gcmap = self.push_pending_call_gcmap();
-            self.emit_abi_int_arg_from_reg(0, 2);
+            self.emit_load_to_rax(frame_loc); // rax = callee jf_ptr
+            self.emit_abi_int_arg_from_reg(0, 0); // arg0 = jf (Windows: rcx = rax)
             if let Some(addr) = target_addr {
-                let addr = addr as i64;
-                self.emit_abi_int_arg_from_imm(1, addr);
+                self.emit_abi_int_arg_from_imm(1, addr as i64);
                 dynasm!(self.mc ; .arch x64 ; mov rax, QWORD trampoline_addr);
                 self.emit_abi_call_rax_aligned();
-            } else if self.self_entry_label.is_some() {
+            } else {
                 let addr_ptr = self.self_entry_addr_ptr as i64;
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD addr_ptr
@@ -5734,30 +5746,34 @@ impl<'a> Assembler386<'a> {
                 dynasm!(self.mc ; .arch x64 ; mov rax, QWORD trampoline_addr);
                 self.emit_abi_call_rax_aligned();
             }
-            dynasm!(self.mc ; .arch x64
-                ; mov rbp, r12
-            );
+            // Callee's _call_footer popped caller's rbp (= pre-GC
+            // address). Reload from shadow stack so subsequent
+            // frame-relative ops hit the moved jitframe.
             self.pop_pending_call_gcmap_after_collect(pushed_gcmap);
-            dynasm!(self.mc ; .arch x64
-                ; mov rdx, rax
-            );
 
+            // ── x86/assembler.py:2274 _call_assembler_check_descr ──
+            // CMP [eax + jf_descr_ofs], imm(done_descr).
+            // x86 has no 64-bit-immediate compare-with-memory, so
+            // stage the pointer through R11 (LARGE_IMM_SCRATCH) — one
+            // mov + one cmp instead of the previous load-into-reg +
+            // load-imm + reg-reg compare. PyPy's `mc.CMP(mem, imm)`
+            // does the same staging internally.
             let fast_path = self.mc.new_dynamic_label();
             let merge = self.mc.new_dynamic_label();
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
             dynasm!(self.mc ; .arch x64
-                ; mov rcx, [rdx + JF_DESCR_OFS]
-                ; mov rax, QWORD done_descr_ptr
-                ; cmp rcx, rax
+                ; mov Rq(scratch), QWORD done_descr_ptr
+                ; cmp [rax + JF_DESCR_OFS], Rq(scratch)
                 ; je =>fast_path
             );
-            // `compile.py:665` parity: helper signature is
-            // `(cpu_handle, callee_jf_ptr, green_key)`. Pass cpu_ptr as
-            // arg0 (rdi) so the trampoline can resolve the attached
-            // `done_with_this_frame_descr_*` /
-            // `exit_frame_with_exception_descr_ref` identities.
+
+            // ── Path A: x86/assembler.py:2271 _call_assembler_emit_helper_call ──
+            // simple_call(asm_helper, [tmploc=rax, vloc], result_loc).
+            // pyre's helper signature is (cpu_handle, callee_jf,
+            // green_key) — see compile.py:665.
             let cpu_ptr = self.cpu_handle_ptr();
             self.emit_abi_int_arg_from_imm(0, cpu_ptr);
-            self.emit_abi_int_arg_from_reg(1, 2);
+            self.emit_abi_int_arg_from_reg(1, 0); // arg1 = rax (callee jf)
             self.emit_abi_int_arg_from_imm(2, green_key);
             dynasm!(self.mc ; .arch x64 ; mov rax, QWORD helper_addr);
             let pushed_gcmap = self.push_pending_call_gcmap();
@@ -5767,21 +5783,25 @@ impl<'a> Assembler386<'a> {
                 ; jmp =>merge
                 ; =>fast_path
             );
+
+            // ── Path B: x86/assembler.py:2291 _call_assembler_load_result ──
+            // MOV result, [eax + first_item_ofs].
             if result_type == Type::Float {
                 dynasm!(self.mc ; .arch x64
-                    ; movsd xmm0, [rdx + FIRST_ITEM_OFFSET as i32]
+                    ; movsd xmm0, [rax + FIRST_ITEM_OFFSET as i32]
                     ; movq rax, xmm0
                     ; =>merge
                 );
             } else {
                 dynasm!(self.mc ; .arch x64
-                    ; mov rax, [rdx + FIRST_ITEM_OFFSET as i32]
+                    ; mov rax, [rax + FIRST_ITEM_OFFSET as i32]
                     ; =>merge
                 );
             }
             if !op.pos.is_none() {
                 self.store_rax_to_result(op.pos);
             }
+            let _ = vable_loc;
             return;
         }
 
