@@ -1593,6 +1593,15 @@ where
         self.ssarepr.insns.push(insn);
     }
 
+    /// `flatten.py:352-353 popline`: pop the most recently emitted
+    /// insn off `ssarepr.insns`.  Used by the `_ovf` rewrite at
+    /// `flatten.py:194 line = self.popline()` to retract the arithmetic
+    /// op just emitted by `serialize_op` and replace it with the
+    /// `*_jump_if_ovf` twin.
+    fn popline(&mut self) -> Option<Insn> {
+        self.ssarepr.insns.pop()
+    }
+
     fn label_name_for_block(&mut self, block: &BlockRef) -> String {
         if let Some(name) = self.block_names.get(block) {
             return name.clone();
@@ -1826,9 +1835,7 @@ where
         // `flatten.py:194 line = self.popline()`.  The most recent
         // serialized op is the `_ovf` arithmetic itself.
         let line = self
-            .ssarepr
-            .insns
-            .pop()
+            .popline()
             .expect("flatten_ovf_canraise: ssarepr.insns must contain the just-emitted _ovf op");
         let (popped_opname, popped_args, popped_result) = match line {
             Insn::Op { opname, args, result } => (opname, args, result),
