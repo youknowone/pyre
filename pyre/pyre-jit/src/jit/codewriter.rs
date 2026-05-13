@@ -1547,12 +1547,12 @@ fn record_residual_call_graph_op(
 /// Matches the call-marker / control-flow emission path in
 /// `rpython/jit/codewriter/jtransform.py:1690-1723` where markers like
 /// `jit_merge_point` and `loop_header` are produced with no `result`
-/// and immediately fed into `GraphFlattener.emit_space_operation`.
+/// and immediately fed into `GraphFlattener.serialize_op`.
 ///
 /// Phase 1 walker-rewrite entrypoint (Task #224): the void counterpart
 /// of `emit_graph_op_with_result`.  Callers that need the recorded
 /// `SpaceOperation` (e.g. to immediately flatten it into the SSARepr via
-/// `GraphFlattener::emit_space_operation`) use the returned value; callers
+/// `GraphFlattener::serialize_op`) use the returned value; callers
 /// that only need the side-effect can ignore it.
 fn emit_graph_op_void(
     block: &super::flow::BlockRef,
@@ -4918,7 +4918,7 @@ impl CodeWriter {
                         // `jtransform.py:1690-1712 handle_jit_marker__jit_merge_point`.
                         // The graph carries the full
                         // `[jd_index, 3 green ListOfKinds, 3 red ListOfKinds]`
-                        // shape, and `GraphFlattener::emit_space_operation`
+                        // shape, and `GraphFlattener::serialize_op`
                         // lowers that same shape into SSARepr — the byte
                         // side is no longer pyre's old 3-list shorthand.
                         // Assembler / blackhole / backend (`assembler.rs:712`)
@@ -4947,7 +4947,7 @@ impl CodeWriter {
                         // in `portal_jit_merge_point_graph_args` (line 152) with
                         // a Variable produced by emitting `getfield_vable_r
                         // frame, PYCODE_FIELD_IDX → pycode_var` immediately
-                        // before `emit_space_operation`. The `lower_variable`
+                        // before `serialize_op`. The `lower_variable`
                         // closure (line 4361) gains a third arm mapping
                         // `pycode_var.id` to the dst register of the new
                         // getfield. Empirical Probe A re-run after the change
@@ -5033,7 +5033,7 @@ impl CodeWriter {
                                 }
                             },
                         )
-                        .emit_space_operation(&graph_op);
+                        .serialize_op(&graph_op);
                         // Task #227.3 mirror GraphFlattener-mediated
                         // jit_merge_point emit into per-block accumulator.
                         for insn in ssarepr.insns[pre_len..].iter().cloned() {

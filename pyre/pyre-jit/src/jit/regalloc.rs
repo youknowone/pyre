@@ -577,7 +577,7 @@ pub(super) fn count_graph_ops_per_opname(graph: &FlowGraph) -> HashMap<String, u
 /// counterpart to `count_graph_ops_per_opname`; together they bracket
 /// the convergence target for `flatten_graph` adoption (Task #227).
 /// Skips `Insn::Label`, `Insn::Unreachable`, and `Insn::PcAnchor`
-/// (none of which are emitted by `GraphFlattener::emit_space_operation`).
+/// (none of which are emitted by `GraphFlattener::serialize_op`).
 pub(super) fn count_ssa_ops_per_opname(ssarepr: &SSARepr) -> HashMap<String, usize> {
     let mut counts: HashMap<String, usize> = HashMap::new();
     for insn in &ssarepr.insns {

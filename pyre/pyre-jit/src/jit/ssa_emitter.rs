@@ -15,7 +15,7 @@
 //! Portal `jit_merge_point` emission now runs through the graph layer:
 //! `codewriter.rs::portal_jit_merge_point_graph_args` builds the
 //! upstream-orthodox 7-arg shape; `record_graph_op` stores it; and
-//! `GraphFlattener::emit_space_operation` lowers it into the SSARepr
+//! `GraphFlattener::serialize_op` lowers it into the SSARepr
 //! with a custom `lower_constant` callback that routes pycode through
 //! the runtime constant pool.  The SSARepr-direct helper that used to
 //! live here is gone.

@@ -1579,7 +1579,7 @@ where
         self
     }
 
-    pub fn emit_space_operation(&mut self, op: &SpaceOperation) {
+    pub fn serialize_op(&mut self, op: &SpaceOperation) {
         let insn = self.flatten_space_operation(op);
         self.ssarepr.insns.push(insn);
     }
@@ -1834,7 +1834,7 @@ where
         assert_eq!(
             popped_opname, raising_opname,
             "flatten_ovf_canraise: popped opname {popped_opname:?} disagrees with \
-             block.raising_op() opname {raising_opname:?} — emit_space_operation \
+             block.raising_op() opname {raising_opname:?} — serialize_op \
              order is corrupted",
         );
         // `flatten.py:195-196` `opname[:7] + '_jump_if_ovf'`.
@@ -2275,7 +2275,7 @@ where
                     op_name = op.opname,
                 );
             }
-            self.emit_space_operation(op);
+            self.serialize_op(op);
         }
         self.insert_exits(&block, handling_ovf);
     }
@@ -2504,7 +2504,7 @@ pub(super) fn flatten_constant_operand_for_probe(constant: &super::flow::Constan
 /// Matches upstream structure:
 /// - `flatten_graph`: driver entry point (this function)
 /// - `generate_ssa_form`: block iteration + per-op dispatch
-///   (delegated here to `GraphFlattener::emit_space_operation`)
+///   (delegated here to `GraphFlattener::serialize_op`)
 /// - `make_bytecode_block`/`make_link`/`insert_exits`: block boundary
 ///   handling — not yet implemented; `Label` insertion happens at
 ///   block entry only, `insert_exits` equivalent is not yet wired.
@@ -4362,7 +4362,7 @@ mod tests {
             Register::new(Kind::Ref, VariableId(0).0 as u16)
         });
 
-        flattener.emit_space_operation(&op);
+        flattener.serialize_op(&op);
 
         match &ssarepr.insns[..] {
             [
@@ -4417,7 +4417,7 @@ mod tests {
             },
         );
 
-        flattener.emit_space_operation(&op);
+        flattener.serialize_op(&op);
 
         match &ssarepr.insns[..] {
             [
@@ -4888,7 +4888,7 @@ mod tests {
             )
         });
 
-        flattener.emit_space_operation(&op);
+        flattener.serialize_op(&op);
 
         match &ssarepr.insns[..] {
             [
