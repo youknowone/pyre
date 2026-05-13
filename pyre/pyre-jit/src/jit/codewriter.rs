@@ -1232,6 +1232,41 @@ fn operand_lists_equal(left: &[super::flatten::Operand], right: &[super::flatten
             .all(|(l, r)| operand_byte_equal(l, r))
 }
 
+/// Content-equality for `DescrOperand` so the byte-equivalence check
+/// doesn't depend on whether two `Operand::Descr`s share the same
+/// `Rc<DescrOperand>` (`intern_call_descr_stub` dedups at the
+/// `Arc<CallDescrStub>` layer; `Operand::descr` then wraps each
+/// `DescrOperand` in a fresh `Rc`, so pointer equality is too strict
+/// for the probe).
+fn descr_operand_byte_equal(
+    left: &super::flatten::DescrOperand,
+    right: &super::flatten::DescrOperand,
+) -> bool {
+    use super::flatten::DescrOperand;
+    match (left, right) {
+        (DescrOperand::Bh(_), DescrOperand::Bh(_)) => {
+            // `BhDescr` lacks PartialEq; for the probe's narrow scope
+            // (the 7 retired families never emit a Bh descr), fall
+            // back to "not byte-equivalent" rather than asserting.
+            // Future expansion may add a structural Bh comparison.
+            false
+        }
+        (DescrOperand::SwitchDict(l), DescrOperand::SwitchDict(r)) => {
+            l.labels.len() == r.labels.len()
+                && l.labels.iter().zip(r.labels.iter()).all(|(a, b)| a == b)
+        }
+        (DescrOperand::CallDescrStub(l), DescrOperand::CallDescrStub(r)) => {
+            l.effect_info == r.effect_info
+                && l.arg_kinds == r.arg_kinds
+                && l.result_kind == r.result_kind
+        }
+        (DescrOperand::VableArrayField(l), DescrOperand::VableArrayField(r)) => l == r,
+        (DescrOperand::VableArray(l), DescrOperand::VableArray(r)) => l == r,
+        (DescrOperand::VableStaticField(l), DescrOperand::VableStaticField(r)) => l == r,
+        _ => false,
+    }
+}
+
 fn operand_byte_equal(left: &super::flatten::Operand, right: &super::flatten::Operand) -> bool {
     use super::flatten::Operand;
     match (left, right) {
@@ -1243,7 +1278,9 @@ fn operand_byte_equal(left: &super::flatten::Operand, right: &super::flatten::Op
         (Operand::ListOfKind(l), Operand::ListOfKind(r)) => {
             l.kind == r.kind && operand_lists_equal(&l.content, &r.content)
         }
-        (Operand::Descr(l), Operand::Descr(r)) => std::rc::Rc::ptr_eq(l, r),
+        (Operand::Descr(l), Operand::Descr(r)) => {
+            std::rc::Rc::ptr_eq(l, r) || descr_operand_byte_equal(l, r)
+        }
         (Operand::IndirectCallTargets(l), Operand::IndirectCallTargets(r)) => {
             l.lst.len() == r.lst.len()
                 && l.lst
@@ -3245,6 +3282,22 @@ impl CodeWriter {
         // hygiene requires captured identifiers be in scope at the
         // macro DEFINITION site.
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
+        // Phase 3 regalloc reconciliation table.  Maps every graph
+        // `Variable` the walker creates to the SSA-register index the
+        // inline emit wrote it into.  Upstream `flatten_graph(graph,
+        // regallocs)` derives the same map from the SSA-side
+        // `regallocs` dict (`flatten.py:386 getcolor`); pyre's walker
+        // doesn't run a graph regalloc on the production path, so the
+        // emit sites populate this side-table directly.
+        //
+        // The probe's `flatten_graph_with_lowering` driver consults
+        // this map (before falling back to the graph-side regalloc)
+        // when building `Register` operands, so the lowered Insn's
+        // register indices match the inline-emitted bytes 1:1.  Once
+        // the production flip swaps inline emit for the driver
+        // (Phase 3), the same map will feed both sides through a
+        // single `flatten_graph` entry.
+        let mut variable_reg_map: HashMap<super::flow::VariableId, u16> = HashMap::new();
         // PRE-EXISTING-ADAPTATION (Task #227 Phase 4 convergence).
         //
         // Upstream `build_flow` relies on `block.dead` alone (flowcontext.py:404);
@@ -4941,6 +4994,9 @@ impl CodeWriter {
                         } else {
                             None
                         };
+                        if let Some(boxed_var) = &boxed {
+                            variable_reg_map.insert(boxed_var.id, stack_base + current_depth);
+                        }
                         let stack_value = boxed
                             .map(super::flow::FlowValue::from)
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -4968,6 +5024,9 @@ impl CodeWriter {
                             dst_slot,
                             VABLE_CODE_FIELD_IDX
                         );
+                        if let Some(v) = &pycode_graph_var {
+                            variable_reg_map.insert(v.id, dst_slot);
+                        }
                         // Task #48 micro-slice 7: LoadConst factor
                         // refactor.  The prior `emit_residual_call(
                         // load_const_fn_idx, ...)` call is replaced by
@@ -5029,7 +5088,7 @@ impl CodeWriter {
                         let value = if let Some(constant_value) = recognised_ref {
                             constant_value
                         } else if let Some(pycode_var) = pycode_graph_var {
-                            record_residual_call_graph_op(
+                            let loaded = record_residual_call_graph_op(
                                 &mut graph,
                                 &current_block.block(),
                                 load_const_fn_idx,
@@ -5040,9 +5099,13 @@ impl CodeWriter {
                                 vec![Kind::Ref, Kind::Int],
                                 ResKind::Ref,
                                 py_pc as i64,
-                            )
-                            .map(super::flow::FlowValue::from)
-                            .unwrap_or_else(|| fresh_ref_value(&mut graph))
+                            );
+                            if let Some(loaded_var) = &loaded {
+                                variable_reg_map.insert(loaded_var.id, dst_slot);
+                            }
+                            loaded
+                                .map(super::flow::FlowValue::from)
+                                .unwrap_or_else(|| fresh_ref_value(&mut graph))
                         } else {
                             // is_portal=false: no graph dual-write at all.
                             fresh_ref_value(&mut graph)
@@ -5244,6 +5307,9 @@ impl CodeWriter {
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         let key_reg = stack_base + current_depth;
+                        if let super::flow::FlowValue::Variable(v) = &key_value {
+                            variable_reg_map.insert(v.id, key_reg);
+                        }
                         current_depth -= 1;
                         emit_vsd!(current_depth);
                         let obj_value = current_state
@@ -5251,6 +5317,9 @@ impl CodeWriter {
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         let obj_reg = stack_base + current_depth;
+                        if let super::flow::FlowValue::Variable(v) = &obj_value {
+                            variable_reg_map.insert(v.id, obj_reg);
+                        }
                         current_depth -= 1;
                         emit_vsd!(current_depth);
                         let stored_value = current_state
@@ -5258,6 +5327,9 @@ impl CodeWriter {
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         let value_reg = stack_base + current_depth;
+                        if let super::flow::FlowValue::Variable(v) = &stored_value {
+                            variable_reg_map.insert(v.id, value_reg);
+                        }
                         emit_frontend_setitem(
                             &mut graph,
                             &current_block.block(),
@@ -5325,12 +5397,18 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        if let super::flow::FlowValue::Variable(v) = &rhs_value {
+                            variable_reg_map.insert(v.id, rhs_reg);
+                        }
                         // Pop lhs.
                         let lhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let lhs_value = current_state
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        if let super::flow::FlowValue::Variable(v) = &lhs_value {
+                            variable_reg_map.insert(v.id, lhs_reg);
+                        }
                         let result_value = emit_frontend_binary(
                             &mut graph,
                             &current_block.block(),
@@ -5339,6 +5417,7 @@ impl CodeWriter {
                             rhs_value,
                             py_pc as i64,
                         );
+                        variable_reg_map.insert(result_value.id, stack_base + current_depth);
                         // Task #48 micro-slice 3: BINARY_OP family
                         // retirement.  The prior `emit_residual_call(
                         // binary_op_fn_idx, ...)` plus its `is_portal`-gated
@@ -5384,11 +5463,17 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        if let super::flow::FlowValue::Variable(v) = &rhs_value {
+                            variable_reg_map.insert(v.id, rhs_reg);
+                        }
                         let lhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let lhs_value = current_state
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        if let super::flow::FlowValue::Variable(v) = &lhs_value {
+                            variable_reg_map.insert(v.id, lhs_reg);
+                        }
                         let result_value = emit_frontend_compare(
                             &mut graph,
                             &current_block.block(),
@@ -5397,6 +5482,7 @@ impl CodeWriter {
                             rhs_value,
                             py_pc as i64,
                         );
+                        variable_reg_map.insert(result_value.id, stack_base + current_depth);
                         // Task #48 micro-slice 4: COMPARE_OP family
                         // retirement.  Mirrors micro-slice 3 BinaryOp
                         // closure.  `[phase4-flatten-lowering]` probe
@@ -5447,6 +5533,9 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        if let super::flow::FlowValue::Variable(v) = &cond_value {
+                            variable_reg_map.insert(v.id, cond_reg);
+                        }
                         let bool_value = emit_frontend_bool(
                             &mut graph,
                             &current_block.block(),
@@ -5457,6 +5546,7 @@ impl CodeWriter {
                         current_block.block().borrow_mut().exitswitch =
                             Some(super::flow::ExitSwitch::Value(bool_value.into()));
                         let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                        variable_reg_map.insert(bool_value.id, scratch_truth);
                         // Task #48 micro-slice 5: BOOL family
                         // retirement.  Mirror of slices 3-4: inline
                         // `emit_residual_call(truth_fn_idx, ...)` plus
@@ -5503,6 +5593,9 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
+                        if let super::flow::FlowValue::Variable(v) = &cond_value {
+                            variable_reg_map.insert(v.id, cond_reg);
+                        }
                         let bool_value = emit_frontend_bool(
                             &mut graph,
                             &current_block.block(),
@@ -5513,6 +5606,7 @@ impl CodeWriter {
                         current_block.block().borrow_mut().exitswitch =
                             Some(super::flow::ExitSwitch::Value(bool_value.into()));
                         let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
+                        variable_reg_map.insert(bool_value.id, scratch_truth);
                         // Task #48 micro-slice 5: BOOL family
                         // retirement (sibling of the PopJumpIfFalse
                         // closure above) — same `(Ref) → Int` shape
@@ -5599,12 +5693,18 @@ impl CodeWriter {
                             scratch_ns,
                             VABLE_NAMESPACE_FIELD_IDX
                         );
+                        if let Some(v) = &ns_graph_var {
+                            variable_reg_map.insert(v.id, scratch_ns);
+                        }
                         let code_graph_var = emit_vable_getfield_ref!(
                             ssarepr,
                             portal_frame_reg,
                             scratch_code,
                             VABLE_CODE_FIELD_IDX
                         );
+                        if let Some(v) = &code_graph_var {
+                            variable_reg_map.insert(v.id, scratch_code);
+                        }
                         // Task #48 micro-slice 8: LoadGlobal factor
                         // refactor.  The prior `emit_residual_call(
                         // load_global_fn_idx, ...)` call is replaced by
@@ -5668,6 +5768,9 @@ impl CodeWriter {
                         } else {
                             None
                         };
+                        if let Some(loaded_var) = &loaded {
+                            variable_reg_map.insert(loaded_var.id, scratch_ns);
+                        }
                         let result_value = loaded
                             .map(super::flow::FlowValue::from)
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -8052,6 +8155,19 @@ impl CodeWriter {
             // `panic=true` and skip the per-family comparison.
             let mut driver_get_register = |variable: super::flow::Variable| {
                 let kind = variable.kind.unwrap_or(super::flatten::Kind::Ref);
+                // Phase 3 regalloc reconciliation: the walker populates
+                // `variable_reg_map` at every emit site that produced a
+                // Variable consumed by the retired-family inline emits
+                // (BINARY_OP / COMPARE_OP / BOOL / SETITEM).  Consult
+                // the map first so the driver's lowered Insn carries
+                // the same `Register` index the inline byte stream
+                // wrote, matching the `byte_equivalent` probe check.
+                // Fall back to the graph regalloc only for Variables
+                // the map hasn't seen (purely graph-internal HLOps,
+                // unused-result residuals).
+                if let Some(reg) = variable_reg_map.get(&variable.id).copied() {
+                    return super::flatten::Register::new(kind, reg);
+                }
                 let color = graph_regallocs
                     .get(&kind)
                     .and_then(|r| r.coloring.get(&variable.id).copied())
