@@ -2132,18 +2132,31 @@ impl Backend for DynasmBackend {
     }
 
     fn read_descr_status(&self, descr_addr: usize) -> u64 {
-        let descr = unsafe { &*(descr_addr as *const DynasmFailDescr) };
-        descr.get_status()
+        // `compile.py:741 self.status` — route through the registry-backed
+        // `Arc<dyn FailDescr>` so the dispatch is trait-based.  Once
+        // `jf_descr` carries the meta Arc address (Unified-Descr identity
+        // flip), only the registry value changes; this dispatch chain
+        // stays the same.
+        if descr_addr == 0 {
+            return 0;
+        }
+        <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr).get_status()
     }
 
     fn start_compiling_descr(&self, descr_addr: usize) {
-        let descr = unsafe { &*(descr_addr as *const DynasmFailDescr) };
-        descr.start_compiling();
+        // `compile.py:786-788 self.start_compiling()` — trait dispatch.
+        if descr_addr == 0 {
+            return;
+        }
+        <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr).start_compiling();
     }
 
     fn done_compiling_descr(&self, descr_addr: usize) {
-        let descr = unsafe { &*(descr_addr as *const DynasmFailDescr) };
-        descr.done_compiling();
+        // `compile.py:790-795 self.done_compiling()` — trait dispatch.
+        if descr_addr == 0 {
+            return;
+        }
+        <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr).done_compiling();
     }
 
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {
