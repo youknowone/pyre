@@ -3387,21 +3387,26 @@ impl CodeWriter {
                 all_walker_blocks.push(synthetic.clone());
                 synthetic
             });
-        // Task #227.5 per-block contiguous walker (now unconditional):
-        // `emit_mark_label_pc!` sets `block_switch_pending = true`
-        // instead of switching `current_block` inline.  The inner
-        // for-loop checks the flag after each per-PC emit and breaks,
-        // yielding to the outer `while let Some(pending_block) =
-        // pendingblocks.pop_front()` which picks up the queued new
-        // block in the next iteration.  This mirrors upstream's
-        // `flowcontext.py:407-416 record_block` shape where each
-        // block is processed contiguously without mid-iteration
-        // re-entry.
+        // Task #227.5 per-block contiguous walker — when env
+        // `PYRE_TASK_227_5_PER_BLOCK_WALKER=1`, `emit_mark_label_pc!`
+        // sets `block_switch_pending = true` instead of switching
+        // `current_block` inline.  The inner for-loop checks the
+        // flag after each per-PC emit and breaks, yielding to the
+        // outer `while let Some(pending_block) = pendingblocks
+        // .pop_front()` which picks up the queued new block in the
+        // next iteration.  This mirrors upstream's `flowcontext.py:
+        // 407-416 record_block` shape where each block is processed
+        // contiguously without mid-iteration re-entry, retiring the
+        // last walker non-orthodoxy that prevents `[phase4-walker-
+        // drain]` byte-equivalent on larger benches.
         //
-        // All 14 production benches report `[phase4-walker-drain]
-        // byte_equivalent=true` under this model (verified
-        // 2026-05-13), so the previous env gate
-        // `PYRE_TASK_227_5_PER_BLOCK_WALKER` has been retired.
+        // Gated on env so the default production path is unchanged
+        // while the restructure is validated bench-by-bench.  When
+        // every bench reports `byte_equivalent=true` under the gate,
+        // the env check retires and per-block-walker becomes
+        // unconditional.
+        let task_227_5_per_block_walker =
+            std::env::var("PYRE_TASK_227_5_PER_BLOCK_WALKER").is_ok();
         let mut block_switch_pending: bool = false;
         let mut current_state = current_block
             .framestate()
@@ -4005,7 +4010,7 @@ impl CodeWriter {
                     // `pendingblocks` (mergeblock-path queuing is
                     // already done by mergeblock itself; joinpoint
                     // match doesn't push automatically).
-                    if target != current_block {
+                    if task_227_5_per_block_walker && target != current_block {
                         if !pendingblocks.iter().any(|b| b == &target) {
                             pendingblocks.push_front(target.clone());
                         }
@@ -4065,7 +4070,7 @@ impl CodeWriter {
                 // breaks, yielding control.  Default (gate off):
                 // switch inline as before, preserving the PC-
                 // sequential walker's behaviour.
-                if new_block != current_block {
+                if task_227_5_per_block_walker && new_block != current_block {
                     // Yield without pushing Label — the new block's
                     // outer iter at start_pc=py_pc will emit its
                     // own Label via its own `emit_mark_label_pc!(
