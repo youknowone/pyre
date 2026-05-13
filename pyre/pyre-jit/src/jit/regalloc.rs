@@ -51,7 +51,7 @@ fn variable_value_id(v: Variable) -> ValueId {
 }
 
 #[derive(Debug, Clone)]
-pub(super) struct GraphAllocationResult {
+pub struct GraphAllocationResult {
     pub coloring: HashMap<super::flow::VariableId, u16>,
     pub num_colors: u16,
 }
@@ -356,7 +356,7 @@ pub(super) fn perform_graph_register_allocation(
 /// analog of upstream's `regallocs` dict and is the input shape that a
 /// future `flatten_graph(graph, regallocs, ...)` driver will read.
 /// (Phase 1 of the production-wiring plan tracked as Task #224.)
-pub(super) fn perform_graph_register_allocation_all_kinds(
+pub fn perform_graph_register_allocation_all_kinds(
     graph: &FlowGraph,
 ) -> HashMap<Kind, GraphAllocationResult> {
     let mut regallocs = HashMap::new();
@@ -384,7 +384,7 @@ pub(super) fn perform_graph_register_allocation_all_kinds(
 /// run this simulation explicitly first.
 ///
 /// Tracks the production-wiring follow-up in Task #214.
-pub(super) fn enforce_input_args_simulation(
+pub fn enforce_input_args_simulation(
     graph: &FlowGraph,
     regallocs: &mut HashMap<Kind, GraphAllocationResult>,
 ) {

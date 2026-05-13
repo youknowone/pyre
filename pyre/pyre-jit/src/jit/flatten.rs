@@ -2523,6 +2523,62 @@ pub fn flatten_graph_with_lowering<'a, F, C>(
     flattener.make_bytecode_block(graph.startblock.clone(), false);
 }
 
+/// `rpython/jit/codewriter/flatten.py:63-70 flatten_graph(graph,
+/// regallocs, _include_all_exc_links=False, cpu=None)`.
+///
+/// The canonical entry point matching upstream signature exactly.
+/// Constructs the `SSARepr` internally, derives `get_register` from
+/// `regallocs[kind].getcolor(v)` (`flatten.py:382-391`), and threads
+/// `cpu` through `make_exception_link` for `handling_ovf=True` reraise
+/// targets (`flatten.py:166-170`).
+///
+/// **PRE-EXISTING-ADAPTATION** (Phase 4 of the issue #27 plan):
+/// upstream's `flatten_graph` does not take a `LoweringContext` — the
+/// rtyper rewrites the graph to post-rtype shape BEFORE flatten_graph
+/// runs, so the dispatcher (`flatten_op_to_insn_with_lowering`) has no
+/// upstream analog.  Pyre's flatten still needs the dispatcher because
+/// pyre's graph carries pre-rtype HLOps for the 4 retired families
+/// (BINARY_OP / COMPARE_OP / BOOL / SETITEM), so a
+/// `LoweringContext` parameter is threaded as a pyre-specific
+/// extension.  Phase 5 retires this once pyre's walker stops emitting
+/// HLOps in favour of post-rtype residual_calls on the graph too.
+///
+/// **PRE-EXISTING-ADAPTATION**: the constant lowering closure used
+/// here is `flatten_constant_operand_for_probe`, which lowers
+/// `Opaque(Ref)` to `ConstRef(0)`.  Production callers needing real
+/// pycode/jitdriver pointers still go through
+/// `flatten_graph_with_lowering` directly with a production closure;
+/// the new orthodox entry is currently consumed by the
+/// `[phase4-flatten-graph]` probe and unit tests where the placeholder
+/// is acceptable.
+pub fn flatten_graph_with_regallocs<'a>(
+    graph: &super::flow::FunctionGraph,
+    regallocs: &'a std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
+    _include_all_exc_links: bool,
+    cpu: Option<&'a super::cpu::Cpu>,
+    lowering_ctx: LoweringContext,
+) -> SSARepr {
+    let mut ssarepr = SSARepr::new(graph.name.clone());
+    let get_register = |variable: Variable| -> Register {
+        let kind = variable.kind.unwrap_or(Kind::Ref);
+        let color = regallocs
+            .get(&kind)
+            .and_then(|r| r.coloring.get(&variable.id).copied())
+            .unwrap_or(u16::MAX);
+        Register::new(kind, color)
+    };
+    let lower_constant = flatten_constant_operand_for_probe;
+    flatten_graph_with_lowering(
+        graph,
+        &mut ssarepr,
+        lowering_ctx,
+        cpu,
+        get_register,
+        lower_constant,
+    );
+    ssarepr
+}
+
 /// Phase 4 Session 18 (Task #227 prerequisite) — single-family parallel
 /// flatten probe.  Walks `graph.iterblocks()` (DFS from startblock per
 /// `flowspace/model.py:66-77 FunctionGraph.iterblocks`) and emits one
@@ -7128,6 +7184,49 @@ mod tests {
                 "{input} must rewrite to {expected} per flatten.py:195"
             );
         }
+    }
+
+    #[test]
+    fn flatten_graph_with_regallocs_canonical_entry_returns_ssarepr() {
+        // Phase 4 — `flatten.py:63-70` orthodox entry.
+        // Build a trivial portal-like graph with a single
+        // `loop_header` op (passthrough family — no LoweringContext
+        // arm needs to fire) and verify the canonical entry returns a
+        // populated `SSARepr` named after the graph.
+        use crate::jit::flow::{Block, FunctionGraph};
+        let retval = Variable::new(VariableId(0), Kind::Ref);
+        let start = Block::shared(Vec::new());
+        let graph = FunctionGraph::new("orthodox", start.clone(), Some(retval));
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("loop_header", vec![Constant::signed(7).into()], None, 0),
+        );
+        start.closeblock(vec![
+            super::super::flow::Link::new(
+                vec![retval.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        let regallocs =
+            super::super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+        let ctx = LoweringContext {
+            binary_op_fn_idx: 0,
+            compare_op_fn_idx: 0,
+            truth_fn_idx: 0,
+            store_subscr_fn_idx: 0,
+        };
+        let ssarepr = flatten_graph_with_regallocs(&graph, &regallocs, false, None, ctx);
+        assert_eq!(ssarepr.name, "orthodox");
+        assert!(
+            ssarepr
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "loop_header")),
+            "canonical entry must walk graph.startblock and emit the `loop_header` op"
+        );
     }
 
     #[test]

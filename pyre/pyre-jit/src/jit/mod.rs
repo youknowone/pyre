@@ -6,7 +6,7 @@ pub mod exceptiondata;
 pub mod flatten;
 pub mod flow;
 pub mod liveness;
-mod regalloc;
+pub mod regalloc;
 mod ssa_emitter;
 pub use pyre_jit_trace::descr;
 pub mod executor;
