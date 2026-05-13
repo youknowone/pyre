@@ -45,15 +45,16 @@ pub struct RawExecResult {
     pub status: u64,
     /// compile.py:780: current_object_addr_as_int(self) — descriptor pointer.
     pub descr_addr: usize,
-    /// `cpu.get_latest_descr(deadframe)` (`history.py:125`, `compile.py:701`)
-    /// — the runtime descr Arc owning this exit.  Always set: routes
-    /// through `Backend::get_latest_descr_arc` rather than the
-    /// `fail_descr_addr` registry, so FINISH / `DoneWithThisFrame*` /
-    /// `ExitFrameWithExceptionDescrRef` singletons return their global
-    /// Arc identity instead of `None`.  Bridge consumers
-    /// (`start_bridge_tracing`, `_trace_and_compile_from_bridge`) read
-    /// `rd_loop_token_clt` / `fail_index_per_trace` directly from this.
-    pub descr_arc: Arc<dyn FailDescr>,
+    /// `cpu.get_latest_descr(deadframe)` (`history.py:125`,
+    /// `compile.py:701`) — the runtime descr Arc owning this exit.
+    /// Always set: routes through `Backend::get_latest_descr_arc`
+    /// rather than the `fail_descr_addr` registry, so FINISH /
+    /// `DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`
+    /// singletons return their global Arc identity instead of `None`.
+    /// Bridge consumers (`start_bridge_tracing`,
+    /// `_trace_and_compile_from_bridge`) call `descr_arc.as_fail_descr()`
+    /// to read `rd_loop_token_clt` / `fail_index_per_trace` directly.
+    pub descr_arc: Arc<dyn Descr>,
 }
 
 /// Backend-neutral static metadata for a compiled trace.
@@ -1713,7 +1714,9 @@ pub trait Backend: Send {
     fn execute_token_raw(&self, token: &JitCellToken, args: &[Value]) -> RawExecResult {
         let frame = self.execute_token(token, args);
         let descr_arc = self.get_latest_descr_arc(&frame);
-        let descr: &dyn FailDescr = &*descr_arc;
+        let descr: &dyn FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("get_latest_descr_arc must return a FailDescr");
         let exit_layout = self.describe_deadframe(&frame);
         let savedata = self.get_savedata_ref(&frame);
         let exception_value = self.grab_exc_value(&frame);
@@ -1954,30 +1957,21 @@ pub trait Backend: Send {
 
     /// Owned Arc counterpart of `get_latest_descr`.
     ///
-    /// PRE-EXISTING-ADAPTATION (split-descr): `cpu.get_latest_descr(deadframe)`
-    /// in RPython (`history.py:125`, consumed at `pyjitpl.py:2890`) returns
-    /// the `ResumeGuardDescr` object the metainterp stamped — the same
-    /// object that owns `rd_numb` / `rd_consts` / `rd_loop_token` etc.,
-    /// kept alive by the GC across the deopt boundary.  Pyre runs a
-    /// *split-descr* model: the backend (dynasm `DynasmFailDescr` /
-    /// cranelift `CraneliftFailDescr`) and the metainterp
-    /// `ResumeGuardDescr` are distinct objects, with the metainterp
-    /// descr forwarded onto the backend descr via `meta_descr` for the
-    /// fields that flow through native code.  Consequently, this method
-    /// returns the *backend-side* `Arc<dyn FailDescr>`, not the
-    /// metainterp ResumeGuardDescr — close enough for descr-identity
-    /// routing (each backend descr is unique per guard, and
-    /// `meta_descr`/`fail_index_per_trace` chase upward to the
-    /// metainterp side) but not byte-for-byte the same object PyPy
-    /// reads in `pyjitpl.py:2890`.
-    ///
-    /// The split exists because pyre emits and registers the backend
-    /// descr at codegen time (it has to be reachable from native fault
-    /// stubs), whereas the metainterp ResumeGuardDescr lives on the
-    /// frontend op-record side; unifying them is the multi-session
-    /// goal that the descr-Arc routing convergence (Task #137 + Task
-    /// #235 + T-series) is approaching one slice at a time.
-    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn FailDescr>;
+    /// `cpu.get_latest_descr(deadframe)` in RPython (`history.py:125`,
+    /// consumed at `pyjitpl.py:2890`) returns the metainterp
+    /// `AbstractFailDescr` object stamped on the originating guard's
+    /// `op.descr` — the same object that owns `rd_numb` / `rd_consts`
+    /// / `rd_loop_token` etc.  Backends return the metainterp Arc
+    /// reached through `meta_descr` when present; synthetic backend
+    /// descrs (FINISH / `PropagateExceptionDescr` /
+    /// `ExitFrameWithExceptionDescr` / external-JUMP) without a
+    /// metainterp counterpart fall back to the backend Arc upcast to
+    /// `Arc<dyn Descr>`.  Callers obtain `&dyn FailDescr` via
+    /// `descr_arc.as_fail_descr()` (`history.py:128 AbstractFailDescr`
+    /// is a sub-class of `AbstractDescr`, so the upcast is implicit on
+    /// the Python side; pyre exposes the supertrait `Descr` and the
+    /// sub-trait `FailDescr` separately).
+    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn Descr>;
 
     /// Resolve a raw fail-descr address to its owning `Arc<dyn FailDescr>`.
     ///

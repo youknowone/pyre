@@ -447,12 +447,14 @@ impl majit_backend::Backend for WasmBackend {
         data.fail_descr.as_ref()
     }
 
-    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn FailDescr> {
+    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {
+        // `history.py:125` parity — wasm backend has no `meta_descr`
+        // back-pointer yet, so return the backend Arc upcast.
         let data = frame
             .data
             .downcast_ref::<WasmFrameData>()
             .expect("not WasmFrameData");
-        Arc::clone(&data.fail_descr) as Arc<dyn FailDescr>
+        Arc::clone(&data.fail_descr) as Arc<dyn majit_ir::Descr>
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {

@@ -2938,12 +2938,18 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
 /// `(trace_id, fail_index)` surrogates.
 pub fn get_latest_descr_arc_from_deadframe(
     frame: &DeadFrame,
-) -> Result<Arc<dyn FailDescr>, BackendError> {
+) -> Result<Arc<dyn majit_ir::Descr>, BackendError> {
+    // `history.py:125` `cpu.get_latest_descr(deadframe)` parity —
+    // transitional: returns the backend Arc upcast to `Arc<dyn Descr>`.
+    // Resume-payload readers reach the metainterp `AbstractFailDescr`
+    // through the backend's `meta_descr` back-pointer; `descr_addr`
+    // derived from this Arc keeps registry-keyed lookups working until
+    // the full jf_descr identity flip lands.
     let jf = frame
         .data
         .downcast_ref::<JitFrameDeadFrame>()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
-    Ok(Arc::clone(&jf.fail_descr) as Arc<dyn FailDescr>)
+    Ok(Arc::clone(&jf.fail_descr) as Arc<dyn majit_ir::Descr>)
 }
 
 pub fn get_int_from_deadframe(frame: &DeadFrame, index: usize) -> Result<i64, BackendError> {
@@ -13960,7 +13966,9 @@ impl majit_backend::Backend for CraneliftBackend {
                     compiled.caller_prefix_layout.as_ref(),
                 );
                 let descr_arc = self.get_latest_descr_arc(&frame);
-                let descr: &dyn FailDescr = &*descr_arc;
+                let descr: &dyn FailDescr = descr_arc
+                    .as_fail_descr()
+                    .expect("get_latest_descr_arc returned a non-FailDescr Descr");
                 let exit_layout = self.describe_deadframe(&frame);
                 let savedata = self.get_savedata_ref(&frame);
                 let exception_value = self.grab_exc_value(&frame);
@@ -14374,7 +14382,7 @@ impl majit_backend::Backend for CraneliftBackend {
         get_latest_descr_from_deadframe(frame).expect("get_latest_descr_from_deadframe failed")
     }
 
-    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn FailDescr> {
+    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {
         get_latest_descr_arc_from_deadframe(frame)
             .expect("get_latest_descr_arc_from_deadframe failed")
     }

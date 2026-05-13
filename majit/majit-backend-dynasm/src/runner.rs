@@ -1936,9 +1936,20 @@ impl Backend for DynasmBackend {
         &*data.fail_descr
     }
 
-    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn FailDescr> {
+    fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {
+        // `history.py:125` `cpu.get_latest_descr(deadframe)` parity.
+        //
+        // Transitional shape: return the backend Arc upcast to
+        // `Arc<dyn Descr>`.  Callers reach the metainterp
+        // `AbstractFailDescr` via the backend Arc's `meta_descr`
+        // back-pointer when they need resume payload (compile.py:855
+        // `_attrs_` are forwarded through `meta_descr`).  The
+        // `descr_addr` derived from this Arc remains the
+        // registry-keyed backend address, so `must_compile_descr` /
+        // `start_compiling_descr` continue to resolve correctly until
+        // the full jf_descr identity flip lands.
         let data = frame.data.downcast_ref::<FrameData>().unwrap();
-        Arc::clone(&data.fail_descr) as Arc<dyn FailDescr>
+        Arc::clone(&data.fail_descr) as Arc<dyn majit_ir::Descr>
     }
 
     /// `fail_descr_registry` is the `addr → Arc<DynasmFailDescr>` table

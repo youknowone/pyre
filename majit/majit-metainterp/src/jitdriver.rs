@@ -3629,14 +3629,15 @@ impl<S: JitState> JitDriver<S> {
     /// `resume_pc` is where interpretation resumes after the guard failure.
     pub fn start_bridge_tracing(
         &mut self,
-        // pyjitpl.py:2890 `handle_guard_failure(self, resumedescr, deadframe)`
-        // threads the descr (`resumedescr`) as the canonical bridge-source
-        // identity.  The pyre backend FailDescr Arc plays the same role —
-        // `descr_owning_jct(arc).green_key`, `arc.trace_id()` and
-        // `arc.fail_index_per_trace()` are the line-by-line readers — so
-        // start_bridge_tracing now consumes the descr Arc directly and
-        // derives the legacy surrogate triple internally.
-        descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
+        // `pyjitpl.py:2890 handle_guard_failure(self, resumedescr,
+        // deadframe)` threads the descr (`resumedescr`) as the
+        // canonical bridge-source identity.  The descr Arc returned by
+        // `cpu.get_latest_descr` (`history.py:125`) plays the same role
+        // — `descr_owning_jct(arc).green_key`, `arc.trace_id()` and
+        // `arc.fail_index_per_trace()` are the line-by-line readers.
+        // Pyre threads `Arc<dyn Descr>` and obtains the `FailDescr`
+        // facet via `as_fail_descr()` (sub-trait of `Descr`).
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
         state: &mut S,
         env: &S::Env,
         raw_fail_values: &[i64],
@@ -3646,12 +3647,15 @@ impl<S: JitState> JitDriver<S> {
         // `compile.giveup()` when the descr's owning JitCellToken weakref
         // is dead (memmgr-evicted).  Pyre signals the same outcome by
         // returning false.
-        let Some(jct) = majit_backend::descr_owning_jct(descr_arc.as_ref()) else {
+        let descr_fd = descr_arc
+            .as_fail_descr()
+            .expect("start_bridge_tracing: descr_arc must be a FailDescr");
+        let Some(jct) = majit_backend::descr_owning_jct(descr_fd) else {
             return false;
         };
         let green_key = jct.green_key;
-        let trace_id = descr_arc.trace_id();
-        let fail_index = descr_arc.fail_index_per_trace();
+        let trace_id = descr_fd.trace_id();
+        let fail_index = descr_fd.fail_index_per_trace();
         let Some(_loop_meta) = self.meta.get_compiled_meta(green_key).cloned() else {
             return false;
         };

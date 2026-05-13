@@ -2281,11 +2281,12 @@ fn handle_blackhole_result(bh_result: BlackholeResult, _green_key: u64) -> Optio
 /// `resume_in_blackhole`.  Pyre's caller signals the same intent by
 /// returning `false` to drop into blackhole resume.
 fn bridge_source_identity_from_descr(
-    descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
 ) -> Option<(u64, u64, u32)> {
-    let green_key = majit_backend::descr_owning_jct(descr_arc.as_ref())?.green_key;
-    let trace_id = descr_arc.trace_id();
-    let fail_index = descr_arc.fail_index_per_trace();
+    let descr_fd = descr_arc.as_fail_descr()?;
+    let green_key = majit_backend::descr_owning_jct(descr_fd)?.green_key;
+    let trace_id = descr_fd.trace_id();
+    let fail_index = descr_fd.fail_index_per_trace();
     Some((green_key, trace_id, fail_index))
 }
 
@@ -2324,7 +2325,7 @@ pub fn trace_and_compile_from_bridge(
     // backends the `Backend::fail_descr_arc_from_addr` registry), so the
     // surrogate `(green_key, trace_id, fail_index)` parameters retired
     // in T-final.B.
-    descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     frame: &mut PyFrame,
     raw_values: &[i64],
     exit_layout: &majit_metainterp::CompiledExitLayout,
@@ -2596,7 +2597,7 @@ fn jit_ca_handle_guard_failure(
     // on a registry miss, matching RPython's `cpu.get_latest_descr(deadframe)`
     // (warmspot.py:1021) which has no failure mode.  T-final.B made
     // `trace_and_compile_from_bridge` itself descr-only.
-    let descr_arc = {
+    let descr_arc: std::sync::Arc<dyn majit_ir::Descr> = {
         use majit_backend::Backend;
         let (driver, _) = crate::eval::driver_pair();
         driver

@@ -6440,7 +6440,9 @@ impl<M: Clone> MetaInterp<M> {
             .execute_token_ints(&compiled.token, live_values);
 
         let descr_arc = self.backend.get_latest_descr_arc(&frame);
-        let descr: &dyn majit_ir::FailDescr = &*descr_arc;
+        let descr: &dyn majit_ir::FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("get_latest_descr_arc returned a non-FailDescr Descr");
         let fail_index = descr.fail_index();
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
@@ -6593,7 +6595,9 @@ impl<M: Clone> MetaInterp<M> {
         // assembler_call_helper (called from compiled code). No deferred queue.
 
         let descr_arc = self.backend.get_latest_descr_arc(&frame);
-        let descr: &dyn majit_ir::FailDescr = &*descr_arc;
+        let descr: &dyn majit_ir::FailDescr = descr_arc
+            .as_fail_descr()
+            .expect("get_latest_descr_arc returned a non-FailDescr Descr");
         let fail_index = descr.fail_index();
         let trace_id = descr.trace_id();
         let is_finish = descr.is_finish();
@@ -7521,13 +7525,16 @@ impl<M: Clone> MetaInterp<M> {
     /// Returns (should_compile, owning_green_key).
     pub fn must_compile_with_values(
         &mut self,
-        descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
+        descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
         fail_values: &[i64],
         fallback_green_key: u64,
     ) -> (bool, u64) {
         let descr_addr = std::sync::Arc::as_ptr(descr_arc) as *const () as usize;
-        let trace_id = descr_arc.trace_id();
-        let fail_index = descr_arc.fail_index_per_trace();
+        let descr_fd = descr_arc
+            .as_fail_descr()
+            .expect("must_compile_with_values: descr_arc must be a FailDescr");
+        let trace_id = descr_fd.trace_id();
+        let fail_index = descr_fd.fail_index_per_trace();
         // compile.py:725 `_trace_and_compile_from_bridge` walks
         // `resumedescr.rd_loop_token.loop_token_wref()` for the owning
         // JCT.  When the weakref is dead (memmgr eviction —
@@ -7536,7 +7543,7 @@ impl<M: Clone> MetaInterp<M> {
         // outer entry key.  RPython doesn't have this fallback because
         // its identity is descr-pointer-based, never indirected through
         // a numeric `green_key`.
-        let owning_key = majit_backend::descr_owning_jct(descr_arc.as_ref())
+        let owning_key = majit_backend::descr_owning_jct(descr_fd)
             .map(|jct| jct.green_key)
             .unwrap_or(fallback_green_key);
         if descr_addr == 0 {
@@ -13077,11 +13084,11 @@ pub enum DetailedDriverRunOutcome {
         fail_index: u32,
         trace_id: u64,
         /// `cpu.get_latest_descr(deadframe)` (`history.py:125`) — the
-        /// backend-side guard descr recovered from the failing frame.
-        /// Pyre currently has split metainterp/backend descr objects;
-        /// this Arc is the runtime descr whose `rd_loop_token_clt` and
-        /// `fail_index_per_trace` mirror the metainterp guard descr.
-        descr_arc: std::sync::Arc<dyn majit_ir::FailDescr>,
+        /// runtime descr Arc returned by `Backend::get_latest_descr_arc`,
+        /// preferring the metainterp `AbstractFailDescr` reached
+        /// through `meta_descr`.  Consumers call `descr_arc.as_fail_descr()`
+        /// to access `rd_loop_token_clt` / `fail_index_per_trace`.
+        descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
         /// compile.py:702: must_compile() result.
         should_bridge: bool,
         /// compile.py: rd_loop_token — owning compiled loop key.

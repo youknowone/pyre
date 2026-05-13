@@ -153,7 +153,7 @@ pub struct CompileResult<'a, M> {
     /// currently has split metainterp/backend descr objects, so this is
     /// the runtime descr carrying the same `rd_loop_token_clt` /
     /// `fail_index_per_trace` identity used for bridge routing.
-    pub descr_arc: std::sync::Arc<dyn majit_ir::FailDescr>,
+    pub descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
     pub is_finish: bool,
     /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity:
     /// true when the FINISH descriptor was
@@ -183,7 +183,7 @@ pub struct RawCompileResult<'a, M> {
     /// Arc identity instead of `None`.  Bridge consumers
     /// (`start_bridge_tracing`, `_trace_and_compile_from_bridge`) read
     /// `rd_loop_token_clt` / `fail_index_per_trace` directly from this.
-    pub descr_arc: std::sync::Arc<dyn majit_ir::FailDescr>,
+    pub descr_arc: std::sync::Arc<dyn majit_ir::Descr>,
     pub is_finish: bool,
     /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity —
     /// mirrors `CompileResult::is_exit_frame_with_exception`.

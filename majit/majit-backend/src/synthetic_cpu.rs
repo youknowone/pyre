@@ -124,7 +124,7 @@ impl crate::Backend for SyntheticCpu {
     fn get_latest_descr_arc(
         &self,
         _frame: &crate::DeadFrame,
-    ) -> std::sync::Arc<dyn majit_ir::FailDescr> {
+    ) -> std::sync::Arc<dyn majit_ir::Descr> {
         unreachable!("SyntheticCpu does not produce DeadFrames; get_latest_descr_arc unreachable")
     }
 

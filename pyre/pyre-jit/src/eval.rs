@@ -2812,7 +2812,7 @@ fn handle_fail(
     _green_key: u64,
     _trace_id: u64,
     _fail_index: u32,
-    descr_arc: &std::sync::Arc<dyn majit_ir::FailDescr>,
+    descr_arc: &std::sync::Arc<dyn majit_ir::Descr>,
     should_bridge: bool,
     _owning_key: u64,
     exit_layout: &CompiledExitLayout,
