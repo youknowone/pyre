@@ -2446,18 +2446,16 @@ fn unregister_call_assembler_expectations(caller_id: CallAssemblerCallerId) {
 fn unregister_bridge_call_assembler_expectations(bridge: &BridgeData) {
     unregister_call_assembler_expectations(CallAssemblerCallerId::BridgeTrace(bridge.trace_id));
     for descr in &bridge.fail_descrs {
-        let attached = descr.bridge_ref();
-        if let Some(ref child_bridge) = *attached {
-            unregister_bridge_call_assembler_expectations(child_bridge);
+        if let Some(child_bridge) = descr.bridge_ref() {
+            unregister_bridge_call_assembler_expectations(&child_bridge);
         }
     }
 }
 
 fn unregister_call_assembler_bridge_tree(fail_descrs: &[Arc<CraneliftFailDescr>]) {
     for descr in fail_descrs {
-        let attached = descr.bridge_ref();
-        if let Some(ref bridge) = *attached {
-            unregister_bridge_call_assembler_expectations(bridge);
+        if let Some(bridge) = descr.bridge_ref() {
+            unregister_bridge_call_assembler_expectations(&bridge);
         }
     }
 }
@@ -3051,20 +3049,18 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
             direct_descr.unwrap_or_else(|| cur_fail_descrs[fail_index as usize].clone());
         let fail_descr = &fail_descr_arc;
         fail_descr.increment_fail_count();
-        let bridge_guard = fail_descr.bridge_ref();
-        if let Some(ref bridge) = *bridge_guard {
+        if let Some(bridge) = fail_descr.bridge_ref() {
             if bridge.loop_reentry {
                 // loop_reentry: use raw fail_args (same as run_compiled_code
                 // bridge dispatch). rebuild_state_after_failure transforms
                 // outputs for blackhole resume which may change Vec length.
                 let raw_outputs = outputs[..bridge.num_inputs].to_vec();
                 let bridge_frame = CraneliftBackend::execute_bridge(
-                    bridge,
+                    &bridge,
                     &raw_outputs,
                     fail_descr.fail_arg_types(),
                     &attachments,
                 );
-                let _ = bridge_guard;
                 let bridge_descr = get_latest_descr_from_deadframe(&bridge_frame)
                     .expect("bridge deadframe must have descriptor");
                 // llgraph/runner.py:1130-1140 Jump exception on external JUMP:
@@ -3101,13 +3097,12 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 bridge.num_inputs,
             );
             return CraneliftBackend::execute_bridge(
-                bridge,
+                &bridge,
                 &mat_outputs,
                 fail_arg_types,
                 &attachments,
             );
         }
-        let _ = bridge_guard;
 
         // Bridge compilation is decided by MetaInterp.must_compile()
         // (compile.py:783-784 jitcounter.tick), not by backend fail_count.
@@ -3272,11 +3267,11 @@ fn call_assembler_guard_failure_inner(
     // fail_count increment when bridge is available, as patched PyPy
     // code jumps to the bridge instead of re-entering the guard helper.
     let fail_descr_ref = unsafe { &*(fail_descr_ptr as *const CraneliftFailDescr) };
-    if let Some(ref bridge) = *fail_descr_ref.bridge_ref() {
+    if let Some(bridge) = fail_descr_ref.bridge_ref() {
         let raw_num = fail_descr_ref.fail_arg_types().len();
         let parent_outputs = unsafe { std::slice::from_raw_parts(outputs_ptr, raw_num) };
         let frame = CraneliftBackend::execute_bridge(
-            bridge,
+            &bridge,
             parent_outputs,
             fail_descr_ref.fail_arg_types(),
             attachments,
@@ -3460,8 +3455,7 @@ fn call_assembler_fast_path_heap(
     // Guard failure — check for bridge, then fall back to force
     fail_descr.increment_fail_count();
 
-    let bridge_guard = fail_descr.bridge_ref();
-    if let Some(ref bridge) = *bridge_guard {
+    if let Some(bridge) = fail_descr.bridge_ref() {
         // rebuild_state_after_failure decodes recovery_layout to match
         // what the bridge tracer saw via rebuild_from_resumedata.
         let mut bridge_outputs = outputs;
@@ -3473,7 +3467,7 @@ fn call_assembler_fast_path_heap(
             bridge.num_inputs,
         );
         let mut frame =
-            CraneliftBackend::execute_bridge(bridge, &bridge_outputs, fail_arg_types, &attachments);
+            CraneliftBackend::execute_bridge(&bridge, &bridge_outputs, fail_arg_types, &attachments);
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
             .expect("bridge deadframe must have a descriptor");
         if bridge_descr.is_finish() {
@@ -3491,8 +3485,6 @@ fn call_assembler_fast_path_heap(
         }
         return 0;
     }
-    let _ = bridge_guard;
-
     // resume.py:1312 blackhole_from_resumedata parity.
     if let Some(bh_fn) = CALL_ASSEMBLER_BLACKHOLE_FN.get() {
         let descr_addr = Arc::as_ptr(fail_descr) as *const () as usize;
@@ -6784,8 +6776,7 @@ impl CraneliftBackend {
                         let tid = prev_d.trace_id();
                         if let Some(new_d) = find_fail_descr_in_fail_descrs(new_descrs, tid, fi) {
                             if !new_d.has_bridge() {
-                                let bridge = prev_d.bridge_ref();
-                                if let Some(ref b) = *bridge {
+                                if let Some(b) = prev_d.bridge_ref() {
                                     if std::env::var_os("MAJIT_LOG").is_some() {
                                         eprintln!(
                                             "[jit] propagate bridge tid={} fi={} to new token",
@@ -7252,8 +7243,7 @@ impl CraneliftBackend {
             // the jitframe uses recovery_layout encoding for virtuals.
             // rebuild_state_after_failure decodes this to match what the
             // bridge tracer saw via rebuild_from_resumedata (resume.py:1042).
-            let bridge_guard = fail_descr.bridge_ref();
-            if let Some(ref bridge) = *bridge_guard {
+            if let Some(bridge) = fail_descr.bridge_ref() {
                 let n = bridge.num_inputs.min(outputs.len());
                 let bridge_inputs = outputs[..n].to_vec();
                 if majit_log_enabled() {
@@ -7271,7 +7261,6 @@ impl CraneliftBackend {
 
                 continue;
             }
-            let _ = bridge_guard;
 
             // llgraph/runner.py:1192-1194 fail_guard without bridge →
             // ExecutionFinished(LLDeadFrame).
@@ -7329,16 +7318,14 @@ impl CraneliftBackend {
 
         fail_descr.increment_fail_count();
 
-        let bridge_guard = fail_descr.bridge_ref();
-        if let Some(ref next_bridge) = *bridge_guard {
+        if let Some(next_bridge) = fail_descr.bridge_ref() {
             return Self::execute_bridge(
-                next_bridge,
+                &next_bridge,
                 &outputs,
                 fail_descr.fail_arg_types(),
                 attachments,
             );
         }
-        let _ = bridge_guard;
 
         // jf_guard_exc already written by emit_guard_exit.
         deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner)
@@ -13662,9 +13649,8 @@ impl majit_backend::Backend for CraneliftBackend {
         }
         {
             if let Some(ref sd) = source_descr {
-                let existing_bridge = sd.bridge_ref();
-                if let Some(ref bridge) = *existing_bridge {
-                    unregister_bridge_call_assembler_expectations(bridge);
+                if let Some(bridge) = sd.bridge_ref() {
+                    unregister_bridge_call_assembler_expectations(&bridge);
                 }
             }
         }
@@ -13713,8 +13699,7 @@ impl majit_backend::Backend for CraneliftBackend {
                         if !prev_descr.has_bridge() {
                             // Reconstruct a minimal BridgeData from the
                             // bridge already attached to `sd`.
-                            let bridge = sd.bridge_ref();
-                            if let Some(ref b) = *bridge {
+                            if let Some(b) = sd.bridge_ref() {
                                 prev_descr.attach_bridge(BridgeData {
                                     trace_id: b.trace_id,
                                     input_types: b.input_types.clone(),
@@ -13810,8 +13795,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 source_fail_index,
             );
             if let Some(descr) = source_descr {
-                let bridge_guard = descr.bridge_ref();
-                if let Some(ref bridge) = *bridge_guard {
+                if let Some(bridge) = descr.bridge_ref() {
                     for (i, &hash) in hashes.iter().enumerate() {
                         if let Some(bd) = bridge.fail_descrs.get(i) {
                             if !bd.is_finish && bd.get_status() == 0 {
@@ -13864,8 +13848,7 @@ impl majit_backend::Backend for CraneliftBackend {
             return;
         };
         for old_fd in &old.fail_descrs {
-            let bridge_guard = old_fd.bridge_ref();
-            let Some(ref b) = *bridge_guard else {
+            let Some(b) = old_fd.bridge_ref() else {
                 continue;
             };
             // Match by (trace_id, fail_index) — same key used by
@@ -14155,8 +14138,7 @@ impl majit_backend::Backend for CraneliftBackend {
             fail_descr.increment_fail_count();
 
             // llgraph/runner.py:1184-1191 fail_guard with bridge.
-            let bridge_guard = fail_descr.bridge_ref();
-            if let Some(ref bridge) = *bridge_guard {
+            if let Some(bridge) = fail_descr.bridge_ref() {
                 let n = bridge.num_inputs.min(outputs.len());
                 let bridge_inputs = outputs[..n].to_vec();
                 cur_code_ptr = bridge.code_ptr;
@@ -14166,7 +14148,6 @@ impl majit_backend::Backend for CraneliftBackend {
                 cur_inputs = bridge_inputs;
                 continue;
             }
-            let _ = bridge_guard;
 
             // llgraph/runner.py:1192-1194 fail_guard without bridge —
             // exit with the raw outputs.
