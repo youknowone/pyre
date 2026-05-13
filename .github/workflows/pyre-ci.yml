@@ -31,7 +31,7 @@ jobs:
     name: cargo fmt --check
     runs-on: ubuntu-24.04
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@stable
       with:
         components: rustfmt
@@ -48,7 +48,7 @@ jobs:
         backend: [dynasm, cranelift]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@stable
     - uses: Swatinem/rust-cache@v2
     - name: Run cargo test for ${{ matrix.backend }}
@@ -63,16 +63,16 @@ jobs:
         os: [ubuntu-24.04, macos-latest, windows-latest]
 
     steps:
-    - uses: actions/checkout@v4
+    - uses: actions/checkout@v6
     - uses: dtolnay/rust-toolchain@stable
     - name: Set up CPython
       id: cpython
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: "3.14"
     - name: Set up PyPy
       id: pypy
-      uses: actions/setup-python@v5
+      uses: actions/setup-python@v6
       with:
         python-version: "pypy3.11"
     - uses: Swatinem/rust-cache@v2

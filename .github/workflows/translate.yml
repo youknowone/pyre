@@ -64,7 +64,7 @@ jobs:
 
     - name: upload
       if: success() || failure()
-      uses: actions/upload-artifact@v7.0.0
+      uses: actions/upload-artifact@v7
       with:
         name: pypy-ci-build-${{ matrix.os }}${{ matrix.revdb && '-revdb' || '' }}
         path: ./pypy-nightly.tar.bz2
