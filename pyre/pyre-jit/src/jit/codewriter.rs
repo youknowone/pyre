@@ -7426,6 +7426,25 @@ impl CodeWriter {
                             "[phase4-walker-drain]   {} first-diff pos={i} drain={:?} ssarepr={:?}",
                             code.obj_name, drained[i], ssarepr.insns[i],
                         );
+                        // Task #227.5 diff-tail dump: show the next 25
+                        // ssarepr entries past the first diff so the
+                        // missing-from-drain emits are identifiable.
+                        if std::env::var("PYRE_TASK_227_DRAIN_VERBOSE").is_ok() {
+                            let tail_end = (i + 25).min(ssarepr.insns.len());
+                            for j in i..tail_end {
+                                eprintln!(
+                                    "[phase4-walker-drain]     ssarepr[{}]={:?}",
+                                    j, ssarepr.insns[j],
+                                );
+                            }
+                            // Also dump drain entries around the diff.
+                            for j in i..tail_end.min(drained.len()) {
+                                eprintln!(
+                                    "[phase4-walker-drain]     drain[{}]={:?}",
+                                    j, drained[j],
+                                );
+                            }
+                        }
                         break;
                     }
                 }
