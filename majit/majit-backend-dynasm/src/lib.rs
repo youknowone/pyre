@@ -607,9 +607,13 @@ fn handle_fail_resume_guard(
     let trace_id = <guard::DynasmFailDescr as majit_ir::FailDescr>::trace_id(descr);
     let fail_index = descr.fail_index;
     let n_fail_args = <guard::DynasmFailDescr as majit_ir::FailDescr>::fail_arg_types(descr).len();
+    let fail_arg_locs = guard::lookup_fail_arg_locs(descr_raw);
     let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
     for i in 0..n_fail_args {
-        let slot = descr.fail_arg_locs.get(i).and_then(|l| *l).unwrap_or(i);
+        let slot = fail_arg_locs
+            .as_ref()
+            .and_then(|l| l.get(i).copied().flatten())
+            .unwrap_or(i);
         raw_values.push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
     }
 

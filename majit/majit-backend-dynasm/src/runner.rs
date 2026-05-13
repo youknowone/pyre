@@ -1853,6 +1853,8 @@ impl Backend for DynasmBackend {
         // llmodel.py:412-420 get_latest_descr: read jf_descr from frame.
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
+        let fail_arg_locs =
+            crate::guard::lookup_fail_arg_locs(Arc::as_ptr(&descr) as usize).unwrap_or_default();
 
         if crate::majit_log_enabled() {
             eprintln!(
@@ -1860,16 +1862,16 @@ impl Backend for DynasmBackend {
                 descr.fail_index,
                 descr.is_finish,
                 descr.fail_arg_types().len(),
-                &descr.fail_arg_locs
+                &fail_arg_locs
             );
         }
 
         // RPython parity: remap jitframe values using fail_arg_locs.
-        let n_locs = descr.fail_arg_locs.len();
+        let n_locs = fail_arg_locs.len();
         let mut raw_values: Vec<i64> = Vec::with_capacity(num_slots);
         for i in 0..num_slots {
             if i < n_locs {
-                match descr.fail_arg_locs[i] {
+                match fail_arg_locs[i] {
                     Some(slot) => {
                         let val =
                             unsafe { crate::llmodel::get_int_value_direct(result_jf, slot) as i64 };
@@ -1946,10 +1948,11 @@ impl Backend for DynasmBackend {
         for i in 0..num_slots {
             outputs.push(unsafe { crate::llmodel::get_int_value_direct(result_jf, i) as i64 });
         }
+        let fail_arg_locs = crate::guard::lookup_fail_arg_locs(Arc::as_ptr(&descr) as usize);
         let mut typed_outputs = Vec::with_capacity(num_fail_args);
         for i in 0..num_fail_args {
-            let raw = match descr.fail_arg_locs.get(i) {
-                Some(Some(slot)) => outputs.get(*slot).copied().unwrap_or(0),
+            let raw = match fail_arg_locs.as_ref().and_then(|l| l.get(i).copied()) {
+                Some(Some(slot)) => outputs.get(slot).copied().unwrap_or(0),
                 Some(None) => 0,
                 None => outputs.get(i).copied().unwrap_or(0),
             };

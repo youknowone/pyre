@@ -3,10 +3,67 @@
 /// metainterp `ResumeGuardDescr` (`majit-metainterp/src/compile.rs`) and
 /// is accessed here via `meta_resume_fd()` forwarding.
 use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use majit_backend::ExitRecoveryLayout;
 use majit_ir::{Descr, DescrRef, FailDescr, Type};
+
+/// Backend-static side-table that maps a `DynasmFailDescr` Arc's
+/// `Arc::as_ptr` address to the regalloc-derived `fail_arg_locs`
+/// (each fail-arg's absolute jitframe slot, or `None` for unmapped
+/// virtual / dead opref).
+///
+/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) does not
+/// carry a `fail_arg_locs` slot; PyPy `assembler.py:286-298`
+/// (`write_failure_recovery_description`) encodes the per-slot
+/// positions directly into the recovery stub's machine code via
+/// immediate operands, and `failure_recovery_func` reads them
+/// back from the instruction stream at fail-time.  Pyre's dynasm
+/// backend retains the equivalent regalloc output as a structured
+/// `Vec<Option<usize>>` keyed off the descr identity so the runtime
+/// helper (`handle_fail_resume_guard` in `lib.rs`) and the dead-frame
+/// build path (`runner.rs::execute_token`) can read jitframe slots
+/// without re-decoding machine code — equivalent semantics, different
+/// encoding.
+///
+/// Static because the trampoline (`handle_fail_resume_guard`) is
+/// reached from a JIT call site that has no backend reference, only
+/// the descr address.  The `DynasmBackend::fail_descr_registry`
+/// (also static-discipline via `Arc<Mutex<…>>`) has the same shape
+/// for the same reason.
+static FAIL_ARG_LOCS_TABLE: OnceLock<Mutex<HashMap<usize, Vec<Option<usize>>>>> = OnceLock::new();
+
+fn fail_arg_locs_table() -> &'static Mutex<HashMap<usize, Vec<Option<usize>>>> {
+    FAIL_ARG_LOCS_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Codegen-time write: invoked from `append_guard_token_with_faillocs`
+/// (x86 + aarch64) right after regalloc finalises the per-fail-arg
+/// jitframe slot map.  Also invoked from `allocate_unmapped_fail_arg_slots`
+/// when guard ops carry unmapped (virtual / dead) oprefs and need a
+/// second-pass write.
+pub fn register_fail_arg_locs(descr_ptr: usize, locs: Vec<Option<usize>>) {
+    fail_arg_locs_table()
+        .lock()
+        .expect("FAIL_ARG_LOCS_TABLE mutex poisoned")
+        .insert(descr_ptr, locs);
+}
+
+/// Runtime / dead-frame read.  Returns `None` when the descr was
+/// constructed outside the assembler path (e.g. backend unit-tests
+/// that build a `DynasmFailDescr` directly without going through
+/// `Assembler386::append_guard_token_with_faillocs`).  Callers that
+/// observe `None` fall back to identity slot indexing (`slot == i`),
+/// matching the pre-table runner behaviour for synthetic test descrs.
+pub fn lookup_fail_arg_locs(descr_ptr: usize) -> Option<Vec<Option<usize>>> {
+    fail_arg_locs_table()
+        .lock()
+        .expect("FAIL_ARG_LOCS_TABLE mutex poisoned")
+        .get(&descr_ptr)
+        .cloned()
+}
 
 /// Re-export the shared per-cpu descr attachment types so existing
 /// `crate::guard::{AttachedDescrPtrs, CpuDescrAttachments, CpuDescrHandle}`
@@ -49,9 +106,16 @@ pub struct DynasmFailDescr {
     /// pyjitpl.py:3238-3245 compile_exit_frame_with_exception.
     pub is_exit_frame_with_exception: bool,
 
-    /// regalloc parity: fail_locs — maps fail_args[i] to jitframe slot.
-    /// None = virtual/unmapped (not in jitframe).
-    pub fail_arg_locs: Vec<Option<usize>>,
+    // fail_arg_locs removed (Session 5h): not in PyPy
+    // `AbstractFailDescr._attrs_` (`history.py:132`).  PyPy encodes the
+    // per-fail-arg slot positions as immediate operands in the recovery
+    // stub's machine code (`assembler.py:286-298
+    // write_failure_recovery_description`); pyre's dynasm retains the
+    // structured `Vec<Option<usize>>` in a backend-static side-table
+    // (`fail_arg_locs_table()` in this module) keyed on
+    // `Arc::as_ptr(&descr)`.  Semantically equivalent, encoded
+    // differently.  Will be folded into machine-code embedding in
+    // future work; for now the side-table lookup is the bridge.
     /// `history.py:132` `AbstractFailDescr._attrs_` `rd_locs` —
     /// transitional dual-storage slot.  Canonical storage is on
     /// `op.descr` accessed via `meta_descr`; this backend slot is a
@@ -138,7 +202,6 @@ impl DynasmFailDescr {
             is_finish,
             is_resume_guard,
             is_exit_frame_with_exception: false,
-            fail_arg_locs: Vec::new(),
             rd_locs: UnsafeCell::new(Vec::new()),
             source_op_index: None,
             recovery_layout: UnsafeCell::new(None),

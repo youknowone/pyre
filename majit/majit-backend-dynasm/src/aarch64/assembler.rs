@@ -3454,7 +3454,6 @@ impl<'a> AssemblerARM64<'a> {
         };
         unsafe {
             let descr_mut = &mut *(Arc::as_ptr(&descr) as *mut DynasmFailDescr);
-            descr_mut.fail_arg_locs = fail_arg_locs;
             descr_mut.source_op_index = Some(op_index);
             *descr_mut.recovery_layout.get_mut() = Some(recovery_layout);
             // Capture the metainterp `AbstractFailDescr` Arc as a
@@ -3466,6 +3465,9 @@ impl<'a> AssemblerARM64<'a> {
             // the metainterp side.
             descr_mut.meta_descr = op.descr.clone();
         }
+        // Session 5h: see x86 counterpart — fail_arg_locs lives in
+        // `crate::guard::fail_arg_locs_table()`, not on the descr.
+        crate::guard::register_fail_arg_locs(Arc::as_ptr(&descr) as usize, fail_arg_locs.clone());
         // `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`
         // — write through the trait accessor so the metainterp
         // `AbstractFailDescr` (`history.py:132 _attrs_`) receives the
@@ -3475,7 +3477,7 @@ impl<'a> AssemblerARM64<'a> {
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] guard-token-slots: fail_index={} fail_arg_locs={:?} rd_locs={:?}",
-                fail_index, &descr.fail_arg_locs, descr.rd_locs()
+                fail_index, &fail_arg_locs, descr.rd_locs()
             );
         }
         let gcmap = self.guard_gcmap_from_faillocs(descr.fail_arg_types(), faillocs);
