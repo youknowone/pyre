@@ -19,6 +19,42 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
+/// `Arc::as_ptr` address to its `ExitRecoveryLayout`.
+///
+/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) carries no
+/// `recovery_layout` slot.  Upstream resume code (`resume.py:450-488`)
+/// decodes recovery on demand from `rd_numb` / `rd_consts` /
+/// `rd_virtuals` / `rd_pendingfields` — the four `_attrs_` payload
+/// fields.  Pyre's cranelift retains the structured layout in a
+/// side-table because Cranelift IR cannot decode the resume tagged-
+/// numbering inline; it is materialised at codegen time and consumed
+/// from the dispatch path.
+static RECOVERY_LAYOUT_TABLE: OnceLock<Mutex<HashMap<usize, ExitRecoveryLayout>>> = OnceLock::new();
+
+fn recovery_layout_table() -> &'static Mutex<HashMap<usize, ExitRecoveryLayout>> {
+    RECOVERY_LAYOUT_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Codegen-time write.  Callers wrap the descr in `Arc::new(...)` then
+/// invoke `register_recovery_layout(Arc::as_ptr(&descr) as usize, layout)`.
+pub fn register_recovery_layout(descr_ptr: usize, layout: ExitRecoveryLayout) {
+    recovery_layout_table()
+        .lock()
+        .expect("RECOVERY_LAYOUT_TABLE mutex poisoned")
+        .insert(descr_ptr, layout);
+}
+
+/// Layout / dispatch-time read.  Returns owned `Option<ExitRecoveryLayout>`
+/// (cloned from the table) so callers can hold it past the lock.
+pub fn lookup_recovery_layout(descr_ptr: usize) -> Option<ExitRecoveryLayout> {
+    recovery_layout_table()
+        .lock()
+        .expect("RECOVERY_LAYOUT_TABLE mutex poisoned")
+        .get(&descr_ptr)
+        .cloned()
+}
+
+/// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to its compile-time `CompiledTraceInfo`.
 ///
 /// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) carries no
@@ -256,8 +292,13 @@ pub struct CraneliftFailDescr {
     // per-trace `CompiledTraceInfo` now lives in `TRACE_INFO_TABLE`
     // keyed on `Arc::as_ptr(&descr)`; RPython recovers the same
     // information from `cpu.asmmemmgr_blocks`.
-    /// Write-once during bridge compilation, read-only after.
-    pub recovery_layout: UnsafeCell<Option<ExitRecoveryLayout>>,
+    // recovery_layout removed (Session 5i-cl): not in PyPy
+    // `AbstractFailDescr._attrs_` (`history.py:132`).  Upstream
+    // resume code decodes recovery on demand from the four payload
+    // attributes (rd_numb / rd_consts / rd_virtuals / rd_pendingfields)
+    // in `resume.py:450-488`.  Cranelift retains the structured
+    // layout in `RECOVERY_LAYOUT_TABLE` (this module) keyed on
+    // `Arc::as_ptr(&descr)`.
     /// compile.py:688-692 ResumeGuardDescr.status:
     /// Stores jitcounter hash (from store_hash / fetch_next_hash).
     /// Used by must_compile() to tick the guard's counter slot.
@@ -359,6 +400,10 @@ impl Drop for CraneliftFailDescr {
             .lock()
             .expect("TRACE_INFO_TABLE mutex poisoned")
             .remove(&ptr);
+        recovery_layout_table()
+            .lock()
+            .expect("RECOVERY_LAYOUT_TABLE mutex poisoned")
+            .remove(&ptr);
     }
 }
 
@@ -380,7 +425,10 @@ impl std::fmt::Debug for CraneliftFailDescr {
                 "trace_info",
                 &lookup_trace_info(self as *const Self as usize),
             )
-            .field("recovery_layout", unsafe { &*self.recovery_layout.get() })
+            .field(
+                "recovery_layout",
+                &lookup_recovery_layout(self as *const Self as usize),
+            )
             .field(
                 "fail_count",
                 &get_fail_count(self as *const Self as usize),
@@ -416,7 +464,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             false,
             Vec::new(),
-            None,
         )
     }
 
@@ -427,7 +474,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             is_finish,
             Vec::new(),
-            None,
         )
     }
 
@@ -443,17 +489,22 @@ impl CraneliftFailDescr {
             fail_arg_types,
             is_finish,
             force_token_slots,
-            None,
         )
     }
 
+    /// Caller responsibility after `Arc::new(descr)`:
+    ///   - if `recovery_layout` was previously passed: invoke
+    ///     `descr.set_recovery_layout(layout)` to install the layout
+    ///     into the backend-static `RECOVERY_LAYOUT_TABLE` (Session
+    ///     5i-cl).  Constructor no longer accepts the layout
+    ///     because the descr's `Arc::as_ptr` address (the table key)
+    ///     is not knowable until wrapping completes.
     pub fn new_with_trace_and_kind_and_force_tokens(
         fail_index: u32,
         trace_id: u64,
         fail_arg_types: Vec<Type>,
         is_finish: bool,
         mut force_token_slots: Vec<usize>,
-        recovery_layout: Option<ExitRecoveryLayout>,
     ) -> Self {
         force_token_slots.sort_unstable();
         force_token_slots.dedup();
@@ -466,7 +517,6 @@ impl CraneliftFailDescr {
             is_finish,
             is_exit_frame_with_exception: false,
             force_token_slots,
-            recovery_layout: UnsafeCell::new(recovery_layout),
             status: std::sync::atomic::AtomicU64::new(0),
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
@@ -486,7 +536,6 @@ impl CraneliftFailDescr {
         trace_id: u64,
         fail_arg_types: Vec<Type>,
         mut force_token_slots: Vec<usize>,
-        recovery_layout: Option<ExitRecoveryLayout>,
     ) -> Self {
         // Caller is expected to wrap the returned descr in `Arc::new(...)`
         // and immediately register the external-JUMP target via
@@ -506,7 +555,6 @@ impl CraneliftFailDescr {
             is_finish: false,
             is_exit_frame_with_exception: false,
             force_token_slots,
-            recovery_layout: UnsafeCell::new(recovery_layout),
             status: std::sync::atomic::AtomicU64::new(0),
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
@@ -545,8 +593,12 @@ impl CraneliftFailDescr {
     }
 
     #[inline]
-    pub fn recovery_layout_ref(&self) -> &Option<ExitRecoveryLayout> {
-        unsafe { &*self.recovery_layout.get() }
+    /// Backend-static side-table read (Session 5i-cl).  Returns an owned
+    /// `Option<ExitRecoveryLayout>` (cloned from the table) so callers
+    /// can hold it past the lock.  Was previously `&Option<…>` borrowed
+    /// from `UnsafeCell`.
+    pub fn recovery_layout_ref(&self) -> Option<ExitRecoveryLayout> {
+        lookup_recovery_layout(self as *const Self as usize)
     }
 
     /// Increment the failure counter and return the new value.
@@ -673,8 +725,9 @@ impl CraneliftFailDescr {
         bridge
     }
 
+    /// Backend-static side-table write (Session 5i-cl).
     pub fn set_recovery_layout(&self, recovery_layout: ExitRecoveryLayout) {
-        unsafe { *self.recovery_layout.get() = Some(recovery_layout) };
+        register_recovery_layout(self as *const Self as usize, recovery_layout);
     }
 
     pub fn set_source_op_index(&mut self, source_op_index: usize) {
@@ -749,7 +802,7 @@ impl CraneliftFailDescr {
             .enumerate()
             .filter_map(|(slot, _)| self.gc_map.is_ref(slot).then_some(slot))
             .collect();
-        let recovery = unsafe { &*self.recovery_layout.get() }.clone();
+        let recovery = lookup_recovery_layout(self as *const Self as usize);
         let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
         FailDescrLayout {
             fail_index: self.fail_index,

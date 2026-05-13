@@ -86,7 +86,6 @@ static DONE_WITH_THIS_FRAME_DESCR_INT: std::sync::LazyLock<Arc<CraneliftFailDesc
                 vec![Type::Int],
                 true,
                 vec![],
-                None,
             ),
         )
     });
@@ -100,7 +99,6 @@ static DONE_WITH_THIS_FRAME_DESCR_FLOAT: std::sync::LazyLock<Arc<CraneliftFailDe
                 vec![Type::Float],
                 true,
                 vec![],
-                None,
             ),
         )
     });
@@ -114,7 +112,6 @@ static DONE_WITH_THIS_FRAME_DESCR_REF: std::sync::LazyLock<Arc<CraneliftFailDesc
                 vec![Type::Ref],
                 true,
                 vec![],
-                None,
             ),
         )
     });
@@ -134,7 +131,6 @@ static EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL: std::sync::LazyLock<Arc<Cranelift
             vec![Type::Ref],
             true,
             vec![],
-            None,
         );
         d.is_exit_frame_with_exception = true;
         Arc::new(d)
@@ -149,7 +145,6 @@ static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::LazyLock<Arc<CraneliftFailDes
                 vec![],
                 true,
                 vec![],
-                None,
             ),
         )
     });
@@ -592,15 +587,16 @@ fn overlay_deadframe_fail_descr(
         base_layout.fail_arg_types.clone(),
         base_layout.is_finish,
         base_layout.force_token_slots.clone(),
-        Some(recovery_layout),
     );
     if let Some(source_op_index) = base_layout.source_op_index {
         descr.set_source_op_index(source_op_index);
     }
     let descr = Arc::new(descr);
+    // `set_recovery_layout` / `set_trace_info` write to the backend-static
+    // side-tables keyed on `Arc::as_ptr(&descr)`, so they must follow Arc
+    // materialisation (Session 5i-cl).
+    descr.set_recovery_layout(recovery_layout);
     if let Some(trace_info) = base_layout.trace_info.clone() {
-        // `set_trace_info` writes to the backend-static `TRACE_INFO_TABLE`
-        // keyed on `Arc::as_ptr(&descr)`, so it must follow Arc materialisation.
         descr.set_trace_info(trace_info);
     }
     descr
@@ -13198,7 +13194,6 @@ fn collect_guards(
                 trace_id,
                 fail_arg_types,
                 force_token_slots,
-                recovery_layout,
             )
         } else {
             CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
@@ -13207,7 +13202,6 @@ fn collect_guards(
                 fail_arg_types,
                 is_finish,
                 force_token_slots,
-                recovery_layout,
             )
         };
         let accum_info = if let Some(fd) = op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
@@ -13232,6 +13226,12 @@ fn collect_guards(
         // through this Arc to the metainterp side.
         descr.meta_descr = op.descr.clone();
         let descr = Arc::new(descr);
+        if let Some(layout) = recovery_layout {
+            // Session 5i-cl: recovery_layout writes to the backend-static
+            // `RECOVERY_LAYOUT_TABLE` keyed on `Arc::as_ptr(&descr)`, so
+            // it must follow Arc materialisation.
+            descr.set_recovery_layout(layout);
+        }
         if let Some(target) = external_jump_target {
             crate::guard::register_external_jump_target(Arc::as_ptr(&descr) as usize, target);
         }
@@ -14351,8 +14351,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
         let mut result = Vec::new();
         for descr in &compiled.fail_descrs {
-            let recovery = descr.recovery_layout_ref();
-            if let Some(ref layout) = *recovery {
+            if let Some(layout) = descr.recovery_layout_ref() {
                 result.push((descr.fail_index, layout.frames.clone()));
             }
         }
@@ -16119,7 +16118,6 @@ mod tests {
             vec![Type::Int],
             false,
             Vec::new(),
-            None,
         );
 
         backend.set_next_trace_id(91);
@@ -16251,7 +16249,6 @@ mod tests {
             vec![Type::Int],
             false,
             Vec::new(),
-            None,
         );
         let mut bridge_guard = mk_op(
             OpCode::GuardFalse,
@@ -16404,7 +16401,6 @@ mod tests {
             vec![Type::Int],
             false,
             Vec::new(),
-            None,
         );
         let mut bridge_guard = mk_op(
             OpCode::GuardFalse,
@@ -16498,7 +16494,6 @@ mod tests {
             vec![Type::Int],
             false,
             Vec::new(),
-            None,
         );
         backend.set_next_trace_id(292);
         backend.set_next_header_pc(3000);
