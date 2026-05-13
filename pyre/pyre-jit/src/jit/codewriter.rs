@@ -3216,7 +3216,19 @@ impl CodeWriter {
         // backedge produces link args aligned with the appended
         // startblock slots.  Non-portal graphs populate neither side
         // and behave exactly as before.
-        let mut graph = new_shadow_graph_with_portal_inputs(code, is_portal);
+        // Phase 4 walker-orthodoxy: every CodeWriter graph now carries
+        // `frame_var` / `ec_var` in `startblock.inputargs` regardless
+        // of `is_portal`.  Upstream RPython builds a full flow graph
+        // for every function and lets `flatten_graph` run on each;
+        // pyre's prior `portal_inputs=is_portal` shortcut left non-
+        // portal startblocks without the frame/ec inputs, so every
+        // `frame_var` reference in a non-portal graph op was a
+        // dangling Variable.  Adding them unconditionally lets the
+        // is_portal gates retire (graph ops in non-portal CodeWriters
+        // now reference well-formed inputargs) and brings non-portal
+        // CodeWriters one step closer to upstream's "every function
+        // has a full graph" contract.
+        let mut graph = new_shadow_graph_with_portal_inputs(code, true);
         let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
         // Step 6A slice S4a: snapshot the walker's `currentstate` at
         // every terminator emission so `collect_link_slot_pairs` can
@@ -3227,7 +3239,12 @@ impl CodeWriter {
         // ADAPTATION) reads the source state per-link to project back
         // onto slots.  Keyed on `LinkRef` (Rc-pointer identity).
         let mut link_exit_states: HashMap<super::flow::LinkRef, FrameState> = HashMap::new();
-        let start_state = entry_frame_state(code, is_portal);
+        // Phase 4 walker-orthodoxy: match the unconditional
+        // `portal_inputs=true` graph build above so the FrameState's
+        // `portal_extras` carry `frame_var` / `ec_var` through every
+        // block transition, keeping `getoutputargs()` aligned with
+        // the startblock's extra slots regardless of `is_portal`.
+        let start_state = entry_frame_state(code, true);
         if num_instrs > 0 {
             let start_block =
                 SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
@@ -3370,7 +3387,11 @@ impl CodeWriter {
         // source of truth.
         macro_rules! emit_vsd {
             ($depth:expr) => {
-                if is_portal {
+                // Phase 4 walker-orthodoxy: emit the vable depth sync
+                // graph dual-write for every CodeWriter (frame_var is
+                // now in startblock.inputargs unconditionally —
+                // `new_shadow_graph_with_portal_inputs(code, true)`).
+                {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // Graph-side shadow: produce a fresh Int Variable
                     // from a constant-source `int_copy` op and consume it
@@ -4329,7 +4350,10 @@ impl CodeWriter {
                 let src_reg = $src;
                 let src_value: super::flow::FlowValue = $src_value;
                 emit_ref_copy!($ssarepr, stack_base + $depth, src_reg);
-                if is_portal {
+                // Phase 4 walker-orthodoxy: vable mirror emit runs for
+                // every CodeWriter (`frame_var` is unconditionally in
+                // startblock.inputargs).
+                {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // `pyframe.py:389 pushvalue` lowers to
                     // `setarrayitem_vable_r(locals_cells_stack_w,
@@ -4398,7 +4422,8 @@ impl CodeWriter {
                      graph shadow uses Constant::none() per assembler.py:109",
                 );
                 emit_ref_const_copy!($ssarepr, stack_base + $depth, value);
-                if is_portal {
+                // Phase 4 walker-orthodoxy.
+                {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     let v_idx = emit_graph_op_with_result(
                         &mut graph,
@@ -4460,7 +4485,8 @@ impl CodeWriter {
                 // --synthetic-pattern comprehensions.py`).
                 $depth = $depth.saturating_sub(1);
                 let popped_reg = stack_base + $depth;
-                if is_portal {
+                // Phase 4 walker-orthodoxy.
+                {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     let v_idx = emit_graph_op_with_result(
                         &mut graph,
