@@ -132,6 +132,10 @@ pub enum ExitVirtualLayout {
         descr_size: usize,
     },
     Array {
+        /// `resume.py:646` `self.arraydescr` — live `ArrayDescr` for
+        /// `allocate_array`.  Identity-comparable via `Arc::ptr_eq`
+        /// (`history.py:125`).
+        arraydescr: Option<majit_ir::DescrRef>,
         descr_index: u32,
         /// resume.py:653: allocate_array(length, arraydescr, self.clear)
         clear: bool,
@@ -253,11 +257,13 @@ impl ExitVirtualLayout {
                 descr_size: *descr_size,
             },
             Self::Array {
+                arraydescr,
                 descr_index,
                 clear,
                 kind,
                 items,
             } => Self::Array {
+                arraydescr: arraydescr.clone(),
                 descr_index: *descr_index,
                 clear: *clear,
                 kind: *kind,
@@ -428,24 +434,20 @@ impl PartialEq for ExitVirtualLayout {
             }
             (
                 Self::Array {
-                    descr_index: a1,
+                    arraydescr: a_ad,
+                    descr_index: _,
                     clear: a2,
                     kind: a3,
                     items: a4,
                 },
                 Self::Array {
-                    descr_index: b1,
+                    arraydescr: b_ad,
+                    descr_index: _,
                     clear: b2,
                     kind: b3,
                     items: b4,
                 },
-            ) => {
-                // `Array` has no `arraydescr: Arc<dyn Descr>` field —
-                // `descr_index` is the only identity handle.  Keep the
-                // numeric compare until the arraydescr Arc is hoisted
-                // onto the layout (parallel to the other variants).
-                a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4
-            }
+            ) => opt_descr_ptr_eq(a_ad, b_ad) && a2 == b2 && a3 == b3 && a4 == b4,
             (
                 Self::ArrayStruct {
                     descr_index: _,

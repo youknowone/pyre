@@ -12943,11 +12943,12 @@ fn collect_guards(
                             }
                         }
                         majit_ir::RdVirtualInfo::VArrayInfoClear {
-                            arraydescr: _,
+                            arraydescr,
                             descr_index,
                             kind,
                             fieldnums,
                         } => ExitVirtualLayout::Array {
+                            arraydescr: arraydescr.clone(),
                             descr_index: *descr_index,
                             clear: true,
                             kind: *kind,
@@ -12957,11 +12958,12 @@ fn collect_guards(
                                 .collect(),
                         },
                         majit_ir::RdVirtualInfo::VArrayInfoNotClear {
-                            arraydescr: _,
+                            arraydescr,
                             descr_index,
                             kind,
                             fieldnums,
                         } => ExitVirtualLayout::Array {
+                            arraydescr: arraydescr.clone(),
                             descr_index: *descr_index,
                             clear: false,
                             kind: *kind,
@@ -16173,6 +16175,7 @@ mod tests {
                 },
             ],
             virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
+                arraydescr: None,
                 descr_index: 17,
                 clear: false,
                 kind: 1,
@@ -16327,6 +16330,7 @@ mod tests {
                 },
             ],
             virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
+                arraydescr: None,
                 descr_index: 17,
                 clear: false,
                 kind: 1,
@@ -16411,6 +16415,7 @@ mod tests {
                 },
             ],
             virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
+                arraydescr: None,
                 descr_index: 99,
                 clear: false,
                 kind: 1,

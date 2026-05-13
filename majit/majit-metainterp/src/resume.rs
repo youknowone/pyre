@@ -983,6 +983,7 @@ impl ResumeVirtualLayoutSummary {
                 clear,
                 items,
             } => ExitVirtualLayout::Array {
+                arraydescr: arraydescr.clone(),
                 descr_index: *descr_index,
                 clear: *clear,
                 // resume.py:656-670: element type from arraydescr

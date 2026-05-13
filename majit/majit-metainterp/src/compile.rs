@@ -829,13 +829,13 @@ pub(crate) fn build_guard_metadata(
                                     }
                                 }
                                 majit_ir::RdVirtualInfo::VArrayInfoClear {
-                                    arraydescr: _,
+                                    arraydescr,
                                     descr_index,
                                     kind,
                                     fieldnums,
                                 }
                                 | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
-                                    arraydescr: _,
+                                    arraydescr,
                                     descr_index,
                                     kind,
                                     fieldnums,
@@ -849,6 +849,7 @@ pub(crate) fn build_guard_metadata(
                                         .map(|&fnum| resolve_tagged_source(fnum))
                                         .collect();
                                     majit_backend::ExitVirtualLayout::Array {
+                                        arraydescr: arraydescr.clone(),
                                         descr_index: *descr_index,
                                         clear,
                                         kind: *kind,
