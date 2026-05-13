@@ -2675,18 +2675,18 @@ pub fn flatten_graph<'a>(
             .unwrap_or(u16::MAX);
         Register::new(kind, color)
     };
-    // PRE-EXISTING-ADAPTATION: pyre's canonical entry currently uses
-    // the probe-side constant lowering, which folds `Opaque(Ref)`
-    // constants down to `ConstRef(0)`.  Upstream's flatten preserves
-    // `Constant(ll_ovf, concretetype=...)` directly because rpython's
-    // assembler resolves the LL pointer at descrification time.  Pyre
-    // production callers that need real PyObject pointers still go
-    // through `flatten_graph_with_lowering` with a production
-    // closure that resolves opaque constants from the per-`CodeWriter`
-    // pycode / jitdriver tables.  Phase 5 unifies that resolution into
-    // the canonical entry once pyre's constant pool exposes the same
-    // upstream lookups.
-    let lower_constant = flatten_constant_operand_for_probe;
+    // `flatten_constant_operand` panics on `Opaque(Ref)` constants
+    // — upstream's `flatten` lowering relies on the rtyper preserving
+    // `Constant(ll_ovf, concretetype=...)` through to the assembler,
+    // and pyre's canonical entry takes the same fail-loud stance:
+    // graphs that carry opaque Ref constants (production pycode /
+    // jitdriver pointers, the OverflowError instance from
+    // `make_exception_link`) MUST be flattened via
+    // `flatten_graph_with_lowering` with a production `lower_constant`
+    // closure that resolves the opaque to the runtime PyObject
+    // pointer.  Calling the canonical entry on such a graph surfaces
+    // the divergence instead of silently materialising `ConstRef(0)`.
+    let lower_constant = flatten_constant_operand;
     let mut flattener = if let Some(ctx) = lowering_ctx {
         GraphFlattener::new_with_full_lowering(&mut ssarepr, get_register, lower_constant, ctx)
     } else {
