@@ -1963,7 +1963,21 @@ where
                     catch_all_seen = catch_all_seen || is_catch_all;
                 }
             }
-            if !self.include_all_exc_links && block.borrow().raising_op().is_none() {
+            // `flatten.py:206-217` trailing `-live-` scan: walk
+            // `block.operations` from the end skipping `-live-`
+            // markers.  If the final op is NOT `-live-` (upstream's
+            // `index == -1` after the loop), the canraise block does
+            // not actually raise — emit the normal exit directly.
+            // Without `_include_all_exc_links` this is the early
+            // return path that upstream takes for canraise blocks
+            // that survived metainterp policy but lack a real
+            // raising-op-with-trailing-`-live-` pattern.
+            let last_op_is_live = block
+                .borrow()
+                .operations
+                .last()
+                .map_or(false, |op| op.opname == OPNAME_LIVE);
+            if !self.include_all_exc_links && !last_op_is_live {
                 self.make_link(&normal_link, false);
                 return;
             }
@@ -4534,6 +4548,15 @@ mod tests {
         super::super::flow::push_op(
             &start,
             SpaceOperation::new("call_can_raise", Vec::new(), None, 0),
+        );
+        // `flatten.py:206-210` recognises a canraise block as "actually
+        // raising" only when there is a trailing `-live-` marker after
+        // the raising op (the rtyper emits one per call/raisecheck;
+        // pyre's frontend uses the same convention).  Append it so
+        // `insert_exits` takes the catch_exception emission path.
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new(crate::jit::flatten::OPNAME_LIVE, Vec::new(), None, 0),
         );
 
         typed_handler.closeblock(vec![
