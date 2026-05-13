@@ -3364,26 +3364,19 @@ impl CodeWriter {
                 all_walker_blocks.push(synthetic.clone());
                 synthetic
             });
-        // Task #227.5 per-block contiguous walker — when env
-        // `PYRE_TASK_227_5_PER_BLOCK_WALKER=1`, `emit_mark_label_pc!`
-        // sets `block_switch_pending = true` instead of switching
-        // `current_block` inline.  The inner for-loop checks the
-        // flag after each per-PC emit and breaks, yielding to the
-        // outer `while let Some(pending_block) = pendingblocks
-        // .pop_front()` which picks up the queued new block in the
-        // next iteration.  This mirrors upstream's `flowcontext.py:
-        // 407-416 record_block` shape where each block is processed
-        // contiguously without mid-iteration re-entry, retiring the
-        // last walker non-orthodoxy that prevents `[phase4-walker-
-        // drain]` byte-equivalent on larger benches.
-        //
-        // Gated on env so the default production path is unchanged
-        // while the restructure is validated bench-by-bench.  When
-        // every bench reports `byte_equivalent=true` under the gate,
-        // the env check retires and per-block-walker becomes
-        // unconditional.
-        let task_227_5_per_block_walker =
-            std::env::var("PYRE_TASK_227_5_PER_BLOCK_WALKER").is_ok();
+        // Task #227.5 per-block contiguous walker — `emit_mark_label_pc!`
+        // sets `block_switch_pending = true` at block transitions
+        // instead of switching `current_block` inline; the inner
+        // for-loop checks the flag after each per-PC emit and breaks,
+        // yielding to the outer `while let Some(pending_block) =
+        // pendingblocks.pop_front()` which picks up the queued new
+        // block in the next iteration.  Mirrors upstream's
+        // `flowcontext.py:407-416 record_block` shape where each
+        // block is processed contiguously without mid-iteration
+        // re-entry.  Correctness relies on the explicit `goto
+        // Label("pcN")` + `Unreachable` pair emitted on the yield
+        // path (Phase 4 alignment with `flatten.py:177-258
+        // insert_exits`).
         let mut block_switch_pending: bool = false;
         let mut current_state = current_block
             .framestate()
@@ -3975,10 +3968,10 @@ impl CodeWriter {
                     // `pendingblocks` (mergeblock-path queuing is
                     // already done by mergeblock itself; joinpoint
                     // match doesn't push automatically).
-                    if task_227_5_per_block_walker && target != current_block {
-                        if !pendingblocks.iter().any(|b| b == &target) {
-                            pendingblocks.push_front(target.clone());
-                        }
+                    if target != current_block
+                        && !pendingblocks.iter().any(|b| b == &target)
+                    {
+                        pendingblocks.push_front(target.clone());
                     }
                     target
                 } else if !current_block.dead() {
@@ -4035,33 +4028,43 @@ impl CodeWriter {
                 // breaks, yielding control.  Default (gate off):
                 // switch inline as before, preserving the PC-
                 // sequential walker's behaviour.
-                if task_227_5_per_block_walker && new_block != current_block {
+                if new_block != current_block {
                     // Yield without pushing Label — the new block's
                     // outer iter at start_pc=py_pc will emit its
                     // own Label via its own `emit_mark_label_pc!(
                     // py_pc)` call (which will see no-switch since
                     // joinpoints[py_pc] now points at new_block ==
                     // current_block at that point).
+                    //
+                    // Emit `goto Label("pcN")` + `Unreachable` into
+                    // the previous block's per-block accumulator
+                    // (mirrors `flatten.py:177-258 insert_exits`)
+                    // before yielding, so the per-block stream
+                    // routes via explicit goto rather than implicit
+                    // fallthrough to whichever block lands next in
+                    // walker-pop order.
+                    if needs_fallthrough {
+                        let target_label = format!("pc{}", py_pc);
+                        let goto_insn = Insn::op(
+                            "goto",
+                            vec![Operand::TLabel(TLabel::new(target_label))],
+                        );
+                        push_walker_emit(&mut $ssarepr, &current_block, goto_insn);
+                        push_walker_emit(&mut $ssarepr, &current_block, Insn::Unreachable);
+                    }
                     block_switch_pending = true;
                 } else {
-                    current_block = new_block;
-                    current_state = current_block
-                        .framestate()
-                        .expect("block state should exist at label");
+                    // No switch — same block continues at py_pc.  Just
+                    // mark the Label so post-walk dispatch resolves
+                    // `pcN` to this position.  No goto / fallthrough
+                    // bookkeeping needed because `current_block`
+                    // doesn't change.
                     needs_fallthrough = true;
-                    // Push Label to program-wide ssarepr.insns and
-                    // to current_block's per-block accumulator (both
-                    // sources for production / drain probe).
-                    $ssarepr
-                        .insns
-                        .push(Insn::Label(super::flatten::Label::new(format!(
-                            "pc{}",
-                            py_pc
-                        ))));
-                    current_block.push_insn(Insn::Label(super::flatten::Label::new(format!(
-                        "pc{}",
-                        py_pc
-                    ))));
+                    push_walker_emit(
+                        &mut $ssarepr,
+                        &current_block,
+                        Insn::Label(super::flatten::Label::new(format!("pc{}", py_pc))),
+                    );
                 }
             }};
         }
@@ -7342,55 +7345,27 @@ impl CodeWriter {
         // (`flowspace/model.py:66-77`); both orderings agree with
         // ssarepr.insns on benches where walker emission is per-
         // block contiguous, so the env is purely diagnostic.
+        // Task #227.4 Phase 4 production flip — `codewriter.py:53
+        // flatten_graph(graph, regallocs, cpu)` shape: ssarepr.insns
+        // becomes the post-walk drain of per-block accumulators in
+        // walker-block-creation order.  The walker's dual-write into
+        // ssarepr.insns above is preserved as the byte-equivalent
+        // mirror used by the assert; the actual installed ssarepr.insns
+        // comes from the drain.
+        //
+        // Block-grouped drain order differs from PC-interleaved walker
+        // order whenever the walker resumes an earlier block at a
+        // non-contiguous PC.  Correctness across both orders is
+        // preserved by the explicit `goto Label("pcN")` +
+        // `Insn::Unreachable` pair the `emit_mark_label_pc!` macro
+        // inserts at every block-switch boundary (Phase 4 alignment
+        // with `flatten.py:177-258 insert_exits`).
         {
             let mut drained: Vec<super::flatten::Insn> = Vec::new();
             for block in all_walker_blocks.iter() {
                 drained.extend(block.per_block_ssarepr());
             }
-            let byte_equivalent = drained.len() == ssarepr.insns.len()
-                && drained
-                    .iter()
-                    .zip(ssarepr.insns.iter())
-                    .all(|(l, r)| insn_byte_equal(l, r));
-            if byte_equivalent
-                || std::env::var("PYRE_TASK_227_FORCE_DRAIN_SWAP").is_ok()
-            {
-                // Swap: per-block accumulator becomes the production
-                // source.  When byte_equivalent, the swap is invisible
-                // downstream.  Under `PYRE_TASK_227_FORCE_DRAIN_SWAP=1`
-                // the swap installs the block-grouped order regardless
-                // of equivalence — diagnostic for Phase 4 convergence
-                // (mirrors `codewriter.py:53 flatten_graph` shape).
-                ssarepr.insns = drained;
-            } else if std::env::var("PYRE_TASK_227_DRAIN_DIFF").is_ok() {
-                // Diagnostic: when the drain disagrees with the walker
-                // emit, log the first divergence position so the
-                // walker / per-block accumulator dual-write can be
-                // audited.  Production callers leave the env unset;
-                // probe runs surface the gap for the byte_equivalent=
-                // 100% convergence work (Task #227 Phase 4).
-                let diff_pos = drained
-                    .iter()
-                    .zip(ssarepr.insns.iter())
-                    .position(|(l, r)| !insn_byte_equal(l, r));
-                eprintln!(
-                    "[phase4-walker-drain] {} drain={} walker={} first_diff={:?}",
-                    code.obj_name,
-                    drained.len(),
-                    ssarepr.insns.len(),
-                    diff_pos,
-                );
-                if let Some(idx) = diff_pos {
-                    let lo = idx.saturating_sub(2);
-                    let hi = (idx + 3).min(drained.len());
-                    for i in lo..hi {
-                        eprintln!(
-                            "  [{i}] drain={:?} walker={:?}",
-                            &drained[i], &ssarepr.insns[i],
-                        );
-                    }
-                }
-            }
+            ssarepr.insns = drained;
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
