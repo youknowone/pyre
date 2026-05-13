@@ -2337,7 +2337,7 @@ where
                 return insn;
             }
         }
-        let args = op.args.iter().map(|arg| self.flatten_arg(arg)).collect();
+        let args = self.flatten_list(&op.args);
         match op.result {
             None => Insn::op(op.opname.clone(), args),
             Some(FlowValue::Variable(variable)) => {
@@ -2380,6 +2380,16 @@ where
                 Operand::IndirectCallTargets((*targets.0).clone())
             }
         }
+    }
+
+    /// `flatten.py:355-371 flatten_list(arglist)` — iterate `arglist`
+    /// and dispatch each arg via `flatten_arg`.  Upstream inlines the
+    /// per-variant dispatch inside `flatten_list`; pyre splits the
+    /// per-arg dispatch into `flatten_arg` for reuse (e.g. probe-side
+    /// `flatten_arg_for_probe`).  The named wrapper matches upstream's
+    /// `serialize_op` call shape (`args = self.flatten_list(op.args)`).
+    fn flatten_list(&mut self, arglist: &[SpaceOperationArg]) -> Vec<Operand> {
+        arglist.iter().map(|arg| self.flatten_arg(arg)).collect()
     }
 
     /// `flatten.py:382-391 GraphFlattener.getcolor(v)`: Variable →
