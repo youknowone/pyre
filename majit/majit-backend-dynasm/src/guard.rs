@@ -149,12 +149,10 @@ pub struct DynasmFailDescr {
     // `Arc::as_ptr(&descr)`.  Semantically equivalent, encoded
     // differently.  Will be folded into machine-code embedding in
     // future work; for now the side-table lookup is the bridge.
-    /// `history.py:132` `AbstractFailDescr._attrs_` `rd_locs` —
-    /// transitional dual-storage slot.  Canonical storage is on
-    /// `op.descr` accessed via `meta_descr`; this backend slot is a
-    /// fallback for test paths that build guards without attaching a
-    /// metainterp descr.  Session 7 removes this slot.
-    pub rd_locs: UnsafeCell<Vec<u16>>,
+    // rd_locs removed (Session 5g-1, paired with adr_jump_offset
+    // 5e-1): canonical storage is on the metainterp
+    // `AbstractFailDescr` Arc via `meta_descr`.  Backend access goes
+    // through `Self::rd_locs()` which forwards to the meta side.
 
     // source_op_index removed (Session 5i-cl parity): not in PyPy
     // `AbstractFailDescr._attrs_` (`history.py:132`).  The codegen-
@@ -167,14 +165,14 @@ pub struct DynasmFailDescr {
     /// compile.py:685 status: packs ST_BUSY_FLAG + type tag + hash.
     pub status: AtomicU64,
 
-    /// `history.py:132` `AbstractFailDescr._attrs_` `adr_jump_offset`
-    /// — transitional dual-storage slot.  The canonical storage is on
-    /// `op.descr` (the metainterp `AbstractFailDescr` Arc) accessed via
-    /// `meta_descr`; this backend slot is the fallback for test paths
-    /// that build guard ops without attaching a descr (`mk_op(...)`
-    /// without `mk_op_with_descr`).  Session 7 will remove this slot
-    /// once `DynasmFailDescr` itself is collapsed into the meta side.
-    pub adr_jump_offset: UnsafeCell<usize>,
+    // adr_jump_offset removed (Session 5e-1): the canonical
+    // `history.py:132 _attrs_` slot lives on the metainterp
+    // `AbstractFailDescr` Arc reached via `meta_descr`.  The previous
+    // backend-local fallback is unreachable in production codegen —
+    // all guard ops carry a `meta_descr`, and the synthetic FINISH /
+    // ExitFrameWithException / PropagateException descrs minted by
+    // the runtime classifier never have their `adr_jump_offset`
+    // accessed.
     // fail_args_slots removed: bridge source_slots are derived from
     // fail_arg_locs via rebuild_faillocs_from_descr (assembler.py:201).
     // bridge_addr removed (Session 5f): not in PyPy `AbstractFailDescr._attrs_`
@@ -257,10 +255,8 @@ impl DynasmFailDescr {
             is_finish,
             is_resume_guard,
             is_exit_frame_with_exception: false,
-            rd_locs: UnsafeCell::new(Vec::new()),
             recovery_layout: UnsafeCell::new(None),
             status: AtomicU64::new(0),
-            adr_jump_offset: UnsafeCell::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             meta_descr: None,
         }
@@ -327,49 +323,49 @@ impl DynasmFailDescr {
         self.status.store(status, Ordering::Release);
     }
 
-    /// `assembler.py:966` — read `adr_jump_offset`.  Prefers the
-    /// metainterp `AbstractFailDescr` (`history.py:132 _attrs_`)
-    /// reached through `meta_descr`; falls back to the backend-local
-    /// transitional slot for test paths that build guards without
-    /// attaching a descr.
+    /// `assembler.py:966` — read `adr_jump_offset`.  Forwarded to the
+    /// metainterp `AbstractFailDescr` (`history.py:132 _attrs_`) via
+    /// `meta_descr`.  Returns `0` for synthetic backend descrs without
+    /// a metainterp counterpart (these descrs never have their
+    /// `adr_jump_offset` accessed in production codegen — guard
+    /// patching is a metainterp-side concern).
     pub fn adr_jump_offset(&self) -> usize {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            return meta_fd.adr_jump_offset();
-        }
-        unsafe { *self.adr_jump_offset.get() }
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(0, |fd| fd.adr_jump_offset())
     }
 
     /// `assembler.py:987` — set `adr_jump_offset` (`0` means
-    /// "patched").  Writes through to the metainterp side when present;
-    /// otherwise stores on the backend-local transitional slot.
+    /// "patched").  Forwarded to the metainterp side; no-op for
+    /// synthetic descrs without a `meta_descr`.
     pub fn set_adr_jump_offset(&self, offset: usize) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.set_adr_jump_offset(offset);
-            return;
         }
-        unsafe { *self.adr_jump_offset.get() = offset };
     }
 
     /// `llsupport/llmodel.py:424` `descr.rd_locs[index]` — read the
-    /// per-fail-arg jitframe slot positions.  Prefers the metainterp
-    /// `AbstractFailDescr` (`history.py:132 _attrs_`) reached through
-    /// `meta_descr`; falls back to the backend-local transitional slot.
+    /// per-fail-arg jitframe slot positions.  Forwarded to the
+    /// metainterp `AbstractFailDescr` (`history.py:132 _attrs_`) via
+    /// `meta_descr`.  Returns an empty slice for synthetic backend
+    /// descrs without a metainterp counterpart (production codegen
+    /// guard tokens always carry `meta_descr`; the runtime classifier
+    /// synthetic descrs never read this slot).
     pub fn rd_locs(&self) -> &[u16] {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            return meta_fd.rd_locs();
-        }
-        unsafe { &*self.rd_locs.get() }
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(&[][..], |fd| fd.rd_locs())
     }
 
     /// `llsupport/assembler.py:279` `guardtok.faildescr.rd_locs =
-    /// positions`.  Writes through to the metainterp side when present;
-    /// otherwise stores on the backend-local transitional slot.
+    /// positions`.  Forwards to the metainterp side; no-op for
+    /// synthetic descrs without `meta_descr`.
     pub fn set_rd_locs(&self, locs: Vec<u16>) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.set_rd_locs(locs);
-            return;
         }
-        unsafe { *self.rd_locs.get() = locs };
     }
 
     /// Read the recovery_layout.
