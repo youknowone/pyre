@@ -2174,22 +2174,42 @@ where
             //
             // **Walker non-orthodoxy adaptation**: until the walker is
             // restructured to either avoid orphan join-points or
-            // attach proper successors, the driver emits an
-            // `unreachable` terminator for them.  Production paths use
-            // inline `ssarepr` emit, not `flatten_graph`, so the
-            // emitted output is informational only — the
-            // `[phase4-flatten-graph]` probe sees `panic=false` (the
-            // driver completes the walk) and the inline byte stream
-            // produced by the walker remains the source of truth.
-            // Convergence: Phase 3+ walker restructure (Task #227)
-            // closes the orphan join-point case so this branch reduces
-            // to the orthodox `make_return(args)` path.
+            // attach proper successors, the driver still walks the
+            // block's operations (mirroring the non-empty-exits arm
+            // below) before emitting an `unreachable` terminator.
+            // This preserves the per-op output for retired-family
+            // probes; production paths use inline `ssarepr` emit, not
+            // `flatten_graph`, so the emitted terminator shape is
+            // informational only.  Convergence: Phase 3+ walker
+            // restructure (Task #227) closes the orphan join-point
+            // case so this branch reduces to the orthodox
+            // `make_return(args)` path.
             if matches!(args.len(), 1 | 2) {
+                // Orthodox final block: no operations to emit, just
+                // the return terminator.  `flatten.py:107-109`.
                 self.make_return(&args);
-            } else {
-                self.emitline(Insn::op("unreachable", Vec::new()));
-                self.emitline(Insn::Unreachable);
+                return;
             }
+            // Orphan-final: emit the block's body before the
+            // unreachable terminator so the probe's per-op
+            // comparison sees every walker-emitted residual_call_*
+            // (FrameState-merge sites can carry binary_op_fn /
+            // box_int_fn calls that the walker emits inline).
+            if self.seen_blocks.contains_key(&block) {
+                let target = self.tlabel_for_block(&block);
+                self.emitline(Insn::op("goto", vec![target]));
+                self.emitline(Insn::Unreachable);
+                return;
+            }
+            self.seen_blocks.insert(block.clone(), true);
+            let block_label = self.label_for_block(&block);
+            self.emitline(block_label);
+            let operations = block.borrow().operations.clone();
+            for op in &operations {
+                self.emit_space_operation(op);
+            }
+            self.emitline(Insn::op("unreachable", Vec::new()));
+            self.emitline(Insn::Unreachable);
             return;
         }
         if self.seen_blocks.contains_key(&block) {

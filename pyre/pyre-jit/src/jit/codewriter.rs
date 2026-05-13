@@ -5982,53 +5982,47 @@ impl CodeWriter {
                                 stack_base + current_depth,
                             ),
                         );
-                        // Task #46 micro-slice 7: graph-side residual_call
-                        // dual-writes for both UnaryNegative emits.  The
-                        // first (box_int_fn(0:Int)→Ref) result is threaded
-                        // into the second (binary_op_fn(zero, operand,
-                        // sub_tag)→Ref) so def-use stays intact.  The
-                        // graph dual-write must mirror the SSA emit's
-                        // operand identity exactly — SSA's binary_op_fn
-                        // takes `operand_reg` (the pre-neg value), so the
-                        // graph dual-write threads the matching pre-neg
-                        // FlowValue (`operand_value_for_dual`, cloned
-                        // before `emit_frontend_neg` consumed
-                        // `operand_value`).  Threading `negated` here
-                        // would record `binary_op_fn(0, neg(operand),
-                        // sub) = +operand` graph-side while SSA computes
-                        // `0 - operand = -operand`, breaking probe parity.
-                        if is_portal {
-                            // Match helper bind-site flavor at
-                            // codewriter.rs:2202 (`box_int_fn` is
-                            // `EF_CAN_RAISE` allocation-only, not
-                            // virtual-forcing).  `binary_op_fn` is
-                            // bound `MayForce` at codewriter.rs:2192
-                            // and stays unchanged.
-                            let zero_graph_var = record_residual_call_graph_op(
+                        // Phase 3 walker-orthodoxy: graph dual-writes for
+                        // the UnaryNegative `box_int_fn(0)` + `binary_op_fn(
+                        // zero, operand, subtract_tag)` pair fire
+                        // unconditionally (no `is_portal` gating).  Both
+                        // residual_calls operate on values that are
+                        // available regardless of portal status —
+                        // `operand_value_for_dual` is the cloned popped
+                        // FlowValue (always present), and the `0:Int`
+                        // constant has no source dependency.  Mirrors
+                        // upstream `jtransform.py rewrite_op_int_neg`
+                        // (`0 - x`) which records both ops on the graph
+                        // for EVERY function, not just the portal.
+                        let zero_graph_var = record_residual_call_graph_op(
+                            &mut graph,
+                            &current_block.block(),
+                            box_int_fn_idx,
+                            CallFlavor::Plain,
+                            vec![super::flow::Constant::signed(0).into()],
+                            vec![],
+                            vec![],
+                            vec![Kind::Int],
+                            ResKind::Ref,
+                            py_pc as i64,
+                        );
+                        if let Some(zero_var) = &zero_graph_var {
+                            variable_reg_map.insert(zero_var.id, scratch_zero);
+                            let binary_result = record_residual_call_graph_op(
                                 &mut graph,
                                 &current_block.block(),
-                                box_int_fn_idx,
-                                CallFlavor::Plain,
-                                vec![super::flow::Constant::signed(0).into()],
+                                binary_op_fn_idx,
+                                CallFlavor::MayForce,
+                                vec![super::flow::Constant::signed(subtract_tag as i64).into()],
+                                vec![zero_var.clone().into(), operand_value_for_dual.into()],
                                 vec![],
-                                vec![],
-                                vec![Kind::Int],
+                                vec![Kind::Ref, Kind::Ref, Kind::Int],
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            if let Some(zero_var) = zero_graph_var {
-                                let _ = record_residual_call_graph_op(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    binary_op_fn_idx,
-                                    CallFlavor::MayForce,
-                                    vec![super::flow::Constant::signed(subtract_tag as i64).into()],
-                                    vec![zero_var.into(), operand_value_for_dual.into()],
-                                    vec![],
-                                    vec![Kind::Ref, Kind::Ref, Kind::Int],
-                                    ResKind::Ref,
-                                    py_pc as i64,
-                                );
+                            if let Some(binary_var) = &binary_result {
+                                variable_reg_map
+                                    .insert(binary_var.id, stack_base + current_depth);
                             }
                         }
                         current_state.stack.push(negated.into());
