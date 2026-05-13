@@ -2366,10 +2366,22 @@ fn is_bool_or_tuple_exitswitch(
     exits: &[LinkRef],
     exitswitch: &Option<super::flow::ExitSwitch>,
 ) -> bool {
+    // `flatten.py:240-242` upstream check: `block.exitswitch` is a
+    // tuple (jtransform-fused `goto_if_not_<opname>` form) OR
+    // `block.exitswitch.concretetype == lltype.Bool` (post-rtype bool
+    // exitswitch).  Pyre collapses upstream's `Bool` and `Signed`
+    // lltypes into a single `Kind::Int`, so the second clause can't
+    // be expressed as a direct kind comparison — instead, test whether
+    // at least one of the two exit links carries a Bool `llexitcase`,
+    // which set_last_bool_exitcase populates for every walker boolean
+    // branch (POP_JUMP_IF_FALSE / POP_JUMP_IF_TRUE).  The bool-branch
+    // arm of `insert_exits` then performs the upstream
+    // `linkfalse, linktrue = block.exits; if linkfalse.llexitcase ==
+    // True: swap` reorder so the bool-marked link becomes `linktrue`.
     matches!(exitswitch, Some(super::flow::ExitSwitch::Tuple(_)))
         || exits
             .iter()
-            .all(|link| is_bool_exitcase(&link.borrow().llexitcase))
+            .any(|link| is_bool_exitcase(&link.borrow().llexitcase))
 }
 
 fn is_bool_exitcase(exitcase: &Option<FlowValue>) -> bool {
