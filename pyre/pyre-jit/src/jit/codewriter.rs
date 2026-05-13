@@ -1216,7 +1216,6 @@ fn shape_descriptor(insn: &super::flatten::Insn) -> String {
         } => (opname.as_str(), args, result.is_some()),
         Insn::Label(_) => return "Label".to_owned(),
         Insn::Unreachable => return "---".to_owned(),
-        Insn::PcAnchor(_) => return "PcAnchor".to_owned(),
     };
     let mut tags = Vec::with_capacity(args.len());
     for arg in args {
@@ -1269,7 +1268,6 @@ fn insn_byte_equal(left: &super::flatten::Insn, right: &super::flatten::Insn) ->
     match (left, right) {
         (Insn::Label(l), Insn::Label(r)) => l == r,
         (Insn::Unreachable, Insn::Unreachable) => true,
-        (Insn::PcAnchor(l), Insn::PcAnchor(r)) => l == r,
         (
             Insn::Op {
                 opname: ln,
@@ -2521,60 +2519,39 @@ fn label_pc_index(insn: &Insn) -> Option<usize> {
 }
 
 fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    // Scan once collecting both PcAnchor-derived and Label-derived
-    // positions.  Prefer PcAnchor when present (current production);
-    // fall back to Label("pc{N}") for the Task #227 PcAnchor retirement
-    // scaffolding so future walker changes that drop PcAnchor still
-    // resolve anchor positions from the per-PC Label naming scheme.
-    let mut anchor_positions = vec![usize::MAX; num_pcs];
-    let mut label_positions = vec![usize::MAX; num_pcs];
+    // Per-PC anchor positions are resolved from `Label("pc{N}")` entries
+    // — the same `Label(block)`-style marker shape RPython uses at
+    // block entry (`flatten.py:116 self.emitline(Label(block))`).
+    // Pyre names the labels `pc{N}` per Python bytecode index so the
+    // dispatcher can map `next_instr` to the JitCode byte offset
+    // post-assemble.
+    let mut positions = vec![usize::MAX; num_pcs];
     for (insn_idx, insn) in ssarepr.insns.iter().enumerate() {
-        if let Insn::PcAnchor(py_pc) = insn {
-            assert!(
-                *py_pc < num_pcs,
-                "pc_anchor_positions: py_pc {py_pc} out of range {num_pcs}"
-            );
-            assert_eq!(
-                anchor_positions[*py_pc],
-                usize::MAX,
-                "pc_anchor_positions: duplicate PcAnchor for py_pc {py_pc}"
-            );
-            anchor_positions[*py_pc] = insn_idx;
-        } else if let Some(py_pc) = label_pc_index(insn) {
+        if let Some(py_pc) = label_pc_index(insn) {
             assert!(
                 py_pc < num_pcs,
                 "pc_anchor_positions: Label pc{py_pc} out of range {num_pcs}"
             );
-            if label_positions[py_pc] == usize::MAX {
-                label_positions[py_pc] = insn_idx;
+            if positions[py_pc] == usize::MAX {
+                positions[py_pc] = insn_idx;
             }
         }
     }
-    let mut positions = vec![usize::MAX; num_pcs];
     for py_pc in 0..num_pcs {
-        positions[py_pc] = if anchor_positions[py_pc] != usize::MAX {
-            anchor_positions[py_pc]
-        } else {
-            label_positions[py_pc]
-        };
         assert_ne!(
             positions[py_pc],
             usize::MAX,
-            "pc_anchor_positions: missing PcAnchor / Label('pc{py_pc}') for py_pc {py_pc}"
+            "pc_anchor_positions: missing Label('pc{py_pc}') for py_pc {py_pc}"
         );
     }
     positions
 }
 
 fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    // Map py_pc → anchor insn_idx.  Prefer `Insn::PcAnchor(py_pc)` if
-    // present (current production), fall back to `Label("pc{py_pc}")`
-    // (Task #227 PcAnchor retirement scaffolding).
+    // Map py_pc → anchor insn_idx via `Label("pc{N}")` entries.
     let mut anchor_for_pc: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
     for (insn_idx, insn) in ssarepr.insns.iter().enumerate() {
-        if let Insn::PcAnchor(py_pc) = insn {
-            anchor_for_pc.insert(*py_pc, insn_idx);
-        } else if let Some(py_pc) = label_pc_index(insn) {
+        if let Some(py_pc) = label_pc_index(insn) {
             anchor_for_pc.entry(py_pc).or_insert(insn_idx);
         }
     }
@@ -10328,7 +10305,7 @@ mod tests {
     #[test]
     fn pc_anchor_and_live_marker_rescan_follow_final_ssarepr_order() {
         let mut ssarepr = SSARepr::new("t");
-        ssarepr.insns.push(Insn::PcAnchor(0));
+        ssarepr.insns.push(Insn::Label(FlatLabel::new("pc0")));
         ssarepr
             .insns
             .push(Insn::live(vec![Operand::Register(Register::new(
@@ -10338,10 +10315,9 @@ mod tests {
         // Task #227.5 item 6: per-PC `Label("pcN")` is a merge boundary
         // in `remove_repeated_live`, so each PC keeps its own `-live-`
         // marker without cross-PC merge-then-reorder.  The anchor scan
-        // finds each PcAnchor at its pre-merge position; the live
-        // marker for each PC stays at its pre-merge position too.
+        // resolves each PC anchor at its Label position; the live
+        // marker for each PC stays at its pre-merge position.
         ssarepr.insns.push(Insn::Label(FlatLabel::new("pc1")));
-        ssarepr.insns.push(Insn::PcAnchor(1));
         ssarepr
             .insns
             .push(Insn::live(vec![Operand::Register(Register::new(
@@ -10351,12 +10327,11 @@ mod tests {
 
         crate::jit::liveness::remove_repeated_live(&mut ssarepr);
 
-        // PcAnchor positions: PcAnchor(0)@0, PcAnchor(1)@3.
-        assert_eq!(pc_anchor_positions(&ssarepr, 2), vec![0, 3]);
-        // Per-PC `-live-` boundaries: live(R0) stays at index 1 (no
-        // longer reordered past Label("pc1") via merge-reorder),
-        // live(R1) at index 4.
-        assert_eq!(live_marker_indices_by_pc(&ssarepr, 2), vec![1, 4]);
+        // Anchor positions: Label("pc0")@0, Label("pc1")@2.
+        assert_eq!(pc_anchor_positions(&ssarepr, 2), vec![0, 2]);
+        // Per-PC `-live-` boundaries: live(R0) at index 1,
+        // live(R1) at index 3.
+        assert_eq!(live_marker_indices_by_pc(&ssarepr, 2), vec![1, 3]);
     }
 
     #[test]
@@ -10369,7 +10344,9 @@ mod tests {
 
         let mut ssarepr = SSARepr::new("t");
         for py_pc in 0..code.instructions.len() {
-            ssarepr.insns.push(Insn::PcAnchor(py_pc));
+            ssarepr
+                .insns
+                .push(Insn::Label(FlatLabel::new(format!("pc{py_pc}"))));
             ssarepr.insns.push(Insn::live(vec![
                 Operand::Register(Register::new(Kind::Ref, 0)),
                 Operand::Register(Register::new(Kind::Ref, 7)),
