@@ -447,40 +447,60 @@ impl CraneliftFailDescr {
     pub const TY_FLOAT: u64 = 0x06;
 
     /// compile.py:826-830 store_hash: assign a unique jitcounter hash.
-    /// `self.status = hash & self.ST_SHIFT_MASK`
+    /// `compile.py:826-830` `store_hash`.  Prefers the metainterp
+    /// `AbstractResumeGuardDescr` (`compile.py:683 _attrs_`) reached
+    /// through `meta_descr`; falls back to the backend-local transitional
+    /// slot for synthetic / test paths.
     pub fn store_hash(&self, hash: u64) {
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.store_hash(hash);
+            return;
+        }
         self.status.store(
             hash & Self::ST_SHIFT_MASK,
             std::sync::atomic::Ordering::Release,
         );
     }
 
-    /// compile.py:741-745: read status for must_compile.
+    /// `compile.py:741-745` `get_status`.
     pub fn get_status(&self) -> u64 {
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            return meta_fd.get_status();
+        }
         self.status.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG.
+    /// `compile.py:786-788` `start_compiling`.
     pub fn start_compiling(&self) {
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.start_compiling();
+            return;
+        }
         self.status
             .fetch_or(Self::ST_BUSY_FLAG, std::sync::atomic::Ordering::AcqRel);
     }
 
-    /// compile.py:790-795: done_compiling — clear ST_BUSY_FLAG.
+    /// `compile.py:790-795` `done_compiling`.
     pub fn done_compiling(&self) {
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.done_compiling();
+            return;
+        }
         self.status
             .fetch_and(!Self::ST_BUSY_FLAG, std::sync::atomic::Ordering::AcqRel);
     }
 
-    /// compile.py:750: check ST_BUSY_FLAG.
+    /// `compile.py:750` check `ST_BUSY_FLAG`.
     pub fn is_compiling(&self) -> bool {
-        self.status.load(std::sync::atomic::Ordering::Acquire) & Self::ST_BUSY_FLAG != 0
+        self.get_status() & Self::ST_BUSY_FLAG != 0
     }
 
-    /// compile.py:813-824: make_a_counter_per_value — for GUARD_VALUE,
-    /// encode the fail_arg index and type tag in status.
-    /// `self.status = ty | (index << ST_SHIFT)`
+    /// `compile.py:813-824` `make_a_counter_per_value`.
     pub fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.make_a_counter_per_value(index, type_tag);
+            return;
+        }
         let status = type_tag | ((index as u64) << Self::ST_SHIFT);
         self.status
             .store(status, std::sync::atomic::Ordering::Release);
@@ -712,10 +732,23 @@ impl FailDescr for CraneliftFailDescr {
     }
 
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
+        // `history.py:132` `AbstractFailDescr._attrs_` `rd_loop_token` —
+        // prefer the metainterp-side slot when meta_descr is attached.
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            if let Some(any) = meta_fd.rd_loop_token_clt() {
+                return Some(any);
+            }
+        }
         CraneliftFailDescr::rd_loop_token_clt(self).map(|arc| arc as &dyn std::any::Any)
     }
 
     fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        // `compile.py:186` `descr.rd_loop_token = clt` — write through
+        // to the metainterp side when present.
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.set_rd_loop_token_clt(clt);
+            return;
+        }
         let typed: std::sync::Arc<majit_backend::CompiledLoopToken> = clt
             .downcast::<majit_backend::CompiledLoopToken>()
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
@@ -731,6 +764,17 @@ impl FailDescr for CraneliftFailDescr {
     }
 
     fn vector_info(&self) -> Vec<AccumInfo> {
+        // `history.py:132` `AbstractFailDescr._attrs_` `rd_vector_info`
+        // — prefer the metainterp-side slot when meta_descr is attached.
+        // The backend `vector_info: Vec<AccumInfo>` slot is a pyre-only
+        // transitional fallback; the canonical store lives on the
+        // metainterp `AbstractFailDescr`.
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            let chain = meta_fd.vector_info();
+            if !chain.is_empty() {
+                return chain;
+            }
+        }
         self.vector_info.clone()
     }
 
