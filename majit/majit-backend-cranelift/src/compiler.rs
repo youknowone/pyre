@@ -2939,12 +2939,11 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
 pub fn get_latest_descr_arc_from_deadframe(
     frame: &DeadFrame,
 ) -> Result<Arc<dyn majit_ir::Descr>, BackendError> {
-    // `history.py:125` `cpu.get_latest_descr(deadframe)` parity —
-    // transitional: returns the backend Arc upcast to `Arc<dyn Descr>`.
-    // Resume-payload readers reach the metainterp `AbstractFailDescr`
-    // through the backend's `meta_descr` back-pointer; `descr_addr`
-    // derived from this Arc keeps registry-keyed lookups working until
-    // the full jf_descr identity flip lands.
+    // `history.py:125` `cpu.get_latest_descr(deadframe)` — same shape
+    // as dynasm's `get_latest_descr_arc`.  Returns the backend Arc
+    // upcast until the dual-key registration window is widened to
+    // cover late `meta_descr` stamping by `build_guard_metadata` /
+    // test harnesses.
     let jf = frame
         .data
         .downcast_ref::<JitFrameDeadFrame>()
@@ -6846,6 +6845,19 @@ impl CraneliftBackend {
             registry
                 .entry(Arc::as_ptr(descr) as usize)
                 .or_insert_with(|| Arc::clone(descr));
+            // Unified-Descr Port Epic: also key the same backend Arc by
+            // the metainterp `AbstractFailDescr` Arc's data pointer
+            // (`history.py:125` identity).  `get_latest_descr_arc`
+            // returns the meta Arc when present, so downstream callers
+            // compute `descr_addr = Arc::as_ptr(arc)` from the meta
+            // pointer and would miss the backend-only key without this
+            // dual indexing.
+            if let Some(meta) = &descr.meta_descr {
+                let meta_ptr = Arc::as_ptr(meta) as *const () as usize;
+                registry
+                    .entry(meta_ptr)
+                    .or_insert_with(|| Arc::clone(descr));
+            }
         }
     }
 

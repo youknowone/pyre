@@ -1950,24 +1950,18 @@ impl Backend for DynasmBackend {
     }
 
     fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {
-        // `history.py:125` `cpu.get_latest_descr(deadframe)` returns the
-        // metainterp `AbstractFailDescr` object — the same descr
-        // `op.descr` stamped, NOT a backend-side facade.  Walk through
-        // the backend Arc's `meta_descr` back-pointer to recover it.
-        //
-        // The backend `register_fail_descrs` keys the same backend Arc
-        // under BOTH addresses (backend data ptr + meta data ptr), so
-        // downstream callers computing `descr_addr = Arc::as_ptr(arc)`
-        // continue to resolve via `fail_descr_arc_from_addr` regardless
-        // of whether the Arc returned here is the meta or backend side.
-        //
-        // Synthetic backend descrs (FINISH / `PropagateExceptionDescr` /
-        // `ExitFrameWithExceptionDescr`) without a meta back-pointer
-        // fall back to the backend Arc upcast.
+        // `history.py:125` `cpu.get_latest_descr(deadframe)` — under the
+        // Unified-Descr Port Epic, this should return the metainterp
+        // `AbstractFailDescr` Arc reached via `meta_descr`.  The
+        // transition is gated by `register_fail_descrs` registering
+        // each backend Arc under BOTH addresses (backend data ptr +
+        // meta data ptr).  However, test paths and `build_guard_metadata`
+        // stamp `meta_descr` AFTER `register_fail_descrs` runs, so the
+        // meta-keyed entry never lands.  Until the dual-key
+        // registration is moved to follow `meta_descr` assignment (or
+        // re-registered on stamp), keep returning the backend Arc
+        // upcast — downstream `descr_addr` lookups stay valid.
         let data = frame.data.downcast_ref::<FrameData>().unwrap();
-        if let Some(meta) = data.fail_descr.meta_descr.clone() {
-            return meta;
-        }
         Arc::clone(&data.fail_descr) as Arc<dyn majit_ir::Descr>
     }
 
