@@ -547,80 +547,111 @@ pub enum RdVirtualInfo {
     Empty,
 }
 
-// PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
+/// `history.py:125` `id(descr)` parity — Option<Arc<dyn Descr>> identity
+/// compare.  Both `None` are equal (unset slots); two `Some` are equal
+/// iff their Arcs share the underlying object (`Arc::ptr_eq`).  Backs
+/// the `RdVirtualInfo` / `GuardPendingFieldEntry` `PartialEq` impls so
+/// resume-info canonicalisation matches PyPy's `descr is other_descr`
+/// rather than relying on the pyre-only `descr_index` serialization
+/// handle.
+#[inline]
+fn opt_descr_ptr_eq(a: &Option<crate::DescrRef>, b: &Option<crate::DescrRef>) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+// `PartialEq/Eq` parity: compare resume-info structurally + descr Arc
+// identity (`history.py:125`); `descr_index` is a serialization handle,
+// not identity.
 impl PartialEq for RdVirtualInfo {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::VirtualInfo {
+                    descr: a_descr,
                     type_id: a0,
-                    descr_index: a1,
+                    descr_index: _,
                     known_class: a2,
                     fielddescrs: a3,
                     fieldnums: a4,
                     descr_size: a5,
-                    ..
                 },
                 Self::VirtualInfo {
+                    descr: b_descr,
                     type_id: b0,
-                    descr_index: b1,
+                    descr_index: _,
                     known_class: b2,
                     fielddescrs: b3,
                     fieldnums: b4,
                     descr_size: b5,
-                    ..
                 },
-            ) => a0 == b0 && a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            ) => {
+                opt_descr_ptr_eq(a_descr, b_descr)
+                    && a0 == b0
+                    && a2 == b2
+                    && a3 == b3
+                    && a4 == b4
+                    && a5 == b5
+            }
             (
                 Self::VStructInfo {
+                    typedescr: a_descr,
                     type_id: a1,
-                    descr_index: a2,
+                    descr_index: _,
                     fielddescrs: a3,
                     fieldnums: a4,
                     descr_size: a5,
-                    ..
                 },
                 Self::VStructInfo {
+                    typedescr: b_descr,
                     type_id: b1,
-                    descr_index: b2,
+                    descr_index: _,
                     fielddescrs: b3,
                     fieldnums: b4,
                     descr_size: b5,
-                    ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            ) => {
+                opt_descr_ptr_eq(a_descr, b_descr)
+                    && a1 == b1
+                    && a3 == b3
+                    && a4 == b4
+                    && a5 == b5
+            }
             (
                 Self::VArrayInfoClear {
-                    arraydescr: _,
-                    descr_index: a1,
+                    arraydescr: a_descr,
+                    descr_index: _,
                     kind: a2,
                     fieldnums: a3,
                 },
                 Self::VArrayInfoClear {
-                    arraydescr: _,
-                    descr_index: b1,
+                    arraydescr: b_descr,
+                    descr_index: _,
                     kind: b2,
                     fieldnums: b3,
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3,
+            ) => opt_descr_ptr_eq(a_descr, b_descr) && a2 == b2 && a3 == b3,
             (
                 Self::VArrayInfoNotClear {
-                    arraydescr: _,
-                    descr_index: a1,
+                    arraydescr: a_descr,
+                    descr_index: _,
                     kind: a2,
                     fieldnums: a3,
                 },
                 Self::VArrayInfoNotClear {
-                    arraydescr: _,
-                    descr_index: b1,
+                    arraydescr: b_descr,
+                    descr_index: _,
                     kind: b2,
                     fieldnums: b3,
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3,
+            ) => opt_descr_ptr_eq(a_descr, b_descr) && a2 == b2 && a3 == b3,
             (
                 Self::VArrayStructInfo {
-                    arraydescr: _,
-                    descr_index: a1,
+                    arraydescr: a_descr,
+                    descr_index: _,
                     size: a2,
                     fielddescrs: _,
                     fielddescr_indices: a3,
@@ -632,8 +663,8 @@ impl PartialEq for RdVirtualInfo {
                     fieldnums: a8,
                 },
                 Self::VArrayStructInfo {
-                    arraydescr: _,
-                    descr_index: b1,
+                    arraydescr: b_descr,
+                    descr_index: _,
                     size: b2,
                     fielddescrs: _,
                     fielddescr_indices: b3,
@@ -645,7 +676,7 @@ impl PartialEq for RdVirtualInfo {
                     fieldnums: b8,
                 },
             ) => {
-                a1 == b1
+                opt_descr_ptr_eq(a_descr, b_descr)
                     && a2 == b2
                     && a3 == b3
                     && a4 == b4
