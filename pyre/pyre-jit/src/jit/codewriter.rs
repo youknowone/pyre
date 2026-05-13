@@ -4926,39 +4926,32 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if is_portal {
-                            // Graph-side dual-write of jtransform.py:1898
-                            // `do_fixed_list_setitem` —
-                            // STORE_FAST → setarrayitem_vable_r(
-                            // locals_cells_stack_w, local_slot, w_value).
-                            // Mirrors the existing emit_pushvalue_ref!
-                            // dual-write so graph regalloc observes the
-                            // locals-side setarrayitem_vable_r liverange.
-                            // SSA emission below stays in
-                            // emit_store_local_with_mirror! — graph and
-                            // SSA are independent IRs.  Synthetic shadow
-                            // offset -1 matches the emit_vsd convention.
-                            let local_slot = local_to_vable_slot(reg as usize) as i64;
-                            let v_idx = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "int_copy",
-                                vec![super::flow::Constant::signed(local_slot).into()],
-                                Kind::Int,
-                                -1,
-                            );
-                            record_graph_op(
-                                &current_block.block(),
-                                "setarrayitem_vable_r",
-                                vable_setarrayitem_ref_graph_args(
-                                    frame_var.into(),
-                                    v_idx.into(),
-                                    stored.clone().into(),
-                                ),
-                                None,
-                                -1,
-                            );
-                        }
+                        // Phase 4 walker-orthodoxy: graph dual-write of
+                        // jtransform.py:1898 `do_fixed_list_setitem` —
+                        // STORE_FAST → setarrayitem_vable_r(
+                        // locals_cells_stack_w, local_slot, w_value).
+                        // Fires for every CodeWriter now (frame_var is
+                        // unconditionally in startblock.inputargs).
+                        let local_slot = local_to_vable_slot(reg as usize) as i64;
+                        let v_idx = emit_graph_op_with_result(
+                            &mut graph,
+                            &current_block.block(),
+                            "int_copy",
+                            vec![super::flow::Constant::signed(local_slot).into()],
+                            Kind::Int,
+                            -1,
+                        );
+                        record_graph_op(
+                            &current_block.block(),
+                            "setarrayitem_vable_r",
+                            vable_setarrayitem_ref_graph_args(
+                                frame_var.into(),
+                                v_idx.into(),
+                                stored.clone().into(),
+                            ),
+                            None,
+                            -1,
+                        );
                         emit_store_local_with_mirror!(ssarepr, reg, stored_reg);
                         if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                             *slot = Some(stored);
@@ -5178,32 +5171,29 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if is_portal {
-                            // STORE_FAST half graph dual-write
-                            // (jtransform.py:1898 `do_fixed_list_setitem`).
-                            // SSA emission for this half is delegated to
-                            // `emit_store_local_with_mirror!` below.
-                            let store_slot = local_to_vable_slot(store_reg as usize) as i64;
-                            let v_store_idx = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "int_copy",
-                                vec![super::flow::Constant::signed(store_slot).into()],
-                                Kind::Int,
-                                -1,
-                            );
-                            record_graph_op(
-                                &current_block.block(),
-                                "setarrayitem_vable_r",
-                                vable_setarrayitem_ref_graph_args(
-                                    frame_var.into(),
-                                    v_store_idx.into(),
-                                    stored.clone().into(),
-                                ),
-                                None,
-                                -1,
-                            );
-                        }
+                        // Phase 4 walker-orthodoxy: STORE_FAST half graph
+                        // dual-write (jtransform.py:1898
+                        // `do_fixed_list_setitem`) fires for every CodeWriter.
+                        let store_slot = local_to_vable_slot(store_reg as usize) as i64;
+                        let v_store_idx = emit_graph_op_with_result(
+                            &mut graph,
+                            &current_block.block(),
+                            "int_copy",
+                            vec![super::flow::Constant::signed(store_slot).into()],
+                            Kind::Int,
+                            -1,
+                        );
+                        record_graph_op(
+                            &current_block.block(),
+                            "setarrayitem_vable_r",
+                            vable_setarrayitem_ref_graph_args(
+                                frame_var.into(),
+                                v_store_idx.into(),
+                                stored.clone().into(),
+                            ),
+                            None,
+                            -1,
+                        );
                         // STORE_FAST half: same dual-write as Instruction::StoreFast.
                         // Non-portal popvalue places `stored_reg` at
                         // `stack_base + current_depth` post-decrement, so the
