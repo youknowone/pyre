@@ -676,8 +676,8 @@ impl FailDescr for CraneliftFailDescr {
     }
 
     fn fail_arg_types(&self) -> &[Type] {
-        // Session 5c + post-audit: forward through `meta_resume_fd()`
-        // (gated on `isinstance(descr, ResumeDescr)`) so the optimizer's
+        // Forward through `meta_resume_fd()` (gated on `compile.py:185
+        // isinstance(descr, ResumeDescr)`) so the optimizer's
         // `store_final_boxes_in_guard` (compile.py:869) stamp on the
         // metainterp side is the single source of truth for guard
         // descrs.  Fallback to backend-local field when meta_descr is
@@ -709,9 +709,9 @@ impl FailDescr for CraneliftFailDescr {
     }
 
     fn is_external_jump(&self) -> bool {
-        // Session 5d: backend-only flag, no metainterp counterpart —
-        // external-JUMP descrs are synthesized at the cranelift backend
-        // for cross-loop JUMP targets and have meta_descr == None.
+        // Backend-only flag, no metainterp counterpart — external-JUMP
+        // descrs are synthesized at the cranelift backend for
+        // cross-loop JUMP targets and have meta_descr == None.
         self.is_external_jump
     }
 

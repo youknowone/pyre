@@ -91,11 +91,11 @@ pub struct DynasmFailDescr {
     /// clt -> upgrade -> Arc<JitCellToken>` matching RPython's
     /// `descr.rd_loop_token.loop_token_wref()` access.
     pub rd_loop_token_clt: UnsafeCell<Option<std::sync::Arc<majit_backend::CompiledLoopToken>>>,
-    /// Unified-Descr Port Epic Session 5a: back-pointer to the metainterp
-    /// `ResumeGuardDescr` Arc the optimizer stamped onto the originating
-    /// guard op (`op.descr`).  PyPy keeps a single descr object per
-    /// guard (`history.py:121`); pyre's transitional split-descr stores
-    /// this Arc as a back-pointer so backend accessors forward
+    /// Back-pointer to the metainterp `AbstractFailDescr` Arc the
+    /// optimizer stamped onto the originating guard op (`op.descr`).
+    /// PyPy keeps a single descr object per guard (`history.py:121`);
+    /// pyre's transitional split-descr stores this Arc as a back-pointer
+    /// so backend accessors forward
     /// `rd_numb`/`rd_consts`/`rd_virtuals`/`rd_pendingfields`/
     /// `fail_arg_types`/`adr_jump_offset`/`rd_locs` to the metainterp
     /// `AbstractFailDescr` (`history.py:132 _attrs_`).  The final
