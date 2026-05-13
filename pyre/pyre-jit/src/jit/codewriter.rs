@@ -6347,41 +6347,39 @@ impl CodeWriter {
                         // takes no args (shape residual_call_r_r with empty
                         // ListR); set_current_exception is `(exc:Ref)→Void`
                         // (shape residual_call_r_v).
-                        if is_portal {
-                            // Match helper bind-site flavors at
-                            // codewriter.rs:2207-2217 — both
-                            // current-exception helpers are TLS
-                            // read/write only and statically prove
-                            // "no GC heap touched", so they bind
-                            // `PlainCannotRaiseNoHeap` for the
-                            // analyzer-equivalent `EF_CANNOT_RAISE +
-                            // empty raw frozensets + can_collect=false`
-                            // shape (`effectinfo.py:281-283`).
-                            let _ = record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
-                                get_current_exception_fn_idx,
-                                CallFlavor::PlainCannotRaiseNoHeap,
-                                vec![],
-                                vec![],
-                                vec![],
-                                vec![],
-                                ResKind::Ref,
-                                py_pc as i64,
-                            );
-                            let _ = record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
-                                set_current_exception_fn_idx,
-                                CallFlavor::PlainCannotRaiseNoHeap,
-                                vec![],
-                                vec![exc_value.clone()],
-                                vec![],
-                                vec![Kind::Ref],
-                                ResKind::Void,
-                                py_pc as i64,
-                            );
-                        }
+                        // Phase 4 walker-orthodoxy: TLS-only helpers,
+                        // no frame_var threading.  Match helper
+                        // bind-site flavors at codewriter.rs:2207-2217
+                        // — both current-exception helpers are TLS
+                        // read/write only and statically prove "no GC
+                        // heap touched", binding `PlainCannotRaiseNoHeap`
+                        // for the analyzer-equivalent `EF_CANNOT_RAISE
+                        // + empty raw frozensets + can_collect=false`
+                        // shape (`effectinfo.py:281-283`).
+                        let _ = record_residual_call_graph_op(
+                            &mut graph,
+                            &current_block.block(),
+                            get_current_exception_fn_idx,
+                            CallFlavor::PlainCannotRaiseNoHeap,
+                            vec![],
+                            vec![],
+                            vec![],
+                            vec![],
+                            ResKind::Ref,
+                            py_pc as i64,
+                        );
+                        let _ = record_residual_call_graph_op(
+                            &mut graph,
+                            &current_block.block(),
+                            set_current_exception_fn_idx,
+                            CallFlavor::PlainCannotRaiseNoHeap,
+                            vec![],
+                            vec![exc_value.clone()],
+                            vec![],
+                            vec![Kind::Ref],
+                            ResKind::Void,
+                            py_pc as i64,
+                        );
                         let prev_value = fresh_ref_value(&mut graph);
                         current_state.stack.push(prev_value.clone());
                         emit_pushvalue_ref!(ssarepr, current_depth, scratch_prev, prev_value);
@@ -6439,22 +6437,21 @@ impl CodeWriter {
                                 scratch_match,
                             ),
                         );
-                        // Task #46 micro-slice 7: compare_fn(exc, match_type,
-                        // ISINSTANCE_OP:Int) → Ref shape residual_call_ir_r.
-                        if is_portal {
-                            let _ = record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
-                                compare_fn_idx,
-                                CallFlavor::MayForce,
-                                vec![super::flow::Constant::signed(10).into()],
-                                vec![exc_value, match_type_value],
-                                vec![],
-                                vec![Kind::Ref, Kind::Ref, Kind::Int],
-                                ResKind::Ref,
-                                py_pc as i64,
-                            );
-                        }
+                        // Phase 4 walker-orthodoxy: compare_fn(exc,
+                        // match_type, ISINSTANCE_OP:Int) → Ref shape
+                        // residual_call_ir_r.  No frame_var threading.
+                        let _ = record_residual_call_graph_op(
+                            &mut graph,
+                            &current_block.block(),
+                            compare_fn_idx,
+                            CallFlavor::MayForce,
+                            vec![super::flow::Constant::signed(10).into()],
+                            vec![exc_value, match_type_value],
+                            vec![],
+                            vec![Kind::Ref, Kind::Ref, Kind::Int],
+                            ResKind::Ref,
+                            py_pc as i64,
+                        );
                         let result_value = fresh_ref_value(&mut graph);
                         current_state.stack.push(result_value.clone());
                         emit_pushvalue_ref!(ssarepr, current_depth, scratch_match, result_value);
@@ -6486,26 +6483,23 @@ impl CodeWriter {
                                 prev_reg,
                             ),
                         );
-                        // Task #46 micro-slice 7: set_current_exception
+                        // Phase 4 walker-orthodoxy: set_current_exception
                         // `(prev:Ref)→Void` shape residual_call_r_v.
-                        // Match helper bind-site flavor at
-                        // codewriter.rs:2213-2217 — TLS write, no GC
-                        // heap touched, `PlainCannotRaiseNoHeap`
-                        // (`effectinfo.py:281-283` analyzer output).
-                        if is_portal {
-                            let _ = record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
-                                set_current_exception_fn_idx,
-                                CallFlavor::PlainCannotRaiseNoHeap,
-                                vec![],
-                                vec![prev_value],
-                                vec![],
-                                vec![Kind::Ref],
-                                ResKind::Void,
-                                py_pc as i64,
-                            );
-                        }
+                        // TLS write, no GC heap touched,
+                        // `PlainCannotRaiseNoHeap` (`effectinfo.py:281-283`
+                        // analyzer output).
+                        let _ = record_residual_call_graph_op(
+                            &mut graph,
+                            &current_block.block(),
+                            set_current_exception_fn_idx,
+                            CallFlavor::PlainCannotRaiseNoHeap,
+                            vec![],
+                            vec![prev_value],
+                            vec![],
+                            vec![Kind::Ref],
+                            ResKind::Void,
+                            py_pc as i64,
+                        );
                         current_state.last_exception = None;
                     }
 
@@ -6636,32 +6630,30 @@ impl CodeWriter {
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            if is_portal {
-                                // Graph-side dual-write — same shape as the
-                                // StoreFast handler.  SSA emission is
-                                // delegated to `emit_store_local_with_mirror!`
-                                // below.
-                                let local_slot = local_to_vable_slot(reg as usize) as i64;
-                                let v_idx = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "int_copy",
-                                    vec![super::flow::Constant::signed(local_slot).into()],
-                                    Kind::Int,
-                                    -1,
-                                );
-                                record_graph_op(
-                                    &current_block.block(),
-                                    "setarrayitem_vable_r",
-                                    vable_setarrayitem_ref_graph_args(
-                                        frame_var.into(),
-                                        v_idx.into(),
-                                        stored.clone().into(),
-                                    ),
-                                    None,
-                                    -1,
-                                );
-                            }
+                            // Phase 4 walker-orthodoxy: graph-side
+                            // dual-write — same shape as the StoreFast
+                            // handler.  SSA emission is delegated to
+                            // `emit_store_local_with_mirror!` below.
+                            let local_slot = local_to_vable_slot(reg as usize) as i64;
+                            let v_idx = emit_graph_op_with_result(
+                                &mut graph,
+                                &current_block.block(),
+                                "int_copy",
+                                vec![super::flow::Constant::signed(local_slot).into()],
+                                Kind::Int,
+                                -1,
+                            );
+                            record_graph_op(
+                                &current_block.block(),
+                                "setarrayitem_vable_r",
+                                vable_setarrayitem_ref_graph_args(
+                                    frame_var.into(),
+                                    v_idx.into(),
+                                    stored.clone().into(),
+                                ),
+                                None,
+                                -1,
+                            );
                             emit_store_local_with_mirror!(ssarepr, reg, stored_reg);
                             if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                                 *slot = Some(stored);
