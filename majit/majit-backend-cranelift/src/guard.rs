@@ -813,9 +813,19 @@ impl FailDescr for CraneliftFailDescr {
     }
 
     fn is_exit_frame_with_exception(&self) -> bool {
-        // Same rationale as `is_finish` — the backend's local field is
-        // set at construction to match the meta_descr's class.
-        self.is_exit_frame_with_exception
+        // `compile.py:658-662 ExitFrameWithExceptionDescrRef`'s identity
+        // lives on the metainterp Arc (see
+        // `ExitFrameWithExceptionDescrRef` in `majit-metainterp/src/
+        // compile.rs:2311-2358`).  Forward through `meta_descr` so
+        // backend descrs constructed with `op.descr = Some(meta)` defer
+        // to the metainterp class hierarchy.  Synthetic backend descrs
+        // (runner classifier path, `meta_descr = None`) fall back to
+        // the local mirror — still needed for backend-only descrs that
+        // never visit the optimizer.
+        match self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            Some(fd) => fd.is_exit_frame_with_exception(),
+            None => self.is_exit_frame_with_exception,
+        }
     }
 
     fn is_external_jump(&self) -> bool {

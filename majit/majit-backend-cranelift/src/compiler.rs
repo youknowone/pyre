@@ -13211,11 +13211,11 @@ fn collect_guards(
             // `history.py:132` `AbstractFailDescr._attrs_` `rd_vector_info`
             // lives on the metainterp `AbstractFailDescr`; backend reads
             // forward through `meta_descr` so no local copy is needed.
-            // `compile.py:658` ExitFrameWithExceptionDescrRef identity
-            // propagation: mirror the metainterp FailDescr flag onto the
-            // backend-local CraneliftFailDescr so downstream runtime
-            // classifiers (`is_exit_frame_with_exception`) keep parity.
-            descr.is_exit_frame_with_exception = fd.is_exit_frame_with_exception();
+            // `compile.py:658` ExitFrameWithExceptionDescrRef identity is
+            // now read through `meta_descr` forwarding in
+            // `FailDescr::is_exit_frame_with_exception` (Session 5i-cl); no
+            // backend-local mirror needed for descrs that carry a
+            // metainterp Arc.
             fd.vector_info()
         } else {
             Vec::new()

@@ -479,8 +479,17 @@ impl FailDescr for DynasmFailDescr {
     }
 
     fn is_exit_frame_with_exception(&self) -> bool {
-        // Class-hierarchy property — local field set at construction.
-        self.is_exit_frame_with_exception
+        // `compile.py:658-662 ExitFrameWithExceptionDescrRef`'s identity
+        // lives on the metainterp Arc.  Forward through `meta_descr` so
+        // backend descrs constructed via `op.descr = Some(meta)` defer
+        // to the metainterp class hierarchy; synthetic backend descrs
+        // minted by the runtime classifier (`meta_descr = None`) fall
+        // back to the local mirror, which is still needed because those
+        // descrs never visit the optimizer.
+        match self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            Some(fd) => fd.is_exit_frame_with_exception(),
+            None => self.is_exit_frame_with_exception,
+        }
     }
 
     fn trace_id(&self) -> u64 {
