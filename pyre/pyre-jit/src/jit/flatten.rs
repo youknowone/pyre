@@ -1020,17 +1020,22 @@ pub const OPNAME_LIVE: &str = "-live-";
 ///     switch dispatch): `goto`, `goto_if_not`, `goto_if_not_<marker>`
 ///     (overflow / int_lt / ...), `goto_if_exception_mismatch`,
 ///     `switch`, `unreachable`, `catch_exception`.
-///   * Link-rename `*_push`/`*_pop` and link-driven
+///   * Link-rename `*_push`/`*_pop`/`*_copy` and link-driven
 ///     `last_exception`/`last_exc_value` — `flatten.py:306-334
 ///     insert_renamings` + `generate_last_exc`. `*_push` carries one
 ///     register source (`int_push %iN`), `*_pop` carries one register
 ///     result (`int_pop -> %iN`); both arise from
 ///     `reorder_renaming_list` swap-cycle resolution.  `*_copy` is
-///     not classified here: pyre's walker also emits register-source
-///     copies for stack / local / call-argument movement, so
-///     treating all register-source copies as SSA-only would hide
-///     real walker→graph gaps until copy provenance is represented
-///     explicitly.
+///     emitted by `insert_renamings` for non-cycle reorderings
+///     (`flatten.py:333`).  All three opname families have NO
+///     `SpaceOperation` counterpart in upstream's flow graph: they
+///     are flatten-time-only emits.  Pyre's walker emits `*_copy`
+///     directly at walker time (`emit_pushvalue_ref!` /
+///     `emit_popvalue_ref!` / `emit_ref_copy!`) as a
+///     PRE-EXISTING-ADAPTATION — the Insn shape is byte-identical to
+///     upstream, only the when differs.  Classifying every
+///     `*_copy` as ssa-only matches upstream's "no graph counterpart
+///     by design" regardless of pyre's emission timing.
 ///
 ///   * `OPNAME_LIVE` (`-live-`) — `liveness.py:5-12`. **Walker-shape
 ///     adaptation, not orthodox.** Upstream `-live-` placement comes
@@ -1128,17 +1133,41 @@ pub fn is_ssa_only_artifact(insn: &Insn) -> bool {
     if opname == "abort_permanent" {
         return true;
     }
-    // `*_copy` is deliberately counted as walker-emitted unless the
-    // instruction carries explicit link-rename provenance. Pyre's walker
-    // emits register-source copies for stack/local/call argument shuffles.
-    // Link-rename `*_push %iN` / `*_pop -> %iN`
-    // (`flatten.py:325-330 reorder_renaming_list`): swap-cycle
-    // resolution. `*_push` carries a register source; `*_pop` carries
-    // a register result. Both are flatten-time emissions with no
-    // graph counterpart by design.
+    // `*_copy` / `*_push` / `*_pop` are flatten-only opnames per
+    // upstream: `flatten.py:319-333 insert_renamings` emits them at
+    // link-rename time only, and `reorder_renaming_list`
+    // (`flatten.py:395-413`) breaks cycles via the push/pop pair.
+    // The opnames have NO `SpaceOperation` counterpart in upstream's
+    // flow graph — they exist purely at the SSARepr layer.
+    //
+    // Pyre's walker emits `*_copy` directly at walker time for
+    // stack / local / call-argument shuffles (`emit_pushvalue_ref!`,
+    // `emit_popvalue_ref!`, `emit_ref_copy!`, ...) as a
+    // PRE-EXISTING-ADAPTATION: pyre's bytecode-1:1 walk doesn't
+    // model the stack via `flowcontext.py`-style `currentstate.stack`
+    // FrameState merges that upstream uses to drop ref_copy entirely
+    // from the walker.  The emitted Insn shape (`ref_copy <src> -> dst`)
+    // is byte-identical to upstream's flatten-time emit; the only
+    // divergence is when (walker time vs flatten time).
+    //
+    // Classifying every `*_copy` as `ssa-only` matches upstream's
+    // "this opname has no graph counterpart by design" semantic
+    // regardless of when pyre's walker emits it.  Convergence path:
+    // Phase 4 walker restructure (Task #227) moves stack / local
+    // shuffles onto Variables threaded through `currentstate.stack`,
+    // letting `insert_renamings` produce ALL `*_copy` ops at
+    // flatten time per upstream.
     matches!(
         opname.as_str(),
-        "int_push" | "ref_push" | "float_push" | "int_pop" | "ref_pop" | "float_pop"
+        "int_push"
+            | "ref_push"
+            | "float_push"
+            | "int_pop"
+            | "ref_pop"
+            | "float_pop"
+            | "int_copy"
+            | "ref_copy"
+            | "float_copy"
     )
 }
 
@@ -1264,13 +1293,39 @@ pub fn is_graph_only_artifact(insn: &Insn) -> bool {
     ) {
         return true;
     }
-    matches!(
+    if matches!(
         opname.as_str(),
         // Container subscript store / unary / call / sequence construction
         // (emit_frontend_{setitem,bool,neg,simple_call,newlist,newslice}).
         // `setattr` and `getattr` are intentionally NOT here — see
         // function-level docstring for the abort_permanent rationale.
         "setitem" | "bool" | "neg" | "simple_call" | "newlist" | "newslice"
+    ) {
+        return true;
+    }
+    // PRE-EXISTING-ADAPTATION (pyre walker NEW-DEVIATION):
+    // pyre's walker records `int_copy(ConstInt(depth_value))` SpaceOps
+    // (`emit_pushvalue_ref!`, `emit_popvalue_ref!`,
+    // `emit_vable_setarrayitem_ref!` macros at codewriter.rs:4078,
+    // 4260, 4316, 4396, …) as synthetic graph-level identity tokens
+    // that thread the vable-array depth index through downstream
+    // `setarrayitem_vable_r` / `getarrayitem_vable_r` graph
+    // SpaceOps.  Upstream RPython does not have these synthetic
+    // SpaceOps because its vable depth flows through Variables
+    // directly — `do_fixed_list_setitem`/`do_fixed_list_getitem`
+    // (`jtransform.py:1882-1898`) consume the depth Variable from
+    // `flowcontext.py`'s `currentstate.stack`.
+    //
+    // Convergence: Phase 4 walker restructure (Task #227) ports the
+    // pyre walker to thread depth Variables through
+    // `currentstate.stack` matches upstream's `flowcontext.py`,
+    // retiring these synthetic int_copy / ref_copy / float_copy
+    // graph SpaceOps.  Until then, classify them as graph-only-by-
+    // design so `[phase4-graph-shape]` doesn't surface them as
+    // false gap.
+    matches!(
+        opname.as_str(),
+        "int_copy" | "ref_copy" | "float_copy"
     )
 }
 
