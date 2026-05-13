@@ -1303,6 +1303,33 @@ pub fn is_graph_only_artifact(insn: &Insn) -> bool {
     ) {
         return true;
     }
+    // `type` is the pre-rtype HLOp recorded by
+    // `explicit_raise_exception_pair` (codewriter.rs:781-788) for
+    // `op.type(w_value).eval(self)` during exception raise — mirrors
+    // upstream `flowcontext.py`'s explicit-raise lowering.  No inline
+    // counterpart: the runtime exception class is materialised in the
+    // assembler from the raise descriptor, not via a `residual_call_*`.
+    if opname == "type" {
+        return true;
+    }
+    // PRE-EXISTING-ADAPTATION (pyre walker NEW-DEVIATION):
+    // `last_exc_value` SpaceOps recorded at catch-landing sites
+    // (codewriter.rs:6594 `emit_graph_op_with_result("last_exc_value",
+    // ...)`) are pyre-only.  Upstream emits `last_exc_value` ONLY at
+    // flatten time via `insert_renamings → generate_last_exc`
+    // (`flatten.py:336-352`), never as a graph SpaceOperation; the
+    // exception value flows through `link.last_exc_value` Variables
+    // and the flatten-time emit reads them.
+    //
+    // Convergence: Phase 4 walker restructure retires the graph
+    // emit, threading the catch-landing's `last_exc_value` Variable
+    // through the link directly so `insert_renamings` produces the
+    // SSARepr emit at flatten time per upstream.  Until then, flag
+    // as graph-only-by-design so `[phase4-graph-shape]` doesn't
+    // surface it as a coverage gap.
+    if opname == "last_exc_value" {
+        return true;
+    }
     // PRE-EXISTING-ADAPTATION (pyre walker NEW-DEVIATION):
     // pyre's walker records `int_copy(ConstInt(depth_value))` SpaceOps
     // (`emit_pushvalue_ref!`, `emit_popvalue_ref!`,
