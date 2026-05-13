@@ -597,10 +597,13 @@ fn overlay_deadframe_fail_descr(
     if let Some(source_op_index) = base_layout.source_op_index {
         descr.set_source_op_index(source_op_index);
     }
+    let descr = Arc::new(descr);
     if let Some(trace_info) = base_layout.trace_info.clone() {
+        // `set_trace_info` writes to the backend-static `TRACE_INFO_TABLE`
+        // keyed on `Arc::as_ptr(&descr)`, so it must follow Arc materialisation.
         descr.set_trace_info(trace_info);
     }
-    Arc::new(descr)
+    descr
 }
 
 fn deadframe_recovery_layout_for_call_assembler(

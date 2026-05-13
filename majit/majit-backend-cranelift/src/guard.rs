@@ -19,6 +19,41 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
+/// `Arc::as_ptr` address to its compile-time `CompiledTraceInfo`.
+///
+/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) carries no
+/// `trace_info` slot — RPython recovers the same information from
+/// `cpu.asmmemmgr_blocks` + `compiled_loop_token`.  Cranelift's
+/// per-trace metadata (input types / header_pc / source_guard tuple)
+/// is the equivalent state, parked here so the descr struct stays
+/// aligned with PyPy's surface.
+static TRACE_INFO_TABLE: OnceLock<Mutex<HashMap<usize, CompiledTraceInfo>>> = OnceLock::new();
+
+fn trace_info_table() -> &'static Mutex<HashMap<usize, CompiledTraceInfo>> {
+    TRACE_INFO_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Codegen-time write: invoked from `compile_loop` /
+/// `overlay_deadframe_fail_descr` once the descr Arc is materialised.
+pub fn register_trace_info(descr_ptr: usize, info: CompiledTraceInfo) {
+    trace_info_table()
+        .lock()
+        .expect("TRACE_INFO_TABLE mutex poisoned")
+        .insert(descr_ptr, info);
+}
+
+/// Layout / dispatch-time read.  Returns `None` when the descr has no
+/// associated trace info (synthetic descrs, descrs built outside the
+/// `compile_loop` path).
+pub fn lookup_trace_info(descr_ptr: usize) -> Option<CompiledTraceInfo> {
+    trace_info_table()
+        .lock()
+        .expect("TRACE_INFO_TABLE mutex poisoned")
+        .get(&descr_ptr)
+        .cloned()
+}
+
+/// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to its external-JUMP target `DescrRef`.
 ///
 /// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) does not
@@ -216,9 +251,11 @@ pub struct CraneliftFailDescr {
     // (keyed on `Arc::as_ptr(&descr)`).  Membership = external-JUMP
     // predicate; lookup value = target `DescrRef`.
     pub force_token_slots: Vec<usize>,
-    /// Write-once during compilation, read-only after.
-    /// No lock — RPython ResumeGuardDescr has no lock (GIL).
-    pub trace_info: UnsafeCell<Option<CompiledTraceInfo>>,
+    // trace_info removed (Session 5i-cl): not in PyPy
+    // `AbstractFailDescr._attrs_` (`history.py:132`).  Cranelift's
+    // per-trace `CompiledTraceInfo` now lives in `TRACE_INFO_TABLE`
+    // keyed on `Arc::as_ptr(&descr)`; RPython recovers the same
+    // information from `cpu.asmmemmgr_blocks`.
     /// Write-once during bridge compilation, read-only after.
     pub recovery_layout: UnsafeCell<Option<ExitRecoveryLayout>>,
     /// compile.py:688-692 ResumeGuardDescr.status:
@@ -318,6 +355,10 @@ impl Drop for CraneliftFailDescr {
             .lock()
             .expect("FAIL_COUNT_TABLE mutex poisoned")
             .remove(&ptr);
+        trace_info_table()
+            .lock()
+            .expect("TRACE_INFO_TABLE mutex poisoned")
+            .remove(&ptr);
     }
 }
 
@@ -335,7 +376,10 @@ impl std::fmt::Debug for CraneliftFailDescr {
                 &lookup_external_jump_target(self as *const Self as usize).map(|d| d.repr()),
             )
             .field("force_token_slots", &self.force_token_slots)
-            .field("trace_info", unsafe { &*self.trace_info.get() })
+            .field(
+                "trace_info",
+                &lookup_trace_info(self as *const Self as usize),
+            )
             .field("recovery_layout", unsafe { &*self.recovery_layout.get() })
             .field(
                 "fail_count",
@@ -422,7 +466,6 @@ impl CraneliftFailDescr {
             is_finish,
             is_exit_frame_with_exception: false,
             force_token_slots,
-            trace_info: UnsafeCell::new(None),
             recovery_layout: UnsafeCell::new(recovery_layout),
             status: std::sync::atomic::AtomicU64::new(0),
             bridge: UnsafeCell::new(None),
@@ -463,7 +506,6 @@ impl CraneliftFailDescr {
             is_finish: false,
             is_exit_frame_with_exception: false,
             force_token_slots,
-            trace_info: UnsafeCell::new(None),
             recovery_layout: UnsafeCell::new(recovery_layout),
             status: std::sync::atomic::AtomicU64::new(0),
             bridge: UnsafeCell::new(None),
@@ -495,8 +537,11 @@ impl CraneliftFailDescr {
     }
 
     #[inline]
-    pub fn trace_info_ref(&self) -> &Option<CompiledTraceInfo> {
-        unsafe { &*self.trace_info.get() }
+    /// Backend-static side-table read (Session 5i-cl).  Returns the
+    /// owned `CompiledTraceInfo` clone, or `None` when no trace info
+    /// has been registered for this descr.
+    pub fn trace_info_ref(&self) -> Option<CompiledTraceInfo> {
+        lookup_trace_info(self as *const Self as usize)
     }
 
     #[inline]
@@ -636,8 +681,11 @@ impl CraneliftFailDescr {
         self.source_op_index = Some(source_op_index);
     }
 
-    pub fn set_trace_info(&self, trace_info: CompiledTraceInfo) {
-        unsafe { *self.trace_info.get() = Some(trace_info) };
+    /// Backend-static side-table write (Session 5i-cl).  Callers are
+    /// `compile_loop` (codegen finaliser) and
+    /// `overlay_deadframe_fail_descr` (CALL_ASSEMBLER prefix overlay).
+    pub fn set_trace_info(self: &Arc<Self>, trace_info: CompiledTraceInfo) {
+        register_trace_info(Arc::as_ptr(self) as usize, trace_info);
     }
 
     pub fn gc_map(&self) -> &GcMap {
@@ -707,7 +755,7 @@ impl CraneliftFailDescr {
             fail_index: self.fail_index,
             source_op_index: self.source_op_index,
             trace_id: <Self as FailDescr>::trace_id(self),
-            trace_info: unsafe { &*self.trace_info.get() }.clone(),
+            trace_info: lookup_trace_info(self as *const Self as usize),
             fail_arg_types: fail_arg_types.to_vec(),
             is_finish: self.is_finish,
             gc_ref_slots,
