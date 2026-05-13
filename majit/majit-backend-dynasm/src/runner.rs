@@ -578,6 +578,18 @@ pub struct DynasmBackend {
     /// is the ptr-indexed view needed to complete that lookup.
     fail_descr_registry:
         Arc<std::sync::Mutex<std::collections::HashMap<usize, Arc<crate::guard::DynasmFailDescr>>>>,
+    /// Backend-internal side-table mapping a source guard descr's
+    /// `Arc::as_ptr` address to the entry pointer of the compiled bridge
+    /// patched in for that guard.  Replaces the prior `bridge_addr` field
+    /// on `DynasmFailDescr` — PyPy's `AbstractFailDescr._attrs_`
+    /// (`history.py:132`) carries no `bridge_addr` slot; once a bridge is
+    /// patched in, RPython relies on the in-place machine-code JMP and
+    /// recovers structural state from `asmmemmgr_blocks`.  Pyre's
+    /// metainterp queries `store_bridge_guard_hashes` /
+    /// `compiled_bridge_fail_descr_layouts` need to walk back from a
+    /// source descr to its bridge `CompiledCode`; this table is the
+    /// indirection that lets us do that without polluting the descr.
+    bridge_addr_by_descr: Arc<std::sync::Mutex<std::collections::HashMap<usize, usize>>>,
 }
 
 impl DynasmBackend {
@@ -648,7 +660,34 @@ impl DynasmBackend {
                 crate::guard::CpuDescrAttachments::default(),
             )),
             fail_descr_registry: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+            bridge_addr_by_descr: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
+    }
+
+    /// Bridge entry-pointer registration keyed on the source guard
+    /// descr's `Arc::as_ptr` address.  Called from `compile_bridge`
+    /// immediately after `patch_jump_for_descr` redirects the source
+    /// guard at `runner.rs::compile_bridge` to point at the freshly
+    /// compiled bridge.  Replaces the previous `descr.set_bridge_addr`
+    /// write on `DynasmFailDescr`.
+    pub fn register_bridge_addr(&self, source_descr_ptr: usize, bridge_addr: usize) {
+        self.bridge_addr_by_descr
+            .lock()
+            .expect("bridge_addr_by_descr mutex poisoned")
+            .insert(source_descr_ptr, bridge_addr);
+    }
+
+    /// Bridge entry-pointer lookup by source descr `Arc::as_ptr` address.
+    /// Returns `0` when no bridge has been registered for the source
+    /// (PyPy parity: `assembler.py` treats `adr_jump_offset == 0`
+    /// uniformly as "patched / no entry").
+    pub fn lookup_bridge_addr(&self, source_descr_ptr: usize) -> usize {
+        self.bridge_addr_by_descr
+            .lock()
+            .expect("bridge_addr_by_descr mutex poisoned")
+            .get(&source_descr_ptr)
+            .copied()
+            .unwrap_or(0)
     }
 
     /// Test helper: attach synthetic per-cpu `DoneWithThisFrame*` +
@@ -1679,7 +1718,7 @@ impl Backend for DynasmBackend {
         } else if crate::majit_log_enabled() {
             eprintln!("[dynasm-bridge] WARNING: adr_jump_offset=0, bridge NOT patched!");
         }
-        guard_descr.set_bridge_addr(bridge_addr);
+        self.register_bridge_addr(Arc::as_ptr(&guard_descr) as usize, bridge_addr);
 
         // llmodel.py:252 asmmemmgr_blocks parity: store the entire
         // bridge CompiledCode on the owning loop token. This keeps
@@ -1783,11 +1822,11 @@ impl Backend for DynasmBackend {
         // Debug: verify bridge patches are visible
         if crate::majit_log_enabled() {
             for descr in &compiled.fail_descrs {
-                if descr.bridge_addr() != 0 && descr.adr_jump_offset() == 0 {
+                let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(descr) as usize);
+                if bridge_addr != 0 && descr.adr_jump_offset() == 0 {
                     eprintln!(
                         "[dynasm] bridge-patched guard fi={} bridge_addr={:#x} ajo=0 (patched)",
-                        descr.fail_index,
-                        descr.bridge_addr()
+                        descr.fail_index, bridge_addr
                     );
                 }
             }
@@ -2151,7 +2190,7 @@ impl Backend for DynasmBackend {
         hashes: &[u64],
     ) {
         let source_descr = Self::find_descr(token, source_trace_id, source_fail_index);
-        let bridge_addr = source_descr.bridge_addr();
+        let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as usize);
         if bridge_addr == 0 {
             return;
         }
@@ -2692,7 +2731,7 @@ impl Backend for DynasmBackend {
         // `compiler.rs:11723 compiled_bridge_fail_descr_layouts`.
         let source_descr =
             Self::try_find_descr(original_token, source_trace_id, source_fail_index)?;
-        let bridge_addr = source_descr.bridge_addr();
+        let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as usize);
         if bridge_addr == 0 {
             return None;
         }

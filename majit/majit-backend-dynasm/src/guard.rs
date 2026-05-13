@@ -76,13 +76,12 @@ pub struct DynasmFailDescr {
     /// without `mk_op_with_descr`).  Session 7 will remove this slot
     /// once `DynasmFailDescr` itself is collapsed into the meta side.
     pub adr_jump_offset: UnsafeCell<usize>,
-
-    /// Bridge code pointer (if a bridge has been compiled for this guard).
-    /// Unlike Cranelift, we don't need bridge data — the machine code is
-    /// patched in place to jump directly to the bridge.
-    pub bridge_addr: UnsafeCell<usize>,
     // fail_args_slots removed: bridge source_slots are derived from
     // fail_arg_locs via rebuild_faillocs_from_descr (assembler.py:201).
+    // bridge_addr removed (Session 5f): not in PyPy `AbstractFailDescr._attrs_`
+    // (`history.py:132`).  Pyre's backend-internal bridge-entry lookup
+    // moved to `DynasmBackend::bridge_addr_by_descr` side-table keyed on
+    // the source descr's `Arc::as_ptr` address.
     /// `compile.py:186` `descr.rd_loop_token = clt` line-by-line port:
     /// the owning `Arc<CompiledLoopToken>` itself. Set by
     /// `record_loop_or_bridge` (compile.py:171-211 walker).  Together
@@ -145,7 +144,6 @@ impl DynasmFailDescr {
             recovery_layout: UnsafeCell::new(None),
             status: AtomicU64::new(0),
             adr_jump_offset: UnsafeCell::new(0),
-            bridge_addr: UnsafeCell::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             meta_descr: None,
         }
@@ -257,21 +255,6 @@ impl DynasmFailDescr {
         unsafe { *self.rd_locs.get() = locs };
     }
 
-    /// Check if a bridge has been patched for this guard.
-    pub fn has_bridge(&self) -> bool {
-        unsafe { *self.bridge_addr.get() != 0 }
-    }
-
-    /// Read the compiled bridge entry address.
-    pub fn bridge_addr(&self) -> usize {
-        unsafe { *self.bridge_addr.get() }
-    }
-
-    /// Set the bridge address after patching.
-    pub fn set_bridge_addr(&self, addr: usize) {
-        unsafe { *self.bridge_addr.get() = addr };
-    }
-
     /// Read the recovery_layout.
     pub fn recovery_layout(&self) -> Option<ExitRecoveryLayout> {
         unsafe { &*self.recovery_layout.get() }.clone()
@@ -347,7 +330,6 @@ impl std::fmt::Debug for DynasmFailDescr {
             .field("is_finish", &self.is_finish)
             .field("status", &self.get_status())
             .field("adr_jump_offset", &self.adr_jump_offset())
-            .field("has_bridge", &self.has_bridge())
             .finish()
     }
 }

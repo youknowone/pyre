@@ -769,20 +769,6 @@ mod tests {
         ptr
     }
 
-    // Placeholder bridge body referenced by `set_bridge_addr` in
-    // `test_helper_trampoline_does_not_execute_bridge`.  `call_assembler_helper_trampoline`
-    // never invokes bridges (they're executed via patched guard jumps,
-    // not the helper), so this body is unreachable in the test — the
-    // descr value written here is arbitrary and its identity is never
-    // classified against a cpu's attachments.
-    extern "C" fn test_bridge_finish_int(jf: *mut jitframe::JitFrame) -> *mut jitframe::JitFrame {
-        unsafe {
-            llmodel::set_latest_descr(jf, 0xFEEDBEEF);
-            llmodel::set_int_value(jf, 0, 321);
-        }
-        jf
-    }
-
     // ── Bug 1 regression: unresolved target must not dereference result as pointer ──
     // The old code let the helper return value flow into `mov rdx, rax; mov rcx, [rdx]`
     // which dereferenced an integer as a pointer. This test verifies the trampoline
@@ -833,6 +819,10 @@ mod tests {
     fn test_helper_trampoline_does_not_execute_bridge() {
         // compile.py:701 parity: helper does NOT re-enter bridges.
         // Bridges are executed via patched guard jumps, not the helper.
+        // Session 5f: `bridge_addr` moved off the descr to the backend
+        // side-table; the helper-trampoline path never queries that
+        // table, so this test simply confirms the trampoline returns
+        // the blackhole result (or 0) regardless of bridge presence.
         let descr = Arc::new(guard::DynasmFailDescr::new(
             3,
             17,
@@ -840,7 +830,6 @@ mod tests {
             false, // is_finish
             true,  // is_resume_guard
         ));
-        descr.set_bridge_addr(test_bridge_finish_int as *const () as usize);
         let descr_ptr = Arc::as_ptr(&descr) as usize;
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr, &[123, 0, 0, 0]) };
