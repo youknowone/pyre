@@ -7352,21 +7352,45 @@ impl CodeWriter {
                     .iter()
                     .zip(ssarepr.insns.iter())
                     .all(|(l, r)| insn_byte_equal(l, r));
-            if byte_equivalent {
+            if byte_equivalent
+                || std::env::var("PYRE_TASK_227_FORCE_DRAIN_SWAP").is_ok()
+            {
                 // Swap: per-block accumulator becomes the production
-                // source.  Byte-identical to the walker emit so
-                // downstream `compute_liveness` + `assemble` see no
-                // difference — but structurally, ssarepr.insns is now
-                // derived from `all_walker_blocks` iteration, matching
-                // `codewriter.py:53 flatten_graph`'s role as the
-                // SSARepr source of truth.
+                // source.  When byte_equivalent, the swap is invisible
+                // downstream.  Under `PYRE_TASK_227_FORCE_DRAIN_SWAP=1`
+                // the swap installs the block-grouped order regardless
+                // of equivalence — diagnostic for Phase 4 convergence
+                // (mirrors `codewriter.py:53 flatten_graph` shape).
                 ssarepr.insns = drained;
+            } else if std::env::var("PYRE_TASK_227_DRAIN_DIFF").is_ok() {
+                // Diagnostic: when the drain disagrees with the walker
+                // emit, log the first divergence position so the
+                // walker / per-block accumulator dual-write can be
+                // audited.  Production callers leave the env unset;
+                // probe runs surface the gap for the byte_equivalent=
+                // 100% convergence work (Task #227 Phase 4).
+                let diff_pos = drained
+                    .iter()
+                    .zip(ssarepr.insns.iter())
+                    .position(|(l, r)| !insn_byte_equal(l, r));
+                eprintln!(
+                    "[phase4-walker-drain] {} drain={} walker={} first_diff={:?}",
+                    code.obj_name,
+                    drained.len(),
+                    ssarepr.insns.len(),
+                    diff_pos,
+                );
+                if let Some(idx) = diff_pos {
+                    let lo = idx.saturating_sub(2);
+                    let hi = (idx + 3).min(drained.len());
+                    for i in lo..hi {
+                        eprintln!(
+                            "  [{i}] drain={:?} walker={:?}",
+                            &drained[i], &ssarepr.insns[i],
+                        );
+                    }
+                }
             }
-            // No swap on mismatch: walker emit stays as production
-            // source.  This is the critical correctness fallback —
-            // post-rebase, main's multi-jit_merge_point interaction
-            // with Task #227.5 walker per-block restructure can
-            // produce non-byte-equivalent drain orderings on fannkuch.
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
