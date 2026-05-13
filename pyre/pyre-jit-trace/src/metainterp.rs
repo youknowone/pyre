@@ -346,7 +346,15 @@ impl PyreMetaInterp {
                     !sym.last_exc_value.is_null() && sym.last_exc_box != OpRef::NONE
                 };
                 if has_exc {
-                    if let Some(action) = self.finishframe_exception(ctx) {
+                    // Single-frame finishframe_exception (called from the
+                    // inline trace step) already consumed any saved
+                    // reraise_lasti for the RERAISE-issuing frame (handler
+                    // push or no-handler last_instr restoration).  Multi-
+                    // frame escalation walks remaining frames whose handler
+                    // dispatch carries no lasti — match PyPy's
+                    // `pyopcode.handle_operation_error(reraise_lasti=-1)`
+                    // default.
+                    if let Some(action) = self.finishframe_exception(ctx, -1) {
                         return action;
                     }
                 }
@@ -607,8 +615,20 @@ impl PyreMetaInterp {
     /// frames that don't have one. Structurally matches RPython's
     /// `while self.framestack: ... self.popframe()` loop.
     ///
+    /// `reraise_lasti` mirrors `pypy/interpreter/pyopcode.py:122
+    /// handle_operation_error`'s like-named parameter: when non-negative it
+    /// is the original raise-site offset extracted by a RERAISE bytecode.
+    /// Per PyPy's single-call locality (`:181-184`), only the FIRST frame
+    /// visited consumes it — either for the handler-entry lasti push
+    /// (`:165-170`) or for the no-handler `last_instr` restoration
+    /// (`:181-184`).  Subsequent frames see -1.
+    ///
     /// Returns Some(LoopAction) if handled, None if all frames exhausted.
-    fn finishframe_exception(&mut self, ctx: &mut TraceCtx) -> Option<LoopAction> {
+    fn finishframe_exception(
+        &mut self,
+        ctx: &mut TraceCtx,
+        mut reraise_lasti: i32,
+    ) -> Option<LoopAction> {
         // RPython pyjitpl.py:2506: while self.framestack:
         while let Some(top) = self.framestack.last() {
             let code = unsafe {
@@ -688,12 +708,24 @@ impl PyreMetaInterp {
                 }
 
                 let lasti_obj = if lasti {
+                    // pyopcode.py:165-170 lasti push:
+                    //   if reraise_lasti >= 0:
+                    //       lasti_value = reraise_lasti
+                    //   else:
+                    //       lasti_value = intmask(self.last_instr)
+                    //   self.pushvalue(self.space.newint(lasti_value))
+                    //
                     // Python 3.11 exception-table adaptation: `push_lasti`
                     // pushes a real W_Int object onto `locals_cells_stack_w`.
                     // Route it through the common stack/vable mirror so the
                     // handler frame's `virtualizable_boxes` snapshot matches
                     // the concrete PyFrame stack.
-                    let lasti_obj = pyre_object::w_int_new(pc as i64);
+                    let lasti_value: i64 = if reraise_lasti >= 0 {
+                        reraise_lasti as i64
+                    } else {
+                        pc as i64
+                    };
+                    let lasti_obj = pyre_object::w_int_new(lasti_value);
                     let lasti_opref = ctx.const_ref(lasti_obj as i64);
                     let stack_idx = sym.valuestackdepth - sym.nlocals;
                     super::trace_opcode::write_stack_slot(
@@ -751,6 +783,27 @@ impl PyreMetaInterp {
                 let exc_box = sym.last_exc_box;
                 let exc_const = sym.class_of_last_exc_is_const;
 
+                // pyopcode.py:181-184 no-handler propagation, applied to
+                // the about-to-be-popped frame's concrete shadow:
+                //   if reraise_lasti >= 0:
+                //       self.last_instr = reraise_lasti
+                //   self.frame_finished_execution = True
+                //
+                // Per `:122` single-call locality, reraise_lasti is
+                // consumed here for the RERAISE-issuing frame; further
+                // iterations see -1 so parent frames behave as if their
+                // own `handle_operation_error(reraise_lasti=-1)` was
+                // called.
+                if let Some(top_mut) = self.framestack.last_mut() {
+                    if let Some(ref mut cf) = top_mut.owned_concrete_frame {
+                        if reraise_lasti >= 0 {
+                            cf.last_instr = reraise_lasti as isize;
+                        }
+                        cf.frame_finished_execution = true;
+                    }
+                }
+                reraise_lasti = -1;
+
                 // Pop the inline frame
                 let popped = self.framestack.pop().unwrap();
                 self.portal_call_depth -= 1;
@@ -793,6 +846,23 @@ impl PyreMetaInterp {
             let exc_opref = sym.last_exc_box;
             if majit_metainterp::majit_log_enabled() {
                 eprintln!("[jit][finishframe_exception] root frame, no handler → FINISH");
+            }
+            // pyopcode.py:181-184 applied to the root concrete frame
+            // before FINISH escapes the trace.  Mirror the same shape as
+            // the inline-pop branch: if this root frame was the RERAISE
+            // origin, restore `last_instr`; either way, set
+            // `frame_finished_execution = True` so the dead frame surfaces
+            // the same flag state the interpreter would.
+            {
+                let concrete_frame_ptr =
+                    sym.concrete_vable_ptr as *mut pyre_interpreter::pyframe::PyFrame;
+                if !concrete_frame_ptr.is_null() {
+                    let cf = unsafe { &mut *concrete_frame_ptr };
+                    if reraise_lasti >= 0 {
+                        cf.last_instr = reraise_lasti as isize;
+                    }
+                    cf.frame_finished_execution = true;
+                }
             }
             // pyjitpl.py:3239: self.store_token_in_vable()
             // Record SetfieldGc on vable_token + GUARD_NOT_FORCED_2 with

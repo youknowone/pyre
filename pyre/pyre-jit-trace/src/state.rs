@@ -6500,11 +6500,7 @@ mod tests {
             &mut ctx,
             &mut sym,
             &[
-                (
-                    non_int_opref,
-                    ConcreteValue::Ref(exc),
-                    majit_ir::Type::Ref,
-                ),
+                (non_int_opref, ConcreteValue::Ref(exc), majit_ir::Type::Ref),
                 (exc_opref, ConcreteValue::Ref(exc), majit_ir::Type::Ref),
             ],
         );

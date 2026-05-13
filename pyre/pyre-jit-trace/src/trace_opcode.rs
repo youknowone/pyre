@@ -6178,12 +6178,7 @@ impl MIFrame {
     /// like-named parameter: when non-negative it is the original raise-site
     /// offset the RERAISE bytecode extracted from the stack via
     /// `pyopcode.py:1361 self.space.int_w(self.peekvalue(oparg))`.
-    fn handle_reraise(
-        &mut self,
-        code: &CodeObject,
-        pc: usize,
-        reraise_lasti: i32,
-    ) -> TraceAction {
+    fn handle_reraise(&mut self, code: &CodeObject, pc: usize, reraise_lasti: i32) -> TraceAction {
         let s = self.sym();
         if s.last_exc_value.is_null() || s.last_exc_box == OpRef::NONE {
             return TraceAction::Abort;
@@ -6377,11 +6372,16 @@ impl MIFrame {
             // `handle_exception` will continue propagation through parent
             // frames, so the RERAISE-issuing frame's `last_instr` must be
             // restored here for `f_lineno` to report the original raise
-            // site rather than the RERAISE site.
-            if reraise_lasti >= 0 {
+            // site rather than the RERAISE site, and `frame_finished_execution`
+            // must mirror PyPy so anything inspecting the dead frame (clear,
+            // generator close, traceback walkers) sees the same flag state.
+            {
                 let frame =
                     unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::PyFrame) };
-                frame.last_instr = reraise_lasti as isize;
+                if reraise_lasti >= 0 {
+                    frame.last_instr = reraise_lasti as isize;
+                }
+                frame.frame_finished_execution = true;
             }
             // No handler in this frame — return Abort so metainterp's
             // multi-frame finishframe_exception can pop this frame and
@@ -6503,9 +6503,7 @@ impl MIFrame {
                 return InlineTraceStepAction::Trace(TraceAction::Abort);
             }
             if self.sym().last_exc_box != OpRef::NONE {
-                return InlineTraceStepAction::Trace(
-                    self.handle_reraise(code, pc, reraise_lasti),
-                );
+                return InlineTraceStepAction::Trace(self.handle_reraise(code, pc, reraise_lasti));
             }
             // Same rationale as root dispatcher: abort RERAISE-with-saved-
             // lasti when the trace lacks a tracked exception box (generic
@@ -7352,14 +7350,15 @@ impl OpcodeStepExecutor for MIFrame {
             // branch detects `oparg != 0 && reraise_lasti < 0` and routes
             // to the interpreter via `TraceAction::Abort`.
             let s = self.sym();
-            match s.valuestackdepth.checked_sub(s.nlocals + oparg as usize + 1) {
+            match s
+                .valuestackdepth
+                .checked_sub(s.nlocals + oparg as usize + 1)
+            {
                 Some(stack_idx) => match s.concrete_stack.get(stack_idx).copied() {
                     Some(crate::state::ConcreteValue::Int(v)) => v as i32,
                     Some(crate::state::ConcreteValue::Ref(obj))
                         if !obj.is_null() && unsafe { pyre_object::is_int(obj) } =>
-                    {
-                        unsafe { pyre_object::w_int_get_value(obj) as i32 }
-                    }
+                    unsafe { pyre_object::w_int_get_value(obj) as i32 },
                     _ => -1,
                 },
                 None => -1,
@@ -7368,12 +7367,24 @@ impl OpcodeStepExecutor for MIFrame {
             -1
         };
         // pyopcode.py:1364 — w_exc = self.popvalue()
+        //
+        // PyPy's `popvalue()` returns the concrete W_Root that was on TOS;
+        // type validation and OperationError construction run against THAT
+        // object (`:1367-1369`).  Our `pop_value` returns the symbolic
+        // OpRef only — the concrete is in `concrete_stack[TOS]`.  Snapshot
+        // the TOS concrete first, then pop, then validate.  Matching the
+        // popped value (not `sym.last_exc_value`) keeps trace semantics
+        // identical to PyPy even when the stack and the tracker drift
+        // (malformed bytecode or a buggy upstream opcode).
+        let w_exc: PyObjectRef = {
+            let s = self.sym();
+            s.valuestackdepth
+                .checked_sub(s.nlocals + 1)
+                .and_then(|idx| s.concrete_stack.get(idx).copied())
+                .map(|cv| cv.to_pyobj())
+                .unwrap_or(pyre_object::PY_NULL)
+        };
         let _ = self.with_ctx(|this, ctx| this.pop_value(ctx))?;
-        // The popped value's identity is cached in `sym.last_exc_value`
-        // (seeded by PUSH_EXC_INFO / GUARD_EXCEPTION), so the type check
-        // and PyError construction read from there rather than re-deriving
-        // the concrete from the popped symbolic slot.
-        let w_exc = self.sym().last_exc_value;
         // pyopcode.py:1367 — w_value = space.interp_w(W_BaseException, w_exc)
         if w_exc.is_null() || !unsafe { pyre_object::is_exception(w_exc) } {
             return Err(PyError::type_error(
