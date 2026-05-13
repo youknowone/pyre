@@ -145,9 +145,11 @@ pub struct CraneliftFailDescr {
     pub status: std::sync::atomic::AtomicU64,
     /// Number of times this guard has failed (for bridge compilation heuristics).
     pub fail_count: AtomicU32,
-    /// schedule.py:654-655 / history.py:143-147 — vector guard metadata
-    /// copied from the frontend fail descriptor during lowering.
-    pub vector_info: Vec<AccumInfo>,
+    // `history.py:132` `AbstractFailDescr._attrs_` `rd_vector_info` —
+    // the canonical store lives on the metainterp `AbstractFailDescr`
+    // (`majit-metainterp/src/compile.rs`), reached via `meta_descr`.
+    // The previous backend-local `vector_info: Vec<AccumInfo>` slot was
+    // dead — initialized empty at construction, never written.
     /// Compiled bridge attached to this guard, if any.
     /// Write-once when bridge is compiled, read-only after.
     /// No lock — RPython compile.py attach_bridge has no lock (GIL).
@@ -195,14 +197,15 @@ pub struct CraneliftFailDescr {
     /// matching RPython's `descr.rd_loop_token.loop_token_wref()`
     /// access (`pyjitpl.py:2897`).
     pub rd_loop_token_clt: UnsafeCell<Option<std::sync::Arc<majit_backend::CompiledLoopToken>>>,
-    /// Unified-Descr Port Epic Session 5a: back-pointer to the metainterp
-    /// `ResumeGuardDescr` Arc the optimizer stamped onto the originating
-    /// guard op (`op.descr`).  PyPy keeps a single descr object per
-    /// guard (`history.py:121`); pyre's split-descr architecture stores
-    /// this Arc as a back-pointer so subsequent Session 5b/c/d can
-    /// migrate readers of duplicated fields (`rd_numb`/`rd_consts`/
-    /// `rd_virtuals`/`rd_pendingfields`/`fail_arg_types` etc.) to read
-    /// through the metainterp Arc instead of the local copy.
+    /// Back-pointer to the metainterp `ResumeGuardDescr` Arc the
+    /// optimizer stamped onto the originating guard op (`op.descr`).
+    /// PyPy keeps a single descr object per guard (`history.py:121`);
+    /// pyre's transitional split-descr stores this Arc as a back-pointer
+    /// so backend accessors forward `rd_numb`/`rd_consts`/`rd_virtuals`/
+    /// `rd_pendingfields`/`fail_arg_types`/`status`/`rd_loop_token`/
+    /// `rd_vector_info` to the metainterp `AbstractFailDescr`
+    /// (`history.py:132 _attrs_`).  The final Unified-Descr endpoint
+    /// collapses `CraneliftFailDescr` into the metainterp descr.
     ///
     /// `None` for synthetic backend descrs minted by the runtime
     /// classifier (`compiler.rs::find_descr_by_ptr` for FINISH /
@@ -230,7 +233,6 @@ impl std::fmt::Debug for CraneliftFailDescr {
             .field("trace_info", unsafe { &*self.trace_info.get() })
             .field("recovery_layout", unsafe { &*self.recovery_layout.get() })
             .field("fail_count", &self.fail_count.load(Ordering::Relaxed))
-            .field("vector_info", &self.vector_info)
             .field("has_bridge", &unsafe { &*self.bridge.get() }.is_some())
             .finish()
     }
@@ -319,7 +321,6 @@ impl CraneliftFailDescr {
             recovery_layout: UnsafeCell::new(recovery_layout),
             status: std::sync::atomic::AtomicU64::new(0),
             fail_count: AtomicU32::new(0),
-            vector_info: Vec::new(),
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
             bridge_frame_depth_cache: std::sync::atomic::AtomicUsize::new(0),
@@ -359,7 +360,6 @@ impl CraneliftFailDescr {
             recovery_layout: UnsafeCell::new(recovery_layout),
             status: std::sync::atomic::AtomicU64::new(0),
             fail_count: AtomicU32::new(0),
-            vector_info: Vec::new(),
             bridge: UnsafeCell::new(None),
             bridge_code_ptr_cache: std::sync::atomic::AtomicUsize::new(0),
             bridge_frame_depth_cache: std::sync::atomic::AtomicUsize::new(0),
@@ -765,17 +765,14 @@ impl FailDescr for CraneliftFailDescr {
 
     fn vector_info(&self) -> Vec<AccumInfo> {
         // `history.py:132` `AbstractFailDescr._attrs_` `rd_vector_info`
-        // — prefer the metainterp-side slot when meta_descr is attached.
-        // The backend `vector_info: Vec<AccumInfo>` slot is a pyre-only
-        // transitional fallback; the canonical store lives on the
-        // metainterp `AbstractFailDescr`.
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            let chain = meta_fd.vector_info();
-            if !chain.is_empty() {
-                return chain;
-            }
-        }
-        self.vector_info.clone()
+        // — the canonical store lives on the metainterp
+        // `AbstractFailDescr`, reached via `meta_descr`.  Synthetic /
+        // FINISH descrs without a `meta_descr` carry no vector info.
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map(|fd| fd.vector_info())
+            .unwrap_or_default()
     }
 
     fn get_status(&self) -> u64 {
