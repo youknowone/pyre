@@ -7343,20 +7343,30 @@ impl CodeWriter {
             }
         }
 
-        // Task #227.4 feature-gated production flip experiment.  When
-        // `PYRE_TASK_227_FLIP_DRAIN=1`, replace the walker-emitted
-        // program-wide `ssarepr.insns` with the per-block accumulator
-        // drained in either walker-visit order (default) or graph-DFS
-        // order (`PYRE_TASK_227_FLIP_DRAIN_DFS=1`) for the upstream-
-        // orthodox `flatten_graph(graph, regallocs, cpu)` ordering
-        // matching `codewriter.py:53` + `flatten.py:67-70` block
-        // iteration.  For benches where the drain reports
-        // `byte_equivalent=true` against `ssarepr.insns`, the swap is
-        // a byte-identical replacement that proves the per-block
-        // accumulator can BE production input to `compute_liveness`
-        // + `assemble`.  Falls back to walker emit on mismatch so
-        // production stays correct.
-        if std::env::var("PYRE_TASK_227_FLIP_DRAIN").is_ok() {
+        // Task #227.4 production flip: drain per-block accumulators
+        // and swap into `ssarepr.insns` when the drained stream
+        // byte-matches the walker emit exactly.  For benches with
+        // simple control flow (no walker re-entry) this makes the
+        // per-block accumulator the production source — the
+        // upstream-orthodox model matching `codewriter.py:53`
+        // (`flatten_graph(graph, regallocs, cpu)` → `compute_liveness`
+        // → `assemble`).
+        //
+        // The conditional swap (only when `byte_equivalent=true`)
+        // preserves production correctness: benches with walker
+        // re-entry (PC-sequential walker bouncing back into earlier
+        // blocks via `mergeblock` joinpoint match) produce
+        // non-byte-equivalent drain orderings; on those, the walker
+        // emit stays as the production source until the per-block
+        // contiguous walker restructure (Task #227.5) retires the
+        // re-entry path.
+        //
+        // `PYRE_TASK_227_FLIP_DRAIN_DFS=1` env switches drain order
+        // from walker-visit to `graph.iterblocks()` DFS order
+        // (`flowspace/model.py:66-77`); both orderings agree with
+        // ssarepr.insns on benches where walker emission is per-
+        // block contiguous, so the env is purely diagnostic.
+        {
             let use_dfs = std::env::var("PYRE_TASK_227_FLIP_DRAIN_DFS").is_ok();
             let drained: Vec<super::flatten::Insn> = if use_dfs {
                 // Map each BlockRef (Rc pointer identity) to its
@@ -7396,22 +7406,21 @@ impl CodeWriter {
                     .zip(ssarepr.insns.iter())
                     .all(|(l, r)| insn_byte_equal(l, r));
             if byte_equivalent {
-                eprintln!(
-                    "[phase4-flip-drain] {} order={} swapping {} ssarepr insns -> drained per-block",
-                    code.obj_name,
-                    if use_dfs { "dfs" } else { "walker" },
-                    ssarepr.insns.len(),
-                );
+                // Swap: per-block accumulator is now the production
+                // source.  Byte-identical to the walker emit so
+                // downstream `compute_liveness` + `assemble` see no
+                // difference — but structurally, ssarepr.insns is now
+                // derived from `graph.iterblocks()` / `all_walker_blocks`
+                // iteration, matching `codewriter.py:53 flatten_graph`'s
+                // role as the SSARepr source of truth.
                 ssarepr.insns = drained;
-            } else {
-                eprintln!(
-                    "[phase4-flip-drain] {} order={} drain not byte_equivalent (drained={} ssarepr={}); leaving walker emit in place",
-                    code.obj_name,
-                    if use_dfs { "dfs" } else { "walker" },
-                    drained.len(),
-                    ssarepr.insns.len(),
-                );
+                let _ = use_dfs;
             }
+            // No swap on mismatch: walker emit stays as production
+            // source.  Diagnostic env `PYRE_TASK_227_DRAIN_PROBE=1`
+            // reports the first-diff position so the per-block
+            // contiguous walker restructure (Task #227.5) can target
+            // the specific re-entry that produced the mismatch.
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
