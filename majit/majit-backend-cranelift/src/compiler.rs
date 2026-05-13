@@ -13189,7 +13189,6 @@ fn collect_guards(
             Vec::new()
         };
         descr.set_source_op_index(op_idx);
-        descr.green_key = header_pc;
         // Unified-Descr Port Epic Session 5b: capture the metainterp
         // ResumeGuardDescr Arc.  rd_numb/rd_consts/rd_virtuals/
         // rd_pendingfields readers (FailDescr trait impl) forward
