@@ -1004,12 +1004,18 @@ fn make_next_block(
     next_offset: usize,
     link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
     pendingblocks: &mut VecDeque<SpamBlockRef>,
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) -> SpamBlockRef {
     let mut fresh = |kind| fresh_variable_for_state(graph, kind);
     let mut newstate = currentstate.copy(&mut fresh);
     newstate.blocklist = frame_blocks_for_offset(code, next_offset);
     newstate.next_offset = next_offset;
     let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
+    // Task #227.3 SpamBlockRef enumeration — track every walker-
+    // created block in walker-visit order so the post-walk drain
+    // probe (`[phase4-walker-drain]`) can iterate per-block
+    // accumulators byte-equivalent to program-wide `ssarepr.insns`.
+    all_walker_blocks.push(newblock.clone());
     newblock.block().borrow_mut().inputargs = newstate.getvariables();
     append_exit_with_state(
         &currentblock.block(),
@@ -1031,6 +1037,7 @@ fn mergeblock(
     next_offset: usize,
     link_exit_states: &mut HashMap<super::flow::LinkRef, FrameState>,
     pendingblocks: &mut VecDeque<SpamBlockRef>,
+    all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) -> SpamBlockRef {
     let candidates = joinpoints.entry(next_offset).or_default();
     for index in 0..candidates.len() {
@@ -1082,6 +1089,9 @@ fn mergeblock(
             }
         }
         let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
+        // Task #227.3 SpamBlockRef enumeration — record the
+        // supersede-newblock in walker-visit order.
+        all_walker_blocks.push(newblock.clone());
         newblock.block().borrow_mut().inputargs = newstate.getvariables();
         append_exit_with_state(
             &currentblock.block(),
@@ -1132,6 +1142,7 @@ fn mergeblock(
         next_offset,
         link_exit_states,
         pendingblocks,
+        all_walker_blocks,
     );
     candidates.insert(0, newblock.clone());
     newblock
@@ -3282,18 +3293,27 @@ impl CodeWriter {
         // onto slots.  Keyed on `LinkRef` (Rc-pointer identity).
         let mut link_exit_states: HashMap<super::flow::LinkRef, FrameState> = HashMap::new();
         let start_state = entry_frame_state(code, is_portal);
+        // Task #227.3 SpamBlockRef enumeration — collects every walker-
+        // created block in walker-visit order so the post-walk drain
+        // probe (`[phase4-walker-drain]`) can iterate per-block
+        // accumulators and verify byte-equivalence with `ssarepr.insns`.
+        // Walker-visit order matches the order in which `ssarepr.insns`
+        // received their emits, since each block's per-block accumulator
+        // received pushes contiguously between the block's first
+        // `emit_mark_label_pc!` and its terminator.
+        let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
         if num_instrs > 0 {
             let start_block =
                 SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
+            all_walker_blocks.push(start_block.clone());
             joinpoints.insert(0, vec![start_block]);
         }
         let mut catch_landing_blocks: HashMap<u16, SpamBlockRef> =
             HashMap::with_capacity(catch_sites.len());
         for site in &catch_sites {
-            catch_landing_blocks.insert(
-                site.landing_label,
-                SpamBlockRef::new(graph.new_block(Vec::new()), None),
-            );
+            let landing = SpamBlockRef::new(graph.new_block(Vec::new()), None);
+            all_walker_blocks.push(landing.clone());
+            catch_landing_blocks.insert(site.landing_label, landing);
         }
         // The walker emits into `current_block`; `emit_mark_label_pc!` and
         // `emit_mark_label_catch_landing!` reassign it as the walker enters
@@ -3304,7 +3324,10 @@ impl CodeWriter {
             .get(&0)
             .and_then(|blocks| blocks.first().cloned())
             .unwrap_or_else(|| {
-                SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()))
+                let synthetic =
+                    SpamBlockRef::new(graph.startblock.clone(), Some(start_state.clone()));
+                all_walker_blocks.push(synthetic.clone());
+                synthetic
             });
         let mut current_state = current_block
             .framestate()
@@ -3654,6 +3677,7 @@ impl CodeWriter {
                     target_py_pc,
                     &mut link_exit_states,
                     &mut pendingblocks,
+                    &mut all_walker_blocks,
                 );
                 needs_fallthrough = false;
             }};
@@ -3878,6 +3902,7 @@ impl CodeWriter {
                         py_pc,
                         &mut link_exit_states,
                         &mut pendingblocks,
+                        &mut all_walker_blocks,
                     )
                 } else if let Some(target) = joinpoints
                     .get(&py_pc)
@@ -4099,6 +4124,7 @@ impl CodeWriter {
                     py_pc,
                     &mut link_exit_states,
                     &mut pendingblocks,
+                    &mut all_walker_blocks,
                 );
             }};
         }
@@ -4134,6 +4160,7 @@ impl CodeWriter {
                     py_pc,
                     &mut link_exit_states,
                     &mut pendingblocks,
+                    &mut all_walker_blocks,
                 );
             }};
         }
@@ -4910,6 +4937,11 @@ impl CodeWriter {
                             graph_args,
                             py_pc as i64,
                         );
+                        // Task #227.3 capture-before/after-len so the
+                        // GraphFlattener-mediated push lands in both
+                        // `ssarepr.insns` AND `current_block`'s per-
+                        // block accumulator.
+                        let pre_len = ssarepr.insns.len();
                         GraphFlattener::new_with_constant_lowering(
                             &mut ssarepr,
                             |v: super::flow::Variable| {
@@ -4946,6 +4978,11 @@ impl CodeWriter {
                             },
                         )
                         .emit_space_operation(&graph_op);
+                        // Task #227.3 mirror GraphFlattener-mediated
+                        // jit_merge_point emit into per-block accumulator.
+                        for insn in ssarepr.insns[pre_len..].iter().cloned() {
+                            current_block.push_insn(insn);
+                        }
                     }
                 }
 
@@ -5682,13 +5719,15 @@ impl CodeWriter {
                         // `emit_residual_call_shape` output.  Graph
                         // carries only the `bool(cond_value)` HLOp
                         // from `emit_frontend_bool` above.
-                        ssarepr
-                            .insns
-                            .push(super::flatten::build_truth_fn_residual_call_r_i_insn(
+                        push_walker_emit(
+                            &mut ssarepr,
+                            &current_block,
+                            super::flatten::build_truth_fn_residual_call_r_i_insn(
                                 truth_fn_idx,
                                 cond_reg,
                                 scratch_truth,
-                            ));
+                            ),
+                        );
                         if target_py_pc < num_instrs {
                             emit_goto_if_not!(ssarepr, scratch_truth, target_py_pc);
                             set_last_bool_exitcase(&current_block.block(), false);
@@ -5734,13 +5773,15 @@ impl CodeWriter {
                         // retirement (sibling of the PopJumpIfFalse
                         // closure above) — same `(Ref) → Int` shape
                         // helper, same probe coverage.
-                        ssarepr
-                            .insns
-                            .push(super::flatten::build_truth_fn_residual_call_r_i_insn(
+                        push_walker_emit(
+                            &mut ssarepr,
+                            &current_block,
+                            super::flatten::build_truth_fn_residual_call_r_i_insn(
                                 truth_fn_idx,
                                 cond_reg,
                                 scratch_truth,
-                            ));
+                            ),
+                        );
                         // `flatten.py:244-267` for a Bool exitswitch always
                         // emits generic `goto_if_not cond, TLabel(linkfalse)`
                         // + inline `make_link(linktrue)`.
@@ -7184,6 +7225,66 @@ impl CodeWriter {
             depth += 1;
             emit_vsd!(depth);
             emit_goto!(ssarepr, site.handler_py_pc);
+        }
+
+        // Task #227.3 `[phase4-walker-drain]` probe: drain per-block
+        // accumulators in walker-visit order and assert byte-equality
+        // with the program-wide `ssarepr.insns` slice the walker
+        // produced.  Walker-visit order is the order in which each
+        // SpamBlockRef was created (matches `all_walker_blocks` push
+        // ordering at SpamBlockRef::new sites in
+        // `transform_graph_to_jitcode` + `mergeblock` +
+        // `make_next_block`).  Block-entry labels are pushed to the
+        // per-block accumulator inside `emit_mark_label_pc!` /
+        // `emit_mark_label_catch_landing!` after `current_block`
+        // switches, so a block's per_block_ssarepr captures exactly
+        // the insn slice the walker emitted while standing in it.
+        //
+        // A byte_equivalent=true reading across all 14 production
+        // benches is the precondition for Task #227.4 (production
+        // flip: drop the program-wide push, drain per-block
+        // accumulators in graph-DFS order, feed the concatenated
+        // stream to `compute_liveness` + `assemble`).  Until then,
+        // production reads from `ssarepr.insns`; the drain only
+        // informs the probe.
+        if std::env::var("PYRE_TASK_227_DRAIN_PROBE").is_ok() {
+            let mut drained: Vec<super::flatten::Insn> = Vec::new();
+            for block in all_walker_blocks.iter() {
+                drained.extend(block.per_block_ssarepr());
+            }
+            let byte_equivalent = drained.len() == ssarepr.insns.len()
+                && drained
+                    .iter()
+                    .zip(ssarepr.insns.iter())
+                    .all(|(l, r)| insn_byte_equal(l, r));
+            eprintln!(
+                "[phase4-walker-drain] {} blocks={} drained={} ssarepr={} byte_equivalent={}",
+                code.obj_name,
+                all_walker_blocks.len(),
+                drained.len(),
+                ssarepr.insns.len(),
+                byte_equivalent,
+            );
+            if !byte_equivalent {
+                let limit = drained.len().min(ssarepr.insns.len());
+                for i in 0..limit {
+                    if !insn_byte_equal(&drained[i], &ssarepr.insns[i]) {
+                        eprintln!(
+                            "[phase4-walker-drain]   {} first-diff pos={i} drain={:?} ssarepr={:?}",
+                            code.obj_name, drained[i], ssarepr.insns[i],
+                        );
+                        break;
+                    }
+                }
+                if drained.len() != ssarepr.insns.len() {
+                    eprintln!(
+                        "[phase4-walker-drain]   {} length mismatch drained={} ssarepr={}",
+                        code.obj_name,
+                        drained.len(),
+                        ssarepr.insns.len(),
+                    );
+                }
+            }
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
@@ -10936,6 +11037,7 @@ mod tests {
         joinpoints.insert(1, vec![target_block.clone()]);
         let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
+        let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
 
         let merged = mergeblock(
             &code,
@@ -10946,6 +11048,7 @@ mod tests {
             1,
             &mut link_exit_states,
             &mut pendingblocks,
+            &mut all_walker_blocks,
         );
 
         assert_eq!(merged, target_block);
@@ -11002,6 +11105,7 @@ mod tests {
         joinpoints.insert(2, vec![existing_block.clone()]);
         let mut link_exit_states: HashMap<LinkRef, FrameState> = HashMap::new();
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
+        let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
 
         let merged = mergeblock(
             &code,
@@ -11012,6 +11116,7 @@ mod tests {
             2,
             &mut link_exit_states,
             &mut pendingblocks,
+            &mut all_walker_blocks,
         );
 
         assert_ne!(merged, existing_block);
