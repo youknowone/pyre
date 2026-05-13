@@ -741,7 +741,14 @@ impl DynasmBackend {
     /// token boundaries — required when a bridge JUMPs into another
     /// compiled loop and that loop's guard fires before control returns
     /// to the bridge's owning token.
-    fn register_fail_descrs(&self, descrs: &[Arc<crate::guard::DynasmFailDescr>]) {
+    /// Register backend `Arc<DynasmFailDescr>` instances into the
+    /// addr→Arc lookup table.  Called from `compile_loop` /
+    /// `compile_bridge` to populate after codegen; also called by test
+    /// helpers that stamp `meta_descr` late, to land the meta-keyed
+    /// entries that the in-codegen call missed because `meta_descr`
+    /// was unset.  Re-running is idempotent: existing entries are
+    /// preserved via `entry().or_insert_with`.
+    pub fn register_fail_descrs(&self, descrs: &[Arc<crate::guard::DynasmFailDescr>]) {
         let mut reg = self.fail_descr_registry.lock().unwrap();
         for descr in descrs {
             let ptr = Arc::as_ptr(descr) as usize;
@@ -1950,18 +1957,29 @@ impl Backend for DynasmBackend {
     }
 
     fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {
-        // `history.py:125` `cpu.get_latest_descr(deadframe)` — under the
-        // Unified-Descr Port Epic, this should return the metainterp
-        // `AbstractFailDescr` Arc reached via `meta_descr`.  The
-        // transition is gated by `register_fail_descrs` registering
-        // each backend Arc under BOTH addresses (backend data ptr +
-        // meta data ptr).  However, test paths and `build_guard_metadata`
-        // stamp `meta_descr` AFTER `register_fail_descrs` runs, so the
-        // meta-keyed entry never lands.  Until the dual-key
-        // registration is moved to follow `meta_descr` assignment (or
-        // re-registered on stamp), keep returning the backend Arc
-        // upcast — downstream `descr_addr` lookups stay valid.
+        // `history.py:125` `cpu.get_latest_descr(deadframe)` returns the
+        // metainterp `AbstractFailDescr` object op.descr stamped — the
+        // same descr identity PyPy returns.  Walk through the backend
+        // Arc's `meta_descr` back-pointer to recover it.
+        //
+        // `register_fail_descrs` dual-indexes by backend addr + meta
+        // addr; test helpers that stamp `meta_descr` late re-run
+        // `register_fail_descrs` to land the meta-keyed entry.
+        // Downstream `descr_addr = Arc::as_ptr(arc)` lookups resolve
+        // to the backend Arc via either key for status/start_compiling
+        // dispatch.  `ResumeGuardDescr::fail_index()` returns the
+        // per-trace key matching the backend's `fail_index` field
+        // (assembler.py:227 self.faildescr.index = i parity), so
+        // `exit_layouts.get(&fail_index)` lookups resolve identically
+        // for both meta and backend Arc identities.
+        //
+        // Synthetic backend descrs (FINISH / `PropagateExceptionDescr`
+        // / `ExitFrameWithExceptionDescr`) without a meta back-pointer
+        // fall back to the backend Arc upcast.
         let data = frame.data.downcast_ref::<FrameData>().unwrap();
+        if let Some(meta) = data.fail_descr.meta_descr.clone() {
+            return meta;
+        }
         Arc::clone(&data.fail_descr) as Arc<dyn majit_ir::Descr>
     }
 

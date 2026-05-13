@@ -2939,15 +2939,23 @@ pub fn get_latest_descr_from_deadframe(frame: &DeadFrame) -> Result<&dyn FailDes
 pub fn get_latest_descr_arc_from_deadframe(
     frame: &DeadFrame,
 ) -> Result<Arc<dyn majit_ir::Descr>, BackendError> {
-    // `history.py:125` `cpu.get_latest_descr(deadframe)` — same shape
-    // as dynasm's `get_latest_descr_arc`.  Returns the backend Arc
-    // upcast until the dual-key registration window is widened to
-    // cover late `meta_descr` stamping by `build_guard_metadata` /
-    // test harnesses.
+    // `history.py:125` `cpu.get_latest_descr(deadframe)` returns the
+    // metainterp `AbstractFailDescr` object op.descr stamped — the
+    // same descr identity PyPy returns.  Walk through the backend
+    // Arc's `meta_descr` back-pointer to recover it.  `register_fail_descrs`
+    // dual-indexes by backend addr + meta addr so downstream
+    // `descr_addr = Arc::as_ptr(arc)` lookups resolve to the backend
+    // Arc for status/start_compiling dispatch.
+    //
+    // Synthetic backend descrs without a meta back-pointer fall back
+    // to the backend Arc upcast.
     let jf = frame
         .data
         .downcast_ref::<JitFrameDeadFrame>()
         .ok_or_else(|| BackendError::Unsupported("expected JitFrameDeadFrame".to_string()))?;
+    if let Some(meta) = jf.fail_descr.meta_descr.clone() {
+        return Ok(meta);
+    }
     Ok(Arc::clone(&jf.fail_descr) as Arc<dyn majit_ir::Descr>)
 }
 
@@ -6839,7 +6847,11 @@ impl CraneliftBackend {
         }
     }
 
-    fn register_fail_descrs(&self, descrs: &[Arc<CraneliftFailDescr>]) {
+    /// Register backend `Arc<CraneliftFailDescr>` instances into the
+    /// addr→Arc lookup table.  Mirrors dynasm's API: callable from
+    /// future late-stamp helpers that need to land meta-keyed entries
+    /// after the in-codegen call missed them.
+    pub fn register_fail_descrs(&self, descrs: &[Arc<CraneliftFailDescr>]) {
         let mut registry = self.fail_descr_registry.lock().unwrap();
         for descr in descrs {
             registry

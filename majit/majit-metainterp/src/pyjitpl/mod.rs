@@ -17686,6 +17686,7 @@ mod tests {
 
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
     fn patch_dynasm_fail_descr_resume_data(
+        backend: &majit_backend_dynasm::runner::DynasmBackend,
         token: &std::sync::Arc<JitCellToken>,
         fail_index: u32,
         rd_numb: Vec<u8>,
@@ -17743,6 +17744,11 @@ mod tests {
         meta_fd.set_rd_consts(Some(rd_consts));
         meta_fd.set_rd_virtuals(Some(vec![]));
         meta_fd.set_rd_pendingfields(Some(vec![]));
+        // `register_fail_descrs` ran at codegen time when `meta_descr`
+        // was unset; re-run now that we've stamped it so the meta-keyed
+        // dual-indexed registry entry lands.  Idempotent: existing
+        // backend-keyed entries are preserved.
+        backend.register_fail_descrs(&compiled.fail_descrs);
     }
 
     #[cfg(all(feature = "dynasm", not(feature = "cranelift")))]
@@ -17789,7 +17795,13 @@ mod tests {
                 .compiled_loops
                 .get_mut(&green_key)
                 .expect("compiled entry");
-            patch_dynasm_fail_descr_resume_data(&entry.token, fail_index, rd_numb, vec![]);
+            patch_dynasm_fail_descr_resume_data(
+                &meta.backend,
+                &entry.token,
+                fail_index,
+                rd_numb,
+                vec![],
+            );
             let mut fresh_token = JitCellToken::new(9003);
             fresh_token.green_key = green_key;
             let old_token = std::mem::replace(&mut entry.token, std::sync::Arc::new(fresh_token));
@@ -18191,7 +18203,8 @@ mod tests {
                 .get_mut(&green_key)
                 .expect("compiled entry");
             patch_dynasm_fail_descr_resume_data(
-                &mut entry.token,
+                &meta.backend,
+                &entry.token,
                 fail_index,
                 expected_rd_numb.clone(),
                 vec![],

@@ -3536,7 +3536,12 @@ impl majit_ir::Descr for ResumeGuardDescr {
 
 impl FailDescr for ResumeGuardDescr {
     fn fail_index(&self) -> u32 {
-        self.fail_index
+        // `assembler.py:227 self.faildescr.index = i` — `descr.fail_index`
+        // is the PER-TRACE key the backend stamps at codegen, NOT the
+        // global identity counter (the global `alloc_fail_index()`
+        // value in `self.fail_index` is pyre-only serialization
+        // identity, accessible via `Descr::index()`).
+        self.fail_index_per_trace.load(Ordering::Relaxed)
     }
     fn trace_id(&self) -> u64 {
         self.trace_id.load(Ordering::Relaxed)
@@ -3809,7 +3814,8 @@ impl majit_ir::Descr for ResumeAtPositionDescr {
 
 impl FailDescr for ResumeAtPositionDescr {
     fn fail_index(&self) -> u32 {
-        self.inner.fail_index
+        // Per-trace key (see ResumeGuardDescr::fail_index).
+        self.inner.fail_index_per_trace.load(Ordering::Relaxed)
     }
     fn trace_id(&self) -> u64 {
         self.inner.trace_id.load(Ordering::Relaxed)
@@ -4013,7 +4019,8 @@ impl majit_ir::Descr for ResumeGuardForcedDescr {
 
 impl FailDescr for ResumeGuardForcedDescr {
     fn fail_index(&self) -> u32 {
-        self.inner.fail_index
+        // Per-trace key (see ResumeGuardDescr::fail_index).
+        self.inner.fail_index_per_trace.load(Ordering::Relaxed)
     }
     fn trace_id(&self) -> u64 {
         self.inner.trace_id.load(Ordering::Relaxed)
@@ -4201,7 +4208,8 @@ impl majit_ir::Descr for ResumeGuardExcDescr {
 
 impl FailDescr for ResumeGuardExcDescr {
     fn fail_index(&self) -> u32 {
-        self.inner.fail_index
+        // Per-trace key (see ResumeGuardDescr::fail_index).
+        self.inner.fail_index_per_trace.load(Ordering::Relaxed)
     }
     fn trace_id(&self) -> u64 {
         self.inner.trace_id.load(Ordering::Relaxed)
@@ -4679,7 +4687,8 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
 
 impl FailDescr for ResumeGuardCopiedExcDescr {
     fn fail_index(&self) -> u32 {
-        self.inner.fail_index
+        // Per-trace key (see ResumeGuardDescr::fail_index).
+        self.inner.fail_index_per_trace.load(Ordering::Relaxed)
     }
     fn trace_id(&self) -> u64 {
         self.inner.trace_id.load(Ordering::Relaxed)
@@ -5550,9 +5559,9 @@ mod fail_descr_tests {
         let d2 = make_fail_descr(3);
         let d3 = make_fail_descr(1);
 
-        let fi1 = d1.as_fail_descr().unwrap().fail_index();
-        let fi2 = d2.as_fail_descr().unwrap().fail_index();
-        let fi3 = d3.as_fail_descr().unwrap().fail_index();
+        let fi1 = d1.index();
+        let fi2 = d2.index();
+        let fi3 = d3.index();
 
         // All indices must be unique
         assert_ne!(fi1, fi2);
@@ -5563,7 +5572,7 @@ mod fail_descr_tests {
     #[test]
     fn test_fail_descr_with_explicit_index() {
         let d = make_fail_descr_with_index(42, 3);
-        assert_eq!(d.as_fail_descr().unwrap().fail_index(), 42);
+        assert_eq!(d.index(), 42);
         assert_eq!(d.as_fail_descr().unwrap().fail_arg_types().len(), 3);
     }
 
@@ -5581,7 +5590,7 @@ mod fail_descr_tests {
     fn test_set_fail_arg_types_preserves_identity_and_subtype() {
         // ResumeAtPositionDescr (unroll extra_guards path).
         let descr = make_resume_at_position_descr_typed(vec![Type::Int]);
-        let original_fail_index = descr.as_fail_descr().unwrap().fail_index();
+        let original_fail_index = descr.index();
         let original_ptr = Arc::as_ptr(&descr);
         assert!(descr.is_resume_at_position());
 
@@ -5593,7 +5602,7 @@ mod fail_descr_tests {
         // Identity preserved: same Arc, same fail_index, same subtype tag.
         assert_eq!(Arc::as_ptr(&descr), original_ptr);
         assert_eq!(
-            descr.as_fail_descr().unwrap().fail_index(),
+            descr.index(),
             original_fail_index
         );
         assert!(descr.is_resume_at_position());
@@ -5623,20 +5632,20 @@ mod fail_descr_tests {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         }) as DescrRef;
-        let lv_fi = lv.as_fail_descr().unwrap().fail_index();
+        let lv_fi = lv.index();
         assert!(lv.as_fail_descr().unwrap().loop_version());
 
         lv.as_fail_descr()
             .unwrap()
             .set_fail_arg_types(vec![Type::Ref]);
 
-        assert_eq!(lv.as_fail_descr().unwrap().fail_index(), lv_fi);
+        assert_eq!(lv.index(), lv_fi);
         assert!(lv.as_fail_descr().unwrap().loop_version());
         assert_eq!(lv.as_fail_descr().unwrap().fail_arg_types(), &[Type::Ref]);
 
         // MetaFailDescr / plain ResumeGuardDescr factory.
         let plain = make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
-        let plain_fi = plain.as_fail_descr().unwrap().fail_index();
+        let plain_fi = plain.index();
         assert!(!plain.is_resume_at_position());
 
         plain
@@ -5644,7 +5653,7 @@ mod fail_descr_tests {
             .unwrap()
             .set_fail_arg_types(vec![Type::Float]);
 
-        assert_eq!(plain.as_fail_descr().unwrap().fail_index(), plain_fi);
+        assert_eq!(plain.index(), plain_fi);
         assert!(!plain.is_resume_at_position());
         assert!(!plain.is_guard_forced());
         assert!(!plain.is_guard_exc());
@@ -5656,7 +5665,7 @@ mod fail_descr_tests {
         // ResumeGuardForcedDescr — `is_guard_forced()` survives
         // `set_fail_arg_types`, identity preserved.
         let forced = make_resume_guard_forced_descr_typed(vec![Type::Int]);
-        let forced_fi = forced.as_fail_descr().unwrap().fail_index();
+        let forced_fi = forced.index();
         let forced_ptr = Arc::as_ptr(&forced);
         assert!(forced.is_guard_forced());
         assert!(!forced.is_guard_exc());
@@ -5667,7 +5676,7 @@ mod fail_descr_tests {
             .set_fail_arg_types(vec![Type::Ref]);
 
         assert_eq!(Arc::as_ptr(&forced), forced_ptr);
-        assert_eq!(forced.as_fail_descr().unwrap().fail_index(), forced_fi);
+        assert_eq!(forced.index(), forced_fi);
         assert!(forced.is_guard_forced());
         assert_eq!(
             forced.as_fail_descr().unwrap().fail_arg_types(),
@@ -5676,7 +5685,7 @@ mod fail_descr_tests {
 
         // ResumeGuardExcDescr — `is_guard_exc()` survives, identity preserved.
         let exc = make_resume_guard_exc_descr_typed(vec![Type::Ref, Type::Int]);
-        let exc_fi = exc.as_fail_descr().unwrap().fail_index();
+        let exc_fi = exc.index();
         let exc_ptr = Arc::as_ptr(&exc);
         assert!(exc.is_guard_exc());
         assert!(!exc.is_guard_forced());
@@ -5686,7 +5695,7 @@ mod fail_descr_tests {
             .set_fail_arg_types(vec![Type::Float]);
 
         assert_eq!(Arc::as_ptr(&exc), exc_ptr);
-        assert_eq!(exc.as_fail_descr().unwrap().fail_index(), exc_fi);
+        assert_eq!(exc.index(), exc_fi);
         assert!(exc.is_guard_exc());
         assert_eq!(
             exc.as_fail_descr().unwrap().fail_arg_types(),
@@ -5703,7 +5712,7 @@ mod fail_descr_tests {
         assert!(!forced_clone.is_guard_forced());
         assert!(!forced_clone.is_guard_exc());
         assert_ne!(
-            forced_clone.as_fail_descr().unwrap().fail_index(),
+            forced_clone.index(),
             forced_fi
         );
         assert_eq!(
@@ -5714,7 +5723,7 @@ mod fail_descr_tests {
         let exc_clone = exc.clone_descr().unwrap();
         assert!(!exc_clone.is_guard_exc());
         assert!(!exc_clone.is_guard_forced());
-        assert_ne!(exc_clone.as_fail_descr().unwrap().fail_index(), exc_fi);
+        assert_ne!(exc_clone.index(), exc_fi);
         assert_eq!(
             exc_clone.as_fail_descr().unwrap().fail_arg_types(),
             &[Type::Float]
@@ -5730,14 +5739,14 @@ mod fail_descr_tests {
     fn test_resume_guard_copied_descr_delegates_to_prev() {
         // Plain copied descr over a ResumeGuardDescr donor.
         let donor = make_resume_guard_descr_typed(vec![Type::Int, Type::Ref]);
-        let donor_fi = donor.as_fail_descr().unwrap().fail_index();
+        let donor_fi = donor.index();
         let donor_ptr = Arc::as_ptr(&donor);
 
         let copied = make_resume_guard_copied_descr(donor.clone());
         assert!(copied.is_resume_guard_copied());
         assert!(!copied.is_guard_exc());
         assert!(!copied.is_guard_forced());
-        assert_ne!(copied.as_fail_descr().unwrap().fail_index(), donor_fi);
+        assert_ne!(copied.index(), donor_fi);
         assert_eq!(
             copied.as_fail_descr().unwrap().fail_arg_types(),
             &[Type::Int, Type::Ref]
@@ -5751,8 +5760,8 @@ mod fail_descr_tests {
         assert!(copied_clone.is_resume_guard_copied());
         assert_eq!(Arc::as_ptr(&copied_clone.prev_descr().unwrap()), donor_ptr);
         assert_ne!(
-            copied_clone.as_fail_descr().unwrap().fail_index(),
-            copied.as_fail_descr().unwrap().fail_index()
+            copied_clone.index(),
+            copied.index()
         );
 
         // Exc-copied subtype carries the same prev and additionally
