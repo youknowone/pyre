@@ -696,18 +696,20 @@ impl std::hash::Hash for SpamBlockRef {
     }
 }
 
-/// Task #227.2 walker emit helper — pushes `insn` into the program-
-/// wide `ssarepr.insns` AND mirrors it into `current_block`'s per-
-/// block accumulator.  Used by every walker emit site so a future
-/// post-walk `flatten_graph(graph, regallocs, cpu)` pass can replace
-/// the program-wide push entirely and drain per-block accumulators
-/// in graph-DFS order (matching `codewriter.py:53` upstream).
+/// Task #227.4 walker emit helper — pushes `insn` into
+/// `current_block`'s per-block accumulator.  The program-wide
+/// `ssarepr.insns` is populated post-walk via the drain swap at
+/// `transform_graph_to_jitcode`'s end (matching `codewriter.py:53
+/// flatten_graph(graph, regallocs, cpu)`).  The `ssarepr` parameter is
+/// retained on the signature for call-site symmetry but unused inside
+/// — once every walker emit site routes through this helper, the
+/// parameter can retire alongside any remaining direct
+/// `ssarepr.insns.push` consumers.
 fn push_walker_emit(
-    ssarepr: &mut super::flatten::SSARepr,
+    _ssarepr: &mut super::flatten::SSARepr,
     current_block: &SpamBlockRef,
     insn: super::flatten::Insn,
 ) {
-    ssarepr.insns.push(insn.clone());
     current_block.push_insn(insn);
 }
 
