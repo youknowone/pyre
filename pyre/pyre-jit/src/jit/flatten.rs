@@ -1907,36 +1907,13 @@ where
             // `flatten.py:211 assert block.exits[0].exitcase is None`.
             // Upstream's `flowcontext.py` guarantees the normal-flow
             // link is always exits[0] for canraise blocks; pyre's
-            // walker can occasionally synthesize canraise blocks
-            // whose link ordering puts the bool-branch fallthrough
-            // first instead of the normal-flow link (a NEW-DEVIATION
-            // from PRE-EXISTING-ADAPTATION at the bool-branch /
-            // canraise interaction in mergeblock).  Match upstream's
-            // contract by reordering: locate the normal-flow link
-            // (exitcase=None) and place it at exits[0].  The check
-            // then validates the post-reorder shape.  Convergence:
-            // Task #227 walker restructure (per-block accumulation)
-            // produces upstream-orthodox link ordering directly.
-            let normal_link_position = exits
-                .iter()
-                .position(|link| link.borrow().exitcase.is_none());
-            let normal_link = match normal_link_position {
-                Some(position) => exits[position].clone(),
-                None => panic!(
-                    "flatten.py:211 invariant: canraise block must have a \
-                     normal-flow link (exitcase=None) somewhere in exits[]"
-                ),
-            };
-            let exits: Vec<LinkRef> = {
-                let mut reordered = Vec::with_capacity(exits.len());
-                reordered.push(normal_link.clone());
-                for (i, link) in exits.iter().enumerate() {
-                    if i != normal_link_position.unwrap() {
-                        reordered.push(link.clone());
-                    }
-                }
-                reordered
-            };
+            // `flatten.py:211` `assert exits[0].exitcase is None`.
+            assert!(
+                exits[0].borrow().exitcase.is_none(),
+                "flatten.py:211 invariant: canraise block's exits[0] must \
+                 be the normal-flow link (exitcase=None)"
+            );
+            let normal_link = exits[0].clone();
             // `flatten.py:189-204` `_ovf` rewrite.  When the last op
             // of a canraise block is an overflow-checked arithmetic
             // op (`int_add_ovf`, `int_sub_ovf`, `int_mul_ovf`,
@@ -1972,21 +1949,13 @@ where
             // W-4 self-loop fix retired the supersede-induced catch-edge
             // re-entries that fed that shape; the order is now stable
             // out of the walker.
-            // `flatten.py:223-238` walks the catch links in order,
-            // breaking on the catch-all (`link.exitcase is Exception`).
-            // Upstream's `flowcontext.py` produces catch links in
-            // typed-then-catch-all order at graph construction time;
-            // pyre's walker can produce mixed orders for certain
-            // exception-handler shapes that supersede catch edges.
-            // Normalise here by sorting catch_links so typed links
-            // (with `llexitcase = Some(...)`) come first and the
-            // single catch-all (`llexitcase = None`) comes last —
-            // matches upstream's per-link iteration shape without
-            // requiring walker restructure.  Convergence: Task #227
-            // walker restructure produces upstream-orthodox ordering
-            // directly.
-            let mut catch_links: Vec<LinkRef> = exits.iter().skip(1).cloned().collect();
-            catch_links.sort_by_key(|link| link.borrow().llexitcase.is_none());
+            // `flatten.py:223-238` walks the catch links in graph
+            // order, breaking on the catch-all (`link.exitcase is
+            // Exception`).  Upstream's `flowcontext.py` produces catch
+            // links in typed-then-catch-all order at graph
+            // construction time, so the iteration order is graph
+            // order without sorting.
+            let catch_links: Vec<LinkRef> = exits.iter().skip(1).cloned().collect();
             // `flatten.py:206-217` trailing `-live-` scan: walk
             // `block.operations` from the end skipping `-live-`
             // markers.  If the final op is NOT `-live-` (upstream's
@@ -2100,33 +2069,14 @@ where
         handling_ovf: bool,
     ) {
         let Some(super::flow::ExitSwitch::Value(exitswitch)) = exitswitch else {
-            // Pyre's walker can synthesize multi-exit blocks with
-            // `exitswitch = None` (no explicit dispatch variable) when
-            // supersede links or fall-through joinpoints accumulate
-            // additional outgoing edges without a corresponding
-            // exitswitch update.  Upstream's `flowcontext.py` never
-            // produces this shape — every multi-exit block has a
-            // bool / canraise / switch exitswitch by graph
-            // construction.
-            //
-            // For probe traversal, treat such shapes as a goto via
-            // exits[0]: emit a single `make_link` to the first exit
-            // and ignore the rest.  At runtime the inline ssarepr
-            // is the production path; the driver output here is
-            // diagnostic only.  Convergence: Task #227 walker
-            // restructure produces upstream-orthodox single-exit /
-            // bool / canraise / switch shapes directly.
-            if !exits.is_empty() {
-                self.make_link(&exits[0], handling_ovf);
-                return;
-            }
-            let block_for_panic = exits[0]
-                .borrow()
-                .prevblock
-                .as_ref()
-                .and_then(|w| w.upgrade())
-                .expect("link prevblock");
-            let block_borrow = block_for_panic.borrow();
+            // RPython `flatten.py:282-309 insert_switch_exits` is only
+            // called via `insert_exits` when the block already has a
+            // Variable exitswitch (`flatten.py:107-115` dispatch by
+            // `exits.len()` + `exitswitch.concretetype`).  A None
+            // exitswitch on a multi-exit block is a malformed graph
+            // shape and upstream would not reach this function — fail
+            // loud so the walker non-orthodoxy that produced it is
+            // visible rather than silently materialising bytes.
             let exitcase_summary: Vec<String> = exits
                 .iter()
                 .map(|link| {
@@ -2135,39 +2085,27 @@ where
                 })
                 .collect();
             panic!(
-                "flatten_graph: unsupported exits shape for block with {} exits; exitswitch={:?}, src(ops.len={}, canraise={}), exits={:?}",
+                "flatten.py:282 insert_switch_exits invariant: \
+                 multi-exit block must carry a Variable exitswitch, got \
+                 None on {} exits = {:?}",
                 exits.len(),
-                exitswitch,
-                block_borrow.operations.len(),
-                block_borrow.canraise(),
                 exitcase_summary,
             );
         };
-        let mut switches: Vec<(usize, LinkRef)> = exits
+        let mut switches: Vec<LinkRef> = exits
             .iter()
-            .enumerate()
-            .filter(|(_, link)| !is_default_exitcase(&link.borrow().exitcase))
-            .map(|(i, link)| (i, link.clone()))
+            .filter(|link| !is_default_exitcase(&link.borrow().exitcase))
+            .cloned()
             .collect();
-        switches.sort_by_key(|(position, link)| {
-            switch_llexitcase_key_with_index(&link.borrow().llexitcase, Some(*position))
-        });
+        switches.sort_by_key(|link| switch_llexitcase_key(&link.borrow().llexitcase));
 
         let mut switchdict = SwitchDictDescr::new();
-        for (position, switch) in &switches {
-            // Pass the link's enumeration position as the fallback key
-            // for `llexitcase = None` shapes that pyre's walker can
-            // produce on synthesised dispatch links — see
-            // `switch_llexitcase_key_with_index` docstring.
-            let key = switch_llexitcase_key_with_index(
-                &switch.borrow().llexitcase,
-                Some(*position),
-            );
+        for switch in &switches {
+            let key = switch_llexitcase_key(&switch.borrow().llexitcase);
             switchdict
                 .labels
                 .push((key, self.tlabel_value_for_link(switch)));
         }
-        let switches: Vec<LinkRef> = switches.into_iter().map(|(_, link)| link).collect();
 
         let switch_value = self.flatten_value(&exitswitch);
         self.emitline(Insn::live(Vec::new()));
@@ -2459,33 +2397,15 @@ fn is_default_exitcase(exitcase: &Option<FlowValue>) -> bool {
     )
 }
 
-fn switch_llexitcase_key(llexitcase: &Option<FlowValue>) -> i64 {
-    switch_llexitcase_key_with_index(llexitcase, None)
-}
-
 /// `rpython/jit/codewriter/flatten.py:296 lltype.cast_primitive(
 /// lltype.Signed, switch.llexitcase)`.
 ///
 /// RPython's `cast_primitive` accepts any primitive castable to
 /// `Signed`: `Signed` is the identity cast, `Bool` widens to 0 / 1.
-/// Pyre's walker can also produce `llexitcase = None` on synthesised
-/// catch-landing / supersede / orphan-joinpoint dispatch links —
-/// these are **PRE-EXISTING-ADAPTATION** introduced by pyre's
-/// PC-sequential walker (codewriter.rs:4520 `emitted_pc_starts`
-/// skip + post-walker cleanup at codewriter.rs:6534+).  Upstream
-/// never produces such shapes because `flowcontext.py:402-405` re-
-/// records every joinpoint and `jtransform.py` lowers switch
-/// dispatch with strictly Signed llexitcase keys; convergence point
-/// is Task #227 walker restructure (per-block accumulation + retire
-/// `emitted_pc_starts` skip).
-///
-/// Until then, treat `llexitcase = None` as a structurally
-/// position-indexed switch case: each unset link in the dispatch
-/// gets its 0-based index as the synthesized Signed key.  Upstream's
-/// `SwitchDictDescr` is keyed on the Signed value, and unique keys
-/// are sufficient for the assembler — position indices preserve the
-/// uniqueness invariant without inventing arbitrary values.
-fn switch_llexitcase_key_with_index(llexitcase: &Option<FlowValue>, position: Option<usize>) -> i64 {
+/// Upstream never produces `llexitcase = None` because `jtransform.py`
+/// lowers switch dispatch with strictly Signed llexitcase keys; fail
+/// loud on malformed shapes per the upstream contract.
+fn switch_llexitcase_key(llexitcase: &Option<FlowValue>) -> i64 {
     match llexitcase {
         Some(FlowValue::Constant(Constant {
             value: ConstantValue::Signed(value),
@@ -2495,14 +2415,6 @@ fn switch_llexitcase_key_with_index(llexitcase: &Option<FlowValue>, position: Op
             value: ConstantValue::Bool(value),
             ..
         })) => i64::from(*value),
-        None => match position {
-            Some(idx) => idx as i64,
-            None => panic!(
-                "flatten_graph: switch link requires Signed/Bool llexitcase per \
-                 flatten.py:296 (`cast_primitive(Signed, ...)`); got None and no \
-                 position fallback was supplied"
-            ),
-        },
         other => panic!(
             "flatten_graph: switch link requires Signed/Bool llexitcase per \
              flatten.py:296 (`cast_primitive(Signed, ...)`); got {other:?}"
@@ -2750,11 +2662,16 @@ pub fn flatten_graph<'a>(
 /// to the canonical `flatten_graph` entry.
 pub fn flatten_graph_with_regallocs<'a>(
     graph: &super::flow::FunctionGraph,
-    regallocs: &'a std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
-    _include_all_exc_links: bool,
+    regallocs: &'a mut std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
+    include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
     lowering_ctx: LoweringContext,
 ) -> SSARepr {
+    // `flatten.py:68 flattener.enforce_input_args()` — same call the
+    // canonical `flatten_graph` makes; the probe-side entry must do
+    // it too or the startblock inputarg colors leak the raw chordal-
+    // coloring assignment into the SSARepr.
+    super::regalloc::enforce_input_args_simulation(graph, regallocs);
     let mut ssarepr = SSARepr::new(graph.name.clone());
     let get_register = |variable: Variable| -> Register {
         let kind = variable.kind.unwrap_or(Kind::Ref);
@@ -2765,14 +2682,21 @@ pub fn flatten_graph_with_regallocs<'a>(
         Register::new(kind, color)
     };
     let lower_constant = flatten_constant_operand_for_probe;
-    flatten_graph_with_lowering(
-        graph,
+    let mut flattener = GraphFlattener::new_with_full_lowering(
         &mut ssarepr,
-        lowering_ctx,
-        cpu,
         get_register,
         lower_constant,
+        lowering_ctx,
     );
+    if let Some(cpu) = cpu {
+        flattener = flattener.with_cpu(cpu);
+    }
+    // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
+    // _include_all_exc_links` — wire the parameter onto the
+    // flattener so downstream `make_exception_link` honours the
+    // upstream contract.
+    flattener.include_all_exc_links = include_all_exc_links;
+    flattener.make_bytecode_block(graph.startblock.clone(), false);
     ssarepr
 }
 
@@ -5253,15 +5177,13 @@ mod tests {
     }
 
     #[test]
-    fn flatten_graph_with_lowering_2_exit_no_exitswitch_takes_first_exit() {
-        // Pyre's walker can synthesize 2-exit blocks with
-        // `exitswitch = None` via supersede / fall-through joinpoint
-        // accumulation.  `insert_switch_exits` handles this shape as
-        // a goto via exits[0] (PRE-EXISTING-ADAPTATION documented at
-        // codewriter.rs:6534+ post-walker cleanup + flatten.rs:2102+
-        // insert_switch_exits None-exitswitch handler).  This test
-        // verifies the driver completes without panic and emits a
-        // make_link to the first exit's target.
+    #[should_panic(expected = "flatten.py:282 insert_switch_exits invariant")]
+    fn flatten_graph_with_lowering_2_exit_no_exitswitch_panics() {
+        // `flatten.py:282-309 insert_switch_exits` is only entered for
+        // blocks that already carry a Variable exitswitch.  A 2-exit
+        // block with `exitswitch = None` is a malformed graph shape
+        // upstream would never produce; fail loud so the upstream
+        // contract is preserved (codex review parity revert).
         use crate::jit::flow::{Block, FunctionGraph, Link};
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
@@ -7446,7 +7368,7 @@ mod tests {
             .into_ref(),
         ]);
 
-        let regallocs =
+        let mut regallocs =
             super::super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
         let ctx = LoweringContext {
             binary_op_fn_idx: 0,
@@ -7454,7 +7376,7 @@ mod tests {
             truth_fn_idx: 0,
             store_subscr_fn_idx: 0,
         };
-        let ssarepr = flatten_graph_with_regallocs(&graph, &regallocs, false, None, ctx);
+        let ssarepr = flatten_graph_with_regallocs(&graph, &mut regallocs, false, None, ctx);
         assert_eq!(ssarepr.name, "orthodox");
         assert!(
             ssarepr
