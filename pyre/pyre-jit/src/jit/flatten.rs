@@ -3586,8 +3586,22 @@ where
     if op.args.len() != 1 {
         return None;
     }
+    // `truth_fn` returns Int (the boolean 0/1 result), so the
+    // dispatcher must emit `dst_reg` with `Kind::Int` regardless of
+    // the HLOp result Variable's recorded kind.  `emit_frontend_bool`
+    // currently records the result as `Kind::Ref` (matching the
+    // upstream `op.bool(w_value)` HLOp result type at the flowspace
+    // level), but the post-rtype `residual_call_r_i` Insn carries an
+    // Int destination register — the byte-equivalence check vs the
+    // inline emit (`scratch_truth = fresh_var(Kind::Int, ...)`)
+    // requires forcing Int here.  Matches upstream
+    // `jtransform.py`-style rtype rewrite that retypes the bool
+    // result to `Bool`/`Int` before flatten_graph runs.
     let result_reg = match &op.result {
-        Some(super::flow::FlowValue::Variable(var)) => get_register(*var),
+        Some(super::flow::FlowValue::Variable(var)) => {
+            let r = get_register(*var);
+            Register::new(Kind::Int, r.index)
+        }
         _ => return None,
     };
     let arg_operand = flatten_arg_with_lowering(&op.args[0], get_register, lower_constant);
