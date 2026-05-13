@@ -491,7 +491,10 @@ impl FailDescr for DynasmFailDescr {
     }
 
     fn is_compiling(&self) -> bool {
-        self.status.load(Ordering::Acquire) & Self::ST_BUSY_FLAG != 0
+        // `compile.py:750` — read through the same forwarding chain as
+        // `get_status`, so the busy-flag observation tracks the canonical
+        // metainterp slot when meta_descr is set.
+        self.get_status() & Self::ST_BUSY_FLAG != 0
     }
 
     // resume.py:450-488 readers gated on `meta_resume_fd()` —
