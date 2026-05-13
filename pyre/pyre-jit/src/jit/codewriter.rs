@@ -3481,6 +3481,8 @@ impl CodeWriter {
                     Register::new(Kind::Ref, dst),
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
             }};
         }
 
@@ -3548,6 +3550,8 @@ impl CodeWriter {
                     Register::new(Kind::Int, dst),
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
             }};
         }
 
@@ -3568,10 +3572,13 @@ impl CodeWriter {
                 let retval = $retval;
                 let insn = Insn::op("ref_return", vec![Operand::reg(Kind::Ref, src)]);
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
                 // `rpython/jit/codewriter/flatten.py:144-146`: terminators
                 // emit `('---',)` so the backward liveness pass clears its
                 // alive set.
                 $ssarepr.insns.push(Insn::Unreachable);
+                current_block.push_insn(Insn::Unreachable);
                 // Step 6.1 Phase 2c: attach the return edge to
                 // `graph.returnblock` (`model.py:18`). The return value
                 // now comes from the symbolic `FrameState` stack,
@@ -3605,11 +3612,14 @@ impl CodeWriter {
                     vec![Operand::TLabel(TLabel::new(format!("pc{}", target_py_pc)))],
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
                 // `rpython/jit/codewriter/flatten.py:111-112`: an
                 // unconditional goto implicitly ends a block so the
                 // liveness pass (`liveness.py:68-69`) can reset the alive
                 // set.
                 $ssarepr.insns.push(Insn::Unreachable);
+                current_block.push_insn(Insn::Unreachable);
                 // Step 6.1 Phase 2b: attach a single unconditional
                 // `Link` from the current block to the target PC's
                 // block. `flatten.py:161` `self.emitline('goto',
@@ -3652,6 +3662,8 @@ impl CodeWriter {
             ($ssarepr:expr) => {{
                 let insn = Insn::op("abort_permanent", Vec::new());
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
                 // pyre-only dead-end: the block has no successor in
                 // the shadow graph. Leaving `needs_fallthrough = false`
                 // blocks the auto-fallthrough at the next
@@ -3672,6 +3684,8 @@ impl CodeWriter {
                 let offset = $offset;
                 let insn = Insn::op("raise", vec![Operand::reg(Kind::Ref, src)]);
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
                 // `flowcontext.py:1246-1261 Raise.nomoreblocks` shape:
                 //   link = Link([w_exc.w_type, w_exc.w_value],
                 //               ctx.graph.exceptblock)
@@ -3717,6 +3731,8 @@ impl CodeWriter {
             ($ssarepr:expr) => {{
                 let insn = Insn::op("reraise", Vec::new());
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
                 // Step 6.1 Phase 2c: same edge as `emit_raise!` — the
                 // re-raise opname shares the `Block.exits` topology
                 // (`flatten.py` emits the two as alternative codings
@@ -3779,6 +3795,8 @@ impl CodeWriter {
                     )))],
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
                 // Step 6.1 Phase 2b: attach the exception edge to the
                 // current PC's block. In RPython this is the
                 // `Constant(last_exception)` exit added by
@@ -4019,7 +4037,9 @@ impl CodeWriter {
                 if portal_ec_reg != u16::MAX {
                     force_alive.push(Operand::Register(Register::new(Kind::Ref, portal_ec_reg)));
                 }
-                $ssarepr.insns.push(Insn::live(force_alive));
+                $ssarepr.insns.push(Insn::live(force_alive.clone()));
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(Insn::live(force_alive));
             }};
         }
 
@@ -4041,6 +4061,8 @@ impl CodeWriter {
                     ],
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
                 // Step 6.1 Phase 2b: attach the conditional-False edge
                 // to the PC's active block. RPython `flatten.py:240-267`
                 // records both the False target and the fallthrough on
@@ -4077,6 +4099,8 @@ impl CodeWriter {
                     ],
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
                 // Step 6.1 Phase 2b: same as `emit_goto_if_not!` — the
                 // specialised `int_is_zero` form is the pyre-port of
                 // `flatten.py:247` `goto_if_not_int_is_zero`; Link
@@ -4160,6 +4184,8 @@ impl CodeWriter {
                     Register::new(Kind::Ref, dst),
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
                 // Graph dual-write threads `frame_var.into()` which is
                 // only a startblock inputarg when `is_portal` (per
                 // `graph_entry_inputargs(code, is_portal)`).  Non-portal
@@ -4200,6 +4226,8 @@ impl CodeWriter {
                     ],
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
             }};
         }
         // RPython-orthodox vable arrayitem shapes (Slices 1+2+3+4
@@ -4268,6 +4296,8 @@ impl CodeWriter {
                     Register::new(Kind::Ref, dst),
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
             }};
         }
         macro_rules! emit_vable_setarrayitem_ref {
@@ -4294,6 +4324,8 @@ impl CodeWriter {
                     ],
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
             }};
         }
 
@@ -4326,6 +4358,8 @@ impl CodeWriter {
                     ],
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
             }};
         }
 
@@ -4350,6 +4384,8 @@ impl CodeWriter {
                     Register::new(Kind::Ref, dst),
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
             }};
         }
 
@@ -4367,6 +4403,8 @@ impl CodeWriter {
                     Register::new(Kind::Ref, dst),
                 );
                 $ssarepr.insns.push(insn.clone());
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(insn.clone());
             }};
         }
 
@@ -4766,6 +4804,8 @@ impl CodeWriter {
                 // Python PC start so the post-compute_liveness /
                 // post-remove_repeated_live SSARepr position is recoverable.
                 ssarepr.insns.push(Insn::PcAnchor(py_pc));
+                // Task #227.1 dual-write into per-block accumulator.
+                current_block.push_insn(Insn::PcAnchor(py_pc));
                 depth_at_pc[py_pc] = current_depth;
                 emit_live_placeholder!(ssarepr);
 
