@@ -617,6 +617,18 @@ struct SpamBlock {
     framestate: Option<FrameState>,
     /// `flowcontext.py:41` `block.dead`.
     dead: bool,
+    /// Task #227 per-block ssarepr accumulator — pyre-side mirror of
+    /// upstream `block.operations` recorded inside `record_block`
+    /// (`flowcontext.py:407-416`).  Populated alongside the program-
+    /// wide `ssarepr.insns` push so a future post-walk `flatten_graph`
+    /// can iterate `graph.iterblocks()` and consume the per-block
+    /// emit sequence in graph-DFS order, matching
+    /// `codewriter.py:53 flatten_graph(graph, regallocs, cpu=...)`.
+    /// While the walker still drives production, this shadow only
+    /// records label-equivalent block entries; once Task #227.2 wires
+    /// every `emit_*!` macro through `push_insn` the shadow becomes
+    /// the authoritative source consumed by the post-walk flatten.
+    per_block_ssarepr: Vec<super::flatten::Insn>,
 }
 
 #[derive(Debug, Clone)]
@@ -628,6 +640,7 @@ impl SpamBlockRef {
             block,
             framestate,
             dead: false,
+            per_block_ssarepr: Vec::new(),
         })))
     }
 
@@ -649,6 +662,23 @@ impl SpamBlockRef {
 
     fn dead(&self) -> bool {
         self.0.borrow().dead
+    }
+
+    /// Push an `Insn` into the per-block accumulator.  Mirrors the
+    /// per-op `block.operations.append(op)` line that
+    /// `flowcontext.py:407-416 record_block` runs inside the recorder
+    /// loop.  Walker emit macros call this alongside their program-
+    /// wide `ssarepr.insns.push(...)` so the per-block shadow stays
+    /// in sync until production flips to consume it (Task #227.3).
+    fn push_insn(&self, insn: super::flatten::Insn) {
+        self.0.borrow_mut().per_block_ssarepr.push(insn);
+    }
+
+    /// Snapshot the per-block accumulator — used by Task #227.2
+    /// verification probes and by the post-walk flatten driver to
+    /// drain the per-block emit sequence in graph-DFS order.
+    fn per_block_ssarepr(&self) -> Vec<super::flatten::Insn> {
+        self.0.borrow().per_block_ssarepr.clone()
     }
 }
 
@@ -3876,6 +3906,18 @@ impl CodeWriter {
                     .framestate()
                     .expect("block state should exist at label");
                 needs_fallthrough = true;
+                // Task #227.1 per-block accumulator dual-write: record
+                // the block-entry Label on the new `current_block` so a
+                // post-walk `flatten_graph(graph, regallocs, cpu)`
+                // pass can drain each block's emit sequence in graph-
+                // DFS order (matching `codewriter.py:53` upstream).
+                // The program-wide push above stays in place until
+                // Task #227.3 flips production to consume the per-
+                // block accumulator instead.
+                current_block.push_insn(Insn::Label(super::flatten::Label::new(format!(
+                    "pc{}",
+                    py_pc
+                ))));
             }};
         }
         macro_rules! emit_mark_label_catch_landing {
@@ -3900,6 +3942,17 @@ impl CodeWriter {
                     current_state = state;
                 }
                 needs_fallthrough = true;
+                // Task #227.1 per-block accumulator dual-write: record
+                // the catch-landing block's entry Label on its own
+                // accumulator so the post-walk `flatten_graph` driver
+                // can reproduce the SSARepr label sequence in graph-
+                // DFS order.  Mirrors `emit_mark_label_pc!`'s dual-
+                // write above; together they cover every block-entry
+                // label the walker emits.
+                current_block.push_insn(Insn::Label(super::flatten::Label::new(format!(
+                    "catch_landing_{}",
+                    landing_label
+                ))));
             }};
         }
 
