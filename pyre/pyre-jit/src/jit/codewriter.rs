@@ -4984,22 +4984,24 @@ impl CodeWriter {
                         // stack so the def-use chain matches the
                         // upstream "call result is the downstream value"
                         // shape.
-                        let boxed = if is_portal {
-                            record_residual_call_graph_op(
-                                &mut graph,
-                                &current_block.block(),
-                                box_int_fn_idx,
-                                CallFlavor::Plain,
-                                vec![super::flow::Constant::signed(val).into()],
-                                vec![],
-                                vec![],
-                                vec![Kind::Int],
-                                ResKind::Ref,
-                                py_pc as i64,
-                            )
-                        } else {
-                            None
-                        };
+                        // Phase 4 walker-orthodoxy: graph residual_call
+                        // dual-write fires unconditionally.  `box_int_fn`
+                        // takes only a literal Int as input, so no
+                        // frame_var or other portal-only Variable is
+                        // threaded — the graph op is well-formed for
+                        // every CodeWriter regardless of is_portal.
+                        let boxed = record_residual_call_graph_op(
+                            &mut graph,
+                            &current_block.block(),
+                            box_int_fn_idx,
+                            CallFlavor::Plain,
+                            vec![super::flow::Constant::signed(val).into()],
+                            vec![],
+                            vec![],
+                            vec![Kind::Int],
+                            ResKind::Ref,
+                            py_pc as i64,
+                        );
                         if let Some(boxed_var) = &boxed {
                             variable_reg_map.insert(boxed_var.id, stack_base + current_depth);
                         }
