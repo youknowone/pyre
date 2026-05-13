@@ -1377,43 +1377,56 @@ pub trait FailDescr: Descr {
         );
     }
 
-    /// Backend-specific extension slot.
+    /// `history.py:132` `AbstractFailDescr._attrs_ = ('adr_jump_offset',
+    /// 'rd_locs', 'rd_loop_token', 'rd_vector_info')`.
     ///
-    /// In RPython the same `ResumeGuardDescr` object carries both the
-    /// metainterp-side fields (`rd_numb`, `rd_consts`, `rd_virtuals`,
-    /// `rd_pendingfields`, `status`, `rd_loop_token`) at compile.py:855
-    /// + compile.py:186 *and* the backend-stored fields (`rd_locs`,
-    /// `adr_jump_offset`, `fail_arg_locs`) that
-    /// `llsupport/assembler.py:279` and `x86/assembler.py:857` write
-    /// directly through Python's dynamic attribute model.  The Rust
-    /// direct translation uses a type-erased `Box<dyn Any + Send + Sync>`
-    /// slot the backend fills with a backend-specific struct
-    /// (e.g. `DynasmGuardData`, `CraneliftGuardData`) at compile time.
-    /// Callers downcast through `downcast_ref::<T>()` on the returned
-    /// reference.
+    /// `assembler.py:966` `tok.faildescr.adr_jump_offset = addr` — the
+    /// address in compiled code where the guard's conditional jump
+    /// offset is stored.  `assembler.py:987` `faildescr.adr_jump_offset
+    /// = 0` after `patch_jump_for_descr` redirects the guard to a
+    /// bridge ("0 means patched").
     ///
-    /// Default `None` — non-resume FailDescrs (`_DoneWithThisFrameDescr`
-    /// family, `ExitFrameWithExceptionDescrRef`) never go through the
-    /// backend-codegen path that populates this slot, mirroring how
-    /// upstream's `assembler.py:279 guardtok.faildescr.rd_locs =
-    /// positions` only fires for `ResumeGuardDescr`-family descrs.
-    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        None
+    /// Default `0` — every `AbstractFailDescr` instance has the slot
+    /// (`_attrs_`), but only `ResumeGuardDescr`-family guards reach the
+    /// backend codegen path that stamps it via
+    /// `patch_pending_failure_recoveries` (`assembler.py:849`).
+    fn adr_jump_offset(&self) -> usize {
+        0
     }
 
-    /// Setter for the backend extension slot. Default panics — only
-    /// `ResumeGuardDescr` and its subtypes (`ResumeAtPositionDescr`,
-    /// `ResumeGuardForcedDescr`, `ResumeGuardExcDescr`,
-    /// `ResumeGuardCopiedDescr`, `ResumeGuardCopiedExcDescr`,
-    /// `CompileLoopVersionDescr`) accept it. Implementations replace
-    /// any prior `Box` in place — the descr identity (Arc address,
-    /// fail_index, status, subtype tag) survives the write.
-    fn set_backend_data(&self, _data: Box<dyn std::any::Any + Send + Sync>) {
+    /// `assembler.py:966,987` write side.  Default panics — non-`ResumeDescr`
+    /// FailDescrs (`DoneWithThisFrame*`, `ExitFrameWithExceptionDescrRef`,
+    /// `PropagateExceptionDescr`) never go through
+    /// `patch_pending_failure_recoveries` and so never receive a stamp.
+    fn set_adr_jump_offset(&self, _offset: usize) {
         panic!(
-            "set_backend_data invoked on a FailDescr that does not \
-             carry a backend_data slot (compile.py:186 + \
-             llsupport/assembler.py:279,857: only ResumeGuardDescr-family \
-             descrs receive backend extension data)"
+            "set_adr_jump_offset invoked on a FailDescr that does not \
+             carry the AbstractFailDescr.adr_jump_offset slot \
+             (history.py:132 — only ResumeGuardDescr-family guards \
+             reach assembler.py:849 patch_pending_failure_recoveries)"
+        );
+    }
+
+    /// `history.py:132` `AbstractFailDescr._attrs_` `rd_locs` —
+    /// `llsupport/assembler.py:279 guardtok.faildescr.rd_locs =
+    /// positions` writes the per-fail-arg jitframe slot positions as a
+    /// `Vec<u16>`.  `llsupport/llmodel.py:424 descr.rd_locs[index] *
+    /// WORD` reads to compute the absolute jitframe offset during
+    /// `get_value_direct`.
+    ///
+    /// Default `&[]` — every `AbstractFailDescr` instance has the slot,
+    /// empty by default; populated by
+    /// `llsupport/assembler.py:225 write_failure_recovery_description`.
+    fn rd_locs(&self) -> &[u16] {
+        &[]
+    }
+
+    /// `llsupport/assembler.py:279` write side.  Default panics — only
+    /// `ResumeGuardDescr`-family guards reach this writer.
+    fn set_rd_locs(&self, _locs: Vec<u16>) {
+        panic!(
+            "set_rd_locs invoked on a FailDescr that does not carry \
+             the AbstractFailDescr.rd_locs slot (history.py:132)"
         );
     }
 

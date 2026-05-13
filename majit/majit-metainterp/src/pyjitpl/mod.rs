@@ -7193,13 +7193,10 @@ impl<M: Clone> MetaInterp<M> {
             // ```
             // The metainterp-side ResumeGuardDescr (this `descr`, carried
             // on `op.descr` in the IR) is the canonical RPython location
-            // of `rd_loop_token`. Phase A/B previously stamped only the
-            // backend descr because `cpu.get_latest_descr()` returns the
-            // backend object; with Phase E foundation in place
-            // (E.1 backend_data slot, E.2/E.5 backend stamp on op.descr,
-            // E.3-prereq keepalive) the same stamp now also lands on the
-            // metainterp descr — closing the deviation called out in
-            // mod.rs:632/729 audit.
+            // of `rd_loop_token`.  An earlier split-descr era stamped only
+            // the backend descr because `cpu.get_latest_descr()` returned
+            // the backend object; the Unified-Descr migration routes the
+            // stamp to the metainterp descr instead.
             //
             // Also push the metainterp ResumeGuardDescr Arc onto the
             // JitCellToken keepalive so it outlives the IR Loop drop

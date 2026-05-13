@@ -2508,22 +2508,27 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
 pub struct PropagateExceptionDescr {
     /// `history.py:122` `index = -1` default.
     descr_index: std::sync::atomic::AtomicI32,
-    /// Unified-Descr Port Epic Session 2 scaffold: empty placeholder
-    /// for the dynasm-backend payload (mirror of the `ResumeGuardDescr`
-    /// scaffold).  RPython parity: `compile.py:1092
-    /// PropagateExceptionDescr(AbstractFailDescr)` carries `rd_locs`
-    /// and `adr_jump_offset` from `history.py:121` `_attrs_` directly.
-    dynasm: DynasmDescrPayload,
-    /// Mirror of `dynasm` for the cranelift backend.
-    cranelift: CraneliftDescrPayload,
+    /// `history.py:132` `AbstractFailDescr._attrs_` `adr_jump_offset`
+    /// — inherited from `AbstractFailDescr` (compile.py:1092 `class
+    /// PropagateExceptionDescr(AbstractFailDescr)`).  Stamped by
+    /// `assembler.py:849 patch_pending_failure_recoveries` when the
+    /// `GUARD_NO_EXCEPTION` recovery stub at `compile.py:1141` is
+    /// finalised.
+    adr_jump_offset: UnsafeCell<usize>,
+    /// `history.py:132` `_attrs_` `rd_locs` — same inheritance path.
+    rd_locs: UnsafeCell<Vec<u16>>,
 }
+
+// Safety: single-threaded JIT (RPython GIL parity).
+unsafe impl Send for PropagateExceptionDescr {}
+unsafe impl Sync for PropagateExceptionDescr {}
 
 impl PropagateExceptionDescr {
     pub fn new() -> Self {
         Self {
             descr_index: std::sync::atomic::AtomicI32::new(-1),
-            dynasm: DynasmDescrPayload::default(),
-            cranelift: CraneliftDescrPayload::default(),
+            adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
         }
     }
 }
@@ -2554,6 +2559,22 @@ impl FailDescr for PropagateExceptionDescr {
         // `compile.py:1092` `class PropagateExceptionDescr(AbstractFailDescr)` —
         // inherits `final_descr = False`.  This is a guard descr, not a finish.
         false
+    }
+    fn adr_jump_offset(&self) -> usize {
+        // Safety: single-threaded JIT (RPython GIL parity).
+        unsafe { *self.adr_jump_offset.get() }
+    }
+    fn set_adr_jump_offset(&self, offset: usize) {
+        // Safety: single-threaded JIT (RPython GIL parity).
+        unsafe { *self.adr_jump_offset.get() = offset };
+    }
+    fn rd_locs(&self) -> &[u16] {
+        // Safety: single-threaded JIT (RPython GIL parity).
+        unsafe { &*self.rd_locs.get() }
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        // Safety: single-threaded JIT (RPython GIL parity).
+        unsafe { *self.rd_locs.get() = locs };
     }
 }
 
@@ -3263,24 +3284,6 @@ fn alloc_fail_index() -> u32 {
     NEXT_FAIL_INDEX.fetch_add(1, Ordering::SeqCst)
 }
 
-/// Per-descr dynasm-backend payload (Unified-Descr Port Epic, Session 2
-/// scaffold).  PyPy parity model: `history.py:121 AbstractFailDescr._attrs_
-/// = ('adr_jump_offset', 'rd_locs', 'rd_loop_token', 'rd_vector_info')`
-/// keeps backend fields on the same descr object.  pyre's split currently
-/// stores those backend fields on `DynasmFailDescr`
-/// (`majit-backend-dynasm/src/guard.rs:25`); subsequent sessions of the
-/// epic move them onto this typed payload so the `Arc<dyn FailDescr>` on
-/// the IR op carries the backend state directly.  Empty in Session 2.
-#[derive(Debug, Default)]
-pub struct DynasmDescrPayload {}
-
-/// Per-descr cranelift-backend payload (Unified-Descr Port Epic, Session 2
-/// scaffold).  Mirror of `DynasmDescrPayload` for the cranelift backend's
-/// counterpart fields on `CraneliftFailDescr`
-/// (`majit-backend-cranelift/src/guard.rs:106`).  Empty in Session 2.
-#[derive(Debug, Default)]
-pub struct CraneliftDescrPayload {}
-
 /// Per-guard backend FailDescr carrying a unique `fail_index`, the
 /// runtime fail-arg `Type` vector, and a vectorization accumulator
 /// chain.  Pyre-only adaptation: this is the bare backend descr used
@@ -3305,19 +3308,24 @@ struct MetaFailDescr {
     /// schedule.py:654: vector accumulation info attached during vectorization.
     /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
     vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
+    /// `history.py:132` `AbstractFailDescr._attrs_` — every
+    /// `AbstractFailDescr` instance has this slot, populated by
+    /// `assembler.py:849 patch_pending_failure_recoveries` when the
+    /// guard's recovery stub gets a final address.  `0` until stamped
+    /// (and `0` again after `assembler.py:987 patch_jump_for_descr`
+    /// redirects to a bridge).
+    adr_jump_offset: UnsafeCell<usize>,
+    /// `history.py:132` `AbstractFailDescr._attrs_` `rd_locs` — the
+    /// per-fail-arg jitframe slot positions written by
+    /// `llsupport/assembler.py:279 guardtok.faildescr.rd_locs =
+    /// positions`.  Empty until backend codegen stamps it.
+    rd_locs: UnsafeCell<Vec<u16>>,
     /// FINISH-vs-guard discriminator. Set by `make_finish_fail_descr_typed`
     /// when this descr stands in for an evicted FINISH op (terminal exit
     /// previous-token fallback) or for a test fallback that bypasses
     /// `MetaInterp::new`'s FINISH-singleton attachment. Default `false`
     /// matches the guard-exit case used by `make_fail_descr_typed`.
     is_finish: bool,
-    /// Unified-Descr Port Epic Session 2 scaffold: empty placeholder
-    /// for the dynasm-backend payload that future sessions migrate
-    /// from `DynasmFailDescr` (`majit-backend-dynasm/src/guard.rs:25`)
-    /// onto this descr (PyPy `history.py:121` single-object model).
-    dynasm: DynasmDescrPayload,
-    /// Mirror of `dynasm` for the cranelift backend.
-    cranelift: CraneliftDescrPayload,
 }
 
 // Safety: JIT is single-threaded. UnsafeCell replaces Mutex for rd_vector_info.
@@ -3338,9 +3346,9 @@ impl majit_ir::Descr for MetaFailDescr {
             fail_index: alloc_fail_index(),
             types: UnsafeCell::new(unsafe { (&*self.types.get()).clone() }),
             vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
+            adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
             is_finish: self.is_finish,
-            dynasm: DynasmDescrPayload::default(),
-            cranelift: CraneliftDescrPayload::default(),
         }))
     }
 }
@@ -3368,6 +3376,22 @@ impl FailDescr for MetaFailDescr {
     }
     fn replace_vector_info(&self, chain: Vec<AccumInfo>) {
         unsafe { *self.vector_info.get() = build_vector_info_chain(chain) }
+    }
+    fn adr_jump_offset(&self) -> usize {
+        // Safety: single-threaded JIT, no concurrent writers.
+        unsafe { *self.adr_jump_offset.get() }
+    }
+    fn set_adr_jump_offset(&self, offset: usize) {
+        // Safety: single-threaded JIT, no concurrent readers.
+        unsafe { *self.adr_jump_offset.get() = offset };
+    }
+    fn rd_locs(&self) -> &[u16] {
+        // Safety: single-threaded JIT, no concurrent writers.
+        unsafe { &*self.rd_locs.get() }
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        // Safety: single-threaded JIT, no concurrent readers.
+        unsafe { *self.rd_locs.get() = locs };
     }
 }
 
@@ -3406,28 +3430,21 @@ struct ResumeGuardDescr {
     /// readers chain through this slot; `clt.loop_token_wref()`
     /// (compile.py:180-181) yields the owning `JitCellToken` weakref.
     rd_loop_token_clt: UnsafeCell<Option<std::sync::Arc<CompiledLoopToken>>>,
-    /// Phase E.1 — backend-specific extension slot.
+    /// `history.py:132` `AbstractFailDescr._attrs_ = ('adr_jump_offset',
+    /// 'rd_locs', 'rd_loop_token', 'rd_vector_info')`.
     ///
-    /// In RPython the same descr object carries
-    /// `llsupport/assembler.py:279 descr.rd_locs = positions` and
-    /// `x86/assembler.py:857 tok.faildescr.adr_jump_offset = addr`
-    /// alongside the metainterp-side `rd_*` payload via Python's
-    /// dynamic-attribute model.  Rust direct translation: a
-    /// type-erased `Box<dyn Any + Send + Sync>` filled by the backend
-    /// at compile time (e.g. `DynasmGuardData`, `CraneliftGuardData`).
-    /// `UnsafeCell` so identity is preserved across the write — the
-    /// `Arc<dyn FailDescr>` address stamped on the IR op stays valid.
-    backend_data: UnsafeCell<Option<Box<dyn std::any::Any + Send + Sync>>>,
-    /// Unified-Descr Port Epic Session 2 scaffold: empty placeholder
-    /// for the dynasm-backend payload that future sessions migrate
-    /// from `DynasmFailDescr` (`majit-backend-dynasm/src/guard.rs:25`)
-    /// onto this descr.  PyPy `history.py:121 AbstractFailDescr._attrs_`
-    /// keeps `adr_jump_offset` / `rd_locs` / `rd_loop_token` on the
-    /// same object as `rd_numb` / `rd_consts` etc.; this field is the
-    /// pyre-side typed substitute for `backend_data` boxing.
-    dynasm: DynasmDescrPayload,
-    /// Mirror of `dynasm` for the cranelift backend.
-    cranelift: CraneliftDescrPayload,
+    /// `assembler.py:849 patch_pending_failure_recoveries` stamps the
+    /// absolute address of the recovery stub.  `assembler.py:987
+    /// patch_jump_for_descr` resets to `0` after a bridge is attached
+    /// ("0 means patched").  `UnsafeCell` so identity is preserved
+    /// across the write — the `Arc<dyn FailDescr>` address stamped on
+    /// the IR op stays valid.
+    adr_jump_offset: UnsafeCell<usize>,
+    /// `history.py:132` `AbstractFailDescr._attrs_` `rd_locs`.  Written
+    /// by `llsupport/assembler.py:279 guardtok.faildescr.rd_locs =
+    /// positions`; read by `llsupport/llmodel.py:424
+    /// descr.rd_locs[index] * WORD`.  Empty until codegen stamps it.
+    rd_locs: UnsafeCell<Vec<u16>>,
     /// Pyre-only: identifier of the compiled trace that owns this guard.
     ///
     /// RPython resolves descr identity directly by Python `id(descr)`
@@ -3475,10 +3492,9 @@ impl majit_ir::Descr for ResumeGuardDescr {
             // extension fields are populated only when this fresh descr
             // reaches the backend codegen path
             // (`llsupport/assembler.py:279`).
-            backend_data: UnsafeCell::new(None),
+            adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
             rd_loop_token_clt: UnsafeCell::new(None),
-            dynasm: DynasmDescrPayload::default(),
-            cranelift: CraneliftDescrPayload::default(),
             // Cloned descrs reach the backend codegen path freshly, so
             // `record_loop_or_bridge` re-stamps `trace_id` for the
             // owning compiled trace.
@@ -3569,13 +3585,21 @@ impl FailDescr for ResumeGuardDescr {
     fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
         self.payload.set_rd_pendingfields_arc(value)
     }
-    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
+    fn adr_jump_offset(&self) -> usize {
         // Safety: single-threaded JIT, no concurrent writers.
-        unsafe { (*self.backend_data.get()).as_deref() }
+        unsafe { *self.adr_jump_offset.get() }
     }
-    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
+    fn set_adr_jump_offset(&self, offset: usize) {
         // Safety: single-threaded JIT, no concurrent readers.
-        unsafe { *self.backend_data.get() = Some(data) };
+        unsafe { *self.adr_jump_offset.get() = offset };
+    }
+    fn rd_locs(&self) -> &[u16] {
+        // Safety: single-threaded JIT, no concurrent writers.
+        unsafe { &*self.rd_locs.get() }
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        // Safety: single-threaded JIT, no concurrent readers.
+        unsafe { *self.rd_locs.get() = locs };
     }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         // compile.py:186 reader: return `&Arc<CompiledLoopToken>` typed
@@ -3607,9 +3631,9 @@ pub fn make_fail_descr(num_live: usize) -> DescrRef {
         fail_index: alloc_fail_index(),
         types: UnsafeCell::new(vec![Type::Int; num_live]),
         vector_info: UnsafeCell::new(None),
+        adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
         is_finish: false,
-        dynasm: DynasmDescrPayload::default(),
-        cranelift: CraneliftDescrPayload::default(),
     })
 }
 
@@ -3622,9 +3646,9 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         fail_index,
         types: UnsafeCell::new(vec![Type::Int; num_live]),
         vector_info: UnsafeCell::new(None),
+        adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
         is_finish: false,
-        dynasm: DynasmDescrPayload::default(),
-        cranelift: CraneliftDescrPayload::default(),
     })
 }
 
@@ -3634,9 +3658,9 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
         fail_index: alloc_fail_index(),
         types: UnsafeCell::new(types),
         vector_info: UnsafeCell::new(None),
+        adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
         is_finish: false,
-        dynasm: DynasmDescrPayload::default(),
-        cranelift: CraneliftDescrPayload::default(),
     })
 }
 
@@ -3651,9 +3675,9 @@ pub fn make_finish_fail_descr_typed(types: Vec<Type>) -> DescrRef {
         fail_index: alloc_fail_index(),
         types: UnsafeCell::new(types),
         vector_info: UnsafeCell::new(None),
+        adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
         is_finish: true,
-        dynasm: DynasmDescrPayload::default(),
-        cranelift: CraneliftDescrPayload::default(),
     })
 }
 
@@ -3683,10 +3707,9 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         },
         payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
-        backend_data: UnsafeCell::new(None),
+        adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
         rd_loop_token_clt: UnsafeCell::new(None),
-        dynasm: DynasmDescrPayload::default(),
-        cranelift: CraneliftDescrPayload::default(),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
     })
@@ -3815,11 +3838,17 @@ impl FailDescr for ResumeAtPositionDescr {
     fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
         self.inner.payload.set_rd_pendingfields_arc(value)
     }
-    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        unsafe { (*self.inner.backend_data.get()).as_deref() }
+    fn adr_jump_offset(&self) -> usize {
+        unsafe { *self.inner.adr_jump_offset.get() }
     }
-    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
-        unsafe { *self.inner.backend_data.get() = Some(data) };
+    fn set_adr_jump_offset(&self, offset: usize) {
+        unsafe { *self.inner.adr_jump_offset.get() = offset };
+    }
+    fn rd_locs(&self) -> &[u16] {
+        unsafe { &*self.inner.rd_locs.get() }
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        unsafe { *self.inner.rd_locs.get() = locs };
     }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
@@ -3849,10 +3878,9 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             },
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
-            backend_data: UnsafeCell::new(None),
+            adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
             rd_loop_token_clt: UnsafeCell::new(None),
-            dynasm: DynasmDescrPayload::default(),
-            cranelift: CraneliftDescrPayload::default(),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         },
@@ -3991,11 +4019,17 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
         self.inner.payload.set_rd_pendingfields_arc(value)
     }
-    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        unsafe { (*self.inner.backend_data.get()).as_deref() }
+    fn adr_jump_offset(&self) -> usize {
+        unsafe { *self.inner.adr_jump_offset.get() }
     }
-    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
-        unsafe { *self.inner.backend_data.get() = Some(data) };
+    fn set_adr_jump_offset(&self, offset: usize) {
+        unsafe { *self.inner.adr_jump_offset.get() = offset };
+    }
+    fn rd_locs(&self) -> &[u16] {
+        unsafe { &*self.inner.rd_locs.get() }
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        unsafe { *self.inner.rd_locs.get() = locs };
     }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
@@ -4025,10 +4059,9 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             },
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
-            backend_data: UnsafeCell::new(None),
+            adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
             rd_loop_token_clt: UnsafeCell::new(None),
-            dynasm: DynasmDescrPayload::default(),
-            cranelift: CraneliftDescrPayload::default(),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         },
@@ -4151,11 +4184,17 @@ impl FailDescr for ResumeGuardExcDescr {
     fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
         self.inner.payload.set_rd_pendingfields_arc(value)
     }
-    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        unsafe { (*self.inner.backend_data.get()).as_deref() }
+    fn adr_jump_offset(&self) -> usize {
+        unsafe { *self.inner.adr_jump_offset.get() }
     }
-    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
-        unsafe { *self.inner.backend_data.get() = Some(data) };
+    fn set_adr_jump_offset(&self, offset: usize) {
+        unsafe { *self.inner.adr_jump_offset.get() = offset };
+    }
+    fn rd_locs(&self) -> &[u16] {
+        unsafe { &*self.inner.rd_locs.get() }
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        unsafe { *self.inner.rd_locs.get() = locs };
     }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
@@ -4185,10 +4224,9 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             },
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
-            backend_data: UnsafeCell::new(None),
+            adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
             rd_loop_token_clt: UnsafeCell::new(None),
-            dynasm: DynasmDescrPayload::default(),
-            cranelift: CraneliftDescrPayload::default(),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         },
@@ -4228,15 +4266,17 @@ pub struct ResumeGuardCopiedDescr {
     /// guard owns its own vector-info chain (history.py:143
     /// `attach_vector_info` writes `self.rd_vector_info`).
     vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
-    /// Phase E.1 — backend-specific extension slot.  Copied descrs
-    /// share their donor's *resume* payload via `prev`
-    /// (`compile.py:849 get_resumestorage(): return prev`), but the
-    /// backend-stored fields (`rd_locs`, `adr_jump_offset`) are written
-    /// per-fail at codegen time (`llsupport/assembler.py:279`), so
-    /// each copied descr owns its own slot — same scoping as
-    /// `vector_info` above (history.py:143 writes `self.rd_vector_info`,
-    /// not `prev.rd_vector_info`).
-    backend_data: UnsafeCell<Option<Box<dyn std::any::Any + Send + Sync>>>,
+    /// `history.py:132` `AbstractFailDescr._attrs_` — copied descrs
+    /// share their donor's *resume* payload via `prev` (`compile.py:849
+    /// get_resumestorage(): return prev`), but `adr_jump_offset` is
+    /// written per-fail at codegen time (`assembler.py:849`), so each
+    /// copied descr owns its own slot.  Same scoping as `vector_info`
+    /// above (history.py:143 writes `self.rd_vector_info`, not
+    /// `prev.rd_vector_info`).
+    adr_jump_offset: UnsafeCell<usize>,
+    /// `history.py:132` `_attrs_` `rd_locs` — same per-fail scoping
+    /// as `adr_jump_offset`.
+    rd_locs: UnsafeCell<Vec<u16>>,
     /// `compile.py:186` `descr.rd_loop_token = clt`.  Copied descrs are
     /// stamped per-guard by the same `record_loop_or_bridge` walker
     /// (`compile.py:185 isinstance(descr, ResumeDescr)` covers
@@ -4298,7 +4338,8 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             fail_index: alloc_fail_index(),
             prev: UnsafeCell::new(self.prev().clone()),
             vector_info: UnsafeCell::new(None),
-            backend_data: UnsafeCell::new(None),
+            adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
@@ -4421,11 +4462,17 @@ impl FailDescr for ResumeGuardCopiedDescr {
              upstream optimizer.py:728 only finalizes ResumeGuardDescr"
         );
     }
-    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        unsafe { (*self.backend_data.get()).as_deref() }
+    fn adr_jump_offset(&self) -> usize {
+        unsafe { *self.adr_jump_offset.get() }
     }
-    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
-        unsafe { *self.backend_data.get() = Some(data) };
+    fn set_adr_jump_offset(&self, offset: usize) {
+        unsafe { *self.adr_jump_offset.get() = offset };
+    }
+    fn rd_locs(&self) -> &[u16] {
+        unsafe { &*self.rd_locs.get() }
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        unsafe { *self.rd_locs.get() = locs };
     }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.rd_loop_token_clt.get() };
@@ -4476,7 +4523,8 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 fail_index: alloc_fail_index(),
                 prev: UnsafeCell::new(self.inner.prev().clone()),
                 vector_info: UnsafeCell::new(None),
-                backend_data: UnsafeCell::new(None),
+                adr_jump_offset: UnsafeCell::new(0),
+                rd_locs: UnsafeCell::new(Vec::new()),
                 rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
@@ -4554,11 +4602,17 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_rd_pendingfields(&self, value: Option<Vec<GuardPendingFieldEntry>>) {
         self.inner.set_rd_pendingfields(value)
     }
-    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        self.inner.backend_data()
+    fn adr_jump_offset(&self) -> usize {
+        self.inner.adr_jump_offset()
     }
-    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
-        self.inner.set_backend_data(data)
+    fn set_adr_jump_offset(&self, offset: usize) {
+        self.inner.set_adr_jump_offset(offset);
+    }
+    fn rd_locs(&self) -> &[u16] {
+        self.inner.rd_locs()
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        self.inner.set_rd_locs(locs);
     }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         self.inner.rd_loop_token_clt()
@@ -4599,7 +4653,8 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         fail_index: alloc_fail_index(),
         prev: UnsafeCell::new(prev),
         vector_info: UnsafeCell::new(None),
-        backend_data: UnsafeCell::new(None),
+        adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
@@ -4628,7 +4683,8 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             fail_index: alloc_fail_index(),
             prev: UnsafeCell::new(prev),
             vector_info: UnsafeCell::new(None),
-            backend_data: UnsafeCell::new(None),
+            adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
@@ -4740,11 +4796,14 @@ pub struct CompileLoopVersionDescr {
     resume_data: ResumeData,
     payload: RdPayload,
     vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
-    /// Phase E.1 — backend-specific extension slot.  Same role as on
-    /// `ResumeGuardDescr`; loop-version guards are a `ResumeGuardDescr`
-    /// subclass per `compile.py:895` and reach the backend codegen
-    /// path identically.
-    backend_data: UnsafeCell<Option<Box<dyn std::any::Any + Send + Sync>>>,
+    /// `history.py:132` `AbstractFailDescr._attrs_` — same scoping as
+    /// on `ResumeGuardDescr`; loop-version guards are a
+    /// `ResumeGuardDescr` subclass (`compile.py:895`) and inherit the
+    /// `adr_jump_offset` slot.
+    adr_jump_offset: UnsafeCell<usize>,
+    /// `history.py:132` `_attrs_` `rd_locs` — same scoping as
+    /// `adr_jump_offset` above.
+    rd_locs: UnsafeCell<Vec<u16>>,
     /// `compile.py:186` `descr.rd_loop_token = clt`.  Same role as on
     /// `ResumeGuardDescr`; loop-version descrs are a `ResumeGuardDescr`
     /// subclass per `compile.py:895` and reach `record_loop_or_bridge`
@@ -4785,7 +4844,8 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
             vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
             // Phase E.1: clone mints a fresh descr with no backend
             // extension yet — same scoping as ResumeGuardDescr.clone_descr.
-            backend_data: UnsafeCell::new(None),
+            adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
@@ -4881,11 +4941,17 @@ impl FailDescr for CompileLoopVersionDescr {
     fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
         self.payload.set_rd_pendingfields_arc(value)
     }
-    fn backend_data(&self) -> Option<&(dyn std::any::Any + Send + Sync)> {
-        unsafe { (*self.backend_data.get()).as_deref() }
+    fn adr_jump_offset(&self) -> usize {
+        unsafe { *self.adr_jump_offset.get() }
     }
-    fn set_backend_data(&self, data: Box<dyn std::any::Any + Send + Sync>) {
-        unsafe { *self.backend_data.get() = Some(data) };
+    fn set_adr_jump_offset(&self, offset: usize) {
+        unsafe { *self.adr_jump_offset.get() = offset };
+    }
+    fn rd_locs(&self) -> &[u16] {
+        unsafe { &*self.rd_locs.get() }
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        unsafe { *self.rd_locs.get() = locs };
     }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.rd_loop_token_clt.get() };
@@ -4969,7 +5035,8 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
         payload,
         // guard.py:91: descr.rd_vector_info = None
         vector_info: UnsafeCell::new(None),
-        backend_data: UnsafeCell::new(None),
+        adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
@@ -5363,7 +5430,8 @@ mod fail_descr_tests {
             },
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
-            backend_data: UnsafeCell::new(None),
+            adr_jump_offset: UnsafeCell::new(0),
+        rd_locs: UnsafeCell::new(Vec::new()),
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
