@@ -697,11 +697,10 @@ impl Eq for SpamBlockRef {}
 /// the program-wide push entirely and drain per-block accumulators
 /// in graph-DFS order (matching `codewriter.py:53` upstream).
 fn push_walker_emit(
-    ssarepr: &mut super::flatten::SSARepr,
+    _ssarepr: &mut super::flatten::SSARepr,
     current_block: &SpamBlockRef,
     insn: super::flatten::Insn,
 ) {
-    ssarepr.insns.push(insn.clone());
     current_block.push_insn(insn);
 }
 
@@ -3586,7 +3585,6 @@ impl CodeWriter {
                     Vec::new(),
                     Register::new(Kind::Ref, dst),
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
             }};
@@ -3655,7 +3653,6 @@ impl CodeWriter {
                     vec![Operand::ConstInt(value)],
                     Register::new(Kind::Int, dst),
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
             }};
@@ -3677,13 +3674,11 @@ impl CodeWriter {
                 let src = $src;
                 let retval = $retval;
                 let insn = Insn::op("ref_return", vec![Operand::reg(Kind::Ref, src)]);
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
                 // `rpython/jit/codewriter/flatten.py:144-146`: terminators
                 // emit `('---',)` so the backward liveness pass clears its
                 // alive set.
-                $ssarepr.insns.push(Insn::Unreachable);
                 current_block.push_insn(Insn::Unreachable);
                 // Step 6.1 Phase 2c: attach the return edge to
                 // `graph.returnblock` (`model.py:18`). The return value
@@ -3717,14 +3712,12 @@ impl CodeWriter {
                     "goto",
                     vec![Operand::TLabel(TLabel::new(format!("pc{}", target_py_pc)))],
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
                 // `rpython/jit/codewriter/flatten.py:111-112`: an
                 // unconditional goto implicitly ends a block so the
                 // liveness pass (`liveness.py:68-69`) can reset the alive
                 // set.
-                $ssarepr.insns.push(Insn::Unreachable);
                 current_block.push_insn(Insn::Unreachable);
                 // Step 6.1 Phase 2b: attach a single unconditional
                 // `Link` from the current block to the target PC's
@@ -3768,7 +3761,6 @@ impl CodeWriter {
         macro_rules! emit_abort_permanent {
             ($ssarepr:expr) => {{
                 let insn = Insn::op("abort_permanent", Vec::new());
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
                 // pyre-only dead-end: the block has no successor in
@@ -3790,7 +3782,6 @@ impl CodeWriter {
                 let evalue_fv: super::flow::FlowValue = $evalue;
                 let offset = $offset;
                 let insn = Insn::op("raise", vec![Operand::reg(Kind::Ref, src)]);
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
                 // `flowcontext.py:1246-1261 Raise.nomoreblocks` shape:
@@ -3837,7 +3828,6 @@ impl CodeWriter {
         macro_rules! emit_reraise {
             ($ssarepr:expr) => {{
                 let insn = Insn::op("reraise", Vec::new());
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
                 // Step 6.1 Phase 2c: same edge as `emit_raise!` — the
@@ -3901,7 +3891,6 @@ impl CodeWriter {
                         catch_label
                     )))],
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
                 // Step 6.1 Phase 2b: attach the exception edge to the
@@ -4197,8 +4186,9 @@ impl CodeWriter {
                 if portal_ec_reg != u16::MAX {
                     force_alive.push(Operand::Register(Register::new(Kind::Ref, portal_ec_reg)));
                 }
-                $ssarepr.insns.push(Insn::live(force_alive.clone()));
-                // Task #227.1 dual-write into per-block accumulator.
+                // Sole writer is the per-block accumulator; drain
+                // produces ssarepr.insns from it.  No direct
+                // `$ssarepr.insns.push(...)` here.
                 current_block.push_insn(Insn::live(force_alive));
             }};
         }
@@ -4220,7 +4210,6 @@ impl CodeWriter {
                         Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
                     ],
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
                 // Step 6.1 Phase 2b: attach the conditional-False edge
@@ -4259,7 +4248,6 @@ impl CodeWriter {
                         Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
                     ],
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
                 // Step 6.1 Phase 2b: same as `emit_goto_if_not!` — the
@@ -4345,7 +4333,6 @@ impl CodeWriter {
                     ],
                     Register::new(Kind::Ref, dst),
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
                 // Graph dual-write threads `frame_var.into()` which is
@@ -4387,7 +4374,6 @@ impl CodeWriter {
                         Operand::descr_vable_static_field(field_idx),
                     ],
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
             }};
@@ -4457,7 +4443,6 @@ impl CodeWriter {
                     ],
                     Register::new(Kind::Ref, dst),
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
             }};
@@ -4485,7 +4470,6 @@ impl CodeWriter {
                         Operand::descr_vable_array(field_idx),
                     ],
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
             }};
@@ -4519,7 +4503,6 @@ impl CodeWriter {
                         Operand::descr_vable_array(field_idx),
                     ],
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
             }};
@@ -4545,7 +4528,6 @@ impl CodeWriter {
                     vec![Operand::reg(Kind::Ref, src)],
                     Register::new(Kind::Ref, dst),
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
             }};
@@ -4564,7 +4546,6 @@ impl CodeWriter {
                     vec![Operand::ConstRef(value)],
                     Register::new(Kind::Ref, dst),
                 );
-                $ssarepr.insns.push(insn.clone());
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(insn.clone());
             }};
@@ -5000,7 +4981,6 @@ impl CodeWriter {
                 // residual role at that point is to prevent
                 // `remove_repeated_live` from merging consecutive
                 // per-PC `-live-` markers across PC boundaries.
-                ssarepr.insns.push(Insn::PcAnchor(py_pc));
                 // Task #227.1 dual-write into per-block accumulator.
                 current_block.push_insn(Insn::PcAnchor(py_pc));
                 depth_at_pc[py_pc] = current_depth;
@@ -7405,43 +7385,18 @@ impl CodeWriter {
         // drain surfaces immediately rather than silently masking
         // via fallback to the walker emit.
         {
-            let drained: Vec<super::flatten::Insn> = {
-                let mut out: Vec<super::flatten::Insn> = Vec::new();
-                for block in all_walker_blocks.iter() {
-                    out.extend(block.per_block_ssarepr());
-                }
-                out
-            };
-            // Fail-loud assertion replaces the previous conditional
-            // fallback: with the per-block contiguous walker as
-            // default, every bench must produce a byte-equivalent
-            // drain.  Any walker regression that violates this
-            // surfaces immediately at the assert site rather than
-            // silently degrading to the legacy walker-direct emit
-            // path.
-            assert_eq!(
-                drained.len(),
-                ssarepr.insns.len(),
-                "Task #227.4 production flip: per-block drain length \
-                 mismatch (drained={} ssarepr.insns={}) — walker \
-                 regression broke per-block contiguous emission",
-                drained.len(),
-                ssarepr.insns.len(),
-            );
-            for (i, (l, r)) in drained.iter().zip(ssarepr.insns.iter()).enumerate() {
-                assert!(
-                    insn_byte_equal(l, r),
-                    "Task #227.4 production flip: per-block drain byte \
-                     mismatch at position {i}: drain={l:?} ssarepr={r:?}"
-                );
+            // Production SSARepr generation: drain per-block
+            // accumulators in walker-visit order and assign as
+            // `ssarepr.insns`.  Walker no longer writes to
+            // `ssarepr.insns` directly — every walker emit goes
+            // through `current_block.push_insn` to the per-block
+            // accumulator only.  This mirrors `codewriter.py:53
+            // flatten_graph(graph, regallocs, cpu)` returning the
+            // post-flatten SSARepr from graph state.
+            let mut drained: Vec<super::flatten::Insn> = Vec::new();
+            for block in all_walker_blocks.iter() {
+                drained.extend(block.per_block_ssarepr());
             }
-            // Swap: per-block accumulator becomes the production
-            // source.  Byte-identical to the walker emit so
-            // downstream `compute_liveness` + `assemble` see no
-            // difference — but structurally, `ssarepr.insns` is now
-            // derived from `all_walker_blocks` iteration, matching
-            // `codewriter.py:53 flatten_graph`'s role as the SSARepr
-            // source of truth.
             ssarepr.insns = drained;
         }
 
