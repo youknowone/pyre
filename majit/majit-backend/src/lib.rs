@@ -346,52 +346,86 @@ impl ExitVirtualLayout {
     }
 }
 
-// PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
+/// `history.py:125` `id(descr)` parity — `Option<Arc<dyn Descr>>`
+/// identity compare via `Arc::ptr_eq`.  Backs the `ExitVirtualLayout`
+/// `PartialEq` so canonicalisation matches PyPy's `descr is
+/// other_descr` rather than relying on the pyre-only `descr_index`
+/// serialization handle.
+#[inline]
+fn opt_descr_ptr_eq(
+    a: &Option<majit_ir::DescrRef>,
+    b: &Option<majit_ir::DescrRef>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
+// `PartialEq/Eq` parity: compare layout structurally + descr Arc
+// identity (`history.py:125`); `descr_index` is a serialization handle,
+// not identity.
 impl PartialEq for ExitVirtualLayout {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 Self::Object {
+                    descr: a_descr,
                     type_id: a1,
-                    descr_index: a2,
+                    descr_index: _,
                     known_class: a7,
                     fields: a3,
                     target_slot: a4,
                     fielddescrs: a5,
                     descr_size: a6,
-                    ..
                 },
                 Self::Object {
+                    descr: b_descr,
                     type_id: b1,
-                    descr_index: b2,
+                    descr_index: _,
                     known_class: b7,
                     fields: b3,
                     target_slot: b4,
                     fielddescrs: b5,
                     descr_size: b6,
-                    ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6 && a7 == b7,
+            ) => {
+                opt_descr_ptr_eq(a_descr, b_descr)
+                    && a1 == b1
+                    && a3 == b3
+                    && a4 == b4
+                    && a5 == b5
+                    && a6 == b6
+                    && a7 == b7
+            }
             (
                 Self::Struct {
+                    typedescr: a_descr,
                     type_id: a1,
-                    descr_index: a2,
+                    descr_index: _,
                     fields: a3,
                     target_slot: a4,
                     fielddescrs: a5,
                     descr_size: a6,
-                    ..
                 },
                 Self::Struct {
+                    typedescr: b_descr,
                     type_id: b1,
-                    descr_index: b2,
+                    descr_index: _,
                     fields: b3,
                     target_slot: b4,
                     fielddescrs: b5,
                     descr_size: b6,
-                    ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5 && a6 == b6,
+            ) => {
+                opt_descr_ptr_eq(a_descr, b_descr)
+                    && a1 == b1
+                    && a3 == b3
+                    && a4 == b4
+                    && a5 == b5
+                    && a6 == b6
+            }
             (
                 Self::Array {
                     descr_index: a1,
@@ -405,29 +439,34 @@ impl PartialEq for ExitVirtualLayout {
                     kind: b3,
                     items: b4,
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            ) => {
+                // `Array` has no `arraydescr: Arc<dyn Descr>` field —
+                // `descr_index` is the only identity handle.  Keep the
+                // numeric compare until the arraydescr Arc is hoisted
+                // onto the layout (parallel to the other variants).
+                a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4
+            }
             (
                 Self::ArrayStruct {
-                    descr_index: a1,
+                    descr_index: _,
                     arraydescr: a_ad,
                     fielddescrs: a_fds,
                     element_fields: a2,
                 },
                 Self::ArrayStruct {
-                    descr_index: b1,
+                    descr_index: _,
                     arraydescr: b_ad,
                     fielddescrs: b_fds,
                     element_fields: b2,
                 },
             ) => {
-                // virtualstate.py:295-305: arraydescr identity + per-fielddescr identity
-                a1 == b1
-                    && a_ad.as_ref().map(|d| d.index()) == b_ad.as_ref().map(|d| d.index())
+                // `virtualstate.py:295-305`: arraydescr identity + per-fielddescr identity
+                opt_descr_ptr_eq(a_ad, b_ad)
                     && a_fds.len() == b_fds.len()
                     && a_fds
                         .iter()
                         .zip(b_fds.iter())
-                        .all(|(a, b)| a.index() == b.index())
+                        .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
                     && a2 == b2
             }
             (
