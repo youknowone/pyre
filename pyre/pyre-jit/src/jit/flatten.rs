@@ -1650,7 +1650,7 @@ where
     }
 
     fn rename_operand(&mut self, value: &FlowValue) -> RenameOperand {
-        match self.flatten_value(value) {
+        match self.getcolor(value) {
             Operand::Register(register) => RenameOperand::Register(register),
             Operand::ConstInt(value) => RenameOperand::ConstInt(value),
             Operand::ConstRef(value) => RenameOperand::ConstRef(value),
@@ -1665,7 +1665,7 @@ where
                 None => self.emitline(Insn::op("void_return", Vec::new())),
                 Some(kind) => {
                     let opname = format!("{}_return", kind.as_str());
-                    let operand = self.flatten_value(value);
+                    let operand = self.getcolor(value);
                     self.emitline(Insn::op(opname, vec![operand]));
                 }
             },
@@ -1673,7 +1673,7 @@ where
                 if exc_value.as_variable().is_some() {
                     self.emitline(Insn::live(Vec::new()));
                 }
-                let operand = self.flatten_value(exc_value);
+                let operand = self.getcolor(exc_value);
                 self.emitline(Insn::op("raise", vec![operand]));
             }
             _ => panic!("make_return expects 1 or 2 args, got {}", args.len()),
@@ -1995,7 +1995,7 @@ where
             for link in &catch_links {
                 let llexitcase = link.borrow().llexitcase.clone();
                 if let Some(case) = llexitcase {
-                    let case_operand = self.flatten_value(&case);
+                    let case_operand = self.getcolor(&case);
                     let mismatch_label = self.tlabel_for_link(link);
                     self.emitline(Insn::op(
                         "goto_if_exception_mismatch",
@@ -2028,7 +2028,7 @@ where
             }
             let (opname, mut opargs) = match exitswitch {
                 super::flow::ExitSwitch::Value(value) => {
-                    ("goto_if_not".to_owned(), vec![self.flatten_value(&value)])
+                    ("goto_if_not".to_owned(), vec![self.getcolor(&value)])
                 }
                 super::flow::ExitSwitch::Tuple(values) => self.flatten_tuple_exitswitch(values),
             };
@@ -2065,7 +2065,7 @@ where
         let args = values
             .into_iter()
             .map(|value| match value {
-                super::flow::ExitSwitchElement::Value(value) => self.flatten_value(&value),
+                super::flow::ExitSwitchElement::Value(value) => self.getcolor(&value),
                 super::flow::ExitSwitchElement::Marker(marker) => {
                     panic!("flatten_graph: unexpected tuple exitswitch marker {marker:?}")
                 }
@@ -2119,7 +2119,7 @@ where
                 .push((key, self.tlabel_value_for_link(switch)));
         }
 
-        let switch_value = self.flatten_value(&exitswitch);
+        let switch_value = self.getcolor(&exitswitch);
         self.emitline(Insn::live(Vec::new()));
         self.emitline(Insn::op(
             "switch",
@@ -2336,12 +2336,12 @@ where
 
     fn flatten_arg(&mut self, arg: &SpaceOperationArg) -> Operand {
         match arg {
-            SpaceOperationArg::Value(value) => self.flatten_value(value),
+            SpaceOperationArg::Value(value) => self.getcolor(value),
             SpaceOperationArg::ListOfKind(list) => Operand::ListOfKind(ListOfKind::new(
                 list.kind,
                 list.content
                     .iter()
-                    .map(|value| self.flatten_value(value))
+                    .map(|value| self.getcolor(value))
                     .collect(),
             )),
             // `flatten.py:365-367` passes AbstractDescr through
@@ -2359,7 +2359,14 @@ where
         }
     }
 
-    fn flatten_value(&mut self, value: &FlowValue) -> Operand {
+    /// `flatten.py:382-391 GraphFlattener.getcolor(v)`: Variable →
+    /// Register (via the regallocs coloring), Constant → pass-through
+    /// lowered Operand.  Upstream returns `v` unchanged for the
+    /// Constant case; pyre's typed `Operand` enum requires explicit
+    /// lowering via `lower_constant` (a closure that resolves opaque
+    /// pycode / jitdriver pointers — see `GraphFlattener.lower_constant`
+    /// docstring).
+    fn getcolor(&mut self, value: &FlowValue) -> Operand {
         match value {
             FlowValue::Variable(variable) => Operand::Register((self.get_register)(*variable)),
             FlowValue::Constant(constant) => (self.lower_constant)(constant),
