@@ -7287,6 +7287,49 @@ impl CodeWriter {
             }
         }
 
+        // Task #227.4 feature-gated production flip experiment.  When
+        // `PYRE_TASK_227_FLIP_DRAIN=1`, replace the walker-emitted
+        // program-wide `ssarepr.insns` with the per-block accumulator
+        // drained in walker-visit order.  For benches where the drain
+        // probe reports `byte_equivalent=true` (small benches with
+        // simple control flow), this is a byte-identical swap that
+        // proves the per-block accumulator can BE production input to
+        // `compute_liveness` + `assemble` — the precondition for full
+        // Task #227.4 (post-walk `flatten_graph(graph, regallocs, cpu)`
+        // replacing per-block drain too, per `codewriter.py:53`).
+        //
+        // For benches where the drain mismatches `ssarepr.insns` (block
+        // creation order vs walker emission order divergence on complex
+        // control flow), the flip would corrupt production; gate the
+        // experiment behind the env var so default production paths
+        // remain unaffected.
+        if std::env::var("PYRE_TASK_227_FLIP_DRAIN").is_ok() {
+            let mut drained: Vec<super::flatten::Insn> = Vec::new();
+            for block in all_walker_blocks.iter() {
+                drained.extend(block.per_block_ssarepr());
+            }
+            let byte_equivalent = drained.len() == ssarepr.insns.len()
+                && drained
+                    .iter()
+                    .zip(ssarepr.insns.iter())
+                    .all(|(l, r)| insn_byte_equal(l, r));
+            if byte_equivalent {
+                eprintln!(
+                    "[phase4-flip-drain] {} swapping {} ssarepr insns -> drained per-block",
+                    code.obj_name,
+                    ssarepr.insns.len(),
+                );
+                ssarepr.insns = drained;
+            } else {
+                eprintln!(
+                    "[phase4-flip-drain] {} drain not byte_equivalent (drained={} ssarepr={}); leaving walker emit in place",
+                    code.obj_name,
+                    drained.len(),
+                    ssarepr.insns.len(),
+                );
+            }
+        }
+
         // codewriter.py:45-47 `for kind in KINDS:
         //   regallocs[kind] = perform_register_allocation(graph, kind)`
         //
