@@ -4098,25 +4098,31 @@ impl CodeWriter {
                     Register::new(Kind::Ref, dst),
                 );
                 $ssarepr.insns.push(insn.clone());
-                // Returns `Option<super::flow::Variable>` so callsites that
-                // need the graph-side identity for downstream dual-writes
-                // (e.g. `load_const_fn(pycode, idx)` whose `pycode` is the
-                // result of this `getfield_vable_r`) can thread the same
-                // Variable.  Non-portal callees skip the graph emit and
-                // return `None`; existing callers that don't capture
-                // discard via the trailing `;` (no-op for unused Option).
-                if is_portal {
-                    Some(emit_graph_op_with_result(
-                        &mut graph,
-                        &current_block.block(),
-                        "getfield_vable_r",
-                        vable_getfield_ref_graph_args(frame_var.into(), field_idx),
-                        Kind::Ref,
-                        -1,
-                    ))
-                } else {
-                    None
-                }
+                // Phase 4 walker-orthodoxy: graph `getfield_vable_r`
+                // dual-write fires for every CodeWriter, not just the
+                // portal.  Upstream RPython builds a full flow graph
+                // for every function and lets `flatten_graph` run on
+                // each; pyre's prior is_portal gate was a pyre-specific
+                // shortcut that dropped graph coverage for inner
+                // helpers, leaving the `[phase4-graph-shape]` probe
+                // surfacing them as inline-only.
+                //
+                // `frame_var` / `ec_var` are stable Variable IDs
+                // (`portal_graph_inputvars`) regardless of `is_portal`;
+                // the graph still records the read even when the
+                // startblock.inputargs doesn't list them (the
+                // PRE-EXISTING-ADAPTATION at `graph_entry_inputargs`).
+                // Phase 4+ walker restructure extends non-portal
+                // startblock.inputargs too so the graph is fully
+                // well-formed.
+                Some(emit_graph_op_with_result(
+                    &mut graph,
+                    &current_block.block(),
+                    "getfield_vable_r",
+                    vable_getfield_ref_graph_args(frame_var.into(), field_idx),
+                    Kind::Ref,
+                    -1,
+                ))
             }};
         }
         macro_rules! emit_vable_setfield_int {
@@ -5906,24 +5912,28 @@ impl CodeWriter {
                             // `(ref, ref, ..., ref) -> ref` (nargs+1 refs,
                             // callable + nargs).  All-ref args make the
                             // shape `residual_call_r_r`.
-                            if is_portal {
-                                let mut graph_args_r: Vec<super::flow::FlowValue> =
-                                    Vec::with_capacity(nargs + 1);
-                                graph_args_r.push(callable_value);
-                                graph_args_r.extend(graph_arg_values_rev.into_iter().rev());
-                                let _ = record_residual_call_graph_op(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    fn_idx,
-                                    CallFlavor::MayForce,
-                                    vec![],
-                                    graph_args_r,
-                                    vec![],
-                                    vec![Kind::Ref; nargs + 1],
-                                    ResKind::Ref,
-                                    py_pc as i64,
-                                );
-                            }
+                            //
+                            // Phase 4 walker-orthodoxy: dual-write fires
+                            // regardless of `is_portal`.  Upstream RPython
+                            // builds full flow graphs for every function;
+                            // pyre's prior is_portal gate dropped graph
+                            // coverage for inner-helper CodeWriters.
+                            let mut graph_args_r: Vec<super::flow::FlowValue> =
+                                Vec::with_capacity(nargs + 1);
+                            graph_args_r.push(callable_value);
+                            graph_args_r.extend(graph_arg_values_rev.into_iter().rev());
+                            let _ = record_residual_call_graph_op(
+                                &mut graph,
+                                &current_block.block(),
+                                fn_idx,
+                                CallFlavor::MayForce,
+                                vec![],
+                                graph_args_r,
+                                vec![],
+                                vec![Kind::Ref; nargs + 1],
+                                ResKind::Ref,
+                                py_pc as i64,
+                            );
                         }
                         current_state.stack.push(call_result_value);
                         current_depth += 1;
@@ -7342,10 +7352,11 @@ impl CodeWriter {
                             })
                             .count()
                     };
-                let pair_family = |inline_shape_counts: &mut HashMap<String, usize>,
-                                   hlop_opnames: &[&str],
-                                   residual_opname: &str,
-                                   fn_idx: u16| {
+                let mut paired_hlop_total: usize = 0;
+                let mut pair_family = |inline_shape_counts: &mut HashMap<String, usize>,
+                                       hlop_opnames: &[&str],
+                                       residual_opname: &str,
+                                       fn_idx: u16| {
                     let hlop_count = count_hlop_family(hlop_opnames);
                     let residual_count = count_residual_call_by_fn_idx(
                         inline_walker.as_slice(),
@@ -7353,6 +7364,7 @@ impl CodeWriter {
                         fn_idx,
                     );
                     let paired = hlop_count.min(residual_count);
+                    paired_hlop_total += paired;
                     if paired > 0 {
                         // The shape_descriptor for a residual_call_* with
                         // `(ConstInt(fn_idx), ListI/ListR(...), Descr)`
@@ -7442,6 +7454,16 @@ impl CodeWriter {
                     let i_count = inline_shape_counts.get(shape).copied().unwrap_or(0);
                     multiset_match += g_count.min(i_count);
                 }
+                // Phase 2/4: add the paired HLOp↔residual_call count
+                // so `multiset_match` covers BOTH (a) shapes that
+                // appear on both `graph_walker` and `inline_walker`
+                // and (b) retired-family HLOps on graph that pair
+                // with `residual_call_*` on inline.  Without this,
+                // a CodeWriter whose graph_walker is empty (every
+                // op is a graph_artifact HLOp) and whose
+                // inline_walker has the matching residual_calls would
+                // misleadingly report multiset_match=0.
+                multiset_match += paired_hlop_total;
                 eprintln!(
                     "[phase4-graph-shape] {} parallel={} graph_walker={} graph_artifact={} \
                      inline_walker={} inline_artifact={} multiset_match={}",
