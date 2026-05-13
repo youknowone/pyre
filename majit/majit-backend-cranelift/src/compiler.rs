@@ -13189,11 +13189,12 @@ fn collect_guards(
             Vec::new()
         };
         descr.set_source_op_index(op_idx);
-        // Unified-Descr Port Epic Session 5b: capture the metainterp
-        // ResumeGuardDescr Arc.  rd_numb/rd_consts/rd_virtuals/
-        // rd_pendingfields readers (FailDescr trait impl) forward
-        // through this Arc to the resume.py:450-488 storage on the
-        // metainterp side, so no separate local copy is kept here.
+        // Capture the metainterp `AbstractFailDescr` Arc as a
+        // back-pointer.  Backend accessors for `_attrs_` fields
+        // (`history.py:132`: adr_jump_offset / rd_locs / rd_loop_token
+        // / rd_vector_info) and resume payload (`compile.py:855` rd_numb
+        // / rd_consts / rd_virtuals / rd_pendingfields / status) forward
+        // through this Arc to the metainterp side.
         descr.meta_descr = op.descr.clone();
         let descr = Arc::new(descr);
         if std::env::var_os("MAJIT_LOG").is_some() && !is_finish && !is_external_jump {

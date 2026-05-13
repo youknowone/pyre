@@ -17708,9 +17708,9 @@ mod tests {
             .iter_mut()
             .find(|descr| descr.fail_index == fail_index)
             .expect("fail descr");
-        // Session 5b: rd_* now forward through `meta_descr` to the
-        // metainterp ResumeGuardDescr Arc.  Test fixtures synthesise
-        // DynasmFailDescr without going through the assembler, so they
+        // Backend rd_* accessors forward through `meta_descr` to the
+        // metainterp `AbstractFailDescr` Arc.  Test fixtures synthesise
+        // `DynasmFailDescr` without going through the assembler, so they
         // have no meta_descr.  Mint a fresh metainterp ResumeGuardDescr
         // (carries the rd_* setters) and stamp it as the back-pointer.
         let descr = unsafe {

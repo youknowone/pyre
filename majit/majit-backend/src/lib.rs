@@ -1018,7 +1018,7 @@ impl CompiledLoopToken {
 /// descrs are skipped by the post-compile walker) or whose owning
 /// `JitCellToken` has been dropped by memmgr.  Bridge-source paths
 /// consume the metainterp ResumeGuardDescr Arc directly (Unified-Descr
-/// Port Epic Session 6.7), so the chain resolves through the descr's
+/// directly), so the chain resolves through the descr's
 /// own `rd_loop_token_clt` slot.
 pub fn descr_owning_clt(descr: &dyn FailDescr) -> Option<&Arc<CompiledLoopToken>> {
     descr
@@ -1037,7 +1037,7 @@ pub fn descr_owning_clt(descr: &dyn FailDescr) -> Option<&Arc<CompiledLoopToken>
 /// (`_DoneWithThisFrameDescr` family / `ExitFrameWithExceptionDescr`,
 /// which `compile.py:185` skips via `isinstance(descr, ResumeDescr)`)
 /// or when the owning JCT was evicted by memmgr.  Bridge-source paths
-/// consume the metainterp ResumeGuardDescr Arc directly (Session 6.7).
+/// consume the metainterp `AbstractFailDescr` Arc directly.
 pub fn descr_owning_jct(descr: &dyn FailDescr) -> Option<Arc<JitCellToken>> {
     descr_owning_clt(descr)?.upgrade_loop_token()
 }

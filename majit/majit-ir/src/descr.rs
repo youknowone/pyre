@@ -1362,9 +1362,8 @@ pub trait FailDescr: Descr {
     /// `compile.py:185 isinstance(descr, ResumeDescr)` and never receive
     /// a clt stamp.  `ResumeGuardDescr` (and subclasses) override this to
     /// return the captured `Arc<CompiledLoopToken>`; the bridge-source
-    /// path consumes the metainterp ResumeGuardDescr Arc directly
-    /// (Unified-Descr Port Epic, Session 6.7) so no proxy override is
-    /// needed.
+    /// path consumes the metainterp `AbstractFailDescr` Arc directly so
+    /// no proxy override is needed.
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         None
     }
