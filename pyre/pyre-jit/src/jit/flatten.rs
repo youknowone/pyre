@@ -2533,39 +2533,18 @@ pub(super) fn flatten_constant_operand_for_probe(constant: &super::flow::Constan
     }
 }
 
-/// Block-level walker matching `rpython/jit/codewriter/flatten.py:60
-/// flatten_graph(graph, regallocs)`.  Walks every block in `graph`,
-/// emits a `Label` for each block and an `Insn` for each
-/// `SpaceOperation`, producing the SSARepr that the assembler consumes.
+/// Test-fixture entry mirroring `rpython/jit/codewriter/flatten.py:63
+/// flatten_graph(graph, regallocs)` — wraps `GraphFlattener::
+/// generate_ssa_form` for callers that already have closure-shaped
+/// `get_register` / `lower_constant` rather than a `regallocs`
+/// HashMap.  Production callers should use the canonical
+/// [`flatten_graph`] entry which carries the full `flatten.py:63-70`
+/// shape (regallocs swap + cpu + lowering_ctx).
 ///
-/// `regallocs` keyed by `Kind` provides the per-kind
-/// `GraphAllocationResult` that the caller computed via
-/// `regalloc::perform_graph_register_allocation_all_kinds(graph)`
-/// (upstream `codewriter.py:44-46`'s `regallocs` dict).  `get_register`
-/// projects `Variable` to `Register` using the appropriate per-kind
-/// coloring; `lower_constant` handles non-raw constants (pycode opaque
-/// refs, jitdriver descrs, etc.) that default `flatten_constant_operand`
-/// cannot express on its own.
-///
-/// **Phase 1 scaffold for Task #224**: currently covers the ops whose
-/// graph shape exists in production (`loop_header`, `jit_merge_point`
-/// with the 7-arg upstream shape); ops that pyre's walker still emits
-/// directly into the SSARepr (the bulk of opcodes in
-/// `codewriter.rs::transform_graph_to_jitcode`) do not yet have a
-/// corresponding graph-side `SpaceOperation`, so `flatten_graph`
-/// cannot reproduce the walker's full output.  Wiring Phase 1c
-/// replaces the direct SSARepr emission with `record_graph_op` at
-/// every walker emit point and then switches production to call this
-/// function in place of the walker's interleaved
-/// `ssarepr.insns.push(...)` calls.
-///
-/// Matches upstream structure:
-/// - `flatten_graph`: driver entry point (this function)
-/// - `generate_ssa_form`: block iteration + per-op dispatch
-///   (delegated here to `GraphFlattener::serialize_op`)
-/// - `make_bytecode_block`/`make_link`/`insert_exits`: block boundary
-///   handling — not yet implemented; `Label` insertion happens at
-///   block entry only, `insert_exits` equivalent is not yet wired.
+/// The `enforce_input_args` step (`flatten.py:68`) is skipped because
+/// callers supply `get_register` directly: the closure projects
+/// whatever color scheme the test fixture computed, so no
+/// inputarg-color rotation is needed.
 pub fn flatten_graph_with_closures<F, C>(
     graph: &super::flow::FunctionGraph,
     ssarepr: &mut SSARepr,
