@@ -3471,14 +3471,28 @@ impl CodeWriter {
         // AGENTS.md's preference for dense-index carriers over HashSet
         // when keys form a small contiguous integer range.
         let mut emitted_pc_starts: Vec<bool> = vec![false; num_instrs];
-        // Task #227.5 item 2: block-identity re-pop guard replacing
-        // the legacy PC-index `emitted_pc_starts` skip.  Mirrors
-        // upstream `flowcontext.py:402-405`'s per-block recorder
-        // dedup.  Each `SpamBlockRef` records at most once;
-        // duplicate pendingblocks entries (from supersede pushing
-        // newblock while old block stays queued) are skipped.
-        let mut processed_blocks: std::collections::HashSet<SpamBlockRef> =
-            std::collections::HashSet::new();
+        // Task #227.5 item 2 — diagnosis after fannkuch first-iteration
+        // regression (output 19288 vs expected 8629 with env gate on):
+        // the legacy `emitted_pc_starts` PC-index skip is structurally
+        // load-bearing for the PC-sequential walker.  Block-identity
+        // dedup ALONE (e.g. a `processed_blocks: HashSet<SpamBlockRef>`)
+        // is insufficient because the ssarepr emission protocol relies
+        // on PC-contiguous walker order: when a block yields mid-PC
+        // to a successor, its ssarepr stream ends WITHOUT an explicit
+        // goto/jump; the next block's stream is appended later in
+        // walker order, and the assembler's linear bytecode layout
+        // would route the old block's fallthrough to whichever block
+        // happens to come next in ssarepr — not necessarily the
+        // graph-level supersede successor.  Upstream `flowcontext.py:
+        // 407-475` sidesteps this entirely because ssarepr emission is
+        // a SEPARATE post-walk pass (`codewriter.py:44-67 flatten_graph
+        // (graph, regallocs)`) that walks the graph in DFS order and
+        // inserts explicit `goto TLabel(block.exits[0])` between
+        // blocks via `flatten.py:148-155 make_link`.  Retiring
+        // `emitted_pc_starts` therefore requires completing Task #227
+        // Phase 4 (production flip to post-walk flatten emission) —
+        // it is not a standalone walker refactor.
+        // PRE-EXISTING-ADAPTATION (Task #227 Phase 4 convergence).
 
         // interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` is called in
         // `jump_absolute` (`jumpto < next_instr` branch), i.e. at each
@@ -4904,27 +4918,38 @@ impl CodeWriter {
             let start_pc = pending_state.next_offset;
             // Task #227.5 item 2 (load-bearing PRE-EXISTING-ADAPTATION):
             // The `emitted_pc_starts` PC-index skip is required because
-            // pyre's walker can produce multiple LIVE blocks at the
-            // same start_pc via joinpoint shadow paths (natural-
-            // fallthrough into joinpoints[py_pc] + branch arrival via
-            // mergeblock both insert at the same PC).  Block-identity
-            // dedup (each `SpamBlockRef` processed once) does NOT
-            // dedup these distinct blocks — they each have unique
-            // identity but share start_pc, and processing both emits
-            // duplicate `Label("pcN")` + live markers (breaking
-            // `live_marker_indices_by_pc`'s one-live-per-PC invariant).
+            // pyre's ssarepr emission is INLINE during the walker
+            // pass.  When the walker re-pops a SpamBlock whose start_pc
+            // overlaps a previously emitted block's PC range, naive
+            // re-processing emits duplicate `Label("pcN")` + live
+            // markers (breaking `live_marker_indices_by_pc`'s
+            // one-live-per-PC invariant) and concatenates the block's
+            // ops into ssarepr a second time — both wrong against
+            // upstream which writes block.operations once per
+            // block-identity (`flowcontext.py:407 record_block`).
             //
-            // Upstream `flowcontext.py:407-475`'s per-block recorder
-            // model unifies joinpoint candidates before recording
-            // (union-or-supersede), so only one block per start_pc
-            // ever survives to record_block.  Retiring this skip
-            // requires aligning pyre's joinpoint shadow split with
-            // upstream's unified candidate semantics — a walker
-            // control-flow refactor outside the emit-mechanism scope.
+            // Block-identity dedup alone is insufficient: the
+            // structural divergence is the emission protocol, not the
+            // recorder.  Upstream's `flowcontext.py:404 if not
+            // block.dead: self.record_block(block)` works because
+            // record_block writes into `block.operations` (a per-block
+            // list), and ssarepr flattening is a SEPARATE later pass
+            // (`codewriter.py:44-67 flatten_graph(graph, regallocs)`)
+            // that walks the graph DFS and inserts explicit goto
+            // links between blocks (`flatten.py:148-155 make_link`).
+            // Pyre's walker pushes directly into program-wide
+            // `ssarepr.insns`, so cross-block fallthrough relies on
+            // PC-contiguous emission order — a property the
+            // `emitted_pc_starts` skip preserves by ensuring each PC
+            // index is written exactly once.
+            //
+            // Retiring this skip requires completing Task #227 Phase 4
+            // (production flip to post-walk `flatten_graph(graph,
+            // regallocs)` emission); it is not a standalone walker
+            // refactor.
             if emitted_pc_starts.get(start_pc).copied().unwrap_or(false) {
                 continue;
             }
-            let _ = &mut processed_blocks;
             current_block = pending_block;
             current_state = pending_state;
             current_depth = current_state.stack.len() as u16;
