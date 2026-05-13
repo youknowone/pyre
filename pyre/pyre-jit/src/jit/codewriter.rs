@@ -3356,7 +3356,15 @@ impl CodeWriter {
             HashMap::with_capacity(catch_sites.len());
         for site in &catch_sites {
             let landing = SpamBlockRef::new(graph.new_block(Vec::new()), None);
-            all_walker_blocks.push(landing.clone());
+            // NOTE: catch landings are NOT pushed to `all_walker_blocks`
+            // at creation — they're queued at emission time inside
+            // `emit_mark_label_catch_landing!` so the drain order
+            // reflects walker emission order (catch landings emit
+            // AFTER the main walker loop completes per
+            // `codewriter.rs::6907+`).  Creation-order tracking would
+            // place them before the walker-created blocks in the
+            // drain, misaligning with the post-main-loop emission
+            // sequence.
             catch_landing_blocks.insert(site.landing_label, landing);
         }
         // The walker emits into `current_block`; `emit_mark_label_pc!` and
@@ -4100,6 +4108,23 @@ impl CodeWriter {
                     current_state = state;
                 }
                 needs_fallthrough = true;
+                // Task #227.5 emission-order tracking: push the catch
+                // landing block to `all_walker_blocks` AT FIRST EMIT
+                // (not at creation) so the drain order reflects
+                // walker emission order — catch landings emit after
+                // the main walker loop per `codewriter.rs::6907+`,
+                // so creation-order tracking would misalign with
+                // ssarepr.insns ordering.  Guard against double-push:
+                // a single catch landing may be entered multiple
+                // times if multiple catch sites share a landing
+                // label (unusual but possible per the catch_sites
+                // dedup at codewriter.rs:catch_sites).
+                if !all_walker_blocks
+                    .iter()
+                    .any(|b| b == &current_block)
+                {
+                    all_walker_blocks.push(current_block.clone());
+                }
                 // Task #227.1 per-block accumulator dual-write: record
                 // the catch-landing block's entry Label on its own
                 // accumulator so the post-walk `flatten_graph` driver
