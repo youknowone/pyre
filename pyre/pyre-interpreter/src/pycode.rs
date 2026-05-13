@@ -327,7 +327,11 @@ pub unsafe fn w_code_lookup_exceptiontable(
     if obj.is_null() {
         return None;
     }
-    let code = unsafe { &*((*(obj as *const W_CodeObject)).code_ptr as *const crate::CodeObject) };
+    let code_ptr = unsafe { (*(obj as *const W_CodeObject)).code_ptr };
+    if code_ptr.is_null() {
+        return None;
+    }
+    let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
     crate::exception_table::lookup_exceptiontable(&code.exceptiontable, instr_offset)
 }
 
@@ -346,7 +350,11 @@ pub unsafe fn w_code_exceptiontable(obj: PyObjectRef) -> Vec<u8> {
     if obj.is_null() {
         return Vec::new();
     }
-    let code = unsafe { &*((*(obj as *const W_CodeObject)).code_ptr as *const crate::CodeObject) };
+    let code_ptr = unsafe { (*(obj as *const W_CodeObject)).code_ptr };
+    if code_ptr.is_null() {
+        return Vec::new();
+    }
+    let code = unsafe { &*(code_ptr as *const crate::CodeObject) };
     code.exceptiontable.to_vec()
 }
 

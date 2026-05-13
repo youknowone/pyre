@@ -6004,9 +6004,34 @@ impl MIFrame {
                 }
             }
         }
-        if matches!(instruction, Instruction::Reraise { .. }) {
+        if let Instruction::Reraise { depth } = instruction {
+            // `pyopcode.py:1361` RERAISE extracts the saved lasti from the
+            // stack and routes through RaiseWithExplicitTraceback, which
+            // becomes `err.reraise_lasti` on our PyError.  When `oparg != 0`
+            // and the trace could not fold a const-int from the symbolic
+            // slot (`reraise()` returned -1), bail to the interpreter — the
+            // trace cannot represent a dynamic lasti at handler-entry push
+            // time as a constant int box.
+            let oparg_val = depth.get(op_arg);
+            let reraise_lasti = step_result
+                .as_ref()
+                .err()
+                .map(|e| e.reraise_lasti)
+                .unwrap_or(-1);
+            if oparg_val != 0 && reraise_lasti < 0 {
+                return TraceAction::Abort;
+            }
             if self.sym().last_exc_box != OpRef::NONE {
-                return self.handle_reraise(code, pc);
+                return self.handle_reraise(code, pc, reraise_lasti);
+            }
+            // `last_exc_box == NONE` for RERAISE means the trace entered an
+            // except* handler without observing the prior PUSH_EXC_INFO —
+            // anomalous.  If the RERAISE carried a saved lasti, the
+            // generic handle_possible_exception fallback would drop it
+            // (its inner finishframe_exception call passes -1).  Abort so
+            // the interpreter handles the case faithfully.
+            if oparg_val != 0 {
+                return TraceAction::Abort;
             }
             if step_result.is_err() {
                 return self.handle_possible_exception(code, pc);
@@ -6131,7 +6156,9 @@ impl MIFrame {
             }
             self.sym_mut().class_of_last_exc_is_const = true;
 
-            self.finishframe_exception(code, pc)
+            // pyopcode.py: generic raise paths carry no saved lasti; the
+            // RERAISE-issuing site is the only producer of reraise_lasti.
+            self.finishframe_exception(code, pc, -1)
         } else {
             // pyjitpl.py:3397: GUARD_NO_EXCEPTION
             self.with_ctx(|this, ctx| {
@@ -6146,12 +6173,22 @@ impl MIFrame {
     /// Unlike generic exc=True ops, RERAISE does not go through
     /// GUARD_EXCEPTION. It resumes directly from the already-known
     /// `last_exc_value` and unwinds to the enclosing handler.
-    fn handle_reraise(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
+    ///
+    /// `reraise_lasti` mirrors PyPy `pyopcode.py:122 handle_operation_error`'s
+    /// like-named parameter: when non-negative it is the original raise-site
+    /// offset the RERAISE bytecode extracted from the stack via
+    /// `pyopcode.py:1361 self.space.int_w(self.peekvalue(oparg))`.
+    fn handle_reraise(
+        &mut self,
+        code: &CodeObject,
+        pc: usize,
+        reraise_lasti: i32,
+    ) -> TraceAction {
         let s = self.sym();
         if s.last_exc_value.is_null() || s.last_exc_box == OpRef::NONE {
             return TraceAction::Abort;
         }
-        self.finishframe_exception(code, pc)
+        self.finishframe_exception(code, pc, reraise_lasti)
     }
 
     /// RPython pyjitpl.py:1688 opimpl_raise parity.
@@ -6161,7 +6198,9 @@ impl MIFrame {
     /// going through GUARD_EXCEPTION.
     fn handle_raise_varargs(&mut self, code: &CodeObject, pc: usize, argc: usize) -> TraceAction {
         if argc == 0 {
-            return self.handle_reraise(code, pc);
+            // RAISE_VARARGS 0 is the bare `raise` re-raise.  It carries no
+            // saved lasti — only the explicit `RERAISE N` opcode does.
+            return self.handle_reraise(code, pc, -1);
         }
         {
             let s = self.sym();
@@ -6169,7 +6208,7 @@ impl MIFrame {
                 return TraceAction::Abort;
             }
         }
-        self.finishframe_exception(code, pc)
+        self.finishframe_exception(code, pc, -1)
     }
 
     /// PyPy `RAISE_VARARGS` materialization paired with RPython
@@ -6201,7 +6240,19 @@ impl MIFrame {
     /// Checks current frame for an exception handler.
     /// If found: unwind stack to handler depth, push exception, continue.
     /// If not found: return Abort (metainterp handles multi-frame unwind).
-    fn finishframe_exception(&mut self, code: &CodeObject, pc: usize) -> TraceAction {
+    ///
+    /// `reraise_lasti` is PyPy `pyopcode.py:122 handle_operation_error`'s
+    /// like-named parameter — non-negative when this dispatch was driven by
+    /// a `RERAISE N` opcode that saved the original raise-site offset.  Used
+    /// (a) for the synthesized `lasti` push at handler entry per
+    /// `pyopcode.py:165-170`, and (b) to restore `frame.last_instr` on the
+    /// no-handler propagation path per `pyopcode.py:181-184`.
+    fn finishframe_exception(
+        &mut self,
+        code: &CodeObject,
+        pc: usize,
+        reraise_lasti: i32,
+    ) -> TraceAction {
         let exc_opref = self.sym().last_exc_box;
         let exc_obj = self.sym().last_exc_value;
         let concrete_frame_addr = self.concrete_frame_addr;
@@ -6261,13 +6312,25 @@ impl MIFrame {
                 });
             }
             let lasti_obj = if lasti {
+                // pyopcode.py:165-170 lasti push:
+                //   if reraise_lasti >= 0:
+                //       lasti_value = reraise_lasti
+                //   else:
+                //       lasti_value = intmask(self.last_instr)
+                //   self.pushvalue(self.space.newint(lasti_value))
+                //
                 // Python 3.11 exception-table adaptation: `push_lasti`
                 // pushes a real W_Int object onto `locals_cells_stack_w`.
                 // Mirror it through the same stack/vable helper as every
                 // other W_Root push so guard/resume snapshots see the
                 // object in `virtualizable_boxes`, not a PY_NULL lazy-fill
                 // placeholder.
-                let lasti_obj = pyre_object::w_int_new(pc as i64);
+                let lasti_value: i64 = if reraise_lasti >= 0 {
+                    reraise_lasti as i64
+                } else {
+                    pc as i64
+                };
+                let lasti_obj = pyre_object::w_int_new(lasti_value);
                 let lasti_opref = self.with_ctx(|_this, ctx| ctx.const_ref(lasti_obj as i64));
                 self.with_ctx(|this, ctx| {
                     let s = this.sym_mut();
@@ -6305,6 +6368,21 @@ impl MIFrame {
             self.sym_mut().pending_next_instr = Some(handler_pc);
             TraceAction::Continue
         } else {
+            // pyopcode.py:175-184 no-handler propagation:
+            //   if reraise_lasti >= 0:
+            //       self.last_instr = reraise_lasti
+            //   self.frame_finished_execution = True
+            //
+            // The trace bails to the interpreter (Abort).  The interpreter's
+            // `handle_exception` will continue propagation through parent
+            // frames, so the RERAISE-issuing frame's `last_instr` must be
+            // restored here for `f_lineno` to report the original raise
+            // site rather than the RERAISE site.
+            if reraise_lasti >= 0 {
+                let frame =
+                    unsafe { &mut *(concrete_frame_addr as *mut pyre_interpreter::PyFrame) };
+                frame.last_instr = reraise_lasti as isize;
+            }
             // No handler in this frame — return Abort so metainterp's
             // multi-frame finishframe_exception can pop this frame and
             // try the parent (pyjitpl.py:2520 self.popframe() loop).
@@ -6410,9 +6488,30 @@ impl MIFrame {
                 }
             }
         }
-        if matches!(instruction, Instruction::Reraise { .. }) {
+        if let Instruction::Reraise { depth } = instruction {
+            // Mirror the root-frame dispatcher: thread `err.reraise_lasti`
+            // into `handle_reraise`, abort if `oparg != 0 && lasti < 0`
+            // (trace cannot fold a const-int from the symbolic stack — fall
+            // back to interpreter via TraceAction::Abort).
+            let oparg_val = depth.get(op_arg);
+            let reraise_lasti = step_result
+                .as_ref()
+                .err()
+                .map(|e| e.reraise_lasti)
+                .unwrap_or(-1);
+            if oparg_val != 0 && reraise_lasti < 0 {
+                return InlineTraceStepAction::Trace(TraceAction::Abort);
+            }
             if self.sym().last_exc_box != OpRef::NONE {
-                return InlineTraceStepAction::Trace(self.handle_reraise(code, pc));
+                return InlineTraceStepAction::Trace(
+                    self.handle_reraise(code, pc, reraise_lasti),
+                );
+            }
+            // Same rationale as root dispatcher: abort RERAISE-with-saved-
+            // lasti when the trace lacks a tracked exception box (generic
+            // fallback would drop the lasti).
+            if oparg_val != 0 {
+                return InlineTraceStepAction::Trace(TraceAction::Abort);
             }
             if step_result.is_err() {
                 return InlineTraceStepAction::Trace(self.handle_possible_exception(code, pc));
@@ -7238,24 +7337,55 @@ impl OpcodeStepExecutor for MIFrame {
         ))
     }
 
-    /// RPython opimpl_reraise (pyjitpl.py:1701).
-    ///
-    /// `oparg` is the RERAISE N depth — when non-zero the original raise-
-    /// site lasti integer sits `oparg` slots below TOS.  The trace path
-    /// reads the same symbolic stack as the interpreter `reraise`
-    /// (`eval.rs:reraise`) so any preserved lasti would have to be
-    /// extracted from there.  At the trace-bridge layer we currently only
-    /// surface the exception object; full reraise_lasti propagation is
-    /// inherited via the concrete-frame fallback in `metainterp.rs`.
-    fn reraise(&mut self, _oparg: u32) -> Result<(), Self::Error> {
-        let exc = self.sym().last_exc_value;
-        unsafe {
-            if pyre_object::is_exception(exc) {
-                Err(PyError::from_exc_object(exc))
-            } else {
-                Err(PyError::runtime_error("reraise during tracing"))
+    /// `pypy/interpreter/pyopcode.py:1348-1376 RERAISE`.
+    fn reraise(&mut self, oparg: u32) -> Result<(), Self::Error> {
+        // pyopcode.py:1357-1363
+        let reraise_lasti: i32 = if oparg != 0 {
+            // pyopcode.py:1361 — self.space.int_w(self.peekvalue(oparg))
+            //
+            // Trace-time peek: the lasti slot was pushed by a prior
+            // exception-table dispatch (`finishframe_exception` lasti push)
+            // as a const-int box `w_int_new(pc as i64)`, so the symbolic
+            // `concrete_stack` carries the value verbatim.  When the slot
+            // has been displaced and the trace can no longer fold a
+            // const-int, signal abort with -1; the dispatcher's RERAISE
+            // branch detects `oparg != 0 && reraise_lasti < 0` and routes
+            // to the interpreter via `TraceAction::Abort`.
+            let s = self.sym();
+            match s.valuestackdepth.checked_sub(s.nlocals + oparg as usize + 1) {
+                Some(stack_idx) => match s.concrete_stack.get(stack_idx).copied() {
+                    Some(crate::state::ConcreteValue::Int(v)) => v as i32,
+                    Some(crate::state::ConcreteValue::Ref(obj))
+                        if !obj.is_null() && unsafe { pyre_object::is_int(obj) } =>
+                    {
+                        unsafe { pyre_object::w_int_get_value(obj) as i32 }
+                    }
+                    _ => -1,
+                },
+                None => -1,
             }
+        } else {
+            -1
+        };
+        // pyopcode.py:1364 — w_exc = self.popvalue()
+        let _ = self.with_ctx(|this, ctx| this.pop_value(ctx))?;
+        // The popped value's identity is cached in `sym.last_exc_value`
+        // (seeded by PUSH_EXC_INFO / GUARD_EXCEPTION), so the type check
+        // and PyError construction read from there rather than re-deriving
+        // the concrete from the popped symbolic slot.
+        let w_exc = self.sym().last_exc_value;
+        // pyopcode.py:1367 — w_value = space.interp_w(W_BaseException, w_exc)
+        if w_exc.is_null() || !unsafe { pyre_object::is_exception(w_exc) } {
+            return Err(PyError::type_error(
+                "exception must derive from BaseException",
+            ));
         }
+        // pyopcode.py:1368-1369 — w_type = space.type(w_exc); operr = OperationError(...)
+        let mut err = unsafe { PyError::from_exc_object(w_exc) };
+        // pyopcode.py:1376 — raise RaiseWithExplicitTraceback(operr, reraise_lasti)
+        err.attach_tb = false;
+        err.reraise_lasti = reraise_lasti;
+        Err(err)
     }
 
     fn unsupported(

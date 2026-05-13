@@ -4521,6 +4521,11 @@ fn init_code_type(ns: &mut DictStorage) {
                 if w_self.is_null() {
                     return Ok(pyre_object::bytesobject::w_bytes_from_bytes(&[]));
                 }
+                if !unsafe { crate::pycode::is_code(w_self) } {
+                    return Err(crate::PyError::type_error(
+                        "descriptor 'co_exceptiontable' requires a 'code' object",
+                    ));
+                }
                 let bytes = unsafe { crate::pycode::w_code_exceptiontable(w_self) };
                 Ok(pyre_object::bytesobject::w_bytes_from_bytes(&bytes))
             },

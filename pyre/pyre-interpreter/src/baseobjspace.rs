@@ -4706,6 +4706,15 @@ pub fn getattr(obj: PyObjectRef, name: &str) -> PyResult {
                 "co_name" => return Ok(w_str_new(code.obj_name.as_ref())),
                 "co_filename" => return Ok(w_str_new(code.source_path.as_ref())),
                 "co_flags" => return Ok(w_int_new(code.flags.bits() as i64)),
+                // `pypy/interpreter/pycode.py:143` — `self.co_firstlineno = firstlineno`,
+                // `typedef.py:718` — `co_firstlineno = interp_attrproperty('co_firstlineno', cls=PyCode, wrapfn="newint")`.
+                // RustPython exposes the field as `Option<OneIndexed>`; map None to 1
+                // (matching CPython's default for module-level code).
+                "co_firstlineno" => {
+                    return Ok(w_int_new(
+                        code.first_line_number.map_or(1, |n| n.get() as i64),
+                    ));
+                }
                 _ => {}
             }
         }
