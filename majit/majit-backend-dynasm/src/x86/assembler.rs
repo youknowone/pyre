@@ -4616,37 +4616,188 @@ impl<'a> Assembler386<'a> {
         self.store_rax_to_result(op.pos);
     }
 
-    /// opassembler.py: emit_op_setfield — sized store via regalloc.
+    /// x86/assembler.py:1746 genop_discard_setfield — sized store via regalloc.
+    /// Stage non-register values through X86_64_SCRATCH_REG (r11), mirroring
+    /// the aarch64 path that uses x16.
     fn emit_op_setfield_regalloc(
         &mut self,
-        _base: &crate::regloc::RegLoc,
-        _val_loc: &Loc,
-        _ofs: i32,
-        _field_size: usize,
+        base: &crate::regloc::RegLoc,
+        val_loc: &Loc,
+        ofs: i32,
+        field_size: usize,
     ) {
-        todo!("x86 emit_op_setfield_regalloc")
+        if let Loc::Reg(v) = val_loc
+            && v.is_xmm
+        {
+            dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + ofs], Rx(v.value));
+            return;
+        }
+        let val_reg = match val_loc {
+            Loc::Reg(v) => v.value,
+            _ => {
+                let scratch = crate::regloc::X86_64_SCRATCH_REG;
+                self.regalloc_mov(val_loc, &Loc::Reg(scratch));
+                scratch.value
+            }
+        };
+        match field_size {
+            1 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rb(val_reg)),
+            2 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rw(val_reg)),
+            4 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rd(val_reg)),
+            _ => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rq(val_reg)),
+        }
     }
 
-    /// opassembler.py: emit_op_gcload — sized load via regalloc.
+    /// x86/assembler.py:1691 _genop_gc_load — sized load via regalloc.
+    /// `size`: byte size (1/2/4/8). Negative = signed load.
     fn emit_op_gcload_regalloc(
         &mut self,
-        _base: &crate::regloc::RegLoc,
-        _ofs_loc: &Loc,
-        _dst: &crate::regloc::RegLoc,
-        _size: i64,
+        base: &crate::regloc::RegLoc,
+        ofs_loc: &Loc,
+        dst: &crate::regloc::RegLoc,
+        size: i64,
     ) {
-        todo!("x86 emit_op_gcload_regalloc")
+        let abs_size = size.unsigned_abs() as usize;
+        let signed = size < 0;
+        match ofs_loc {
+            Loc::Immed(i) => {
+                let o = i.value as i32;
+                self.emit_gcload_sized(base, o, None, dst, abs_size, signed);
+            }
+            Loc::Reg(ofs_r) => {
+                self.emit_gcload_sized(base, 0, Some(ofs_r), dst, abs_size, signed);
+            }
+            _ => {}
+        }
     }
 
-    /// opassembler.py: emit_op_gcstore — sized store via regalloc.
+    /// Sized load: `[base + ofs]` or `[base + ofs_reg]` — assembler.py:1645 load_from_mem.
+    fn emit_gcload_sized(
+        &mut self,
+        base: &crate::regloc::RegLoc,
+        ofs: i32,
+        ofs_reg: Option<&crate::regloc::RegLoc>,
+        dst: &crate::regloc::RegLoc,
+        size: usize,
+        signed: bool,
+    ) {
+        if dst.is_xmm {
+            if let Some(r) = ofs_reg {
+                dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + Rq(r.value)]);
+            } else {
+                dynasm!(self.mc ; .arch x64 ; movsd Rx(dst.value), [Rq(base.value) + ofs]);
+            }
+            return;
+        }
+        if let Some(r) = ofs_reg {
+            match (size, signed) {
+                (1, false) => {
+                    dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), BYTE [Rq(base.value) + Rq(r.value)])
+                }
+                (1, true) => {
+                    dynasm!(self.mc ; .arch x64 ; movsx Rq(dst.value), BYTE [Rq(base.value) + Rq(r.value)])
+                }
+                (2, false) => {
+                    dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), WORD [Rq(base.value) + Rq(r.value)])
+                }
+                (2, true) => {
+                    dynasm!(self.mc ; .arch x64 ; movsx Rq(dst.value), WORD [Rq(base.value) + Rq(r.value)])
+                }
+                (4, false) => {
+                    dynasm!(self.mc ; .arch x64 ; mov Rd(dst.value), [Rq(base.value) + Rq(r.value)])
+                }
+                (4, true) => {
+                    dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst.value), DWORD [Rq(base.value) + Rq(r.value)])
+                }
+                _ => {
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + Rq(r.value)])
+                }
+            }
+        } else {
+            match (size, signed) {
+                (1, false) => {
+                    dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), BYTE [Rq(base.value) + ofs])
+                }
+                (1, true) => {
+                    dynasm!(self.mc ; .arch x64 ; movsx Rq(dst.value), BYTE [Rq(base.value) + ofs])
+                }
+                (2, false) => {
+                    dynasm!(self.mc ; .arch x64 ; movzx Rq(dst.value), WORD [Rq(base.value) + ofs])
+                }
+                (2, true) => {
+                    dynasm!(self.mc ; .arch x64 ; movsx Rq(dst.value), WORD [Rq(base.value) + ofs])
+                }
+                (4, false) => {
+                    dynasm!(self.mc ; .arch x64 ; mov Rd(dst.value), [Rq(base.value) + ofs])
+                }
+                (4, true) => {
+                    dynasm!(self.mc ; .arch x64 ; movsxd Rq(dst.value), DWORD [Rq(base.value) + ofs])
+                }
+                _ => dynasm!(self.mc ; .arch x64 ; mov Rq(dst.value), [Rq(base.value) + ofs]),
+            }
+        }
+    }
+
+    /// x86/assembler.py:1746 genop_discard_gc_store — sized store via regalloc.
     fn emit_op_gcstore_regalloc(
         &mut self,
-        _base: &crate::regloc::RegLoc,
-        _ofs_loc: &Loc,
-        _val: &crate::regloc::RegLoc,
-        _size: usize,
+        base: &crate::regloc::RegLoc,
+        ofs_loc: &Loc,
+        val: &crate::regloc::RegLoc,
+        size: usize,
     ) {
-        todo!("x86 emit_op_gcstore_regalloc")
+        match ofs_loc {
+            Loc::Immed(i) => {
+                let o = i.value as i32;
+                self.emit_gcstore_sized(base, o, None, val, size);
+            }
+            Loc::Reg(ofs_r) => {
+                self.emit_gcstore_sized(base, 0, Some(ofs_r), val, size);
+            }
+            _ => {}
+        }
+    }
+
+    /// Sized store: `[base + ofs]` or `[base + ofs_reg]` — assembler.py:1671 save_into_mem.
+    fn emit_gcstore_sized(
+        &mut self,
+        base: &crate::regloc::RegLoc,
+        ofs: i32,
+        ofs_reg: Option<&crate::regloc::RegLoc>,
+        val: &crate::regloc::RegLoc,
+        size: usize,
+    ) {
+        if val.is_xmm {
+            if let Some(r) = ofs_reg {
+                dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + Rq(r.value)], Rx(val.value));
+            } else {
+                dynasm!(self.mc ; .arch x64 ; movsd [Rq(base.value) + ofs], Rx(val.value));
+            }
+            return;
+        }
+        if let Some(r) = ofs_reg {
+            match size {
+                1 => {
+                    dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(r.value)], Rb(val.value))
+                }
+                2 => {
+                    dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(r.value)], Rw(val.value))
+                }
+                4 => {
+                    dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(r.value)], Rd(val.value))
+                }
+                _ => {
+                    dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(r.value)], Rq(val.value))
+                }
+            }
+        } else {
+            match size {
+                1 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rb(val.value)),
+                2 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rw(val.value)),
+                4 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rd(val.value)),
+                _ => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rq(val.value)),
+            }
+        }
     }
 
     /// SETFIELD_GC: [arg0 + offset] = arg1

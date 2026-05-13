@@ -63,31 +63,76 @@ def _run_timed_win32(args, timeout_s):
     import ctypes
     from ctypes import wintypes
 
+    # pypy3.exe on Windows is a launcher that spawns the real interpreter as a
+    # child process; GetProcessTimes on Popen's handle only sees the launcher
+    # and reports ~0s. A JobObject aggregates user/kernel time across all
+    # descendant processes, which is what we actually want.
+    class _IOCounters(ctypes.Structure):
+        _fields_ = [
+            ("ReadOperationCount", ctypes.c_uint64),
+            ("WriteOperationCount", ctypes.c_uint64),
+            ("OtherOperationCount", ctypes.c_uint64),
+            ("ReadTransferCount", ctypes.c_uint64),
+            ("WriteTransferCount", ctypes.c_uint64),
+            ("OtherTransferCount", ctypes.c_uint64),
+        ]
+
+    class _JobBasic(ctypes.Structure):
+        _fields_ = [
+            ("TotalUserTime", ctypes.c_int64),
+            ("TotalKernelTime", ctypes.c_int64),
+            ("ThisPeriodTotalUserTime", ctypes.c_int64),
+            ("ThisPeriodTotalKernelTime", ctypes.c_int64),
+            ("TotalPageFaultCount", ctypes.c_uint32),
+            ("TotalProcesses", ctypes.c_uint32),
+            ("ActiveProcesses", ctypes.c_uint32),
+            ("TotalTerminatedProcesses", ctypes.c_uint32),
+        ]
+
+    class _JobBasicAndIo(ctypes.Structure):
+        _fields_ = [("BasicInfo", _JobBasic), ("IoInfo", _IOCounters)]
+
+    kernel32 = ctypes.windll.kernel32
+    job = kernel32.CreateJobObjectW(None, None)
+
     proc = subprocess.Popen(
         args, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     )
+    # Assigning right after Popen catches launchers like pypy3.exe before they
+    # spawn their interpreter child; descendants inherit job membership.
+    assigned = bool(kernel32.AssignProcessToJobObject(job, int(proc._handle)))
+
     try:
         stdout_bytes, _ = proc.communicate(timeout=timeout_s)
     except subprocess.TimeoutExpired:
         proc.kill()
         proc.communicate()
+        kernel32.CloseHandle(job)
         return "", 0.0, 124
 
     utime = 0.0
-    try:
+    JobObjectBasicAndIoAccountingInformation = 8
+    if assigned:
+        info = _JobBasicAndIo()
+        if kernel32.QueryInformationJobObject(
+            job, JobObjectBasicAndIoAccountingInformation,
+            ctypes.byref(info), ctypes.sizeof(info), None,
+        ):
+            utime = info.BasicInfo.TotalUserTime / 1e7
+    else:
+        # Job assignment refused (e.g. already in a non-nestable job on older
+        # Windows). Fall back to per-process times.
         ct = wintypes.FILETIME()
         et = wintypes.FILETIME()
         kt = wintypes.FILETIME()
         ut = wintypes.FILETIME()
-        handle = int(proc._handle)
-        if ctypes.windll.kernel32.GetProcessTimes(
-            handle,
+        if kernel32.GetProcessTimes(
+            int(proc._handle),
             ctypes.byref(ct), ctypes.byref(et),
             ctypes.byref(kt), ctypes.byref(ut),
         ):
             utime = ((ut.dwHighDateTime << 32) | ut.dwLowDateTime) / 1e7
-    except Exception:
-        pass
+    kernel32.CloseHandle(job)
     return stdout_bytes.decode("utf-8", errors="replace"), utime, proc.returncode
 
 
@@ -389,6 +434,8 @@ class Check:
             and cranelift_vs_cpython
         ):
             need_cpython = True
+        if self.args.full:
+            need_cpython = True
 
         print(f"  {name}")
 
@@ -557,6 +604,11 @@ def parse_args():
     parser.add_argument("--snapshot", dest="snapshot_mode", action="store_const", const="record")
     parser.add_argument("--snapshot-diff", dest="snapshot_mode", action="store_const", const="diff")
     parser.add_argument("--threshold", type=float, default=None)
+    parser.add_argument(
+        "--full",
+        action="store_true",
+        help="also run cpython on benchmarks without a vs_cpython gate (comparison only)",
+    )
     parser.add_argument("pyre_path", nargs="?", default="")
     args = parser.parse_args()
 
