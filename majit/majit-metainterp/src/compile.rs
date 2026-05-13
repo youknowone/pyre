@@ -3515,16 +3515,15 @@ impl majit_ir::Descr for ResumeGuardDescr {
             resume_data: self.resume_data.clone(),
             payload: self.payload.deep_clone(),
             vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
-            // Phase E.1: clone produces a fresh descr with no backend
-            // data — RPython compile.py:844-846 `ResumeGuardDescr()`
-            // mints a default-attributes object; backend-stored
-            // extension fields are populated only when this fresh descr
-            // reaches the backend codegen path
-            // (`llsupport/assembler.py:279`).
+            // `compile.py:844-846` `ResumeGuardDescr()` mints a default-
+            // attributes object; the `_attrs_` slots (adr_jump_offset /
+            // rd_locs / status / rd_loop_token / rd_vector_info) reset
+            // to their initial values when this fresh descr reaches
+            // backend codegen (`llsupport/assembler.py:279`).
             adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
-        rd_loop_token_clt: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
             // Cloned descrs reach the backend codegen path freshly, so
             // `record_loop_or_bridge` re-stamps `trace_id` for the
             // owning compiled trace.
@@ -5006,12 +5005,13 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
             resume_data: self.resume_data.clone(),
             payload: self.payload.deep_clone(),
             vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
-            // Phase E.1: clone mints a fresh descr with no backend
-            // extension yet — same scoping as ResumeGuardDescr.clone_descr.
+            // `compile.py:907 CompileLoopVersionDescr().clone()` mints a
+            // default-attributes object — same scoping as
+            // `ResumeGuardDescr.clone_descr`.
             adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
+            rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
-        rd_loop_token_clt: UnsafeCell::new(None),
+            rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         }))
