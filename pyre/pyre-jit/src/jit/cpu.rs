@@ -72,6 +72,20 @@ pub struct Cpu {
     /// pyre operates on the flowspace graph directly, without a
     /// typed-low-level rewrite.
     pub rtyper: super::exceptiondata::Rtyper,
+    /// Retired-family fn-idx pool — pyre-specific extension carried
+    /// on `Cpu` so the canonical `flatten_graph(graph, regallocs,
+    /// _include_all_exc_links, cpu)` entry can derive the
+    /// dispatcher's `LoweringContext` from `cpu` alone (matching
+    /// upstream's "cpu carries everything flatten needs" contract).
+    /// Each `Option<u16>` is populated by `CodeWriter::transform_
+    /// graph_to_jitcode` from `descrs.intern_int_method_index`.
+    /// **PRE-EXISTING-ADAPTATION**: upstream's `cpu` does not carry
+    /// these because upstream's rtyper rewrites the graph to post-
+    /// rtype shape before `flatten_graph` runs, so the dispatcher has
+    /// no upstream analog.  Phase 5 retires these fields once pyre's
+    /// walker stops emitting pre-rtype HLOps in favour of post-rtype
+    /// residual_call SpaceOperations on the graph.
+    pub lowering_ctx: std::sync::RwLock<Option<super::flatten::LoweringContext>>,
 }
 
 impl Cpu {
@@ -102,6 +116,7 @@ impl Cpu {
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
             rtyper: super::exceptiondata::Rtyper::new(),
+            lowering_ctx: std::sync::RwLock::new(None),
         }
     }
 }

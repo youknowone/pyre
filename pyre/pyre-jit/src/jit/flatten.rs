@@ -2471,7 +2471,7 @@ pub(super) fn flatten_constant_operand_for_probe(constant: &super::flow::Constan
 /// - `make_bytecode_block`/`make_link`/`insert_exits`: block boundary
 ///   handling — not yet implemented; `Label` insertion happens at
 ///   block entry only, `insert_exits` equivalent is not yet wired.
-pub fn flatten_graph<F, C>(
+pub fn flatten_graph_with_closures<F, C>(
     graph: &super::flow::FunctionGraph,
     ssarepr: &mut SSARepr,
     get_register: F,
@@ -2551,6 +2551,61 @@ pub fn flatten_graph_with_lowering<'a, F, C>(
 /// the new orthodox entry is currently consumed by the
 /// `[phase4-flatten-graph]` probe and unit tests where the placeholder
 /// is acceptable.
+/// **Upstream-orthodox entry** matching
+/// `rpython/jit/codewriter/flatten.py:63-70 flatten_graph(graph,
+/// regallocs, _include_all_exc_links=False, cpu=None)` signature with
+/// no additional parameters.  Derives the dispatcher's
+/// `LoweringContext` from `cpu.lowering_ctx` (a pyre-specific
+/// extension on `Cpu` documented at `cpu.rs::Cpu::lowering_ctx`).
+/// When `cpu` is `None` or `cpu.lowering_ctx` is unset, the HLOp
+/// dispatcher is disabled and pre-rtype HLOp opnames passthrough to
+/// the SSARepr — useful for tests against structural-only graphs.
+pub fn flatten_graph<'a>(
+    graph: &super::flow::FunctionGraph,
+    regallocs: &'a std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
+    _include_all_exc_links: bool,
+    cpu: Option<&'a super::cpu::Cpu>,
+) -> SSARepr {
+    let lowering_ctx = cpu
+        .and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
+    let mut ssarepr = SSARepr::new(graph.name.clone());
+    let get_register = |variable: Variable| -> Register {
+        let kind = variable.kind.unwrap_or(Kind::Ref);
+        let color = regallocs
+            .get(&kind)
+            .and_then(|r| r.coloring.get(&variable.id).copied())
+            .unwrap_or(u16::MAX);
+        Register::new(kind, color)
+    };
+    let lower_constant = flatten_constant_operand_for_probe;
+    if let Some(ctx) = lowering_ctx {
+        flatten_graph_with_lowering(
+            graph,
+            &mut ssarepr,
+            ctx,
+            cpu,
+            get_register,
+            lower_constant,
+        );
+    } else {
+        let mut flattener =
+            GraphFlattener::new_with_constant_lowering(&mut ssarepr, get_register, lower_constant);
+        if let Some(cpu) = cpu {
+            flattener = flattener.with_cpu(cpu);
+        }
+        flattener.make_bytecode_block(graph.startblock.clone(), false);
+    }
+    ssarepr
+}
+
+/// Phase 4 transitional entry — the same shape as the orthodox
+/// `flatten_graph` above but with a `LoweringContext` parameter that
+/// the caller threads explicitly.  Retained for the
+/// `[phase4-flatten-graph]` probe (which builds the `LoweringContext`
+/// per-CodeWriter from local `descrs.intern_*` lookups and would
+/// prefer to bypass the `Cpu::lowering_ctx` RwLock when the indexes
+/// are already in hand).  Phase 5 retires this once the probe migrates
+/// to the canonical `flatten_graph` entry.
 pub fn flatten_graph_with_regallocs<'a>(
     graph: &super::flow::FunctionGraph,
     regallocs: &'a std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
@@ -4369,9 +4424,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("flat_walk");
-        flatten_graph(
-            &graph,
-            &mut ssarepr,
+        flatten_graph_with_closures(&graph, &mut ssarepr,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4405,9 +4458,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("renaming");
-        flatten_graph(
-            &graph,
-            &mut ssarepr,
+        flatten_graph_with_closures(&graph, &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4495,9 +4546,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("exc_dispatch");
-        flatten_graph(
-            &graph,
-            &mut ssarepr,
+        flatten_graph_with_closures(&graph, &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4557,9 +4606,7 @@ mod tests {
         start.closeblock(vec![false_link, true_link]);
 
         let mut ssarepr = SSARepr::new("bool_branch");
-        flatten_graph(
-            &graph,
-            &mut ssarepr,
+        flatten_graph_with_closures(&graph, &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4615,9 +4662,7 @@ mod tests {
         start.closeblock(vec![case_three, case_one, default]);
 
         let mut ssarepr = SSARepr::new("int_switch");
-        flatten_graph(
-            &graph,
-            &mut ssarepr,
+        flatten_graph_with_closures(&graph, &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4684,9 +4729,7 @@ mod tests {
         start.closeblock(vec![case_three, case_one]);
 
         let mut ssarepr = SSARepr::new("int_switch_no_default");
-        flatten_graph(
-            &graph,
-            &mut ssarepr,
+        flatten_graph_with_closures(&graph, &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4739,9 +4782,7 @@ mod tests {
         start.closeblock(vec![false_link, true_link]);
 
         let mut ssarepr = SSARepr::new("tuple_branch");
-        flatten_graph(
-            &graph,
-            &mut ssarepr,
+        flatten_graph_with_closures(&graph, &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -5145,9 +5186,7 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("passthrough");
-        flatten_graph(
-            &graph,
-            &mut ssarepr,
+        flatten_graph_with_closures(&graph, &mut ssarepr,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -7201,6 +7240,39 @@ mod tests {
     }
 
     #[test]
+    fn flatten_graph_canonical_four_arg_entry_works_without_lowering_ctx() {
+        // Phase 4 — `flatten.py:63-70` orthodox 4-arg entry.  No
+        // `lowering_ctx` parameter; `cpu=None` so dispatcher is
+        // disabled and pre-rtype HLOp opnames passthrough.
+        use crate::jit::flow::{Block, FunctionGraph};
+        let retval = Variable::new(VariableId(99), Kind::Ref);
+        let start = Block::shared(Vec::new());
+        let graph = FunctionGraph::new("orthodox4arg", start.clone(), Some(retval));
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("loop_header", vec![Constant::signed(11).into()], None, 0),
+        );
+        start.closeblock(vec![
+            super::super::flow::Link::new(
+                vec![retval.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+        let regallocs =
+            super::super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+        let ssarepr = flatten_graph(&graph, &regallocs, false, None);
+        assert_eq!(ssarepr.name, "orthodox4arg");
+        assert!(
+            ssarepr
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "loop_header"))
+        );
+    }
+
+    #[test]
     fn flatten_graph_with_regallocs_canonical_entry_returns_ssarepr() {
         // Phase 4 — `flatten.py:63-70` orthodox entry.
         // Build a trivial portal-like graph with a single
@@ -7272,9 +7344,7 @@ mod tests {
             Link::new(vec![res.into()], Some(graph.returnblock.clone()), None).into_ref(),
         ]);
         let mut ssarepr = SSARepr::new("ovf_no_catch");
-        flatten_graph(
-            &graph,
-            &mut ssarepr,
+        flatten_graph_with_closures(&graph, &mut ssarepr,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
