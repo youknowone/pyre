@@ -1580,8 +1580,13 @@ where
     }
 
     pub fn serialize_op(&mut self, op: &SpaceOperation) {
+        // `flatten.py:373-380 serialize_op`: serialise an op into the
+        // SSARepr via `emitline`.  Pyre's `flatten_space_operation`
+        // splits out the per-op lowering (HLOp dispatch + arg /
+        // result handling); the `emitline` call below matches
+        // upstream's final push.
         let insn = self.flatten_space_operation(op);
-        self.ssarepr.insns.push(insn);
+        self.emitline(insn);
     }
 
     fn emitline(&mut self, insn: Insn) {
