@@ -3284,6 +3284,25 @@ fn alloc_fail_index() -> u32 {
     NEXT_FAIL_INDEX.fetch_add(1, Ordering::SeqCst)
 }
 
+// `compile.py:687-696 AbstractResumeGuardDescr` status-bit constants.
+//
+// Status packs three pieces in one `u64`:
+//   - bit 0          : `ST_BUSY_FLAG` (set during retrace; clear once done).
+//   - bits 1..3      : `ST_TYPE_MASK` — `TY_NONE` / `TY_INT` / `TY_REF` /
+//                      `TY_FLOAT`, set by `make_a_counter_per_value` to
+//                      distinguish guard_value-by-int / -by-ref / -by-float.
+//   - bits 3..end    : jitcounter hash (when TY_NONE) or guard_value
+//                      failarg index (when TY_INT/REF/FLOAT), accessed via
+//                      `>> ST_SHIFT` with `STATUS_SHIFT_MASK`.
+pub(crate) const STATUS_BUSY_FLAG: u64 = 0x01;
+pub(crate) const STATUS_TYPE_MASK: u64 = 0x06;
+pub(crate) const STATUS_SHIFT: u32 = 3;
+pub(crate) const STATUS_SHIFT_MASK: u64 = !((1u64 << STATUS_SHIFT) - 1);
+pub(crate) const STATUS_TY_NONE: u64 = 0x00;
+pub(crate) const STATUS_TY_INT: u64 = 0x02;
+pub(crate) const STATUS_TY_REF: u64 = 0x04;
+pub(crate) const STATUS_TY_FLOAT: u64 = 0x06;
+
 /// Per-guard backend FailDescr carrying a unique `fail_index`, the
 /// runtime fail-arg `Type` vector, and a vectorization accumulator
 /// chain.  Pyre-only adaptation: this is the bare backend descr used
@@ -3393,6 +3412,10 @@ impl FailDescr for MetaFailDescr {
         // Safety: single-threaded JIT, no concurrent readers.
         unsafe { *self.rd_locs.get() = locs };
     }
+    // `compile.py:683` `AbstractResumeGuardDescr._attrs_ = ('status',)`
+    // — `status` is NOT inherited by `BasicFailDescr` /
+    // `MetaFailDescr` (these subclass `AbstractFailDescr` directly).
+    // Trait defaults (`get_status() -> 0`, no-op setters) are correct.
 }
 
 /// Per-guard FailDescr that also carries resume data for deoptimization.
@@ -3445,6 +3468,11 @@ struct ResumeGuardDescr {
     /// positions`; read by `llsupport/llmodel.py:424
     /// descr.rd_locs[index] * WORD`.  Empty until codegen stamps it.
     rd_locs: UnsafeCell<Vec<u16>>,
+    /// `compile.py:683` `AbstractResumeGuardDescr._attrs_ = ('status',)`.
+    /// Packs `ST_BUSY_FLAG` + type tag + jitcounter hash;
+    /// `start_compiling` / `done_compiling` toggle the busy bit and
+    /// `store_hash` / `make_a_counter_per_value` write the rest.
+    status: AtomicU64,
     /// Pyre-only: identifier of the compiled trace that owns this guard.
     ///
     /// RPython resolves descr identity directly by Python `id(descr)`
@@ -3494,7 +3522,8 @@ impl majit_ir::Descr for ResumeGuardDescr {
             // (`llsupport/assembler.py:279`).
             adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
-            rd_loop_token_clt: UnsafeCell::new(None),
+            status: AtomicU64::new(0),
+        rd_loop_token_clt: UnsafeCell::new(None),
             // Cloned descrs reach the backend codegen path freshly, so
             // `record_loop_or_bridge` re-stamps `trace_id` for the
             // owning compiled trace.
@@ -3600,6 +3629,25 @@ impl FailDescr for ResumeGuardDescr {
     fn set_rd_locs(&self, locs: Vec<u16>) {
         // Safety: single-threaded JIT, no concurrent readers.
         unsafe { *self.rd_locs.get() = locs };
+    }
+    fn get_status(&self) -> u64 {
+        self.status.load(Ordering::Acquire)
+    }
+    fn start_compiling(&self) {
+        self.status
+            .fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn done_compiling(&self) {
+        self.status
+            .fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn store_hash(&self, hash: u64) {
+        self.status
+            .store(hash & STATUS_SHIFT_MASK, Ordering::Release);
+    }
+    fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
+        let value = type_tag | ((index as u64) << STATUS_SHIFT);
+        self.status.store(value, Ordering::Release);
     }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         // compile.py:186 reader: return `&Arc<CompiledLoopToken>` typed
@@ -3709,6 +3757,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
+        status: AtomicU64::new(0),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
@@ -3850,6 +3899,28 @@ impl FailDescr for ResumeAtPositionDescr {
     fn set_rd_locs(&self, locs: Vec<u16>) {
         unsafe { *self.inner.rd_locs.get() = locs };
     }
+    fn get_status(&self) -> u64 {
+        self.inner.status.load(Ordering::Acquire)
+    }
+    fn start_compiling(&self) {
+        self.inner
+            .status
+            .fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn done_compiling(&self) {
+        self.inner
+            .status
+            .fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn store_hash(&self, hash: u64) {
+        self.inner
+            .status
+            .store(hash & STATUS_SHIFT_MASK, Ordering::Release);
+    }
+    fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
+        let value = type_tag | ((index as u64) << STATUS_SHIFT);
+        self.inner.status.store(value, Ordering::Release);
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
         cell.as_ref().map(|arc| arc as &dyn std::any::Any)
@@ -3880,7 +3951,8 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
-            rd_loop_token_clt: UnsafeCell::new(None),
+            status: AtomicU64::new(0),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         },
@@ -4031,6 +4103,28 @@ impl FailDescr for ResumeGuardForcedDescr {
     fn set_rd_locs(&self, locs: Vec<u16>) {
         unsafe { *self.inner.rd_locs.get() = locs };
     }
+    fn get_status(&self) -> u64 {
+        self.inner.status.load(Ordering::Acquire)
+    }
+    fn start_compiling(&self) {
+        self.inner
+            .status
+            .fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn done_compiling(&self) {
+        self.inner
+            .status
+            .fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn store_hash(&self, hash: u64) {
+        self.inner
+            .status
+            .store(hash & STATUS_SHIFT_MASK, Ordering::Release);
+    }
+    fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
+        let value = type_tag | ((index as u64) << STATUS_SHIFT);
+        self.inner.status.store(value, Ordering::Release);
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
         cell.as_ref().map(|arc| arc as &dyn std::any::Any)
@@ -4061,7 +4155,8 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
-            rd_loop_token_clt: UnsafeCell::new(None),
+            status: AtomicU64::new(0),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         },
@@ -4196,6 +4291,28 @@ impl FailDescr for ResumeGuardExcDescr {
     fn set_rd_locs(&self, locs: Vec<u16>) {
         unsafe { *self.inner.rd_locs.get() = locs };
     }
+    fn get_status(&self) -> u64 {
+        self.inner.status.load(Ordering::Acquire)
+    }
+    fn start_compiling(&self) {
+        self.inner
+            .status
+            .fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn done_compiling(&self) {
+        self.inner
+            .status
+            .fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn store_hash(&self, hash: u64) {
+        self.inner
+            .status
+            .store(hash & STATUS_SHIFT_MASK, Ordering::Release);
+    }
+    fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
+        let value = type_tag | ((index as u64) << STATUS_SHIFT);
+        self.inner.status.store(value, Ordering::Release);
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.inner.rd_loop_token_clt.get() };
         cell.as_ref().map(|arc| arc as &dyn std::any::Any)
@@ -4226,7 +4343,8 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
-            rd_loop_token_clt: UnsafeCell::new(None),
+            status: AtomicU64::new(0),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         },
@@ -4277,6 +4395,10 @@ pub struct ResumeGuardCopiedDescr {
     /// `history.py:132` `_attrs_` `rd_locs` — same per-fail scoping
     /// as `adr_jump_offset`.
     rd_locs: UnsafeCell<Vec<u16>>,
+    /// `compile.py:683` `AbstractResumeGuardDescr._attrs_` `status` —
+    /// each copied descr carries its own status (the copied receiver is
+    /// retraced independently of the donor).
+    status: AtomicU64,
     /// `compile.py:186` `descr.rd_loop_token = clt`.  Copied descrs are
     /// stamped per-guard by the same `record_loop_or_bridge` walker
     /// (`compile.py:185 isinstance(descr, ResumeDescr)` covers
@@ -4340,7 +4462,8 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
-            rd_loop_token_clt: UnsafeCell::new(None),
+            status: AtomicU64::new(0),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         }))
@@ -4474,6 +4597,25 @@ impl FailDescr for ResumeGuardCopiedDescr {
     fn set_rd_locs(&self, locs: Vec<u16>) {
         unsafe { *self.rd_locs.get() = locs };
     }
+    fn get_status(&self) -> u64 {
+        self.status.load(Ordering::Acquire)
+    }
+    fn start_compiling(&self) {
+        self.status
+            .fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn done_compiling(&self) {
+        self.status
+            .fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn store_hash(&self, hash: u64) {
+        self.status
+            .store(hash & STATUS_SHIFT_MASK, Ordering::Release);
+    }
+    fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
+        let value = type_tag | ((index as u64) << STATUS_SHIFT);
+        self.status.store(value, Ordering::Release);
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.rd_loop_token_clt.get() };
         cell.as_ref().map(|arc| arc as &dyn std::any::Any)
@@ -4525,7 +4667,8 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 vector_info: UnsafeCell::new(None),
                 adr_jump_offset: UnsafeCell::new(0),
                 rd_locs: UnsafeCell::new(Vec::new()),
-                rd_loop_token_clt: UnsafeCell::new(None),
+                status: AtomicU64::new(0),
+        rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
             },
@@ -4614,6 +4757,21 @@ impl FailDescr for ResumeGuardCopiedExcDescr {
     fn set_rd_locs(&self, locs: Vec<u16>) {
         self.inner.set_rd_locs(locs);
     }
+    fn get_status(&self) -> u64 {
+        self.inner.get_status()
+    }
+    fn start_compiling(&self) {
+        self.inner.start_compiling();
+    }
+    fn done_compiling(&self) {
+        self.inner.done_compiling();
+    }
+    fn store_hash(&self, hash: u64) {
+        self.inner.store_hash(hash);
+    }
+    fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
+        self.inner.make_a_counter_per_value(index, type_tag);
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         self.inner.rd_loop_token_clt()
     }
@@ -4655,6 +4813,7 @@ pub fn make_resume_guard_copied_descr(prev: DescrRef) -> DescrRef {
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
+        status: AtomicU64::new(0),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
@@ -4685,7 +4844,8 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
-            rd_loop_token_clt: UnsafeCell::new(None),
+            status: AtomicU64::new(0),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         },
@@ -4804,6 +4964,9 @@ pub struct CompileLoopVersionDescr {
     /// `history.py:132` `_attrs_` `rd_locs` — same scoping as
     /// `adr_jump_offset` above.
     rd_locs: UnsafeCell<Vec<u16>>,
+    /// `compile.py:683` `AbstractResumeGuardDescr._attrs_` `status` —
+    /// loop-version guards inherit the slot per `compile.py:895`.
+    status: AtomicU64,
     /// `compile.py:186` `descr.rd_loop_token = clt`.  Same role as on
     /// `ResumeGuardDescr`; loop-version descrs are a `ResumeGuardDescr`
     /// subclass per `compile.py:895` and reach `record_loop_or_bridge`
@@ -4846,7 +5009,8 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
             // extension yet — same scoping as ResumeGuardDescr.clone_descr.
             adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
-            rd_loop_token_clt: UnsafeCell::new(None),
+            status: AtomicU64::new(0),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         }))
@@ -4953,6 +5117,25 @@ impl FailDescr for CompileLoopVersionDescr {
     fn set_rd_locs(&self, locs: Vec<u16>) {
         unsafe { *self.rd_locs.get() = locs };
     }
+    fn get_status(&self) -> u64 {
+        self.status.load(Ordering::Acquire)
+    }
+    fn start_compiling(&self) {
+        self.status
+            .fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn done_compiling(&self) {
+        self.status
+            .fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
+    }
+    fn store_hash(&self, hash: u64) {
+        self.status
+            .store(hash & STATUS_SHIFT_MASK, Ordering::Release);
+    }
+    fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
+        let value = type_tag | ((index as u64) << STATUS_SHIFT);
+        self.status.store(value, Ordering::Release);
+    }
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         let cell = unsafe { &*self.rd_loop_token_clt.get() };
         cell.as_ref().map(|arc| arc as &dyn std::any::Any)
@@ -5037,6 +5220,7 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
+        status: AtomicU64::new(0),
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
@@ -5432,7 +5616,8 @@ mod fail_descr_tests {
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
-            rd_loop_token_clt: UnsafeCell::new(None),
+            status: AtomicU64::new(0),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         }) as DescrRef;

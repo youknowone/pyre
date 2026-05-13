@@ -1448,21 +1448,34 @@ pub trait FailDescr: Descr {
         &[]
     }
 
-    /// compile.py:741-745: read status for must_compile.
+    /// `compile.py:683` `AbstractResumeGuardDescr._attrs_ = ('status',)`
+    /// — packs `ST_BUSY_FLAG` + type tag + hash on the resume-guard
+    /// descr.  `compile.py:741-745` `self.status` read for
+    /// `must_compile`.
     fn get_status(&self) -> u64 {
         0
     }
 
-    /// compile.py:786-788: start_compiling — set ST_BUSY_FLAG.
+    /// `compile.py:786-788` `start_compiling — self.status |=
+    /// ST_BUSY_FLAG`.
     fn start_compiling(&self) {}
 
-    /// compile.py:790-795: done_compiling — clear ST_BUSY_FLAG.
+    /// `compile.py:790-795` `done_compiling — self.status &=
+    /// ~ST_BUSY_FLAG`.
     fn done_compiling(&self) {}
 
-    /// compile.py:750: check ST_BUSY_FLAG.
+    /// `compile.py:750` check `ST_BUSY_FLAG`.
     fn is_compiling(&self) -> bool {
         false
     }
+
+    /// `compile.py:826-830` `store_hash(metainterp_sd)` — write the
+    /// jitcounter hash bits (status with `ST_SHIFT_MASK` applied).
+    fn store_hash(&self, _hash: u64) {}
+
+    /// `compile.py:813-824` `make_a_counter_per_value(op, index)` —
+    /// pack `type_tag | (index << ST_SHIFT)` into status.
+    fn make_a_counter_per_value(&self, _index: u32, _type_tag: u64) {}
 
     /// history.py:143-147 / schedule.py:654-655 — attach vector resume info
     /// to a guard descriptor. Non-guard fail descriptors ignore this.
