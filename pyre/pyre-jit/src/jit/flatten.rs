@@ -1900,7 +1900,30 @@ where
     fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
         let exits = block.borrow().exits.clone();
         if exits.len() == 1 {
-            self.make_link(&exits[0], handling_ovf);
+            // `flatten.py:181 assert link.exitcase in (None, False, True)`
+            // — single-exit links carry either the default fall-through
+            // marker (None) or a Bool case from a hand-hacked generator
+            // graph (False/True).  Upstream's comment says "the cases
+            // False or True should not really occur, but can show up in
+            // the manually hacked graphs for generators…", so accept
+            // them but fail loud on anything else.
+            let link = &exits[0];
+            let exitcase = link.borrow().exitcase.clone();
+            match &exitcase {
+                None => {}
+                Some(super::flow::FlowValue::Constant(c)) => match &c.value {
+                    super::flow::ConstantValue::Bool(_) => {}
+                    other => panic!(
+                        "flatten.py:181 invariant: single-exit link.exitcase \
+                         must be None / False / True, got Constant({other:?})"
+                    ),
+                },
+                Some(other) => panic!(
+                    "flatten.py:181 invariant: single-exit link.exitcase \
+                     must be None / False / True, got {other:?}"
+                ),
+            }
+            self.make_link(link, handling_ovf);
             return;
         }
         if block.borrow().canraise() {
