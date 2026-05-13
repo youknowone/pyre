@@ -51,6 +51,7 @@ pub fn trace_bytecode(
         caller_result_stack_idx: None,
         caller_result_type: None,
         arg_state: pyre_interpreter::bytecode::OpArgState::default(),
+        call_site_pc: None,
     };
 
     let mut metainterp = PyreMetaInterp::new(w_code, std::ptr::null_mut());

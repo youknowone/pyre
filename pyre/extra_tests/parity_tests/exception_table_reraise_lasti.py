@@ -37,21 +37,26 @@ assert got is sentinel, ("identity lost across RERAISE", id(got), id(sentinel))
 assert str(got) == "orig-payload", str(got)
 
 # Now exercise a deeper RERAISE chain — the inner reraise carries
-# through two handlers.
+# through two handlers.  Capture the original exception in the
+# innermost handler so the outermost return can also be checked for
+# object identity, not just type/args.
 def chain():
+    first = None
     try:
         try:
             try:
                 raise KeyError("k")
-            except KeyError:
+            except KeyError as e:
+                first = e
                 raise  # RERAISE 1
         except KeyError:
             raise  # RERAISE 2
     except KeyError as e:
-        return e
+        return first, e
 
 
-got2 = chain()
+first2, got2 = chain()
+assert got2 is first2, ("identity lost across nested RERAISE", id(got2), id(first2))
 assert isinstance(got2, KeyError), type(got2)
 assert got2.args == ("k",), got2.args
 

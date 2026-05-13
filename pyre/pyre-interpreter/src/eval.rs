@@ -540,17 +540,34 @@ pub fn handle_exception(frame: &mut PyFrame, err: &mut PyError, next_instr: &mut
         }
     }
     let code = unsafe { &*crate::pyframe_get_pycode(frame) };
-    let pc_units = frame.last_instr as u32;
     // pyre's `last_instr` is a rustpython code-unit index; the PyPy-shaped
     // `lookup_exceptiontable` lookup takes byte offsets, so multiply by 2.
     // (See exception_table.rs: varint values are word offsets but the lookup
     // operates in byte space, mirroring `pycode.py:241-246`.)
-    let pc_bytes = pc_units * 2;
+    //
+    // `frame.last_instr == -1` is the pre-first-opcode sentinel
+    // (`pyframe.py:227-235` initialization).  An injected operr
+    // (`eval_frame_plain_with_operr`) drives `handle_exception` before any
+    // bytecode has executed, so the lookup must mirror PyPy
+    // `pycode.py:250-253`: with `instr_offset == -1`, the first entry's
+    // `start <= -1` is False and `start > -1` is True, returning the
+    // `depth == -1` sentinel (no handler).  Skip the table lookup outright
+    // rather than casting -1 to `u32::MAX` (panic in debug, wrap in
+    // release).
+    let lookup_result = if frame.last_instr < 0 {
+        None
+    } else {
+        let pc_bytes = (frame.last_instr as u32) * 2;
+        crate::exception_table::lookup_exceptiontable(&code.exceptiontable, pc_bytes)
+    };
+    let pc_units = if frame.last_instr < 0 {
+        0u32
+    } else {
+        frame.last_instr as u32
+    };
 
     // `pypy/interpreter/pyopcode.py:151-173` exception-table dispatch.
-    if let Some((target_bytes, depth, lasti)) =
-        crate::exception_table::lookup_exceptiontable(&code.exceptiontable, pc_bytes)
-    {
+    if let Some((target_bytes, depth, lasti)) = lookup_result {
         // `pyopcode.py:155-156` — depth is relative (0 = empty value
         // stack); convert to absolute by adding the frame's locals+cells
         // base, then drop the stack to that depth.
