@@ -4976,18 +4976,14 @@ impl CodeWriter {
                 // Python PC start so the post-compute_liveness /
                 // post-remove_repeated_live SSARepr position is recoverable.
                 //
-                // Task #227 PcAnchor retirement scaffolding: the consumer
+                // Task #227 PcAnchor retirement scaffolding: consumer
                 // helpers `pc_anchor_positions` / `live_marker_indices_by_pc`
-                // also accept `Label("pc{N}")` as the per-PC anchor when
-                // the explicit `Insn::PcAnchor` is absent.  Walker still
-                // emits `Insn::PcAnchor(py_pc)` until upstream-orthodox
-                // per-PC `-live-` retirement (only at flatten-time
-                // decision points per `flatten.py:142, 259, 285, 303`)
-                // makes the per-Label boundary unnecessary; PcAnchor's
-                // residual role at that point is to prevent
-                // `remove_repeated_live` from merging consecutive
-                // per-PC `-live-` markers across PC boundaries.
-                // Task #227.1 dual-write into per-block accumulator.
+                // accept Label("pc{N}") as the per-PC anchor when PcAnchor
+                // is absent.  Walker still emits `Insn::PcAnchor(py_pc)`
+                // because retirement requires aligning `remove_repeated_live`
+                // (which uses Labels as merge participants per upstream
+                // `liveness.py:99-100`) with pyre's per-PC Label model —
+                // an orthogonal liveness mechanism refactor.
                 current_block.push_insn(Insn::PcAnchor(py_pc));
                 depth_at_pc[py_pc] = current_depth;
                 emit_live_placeholder!(ssarepr);
