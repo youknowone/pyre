@@ -746,6 +746,19 @@ impl DynasmBackend {
         for descr in descrs {
             let ptr = Arc::as_ptr(descr) as usize;
             reg.entry(ptr).or_insert_with(|| Arc::clone(descr));
+            // Unified-Descr Port Epic: also key the same backend Arc by
+            // the metainterp `AbstractFailDescr` Arc's data pointer
+            // (`history.py:125` identity).  After the full identity flip
+            // `jf_descr` will embed the meta addr; the backend status
+            // methods (`compile.py:741/786/790 get_status / start_compiling
+            // / done_compiling`) still need the backend Arc for the
+            // local `AtomicU64` status fallback, so the same Arc lives
+            // under both keys.  Skip when `meta_descr` is unset
+            // (test/synthetic paths) — the backend addr is the only key.
+            if let Some(meta) = &descr.meta_descr {
+                let meta_ptr = Arc::as_ptr(meta) as *const () as usize;
+                reg.entry(meta_ptr).or_insert_with(|| Arc::clone(descr));
+            }
         }
     }
 
@@ -1937,18 +1950,24 @@ impl Backend for DynasmBackend {
     }
 
     fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {
-        // `history.py:125` `cpu.get_latest_descr(deadframe)` parity.
+        // `history.py:125` `cpu.get_latest_descr(deadframe)` returns the
+        // metainterp `AbstractFailDescr` object — the same descr
+        // `op.descr` stamped, NOT a backend-side facade.  Walk through
+        // the backend Arc's `meta_descr` back-pointer to recover it.
         //
-        // Transitional shape: return the backend Arc upcast to
-        // `Arc<dyn Descr>`.  Callers reach the metainterp
-        // `AbstractFailDescr` via the backend Arc's `meta_descr`
-        // back-pointer when they need resume payload (compile.py:855
-        // `_attrs_` are forwarded through `meta_descr`).  The
-        // `descr_addr` derived from this Arc remains the
-        // registry-keyed backend address, so `must_compile_descr` /
-        // `start_compiling_descr` continue to resolve correctly until
-        // the full jf_descr identity flip lands.
+        // The backend `register_fail_descrs` keys the same backend Arc
+        // under BOTH addresses (backend data ptr + meta data ptr), so
+        // downstream callers computing `descr_addr = Arc::as_ptr(arc)`
+        // continue to resolve via `fail_descr_arc_from_addr` regardless
+        // of whether the Arc returned here is the meta or backend side.
+        //
+        // Synthetic backend descrs (FINISH / `PropagateExceptionDescr` /
+        // `ExitFrameWithExceptionDescr`) without a meta back-pointer
+        // fall back to the backend Arc upcast.
         let data = frame.data.downcast_ref::<FrameData>().unwrap();
+        if let Some(meta) = data.fail_descr.meta_descr.clone() {
+            return meta;
+        }
         Arc::clone(&data.fail_descr) as Arc<dyn majit_ir::Descr>
     }
 
