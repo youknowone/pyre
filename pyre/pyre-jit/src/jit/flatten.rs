@@ -2413,17 +2413,16 @@ fn is_bool_or_tuple_exitswitch(
     // `block.exitswitch.concretetype == lltype.Bool` (post-rtype bool
     // exitswitch).  Pyre collapses upstream's `Bool` and `Signed`
     // lltypes into a single `Kind::Int`, so the second clause can't
-    // be expressed as a direct kind comparison — instead, test whether
-    // at least one of the two exit links carries a Bool `llexitcase`,
-    // which set_last_bool_exitcase populates for every walker boolean
-    // branch (POP_JUMP_IF_FALSE / POP_JUMP_IF_TRUE).  The bool-branch
-    // arm of `insert_exits` then performs the upstream
-    // `linkfalse, linktrue = block.exits; if linkfalse.llexitcase ==
-    // True: swap` reorder so the bool-marked link becomes `linktrue`.
+    // be expressed as a direct kind comparison — instead, require
+    // BOTH exit links to carry a Bool `llexitcase` (a True/False pair
+    // populated by `set_last_bool_exitcase` for POP_JUMP_IF_FALSE /
+    // POP_JUMP_IF_TRUE walker branches).  Requiring both (stricter
+    // than `any`) prevents malformed 2-exit graphs from silently
+    // falling into the bool-branch path with only one Bool exitcase.
     matches!(exitswitch, Some(super::flow::ExitSwitch::Tuple(_)))
         || exits
             .iter()
-            .any(|link| is_bool_exitcase(&link.borrow().llexitcase))
+            .all(|link| is_bool_exitcase(&link.borrow().llexitcase))
 }
 
 fn is_bool_exitcase(exitcase: &Option<FlowValue>) -> bool {
@@ -2449,24 +2448,26 @@ fn is_default_exitcase(exitcase: &Option<FlowValue>) -> bool {
 /// `rpython/jit/codewriter/flatten.py:296 lltype.cast_primitive(
 /// lltype.Signed, switch.llexitcase)`.
 ///
-/// RPython's `cast_primitive` accepts any primitive castable to
-/// `Signed`: `Signed` is the identity cast, `Bool` widens to 0 / 1.
-/// Upstream never produces `llexitcase = None` because `jtransform.py`
-/// lowers switch dispatch with strictly Signed llexitcase keys; fail
-/// loud on malformed shapes per the upstream contract.
+/// RPython's switch path runs only after `flatten.py:275 kind ==
+/// 'int'` asserts — Bool exitswitches go through the bool-branch
+/// path at `flatten.py:240-267`, not this switch path.  So the
+/// switch llexitcase keys are Signed only; `cast_primitive(Signed,
+/// switch.llexitcase)` is effectively an identity cast.  Pyre's
+/// previous Bool-widening clause was added when Bool exitcase pairs
+/// fell through to switch handling, but that path no longer fires
+/// (the stricter `is_bool_or_tuple_exitswitch` requires BOTH exits
+/// to carry Bool llexitcase, so a partial-Bool 2-exit shape goes
+/// to the switch path which now fails loud on the Bool).
 fn switch_llexitcase_key(llexitcase: &Option<FlowValue>) -> i64 {
     match llexitcase {
         Some(FlowValue::Constant(Constant {
             value: ConstantValue::Signed(value),
             ..
         })) => *value,
-        Some(FlowValue::Constant(Constant {
-            value: ConstantValue::Bool(value),
-            ..
-        })) => i64::from(*value),
         other => panic!(
-            "flatten_graph: switch link requires Signed/Bool llexitcase per \
-             flatten.py:296 (`cast_primitive(Signed, ...)`); got {other:?}"
+            "flatten_graph: switch link requires Signed llexitcase per \
+             flatten.py:275-296 (kind == 'int' assert + cast_primitive); \
+             got {other:?}"
         ),
     }
 }
