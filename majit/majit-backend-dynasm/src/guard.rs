@@ -453,10 +453,25 @@ impl FailDescr for DynasmFailDescr {
     }
 
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
+        // `history.py:132` `AbstractFailDescr._attrs_` `rd_loop_token` —
+        // prefer the metainterp-side slot when meta_descr is attached;
+        // fall back to the backend-local transitional slot.
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            if let Some(any) = meta_fd.rd_loop_token_clt() {
+                return Some(any);
+            }
+        }
         DynasmFailDescr::rd_loop_token_clt(self).map(|arc| arc as &dyn std::any::Any)
     }
 
     fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
+        // `compile.py:186` `descr.rd_loop_token = clt` — write through
+        // to the metainterp side when present; otherwise stamp the
+        // backend-local transitional slot.
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.set_rd_loop_token_clt(clt);
+            return;
+        }
         let typed: std::sync::Arc<majit_backend::CompiledLoopToken> = clt
             .downcast::<majit_backend::CompiledLoopToken>()
             .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
