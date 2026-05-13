@@ -692,6 +692,13 @@ impl BlockRef {
         Rc::downgrade(&self.0)
     }
 
+    /// Rc pointer identity — used by the Task #227.4 graph-DFS drain
+    /// to map `graph.iterblocks()` outputs back to walker-tracked
+    /// `SpamBlockRef`s.
+    pub fn as_ptr(&self) -> *const RefCell<Block> {
+        Rc::as_ptr(&self.0)
+    }
+
     pub fn input_arity(&self) -> usize {
         self.borrow().inputargs.len()
     }

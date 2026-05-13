@@ -7290,24 +7290,50 @@ impl CodeWriter {
         // Task #227.4 feature-gated production flip experiment.  When
         // `PYRE_TASK_227_FLIP_DRAIN=1`, replace the walker-emitted
         // program-wide `ssarepr.insns` with the per-block accumulator
-        // drained in walker-visit order.  For benches where the drain
-        // probe reports `byte_equivalent=true` (small benches with
-        // simple control flow), this is a byte-identical swap that
-        // proves the per-block accumulator can BE production input to
-        // `compute_liveness` + `assemble` — the precondition for full
-        // Task #227.4 (post-walk `flatten_graph(graph, regallocs, cpu)`
-        // replacing per-block drain too, per `codewriter.py:53`).
-        //
-        // For benches where the drain mismatches `ssarepr.insns` (block
-        // creation order vs walker emission order divergence on complex
-        // control flow), the flip would corrupt production; gate the
-        // experiment behind the env var so default production paths
-        // remain unaffected.
+        // drained in either walker-visit order (default) or graph-DFS
+        // order (`PYRE_TASK_227_FLIP_DRAIN_DFS=1`) for the upstream-
+        // orthodox `flatten_graph(graph, regallocs, cpu)` ordering
+        // matching `codewriter.py:53` + `flatten.py:67-70` block
+        // iteration.  For benches where the drain reports
+        // `byte_equivalent=true` against `ssarepr.insns`, the swap is
+        // a byte-identical replacement that proves the per-block
+        // accumulator can BE production input to `compute_liveness`
+        // + `assemble`.  Falls back to walker emit on mismatch so
+        // production stays correct.
         if std::env::var("PYRE_TASK_227_FLIP_DRAIN").is_ok() {
-            let mut drained: Vec<super::flatten::Insn> = Vec::new();
-            for block in all_walker_blocks.iter() {
-                drained.extend(block.per_block_ssarepr());
-            }
+            let use_dfs = std::env::var("PYRE_TASK_227_FLIP_DRAIN_DFS").is_ok();
+            let drained: Vec<super::flatten::Insn> = if use_dfs {
+                // Map each BlockRef (Rc pointer identity) to its
+                // SpamBlockRef so `graph.iterblocks()` (DFS from
+                // startblock per `flowspace/model.py:66-77`) can drive
+                // the drain order.  Mirrors upstream's per-block
+                // iteration inside `flatten.py:67-70 GraphFlattener
+                // .generate_ssa_form()` starting at
+                // `make_bytecode_block(graph.startblock)`.
+                let mut block_to_spam: std::collections::HashMap<
+                    *const std::cell::RefCell<super::flow::Block>,
+                    SpamBlockRef,
+                > = std::collections::HashMap::new();
+                for spam in all_walker_blocks.iter() {
+                    let block_ref = spam.block();
+                    let ptr = block_ref.as_ptr();
+                    block_to_spam.entry(ptr).or_insert_with(|| spam.clone());
+                }
+                let mut out: Vec<super::flatten::Insn> = Vec::new();
+                for block_ref in graph.iterblocks() {
+                    let ptr = block_ref.as_ptr();
+                    if let Some(spam) = block_to_spam.get(&ptr) {
+                        out.extend(spam.per_block_ssarepr());
+                    }
+                }
+                out
+            } else {
+                let mut out: Vec<super::flatten::Insn> = Vec::new();
+                for block in all_walker_blocks.iter() {
+                    out.extend(block.per_block_ssarepr());
+                }
+                out
+            };
             let byte_equivalent = drained.len() == ssarepr.insns.len()
                 && drained
                     .iter()
@@ -7315,15 +7341,17 @@ impl CodeWriter {
                     .all(|(l, r)| insn_byte_equal(l, r));
             if byte_equivalent {
                 eprintln!(
-                    "[phase4-flip-drain] {} swapping {} ssarepr insns -> drained per-block",
+                    "[phase4-flip-drain] {} order={} swapping {} ssarepr insns -> drained per-block",
                     code.obj_name,
+                    if use_dfs { "dfs" } else { "walker" },
                     ssarepr.insns.len(),
                 );
                 ssarepr.insns = drained;
             } else {
                 eprintln!(
-                    "[phase4-flip-drain] {} drain not byte_equivalent (drained={} ssarepr={}); leaving walker emit in place",
+                    "[phase4-flip-drain] {} order={} drain not byte_equivalent (drained={} ssarepr={}); leaving walker emit in place",
                     code.obj_name,
+                    if use_dfs { "dfs" } else { "walker" },
                     drained.len(),
                     ssarepr.insns.len(),
                 );
