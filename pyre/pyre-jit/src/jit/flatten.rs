@@ -2264,6 +2264,33 @@ where
         }
     }
 
+    /// `rpython/jit/codewriter/flatten.py:88-100 enforce_input_args` —
+    /// rotate startblock inputarg colors so each kind's inputargs occupy
+    /// the canonical `0..n-1` slots, swapping any current allocation
+    /// into the inputarg's target slot.  Upstream stores `regallocs` as
+    /// `self.regallocs`; pyre threads it through the call because the
+    /// `get_register` closure already encapsulates regallocs access for
+    /// the rest of the flatten pass.  The two-callsite shape is a
+    /// pre-Phase-4 adaptation; once the walker stops computing
+    /// regallocs externally, both reduce to one canonical call.
+    pub fn enforce_input_args(
+        &mut self,
+        graph: &super::flow::FunctionGraph,
+        regallocs: &mut std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
+    ) {
+        super::regalloc::enforce_input_args_simulation(graph, regallocs);
+    }
+
+    /// `rpython/jit/codewriter/flatten.py:102-104 generate_ssa_form` —
+    /// reset `seen_blocks` and recurse from `graph.startblock`.  Upstream
+    /// stores `graph` as `self.graph`; pyre threads it through because
+    /// `make_bytecode_block` operates on the block argument and does not
+    /// need a graph backreference for any other step.
+    pub fn generate_ssa_form(&mut self, graph: &super::flow::FunctionGraph) {
+        self.seen_blocks.clear();
+        self.make_bytecode_block(graph.startblock.clone(), false);
+    }
+
     fn make_bytecode_block(&mut self, block: BlockRef, handling_ovf: bool) {
         if block.borrow().exits.is_empty() {
             // `rpython/jit/codewriter/flatten.py:107-109`: empty-exits
@@ -2569,7 +2596,8 @@ pub fn flatten_graph_with_closures<F, C>(
 {
     let mut flattener =
         GraphFlattener::new_with_constant_lowering(ssarepr, get_register, lower_constant);
-    flattener.make_bytecode_block(graph.startblock.clone(), false);
+    // `flatten.py:69 flattener.generate_ssa_form()`.
+    flattener.generate_ssa_form(graph);
 }
 
 /// Slice #48.18 (Option C pipeline-flip prep): variant of
@@ -2607,7 +2635,8 @@ pub fn flatten_graph_with_lowering<'a, F, C>(
     if let Some(cpu) = cpu {
         flattener = flattener.with_cpu(cpu);
     }
-    flattener.make_bytecode_block(graph.startblock.clone(), false);
+    // `flatten.py:69 flattener.generate_ssa_form()`.
+    flattener.generate_ssa_form(graph);
 }
 
 /// `rpython/jit/codewriter/flatten.py:63-70 flatten_graph(graph,
@@ -2653,18 +2682,23 @@ pub fn flatten_graph<'a>(
     include_all_exc_links: bool,
     cpu: Option<&'a super::cpu::Cpu>,
 ) -> SSARepr {
-    // `flatten.py:68 flattener.enforce_input_args()` — rotate
-    // startblock input colors to the canonical `0..n-1` per kind
-    // before `generate_ssa_form` walks the graph.  Pyre's port lives
-    // in `super::regalloc::enforce_input_args_simulation` since the
-    // walker computes `regallocs` outside the driver today; the
-    // canonical entry calls it before constructing the flattener so
-    // every downstream `getcolor()` read sees the post-swap shape.
+    // `flatten.py:68 flattener.enforce_input_args()`.  Upstream stores
+    // `regallocs` on `self.regallocs` and the method mutates it
+    // in place; pyre's `get_register` closure (constructed below)
+    // captures `&regallocs`, so the swap must run BEFORE the closure
+    // exists.  Once Task #227 Phase 4 makes regallocs a
+    // `GraphFlattener` field, this call collapses inside the
+    // construct-then-call sequence at the bottom of this function
+    // and matches the upstream order line-by-line.
+    // PRE-EXISTING-ADAPTATION (Task #227 Phase 4 convergence).
     super::regalloc::enforce_input_args_simulation(graph, regallocs);
+    // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
+    // _include_all_exc_links, cpu)`.
     let lowering_ctx = cpu
         .and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
-    // `flatten.py:382-391 getcolor(v)` reads `regallocs[kind].getcolor(v)`.
+    // `flatten.py:382-391 getcolor(v)` — read
+    // `regallocs[kind].coloring[variable.id]` through the closure.
     let get_register = |variable: Variable| -> Register {
         let kind = variable.kind.unwrap_or(Kind::Ref);
         let color = regallocs
@@ -2696,9 +2730,8 @@ pub fn flatten_graph<'a>(
     // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
     // _include_all_exc_links`.
     flattener.include_all_exc_links = include_all_exc_links;
-    // `flatten.py:69 flattener.generate_ssa_form()` —
-    // `make_bytecode_block(graph.startblock)`.
-    flattener.make_bytecode_block(graph.startblock.clone(), false);
+    // `flatten.py:69 flattener.generate_ssa_form()`.
+    flattener.generate_ssa_form(graph);
     ssarepr
 }
 
@@ -2746,7 +2779,8 @@ pub fn flatten_graph_with_regallocs<'a>(
     // flattener so downstream `make_exception_link` honours the
     // upstream contract.
     flattener.include_all_exc_links = include_all_exc_links;
-    flattener.make_bytecode_block(graph.startblock.clone(), false);
+    // `flatten.py:69 flattener.generate_ssa_form()`.
+    flattener.generate_ssa_form(graph);
     ssarepr
 }
 
