@@ -6,15 +6,19 @@
 /// Descriptors carry type metadata needed by the optimizer and backend
 /// for field access, array access, function calls, and guard failures.
 ///
-/// # TODO: migrate `descr_index: u32` → `descr: DescrRef` on ResOperation
+/// # TODO: migrate `descr_index: u32` → `descr: DescrRef` on resume metadata
 ///
 /// **Deviation.** RPython's `ResOperation` carries `Arc<dyn Descr>`
 /// directly (`history.py:95 AbstractDescr`); identity is pointer
-/// comparison via `op.getdescr() is other.getdescr()`. Pyre stores a
-/// `descr_index: u32` pool handle (resoperation.rs:100/112/121/130/139)
-/// and resolves it through `pool.resolve(idx)`. The pool canonicalizes
-/// per-LLType so `u32` equality is identity-equivalent to RPython's
-/// pointer equality, but the indirection layer is pyre-only.
+/// comparison via `op.getdescr() is other.getdescr()`.  Pyre's
+/// resume-metadata structs (`RdVirtualInfo` variants at
+/// resoperation.rs:436/448/457/466/475, `GuardPendingFieldEntry` at
+/// resoperation.rs:784) carry a `descr_index: u32` alongside `descr:
+/// Option<DescrRef>` for serialization sinks
+/// (`ExitVirtualLayout` / `ExitPendingFieldLayout` /
+/// `PendingFieldLayoutSummary`).  The pool canonicalises per-LLType so
+/// `u32` equality is identity-equivalent to RPython's pointer
+/// equality, but the indirection layer is pyre-only.
 ///
 /// **When to fix.** When the build-time `opcode_insns.bin`
 /// determinism guarantee no longer needs to come from a `u32` pool
@@ -22,11 +26,12 @@
 /// or when an upstream pass requires in-place descr mutation that the
 /// pool indirection blocks.
 ///
-/// **How to fix.** (1) Replace `descr_index: u32` with `descr:
-/// DescrRef` in every `OpKind` variant in `resoperation.rs`. (2) Drop
-/// `pool.resolve(idx)` call sites; consumers read `op.descr` directly.
-/// (3) Stand up a stable-id registry that takes over the pool's
-/// trace-dump / serialization determinism role. (4) Audit for new Arc
+/// **How to fix.** (1) Switch identity `PartialEq` comparisons in
+/// `RdVirtualInfo` / `GuardPendingFieldEntry` from `descr_index` to
+/// `Arc::ptr_eq` on the carried `descr` Arcs (PyPy `id(descr)`
+/// parity).  (2) Keep `descr_index` as a pure serialization handle
+/// (downstream `ExitVirtualLayout` / `ExitPendingFieldLayout` still
+/// need a stable `u32` for trace-dump replay).  (3) Audit for Arc
 /// cycle risk between IR ops and the descr graph (FieldDescr →
 /// SizeDescr, CallDescr → effectinfo's field/array descr lists).
 use std::collections::HashMap;
