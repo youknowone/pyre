@@ -7741,22 +7741,16 @@ impl<M: Clone> MetaInterp<M> {
             }
         }
         // `warmspot.py:1022` `cpu.get_latest_descr(deadframe)` parity:
-        // when `op.descr` is unavailable (synthetic / cut-tentative ops,
-        // post-retrace stale traces) the backend still owns the live
-        // FailDescr Arc — it's the same identity pyre's runtime guard-
-        // failure helpers received as `descr_addr` and the same identity
-        // PyPy's deadframe carries.  Walk the current token first, then
-        // `previous_tokens` (matches `bridge_was_compiled`'s chain at
-        // mod.rs:7710).
-        //
-        // Empirically (epic #236 Slice E, 2026-05-05) this fallback
-        // fires zero times across nbody / fannkuch / fib_recursive /
-        // raise_catch_loop / spectral_norm × {dynasm, cranelift};
-        // current production benchmarks always carry a live `op.descr`
-        // at the lookup.  The fallback is kept as defensive RPython
-        // parity for the split-descr period — Phase E.3+ unification
-        // will eventually collapse both paths back to a single
-        // ResumeGuardDescr identity.
+        // when `op.descr` is unavailable on the primary path (post-retrace
+        // exit_layouts eviction, synthetic / cut-tentative ops) the
+        // backend still owns the live FailDescr Arc via its per-token
+        // `fail_descrs` vec — same identity pyre's runtime guard-failure
+        // helpers received as `descr_addr` and the same identity PyPy's
+        // deadframe carries.  Walk the current token first, then
+        // `previous_tokens` (matches `bridge_was_compiled`).  The full
+        // Unified-Descr identity flip (jf_descr embedding the meta Arc
+        // address) is the structural fix that lets this fallback retire;
+        // until then it covers exit_layouts eviction.
         if let Some(descr) =
             self.backend
                 .compiled_bridge_descr_arc(&compiled.token, trace_id, fail_index)
