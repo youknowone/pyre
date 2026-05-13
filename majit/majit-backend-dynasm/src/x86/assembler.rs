@@ -1817,7 +1817,13 @@ impl<'a> Assembler386<'a> {
                 RegAllocOp::PerformDiscard { op_index, arglocs } => {
                     let op = &ops[*op_index];
                     if std::env::var_os("MAJIT_LOG").is_some() {
-                        eprintln!("[dynasm] discard[{}]: {:?}", op_index, op.opcode);
+                        let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
+                        eprintln!(
+                            "[dynasm] discard[{}]: {:?} args=[{}]",
+                            op_index,
+                            op.opcode,
+                            al.join(", ")
+                        );
                     }
                     self.regalloc_perform(op, *op_index, arglocs, None, fail_index, ops);
                     if op.opcode.is_guard() || op.opcode == OpCode::Finish {
@@ -1869,13 +1875,33 @@ impl<'a> Assembler386<'a> {
                 }
             }
             // ── Integer binary (result_loc == arglocs[0], guaranteed by regalloc) ──
-            OpCode::IntAdd
-            | OpCode::IntSub
-            | OpCode::IntMul
-            | OpCode::IntAnd
-            | OpCode::IntOr
-            | OpCode::IntXor
-            | OpCode::NurseryPtrIncrement => {
+            // x86/assembler.py:1881 genop_int_add uses LEA, not ADD, because
+            // regalloc.py:566 consider_int_add routes 32-bit constants through
+            // `_consider_lea`, which force-allocates a fresh result register
+            // (independent of arg0). Emitting `add dst, src` here would
+            // operate on whatever stale value Rq(dst) still held — for the
+            // fib_loop trace this turned `t = i + 1` into `t = n_obj_ptr + 1`,
+            // poisoning the new W_IntObject and tripping GuardTrue on the
+            // next iteration. LEA also handles the consider_binop_symm path
+            // where `dst == arg0`: `lea dst, [dst + src]` is identical to
+            // `add dst, src`.
+            OpCode::IntAdd | OpCode::NurseryPtrIncrement => {
+                if let (Some(Loc::Reg(dst)), Some(Loc::Reg(a0)), Some(src)) =
+                    (result_loc, arglocs.first(), arglocs.get(1))
+                {
+                    match src {
+                        Loc::Reg(s) => dynasm!(self.mc ; .arch x64
+                            ; lea Rq(dst.value), [Rq(a0.value) + Rq(s.value)]),
+                        Loc::Immed(i) => {
+                            let v = i.value as i32;
+                            dynasm!(self.mc ; .arch x64
+                                ; lea Rq(dst.value), [Rq(a0.value) + v])
+                        }
+                        _ => self.emit_binop_reg_loc(op.opcode, dst.value, src),
+                    }
+                }
+            }
+            OpCode::IntSub | OpCode::IntMul | OpCode::IntAnd | OpCode::IntOr | OpCode::IntXor => {
                 if let (Some(Loc::Reg(dst)), Some(src)) = (result_loc, arglocs.get(1)) {
                     self.emit_binop_reg_loc(op.opcode, dst.value, src);
                 }
@@ -2279,17 +2305,41 @@ impl<'a> Assembler386<'a> {
                 }
             }
             // ── GC store / raw store: opassembler.rs emit_op_gcstore_regalloc ──
-            // arglocs = [value_loc, base_loc, ofs_loc, size_loc]
+            // arglocs = [value_loc, base_loc, ofs_loc, size_loc].
+            // value_loc may be Loc::Immed when the source is a Const
+            // (llsupport/regalloc.py:625 return_constant), so the emitter
+            // must materialize it before the store — silently dropping
+            // such writes left newly-allocated objects without vtables
+            // and triggered downstream GuardClass failures.
             OpCode::GcStore | OpCode::RawStore => {
-                if arglocs.len() >= 3 {
-                    if let (Some(Loc::Reg(val)), Some(Loc::Reg(base))) =
-                        (arglocs.first(), arglocs.get(1))
-                    {
-                        let size = match arglocs.get(3) {
-                            Some(Loc::Immed(i)) => i.value.unsigned_abs() as usize,
-                            _ => 8,
-                        };
-                        self.emit_op_gcstore_regalloc(base, &arglocs[2], val, size);
+                let (value_loc, base_loc, ofs_loc, size_loc) = match arglocs {
+                    [v, b, o, s] => (v, b, o, s),
+                    _ => panic!(
+                        "GcStore arglocs must be [value, base, ofs, size] (got {} locs)",
+                        arglocs.len(),
+                    ),
+                };
+                let base = match base_loc {
+                    Loc::Reg(r) => r,
+                    other => panic!(
+                        "GcStore base_loc must be Loc::Reg (regalloc contract), got {other:?}",
+                    ),
+                };
+                let size = match size_loc {
+                    Loc::Immed(i) => i.value.unsigned_abs() as usize,
+                    other => panic!(
+                        "GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",
+                    ),
+                };
+                match value_loc {
+                    Loc::Reg(val) => {
+                        self.emit_op_gcstore_regalloc(base, ofs_loc, val, size);
+                    }
+                    Loc::Immed(val_imm) => {
+                        self.emit_op_gcstore_imm_regalloc(base, ofs_loc, val_imm.value, size);
+                    }
+                    other => {
+                        panic!("GcStore value_loc must be Loc::Reg or Loc::Immed, got {other:?}")
                     }
                 }
             }
@@ -2988,19 +3038,37 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// Helper: guard class comparison
+    /// Helper: guard class comparison.
+    /// x86/assembler.py:1880 `_cmp_guard_class` emits a single
+    /// `CMP [obj + vtable_offset], classptr` so the object register is
+    /// never touched. Mirror that: for register and 32-bit-fitting
+    /// immediate classptrs we emit the memory-operand CMP directly; for
+    /// 64-bit immediates we stage through the dedicated scratch (R11)
+    /// rather than RAX, which may itself hold `obj_loc`. The earlier
+    /// `mov rax, imm` clobbered `obj_loc` when the regalloc placed the
+    /// object in RAX, leaving subsequent uses (e.g. the immediately
+    /// following `move: Reg(0) → Frame(pos=N)`) writing the vtable
+    /// constant into the deopt slot.
     fn _cmp_guard_class(&mut self, obj_loc: &Loc, class_loc: &Loc) {
         if let Loc::Reg(obj) = obj_loc {
             if let Some(vtable_offset) = self.vtable_offset {
-                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                 let ofs = vtable_offset as i32;
-                dynasm!(self.mc ; .arch x64 ; mov Rq(scratch), [Rq(obj.value) + ofs]);
                 match class_loc {
                     Loc::Reg(c) => {
-                        dynasm!(self.mc ; .arch x64 ; cmp Rq(scratch), Rq(c.value));
+                        dynasm!(self.mc ; .arch x64
+                            ; cmp QWORD [Rq(obj.value) + ofs], Rq(c.value));
                     }
                     Loc::Immed(i) => {
-                        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD i.value ; cmp Rq(scratch), rax);
+                        let fits_imm32 = (i.value as i32) as i64 == i.value;
+                        if fits_imm32 {
+                            dynasm!(self.mc ; .arch x64
+                                ; cmp QWORD [Rq(obj.value) + ofs], i.value as i32);
+                        } else {
+                            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                            dynasm!(self.mc ; .arch x64
+                                ; mov Rq(scratch), QWORD i.value
+                                ; cmp QWORD [Rq(obj.value) + ofs], Rq(scratch));
+                        }
                     }
                     _ => {}
                 }
@@ -4755,6 +4823,96 @@ impl<'a> Assembler386<'a> {
                 self.emit_gcstore_sized(base, 0, Some(ofs_r), val, size);
             }
             _ => {}
+        }
+    }
+
+    /// Immediate-value variant of `emit_op_gcstore_regalloc`.
+    /// `llsupport/regalloc.py:625 return_constant` may return a bare
+    /// `Loc::Immed` for a Const value, so GcStore reaches the emitter
+    /// with the literal already in hand. x86 can write the immediate
+    /// directly into memory when it fits in `imm32` (sign-extended for
+    /// QWORD stores), avoiding the need for a staging register.
+    fn emit_op_gcstore_imm_regalloc(
+        &mut self,
+        base: &crate::regloc::RegLoc,
+        ofs_loc: &Loc,
+        val: i64,
+        size: usize,
+    ) {
+        let val_fits_imm32 = (val as i32) as i64 == val;
+        let val_fits_at_size = match size {
+            1 => (val & !0xFF) == 0 || (val | 0xFF) == -1,
+            2 => (val & !0xFFFF) == 0 || (val | 0xFFFF) == -1,
+            4 => (val & !0xFFFFFFFFi64) == 0 || (val | 0xFFFFFFFFi64) == -1,
+            _ => val_fits_imm32,
+        };
+        if val_fits_at_size {
+            match ofs_loc {
+                Loc::Immed(i) => {
+                    let o = i.value as i32;
+                    self.emit_gcstore_imm_sized(base, o, None, val, size);
+                }
+                Loc::Reg(ofs_r) => {
+                    self.emit_gcstore_imm_sized(base, 0, Some(ofs_r), val, size);
+                }
+                _ => {}
+            }
+            return;
+        }
+        // 64-bit immediate that doesn't fit imm32 — stage through R11.
+        // The regalloc materialises out-of-range offsets into R11 too
+        // (see `LARGE_IMM_SCRATCH`), so refuse the conflict explicitly.
+        let scratch = crate::regloc::X86_64_SCRATCH_REG;
+        if let Loc::Reg(ofs_r) = ofs_loc {
+            assert!(
+                ofs_r.value != scratch.value,
+                "GcStore: cannot stage 64-bit immediate when offset already occupies R11",
+            );
+        }
+        dynasm!(self.mc ; .arch x64 ; mov Rq(scratch.value), QWORD val);
+        match ofs_loc {
+            Loc::Immed(i) => {
+                let o = i.value as i32;
+                self.emit_gcstore_sized(base, o, None, &scratch, size);
+            }
+            Loc::Reg(ofs_r) => {
+                self.emit_gcstore_sized(base, 0, Some(ofs_r), &scratch, size);
+            }
+            _ => {}
+        }
+    }
+
+    /// Sized direct memory-immediate store: `mov SIZE [base + ofs(_reg)], imm`.
+    fn emit_gcstore_imm_sized(
+        &mut self,
+        base: &crate::regloc::RegLoc,
+        ofs: i32,
+        ofs_reg: Option<&crate::regloc::RegLoc>,
+        val: i64,
+        size: usize,
+    ) {
+        if let Some(r) = ofs_reg {
+            match size {
+                1 => dynasm!(self.mc ; .arch x64
+                    ; mov BYTE [Rq(base.value) + Rq(r.value)], val as i8),
+                2 => dynasm!(self.mc ; .arch x64
+                    ; mov WORD [Rq(base.value) + Rq(r.value)], val as i16),
+                4 => dynasm!(self.mc ; .arch x64
+                    ; mov DWORD [Rq(base.value) + Rq(r.value)], val as i32),
+                _ => dynasm!(self.mc ; .arch x64
+                    ; mov QWORD [Rq(base.value) + Rq(r.value)], val as i32),
+            }
+        } else {
+            match size {
+                1 => dynasm!(self.mc ; .arch x64
+                    ; mov BYTE [Rq(base.value) + ofs], val as i8),
+                2 => dynasm!(self.mc ; .arch x64
+                    ; mov WORD [Rq(base.value) + ofs], val as i16),
+                4 => dynasm!(self.mc ; .arch x64
+                    ; mov DWORD [Rq(base.value) + ofs], val as i32),
+                _ => dynasm!(self.mc ; .arch x64
+                    ; mov QWORD [Rq(base.value) + ofs], val as i32),
+            }
         }
     }
 
