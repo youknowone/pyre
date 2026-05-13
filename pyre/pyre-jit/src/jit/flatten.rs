@@ -1682,7 +1682,16 @@ where
     }
 
     fn make_link(&mut self, link: &LinkRef, handling_ovf: bool) {
-        let (target, args, last_exception, last_exc_value, can_return_directly) = {
+        // `rpython/jit/codewriter/flatten.py:148-155 make_link`:
+        //
+        //     if (link.target.exits == ()
+        //         and link.last_exception not in link.args
+        //         and link.last_exc_value not in link.args):
+        //         self.make_return(link.args)     # optimization only
+        //         return
+        //     self.insert_renamings(link)
+        //     self.make_bytecode_block(link.target, handling_ovf)
+        let (target, args, can_return_directly) = {
             let link_borrow = link.borrow();
             let target = link_borrow
                 .target
@@ -1705,20 +1714,9 @@ where
                 .flatten()
                 .cloned()
                 .collect::<Vec<_>>();
-            // `rpython/jit/codewriter/flatten.py:148-155 make_link`:
-            // when the target has empty `exits` and the link's args do
-            // not reference `last_exception` / `last_exc_value`, call
-            // `make_return(link.args)` directly.  `make_return`
-            // (`flatten.py:130-145`) only accepts 1 or 2 args and
-            // raises `Exception("?")` otherwise — pyre keeps the
-            // upstream behavior: malformed final-target links surface
-            // the fail-loud message via `make_return`'s assert at
-            // emission time, not via a separate gate here.
             (
                 target,
                 collected_args,
-                link_borrow.last_exception,
-                link_borrow.last_exc_value,
                 target_is_final && !uses_last_exception && !uses_last_exc_value,
             )
         };
@@ -1726,7 +1724,6 @@ where
             self.make_return(&args);
             return;
         }
-        let _ = (last_exception, last_exc_value, handling_ovf);
         self.insert_renamings(link);
         self.make_bytecode_block(target, handling_ovf);
     }
