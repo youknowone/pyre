@@ -632,9 +632,10 @@ impl majit_ir::Descr for CraneliftFailDescr {
     /// `ResumeDescr` in upstream; finish descrs and `TargetToken`s are
     /// distinct class hierarchies and `compile.py:185` skips them.
     ///
-    /// Session 5d/5e parity audit fix: gate forwarding on
-    /// `meta_resume_fd()` so non-`ResumeDescr` meta descrs
-    /// (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef` /
+    /// `compile.py:185 isinstance(descr, ResumeDescr)` — forward through
+    /// `meta_descr` (covering both `ResumeGuardDescr`-family and
+    /// `ResumeGuardCopiedDescr` siblings) so non-`ResumeDescr` meta
+    /// descrs (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef` /
     /// `PropagateExceptionDescr`) do not flip the backend's role
     /// reading.  `is_external_jump` short-circuits to false because
     /// cranelift's external-JUMP descrs are backend-only synthetic
