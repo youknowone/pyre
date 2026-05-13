@@ -3448,7 +3448,8 @@ impl<'a> RegAlloc<'a> {
         if !lhs_in_reg && !rhs_in_reg && !lhs.is_constant() && !rhs.is_constant() {
             arglocs[0] = self.make_sure_var_in_reg(lhs, Type::Int, &[], None, false);
         }
-        let result_loc = Loc::Reg(self.force_allocate_reg(dst, Type::Int, &[], None, false));
+        let ops_ref: &[Op] = self.operations;
+        let result_loc = self.force_allocate_reg_or_cc(dst, ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);
     }
 
@@ -3705,6 +3706,66 @@ impl<'a> RegAlloc<'a> {
         self.perform(i, vec![argloc, numbytesloc], Some(resloc), output);
     }
 
+    /// llsupport/regalloc.py:873 `next_op_can_accept_cc` parity.
+    ///
+    /// Returns `true` when `operations[i]`'s result is consumed solely
+    /// by `operations[i + 1]`, and that op is `GuardTrue/False/Nonnull/
+    /// Isnull` or `CondCallN`. The CompOp emitter can then leave its
+    /// result in the condition flags instead of materialising it via
+    /// `setcc`+`movzx`; the guard emitter consumes those flags
+    /// directly via `implement_guard`.
+    fn next_op_can_accept_cc(&self, ops: &[Op], i: usize, result: OpRef) -> bool {
+        if i + 1 >= ops.len() {
+            return false;
+        }
+        let next_op = &ops[i + 1];
+        let opnum = next_op.opcode;
+        if !matches!(
+            opnum,
+            OpCode::GuardTrue
+                | OpCode::GuardFalse
+                | OpCode::GuardNonnull
+                | OpCode::GuardIsnull
+                | OpCode::CondCallN
+        ) {
+            return false;
+        }
+        if next_op.args.is_empty() || next_op.args[0].raw() != result.raw() {
+            return false;
+        }
+        if let Some(lt) = self.longevity.get(result) {
+            if lt.last_usage > (i as i32) + 1 {
+                return false;
+            }
+        }
+        if opnum != OpCode::CondCallN {
+            if let Some(fail_args) = next_op.fail_args.as_ref() {
+                if fail_args.iter().any(|a| a.raw() == result.raw()) {
+                    return false;
+                }
+            }
+        } else if next_op.args.iter().skip(1).any(|a| a.raw() == result.raw()) {
+            return false;
+        }
+        true
+    }
+
+    /// x86/regalloc.py:265 `force_allocate_reg_or_cc` parity.
+    ///
+    /// If the next op consumes the condition flags directly, return
+    /// the `frame_reg` (rbp) sentinel — the assembler reads this back
+    /// in the CompOp emit and threads `guard_success_cc` through to the
+    /// following guard. Otherwise force-allocate a general-purpose
+    /// register (with `need_lower_byte` so `SETcc r8b` is encodable).
+    fn force_allocate_reg_or_cc(&mut self, result: OpRef, ops: &[Op], i: usize) -> Loc {
+        if self.next_op_can_accept_cc(ops, i, result) {
+            self.rm.force_allocate_frame_reg(result);
+            Loc::Reg(crate::x86::regalloc::frame_reg())
+        } else {
+            Loc::Reg(self.force_allocate_reg(result, Type::Int, &[], None, true))
+        }
+    }
+
     /// x86/regalloc.py:636 _consider_compop
     fn consider_compop(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let vx = op.args[0];
@@ -3716,9 +3777,9 @@ impl<'a> RegAlloc<'a> {
         if !vx_in_reg && !vy_in_reg && !vx.is_constant() && !vy.is_constant() {
             arglocs[0] = self.make_sure_var_in_reg(vx, Type::Int, &[], None, false);
         }
-        // x86/regalloc.py:645 force_allocate_reg_or_cc
-        // For now, allocate a register (CC optimization is assembler-level)
-        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos, Type::Int, &[], None, false));
+        // x86/regalloc.py:645 force_allocate_reg_or_cc.
+        let ops_ref: &[Op] = self.operations;
+        let result_loc = self.force_allocate_reg_or_cc(op.pos, ops_ref, i);
         self.perform(i, arglocs, Some(result_loc), output);
     }
 
@@ -5295,7 +5356,9 @@ impl<'a> RegAlloc<'a> {
         // aarch64/regalloc.py:985: only move values away from x0/x1.
         // The slow path saves/restores all managed registers except
         // x0/x1, so spilling every register here is both unnecessary and
-        // diverges from the upstream calling convention.
+        // diverges from the upstream calling convention. The x86 emit
+        // mirrors the same contract by wrapping the slowpath with
+        // `push_all_regs_to_jitframe` / `pop_all_regs_from_jitframe`.
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
             &[],

@@ -1093,6 +1093,7 @@ impl<'a> Assembler386<'a> {
         }
         // When addresses are not registered (tests / early startup), no
         // stack check is emitted — assembler.py:1082-1083 parity.
+        self.gen_shadowstack_header();
         self.setup_input_state(inputargs);
     }
 
@@ -1389,12 +1390,110 @@ impl<'a> Assembler386<'a> {
 
     /// Emit the function epilogue: return jf_ptr in RAX/X0.
     fn _call_footer(&mut self) {
+        self.gen_footer_shadowstack();
         dynasm!(self.mc
             ; .arch x64
             ; mov rax, rbp
             ; pop r12                // restore r12
             ; pop rbp
             ; ret
+        );
+    }
+
+    /// x86/assembler.py:254 `_push_all_regs_to_jitframe` parity. Writes
+    /// every managed GPR (and optionally XMM) into its canonical
+    /// jitframe save slot so a subsequent collecting helper call can
+    /// trace live Refs via the gcmap. Skips registers in `ignored_regs`
+    /// (typically the slow-path's argument / result register, which
+    /// holds non-Ref data across the call).
+    ///
+    /// Indexes through `crate::x86::regalloc::all_core_regs()` /
+    /// `all_float_regs()` — the same ordering `regalloc::get_gcmap`
+    /// uses to encode bits via `core_reg_index`. The two lists diverge
+    /// on Windows (where R13 is removed from `all_core_regs`), so
+    /// indexing by `all_gen_regs` here would map R14/R15 to the wrong
+    /// slot relative to the gcmap.
+    fn push_all_regs_to_jitframe(
+        &mut self,
+        ignored_regs: &[crate::regloc::RegLoc],
+        withfloats: bool,
+    ) {
+        for (idx, reg) in crate::x86::regalloc::all_core_regs().iter().enumerate() {
+            if ignored_regs.contains(reg) {
+                continue;
+            }
+            let ofs = Self::slot_offset(idx);
+            dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(reg.value));
+        }
+        if withfloats {
+            let gpr_count = crate::x86::regalloc::all_core_regs().len();
+            for (idx, reg) in crate::x86::regalloc::all_float_regs().iter().enumerate() {
+                let ofs = Self::slot_offset(gpr_count + idx);
+                dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(reg.value));
+            }
+        }
+    }
+
+    /// x86/assembler.py:283 `_pop_all_regs_from_jitframe` parity.
+    fn pop_all_regs_from_jitframe(
+        &mut self,
+        ignored_regs: &[crate::regloc::RegLoc],
+        withfloats: bool,
+    ) {
+        for (idx, reg) in crate::x86::regalloc::all_core_regs().iter().enumerate() {
+            if ignored_regs.contains(reg) {
+                continue;
+            }
+            let ofs = Self::slot_offset(idx);
+            dynasm!(self.mc ; .arch x64 ; mov Rq(reg.value), [rbp + ofs]);
+        }
+        if withfloats {
+            let gpr_count = crate::x86::regalloc::all_core_regs().len();
+            for (idx, reg) in crate::x86::regalloc::all_float_regs().iter().enumerate() {
+                let ofs = Self::slot_offset(gpr_count + idx);
+                dynasm!(self.mc ; .arch x64 ; movsd Rx(reg.value), [rbp + ofs]);
+            }
+        }
+    }
+
+    /// x86/assembler.py:1422 `gen_shadowstack_header` parity (mirrors
+    /// aarch64). Pushes two words onto the jitframe shadow stack on
+    /// every JIT function entry: an `is_minor` marker (`1`) and the
+    /// current jitframe pointer (rbp). The GC walks this stack during
+    /// minor-collect to update jf pointers — without it, a minor GC
+    /// inside a recursive call (e.g. fib_recursive) leaves rbp dangling
+    /// at the freed nursery slot.
+    fn gen_shadowstack_header(&mut self) {
+        let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD rst
+            ; mov rax, [Rq(scratch)]    // rax = *rst = top
+            ; mov QWORD [rax], 1        // [top] = 1 (is_minor marker)
+            ; mov [rax + 8], rbp        // [top + WORD] = rbp (jf_ptr)
+            ; add rax, 16               // top += 2*WORD
+            ; mov [Rq(scratch)], rax    // *rst = top
+        );
+    }
+
+    /// x86/assembler.py:1130 `_call_footer_shadowstack` parity:
+    ///
+    /// ```python
+    /// if rx86.fits_in_32bits(rst):
+    ///     self.mc.SUB_ji8(rst, WORD * 2)       # SUB [rootstacktop], 16
+    /// else:
+    ///     self.mc.MOV_ri(ebx.value, rst)       # MOV ebx, rootstacktop
+    ///     self.mc.SUB_mi8((ebx.value, 0), WORD * 2)  # SUB [ebx], 16
+    /// ```
+    ///
+    /// One in-memory subtract — no need to load the current top into a
+    /// register, decrement, and store back.
+    fn gen_footer_shadowstack(&mut self) {
+        let rst = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD rst
+            ; sub QWORD [Rq(scratch)], 16
         );
     }
 
@@ -1435,20 +1534,27 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// assembler.py:405-412 _reload_frame_if_necessary parity:
-    /// after a helper or collecting call, follow jf_forward so rbp/x29
-    /// points at the current jitframe location.
+    /// x86/assembler.py:1369-1377 `_reload_frame_if_necessary` parity:
+    ///
+    /// ```python
+    ///   MOV ecx, [rootstacktop]   // shadow stack top pointer
+    ///   MOV ebp, [ecx - WORD]     // jf_ptr at top - WORD
+    /// ```
+    ///
+    /// After a collecting helper call the GC may have copied the
+    /// jitframe from nursery to old gen. PyPy minor-GC does not write
+    /// `jf_forward` on a move — that field is reserved for the
+    /// `grow_jitframe` realloc path — so chasing `jf_forward` here
+    /// reads the freed nursery slot. The shadow-stack entry IS
+    /// rewritten by the GC visitor during copy, so the live jf_ptr
+    /// lives at `*(root_stack_top - WORD)`. Reload `rbp` from there
+    /// (matches the aarch64 and cranelift backends).
     fn reload_frame_if_necessary(&mut self) {
-        let loop_label = self.mc.new_dynamic_label();
-        let done_label = self.mc.new_dynamic_label();
+        let rst_addr = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
         dynasm!(self.mc ; .arch x64
-            ; =>loop_label
-            ; mov rcx, [rbp + JF_FORWARD_OFS]
-            ; test rcx, rcx
-            ; je =>done_label
-            ; mov rbp, rcx
-            ; jmp =>loop_label
-            ; =>done_label
+            ; mov rcx, QWORD rst_addr
+            ; mov rcx, [rcx]            // rcx = *rst_addr = root_stack_top
+            ; mov rbp, [rcx - 8]        // rbp = *(top - WORD) = jf_ptr
         );
     }
 
@@ -1967,6 +2073,14 @@ impl<'a> Assembler386<'a> {
                 }
             }
             // ── Integer comparisons ──
+            // x86/assembler.py:1301 `_cmpop` + 1286 `flush_cc` parity.
+            // When the regalloc picks `frame_reg` (rbp) as the result
+            // sentinel, the comparison's outcome lives in the condition
+            // flags and the following guard consumes it directly —
+            // saving the SETcc + MOVZX (+ later TEST) per CompOp. The
+            // result-in-register path emits the boolean materialisation
+            // as before for cases where the value is also read by a
+            // non-guard consumer.
             OpCode::IntLt
             | OpCode::IntLe
             | OpCode::IntGt
@@ -1984,10 +2098,8 @@ impl<'a> Assembler386<'a> {
                 if arglocs.len() >= 2 {
                     self.emit_cmp_loc_loc(&arglocs[0], &arglocs[1]);
                 }
-                if let Some(Loc::Reg(r)) = result_loc {
-                    let cc = Self::opcode_to_cc(op.opcode);
-                    self.emit_setcc(cc, r.value);
-                }
+                let cc = Self::opcode_to_cc(op.opcode);
+                self.flush_cc(cc, result_loc);
             }
             OpCode::IntIsTrue => {
                 if let (Some(src), Some(Loc::Reg(r))) = (arglocs.first(), result_loc) {
@@ -2275,13 +2387,24 @@ impl<'a> Assembler386<'a> {
                     self.genop_discard_setfield(op);
                 }
             }
-            // arglocs = [base_loc, ofs_loc, res_loc, imm(nsize)]
+            // arglocs = [base_loc, ofs_loc, res_loc, imm(nsize)].
+            // `base_loc` may be Loc::Immed when the load is from a
+            // constant pointer (e.g. `GcLoadI(jfi_descr_ptr, 8, 8)` for
+            // the JITFRAME size in CallMallocNurseryVarsizeFrame).
+            // llsupport/regalloc.py:625 return_constant returns the
+            // bare Loc::Immed in that case and the assembler is
+            // responsible for materializing it. Mirror aarch64 by
+            // staging the constant through the scratch register (R11);
+            // dropping the load left the destination register holding
+            // stale heap pointers, which the varsize-frame slowpath
+            // then dereferenced as an allocation size and tripped a
+            // multi-terabyte OOM (fib_recursive on x86).
             OpCode::GcLoadI
             | OpCode::GcLoadR
             | OpCode::GcLoadF
             | OpCode::RawLoadI
             | OpCode::RawLoadF => {
-                if let (Some(Loc::Reg(base)), Some(ofs_loc)) = (arglocs.first(), arglocs.get(1)) {
+                if let Some(ofs_loc) = arglocs.get(1) {
                     let dst = match arglocs.get(2) {
                         Some(Loc::Reg(r)) => r,
                         _ => match result_loc {
@@ -2301,7 +2424,30 @@ impl<'a> Assembler386<'a> {
                             })
                             .unwrap_or(8),
                     };
-                    self.emit_op_gcload_regalloc(base, ofs_loc, dst, nsize);
+                    match arglocs.first() {
+                        Some(Loc::Reg(base)) => {
+                            self.emit_op_gcload_regalloc(base, ofs_loc, dst, nsize);
+                        }
+                        Some(Loc::Immed(base_i)) => {
+                            let scratch = crate::regloc::X86_64_SCRATCH_REG;
+                            // regalloc.rs materializes out-of-range
+                            // offsets into LARGE_IMM_SCRATCH (R11). If
+                            // we land in that case while base is also
+                            // an immediate we cannot share R11.
+                            if let Loc::Reg(r) = ofs_loc {
+                                assert!(
+                                    r.value != scratch.value,
+                                    "GcLoad: base=Immed and ofs already occupies R11",
+                                );
+                            }
+                            dynasm!(self.mc ; .arch x64
+                                ; mov Rq(scratch.value), QWORD base_i.value);
+                            self.emit_op_gcload_regalloc(&scratch, ofs_loc, dst, nsize);
+                        }
+                        other => panic!(
+                            "GcLoad base_loc must be Loc::Reg or Loc::Immed, got {other:?}",
+                        ),
+                    }
                 }
             }
             // ── GC store / raw store: opassembler.rs emit_op_gcstore_regalloc ──
@@ -2787,19 +2933,115 @@ impl<'a> Assembler386<'a> {
             OpCode::CallMallocNursery => {
                 self.genop_call_malloc_nursery(op, result_loc);
             }
+            // assembler.py:715 malloc_cond_varsize_frame parity.
+            // The JITFRAME allocation goes through a collecting slowpath:
+            // 1. publish `pending_malloc_nursery_gcmap` into JF_GCMAP_OFS
+            //    so a minor GC during the call can trace live frame-
+            //    resident Refs (previously unconditionally cleared,
+            //    which left ref roots invisible and corrupted live
+            //    boxes after a collect — fib_recursive crashed on the
+            //    first nursery overflow that triggered a minor GC).
+            // 2. invoke `dynasm_nursery_slowpath_jitframe`, which uses
+            //    the JITFRAME type_id rather than the generic nursery
+            //    slowpath.
+            // 3. clear gcmap after.
+            // 4. copy RAX into the regalloc-assigned `result_loc`
+            //    register; the regalloc may pick something other than
+            //    RAX and downstream ops read that register directly.
             OpCode::CallMallocNurseryVarsizeFrame => {
-                if let Some(Loc::Reg(sizeloc)) = arglocs.first() {
-                    self.emit_abi_int_arg_from_reg(0, sizeloc.value as u8);
+                // x86/assembler.py:715 malloc_cond_varsize_frame parity:
+                // an inline bump-allocator fast path keeps the common
+                // path off the helper (which may trigger a minor GC).
+                // The slowpath is bracketed with push_all_regs /
+                // pop_all_regs so any Ref the regalloc left in a
+                // register survives a minor collection (the gcmap
+                // describes the saved-reg slots, and the visitor
+                // rewrites them in place). Without the push/pop and
+                // reload_frame_if_necessary, fib_recursive on x86 read
+                // stale parent-frame pointers out of call-clobbered
+                // registers after the first minor GC fired by a
+                // recursive JITFRAME alloc.
+                let sizeloc = match arglocs.first() {
+                    Some(Loc::Reg(r)) => *r,
+                    other => panic!(
+                        "CallMallocNurseryVarsizeFrame size arg must be Loc::Reg, got {other:?}",
+                    ),
+                };
+                let result_reg = match result_loc {
+                    Some(Loc::Reg(r)) => *r,
+                    other => panic!(
+                        "CallMallocNurseryVarsizeFrame result_loc must be Loc::Reg, got {other:?}",
+                    ),
+                };
+                let sv = sizeloc.value;
+                let rv = result_reg.value;
+                // `MALLOC_NURSERY_CLOBBER` spills any live variable
+                // out of RCX/RDX before this op, so `sizeloc` is never
+                // in those registers and is guaranteed disjoint from
+                // `result_reg = MALLOC_NURSERY_RESULT = RCX`. R11
+                // (scratch) loads address constants and is not the
+                // sizeloc. RAX is used only AFTER the last read of
+                // sizeloc, so a sv==RAX overlap is benign.
+                assert!(
+                    rv != sv,
+                    "CallMallocNurseryVarsizeFrame: sizeloc must differ from result_reg",
+                );
+                let (nf_addr, nt_addr) = crate::runner::dynasm_nursery_addrs();
+                let slow_path = self.mc.new_dynamic_label();
+                let done = self.mc.new_dynamic_label();
+                let gc_header_size = majit_gc::header::GcHeader::SIZE as i32;
+                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                if nf_addr == 0 || nt_addr == 0 {
+                    dynasm!(self.mc ; .arch x64 ; jmp =>slow_path);
+                } else {
+                    // Fast path. Use `result_reg` as scratch for the
+                    // proposed new free pointer; on success it ends
+                    // holding the allocated object's payload address.
+                    // RAX is loaded with the old nursery_free AFTER
+                    // the `ja slow_path` so sizeloc remains intact on
+                    // the slow-path fall-through even when sv == RAX.
+                    dynasm!(self.mc ; .arch x64
+                        ; mov Rq(scratch), QWORD nf_addr as i64
+                        ; mov Rq(rv), [Rq(scratch)]
+                        ; add Rq(rv), Rq(sv)
+                        ; add Rq(rv), gc_header_size
+                        ; mov Rq(scratch), QWORD nt_addr as i64
+                        ; cmp Rq(rv), [Rq(scratch)]
+                        ; ja =>slow_path
+                        ; mov Rq(scratch), QWORD nf_addr as i64
+                        ; mov rax, [Rq(scratch)]            // rax = old nf
+                        ; mov [Rq(scratch)], Rq(rv)         // *nf = new_nf
+                        ; mov QWORD [rax], 0                // zero GC header
+                        ; lea Rq(rv), [rax + gc_header_size] // payload ptr
+                        ; jmp =>done
+                    );
                 }
-                let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
-                dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+                dynasm!(self.mc ; .arch x64 ; =>slow_path);
+                self.push_all_regs_to_jitframe(&[sizeloc, result_reg], true);
+                self.emit_abi_int_arg_from_reg(0, sizeloc.value as u8);
+                if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
+                    self.push_gcmap(gcmap as *mut usize);
+                } else {
+                    let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
+                    dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+                }
                 dynasm!(self.mc ; .arch x64
-                    ; mov rax, QWORD crate::runner::dynasm_nursery_slowpath as *const () as i64
+                    ; mov rax, QWORD crate::runner::dynasm_nursery_slowpath_jitframe as *const () as i64
                 );
                 self.emit_abi_call_rax();
+                let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
                 self.reload_frame_if_necessary();
+                if result_reg.value != 0 {
+                    let rv = result_reg.value;
+                    dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
+                }
+                self.pop_all_regs_from_jitframe(&[sizeloc, result_reg], true);
+                dynasm!(self.mc ; .arch x64 ; =>done);
                 if !op.pos.is_none() {
+                    if result_reg.value != 0 {
+                        dynasm!(self.mc ; .arch x64 ; mov rax, Rq(result_reg.value));
+                    }
                     self.store_rax_to_result(op.pos);
                 }
             }
@@ -2945,19 +3187,25 @@ impl<'a> Assembler386<'a> {
         fail_index: u32,
     ) {
         match op.opcode {
+            // x86/assembler.py:1773 `genop_guard_guard_true` is a bare
+            // `implement_guard(guard_token)` — the regalloc routed the
+            // condition through `load_condition_into_cc`, which either
+            // reuses the cc from the prior CompOp (CC fusion) or emits
+            // a TEST itself before this point. Mirror that here.
             OpCode::GuardTrue | OpCode::VecGuardTrue | OpCode::GuardNonnull => {
-                // arglocs[0] = condition location
                 if let Some(loc) = arglocs.first() {
-                    self.emit_test_loc(loc);
-                    self.guard_success_cc = Some(CC_NE);
+                    self.load_condition_into_cc(loc);
                 }
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
+            // x86/assembler.py:1777 `genop_guard_guard_false` inverts
+            // the published cc, then implements. So a fused IntLt that
+            // set CC_L turns into a CC_GE failure jump under GuardFalse.
             OpCode::GuardFalse | OpCode::VecGuardFalse | OpCode::GuardIsnull => {
                 if let Some(loc) = arglocs.first() {
-                    self.emit_test_loc(loc);
-                    self.guard_success_cc = Some(CC_E);
+                    self.load_condition_into_cc(loc);
                 }
+                self.guard_success_cc = self.guard_success_cc.map(invert_cc);
                 self.implement_guard_with_faillocs(op, op_index, fail_index, faillocs);
             }
             OpCode::GuardValue => {
@@ -3050,37 +3298,49 @@ impl<'a> Assembler386<'a> {
     /// following `move: Reg(0) → Frame(pos=N)`) writing the vtable
     /// constant into the deopt slot.
     fn _cmp_guard_class(&mut self, obj_loc: &Loc, class_loc: &Loc) {
-        if let Loc::Reg(obj) = obj_loc {
-            if let Some(vtable_offset) = self.vtable_offset {
-                let ofs = vtable_offset as i32;
-                match class_loc {
-                    Loc::Reg(c) => {
-                        dynasm!(self.mc ; .arch x64
-                            ; cmp QWORD [Rq(obj.value) + ofs], Rq(c.value));
-                    }
-                    Loc::Immed(i) => {
-                        let fits_imm32 = (i.value as i32) as i64 == i.value;
-                        if fits_imm32 {
-                            dynasm!(self.mc ; .arch x64
-                                ; cmp QWORD [Rq(obj.value) + ofs], i.value as i32);
-                        } else {
-                            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
-                            dynasm!(self.mc ; .arch x64
-                                ; mov Rq(scratch), QWORD i.value
-                                ; cmp QWORD [Rq(obj.value) + ofs], Rq(scratch));
-                        }
-                    }
-                    _ => {}
+        // Caller (genop_guard_guard_class) sets `guard_success_cc =
+        // Some(CC_E)` immediately after this returns, so any path that
+        // fails to emit a CMP would branch on stale flags from a
+        // preceding instruction. Fail closed instead.
+        let Loc::Reg(obj) = obj_loc else {
+            panic!("GuardClass: obj_loc must be Loc::Reg, got {obj_loc:?}");
+        };
+        if let Some(vtable_offset) = self.vtable_offset {
+            let ofs = vtable_offset as i32;
+            match class_loc {
+                Loc::Reg(c) => {
+                    dynasm!(self.mc ; .arch x64
+                        ; cmp QWORD [Rq(obj.value) + ofs], Rq(c.value));
                 }
-            } else if let Loc::Immed(i) = class_loc {
-                let expected_typeid = self
-                    .lookup_typeid_from_classptr(i.value as usize)
-                    .expect("GuardClass: missing typeid for classptr");
-                self._cmp_guard_gc_type(
-                    &Loc::Reg(*obj),
-                    &Loc::Immed(crate::regloc::ImmedLoc::new(expected_typeid as i64)),
-                );
+                Loc::Immed(i) => {
+                    let fits_imm32 = (i.value as i32) as i64 == i.value;
+                    if fits_imm32 {
+                        dynasm!(self.mc ; .arch x64
+                            ; cmp QWORD [Rq(obj.value) + ofs], i.value as i32);
+                    } else {
+                        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                        dynasm!(self.mc ; .arch x64
+                            ; mov Rq(scratch), QWORD i.value
+                            ; cmp QWORD [Rq(obj.value) + ofs], Rq(scratch));
+                    }
+                }
+                other => panic!(
+                    "GuardClass (vtable form): class_loc must be Loc::Reg or Loc::Immed, got {other:?}",
+                ),
             }
+        } else {
+            let Loc::Immed(i) = class_loc else {
+                panic!(
+                    "GuardClass (typeid form): class_loc must be Loc::Immed, got {class_loc:?}",
+                );
+            };
+            let expected_typeid = self
+                .lookup_typeid_from_classptr(i.value as usize)
+                .expect("GuardClass: missing typeid for classptr");
+            self._cmp_guard_gc_type(
+                &Loc::Reg(*obj),
+                &Loc::Immed(crate::regloc::ImmedLoc::new(expected_typeid as i64)),
+            );
         }
     }
 
@@ -3108,8 +3368,11 @@ impl<'a> Assembler386<'a> {
     /// majit's object pointer: the GC header word lives at
     /// `obj - GcHeader::SIZE`, and a 32-bit load zero-extends the type id.
     fn _cmp_guard_gc_type(&mut self, obj_loc: &Loc, expected_typeid_loc: &Loc) {
+        // Callers (guard_class typeid form, guard_gc_type, ...) rely on
+        // CC_E being set from this CMP. A silent no-op would leave the
+        // guard branching on stale flags.
         let Loc::Reg(obj) = obj_loc else {
-            return;
+            panic!("guard_gc_type: obj_loc must be Loc::Reg, got {obj_loc:?}");
         };
         let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
         self.emit_load_gc_typeid_into_reg(obj.value, scratch);
@@ -3125,7 +3388,9 @@ impl<'a> Assembler386<'a> {
                 let expected_i32 = expected.value as i32;
                 dynasm!(self.mc ; .arch x64 ; cmp Rq(scratch), expected_i32);
             }
-            _ => {}
+            other => panic!(
+                "guard_gc_type: expected_typeid_loc must be Reg/Frame/Immed, got {other:?}",
+            ),
         }
     }
 
@@ -3336,6 +3601,48 @@ impl<'a> Assembler386<'a> {
             }
         }
         dynasm!(self.mc ; .arch x64 ; movzx Rd(dst_reg), Rb(dst_reg));
+    }
+
+    /// x86/assembler.py:1286 `flush_cc` parity.
+    ///
+    /// After emitting a CMP/TEST that leaves a boolean in the
+    /// condition flags, call this. If the regalloc picked `frame_reg`
+    /// (rbp) for `result_loc` the value is treated as living in the cc
+    /// — `guard_success_cc` is published for the following guard to
+    /// consume. Otherwise the boolean is materialised via a zeroed
+    /// register + `SETcc` of its low byte. The MOV-zero + SETcc shape
+    /// matches PyPy's emission and gives the regalloc a clean i64
+    /// value for non-guard consumers (e.g. boolean stored into a
+    /// frame slot).
+    fn flush_cc(&mut self, cond: u8, result_loc: Option<&Loc>) {
+        let frame_reg_value = crate::x86::regalloc::frame_reg().value;
+        if let Some(Loc::Reg(r)) = result_loc {
+            if r.value == frame_reg_value {
+                // Sentinel: the next op accepts cc.
+                debug_assert!(
+                    self.guard_success_cc.is_none(),
+                    "flush_cc: guard_success_cc already set",
+                );
+                self.guard_success_cc = Some(cond);
+                return;
+            }
+            dynasm!(self.mc ; .arch x64 ; mov Rq(r.value), 0);
+            self.emit_setcc(cond, r.value);
+        }
+    }
+
+    /// x86/regalloc.py:429 `load_condition_into_cc` parity for the
+    /// emit side. If the previous op already published a cond in
+    /// `guard_success_cc`, the guard reads it directly. Otherwise the
+    /// guard arg is a materialised boolean and we re-issue
+    /// TEST + set CC_NE so `implement_guard` has a flag state to jump
+    /// off of.
+    fn load_condition_into_cc(&mut self, loc: &Loc) {
+        if self.guard_success_cc.is_some() {
+            return;
+        }
+        self.emit_test_loc(loc);
+        self.guard_success_cc = Some(CC_NE);
     }
 
     /// Map an integer comparison OpCode to a condition code.
@@ -4822,7 +5129,9 @@ impl<'a> Assembler386<'a> {
             Loc::Reg(ofs_r) => {
                 self.emit_gcstore_sized(base, 0, Some(ofs_r), val, size);
             }
-            _ => {}
+            other => panic!(
+                "GcStore: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",
+            ),
         }
     }
 
@@ -4855,30 +5164,39 @@ impl<'a> Assembler386<'a> {
                 Loc::Reg(ofs_r) => {
                     self.emit_gcstore_imm_sized(base, 0, Some(ofs_r), val, size);
                 }
-                _ => {}
+                other => panic!(
+                    "GcStore imm: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",
+                ),
             }
             return;
         }
-        // 64-bit immediate that doesn't fit imm32 — stage through R11.
-        // The regalloc materialises out-of-range offsets into R11 too
-        // (see `LARGE_IMM_SCRATCH`), so refuse the conflict explicitly.
-        let scratch = crate::regloc::X86_64_SCRATCH_REG;
-        if let Loc::Reg(ofs_r) = ofs_loc {
-            assert!(
-                ofs_r.value != scratch.value,
-                "GcStore: cannot stage 64-bit immediate when offset already occupies R11",
-            );
-        }
-        dynasm!(self.mc ; .arch x64 ; mov Rq(scratch.value), QWORD val);
+        // 64-bit immediate that doesn't fit sign-extended imm32. The
+        // regalloc materialises an out-of-range offset into
+        // LARGE_IMM_SCRATCH (R11), so staging val through R11 too would
+        // clobber the offset register. Split the QWORD write into two
+        // DWORD writes instead — `mov DWORD [mem], imm32` accepts a
+        // bare immediate and leaves the offset register intact.
+        debug_assert_eq!(
+            size, 8,
+            "split-store path only reachable for QWORD stores; smaller sizes go through val_fits_at_size",
+        );
+        let lo = val as i32;
+        let hi = (val >> 32) as i32;
         match ofs_loc {
             Loc::Immed(i) => {
                 let o = i.value as i32;
-                self.emit_gcstore_sized(base, o, None, &scratch, size);
+                dynasm!(self.mc ; .arch x64
+                    ; mov DWORD [Rq(base.value) + o], lo
+                    ; mov DWORD [Rq(base.value) + o + 4], hi);
             }
             Loc::Reg(ofs_r) => {
-                self.emit_gcstore_sized(base, 0, Some(ofs_r), &scratch, size);
+                dynasm!(self.mc ; .arch x64
+                    ; mov DWORD [Rq(base.value) + Rq(ofs_r.value)], lo
+                    ; mov DWORD [Rq(base.value) + Rq(ofs_r.value) + 4], hi);
             }
-            _ => {}
+            other => panic!(
+                "GcStore imm: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",
+            ),
         }
     }
 
@@ -4899,8 +5217,9 @@ impl<'a> Assembler386<'a> {
                     ; mov WORD [Rq(base.value) + Rq(r.value)], val as i16),
                 4 => dynasm!(self.mc ; .arch x64
                     ; mov DWORD [Rq(base.value) + Rq(r.value)], val as i32),
-                _ => dynasm!(self.mc ; .arch x64
+                8 => dynasm!(self.mc ; .arch x64
                     ; mov QWORD [Rq(base.value) + Rq(r.value)], val as i32),
+                other => panic!("GcStore imm: unsupported store size {other}"),
             }
         } else {
             match size {
@@ -4910,8 +5229,9 @@ impl<'a> Assembler386<'a> {
                     ; mov WORD [Rq(base.value) + ofs], val as i16),
                 4 => dynasm!(self.mc ; .arch x64
                     ; mov DWORD [Rq(base.value) + ofs], val as i32),
-                _ => dynasm!(self.mc ; .arch x64
+                8 => dynasm!(self.mc ; .arch x64
                     ; mov QWORD [Rq(base.value) + ofs], val as i32),
+                other => panic!("GcStore imm: unsupported store size {other}"),
             }
         }
     }
@@ -4944,16 +5264,18 @@ impl<'a> Assembler386<'a> {
                 4 => {
                     dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(r.value)], Rd(val.value))
                 }
-                _ => {
+                8 => {
                     dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + Rq(r.value)], Rq(val.value))
                 }
+                other => panic!("GcStore: unsupported store size {other}"),
             }
         } else {
             match size {
                 1 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rb(val.value)),
                 2 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rw(val.value)),
                 4 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rd(val.value)),
-                _ => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rq(val.value)),
+                8 => dynasm!(self.mc ; .arch x64 ; mov [Rq(base.value) + ofs], Rq(val.value)),
+                other => panic!("GcStore: unsupported store size {other}"),
             }
         }
     }
@@ -6024,6 +6346,12 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_call_rax();
         // pop_gcmap
         dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
+        // A minor GC inside the slowpath may have moved the current
+        // jitframe; reload rbp from the shadow stack so subsequent
+        // frame-relative loads/stores hit the new location. The
+        // RPython x86 backend mirrors `_reload_frame_if_necessary`
+        // here (assembler.py:2553-2557).
+        self.reload_frame_if_necessary();
 
         dynasm!(self.mc ; .arch x64 ; =>done);
         if let Some(Loc::Reg(r)) = result_loc {
