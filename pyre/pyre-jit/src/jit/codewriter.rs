@@ -6704,6 +6704,53 @@ impl CodeWriter {
             }
         } // end while-let pendingblocks
 
+        // Phase 4 walker-orthodoxy post-walker cleanup: scan blocks
+        // reachable from the graph's startblock and patch any orphan
+        // joinpoint blocks (non-final blocks with empty exits) so the
+        // graph is well-formed for `flatten_graph(graph, regallocs,
+        // _include_all_exc_links, cpu)`.  Such joinpoints arise when
+        // the walker creates a `mergeblock` candidate at a PC whose
+        // `emitted_pc_starts` flag is later set (pyre PRE-EXISTING-
+        // ADAPTATION at codewriter.rs:4520), preventing the
+        // pendingblocks loop from re-popping the candidate to fill
+        // its operations / exits.  Upstream RPython has no analog
+        // because `flowcontext.py:402-405 build_flow` re-records
+        // unconditionally — the upstream walker never produces empty-
+        // exits non-final blocks.
+        //
+        // The cleanup attaches a synthetic single-arg exit pointing
+        // at `graph.returnblock`, carrying the joinpoint's first
+        // `inputarg` as the return value.  After the patch the orphan
+        // block flows through `make_link` → `make_return` (one arg,
+        // upstream-orthodox per `flatten.py:130-138`), and the
+        // `[phase4-flatten-graph]` probe sees `panic=false`.
+        // Convergence: Task #227 walker restructure (per-block
+        // `block.operations` accumulation + retire `emitted_pc_starts`
+        // skip) lets the walker fill these joinpoints during the
+        // normal pendingblocks loop, retiring this cleanup.
+        for block in graph.iterblocks() {
+            let needs_patch = {
+                let b = block.borrow();
+                !b.is_final_block() && b.exits.is_empty()
+            };
+            if !needs_patch {
+                continue;
+            }
+            let first_arg = block
+                .borrow()
+                .inputargs
+                .first()
+                .cloned()
+                .unwrap_or_else(|| super::flow::Constant::none().into());
+            let synthetic_link = super::flow::Link::new(
+                vec![first_arg],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref();
+            block.closeblock(vec![synthetic_link]);
+        }
+
         // RPython flatten.py parity: every code path ends with an explicit
         // return/raise/goto/unreachable. No end-of-code sentinel needed —
         // falling off the end is unreachable if all bytecodes are covered.
