@@ -6500,6 +6500,21 @@ impl MIFrame {
                 .map(|e| e.reraise_lasti)
                 .unwrap_or(-1);
             if oparg_val != 0 && reraise_lasti < 0 {
+                // Wipe the trace's tracked exception state so the
+                // metainterp's Abort handler skips its in-trace
+                // `finishframe_exception` (which would otherwise dispatch
+                // a handler-entry push with `reraise_lasti=-1`,
+                // synthesizing the WRONG lasti and mutating
+                // `owned_concrete_frame` in a way the interpreter would
+                // then resume with).  `executor.reraise()` only mutated
+                // the symbolic stack and emitted IR — both abandoned on
+                // abort.  The concrete PyFrame is untouched, so the
+                // interpreter re-runs RERAISE freshly via its own
+                // `peekvalue(oparg)` path and gets the correct saved
+                // lasti from runtime state.
+                let s = self.sym_mut();
+                s.last_exc_value = pyre_object::PY_NULL;
+                s.last_exc_box = OpRef::NONE;
                 return InlineTraceStepAction::Trace(TraceAction::Abort);
             }
             if self.sym().last_exc_box != OpRef::NONE {
@@ -6509,6 +6524,11 @@ impl MIFrame {
             // lasti when the trace lacks a tracked exception box (generic
             // fallback would drop the lasti).
             if oparg_val != 0 {
+                // last_exc_box is already NONE here; keep last_exc_value
+                // clear for symmetry with the const-fold-abort branch
+                // above so metainterp's `has_exc` check observes no
+                // tracked exception either way.
+                self.sym_mut().last_exc_value = pyre_object::PY_NULL;
                 return InlineTraceStepAction::Trace(TraceAction::Abort);
             }
             if step_result.is_err() {
