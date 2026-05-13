@@ -7384,85 +7384,12 @@ impl CodeWriter {
             emit_goto!(ssarepr, site.handler_py_pc);
         }
 
-        // Task #227.3 `[phase4-walker-drain]` probe: drain per-block
-        // accumulators in walker-visit order and assert byte-equality
-        // with the program-wide `ssarepr.insns` slice the walker
-        // produced.  Walker-visit order is the order in which each
-        // SpamBlockRef was created (matches `all_walker_blocks` push
-        // ordering at SpamBlockRef::new sites in
-        // `transform_graph_to_jitcode` + `mergeblock` +
-        // `make_next_block`).  Block-entry labels are pushed to the
-        // per-block accumulator inside `emit_mark_label_pc!` /
-        // `emit_mark_label_catch_landing!` after `current_block`
-        // switches, so a block's per_block_ssarepr captures exactly
-        // the insn slice the walker emitted while standing in it.
+        // Task #227.3 `[phase4-walker-drain]` probe is retired: with
+        // the unconditional drain swap below + assert, any mismatch
+        // panics fail-loud at the assert site.  The probe's
+        // byte_equivalent reporting purpose is subsumed by the
+        // assertion.
         //
-        // A byte_equivalent=true reading across all 14 production
-        // benches is the precondition for Task #227.4 (production
-        // flip: drop the program-wide push, drain per-block
-        // accumulators in graph-DFS order, feed the concatenated
-        // stream to `compute_liveness` + `assemble`).  Until then,
-        // production reads from `ssarepr.insns`; the drain only
-        // informs the probe.
-        if std::env::var("PYRE_TASK_227_DRAIN_PROBE").is_ok() {
-            let mut drained: Vec<super::flatten::Insn> = Vec::new();
-            for block in all_walker_blocks.iter() {
-                drained.extend(block.per_block_ssarepr());
-            }
-            let byte_equivalent = drained.len() == ssarepr.insns.len()
-                && drained
-                    .iter()
-                    .zip(ssarepr.insns.iter())
-                    .all(|(l, r)| insn_byte_equal(l, r));
-            eprintln!(
-                "[phase4-walker-drain] {} blocks={} drained={} ssarepr={} byte_equivalent={}",
-                code.obj_name,
-                all_walker_blocks.len(),
-                drained.len(),
-                ssarepr.insns.len(),
-                byte_equivalent,
-            );
-            if !byte_equivalent {
-                let limit = drained.len().min(ssarepr.insns.len());
-                for i in 0..limit {
-                    if !insn_byte_equal(&drained[i], &ssarepr.insns[i]) {
-                        eprintln!(
-                            "[phase4-walker-drain]   {} first-diff pos={i} drain={:?} ssarepr={:?}",
-                            code.obj_name, drained[i], ssarepr.insns[i],
-                        );
-                        // Task #227.5 diff-tail dump: show the next 25
-                        // ssarepr entries past the first diff so the
-                        // missing-from-drain emits are identifiable.
-                        if std::env::var("PYRE_TASK_227_DRAIN_VERBOSE").is_ok() {
-                            let tail_end = (i + 25).min(ssarepr.insns.len());
-                            for j in i..tail_end {
-                                eprintln!(
-                                    "[phase4-walker-drain]     ssarepr[{}]={:?}",
-                                    j, ssarepr.insns[j],
-                                );
-                            }
-                            // Also dump drain entries around the diff.
-                            for j in i..tail_end.min(drained.len()) {
-                                eprintln!(
-                                    "[phase4-walker-drain]     drain[{}]={:?}",
-                                    j, drained[j],
-                                );
-                            }
-                        }
-                        break;
-                    }
-                }
-                if drained.len() != ssarepr.insns.len() {
-                    eprintln!(
-                        "[phase4-walker-drain]   {} length mismatch drained={} ssarepr={}",
-                        code.obj_name,
-                        drained.len(),
-                        ssarepr.insns.len(),
-                    );
-                }
-            }
-        }
-
         // Task #227.4 production flip (unconditional): drain per-block
         // accumulators and replace `ssarepr.insns`.  With the
         // per-block contiguous walker (Task #227.5) as the default
