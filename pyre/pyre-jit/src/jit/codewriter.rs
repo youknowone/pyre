@@ -3373,6 +3373,27 @@ impl CodeWriter {
                 all_walker_blocks.push(synthetic.clone());
                 synthetic
             });
+        // Task #227.5 per-block contiguous walker — when env
+        // `PYRE_TASK_227_5_PER_BLOCK_WALKER=1`, `emit_mark_label_pc!`
+        // sets `block_switch_pending = true` instead of switching
+        // `current_block` inline.  The inner for-loop checks the
+        // flag after each per-PC emit and breaks, yielding to the
+        // outer `while let Some(pending_block) = pendingblocks
+        // .pop_front()` which picks up the queued new block in the
+        // next iteration.  This mirrors upstream's `flowcontext.py:
+        // 407-416 record_block` shape where each block is processed
+        // contiguously without mid-iteration re-entry, retiring the
+        // last walker non-orthodoxy that prevents `[phase4-walker-
+        // drain]` byte-equivalent on larger benches.
+        //
+        // Gated on env so the default production path is unchanged
+        // while the restructure is validated bench-by-bench.  When
+        // every bench reports `byte_equivalent=true` under the gate,
+        // the env check retires and per-block-walker becomes
+        // unconditional.
+        let task_227_5_per_block_walker =
+            std::env::var("PYRE_TASK_227_5_PER_BLOCK_WALKER").is_ok();
+        let mut block_switch_pending: bool = false;
         let mut current_state = current_block
             .framestate()
             .unwrap_or_else(|| start_state.clone());
@@ -3959,6 +3980,18 @@ impl CodeWriter {
                     // `mergeblock` that targeted `py_pc` populated the
                     // joinpoint candidate list (`flowcontext.py:426
                     // candidates = self.joinpoints.setdefault(...)`).
+                    //
+                    // Task #227.5 per-block contiguous walker: when
+                    // the gate is on AND the joinpoint target differs
+                    // from `current_block`, queue the target to
+                    // `pendingblocks` (mergeblock-path queuing is
+                    // already done by mergeblock itself; joinpoint
+                    // match doesn't push automatically).
+                    if task_227_5_per_block_walker && target != current_block {
+                        if !pendingblocks.iter().any(|b| b == &target) {
+                            pendingblocks.push_front(target.clone());
+                        }
+                    }
                     target
                 } else if !current_block.dead() {
                     // Natural fall-through: previous opcode set
@@ -4003,23 +4036,38 @@ impl CodeWriter {
                 if let Some(fallthrough_case) = pending_bool_fallthrough_case.take() {
                     set_last_bool_exitcase(&current_block.block(), fallthrough_case);
                 }
-                current_block = new_block;
-                current_state = current_block
-                    .framestate()
-                    .expect("block state should exist at label");
-                needs_fallthrough = true;
-                // Task #227.1 per-block accumulator dual-write: record
-                // the block-entry Label on the new `current_block` so a
-                // post-walk `flatten_graph(graph, regallocs, cpu)`
-                // pass can drain each block's emit sequence in graph-
-                // DFS order (matching `codewriter.py:53` upstream).
-                // The program-wide push above stays in place until
-                // Task #227.3 flips production to consume the per-
-                // block accumulator instead.
-                current_block.push_insn(Insn::Label(super::flatten::Label::new(format!(
-                    "pc{}",
-                    py_pc
-                ))));
+                // Task #227.5 yield-on-switch: when the gate is on and
+                // `new_block` differs from `current_block`, set the
+                // `block_switch_pending` flag and SKIP the inline
+                // switch (the new block has been queued to
+                // `pendingblocks` above; the outer walker loop will
+                // pop it and process its emit sequence
+                // contiguously).  The inner for-loop body checks
+                // `block_switch_pending` after each per-PC emit and
+                // breaks, yielding control.  Default (gate off):
+                // switch inline as before, preserving the PC-
+                // sequential walker's behaviour.
+                if task_227_5_per_block_walker && new_block != current_block {
+                    block_switch_pending = true;
+                } else {
+                    current_block = new_block;
+                    current_state = current_block
+                        .framestate()
+                        .expect("block state should exist at label");
+                    needs_fallthrough = true;
+                    // Task #227.1 per-block accumulator dual-write: record
+                    // the block-entry Label on the new `current_block` so a
+                    // post-walk `flatten_graph(graph, regallocs, cpu)`
+                    // pass can drain each block's emit sequence in graph-
+                    // DFS order (matching `codewriter.py:53` upstream).
+                    // The program-wide push above stays in place until
+                    // Task #227.3 flips production to consume the per-
+                    // block accumulator instead.
+                    current_block.push_insn(Insn::Label(super::flatten::Label::new(format!(
+                        "pc{}",
+                        py_pc
+                    ))));
+                }
             }};
         }
         macro_rules! emit_mark_label_catch_landing {
@@ -4848,6 +4896,10 @@ impl CodeWriter {
             current_depth = current_state.stack.len() as u16;
             needs_fallthrough = true;
             pending_bool_fallthrough_case = None;
+            // Task #227.5 per-block walker: reset switch flag at the
+            // start of every new block iteration so a previous
+            // block's queued switch doesn't bleed into this one.
+            block_switch_pending = false;
             // PRE-EXISTING-ADAPTATION — upstream `flowcontext.py:407-416`
             // drives per-block op accumulation via `while True:
             // handle_bytecode(...)` until a terminator, then
@@ -4885,6 +4937,15 @@ impl CodeWriter {
                 }
                 // RPython flatten.py: Label(block) at block entry
                 emit_mark_label_pc!(ssarepr, py_pc);
+                // Task #227.5 yield-on-switch: if `emit_mark_label_pc!`
+                // detected a block boundary at this PC and queued the
+                // new block to `pendingblocks`, break the inner loop
+                // and let the outer walker pop the new block in its
+                // own iteration.  Production with gate off: this is
+                // a dead branch (`block_switch_pending` never set).
+                if block_switch_pending {
+                    break;
+                }
                 // pyre PRE-EXISTING-ADAPTATION (see `Insn::PcAnchor`
                 // docstring in `flatten.rs`): emit a stable anchor at every
                 // Python PC start so the post-compute_liveness /
