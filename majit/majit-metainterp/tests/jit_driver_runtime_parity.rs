@@ -1917,6 +1917,7 @@ fn jit_state_restore_guard_failure_replays_pending_writes_with_virtual_target_an
     resume.set_slot_virtual(0, parent);
     resume.set_slot_virtual(1, child);
     resume.add_pending_field_write(
+        None,
         21,
         majit_metainterp::resume::ResumeValueSource::Virtual(parent),
         majit_metainterp::resume::ResumeValueSource::Virtual(child),

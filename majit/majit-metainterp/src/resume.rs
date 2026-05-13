@@ -665,8 +665,14 @@ pub enum ResumeVirtualLayoutSummary {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct PendingFieldLayoutSummary {
+    /// `resume.py:88 lldescr` — identity-compared via `Arc::ptr_eq`
+    /// (`history.py:125`).
+    pub descr: Option<majit_ir::DescrRef>,
+    /// Stable u32 handle for serialization sinks
+    /// (`ExitPendingFieldLayout`).  Equals `descr.as_ref().map_or(0,
+    /// |d| d.index())` when both are set.
     pub descr_index: u32,
     pub item_index: Option<usize>,
     pub is_array_item: bool,
@@ -675,6 +681,19 @@ pub struct PendingFieldLayoutSummary {
     pub target: ResumeValueLayoutSummary,
     pub value: ResumeValueLayoutSummary,
 }
+
+impl PartialEq for PendingFieldLayoutSummary {
+    fn eq(&self, other: &Self) -> bool {
+        opt_descr_arc_ptr_eq(&self.descr, &other.descr)
+            && self.item_index == other.item_index
+            && self.is_array_item == other.is_array_item
+            && self.target_kind == other.target_kind
+            && self.value_kind == other.value_kind
+            && self.target == other.target
+            && self.value == other.value
+    }
+}
+impl Eq for PendingFieldLayoutSummary {}
 
 #[derive(Debug, Clone)]
 pub struct ResumeLayoutSummary {
@@ -1037,6 +1056,7 @@ impl ResumeVirtualLayoutSummary {
 impl PendingFieldLayoutSummary {
     fn to_pending_field_info(&self) -> PendingFieldInfo {
         PendingFieldInfo {
+            descr: self.descr.clone(),
             descr_index: self.descr_index,
             target: self.target.to_resume_source(),
             value: self.value.to_resume_source(),
@@ -1962,9 +1982,15 @@ pub fn rd_virtual_to_virtual_info(
 }
 
 /// Deferred heap write to replay during resume.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct PendingFieldInfo {
-    /// Descriptor index identifying the target field or array descriptor.
+    /// `resume.py:88 lldescr` — the field/array descriptor itself.
+    /// Carries `field_offset` / `field_size` / `field_type` via the
+    /// trait, identity-compared via `Arc::ptr_eq` (`history.py:125`).
+    pub descr: Option<majit_ir::DescrRef>,
+    /// Stable u32 handle for serialization sinks
+    /// (`PendingFieldLayoutSummary`, `ExitPendingFieldLayout`).
+    /// Equals `descr.as_ref().map_or(0, |d| d.index())` when both are set.
     pub descr_index: u32,
     /// Source of the object/array pointer to update.
     pub target: ResumeValueSource,
@@ -1974,9 +2000,33 @@ pub struct PendingFieldInfo {
     pub item_index: Option<usize>,
 }
 
+impl PartialEq for PendingFieldInfo {
+    fn eq(&self, other: &Self) -> bool {
+        // `history.py:125 id(descr)` parity: descr identity via Arc::ptr_eq.
+        // `descr_index` is a serialization handle, not identity.
+        opt_descr_arc_ptr_eq(&self.descr, &other.descr)
+            && self.target == other.target
+            && self.value == other.value
+            && self.item_index == other.item_index
+    }
+}
+
+#[inline]
+fn opt_descr_arc_ptr_eq(
+    a: &Option<majit_ir::DescrRef>,
+    b: &Option<majit_ir::DescrRef>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
 impl PendingFieldInfo {
     pub fn layout_summary(&self) -> PendingFieldLayoutSummary {
         PendingFieldLayoutSummary {
+            descr: self.descr.clone(),
             descr_index: self.descr_index,
             item_index: self.item_index,
             is_array_item: self.item_index.is_some(),
@@ -2469,6 +2519,11 @@ impl EncodedResumeData {
             .rd_pendingfields
             .iter()
             .map(|pending| PendingFieldInfo {
+                // Decoder-side: the live `Arc<dyn Descr>` is recovered
+                // by callers via `descr_index → pool` lookup if needed.
+                // The encoded form (`EncodedPendingFieldWrite`) only
+                // persists the `descr_index` handle, not the Arc.
+                descr: None,
                 descr_index: pending.descr_index,
                 target: self.decode_box(pending.target),
                 value: self.decode_box(pending.value),
@@ -3383,11 +3438,13 @@ impl ResumeDataVirtualAdder {
     /// Add a deferred field write to replay on resume.
     pub fn add_pending_field_write(
         &mut self,
+        descr: Option<majit_ir::DescrRef>,
         descr_index: u32,
         target: ResumeValueSource,
         value: ResumeValueSource,
     ) {
         self.pending_fields.push(PendingFieldInfo {
+            descr,
             descr_index,
             target,
             value,
@@ -3398,12 +3455,14 @@ impl ResumeDataVirtualAdder {
     /// Add a deferred array item write to replay on resume.
     pub fn add_pending_arrayitem_write(
         &mut self,
+        descr: Option<majit_ir::DescrRef>,
         descr_index: u32,
         target: ResumeValueSource,
         item_index: usize,
         value: ResumeValueSource,
     ) {
         self.pending_fields.push(PendingFieldInfo {
+            descr,
             descr_index,
             target,
             value,
