@@ -272,11 +272,25 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
         let mut lives: Vec<Insn> = vec![insn];
 
         // `liveness.py:97-106` inner loop.
+        //
+        // Task #227.5 item 6: pyre emits `Label("pc{N}")` at every
+        // Python PC entry as a per-PC anchor (pyre-specific
+        // construct; upstream RPython has no per-PC Labels — only
+        // block-entry Labels).  `remove_repeated_live` must NOT
+        // merge `-live-` runs across `Label("pc{N}")` boundaries —
+        // otherwise consecutive per-PC live markers collapse into
+        // one and `live_marker_indices_by_pc` loses the per-PC
+        // mapping.  Other Labels (catch_landing, link-target) keep
+        // merging per upstream `liveness.py:99-100`.  This carveout
+        // is the necessary structural adaptation for pyre's per-PC
+        // Label model and enables Task #227 PcAnchor retirement.
         while i < ssarepr.insns.len() {
             let next = ssarepr.insns[i].clone();
             if next.is_live() {
                 lives.push(next);
                 i += 1;
+            } else if matches!(&next, Insn::Label(label) if label.name.starts_with("pc")) {
+                break;
             } else if matches!(next, Insn::Label(_)) {
                 labels.push(next);
                 i += 1;

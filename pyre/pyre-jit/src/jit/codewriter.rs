@@ -4971,20 +4971,15 @@ impl CodeWriter {
                 if let Some(slot) = emitted_pc_starts.get_mut(py_pc) {
                     *slot = true;
                 }
-                // pyre PRE-EXISTING-ADAPTATION (see `Insn::PcAnchor`
-                // docstring in `flatten.rs`): emit a stable anchor at every
-                // Python PC start so the post-compute_liveness /
-                // post-remove_repeated_live SSARepr position is recoverable.
-                //
-                // Task #227 PcAnchor retirement scaffolding: consumer
-                // helpers `pc_anchor_positions` / `live_marker_indices_by_pc`
-                // accept Label("pc{N}") as the per-PC anchor when PcAnchor
-                // is absent.  Walker still emits `Insn::PcAnchor(py_pc)`
-                // because retirement requires aligning `remove_repeated_live`
-                // (which uses Labels as merge participants per upstream
-                // `liveness.py:99-100`) with pyre's per-PC Label model —
-                // an orthogonal liveness mechanism refactor.
-                current_block.push_insn(Insn::PcAnchor(py_pc));
+                // Task #227.5 item 6: PcAnchor walker emit retired.
+                // The `Label("pc{N}")` that `emit_mark_label_pc!`
+                // emitted is the per-PC anchor for
+                // `pc_anchor_positions` / `live_marker_indices_by_pc`
+                // (Label-based fallback).  `remove_repeated_live` is
+                // updated to break its merge run on per-PC Labels so
+                // each PC keeps its own `-live-` marker.  Aligns
+                // with upstream RPython which has no per-PC anchor
+                // concept — Labels are the boundary markers.
                 depth_at_pc[py_pc] = current_depth;
                 emit_live_placeholder!(ssarepr);
 
@@ -10313,9 +10308,11 @@ mod tests {
                 Kind::Ref,
                 0,
             ))]));
-        // `remove_repeated_live` rewrites `-live-, Label` into
-        // `Label, -live-`; the anchor scan must use the final insn order,
-        // not the pre-rewrite placeholder index.
+        // Task #227.5 item 6: per-PC `Label("pcN")` is a merge boundary
+        // in `remove_repeated_live`, so each PC keeps its own `-live-`
+        // marker without cross-PC merge-then-reorder.  The anchor scan
+        // finds each PcAnchor at its pre-merge position; the live
+        // marker for each PC stays at its pre-merge position too.
         ssarepr.insns.push(Insn::Label(FlatLabel::new("pc1")));
         ssarepr.insns.push(Insn::PcAnchor(1));
         ssarepr
@@ -10327,8 +10324,12 @@ mod tests {
 
         crate::jit::liveness::remove_repeated_live(&mut ssarepr);
 
+        // PcAnchor positions: PcAnchor(0)@0, PcAnchor(1)@3.
         assert_eq!(pc_anchor_positions(&ssarepr, 2), vec![0, 3]);
-        assert_eq!(live_marker_indices_by_pc(&ssarepr, 2), vec![2, 4]);
+        // Per-PC `-live-` boundaries: live(R0) stays at index 1 (no
+        // longer reordered past Label("pc1") via merge-reorder),
+        // live(R1) at index 4.
+        assert_eq!(live_marker_indices_by_pc(&ssarepr, 2), vec![1, 4]);
     }
 
     #[test]
