@@ -589,10 +589,10 @@ fn overlay_deadframe_fail_descr(
         base_layout.force_token_slots.clone(),
     );
     let descr = Arc::new(descr);
-    // `set_source_op_index` / `set_recovery_layout` / `set_trace_info`
-    // write to the backend-static side-tables keyed on
-    // `Arc::as_ptr(&descr)`, so they must follow Arc materialisation
-    // (Session 5i-cl).
+    // `set_source_op_index` / `set_recovery_layout` / `set_trace_info` /
+    // `register_force_token_slots` all write to backend-static side-tables
+    // keyed on `Arc::as_ptr(&descr)`, so they must follow Arc
+    // materialisation (Session 5i-cl).
     if let Some(source_op_index) = base_layout.source_op_index {
         descr.set_source_op_index(source_op_index);
     }
@@ -600,6 +600,10 @@ fn overlay_deadframe_fail_descr(
     if let Some(trace_info) = base_layout.trace_info.clone() {
         descr.set_trace_info(trace_info);
     }
+    crate::guard::register_force_token_slots(
+        Arc::as_ptr(&descr) as usize,
+        base_layout.force_token_slots.clone(),
+    );
     descr
 }
 
@@ -4473,7 +4477,7 @@ fn expected_call_assembler_result_kind(
                 })?;
             Ok(
                 if finish_descr.fail_arg_types() == [Type::Ref]
-                    && finish_descr.force_token_slots == [0]
+                    && finish_descr.force_token_slots() == [0]
                 {
                     CALL_ASSEMBLER_RESULT_FORCE_TOKEN_REF
                 } else {
@@ -4520,7 +4524,7 @@ fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u
                     target.fail_descrs.iter().find(|descr| descr.is_finish())
                 {
                     if finish_descr.fail_arg_types() == [Type::Ref]
-                        && finish_descr.force_token_slots == [0]
+                        && finish_descr.force_token_slots() == [0]
                     {
                         force_tokens.insert(result_var);
                     }
@@ -12777,7 +12781,7 @@ fn collect_guards(
             *max_output_slots = n;
         }
 
-        let force_token_slots = fail_arg_refs
+        let force_token_slots: Vec<usize> = fail_arg_refs
             .iter()
             .enumerate()
             .filter_map(|(slot, opref)| force_tokens.contains(&opref.raw()).then_some(slot))
@@ -13189,6 +13193,11 @@ fn collect_guards(
         } else {
             None
         };
+        // Session 5i-cl: force_token_slots moved to a backend-static
+        // side-table.  Capture a clone now; the constructor consumes
+        // the original to compute `gc_map`, and we register the
+        // captured copy against the descr's Arc address below.
+        let force_token_slots_for_register = force_token_slots.clone();
         let mut descr = if is_external_jump {
             CraneliftFailDescr::new_external_jump(
                 fail_index,
@@ -13233,6 +13242,10 @@ fn collect_guards(
         if let Some(layout) = recovery_layout {
             descr.set_recovery_layout(layout);
         }
+        crate::guard::register_force_token_slots(
+            Arc::as_ptr(&descr) as usize,
+            force_token_slots_for_register,
+        );
         if let Some(target) = external_jump_target {
             crate::guard::register_external_jump_target(Arc::as_ptr(&descr) as usize, target);
         }

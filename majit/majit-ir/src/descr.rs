@@ -1447,8 +1447,13 @@ pub trait FailDescr: Descr {
     }
 
     /// Exit slot indices that carry opaque force-token handles.
-    fn force_token_slots(&self) -> &[usize] {
-        &[]
+    ///
+    /// Returns owned `Vec<usize>` (cloned per call) — Session 5i-cl moved
+    /// the cranelift implementation to `FORCE_TOKEN_SLOTS_TABLE`, a
+    /// backend-static side-table that cannot hand out a borrow under a
+    /// lock.
+    fn force_token_slots(&self) -> Vec<usize> {
+        Vec::new()
     }
 
     /// `compile.py:683` `AbstractResumeGuardDescr._attrs_ = ('status',)`
