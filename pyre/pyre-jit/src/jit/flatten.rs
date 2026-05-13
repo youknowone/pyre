@@ -1375,6 +1375,18 @@ pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
     link_names: HashMap<LinkRef, String>,
     next_label_id: usize,
     include_all_exc_links: bool,
+    /// `rpython/jit/codewriter/flatten.py:79 self.cpu = cpu`.
+    ///
+    /// Upstream `flatten_graph(graph, regallocs, _include_all_exc_links,
+    /// cpu)` threads the LLGraphCPU through so `make_exception_link`
+    /// can read `self.cpu.rtyper.exceptiondata.
+    /// get_standard_ll_exc_instance_by_class(OverflowError)` on the
+    /// `handling_ovf=True` arm (`flatten.py:166-170`).  Pyre stores it
+    /// as a borrow; production callers thread `CodeWriter::cpu()`
+    /// (`codewriter.rs:2661`).  Test fixtures that do not exercise
+    /// the overflow path leave it `None`, matching upstream's
+    /// `cpu=None` default at `flatten.py:64`.
+    cpu: Option<&'a super::cpu::Cpu>,
     /// Slice #48.18 (Option C pipeline-flip prep): when `Some`,
     /// `flatten_space_operation` routes pre-rtype HLOp opnames from
     /// the four retired families (BINARY_OP / COMPARE_OP / BOOL /
@@ -1400,6 +1412,7 @@ where
             link_names: HashMap::new(),
             next_label_id: 0,
             include_all_exc_links: false,
+            cpu: None,
             lowering_ctx: None,
         }
     }
@@ -1424,6 +1437,7 @@ where
             link_names: HashMap::new(),
             next_label_id: 0,
             include_all_exc_links: false,
+            cpu: None,
             lowering_ctx: None,
         }
     }
@@ -1453,8 +1467,21 @@ where
             link_names: HashMap::new(),
             next_label_id: 0,
             include_all_exc_links: false,
+            cpu: None,
             lowering_ctx: Some(lowering_ctx),
         }
+    }
+
+    /// `flatten.py:63 def flatten_graph(graph, regallocs,
+    /// _include_all_exc_links=False, cpu=None)` cpu kwarg parity.
+    ///
+    /// Production callers thread `CodeWriter::cpu()` so
+    /// `make_exception_link`'s `handling_ovf=True` arm can fetch the
+    /// `OverflowError` exception instance (`flatten.py:166-170`).
+    /// Returns `self` to support builder-style chaining at construction.
+    pub fn with_cpu(mut self, cpu: &'a super::cpu::Cpu) -> Self {
+        self.cpu = Some(cpu);
+        self
     }
 
     pub fn emit_space_operation(&mut self, op: &SpaceOperation) {
@@ -1648,15 +1675,129 @@ where
                 && link_borrow.args[1] == Some(last_exc_value.into())
         };
         if should_reraise {
-            assert!(
-                !handling_ovf,
-                "overflow exception edges are not modeled in pyre flatten_graph yet"
-            );
-            self.emitline(Insn::op("reraise", Vec::new()));
+            if handling_ovf {
+                // `flatten.py:165-170` direct-OverflowError raise:
+                //   exc_data = self.cpu.rtyper.exceptiondata
+                //   ll_ovf = exc_data.get_standard_ll_exc_instance_by_class(
+                //       OverflowError)
+                //   c = Constant(ll_ovf, concretetype=lltype.typeOf(ll_ovf))
+                //   self.emitline("raise", c)
+                let cpu = self.cpu.expect(
+                    "make_exception_link: handling_ovf=true requires a Cpu; \
+                     production callers thread `CodeWriter::cpu()` so \
+                     `cpu.rtyper.exceptiondata.\
+                     get_standard_ll_exc_instance_by_class(OverflowError)` \
+                     resolves per flatten.py:166-170",
+                );
+                let exc_data = &cpu.rtyper.exceptiondata;
+                let ll_ovf = exc_data
+                    .get_standard_ll_exc_instance_by_class("OverflowError")
+                    .expect(
+                        "ExceptionData::get_standard_ll_exc_instance_by_class\
+                         (OverflowError) must succeed for the standard \
+                         exception (flatten.py:167)",
+                    );
+                let operand = (self.lower_constant)(&ll_ovf);
+                self.emitline(Insn::op("raise", vec![operand]));
+            } else {
+                self.emitline(Insn::op("reraise", Vec::new()));
+            }
             self.emitline(Insn::Unreachable);
             return;
         }
         self.make_link(link, handling_ovf);
+    }
+
+    /// `rpython/jit/codewriter/flatten.py:189-204` `_ovf` rewrite of
+    /// the canraise tail.
+    ///
+    /// Upstream:
+    /// ```py
+    /// if '_ovf' in opname:
+    ///     line = self.popline()
+    ///     self.emitline(opname[:7] + '_jump_if_ovf',
+    ///                   TLabel(block.exits[1]), *line[1:])
+    ///     assert len(block.exits) in (2, 3)
+    ///     self.make_link(block.exits[0], False)
+    ///     self.emitline(Label(block.exits[1]))
+    ///     self.make_exception_link(block.exits[1], True)
+    ///     if len(block.exits) == 3:
+    ///         assert block.exits[2].exitcase is Exception
+    ///         self.make_exception_link(block.exits[2], False)
+    ///     return
+    /// ```
+    ///
+    /// Pyre's `Insn::Op` carries `opname` separately from `args` /
+    /// `result`, so `line[1:]` translates to "args + the trailing
+    /// `->` result hint kept as `Insn::Op::result`".  The popped
+    /// `_ovf` op's `opname[:7]` always yields the upstream "int_xxx"
+    /// prefix (`int_add`, `int_sub`, `int_mul`, `int_neg`, …).
+    fn flatten_ovf_canraise(&mut self, exits: &[LinkRef], raising_opname: &str) {
+        // `flatten.py:194 line = self.popline()`.  The most recent
+        // serialized op is the `_ovf` arithmetic itself.
+        let line = self
+            .ssarepr
+            .insns
+            .pop()
+            .expect("flatten_ovf_canraise: ssarepr.insns must contain the just-emitted _ovf op");
+        let (popped_opname, popped_args, popped_result) = match line {
+            Insn::Op { opname, args, result } => (opname, args, result),
+            other => panic!(
+                "flatten_ovf_canraise: popline expected Insn::Op('{raising_opname}', ...), got {other:?}"
+            ),
+        };
+        assert_eq!(
+            popped_opname, raising_opname,
+            "flatten_ovf_canraise: popped opname {popped_opname:?} disagrees with \
+             block.raising_op() opname {raising_opname:?} — emit_space_operation \
+             order is corrupted",
+        );
+        // `flatten.py:195-196` `opname[:7] + '_jump_if_ovf'`.
+        assert!(
+            popped_opname.len() >= 7,
+            "flatten_ovf_canraise: opname {popped_opname:?} is shorter than the \
+             upstream 7-char `int_xxx` prefix expected at flatten.py:195",
+        );
+        let jump_opname = format!("{}_jump_if_ovf", &popped_opname[..7]);
+        // `flatten.py:196` `*line[1:]` — prepend the overflow target
+        // TLabel, then keep all original args.  The result hint
+        // (`Insn::Op::result`) stays on the new op since upstream's
+        // `line[1:]` includes the trailing `'->', result` pair.
+        let mut new_args = Vec::with_capacity(popped_args.len() + 1);
+        new_args.push(self.tlabel_for_link(&exits[1]));
+        new_args.extend(popped_args);
+        let jump_insn = match popped_result {
+            Some(result) => Insn::op_with_result(jump_opname, new_args, result),
+            None => Insn::op(jump_opname, new_args),
+        };
+        self.emitline(jump_insn);
+        // `flatten.py:197 assert len(block.exits) in (2, 3)`.
+        assert!(
+            matches!(exits.len(), 2 | 3),
+            "flatten_ovf_canraise: _ovf canraise block must have 2 or 3 exits per \
+             flatten.py:197 (got {})",
+            exits.len(),
+        );
+        // `flatten.py:198 self.make_link(block.exits[0], False)`.
+        self.make_link(&exits[0], false);
+        // `flatten.py:199 self.emitline(Label(block.exits[1]))`.
+        let exit1_label = self.label_for_link(&exits[1]);
+        self.emitline(exit1_label);
+        // `flatten.py:200 self.make_exception_link(block.exits[1], True)`.
+        self.make_exception_link(&exits[1], true);
+        if exits.len() == 3 {
+            // `flatten.py:202 assert block.exits[2].exitcase is Exception`.
+            // pyre represents the `Exception` catch-all by an Atom
+            // exitcase (see `flow.rs::Atom::ExceptCatchAll`), and
+            // `llexitcase` stays `None` for catch-all links.
+            assert!(
+                exits[2].borrow().llexitcase.is_none(),
+                "flatten_ovf_canraise: _ovf 3-exit canraise expects exits[2] to be \
+                 the `Exception` catch-all (llexitcase=None) per flatten.py:202",
+            );
+            // `flatten.py:203 self.make_exception_link(block.exits[2], False)`.
+            self.make_exception_link(&exits[2], false);
+        }
     }
 
     fn insert_exits(&mut self, block: &BlockRef, handling_ovf: bool) {
@@ -1687,6 +1828,30 @@ where
                      normal-flow link (last_exception=None, \
                      llexitcase=None) per flatten.py:211"
                 );
+            }
+            // `flatten.py:189-204` `_ovf` rewrite.  When the last op
+            // of a canraise block is an overflow-checked arithmetic
+            // op (`int_add_ovf`, `int_sub_ovf`, `int_mul_ovf`,
+            // `int_neg_ovf`, ...), pop the just-serialized op and
+            // emit its `_jump_if_ovf` twin: the new op carries the
+            // overflow-target TLabel as its first operand, followed
+            // by the original op's args/result.  Then walk the normal
+            // exit, emit `Label(exits[1])`, walk the OverflowError
+            // edge with `handling_ovf=True`, and optionally walk the
+            // `Exception` catch-all (`exits[2]`).
+            //
+            // The W-3 catch-link-order assertion below does NOT apply
+            // to `_ovf` blocks because their `exits[1]` is the direct
+            // OverflowError-reraise edge (not a typed catch), so check
+            // for `_ovf` first and early-return before that assertion.
+            let raising_opname = block
+                .borrow()
+                .raising_op()
+                .map(|op| op.opname.clone())
+                .unwrap_or_default();
+            if raising_opname.contains("_ovf") {
+                self.flatten_ovf_canraise(&exits, &raising_opname);
+                return;
             }
             // RPython `flatten.py:223-238` invariant: typed catches
             // (`llexitcase = Some(case)`) precede the catch-all
@@ -2012,7 +2177,26 @@ where
         let block_label = self.label_for_block(&block);
         self.emitline(block_label);
         let operations = block.borrow().operations.clone();
+        let exits_len = block.borrow().exits.len();
+        let exitswitch_is_last_exception = block.borrow().canraise();
         for op in &operations {
+            // `flatten.py:120-125` `_ovf` validity check: an overflow-
+            // checked op must live in a canraise block with 2 or 3
+            // exits; otherwise the rtyper-side guarantee that an
+            // `OverflowError` is caught fails to hold, and the
+            // `_jump_if_ovf` rewrite in `flatten_ovf_canraise`
+            // (`flatten.py:189-204`) would have no overflow target.
+            if op.opname.contains("_ovf") {
+                assert!(
+                    matches!(exits_len, 2 | 3) && exitswitch_is_last_exception,
+                    "detected a block containing ovfcheck() but no \
+                     OverflowError is caught, this is not legal in \
+                     jitted blocks (op={op_name}, exits={exits_len}, \
+                     canraise={exitswitch_is_last_exception}) — \
+                     flatten.py:122-125",
+                    op_name = op.opname,
+                );
+            }
             self.emit_space_operation(op);
         }
         self.insert_exits(&block, handling_ovf);
@@ -2125,11 +2309,24 @@ fn is_default_exitcase(exitcase: &Option<FlowValue>) -> bool {
 
 fn switch_llexitcase_key(llexitcase: &Option<FlowValue>) -> i64 {
     match llexitcase {
+        // `flatten.py:296 lltype.cast_primitive(lltype.Signed, switch.llexitcase)`.
+        // RPython's `lltype.cast_primitive` accepts any primitive type
+        // castable to `Signed`; `Signed` is the identity cast and `Bool`
+        // widens to 0 / 1.  Other shapes (None, Ref, opaque) violate
+        // upstream's `assert kind == 'int'` contract at flatten.py:276
+        // and panic fail-loud.
         Some(FlowValue::Constant(Constant {
             value: ConstantValue::Signed(value),
             ..
         })) => *value,
-        other => panic!("flatten_graph: switch link requires signed llexitcase, got {other:?}"),
+        Some(FlowValue::Constant(Constant {
+            value: ConstantValue::Bool(value),
+            ..
+        })) => i64::from(*value),
+        other => panic!(
+            "flatten_graph: switch link requires Signed/Bool llexitcase per \
+             flatten.py:296 (`cast_primitive(Signed, ...)`); got {other:?}"
+        ),
     }
 }
 
@@ -2252,10 +2449,11 @@ pub fn flatten_graph<F, C>(
 /// Subsequent slices (Slice #48.19+) introduce frontend HLOp recording
 /// at those walker arms; this driver becomes the production SSARepr
 /// producer once every walker emit point has a graph counterpart.
-pub fn flatten_graph_with_lowering<F, C>(
+pub fn flatten_graph_with_lowering<'a, F, C>(
     graph: &super::flow::FunctionGraph,
-    ssarepr: &mut SSARepr,
+    ssarepr: &'a mut SSARepr,
     lowering_ctx: LoweringContext,
+    cpu: Option<&'a super::cpu::Cpu>,
     get_register: F,
     lower_constant: C,
 ) where
@@ -2264,6 +2462,9 @@ pub fn flatten_graph_with_lowering<F, C>(
 {
     let mut flattener =
         GraphFlattener::new_with_full_lowering(ssarepr, get_register, lower_constant, lowering_ctx);
+    if let Some(cpu) = cpu {
+        flattener = flattener.with_cpu(cpu);
+    }
     flattener.make_bytecode_block(graph.startblock.clone(), false);
 }
 
@@ -4524,6 +4725,7 @@ mod tests {
             &graph,
             &mut ssarepr,
             ctx,
+            None,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4652,6 +4854,7 @@ mod tests {
             &graph,
             &mut ssarepr,
             ctx,
+            None,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4783,6 +4986,7 @@ mod tests {
             &graph,
             &mut ssarepr,
             ctx,
+            None,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -6649,5 +6853,262 @@ mod tests {
             }
             other => panic!("expected Insn::Op (Void), got {other:?}"),
         }
+    }
+
+    // ----------------------------------------------------------------
+    // Phase 1 — `_ovf` popline rewrite + handling_ovf=true reraise.
+    //
+    // Tests for `rpython/jit/codewriter/flatten.py:120-204`:
+    //   * `make_bytecode_block` `_ovf` validity check (lines 120-125)
+    //   * `insert_exits` `_ovf` tail rewrite (lines 191-204) routed
+    //     through `flatten_ovf_canraise`.
+    //   * `make_exception_link` `handling_ovf=True` arm (lines 165-170)
+    //     emitting `raise <OverflowError const>` via the cpu/rtyper/
+    //     exceptiondata shim.
+    // ----------------------------------------------------------------
+
+    /// Build a canraise startblock containing a single overflow-checked
+    /// arithmetic op, then close it with `(normal, ovf [, catch_all])`
+    /// exits.  Returns `(graph, ssarepr)` after `flatten_graph` runs;
+    /// the test asserts on the recorded `ssarepr.insns` shape.
+    fn flatten_ovf_canraise_graph(
+        name: &str,
+        opname: &str,
+        with_catch_all: bool,
+        cpu: &super::super::cpu::Cpu,
+    ) -> SSARepr {
+        use crate::jit::flow::{Block, ExitSwitch, FunctionGraph, Link, c_last_exception};
+
+        let lhs = Variable::new(VariableId(0), Kind::Int);
+        let rhs = Variable::new(VariableId(1), Kind::Int);
+        let res = Variable::new(VariableId(2), Kind::Int);
+        let except_etype = Variable::new(VariableId(3), Kind::Int);
+        let except_evalue = Variable::new(VariableId(4), Kind::Ref);
+
+        let start = Block::shared(vec![lhs.into(), rhs.into()]);
+        // `make_return` for the normal path expects the returnblock
+        // input to be a single Variable; pass `res` as the return slot
+        // (will be renamed via the normal link).
+        let mut graph = FunctionGraph::new(name, start.clone(), Some(res));
+
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new(
+                opname,
+                vec![lhs.into(), rhs.into()],
+                Some(res.into()),
+                42,
+            ),
+        );
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(c_last_exception().into()));
+
+        let normal_link = Link::new(
+            vec![res.into()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+
+        let mut ovf_link = Link::new(
+            vec![except_etype.into(), except_evalue.into()],
+            Some(graph.exceptblock.clone()),
+            None,
+        );
+        ovf_link.extravars(Some(except_etype), Some(except_evalue));
+
+        let mut exits = vec![normal_link, ovf_link.into_ref()];
+        if with_catch_all {
+            let mut catch_all = Link::new(
+                vec![except_etype.into(), except_evalue.into()],
+                Some(graph.exceptblock.clone()),
+                None,
+            );
+            catch_all.extravars(Some(except_etype), Some(except_evalue));
+            exits.push(catch_all.into_ref());
+        }
+        start.closeblock(exits);
+
+        let mut ssarepr = SSARepr::new(name);
+        let ctx = LoweringContext {
+            binary_op_fn_idx: 0,
+            compare_op_fn_idx: 0,
+            truth_fn_idx: 0,
+            store_subscr_fn_idx: 0,
+        };
+        flatten_graph_with_lowering(
+            &graph,
+            &mut ssarepr,
+            ctx,
+            Some(cpu),
+            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
+            |c| match (&c.value, c.kind) {
+                (ConstantValue::Opaque(opaque), Some(Kind::Ref)) => {
+                    // Test-side lowering: encode the OverflowError
+                    // marker as `ConstRef(0xFFFF_FFFF)` so the assertion
+                    // can recognize it without resolving the runtime
+                    // pointer.
+                    let _ = opaque;
+                    Operand::ConstRef(0xFFFF_FFFF)
+                }
+                _ => flatten_constant_operand(c),
+            },
+        );
+        ssarepr
+    }
+
+    #[test]
+    fn flatten_ovf_canraise_rewrites_to_jump_if_ovf_two_exits() {
+        let cpu = super::super::cpu::Cpu::new();
+        let ssarepr = flatten_ovf_canraise_graph(
+            "int_add_ovf_2exit",
+            "int_add_ovf",
+            false,
+            &cpu,
+        );
+        // Expected shape after flatten_graph:
+        //   Label(startblock)
+        //   int_add_jump_if_ovf TLabel(ovf_link) %i0 %i1 -> %i2
+        //   <normal path: link renamings + ref_return>
+        //   Label(ovf_link)
+        //   raise ConstRef(OverflowError)
+        //   ---
+        let jump = ssarepr
+            .insns
+            .iter()
+            .find(|insn| {
+                matches!(insn, Insn::Op { opname, .. } if opname == "int_add_jump_if_ovf")
+            })
+            .expect("int_add_ovf must rewrite to int_add_jump_if_ovf per flatten.py:195");
+        match jump {
+            Insn::Op {
+                args,
+                result,
+                ..
+            } => {
+                // First arg is the TLabel for the overflow target.
+                assert!(matches!(args[0], Operand::TLabel(_)));
+                // Remaining args are the original lhs/rhs registers.
+                assert!(matches!(
+                    args[1],
+                    Operand::Register(Register { kind: Kind::Int, index: 0 })
+                ));
+                assert!(matches!(
+                    args[2],
+                    Operand::Register(Register { kind: Kind::Int, index: 1 })
+                ));
+                // Result is the original op's result Variable.
+                assert!(matches!(
+                    result,
+                    Some(Register { kind: Kind::Int, index: 2 })
+                ));
+            }
+            _ => unreachable!(),
+        }
+        // The handling_ovf=true arm of make_exception_link emits
+        // `raise ConstRef(OverflowError)` (see flatten.py:165-170).
+        let raise = ssarepr.insns.iter().find_map(|insn| match insn {
+            Insn::Op { opname, args, .. } if opname == "raise" => Some(args),
+            _ => None,
+        });
+        let raise_args =
+            raise.expect("flatten.py:166-170 handling_ovf=true must emit `raise <const>`");
+        assert_eq!(
+            raise_args.len(),
+            1,
+            "raise carries exactly one operand: the OverflowError instance"
+        );
+        assert!(matches!(raise_args[0], Operand::ConstRef(0xFFFF_FFFF)));
+        // The driver no longer emits `reraise` for the ovf direct-raise edge.
+        assert!(
+            !ssarepr
+                .insns
+                .iter()
+                .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "reraise")),
+            "handling_ovf=true must NOT emit reraise (upstream replaces it with `raise <const>`)"
+        );
+    }
+
+    #[test]
+    fn flatten_ovf_canraise_three_exits_emits_catch_all() {
+        let cpu = super::super::cpu::Cpu::new();
+        let ssarepr = flatten_ovf_canraise_graph(
+            "int_mul_ovf_3exit",
+            "int_mul_ovf",
+            true,
+            &cpu,
+        );
+        // Three-exit shape per flatten.py:201-203:
+        //   - exits[1]: handling_ovf=true → raise <const>
+        //   - exits[2]: handling_ovf=false → reraise (catch-all)
+        // Both should appear in the SSARepr.
+        let has_raise_const = ssarepr.insns.iter().any(|insn| matches!(
+            insn,
+            Insn::Op { opname, args, .. }
+                if opname == "raise" && matches!(args.first(), Some(Operand::ConstRef(_)))
+        ));
+        let has_reraise = ssarepr
+            .insns
+            .iter()
+            .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "reraise"));
+        assert!(has_raise_const, "ovf direct edge must emit raise <const>");
+        assert!(has_reraise, "Exception catch-all must emit reraise");
+    }
+
+    #[test]
+    fn flatten_ovf_canraise_uses_seven_char_prefix() {
+        // flatten.py:195 `opname[:7] + '_jump_if_ovf'` — verify the
+        // prefix transform for each of the standard upstream `_ovf` ops.
+        let cpu = super::super::cpu::Cpu::new();
+        for (input, expected) in [
+            ("int_add_ovf", "int_add_jump_if_ovf"),
+            ("int_sub_ovf", "int_sub_jump_if_ovf"),
+            ("int_mul_ovf", "int_mul_jump_if_ovf"),
+        ] {
+            let ssarepr = flatten_ovf_canraise_graph(input, input, false, &cpu);
+            assert!(
+                ssarepr
+                    .insns
+                    .iter()
+                    .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == expected)),
+                "{input} must rewrite to {expected} per flatten.py:195"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "detected a block containing ovfcheck() but no OverflowError is caught"
+    )]
+    fn flatten_ovf_op_in_non_canraise_block_panics() {
+        // flatten.py:120-125 — `_ovf` op outside a 2-or-3-exit canraise
+        // block is illegal.  Build such a block and verify the
+        // `make_bytecode_block` validity check fires.
+        use crate::jit::flow::{Block, FunctionGraph, Link};
+        let lhs = Variable::new(VariableId(0), Kind::Int);
+        let rhs = Variable::new(VariableId(1), Kind::Int);
+        let res = Variable::new(VariableId(2), Kind::Int);
+        let start = Block::shared(vec![lhs.into(), rhs.into()]);
+        let mut graph = FunctionGraph::new("ovf_no_catch", start.clone(), Some(res));
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new(
+                "int_add_ovf",
+                vec![lhs.into(), rhs.into()],
+                Some(res.into()),
+                0,
+            ),
+        );
+        // Close with a single normal link → returnblock; no canraise
+        // exitswitch → triggers the validity panic.
+        start.closeblock(vec![
+            Link::new(vec![res.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+        let mut ssarepr = SSARepr::new("ovf_no_catch");
+        flatten_graph(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
+            flatten_constant_operand,
+        );
     }
 }

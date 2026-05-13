@@ -7862,11 +7862,13 @@ impl CodeWriter {
                 |c: &super::flow::Constant| super::flatten::flatten_constant_operand_for_probe(c);
             let driver_name = format!("{}-driver", code.obj_name);
             let mut driver_ssarepr = super::flatten::SSARepr::new(driver_name);
+            let driver_cpu = self.cpu();
             let driver_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 super::flatten::flatten_graph_with_lowering(
                     &graph,
                     &mut driver_ssarepr,
                     lowering_ctx,
+                    Some(driver_cpu),
                     &mut driver_get_register,
                     &mut driver_lower_constant,
                 );

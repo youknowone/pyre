@@ -2,6 +2,7 @@ pub mod assembler;
 pub mod call;
 pub mod codewriter;
 pub mod cpu;
+pub mod exceptiondata;
 pub mod flatten;
 pub mod flow;
 pub mod liveness;

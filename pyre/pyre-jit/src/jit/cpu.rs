@@ -62,6 +62,16 @@ pub struct Cpu {
     /// Write per-thread `CURRENT_EXCEPTION` — used by `PUSH_EXC_INFO`
     /// (set to new exc) and `POP_EXCEPT` (restore saved prev).
     pub set_current_exception_fn: extern "C" fn(i64),
+    /// `rpython/jit/backend/llgraph/runner.py:LLGraphCPU.rtyper` —
+    /// upstream `flatten_graph` reaches `cpu.rtyper.exceptiondata.
+    /// get_standard_ll_exc_instance_by_class(OverflowError)` at
+    /// `flatten.py:166-170` (the `handling_ovf=True` arm of
+    /// `make_exception_link`).  Pyre's rtyper shim
+    /// ([`super::exceptiondata::Rtyper`]) exposes only that attribute
+    /// chain; other rtyper machinery is intentionally absent because
+    /// pyre operates on the flowspace graph directly, without a
+    /// typed-low-level rewrite.
+    pub rtyper: super::exceptiondata::Rtyper,
 }
 
 impl Cpu {
@@ -91,6 +101,7 @@ impl Cpu {
             normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_fn,
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
+            rtyper: super::exceptiondata::Rtyper::new(),
         }
     }
 }
