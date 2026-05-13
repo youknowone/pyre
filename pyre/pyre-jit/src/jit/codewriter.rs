@@ -4908,14 +4908,21 @@ impl CodeWriter {
                 .framestate()
                 .expect("pending block must carry a FrameState (flowcontext.py:408)");
             let start_pc = pending_state.next_offset;
-            // PRE-EXISTING-ADAPTATION — upstream `flowcontext.py:402-405`
-            // pops and re-records unconditionally; pyre skips the
-            // re-pop because the walker emits into program-wide
-            // `ssarepr.insns` (not per-block `block.operations`).
-            // Convergence: Task #227 Phase 4 + Task #212 (walker
-            // restructure to per-block accumulation + post-walk
-            // `flatten_graph(graph, regallocs)` per
-            // `codewriter.py:44-67`).
+            // Task #227.5 follow-up: the `emitted_pc_starts` re-pop
+            // skip is retained as a guard against pendingblocks
+            // containing two blocks with the same `start_pc`
+            // (mergeblock supersede path creates a fresh newblock
+            // when the joinpoint candidate's framestate widens; the
+            // old block is marked dead but the queue still holds
+            // both).  Under the per-block contiguous walker model,
+            // each pop processes exactly one block per start_pc;
+            // double-pop would push duplicate Label("pcN") + emits
+            // into ssarepr.insns.  Upstream `flowcontext.py:455-463`
+            // supersede explicitly does `candidates.remove(block)`
+            // before queueing the new one, so the queue never holds
+            // both — pyre's PRE-EXISTING-ADAPTATION inverted that
+            // (mark instead of remove).  Convergence: align with
+            // upstream's remove-on-supersede in a follow-up.
             if emitted_pc_starts.get(start_pc).copied().unwrap_or(false) {
                 continue;
             }
@@ -7456,84 +7463,59 @@ impl CodeWriter {
             }
         }
 
-        // Task #227.4 production flip: drain per-block accumulators
-        // and swap into `ssarepr.insns` when the drained stream
-        // byte-matches the walker emit exactly.  For benches with
-        // simple control flow (no walker re-entry) this makes the
-        // per-block accumulator the production source — the
-        // upstream-orthodox model matching `codewriter.py:53`
-        // (`flatten_graph(graph, regallocs, cpu)` → `compute_liveness`
-        // → `assemble`).
+        // Task #227.4 production flip (unconditional): drain per-block
+        // accumulators and replace `ssarepr.insns`.  With the
+        // per-block contiguous walker (Task #227.5) as the default
+        // walker model, every bench produces byte-equivalent drain
+        // orderings — the swap is byte-identical to the walker emit
+        // and structurally aligns pyre's production source with
+        // upstream `codewriter.py:53 flatten_graph(graph, regallocs,
+        // cpu)` → `compute_liveness` → `assemble`.
         //
-        // The conditional swap (only when `byte_equivalent=true`)
-        // preserves production correctness: benches with walker
-        // re-entry (PC-sequential walker bouncing back into earlier
-        // blocks via `mergeblock` joinpoint match) produce
-        // non-byte-equivalent drain orderings; on those, the walker
-        // emit stays as the production source until the per-block
-        // contiguous walker restructure (Task #227.5) retires the
-        // re-entry path.
-        //
-        // `PYRE_TASK_227_FLIP_DRAIN_DFS=1` env switches drain order
-        // from walker-visit to `graph.iterblocks()` DFS order
-        // (`flowspace/model.py:66-77`); both orderings agree with
-        // ssarepr.insns on benches where walker emission is per-
-        // block contiguous, so the env is purely diagnostic.
+        // The previous conditional-on-byte_equivalent fallback has
+        // been retired; an assertion replaces it so any future
+        // walker regression that produces a non-byte-equivalent
+        // drain surfaces immediately rather than silently masking
+        // via fallback to the walker emit.
         {
-            let use_dfs = std::env::var("PYRE_TASK_227_FLIP_DRAIN_DFS").is_ok();
-            let drained: Vec<super::flatten::Insn> = if use_dfs {
-                // Map each BlockRef (Rc pointer identity) to its
-                // SpamBlockRef so `graph.iterblocks()` (DFS from
-                // startblock per `flowspace/model.py:66-77`) can drive
-                // the drain order.  Mirrors upstream's per-block
-                // iteration inside `flatten.py:67-70 GraphFlattener
-                // .generate_ssa_form()` starting at
-                // `make_bytecode_block(graph.startblock)`.
-                let mut block_to_spam: std::collections::HashMap<
-                    *const std::cell::RefCell<super::flow::Block>,
-                    SpamBlockRef,
-                > = std::collections::HashMap::new();
-                for spam in all_walker_blocks.iter() {
-                    let block_ref = spam.block();
-                    let ptr = block_ref.as_ptr();
-                    block_to_spam.entry(ptr).or_insert_with(|| spam.clone());
-                }
-                let mut out: Vec<super::flatten::Insn> = Vec::new();
-                for block_ref in graph.iterblocks() {
-                    let ptr = block_ref.as_ptr();
-                    if let Some(spam) = block_to_spam.get(&ptr) {
-                        out.extend(spam.per_block_ssarepr());
-                    }
-                }
-                out
-            } else {
+            let drained: Vec<super::flatten::Insn> = {
                 let mut out: Vec<super::flatten::Insn> = Vec::new();
                 for block in all_walker_blocks.iter() {
                     out.extend(block.per_block_ssarepr());
                 }
                 out
             };
-            let byte_equivalent = drained.len() == ssarepr.insns.len()
-                && drained
-                    .iter()
-                    .zip(ssarepr.insns.iter())
-                    .all(|(l, r)| insn_byte_equal(l, r));
-            if byte_equivalent {
-                // Swap: per-block accumulator is now the production
-                // source.  Byte-identical to the walker emit so
-                // downstream `compute_liveness` + `assemble` see no
-                // difference — but structurally, ssarepr.insns is now
-                // derived from `graph.iterblocks()` / `all_walker_blocks`
-                // iteration, matching `codewriter.py:53 flatten_graph`'s
-                // role as the SSARepr source of truth.
-                ssarepr.insns = drained;
-                let _ = use_dfs;
+            // Fail-loud assertion replaces the previous conditional
+            // fallback: with the per-block contiguous walker as
+            // default, every bench must produce a byte-equivalent
+            // drain.  Any walker regression that violates this
+            // surfaces immediately at the assert site rather than
+            // silently degrading to the legacy walker-direct emit
+            // path.
+            assert_eq!(
+                drained.len(),
+                ssarepr.insns.len(),
+                "Task #227.4 production flip: per-block drain length \
+                 mismatch (drained={} ssarepr.insns={}) — walker \
+                 regression broke per-block contiguous emission",
+                drained.len(),
+                ssarepr.insns.len(),
+            );
+            for (i, (l, r)) in drained.iter().zip(ssarepr.insns.iter()).enumerate() {
+                assert!(
+                    insn_byte_equal(l, r),
+                    "Task #227.4 production flip: per-block drain byte \
+                     mismatch at position {i}: drain={l:?} ssarepr={r:?}"
+                );
             }
-            // No swap on mismatch: walker emit stays as production
-            // source.  Diagnostic env `PYRE_TASK_227_DRAIN_PROBE=1`
-            // reports the first-diff position so the per-block
-            // contiguous walker restructure (Task #227.5) can target
-            // the specific re-entry that produced the mismatch.
+            // Swap: per-block accumulator becomes the production
+            // source.  Byte-identical to the walker emit so
+            // downstream `compute_liveness` + `assemble` see no
+            // difference — but structurally, `ssarepr.insns` is now
+            // derived from `all_walker_blocks` iteration, matching
+            // `codewriter.py:53 flatten_graph`'s role as the SSARepr
+            // source of truth.
+            ssarepr.insns = drained;
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
