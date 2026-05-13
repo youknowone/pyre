@@ -341,7 +341,11 @@ pub struct CraneliftFailDescr {
     // `Arc::as_ptr(&descr)`.
     pub trace_id: u64,
     pub fail_arg_types: Vec<Type>,
-    pub gc_map: GcMap,
+    // gc_map removed (Session 5i-cl): not in PyPy
+    // `AbstractFailDescr._attrs_` (`history.py:132`).  Upstream
+    // `assembler.py` parks the GC-map in `compiled_loop_token.gcmap`.
+    // Cranelift retains the per-descr GcMap in `GC_MAP_TABLE` keyed
+    // on `Arc::as_ptr(&descr)`.
     pub is_finish: bool,
     /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
     /// True when this FINISH was emitted via
@@ -506,7 +510,7 @@ impl std::fmt::Debug for CraneliftFailDescr {
             )
             .field("trace_id", &self.trace_id)
             .field("fail_arg_types", &self.fail_arg_types)
-            .field("gc_map", &self.gc_map)
+            .field("gc_map", &self.gc_map())
             .field("is_finish", &self.is_finish)
             .field(
                 "external_jump_target",
@@ -606,7 +610,6 @@ impl CraneliftFailDescr {
         CraneliftFailDescr {
             fail_index,
             trace_id,
-            gc_map: Self::gc_map_for_types(&fail_arg_types, &force_token_slots),
             fail_arg_types,
             is_finish,
             is_exit_frame_with_exception: false,
@@ -642,7 +645,6 @@ impl CraneliftFailDescr {
         CraneliftFailDescr {
             fail_index,
             trace_id,
-            gc_map: Self::gc_map_for_types(&fail_arg_types, &force_token_slots),
             fail_arg_types,
             is_finish: false,
             is_exit_frame_with_exception: false,
@@ -838,8 +840,14 @@ impl CraneliftFailDescr {
         register_trace_info(Arc::as_ptr(self) as usize, trace_info);
     }
 
-    pub fn gc_map(&self) -> &GcMap {
-        &self.gc_map
+    /// Derive the `GcMap` on demand from `fail_arg_types` and the
+    /// side-table-stored `force_token_slots`.  Replaces the previous
+    /// `pub gc_map: GcMap` field (Session 5i-cl); upstream
+    /// `assembler.py:write_failure_recovery_description` parity
+    /// recomputes equivalent bits inline at codegen time.
+    pub fn gc_map(&self) -> GcMap {
+        let force_token_slots = lookup_force_token_slots(self as *const Self as usize);
+        Self::gc_map_for_types(&self.fail_arg_types, &force_token_slots)
     }
 
     pub fn is_finish(&self) -> bool {
@@ -898,10 +906,11 @@ impl CraneliftFailDescr {
         // ResumeDescr upstream).
         let meta_fd = self.meta_resume_fd();
         let fail_arg_types = <Self as FailDescr>::fail_arg_types(self);
+        let gc_map_local = self.gc_map();
         let gc_ref_slots = fail_arg_types
             .iter()
             .enumerate()
-            .filter_map(|(slot, _)| self.gc_map.is_ref(slot).then_some(slot))
+            .filter_map(|(slot, _)| gc_map_local.is_ref(slot).then_some(slot))
             .collect();
         let recovery = lookup_recovery_layout(self as *const Self as usize);
         let frame_stack = recovery.as_ref().map(|r| r.frames.clone());
@@ -1081,7 +1090,16 @@ impl FailDescr for CraneliftFailDescr {
     }
 
     fn is_gc_ref_slot(&self, slot: usize) -> bool {
-        self.gc_map.is_ref(slot)
+        // gc_map is derived on demand from fail_arg_types +
+        // force_token_slots (Session 5i-cl).  Match the inline
+        // semantics of `gc_map_for_types`: slot is a GC ref iff its
+        // type is Ref AND the slot is not a force-token producer.
+        match self.fail_arg_types.get(slot) {
+            Some(Type::Ref) => {
+                !lookup_force_token_slots(self as *const Self as usize).contains(&slot)
+            }
+            _ => false,
+        }
     }
 
     fn force_token_slots(&self) -> Vec<usize> {
