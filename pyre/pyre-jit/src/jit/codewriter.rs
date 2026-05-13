@@ -1191,6 +1191,70 @@ fn insn_shape_matches(left: &super::flatten::Insn, right: &super::flatten::Insn)
     shape_descriptor(left) == shape_descriptor(right)
 }
 
+/// Phase 3 byte-equivalence check.  Compares two `Insn` values
+/// including register indices and constant operand literal values
+/// (`Operand::Register::index`, `Operand::ConstInt(i64)`,
+/// `Operand::ConstRef(i64)`, `Operand::ConstFloat(i64)`).  The plan
+/// requires this stricter check before the production flip can swap
+/// inline emit for `flatten_graph_with_lowering` output — sequence-
+/// match under `shape_descriptor` is necessary but not sufficient,
+/// because graph regalloc and SSA regalloc currently produce
+/// different colorings.  `IndirectCallTargets` is compared via pointer
+/// equality on its `Arc<JitCode>` entries (matching `id(...)`-based
+/// dedup upstream); `Operand::Descr` is compared via `Rc::ptr_eq`.
+fn insn_byte_equal(left: &super::flatten::Insn, right: &super::flatten::Insn) -> bool {
+    use super::flatten::Insn;
+    match (left, right) {
+        (Insn::Label(l), Insn::Label(r)) => l == r,
+        (Insn::Unreachable, Insn::Unreachable) => true,
+        (Insn::PcAnchor(l), Insn::PcAnchor(r)) => l == r,
+        (
+            Insn::Op {
+                opname: ln,
+                args: la,
+                result: lr,
+            },
+            Insn::Op {
+                opname: rn,
+                args: ra,
+                result: rr,
+            },
+        ) => ln == rn && lr == rr && operand_lists_equal(la, ra),
+        _ => false,
+    }
+}
+
+fn operand_lists_equal(left: &[super::flatten::Operand], right: &[super::flatten::Operand]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right.iter())
+            .all(|(l, r)| operand_byte_equal(l, r))
+}
+
+fn operand_byte_equal(left: &super::flatten::Operand, right: &super::flatten::Operand) -> bool {
+    use super::flatten::Operand;
+    match (left, right) {
+        (Operand::Register(l), Operand::Register(r)) => l == r,
+        (Operand::ConstInt(l), Operand::ConstInt(r)) => l == r,
+        (Operand::ConstRef(l), Operand::ConstRef(r)) => l == r,
+        (Operand::ConstFloat(l), Operand::ConstFloat(r)) => l == r,
+        (Operand::TLabel(l), Operand::TLabel(r)) => l == r,
+        (Operand::ListOfKind(l), Operand::ListOfKind(r)) => {
+            l.kind == r.kind && operand_lists_equal(&l.content, &r.content)
+        }
+        (Operand::Descr(l), Operand::Descr(r)) => std::rc::Rc::ptr_eq(l, r),
+        (Operand::IndirectCallTargets(l), Operand::IndirectCallTargets(r)) => {
+            l.lst.len() == r.lst.len()
+                && l.lst
+                    .iter()
+                    .zip(r.lst.iter())
+                    .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
+        }
+        _ => false,
+    }
+}
+
 /// Step 6 transitional dual-write.  `rpython/jit/codewriter/codewriter.py:44-67`
 /// runs `perform_register_allocation(graph) → flatten_graph(graph) →
 /// compute_liveness(ssarepr) → assemble(ssarepr)`.  Upstream has **one**
@@ -8055,17 +8119,32 @@ impl CodeWriter {
                                     )
                                 })
                                 .collect();
+                        // Phase 3 byte-equivalent check.  `shape_descriptor`
+                        // ignores `Operand::Register` indices and the
+                        // `ConstInt`/`ConstRef`/`ConstFloat` literal
+                        // values; per the plan, the production flip
+                        // requires exact byte equivalence (operand index
+                        // + constant values) so a `sequence_match=true`
+                        // log under shape comparison is necessary but
+                        // not sufficient.  The `byte_equivalent` flag
+                        // below applies the stricter check.
                         let sequence_match = driver.len() == inline.len()
                             && driver
                                 .iter()
                                 .zip(inline.iter())
                                 .all(|(l, r)| shape_descriptor(l) == shape_descriptor(*r));
+                        let byte_equivalent = driver.len() == inline.len()
+                            && driver
+                                .iter()
+                                .zip(inline.iter())
+                                .all(|(l, r)| insn_byte_equal(l, r));
                         eprintln!(
-                            "[phase4-flatten-graph] {} {family} driver={} inline={} sequence_match={}",
+                            "[phase4-flatten-graph] {} {family} driver={} inline={} sequence_match={} byte_equivalent={}",
                             code.obj_name,
                             driver.len(),
                             inline.len(),
                             sequence_match,
+                            byte_equivalent,
                         );
                         if !sequence_match && driver.len() == inline.len() {
                             for (i, (l, r)) in driver.iter().zip(inline.iter()).enumerate() {
@@ -8074,6 +8153,23 @@ impl CodeWriter {
                                 if ls != rs {
                                     eprintln!(
                                         "[phase4-flatten-graph]   {} {family} pos={i} driver_shape={ls} inline_shape={rs}",
+                                        code.obj_name,
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                        // When shape matches but bytes don't, the
+                        // divergence is in operand register indices or
+                        // constant values — the prime suspect for
+                        // graph vs SSA regalloc colorings.  Surface the
+                        // first such position so the regalloc
+                        // reconciliation work has a concrete target.
+                        if sequence_match && !byte_equivalent {
+                            for (i, (l, r)) in driver.iter().zip(inline.iter()).enumerate() {
+                                if !insn_byte_equal(l, r) {
+                                    eprintln!(
+                                        "[phase4-flatten-graph]   {} {family} pos={i} byte-diff driver={l:?} inline={r:?}",
                                         code.obj_name,
                                     );
                                     break;
