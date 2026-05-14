@@ -7228,7 +7228,7 @@ impl CraneliftBackend {
                 continue;
             }
             // llgraph/runner.py:1200-1201 execute_finish → ExecutionFinished.
-            if fail_descr.is_finish {
+            if FailDescr::is_finish(fail_descr.as_ref()) {
                 // Real FINISH — function completed.
                 // jf_savedata already correct in jf_frame memory.
                 // jf_guard_exc already written by emit_guard_exit.
@@ -7311,7 +7311,7 @@ impl CraneliftBackend {
         // RPython parity: FINISH exits in bridges return directly,
         // just like in execute_with_inputs. Without this, the FINISH
         // bridge's exit is misinterpreted as a guard failure.
-        if fail_descr.is_finish {
+        if FailDescr::is_finish(fail_descr.as_ref()) {
             // jf_guard_exc already written by emit_guard_exit.
             return deadframe_from_jitframe(exec.jf_gcref, fail_descr.clone(), exec.heap_owner);
         }
@@ -13766,9 +13766,13 @@ impl majit_backend::Backend for CraneliftBackend {
         if let Some(compiled) = compiled {
             for (i, &hash) in hashes.iter().enumerate() {
                 if let Some(descr) = compiled.fail_descrs.get(i) {
-                    // Skip FINISH, external JUMP, and GUARD_VALUE
-                    // (make_a_counter_per_value already set status).
-                    if !descr.is_finish && descr.get_status() == 0 {
+                    // `compile.py:826-829` `store_hash` only fires for non-
+                    // final `AbstractResumeGuardDescr` whose status is
+                    // still 0.  Route through the FailDescr trait so the
+                    // metainterp class hierarchy answers `final_descr`
+                    // (Done*/Exit*/Propagate, compile.py:624 / 658-662 /
+                    // 1092) instead of the backend-local mirror.
+                    if !FailDescr::is_finish(descr.as_ref()) && descr.get_status() == 0 {
                         descr.store_hash(hash);
                     }
                 }
@@ -13798,7 +13802,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 if let Some(bridge) = descr.bridge_ref() {
                     for (i, &hash) in hashes.iter().enumerate() {
                         if let Some(bd) = bridge.fail_descrs.get(i) {
-                            if !bd.is_finish && bd.get_status() == 0 {
+                            if !FailDescr::is_finish(bd.as_ref()) && bd.get_status() == 0 {
                                 bd.store_hash(hash);
                             }
                         }
@@ -14095,7 +14099,7 @@ impl majit_backend::Backend for CraneliftBackend {
             // the dispatch loop with the trace's payload — the raw path
             // reads outputs / savedata / exception directly from the
             // jitframe and emits a `RawExecResult`.
-            if fail_descr.is_finish {
+            if FailDescr::is_finish(fail_descr.as_ref()) {
                 let savedata = {
                     let raw =
                         unsafe { *((exec.jf_gcref.0 + JF_SAVEDATA_OFS as usize) as *const usize) };
