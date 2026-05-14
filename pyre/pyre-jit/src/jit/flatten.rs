@@ -2382,55 +2382,6 @@ pub fn flatten_graph<'a>(
     ssarepr
 }
 
-/// Phase 4 transitional entry — the same shape as the orthodox
-/// `flatten_graph` above but with a `LoweringContext` parameter that
-/// the caller threads explicitly.  Retained for the
-/// `[phase4-flatten-graph]` probe (which builds the `LoweringContext`
-/// per-CodeWriter from local `descrs.intern_*` lookups and would
-/// prefer to bypass the `Cpu::lowering_ctx` RwLock when the indexes
-/// are already in hand).  Phase 5 retires this once the probe migrates
-/// to the canonical `flatten_graph` entry.
-pub fn flatten_graph_with_regallocs<'a>(
-    graph: &super::flow::FunctionGraph,
-    regallocs: &'a mut std::collections::HashMap<Kind, super::regalloc::GraphAllocationResult>,
-    include_all_exc_links: bool,
-    cpu: Option<&'a super::cpu::Cpu>,
-    lowering_ctx: LoweringContext,
-) -> SSARepr {
-    // `flatten.py:68 flattener.enforce_input_args()` — same call the
-    // canonical `flatten_graph` makes; the probe-side entry must do
-    // it too or the startblock inputarg colors leak the raw chordal-
-    // coloring assignment into the SSARepr.
-    super::regalloc::enforce_input_args_simulation(graph, regallocs);
-    let mut ssarepr = SSARepr::new(graph.name.clone());
-    let get_register = |variable: Variable| -> Register {
-        let kind = variable.kind.unwrap_or(Kind::Ref);
-        let color = regallocs
-            .get(&kind)
-            .and_then(|r| r.coloring.get(&variable.id).copied())
-            .unwrap_or(u16::MAX);
-        Register::new(kind, color)
-    };
-    let lower_constant = flatten_constant_operand_for_probe;
-    let mut flattener = GraphFlattener::new_with_full_lowering(
-        &mut ssarepr,
-        get_register,
-        lower_constant,
-        lowering_ctx,
-    );
-    if let Some(cpu) = cpu {
-        flattener = flattener.with_cpu(cpu);
-    }
-    // `flatten.py:75 GraphFlattener.__init__ ._include_all_exc_links =
-    // _include_all_exc_links` — wire the parameter onto the
-    // flattener so downstream `make_exception_link` honours the
-    // upstream contract.
-    flattener.include_all_exc_links = include_all_exc_links;
-    // `flatten.py:69 flattener.generate_ssa_form()`.
-    flattener.generate_ssa_form(graph);
-    ssarepr
-}
-
 /// Phase 4 Session 18 (Task #227 prerequisite) — single-family parallel
 /// flatten probe.  Walks `graph.iterblocks()` (DFS from startblock per
 /// `flowspace/model.py:66-77 FunctionGraph.iterblocks`) and emits one
@@ -7031,13 +6982,10 @@ mod tests {
 
         let mut regallocs =
             super::super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
-        let ctx = LoweringContext {
-            binary_op_fn_idx: 0,
-            compare_op_fn_idx: 0,
-            truth_fn_idx: 0,
-            store_subscr_fn_idx: 0,
-        };
-        let ssarepr = flatten_graph_with_regallocs(&graph, &mut regallocs, false, None, ctx);
+        // Use the canonical `flatten_graph(graph, regallocs,
+        // include_all_exc_links, cpu)` entry — the loop_header op is a
+        // passthrough family and needs no LoweringContext arm to fire.
+        let ssarepr = flatten_graph(&graph, &mut regallocs, false, None);
         assert_eq!(ssarepr.name, "orthodox");
         assert!(
             ssarepr
