@@ -461,7 +461,12 @@ pub struct CraneliftFailDescr {
     // `assembler.py` parks the GC-map in `compiled_loop_token.gcmap`.
     // Cranelift retains the per-descr GcMap in `GC_MAP_TABLE` keyed
     // on `Arc::as_ptr(&descr)`.
-    pub is_finish: bool,
+    // is_finish removed: `compile.py:624 final_descr=True` is a class
+    // attribute on `_DoneWithThisFrameDescr`/`ExitFrameWithExceptionDescrRef`.
+    // After cranelift singletons carry meta_descr to the class-distinct
+    // majit-backend types and codegen descrs carry meta_descr =
+    // op.descr, every CraneliftFailDescr forwards is_finish through the
+    // upstream class hierarchy.
     /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
     /// True when this FINISH was emitted via
     /// pyjitpl.py:3238-3245 compile_exit_frame_with_exception.
@@ -618,7 +623,7 @@ impl std::fmt::Debug for CraneliftFailDescr {
             .field("trace_id", &self.trace_id)
             .field("fail_arg_types", &self.fail_arg_types)
             .field("gc_map", &self.gc_map())
-            .field("is_finish", &self.is_finish)
+            .field("is_finish", &<Self as FailDescr>::is_finish(self))
             .field(
                 "external_jump_target",
                 &lookup_external_jump_target(self as *const Self as usize).map(|d| d.repr()),
@@ -676,12 +681,12 @@ impl CraneliftFailDescr {
         )
     }
 
-    pub fn new_with_kind(fail_index: u32, fail_arg_types: Vec<Type>, is_finish: bool) -> Self {
+    pub fn new_with_kind(fail_index: u32, fail_arg_types: Vec<Type>, _is_finish: bool) -> Self {
         Self::new_with_trace_and_kind_and_force_tokens(
             fail_index,
             0,
             fail_arg_types,
-            is_finish,
+            _is_finish,
             Vec::new(),
         )
     }
@@ -689,14 +694,14 @@ impl CraneliftFailDescr {
     pub fn new_with_kind_and_force_tokens(
         fail_index: u32,
         fail_arg_types: Vec<Type>,
-        is_finish: bool,
+        _is_finish: bool,
         force_token_slots: Vec<usize>,
     ) -> Self {
         Self::new_with_trace_and_kind_and_force_tokens(
             fail_index,
             0,
             fail_arg_types,
-            is_finish,
+            _is_finish,
             force_token_slots,
         )
     }
@@ -708,11 +713,16 @@ impl CraneliftFailDescr {
     ///     5i-cl).  Constructor no longer accepts the layout
     ///     because the descr's `Arc::as_ptr` address (the table key)
     ///     is not knowable until wrapping completes.
+    ///
+    /// The `_is_finish` parameter is preserved for caller-site clarity
+    /// during the transition; it is no longer stored on the descr —
+    /// `compile.py:624 final_descr=True` is answered through meta_descr
+    /// forwarding.
     pub fn new_with_trace_and_kind_and_force_tokens(
         fail_index: u32,
         trace_id: u64,
         fail_arg_types: Vec<Type>,
-        is_finish: bool,
+        _is_finish: bool,
         mut force_token_slots: Vec<usize>,
     ) -> Self {
         force_token_slots.sort_unstable();
@@ -721,7 +731,6 @@ impl CraneliftFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
-            is_finish,
             is_exit_frame_with_exception: false,
             meta_descr: None,
         }
@@ -751,7 +760,6 @@ impl CraneliftFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
-            is_finish: false,
             is_exit_frame_with_exception: false,
             meta_descr: None,
         }
@@ -936,7 +944,7 @@ impl CraneliftFailDescr {
             trace_id: <Self as FailDescr>::trace_id(self),
             trace_info: lookup_trace_info(self as *const Self as usize),
             fail_arg_types: fail_arg_types.to_vec(),
-            is_finish: self.is_finish,
+            is_finish: <Self as FailDescr>::is_finish(self),
             gc_ref_slots,
             force_token_slots: lookup_force_token_slots(self as *const Self as usize),
             recovery_layout: recovery,
@@ -981,17 +989,15 @@ impl majit_ir::Descr for CraneliftFailDescr {
         if lookup_external_jump_target(self as *const Self as usize).is_some() {
             return false;
         }
-        // When meta_descr is a ResumeDescr family member, return true.
-        // When it is set but not a ResumeDescr (Done*/ExitExc/
-        // PropagateException), the upstream class is not a
-        // ResumeDescr → return false.  When meta_descr is None (synthetic
-        // descr), fall back to !is_finish (matching the construction-time
-        // class: guard descrs have is_finish=false, FINISH descrs have
-        // is_finish=true).
-        match self.meta_descr.as_ref() {
-            Some(d) => d.is_resume_guard() || d.is_resume_guard_copied(),
-            None => !self.is_finish,
-        }
+        // `compile.py:185` `isinstance(descr, ResumeDescr)` — answered by
+        // forwarding to the metainterp class hierarchy via meta_descr.
+        // After cranelift singletons + codegen all stamp meta_descr,
+        // every production CraneliftFailDescr forwards correctly.
+        // Synthetic test descrs without meta_descr take the trait
+        // default false.
+        self.meta_descr
+            .as_ref()
+            .map_or(false, |d| d.is_resume_guard() || d.is_resume_guard_copied())
     }
 }
 
@@ -1030,14 +1036,16 @@ impl FailDescr for CraneliftFailDescr {
 
     fn is_finish(&self) -> bool {
         // `compile.py:624` `_DoneWithThisFrameDescr` family carries
-        // `final_descr = True`.  Forward through `meta_descr` so the
-        // metainterp class hierarchy answers the predicate; fall back
-        // to the local mirror for synthetic backend descrs minted by
-        // the runtime classifier (`meta_descr = None`).
-        match self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            Some(fd) => fd.is_finish(),
-            None => self.is_finish,
-        }
+        // `final_descr = True`.  After cranelift LazyLock singletons +
+        // production codegen + external JUMP all stamp meta_descr
+        // (singletons via majit-backend class-distinct types, codegen
+        // via op.descr), the trait method forwards via meta_descr to
+        // the upstream class hierarchy.  Synthetic test descrs without
+        // meta_descr take the trait default false.
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(false, |fd| fd.is_finish())
     }
 
     fn is_exit_frame_with_exception(&self) -> bool {

@@ -13223,7 +13223,29 @@ fn collect_guards(
         // / rd_vector_info) and resume payload (`compile.py:855` rd_numb
         // / rd_consts / rd_virtuals / rd_pendingfields / status) forward
         // through this Arc to the metainterp side.
-        descr.meta_descr = op.descr.clone();
+        //
+        // FINISH ops without an explicit op.descr (test scaffolding +
+        // codegen-internal FINISH emission) get the class-distinct
+        // metainterp DoneWithThisFrameDescr* matching the result type
+        // so trait predicates (is_finish / fail_arg_types) resolve via
+        // the upstream class hierarchy.
+        descr.meta_descr = if let Some(d) = op.descr.clone() {
+            Some(d)
+        } else if is_finish {
+            let result_type = descr.fail_arg_types.first().copied().unwrap_or(Type::Void);
+            Some(match result_type {
+                Type::Void => Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new())
+                    as majit_ir::DescrRef,
+                Type::Int => Arc::new(majit_backend::DoneWithThisFrameDescrInt::new())
+                    as majit_ir::DescrRef,
+                Type::Ref => Arc::new(majit_backend::DoneWithThisFrameDescrRef::new())
+                    as majit_ir::DescrRef,
+                Type::Float => Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new())
+                    as majit_ir::DescrRef,
+            })
+        } else {
+            None
+        };
         let descr = Arc::new(descr);
         // Session 5i-cl: source_op_index / recovery_layout writes go to
         // backend-static side-tables keyed on `Arc::as_ptr(&descr)`, so
