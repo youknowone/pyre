@@ -605,7 +605,8 @@ fn handle_fail_resume_guard(
     _outer_green_key: u64,
 ) -> i64 {
     let trace_id = <guard::DynasmFailDescr as majit_ir::FailDescr>::trace_id(descr);
-    let fail_index = descr.fail_index;
+    let fail_index =
+        <guard::DynasmFailDescr as majit_ir::FailDescr>::fail_index_per_trace(descr);
     let n_fail_args = <guard::DynasmFailDescr as majit_ir::FailDescr>::fail_arg_types(descr).len();
     let fail_arg_locs = guard::lookup_fail_arg_locs(descr_raw);
     let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);

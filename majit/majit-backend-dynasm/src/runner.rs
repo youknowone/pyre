@@ -1714,7 +1714,9 @@ impl Backend for DynasmBackend {
             eprintln!(
                 "[dynasm-bridge] patch: trace_id={} fail_index={} adr_jump_offset=0x{:x} bridge_addr=0x{:x}",
                 guard_descr.trace_id(),
-                guard_descr.fail_index,
+                <crate::guard::DynasmFailDescr as FailDescr>::fail_index_per_trace(
+                    guard_descr.as_ref(),
+                ),
                 ajo,
                 bridge_addr
             );
@@ -1834,7 +1836,10 @@ impl Backend for DynasmBackend {
                 if bridge_addr != 0 && descr.adr_jump_offset() == 0 {
                     eprintln!(
                         "[dynasm] bridge-patched guard fi={} bridge_addr={:#x} ajo=0 (patched)",
-                        descr.fail_index, bridge_addr
+                        <crate::guard::DynasmFailDescr as FailDescr>::fail_index_per_trace(
+                            descr.as_ref(),
+                        ),
+                        bridge_addr
                     );
                 }
             }
