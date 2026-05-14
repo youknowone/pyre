@@ -4940,6 +4940,15 @@ impl CodeWriter {
             // regallocs)` emission); it is not a standalone walker
             // refactor.
             if emitted_pc_starts.get(start_pc).copied().unwrap_or(false) {
+                // Mark the orphan-prone newblock dead so downstream
+                // graph traversals (flatten_graph, post-walk scans)
+                // can skip it.  The block is reachable from upstream
+                // via the link mergeblock added (when emit_goto_if_not
+                // / mergeblock-from-emit_mark_label_pc fired), but its
+                // operations + exits stay empty — flatten_graph's
+                // make_return graceful arm (Phase 4.B) handles the
+                // empty-exits case.
+                pending_block.mark_dead();
                 continue;
             }
             current_block = pending_block;
