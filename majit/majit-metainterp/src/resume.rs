@@ -1163,332 +1163,18 @@ pub use majit_backend::ResumeValueLayoutSummaryExt;
 // (Phase C-1 cascade) alongside FrameInfo.
 pub use majit_backend::FrameSlotSource;
 
-/// Description of a virtual object that needs materialization on resume.
-///
-/// Mirrors RPython's AbstractVirtualInfo hierarchy:
-/// - VirtualInfo (NEW_WITH_VTABLE)
-/// - VStructInfo (NEW / plain struct)
-/// - VArrayInfoClear / VArrayInfoNotClear (NEW_ARRAY)
-/// - VArrayStructInfo (array of structs with interior fields)
-/// - VRawBufferInfo (raw memory buffer)
-#[derive(Debug, Clone)]
-pub enum VirtualInfo {
-    /// resume.py:612 VirtualInfo(descr, fielddescrs).
-    VirtualObj {
-        /// resume.py:615 self.descr — live SizeDescr.
-        descr: Option<majit_ir::DescrRef>,
-        type_id: u32,
-        descr_index: u32,
-        /// info.py:318 _known_class — vtable pointer.
-        known_class: Option<i64>,
-        fields: Vec<(u32, VirtualFieldSource)>,
-        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
-        descr_size: usize,
-    },
-    /// resume.py:628 VStructInfo(typedescr, fielddescrs).
-    VStruct {
-        /// resume.py:631 self.typedescr — the full SizeDescr.
-        typedescr: Option<majit_ir::DescrRef>,
-        type_id: u32,
-        descr_index: u32,
-        fields: Vec<(u32, VirtualFieldSource)>,
-        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
-        descr_size: usize,
-    },
-    /// resume.py:643-684 AbstractVArrayInfo (from NEW_ARRAY).
-    VArray {
-        /// resume.py:646: self.arraydescr
-        arraydescr: Option<majit_ir::DescrRef>,
-        /// Array descriptor index (serialization compat).
-        descr_index: u32,
-        /// resume.py:680-683: VArrayInfoClear.clear / VArrayInfoNotClear.clear
-        clear: bool,
-        /// Element values.
-        items: Vec<VirtualFieldSource>,
-    },
-    /// resume.py:736 VArrayStructInfo (from arrays with interior field access).
-    VArrayStruct {
-        /// resume.py:739: self.arraydescr
-        arraydescr: Option<majit_ir::DescrRef>,
-        /// Array descriptor index (serialization compat).
-        descr_index: u32,
-        /// resume.py:740: self.fielddescrs — live InteriorFieldDescr objects
-        /// for setinteriorfield dispatch.
-        fielddescrs: Vec<majit_ir::DescrRef>,
-        /// Per-element fields: outer Vec = elements, inner Vec = (field_index, source).
-        element_fields: Vec<Vec<(u32, VirtualFieldSource)>>,
-    },
-    /// resume.py:692 VRawBufferInfo(func, size, offsets, descrs).
-    VRawBuffer {
-        /// resume.py:694: self.func — raw malloc function pointer.
-        func: i64,
-        /// Size of the buffer in bytes.
-        size: usize,
-        /// resume.py:695: self.offsets — byte offsets for each stored
-        /// value. Signed to match rawbuffer.py:14.
-        offsets: Vec<i64>,
-        /// resume.py:697: self.descrs — per-entry ArrayDescr snapshots.
-        descrs: Vec<majit_ir::ArrayDescrInfo>,
-        /// resume.py:693: fieldnums — per-entry source (decoded from tagged fieldnums).
-        values: Vec<VirtualFieldSource>,
-    },
-    /// resume.py: VRawSliceInfo — a slice into a virtual raw buffer.
-    VRawSlice {
-        /// Offset from the parent raw buffer.
-        offset: i64,
-        /// Source of the parent buffer.
-        parent: VirtualFieldSource,
-    },
-    /// resume.py:763 VStrPlainInfo — virtual string (known characters).
-    VStrPlain {
-        /// Character values (as OpRef sources).
-        chars: Vec<VirtualFieldSource>,
-    },
-    /// resume.py:781 VStrConcatInfo — virtual string concat (left + right).
-    VStrConcat {
-        left: Box<VirtualFieldSource>,
-        right: Box<VirtualFieldSource>,
-    },
-    /// resume.py:801 VStrSliceInfo — virtual string slice.
-    VStrSlice {
-        source: Box<VirtualFieldSource>,
-        start: Box<VirtualFieldSource>,
-        length: Box<VirtualFieldSource>,
-    },
-    /// resume.py:817 VUniPlainInfo — virtual unicode string.
-    VUniPlain { chars: Vec<VirtualFieldSource> },
-    /// resume.py:836 VUniConcatInfo — virtual unicode concat.
-    VUniConcat {
-        left: Box<VirtualFieldSource>,
-        right: Box<VirtualFieldSource>,
-    },
-    /// resume.py:856 VUniSliceInfo — virtual unicode slice.
-    VUniSlice {
-        source: Box<VirtualFieldSource>,
-        start: Box<VirtualFieldSource>,
-        length: Box<VirtualFieldSource>,
-    },
-}
+// VirtualInfo moved to majit-backend::resume_value (Phase C-1
+// cascade) along with its PartialEq + first impl block
+// (field_sources / kind / layout_summary).  The second impl block
+// (allocate / is_about_raw, line ~5577) stays in metainterp since it
+// depends on ResumeDataDirectReader + BlackholeAllocator which are
+// metainterp-specific.  Re-exported here for caller compatibility.
+pub use majit_backend::VirtualInfo;
 
-// PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
-impl PartialEq for VirtualInfo {
-    fn eq(&self, other: &Self) -> bool {
-        match (self, other) {
-            (
-                VirtualInfo::VirtualObj {
-                    descr: None,
-                    type_id: a1,
-                    descr_index: a2,
-                    fields: a3,
-                    fielddescrs: a4,
-                    descr_size: a5,
-                    ..
-                },
-                VirtualInfo::VirtualObj {
-                    descr: None,
-                    type_id: b1,
-                    descr_index: b2,
-                    fields: b3,
-                    fielddescrs: b4,
-                    descr_size: b5,
-                    ..
-                },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
-            (
-                VirtualInfo::VStruct {
-                    type_id: a1,
-                    descr_index: a2,
-                    fields: a3,
-                    fielddescrs: a4,
-                    descr_size: a5,
-                    ..
-                },
-                VirtualInfo::VStruct {
-                    type_id: b1,
-                    descr_index: b2,
-                    fields: b3,
-                    fielddescrs: b4,
-                    descr_size: b5,
-                    ..
-                },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
-            (
-                VirtualInfo::VArray {
-                    arraydescr: _,
-                    descr_index: a1,
-                    clear: a_clear,
-                    items: a2,
-                },
-                VirtualInfo::VArray {
-                    arraydescr: _,
-                    descr_index: b1,
-                    clear: b_clear,
-                    items: b2,
-                },
-            ) => a1 == b1 && a_clear == b_clear && a2 == b2,
-            _ => false,
-        }
-    }
-}
-impl Eq for VirtualInfo {}
 
-impl VirtualInfo {
-    /// Iterate over all field sources in this virtual.
-    /// resume.py: visitor_walk_recursive walks all box references in a virtual.
-    pub fn field_sources(&self) -> Vec<&VirtualFieldSource> {
-        match self {
-            VirtualInfo::VirtualObj { fields, .. } | VirtualInfo::VStruct { fields, .. } => {
-                fields.iter().map(|(_, src)| src).collect()
-            }
-            VirtualInfo::VArray { items, .. } => items.iter().collect(),
-            VirtualInfo::VArrayStruct { element_fields, .. } => element_fields
-                .iter()
-                .flat_map(|el| el.iter().map(|(_, src)| src))
-                .collect(),
-            VirtualInfo::VRawBuffer { values, .. } => values.iter().collect(),
-            VirtualInfo::VRawSlice { parent, .. } => vec![parent],
-            VirtualInfo::VStrPlain { chars } | VirtualInfo::VUniPlain { chars } => {
-                chars.iter().collect()
-            }
-            VirtualInfo::VStrConcat { left, right } | VirtualInfo::VUniConcat { left, right } => {
-                vec![left.as_ref(), right.as_ref()]
-            }
-            VirtualInfo::VStrSlice {
-                source,
-                start,
-                length,
-            }
-            | VirtualInfo::VUniSlice {
-                source,
-                start,
-                length,
-            } => vec![source.as_ref(), start.as_ref(), length.as_ref()],
-        }
-    }
-
-    pub fn kind(&self) -> ResumeVirtualKind {
-        match self {
-            VirtualInfo::VirtualObj { .. } => ResumeVirtualKind::Object,
-            VirtualInfo::VStruct { .. } => ResumeVirtualKind::Struct,
-            VirtualInfo::VArray { .. } => ResumeVirtualKind::Array,
-            VirtualInfo::VArrayStruct { .. } => ResumeVirtualKind::ArrayStruct,
-            VirtualInfo::VRawBuffer { .. } | VirtualInfo::VRawSlice { .. } => {
-                ResumeVirtualKind::RawBuffer
-            }
-            VirtualInfo::VStrPlain { .. } => ResumeVirtualKind::StrPlain,
-            VirtualInfo::VStrConcat { .. } => ResumeVirtualKind::StrConcat,
-            VirtualInfo::VStrSlice { .. } => ResumeVirtualKind::StrSlice,
-            VirtualInfo::VUniPlain { .. } => ResumeVirtualKind::UniPlain,
-            VirtualInfo::VUniConcat { .. } => ResumeVirtualKind::UniConcat,
-            VirtualInfo::VUniSlice { .. } => ResumeVirtualKind::UniSlice,
-        }
-    }
-
-    pub fn layout_summary(&self) -> ResumeVirtualLayoutSummary {
-        match self {
-            VirtualInfo::VirtualObj {
-                descr,
-                type_id,
-                descr_index,
-                known_class,
-                fields,
-                fielddescrs,
-                descr_size,
-            } => ResumeVirtualLayoutSummary::Object {
-                descr: descr.clone(),
-                type_id: *type_id,
-                descr_index: *descr_index,
-                known_class: *known_class,
-                fields: fields
-                    .iter()
-                    .map(|(fd, src)| (*fd, src.layout_summary()))
-                    .collect(),
-                fielddescrs: fielddescrs.clone(),
-                descr_size: *descr_size,
-            },
-            VirtualInfo::VStruct {
-                typedescr,
-                type_id,
-                descr_index,
-                fields,
-                fielddescrs,
-                descr_size,
-            } => ResumeVirtualLayoutSummary::Struct {
-                typedescr: typedescr.clone(),
-                type_id: *type_id,
-                descr_index: *descr_index,
-                fields: fields
-                    .iter()
-                    .map(|(fd, src)| (*fd, src.layout_summary()))
-                    .collect(),
-                fielddescrs: fielddescrs.clone(),
-                descr_size: *descr_size,
-            },
-            VirtualInfo::VArray {
-                arraydescr,
-                descr_index,
-                clear,
-                items,
-            } => ResumeVirtualLayoutSummary::Array {
-                arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
-                clear: *clear,
-                items: items.iter().map(|source| source.layout_summary()).collect(),
-            },
-            VirtualInfo::VArrayStruct {
-                arraydescr,
-                descr_index,
-                fielddescrs,
-                element_fields,
-            } => ResumeVirtualLayoutSummary::ArrayStruct {
-                arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
-                fielddescrs: fielddescrs.clone(),
-                element_fields: element_fields
-                    .iter()
-                    .map(|fields| {
-                        fields
-                            .iter()
-                            .map(|(field_descr, source)| (*field_descr, source.layout_summary()))
-                            .collect()
-                    })
-                    .collect(),
-            },
-            VirtualInfo::VRawBuffer {
-                func,
-                size,
-                offsets,
-                descrs,
-                values,
-            } => ResumeVirtualLayoutSummary::RawBuffer {
-                func: *func,
-                size: *size,
-                offsets: offsets.clone(),
-                descrs: descrs.clone(),
-                values: values.iter().map(|src| src.layout_summary()).collect(),
-            },
-            // String/unicode virtual infos — represented as structs
-            // with synthetic field indices for reconstruction.
-            VirtualInfo::VRawSlice { .. }
-            | VirtualInfo::VStrPlain { .. }
-            | VirtualInfo::VStrConcat { .. }
-            | VirtualInfo::VStrSlice { .. }
-            | VirtualInfo::VUniPlain { .. }
-            | VirtualInfo::VUniConcat { .. }
-            | VirtualInfo::VUniSlice { .. } => ResumeVirtualLayoutSummary::Struct {
-                typedescr: None,
-                type_id: 0,
-                descr_index: 0,
-                fields: vec![],
-                fielddescrs: vec![],
-                descr_size: 0,
-            },
-        }
-    }
-}
-
-/// Source of a virtual object's field value.
-pub type VirtualFieldSource = ResumeValueSource;
+// VirtualFieldSource type alias re-exported from majit-backend
+// (Phase C-1 cascade), same as FrameSlotSource.
+pub use majit_backend::VirtualFieldSource;
 
 /// Convert a tagged fieldnum (i16, resume.py encoding) to a VirtualFieldSource.
 ///
@@ -5574,10 +5260,30 @@ pub trait BlackholeAllocator {
 pub struct NullAllocator;
 impl BlackholeAllocator for NullAllocator {}
 
-impl VirtualInfo {
+/// Metainterp-side extension methods on `VirtualInfo` (which lives in
+/// majit-backend since the Phase C-1 cascade).  These methods depend
+/// on `ResumeDataDirectReader` + `BlackholeAllocator` — both
+/// metainterp-specific — so they stay here as a trait extension.
+pub trait VirtualInfoBlackholeExt {
+    fn is_about_raw(&self) -> bool;
+    fn allocate(
+        &self,
+        decoder: &mut ResumeDataDirectReader,
+        index: usize,
+        allocator: &dyn BlackholeAllocator,
+    ) -> i64;
+    fn allocate_int(
+        &self,
+        decoder: &mut ResumeDataDirectReader,
+        index: usize,
+        allocator: &dyn BlackholeAllocator,
+    ) -> i64;
+}
+
+impl VirtualInfoBlackholeExt for VirtualInfo {
     /// resume.py:576 kind attribute — REF for object/struct/array/string,
     /// INT for raw buffers.
-    pub fn is_about_raw(&self) -> bool {
+    fn is_about_raw(&self) -> bool {
         matches!(
             self,
             VirtualInfo::VRawBuffer { .. } | VirtualInfo::VRawSlice { .. }
@@ -5588,7 +5294,7 @@ impl VirtualInfo {
     ///
     /// Allocate a virtual object and fill in its fields from the decoder.
     /// Sets virtuals_cache_ptr[index] before filling fields (for recursive refs).
-    pub fn allocate(
+    fn allocate(
         &self,
         decoder: &mut ResumeDataDirectReader,
         index: usize,
@@ -5743,7 +5449,7 @@ impl VirtualInfo {
     }
 
     /// resume.py:701 VRawBufferInfo.allocate_int / VRawSliceInfo.allocate_int
-    pub fn allocate_int(
+    fn allocate_int(
         &self,
         decoder: &mut ResumeDataDirectReader,
         index: usize,
