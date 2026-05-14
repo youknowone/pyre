@@ -4013,10 +4013,13 @@ impl<'a> Assembler386<'a> {
             pre
         } else {
             // Guard exit — `compile.py:185` ResumeGuardDescr family.
-            Arc::new(DynasmFailDescr::new(
+            // Stamp the metainterp `AbstractFailDescr` Arc from `op.descr`
+            // up front so the descr is immutable from the Arc::new onward.
+            Arc::new(DynasmFailDescr::with_meta(
                 fail_index,
                 self.trace_id,
                 fail_arg_types,
+                op.descr.clone(),
             ))
         };
         if crate::majit_log_enabled() {
@@ -4112,17 +4115,6 @@ impl<'a> Assembler386<'a> {
         // Session 7 parity: recovery_layout moved to a backend-static
         // side-table keyed on the descr Arc address.
         crate::guard::register_recovery_layout(Arc::as_ptr(&descr) as usize, recovery_layout);
-        unsafe {
-            let descr_mut = &mut *(Arc::as_ptr(&descr) as *mut DynasmFailDescr);
-            // Capture the metainterp `AbstractFailDescr` Arc as a
-            // back-pointer.  Backend accessors for `_attrs_` fields
-            // (`history.py:132`: adr_jump_offset / rd_locs /
-            // rd_loop_token / rd_vector_info) and resume payload
-            // (`compile.py:855` rd_numb / rd_consts / rd_virtuals /
-            // rd_pendingfields / status) forward through this Arc to
-            // the metainterp side.
-            descr_mut.meta_descr = op.descr.clone();
-        }
         // Session 5h: fail_arg_locs lives on the backend-static side-table
         // (`fail_arg_locs_table()` in guard.rs), not on the descr.  See the
         // module-level comment for the PyPy machine-code immediate-embedding
@@ -4775,10 +4767,14 @@ impl<'a> Assembler386<'a> {
         // when the guard is actually emitted in append_guard_token_with_faillocs.
         let fail_arg_types = self.infer_fail_arg_types(next_op, Some(next_idx));
         // Pre-allocated GuardNotForced descr — ResumeGuardDescr family.
-        let descr = Arc::new(DynasmFailDescr::new(
+        // Stamp the metainterp `AbstractFailDescr` Arc from `next_op.descr`
+        // here so `append_guard_token_with_faillocs` does not need a second
+        // pass through `unsafe { Arc::as_ptr as *mut }`.
+        let descr = Arc::new(DynasmFailDescr::with_meta(
             fail_index,
             self.trace_id,
             fail_arg_types,
+            next_op.descr.clone(),
         ));
         let descr_ptr = Arc::as_ptr(&descr) as i64;
         self.pending_force_descr = Some(descr);
