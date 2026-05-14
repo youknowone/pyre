@@ -12545,7 +12545,12 @@ impl CraneliftBackend {
         if std::env::var_os("MAJIT_LOG").is_some() {
             let fail_descr_preview: Vec<(u32, usize)> = fail_descrs
                 .iter()
-                .map(|descr| (descr.fail_index, Arc::as_ptr(descr) as usize))
+                .map(|descr| {
+                    (
+                        FailDescr::fail_index_per_trace(descr.as_ref()),
+                        Arc::as_ptr(descr) as usize,
+                    )
+                })
                 .collect();
             eprintln!(
                 "[jit][compile-loop] trace_id={} header_pc={} code_ptr={:p} fail_descrs={:?}",
@@ -12580,7 +12585,7 @@ impl CraneliftBackend {
             fail_descrs
                 .iter()
                 .enumerate()
-                .all(|(i, d)| d.fail_index as usize == i),
+                .all(|(i, d)| FailDescr::fail_index_per_trace(d.as_ref()) as usize == i),
             "fail_descrs position must equal fail_index"
         );
         let fail_descrs: Box<[Arc<CraneliftFailDescr>]> = fail_descrs.into_boxed_slice();
@@ -13905,7 +13910,7 @@ impl majit_backend::Backend for CraneliftBackend {
             let target = find_fail_descr_in_fail_descrs(
                 &new.fail_descrs,
                 old_fd.trace_id(),
-                old_fd.fail_index,
+                FailDescr::fail_index_per_trace(old_fd.as_ref()),
             );
             if let Some(new_fd) = target {
                 if !new_fd.has_bridge() {
