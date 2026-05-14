@@ -96,6 +96,21 @@ thread_local! {
         const { RefCell::new(None) };
 }
 
+/// Phase C-1 Step 4b: extract `FailDescrLayout` from a trait-object
+/// fail descr.  The `layout` accessor lives as an inherent method on
+/// `DynasmFailDescr`; recover the concrete type via `Descr::as_any`
+/// downcast.  All `compiled.fail_descrs` entries are
+/// `DynasmFailDescr` (only synthetic classifier descrs from
+/// `find_descr_by_ptr` differ, and those are never queried for
+/// layouts), so the downcast is infallible in practice.
+fn layout_of(descr: &Arc<dyn FailDescr>) -> majit_backend::FailDescrLayout {
+    descr
+        .as_any()
+        .and_then(|a| a.downcast_ref::<crate::guard::DynasmFailDescr>())
+        .expect("compiled.fail_descrs entries are always DynasmFailDescr")
+        .layout()
+}
+
 fn with_dynasm_active_gc<R>(f: impl FnOnce(&dyn majit_gc::GcAllocator) -> R) -> Option<R> {
     DYNASM_ACTIVE_GC.with(|cell| {
         let guard = cell.borrow();
@@ -787,11 +802,11 @@ impl DynasmBackend {
     /// entries that the in-codegen call missed because `meta_descr`
     /// was unset.  Re-running is idempotent: existing entries are
     /// preserved via `entry().or_insert_with`.
-    pub fn register_fail_descrs(&self, descrs: &[Arc<crate::guard::DynasmFailDescr>]) {
+    pub fn register_fail_descrs(&self, descrs: &[Arc<dyn FailDescr>]) {
         let mut reg = self.fail_descr_registry.lock().unwrap();
         for descr in descrs {
-            let ptr = Arc::as_ptr(descr) as usize;
-            let trait_arc: Arc<dyn FailDescr> = Arc::clone(descr) as Arc<dyn FailDescr>;
+            let ptr = Arc::as_ptr(descr) as *const () as usize;
+            let trait_arc: Arc<dyn FailDescr> = Arc::clone(descr);
             reg.entry(ptr).or_insert_with(|| Arc::clone(&trait_arc));
             // Unified-Descr Port Epic: also key the same backend Arc by
             // the metainterp `AbstractFailDescr` Arc's data pointer
@@ -802,9 +817,16 @@ impl DynasmBackend {
             // local `AtomicU64` status fallback, so the same Arc lives
             // under both keys.  Skip when `meta_descr` is unset
             // (test/synthetic paths) — the backend addr is the only key.
-            if let Some(meta) = &descr.meta_descr {
-                let meta_ptr = Arc::as_ptr(meta) as *const () as usize;
-                reg.entry(meta_ptr).or_insert_with(|| Arc::clone(&trait_arc));
+            // Recover concrete `DynasmFailDescr` to reach the
+            // `meta_descr` back-pointer field for dual-key registration.
+            if let Some(d) = descr
+                .as_any()
+                .and_then(|a| a.downcast_ref::<crate::guard::DynasmFailDescr>())
+            {
+                if let Some(meta) = &d.meta_descr {
+                    let meta_ptr = Arc::as_ptr(meta) as *const () as usize;
+                    reg.entry(meta_ptr).or_insert_with(|| Arc::clone(&trait_arc));
+                }
             }
         }
     }
@@ -1219,7 +1241,7 @@ impl DynasmBackend {
         if let Some(found) = compiled
             .fail_descrs
             .iter()
-            .find(|d| Arc::as_ptr(d) as usize == ptr)
+            .find(|d| Arc::as_ptr(d) as *const () as usize == ptr)
         {
             return found.clone();
         }
@@ -1231,7 +1253,7 @@ impl DynasmBackend {
                 if let Some(found) = bridge
                     .fail_descrs
                     .iter()
-                    .find(|d| Arc::as_ptr(d) as usize == ptr)
+                    .find(|d| Arc::as_ptr(d) as *const () as usize == ptr)
                 {
                     return found.clone();
                 }
@@ -1270,7 +1292,7 @@ impl DynasmBackend {
     /// "is this guard already compiled?" and must treat the miss as
     /// `None` (matching cranelift's `?`-on-miss semantics in
     /// `compiler.rs:11723`).
-    fn find_descr(token: &JitCellToken, trace_id: u64, fail_index: u32) -> Arc<DynasmFailDescr> {
+    fn find_descr(token: &JitCellToken, trace_id: u64, fail_index: u32) -> Arc<dyn FailDescr> {
         Self::try_find_descr(token, trace_id, fail_index).unwrap_or_else(|| {
             panic!(
                 "find_descr: (trace_id={}, fail_index={}) not found in \
@@ -1285,7 +1307,7 @@ impl DynasmBackend {
         token: &JitCellToken,
         trace_id: u64,
         fail_index: u32,
-    ) -> Option<Arc<DynasmFailDescr>> {
+    ) -> Option<Arc<dyn FailDescr>> {
         // Query-style miss tolerance: when `token.compiled` is absent
         // (e.g. a freshly issued JitCellToken whose backend code has
         // not been attached, or one rotated into `previous_tokens`),
@@ -1312,7 +1334,7 @@ impl DynasmBackend {
         if let Some(found) = compiled
             .fail_descrs
             .iter()
-            .find(|d| d.trace_id() == trace_id && d.fail_index == fail_index)
+            .find(|d| d.trace_id() == trace_id && d.fail_index() == fail_index)
         {
             return Some(found.clone());
         }
@@ -1322,7 +1344,7 @@ impl DynasmBackend {
                 if let Some(found) = bridge
                     .fail_descrs
                     .iter()
-                    .find(|d| d.trace_id() == trace_id && d.fail_index == fail_index)
+                    .find(|d| d.trace_id() == trace_id && d.fail_index() == fail_index)
                 {
                     return Some(found.clone());
                 }
@@ -1523,7 +1545,9 @@ impl Backend for DynasmBackend {
                 if !descr.is_resume_guard() {
                     continue;
                 }
-                descr.set_rd_loop_token_clt(std::sync::Arc::clone(clt));
+                let clt_arc = std::sync::Arc::clone(clt);
+                let clt_any: std::sync::Arc<dyn std::any::Any + Send + Sync> = clt_arc;
+                descr.set_rd_loop_token_clt(clt_any);
             }
         }
 
@@ -1671,7 +1695,14 @@ impl Backend for DynasmBackend {
             fail_descr.trace_id(),
             fail_descr.fail_index_per_trace(),
         );
-        let arglocs = Asm::rebuild_faillocs_from_descr(&guard_descr, inputargs);
+        // `rebuild_faillocs_from_descr` takes `&DynasmFailDescr` (inherent
+        // method access on `rd_locs`); downcast through `as_any` until the
+        // helper is promoted to `&dyn FailDescr`.
+        let guard_descr_d = guard_descr
+            .as_any()
+            .and_then(|a| a.downcast_ref::<DynasmFailDescr>())
+            .expect("guard_descr is always a DynasmFailDescr in this backend");
+        let arglocs = Asm::rebuild_faillocs_from_descr(guard_descr_d, inputargs);
         let compiled = asm.assemble_bridge(fail_descr, &arglocs)?;
 
         let bridge_addr = codebuf::buffer_ptr(&compiled.buffer) as usize;
@@ -1709,17 +1740,20 @@ impl Backend for DynasmBackend {
             eprintln!(
                 "[dynasm-bridge] patch: trace_id={} fail_index={} adr_jump_offset=0x{:x} bridge_addr=0x{:x}",
                 guard_descr.trace_id(),
-                guard_descr.fail_index,
+                guard_descr.fail_index(),
                 ajo,
                 bridge_addr
             );
         }
         if ajo != 0 {
-            Asm::patch_jump_for_descr(&guard_descr, bridge_addr);
+            Asm::patch_jump_for_descr(guard_descr_d, bridge_addr);
         } else if crate::majit_log_enabled() {
             eprintln!("[dynasm-bridge] WARNING: adr_jump_offset=0, bridge NOT patched!");
         }
-        self.register_bridge_addr(Arc::as_ptr(&guard_descr) as usize, bridge_addr);
+        self.register_bridge_addr(
+            Arc::as_ptr(&guard_descr) as *const () as usize,
+            bridge_addr,
+        );
 
         // llmodel.py:252 asmmemmgr_blocks parity: store the entire
         // bridge CompiledCode on the owning loop token. This keeps
@@ -1740,7 +1774,9 @@ impl Backend for DynasmBackend {
                 if !descr.is_resume_guard() {
                     continue;
                 }
-                descr.set_rd_loop_token_clt(std::sync::Arc::clone(clt));
+                let clt_arc = std::sync::Arc::clone(clt);
+                let clt_any: std::sync::Arc<dyn std::any::Any + Send + Sync> = clt_arc;
+                descr.set_rd_loop_token_clt(clt_any);
             }
         }
 
@@ -1823,11 +1859,13 @@ impl Backend for DynasmBackend {
         // Debug: verify bridge patches are visible
         if crate::majit_log_enabled() {
             for descr in &compiled.fail_descrs {
-                let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(descr) as usize);
+                let bridge_addr =
+                    self.lookup_bridge_addr(Arc::as_ptr(descr) as *const () as usize);
                 if bridge_addr != 0 && descr.adr_jump_offset() == 0 {
                     eprintln!(
                         "[dynasm] bridge-patched guard fi={} bridge_addr={:#x} ajo=0 (patched)",
-                        descr.fail_index, bridge_addr
+                        descr.fail_index(),
+                        bridge_addr
                     );
                 }
             }
@@ -2187,7 +2225,7 @@ impl Backend for DynasmBackend {
         let compiled = Self::get_compiled(token);
         for (i, &hash) in hashes.iter().enumerate() {
             if let Some(descr) = compiled.fail_descrs.get(i) {
-                if !descr.is_finish && descr.get_status() == 0 {
+                if !descr.is_finish() && descr.get_status() == 0 {
                     descr.store_hash(hash);
                 }
             }
@@ -2201,7 +2239,10 @@ impl Backend for DynasmBackend {
         fail_index: u32,
     ) -> (u64, usize) {
         let descr = Self::find_descr(token, trace_id, fail_index);
-        (descr.get_status(), Arc::as_ptr(&descr) as usize)
+        (
+            descr.get_status(),
+            Arc::as_ptr(&descr) as *const () as usize,
+        )
     }
 
     fn store_bridge_guard_hashes(
@@ -2212,7 +2253,8 @@ impl Backend for DynasmBackend {
         hashes: &[u64],
     ) {
         let source_descr = Self::find_descr(token, source_trace_id, source_fail_index);
-        let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as usize);
+        let bridge_addr =
+            self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as *const () as usize);
         if bridge_addr == 0 {
             return;
         }
@@ -2223,7 +2265,7 @@ impl Backend for DynasmBackend {
                 if addr == bridge_addr {
                     for (i, &hash) in hashes.iter().enumerate() {
                         if let Some(descr) = bridge.fail_descrs.get(i) {
-                            if !descr.is_finish && descr.get_status() == 0 {
+                            if !descr.is_finish() && descr.get_status() == 0 {
                                 descr.store_hash(hash);
                             }
                         }
@@ -2716,7 +2758,7 @@ impl Backend for DynasmBackend {
         token: &JitCellToken,
     ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let compiled = Self::get_compiled(token);
-        Some(compiled.fail_descrs.iter().map(|d| d.layout()).collect())
+        Some(compiled.fail_descrs.iter().map(layout_of).collect())
     }
 
     fn compiled_trace_fail_descr_layouts(
@@ -2726,14 +2768,14 @@ impl Backend for DynasmBackend {
     ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let compiled = Self::get_compiled(token);
         if compiled.trace_id == trace_id {
-            return Some(compiled.fail_descrs.iter().map(|d| d.layout()).collect());
+            return Some(compiled.fail_descrs.iter().map(layout_of).collect());
         }
         // Search bridge fail_descrs in asmmemmgr_blocks.
         let blocks = token.asmmemmgr_blocks();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 if bridge.trace_id == trace_id {
-                    return Some(bridge.fail_descrs.iter().map(|d| d.layout()).collect());
+                    return Some(bridge.fail_descrs.iter().map(layout_of).collect());
                 }
             }
         }
@@ -2753,7 +2795,8 @@ impl Backend for DynasmBackend {
         // `compiler.rs:11723 compiled_bridge_fail_descr_layouts`.
         let source_descr =
             Self::try_find_descr(original_token, source_trace_id, source_fail_index)?;
-        let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as usize);
+        let bridge_addr =
+            self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as *const () as usize);
         if bridge_addr == 0 {
             return None;
         }
@@ -2762,7 +2805,7 @@ impl Backend for DynasmBackend {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 let addr = codebuf::buffer_ptr(&bridge.buffer) as usize;
                 if addr == bridge_addr {
-                    return Some(bridge.fail_descrs.iter().map(|d| d.layout()).collect());
+                    return Some(bridge.fail_descrs.iter().map(layout_of).collect());
                 }
             }
         }
@@ -2788,8 +2831,16 @@ impl Backend for DynasmBackend {
         recovery_layout: ExitRecoveryLayout,
     ) -> bool {
         let descr = Self::find_descr(token, trace_id, fail_index);
-        descr.set_recovery_layout(recovery_layout);
-        true
+        // `set_recovery_layout` is an inherent on `DynasmFailDescr`;
+        // recover via `as_any` downcast.
+        if let Some(d) = descr
+            .as_any()
+            .and_then(|a| a.downcast_ref::<DynasmFailDescr>())
+        {
+            d.set_recovery_layout(recovery_layout);
+            return true;
+        }
+        false
     }
 
     fn setup_once(&mut self) {}

@@ -208,7 +208,7 @@ pub struct AssemblerARM64<'a> {
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
     /// Fail descriptors built during assembly.
-    fail_descrs: Vec<Arc<DynasmFailDescr>>,
+    fail_descrs: Vec<Arc<dyn majit_ir::FailDescr>>,
     /// trace_id for this compilation.
     trace_id: u64,
     /// header_pc (green_key) for this compilation.
@@ -325,7 +325,7 @@ pub struct CompiledCode {
     /// contract (compile.py:183-203 record_loop_or_bridge). Position
     /// equals `descr.fail_index` by an invariant asserted at conversion
     /// from the in-progress `AssemblerARM64.fail_descrs` Vec.
-    pub fail_descrs: Box<[Arc<DynasmFailDescr>]>,
+    pub fail_descrs: Box<[Arc<dyn majit_ir::FailDescr>]>,
     /// Input argument types.
     pub input_types: Vec<Type>,
     /// `compile.py:665-674` parity: `Arc` clone of the owning cpu's
@@ -1365,7 +1365,7 @@ impl<'a> AssemblerARM64<'a> {
             self.fail_descrs
                 .iter()
                 .enumerate()
-                .all(|(i, d)| d.fail_index as usize == i),
+                .all(|(i, d)| d.fail_index() as usize == i),
             "fail_descrs position must equal fail_index"
         );
         Ok(CompiledCode {
@@ -1495,7 +1495,7 @@ impl<'a> AssemblerARM64<'a> {
             self.fail_descrs
                 .iter()
                 .enumerate()
-                .all(|(i, d)| d.fail_index as usize == i),
+                .all(|(i, d)| d.fail_index() as usize == i),
             "fail_descrs position must equal fail_index"
         );
         Ok(CompiledCode {
