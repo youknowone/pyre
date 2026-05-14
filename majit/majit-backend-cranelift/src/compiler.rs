@@ -13228,6 +13228,20 @@ fn collect_guards(
         } else {
             Vec::new()
         };
+        // Stamp the per-trace fail_index and trace_id onto the metainterp
+        // ResumeGuardDescr (`op.descr`).  `compile.py:185` gates the
+        // setters at the ResumeDescr family; non-resume meta descrs
+        // (Done* / Exit* / Propagate / TargetToken for external JUMP)
+        // skip the trait calls so the trait-default panic path stays
+        // unreached.
+        if let Some(d) = op.descr.as_ref() {
+            if d.is_resume_guard() || d.is_resume_guard_copied() {
+                if let Some(fd) = d.as_fail_descr() {
+                    fd.set_fail_index_per_trace(fail_index);
+                    fd.set_trace_id(trace_id);
+                }
+            }
+        }
         // Capture the metainterp `AbstractFailDescr` Arc as a
         // back-pointer.  Backend accessors for `_attrs_` fields
         // (`history.py:132`: adr_jump_offset / rd_locs / rd_loop_token
