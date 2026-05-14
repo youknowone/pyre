@@ -856,56 +856,11 @@ impl CraneliftFailDescr {
     pub const TY_REF: u64 = 0x04;
     pub const TY_FLOAT: u64 = 0x06;
 
-    /// compile.py:826-830 store_hash: assign a unique jitcounter hash.
-    /// `compile.py:826-830` `store_hash`.  Prefers the metainterp
-    /// `AbstractResumeGuardDescr` (`compile.py:683 _attrs_`) reached
-    /// through `meta_descr`; falls back to the backend-local transitional
-    /// slot for synthetic / test paths.
-    pub fn store_hash(&self, hash: u64) {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            meta_fd.store_hash(hash);
-            return;
-        }
-        self.status.store(
-            hash & Self::ST_SHIFT_MASK,
-            std::sync::atomic::Ordering::Release,
-        );
-    }
-
-    /// `compile.py:741-745` `get_status`.
-    pub fn get_status(&self) -> u64 {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            return meta_fd.get_status();
-        }
-        self.status.load(std::sync::atomic::Ordering::Acquire)
-    }
-
-    /// `compile.py:786-788` `start_compiling`.
-    pub fn start_compiling(&self) {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            meta_fd.start_compiling();
-            return;
-        }
-        self.status
-            .fetch_or(Self::ST_BUSY_FLAG, std::sync::atomic::Ordering::AcqRel);
-    }
-
-    /// `compile.py:790-795` `done_compiling`.
-    pub fn done_compiling(&self) {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            meta_fd.done_compiling();
-            return;
-        }
-        self.status
-            .fetch_and(!Self::ST_BUSY_FLAG, std::sync::atomic::Ordering::AcqRel);
-    }
-
-    /// `compile.py:750` check `ST_BUSY_FLAG`.
-    pub fn is_compiling(&self) -> bool {
-        self.get_status() & Self::ST_BUSY_FLAG != 0
-    }
-
-    /// `compile.py:813-824` `make_a_counter_per_value`.
+    /// `compile.py:813-824` `make_a_counter_per_value`.  Kept as
+    /// inherent because the trait signature does not expose the
+    /// type-tag parameter; remaining `store_hash` / `get_status` /
+    /// `start_compiling` / `done_compiling` / `is_compiling` are
+    /// reached via trait dispatch (see the `impl FailDescr` block).
     pub fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.make_a_counter_per_value(index, type_tag);
@@ -1217,20 +1172,53 @@ impl FailDescr for CraneliftFailDescr {
             .unwrap_or_default()
     }
 
+    /// `compile.py:741-745` `get_status`.  Forwards through the
+    /// metainterp `AbstractResumeGuardDescr` (`compile.py:683 _attrs_`
+    /// `('status',)`) when `meta_descr` is set; falls back to the
+    /// backend-local mirror for synthetic descrs minted outside the
+    /// optimizer.
     fn get_status(&self) -> u64 {
-        self.get_status()
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            return meta_fd.get_status();
+        }
+        self.status.load(std::sync::atomic::Ordering::Acquire)
     }
 
+    /// `compile.py:786-788` `start_compiling`.
     fn start_compiling(&self) {
-        self.start_compiling()
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.start_compiling();
+            return;
+        }
+        self.status
+            .fetch_or(Self::ST_BUSY_FLAG, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// `compile.py:790-795` `done_compiling`.
     fn done_compiling(&self) {
-        self.done_compiling()
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.done_compiling();
+            return;
+        }
+        self.status
+            .fetch_and(!Self::ST_BUSY_FLAG, std::sync::atomic::Ordering::AcqRel);
     }
 
+    /// `compile.py:826-830` `store_hash`.
+    fn store_hash(&self, hash: u64) {
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.store_hash(hash);
+            return;
+        }
+        self.status.store(
+            hash & Self::ST_SHIFT_MASK,
+            std::sync::atomic::Ordering::Release,
+        );
+    }
+
+    /// `compile.py:750` check `ST_BUSY_FLAG`.
     fn is_compiling(&self) -> bool {
-        self.is_compiling()
+        self.get_status() & Self::ST_BUSY_FLAG != 0
     }
 
     // resume.py:450-488 readers gated on `meta_resume_fd()` —
