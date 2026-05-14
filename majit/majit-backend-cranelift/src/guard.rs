@@ -499,11 +499,11 @@ pub struct CraneliftFailDescr {
     // in `resume.py:450-488`.  Cranelift retains the structured
     // layout in `RECOVERY_LAYOUT_TABLE` (this module) keyed on
     // `Arc::as_ptr(&descr)`.
-    /// compile.py:688-692 ResumeGuardDescr.status:
-    /// Stores jitcounter hash (from store_hash / fetch_next_hash).
-    /// Used by must_compile() to tick the guard's counter slot.
-    /// Assigned at compile time, read at guard failure time.
-    pub status: std::sync::atomic::AtomicU64,
+    // status removed: `compile.py:683 AbstractResumeGuardDescr._attrs_
+    // = ('status',)` — only ResumeGuardDescr family carries this slot.
+    // Done*/Exit/Propagate inherit AbstractFailDescr without status.
+    // After Phase A every backend descr forwards through meta_descr to
+    // the metainterp class, so the local AtomicU64 mirror is unused.
     // fail_count removed (Session 5i-cl): not in PyPy
     // `AbstractFailDescr._attrs_` (`history.py:132`).  The per-descr
     // bridge-compilation threshold counter moved to
@@ -723,7 +723,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             is_finish,
             is_exit_frame_with_exception: false,
-            status: std::sync::atomic::AtomicU64::new(0),
             meta_descr: None,
         }
     }
@@ -754,7 +753,6 @@ impl CraneliftFailDescr {
             fail_arg_types,
             is_finish: false,
             is_exit_frame_with_exception: false,
-            status: std::sync::atomic::AtomicU64::new(0),
             meta_descr: None,
         }
     }
@@ -1141,53 +1139,42 @@ impl FailDescr for CraneliftFailDescr {
     /// backend-local mirror for synthetic descrs minted outside the
     /// optimizer.
     fn get_status(&self) -> u64 {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            return meta_fd.get_status();
-        }
-        self.status.load(std::sync::atomic::Ordering::Acquire)
+        // `compile.py:683 AbstractResumeGuardDescr._attrs_ = ('status',)`
+        // — only ResumeGuardDescr family carries this slot.  Forward
+        // through meta_descr; non-ResumeGuardDescr targets take the
+        // trait default 0, matching upstream.
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(0, |fd| fd.get_status())
     }
 
     /// `compile.py:786-788` `start_compiling`.
     fn start_compiling(&self) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.start_compiling();
-            return;
         }
-        self.status
-            .fetch_or(Self::ST_BUSY_FLAG, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// `compile.py:790-795` `done_compiling`.
     fn done_compiling(&self) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.done_compiling();
-            return;
         }
-        self.status
-            .fetch_and(!Self::ST_BUSY_FLAG, std::sync::atomic::Ordering::AcqRel);
     }
 
     /// `compile.py:826-830` `store_hash`.
     fn store_hash(&self, hash: u64) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.store_hash(hash);
-            return;
         }
-        self.status.store(
-            hash & Self::ST_SHIFT_MASK,
-            std::sync::atomic::Ordering::Release,
-        );
     }
 
     /// `compile.py:813-824` `make_a_counter_per_value`.
     fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.make_a_counter_per_value(index, type_tag);
-            return;
         }
-        let status = type_tag | ((index as u64) << Self::ST_SHIFT);
-        self.status
-            .store(status, std::sync::atomic::Ordering::Release);
     }
 
     /// `compile.py:750` check `ST_BUSY_FLAG`.
