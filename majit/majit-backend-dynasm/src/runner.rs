@@ -577,7 +577,7 @@ pub struct DynasmBackend {
     /// owning token is not the one currently executing. This registry
     /// is the ptr-indexed view needed to complete that lookup.
     fail_descr_registry:
-        Arc<std::sync::Mutex<std::collections::HashMap<usize, Arc<dyn FailDescr>>>>,
+        Arc<std::sync::Mutex<std::collections::HashMap<usize, Arc<crate::guard::DynasmFailDescr>>>>,
     /// Backend-internal side-table mapping a source guard descr's
     /// `Arc::as_ptr` address to the entry pointer of the compiled bridge
     /// patched in for that guard.  Replaces the prior `bridge_addr` field
@@ -791,8 +791,7 @@ impl DynasmBackend {
         let mut reg = self.fail_descr_registry.lock().unwrap();
         for descr in descrs {
             let ptr = Arc::as_ptr(descr) as usize;
-            let trait_arc: Arc<dyn FailDescr> = Arc::clone(descr) as Arc<dyn FailDescr>;
-            reg.entry(ptr).or_insert_with(|| Arc::clone(&trait_arc));
+            reg.entry(ptr).or_insert_with(|| Arc::clone(descr));
             // Unified-Descr Port Epic: also key the same backend Arc by
             // the metainterp `AbstractFailDescr` Arc's data pointer
             // (`history.py:125` identity).  After the full identity flip
@@ -804,7 +803,7 @@ impl DynasmBackend {
             // (test/synthetic paths) — the backend addr is the only key.
             if let Some(meta) = &descr.meta_descr {
                 let meta_ptr = Arc::as_ptr(meta) as *const () as usize;
-                reg.entry(meta_ptr).or_insert_with(|| Arc::clone(&trait_arc));
+                reg.entry(meta_ptr).or_insert_with(|| Arc::clone(descr));
             }
         }
     }
