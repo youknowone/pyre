@@ -1115,29 +1115,28 @@ mod tests {
         // dispatch-able byte stream.
         let jc = jitcode_for_instruction(&Instruction::PopTop)
             .expect("PopTop must resolve to a jitcode");
-        assert_eq!(
-            jc.code.len(),
-            25,
-            "PopTop jitcode size shifted — refresh the expected sequence below",
-        );
         let sequence: Vec<(String, String)> = decoded_ops(&jc.code)
             .map(|op| (op.opname.to_string(), op.argcodes.to_string()))
             .collect();
-        // Note: the trailing `int_copy + residual_call_r_r` pair that
-        // previously wrapped `Ok(...)` is gone — jtransform now elides
-        // single-arg `Ok`/`Err`/`Some` constructor calls via
-        // `RewriteResult::Identity` so the trace recorder no longer
-        // emits a synthetic `CallR` for the return-type wrapper.
+        assert_eq!(
+            jc.code.len(),
+            15,
+            "PopTop jitcode size shifted — refresh the expected sequence below",
+        );
+        // Phase 2 of the SSA REPR parity work switched the codewriter
+        // to RPython's recursive `make_bytecode_block` shape
+        // (`flatten.py:106-128`), so the normal-link body now falls
+        // through inline after `catch_exception` instead of being
+        // reached via a separate `goto` landing.  The exception-side
+        // `ref_return` body is similarly elided when the link target
+        // is the final returnblock.  RPython produces the same trace
+        // for the equivalent input graph.
         let expected: Vec<(String, String)> = [
             ("inline_call_r_r", "dR>r"),
             ("live", ""),
             ("catch_exception", "L"),
-            ("goto", "L"),
+            ("ref_return", "r"),
             ("reraise", ""),
-            ("ref_return", "r"),
-            ("live", ""),
-            ("raise", "r"),
-            ("ref_return", "r"),
         ]
         .iter()
         .map(|(o, a)| (o.to_string(), a.to_string()))

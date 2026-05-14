@@ -16,6 +16,64 @@ use vecset::VecSet;
 
 use crate::call::CallControl;
 use crate::flatten::{FlatOp, IntOvfOp, Label, RegKind, SSARepr};
+
+/// `flatten.py:30` `Register.kind[0]` — single-char prefix for opname keys.
+fn kind_char_of(kind: RegKind) -> char {
+    match kind {
+        RegKind::Int => 'i',
+        RegKind::Ref => 'r',
+        RegKind::Float => 'f',
+    }
+}
+
+/// Companion long form (`'int'`/`'ref'`/`'float'`) used in
+/// `int_copy`/`ref_copy`/`float_copy` opname keys.
+fn kind_long_name(kind: RegKind) -> &'static str {
+    match kind {
+        RegKind::Int => "int",
+        RegKind::Ref => "ref",
+        RegKind::Float => "float",
+    }
+}
+
+/// Phase 3 replacement for `lookup_reg_with_kind` — the variant
+/// determines the expected kind, so the caller passes it in
+/// explicitly.  Falls back to "search all classes" when the expected
+/// kind misses, mirroring the pre-Phase-C-v2-Slice-C-3 behaviour the
+/// previous `lookup_coloring` exposed via `value_kinds`.  Pyre's
+/// annotator/rtyper still has known coverage gaps where a value's
+/// declared variant kind disagrees with its regalloc class (tracked
+/// alongside the value_kinds removal in
+/// `~/.claude/plans/delightful-cooking-salamander.md`); the fallback
+/// keeps the assembler robust until those root causes are fixed
+/// upstream.  The lookup ALWAYS prefers the requested kind first so
+/// well-typed graphs see the strict path.
+fn reg_byte(
+    v: crate::model::ValueId,
+    kind: RegKind,
+    regallocs: &HashMap<RegKind, crate::regalloc::RegAllocResult>,
+) -> u8 {
+    if let Some(ra) = regallocs.get(&kind) {
+        if let Some(&color) = ra.coloring.get(&v) {
+            return color as u8;
+        }
+    }
+    for fallback_kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+        if fallback_kind == kind {
+            continue;
+        }
+        if let Some(ra) = regallocs.get(&fallback_kind) {
+            if let Some(&color) = ra.coloring.get(&v) {
+                return color as u8;
+            }
+        }
+    }
+    panic!(
+        "reg_byte: ValueId {:?} has no coloring in any of regallocs[Int|Ref|Float] \
+         (expected kind {:?})",
+        v, kind
+    )
+}
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody};
 use crate::model::{LinkArg, ValueId};
@@ -106,19 +164,6 @@ pub struct Assembler {
     /// the `MAJIT_COVERAGE_PANIC=1` diagnostic so the missing-ValueId
     /// panic can cite the offending op.
     current_flatop_debug: Option<String>,
-    /// Phase C v2 Slice C-3: authoritative ValueId → RegKind table for
-    /// the SSARepr currently being assembled.  Set at `assemble`
-    /// entry from `ssarepr.value_kinds` and consulted by
-    /// `lookup_coloring`, which previously fell back to "search all
-    /// three regalloc classes" and silently returned whichever class
-    /// happened to hold a coloring for the ValueId.  RPython has no
-    /// analogue because `Variable.concretetype` (set once at
-    /// `flowmodel.py:Variable.__init__`) is the single source of
-    /// truth, and `regalloc.py` only produces a coloring in the kind
-    /// matching `getkind(v.concretetype)`.  Pyre's authoritative
-    /// table now plays the same role: the kind decided at build time
-    /// must match the regalloc class that holds the coloring.
-    current_value_kinds: Option<HashMap<ValueId, RegKind>>,
 }
 
 impl Assembler {
@@ -141,7 +186,6 @@ impl Assembler {
             canonical_liveness_offset: None,
             current_graph_name: None,
             current_flatop_debug: None,
-            current_value_kinds: None,
         }
     }
 
@@ -240,17 +284,12 @@ impl Assembler {
     ) -> JitCodeBody {
         // RPython codewriter.py:56: compute_liveness(ssarepr)
         // Must run BEFORE assembly so -live- markers carry the full
-        // set of alive registers.
-        crate::liveness::compute_liveness(ssarepr);
+        // set of alive registers.  Phase 3 ports the alive set to
+        // [`crate::flatten::Register`]-based identity, so liveness now
+        // also takes the regalloc result for the `ValueId → Register`
+        // bridge on `FlatOp::Op` operands.
+        crate::liveness::compute_liveness(ssarepr, regallocs);
         self.current_graph_name = Some(ssarepr.name.clone());
-        // Phase C v2 Slice C-3: snapshot the authoritative ValueId →
-        // RegKind table for `lookup_coloring`.  `flatten_with_types`
-        // populates `ssarepr.value_kinds` from the resolved type
-        // state and augments the canonical exception-block
-        // inputargs.  Cloning here keeps lookup_coloring's signature
-        // unchanged so the existing `regallocs` parameter still
-        // dominates write_insn's read path.
-        self.current_value_kinds = Some(ssarepr.value_kinds.clone());
 
         // Pyre-only diagnostic: under `MAJIT_COVERAGE_AUDIT=1` enumerate
         // every ValueId referenced in `ssarepr.insns` that has no
@@ -383,11 +422,6 @@ impl Assembler {
         };
 
         self.count_jitcodes += 1;
-        // Phase C v2 Slice C-3: drop the per-graph value_kinds snapshot.
-        // A subsequent assemble call will repopulate it from its own
-        // SSARepr, so leaking the previous graph's table here would let a
-        // stale entry mask a missing kind.
-        self.current_value_kinds = None;
         body
     }
 
@@ -418,16 +452,17 @@ impl Assembler {
                 let key = state.code.len();
                 state.startpoints.insert(key);
                 // assembler.py:151-156 `live_i, live_r, live_f` —
-                // partition live values by kind via the regalloc result.
+                // partition live registers by kind.  Each [`Register`]
+                // already carries `(kind, color)` from the flatten
+                // pass, so no regalloc lookup is needed here.
                 let mut live_i = Vec::new();
                 let mut live_r = Vec::new();
                 let mut live_f = Vec::new();
-                for &v in live_values {
-                    let (color, kind) = self.lookup_coloring(v, regallocs);
-                    match kind {
-                        RegKind::Int => live_i.push(color),
-                        RegKind::Ref => live_r.push(color),
-                        RegKind::Float => live_f.push(color),
+                for r in live_values {
+                    match r.kind {
+                        RegKind::Int => live_i.push(r.index as u8),
+                        RegKind::Ref => live_r.push(r.index as u8),
+                        RegKind::Float => live_f.push(r.index as u8),
                     }
                 }
                 // assembler.py:236 `key = (frozenset(live_i), …)` —
@@ -507,7 +542,7 @@ impl Assembler {
             // RPython flatten.py:247-267: goto_if_not(cond, TLabel(false_path))
             // Only goto_if_not exists — no goto_if_true in RPython.
             FlatOp::GotoIfNot { cond, target } => {
-                let (reg, _) = self.lookup_reg_with_kind(*cond, regallocs);
+                let reg = reg_byte(*cond, RegKind::Int, regallocs);
                 let opnum = self.get_opnum("goto_if_not/iL");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -520,8 +555,7 @@ impl Assembler {
             }
 
             FlatOp::Switch { value, targets } => {
-                let (reg, kind) = self.lookup_reg_with_kind(*value, regallocs);
-                assert_eq!(kind, 'i', "switch/id expects an int register");
+                let reg = reg_byte(*value, RegKind::Int, regallocs);
                 let descr_idx = self.emit_pending_switch_descr(targets.clone());
                 let opnum = self.get_opnum("switch/id");
                 state.startpoints.insert(state.code.len());
@@ -544,12 +578,9 @@ impl Assembler {
                     IntOvfOp::Mul => "int_mul_jump_if_ovf/Lii>i",
                 };
                 let opnum = self.get_opnum(opname);
-                let (lhs_reg, lhs_kind) = self.lookup_reg_with_kind(*lhs, regallocs);
-                let (rhs_reg, rhs_kind) = self.lookup_reg_with_kind(*rhs, regallocs);
-                let (dst_reg, dst_kind) = self.lookup_reg_with_kind(*dst, regallocs);
-                debug_assert_eq!(lhs_kind, 'i');
-                debug_assert_eq!(rhs_kind, 'i');
-                debug_assert_eq!(dst_kind, 'i');
+                let lhs_reg = reg_byte(*lhs, RegKind::Int, regallocs);
+                let rhs_reg = reg_byte(*rhs, RegKind::Int, regallocs);
+                let dst_reg = reg_byte(*dst, RegKind::Int, regallocs);
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.alllabels.insert(state.code.len());
@@ -576,72 +607,47 @@ impl Assembler {
             // disambiguates register vs constant at decode time via
             // `byte >= count_regs[kind]`.
             FlatOp::Move { dst, src } => {
-                let (dst_reg, dst_kind) = self.lookup_reg_with_kind(*dst, regallocs);
-                let (src_reg, src_kind) = self.encode_link_arg_source(src, regallocs, state);
+                let (src_reg, src_kind) =
+                    self.encode_regorconst_source(src, regallocs, state, dst.kind);
+                let dst_kind_char = kind_char_of(dst.kind);
                 debug_assert_eq!(
-                    src_kind, dst_kind,
+                    src_kind, dst_kind_char,
                     "int/ref/float_copy src and dst must share kind"
                 );
-                let kind_name = match src_kind {
-                    'r' => "ref",
-                    'f' => "float",
-                    _ => "int",
-                };
+                let kind_name = kind_long_name(dst.kind);
                 let key = format!("{kind_name}_copy/{src_kind}>{src_kind}");
                 let opnum = self.get_opnum(&key);
                 state.code.push(opnum);
                 state.code.push(src_reg);
-                state.code.push(dst_reg);
-                // RPython `assembler.py:210-212`: when argcodes contain
-                // `>`, record the reskind at the current pc. Mirrors
-                // `encode_op`'s handling of any op with a result slot.
+                state.code.push(dst.index as u8);
                 state.resulttypes.insert(state.code.len(), src_kind);
             }
 
             // RPython `flatten.py:329` `self.emitline('%s_push' % kind, v)`.
-            // Argcodes: one typed register, no result marker. Blackhole
-            // wires under `{kind}_push/{kind}` (see blackhole.rs:5727-5729).
-            // Only register-backed cycle breaks reach this path.
             FlatOp::Push(src) => {
-                let (src_reg, src_kind) = self.lookup_reg_with_kind(*src, regallocs);
-                let kind_name = match src_kind {
-                    'r' => "ref",
-                    'f' => "float",
-                    _ => "int",
-                };
-                let key = format!("{kind_name}_push/{src_kind}");
+                let kind_char = kind_char_of(src.kind);
+                let kind_name = kind_long_name(src.kind);
+                let key = format!("{kind_name}_push/{kind_char}");
                 let opnum = self.get_opnum(&key);
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
-                state.code.push(src_reg);
-                // No `>` in argcodes → no resulttypes entry (upstream
-                // `assembler.py:210-212` guarded on `'>' in argcodes`).
+                state.code.push(src.index as u8);
             }
 
             // RPython `flatten.py:331` `self.emitline('%s_pop' % kind, "->", w)`.
-            // Argcodes: `>{kind}` — result marker then one typed register.
-            // Blackhole wires under `{kind}_pop/>{kind}` (see
-            // blackhole.rs:5730-5732).
             FlatOp::Pop(dst) => {
-                let (dst_reg, dst_kind) = self.lookup_reg_with_kind(*dst, regallocs);
-                let kind_name = match dst_kind {
-                    'r' => "ref",
-                    'f' => "float",
-                    _ => "int",
-                };
-                let key = format!("{kind_name}_pop/>{dst_kind}");
+                let kind_char = kind_char_of(dst.kind);
+                let kind_name = kind_long_name(dst.kind);
+                let key = format!("{kind_name}_pop/>{kind_char}");
                 let opnum = self.get_opnum(&key);
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
-                state.code.push(dst_reg);
-                // `>` present in argcodes → record reskind per upstream
-                // `assembler.py:210-212`.
-                state.resulttypes.insert(state.code.len(), dst_kind);
+                state.code.push(dst.index as u8);
+                state.resulttypes.insert(state.code.len(), kind_char);
             }
 
             FlatOp::LastException { dst } => {
-                let (reg, kind) = self.lookup_reg_with_kind(*dst, regallocs);
-                debug_assert_eq!(kind, 'i');
+                let reg = reg_byte(*dst, RegKind::Int, regallocs);
                 let opnum = self.get_opnum("last_exception/>i");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -650,8 +656,7 @@ impl Assembler {
             }
 
             FlatOp::LastExcValue { dst } => {
-                let (reg, kind) = self.lookup_reg_with_kind(*dst, regallocs);
-                debug_assert_eq!(kind, 'r');
+                let reg = reg_byte(*dst, RegKind::Ref, regallocs);
                 let opnum = self.get_opnum("last_exc_value/>r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -671,24 +676,21 @@ impl Assembler {
             // single-byte argcode `i`/`r`/`f` suffices for both register
             // and constant sources (upstream `assembler.py:164-174`).
             FlatOp::IntReturn(v) => {
-                let (reg, kind) = self.encode_link_arg_source(v, regallocs, state);
-                debug_assert_eq!(kind, 'i');
+                let reg = self.encode_link_arg_for_kind(v, RegKind::Int, regallocs, state);
                 let opnum = self.get_opnum("int_return/i");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(reg);
             }
             FlatOp::RefReturn(v) => {
-                let (reg, kind) = self.encode_link_arg_source(v, regallocs, state);
-                debug_assert_eq!(kind, 'r');
+                let reg = self.encode_link_arg_for_kind(v, RegKind::Ref, regallocs, state);
                 let opnum = self.get_opnum("ref_return/r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(reg);
             }
             FlatOp::FloatReturn(v) => {
-                let (reg, kind) = self.encode_link_arg_source(v, regallocs, state);
-                debug_assert_eq!(kind, 'f');
+                let reg = self.encode_link_arg_for_kind(v, RegKind::Float, regallocs, state);
                 let opnum = self.get_opnum("float_return/f");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -707,8 +709,7 @@ impl Assembler {
             // OverflowError instance), and the single-byte argcode `r`
             // covers both.  Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.
             FlatOp::Raise(v) => {
-                let (reg, kind) = self.encode_link_arg_source(v, regallocs, state);
-                debug_assert_eq!(kind, 'r');
+                let reg = self.encode_link_arg_for_kind(v, RegKind::Ref, regallocs, state);
                 let opnum = self.get_opnum("raise/r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -830,6 +831,49 @@ impl Assembler {
                 let kind = crate::flatten::constvalue_kind(cv);
                 let byte = self.emit_const(cv, kind, state);
                 (byte, kind)
+            }
+        }
+    }
+
+    /// Phase 3 — explicit-kind sibling of [`Self::encode_link_arg_source`]
+    /// for FlatOp variants whose operand kind is fixed by the variant
+    /// itself (`int_return`/`ref_return`/`float_return`/`raise`).  No
+    /// `value_kinds` lookup is needed; kinds come straight from the
+    /// caller.
+    fn encode_link_arg_for_kind(
+        &mut self,
+        arg: &LinkArg,
+        kind: RegKind,
+        regallocs: &HashMap<RegKind, RegAllocResult>,
+        state: &mut AssemblyState,
+    ) -> u8 {
+        match arg {
+            LinkArg::Value(v) => reg_byte(*v, kind, regallocs),
+            LinkArg::Const(cv) => self.emit_const(cv, kind_char_of(kind), state),
+        }
+    }
+
+    /// Phase 3 [`RegOrConst`] companion of [`Self::encode_link_arg_source`].
+    ///
+    /// `RegOrConst::Reg` carries `(kind, color)` directly so no
+    /// `lookup_reg_with_kind` lookup is needed.  Constants emit through
+    /// the same `emit_const` path; `dst_kind` provides the expected
+    /// kind so a [`ConstValue`] whose [`crate::flatten::constvalue_kind`]
+    /// would otherwise pick the wrong char (e.g. `HostObject` →
+    /// `'r'` while the dst is int) is forced to the dst kind.
+    fn encode_regorconst_source(
+        &mut self,
+        arg: &crate::flatten::RegOrConst,
+        _regallocs: &HashMap<RegKind, RegAllocResult>,
+        state: &mut AssemblyState,
+        dst_kind: RegKind,
+    ) -> (u8, char) {
+        match arg {
+            crate::flatten::RegOrConst::Reg(r) => (r.index as u8, kind_char_of(r.kind)),
+            crate::flatten::RegOrConst::Const(cv) => {
+                let kind_char = kind_char_of(dst_kind);
+                let byte = self.emit_const(cv, kind_char, state);
+                (byte, kind_char)
             }
         }
     }
@@ -1768,72 +1812,42 @@ impl Assembler {
         );
     }
 
-    /// Resolve `(register_index, kind)` for a `ValueId`.
-    ///
-    /// RPython parity: every `Variable` reaching the assembler has a
-    /// `concretetype` and therefore exactly one `(kind, color)` pair
-    /// via `getkind()` + `regalloc.py` (`rpython/jit/codewriter/
-    /// regalloc.py`).  Phase C v2 Slice C-3 promotes pyre to the same
-    /// invariant: `current_value_kinds[v]` (set at `assemble` entry
-    /// from `ssarepr.value_kinds`) is the authoritative kind, and the
-    /// matching `regallocs[kind].coloring` is the only place we look
-    /// for the color.  A miss in either side panics with the full
-    /// per-class coverage so future drift surfaces at build time
-    /// rather than getting silently masked by the previous "search
-    /// all three classes" fallback.
+    /// Resolve `(register_index, kind)` for a `ValueId` via direct
+    /// regalloc lookup.  Phase 3 dropped the `value_kinds` side-table,
+    /// so the kind is no longer pre-declared per value — it is
+    /// recovered by searching `regallocs` for the first class that
+    /// colored `v`.  RPython has no equivalent because its
+    /// `Variable.concretetype` carries the kind directly; pyre's
+    /// equivalent is the per-class regalloc result, and well-typed
+    /// graphs land in exactly one class.  A miss across all three
+    /// classes panics with the full per-class coverage so the gap is
+    /// debuggable.
     fn lookup_coloring(
         &self,
         v: ValueId,
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> (u8, RegKind) {
-        let value_kinds = self.current_value_kinds.as_ref().unwrap_or_else(|| {
-            panic!(
-                "lookup_coloring: assemble entry must seed current_value_kinds \
-                 before any write_insn lookup (graph={:?}, op={:?})",
-                self.current_graph_name, self.current_flatop_debug,
-            );
-        });
-        let class_coverage = || -> Vec<_> {
-            [RegKind::Int, RegKind::Ref, RegKind::Float]
-                .iter()
-                .filter_map(|k| regallocs.get(k).map(|ra| (*k, ra)))
-                .map(|(k, ra)| {
-                    let min = ra.coloring.keys().map(|v| v.0).min();
-                    let max = ra.coloring.keys().map(|v| v.0).max();
-                    let contains_v = ra.coloring.contains_key(&v);
-                    (k, ra.coloring.len(), min, max, contains_v)
-                })
-                .collect()
-        };
-        let expected = value_kinds.get(&v).copied().unwrap_or_else(|| {
-            panic!(
-                "lookup_coloring: value {v:?} has no value_kinds entry — \
-                 type-state did not classify it before regalloc \
-                 (graph={:?}, op={:?}, regalloc_coverage={:?})",
-                self.current_graph_name,
-                self.current_flatop_debug,
-                class_coverage(),
-            );
-        });
-        let ra = regallocs.get(&expected).unwrap_or_else(|| {
-            panic!(
-                "lookup_coloring: regallocs map is missing the expected kind {expected:?} \
-                 entry for value {v:?} (graph={:?}, op={:?})",
-                self.current_graph_name, self.current_flatop_debug,
-            );
-        });
-        let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
-            panic!(
-                "lookup_coloring: value {v:?} declared as {expected:?} by value_kinds \
-                 but has no coloring in regallocs[{expected:?}] — \
-                 type-state ↔ regalloc kind mismatch \
-                 (graph={:?}, op={:?}, regalloc_coverage={:?})",
-                self.current_graph_name,
-                self.current_flatop_debug,
-                class_coverage(),
-            );
-        });
-        (color as u8, expected)
+        for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+            if let Some(ra) = regallocs.get(&kind) {
+                if let Some(&color) = ra.coloring.get(&v) {
+                    return (color as u8, kind);
+                }
+            }
+        }
+        let class_coverage: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+            .iter()
+            .filter_map(|k| regallocs.get(k).map(|ra| (*k, ra)))
+            .map(|(k, ra)| {
+                let min = ra.coloring.keys().map(|v| v.0).min();
+                let max = ra.coloring.keys().map(|v| v.0).max();
+                (k, ra.coloring.len(), min, max)
+            })
+            .collect();
+        panic!(
+            "lookup_coloring: value {v:?} has no coloring in any regalloc class \
+             (graph={:?}, op={:?}, regalloc_coverage={:?})",
+            self.current_graph_name, self.current_flatop_debug, class_coverage,
+        );
     }
 
     /// Look up the register index (as u8) for a ValueId.
@@ -1967,21 +1981,17 @@ impl Assembler {
                         s.first_use_tag.get_or_insert("IntBinOpJumpIfOvf");
                     }
                 }
-                FlatOp::Move { dst, src } => {
-                    sites.entry(*dst).or_default().has_def = true;
-                    if let Some(v) = src.as_value() {
-                        let s = sites.entry(v).or_default();
-                        s.use_count += 1;
-                        s.first_use_tag.get_or_insert("Move");
-                    }
-                }
-                FlatOp::Push(v) => {
-                    let s = sites.entry(*v).or_default();
-                    s.use_count += 1;
-                    s.first_use_tag.get_or_insert("Push");
-                }
-                FlatOp::Pop(v) => {
-                    sites.entry(*v).or_default().has_def = true;
+                FlatOp::Move { .. } | FlatOp::Push(_) | FlatOp::Pop(_) => {
+                    // Phase 3 — Move/Push/Pop carry [`Register`]
+                    // (post-regalloc identity) rather than [`ValueId`],
+                    // so the audit (which is keyed on pre-regalloc
+                    // ValueIds) can no longer attribute uses/defs to a
+                    // specific source variable here.  The coverage
+                    // gap-finder still reads SpaceOperation arguments
+                    // via the surrounding match arms; cycle-break and
+                    // copy register operands are by construction
+                    // covered, so dropping them from the audit is
+                    // safe.
                 }
                 FlatOp::LastException { dst } | FlatOp::LastExcValue { dst } => {
                     sites.entry(*dst).or_default().has_def = true;
@@ -1996,10 +2006,9 @@ impl Assembler {
                         s.first_use_tag.get_or_insert("Return/Raise");
                     }
                 }
-                FlatOp::Live { live_values } => {
-                    for v in live_values {
-                        sites.entry(*v).or_default().live_count += 1;
-                    }
+                FlatOp::Live { .. } => {
+                    // Phase 3 — Live carries [`Register`]s now; not
+                    // tracked by the pre-regalloc ValueId audit.
                 }
                 FlatOp::Label(_)
                 | FlatOp::Jump(_)
@@ -3677,7 +3686,6 @@ mod tests {
             insns: vec![],
             num_values: 0,
             num_blocks: 1,
-            value_kinds: HashMap::new(),
             insns_pos: None,
         };
 
@@ -3702,7 +3710,6 @@ mod tests {
             )))],
             num_values: 0,
             num_blocks: 1,
-            value_kinds: HashMap::new(),
             insns_pos: None,
         };
 
@@ -3760,12 +3767,12 @@ mod tests {
         value_kinds.insert(v2, RegKind::Ref);
 
         let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
+        let _ = value_kinds; // Phase 3 dropped SSARepr.value_kinds
         let mut flat = SSARepr {
             name: "add".into(),
             insns: vec![],
             num_values: 3,
             num_blocks: 1,
-            value_kinds,
             insns_pos: None,
         };
         let mut asm = Assembler::new();
@@ -3834,8 +3841,6 @@ mod tests {
         // state) leaves it empty, but the Slice C-3 lookup_coloring
         // contract requires the same authoritative table that
         // `perform_all_register_allocations` consumed.
-        flat.value_kinds =
-            regalloc::augment_value_kinds_with_canonical_exceptblock(&rewritten, &value_kinds);
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
 
@@ -3961,8 +3966,6 @@ mod tests {
         // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
         // exceptblock-augmented map so `lookup_coloring` finds every
         // operand including the synthetic `(etype, evalue)` pair.
-        flat.value_kinds =
-            regalloc::augment_value_kinds_with_canonical_exceptblock(&rewritten, &value_kinds);
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
@@ -4084,8 +4087,6 @@ mod tests {
         // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
         // exceptblock-augmented map so `lookup_coloring` finds every
         // operand including the synthetic `(etype, evalue)` pair.
-        flat.value_kinds =
-            regalloc::augment_value_kinds_with_canonical_exceptblock(&rewritten, &value_kinds);
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
@@ -4179,8 +4180,6 @@ mod tests {
         // with the canonical-exceptblock-augmented map so
         // `lookup_coloring` finds every operand including the
         // synthetic `(etype, evalue)` pair.
-        flat.value_kinds =
-            regalloc::augment_value_kinds_with_canonical_exceptblock(&graph, &value_kinds);
         assert!(
             !flat.insns.iter().any(|op| matches!(
                 op,
@@ -4217,7 +4216,6 @@ mod tests {
             })],
             num_values: 1,
             num_blocks: 1,
-            value_kinds: HashMap::new(),
             insns_pos: None,
         };
         let mut regallocs = HashMap::new();

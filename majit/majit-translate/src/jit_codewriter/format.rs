@@ -28,8 +28,29 @@
 use std::collections::HashMap;
 use std::fmt::Write;
 
-use crate::flatten::{FlatOp, Label, RegKind, SSARepr};
+use crate::flatten::{FlatOp, Label, RegKind, RegOrConst, SSARepr};
 use crate::model::ValueId;
+
+/// `flatten.py:30 Register.kind[0]` — single-char prefix used in
+/// `int_copy`/`ref_copy`/`float_copy` opnames.
+fn kind_short_name(kind: RegKind) -> &'static str {
+    match kind {
+        RegKind::Int => "int",
+        RegKind::Ref => "ref",
+        RegKind::Float => "float",
+    }
+}
+
+/// `flatten.py:382-391 getcolor` returns either a [`Register`] (printed
+/// as `%i<n>`/`%r<n>`/`%f<n>`) or a [`ConstValue`] (printed as
+/// `$<value>`).  This helper renders the union form for `int_copy`
+/// source operands and `int_return` arguments.
+fn regorconst_repr(arg: &RegOrConst) -> String {
+    match arg {
+        RegOrConst::Reg(r) => r.repr(),
+        RegOrConst::Const(cv) => format!("${cv}"),
+    }
+}
 
 /// format.py:12-81 `format_assembler(ssarepr)`.
 pub fn format_assembler(ssarepr: &SSARepr) -> String {
@@ -88,7 +109,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 }
             }
             FlatOp::Op(space_op) => {
-                let args = op_args_repr(space_op, &ssarepr.value_kinds);
+                let args = op_args_repr(space_op);
                 if args.is_empty() {
                     let _ = writeln!(out, "{prefix}{}", op_name(space_op));
                 } else {
@@ -115,7 +136,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let _ = writeln!(
                     out,
                     "{prefix}goto_if_not {}, L{num}",
-                    register_repr(*cond, &ssarepr.value_kinds)
+                    register_repr_for_kind(*cond, RegKind::Int)
                 );
             }
             FlatOp::Switch { value, targets } => {
@@ -129,7 +150,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let _ = writeln!(
                     out,
                     "{prefix}switch {}, <SwitchDictDescr {}>",
-                    register_repr(*value, &ssarepr.value_kinds),
+                    register_repr_for_kind(*value, RegKind::Int),
                     cases.join(", ")
                 );
             }
@@ -149,61 +170,51 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let _ = writeln!(
                     out,
                     "{prefix}{opname} L{num}, {}, {} -> {}",
-                    register_repr(*lhs, &ssarepr.value_kinds),
-                    register_repr(*rhs, &ssarepr.value_kinds),
-                    register_repr(*dst, &ssarepr.value_kinds)
+                    register_repr_for_kind(*lhs, RegKind::Int),
+                    register_repr_for_kind(*rhs, RegKind::Int),
+                    register_repr_for_kind(*dst, RegKind::Int)
                 );
             }
-            // `flatten.py:333-335` emits opnames prefixed by kind —
-            // `int_copy`/`ref_copy`/`float_copy`,
+            // `flatten.py:333-335` — opnames are kind-prefixed
+            // (`int_copy`/`ref_copy`/`float_copy`,
             // `int_push`/`ref_push`/`float_push`,
-            // `int_pop`/`ref_pop`/`float_pop` — so the formatter just
-            // prints `asm[0]` verbatim. Mirror that here by deriving
-            // the kind from the moved register's `value_kinds` entry.
+            // `int_pop`/`ref_pop`/`float_pop`).  After Phase 3 the
+            // [`Register`] operand carries its kind directly, so the
+            // formatter no longer reaches into a side-table — it just
+            // reads `dst.kind` / `src.kind` for the prefix.
             FlatOp::Move { dst, src } => {
-                let kind = linkarg_kind_name(src, &ssarepr.value_kinds);
+                let kind = kind_short_name(dst.kind);
                 let _ = writeln!(
                     out,
                     "{prefix}{kind}_copy {} -> {}",
-                    linkarg_repr(src, &ssarepr.value_kinds),
-                    register_repr(*dst, &ssarepr.value_kinds)
+                    regorconst_repr(src),
+                    dst.repr()
                 );
             }
             FlatOp::Push(src) => {
-                let kind = kind_name(*src, &ssarepr.value_kinds);
-                let _ = writeln!(
-                    out,
-                    "{prefix}{kind}_push {}",
-                    register_repr(*src, &ssarepr.value_kinds)
-                );
+                let kind = kind_short_name(src.kind);
+                let _ = writeln!(out, "{prefix}{kind}_push {}", src.repr());
             }
             FlatOp::Pop(dst) => {
-                let kind = kind_name(*dst, &ssarepr.value_kinds);
-                let _ = writeln!(
-                    out,
-                    "{prefix}{kind}_pop -> {}",
-                    register_repr(*dst, &ssarepr.value_kinds)
-                );
+                let kind = kind_short_name(dst.kind);
+                let _ = writeln!(out, "{prefix}{kind}_pop -> {}", dst.repr());
             }
             FlatOp::LastException { dst } => {
                 let _ = writeln!(
                     out,
                     "{prefix}last_exception -> {}",
-                    register_repr(*dst, &ssarepr.value_kinds)
+                    register_repr_for_kind(*dst, RegKind::Int)
                 );
             }
             FlatOp::LastExcValue { dst } => {
                 let _ = writeln!(
                     out,
                     "{prefix}last_exc_value -> {}",
-                    register_repr(*dst, &ssarepr.value_kinds)
+                    register_repr_for_kind(*dst, RegKind::Ref)
                 );
             }
             FlatOp::Live { live_values } => {
-                let mut names: Vec<String> = live_values
-                    .iter()
-                    .map(|v| register_repr(*v, &ssarepr.value_kinds))
-                    .collect();
+                let mut names: Vec<String> = live_values.iter().map(|reg| reg.repr()).collect();
                 // format.py:76: `if asm[0] == '-live-': lst.sort()`.
                 names.sort();
                 let _ = writeln!(out, "{prefix}-live- {}", names.join(", "));
@@ -215,21 +226,21 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let _ = writeln!(
                     out,
                     "{prefix}int_return {}",
-                    linkarg_repr(v, &ssarepr.value_kinds)
+                    linkarg_repr_for_kind(v, RegKind::Int)
                 );
             }
             FlatOp::RefReturn(v) => {
                 let _ = writeln!(
                     out,
                     "{prefix}ref_return {}",
-                    linkarg_repr(v, &ssarepr.value_kinds)
+                    linkarg_repr_for_kind(v, RegKind::Ref)
                 );
             }
             FlatOp::FloatReturn(v) => {
                 let _ = writeln!(
                     out,
                     "{prefix}float_return {}",
-                    linkarg_repr(v, &ssarepr.value_kinds)
+                    linkarg_repr_for_kind(v, RegKind::Float)
                 );
             }
             FlatOp::VoidReturn => {
@@ -239,7 +250,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let _ = writeln!(
                     out,
                     "{prefix}raise {}",
-                    linkarg_repr(v, &ssarepr.value_kinds)
+                    linkarg_repr_for_kind(v, RegKind::Ref)
                 );
             }
             FlatOp::EndOfBlock => {
@@ -323,8 +334,7 @@ fn normalize_expected(expected: &str) -> String {
     out
 }
 
-fn register_repr(v: ValueId, kinds: &HashMap<ValueId, RegKind>) -> String {
-    let kind = kinds.get(&v).copied().unwrap_or(RegKind::Ref);
+fn register_repr_for_kind(v: ValueId, kind: RegKind) -> String {
     let prefix = match kind {
         RegKind::Int => 'i',
         RegKind::Ref => 'r',
@@ -333,40 +343,10 @@ fn register_repr(v: ValueId, kinds: &HashMap<ValueId, RegKind>) -> String {
     format!("%{prefix}{}", v.0)
 }
 
-/// `flatten.py:326-335` — the kind prefix used when spelling
-/// `int_copy`/`ref_copy`/`float_copy` (and `*_push`/`*_pop`).
-fn kind_name(v: ValueId, kinds: &HashMap<ValueId, RegKind>) -> &'static str {
-    match kinds.get(&v).copied().unwrap_or(RegKind::Ref) {
-        RegKind::Int => "int",
-        RegKind::Ref => "ref",
-        RegKind::Float => "float",
-    }
-}
-
-/// Upstream `getcolor(v)` returns either a `Register` (→ `%{i,r,f}<n>`)
-/// or a `Constant` (→ `$<value>`); reproduce both shapes for the
-/// `int_copy`/`ref_copy`/`float_copy` + `*_push` + `*_return` + `raise`
-/// source operand printing.
-fn linkarg_repr(arg: &crate::model::LinkArg, kinds: &HashMap<ValueId, RegKind>) -> String {
+fn linkarg_repr_for_kind(arg: &crate::model::LinkArg, kind: RegKind) -> String {
     match arg {
-        crate::model::LinkArg::Value(v) => register_repr(*v, kinds),
+        crate::model::LinkArg::Value(v) => register_repr_for_kind(*v, kind),
         crate::model::LinkArg::Const(cv) => format!("${cv}"),
-    }
-}
-
-/// Kind prefix for a [`LinkArg`] source — `value_kinds` for Variables,
-/// `ConstValue` shape (via `flatten::constvalue_kind`) for Constants.
-fn linkarg_kind_name(
-    arg: &crate::model::LinkArg,
-    kinds: &HashMap<ValueId, RegKind>,
-) -> &'static str {
-    match arg {
-        crate::model::LinkArg::Value(v) => kind_name(*v, kinds),
-        crate::model::LinkArg::Const(cv) => match crate::flatten::constvalue_kind(cv) {
-            'i' => "int",
-            'f' => "float",
-            _ => "ref",
-        },
     }
 }
 
@@ -374,13 +354,18 @@ fn linkarg_kind_name(
 ///
 /// Upstream emits `'%s[%s]' % (x.kind[0].upper(), ', '.join(map(repr, x)))`.
 /// Pyre's call-family `OpKind` variants split args into typed
-/// `args_i`/`args_r`/`args_f` Vecs, so the kind char is fixed per slot.
-fn list_of_kind_repr(
-    kind_char: char,
-    args: &[ValueId],
-    kinds: &HashMap<ValueId, RegKind>,
-) -> String {
-    let parts: Vec<String> = args.iter().map(|v| register_repr(*v, kinds)).collect();
+/// `args_i`/`args_r`/`args_f` Vecs, so the kind char is fixed per slot —
+/// it is passed in directly rather than fetched from a side-table.
+fn list_of_kind_repr(kind_char: char, args: &[ValueId]) -> String {
+    let kind = match kind_char.to_ascii_lowercase() {
+        'i' => RegKind::Int,
+        'f' => RegKind::Float,
+        _ => RegKind::Ref,
+    };
+    let parts: Vec<String> = args
+        .iter()
+        .map(|v| register_repr_for_kind(*v, kind))
+        .collect();
     format!("{}[{}]", kind_char.to_ascii_uppercase(), parts.join(", "))
 }
 
@@ -415,13 +400,14 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
     }
 }
 
-fn call_funcptr_repr(
-    funcptr: &crate::model::CallFuncPtr,
-    kinds: &std::collections::HashMap<crate::model::ValueId, crate::flatten::RegKind>,
-) -> String {
+fn call_funcptr_repr(funcptr: &crate::model::CallFuncPtr) -> String {
     match funcptr {
         crate::model::CallFuncPtr::Target(target) => call_target_repr(target),
-        crate::model::CallFuncPtr::Value(value) => register_repr(*value, kinds),
+        // The funcptr slot of a residual_call/inline_call is always
+        // ref-typed (the boxed callee pointer), per
+        // `jtransform.py:457 [op.args[0]] + extraargs` where `args[0]`
+        // is the function pointer Constant or Variable.
+        crate::model::CallFuncPtr::Value(value) => register_repr_for_kind(*value, RegKind::Ref),
     }
 }
 
@@ -514,12 +500,21 @@ fn kind_signature(args_i: &[ValueId], args_r: &[ValueId], args_f: &[ValueId]) ->
     out
 }
 
-fn op_args_repr(op: &crate::model::SpaceOperation, kinds: &HashMap<ValueId, RegKind>) -> String {
+fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
     use crate::model::OpKind;
     let mut out = String::new();
     match &op.kind {
+        // OpKind::Call carries a heterogeneous argument list with no
+        // per-slot kind information.  Phase 3 dropped the value_kinds
+        // side-table that previously rescued the formatting, so this
+        // branch falls back to printing each value as `%r<n>` (Ref) —
+        // good enough for debug output until OpKind::Call grows typed
+        // slots like the other call families.
         OpKind::Call { args, .. } => {
-            let parts: Vec<String> = args.iter().map(|v| register_repr(*v, kinds)).collect();
+            let parts: Vec<String> = args
+                .iter()
+                .map(|v| register_repr_for_kind(*v, RegKind::Ref))
+                .collect();
             out.push_str(&parts.join(", "));
         }
         // format.py:23 `'$%r' % (x.value,)` — constants print as $<value>.
@@ -561,17 +556,17 @@ fn op_args_repr(op: &crate::model::SpaceOperation, kinds: &HashMap<ValueId, RegK
             args_f,
             ..
         } => {
-            let mut parts = vec![call_funcptr_repr(funcptr, kinds)];
+            let mut parts = vec![call_funcptr_repr(funcptr)];
             // jtransform.py:430-433 — emit each ListOfKind only when the
             // matching kind char is in the signature.
             if !args_i.is_empty() {
-                parts.push(list_of_kind_repr('i', args_i, kinds));
+                parts.push(list_of_kind_repr('i', args_i));
             }
             if !args_r.is_empty() {
-                parts.push(list_of_kind_repr('r', args_r, kinds));
+                parts.push(list_of_kind_repr('r', args_r));
             }
             if !args_f.is_empty() {
-                parts.push(list_of_kind_repr('f', args_f, kinds));
+                parts.push(list_of_kind_repr('f', args_f));
             }
             // jtransform.py:434 — descr is the last sublist when set.
             parts.push(format!("{:?}", descriptor.extra_info));
@@ -595,13 +590,13 @@ fn op_args_repr(op: &crate::model::SpaceOperation, kinds: &HashMap<ValueId, RegK
             };
             let mut parts = vec![head];
             if !args_i.is_empty() {
-                parts.push(list_of_kind_repr('i', args_i, kinds));
+                parts.push(list_of_kind_repr('i', args_i));
             }
             if !args_r.is_empty() {
-                parts.push(list_of_kind_repr('r', args_r, kinds));
+                parts.push(list_of_kind_repr('r', args_r));
             }
             if !args_f.is_empty() {
-                parts.push(list_of_kind_repr('f', args_f, kinds));
+                parts.push(list_of_kind_repr('f', args_f));
             }
             out.push_str(&parts.join(", "));
         }
@@ -619,12 +614,12 @@ fn op_args_repr(op: &crate::model::SpaceOperation, kinds: &HashMap<ValueId, RegK
             ..
         } => {
             let mut parts = vec![format!("${jd_index}")];
-            parts.push(list_of_kind_repr('i', greens_i, kinds));
-            parts.push(list_of_kind_repr('r', greens_r, kinds));
-            parts.push(list_of_kind_repr('f', greens_f, kinds));
-            parts.push(list_of_kind_repr('i', reds_i, kinds));
-            parts.push(list_of_kind_repr('r', reds_r, kinds));
-            parts.push(list_of_kind_repr('f', reds_f, kinds));
+            parts.push(list_of_kind_repr('i', greens_i));
+            parts.push(list_of_kind_repr('r', greens_r));
+            parts.push(list_of_kind_repr('f', greens_f));
+            parts.push(list_of_kind_repr('i', reds_i));
+            parts.push(list_of_kind_repr('r', reds_r));
+            parts.push(list_of_kind_repr('f', reds_f));
             out.push_str(&parts.join(", "));
         }
         _ => {
@@ -641,7 +636,26 @@ fn op_args_repr(op: &crate::model::SpaceOperation, kinds: &HashMap<ValueId, RegK
             out.push(' ');
         }
         out.push_str("-> ");
-        out.push_str(&register_repr(result, kinds));
+        // Result kind defaults to Ref when the OpKind doesn't pin it
+        // explicitly.  Phase 3 dropped value_kinds so the per-result
+        // kind comes from the variant when known (e.g. CallElidable
+        // carries `result_kind`); the fallback `register_repr_for_kind`
+        // call mirrors the previous "default Ref when missing" path.
+        let result_kind = match &op.kind {
+            crate::model::OpKind::CallElidable { result_kind, .. }
+            | crate::model::OpKind::CallResidual { result_kind, .. }
+            | crate::model::OpKind::CallMayForce { result_kind, .. }
+            | crate::model::OpKind::InlineCall { result_kind, .. }
+            | crate::model::OpKind::RecursiveCall { result_kind, .. } => match result_kind {
+                'i' => RegKind::Int,
+                'f' => RegKind::Float,
+                _ => RegKind::Ref,
+            },
+            crate::model::OpKind::ConstInt(_) => RegKind::Int,
+            crate::model::OpKind::ConstFloat(_) => RegKind::Float,
+            _ => RegKind::Ref,
+        };
+        out.push_str(&register_repr_for_kind(result, result_kind));
     }
     out
 }
@@ -657,7 +671,6 @@ mod tests {
             insns: Vec::new(),
             num_values: 0,
             num_blocks: 0,
-            value_kinds: HashMap::new(),
             insns_pos: None,
         }
     }
@@ -684,7 +697,6 @@ mod tests {
     #[test]
     fn format_switch_uses_switchdictdescr_repr() {
         let mut ssa = empty_ssa();
-        ssa.value_kinds.insert(ValueId(0), RegKind::Int);
         ssa.insns.push(FlatOp::Switch {
             value: ValueId(0),
             targets: vec![(4, Label(2)), (5, Label(1))],
@@ -736,7 +748,6 @@ mod tests {
         // format.py:23 `'$%r' % (x.value,)`.
         use crate::model::{OpKind, SpaceOperation};
         let mut ssa = empty_ssa();
-        ssa.value_kinds.insert(ValueId(0), RegKind::Int);
         ssa.insns.push(FlatOp::Op(SpaceOperation {
             kind: OpKind::ConstInt(42),
             result: Some(ValueId(0)),
@@ -754,9 +765,6 @@ mod tests {
         use majit_ir::descr::EffectInfo;
 
         let mut ssa = empty_ssa();
-        ssa.value_kinds.insert(ValueId(1), RegKind::Int);
-        ssa.value_kinds.insert(ValueId(2), RegKind::Ref);
-        ssa.value_kinds.insert(ValueId(3), RegKind::Int);
 
         let funcptr = CallTarget::function_path(["foo"]);
         let descriptor = CallDescriptor::known(EffectInfo::default());
@@ -800,7 +808,6 @@ mod tests {
     fn format_inline_call_emits_jitcode_and_listofkind() {
         use crate::model::{OpKind, SpaceOperation};
         let mut ssa = empty_ssa();
-        ssa.value_kinds.insert(ValueId(1), RegKind::Ref);
         let callee = std::sync::Arc::new(crate::jitcode::JitCode::new("callee"));
         callee.set_index(7);
         ssa.insns.push(FlatOp::Op(SpaceOperation {
@@ -830,8 +837,6 @@ mod tests {
     fn format_recursive_call_emits_jd_and_six_listofkinds() {
         use crate::model::{OpKind, SpaceOperation};
         let mut ssa = empty_ssa();
-        ssa.value_kinds.insert(ValueId(1), RegKind::Int);
-        ssa.value_kinds.insert(ValueId(2), RegKind::Ref);
         ssa.insns.push(FlatOp::Op(SpaceOperation {
             kind: OpKind::RecursiveCall {
                 jd_index: 0,

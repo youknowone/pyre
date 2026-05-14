@@ -11,23 +11,30 @@
 
 use std::collections::{HashMap, HashSet};
 
-use crate::flatten::{FlatOp, Label, SSARepr};
+use crate::flatten::{FlatOp, Label, RegKind, Register, SSARepr};
 use crate::model::ValueId;
+use crate::regalloc::RegAllocResult;
 
 /// Compute liveness for a flattened function.
 ///
 /// RPython: `liveness.py::compute_liveness(ssarepr)`.
 ///
 /// Modifies the flattened ops in place: each `FlatOp::Live` marker
-/// gets its `live_values` set populated with all values alive at that
-/// point in the instruction sequence.
+/// gets its `live_values` set populated with all [`Register`]s alive
+/// at that point in the instruction sequence.
+///
+/// `regallocs` supplies the [`ValueId`]→`(kind, color)` mapping used
+/// to convert FlatOp::Op operand [`ValueId`]s to [`Register`]s for
+/// the alive set — RPython works directly on Registers because
+/// `serialize_op` already projects `Variable`→`Register` via
+/// `getcolor`; pyre keeps `SpaceOperation` slots as `ValueId` for now,
+/// so the conversion happens here at the liveness boundary.
 /// RPython liveness.py:19-23.
-pub fn compute_liveness(flattened: &mut SSARepr) {
-    let mut label2alive: HashMap<Label, HashSet<ValueId>> = HashMap::new();
+pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, RegAllocResult>) {
+    let mut label2alive: HashMap<Label, HashSet<Register>> = HashMap::new();
 
-    // Iterate to fixpoint (RPython: while _compute_liveness_must_continue)
     loop {
-        if !compute_liveness_pass(&mut flattened.insns, &mut label2alive) {
+        if !compute_liveness_pass(&mut flattened.insns, &mut label2alive, regallocs) {
             break;
         }
     }
@@ -35,10 +42,19 @@ pub fn compute_liveness(flattened: &mut SSARepr) {
     remove_repeated_live(&mut flattened.insns);
 }
 
+fn value_to_register(v: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> Option<Register> {
+    for (&kind, ra) in regallocs {
+        if let Some(&color) = ra.coloring.get(&v) {
+            return Some(Register::new(kind, color));
+        }
+    }
+    None
+}
+
 /// RPython liveness.py:82-116: remove_repeated_live.
 ///
 /// Merges consecutive `-live-` markers into a single one (union of
-/// all live values). Labels between them are preserved.
+/// all live registers). Labels between them are preserved.
 fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
     let mut result: Vec<FlatOp> = Vec::new();
     let mut i = 0;
@@ -48,13 +64,12 @@ fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
             i += 1;
             continue;
         }
-        // Collect consecutive Live + Label runs
         let mut labels = Vec::new();
-        let mut merged_live: HashSet<ValueId> = HashSet::new();
+        let mut merged_live: HashSet<Register> = HashSet::new();
         while i < ops.len() {
             match &ops[i] {
                 FlatOp::Live { live_values } => {
-                    merged_live.extend(live_values.iter());
+                    merged_live.extend(live_values.iter().copied());
                     i += 1;
                 }
                 FlatOp::Label(_) => {
@@ -64,10 +79,10 @@ fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
                 _ => break,
             }
         }
-        // Emit labels first, then the merged -live-
         result.extend(labels);
-        let mut merged: Vec<ValueId> = merged_live.into_iter().collect();
-        merged.sort_by_key(|v| v.0);
+        // Stable order so the final bytecode encoding is reproducible.
+        let mut merged: Vec<Register> = merged_live.into_iter().collect();
+        merged.sort_by_key(|r| (r.kind as u8, r.index));
         result.push(FlatOp::Live {
             live_values: merged,
         });
@@ -84,12 +99,28 @@ fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
 /// marker, expands it to include all values alive at that point.
 fn compute_liveness_pass(
     ops: &mut [FlatOp],
-    label2alive: &mut HashMap<Label, HashSet<ValueId>>,
+    label2alive: &mut HashMap<Label, HashSet<Register>>,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
 ) -> bool {
-    let mut alive: HashSet<ValueId> = HashSet::new();
+    let mut alive: HashSet<Register> = HashSet::new();
     let mut must_continue = false;
 
-    // Walk backward through instructions
+    // `def_value` and `use_value` route a `FlatOp::Op`-side
+    // [`ValueId`] through regalloc to its [`Register`] before joining
+    // the alive set.  Void / unallocated values are silently dropped
+    // (RPython's `flatten.py:325 if v.concretetype is not lltype.Void`
+    // makes the same filter at flatten time).
+    let def_value = |alive: &mut HashSet<Register>, v: ValueId| {
+        if let Some(r) = value_to_register(v, regallocs) {
+            alive.remove(&r);
+        }
+    };
+    let use_value = |alive: &mut HashSet<Register>, v: ValueId| {
+        if let Some(r) = value_to_register(v, regallocs) {
+            alive.insert(r);
+        }
+    };
+
     for i in (0..ops.len()).rev() {
         match &ops[i] {
             FlatOp::Label(label) => {
@@ -102,39 +133,27 @@ fn compute_liveness_pass(
                 }
             }
             FlatOp::Live { live_values } => {
-                // RPython liveness.py:44-52: -live- markers are expanded
-                // to include all values currently alive at this point.
-                // Also union any explicitly-forced values from jtransform.
-                for v in live_values {
-                    alive.insert(*v);
+                // RPython liveness.py:44-52: `-live-` markers are
+                // expanded to the full set of [`Register`]s alive at
+                // this point.  Pre-seeded values (e.g. forced by
+                // jtransform) merge in here.
+                for r in live_values {
+                    alive.insert(*r);
                 }
-                // Expand: replace this Live marker with all alive values.
                 ops[i] = FlatOp::Live {
                     live_values: alive.iter().copied().collect(),
                 };
             }
             FlatOp::EndOfBlock => {
-                // RPython `liveness.py:55-57`: `'---'` resets the alive
-                // set so the next block starts a fresh liveness region.
                 alive.clear();
             }
-            FlatOp::Unreachable => {
-                // The real `unreachable` opcode (`blackhole.py:962-964
-                // bhimpl_unreachable`) ends the trace path with an
-                // `AssertionError`. RPython treats it as a regular
-                // operand-less opcode and goes through `liveness.py:59+`
-                // with an empty arg list, leaving the alive set
-                // unchanged. The trailing `EndOfBlock` (`flatten.py:292-293`
-                // always emits the pair) is what resets it.
-            }
+            FlatOp::Unreachable => {}
             FlatOp::Op(inner_op) => {
-                // Result is defined here — remove from alive
                 if let Some(result) = inner_op.result {
-                    alive.remove(&result);
+                    def_value(&mut alive, result);
                 }
-                // Operands are used here — add to alive
                 for vid in crate::inline::op_value_refs(&inner_op.kind) {
-                    alive.insert(vid);
+                    use_value(&mut alive, vid);
                 }
             }
             FlatOp::Jump(label) => {
@@ -158,13 +177,13 @@ fn compute_liveness_pass(
             FlatOp::GotoIfNot { cond, target } => {
                 let cond = *cond;
                 let target = *target;
-                alive.insert(cond);
+                use_value(&mut alive, cond);
                 if let Some(alive_at_target) = label2alive.get(&target) {
                     alive.extend(alive_at_target.iter());
                 }
             }
             FlatOp::Switch { value, targets } => {
-                alive.insert(*value);
+                use_value(&mut alive, *value);
                 for (_, target) in targets {
                     if let Some(alive_at_target) = label2alive.get(target) {
                         alive.extend(alive_at_target.iter());
@@ -178,64 +197,49 @@ fn compute_liveness_pass(
                 dst,
                 ..
             } => {
-                alive.remove(dst);
-                alive.insert(*lhs);
-                alive.insert(*rhs);
+                def_value(&mut alive, *dst);
+                use_value(&mut alive, *lhs);
+                use_value(&mut alive, *rhs);
                 if let Some(alive_at_target) = label2alive.get(target) {
                     alive.extend(alive_at_target.iter());
                 }
             }
             FlatOp::Move { dst, src } => {
-                // `src` may be a Variable or a Constant (upstream
-                // `getcolor` at flatten.py:382-384 returns the Constant
-                // as-is); Constants contribute no live range.
+                // `flatten.py:333` — `int_copy %src -> %dst`.
+                // Backward: dst is defined, register source is used,
+                // constant source contributes nothing.
                 alive.remove(dst);
-                if let Some(v) = src.as_value() {
-                    alive.insert(v);
+                if let crate::flatten::RegOrConst::Reg(r) = src {
+                    alive.insert(*r);
                 }
             }
             FlatOp::Push(src) => {
-                // RPython `flatten.py:329` `%s_push` — reads `v` into
-                // tmpreg. Backwards: treat as a pure use of `src`.
-                //
-                // Only Variables reach this arm: upstream
-                // `reorder_renaming_list` at `flatten.py:395-414` only
-                // triggers a push when no progress is possible, which
-                // requires every `to[i]` Register to appear in `frm`;
-                // Constants are structurally distinct from Registers
-                // (Python `==`), so a Constant `frm[i]` is always
-                // consumed in a non-cycle step and never lands in the
-                // cycle-break save slot.
+                // `flatten.py:329` — `int_push %src` reads `src` into
+                // the per-kind tmpreg.  Backward: a pure use of src.
                 alive.insert(*src);
             }
             FlatOp::Pop(dst) => {
-                // RPython `flatten.py:331` `%s_pop` — writes tmpreg
-                // into `w`. Backwards: treat as a pure def of `dst`.
+                // `flatten.py:331` — `int_pop -> %dst` writes tmpreg
+                // into dst.  Backward: a pure def of dst.
                 alive.remove(dst);
             }
             FlatOp::LastException { dst } | FlatOp::LastExcValue { dst } => {
-                alive.remove(dst);
+                def_value(&mut alive, *dst);
             }
             FlatOp::Reraise => {}
             FlatOp::IntReturn(v) | FlatOp::RefReturn(v) | FlatOp::FloatReturn(v) => {
-                // RPython blackhole `bhimpl_*_return(a)` reads `a` and
-                // leaves the frame.  Backward walk: the return value is
-                // alive at this point; after it (forward) nothing is.
                 alive.clear();
                 if let Some(value) = v.as_value() {
-                    alive.insert(value);
+                    use_value(&mut alive, value);
                 }
             }
             FlatOp::VoidReturn => {
-                // `bhimpl_void_return()` has no args.  Nothing alive
-                // after the return.
                 alive.clear();
             }
             FlatOp::Raise(v) => {
-                // `bhimpl_raise(excvalue)` reads the evalue and raises.
                 alive.clear();
                 if let Some(value) = v.as_value() {
-                    alive.insert(value);
+                    use_value(&mut alive, value);
                 }
             }
         }
@@ -407,12 +411,15 @@ mod tests {
             ],
             num_values: 3,
             num_blocks: 1,
-            value_kinds: std::collections::HashMap::new(),
             insns_pos: None,
         };
 
-        // Should not panic
-        compute_liveness(&mut flat);
+        // Should not panic.  Phase 3 added the `regallocs` parameter
+        // for the FlatOp::Op `ValueId → Register` bridge; pass an
+        // empty map since this fixture has no inputargs that exercise
+        // the conversion.
+        let regallocs: HashMap<RegKind, RegAllocResult> = HashMap::new();
+        compute_liveness(&mut flat, &regallocs);
     }
 
     #[test]

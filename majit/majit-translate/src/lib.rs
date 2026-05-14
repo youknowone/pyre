@@ -49,7 +49,9 @@ mod test_support;
 pub mod translator;
 
 pub use call::{CallDescriptor, StructFieldLayout, StructLayout};
-pub use flatten::{FlatOp, Label, RegKind, SSARepr, flatten, flatten_with_types};
+pub use flatten::{
+    FlatOp, GraphFlattener, Label, RegKind, SSARepr, flatten, flatten_graph, flatten_with_types,
+};
 pub use front::{
     AstGraphOptions, SemanticFunction, SemanticProgram, build_semantic_program,
     build_semantic_program_from_parsed_files,

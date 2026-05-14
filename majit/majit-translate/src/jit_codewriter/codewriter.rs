@@ -376,14 +376,27 @@ impl CodeWriter {
             let start_block = rewritten.graph.block(rewritten.graph.startblock);
             let mut arg_classes = String::new();
             for arg_id in &start_block.inputargs {
-                match ssarepr.value_kinds.get(arg_id) {
-                    Some(RegKind::Int) => arg_classes.push('i'),
-                    Some(RegKind::Ref) => arg_classes.push('r'),
-                    Some(RegKind::Float) => arg_classes.push('f'),
-                    None => arg_classes.push('i'),
-                }
+                let class = if regallocs
+                    .get(&RegKind::Int)
+                    .is_some_and(|ra| ra.coloring.contains_key(arg_id))
+                {
+                    'i'
+                } else if regallocs
+                    .get(&RegKind::Ref)
+                    .is_some_and(|ra| ra.coloring.contains_key(arg_id))
+                {
+                    'r'
+                } else if regallocs
+                    .get(&RegKind::Float)
+                    .is_some_and(|ra| ra.coloring.contains_key(arg_id))
+                {
+                    'f'
+                } else {
+                    'i'
+                };
+                arg_classes.push(class);
             }
-            let cfg_kind = graph_result_kind(&rewritten.graph, &ssarepr.value_kinds);
+            let cfg_kind = graph_result_kind(&rewritten.graph, &regallocs);
             let declared_kind = callcontrol.declared_return_kind(path);
             let result_type = declared_kind.unwrap_or(cfg_kind);
             // Cross-check: when both sources are present they must agree,
@@ -572,21 +585,25 @@ impl Default for CodeWriter {
 /// pointer type; the graph-level surface is
 /// `flowspace/model.py:17-18` `graph.returnblock = Block([return_var])`,
 /// where `return_var.concretetype` carries the same information.
-/// pyre stores the kind in `value_kinds[returnblock.inputargs[0]]`
-/// after the rtyper pass, so read it directly instead of scanning
-/// block terminators.
+/// Phase 3 dropped the `value_kinds` side-table — pyre now reads the
+/// kind from the regalloc result directly: the returnblock's
+/// inputarg appears in exactly one of `regallocs[Int|Ref|Float]`.
 fn graph_result_kind(
     graph: &FunctionGraph,
-    value_kinds: &std::collections::HashMap<ValueId, RegKind>,
+    regallocs: &std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult>,
 ) -> char {
     let returnblock = graph.block(graph.returnblock);
-    match returnblock.inputargs.first() {
-        Some(vid) => match value_kinds.get(vid) {
-            Some(RegKind::Int) => 'i',
-            Some(RegKind::Ref) => 'r',
-            Some(RegKind::Float) => 'f',
-            None => 'v',
-        },
-        None => 'v',
+    let Some(vid) = returnblock.inputargs.first() else {
+        return 'v';
+    };
+    for (&kind, ra) in regallocs {
+        if ra.coloring.contains_key(vid) {
+            return match kind {
+                RegKind::Int => 'i',
+                RegKind::Ref => 'r',
+                RegKind::Float => 'f',
+            };
+        }
     }
+    'v'
 }

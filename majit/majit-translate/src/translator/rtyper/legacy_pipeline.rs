@@ -295,7 +295,6 @@ mod tests {
             )))],
             num_values: 0,
             num_blocks: 1,
-            value_kinds: Default::default(),
             insns_pos: None,
         };
         let program = ProgramPipelineResult {

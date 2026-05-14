@@ -2732,7 +2732,6 @@ mod tests {
                     insns: Vec::new(),
                     num_values: 0,
                     num_blocks: 0,
-                    value_kinds: std::collections::HashMap::new(),
                     insns_pos: None,
                 },
             });
@@ -2783,7 +2782,6 @@ mod tests {
                 insns: Vec::new(),
                 num_values: 0,
                 num_blocks: 0,
-                value_kinds: std::collections::HashMap::new(),
                 insns_pos: None,
             },
         });
