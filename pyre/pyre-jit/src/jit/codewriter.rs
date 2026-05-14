@@ -3546,13 +3546,11 @@ impl CodeWriter {
                         None,
                         -1,
                     );
-                    let scratch_depth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                    emit_load_const_i!(ssarepr, scratch_depth, depth_value);
-                    emit_vable_setfield_int!(
+                    emit_vable_setfield_int_const!(
                         ssarepr,
                         portal_frame_reg,
                         VABLE_VALUESTACKDEPTH_FIELD_IDX,
-                        scratch_depth
+                        depth_value
                     );
                 }
             };
@@ -4339,6 +4337,27 @@ impl CodeWriter {
                     vec![
                         Operand::reg(Kind::Ref, vable_reg),
                         Operand::reg(Kind::Int, src),
+                        Operand::descr_vable_static_field(field_idx),
+                    ],
+                );
+                push_walker_emit(&mut $ssarepr, &current_block, insn);
+            }};
+        }
+        macro_rules! emit_vable_setfield_int_const {
+            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $value:expr) => {{
+                let vable_reg: u16 = $vable_reg;
+                let field_idx: u16 = $field_idx;
+                let value: i64 = $value;
+                // ConstInt-source setfield_vable_i: assembler dispatch
+                // (assembler.rs:907-911) routes `Operand::ConstInt` to
+                // `vable_setfield_int_const_value_with_base`.  Matches
+                // upstream's flatten output for jtransform.py:927-928
+                // when the value is a folded ConstInt.
+                let insn = Insn::op(
+                    "setfield_vable_i",
+                    vec![
+                        Operand::reg(Kind::Ref, vable_reg),
+                        Operand::ConstInt(value),
                         Operand::descr_vable_static_field(field_idx),
                     ],
                 );
