@@ -243,6 +243,14 @@ impl Assembler {
     ///   ssarepr = flatten_graph(graph, regallocs)
     ///   compute_liveness(ssarepr)          ← step 3b
     ///   self.assembler.assemble(ssarepr)   ← step 4
+    /// **Test-only entrypoint** — production callers must use
+    /// [`Self::assemble_with_types`] so the strict
+    /// `getkind(v.concretetype)` path inside [`Self::lookup_coloring`]
+    /// is engaged.  PyPy's `Assembler.assemble` always runs against
+    /// a fully-typed `ssarepr`; this no-types overload exists only
+    /// for hand-built test fixtures whose graphs do not carry a
+    /// `TypeResolutionState`.  The KINDS-ordered single-class scan
+    /// fallback then takes over.
     pub fn assemble(
         &mut self,
         ssarepr: &mut SSARepr,
@@ -266,6 +274,9 @@ impl Assembler {
         self.assemble_with_callcontrol_and_types(ssarepr, regallocs, None, Some(types))
     }
 
+    /// **Test-only entrypoint** — production callers must use
+    /// [`Self::assemble_with_callcontrol_and_types`].  See
+    /// [`Self::assemble`] for the rationale.
     pub fn assemble_with_callcontrol(
         &mut self,
         ssarepr: &mut SSARepr,
@@ -288,7 +299,7 @@ impl Assembler {
         // [`crate::flatten::Register`]-based identity, so liveness now
         // also takes the regalloc result for the `ValueId → Register`
         // bridge on `FlatOp::Op` operands.
-        crate::liveness::compute_liveness(ssarepr, regallocs);
+        crate::liveness::compute_liveness_with_types(ssarepr, regallocs, types);
         self.current_graph_name = Some(ssarepr.name.clone());
         self.current_types = types.cloned();
 
@@ -1873,28 +1884,55 @@ impl Assembler {
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> (u8, RegKind) {
         // Strict path: type-state declares the kind; regallocs[kind]
-        // supplies the color.  Mirrors `flatten.py:386-387`.
+        // supplies the color.  Mirrors `flatten.py:386-387` — PyPy
+        // never falls back to other classes here, and neither do we
+        // when type-state is in scope.  A miss panics so an
+        // upstream type ↔ regalloc mismatch surfaces immediately.
         if let Some(types) = self.current_types.as_ref() {
             use crate::jit_codewriter::type_state::ConcreteType;
             let kind = match types.get(v) {
                 ConcreteType::Signed => Some(RegKind::Int),
                 ConcreteType::GcRef => Some(RegKind::Ref),
                 ConcreteType::Float => Some(RegKind::Float),
+                // Void inputargs / Unknown placeholders skip regalloc
+                // (`flatten.py:325`); fall through to the bare
+                // KINDS-scan path below as the documented escape
+                // hatch for those cases only.
                 ConcreteType::Void | ConcreteType::Unknown => None,
             };
             if let Some(kind) = kind {
-                if let Some(ra) = regallocs.get(&kind) {
-                    if let Some(&color) = ra.coloring.get(&v) {
-                        return (color as u8, kind);
-                    }
-                }
-                // `types` declared `kind` but the regalloc disagrees.
-                // Fall through to the per-kind scan as a documented
-                // divergence (TODO #71/#74); the chosen class is then
-                // still deterministic via KINDS order.
+                let ra = regallocs.get(&kind).unwrap_or_else(|| {
+                    panic!(
+                        "lookup_coloring: type-state declared kind {kind:?} for {v:?} \
+                         but regallocs map is missing the entry (graph={:?}, op={:?})",
+                        self.current_graph_name, self.current_flatop_debug,
+                    )
+                });
+                let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
+                    let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+                        .iter()
+                        .filter(|k| **k != kind)
+                        .filter(|k| {
+                            regallocs
+                                .get(*k)
+                                .is_some_and(|ra| ra.coloring.contains_key(&v))
+                        })
+                        .copied()
+                        .collect();
+                    panic!(
+                        "lookup_coloring: type-state declared kind {kind:?} for {v:?} \
+                         but regallocs[{kind:?}] has no coloring (other classes with a \
+                         coloring: {other_classes:?}; graph={:?}, op={:?})",
+                        self.current_graph_name, self.current_flatop_debug,
+                    )
+                });
+                return (color as u8, kind);
             }
         }
-        // Fallback: KINDS-ordered scan with single-class assertion.
+        // No type-state in scope (test fixtures, hand-built graphs)
+        // OR the type-state classified the value as Void / Unknown.
+        // Fall back to a KINDS-ordered scan with a single-class
+        // assertion; a multi-class hit is still a hard error.
         let mut found: Option<(u8, RegKind)> = None;
         for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
             if let Some(ra) = regallocs.get(&kind) {

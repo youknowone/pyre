@@ -52,8 +52,25 @@ fn regorconst_repr(arg: &RegOrConst) -> String {
     }
 }
 
-/// format.py:12-81 `format_assembler(ssarepr)`.
+/// `format.py:12-81 format_assembler(ssarepr)`.  Type-state-aware
+/// variant — when callers can supply the per-graph
+/// [`crate::jit_codewriter::type_state::TypeResolutionState`], pass
+/// it through [`Self::format_assembler_with_types`] so generic
+/// `OpKind::Call` argument lists print with `getkind(v.concretetype)`
+/// kinds instead of falling back to the Ref shape.
 pub fn format_assembler(ssarepr: &SSARepr) -> String {
+    format_assembler_with_types(ssarepr, None)
+}
+
+/// Type-aware sibling of [`format_assembler`].  Mirrors
+/// `flatten.py:382 getcolor` for the residual `FlatOp::Op` and
+/// `OpKind::Call` slots that still carry [`ValueId`]s — when
+/// `types` is supplied, every per-arg kind is resolved via
+/// `getkind(v.concretetype)`.
+pub fn format_assembler_with_types(
+    ssarepr: &SSARepr,
+    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
+) -> String {
     // First pass: collect every label that appears as a target so the
     // numbering matches format.py's getlabelname (labels are numbered in
     // first-seen order).
@@ -109,7 +126,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 }
             }
             FlatOp::Op(space_op) => {
-                let args = op_args_repr(space_op);
+                let args = op_args_repr(space_op, types);
                 if args.is_empty() {
                     let _ = writeln!(out, "{prefix}{}", op_name(space_op));
                 } else {
@@ -372,14 +389,23 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
     }
 }
 
-fn call_funcptr_repr(funcptr: &crate::model::CallFuncPtr) -> String {
+fn call_funcptr_repr(
+    funcptr: &crate::model::CallFuncPtr,
+    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
+) -> String {
     match funcptr {
         crate::model::CallFuncPtr::Target(target) => call_target_repr(target),
-        // The funcptr slot of a residual_call/inline_call is always
-        // ref-typed (the boxed callee pointer), per
-        // `jtransform.py:457 [op.args[0]] + extraargs` where `args[0]`
-        // is the function pointer Constant or Variable.
-        crate::model::CallFuncPtr::Value(value) => register_repr_for_kind(*value, RegKind::Ref),
+        // RPython's funcptr slot is `lltype.Ptr(FUNC)` (kind 'r')
+        // by construction.  Pyre's lowering, however, can
+        // materialize a funcptr Variable as Int when the rtyper
+        // chose the integer-indexed dispatch path (e.g. opcode
+        // dispatch tables).  When the caller supplies a
+        // `TypeResolutionState` we read kind from
+        // `getkind(v.concretetype)`; otherwise we keep the upstream
+        // default (`Ref`).
+        crate::model::CallFuncPtr::Value(value) => {
+            register_repr_for_kind(*value, value_id_kind(*value, types).unwrap_or(RegKind::Ref))
+        }
     }
 }
 
@@ -472,20 +498,23 @@ fn kind_signature(args_i: &[ValueId], args_r: &[ValueId], args_f: &[ValueId]) ->
     out
 }
 
-fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
+fn op_args_repr(
+    op: &crate::model::SpaceOperation,
+    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
+) -> String {
     use crate::model::OpKind;
     let mut out = String::new();
     match &op.kind {
-        // OpKind::Call carries a heterogeneous argument list with no
-        // per-slot kind information.  Phase 3 dropped the value_kinds
-        // side-table that previously rescued the formatting, so this
-        // branch falls back to printing each value as `%r<n>` (Ref) —
-        // good enough for debug output until OpKind::Call grows typed
-        // slots like the other call families.
+        // `OpKind::Call` carries a heterogeneous argument list (no
+        // per-slot kind on the variant).  When the caller supplies
+        // a [`TypeResolutionState`], each arg's kind comes from
+        // `getkind(v.concretetype)` via [`value_id_kind`] — same
+        // strict source PyPy uses.  Without types (test fixtures),
+        // fall back to the Ref shape.
         OpKind::Call { args, .. } => {
             let parts: Vec<String> = args
                 .iter()
-                .map(|v| register_repr_for_kind(*v, RegKind::Ref))
+                .map(|v| register_repr_for_kind(*v, value_id_kind(*v, types).unwrap_or(RegKind::Ref)))
                 .collect();
             out.push_str(&parts.join(", "));
         }
@@ -528,7 +557,7 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
             args_f,
             ..
         } => {
-            let mut parts = vec![call_funcptr_repr(funcptr)];
+            let mut parts = vec![call_funcptr_repr(funcptr, types)];
             // jtransform.py:430-433 — emit each ListOfKind only when the
             // matching kind char is in the signature.
             if !args_i.is_empty() {
@@ -620,6 +649,26 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
         out.push_str(&register_repr_for_kind(result, result_kind));
     }
     out
+}
+
+/// `getkind(v.concretetype)` for a [`ValueId`] — the type-state
+/// driven analogue used by debug-format helpers that resolve an arg
+/// list whose per-slot kind is not pinned by the variant (notably
+/// [`crate::model::OpKind::Call`]).  Returns `None` when no
+/// type-state is available or the value classifies as
+/// Void / Unknown.
+fn value_id_kind(
+    v: ValueId,
+    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
+) -> Option<RegKind> {
+    use crate::jit_codewriter::type_state::ConcreteType;
+    let types = types?;
+    match types.get(v) {
+        ConcreteType::Signed => Some(RegKind::Int),
+        ConcreteType::GcRef => Some(RegKind::Ref),
+        ConcreteType::Float => Some(RegKind::Float),
+        ConcreteType::Void | ConcreteType::Unknown => None,
+    }
 }
 
 /// `getkind(v.concretetype)` parity for pyre's [`crate::model::ValueType`].

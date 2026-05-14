@@ -486,9 +486,17 @@ impl<'a> GraphFlattener<'a> {
     }
 
     /// `getkind(v.concretetype)` + `regallocs[kind].coloring[v]` —
-    /// the strict `flatten.py:386` lookup with a fallback for callers
-    /// that don't have a `TypeResolutionState`.  Returns `None` for
-    /// Void slots (RPython skips them at `flatten.py:325`).
+    /// `flatten.py:386` strict 1:1 lookup.
+    ///
+    /// When the [`TypeResolutionState`] is in scope (post-rtyper
+    /// production path) the kind comes straight from `types.get(v)`
+    /// and `regallocs[kind].coloring[v]` is the only color source.
+    /// A miss panics — PyPy never tries another class once
+    /// `getkind(v.concretetype)` has decided.  `Void` / `Unknown`
+    /// fall through to the bare regalloc scan because both kinds
+    /// skip regalloc partitioning entirely (`flatten.py:325`).  Test
+    /// fixtures that drive `flatten_graph` without a type-state also
+    /// reach the scan path.
     fn kind_color_of(&self, v: ValueId) -> Option<(RegKind, usize)> {
         if let Some(types) = self.types {
             use crate::jit_codewriter::type_state::ConcreteType;
@@ -496,22 +504,35 @@ impl<'a> GraphFlattener<'a> {
                 ConcreteType::Signed => Some(RegKind::Int),
                 ConcreteType::GcRef => Some(RegKind::Ref),
                 ConcreteType::Float => Some(RegKind::Float),
-                // `Void` (`flatten.py:325`) and `Unknown` (pyre-only
-                // pre-rtyper placeholder) skip the regalloc lookup
-                // and fall through to the bare regalloc scan as a
-                // safety net for upstream coverage gaps.
                 ConcreteType::Void | ConcreteType::Unknown => None,
             };
             if let Some(kind) = kind {
-                if let Some(ra) = self.regallocs.get(&kind) {
-                    if let Some(&color) = ra.coloring.get(&v) {
-                        return Some((kind, color));
-                    }
-                }
-                // `types` says `kind` but regallocs disagrees — fall
-                // through to the per-kind scan below as a documented
-                // divergence (TODO: tighten once annotator/rtyper
-                // gaps close).
+                let ra = self.regallocs.get(&kind).unwrap_or_else(|| {
+                    panic!(
+                        "kind_color_of: type-state declared kind {kind:?} for {v:?} \
+                         but regallocs map is missing the entry (graph {:?})",
+                        self.graph.name,
+                    )
+                });
+                let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
+                    let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+                        .iter()
+                        .filter(|k| **k != kind)
+                        .filter(|k| {
+                            self.regallocs
+                                .get(*k)
+                                .is_some_and(|ra| ra.coloring.contains_key(&v))
+                        })
+                        .copied()
+                        .collect();
+                    panic!(
+                        "kind_color_of: type-state declared kind {kind:?} for {v:?} \
+                         but regallocs[{kind:?}] has no coloring (other classes with a \
+                         coloring: {other_classes:?}; graph {:?})",
+                        self.graph.name,
+                    )
+                });
+                return Some((kind, color));
             }
         }
         lookup_kind_color(v, self.regallocs)

@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flatten::{FlatOp, Label, RegKind, Register, SSARepr};
+use crate::jit_codewriter::type_state::TypeResolutionState;
 use crate::model::ValueId;
 use crate::regalloc::RegAllocResult;
 
@@ -31,10 +32,22 @@ use crate::regalloc::RegAllocResult;
 /// so the conversion happens here at the liveness boundary.
 /// RPython liveness.py:19-23.
 pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, RegAllocResult>) {
+    compute_liveness_with_types(flattened, regallocs, None);
+}
+
+/// `compute_liveness` variant that also threads the per-graph
+/// [`TypeResolutionState`] so [`value_to_register`] reads kind from
+/// `getkind(v.concretetype)` first — `flatten.py:382 getcolor`
+/// strict 1:1 parity for the `FlatOp::Op` operand bridge.
+pub fn compute_liveness_with_types(
+    flattened: &mut SSARepr,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+    types: Option<&TypeResolutionState>,
+) {
     let mut label2alive: HashMap<Label, HashSet<Register>> = HashMap::new();
 
     loop {
-        if !compute_liveness_pass(&mut flattened.insns, &mut label2alive, regallocs) {
+        if !compute_liveness_pass(&mut flattened.insns, &mut label2alive, regallocs, types) {
             break;
         }
     }
@@ -47,12 +60,55 @@ pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, Re
 ///
 /// **RPython invariant** (`flatten.py:382` `getcolor`): every
 /// `Variable` has a single `(kind, color)` via
-/// `getkind(v.concretetype)` + `regallocs[kind]`.  Iterates the
-/// per-kind regalloc results in [`KINDS`] order (NOT the
-/// nondeterministic `HashMap` iteration order) and panics on
-/// multi-class hits — RPython would never reach that case because
-/// `getkind` picks exactly one class per Variable.
-fn value_to_register(v: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> Option<Register> {
+/// `getkind(v.concretetype)` + `regallocs[kind]`.  When `types` is
+/// supplied (production path) the lookup reads kind from
+/// `types.get(v)` first and `regallocs[kind].coloring[v]` is the
+/// only color source; a miss panics — PyPy would never fall back to
+/// other classes.  Without `types` (test fixtures), the helper
+/// scans regallocs in [`KINDS`] order and asserts at most one class
+/// matches.  Returns `None` for Void / Unknown values that regalloc
+/// skipped (`flatten.py:325`).
+fn value_to_register(
+    v: ValueId,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+    types: Option<&TypeResolutionState>,
+) -> Option<Register> {
+    if let Some(types) = types {
+        use crate::jit_codewriter::type_state::ConcreteType;
+        let kind = match types.get(v) {
+            ConcreteType::Signed => Some(RegKind::Int),
+            ConcreteType::GcRef => Some(RegKind::Ref),
+            ConcreteType::Float => Some(RegKind::Float),
+            ConcreteType::Void | ConcreteType::Unknown => None,
+        };
+        if let Some(kind) = kind {
+            let ra = regallocs.get(&kind).unwrap_or_else(|| {
+                panic!(
+                    "value_to_register: type-state declared kind {kind:?} for {v:?} \
+                     but regallocs map is missing the entry",
+                )
+            });
+            let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
+                let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+                    .iter()
+                    .filter(|k| **k != kind)
+                    .filter(|k| {
+                        regallocs
+                            .get(*k)
+                            .is_some_and(|ra| ra.coloring.contains_key(&v))
+                    })
+                    .copied()
+                    .collect();
+                panic!(
+                    "value_to_register: type-state declared kind {kind:?} for {v:?} \
+                     but regallocs[{kind:?}] has no coloring (other classes with a \
+                     coloring: {other_classes:?})",
+                )
+            });
+            return Some(Register::new(kind, color));
+        }
+        // Void / Unknown — fall through to scan path.
+    }
     let mut found: Option<Register> = None;
     for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
         if let Some(ra) = regallocs.get(&kind) {
@@ -122,22 +178,26 @@ fn compute_liveness_pass(
     ops: &mut [FlatOp],
     label2alive: &mut HashMap<Label, HashSet<Register>>,
     regallocs: &HashMap<RegKind, RegAllocResult>,
+    types: Option<&TypeResolutionState>,
 ) -> bool {
     let mut alive: HashSet<Register> = HashSet::new();
     let mut must_continue = false;
 
     // `def_value` and `use_value` route a `FlatOp::Op`-side
     // [`ValueId`] through regalloc to its [`Register`] before joining
-    // the alive set.  Void / unallocated values are silently dropped
-    // (RPython's `flatten.py:325 if v.concretetype is not lltype.Void`
-    // makes the same filter at flatten time).
+    // the alive set.  When `types` is supplied (production path) the
+    // strict `getkind(v.concretetype)` lookup runs; otherwise the
+    // KINDS-ordered scan with single-class assertion takes over.
+    // Void / unallocated values are silently dropped (RPython's
+    // `flatten.py:325 if v.concretetype is not lltype.Void` makes
+    // the same filter at flatten time).
     let def_value = |alive: &mut HashSet<Register>, v: ValueId| {
-        if let Some(r) = value_to_register(v, regallocs) {
+        if let Some(r) = value_to_register(v, regallocs, types) {
             alive.remove(&r);
         }
     };
     let use_value = |alive: &mut HashSet<Register>, v: ValueId| {
-        if let Some(r) = value_to_register(v, regallocs) {
+        if let Some(r) = value_to_register(v, regallocs, types) {
             alive.insert(r);
         }
     };
