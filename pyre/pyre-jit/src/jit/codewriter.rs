@@ -4541,18 +4541,14 @@ impl CodeWriter {
                     // `pyframe.py:389 pushvalue` lowers to
                     // `setarrayitem_vable_r(locals_cells_stack_w,
                     // depth, w_object)` via `jtransform.py:1898
-                    // do_fixed_list_setitem` (vable branch). The
-                    // graph mirror carries the source FlowValue as
-                    // the shadow stack does. Graph offset -1 matches
-                    // the `emit_vsd` shadow convention.
-                    let v_idx = emit_graph_op_with_result(
-                        &mut graph,
-                        &current_block.block(),
-                        "int_copy",
-                        vec![super::flow::Constant::signed(depth_value).into()],
-                        Kind::Int,
-                        -1,
-                    );
+                    // do_fixed_list_setitem` (vable branch).  The
+                    // index operand goes directly as a Constant —
+                    // upstream's vable branch threads the depth as a
+                    // ConstInt arg to setarrayitem_vable_r, no
+                    // intermediate `int_copy(ConstInt(depth)) → Var`
+                    // SpaceOp.
+                    let v_idx: super::flow::FlowValue =
+                        super::flow::Constant::signed(depth_value).into();
                     record_graph_op(
                         &current_block.block(),
                         "setarrayitem_vable_r",
@@ -4607,14 +4603,8 @@ impl CodeWriter {
                 emit_ref_const_copy!($ssarepr, stack_base + $depth, value);
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
-                    let v_idx = emit_graph_op_with_result(
-                        &mut graph,
-                        &current_block.block(),
-                        "int_copy",
-                        vec![super::flow::Constant::signed(depth_value).into()],
-                        Kind::Int,
-                        -1,
-                    );
+                    let v_idx: super::flow::FlowValue =
+                        super::flow::Constant::signed(depth_value).into();
                     record_graph_op(
                         &current_block.block(),
                         "setarrayitem_vable_r",
@@ -4669,14 +4659,8 @@ impl CodeWriter {
                 let popped_reg = stack_base + $depth;
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
-                    let v_idx = emit_graph_op_with_result(
-                        &mut graph,
-                        &current_block.block(),
-                        "int_copy",
-                        vec![super::flow::Constant::signed(depth_value).into()],
-                        Kind::Int,
-                        -1,
-                    );
+                    let v_idx: super::flow::FlowValue =
+                        super::flow::Constant::signed(depth_value).into();
                     record_graph_op(
                         &current_block.block(),
                         "setarrayitem_vable_r",
