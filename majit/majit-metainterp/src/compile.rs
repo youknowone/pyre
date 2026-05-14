@@ -3399,15 +3399,24 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
 /// tests that bypass `MetaInterp::new` (so the resulting descr's
 /// `is_finish()` matches `compile.py:658-662 ExitFrameWithExceptionDescrRef`
 /// / `pyjitpl.py:3198-3220 compile_done_with_this_frame` semantics).
+///
+/// `compile.py:626-647` `_DoneWithThisFrameDescr` family — return the
+/// class-distinct singleton matching the result-type signature so the
+/// metainterp class hierarchy answers `is_finish` and downstream
+/// `is_exit_frame_with_exception` correctly.  `Type::Void` selects the
+/// no-result `DoneWithThisFrameDescrVoid`.
 pub fn make_finish_fail_descr_typed(types: Vec<Type>) -> DescrRef {
-    Arc::new(MetaFailDescr {
-        fail_index: alloc_fail_index(),
-        types: UnsafeCell::new(types),
-        vector_info: UnsafeCell::new(None),
-        adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
-        is_finish: true,
-    })
+    match types.as_slice() {
+        [] => Arc::new(DoneWithThisFrameDescrVoid::new()),
+        [Type::Float] => Arc::new(DoneWithThisFrameDescrFloat::new()),
+        [Type::Ref] => Arc::new(DoneWithThisFrameDescrRef::new()),
+        [Type::Int] => Arc::new(DoneWithThisFrameDescrInt::new()),
+        // Multi-result FINISH (pyre extension; PyPy FINISH always carries
+        // 0 or 1 result).  Fall back to a Void-flavoured class type;
+        // backend layout consumers read `fail_arg_types()` from the descr
+        // for any actual slot decoding.
+        _ => Arc::new(DoneWithThisFrameDescrVoid::new()),
+    }
 }
 
 /// compile.py:840-843 `ResumeGuardDescr` parity: a fresh guard descr
