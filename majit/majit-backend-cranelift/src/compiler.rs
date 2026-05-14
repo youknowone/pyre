@@ -79,41 +79,41 @@ use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
 
 static DONE_WITH_THIS_FRAME_DESCR_INT: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
-        Arc::new(
-            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-                u32::MAX,
-                0,
-                vec![Type::Int],
-                true,
-                vec![],
-            ),
-        )
+        let mut d = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            u32::MAX,
+            0,
+            vec![Type::Int],
+            true,
+            vec![],
+        );
+        d.meta_descr = Some(Arc::new(majit_backend::DoneWithThisFrameDescrInt::new()));
+        Arc::new(d)
     });
 
 static DONE_WITH_THIS_FRAME_DESCR_FLOAT: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
-        Arc::new(
-            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-                u32::MAX,
-                0,
-                vec![Type::Float],
-                true,
-                vec![],
-            ),
-        )
+        let mut d = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            u32::MAX,
+            0,
+            vec![Type::Float],
+            true,
+            vec![],
+        );
+        d.meta_descr = Some(Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new()));
+        Arc::new(d)
     });
 
 static DONE_WITH_THIS_FRAME_DESCR_REF: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
-        Arc::new(
-            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-                u32::MAX,
-                0,
-                vec![Type::Ref],
-                true,
-                vec![],
-            ),
-        )
+        let mut d = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            u32::MAX,
+            0,
+            vec![Type::Ref],
+            true,
+            vec![],
+        );
+        d.meta_descr = Some(Arc::new(majit_backend::DoneWithThisFrameDescrRef::new()));
+        Arc::new(d)
     });
 
 /// compile.py:658-662 ExitFrameWithExceptionDescrRef singleton.
@@ -133,20 +133,21 @@ static EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL: std::sync::LazyLock<Arc<Cranelift
             vec![],
         );
         d.is_exit_frame_with_exception = true;
+        d.meta_descr = Some(Arc::new(majit_backend::ExitFrameWithExceptionDescrRef::new()));
         Arc::new(d)
     });
 
 static DONE_WITH_THIS_FRAME_DESCR_VOID: std::sync::LazyLock<Arc<CraneliftFailDescr>> =
     std::sync::LazyLock::new(|| {
-        Arc::new(
-            CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
-                u32::MAX,
-                0,
-                vec![],
-                true,
-                vec![],
-            ),
-        )
+        let mut d = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+            u32::MAX,
+            0,
+            vec![],
+            true,
+            vec![],
+        );
+        d.meta_descr = Some(Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new()));
+        Arc::new(d)
     });
 
 /// compile.py:665-674 parity: return the singleton FailDescr for a
