@@ -13293,9 +13293,9 @@ fn collect_guards(
                 let arg0 = op.arg(0);
                 if let Some(idx) = fa.iter().position(|&r| r == arg0) {
                     let type_tag = match descr.fail_arg_types().get(idx) {
-                        Some(majit_ir::Type::Ref) => CraneliftFailDescr::TY_REF,
-                        Some(majit_ir::Type::Float) => CraneliftFailDescr::TY_FLOAT,
-                        _ => CraneliftFailDescr::TY_INT,
+                        Some(majit_ir::Type::Ref) => majit_backend::STATUS_TY_REF,
+                        Some(majit_ir::Type::Float) => majit_backend::STATUS_TY_FLOAT,
+                        _ => majit_backend::STATUS_TY_INT,
                     };
                     descr.make_a_counter_per_value(idx as u32, type_tag);
                 }

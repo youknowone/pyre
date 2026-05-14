@@ -280,16 +280,6 @@ impl Drop for DynasmFailDescr {
 }
 
 impl DynasmFailDescr {
-    // compile.py:687-696 status encoding constants.
-    pub const ST_BUSY_FLAG: u64 = 0x01;
-    pub const ST_TYPE_MASK: u64 = 0x06;
-    pub const ST_SHIFT: u32 = 3;
-    pub const ST_SHIFT_MASK: u64 = !((1u64 << Self::ST_SHIFT) - 1);
-    pub const TY_NONE: u64 = 0x00;
-    pub const TY_INT: u64 = 0x02;
-    pub const TY_REF: u64 = 0x04;
-    pub const TY_FLOAT: u64 = 0x06;
-
     pub fn new(
         fail_index: u32,
         trace_id: u64,
@@ -610,7 +600,7 @@ impl FailDescr for DynasmFailDescr {
         // `compile.py:750` — read through the same forwarding chain as
         // `get_status`, so the busy-flag observation tracks the canonical
         // metainterp slot when meta_descr is set.
-        self.get_status() & Self::ST_BUSY_FLAG != 0
+        self.get_status() & majit_backend::STATUS_BUSY_FLAG != 0
     }
 
     // resume.py:450-488 readers gated on `meta_resume_fd()` —
