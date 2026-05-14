@@ -1816,14 +1816,26 @@ where
         self.make_exception_link(&exits[1], true);
         if exits.len() == 3 {
             // `flatten.py:202 assert block.exits[2].exitcase is Exception`.
-            // pyre represents the `Exception` catch-all by an Atom
-            // exitcase (see `flow.rs::Atom::ExceptCatchAll`), and
-            // `llexitcase` stays `None` for catch-all links.
+            // pyre represents the `Exception` catch-all by an exception
+            // link with the extravars (`last_exception`, `last_exc_value`)
+            // pair seeded by `attach_catch_exception_edge`, no typed
+            // `llexitcase` (untyped catch-all), and arity-2 args mirroring
+            // the reraise shape — together those distinguish the catch-all
+            // from a normal-flow link (which has all three None) and from
+            // a typed catch (which has `llexitcase = Some(case)`).
+            let exit2 = exits[2].borrow();
             assert!(
-                exits[2].borrow().llexitcase.is_none(),
+                exit2.llexitcase.is_none(),
                 "flatten_ovf_canraise: _ovf 3-exit canraise expects exits[2] to be \
                  the `Exception` catch-all (llexitcase=None) per flatten.py:202",
             );
+            assert!(
+                exit2.last_exception.is_some() && exit2.last_exc_value.is_some(),
+                "flatten_ovf_canraise: _ovf 3-exit canraise expects exits[2] to be \
+                 an exception link with extravars seeded per flowcontext.py:130-143 \
+                 (matches `exitcase is Exception` invariant from flatten.py:202)",
+            );
+            drop(exit2);
             // `flatten.py:203 self.make_exception_link(block.exits[2], False)`.
             self.make_exception_link(&exits[2], false);
         }
