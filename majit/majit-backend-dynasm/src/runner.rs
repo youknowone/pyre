@@ -1203,20 +1203,22 @@ impl DynasmBackend {
             // dispatch reads the exc value through the standard
             // get_ref_value(0) path (compile.py:660).
             unsafe { crate::llmodel::set_int_value(frame_ptr, 0, exc_val as isize) };
-            // `pyjitpl.py:2283 self.cpu.propagate_exception_descr = exc_descr`
-            // is a `PropagateExceptionDescr` instance.  pyre routes the
-            // failure through the same toplevel ExitFrameWithException
-            // path the metainterp uses for explicit raises; carry the
-            // PropagateException Arc as `meta_descr` so the runtime
-            // descr layer sees the upstream class identity.
+            // `compile.py:1092-1098 PropagateExceptionDescr.handle_fail`
+            // raises `jitexc.ExitFrameWithExceptionRef(exception)`.  pyre
+            // has no descr-class polymorphic `handle_fail`; the flat
+            // dispatcher reads `is_exit_frame_with_exception()` to route
+            // exception exits.  Carry the metainterp
+            // `ExitFrameWithExceptionDescrRef` Arc as meta_descr so trait
+            // forwarding answers the predicate via the upstream class
+            // identity that handle_fail would have raised, instead of the
+            // PropagateException class identity (which would answer false).
             let meta = self
                 .descr_attachments
                 .read()
                 .unwrap()
-                .propagate_exception_descr
+                .exit_frame_with_exception_descr_ref
                 .clone();
             let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref]);
-            d.is_exit_frame_with_exception = true;
             d.meta_descr = meta;
             return Arc::new(d);
         }

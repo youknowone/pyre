@@ -167,10 +167,17 @@ pub struct DynasmFailDescr {
     // harnesses no longer mint plain `DynasmFailDescr` for the
     // Done*/Exit attachments — `attach_default_test_descrs` uses the
     // class-distinct Done* types directly.
-    /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
-    /// True when this FINISH was emitted via
-    /// pyjitpl.py:3238-3245 compile_exit_frame_with_exception.
-    pub is_exit_frame_with_exception: bool,
+    // is_exit_frame_with_exception removed: `compile.py:658-662
+    // ExitFrameWithExceptionDescrRef` is a class identity on the
+    // metainterp side.  After the FINISH-meta_descr stamping commit
+    // every backend descr that should answer true for this predicate
+    // (compile_exit_frame_with_exception emission, find_descr_by_ptr
+    // ExitFrame and Propagate synthetic exits) carries meta_descr to
+    // the metainterp ExitFrameWithExceptionDescrRef Arc.  The Propagate
+    // path stamps ExitFrameWithExceptionDescrRef rather than
+    // PropagateExceptionDescr because `compile.py:1092 handle_fail`
+    // raises `jitexc.ExitFrameWithExceptionRef` — the dispatcher sees
+    // the resulting class identity, not the originating Propagate.
 
     // fail_arg_locs removed (Session 5h): not in PyPy
     // `AbstractFailDescr._attrs_` (`history.py:132`).  PyPy encodes the
@@ -290,7 +297,6 @@ impl DynasmFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
-            is_exit_frame_with_exception: false,
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             meta_descr: None,
@@ -484,16 +490,15 @@ impl FailDescr for DynasmFailDescr {
 
     fn is_exit_frame_with_exception(&self) -> bool {
         // `compile.py:658-662 ExitFrameWithExceptionDescrRef`'s identity
-        // lives on the metainterp Arc.  Forward through `meta_descr` so
-        // backend descrs constructed via `op.descr = Some(meta)` defer
-        // to the metainterp class hierarchy; synthetic backend descrs
-        // minted by the runtime classifier (`meta_descr = None`) fall
-        // back to the local mirror, which is still needed because those
-        // descrs never visit the optimizer.
-        match self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            Some(fd) => fd.is_exit_frame_with_exception(),
-            None => self.is_exit_frame_with_exception,
-        }
+        // lives on the metainterp Arc.  After the FINISH-meta_descr
+        // stamping commit every production codegen + synthetic
+        // find_descr_by_ptr exit carries meta_descr; the trait method
+        // forwards through it.  Synthetic descrs without meta_descr
+        // (test scaffolding) take the trait default false.
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(false, |fd| fd.is_exit_frame_with_exception())
     }
 
     fn trace_id(&self) -> u64 {
