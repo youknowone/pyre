@@ -43,6 +43,39 @@ pub fn lookup_source_op_index(descr_ptr: usize) -> Option<usize> {
 use majit_backend::ExitRecoveryLayout;
 use majit_ir::{Descr, DescrRef, FailDescr, Type};
 
+/// Backend-static side-table mapping a `DynasmFailDescr` Arc's
+/// `Arc::as_ptr` address to its `ExitRecoveryLayout` (Session 7
+/// pre-flight, mirrors cranelift `RECOVERY_LAYOUT_TABLE`).
+///
+/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) does not
+/// carry a `recovery_layout` slot.  Upstream resume code
+/// (`resume.py:450-488`) decodes recovery on demand from the four
+/// payload attributes (rd_numb / rd_consts / rd_virtuals /
+/// rd_pendingfields).  Pyre keeps the structured layout because the
+/// recovery path is shared across both backends via
+/// `ExitRecoveryLayout` rather than re-decoding the resume tagged
+/// numbering inline.
+static RECOVERY_LAYOUT_TABLE: OnceLock<Mutex<HashMap<usize, ExitRecoveryLayout>>> = OnceLock::new();
+
+fn recovery_layout_table() -> &'static Mutex<HashMap<usize, ExitRecoveryLayout>> {
+    RECOVERY_LAYOUT_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn register_recovery_layout(descr_ptr: usize, layout: ExitRecoveryLayout) {
+    recovery_layout_table()
+        .lock()
+        .expect("RECOVERY_LAYOUT_TABLE mutex poisoned")
+        .insert(descr_ptr, layout);
+}
+
+pub fn lookup_recovery_layout(descr_ptr: usize) -> Option<ExitRecoveryLayout> {
+    recovery_layout_table()
+        .lock()
+        .expect("RECOVERY_LAYOUT_TABLE mutex poisoned")
+        .get(&descr_ptr)
+        .cloned()
+}
+
 /// Backend-static side-table that maps a `DynasmFailDescr` Arc's
 /// `Arc::as_ptr` address to the regalloc-derived `fail_arg_locs`
 /// (each fail-arg's absolute jitframe slot, or `None` for unmapped
@@ -160,7 +193,10 @@ pub struct DynasmFailDescr {
     // the descr's inner address.
 
     /// Backend-origin recovery layout, built at compile time from fail_arg_types.
-    pub recovery_layout: UnsafeCell<Option<ExitRecoveryLayout>>,
+    // recovery_layout removed (Session 7): not in PyPy
+    // `AbstractFailDescr._attrs_` (`history.py:132`).  The structured
+    // layout lives in `RECOVERY_LAYOUT_TABLE` keyed on
+    // `Arc::as_ptr(&descr)`.
 
     /// compile.py:685 status: packs ST_BUSY_FLAG + type tag + hash.
     pub status: AtomicU64,
@@ -227,6 +263,10 @@ impl Drop for DynasmFailDescr {
             .lock()
             .expect("SOURCE_OP_INDEX_TABLE mutex poisoned")
             .remove(&ptr);
+        recovery_layout_table()
+            .lock()
+            .expect("RECOVERY_LAYOUT_TABLE mutex poisoned")
+            .remove(&ptr);
     }
 }
 
@@ -255,7 +295,6 @@ impl DynasmFailDescr {
             is_finish,
             is_resume_guard,
             is_exit_frame_with_exception: false,
-            recovery_layout: UnsafeCell::new(None),
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             meta_descr: None,
@@ -368,14 +407,14 @@ impl DynasmFailDescr {
         }
     }
 
-    /// Read the recovery_layout.
+    /// Read the recovery_layout from the backend-static side-table.
     pub fn recovery_layout(&self) -> Option<ExitRecoveryLayout> {
-        unsafe { &*self.recovery_layout.get() }.clone()
+        lookup_recovery_layout(self as *const Self as usize)
     }
 
-    /// Set the recovery_layout.
+    /// Set the recovery_layout in the backend-static side-table.
     pub fn set_recovery_layout(&self, layout: ExitRecoveryLayout) {
-        unsafe { *self.recovery_layout.get() = Some(layout) };
+        register_recovery_layout(self as *const Self as usize, layout);
     }
 
     /// `compile.py:185` `isinstance(descr, ResumeDescr)` gate for

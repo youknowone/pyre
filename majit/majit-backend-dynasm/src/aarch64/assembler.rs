@@ -3455,9 +3455,11 @@ impl<'a> AssemblerARM64<'a> {
         // Session 5i-cl parity: source_op_index moved to a backend-static
         // side-table keyed on the descr Arc address.
         crate::guard::register_source_op_index(Arc::as_ptr(&descr) as usize, op_index);
+        // Session 7 parity: recovery_layout moved to a backend-static
+        // side-table keyed on the descr Arc address.
+        crate::guard::register_recovery_layout(Arc::as_ptr(&descr) as usize, recovery_layout);
         unsafe {
             let descr_mut = &mut *(Arc::as_ptr(&descr) as *mut DynasmFailDescr);
-            *descr_mut.recovery_layout.get_mut() = Some(recovery_layout);
             // Capture the metainterp `AbstractFailDescr` Arc as a
             // back-pointer.  Backend accessors for `_attrs_` fields
             // (`history.py:132`: adr_jump_offset / rd_locs /
