@@ -3532,6 +3532,7 @@ impl JitCodeBuilder {
             alllabels: Some(self.alllabels),
             resulttypes,
             _ssarepr: None,
+            _types: None,
         };
         let mut jc = JitCode::new(self.name);
         // RPython `JitCode(name, fnaddr, calldescr)` (`call.py:167-169`)

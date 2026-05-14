@@ -243,14 +243,25 @@ impl Assembler {
     ///   ssarepr = flatten_graph(graph, regallocs)
     ///   compute_liveness(ssarepr)          ← step 3b
     ///   self.assembler.assemble(ssarepr)   ← step 4
-    /// **Test-only entrypoint** — production callers must use
-    /// [`Self::assemble_with_types`] so the strict
-    /// `getkind(v.concretetype)` path inside [`Self::lookup_coloring`]
-    /// is engaged.  PyPy's `Assembler.assemble` always runs against
-    /// a fully-typed `ssarepr`; this no-types overload exists only
-    /// for hand-built test fixtures whose graphs do not carry a
-    /// `TypeResolutionState`.  The KINDS-ordered single-class scan
-    /// fallback then takes over.
+    /// **Test-only entrypoint — DO NOT use in production code.**
+    ///
+    /// PyPy's `Assembler.assemble` always runs against a fully-typed
+    /// `ssarepr` (every Variable has `.concretetype`), so the strict
+    /// `getkind(v.concretetype)` lookup inside
+    /// [`Self::lookup_coloring`] is the only path RPython exercises.
+    /// Pyre production callers go through
+    /// [`Self::assemble_with_types`] /
+    /// [`Self::assemble_with_callcontrol_and_types`] which engage
+    /// the same strict path.
+    ///
+    /// This no-types overload is a pyre-only divergence retained for
+    /// hand-built test fixtures whose graphs lack a
+    /// `TypeResolutionState` (e.g. `assembler::tests::*` and
+    /// `regalloc::tests::*` that exercise the wire format directly
+    /// from synthesized `SSARepr`s).  When called, lookup falls
+    /// back to a [`KINDS`]-ordered scan with a single-class
+    /// assertion — RPython has no equivalent fallback path.
+    #[doc(hidden)]
     pub fn assemble(
         &mut self,
         ssarepr: &mut SSARepr,
@@ -274,9 +285,11 @@ impl Assembler {
         self.assemble_with_callcontrol_and_types(ssarepr, regallocs, None, Some(types))
     }
 
-    /// **Test-only entrypoint** — production callers must use
+    /// **Test-only entrypoint — DO NOT use in production code.**
+    /// Production callers must use
     /// [`Self::assemble_with_callcontrol_and_types`].  See
     /// [`Self::assemble`] for the rationale.
+    #[doc(hidden)]
     pub fn assemble_with_callcontrol(
         &mut self,
         ssarepr: &mut SSARepr,
@@ -431,6 +444,7 @@ impl Assembler {
             alllabels: Some(state.alllabels),
             resulttypes: Some(state.resulttypes),
             _ssarepr: Some(ssarepr.clone()),
+            _types: types.cloned(),
         };
 
         self.count_jitcodes += 1;

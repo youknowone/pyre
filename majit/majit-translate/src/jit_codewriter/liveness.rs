@@ -58,6 +58,17 @@ pub fn compute_liveness_with_types(
 /// Resolve a [`ValueId`] from a `FlatOp::Op` operand to its
 /// [`Register`].
 ///
+/// **Structural divergence (TODO)**: PyPy `liveness.py:67` walks
+/// instructions whose register operands are already
+/// [`Register`] / `ListOfKind` because `flatten_list()`
+/// (`flatten.py:355-371`) projected `Variable` → `Register` at
+/// flatten time.  Pyre's `FlatOp::Op` still carries
+/// [`crate::model::SpaceOperation`] with [`ValueId`] slots, so the
+/// liveness pass has to redo the `getcolor` lookup here.  The fix
+/// is to migrate `SpaceOperation` slots to `Register` so liveness
+/// can read the kind off the operand directly; until that lands
+/// this helper preserves the same `(kind, color)` answer.
+///
 /// **RPython invariant** (`flatten.py:382` `getcolor`): every
 /// `Variable` has a single `(kind, color)` via
 /// `getkind(v.concretetype)` + `regallocs[kind]`.  When `types` is
