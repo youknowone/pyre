@@ -313,21 +313,6 @@ impl DynasmFailDescr {
         unsafe { (*self.rd_loop_token_clt.get()).as_ref() }
     }
 
-    /// `compile.py:813-824` `make_a_counter_per_value`.  Kept as an
-    /// inherent helper because it accepts the type-tag parameter the
-    /// `FailDescr` trait does not yet expose; remaining `store_hash` /
-    /// `get_status` / `start_compiling` / `done_compiling` redundancies
-    /// have been collapsed onto the trait dispatch (callers reach them
-    /// via `<Self as FailDescr>` already).
-    pub fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            meta_fd.make_a_counter_per_value(index, type_tag);
-            return;
-        }
-        let status = type_tag | ((index as u64) << Self::ST_SHIFT);
-        self.status.store(status, Ordering::Release);
-    }
-
     /// `assembler.py:966` — read `adr_jump_offset`.  Forwarded to the
     /// metainterp `AbstractFailDescr` (`history.py:132 _attrs_`) via
     /// `meta_descr`.  Returns `0` for synthetic backend descrs without
@@ -631,6 +616,16 @@ impl FailDescr for DynasmFailDescr {
         }
         self.status
             .store(hash & Self::ST_SHIFT_MASK, Ordering::Release);
+    }
+
+    /// `compile.py:813-824` `make_a_counter_per_value`.
+    fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.make_a_counter_per_value(index, type_tag);
+            return;
+        }
+        let status = type_tag | ((index as u64) << Self::ST_SHIFT);
+        self.status.store(status, Ordering::Release);
     }
 
     fn is_compiling(&self) -> bool {

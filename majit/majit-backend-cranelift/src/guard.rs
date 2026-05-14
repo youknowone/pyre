@@ -856,21 +856,6 @@ impl CraneliftFailDescr {
     pub const TY_REF: u64 = 0x04;
     pub const TY_FLOAT: u64 = 0x06;
 
-    /// `compile.py:813-824` `make_a_counter_per_value`.  Kept as
-    /// inherent because the trait signature does not expose the
-    /// type-tag parameter; remaining `store_hash` / `get_status` /
-    /// `start_compiling` / `done_compiling` / `is_compiling` are
-    /// reached via trait dispatch (see the `impl FailDescr` block).
-    pub fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            meta_fd.make_a_counter_per_value(index, type_tag);
-            return;
-        }
-        let status = type_tag | ((index as u64) << Self::ST_SHIFT);
-        self.status
-            .store(status, std::sync::atomic::Ordering::Release);
-    }
-
     /// Backend-static side-table write (Session 5i-cl).
     pub fn set_recovery_layout(&self, recovery_layout: ExitRecoveryLayout) {
         register_recovery_layout(self as *const Self as usize, recovery_layout);
@@ -1214,6 +1199,17 @@ impl FailDescr for CraneliftFailDescr {
             hash & Self::ST_SHIFT_MASK,
             std::sync::atomic::Ordering::Release,
         );
+    }
+
+    /// `compile.py:813-824` `make_a_counter_per_value`.
+    fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.make_a_counter_per_value(index, type_tag);
+            return;
+        }
+        let status = type_tag | ((index as u64) << Self::ST_SHIFT);
+        self.status
+            .store(status, std::sync::atomic::Ordering::Release);
     }
 
     /// `compile.py:750` check `ST_BUSY_FLAG`.
