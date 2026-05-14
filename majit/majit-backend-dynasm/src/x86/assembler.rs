@@ -3029,9 +3029,15 @@ impl<'a> Assembler386<'a> {
                     ; mov rax, QWORD crate::runner::dynasm_nursery_slowpath_jitframe as *const () as i64
                 );
                 self.emit_abi_call_rax();
+                // Reload `rbp` first: a minor GC during the slowpath may
+                // have copied the jitframe to old-gen, so the current
+                // `rbp` points at the freed nursery copy. Clearing
+                // `JF_GCMAP_OFS` on it would write garbage and leave the
+                // moved jitframe's gcmap published — a stale gcmap that
+                // a subsequent collecting call would walk.
+                self.reload_frame_if_necessary();
                 let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
-                self.reload_frame_if_necessary();
                 if result_reg.value != 0 {
                     let rv = result_reg.value;
                     dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
@@ -3077,6 +3083,11 @@ impl<'a> Assembler386<'a> {
                     ; mov rax, QWORD crate::runner::dynasm_nursery_slowpath_varsize as *const () as i64
                 );
                 self.emit_abi_call_rax();
+                // _build_malloc_slowpath parity (assembler.py:295-308):
+                // reload the (possibly moved) jitframe before clearing the
+                // gcmap, otherwise the clear would target the freed
+                // nursery copy.
+                self.reload_frame_if_necessary();
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
                 if !op.pos.is_none() {
                     self.store_rax_to_result(op.pos);
@@ -6911,10 +6922,22 @@ impl<'a> Assembler386<'a> {
     // ================================================================
 
     /// COND_CALL_N: if arg(0) != 0, call function at arg(1).
+    ///
+    /// `x86/assembler.py:2526 cond_call` parity: the regalloc may fuse
+    /// a preceding CompOp's result into `guard_success_cc` rather than
+    /// materialising the boolean (see `next_op_can_accept_cc`). When
+    /// that's the case, `op.arg(0)` lives in the condition flags, not
+    /// a register/slot — so we must branch off the CC directly instead
+    /// of issuing `load_arg_to_rax; test rax, rax`, which would read
+    /// `rbp` (the frame_reg sentinel) and miss the comparison result.
     fn genop_discard_cond_call(&mut self, op: &Op) {
-        self.load_arg_to_rax(op.arg(0));
         let skip_label = self.mc.new_dynamic_label();
-        dynasm!(self.mc ; .arch x64 ; test rax, rax ; jz =>skip_label);
+        if let Some(cc) = self.guard_success_cc.take() {
+            self.emit_jcc_to_label(invert_cc(cc), skip_label);
+        } else {
+            self.load_arg_to_rax(op.arg(0));
+            dynasm!(self.mc ; .arch x64 ; test rax, rax ; jz =>skip_label);
+        }
 
         self.emit_call(op, 1);
 

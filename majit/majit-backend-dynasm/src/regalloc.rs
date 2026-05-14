@@ -3709,11 +3709,17 @@ impl<'a> RegAlloc<'a> {
     /// llsupport/regalloc.py:873 `next_op_can_accept_cc` parity.
     ///
     /// Returns `true` when `operations[i]`'s result is consumed solely
-    /// by `operations[i + 1]`, and that op is `GuardTrue/False/Nonnull/
-    /// Isnull` or `CondCallN`. The CompOp emitter can then leave its
-    /// result in the condition flags instead of materialising it via
-    /// `setcc`+`movzx`; the guard emitter consumes those flags
-    /// directly via `implement_guard`.
+    /// by `operations[i + 1]`, and that op is `GuardTrue/False` or
+    /// `CondCallN`. We also accept `GuardNonnull/Isnull` against an
+    /// integer compare since our emit treats those equivalently. The
+    /// CompOp emitter then leaves the result in the condition flags
+    /// instead of materialising it via `setcc`+`movzx`, and the next
+    /// op's emit consumes those flags directly:
+    ///
+    /// - `Guard{True,False,Nonnull,Isnull}` via `implement_guard`.
+    /// - `CondCallN` via `guard_success_cc` (see
+    ///   `genop_discard_cond_call`, mirrors `x86/assembler.py:2526
+    ///   cond_call`).
     #[cfg(target_arch = "x86_64")]
     fn next_op_can_accept_cc(&self, ops: &[Op], i: usize, result: OpRef) -> bool {
         if i + 1 >= ops.len() {
