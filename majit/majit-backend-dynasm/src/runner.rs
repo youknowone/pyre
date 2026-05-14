@@ -1315,7 +1315,7 @@ impl DynasmBackend {
         if let Some(found) = compiled
             .fail_descrs
             .iter()
-            .find(|d| d.trace_id() == trace_id && d.fail_index == fail_index)
+            .find(|d| d.trace_id() == trace_id && <DynasmFailDescr as majit_ir::FailDescr>::fail_index_per_trace(d) == fail_index)
         {
             return Some(found.clone());
         }
@@ -1325,7 +1325,7 @@ impl DynasmBackend {
                 if let Some(found) = bridge
                     .fail_descrs
                     .iter()
-                    .find(|d| d.trace_id() == trace_id && d.fail_index == fail_index)
+                    .find(|d| d.trace_id() == trace_id && <DynasmFailDescr as majit_ir::FailDescr>::fail_index_per_trace(d) == fail_index)
                 {
                     return Some(found.clone());
                 }

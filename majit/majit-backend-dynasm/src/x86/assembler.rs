@@ -1699,7 +1699,7 @@ impl<'a> Assembler386<'a> {
             self.fail_descrs
                 .iter()
                 .enumerate()
-                .all(|(i, d)| d.fail_index as usize == i),
+                .all(|(i, d)| <DynasmFailDescr as majit_ir::FailDescr>::fail_index_per_trace(d) as usize == i),
             "fail_descrs position must equal fail_index"
         );
         Ok(CompiledCode {
@@ -1822,7 +1822,7 @@ impl<'a> Assembler386<'a> {
             self.fail_descrs
                 .iter()
                 .enumerate()
-                .all(|(i, d)| d.fail_index as usize == i),
+                .all(|(i, d)| <DynasmFailDescr as majit_ir::FailDescr>::fail_index_per_trace(d) as usize == i),
             "fail_descrs position must equal fail_index"
         );
         Ok(CompiledCode {

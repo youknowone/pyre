@@ -14403,7 +14403,7 @@ impl majit_backend::Backend for CraneliftBackend {
         let mut result = Vec::new();
         for descr in &compiled.fail_descrs {
             if let Some(layout) = descr.recovery_layout_ref() {
-                result.push((descr.fail_index, layout.frames.clone()));
+                result.push((<CraneliftFailDescr as majit_ir::FailDescr>::fail_index_per_trace(descr), layout.frames.clone()));
             }
         }
         Some(result)
