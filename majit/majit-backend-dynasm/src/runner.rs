@@ -2072,7 +2072,7 @@ impl Backend for DynasmBackend {
         });
     }
 
-    fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> Arc<dyn FailDescr> {
+    fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
         // warmspot.py:1021 cpu.get_latest_descr(deadframe) parity: the
         // dynasm registry holds a strong Arc for every emitted DynasmFailDescr
         // through its full lifetime, so a `descr_addr` arriving from the
@@ -2089,7 +2089,7 @@ impl Backend for DynasmBackend {
                  registered before its address reaches the C-ABI guard-fail boundary"
             )
         });
-        descr as Arc<dyn FailDescr>
+        descr as majit_ir::DescrRef
     }
 
     fn get_int_value(&self, frame: &DeadFrame, index: usize) -> i64 {
@@ -2241,7 +2241,9 @@ impl Backend for DynasmBackend {
         if descr_addr == 0 {
             return 0;
         }
-        <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr).get_status()
+        <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr)
+            .as_fail_descr()
+            .map_or(0, |fd| fd.get_status())
     }
 
     fn start_compiling_descr(&self, descr_addr: usize) {
@@ -2249,7 +2251,11 @@ impl Backend for DynasmBackend {
         if descr_addr == 0 {
             return;
         }
-        <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr).start_compiling();
+        if let Some(fd) =
+            <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr).as_fail_descr()
+        {
+            fd.start_compiling();
+        }
     }
 
     fn done_compiling_descr(&self, descr_addr: usize) {
@@ -2257,7 +2263,11 @@ impl Backend for DynasmBackend {
         if descr_addr == 0 {
             return;
         }
-        <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr).done_compiling();
+        if let Some(fd) =
+            <Self as Backend>::fail_descr_arc_from_addr(self, descr_addr).as_fail_descr()
+        {
+            fd.done_compiling();
+        }
     }
 
     fn bh_new(&self, sizedescr: &majit_translate::jitcode::BhDescr) -> i64 {

@@ -13848,7 +13848,9 @@ impl majit_backend::Backend for CraneliftBackend {
         if descr_addr == 0 {
             return 0;
         }
-        <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr).get_status()
+        <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr)
+            .as_fail_descr()
+            .map_or(0, |fd| fd.get_status())
     }
 
     fn start_compiling_descr(&self, descr_addr: usize) {
@@ -13856,7 +13858,12 @@ impl majit_backend::Backend for CraneliftBackend {
         if descr_addr == 0 {
             return;
         }
-        <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr).start_compiling();
+        if let Some(fd) =
+            <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr)
+                .as_fail_descr()
+        {
+            fd.start_compiling();
+        }
     }
 
     fn done_compiling_descr(&self, descr_addr: usize) {
@@ -13864,7 +13871,12 @@ impl majit_backend::Backend for CraneliftBackend {
         if descr_addr == 0 {
             return;
         }
-        <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr).done_compiling();
+        if let Some(fd) =
+            <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr)
+                .as_fail_descr()
+        {
+            fd.done_compiling();
+        }
     }
 
     fn migrate_bridges(&self, old_token: &JitCellToken, new_token: &JitCellToken) {
@@ -14453,7 +14465,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .expect("get_latest_descr_arc_from_deadframe failed")
     }
 
-    fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> Arc<dyn FailDescr> {
+    fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
         // warmspot.py:1021 cpu.get_latest_descr(deadframe) parity:
         // compiled guard descrs are held strongly for the lifetime of
         // their owning machine code.  CALL_ASSEMBLER overlays are
@@ -14465,7 +14477,7 @@ impl majit_backend::Backend for CraneliftBackend {
                 .lock()
                 .expect("fail_descr_registry mutex poisoned");
             if let Some(descr) = registry.get(&descr_addr).cloned() {
-                return descr;
+                return descr as majit_ir::DescrRef;
             }
         }
 
@@ -14477,7 +14489,7 @@ impl majit_backend::Backend for CraneliftBackend {
             .get(&descr_addr)
             .and_then(|weak| weak.upgrade())
         {
-            return descr;
+            return descr as majit_ir::DescrRef;
         }
         overlay_registry.remove(&descr_addr);
         panic!(

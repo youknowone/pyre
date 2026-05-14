@@ -2028,7 +2028,7 @@ pub trait Backend: Send {
     /// lookup is therefore infallible.  Default panics so backends that
     /// receive C-ABI guard-fail callbacks must opt in explicitly;
     /// `SyntheticCpu` and `wasm` never reach this path.
-    fn fail_descr_arc_from_addr(&self, _descr_addr: usize) -> Arc<dyn FailDescr> {
+    fn fail_descr_arc_from_addr(&self, _descr_addr: usize) -> majit_ir::DescrRef {
         panic!(
             "Backend::fail_descr_arc_from_addr default invoked: backend wired into a runtime \
              guard-fail path must register every emitted FailDescr in an addr→Arc table and \
