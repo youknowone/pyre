@@ -555,14 +555,10 @@ struct DecodedResumeLayout {
     pending_fields: Vec<PendingFieldInfo>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResumeValueKind {
-    FailArg,
-    Constant,
-    Virtual,
-    Uninitialized,
-    Unavailable,
-}
+// ResumeValueKind moved to majit-ir::resumedata so backend codepaths
+// can reference the resume-value tag discriminator without a metainterp
+// dependency (Phase C-1 cascade toward backend struct deletion).
+pub use majit_ir::resumedata::ResumeValueKind;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeValueLayoutSummary {

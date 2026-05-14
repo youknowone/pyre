@@ -39,6 +39,20 @@ pub const TAGCONST: u8 = 0;
 pub const TAGINT: u8 = 1;
 pub const TAGBOX: u8 = 2;
 pub const TAGVIRTUAL: u8 = 3;
+
+/// `resume.py` tag discriminator used by `ResumeValueSource` /
+/// `ResumeValueLayoutSummary` to record where a guard-time value
+/// comes from.  Moved here from `majit-metainterp::resume` so it can
+/// be referenced from `majit-backend` along with the rest of the
+/// Phase C-1 unified-descr type migration.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeValueKind {
+    FailArg,
+    Constant,
+    Virtual,
+    Uninitialized,
+    Unavailable,
+}
 const TAGMASK: u8 = 3;
 
 pub const UNASSIGNED: i16 = ((-1i32 << 13) << 2 | TAGBOX as i32) as i16;
