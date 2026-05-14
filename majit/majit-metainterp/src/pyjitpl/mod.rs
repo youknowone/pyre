@@ -17704,37 +17704,32 @@ mod tests {
             .expect("compiled token")
             .downcast_mut::<DynasmCompiledCode>()
             .expect("dynasm compiled code");
-        let descr = compiled
+        let descr_ref = compiled
             .fail_descrs
-            .iter_mut()
-            .find(|descr| descr.fail_index == fail_index)
+            .iter()
+            .find(|descr| {
+                descr.as_fail_descr().map_or(false, |fd| fd.fail_index_per_trace() == fail_index)
+            })
             .expect("fail descr");
         // Backend rd_* accessors forward through `meta_descr` to the
         // metainterp `AbstractFailDescr` Arc.  Test fixtures synthesise
-        // `DynasmFailDescr` without going through the assembler, so they
-        // have no meta_descr.  Mint a fresh metainterp ResumeGuardDescr
-        // (carries the rd_* setters) and stamp it as the back-pointer.
-        let descr = unsafe {
-            &mut *(std::sync::Arc::as_ptr(descr)
+        // `DynasmFailDescr` through the codegen path without `op.descr`
+        // set, so `meta_descr` is `None`.  Stamp a fresh metainterp
+        // ResumeGuardDescr that carries the rd_* setters.
+        let backend_descr = unsafe {
+            &mut *(std::sync::Arc::as_ptr(descr_ref) as *const ()
                 as *mut majit_backend_dynasm::guard::DynasmFailDescr)
         };
-        if descr.meta_descr.is_none() {
-            let meta = crate::compile::make_resume_guard_descr_typed(descr.fail_arg_types.clone());
-            // `DynasmFailDescr::trace_id()` (`guard.rs:380-392`) forwards
-            // through `meta_resume_fd().trace_id()` whenever a meta_descr
-            // is attached and falls back to the backend-local
-            // `self.trace_id` field only when meta_descr is absent.
-            // `make_resume_guard_descr_typed` initialises trace_id to 0
-            // (`compile.rs:3425`); without copying the backend-local
-            // trace_id over, the freshly-stamped meta_descr would mask
-            // the descr's real trace_id and break `(trace_id, fail_index)`
-            // lookups in `try_find_descr`.
+        if backend_descr.meta_descr.is_none() {
+            let meta = crate::compile::make_resume_guard_descr_typed(
+                backend_descr.fail_arg_types.clone(),
+            );
             if let Some(meta_fd) = meta.as_fail_descr() {
-                meta_fd.set_trace_id(descr.trace_id);
+                meta_fd.set_trace_id(backend_descr.trace_id);
             }
-            descr.meta_descr = Some(meta);
+            backend_descr.meta_descr = Some(meta);
         }
-        let meta_fd = descr
+        let meta_fd = backend_descr
             .meta_descr
             .as_ref()
             .unwrap()
@@ -17744,10 +17739,8 @@ mod tests {
         meta_fd.set_rd_consts(Some(rd_consts));
         meta_fd.set_rd_virtuals(Some(vec![]));
         meta_fd.set_rd_pendingfields(Some(vec![]));
-        // `register_fail_descrs` ran at codegen time when `meta_descr`
-        // was unset; re-run now that we've stamped it so the meta-keyed
-        // dual-indexed registry entry lands.  Idempotent: existing
-        // backend-keyed entries are preserved.
+        // Re-run register_fail_descrs so the meta-keyed registry entry
+        // lands.  Idempotent: existing backend-keyed entries are preserved.
         backend.register_fail_descrs(&compiled.fail_descrs);
     }
 

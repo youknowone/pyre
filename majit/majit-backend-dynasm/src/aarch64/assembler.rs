@@ -208,7 +208,7 @@ pub struct AssemblerARM64<'a> {
     /// Frame depth (in WORD units) for the current trace.
     frame_depth: usize,
     /// Fail descriptors built during assembly.
-    fail_descrs: Vec<Arc<DynasmFailDescr>>,
+    fail_descrs: Vec<majit_ir::DescrRef>,
     /// trace_id for this compilation.
     trace_id: u64,
     /// header_pc (green_key) for this compilation.
@@ -325,7 +325,7 @@ pub struct CompiledCode {
     /// contract (compile.py:183-203 record_loop_or_bridge). Position
     /// equals `descr.fail_index` by an invariant asserted at conversion
     /// from the in-progress `AssemblerARM64.fail_descrs` Vec.
-    pub fail_descrs: Box<[Arc<DynasmFailDescr>]>,
+    pub fail_descrs: Box<[majit_ir::DescrRef]>,
     /// Input argument types.
     pub input_types: Vec<Type>,
     /// `compile.py:665-674` parity: `Arc` clone of the owning cpu's
@@ -1384,7 +1384,7 @@ impl<'a> AssemblerARM64<'a> {
             self.fail_descrs
                 .iter()
                 .enumerate()
-                .all(|(i, d)| <DynasmFailDescr as majit_ir::FailDescr>::fail_index_per_trace(d) as usize == i),
+                .all(|(i, d)| d.as_fail_descr().map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
             "fail_descrs position must equal fail_index"
         );
         Ok(CompiledCode {
@@ -1413,7 +1413,7 @@ impl<'a> AssemblerARM64<'a> {
     /// The bridge sees live registers exactly as they were at guard time.
     /// Return Reg locs for register positions, matching RPython.
     pub fn rebuild_faillocs_from_descr(
-        descr: &DynasmFailDescr,
+        descr: &dyn majit_ir::FailDescr,
         inputargs: &[InputArg],
     ) -> Vec<Loc> {
         let mut locs = Vec::new();
@@ -1514,7 +1514,7 @@ impl<'a> AssemblerARM64<'a> {
             self.fail_descrs
                 .iter()
                 .enumerate()
-                .all(|(i, d)| <DynasmFailDescr as majit_ir::FailDescr>::fail_index_per_trace(d) as usize == i),
+                .all(|(i, d)| d.as_fail_descr().map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
             "fail_descrs position must equal fail_index"
         );
         Ok(CompiledCode {
@@ -2626,7 +2626,7 @@ impl<'a> AssemblerARM64<'a> {
                 }
 
                 self._call_footer();
-                self.fail_descrs.push(descr);
+                self.fail_descrs.push(descr.clone() as majit_ir::DescrRef);
             }
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
@@ -3515,7 +3515,7 @@ impl<'a> AssemblerARM64<'a> {
         if op.opcode == OpCode::GuardNotForced2 {
             self.finish_gcmap = Some(gcmap);
         }
-        self.fail_descrs.push(descr);
+        self.fail_descrs.push(descr.clone() as majit_ir::DescrRef);
     }
 
     // ----------------------------------------------------------------
@@ -3619,7 +3619,7 @@ impl<'a> AssemblerARM64<'a> {
     /// stub with "MOV r11, bridge_addr; JMP r11" (x64) or "BL imm26"
     /// (aarch64), matching rpython/jit/backend/aarch64/assembler.py
     /// patch_trace().
-    pub fn patch_jump_for_descr(descr: &DynasmFailDescr, adr_new_target: usize) {
+    pub fn patch_jump_for_descr(descr: &dyn majit_ir::FailDescr, adr_new_target: usize) {
         let stub_addr = descr.adr_jump_offset();
         assert!(stub_addr != 0, "guard already patched");
 
@@ -4378,7 +4378,7 @@ impl<'a> AssemblerARM64<'a> {
         // Emit epilogue (return jf_ptr).
         self._call_footer();
 
-        self.fail_descrs.push(descr);
+        self.fail_descrs.push(descr.clone() as majit_ir::DescrRef);
     }
 
     // ----------------------------------------------------------------
