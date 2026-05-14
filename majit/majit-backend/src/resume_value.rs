@@ -550,6 +550,34 @@ impl VirtualInfo {
 }
 
 
+/// Complete resume data for a guard exit point.
+///
+/// Moved here from `majit-metainterp::resume` (Phase C-1 cascade).
+/// All field types (`ResumeValueSource`, `FrameInfo`, `VirtualInfo`,
+/// `PendingFieldInfo`) live in `majit-backend`.  Inherent impl
+/// methods are provided by the `ResumeDataExt` trait in
+/// `majit-metainterp::resume` (cross-crate orphan rule prevents
+/// inherent impl outside this crate).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResumeData {
+    /// resume.py: snapshot_iter.vable_array / virtualizable_boxes
+    pub vable_array: Vec<ResumeValueSource>,
+    /// resume.py: snapshot_iter.vref_array / virtualref_boxes
+    pub vref_array: Vec<ResumeValueSource>,
+    /// Stack of frames, outermost first.
+    /// For a simple non-inlined trace, this has exactly one entry.
+    pub frames: Vec<FrameInfo>,
+    /// Virtual object descriptions for virtualized state.
+    /// Each entry maps a fail_arg position to a virtual object that needs
+    /// to be materialized when resuming.
+    pub virtuals: Vec<VirtualInfo>,
+    /// Deferred heap writes that must be replayed when resuming.
+    ///
+    /// Mirrors RPython's `rd_pendingfields`, which applies writes after
+    /// virtuals and boxes have been reconstructed.
+    pub pending_fields: Vec<PendingFieldInfo>,
+}
+
 /// Deferred heap write to replay during resume.
 #[derive(Debug, Clone)]
 pub struct PendingFieldInfo {

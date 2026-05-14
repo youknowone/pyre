@@ -1109,29 +1109,10 @@ fn decode_u64(value: i64) -> u64 {
 // resolvable.
 pub use majit_backend::FrameInfo;
 
-/// Complete resume data for a guard exit point.
-///
-/// Contains enough information to reconstruct the full interpreter state
-/// from the values stored in a DeadFrame.
-#[derive(Debug, Clone, PartialEq)]
-pub struct ResumeData {
-    /// resume.py: snapshot_iter.vable_array / virtualizable_boxes
-    pub vable_array: Vec<ResumeValueSource>,
-    /// resume.py: snapshot_iter.vref_array / virtualref_boxes
-    pub vref_array: Vec<ResumeValueSource>,
-    /// Stack of frames, outermost first.
-    /// For a simple non-inlined trace, this has exactly one entry.
-    pub frames: Vec<FrameInfo>,
-    /// Virtual object descriptions for virtualized state.
-    /// Each entry maps a fail_arg position to a virtual object that needs
-    /// to be materialized when resuming.
-    pub virtuals: Vec<VirtualInfo>,
-    /// Deferred heap writes that must be replayed when resuming.
-    ///
-    /// Mirrors RPython's `rd_pendingfields`, which applies writes after
-    /// virtuals and boxes have been reconstructed.
-    pub pending_fields: Vec<PendingFieldInfo>,
-}
+// ResumeData moved to majit-backend::resume_value (Phase C-1 cascade);
+// re-exported for caller compatibility.  Inherent impl methods are
+// provided by ResumeDataExt trait declared below.
+pub use majit_backend::ResumeData;
 
 // ResumeValueSource moved to majit-backend::resume_value (Phase C-1
 // cascade) so the resume-data type chain can live in a

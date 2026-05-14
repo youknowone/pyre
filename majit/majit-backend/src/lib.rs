@@ -23,8 +23,9 @@ pub use finish_descrs::{
 };
 pub use rd_payload::RdPayload;
 pub use resume_value::{
-    FrameInfo, FrameSlotSource, PendingFieldInfo, ResumeValueLayoutSummaryExt, ResumeValueSource,
-    VirtualFieldSource, VirtualInfo, resume_value_layout_summary_from_exit_value_source,
+    FrameInfo, FrameSlotSource, PendingFieldInfo, ResumeData, ResumeValueLayoutSummaryExt,
+    ResumeValueSource, VirtualFieldSource, VirtualInfo,
+    resume_value_layout_summary_from_exit_value_source,
 };
 
 /// Lightweight execution result that avoids DeadFrame boxing.
