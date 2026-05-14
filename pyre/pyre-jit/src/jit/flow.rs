@@ -692,7 +692,6 @@ impl BlockRef {
         Rc::downgrade(&self.0)
     }
 
-
     pub fn input_arity(&self) -> usize {
         self.borrow().inputargs.len()
     }

@@ -1286,7 +1286,10 @@ fn insn_byte_equal(left: &super::flatten::Insn, right: &super::flatten::Insn) ->
     }
 }
 
-fn operand_lists_equal(left: &[super::flatten::Operand], right: &[super::flatten::Operand]) -> bool {
+fn operand_lists_equal(
+    left: &[super::flatten::Operand],
+    right: &[super::flatten::Operand],
+) -> bool {
     left.len() == right.len()
         && left
             .iter()
@@ -2551,7 +2554,8 @@ fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec
 
 fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
     // Map py_pc → anchor insn_idx via `Label("pc{N}")` entries.
-    let mut anchor_for_pc: std::collections::HashMap<usize, usize> = std::collections::HashMap::new();
+    let mut anchor_for_pc: std::collections::HashMap<usize, usize> =
+        std::collections::HashMap::new();
     for (insn_idx, insn) in ssarepr.insns.iter().enumerate() {
         if let Some(py_pc) = label_pc_index(insn) {
             anchor_for_pc.entry(py_pc).or_insert(insn_idx);
@@ -3970,9 +3974,7 @@ impl CodeWriter {
                     // `pendingblocks` (mergeblock-path queuing is
                     // already done by mergeblock itself; joinpoint
                     // match doesn't push automatically).
-                    if target != current_block
-                        && !pendingblocks.iter().any(|b| b == &target)
-                    {
+                    if target != current_block && !pendingblocks.iter().any(|b| b == &target) {
                         pendingblocks.push_front(target.clone());
                     }
                     target
@@ -4047,10 +4049,8 @@ impl CodeWriter {
                     // walker-pop order.
                     if needs_fallthrough {
                         let target_label = format!("pc{}", py_pc);
-                        let goto_insn = Insn::op(
-                            "goto",
-                            vec![Operand::TLabel(TLabel::new(target_label))],
-                        );
+                        let goto_insn =
+                            Insn::op("goto", vec![Operand::TLabel(TLabel::new(target_label))]);
                         push_walker_emit(&mut $ssarepr, &current_block, goto_insn);
                         push_walker_emit(&mut $ssarepr, &current_block, Insn::Unreachable);
                     }
@@ -4103,10 +4103,7 @@ impl CodeWriter {
                 // times if multiple catch sites share a landing
                 // label (unusual but possible per the catch_sites
                 // dedup at codewriter.rs:catch_sites).
-                if !all_walker_blocks
-                    .iter()
-                    .any(|b| b == &current_block)
-                {
+                if !all_walker_blocks.iter().any(|b| b == &current_block) {
                     all_walker_blocks.push(current_block.clone());
                 }
                 // Task #227.1 per-block accumulator dual-write: record
@@ -5260,8 +5257,7 @@ impl CodeWriter {
                             ResKind::Ref,
                             py_pc as i64,
                         );
-                        if let Some(boxed_var) = &boxed {
-                        }
+                        if let Some(boxed_var) = &boxed {}
                         let stack_value = boxed
                             .map(super::flow::FlowValue::from)
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -5289,8 +5285,7 @@ impl CodeWriter {
                             dst_slot,
                             VABLE_CODE_FIELD_IDX
                         );
-                        if let Some(v) = &pycode_graph_var {
-                        }
+                        if let Some(v) = &pycode_graph_var {}
                         // Task #48 micro-slice 7: LoadConst factor
                         // refactor.  The prior `emit_residual_call(
                         // load_const_fn_idx, ...)` call is replaced by
@@ -5366,8 +5361,7 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            if let Some(loaded_var) = &loaded {
-                            }
+                            if let Some(loaded_var) = &loaded {}
                             loaded
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph))
@@ -5570,8 +5564,7 @@ impl CodeWriter {
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         let key_reg = stack_base + current_depth;
-                        if let super::flow::FlowValue::Variable(v) = &key_value {
-                        }
+                        if let super::flow::FlowValue::Variable(v) = &key_value {}
                         current_depth -= 1;
                         emit_vsd!(current_depth);
                         let obj_value = current_state
@@ -5579,8 +5572,7 @@ impl CodeWriter {
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         let obj_reg = stack_base + current_depth;
-                        if let super::flow::FlowValue::Variable(v) = &obj_value {
-                        }
+                        if let super::flow::FlowValue::Variable(v) = &obj_value {}
                         current_depth -= 1;
                         emit_vsd!(current_depth);
                         let stored_value = current_state
@@ -5588,8 +5580,7 @@ impl CodeWriter {
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         let value_reg = stack_base + current_depth;
-                        if let super::flow::FlowValue::Variable(v) = &stored_value {
-                        }
+                        if let super::flow::FlowValue::Variable(v) = &stored_value {}
                         emit_frontend_setitem(
                             &mut graph,
                             &current_block.block(),
@@ -5659,16 +5650,14 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &rhs_value {
-                        }
+                        if let super::flow::FlowValue::Variable(v) = &rhs_value {}
                         // Pop lhs.
                         let lhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let lhs_value = current_state
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &lhs_value {
-                        }
+                        if let super::flow::FlowValue::Variable(v) = &lhs_value {}
                         let result_value = emit_frontend_binary(
                             &mut graph,
                             &current_block.block(),
@@ -5724,15 +5713,13 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &rhs_value {
-                        }
+                        if let super::flow::FlowValue::Variable(v) = &rhs_value {}
                         let lhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
                         let lhs_value = current_state
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &lhs_value {
-                        }
+                        if let super::flow::FlowValue::Variable(v) = &lhs_value {}
                         let result_value = emit_frontend_compare(
                             &mut graph,
                             &current_block.block(),
@@ -5793,8 +5780,7 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &cond_value {
-                        }
+                        if let super::flow::FlowValue::Variable(v) = &cond_value {}
                         let bool_value = emit_frontend_bool(
                             &mut graph,
                             &current_block.block(),
@@ -5853,8 +5839,7 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &cond_value {
-                        }
+                        if let super::flow::FlowValue::Variable(v) = &cond_value {}
                         let bool_value = emit_frontend_bool(
                             &mut graph,
                             &current_block.block(),
@@ -5953,16 +5938,14 @@ impl CodeWriter {
                             scratch_ns,
                             VABLE_NAMESPACE_FIELD_IDX
                         );
-                        if let Some(v) = &ns_graph_var {
-                        }
+                        if let Some(v) = &ns_graph_var {}
                         let code_graph_var = emit_vable_getfield_ref!(
                             ssarepr,
                             portal_frame_reg,
                             scratch_code,
                             VABLE_CODE_FIELD_IDX
                         );
-                        if let Some(v) = &code_graph_var {
-                        }
+                        if let Some(v) = &code_graph_var {}
                         // Task #48 micro-slice 8: LoadGlobal factor
                         // refactor.  The prior `emit_residual_call(
                         // load_global_fn_idx, ...)` call is replaced by
@@ -6028,8 +6011,7 @@ impl CodeWriter {
                         } else {
                             None
                         };
-                        if let Some(loaded_var) = &loaded {
-                        }
+                        if let Some(loaded_var) = &loaded {}
                         let result_value = loaded
                             .map(super::flow::FlowValue::from)
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -7010,12 +6992,9 @@ impl CodeWriter {
                 .first()
                 .cloned()
                 .unwrap_or_else(|| super::flow::Constant::none().into());
-            let synthetic_link = super::flow::Link::new(
-                vec![first_arg],
-                Some(graph.returnblock.clone()),
-                None,
-            )
-            .into_ref();
+            let synthetic_link =
+                super::flow::Link::new(vec![first_arg], Some(graph.returnblock.clone()), None)
+                    .into_ref();
             block.closeblock(vec![synthetic_link]);
         }
 
@@ -7376,44 +7355,49 @@ impl CodeWriter {
             // goto+Unreachable pair that the runtime executes as a
             // no-op trampoline, regressing fib_recursive on
             // backends that don't fold trivial branches.
-            let blocks: Vec<Vec<super::flatten::Insn>> = all_walker_blocks
+            let mut blocks: Vec<Vec<super::flatten::Insn>> = all_walker_blocks
                 .iter()
                 .map(|block| block.per_block_ssarepr())
                 .collect();
-            let mut drained: Vec<super::flatten::Insn> = Vec::new();
-            for (idx, block_insns) in blocks.iter().enumerate() {
-                let next_label_name: Option<&str> = blocks
-                    .get(idx + 1)
+            let total_capacity: usize = blocks.iter().map(|b| b.len()).sum();
+            let mut drained: Vec<super::flatten::Insn> = Vec::with_capacity(total_capacity);
+            let n = blocks.len();
+            for i in 0..n {
+                let next_label_name: Option<String> = blocks
+                    .get(i + 1)
                     .and_then(|next| next.first())
                     .and_then(|first| match first {
-                        super::flatten::Insn::Label(l) => Some(l.name.as_str()),
+                        super::flatten::Insn::Label(l) => Some(l.name.clone()),
                         _ => None,
                     });
-                let strip_tail = match (block_insns.len() >= 2).then_some(()).and_then(|_| {
-                    let n = block_insns.len();
-                    let goto = &block_insns[n - 2];
-                    let tail = &block_insns[n - 1];
-                    match (goto, tail, next_label_name) {
+                let block_insns = &mut blocks[i];
+                let len = block_insns.len();
+                let strip_tail = if len >= 2 {
+                    match (
+                        &block_insns[len - 2],
+                        &block_insns[len - 1],
+                        next_label_name.as_deref(),
+                    ) {
                         (
                             super::flatten::Insn::Op { opname, args, .. },
                             super::flatten::Insn::Unreachable,
                             Some(next_name),
-                        ) if opname == "goto" && args.len() == 1 => {
-                            if let Operand::TLabel(target) = &args[0] {
-                                if target.name == next_name {
-                                    return Some(2);
-                                }
-                            }
-                            None
+                        ) if opname == "goto"
+                            && args.len() == 1
+                            && matches!(&args[0], Operand::TLabel(target) if target.name == next_name) =>
+                        {
+                            2
                         }
-                        _ => None,
+                        _ => 0,
                     }
-                }) {
-                    Some(n) => n,
-                    None => 0,
+                } else {
+                    0
                 };
-                let take = block_insns.len() - strip_tail;
-                drained.extend(block_insns[..take].iter().cloned());
+                block_insns.truncate(len - strip_tail);
+                // Append moves elements (no per-Insn clone), saving one
+                // round of allocation/copy per block compared to the
+                // earlier `extend(iter().cloned())` formulation.
+                drained.append(block_insns);
             }
             ssarepr.insns = drained;
         }
@@ -7745,23 +7729,25 @@ impl CodeWriter {
                         })
                         .count()
                 };
-                let count_residual_call_by_fn_idx =
-                    |insns: &[&super::flatten::Insn], expected_opname: &str, fn_idx: u16| -> usize {
-                        insns
-                            .iter()
-                            .filter(|insn| match insn {
-                                super::flatten::Insn::Op { opname, args, .. } => {
-                                    opname == expected_opname
-                                        && matches!(
-                                            args.first(),
-                                            Some(super::flatten::Operand::ConstInt(v))
-                                                if *v == fn_idx as i64
-                                        )
-                                }
-                                _ => false,
-                            })
-                            .count()
-                    };
+                let count_residual_call_by_fn_idx = |insns: &[&super::flatten::Insn],
+                                                     expected_opname: &str,
+                                                     fn_idx: u16|
+                 -> usize {
+                    insns
+                        .iter()
+                        .filter(|insn| match insn {
+                            super::flatten::Insn::Op { opname, args, .. } => {
+                                opname == expected_opname
+                                    && matches!(
+                                        args.first(),
+                                        Some(super::flatten::Operand::ConstInt(v))
+                                            if *v == fn_idx as i64
+                                    )
+                            }
+                            _ => false,
+                        })
+                        .count()
+                };
                 let mut paired_hlop_total: usize = 0;
                 let mut pair_family = |inline_shape_counts: &mut HashMap<String, usize>,
                                        hlop_opnames: &[&str],

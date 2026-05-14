@@ -1350,10 +1350,7 @@ pub fn is_graph_only_artifact(insn: &Insn) -> bool {
     // graph SpaceOps.  Until then, classify them as graph-only-by-
     // design so `[phase4-graph-shape]` doesn't surface them as
     // false gap.
-    matches!(
-        opname.as_str(),
-        "int_copy" | "ref_copy" | "float_copy"
-    )
+    matches!(opname.as_str(), "int_copy" | "ref_copy" | "float_copy")
 }
 
 /// Instruction tuple (`ssarepr.insns[i]`).
@@ -1816,7 +1813,11 @@ where
             .popline()
             .expect("flatten_ovf_canraise: ssarepr.insns must contain the just-emitted _ovf op");
         let (popped_opname, popped_args, popped_result) = match line {
-            Insn::Op { opname, args, result } => (opname, args, result),
+            Insn::Op {
+                opname,
+                args,
+                result,
+            } => (opname, args, result),
             other => panic!(
                 "flatten_ovf_canraise: popline expected Insn::Op('{raising_opname}', ...), got {other:?}"
             ),
@@ -2654,8 +2655,7 @@ pub fn flatten_graph<'a>(
     super::regalloc::enforce_input_args_simulation(graph, regallocs);
     // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
     // _include_all_exc_links, cpu)`.
-    let lowering_ctx = cpu
-        .and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
+    let lowering_ctx = cpu.and_then(|c| c.lowering_ctx.read().ok().and_then(|guard| *guard));
     let mut ssarepr = SSARepr::new(graph.name.clone());
     // `flatten.py:382-391 getcolor(v)` — read
     // `regallocs[kind].coloring[variable.id]` through the closure.
@@ -4534,7 +4534,9 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("flat_walk");
-        flatten_graph_with_closures(&graph, &mut ssarepr,
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4568,7 +4570,9 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("renaming");
-        flatten_graph_with_closures(&graph, &mut ssarepr,
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4665,7 +4669,9 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("exc_dispatch");
-        flatten_graph_with_closures(&graph, &mut ssarepr,
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4725,7 +4731,9 @@ mod tests {
         start.closeblock(vec![false_link, true_link]);
 
         let mut ssarepr = SSARepr::new("bool_branch");
-        flatten_graph_with_closures(&graph, &mut ssarepr,
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4781,7 +4789,9 @@ mod tests {
         start.closeblock(vec![case_three, case_one, default]);
 
         let mut ssarepr = SSARepr::new("int_switch");
-        flatten_graph_with_closures(&graph, &mut ssarepr,
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4848,7 +4858,9 @@ mod tests {
         start.closeblock(vec![case_three, case_one]);
 
         let mut ssarepr = SSARepr::new("int_switch_no_default");
-        flatten_graph_with_closures(&graph, &mut ssarepr,
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -4901,7 +4913,9 @@ mod tests {
         start.closeblock(vec![false_link, true_link]);
 
         let mut ssarepr = SSARepr::new("tuple_branch");
-        flatten_graph_with_closures(&graph, &mut ssarepr,
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
             |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -5302,7 +5316,9 @@ mod tests {
         ]);
 
         let mut ssarepr = SSARepr::new("passthrough");
-        flatten_graph_with_closures(&graph, &mut ssarepr,
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
@@ -7173,21 +7189,12 @@ mod tests {
 
         super::super::flow::push_op(
             &start,
-            SpaceOperation::new(
-                opname,
-                vec![lhs.into(), rhs.into()],
-                Some(res.into()),
-                42,
-            ),
+            SpaceOperation::new(opname, vec![lhs.into(), rhs.into()], Some(res.into()), 42),
         );
         start.borrow_mut().exitswitch = Some(ExitSwitch::Value(c_last_exception().into()));
 
-        let normal_link = Link::new(
-            vec![res.into()],
-            Some(graph.returnblock.clone()),
-            None,
-        )
-        .into_ref();
+        let normal_link =
+            Link::new(vec![res.into()], Some(graph.returnblock.clone()), None).into_ref();
 
         let mut ovf_link = Link::new(
             vec![except_etype.into(), except_evalue.into()],
@@ -7239,12 +7246,7 @@ mod tests {
     #[test]
     fn flatten_ovf_canraise_rewrites_to_jump_if_ovf_two_exits() {
         let cpu = super::super::cpu::Cpu::new();
-        let ssarepr = flatten_ovf_canraise_graph(
-            "int_add_ovf_2exit",
-            "int_add_ovf",
-            false,
-            &cpu,
-        );
+        let ssarepr = flatten_ovf_canraise_graph("int_add_ovf_2exit", "int_add_ovf", false, &cpu);
         // Expected shape after flatten_graph:
         //   Label(startblock)
         //   int_add_jump_if_ovf TLabel(ovf_link) %i0 %i1 -> %i2
@@ -7255,31 +7257,34 @@ mod tests {
         let jump = ssarepr
             .insns
             .iter()
-            .find(|insn| {
-                matches!(insn, Insn::Op { opname, .. } if opname == "int_add_jump_if_ovf")
-            })
+            .find(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "int_add_jump_if_ovf"))
             .expect("int_add_ovf must rewrite to int_add_jump_if_ovf per flatten.py:195");
         match jump {
-            Insn::Op {
-                args,
-                result,
-                ..
-            } => {
+            Insn::Op { args, result, .. } => {
                 // First arg is the TLabel for the overflow target.
                 assert!(matches!(args[0], Operand::TLabel(_)));
                 // Remaining args are the original lhs/rhs registers.
                 assert!(matches!(
                     args[1],
-                    Operand::Register(Register { kind: Kind::Int, index: 0 })
+                    Operand::Register(Register {
+                        kind: Kind::Int,
+                        index: 0
+                    })
                 ));
                 assert!(matches!(
                     args[2],
-                    Operand::Register(Register { kind: Kind::Int, index: 1 })
+                    Operand::Register(Register {
+                        kind: Kind::Int,
+                        index: 1
+                    })
                 ));
                 // Result is the original op's result Variable.
                 assert!(matches!(
                     result,
-                    Some(Register { kind: Kind::Int, index: 2 })
+                    Some(Register {
+                        kind: Kind::Int,
+                        index: 2
+                    })
                 ));
             }
             _ => unreachable!(),
@@ -7311,21 +7316,18 @@ mod tests {
     #[test]
     fn flatten_ovf_canraise_three_exits_emits_catch_all() {
         let cpu = super::super::cpu::Cpu::new();
-        let ssarepr = flatten_ovf_canraise_graph(
-            "int_mul_ovf_3exit",
-            "int_mul_ovf",
-            true,
-            &cpu,
-        );
+        let ssarepr = flatten_ovf_canraise_graph("int_mul_ovf_3exit", "int_mul_ovf", true, &cpu);
         // Three-exit shape per flatten.py:201-203:
         //   - exits[1]: handling_ovf=true → raise <const>
         //   - exits[2]: handling_ovf=false → reraise (catch-all)
         // Both should appear in the SSARepr.
-        let has_raise_const = ssarepr.insns.iter().any(|insn| matches!(
-            insn,
-            Insn::Op { opname, args, .. }
-                if opname == "raise" && matches!(args.first(), Some(Operand::ConstRef(_)))
-        ));
+        let has_raise_const = ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::Op { opname, args, .. }
+                    if opname == "raise" && matches!(args.first(), Some(Operand::ConstRef(_)))
+            )
+        });
         let has_reraise = ssarepr
             .insns
             .iter()
@@ -7460,7 +7462,9 @@ mod tests {
             Link::new(vec![res.into()], Some(graph.returnblock.clone()), None).into_ref(),
         ]);
         let mut ssarepr = SSARepr::new("ovf_no_catch");
-        flatten_graph_with_closures(&graph, &mut ssarepr,
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
             |v| Register::new(v.kind.unwrap_or(Kind::Ref), v.id.0 as u16),
             flatten_constant_operand,
         );
