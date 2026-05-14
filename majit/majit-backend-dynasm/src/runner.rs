@@ -576,8 +576,9 @@ pub struct DynasmBackend {
     /// compiled loop can leave the runtime holding a jf_descr whose
     /// owning token is not the one currently executing. This registry
     /// is the ptr-indexed view needed to complete that lookup.
-    fail_descr_registry:
-        Arc<std::sync::Mutex<std::collections::HashMap<usize, Arc<crate::guard::DynasmFailDescr>>>>,
+    fail_descr_registry: Arc<
+        std::sync::Mutex<std::collections::HashMap<usize, majit_ir::DescrRef>>,
+    >,
     /// Backend-internal side-table mapping a source guard descr's
     /// `Arc::as_ptr` address to the entry pointer of the compiled bridge
     /// patched in for that guard.  Replaces the prior `bridge_addr` field
@@ -766,19 +767,20 @@ impl DynasmBackend {
         let mut reg = self.fail_descr_registry.lock().unwrap();
         for descr in descrs {
             let ptr = Arc::as_ptr(descr) as usize;
-            reg.entry(ptr).or_insert_with(|| Arc::clone(descr));
+            let descr_ref: majit_ir::DescrRef = Arc::clone(descr) as majit_ir::DescrRef;
+            reg.entry(ptr).or_insert_with(|| descr_ref.clone());
             // Unified-Descr Port Epic: also key the same backend Arc by
             // the metainterp `AbstractFailDescr` Arc's data pointer
-            // (`history.py:125` identity).  After the full identity flip
-            // `jf_descr` will embed the meta addr; the backend status
+            // (`history.py:125` identity).  After Phase B identity flip
+            // `jf_descr` embeds the meta addr; the backend status
             // methods (`compile.py:741/786/790 get_status / start_compiling
-            // / done_compiling`) still need the backend Arc for the
-            // local `AtomicU64` status fallback, so the same Arc lives
-            // under both keys.  Skip when `meta_descr` is unset
-            // (test/synthetic paths) — the backend addr is the only key.
+            // / done_compiling`) forward through meta_descr to the
+            // metainterp ResumeGuardDescr.  Skip when `meta_descr` is
+            // unset (test/synthetic paths) — the backend addr is the
+            // only key.
             if let Some(meta) = &descr.meta_descr {
                 let meta_ptr = Arc::as_ptr(meta) as *const () as usize;
-                reg.entry(meta_ptr).or_insert_with(|| Arc::clone(descr));
+                reg.entry(meta_ptr).or_insert_with(|| descr_ref.clone());
             }
         }
     }
@@ -2064,7 +2066,10 @@ impl Backend for DynasmBackend {
             .lock()
             .expect("fail_descr_registry mutex poisoned");
         registry.retain(|_, descr| {
-            let dyn_descr: &dyn FailDescr = descr.as_ref();
+            let dyn_descr = match descr.as_fail_descr() {
+                Some(fd) => fd,
+                None => return true,
+            };
             match majit_backend::descr_owning_jct(dyn_descr) {
                 Some(owner) => owner.number != token.number,
                 None => true,
