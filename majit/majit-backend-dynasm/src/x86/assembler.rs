@@ -488,6 +488,25 @@ impl<'a> Assembler386<'a> {
             .done_with_this_frame_descr_ptr_for_type(tp) as i64
     }
 
+    /// `compile.py:665-674` `make_and_attach_done_descrs` Arc lookup —
+    /// returns the metainterp `DoneWithThisFrameDescr*` Arc the
+    /// optimizer attached for the given result type.  Used to stamp
+    /// `meta_descr` on backend FINISH descrs so trait forwarding routes
+    /// `is_finish` / `fail_arg_types` through the metainterp class
+    /// hierarchy (`compile.py:624 final_descr=True`).
+    fn done_with_this_frame_descr_arc_for_type(
+        &self,
+        tp: Type,
+    ) -> Option<majit_ir::DescrRef> {
+        let attachments = self.cpu_handle.read().unwrap();
+        match tp {
+            Type::Void => attachments.done_with_this_frame_descr_void.clone(),
+            Type::Int => attachments.done_with_this_frame_descr_int.clone(),
+            Type::Ref => attachments.done_with_this_frame_descr_ref.clone(),
+            Type::Float => attachments.done_with_this_frame_descr_float.clone(),
+        }
+    }
+
     /// `compile.py:658` parity: `self.cpu.exit_frame_with_exception_descr_ref`.
     fn exit_frame_with_exception_descr_ref_ptr(&self) -> i64 {
         self.attached_descrs.exit_frame_with_exception_descr_ref as i64
@@ -3066,12 +3085,16 @@ impl<'a> Assembler386<'a> {
                 };
                 // FINISH op exit (DoneWithThisFrame* / ExitFrameWithExceptionDescr).
                 // `compile.py:185` skips these — not a `ResumeDescr`.
-                let descr = Arc::new(DynasmFailDescr::new(
-                    fail_index,
-                    self.trace_id,
-                    fail_arg_types.clone(),
-                    true, // is_finish
-                ));
+                let descr = {
+                    let mut d = DynasmFailDescr::new(
+                        fail_index,
+                        self.trace_id,
+                        fail_arg_types.clone(),
+                        true, // is_finish
+                    );
+                    d.meta_descr = self.done_with_this_frame_descr_arc_for_type(result_type);
+                    Arc::new(d)
+                };
 
                 // Store result to jf_frame[0]
                 if let Some(result) = arglocs.first() {
@@ -4987,12 +5010,6 @@ impl<'a> Assembler386<'a> {
         };
         // compile.py:618-669 parity: use type-specific global singleton.
         // FINISH op exit (DoneWithThisFrame*) — `compile.py:185` skips these.
-        let descr = Arc::new(DynasmFailDescr::new(
-            fail_index,
-            self.trace_id,
-            fail_arg_types.clone(),
-            true, // is_finish
-        ));
         // Finish ops write the type-appropriate singleton pointer to jf_descr
         // so CALL_ASSEMBLER's fast path CMP matches the correct variant.
         let result_type = if fail_arg_types.is_empty() {
@@ -5001,6 +5018,16 @@ impl<'a> Assembler386<'a> {
             fail_arg_types[0]
         };
         let global_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
+        let descr = {
+            let mut d = DynasmFailDescr::new(
+                fail_index,
+                self.trace_id,
+                fail_arg_types.clone(),
+                true, // is_finish
+            );
+            d.meta_descr = self.done_with_this_frame_descr_arc_for_type(result_type);
+            Arc::new(d)
+        };
 
         // If there's a result argument, store it to jf_frame[0].
         // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.
