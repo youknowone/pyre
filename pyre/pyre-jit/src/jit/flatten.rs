@@ -1303,33 +1303,7 @@ where
                 let operand = self.getcolor(exc_value);
                 self.emitline(Insn::op("raise", vec![operand]));
             }
-            other => {
-                // PRE-EXISTING-ADAPTATION (Phase 4 walker restructure
-                // convergence): pyre's PC-sequential walker can leave
-                // orphan join-point blocks in the graph (non-final
-                // blocks with empty operations + empty exits) when
-                // `emitted_pc_starts` skip + supersede combine to drop
-                // a candidate without filling its content.  Upstream
-                // `flatten.py:148-155 make_link` reaches `make_return`
-                // only on links to graph.returnblock / graph.exceptblock,
-                // where args.len() is 1 or 2 by graph construction;
-                // upstream's `flowcontext.py:402-475` per-block
-                // walker never produces orphans.
-                //
-                // Emit `unreachable` instead of panicking so the
-                // probe-only `flatten_graph` driver completes on
-                // graphs that pyre's walker produces.  Production
-                // SSARepr is not affected — the inline walker emit
-                // path is the production source.  Convergence: the
-                // per-block walker restructure (Task #227 Phase 4)
-                // retires the orphan-producing emitted_pc_starts
-                // skip; once orphans no longer reach `flatten_graph`,
-                // this arm becomes dead code and reverts to
-                // `panic!("make_return expects 1 or 2 args, got {}",
-                // other.len())` per upstream.
-                let _ = other;
-                self.emitline(Insn::op("unreachable", Vec::new()));
-            }
+            _ => panic!("make_return expects 1 or 2 args, got {}", args.len()),
         }
         self.emitline(Insn::Unreachable);
     }
