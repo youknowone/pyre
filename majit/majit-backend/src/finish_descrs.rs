@@ -18,7 +18,12 @@ use majit_ir::{Descr, FailDescr, Type};
 ///
 /// Shared base fields for the four `DoneWithThisFrame*` subclasses —
 /// a stable `fail_arg_types` vector plus the `final_descr = True`
-/// marker exposed through `FailDescr::is_finish()`.
+/// marker exposed through `FailDescr::is_finish()`.  Inherits the
+/// `history.py:132` `_attrs_` slots `adr_jump_offset` / `rd_locs` from
+/// `AbstractFailDescr`; backend codegen
+/// (`assembler.py:849 patch_pending_failure_recoveries` /
+/// `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`)
+/// stamps them on every descr regardless of class.
 #[derive(Debug)]
 struct DoneWithThisFrameDescrBase {
     /// `history.py:122` `index = -1`.  For this descriptor family
@@ -29,14 +34,39 @@ struct DoneWithThisFrameDescrBase {
     /// out of `deadframe[0]`.  pyre carries the same one-slot shape via
     /// `fail_arg_types`.
     fail_arg_types: Vec<Type>,
+    /// `history.py:132` `AbstractFailDescr._attrs_` `adr_jump_offset`.
+    /// Stamped by `assembler.py:849 patch_pending_failure_recoveries`
+    /// when the recovery stub gets a final address.  `0` until stamped.
+    adr_jump_offset: UnsafeCell<usize>,
+    /// `history.py:132` `AbstractFailDescr._attrs_` `rd_locs`.  Written
+    /// by `llsupport/assembler.py:279`.  Empty until codegen stamps it.
+    rd_locs: UnsafeCell<Vec<u16>>,
 }
+
+// Safety: single-threaded JIT (RPython GIL parity).
+unsafe impl Send for DoneWithThisFrameDescrBase {}
+unsafe impl Sync for DoneWithThisFrameDescrBase {}
 
 impl DoneWithThisFrameDescrBase {
     fn new(fail_arg_types: Vec<Type>) -> Self {
         Self {
             descr_index: AtomicI32::new(-1),
             fail_arg_types,
+            adr_jump_offset: UnsafeCell::new(0),
+            rd_locs: UnsafeCell::new(Vec::new()),
         }
+    }
+    fn adr_jump_offset(&self) -> usize {
+        unsafe { *self.adr_jump_offset.get() }
+    }
+    fn set_adr_jump_offset(&self, offset: usize) {
+        unsafe { *self.adr_jump_offset.get() = offset };
+    }
+    fn rd_locs(&self) -> &[u16] {
+        unsafe { &*self.rd_locs.get() }
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        unsafe { *self.rd_locs.get() = locs };
     }
 }
 
@@ -79,6 +109,18 @@ impl FailDescr for DoneWithThisFrameDescrVoid {
         // `compile.py:624` `final_descr = True`.
         true
     }
+    fn adr_jump_offset(&self) -> usize {
+        self.0.adr_jump_offset()
+    }
+    fn set_adr_jump_offset(&self, offset: usize) {
+        self.0.set_adr_jump_offset(offset);
+    }
+    fn rd_locs(&self) -> &[u16] {
+        self.0.rd_locs()
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        self.0.set_rd_locs(locs);
+    }
 }
 
 /// `compile.py:631-638` `class DoneWithThisFrameDescrInt(_DoneWithThisFrameDescr)`.
@@ -118,6 +160,18 @@ impl FailDescr for DoneWithThisFrameDescrInt {
     }
     fn is_finish(&self) -> bool {
         true
+    }
+    fn adr_jump_offset(&self) -> usize {
+        self.0.adr_jump_offset()
+    }
+    fn set_adr_jump_offset(&self, offset: usize) {
+        self.0.set_adr_jump_offset(offset);
+    }
+    fn rd_locs(&self) -> &[u16] {
+        self.0.rd_locs()
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        self.0.set_rd_locs(locs);
     }
 }
 
@@ -159,6 +213,18 @@ impl FailDescr for DoneWithThisFrameDescrRef {
     fn is_finish(&self) -> bool {
         true
     }
+    fn adr_jump_offset(&self) -> usize {
+        self.0.adr_jump_offset()
+    }
+    fn set_adr_jump_offset(&self, offset: usize) {
+        self.0.set_adr_jump_offset(offset);
+    }
+    fn rd_locs(&self) -> &[u16] {
+        self.0.rd_locs()
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        self.0.set_rd_locs(locs);
+    }
 }
 
 /// `compile.py:649-656` `class DoneWithThisFrameDescrFloat(_DoneWithThisFrameDescr)`.
@@ -198,6 +264,18 @@ impl FailDescr for DoneWithThisFrameDescrFloat {
     }
     fn is_finish(&self) -> bool {
         true
+    }
+    fn adr_jump_offset(&self) -> usize {
+        self.0.adr_jump_offset()
+    }
+    fn set_adr_jump_offset(&self, offset: usize) {
+        self.0.set_adr_jump_offset(offset);
+    }
+    fn rd_locs(&self) -> &[u16] {
+        self.0.rd_locs()
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        self.0.set_rd_locs(locs);
     }
 }
 
@@ -244,6 +322,18 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
         // `compile.py:658` subclass identity: ExitFrameWithExceptionDescrRef
         // dispatches to `jitexc.ExitFrameWithExceptionRef` via `handle_fail`.
         true
+    }
+    fn adr_jump_offset(&self) -> usize {
+        self.0.adr_jump_offset()
+    }
+    fn set_adr_jump_offset(&self, offset: usize) {
+        self.0.set_adr_jump_offset(offset);
+    }
+    fn rd_locs(&self) -> &[u16] {
+        self.0.rd_locs()
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        self.0.set_rd_locs(locs);
     }
 }
 
