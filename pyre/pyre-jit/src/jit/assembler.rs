@@ -976,10 +976,23 @@ fn dispatch_op(
         }
         "getarrayitem_vable_r" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
-            let (vable_reg, index_reg, array_idx) = expect_vable_array_read_args(args);
-            state
-                .builder
-                .vable_getarrayitem_ref_with_base(dst, vable_reg, array_idx, index_reg);
+            let (vable_reg, array_idx) = expect_vable_array_read_prefix(args);
+            match &args[1] {
+                Operand::Register(r) if r.kind == Kind::Int => {
+                    state.builder.vable_getarrayitem_ref_with_base(
+                        dst, vable_reg, array_idx, r.index,
+                    );
+                }
+                Operand::ConstInt(value) => {
+                    state.builder.vable_getarrayitem_ref_const_idx_with_base(
+                        dst, vable_reg, array_idx, *value,
+                    );
+                }
+                other => panic!(
+                    "getarrayitem_vable_r expects Register(Int) or ConstInt index, got {:?}",
+                    other,
+                ),
+            }
         }
         "getarrayitem_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
@@ -1009,21 +1022,36 @@ fn dispatch_op(
             }
         }
         "setarrayitem_vable_r" => {
-            let (vable_reg, index_reg, array_idx) = expect_vable_array_write_prefix(args);
-            match &args[2] {
-                Operand::Register(r) if r.kind == Kind::Ref => {
-                    state
-                        .builder
-                        .vable_setarrayitem_ref_with_base(vable_reg, array_idx, index_reg, r.index);
-                }
-                Operand::ConstRef(value) => {
-                    state.builder.vable_setarrayitem_ref_const_value_with_base(
-                        vable_reg, array_idx, index_reg, *value,
+            let (vable_reg, array_idx) = expect_vable_array_write_prefix_no_idx(args);
+            match (&args[1], &args[2]) {
+                (Operand::Register(idx), Operand::Register(src))
+                    if idx.kind == Kind::Int && src.kind == Kind::Ref =>
+                {
+                    state.builder.vable_setarrayitem_ref_with_base(
+                        vable_reg, array_idx, idx.index, src.index,
                     );
                 }
-                other => panic!(
-                    "setarrayitem_vable_r expects Register(Ref) or ConstRef, got {:?}",
-                    other,
+                (Operand::Register(idx), Operand::ConstRef(value)) if idx.kind == Kind::Int => {
+                    state.builder.vable_setarrayitem_ref_const_value_with_base(
+                        vable_reg, array_idx, idx.index, *value,
+                    );
+                }
+                (Operand::ConstInt(idx_value), Operand::Register(src)) if src.kind == Kind::Ref => {
+                    state.builder.vable_setarrayitem_ref_const_idx_with_base(
+                        vable_reg, array_idx, *idx_value, src.index,
+                    );
+                }
+                (Operand::ConstInt(idx_value), Operand::ConstRef(src_value)) => {
+                    state
+                        .builder
+                        .vable_setarrayitem_ref_const_idx_const_value_with_base(
+                            vable_reg, array_idx, *idx_value, *src_value,
+                        );
+                }
+                (idx, src) => panic!(
+                    "setarrayitem_vable_r expects (Register(Int) | ConstInt) index and \
+                     (Register(Ref) | ConstRef) value, got idx={:?} src={:?}",
+                    idx, src,
                 ),
             }
         }
@@ -1628,6 +1656,20 @@ fn expect_vable_array_read_args(args: &[Operand]) -> (u16, u16, u16) {
     (vable_reg, index_reg, array_idx)
 }
 
+/// Read prefix for getarrayitem_vable_*: returns (vable_reg, array_idx)
+/// without dispatching on the index slot, leaving the caller to decide
+/// between Register and ConstInt index.
+fn expect_vable_array_read_prefix(args: &[Operand]) -> (u16, u16) {
+    assert_eq!(
+        args.len(),
+        4,
+        "getarrayitem_vable_* expects [vable, index, arrayfielddescr, arraydescr]"
+    );
+    let vable_reg = expect_reg(&args[0], Kind::Ref);
+    let array_idx = expect_matching_vable_array_descrs(&args[2], &args[3], "getarrayitem_vable_*");
+    (vable_reg, array_idx)
+}
+
 fn expect_vable_array_write_prefix(args: &[Operand]) -> (u16, u16, u16) {
     assert_eq!(
         args.len(),
@@ -1638,6 +1680,20 @@ fn expect_vable_array_write_prefix(args: &[Operand]) -> (u16, u16, u16) {
     let index_reg = expect_reg(&args[1], Kind::Int);
     let array_idx = expect_matching_vable_array_descrs(&args[3], &args[4], "setarrayitem_vable_*");
     (vable_reg, index_reg, array_idx)
+}
+
+/// Write prefix for setarrayitem_vable_* WITHOUT dispatching on the
+/// index slot — returns (vable_reg, array_idx) only.  Caller dispatches
+/// on args[1] (index) and args[2] (value) shape combinations.
+fn expect_vable_array_write_prefix_no_idx(args: &[Operand]) -> (u16, u16) {
+    assert_eq!(
+        args.len(),
+        5,
+        "setarrayitem_vable_* expects [vable, index, value, arrayfielddescr, arraydescr]"
+    );
+    let vable_reg = expect_reg(&args[0], Kind::Ref);
+    let array_idx = expect_matching_vable_array_descrs(&args[3], &args[4], "setarrayitem_vable_*");
+    (vable_reg, array_idx)
 }
 
 fn expect_vable_arraylen_args(args: &[Operand]) -> (u16, u16) {

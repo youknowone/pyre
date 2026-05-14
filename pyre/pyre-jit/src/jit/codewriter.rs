@@ -4491,6 +4491,77 @@ impl CodeWriter {
             }};
         }
 
+        // `setarrayitem_vable_r(vable, ConstInt(idx), value_reg)` —
+        // ConstInt-INDEX variant matching upstream's `jtransform.py:1898`
+        // shape when the index is folded to a Const.  Assembler dispatch
+        // routes to `vable_setarrayitem_ref_const_idx_with_base`.
+        macro_rules! emit_vable_setarrayitem_ref_const_idx {
+            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $index_value:expr, $src:expr) => {{
+                let vable_reg: u16 = $vable_reg;
+                let field_idx: u16 = $field_idx;
+                let index_value: i64 = $index_value;
+                let src = $src;
+                let insn = Insn::op(
+                    "setarrayitem_vable_r",
+                    vec![
+                        Operand::reg(Kind::Ref, vable_reg),
+                        Operand::ConstInt(index_value),
+                        Operand::reg(Kind::Ref, src),
+                        Operand::descr_vable_array_field(field_idx),
+                        Operand::descr_vable_array(field_idx),
+                    ],
+                );
+                push_walker_emit(&mut $ssarepr, &current_block, insn);
+            }};
+        }
+
+        // `setarrayitem_vable_r(vable, ConstInt(idx), ConstRef(value))`
+        // — both index and value as constants.  Assembler routes to
+        // `vable_setarrayitem_ref_const_idx_const_value_with_base`.
+        macro_rules! emit_vable_setarrayitem_ref_const_idx_const_value {
+            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $index_value:expr, $src_value:expr) => {{
+                let vable_reg: u16 = $vable_reg;
+                let field_idx: u16 = $field_idx;
+                let index_value: i64 = $index_value;
+                let src_value: i64 = $src_value;
+                let insn = Insn::op(
+                    "setarrayitem_vable_r",
+                    vec![
+                        Operand::reg(Kind::Ref, vable_reg),
+                        Operand::ConstInt(index_value),
+                        Operand::ConstRef(src_value),
+                        Operand::descr_vable_array_field(field_idx),
+                        Operand::descr_vable_array(field_idx),
+                    ],
+                );
+                push_walker_emit(&mut $ssarepr, &current_block, insn);
+            }};
+        }
+
+        // `getarrayitem_vable_r(vable, ConstInt(idx)) → dst` — ConstInt-
+        // INDEX variant matching upstream's `jtransform.py:1882-1885`
+        // shape when the index is folded.  Assembler dispatch routes to
+        // `vable_getarrayitem_ref_const_idx_with_base`.
+        macro_rules! emit_vable_getarrayitem_ref_const_idx {
+            ($ssarepr:expr, $vable_reg:expr, $dst:expr, $field_idx:expr, $index_value:expr) => {{
+                let vable_reg: u16 = $vable_reg;
+                let dst = $dst;
+                let field_idx: u16 = $field_idx;
+                let index_value: i64 = $index_value;
+                let insn = Insn::op_with_result(
+                    "getarrayitem_vable_r",
+                    vec![
+                        Operand::reg(Kind::Ref, vable_reg),
+                        Operand::ConstInt(index_value),
+                        Operand::descr_vable_array_field(field_idx),
+                        Operand::descr_vable_array(field_idx),
+                    ],
+                    Register::new(Kind::Ref, dst),
+                );
+                push_walker_emit(&mut $ssarepr, &current_block, insn);
+            }};
+        }
+
         // RPython parity: `flatten.py:333`
         // `self.emitline('%s_copy' % kind, v, "->", w)` emits the
         // register-to-register move as `ref_copy` when `kind == 'ref'`;
@@ -4573,13 +4644,11 @@ impl CodeWriter {
                         None,
                         -1,
                     );
-                    let scratch_depth = $ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                    emit_load_const_i!($ssarepr, scratch_depth, depth_value);
-                    emit_vable_setarrayitem_ref!(
+                    emit_vable_setarrayitem_ref_const_idx!(
                         $ssarepr,
                         portal_frame_reg,
                         0_u16,
-                        scratch_depth,
+                        depth_value,
                         src_reg
                     );
                 }
@@ -4629,13 +4698,11 @@ impl CodeWriter {
                         None,
                         -1,
                     );
-                    let scratch_depth = $ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                    emit_load_const_i!($ssarepr, scratch_depth, depth_value);
-                    emit_vable_setarrayitem_ref_const!(
+                    emit_vable_setarrayitem_ref_const_idx_const_value!(
                         $ssarepr,
                         portal_frame_reg,
                         0_u16,
-                        scratch_depth,
+                        depth_value,
                         value
                     );
                 }
@@ -4685,13 +4752,11 @@ impl CodeWriter {
                         None,
                         -1,
                     );
-                    let scratch_depth = $ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                    emit_load_const_i!($ssarepr, scratch_depth, depth_value);
-                    emit_vable_setarrayitem_ref_const!(
+                    emit_vable_setarrayitem_ref_const_idx_const_value!(
                         $ssarepr,
                         portal_frame_reg,
                         0_u16,
-                        scratch_depth,
+                        depth_value,
                         pyre_object::PY_NULL as i64
                     );
                 }
@@ -4713,14 +4778,12 @@ impl CodeWriter {
                 if is_portal {
                     let local_slot = local_to_vable_slot(reg as usize) as i64;
                     let stack_slot = (stack_base_absolute + $depth as usize) as i64;
-                    let scratch_local_idx = $ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                    emit_load_const_i!($ssarepr, scratch_local_idx, local_slot);
-                    emit_vable_getarrayitem_ref!(
+                    emit_vable_getarrayitem_ref_const_idx!(
                         $ssarepr,
                         portal_frame_reg,
                         stack_base + $depth,
                         0_u16,
-                        scratch_local_idx
+                        local_slot
                     );
                     // Graph-side dual-write of BOTH halves of the
                     // LOAD_FAST lowering:
@@ -4770,13 +4833,11 @@ impl CodeWriter {
                         None,
                         -1,
                     );
-                    let scratch_stack_idx = $ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                    emit_load_const_i!($ssarepr, scratch_stack_idx, stack_slot);
-                    emit_vable_setarrayitem_ref!(
+                    emit_vable_setarrayitem_ref_const_idx!(
                         $ssarepr,
                         portal_frame_reg,
                         0_u16,
-                        scratch_stack_idx,
+                        stack_slot,
                         stack_base + $depth
                     );
                     current_state.stack.push(loaded);
@@ -4810,17 +4871,11 @@ impl CodeWriter {
                 let reg = $reg;
                 let stored_reg = $stored_reg;
                 if is_portal {
-                    let scratch_local_idx = $ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                    emit_load_const_i!(
-                        $ssarepr,
-                        scratch_local_idx,
-                        local_to_vable_slot(reg as usize) as i64
-                    );
-                    emit_vable_setarrayitem_ref!(
+                    emit_vable_setarrayitem_ref_const_idx!(
                         $ssarepr,
                         portal_frame_reg,
                         0_u16,
-                        scratch_local_idx,
+                        local_to_vable_slot(reg as usize) as i64,
                         stored_reg
                     );
                 }
@@ -5412,15 +5467,12 @@ impl CodeWriter {
                             let stack_slot = (stack_base_absolute + current_depth as usize) as i64;
                             // LOAD_FAST half: read local, then pyframe.py:378-381
                             // pushvalue parity — mirror to the value-stack slot.
-                            let scratch_local_idx =
-                                ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                            emit_load_const_i!(ssarepr, scratch_local_idx, load_slot);
-                            emit_vable_getarrayitem_ref!(
+                            emit_vable_getarrayitem_ref_const_idx!(
                                 ssarepr,
                                 portal_frame_reg,
                                 stack_base + current_depth,
                                 0_u16,
-                                scratch_local_idx
+                                load_slot
                             );
                             // CPython 3.13 super-instruction semantics: STORE
                             // is observable to the immediately-following LOAD
@@ -5485,13 +5537,11 @@ impl CodeWriter {
                                 None,
                                 -1,
                             );
-                            let scratch_depth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                            emit_load_const_i!(ssarepr, scratch_depth, stack_slot);
-                            emit_vable_setarrayitem_ref!(
+                            emit_vable_setarrayitem_ref_const_idx!(
                                 ssarepr,
                                 portal_frame_reg,
                                 0_u16,
-                                scratch_depth,
+                                stack_slot,
                                 stack_base + current_depth
                             );
                             current_state.stack.push(loaded);
@@ -7045,13 +7095,11 @@ impl CodeWriter {
                         None,
                         -1,
                     );
-                    let scratch_unwind_depth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                    emit_load_const_i!(ssarepr, scratch_unwind_depth, depth_value);
-                    emit_vable_setarrayitem_ref_const!(
+                    emit_vable_setarrayitem_ref_const_idx_const_value!(
                         ssarepr,
                         portal_frame_reg,
                         0_u16,
-                        scratch_unwind_depth,
+                        depth_value,
                         pyre_object::PY_NULL as i64
                     );
                 }
@@ -7120,17 +7168,11 @@ impl CodeWriter {
                             -1,
                         );
                     }
-                    let scratch_lasti_depth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                    emit_load_const_i!(
-                        ssarepr,
-                        scratch_lasti_depth,
-                        (stack_base_absolute + depth as usize) as i64,
-                    );
-                    emit_vable_setarrayitem_ref!(
+                    emit_vable_setarrayitem_ref_const_idx!(
                         ssarepr,
                         portal_frame_reg,
                         0_u16,
-                        scratch_lasti_depth,
+                        (stack_base_absolute + depth as usize) as i64,
                         exc_slot
                     );
                 }
@@ -7156,13 +7198,11 @@ impl CodeWriter {
                     None,
                     -1,
                 );
-                let scratch_exc_depth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                emit_load_const_i!(ssarepr, scratch_exc_depth, depth_value);
-                emit_vable_setarrayitem_ref!(
+                emit_vable_setarrayitem_ref_const_idx!(
                     ssarepr,
                     portal_frame_reg,
                     0_u16,
-                    scratch_exc_depth,
+                    depth_value,
                     exc_slot
                 );
             }

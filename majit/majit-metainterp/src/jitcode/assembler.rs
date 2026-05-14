@@ -551,6 +551,33 @@ impl JitCodeBuilder {
         self.push_reg_u8(dest, "getarrayitem_vable_r result");
     }
 
+    /// `getarrayitem_vable_r` with a ConstInt index.  Mirrors
+    /// `jtransform.py:1882-1885 do_fixed_list_getitem` (vable branch)
+    /// when the index is folded to a `ConstInt` by the optimizer.
+    /// Patches the index slot via the constants pool.
+    pub fn vable_getarrayitem_ref_const_idx_with_base(
+        &mut self,
+        dest: u16,
+        vable_reg: u16,
+        array_idx: u16,
+        index_value: i64,
+    ) {
+        let const_idx = self.add_const_i(index_value);
+        self.touch_ref_reg(vable_reg);
+        self.touch_ref_reg(dest);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Ref, false);
+        self.write_insn("getarrayitem_vable_r/ridd>r");
+        self.push_reg_u8(vable_reg, "getarrayitem_vable_r base");
+        let idx_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((idx_offset, ConstKind::Int, const_idx));
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+        self.push_reg_u8(dest, "getarrayitem_vable_r result");
+    }
+
     pub fn vable_getarrayitem_float_with_base(
         &mut self,
         dest: u16,
@@ -630,6 +657,64 @@ impl JitCodeBuilder {
         self.push_u8(0);
         self.const_patches_u8
             .push((src_offset, ConstKind::Ref, const_idx));
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+    }
+
+    /// `setarrayitem_vable_r` with a ConstInt-sourced index.  Mirrors
+    /// `jtransform.py:1898 do_fixed_list_setitem` (vable branch) when
+    /// the index is folded to a `ConstInt` by the optimizer.  Patches
+    /// the index slot via the constants pool so the runtime
+    /// `BC_SETARRAYITEM_VABLE_R` reads the index from the unified
+    /// register space's constants suffix.
+    pub fn vable_setarrayitem_ref_const_idx_with_base(
+        &mut self,
+        vable_reg: u16,
+        array_idx: u16,
+        index_value: i64,
+        src: u16,
+    ) {
+        let const_idx = self.add_const_i(index_value);
+        self.touch_ref_reg(vable_reg);
+        self.touch_ref_reg(src);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Ref, false);
+        self.write_insn("setarrayitem_vable_r/rirdd");
+        self.push_reg_u8(vable_reg, "setarrayitem_vable_r base");
+        let idx_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((idx_offset, ConstKind::Int, const_idx));
+        self.push_reg_u8(src, "setarrayitem_vable_r value");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+    }
+
+    /// `setarrayitem_vable_r` with both ConstInt index AND ConstRef
+    /// source — the all-constant variant produced when both index and
+    /// value are folded.  Patches both slots via constants pool.
+    pub fn vable_setarrayitem_ref_const_idx_const_value_with_base(
+        &mut self,
+        vable_reg: u16,
+        array_idx: u16,
+        index_value: i64,
+        src_value: i64,
+    ) {
+        let const_idx_int = self.add_const_i(index_value);
+        let const_idx_ref = self.add_const_r(src_value);
+        self.touch_ref_reg(vable_reg);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Ref, false);
+        self.write_insn("setarrayitem_vable_r/rirdd");
+        self.push_reg_u8(vable_reg, "setarrayitem_vable_r base");
+        let idx_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((idx_offset, ConstKind::Int, const_idx_int));
+        let src_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((src_offset, ConstKind::Ref, const_idx_ref));
         self.push_u16(field_descr);
         self.push_u16(array_descr);
     }
