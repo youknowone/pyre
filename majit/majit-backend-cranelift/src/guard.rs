@@ -619,7 +619,10 @@ impl Drop for CraneliftFailDescr {
 impl std::fmt::Debug for CraneliftFailDescr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("CraneliftFailDescr")
-            .field("fail_index", &self.fail_index)
+            .field(
+                "fail_index",
+                &<Self as FailDescr>::fail_index_per_trace(self),
+            )
             .field(
                 "source_op_index",
                 &lookup_source_op_index(self as *const Self as usize),

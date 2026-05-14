@@ -6072,7 +6072,9 @@ fn find_fail_descr_in_fail_descrs(
     fail_index: u32,
 ) -> Option<Arc<CraneliftFailDescr>> {
     for descr in fail_descrs {
-        if descr.trace_id() == trace_id && descr.fail_index == fail_index {
+        if descr.trace_id() == trace_id
+            && FailDescr::fail_index_per_trace(descr.as_ref()) == fail_index
+        {
             return Some(descr.clone());
         }
         let bridge_guard = descr.bridge_ref();
@@ -6489,7 +6491,9 @@ fn patch_fail_descr_recovery_layout(
     recovery_layout: &ExitRecoveryLayout,
 ) -> bool {
     for descr in fail_descrs {
-        if descr.trace_id() == trace_id && descr.fail_index == fail_index {
+        if descr.trace_id() == trace_id
+            && FailDescr::fail_index_per_trace(descr.as_ref()) == fail_index
+        {
             descr.set_recovery_layout(recovery_layout.clone());
             return true;
         }
