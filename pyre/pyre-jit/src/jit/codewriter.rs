@@ -3418,16 +3418,6 @@ impl CodeWriter {
         // hygiene requires captured identifiers be in scope at the
         // macro DEFINITION site.
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
-        // `variable_reg_map` side table retired (was: probe-only
-        // Variable→register reconciliation for the
-        // `[phase4-flatten-graph]` probe's driver_get_register
-        // closure).  Codex review identified it as a structural
-        // deviation with no RPython counterpart — upstream
-        // `flatten.py:386 getcolor` derives register from
-        // `regallocs[kind].getcolor(v)` directly.  Probe now falls
-        // back to `graph_regallocs` unconditionally.
-        // PRE-EXISTING-ADAPTATION (Task #227 Phase 4 convergence).
-        //
         // Upstream `build_flow` relies on `block.dead` alone (flowcontext.py:404);
         // a popped newblock with `dead=False` is re-recorded by
         // `record_block` and its ops are written into `block.operations`
