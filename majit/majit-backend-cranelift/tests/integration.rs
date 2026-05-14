@@ -343,7 +343,6 @@ fn test_bridge_end_to_end() {
             vec![Type::Int, Type::Int],
             false,
             Vec::new(),
-            None,
         );
 
     let bridge_info = backend
@@ -2464,7 +2463,6 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
         vec![Type::Int, Type::Int],
         false,
         Vec::new(),
-        None,
     );
 
     backend.set_next_trace_id(911);
