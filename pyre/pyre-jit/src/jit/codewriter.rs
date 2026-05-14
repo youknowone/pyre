@@ -7034,28 +7034,17 @@ impl CodeWriter {
             if site.push_lasti {
                 current_state.stack.push(fresh_ref_value(&mut graph));
             }
-            // flatten.py:336-347 `generate_last_exc` lowering — every
-            // catch entry produces its own Ref Variable via the
-            // upstream `last_exc_value` op emitted at flatten time
-            // (`emitline("last_exc_value", "->", color)` at
-            // flatten.py:347).  The Variable that
-            // `current_state.last_exception` may carry is the
-            // raising-edge Variable, which is upstream of THIS catch
-            // landing block; using a fresh graph-defined Variable
-            // here matches RPython parity (one `last_exc_value()`
-            // per catch entry) and gives the subsequent
-            // `setarrayitem_vable_r` push a graph-side def-use
-            // chain that does not depend on raise-edge graph
-            // coverage.
-            let v_exc_value = emit_graph_op_with_result(
-                &mut graph,
-                &current_block.block(),
-                "last_exc_value",
-                vec![],
-                Kind::Ref,
-                -1,
-            );
-            let exc_value: super::flow::FlowValue = v_exc_value.into();
+            // `flatten.py:336-352 generate_last_exc` emits the
+            // `last_exc_value` SSARepr op at flatten time only — there
+            // is no graph SpaceOperation counterpart, the Variable
+            // flows through `link.last_exc_value` and is materialised
+            // by the flatten-time emission.  Allocate a fresh Ref
+            // Variable to carry the catch-landing's exception value
+            // through `current_state.stack` and the subsequent vable
+            // push, matching the variable-lifecycle shape upstream
+            // produces — without recording a graph `last_exc_value`
+            // SpaceOp the flatten driver would have to filter.
+            let exc_value: super::flow::FlowValue = fresh_ref_value(&mut graph);
             current_state.stack.push(exc_value.clone());
             // pyframe.py:503-510 + eval.rs:155-158 `dropvaluesuntil` parity:
             //
