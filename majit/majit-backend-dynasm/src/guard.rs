@@ -148,25 +148,17 @@ pub struct DynasmFailDescr {
     pub trace_id: u64,
     pub fail_arg_types: Vec<Type>,
     pub is_finish: bool,
-    /// `compile.py:185` `isinstance(descr, ResumeDescr)` parity at the
-    /// runtime descr layer.  Set explicitly at construction site to
-    /// reflect the upstream class hierarchy:
-    ///   - `ResumeGuardDescr` family (`ResumeAtPositionDescr`,
-    ///     `ResumeGuardForcedDescr`, `ResumeGuardExcDescr`,
-    ///     `CompileLoopVersionDescr`) → true.
-    ///   - `DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef` /
-    ///     `PropagateExceptionDescr` (`compile.py:1092` —
-    ///     `class PropagateExceptionDescr(AbstractFailDescr)`, NOT
-    ///     a `ResumeDescr`) → false.
-    /// Stored explicitly because `!is_finish` is NOT equivalent to
-    /// `is_resume_guard` upstream — `PropagateExceptionDescr` is
-    /// `final_descr=False` AND not a `ResumeDescr`, so the predicate
-    /// must come from the producer, not be derived at the use site.
-    /// Dynasm has no `is_external_jump` counterpart (raw cross-loop
-    /// JMP at `assembler.py:2456-2462 closing_jump` produces no fail
-    /// descr), so the field is the only producer signal for the
-    /// non-`ResumeDescr` non-FINISH case.
-    pub is_resume_guard: bool,
+    // is_resume_guard removed: the predicate is answered by the
+    // metainterp class hierarchy through `meta_descr` forwarding
+    // (`compile.py:185` `isinstance(descr, ResumeDescr)` test against
+    // the actual `ResumeGuardDescr` / `DoneWithThisFrame*` /
+    // `PropagateExceptionDescr` Arc reached via `op.descr`).  Production
+    // codegen sets `meta_descr` immediately after constructing the
+    // backend descr; synthetic `find_descr_by_ptr` exits also carry
+    // `meta_descr` to the attached metainterp Arc.  Backend-only test
+    // harnesses no longer mint plain `DynasmFailDescr` for the
+    // Done*/Exit attachments — `attach_default_test_descrs` uses the
+    // class-distinct Done* types directly.
     /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
     /// True when this FINISH was emitted via
     /// pyjitpl.py:3238-3245 compile_exit_frame_with_exception.
@@ -286,14 +278,12 @@ impl DynasmFailDescr {
         trace_id: u64,
         fail_arg_types: Vec<Type>,
         is_finish: bool,
-        is_resume_guard: bool,
     ) -> Self {
         DynasmFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
             is_finish,
-            is_resume_guard,
             is_exit_frame_with_exception: false,
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
@@ -430,10 +420,15 @@ impl Descr for DynasmFailDescr {
     /// `PropagateExceptionDescr` (final_descr=False AND not
     /// ResumeDescr) so the explicit producer-set bool is required.
     fn is_resume_guard(&self) -> bool {
-        match self.meta_descr.as_ref() {
-            Some(d) => d.is_resume_guard() || d.is_resume_guard_copied(),
-            None => self.is_resume_guard,
-        }
+        // `compile.py:185` `isinstance(descr, ResumeDescr)` — answered by
+        // forwarding to the metainterp class hierarchy via meta_descr.
+        // Synthetic descrs without meta_descr (test scaffolding for the
+        // helper trampoline) take the trait default false; their
+        // ResumeDescr-classification predicate is irrelevant in those
+        // paths.
+        self.meta_descr
+            .as_ref()
+            .map_or(false, |d| d.is_resume_guard() || d.is_resume_guard_copied())
     }
 }
 

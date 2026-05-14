@@ -3070,8 +3070,7 @@ impl<'a> Assembler386<'a> {
                     fail_index,
                     self.trace_id,
                     fail_arg_types.clone(),
-                    true,  // is_finish
-                    false, // is_resume_guard
+                    true, // is_finish
                 ));
 
                 // Store result to jf_frame[0]
@@ -4000,7 +3999,6 @@ impl<'a> Assembler386<'a> {
                 self.trace_id,
                 fail_arg_types,
                 false, // is_finish
-                true,  // is_resume_guard
             ))
         };
         if crate::majit_log_enabled() {
@@ -4764,7 +4762,6 @@ impl<'a> Assembler386<'a> {
             self.trace_id,
             fail_arg_types,
             false, // is_finish
-            true,  // is_resume_guard
         ));
         let descr_ptr = Arc::as_ptr(&descr) as i64;
         self.pending_force_descr = Some(descr);
@@ -4994,8 +4991,7 @@ impl<'a> Assembler386<'a> {
             fail_index,
             self.trace_id,
             fail_arg_types.clone(),
-            true,  // is_finish
-            false, // is_resume_guard
+            true, // is_finish
         ));
         // Finish ops write the type-appropriate singleton pointer to jf_descr
         // so CALL_ASSEMBLER's fast path CMP matches the correct variant.

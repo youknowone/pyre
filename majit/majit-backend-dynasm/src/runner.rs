@@ -1140,7 +1140,7 @@ impl DynasmBackend {
                     (vec![Type::Int], att.done_with_this_frame_descr_int.clone())
                 }
             };
-            let mut d = DynasmFailDescr::new(u32::MAX, 0, types, true, false);
+            let mut d = DynasmFailDescr::new(u32::MAX, 0, types, true);
             d.meta_descr = meta;
             return Arc::new(d);
         }
@@ -1157,7 +1157,7 @@ impl DynasmBackend {
                 .unwrap()
                 .exit_frame_with_exception_descr_ref
                 .clone();
-            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true, false);
+            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true);
             // is_exit_frame_with_exception() forwards through meta_descr;
             // ExitFrameWithExceptionDescrRef in `compile.rs` answers true
             // via its FailDescr trait impl (compile.py:658-662 class
@@ -1215,7 +1215,7 @@ impl DynasmBackend {
                 .unwrap()
                 .propagate_exception_descr
                 .clone();
-            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true, false);
+            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true);
             d.is_exit_frame_with_exception = true;
             d.meta_descr = meta;
             return Arc::new(d);

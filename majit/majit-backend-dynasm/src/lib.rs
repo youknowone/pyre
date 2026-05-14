@@ -808,7 +808,6 @@ mod tests {
             99, // trace_id
             vec![Type::Int, Type::Int],
             false, // is_finish
-            true,  // is_resume_guard
         ));
         let descr_ptr = Arc::as_ptr(&descr) as i64;
 
@@ -832,7 +831,6 @@ mod tests {
             17,
             vec![Type::Int],
             false, // is_finish
-            true,  // is_resume_guard
         ));
         let descr_ptr = Arc::as_ptr(&descr) as usize;
 
