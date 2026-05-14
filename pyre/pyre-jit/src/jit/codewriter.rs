@@ -3533,14 +3533,8 @@ impl CodeWriter {
                     // advisory in regalloc (`regalloc.rs::make_dependencies`
                     // doesn't read it); -1 simply distinguishes them from
                     // real py_pc-anchored ops.
-                    let v_depth = emit_graph_op_with_result(
-                        &mut graph,
-                        &current_block.block(),
-                        "int_copy",
-                        vec![super::flow::Constant::signed(depth_value).into()],
-                        Kind::Int,
-                        -1,
-                    );
+                    let v_depth: super::flow::FlowValue =
+                        super::flow::Constant::signed(depth_value).into();
                     record_graph_op(
                         &current_block.block(),
                         "setfield_vable_i",
@@ -4733,14 +4727,8 @@ impl CodeWriter {
                     // the local slot for subsequent reads (matching
                     // RPython, where `getarrayitem_vable_r` reads do
                     // not feed back into `vable_array_vars`).
-                    let v_local_idx = emit_graph_op_with_result(
-                        &mut graph,
-                        &current_block.block(),
-                        "int_copy",
-                        vec![super::flow::Constant::signed(local_slot).into()],
-                        Kind::Int,
-                        -1,
-                    );
+                    let v_local_idx: super::flow::FlowValue =
+                        super::flow::Constant::signed(local_slot).into();
                     let v_loaded = emit_graph_op_with_result(
                         &mut graph,
                         &current_block.block(),
@@ -4750,14 +4738,8 @@ impl CodeWriter {
                         -1,
                     );
                     let loaded: super::flow::FlowValue = v_loaded.into();
-                    let v_stack_idx = emit_graph_op_with_result(
-                        &mut graph,
-                        &current_block.block(),
-                        "int_copy",
-                        vec![super::flow::Constant::signed(stack_slot).into()],
-                        Kind::Int,
-                        -1,
-                    );
+                    let v_stack_idx: super::flow::FlowValue =
+                        super::flow::Constant::signed(stack_slot).into();
                     record_graph_op(
                         &current_block.block(),
                         "setarrayitem_vable_r",
@@ -5150,14 +5132,8 @@ impl CodeWriter {
                             // local_slot, w_value)`.  `frame_var` is a
                             // startblock inputarg only when `is_portal`.
                             let local_slot = local_to_vable_slot(reg as usize) as i64;
-                            let v_idx = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "int_copy",
-                                vec![super::flow::Constant::signed(local_slot).into()],
-                                Kind::Int,
-                                -1,
-                            );
+                            let v_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(local_slot).into();
                             record_graph_op(
                                 &current_block.block(),
                                 "setarrayitem_vable_r",
@@ -5391,14 +5367,8 @@ impl CodeWriter {
                             // STORE_FAST half graph dual-write
                             // (jtransform.py:1898 `do_fixed_list_setitem`).
                             let store_slot = local_to_vable_slot(store_reg as usize) as i64;
-                            let v_store_idx = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "int_copy",
-                                vec![super::flow::Constant::signed(store_slot).into()],
-                                Kind::Int,
-                                -1,
-                            );
+                            let v_store_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(store_slot).into();
                             record_graph_op(
                                 &current_block.block(),
                                 "setarrayitem_vable_r",
@@ -5469,14 +5439,8 @@ impl CodeWriter {
                             // remains as the slot's Variable
                             // (matching pyopcode.py super-instruction
                             // semantics).
-                            let v_load_idx = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "int_copy",
-                                vec![super::flow::Constant::signed(load_slot).into()],
-                                Kind::Int,
-                                -1,
-                            );
+                            let v_load_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(load_slot).into();
                             let v_loaded = emit_graph_op_with_result(
                                 &mut graph,
                                 &current_block.block(),
@@ -5489,14 +5453,8 @@ impl CodeWriter {
                                 -1,
                             );
                             let loaded: super::flow::FlowValue = v_loaded.into();
-                            let v_stack_idx = emit_graph_op_with_result(
-                                &mut graph,
-                                &current_block.block(),
-                                "int_copy",
-                                vec![super::flow::Constant::signed(stack_slot).into()],
-                                Kind::Int,
-                                -1,
-                            );
+                            let v_stack_idx: super::flow::FlowValue =
+                                super::flow::Constant::signed(stack_slot).into();
                             record_graph_op(
                                 &current_block.block(),
                                 "setarrayitem_vable_r",
@@ -6883,14 +6841,8 @@ impl CodeWriter {
                                 // is delegated to
                                 // `emit_store_local_with_mirror!` below.
                                 let local_slot = local_to_vable_slot(reg as usize) as i64;
-                                let v_idx = emit_graph_op_with_result(
-                                    &mut graph,
-                                    &current_block.block(),
-                                    "int_copy",
-                                    vec![super::flow::Constant::signed(local_slot).into()],
-                                    Kind::Int,
-                                    -1,
-                                );
+                                let v_idx: super::flow::FlowValue =
+                                    super::flow::Constant::signed(local_slot).into();
                                 record_graph_op(
                                     &current_block.block(),
                                     "setarrayitem_vable_r",
@@ -7061,14 +7013,8 @@ impl CodeWriter {
                     // `emit_pushvalue_ref_const!` at codewriter.rs:3576-3603.
                     // The unwind PY_NULL is `Constant::none()` per
                     // assembler.py:109 ConstPtr.NULL.
-                    let v_idx = emit_graph_op_with_result(
-                        &mut graph,
-                        &current_block.block(),
-                        "int_copy",
-                        vec![super::flow::Constant::signed(depth_value).into()],
-                        Kind::Int,
-                        -1,
-                    );
+                    let v_idx: super::flow::FlowValue =
+                        super::flow::Constant::signed(depth_value).into();
                     record_graph_op(
                         &current_block.block(),
                         "setarrayitem_vable_r",
@@ -7141,14 +7087,8 @@ impl CodeWriter {
                     );
                     if let Some(boxed_var) = boxed_lasti {
                         let lasti_depth_value = (stack_base_absolute + depth as usize) as i64;
-                        let v_lasti_idx = emit_graph_op_with_result(
-                            &mut graph,
-                            &current_block.block(),
-                            "int_copy",
-                            vec![super::flow::Constant::signed(lasti_depth_value).into()],
-                            Kind::Int,
-                            -1,
-                        );
+                        let v_lasti_idx: super::flow::FlowValue =
+                            super::flow::Constant::signed(lasti_depth_value).into();
                         record_graph_op(
                             &current_block.block(),
                             "setarrayitem_vable_r",
@@ -7183,18 +7123,9 @@ impl CodeWriter {
             if is_portal {
                 let depth_value = (stack_base_absolute + depth as usize) as i64;
                 // pyframe.py:378-387 `pushvalue` semantics — graph
-                // dual-write of the stack mirror.  Source is the
-                // graph-defined `v_exc_value` produced by
-                // `last_exc_value` above, so the def-use chain is
-                // intact (no orphan use).
-                let v_idx = emit_graph_op_with_result(
-                    &mut graph,
-                    &current_block.block(),
-                    "int_copy",
-                    vec![super::flow::Constant::signed(depth_value).into()],
-                    Kind::Int,
-                    -1,
-                );
+                // dual-write of the stack mirror.
+                let v_idx: super::flow::FlowValue =
+                    super::flow::Constant::signed(depth_value).into();
                 record_graph_op(
                     &current_block.block(),
                     "setarrayitem_vable_r",
