@@ -7298,19 +7298,40 @@ impl CodeWriter {
         // inserts at every block-switch boundary (Phase 4 alignment
         // with `flatten.py:177-258 insert_exits`).
         {
-            // Concatenate per-block accumulators, then peel off
-            // redundant `goto Label("pcN") + Unreachable` pairs
-            // whenever the immediately-following block opens with
-            // `Label("pcN")` for the SAME N — matching upstream
-            // `flatten.py:148-155 make_link`'s shape, which
-            // recurses into the link target via `make_bytecode_block`
-            // (no goto inserted) and only falls through to
-            // `goto TLabel(block) + ---` for already-seen targets
-            // (`flatten.py:110-113`).  Without the peel-off, every
-            // walker block transition would carry an extra
-            // goto+Unreachable pair that the runtime executes as a
-            // no-op trampoline, regressing fib_recursive on
-            // backends that don't fold trivial branches.
+            // PRE-EXISTING-ADAPTATION (Phase 4 walker restructure
+            // convergence): concatenate per-block accumulators, then
+            // peel off redundant `goto Label("pcN") + Unreachable`
+            // pairs whenever the immediately-following block opens
+            // with `Label("pcN")` for the SAME N.
+            //
+            // Upstream `flatten.py:106-155 make_link` recurses into
+            // the link target via `make_bytecode_block` on first
+            // sight (no goto emitted, fall-through is implicit) and
+            // only emits `goto TLabel(block) + ---` for targets
+            // already in `seen_blocks` (`flatten.py:110-113`).  That
+            // seen-blocks decision is taken AT EMIT TIME because
+            // upstream's emission order is determined by the
+            // recursive descent itself.
+            //
+            // Pyre's walker is PC-sequential and uses a `pendingblocks`
+            // VecDeque populated by a mix of `push_front` (joinpoint
+            // re-entry, codewriter.rs:3897) and `push_back` (mergeblock
+            // newblock queueing, codewriter.rs:1035 / 1140); the eventual
+            // drain order is therefore not known at the moment the
+            // walker yields with `block_switch_pending`.  The walker
+            // emits goto+Unreachable defensively at every block-switch
+            // boundary, and this post-walk pass strips the pair when
+            // the actual drain order made the goto a no-op trampoline.
+            //
+            // Without the peel-off, every defensive goto+Unreachable
+            // would cost a runtime no-op branch, regressing
+            // fib_recursive on backends that don't fold trivial
+            // branches.  Convergence: Phase 4 retires the walker's
+            // inline SSARepr emit in favour of post-walk
+            // `flatten_graph(graph, regallocs, cpu)`, which produces
+            // the seen-blocks fall-through shape directly via its
+            // recursive `make_bytecode_block`; this peel-off goes
+            // away together with the walker's own SSARepr writes.
             let mut blocks: Vec<Vec<super::flatten::Insn>> = all_walker_blocks
                 .iter()
                 .map(|block| block.per_block_ssarepr())
