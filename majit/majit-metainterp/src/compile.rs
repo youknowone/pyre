@@ -2832,94 +2832,10 @@ mod tests {
 /// `Arc::clone()` rather than a `Vec::clone()` that would deep-copy
 /// the bytes.  External setters still accept `Option<Vec<T>>`; the
 /// conversion to `Arc<[T]>` is one move per (rare) write.
-#[derive(Debug)]
-struct RdPayload {
-    rd_numb: UnsafeCell<Option<Arc<[u8]>>>,
-    rd_consts: UnsafeCell<Option<Arc<[Const]>>>,
-    rd_virtuals: UnsafeCell<Option<Arc<[Rc<RdVirtualInfo>]>>>,
-    rd_pendingfields: UnsafeCell<Option<Arc<[GuardPendingFieldEntry]>>>,
-}
-
-impl RdPayload {
-    fn empty() -> Self {
-        Self {
-            rd_numb: UnsafeCell::new(None),
-            rd_consts: UnsafeCell::new(None),
-            rd_virtuals: UnsafeCell::new(None),
-            rd_pendingfields: UnsafeCell::new(None),
-        }
-    }
-
-    /// `clone()` shares every field — used by `clone_descr()`, which
-    /// mirrors RPython's `ResumeGuardDescr.clone()` (compile.py:844-846).
-    ///
-    /// RPython `copy_all_attributes_from` (compile.py:861-867) does
-    /// `self.rd_consts = other.rd_consts` etc. — list reference share.
-    /// `Arc<[T]>` provides the equivalent: `Arc::clone()` only bumps a
-    /// refcount.  In-place mutation never happens (the only writer is
-    /// `set_rd_*` which swap-replaces the whole slot), so sharing is
-    /// safe and observably identical to RPython.
-    fn deep_clone(&self) -> Self {
-        Self {
-            rd_numb: UnsafeCell::new(unsafe { (*self.rd_numb.get()).clone() }),
-            rd_consts: UnsafeCell::new(unsafe { (*self.rd_consts.get()).clone() }),
-            rd_virtuals: UnsafeCell::new(unsafe { (*self.rd_virtuals.get()).clone() }),
-            rd_pendingfields: UnsafeCell::new(unsafe { (*self.rd_pendingfields.get()).clone() }),
-        }
-    }
-
-    fn rd_numb(&self) -> Option<&[u8]> {
-        unsafe { (*self.rd_numb.get()).as_deref() }
-    }
-    fn rd_numb_arc(&self) -> Option<Arc<[u8]>> {
-        unsafe { (*self.rd_numb.get()).clone() }
-    }
-    fn set_rd_numb(&self, value: Option<Vec<u8>>) {
-        unsafe { *self.rd_numb.get() = value.map(Arc::from) }
-    }
-    fn set_rd_numb_arc(&self, value: Option<Arc<[u8]>>) {
-        unsafe { *self.rd_numb.get() = value }
-    }
-
-    fn rd_consts(&self) -> Option<&[Const]> {
-        unsafe { (*self.rd_consts.get()).as_deref() }
-    }
-    fn rd_consts_arc(&self) -> Option<Arc<[Const]>> {
-        unsafe { (*self.rd_consts.get()).clone() }
-    }
-    fn set_rd_consts(&self, value: Option<Vec<Const>>) {
-        unsafe { *self.rd_consts.get() = value.map(Arc::from) }
-    }
-    fn set_rd_consts_arc(&self, value: Option<Arc<[Const]>>) {
-        unsafe { *self.rd_consts.get() = value }
-    }
-
-    fn rd_virtuals(&self) -> Option<&[Rc<RdVirtualInfo>]> {
-        unsafe { (*self.rd_virtuals.get()).as_deref() }
-    }
-    fn rd_virtuals_arc(&self) -> Option<Arc<[Rc<RdVirtualInfo>]>> {
-        unsafe { (*self.rd_virtuals.get()).clone() }
-    }
-    fn set_rd_virtuals(&self, value: Option<Vec<Rc<RdVirtualInfo>>>) {
-        unsafe { *self.rd_virtuals.get() = value.map(Arc::from) }
-    }
-    fn set_rd_virtuals_arc(&self, value: Option<Arc<[Rc<RdVirtualInfo>]>>) {
-        unsafe { *self.rd_virtuals.get() = value }
-    }
-
-    fn rd_pendingfields(&self) -> Option<&[GuardPendingFieldEntry]> {
-        unsafe { (*self.rd_pendingfields.get()).as_deref() }
-    }
-    fn rd_pendingfields_arc(&self) -> Option<Arc<[GuardPendingFieldEntry]>> {
-        unsafe { (*self.rd_pendingfields.get()).clone() }
-    }
-    fn set_rd_pendingfields(&self, value: Option<Vec<GuardPendingFieldEntry>>) {
-        unsafe { *self.rd_pendingfields.get() = value.map(Arc::from) }
-    }
-    fn set_rd_pendingfields_arc(&self, value: Option<Arc<[GuardPendingFieldEntry]>>) {
-        unsafe { *self.rd_pendingfields.get() = value }
-    }
-}
+// RdPayload moved to majit-backend::rd_payload (Phase C-1
+// preparatory step toward backend struct deletion).  Re-export from
+// here so existing `compile::RdPayload` references stay resolvable.
+pub use majit_backend::RdPayload;
 
 fn push_vector_info(head: &mut Option<Box<AccumInfo>>, mut info: AccumInfo) {
     info.prev = head.take();
@@ -4795,12 +4711,12 @@ pub fn make_compile_loop_version_descr_from(source_op: &majit_ir::Op) -> DescrRe
     // compile.py:861-872 copy_all_attributes_from copies rd_*; mirror
     // RPython's reference-share by reusing the donor's `Arc<[T]>`
     // slots — `Arc::clone` only bumps a refcount.
-    let payload = RdPayload {
-        rd_numb: UnsafeCell::new(src_fd.rd_numb_arc()),
-        rd_consts: UnsafeCell::new(src_fd.rd_consts_arc()),
-        rd_virtuals: UnsafeCell::new(src_fd.rd_virtuals_arc()),
-        rd_pendingfields: UnsafeCell::new(src_fd.rd_pendingfields_arc()),
-    };
+    let payload = RdPayload::from_arcs(
+        src_fd.rd_numb_arc(),
+        src_fd.rd_consts_arc(),
+        src_fd.rd_virtuals_arc(),
+        src_fd.rd_pendingfields_arc(),
+    );
     Arc::new(CompileLoopVersionDescr {
         fail_index: alloc_fail_index(),
         types: UnsafeCell::new(types),

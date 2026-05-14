@@ -13,12 +13,14 @@ pub mod call_stub;
 pub mod finish_descrs;
 pub mod jitframe;
 pub mod llmodel;
+pub mod rd_payload;
 pub mod synthetic_cpu;
 
 pub use finish_descrs::{
     DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrRef,
     DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
 };
+pub use rd_payload::RdPayload;
 
 /// Lightweight execution result that avoids DeadFrame boxing.
 ///
