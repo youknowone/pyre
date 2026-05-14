@@ -52,13 +52,6 @@ pub fn lookup_bridge(descr_ptr: usize) -> Option<Arc<BridgeData>> {
         .cloned()
 }
 
-pub fn take_bridge(descr_ptr: usize) -> Option<Arc<BridgeData>> {
-    bridge_table()
-        .lock()
-        .expect("BRIDGE_TABLE mutex poisoned")
-        .remove(&descr_ptr)
-}
-
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to its `Box<AtomicUsize>` bridge caches.
 ///
@@ -921,19 +914,6 @@ impl CraneliftFailDescr {
         let status = type_tag | ((index as u64) << Self::ST_SHIFT);
         self.status
             .store(status, std::sync::atomic::Ordering::Release);
-    }
-
-    /// Take the bridge data out of this fail descriptor, leaving None.
-    /// Backed by the `BRIDGE_TABLE` side-table (Session 5i-cl); returns
-    /// an `Arc<BridgeData>` clone (the original is removed from the
-    /// table).  No external callsites at the moment; retained for
-    /// symmetry with `attach_bridge`.
-    pub fn take_bridge(&self) -> Option<Arc<BridgeData>> {
-        let bridge = take_bridge(self as *const Self as usize);
-        if bridge.is_some() {
-            store_bridge_caches(self as *const Self as usize, 0, 0);
-        }
-        bridge
     }
 
     /// Backend-static side-table write (Session 5i-cl).
