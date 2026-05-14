@@ -10,9 +10,15 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use majit_ir::{Const, Descr, FailDescr, GcRef, InputArg, Op, Type, Value};
 
 pub mod call_stub;
+pub mod finish_descrs;
 pub mod jitframe;
 pub mod llmodel;
 pub mod synthetic_cpu;
+
+pub use finish_descrs::{
+    DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrRef,
+    DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
+};
 
 /// Lightweight execution result that avoids DeadFrame boxing.
 ///
