@@ -574,26 +574,9 @@ pub struct ResumeFrameLayoutSummary {
     pub slot_types: Option<Vec<Type>>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResumeVirtualKind {
-    Object,
-    Struct,
-    Array,
-    ArrayStruct,
-    RawBuffer,
-    /// resume.py:763 VStrPlainInfo — virtual plain string.
-    StrPlain,
-    /// resume.py:781 VStrConcatInfo — virtual concatenated string.
-    StrConcat,
-    /// resume.py:801 VStrSliceInfo — virtual string slice.
-    StrSlice,
-    /// resume.py:817 VUniPlainInfo — virtual plain unicode string.
-    UniPlain,
-    /// resume.py:836 VUniConcatInfo — virtual concatenated unicode.
-    UniConcat,
-    /// resume.py:856 VUniSliceInfo — virtual unicode slice.
-    UniSlice,
-}
+// ResumeVirtualKind moved to majit-ir::resumedata (Phase C-1
+// cascade); re-exported for caller compatibility.
+pub use majit_ir::resumedata::ResumeVirtualKind;
 
 #[derive(Debug, Clone)]
 pub enum ResumeVirtualLayoutSummary {

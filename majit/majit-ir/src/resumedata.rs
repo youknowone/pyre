@@ -72,6 +72,31 @@ pub struct ResumeValueLayoutSummary {
     pub constant_type: Option<Type>,
     pub virtual_index: Option<usize>,
 }
+
+/// `resume.py` virtual-info class discriminator used by `VirtualInfo`
+/// to record the variant kind without unfolding the enum.  Moved here
+/// from `majit-metainterp::resume` (Phase C-1 cascade) so the
+/// `ResumeData` chain can live in a backend-accessible crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResumeVirtualKind {
+    Object,
+    Struct,
+    Array,
+    ArrayStruct,
+    RawBuffer,
+    /// resume.py:763 VStrPlainInfo — virtual plain string.
+    StrPlain,
+    /// resume.py:781 VStrConcatInfo — virtual concatenated string.
+    StrConcat,
+    /// resume.py:801 VStrSliceInfo — virtual string slice.
+    StrSlice,
+    /// resume.py:817 VUniPlainInfo — virtual plain unicode string.
+    UniPlain,
+    /// resume.py:836 VUniConcatInfo — virtual concatenated unicode.
+    UniConcat,
+    /// resume.py:856 VUniSliceInfo — virtual unicode slice.
+    UniSlice,
+}
 const TAGMASK: u8 = 3;
 
 pub const UNASSIGNED: i16 = ((-1i32 << 13) << 2 | TAGBOX as i32) as i16;
