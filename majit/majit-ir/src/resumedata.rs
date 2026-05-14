@@ -53,6 +53,25 @@ pub enum ResumeValueKind {
     Uninitialized,
     Unavailable,
 }
+
+/// Summary of a `ResumeValueSource` in serialization-friendly form.
+///
+/// Moved here from `majit-metainterp::resume` (Phase C-1 cascade)
+/// alongside `ResumeValueKind` so backend-side resume readers can
+/// build summaries without depending on the metainterp crate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeValueLayoutSummary {
+    pub kind: ResumeValueKind,
+    pub fail_arg_index: usize,
+    pub raw_fail_arg_position: Option<usize>,
+    /// RPython parity: `Const.value` raw bits (getint/getref_base/getfloatstorage
+    /// all project to `i64`).
+    pub constant: Option<i64>,
+    /// RPython parity: `Const.type` — paired with `constant` so the summary
+    /// round-trips back into a typed `ResumeValueSource::Constant(Const)`.
+    pub constant_type: Option<Type>,
+    pub virtual_index: Option<usize>,
+}
 const TAGMASK: u8 = 3;
 
 pub const UNASSIGNED: i16 = ((-1i32 << 13) << 2 | TAGBOX as i32) as i16;

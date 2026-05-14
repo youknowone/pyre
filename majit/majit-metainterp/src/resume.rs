@@ -555,24 +555,11 @@ struct DecodedResumeLayout {
     pending_fields: Vec<PendingFieldInfo>,
 }
 
-// ResumeValueKind moved to majit-ir::resumedata so backend codepaths
-// can reference the resume-value tag discriminator without a metainterp
-// dependency (Phase C-1 cascade toward backend struct deletion).
-pub use majit_ir::resumedata::ResumeValueKind;
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResumeValueLayoutSummary {
-    pub kind: ResumeValueKind,
-    pub fail_arg_index: usize,
-    pub raw_fail_arg_position: Option<usize>,
-    /// RPython parity: `Const.value` raw bits (getint/getref_base/getfloatstorage
-    /// all project to `i64`).
-    pub constant: Option<i64>,
-    /// RPython parity: `Const.type` — paired with `constant` so the summary
-    /// round-trips back into a typed `ResumeValueSource::Constant(Const)`.
-    pub constant_type: Option<Type>,
-    pub virtual_index: Option<usize>,
-}
+// ResumeValueKind / ResumeValueLayoutSummary moved to
+// majit-ir::resumedata (Phase C-1 cascade) so backend codepaths can
+// reference the resume-value tag discriminator + summary without a
+// metainterp dependency.
+pub use majit_ir::resumedata::{ResumeValueKind, ResumeValueLayoutSummary};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResumeFrameLayoutSummary {
@@ -706,48 +693,11 @@ pub struct ResumeLayoutSummary {
     pub const_pool_size: usize,
 }
 
-impl ResumeValueLayoutSummary {
-    pub(crate) fn raw_fail_arg_position(&self) -> usize {
-        if let Some(position) = self.raw_fail_arg_position {
-            return position;
-        }
-        self.fail_arg_index
-    }
-
-    fn to_resume_source(&self) -> ResumeValueSource {
-        match self.kind {
-            ResumeValueKind::FailArg => ResumeValueSource::FailArg(self.raw_fail_arg_position()),
-            ResumeValueKind::Constant => {
-                let raw = self.constant.expect("missing constant value");
-                // Constant kind requires both raw and type to be set; the
-                // .expect() above already enforces raw, mirror it for type.
-                let tp = self.constant_type.expect("missing constant type");
-                ResumeValueSource::Constant(majit_ir::Const::from_raw_i64(raw, tp))
-            }
-            ResumeValueKind::Virtual => {
-                ResumeValueSource::Virtual(self.virtual_index.expect("missing virtual index"))
-            }
-            ResumeValueKind::Uninitialized => ResumeValueSource::Uninitialized,
-            ResumeValueKind::Unavailable => ResumeValueSource::Unavailable,
-        }
-    }
-
-    fn to_exit_source(&self, virtual_offset: usize) -> ExitValueSourceLayout {
-        match self.kind {
-            ResumeValueKind::FailArg => {
-                ExitValueSourceLayout::ExitValue(self.raw_fail_arg_position())
-            }
-            ResumeValueKind::Constant => {
-                ExitValueSourceLayout::Constant(self.constant.expect("missing constant value"))
-            }
-            ResumeValueKind::Virtual => ExitValueSourceLayout::Virtual(
-                self.virtual_index.expect("missing virtual index") + virtual_offset,
-            ),
-            ResumeValueKind::Uninitialized => ExitValueSourceLayout::Uninitialized,
-            ResumeValueKind::Unavailable => ExitValueSourceLayout::Unavailable,
-        }
-    }
-}
+// ResumeValueLayoutSummary inherent impls moved to
+// majit-backend::resume_value (Phase C-1 cascade).  The conversion
+// methods (raw_fail_arg_position, to_resume_source, to_exit_source)
+// are available through the ResumeValueLayoutSummaryExt trait
+// re-exported above.
 
 impl ResumeFrameLayoutSummary {
     fn to_frame_info(&self) -> FrameInfo {
@@ -786,7 +736,7 @@ impl ResumeFrameLayoutSummary {
         let slot_layouts: Vec<ResumeValueLayoutSummary> = exit_frame
             .slots
             .iter()
-            .map(ResumeValueLayoutSummary::from_exit_value_source)
+            .map(majit_backend::resume_value_layout_summary_from_exit_value_source)
             .collect();
         let slot_sources: Vec<ResumeValueKind> = slot_layouts.iter().map(|s| s.kind).collect();
 
@@ -803,57 +753,10 @@ impl ResumeFrameLayoutSummary {
     }
 }
 
-impl ResumeValueLayoutSummary {
-    /// Build a `ResumeValueLayoutSummary` from a backend-origin `ExitValueSourceLayout`.
-    ///
-    /// Backend-origin constants are always `Int` (numeric or tagged) — the
-    /// backend layer is untyped, so we default the Const type to Int here.
-    pub fn from_exit_value_source(source: &ExitValueSourceLayout) -> Self {
-        match source {
-            ExitValueSourceLayout::ExitValue(index) => Self {
-                kind: ResumeValueKind::FailArg,
-                fail_arg_index: *index,
-                raw_fail_arg_position: Some(*index),
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-            ExitValueSourceLayout::Constant(value) => Self {
-                kind: ResumeValueKind::Constant,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: Some(*value),
-                constant_type: Some(Type::Int),
-                virtual_index: None,
-            },
-            ExitValueSourceLayout::Virtual(index) => Self {
-                kind: ResumeValueKind::Virtual,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: Some(*index),
-            },
-            ExitValueSourceLayout::Uninitialized => Self {
-                kind: ResumeValueKind::Uninitialized,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-            ExitValueSourceLayout::Unavailable => Self {
-                kind: ResumeValueKind::Unavailable,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-        }
-    }
-}
-
+// `from_exit_value_source` constructor moved to
+// majit-backend::resume_value as
+// `resume_value_layout_summary_from_exit_value_source` (cross-crate
+// orphan rule prevents inherent impl on the foreign type).
 impl ResumeVirtualLayoutSummary {
     fn to_virtual_info(&self) -> VirtualInfo {
         match self {
@@ -1314,86 +1217,12 @@ pub struct ResumeData {
     pub pending_fields: Vec<PendingFieldInfo>,
 }
 
-/// Tagged source for a value that must be reconstructed on resume.
-///
-/// This is the majit equivalent of the tagged numbering used by
-/// `rpython/jit/metainterp/resume.py`. Each `Constant` entry carries a
-/// full `majit_ir::Const` (Int/Float/Ref) so the encoder's `getconst`
-/// dispatch (resume.py:157-188) can route through the shared pool
-/// (`ResumeDataLoopMemo.consts`) without losing type information.
-#[derive(Debug, Clone, PartialEq)]
-pub enum ResumeValueSource {
-    /// Value comes from the deadframe fail-args array.
-    FailArg(usize),
-    /// Value is a compile-time constant — carries the Const so that the
-    /// type survives encoding, matching RPython's `Const` object.
-    Constant(majit_ir::Const),
-    /// Value is a virtual object that must be materialized on resume.
-    Virtual(usize),
-    /// Value exists conceptually but is still uninitialized.
-    ///
-    /// Mirrors RPython's `UNINITIALIZED` tag used for string/unicode content.
-    Uninitialized,
-    /// Slot is not live at this guard.
-    Unavailable,
-}
-
-impl ResumeValueSource {
-    pub fn kind(&self) -> ResumeValueKind {
-        match self {
-            ResumeValueSource::FailArg(_) => ResumeValueKind::FailArg,
-            ResumeValueSource::Constant(_) => ResumeValueKind::Constant,
-            ResumeValueSource::Virtual(_) => ResumeValueKind::Virtual,
-            ResumeValueSource::Uninitialized => ResumeValueKind::Uninitialized,
-            ResumeValueSource::Unavailable => ResumeValueKind::Unavailable,
-        }
-    }
-
-    pub fn layout_summary(&self) -> ResumeValueLayoutSummary {
-        match self {
-            ResumeValueSource::FailArg(index) => ResumeValueLayoutSummary {
-                kind: ResumeValueKind::FailArg,
-                fail_arg_index: *index,
-                raw_fail_arg_position: Some(*index),
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-            ResumeValueSource::Constant(c) => ResumeValueLayoutSummary {
-                kind: ResumeValueKind::Constant,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: Some(c.as_raw_i64()),
-                constant_type: Some(c.get_type()),
-                virtual_index: None,
-            },
-            ResumeValueSource::Virtual(index) => ResumeValueLayoutSummary {
-                kind: ResumeValueKind::Virtual,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: Some(*index),
-            },
-            ResumeValueSource::Uninitialized => ResumeValueLayoutSummary {
-                kind: ResumeValueKind::Uninitialized,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-            ResumeValueSource::Unavailable => ResumeValueLayoutSummary {
-                kind: ResumeValueKind::Unavailable,
-                fail_arg_index: 0,
-                raw_fail_arg_position: None,
-                constant: None,
-                constant_type: None,
-                virtual_index: None,
-            },
-        }
-    }
-}
+// ResumeValueSource moved to majit-backend::resume_value (Phase C-1
+// cascade) so the resume-data type chain can live in a
+// backend-accessible crate.  Re-export so existing
+// crate::resume::ResumeValueSource references stay resolvable.
+pub use majit_backend::ResumeValueSource;
+pub use majit_backend::ResumeValueLayoutSummaryExt;
 
 /// Source for a resumed frame slot.
 pub type FrameSlotSource = ResumeValueSource;

@@ -14,6 +14,7 @@ pub mod finish_descrs;
 pub mod jitframe;
 pub mod llmodel;
 pub mod rd_payload;
+pub mod resume_value;
 pub mod synthetic_cpu;
 
 pub use finish_descrs::{
@@ -21,6 +22,9 @@ pub use finish_descrs::{
     DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
 };
 pub use rd_payload::RdPayload;
+pub use resume_value::{
+    ResumeValueLayoutSummaryExt, ResumeValueSource, resume_value_layout_summary_from_exit_value_source,
+};
 
 /// Lightweight execution result that avoids DeadFrame boxing.
 ///
