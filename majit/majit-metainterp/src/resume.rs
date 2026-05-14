@@ -976,13 +976,9 @@ impl ResumeLayoutSummary {
                 .iter()
                 .map(|virt| resume_virtual_layout_to_exit_virtual_layout(virt, virtual_offset)),
         );
-        pending_field_layouts.extend(
-            self.pending_field_layouts
-                .iter()
-                .map(|pending| {
-                    pending_field_layout_to_exit_pending_field_layout(pending, virtual_offset)
-                }),
-        );
+        pending_field_layouts.extend(self.pending_field_layouts.iter().map(|pending| {
+            pending_field_layout_to_exit_pending_field_layout(pending, virtual_offset)
+        }));
 
         ExitRecoveryLayout {
             vable_array: Vec::new(),
@@ -1118,8 +1114,8 @@ pub use majit_backend::ResumeData;
 // cascade) so the resume-data type chain can live in a
 // backend-accessible crate.  Re-export so existing
 // crate::resume::ResumeValueSource references stay resolvable.
-pub use majit_backend::ResumeValueSource;
 pub use majit_backend::ResumeValueLayoutSummaryExt;
+pub use majit_backend::ResumeValueSource;
 
 // FrameSlotSource type alias re-exported from majit-backend
 // (Phase C-1 cascade) alongside FrameInfo.
@@ -1132,7 +1128,6 @@ pub use majit_backend::FrameSlotSource;
 // depends on ResumeDataDirectReader + BlackholeAllocator which are
 // metainterp-specific.  Re-exported here for caller compatibility.
 pub use majit_backend::VirtualInfo;
-
 
 // VirtualFieldSource type alias re-exported from majit-backend
 // (Phase C-1 cascade), same as FrameSlotSource.
@@ -2151,11 +2146,10 @@ impl ResumeDataExt for ResumeData {
 
     fn reconstruct_state(&self, fail_values: &[i64]) -> ReconstructedState {
         let decoded = self.decode_layout();
-        let materialized_virtuals =
-            <ResumeData as ResumeDataExt>::materialize_virtuals_from_infos(
-                &decoded.virtuals,
-                fail_values,
-            );
+        let materialized_virtuals = <ResumeData as ResumeDataExt>::materialize_virtuals_from_infos(
+            &decoded.virtuals,
+            fail_values,
+        );
         let frames = decoded
             .frames
             .iter()
@@ -2164,10 +2158,7 @@ impl ResumeDataExt for ResumeData {
                     .slot_map
                     .iter()
                     .map(|slot| {
-                        <ResumeData as ResumeDataExt>::resolve_frame_slot_source(
-                            slot,
-                            fail_values,
-                        )
+                        <ResumeData as ResumeDataExt>::resolve_frame_slot_source(slot, fail_values)
                     })
                     .collect();
                 ReconstructedFrame {

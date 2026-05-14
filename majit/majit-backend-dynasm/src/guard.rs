@@ -232,7 +232,6 @@ pub struct DynasmFailDescr {
     // `AbstractFailDescr._attrs_` (`history.py:132`).  The codegen-
     // time trace-op index lives in `SOURCE_OP_INDEX_TABLE` keyed on
     // the descr's inner address.
-
     /// Backend-origin recovery layout, built at compile time from fail_arg_types.
     // recovery_layout removed (Session 7): not in PyPy
     // `AbstractFailDescr._attrs_` (`history.py:132`).  The structured
@@ -647,18 +646,12 @@ impl FailDescr for DynasmFailDescr {
         self.get_status() & majit_backend::STATUS_BUSY_FLAG != 0
     }
 
-    // resume.py:450-488 readers gated on `meta_resume_fd()` —
-    // `isinstance(descr, ResumeDescr)` per `record_loop_or_bridge`.
-    fn rd_numb(&self) -> Option<&[u8]> {
-        self.meta_resume_fd().and_then(|fd| fd.rd_numb())
-    }
-    fn rd_consts(&self) -> Option<&[majit_ir::Const]> {
-        self.meta_resume_fd().and_then(|fd| fd.rd_consts())
-    }
-    fn rd_virtuals(&self) -> Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]> {
-        self.meta_resume_fd().and_then(|fd| fd.rd_virtuals())
-    }
-    fn rd_pendingfields(&self) -> Option<&[majit_ir::GuardPendingFieldEntry]> {
-        self.meta_resume_fd().and_then(|fd| fd.rd_pendingfields())
-    }
+    // rd_numb / rd_consts / rd_virtuals / rd_pendingfields: trait defaults
+    // (`majit-ir/src/descr.rs:1144-1212`) return `None`.  After the GUARD
+    // wrapper deletion (`dd9848f35b`), `DynasmFailDescr` only wraps FINISH
+    // descrs (`_DoneWithThisFrameDescr` / `ExitFrameWithExceptionDescrRef`
+    // singletons in `meta_descr`).  Those singletons are NOT `ResumeDescr`
+    // per `compile.py:185`, so `meta_resume_fd()` always returns `None` for
+    // them, making the prior forwarding overrides equivalent to the trait
+    // defaults — dropped.
 }

@@ -1819,20 +1819,19 @@ fn jit_blackhole_resume_from_guard(
     // Phase E.3+ unification (Task #235) replaces `(green_key, trace_id,
     // fail_index)` keying with descr identity — at which point this
     // whole recovery block collapses.
-    let actual_green_key =
-        match majit_backend::descr_owning_jct(descr_fd).map(|j| j.green_key) {
-            Some(gk) => gk,
-            None if num_fail_values >= 1 => {
-                let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
-                if !frame_ptr.is_null() {
-                    let code = unsafe { (*frame_ptr).pycode };
-                    crate::eval::make_green_key(code, 0)
-                } else {
-                    0
-                }
+    let actual_green_key = match majit_backend::descr_owning_jct(descr_fd).map(|j| j.green_key) {
+        Some(gk) => gk,
+        None if num_fail_values >= 1 => {
+            let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
+            if !frame_ptr.is_null() {
+                let code = unsafe { (*frame_ptr).pycode };
+                crate::eval::make_green_key(code, 0)
+            } else {
+                0
             }
-            None => 0,
-        };
+        }
+        None => 0,
+    };
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!(

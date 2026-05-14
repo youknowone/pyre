@@ -17708,7 +17708,9 @@ mod tests {
             .fail_descrs
             .iter()
             .find(|descr| {
-                descr.as_fail_descr().map_or(false, |fd| fd.fail_index_per_trace() == fail_index)
+                descr
+                    .as_fail_descr()
+                    .map_or(false, |fd| fd.fail_index_per_trace() == fail_index)
             })
             .expect("fail descr");
         // After backend struct deletion, the `fail_descrs` vec stores

@@ -154,10 +154,7 @@ impl Eq for PendingFieldLayoutSummary {}
 /// `history.py:125 id(descr)` parity: `Option<DescrRef>` identity
 /// comparison via `Arc::ptr_eq`.
 #[inline]
-pub fn opt_descr_arc_ptr_eq(
-    a: &Option<crate::DescrRef>,
-    b: &Option<crate::DescrRef>,
-) -> bool {
+pub fn opt_descr_arc_ptr_eq(a: &Option<crate::DescrRef>, b: &Option<crate::DescrRef>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),

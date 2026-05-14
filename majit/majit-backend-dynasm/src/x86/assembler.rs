@@ -494,10 +494,7 @@ impl<'a> Assembler386<'a> {
     /// `meta_descr` on backend FINISH descrs so trait forwarding routes
     /// `is_finish` / `fail_arg_types` through the metainterp class
     /// hierarchy (`compile.py:624 final_descr=True`).
-    fn done_with_this_frame_descr_arc_for_type(
-        &self,
-        tp: Type,
-    ) -> Option<majit_ir::DescrRef> {
+    fn done_with_this_frame_descr_arc_for_type(&self, tp: Type) -> Option<majit_ir::DescrRef> {
         let attachments = self.cpu_handle.read().unwrap();
         match tp {
             Type::Void => attachments.done_with_this_frame_descr_void.clone(),
@@ -1696,10 +1693,9 @@ impl<'a> Assembler386<'a> {
         // build catches the position/fail_index mismatch eagerly rather
         // than dispatching to the wrong descr at runtime.
         assert!(
-            self.fail_descrs
-                .iter()
-                .enumerate()
-                .all(|(i, d)| d.as_fail_descr().map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
+            self.fail_descrs.iter().enumerate().all(|(i, d)| d
+                .as_fail_descr()
+                .map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
             "fail_descrs position must equal fail_index"
         );
         Ok(CompiledCode {
@@ -1819,10 +1815,9 @@ impl<'a> Assembler386<'a> {
         // build catches the position/fail_index mismatch eagerly rather
         // than dispatching to the wrong descr at runtime.
         assert!(
-            self.fail_descrs
-                .iter()
-                .enumerate()
-                .all(|(i, d)| d.as_fail_descr().map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
+            self.fail_descrs.iter().enumerate().all(|(i, d)| d
+                .as_fail_descr()
+                .map_or(false, |fd| fd.fail_index_per_trace() as usize == i)),
             "fail_descrs position must equal fail_index"
         );
         Ok(CompiledCode {
@@ -4147,10 +4142,7 @@ impl<'a> Assembler386<'a> {
         };
         // Session 5i-cl parity: source_op_index moved to a backend-static
         // side-table keyed on the descr Arc address.
-        crate::guard::register_source_op_index(
-            Arc::as_ptr(&descr) as *const () as usize,
-            op_index,
-        );
+        crate::guard::register_source_op_index(Arc::as_ptr(&descr) as *const () as usize, op_index);
         // Session 7 parity: recovery_layout moved to a backend-static
         // side-table keyed on the descr Arc address.
         crate::guard::register_recovery_layout(
@@ -4173,7 +4165,9 @@ impl<'a> Assembler386<'a> {
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] guard-token-slots: fail_index={} fail_arg_locs={:?} rd_locs={:?}",
-                fail_index, &fail_arg_locs, descr_fd.rd_locs()
+                fail_index,
+                &fail_arg_locs,
+                descr_fd.rd_locs()
             );
         }
         let gcmap = self.guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), faillocs);

@@ -35,11 +35,7 @@ impl std::fmt::Debug for FrameData {
 }
 
 impl FrameData {
-    pub fn new(
-        raw_values: Vec<i64>,
-        fail_descr: DescrRef,
-        latest_descr: Option<DescrRef>,
-    ) -> Self {
+    pub fn new(raw_values: Vec<i64>, fail_descr: DescrRef, latest_descr: Option<DescrRef>) -> Self {
         FrameData {
             raw_values,
             fail_descr,

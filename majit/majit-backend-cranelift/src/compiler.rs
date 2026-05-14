@@ -134,7 +134,9 @@ static EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL: std::sync::LazyLock<Arc<Cranelift
         );
         // is_exit_frame_with_exception() forwards through meta_descr to
         // the metainterp ExitFrameWithExceptionDescrRef Arc.
-        d.meta_descr = Some(Arc::new(majit_backend::ExitFrameWithExceptionDescrRef::new()));
+        d.meta_descr = Some(Arc::new(
+            majit_backend::ExitFrameWithExceptionDescrRef::new(),
+        ));
         Arc::new(d)
     });
 
@@ -2626,11 +2628,9 @@ fn register_call_assembler_target(
     // pick the metainterp-attached `Arc<DoneWithThisFrameDescr*>` when
     // available and fall back to the cranelift-side singleton in its
     // absence (backend-only tests).
-    if let Some(finish_descr) = compiled
-        .fail_descrs
-        .iter()
-        .find(|d| FailDescr::is_finish(d.as_ref()) && !FailDescr::is_exit_frame_with_exception(d.as_ref()))
-    {
+    if let Some(finish_descr) = compiled.fail_descrs.iter().find(|d| {
+        FailDescr::is_finish(d.as_ref()) && !FailDescr::is_exit_frame_with_exception(d.as_ref())
+    }) {
         let result_type = finish_descr
             .fail_arg_types()
             .first()
@@ -2726,7 +2726,9 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
     let new_finish_descr_ptr = new_target
         .fail_descrs
         .iter()
-        .find(|d| FailDescr::is_finish(d.as_ref()) && !FailDescr::is_exit_frame_with_exception(d.as_ref()))
+        .find(|d| {
+            FailDescr::is_finish(d.as_ref()) && !FailDescr::is_exit_frame_with_exception(d.as_ref())
+        })
         .map(|d| {
             let result_type = d.fail_arg_types().first().copied().unwrap_or(Type::Void);
             attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64
@@ -3468,8 +3470,12 @@ fn call_assembler_fast_path_heap(
             fail_descr.recovery_layout_ref().as_ref(),
             bridge.num_inputs,
         );
-        let mut frame =
-            CraneliftBackend::execute_bridge(&bridge, &bridge_outputs, fail_arg_types, &attachments);
+        let mut frame = CraneliftBackend::execute_bridge(
+            &bridge,
+            &bridge_outputs,
+            fail_arg_types,
+            &attachments,
+        );
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
             .expect("bridge deadframe must have a descriptor");
         if bridge_descr.is_finish() {
@@ -13254,23 +13260,24 @@ fn collect_guards(
         // metainterp DoneWithThisFrameDescr* matching the result type
         // so trait predicates (is_finish / fail_arg_types) resolve via
         // the upstream class hierarchy.
-        descr.meta_descr = if let Some(d) = op.descr.clone() {
-            Some(d)
-        } else if is_finish {
-            let result_type = descr.fail_arg_types.first().copied().unwrap_or(Type::Void);
-            Some(match result_type {
-                Type::Void => Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new())
-                    as majit_ir::DescrRef,
-                Type::Int => Arc::new(majit_backend::DoneWithThisFrameDescrInt::new())
-                    as majit_ir::DescrRef,
-                Type::Ref => Arc::new(majit_backend::DoneWithThisFrameDescrRef::new())
-                    as majit_ir::DescrRef,
-                Type::Float => Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new())
-                    as majit_ir::DescrRef,
-            })
-        } else {
-            None
-        };
+        descr.meta_descr =
+            if let Some(d) = op.descr.clone() {
+                Some(d)
+            } else if is_finish {
+                let result_type = descr.fail_arg_types.first().copied().unwrap_or(Type::Void);
+                Some(match result_type {
+                    Type::Void => Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new())
+                        as majit_ir::DescrRef,
+                    Type::Int => Arc::new(majit_backend::DoneWithThisFrameDescrInt::new())
+                        as majit_ir::DescrRef,
+                    Type::Ref => Arc::new(majit_backend::DoneWithThisFrameDescrRef::new())
+                        as majit_ir::DescrRef,
+                    Type::Float => Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new())
+                        as majit_ir::DescrRef,
+                })
+            } else {
+                None
+            };
         let descr = Arc::new(descr);
         // Session 5i-cl: source_op_index / recovery_layout writes go to
         // backend-static side-tables keyed on `Arc::as_ptr(&descr)`, so
@@ -13495,9 +13502,9 @@ impl majit_backend::Backend for CraneliftBackend {
                 if !descr.is_resume_guard() {
                     continue;
                 }
-                descr.set_rd_loop_token_clt(
-                    std::sync::Arc::clone(clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>,
-                );
+                descr
+                    .set_rd_loop_token_clt(std::sync::Arc::clone(clt)
+                        as std::sync::Arc<dyn std::any::Any + Send + Sync>);
             }
         }
 
@@ -13688,9 +13695,9 @@ impl majit_backend::Backend for CraneliftBackend {
                 continue;
             }
             if let Some(clt) = clt_arc.as_ref() {
-                descr.set_rd_loop_token_clt(
-                    std::sync::Arc::clone(clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>,
-                );
+                descr
+                    .set_rd_loop_token_clt(std::sync::Arc::clone(clt)
+                        as std::sync::Arc<dyn std::any::Any + Send + Sync>);
             }
         }
         {
@@ -14417,7 +14424,10 @@ impl majit_backend::Backend for CraneliftBackend {
         let mut result = Vec::new();
         for descr in &compiled.fail_descrs {
             if let Some(layout) = descr.recovery_layout_ref() {
-                result.push((<CraneliftFailDescr as majit_ir::FailDescr>::fail_index_per_trace(descr), layout.frames.clone()));
+                result.push((
+                    <CraneliftFailDescr as majit_ir::FailDescr>::fail_index_per_trace(descr),
+                    layout.frames.clone(),
+                ));
             }
         }
         Some(result)

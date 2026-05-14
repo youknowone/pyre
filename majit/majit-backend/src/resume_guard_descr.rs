@@ -17,9 +17,9 @@ use majit_ir::{
     AccumInfo, Const, Descr, DescrRef, FailDescr, GuardPendingFieldEntry, RdVirtualInfo, Type,
 };
 
+use crate::CompiledLoopToken;
 use crate::rd_payload::RdPayload;
 use crate::resume_value::ResumeData;
-use crate::CompiledLoopToken;
 
 // `compile.py:687-696 AbstractResumeGuardDescr` status-bit constants.
 //
@@ -175,7 +175,8 @@ impl FailDescr for ResumeGuardDescr {
         self.fail_index_per_trace.load(Ordering::Relaxed)
     }
     fn set_fail_index_per_trace(&self, fail_index: u32) {
-        self.fail_index_per_trace.store(fail_index, Ordering::Relaxed);
+        self.fail_index_per_trace
+            .store(fail_index, Ordering::Relaxed);
     }
     fn fail_arg_types(&self) -> &[Type] {
         unsafe { &*self.types.get() }

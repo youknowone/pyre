@@ -24,10 +24,10 @@ pub use finish_descrs::{
 };
 pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{
-    ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK, STATUS_TYPE_MASK,
-    STATUS_TY_FLOAT, STATUS_TY_INT, STATUS_TY_NONE, STATUS_TY_REF, alloc_fail_index,
-    build_vector_info_chain, flatten_vector_info, make_resume_guard_descr_typed,
-    push_vector_info, reset_fail_index_counter,
+    ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK, STATUS_TY_FLOAT,
+    STATUS_TY_INT, STATUS_TY_NONE, STATUS_TY_REF, STATUS_TYPE_MASK, alloc_fail_index,
+    build_vector_info_chain, flatten_vector_info, make_resume_guard_descr_typed, push_vector_info,
+    reset_fail_index_counter,
 };
 pub use resume_value::{
     FrameInfo, FrameSlotSource, PendingFieldInfo, ResumeData, ResumeValueLayoutSummaryExt,
@@ -380,10 +380,7 @@ impl ExitVirtualLayout {
 /// other_descr` rather than relying on the pyre-only `descr_index`
 /// serialization handle.
 #[inline]
-fn opt_descr_ptr_eq(
-    a: &Option<majit_ir::DescrRef>,
-    b: &Option<majit_ir::DescrRef>,
-) -> bool {
+fn opt_descr_ptr_eq(a: &Option<majit_ir::DescrRef>, b: &Option<majit_ir::DescrRef>) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),

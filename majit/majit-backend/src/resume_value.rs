@@ -549,7 +549,6 @@ impl VirtualInfo {
     }
 }
 
-
 /// Complete resume data for a guard exit point.
 ///
 /// Moved here from `majit-metainterp::resume` (Phase C-1 cascade).

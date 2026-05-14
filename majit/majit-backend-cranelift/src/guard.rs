@@ -607,9 +607,7 @@ impl Drop for CraneliftFailDescr {
         // `BridgeData::fail_descrs`' inner Arcs cascade into descr
         // `Drop` calls that re-acquire `BRIDGE_TABLE`.
         let removed_bridge = {
-            let mut guard = bridge_table()
-                .lock()
-                .expect("BRIDGE_TABLE mutex poisoned");
+            let mut guard = bridge_table().lock().expect("BRIDGE_TABLE mutex poisoned");
             guard.remove(&ptr)
         };
         drop(removed_bridge);
@@ -647,10 +645,7 @@ impl std::fmt::Debug for CraneliftFailDescr {
                 "recovery_layout",
                 &lookup_recovery_layout(self as *const Self as usize),
             )
-            .field(
-                "fail_count",
-                &get_fail_count(self as *const Self as usize),
-            )
+            .field("fail_count", &get_fail_count(self as *const Self as usize))
             .field(
                 "has_bridge",
                 &lookup_bridge(self as *const Self as usize).is_some(),

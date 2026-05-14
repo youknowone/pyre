@@ -613,13 +613,7 @@ impl PartialEq for RdVirtualInfo {
                     fieldnums: b4,
                     descr_size: b5,
                 },
-            ) => {
-                opt_descr_ptr_eq(a_descr, b_descr)
-                    && a1 == b1
-                    && a3 == b3
-                    && a4 == b4
-                    && a5 == b5
-            }
+            ) => opt_descr_ptr_eq(a_descr, b_descr) && a1 == b1 && a3 == b3 && a4 == b4 && a5 == b5,
             (
                 Self::VArrayInfoClear {
                     arraydescr: a_descr,
