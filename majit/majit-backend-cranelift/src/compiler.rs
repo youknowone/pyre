@@ -13447,7 +13447,9 @@ impl majit_backend::Backend for CraneliftBackend {
                 if !descr.is_resume_guard() {
                     continue;
                 }
-                descr.set_rd_loop_token_clt(std::sync::Arc::clone(clt));
+                descr.set_rd_loop_token_clt(
+                    std::sync::Arc::clone(clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>,
+                );
             }
         }
 
@@ -13638,7 +13640,9 @@ impl majit_backend::Backend for CraneliftBackend {
                 continue;
             }
             if let Some(clt) = clt_arc.as_ref() {
-                descr.set_rd_loop_token_clt(std::sync::Arc::clone(clt));
+                descr.set_rd_loop_token_clt(
+                    std::sync::Arc::clone(clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>,
+                );
             }
         }
         {
