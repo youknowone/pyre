@@ -7363,9 +7363,57 @@ impl CodeWriter {
         // inserts at every block-switch boundary (Phase 4 alignment
         // with `flatten.py:177-258 insert_exits`).
         {
+            // Concatenate per-block accumulators, then peel off
+            // redundant `goto Label("pcN") + Unreachable` pairs
+            // whenever the immediately-following block opens with
+            // `Label("pcN")` for the SAME N — matching upstream
+            // `flatten.py:148-155 make_link`'s shape, which
+            // recurses into the link target via `make_bytecode_block`
+            // (no goto inserted) and only falls through to
+            // `goto TLabel(block) + ---` for already-seen targets
+            // (`flatten.py:110-113`).  Without the peel-off, every
+            // walker block transition would carry an extra
+            // goto+Unreachable pair that the runtime executes as a
+            // no-op trampoline, regressing fib_recursive on
+            // backends that don't fold trivial branches.
+            let blocks: Vec<Vec<super::flatten::Insn>> = all_walker_blocks
+                .iter()
+                .map(|block| block.per_block_ssarepr())
+                .collect();
             let mut drained: Vec<super::flatten::Insn> = Vec::new();
-            for block in all_walker_blocks.iter() {
-                drained.extend(block.per_block_ssarepr());
+            for (idx, block_insns) in blocks.iter().enumerate() {
+                let next_label_name: Option<&str> = blocks
+                    .get(idx + 1)
+                    .and_then(|next| next.first())
+                    .and_then(|first| match first {
+                        super::flatten::Insn::Label(l) => Some(l.name.as_str()),
+                        _ => None,
+                    });
+                let strip_tail = match (block_insns.len() >= 2).then_some(()).and_then(|_| {
+                    let n = block_insns.len();
+                    let goto = &block_insns[n - 2];
+                    let tail = &block_insns[n - 1];
+                    match (goto, tail, next_label_name) {
+                        (
+                            super::flatten::Insn::Op { opname, args, .. },
+                            super::flatten::Insn::Unreachable,
+                            Some(next_name),
+                        ) if opname == "goto" && args.len() == 1 => {
+                            if let Operand::TLabel(target) = &args[0] {
+                                if target.name == next_name {
+                                    return Some(2);
+                                }
+                            }
+                            None
+                        }
+                        _ => None,
+                    }
+                }) {
+                    Some(n) => n,
+                    None => 0,
+                };
+                let take = block_insns.len() - strip_tail;
+                drained.extend(block_insns[..take].iter().cloned());
             }
             ssarepr.insns = drained;
         }
