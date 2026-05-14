@@ -1142,7 +1142,10 @@ impl DynasmBackend {
         frame_ptr: *mut JitFrame,
     ) -> Arc<DynasmFailDescr> {
         let attached = self.attached_descr_ptrs();
-        // compile.py:618-669 done_with_this_frame_descr — check all 4 variants
+        // compile.py:618-669 done_with_this_frame_descr — check all 4 variants.
+        // Forward through `meta_descr` so the metainterp class hierarchy
+        // (DoneWithThisFrameDescr{Void,Int,Ref,Float}) answers
+        // `is_finish` / `fail_arg_types` etc. via `compile.py:624 final_descr=True`.
         if ptr != 0
             && (ptr == attached.done_with_this_frame_descr_void
                 || ptr == attached.done_with_this_frame_descr_int
@@ -1150,24 +1153,38 @@ impl DynasmBackend {
                 || ptr == attached.done_with_this_frame_descr_float)
         {
             // Determine type from which variant matched
-            let types = if ptr == attached.done_with_this_frame_descr_void {
-                vec![]
-            } else if ptr == attached.done_with_this_frame_descr_float {
-                vec![Type::Float]
-            } else if ptr == attached.done_with_this_frame_descr_ref {
-                vec![Type::Ref]
-            } else {
-                vec![Type::Int]
+            let (types, meta) = {
+                let att = self.descr_attachments.read().unwrap();
+                if ptr == attached.done_with_this_frame_descr_void {
+                    (vec![], att.done_with_this_frame_descr_void.clone())
+                } else if ptr == attached.done_with_this_frame_descr_float {
+                    (vec![Type::Float], att.done_with_this_frame_descr_float.clone())
+                } else if ptr == attached.done_with_this_frame_descr_ref {
+                    (vec![Type::Ref], att.done_with_this_frame_descr_ref.clone())
+                } else {
+                    (vec![Type::Int], att.done_with_this_frame_descr_int.clone())
+                }
             };
-            return Arc::new(DynasmFailDescr::new(u32::MAX, 0, types, true, false));
+            let mut d = DynasmFailDescr::new(u32::MAX, 0, types, true, false);
+            d.meta_descr = meta;
+            return Arc::new(d);
         }
 
         // compile.py:658-662 ExitFrameWithExceptionDescrRef — route to
-        // jitexc.ExitFrameWithExceptionRef via is_exit_frame_with_exception.
-        // Result type is Ref (exc value at slot 0, jitexc.py:45).
+        // jitexc.ExitFrameWithExceptionRef via the metainterp Arc's class
+        // identity. `is_exit_frame_with_exception()` forwards through
+        // `meta_descr` to the metainterp ExitFrameWithExceptionDescrRef
+        // singleton.
         if ptr != 0 && ptr == attached.exit_frame_with_exception_descr_ref {
+            let meta = self
+                .descr_attachments
+                .read()
+                .unwrap()
+                .exit_frame_with_exception_descr_ref
+                .clone();
             let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true, false);
             d.is_exit_frame_with_exception = true;
+            d.meta_descr = meta;
             return Arc::new(d);
         }
 
@@ -1208,8 +1225,21 @@ impl DynasmBackend {
             // dispatch reads the exc value through the standard
             // get_ref_value(0) path (compile.py:660).
             unsafe { crate::llmodel::set_int_value(frame_ptr, 0, exc_val as isize) };
+            // `pyjitpl.py:2283 self.cpu.propagate_exception_descr = exc_descr`
+            // is a `PropagateExceptionDescr` instance.  pyre routes the
+            // failure through the same toplevel ExitFrameWithException
+            // path the metainterp uses for explicit raises; carry the
+            // PropagateException Arc as `meta_descr` so the runtime
+            // descr layer sees the upstream class identity.
+            let meta = self
+                .descr_attachments
+                .read()
+                .unwrap()
+                .propagate_exception_descr
+                .clone();
             let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true, false);
             d.is_exit_frame_with_exception = true;
+            d.meta_descr = meta;
             return Arc::new(d);
         }
 
