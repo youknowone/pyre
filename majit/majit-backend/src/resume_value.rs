@@ -147,6 +147,26 @@ impl ResumeValueLayoutSummaryExt for ResumeValueLayoutSummary {
     }
 }
 
+/// Source for a resumed frame slot.  Type alias kept for caller
+/// compatibility with `resume.py` naming.
+pub type FrameSlotSource = ResumeValueSource;
+
+/// Describes how to reconstruct a single frame in the interpreter's call stack.
+///
+/// Each frame has a bytecode position (pc) and a set of named/indexed slots
+/// that map to tagged resume sources.  Moved here from
+/// `majit-metainterp::resume` (Phase C-1 cascade) as the next hop
+/// toward the ResumeData migration.
+#[derive(Debug, Clone, PartialEq)]
+pub struct FrameInfo {
+    /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
+    pub jitcode_index: i32,
+    /// Bytecode position (program counter) for this frame.
+    pub pc: u64,
+    /// Mapping from slot index to a tagged resume source.
+    pub slot_map: Vec<FrameSlotSource>,
+}
+
 /// Free function constructor (replaces the moved
 /// `ResumeValueLayoutSummary::from_exit_value_source` inherent method
 /// — cross-crate orphan rule prevents defining inherent impls on a

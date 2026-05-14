@@ -1179,19 +1179,10 @@ fn decode_u64(value: i64) -> u64 {
     value as u64
 }
 
-/// Describes how to reconstruct a single frame in the interpreter's call stack.
-///
-/// Each frame has a bytecode position (pc) and a set of named/indexed slots
-/// that map to tagged resume sources.
-#[derive(Debug, Clone, PartialEq)]
-pub struct FrameInfo {
-    /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
-    pub jitcode_index: i32,
-    /// Bytecode position (program counter) for this frame.
-    pub pc: u64,
-    /// Mapping from slot index to a tagged resume source.
-    pub slot_map: Vec<FrameSlotSource>,
-}
+// FrameInfo moved to majit-backend::resume_value (Phase C-1 cascade).
+// Re-exported so existing crate::resume::FrameInfo references stay
+// resolvable.
+pub use majit_backend::FrameInfo;
 
 /// Complete resume data for a guard exit point.
 ///
@@ -1224,8 +1215,9 @@ pub struct ResumeData {
 pub use majit_backend::ResumeValueSource;
 pub use majit_backend::ResumeValueLayoutSummaryExt;
 
-/// Source for a resumed frame slot.
-pub type FrameSlotSource = ResumeValueSource;
+// FrameSlotSource type alias re-exported from majit-backend
+// (Phase C-1 cascade) alongside FrameInfo.
+pub use majit_backend::FrameSlotSource;
 
 /// Description of a virtual object that needs materialization on resume.
 ///
