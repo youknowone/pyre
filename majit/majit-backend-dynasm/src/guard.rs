@@ -561,10 +561,15 @@ impl FailDescr for DynasmFailDescr {
     }
 
     fn is_finish(&self) -> bool {
-        // Class-hierarchy property — backend-local field is set at
-        // construction matching the meta_descr's class (parallel to
-        // cranelift's local field).
-        self.is_finish
+        // `compile.py:624` `_DoneWithThisFrameDescr` family carries
+        // `final_descr = True`.  Forward through `meta_descr` so the
+        // metainterp class hierarchy answers the predicate; fall back
+        // to the local mirror for synthetic backend descrs minted by
+        // the runtime classifier (`meta_descr = None`).
+        match self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            Some(fd) => fd.is_finish(),
+            None => self.is_finish,
+        }
     }
 
     fn is_exit_frame_with_exception(&self) -> bool {
