@@ -1532,7 +1532,9 @@ impl Backend for DynasmBackend {
                 if !descr.is_resume_guard() {
                     continue;
                 }
-                descr.set_rd_loop_token_clt(std::sync::Arc::clone(clt));
+                descr.set_rd_loop_token_clt(
+                    std::sync::Arc::clone(clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>,
+                );
             }
         }
 
@@ -1749,7 +1751,9 @@ impl Backend for DynasmBackend {
                 if !descr.is_resume_guard() {
                     continue;
                 }
-                descr.set_rd_loop_token_clt(std::sync::Arc::clone(clt));
+                descr.set_rd_loop_token_clt(
+                    std::sync::Arc::clone(clt) as std::sync::Arc<dyn std::any::Any + Send + Sync>,
+                );
             }
         }
 

@@ -2,7 +2,6 @@
 /// jump offset (`history.py:132 _attrs_` `adr_jump_offset`) lives on the
 /// metainterp `ResumeGuardDescr` (`majit-metainterp/src/compile.rs`) and
 /// is accessed here via `meta_resume_fd()` forwarding.
-use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
@@ -223,14 +222,13 @@ pub struct DynasmFailDescr {
     // (`history.py:132`).  Pyre's backend-internal bridge-entry lookup
     // moved to `DynasmBackend::bridge_addr_by_descr` side-table keyed on
     // the source descr's `Arc::as_ptr` address.
-    /// `compile.py:186` `descr.rd_loop_token = clt` line-by-line port:
-    /// the owning `Arc<CompiledLoopToken>` itself. Set by
-    /// `record_loop_or_bridge` (compile.py:171-211 walker).  Together
-    /// with `CompiledLoopToken.loop_token_wref` (compile.py:180-181)
-    /// this gives readers a direct chain `descr.rd_loop_token_clt() ->
-    /// clt -> upgrade -> Arc<JitCellToken>` matching RPython's
-    /// `descr.rd_loop_token.loop_token_wref()` access.
-    pub rd_loop_token_clt: UnsafeCell<Option<std::sync::Arc<majit_backend::CompiledLoopToken>>>,
+    // rd_loop_token_clt removed: `history.py:132 AbstractFailDescr._attrs_`
+    // `rd_loop_token` lives on the metainterp Arc.  Only ResumeDescr
+    // family descrs receive `record_loop_or_bridge`'s
+    // `descr.rd_loop_token = clt` stamp (compile.py:183-186); pyre's
+    // walker (runner.rs:1518-1524) gates the call on
+    // `descr.is_resume_guard()` so the write always lands on the
+    // metainterp ResumeGuardDescr through meta_descr forwarding.
     /// Back-pointer to the metainterp `AbstractFailDescr` Arc the
     /// optimizer stamped onto the originating guard op (`op.descr`).
     /// PyPy keeps a single descr object per guard (`history.py:121`);
@@ -298,21 +296,8 @@ impl DynasmFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
-            rd_loop_token_clt: UnsafeCell::new(None),
             meta_descr: None,
         }
-    }
-
-    /// `compile.py:186` write side: invoked by the post-compile walker
-    /// once per ResumeDescr in the newly-compiled trace.  Stamps the
-    /// owning `Arc<CompiledLoopToken>`.
-    pub fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<majit_backend::CompiledLoopToken>) {
-        unsafe { *self.rd_loop_token_clt.get() = Some(clt) };
-    }
-
-    /// `compile.py:186` reader for the clt-typed slot.
-    pub fn rd_loop_token_clt(&self) -> Option<&std::sync::Arc<majit_backend::CompiledLoopToken>> {
-        unsafe { (*self.rd_loop_token_clt.get()).as_ref() }
     }
 
     /// Read the recovery_layout from the backend-static side-table.
@@ -517,28 +502,25 @@ impl FailDescr for DynasmFailDescr {
 
     fn rd_loop_token_clt(&self) -> Option<&dyn std::any::Any> {
         // `history.py:132` `AbstractFailDescr._attrs_` `rd_loop_token` —
-        // prefer the metainterp-side slot when meta_descr is attached;
-        // fall back to the backend-local transitional slot.
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            if let Some(any) = meta_fd.rd_loop_token_clt() {
-                return Some(any);
-            }
-        }
-        DynasmFailDescr::rd_loop_token_clt(self).map(|arc| arc as &dyn std::any::Any)
+        // forward through `meta_descr` to the metainterp ResumeGuardDescr
+        // slot.  `record_loop_or_bridge` only stamps ResumeDescr family
+        // descrs (compile.py:183-186), so meta_descr is always present
+        // when this read fires; absent meta_descr indicates a synthetic
+        // FINISH/Exit/Propagate descr that never visits the walker.
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .and_then(|fd| fd.rd_loop_token_clt())
     }
 
     fn set_rd_loop_token_clt(&self, clt: std::sync::Arc<dyn std::any::Any + Send + Sync>) {
         // `compile.py:186` `descr.rd_loop_token = clt` — write through
-        // to the metainterp side when present; otherwise stamp the
-        // backend-local transitional slot.
+        // to the metainterp ResumeGuardDescr.  Caller (runner.rs walker)
+        // gates on `descr.is_resume_guard()` before invocation, so
+        // meta_descr is always present here in production.
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.set_rd_loop_token_clt(clt);
-            return;
         }
-        let typed: std::sync::Arc<majit_backend::CompiledLoopToken> = clt
-            .downcast::<majit_backend::CompiledLoopToken>()
-            .expect("set_rd_loop_token_clt expected Arc<CompiledLoopToken>");
-        DynasmFailDescr::set_rd_loop_token_clt(self, typed);
     }
 
     /// `compile.py:741-745` `get_status`.  `compile.py:683`
