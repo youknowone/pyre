@@ -698,43 +698,18 @@ impl DynasmBackend {
     /// only unit/integration tests that skip the metainterp call
     /// this to get a populated cpu before running `compile_loop`.
     pub fn attach_default_test_descrs(&mut self) {
-        use majit_ir::Type;
-        // DoneWithThisFrame{Void,Int,Ref,Float}Descr / ExitFrameWithExceptionDescr
-        // — `compile.py:185` skips these (not `ResumeDescr`).
-        let void: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
-            u32::MAX,
-            0,
-            vec![],
-            true,  // is_finish
-            false, // is_resume_guard
-        ));
-        let int: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
-            u32::MAX,
-            0,
-            vec![Type::Int],
-            true,
-            false,
-        ));
-        let r: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
-            u32::MAX,
-            0,
-            vec![Type::Ref],
-            true,
-            false,
-        ));
-        let float: majit_ir::DescrRef = Arc::new(crate::guard::DynasmFailDescr::new(
-            u32::MAX,
-            0,
-            vec![Type::Float],
-            true,
-            false,
-        ));
-        let exit_exc: majit_ir::DescrRef = {
-            let mut d =
-                crate::guard::DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true, false);
-            d.is_exit_frame_with_exception = true;
-            Arc::new(d)
-        };
+        // `compile.py:665-674 make_and_attach_done_descrs` parity:
+        // attach the class-distinct DoneWithThisFrameDescr* /
+        // ExitFrameWithExceptionDescrRef the metainterp would mint
+        // through `MetaInterp::new`.  Backend-only tests that skip the
+        // metainterp call this to land the same descrs the runtime
+        // classifier expects.
+        let void: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new());
+        let int: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrInt::new());
+        let r: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrRef::new());
+        let float: majit_ir::DescrRef = Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new());
+        let exit_exc: majit_ir::DescrRef =
+            Arc::new(majit_backend::ExitFrameWithExceptionDescrRef::new());
         <Self as Backend>::set_done_with_this_frame_descr_void(self, void);
         <Self as Backend>::set_done_with_this_frame_descr_int(self, int);
         <Self as Backend>::set_done_with_this_frame_descr_ref(self, r);
