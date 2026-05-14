@@ -51,6 +51,8 @@ jobs:
     - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
     - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        cache-bin: false
     - name: Run cargo test for ${{ matrix.backend }}
       run: cargo test --all --no-default-features --features ${{ matrix.backend }}
 
@@ -76,6 +78,8 @@ jobs:
       with:
         python-version: "pypy3.11"
     - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      with:
+        cache-bin: false
     - name: Run pyre/check.py
       env:
         PYRE_CHECK_PYTHON3: ${{ steps.cpython.outputs.python-path }}

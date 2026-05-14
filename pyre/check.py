@@ -310,10 +310,50 @@ class Check:
                 print("─── cargo stderr ───")
                 print(proc.stderr.rstrip())
             print("────────────────────")
+            self._print_cargo_diagnostics(cargo_path)
             sys.exit(1)
         lines = (proc.stdout or "").strip().splitlines() + (proc.stderr or "").strip().splitlines()
         if lines:
             print(lines[-1])
+
+    def _print_cargo_diagnostics(self, cargo_path):
+        """Dump the toolchain state when cargo refuses to run.
+
+        Targets the macOS CI failure mode where Swatinem/rust-cache restores
+        a stale `~/.cargo/bin/cargo` rustup proxy after a runner-image bump.
+        The new rustup's state under `~/.rustup/` then mismatches the old
+        proxy, which falls back to rustup-init mode and clap-rejects `build`.
+        """
+        print("─── cargo diagnostics ───")
+        print(f"PATH = {os.environ.get('PATH', '')}")
+        print(f"CARGO_HOME = {os.environ.get('CARGO_HOME', '(unset)')}")
+        print(f"RUSTUP_HOME = {os.environ.get('RUSTUP_HOME', '(unset)')}")
+        if sys.platform != "win32":
+            for which_cmd in (["which", "-a", "cargo"], ["which", "-a", "rustup"]):
+                self._run_diag(which_cmd)
+            cargo_dir = os.path.dirname(cargo_path) if os.path.sep in cargo_path else ""
+            if cargo_dir:
+                self._run_diag(["ls", "-laHi", cargo_dir])
+            if cargo_dir and os.path.isfile(cargo_path):
+                self._run_diag(["file", cargo_path])
+        self._run_diag(["cargo", "--version"])
+        self._run_diag(["rustup", "show"])
+        print("─────────────────────────")
+
+    @staticmethod
+    def _run_diag(cmd):
+        try:
+            proc = subprocess.run(
+                cmd, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=10,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError, OSError) as e:
+            print(f"  $ {' '.join(cmd)}\n    [error: {e}]")
+            return
+        out = (proc.stdout or "") + (proc.stderr or "")
+        print(f"  $ {' '.join(cmd)} (exit {proc.returncode})")
+        for line in out.rstrip().splitlines():
+            print(f"    {line}")
 
     # ── warmup ──
 
@@ -669,7 +709,7 @@ def main():
     chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     6,       None,    None,    None,    None)
     chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       10,       10,      None,    20,      None)
     chk.run_bench("nbody",          f"{B}/nbody_50k.py",           10,       5,       None,    30,      None)
-    chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       2,       10,      30,      None)
+    chk.run_bench("fannkuch",       f"{B}/fannkuch.py",            30,       2,       10,      40,      None)
     chk.run_bench("list_reverse",   f"{B}/list_reverse.py",         5,       10,      None,    10,      None)
     chk.run_bench("list_pop_append",f"{B}/list_pop_append.py",      5,       15,      None,    15,      None)
     chk.run_bench("list_insert",    f"{B}/list_insert.py",          5,       None,    2,       None,    2)
