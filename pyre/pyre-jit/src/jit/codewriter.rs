@@ -4189,36 +4189,31 @@ impl CodeWriter {
                     ],
                 );
                 push_walker_emit(&mut $ssarepr, &current_block, insn);
-                // Step 6.1 Phase 2b: attach the conditional-False edge
-                // to the PC's active block. RPython `flatten.py:240-267`
-                // records both the False target and the fallthrough on
-                // the block's `exits`; the fallthrough link is added
-                // implicitly at the next `emit_mark_label_pc!` in a
-                // follow-up slice when pyre's walker learns to insert
-                // fallthrough Links for non-terminating blocks.
-                //
-                // Note: unlike `emit_goto!` we do NOT skip mergeblock
-                // for already-emitted back-edge targets here — the
-                // immediate `set_last_bool_exitcase(false)` callsites
-                // (PopJumpIfFalse / PopJumpIfTrue) require this
-                // mergeblock to have appended a fresh linkfalse exit
-                // so the case stamps onto the right link.
-                mergeblock(
-                    code,
-                    &mut graph,
-                    &mut joinpoints,
-                    &current_block,
-                    &{
-                        let mut branch_state = current_state.clone();
-                        branch_state.next_offset = py_pc;
-                        branch_state.blocklist = frame_blocks_for_offset(code, py_pc);
-                        branch_state
-                    },
-                    py_pc,
-                    &mut link_exit_states,
-                    &mut pendingblocks,
-                    &mut all_walker_blocks,
-                );
+                // Skip mergeblock for already-emitted back-edge targets
+                // to prevent orphan creation (same rationale as
+                // `emit_goto!`).  Callers that pair this with
+                // `set_last_bool_exitcase(false)` (PopJumpIfFalse /
+                // PopJumpIfTrue) MUST gate the case-stamp on the same
+                // back-edge check, otherwise the case overwrites a
+                // pre-existing exit.
+                if !emitted_pc_starts.get(py_pc).copied().unwrap_or(false) {
+                    mergeblock(
+                        code,
+                        &mut graph,
+                        &mut joinpoints,
+                        &current_block,
+                        &{
+                            let mut branch_state = current_state.clone();
+                            branch_state.next_offset = py_pc;
+                            branch_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                            branch_state
+                        },
+                        py_pc,
+                        &mut link_exit_states,
+                        &mut pendingblocks,
+                        &mut all_walker_blocks,
+                    );
+                }
             }};
         }
         macro_rules! emit_goto_if_not_int_is_zero {
@@ -5855,8 +5850,22 @@ impl CodeWriter {
                         // `flatten.py:275`.
                         let fallthrough_py_pc = py_pc + 1;
                         if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
+                            let target_is_back_edge = emitted_pc_starts
+                                .get(target_py_pc)
+                                .copied()
+                                .unwrap_or(false);
                             emit_goto_if_not!(ssarepr, scratch_truth, target_py_pc);
-                            set_last_bool_exitcase(&current_block.block(), false);
+                            // Stamp linkfalse case only when emit_goto_if_not's
+                            // mergeblock actually appended a fresh exit (i.e.
+                            // target is forward, not a back-edge to an
+                            // already-emitted PC).  Back-edge case skips both
+                            // the link creation and the case stamp; the
+                            // resulting block has only the linktrue exit, and
+                            // the dispatcher's 1-exit arm handles it via
+                            // `flatten.py:181 link.exitcase in (None, False, True)`.
+                            if !target_is_back_edge {
+                                set_last_bool_exitcase(&current_block.block(), false);
+                            }
                             mergeblock(
                                 code,
                                 &mut graph,
@@ -5935,10 +5944,23 @@ impl CodeWriter {
                         // exitswitches like this truthiness branch.
                         let fallthrough_py_pc = py_pc + 1;
                         if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
+                            // POP_JUMP_IF_TRUE: emit_goto_if_not(fallthrough)
+                            // always targets PC+1 (forward, never emitted),
+                            // so its mergeblock always appends linkfalse.
+                            // emit_goto(target) may be a back-edge (target
+                            // already emitted) — in that case Phase 4.C's
+                            // skip prevents linktrue creation, and the
+                            // case stamp must be skipped too.
+                            let target_is_back_edge = emitted_pc_starts
+                                .get(target_py_pc)
+                                .copied()
+                                .unwrap_or(false);
                             emit_goto_if_not!(ssarepr, scratch_truth, fallthrough_py_pc);
                             set_last_bool_exitcase(&current_block.block(), false);
                             emit_goto!(ssarepr, target_py_pc);
-                            set_last_bool_exitcase(&current_block.block(), true);
+                            if !target_is_back_edge {
+                                set_last_bool_exitcase(&current_block.block(), true);
+                            }
                         }
                     }
 
