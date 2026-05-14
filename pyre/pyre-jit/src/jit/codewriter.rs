@@ -3399,7 +3399,11 @@ impl CodeWriter {
         // always coexists with the straight-line successor on
         // `Block.exits`.
         let mut needs_fallthrough: bool = true;
-        let mut pending_bool_fallthrough_case: Option<bool> = None;
+        // pending_bool_fallthrough_case retired: PopJumpIfFalse now mirrors
+        // PopJumpIfTrue by attaching both Bool exit links at the branch
+        // point via explicit mergeblock + set_last_bool_exitcase pairs.
+        // The deferred case-application across emit_mark_label_pc no
+        // longer exists.
 
         // rpython/flowspace/flowcontext.py:399-405 `build_flow` parity:
         // `pendingblocks = deque([startblock])` + `while pendingblocks:
@@ -4018,9 +4022,6 @@ impl CodeWriter {
                         py_pc,
                     );
                 };
-                if let Some(fallthrough_case) = pending_bool_fallthrough_case.take() {
-                    set_last_bool_exitcase(&current_block.block(), fallthrough_case);
-                }
                 // Task #227.5 yield-on-switch: when the gate is on and
                 // `new_block` differs from `current_block`, set the
                 // `block_switch_pending` flag and SKIP the inline
@@ -4894,7 +4895,6 @@ impl CodeWriter {
             current_state = pending_state;
             current_depth = current_state.stack.len() as u16;
             needs_fallthrough = true;
-            pending_bool_fallthrough_case = None;
             // Task #227.5 per-block walker: reset switch flag at the
             // start of every new block iteration so a previous
             // block's queued switch doesn't bleed into this one.
@@ -5812,10 +5812,42 @@ impl CodeWriter {
                                 scratch_truth,
                             ),
                         );
-                        if target_py_pc < num_instrs {
+                        // POP_JUMP_IF_FALSE jumps when cond is false; the
+                        // bool=true path falls through to PC+1.  Mirror
+                        // POP_JUMP_IF_TRUE by attaching BOTH the linkfalse
+                        // (to target) and the linktrue (to PC+1) at this
+                        // emit point so the closed Bool-exitswitch block
+                        // carries both Bool exit cases.  Without the
+                        // explicit linktrue mergeblock here, the walker's
+                        // PC-sequential continuation into PC+1 reuses the
+                        // same `current_block` (no new exit created via
+                        // `emit_mark_label_pc!`'s joinpoint arm), leaving
+                        // the linktrue link missing and the dispatcher
+                        // falling through to the switch path with the
+                        // surviving exit's None llexitcase per
+                        // `flatten.py:275`.
+                        let fallthrough_py_pc = py_pc + 1;
+                        if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
                             emit_goto_if_not!(ssarepr, scratch_truth, target_py_pc);
                             set_last_bool_exitcase(&current_block.block(), false);
-                            pending_bool_fallthrough_case = Some(true);
+                            mergeblock(
+                                code,
+                                &mut graph,
+                                &mut joinpoints,
+                                &current_block,
+                                &{
+                                    let mut branch_state = current_state.clone();
+                                    branch_state.next_offset = fallthrough_py_pc;
+                                    branch_state.blocklist =
+                                        frame_blocks_for_offset(code, fallthrough_py_pc);
+                                    branch_state
+                                },
+                                fallthrough_py_pc,
+                                &mut link_exit_states,
+                                &mut pendingblocks,
+                                &mut all_walker_blocks,
+                            );
+                            set_last_bool_exitcase(&current_block.block(), true);
                         }
                     }
 
