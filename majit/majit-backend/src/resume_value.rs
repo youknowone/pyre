@@ -9,7 +9,8 @@
 //! codegen can instantiate it directly.
 
 use majit_ir::resumedata::{
-    ResumeValueKind, ResumeValueLayoutSummary, ResumeVirtualKind, ResumeVirtualLayoutSummary,
+    PendingFieldLayoutSummary, ResumeValueKind, ResumeValueLayoutSummary, ResumeVirtualKind,
+    ResumeVirtualLayoutSummary, opt_descr_arc_ptr_eq,
 };
 use majit_ir::{ArrayDescrInfo, Const, DescrRef, FieldDescrInfo, Type};
 
@@ -544,6 +545,52 @@ impl VirtualInfo {
                 fielddescrs: vec![],
                 descr_size: 0,
             },
+        }
+    }
+}
+
+
+/// Deferred heap write to replay during resume.
+#[derive(Debug, Clone)]
+pub struct PendingFieldInfo {
+    /// `resume.py:88 lldescr` — the field/array descriptor itself.
+    /// Carries `field_offset` / `field_size` / `field_type` via the
+    /// trait, identity-compared via `Arc::ptr_eq` (`history.py:125`).
+    pub descr: Option<DescrRef>,
+    /// Stable u32 handle for serialization sinks
+    /// (`PendingFieldLayoutSummary`, `ExitPendingFieldLayout`).
+    /// Equals `descr.as_ref().map_or(0, |d| d.index())` when both are set.
+    pub descr_index: u32,
+    /// Source of the object/array pointer to update.
+    pub target: ResumeValueSource,
+    /// Source of the value to write.
+    pub value: ResumeValueSource,
+    /// Array item index. `None` means a plain field write.
+    pub item_index: Option<usize>,
+}
+
+impl PartialEq for PendingFieldInfo {
+    fn eq(&self, other: &Self) -> bool {
+        // `history.py:125 id(descr)` parity: descr identity via Arc::ptr_eq.
+        // `descr_index` is a serialization handle, not identity.
+        opt_descr_arc_ptr_eq(&self.descr, &other.descr)
+            && self.target == other.target
+            && self.value == other.value
+            && self.item_index == other.item_index
+    }
+}
+
+impl PendingFieldInfo {
+    pub fn layout_summary(&self) -> PendingFieldLayoutSummary {
+        PendingFieldLayoutSummary {
+            descr: self.descr.clone(),
+            descr_index: self.descr_index,
+            item_index: self.item_index,
+            is_array_item: self.item_index.is_some(),
+            target_kind: self.target.kind(),
+            value_kind: self.value.kind(),
+            target: self.target.layout_summary(),
+            value: self.value.layout_summary(),
         }
     }
 }

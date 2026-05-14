@@ -98,6 +98,55 @@ pub enum ResumeVirtualKind {
     UniSlice,
 }
 
+/// Serialization-friendly summary of a `PendingFieldInfo`.
+///
+/// Moved here from `majit-metainterp::resume` (Phase C-1 cascade);
+/// dependencies (`DescrRef`, `ResumeValueKind`, `ResumeValueLayoutSummary`)
+/// are all in `majit-ir`.
+#[derive(Debug, Clone)]
+pub struct PendingFieldLayoutSummary {
+    /// `resume.py:88 lldescr` — identity-compared via `Arc::ptr_eq`
+    /// (`history.py:125`).
+    pub descr: Option<crate::DescrRef>,
+    /// Stable u32 handle for serialization sinks
+    /// (`ExitPendingFieldLayout`).  Equals `descr.as_ref().map_or(0,
+    /// |d| d.index())` when both are set.
+    pub descr_index: u32,
+    pub item_index: Option<usize>,
+    pub is_array_item: bool,
+    pub target_kind: ResumeValueKind,
+    pub value_kind: ResumeValueKind,
+    pub target: ResumeValueLayoutSummary,
+    pub value: ResumeValueLayoutSummary,
+}
+
+impl PartialEq for PendingFieldLayoutSummary {
+    fn eq(&self, other: &Self) -> bool {
+        opt_descr_arc_ptr_eq(&self.descr, &other.descr)
+            && self.item_index == other.item_index
+            && self.is_array_item == other.is_array_item
+            && self.target_kind == other.target_kind
+            && self.value_kind == other.value_kind
+            && self.target == other.target
+            && self.value == other.value
+    }
+}
+impl Eq for PendingFieldLayoutSummary {}
+
+/// `history.py:125 id(descr)` parity: `Option<DescrRef>` identity
+/// comparison via `Arc::ptr_eq`.
+#[inline]
+pub fn opt_descr_arc_ptr_eq(
+    a: &Option<crate::DescrRef>,
+    b: &Option<crate::DescrRef>,
+) -> bool {
+    match (a, b) {
+        (None, None) => true,
+        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
+        _ => false,
+    }
+}
+
 /// Serialization-friendly summary of a `VirtualInfo`.
 ///
 /// Moved here from `majit-metainterp::resume` (Phase C-1 cascade).

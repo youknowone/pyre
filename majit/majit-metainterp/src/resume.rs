@@ -582,35 +582,10 @@ pub use majit_ir::resumedata::ResumeVirtualKind;
 // cascade); re-exported for caller compatibility.
 pub use majit_ir::resumedata::ResumeVirtualLayoutSummary;
 
-#[derive(Debug, Clone)]
-pub struct PendingFieldLayoutSummary {
-    /// `resume.py:88 lldescr` — identity-compared via `Arc::ptr_eq`
-    /// (`history.py:125`).
-    pub descr: Option<majit_ir::DescrRef>,
-    /// Stable u32 handle for serialization sinks
-    /// (`ExitPendingFieldLayout`).  Equals `descr.as_ref().map_or(0,
-    /// |d| d.index())` when both are set.
-    pub descr_index: u32,
-    pub item_index: Option<usize>,
-    pub is_array_item: bool,
-    pub target_kind: ResumeValueKind,
-    pub value_kind: ResumeValueKind,
-    pub target: ResumeValueLayoutSummary,
-    pub value: ResumeValueLayoutSummary,
-}
-
-impl PartialEq for PendingFieldLayoutSummary {
-    fn eq(&self, other: &Self) -> bool {
-        opt_descr_arc_ptr_eq(&self.descr, &other.descr)
-            && self.item_index == other.item_index
-            && self.is_array_item == other.is_array_item
-            && self.target_kind == other.target_kind
-            && self.value_kind == other.value_kind
-            && self.target == other.target
-            && self.value == other.value
-    }
-}
-impl Eq for PendingFieldLayoutSummary {}
+// PendingFieldLayoutSummary moved to majit-ir::resumedata along with
+// opt_descr_arc_ptr_eq helper (Phase C-1 cascade); re-exported for
+// caller compatibility.
+pub use majit_ir::resumedata::{PendingFieldLayoutSummary, opt_descr_arc_ptr_eq};
 
 #[derive(Debug, Clone)]
 pub struct ResumeLayoutSummary {
@@ -896,29 +871,35 @@ fn resume_virtual_layout_to_exit_virtual_layout(
     }
 }
 
-impl PendingFieldLayoutSummary {
-    fn to_pending_field_info(&self) -> PendingFieldInfo {
-        PendingFieldInfo {
-            descr: self.descr.clone(),
-            descr_index: self.descr_index,
-            target: self.target.to_resume_source(),
-            value: self.value.to_resume_source(),
-            item_index: self.item_index,
-        }
+// PendingFieldLayoutSummary inherent impls extracted as free
+// functions (cross-crate orphan rule after the type moved to
+// majit-ir::resumedata).
+fn pending_field_layout_to_pending_field_info(
+    layout: &PendingFieldLayoutSummary,
+) -> PendingFieldInfo {
+    PendingFieldInfo {
+        descr: layout.descr.clone(),
+        descr_index: layout.descr_index,
+        target: layout.target.to_resume_source(),
+        value: layout.value.to_resume_source(),
+        item_index: layout.item_index,
     }
+}
 
-    fn to_exit_pending_field_layout(&self, virtual_offset: usize) -> ExitPendingFieldLayout {
-        ExitPendingFieldLayout {
-            descr: self.descr.clone(),
-            descr_index: self.descr_index,
-            item_index: self.item_index,
-            is_array_item: self.is_array_item,
-            target: self.target.to_exit_source(virtual_offset),
-            value: self.value.to_exit_source(virtual_offset),
-            field_offset: 0,
-            field_size: 0,
-            field_type: majit_ir::Type::Int,
-        }
+fn pending_field_layout_to_exit_pending_field_layout(
+    layout: &PendingFieldLayoutSummary,
+    virtual_offset: usize,
+) -> ExitPendingFieldLayout {
+    ExitPendingFieldLayout {
+        descr: layout.descr.clone(),
+        descr_index: layout.descr_index,
+        item_index: layout.item_index,
+        is_array_item: layout.is_array_item,
+        target: layout.target.to_exit_source(virtual_offset),
+        value: layout.value.to_exit_source(virtual_offset),
+        field_offset: 0,
+        field_size: 0,
+        field_type: majit_ir::Type::Int,
     }
 }
 
@@ -940,7 +921,7 @@ impl ResumeLayoutSummary {
             pending_fields: self
                 .pending_field_layouts
                 .iter()
-                .map(|pending| pending.to_pending_field_info())
+                .map(pending_field_layout_to_pending_field_info)
                 .collect(),
         }
     }
@@ -1000,7 +981,9 @@ impl ResumeLayoutSummary {
         pending_field_layouts.extend(
             self.pending_field_layouts
                 .iter()
-                .map(|pending| pending.to_exit_pending_field_layout(virtual_offset)),
+                .map(|pending| {
+                    pending_field_layout_to_exit_pending_field_layout(pending, virtual_offset)
+                }),
         );
 
         ExitRecoveryLayout {
@@ -1429,62 +1412,10 @@ pub fn rd_virtual_to_virtual_info(
     }
 }
 
-/// Deferred heap write to replay during resume.
-#[derive(Debug, Clone)]
-pub struct PendingFieldInfo {
-    /// `resume.py:88 lldescr` — the field/array descriptor itself.
-    /// Carries `field_offset` / `field_size` / `field_type` via the
-    /// trait, identity-compared via `Arc::ptr_eq` (`history.py:125`).
-    pub descr: Option<majit_ir::DescrRef>,
-    /// Stable u32 handle for serialization sinks
-    /// (`PendingFieldLayoutSummary`, `ExitPendingFieldLayout`).
-    /// Equals `descr.as_ref().map_or(0, |d| d.index())` when both are set.
-    pub descr_index: u32,
-    /// Source of the object/array pointer to update.
-    pub target: ResumeValueSource,
-    /// Source of the value to write.
-    pub value: ResumeValueSource,
-    /// Array item index. `None` means a plain field write.
-    pub item_index: Option<usize>,
-}
-
-impl PartialEq for PendingFieldInfo {
-    fn eq(&self, other: &Self) -> bool {
-        // `history.py:125 id(descr)` parity: descr identity via Arc::ptr_eq.
-        // `descr_index` is a serialization handle, not identity.
-        opt_descr_arc_ptr_eq(&self.descr, &other.descr)
-            && self.target == other.target
-            && self.value == other.value
-            && self.item_index == other.item_index
-    }
-}
-
-#[inline]
-fn opt_descr_arc_ptr_eq(
-    a: &Option<majit_ir::DescrRef>,
-    b: &Option<majit_ir::DescrRef>,
-) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
-        _ => false,
-    }
-}
-
-impl PendingFieldInfo {
-    pub fn layout_summary(&self) -> PendingFieldLayoutSummary {
-        PendingFieldLayoutSummary {
-            descr: self.descr.clone(),
-            descr_index: self.descr_index,
-            item_index: self.item_index,
-            is_array_item: self.item_index.is_some(),
-            target_kind: self.target.kind(),
-            value_kind: self.value.kind(),
-            target: self.target.layout_summary(),
-            value: self.value.layout_summary(),
-        }
-    }
-}
+// PendingFieldInfo moved to majit-backend::resume_value (Phase C-1
+// cascade) along with its PartialEq and layout_summary impl.
+// Re-exported for caller compatibility.
+pub use majit_backend::PendingFieldInfo;
 
 /// Concrete pending heap write reconstructed from resume data.
 #[derive(Debug, Clone, PartialEq, Eq)]
