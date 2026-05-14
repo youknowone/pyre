@@ -600,7 +600,9 @@ impl Drop for CraneliftFailDescr {
         // `BridgeData::fail_descrs`' inner Arcs cascade into descr
         // `Drop` calls that re-acquire `BRIDGE_TABLE`.
         let removed_bridge = {
-            let mut guard = bridge_table().lock().expect("BRIDGE_TABLE mutex poisoned");
+            let mut guard = bridge_table()
+                .lock()
+                .expect("BRIDGE_TABLE mutex poisoned");
             guard.remove(&ptr)
         };
         drop(removed_bridge);
@@ -635,7 +637,10 @@ impl std::fmt::Debug for CraneliftFailDescr {
                 "recovery_layout",
                 &lookup_recovery_layout(self as *const Self as usize),
             )
-            .field("fail_count", &get_fail_count(self as *const Self as usize))
+            .field(
+                "fail_count",
+                &get_fail_count(self as *const Self as usize),
+            )
             .field(
                 "has_bridge",
                 &lookup_bridge(self as *const Self as usize).is_some(),
@@ -971,16 +976,6 @@ impl CraneliftFailDescr {
 impl majit_ir::Descr for CraneliftFailDescr {
     fn index(&self) -> u32 {
         self.fail_index
-    }
-
-    /// Phase C-1 Step 1: downcast support (parallel to dynasm
-    /// `DynasmFailDescr::as_any`).  Caller path:
-    ///   `arc.as_ref().as_any().and_then(|a| a.downcast_ref::<CraneliftFailDescr>())`
-    /// recovers the concrete backend type for inherent-method access
-    /// (e.g. `bridge_ref`, `gc_map`, `recovery_layout_ref`) once the
-    /// `Arc<dyn FailDescr>` cascade lands.
-    fn as_any(&self) -> Option<&dyn std::any::Any> {
-        Some(self)
     }
 
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {

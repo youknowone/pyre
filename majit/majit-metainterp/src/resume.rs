@@ -684,12 +684,8 @@ pub struct PendingFieldLayoutSummary {
 
 impl PartialEq for PendingFieldLayoutSummary {
     fn eq(&self, other: &Self) -> bool {
-        opt_descr_arc_ptr_eq_or_index(
-            &self.descr,
-            self.descr_index,
-            &other.descr,
-            other.descr_index,
-        ) && self.item_index == other.item_index
+        opt_descr_arc_ptr_eq(&self.descr, &other.descr)
+            && self.item_index == other.item_index
             && self.is_array_item == other.is_array_item
             && self.target_kind == other.target_kind
             && self.value_kind == other.value_kind
@@ -2007,29 +2003,22 @@ pub struct PendingFieldInfo {
 
 impl PartialEq for PendingFieldInfo {
     fn eq(&self, other: &Self) -> bool {
-        // `history.py:125 id(descr)` parity: live descriptors compare by
-        // Arc identity.  Encoded snapshots can only carry the stable
-        // descriptor handle, so preserve the old descriptor distinction there.
-        opt_descr_arc_ptr_eq_or_index(
-            &self.descr,
-            self.descr_index,
-            &other.descr,
-            other.descr_index,
-        ) && self.target == other.target
+        // `history.py:125 id(descr)` parity: descr identity via Arc::ptr_eq.
+        // `descr_index` is a serialization handle, not identity.
+        opt_descr_arc_ptr_eq(&self.descr, &other.descr)
+            && self.target == other.target
             && self.value == other.value
             && self.item_index == other.item_index
     }
 }
 
 #[inline]
-fn opt_descr_arc_ptr_eq_or_index(
+fn opt_descr_arc_ptr_eq(
     a: &Option<majit_ir::DescrRef>,
-    a_index: u32,
     b: &Option<majit_ir::DescrRef>,
-    b_index: u32,
 ) -> bool {
     match (a, b) {
-        (None, None) => a_index == b_index,
+        (None, None) => true,
         (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),
         _ => false,
     }
@@ -4913,25 +4902,6 @@ mod tests {
             liveboxes.iter().collect::<Vec<_>>(),
             vec![(input, UNASSIGNED), (op, UNASSIGNEDVIRTUAL)]
         );
-    }
-
-    #[test]
-    fn pending_field_equality_preserves_encoded_descriptor_index() {
-        let first = PendingFieldInfo {
-            descr: None,
-            descr_index: 1,
-            target: ResumeValueSource::FailArg(0),
-            value: ResumeValueSource::FailArg(1),
-            item_index: None,
-        };
-        let second = PendingFieldInfo {
-            descr: None,
-            descr_index: 2,
-            ..first.clone()
-        };
-
-        assert_ne!(first, second);
-        assert_ne!(first.layout_summary(), second.layout_summary());
     }
 
     #[test]

@@ -2530,7 +2530,7 @@ impl PropagateExceptionDescr {
         Self {
             descr_index: std::sync::atomic::AtomicI32::new(-1),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(Vec::new()),
         }
     }
 }
@@ -3368,7 +3368,7 @@ impl majit_ir::Descr for MetaFailDescr {
             types: UnsafeCell::new(unsafe { (&*self.types.get()).clone() }),
             vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(Vec::new()),
             is_finish: self.is_finish,
         }))
     }
@@ -3640,10 +3640,12 @@ impl FailDescr for ResumeGuardDescr {
         self.status.load(Ordering::Acquire)
     }
     fn start_compiling(&self) {
-        self.status.fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
+        self.status
+            .fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
     }
     fn done_compiling(&self) {
-        self.status.fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
+        self.status
+            .fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
     }
     fn store_hash(&self, hash: u64) {
         self.status
@@ -3955,9 +3957,9 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
-            rd_loop_token_clt: UnsafeCell::new(None),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         },
@@ -4160,9 +4162,9 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
-            rd_loop_token_clt: UnsafeCell::new(None),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         },
@@ -4349,9 +4351,9 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
-            rd_loop_token_clt: UnsafeCell::new(None),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         },
@@ -4468,9 +4470,9 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
             prev: UnsafeCell::new(self.prev().clone()),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
-            rd_loop_token_clt: UnsafeCell::new(None),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         }))
@@ -4608,10 +4610,12 @@ impl FailDescr for ResumeGuardCopiedDescr {
         self.status.load(Ordering::Acquire)
     }
     fn start_compiling(&self) {
-        self.status.fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
+        self.status
+            .fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
     }
     fn done_compiling(&self) {
-        self.status.fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
+        self.status
+            .fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
     }
     fn store_hash(&self, hash: u64) {
         self.status
@@ -4673,7 +4677,7 @@ impl majit_ir::Descr for ResumeGuardCopiedExcDescr {
                 adr_jump_offset: UnsafeCell::new(0),
                 rd_locs: UnsafeCell::new(Vec::new()),
                 status: AtomicU64::new(0),
-                rd_loop_token_clt: UnsafeCell::new(None),
+        rd_loop_token_clt: UnsafeCell::new(None),
                 trace_id: AtomicU64::new(0),
                 fail_index_per_trace: AtomicU32::new(0),
             },
@@ -4849,9 +4853,9 @@ pub fn make_resume_guard_copied_exc_descr(prev: DescrRef) -> DescrRef {
             prev: UnsafeCell::new(prev),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
-            rd_loop_token_clt: UnsafeCell::new(None),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         },
@@ -5128,10 +5132,12 @@ impl FailDescr for CompileLoopVersionDescr {
         self.status.load(Ordering::Acquire)
     }
     fn start_compiling(&self) {
-        self.status.fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
+        self.status
+            .fetch_or(STATUS_BUSY_FLAG, Ordering::AcqRel);
     }
     fn done_compiling(&self) {
-        self.status.fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
+        self.status
+            .fetch_and(!STATUS_BUSY_FLAG, Ordering::AcqRel);
     }
     fn store_hash(&self, hash: u64) {
         self.status
@@ -5595,7 +5601,10 @@ mod fail_descr_tests {
 
         // Identity preserved: same Arc, same fail_index, same subtype tag.
         assert_eq!(Arc::as_ptr(&descr), original_ptr);
-        assert_eq!(descr.index(), original_fail_index);
+        assert_eq!(
+            descr.index(),
+            original_fail_index
+        );
         assert!(descr.is_resume_at_position());
         // Types updated.
         assert_eq!(
@@ -5617,9 +5626,9 @@ mod fail_descr_tests {
             payload: RdPayload::empty(),
             vector_info: UnsafeCell::new(None),
             adr_jump_offset: UnsafeCell::new(0),
-            rd_locs: UnsafeCell::new(Vec::new()),
+        rd_locs: UnsafeCell::new(Vec::new()),
             status: AtomicU64::new(0),
-            rd_loop_token_clt: UnsafeCell::new(None),
+        rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
         }) as DescrRef;
@@ -5702,7 +5711,10 @@ mod fail_descr_tests {
         let forced_clone = forced.clone_descr().unwrap();
         assert!(!forced_clone.is_guard_forced());
         assert!(!forced_clone.is_guard_exc());
-        assert_ne!(forced_clone.index(), forced_fi);
+        assert_ne!(
+            forced_clone.index(),
+            forced_fi
+        );
         assert_eq!(
             forced_clone.as_fail_descr().unwrap().fail_arg_types(),
             &[Type::Ref]
@@ -5747,7 +5759,10 @@ mod fail_descr_tests {
         let copied_clone = copied.clone_descr().unwrap();
         assert!(copied_clone.is_resume_guard_copied());
         assert_eq!(Arc::as_ptr(&copied_clone.prev_descr().unwrap()), donor_ptr);
-        assert_ne!(copied_clone.index(), copied.index());
+        assert_ne!(
+            copied_clone.index(),
+            copied.index()
+        );
 
         // Exc-copied subtype carries the same prev and additionally
         // reports is_guard_exc() = true.

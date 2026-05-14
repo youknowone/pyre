@@ -359,7 +359,10 @@ impl ExitVirtualLayout {
 /// other_descr` rather than relying on the pyre-only `descr_index`
 /// serialization handle.
 #[inline]
-fn opt_descr_ptr_eq(a: &Option<majit_ir::DescrRef>, b: &Option<majit_ir::DescrRef>) -> bool {
+fn opt_descr_ptr_eq(
+    a: &Option<majit_ir::DescrRef>,
+    b: &Option<majit_ir::DescrRef>,
+) -> bool {
     match (a, b) {
         (None, None) => true,
         (Some(a), Some(b)) => std::sync::Arc::ptr_eq(a, b),

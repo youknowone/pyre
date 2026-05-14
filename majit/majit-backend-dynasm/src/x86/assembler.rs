@@ -4120,9 +4120,7 @@ impl<'a> Assembler386<'a> {
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] guard-token-slots: fail_index={} fail_arg_locs={:?} rd_locs={:?}",
-                fail_index,
-                &fail_arg_locs,
-                descr.rd_locs()
+                fail_index, &fail_arg_locs, descr.rd_locs()
             );
         }
         let gcmap = self.guard_gcmap_from_faillocs(descr.fail_arg_types(), faillocs);
@@ -4165,7 +4163,10 @@ impl<'a> Assembler386<'a> {
                     }
                 })
                 .collect();
-            crate::guard::register_fail_arg_locs(Arc::as_ptr(&gt.fail_descr) as usize, locs);
+            crate::guard::register_fail_arg_locs(
+                Arc::as_ptr(&gt.fail_descr) as usize,
+                locs,
+            );
         }
     }
 
