@@ -2019,8 +2019,19 @@ impl Backend for DynasmBackend {
         // / `ExitFrameWithExceptionDescr`) without a meta back-pointer
         // fall back to the backend Arc upcast.
         let data = frame.data.downcast_ref::<FrameData>().unwrap();
-        if let Some(meta) = data.fail_descr.meta_descr.clone() {
-            return meta;
+        // Phase C-1 Step 2: `data.fail_descr` is now `Arc<dyn FailDescr>`;
+        // recover the concrete `DynasmFailDescr` via `as_any` downcast to
+        // reach the `meta_descr` back-pointer field that is not on the
+        // trait surface.  Synthetic backend descrs without a meta
+        // back-pointer fall back to the backend Arc upcast.
+        if let Some(d) = data
+            .fail_descr
+            .as_any()
+            .and_then(|a| a.downcast_ref::<DynasmFailDescr>())
+        {
+            if let Some(meta) = d.meta_descr.clone() {
+                return meta;
+            }
         }
         Arc::clone(&data.fail_descr) as Arc<dyn majit_ir::Descr>
     }
