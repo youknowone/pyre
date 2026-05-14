@@ -86,6 +86,7 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
             descr_size: 0,
         }],
         pending_fields: vec![majit_metainterp::resume::PendingFieldInfo {
+            descr: None,
             descr_index: 5,
             target: FrameSlotSource::FailArg(0),
             value: FrameSlotSource::Constant(Const::Int(123)),
@@ -162,6 +163,7 @@ fn resume_py_count_includes_virtual_and_pending_field_failargs() {
             descr_size: 0,
         }],
         pending_fields: vec![majit_metainterp::resume::PendingFieldInfo {
+            descr: None,
             descr_index: 0,
             target: FrameSlotSource::FailArg(0),
             value: FrameSlotSource::FailArg(2),
