@@ -2015,8 +2015,15 @@ impl Backend for DynasmBackend {
             exception_value: GcRef::NULL,
             fail_index: descr.fail_index,
             trace_id: descr.trace_id(),
-            is_finish: descr.is_finish,
-            is_exit_frame_with_exception: descr.is_exit_frame_with_exception,
+            // `compile.py:185 isinstance(descr, ResumeDescr)` /
+            // `compile.py:624 final_descr=True` semantics live on the
+            // metainterp class hierarchy reached via meta_descr; defer to
+            // the FailDescr trait method instead of the backend-local
+            // mirror field so synthetic Done*/Exit*/Propagate descrs
+            // resolve through the upstream class identity.
+            is_finish: <crate::guard::DynasmFailDescr as FailDescr>::is_finish(&descr),
+            is_exit_frame_with_exception:
+                <crate::guard::DynasmFailDescr as FailDescr>::is_exit_frame_with_exception(&descr),
             status: descr.get_status(),
             descr_addr,
             descr_arc,
@@ -2198,7 +2205,15 @@ impl Backend for DynasmBackend {
         let compiled = Self::get_compiled(token);
         for (i, &hash) in hashes.iter().enumerate() {
             if let Some(descr) = compiled.fail_descrs.get(i) {
-                if !descr.is_finish && descr.get_status() == 0 {
+                // `compile.py:826-829` `store_hash` only fires for non-final
+                // `AbstractResumeGuardDescr` whose status is still 0 (no
+                // counter yet stamped).  Route the predicate through the
+                // FailDescr trait so the metainterp class hierarchy
+                // (`final_descr=True` on Done*/Exit*/Propagate) answers
+                // instead of the backend-local mirror field.
+                if !<crate::guard::DynasmFailDescr as FailDescr>::is_finish(descr)
+                    && descr.get_status() == 0
+                {
                     descr.store_hash(hash);
                 }
             }
@@ -2234,7 +2249,9 @@ impl Backend for DynasmBackend {
                 if addr == bridge_addr {
                     for (i, &hash) in hashes.iter().enumerate() {
                         if let Some(descr) = bridge.fail_descrs.get(i) {
-                            if !descr.is_finish && descr.get_status() == 0 {
+                            if !<crate::guard::DynasmFailDescr as FailDescr>::is_finish(descr)
+                                && descr.get_status() == 0
+                            {
                                 descr.store_hash(hash);
                             }
                         }
