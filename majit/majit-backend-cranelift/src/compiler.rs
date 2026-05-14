@@ -1145,7 +1145,7 @@ thread_local! {
     /// across the FFI boundary so the registry round-trip is needed for
     /// ABI safety.
     static CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY: RefCell<
-        Option<Arc<Mutex<HashMap<usize, Arc<CraneliftFailDescr>>>>>,
+        Option<Arc<Mutex<HashMap<usize, majit_ir::DescrRef>>>>,
     > = const { RefCell::new(None) };
     /// Active backend's transient overlay registry.  Unlike
     /// `CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY`, this stores Weak refs: the
@@ -1193,7 +1193,7 @@ fn cranelift_gc_active() -> bool {
 /// Set/clear the active backend's `fail_descr_registry` handle for the
 /// duration of compiled-code dispatch. Mirrors `set_cranelift_active_gc`.
 fn set_cranelift_active_fail_descr_registry(
-    registry: Option<Arc<Mutex<HashMap<usize, Arc<CraneliftFailDescr>>>>>,
+    registry: Option<Arc<Mutex<HashMap<usize, majit_ir::DescrRef>>>>,
 ) {
     CRANELIFT_ACTIVE_FAIL_DESCR_REGISTRY.with(|cell| *cell.borrow_mut() = registry);
 }
@@ -6667,7 +6667,7 @@ pub struct CraneliftBackend {
     /// Native guards carry raw `CraneliftFailDescr` addresses.  Keep the
     /// corresponding Arcs alive and recoverable across call-assembler
     /// guard failures, matching PyPy's CPU-held descr object identity.
-    fail_descr_registry: Arc<Mutex<HashMap<usize, Arc<CraneliftFailDescr>>>>,
+    fail_descr_registry: Arc<Mutex<HashMap<usize, majit_ir::DescrRef>>>,
     /// Transient CALL_ASSEMBLER overlay descrs keyed by raw address.
     /// Values are Weak because the owning `JitFrameDeadFrame` is the
     /// lifetime root; the registry is only an addr→identity adapter for
@@ -6854,9 +6854,10 @@ impl CraneliftBackend {
     pub fn register_fail_descrs(&self, descrs: &[Arc<CraneliftFailDescr>]) {
         let mut registry = self.fail_descr_registry.lock().unwrap();
         for descr in descrs {
+            let descr_ref: majit_ir::DescrRef = Arc::clone(descr) as majit_ir::DescrRef;
             registry
                 .entry(Arc::as_ptr(descr) as usize)
-                .or_insert_with(|| Arc::clone(descr));
+                .or_insert_with(|| descr_ref.clone());
             // Unified-Descr Port Epic: also key the same backend Arc by
             // the metainterp `AbstractFailDescr` Arc's data pointer
             // (`history.py:125` identity).  `get_latest_descr_arc`
@@ -6868,7 +6869,7 @@ impl CraneliftBackend {
                 let meta_ptr = Arc::as_ptr(meta) as *const () as usize;
                 registry
                     .entry(meta_ptr)
-                    .or_insert_with(|| Arc::clone(descr));
+                    .or_insert_with(|| descr_ref.clone());
             }
         }
     }
@@ -14565,12 +14566,16 @@ impl majit_backend::Backend for CraneliftBackend {
             .fail_descr_registry
             .lock()
             .expect("fail_descr_registry mutex poisoned");
-        registry.retain(
-            |_, descr| match majit_backend::descr_owning_jct(descr.as_ref()) {
+        registry.retain(|_, descr| {
+            let fd = match descr.as_fail_descr() {
+                Some(fd) => fd,
+                None => return true,
+            };
+            match majit_backend::descr_owning_jct(fd) {
                 Some(owner) => owner.number != token.number,
                 None => true,
-            },
-        );
+            }
+        });
         drop(registry);
         self.sweep_stale_overlay_fail_descrs();
     }
