@@ -313,51 +313,6 @@ impl DynasmFailDescr {
         unsafe { (*self.rd_loop_token_clt.get()).as_ref() }
     }
 
-    /// `assembler.py:966` — read `adr_jump_offset`.  Forwarded to the
-    /// metainterp `AbstractFailDescr` (`history.py:132 _attrs_`) via
-    /// `meta_descr`.  Returns `0` for synthetic backend descrs without
-    /// a metainterp counterpart (these descrs never have their
-    /// `adr_jump_offset` accessed in production codegen — guard
-    /// patching is a metainterp-side concern).
-    pub fn adr_jump_offset(&self) -> usize {
-        self.meta_descr
-            .as_ref()
-            .and_then(|d| d.as_fail_descr())
-            .map_or(0, |fd| fd.adr_jump_offset())
-    }
-
-    /// `assembler.py:987` — set `adr_jump_offset` (`0` means
-    /// "patched").  Forwarded to the metainterp side; no-op for
-    /// synthetic descrs without a `meta_descr`.
-    pub fn set_adr_jump_offset(&self, offset: usize) {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            meta_fd.set_adr_jump_offset(offset);
-        }
-    }
-
-    /// `llsupport/llmodel.py:424` `descr.rd_locs[index]` — read the
-    /// per-fail-arg jitframe slot positions.  Forwarded to the
-    /// metainterp `AbstractFailDescr` (`history.py:132 _attrs_`) via
-    /// `meta_descr`.  Returns an empty slice for synthetic backend
-    /// descrs without a metainterp counterpart (production codegen
-    /// guard tokens always carry `meta_descr`; the runtime classifier
-    /// synthetic descrs never read this slot).
-    pub fn rd_locs(&self) -> &[u16] {
-        self.meta_descr
-            .as_ref()
-            .and_then(|d| d.as_fail_descr())
-            .map_or(&[][..], |fd| fd.rd_locs())
-    }
-
-    /// `llsupport/assembler.py:279` `guardtok.faildescr.rd_locs =
-    /// positions`.  Forwards to the metainterp side; no-op for
-    /// synthetic descrs without `meta_descr`.
-    pub fn set_rd_locs(&self, locs: Vec<u16>) {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            meta_fd.set_rd_locs(locs);
-        }
-    }
-
     /// Read the recovery_layout from the backend-static side-table.
     pub fn recovery_layout(&self) -> Option<ExitRecoveryLayout> {
         lookup_recovery_layout(self as *const Self as usize)
@@ -626,6 +581,39 @@ impl FailDescr for DynasmFailDescr {
         }
         let status = type_tag | ((index as u64) << Self::ST_SHIFT);
         self.status.store(status, Ordering::Release);
+    }
+
+    /// `assembler.py:966` — read `adr_jump_offset`.  Forwarded to the
+    /// metainterp `AbstractFailDescr` (`history.py:132 _attrs_`) via
+    /// `meta_descr`.  Returns `0` for synthetic backend descrs without
+    /// a metainterp counterpart.
+    fn adr_jump_offset(&self) -> usize {
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(0, |fd| fd.adr_jump_offset())
+    }
+
+    /// `assembler.py:987` — set `adr_jump_offset` (`0` means "patched").
+    fn set_adr_jump_offset(&self, offset: usize) {
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.set_adr_jump_offset(offset);
+        }
+    }
+
+    /// `llsupport/llmodel.py:424` `descr.rd_locs[index]`.
+    fn rd_locs(&self) -> &[u16] {
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(&[][..], |fd| fd.rd_locs())
+    }
+
+    /// `llsupport/assembler.py:279` `guardtok.faildescr.rd_locs = positions`.
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.set_rd_locs(locs);
+        }
     }
 
     fn is_compiling(&self) -> bool {
