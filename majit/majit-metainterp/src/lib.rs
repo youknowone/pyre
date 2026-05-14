@@ -96,15 +96,22 @@ pub use quasiimmut::QuasiImmut;
 pub use trace_ctx::MergePoint;
 pub use trace_ctx::TraceCtx;
 
-/// Whether `MAJIT_LOG` is set, cached at first access.
 /// Compute green key from code pointer and PC.
 /// Must use the same hash as the front-end's make_green_key.
 pub fn green_key_from_code_ptr(code_ptr: usize, pc: usize) -> u64 {
     (code_ptr as u64).wrapping_mul(1000003) ^ (pc as u64)
 }
 
+/// Whether `MAJIT_LOG` is set, cached at first access.
+///
+/// `std::env::var_os` acquires a global env lock and walks the env table on
+/// every call. The flag never changes after process startup, so checking it
+/// from hot dispatch paths (e.g. `run_compiled_code_inner` per bridge hop)
+/// shows up in profiles. The `LazyLock` caches the boolean.
 pub fn majit_log_enabled() -> bool {
-    std::env::var_os("MAJIT_LOG").is_some()
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
+    *ENABLED
 }
 
 /// Result of tracing a single instruction.

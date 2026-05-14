@@ -33,6 +33,25 @@ use majit_ir::{
     OpRef, OpTypeIndex, Type, Value,
 };
 
+/// Whether `MAJIT_LOG` is set, cached at first access.
+///
+/// `std::env::var_os` acquires a global env lock and walks the env table on
+/// every call. The flag never changes after process startup, so checking it
+/// from hot dispatch paths (e.g. `run_compiled_code_inner` per bridge hop)
+/// shows up in profiles. `LazyLock` caches the boolean.
+fn majit_log_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
+    *ENABLED
+}
+
+/// Whether `MAJIT_VERIFY` is set, cached at first access.
+fn majit_verify_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_VERIFY").is_some());
+    *ENABLED
+}
+
 use crate::guard::{BridgeData, CraneliftFailDescr, JitFrameDeadFrame};
 
 // ── compile.py:665-674 done_with_this_frame singletons ──────────────
@@ -6128,7 +6147,7 @@ fn run_compiled_code_inner(
     let depth = max_output_slots.max(inputs.len()).max(1);
     let header_words = (JF_FRAME_ITEM0_OFS as usize) / 8; // 8 words = 64 bytes
     let frame_depth = depth + num_ref_roots;
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         eprintln!(
             "[jf-alloc] frame_depth={} depth={} max_output={} inputs={} ref_roots={}",
             frame_depth,
@@ -6192,12 +6211,12 @@ fn run_compiled_code_inner(
     for (i, &val) in inputs.iter().enumerate() {
         unsafe { *jf_ptr.add(header_words + i) = val };
     }
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         let preview: Vec<i64> = inputs.iter().copied().take(10).collect();
         eprintln!("[pre-call-inputs] {:?}", preview);
     }
     // Debug: verify first input (frame ptr) is valid
-    if std::env::var_os("MAJIT_VERIFY").is_some() && !inputs.is_empty() {
+    if majit_verify_enabled() && !inputs.is_empty() {
         let frame_ptr = inputs[0];
         if frame_ptr != 0 && (frame_ptr < 0x1000 || (frame_ptr as usize & 0x7) != 0) {
             eprintln!("[VERIFY] BAD frame_ptr input[0]={:#x}", frame_ptr);
@@ -6218,7 +6237,7 @@ fn run_compiled_code_inner(
     // _call_footer_shadowstack are emitted as inline MOVs in compiled
     // code's prologue/epilogue. The caller does NOT touch root_stack_top.
 
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         eprintln!(
             "[pre-call] code_ptr={:p} jf_ptr={:p} inputs.len={} ref_roots={} max_output={}",
             code_ptr,
@@ -6229,7 +6248,7 @@ fn run_compiled_code_inner(
         );
     }
     let result_jf = unsafe { func(jf_ptr) };
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         eprintln!("[post-call] result_jf={:p}", result_jf);
     }
 
@@ -6352,7 +6371,7 @@ fn run_compiled_code_inner(
         });
         (fi, arc)
     };
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         eprintln!(
             "[post-call-descr] raw={:#x} fail_index={} matched_local={}",
             jf_descr_raw,
@@ -7193,7 +7212,7 @@ impl CraneliftBackend {
             if let Some(ref bridge) = *bridge_guard {
                 let n = bridge.num_inputs.min(outputs.len());
                 let bridge_inputs = outputs[..n].to_vec();
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if majit_log_enabled() {
                     eprintln!(
                         "[bridge-dispatch] fail_idx={} n={} bridge_inputs={:?} types={:?}",
                         fail_index, n, &bridge_inputs, &bridge.input_types
