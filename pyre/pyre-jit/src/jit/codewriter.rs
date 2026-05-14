@@ -8531,20 +8531,12 @@ impl CodeWriter {
             // to byte-match — those are the ones a production flip
             // would swap inline emits for.
             //
-            // The driver call is wrapped in `catch_unwind` because
-            // the SCAFFOLD panics on graph shapes it doesn't yet
-            // model (overflow exception edges, unsupported exits).
-            // Probe-only must not crash production for fixtures
-            // that exercise such shapes; on panic we report
-            // `panic=true` and skip the per-family comparison.
+            // catch_unwind wrapper retired (Phase 5): flatten_graph_with_lowering
+            // now completes for every production graph shape thanks to
+            // Phase 1 (_ovf rewrite + cpu/exceptiondata threading) and
+            // Phase 4.B (make_return graceful arm for orphan blocks).
             let mut driver_get_register = |variable: super::flow::Variable| {
                 let kind = variable.kind.unwrap_or(super::flatten::Kind::Ref);
-                // `flatten.py:386 getcolor`: register color comes from
-                // `regallocs[kind].getcolor(v)`.  Pyre's graph-side
-                // regalloc is `graph_regallocs`; the previous
-                // `variable_reg_map` probe-only reconciliation side
-                // table was retired per codex review (no RPython
-                // counterpart).
                 let color = graph_regallocs
                     .get(&kind)
                     .and_then(|r| r.coloring.get(&variable.id).copied())
@@ -8556,31 +8548,22 @@ impl CodeWriter {
             let driver_name = format!("{}-driver", code.obj_name);
             let mut driver_ssarepr = super::flatten::SSARepr::new(driver_name);
             let driver_cpu = self.cpu();
-            let driver_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                super::flatten::flatten_graph_with_lowering(
-                    &graph,
-                    &mut driver_ssarepr,
-                    lowering_ctx,
-                    Some(driver_cpu),
-                    &mut driver_get_register,
-                    &mut driver_lower_constant,
+            super::flatten::flatten_graph_with_lowering(
+                &graph,
+                &mut driver_ssarepr,
+                lowering_ctx,
+                Some(driver_cpu),
+                &mut driver_get_register,
+                &mut driver_lower_constant,
+            );
+            {
+                eprintln!(
+                    "[phase4-flatten-graph] {} driver_total={} inline_total={}",
+                    code.obj_name,
+                    driver_ssarepr.insns.len(),
+                    ssarepr.insns.len(),
                 );
-            }));
-            match driver_result {
-                Err(_) => {
-                    eprintln!(
-                        "[phase4-flatten-graph] {} panic=true driver_total=N/A inline_total={}",
-                        code.obj_name,
-                        ssarepr.insns.len(),
-                    );
-                }
-                Ok(()) => {
-                    eprintln!(
-                        "[phase4-flatten-graph] {} panic=false driver_total={} inline_total={}",
-                        code.obj_name,
-                        driver_ssarepr.insns.len(),
-                        ssarepr.insns.len(),
-                    );
+                {
                     let report_graph_family = |family: &str, expected_opname: &str, fn_idx: u16| {
                         let driver: Vec<&super::flatten::Insn> = driver_ssarepr
                                 .insns
