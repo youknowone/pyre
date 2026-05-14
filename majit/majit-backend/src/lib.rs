@@ -14,6 +14,7 @@ pub mod finish_descrs;
 pub mod jitframe;
 pub mod llmodel;
 pub mod rd_payload;
+pub mod resume_guard_descr;
 pub mod resume_value;
 pub mod synthetic_cpu;
 
@@ -22,6 +23,12 @@ pub use finish_descrs::{
     DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
 };
 pub use rd_payload::RdPayload;
+pub use resume_guard_descr::{
+    ResumeGuardDescr, STATUS_BUSY_FLAG, STATUS_SHIFT, STATUS_SHIFT_MASK, STATUS_TYPE_MASK,
+    STATUS_TY_FLOAT, STATUS_TY_INT, STATUS_TY_NONE, STATUS_TY_REF, alloc_fail_index,
+    build_vector_info_chain, flatten_vector_info, make_resume_guard_descr_typed,
+    push_vector_info, reset_fail_index_counter,
+};
 pub use resume_value::{
     FrameInfo, FrameSlotSource, PendingFieldInfo, ResumeData, ResumeValueLayoutSummaryExt,
     ResumeValueSource, VirtualFieldSource, VirtualInfo,
