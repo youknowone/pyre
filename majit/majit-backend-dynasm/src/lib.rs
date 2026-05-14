@@ -817,14 +817,11 @@ mod tests {
         // without calling force. We do this by setting up a guard descr and
         // checking the trampoline reads fail_arg values correctly.
 
-        let descr = Arc::new(guard::DynasmFailDescr::new(
-            7,  // fail_index
-            99, // trace_id
-            vec![Type::Int, Type::Int],
-        ));
-        let descr_ptr = Arc::as_ptr(&descr) as i64;
+        let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Int, Type::Int]);
+        let descr_ptr = Arc::as_ptr(&descr) as *const () as usize;
+        guard::register_fail_descr_global(descr_ptr, &descr);
 
-        let jf = unsafe { alloc_test_jitframe(descr_ptr as usize, &[100, 200, 0, 0]) };
+        let jf = unsafe { alloc_test_jitframe(descr_ptr, &[100, 200, 0, 0]) };
         let result = call_assembler_helper_trampoline(std::ptr::null(), jf, 42);
         // No blackhole registered → returns 0, no crash.
         assert_eq!(result, 0);
@@ -839,12 +836,9 @@ mod tests {
         // side-table; the helper-trampoline path never queries that
         // table, so this test simply confirms the trampoline returns
         // the blackhole result (or 0) regardless of bridge presence.
-        let descr = Arc::new(guard::DynasmFailDescr::new(
-            3,
-            17,
-            vec![Type::Int],
-        ));
-        let descr_ptr = Arc::as_ptr(&descr) as usize;
+        let descr = majit_backend::make_resume_guard_descr_typed(vec![Type::Int]);
+        let descr_ptr = Arc::as_ptr(&descr) as *const () as usize;
+        guard::register_fail_descr_global(descr_ptr, &descr);
 
         let jf = unsafe { alloc_test_jitframe(descr_ptr, &[123, 0, 0, 0]) };
         let result = call_assembler_helper_trampoline(std::ptr::null(), jf, 99);
