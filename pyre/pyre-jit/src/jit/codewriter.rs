@@ -658,6 +658,12 @@ impl SpamBlockRef {
 
     fn mark_dead(&self) {
         self.0.borrow_mut().dead = true;
+        // Mirror onto the underlying flow::Block so flatten_graph and
+        // any post-walker graph traversal can see the dead status
+        // without needing the SpamBlockRef wrapper (matching upstream
+        // `flowcontext.py:42 SpamBlock.dead` which is read during
+        // `flatten` via `block.dead` access on the flow Block).
+        self.0.borrow().block.borrow_mut().dead = true;
     }
 
     fn dead(&self) -> bool {

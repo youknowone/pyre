@@ -1350,6 +1350,19 @@ where
                 .target
                 .clone()
                 .expect("link target required for make_link");
+            // `flowcontext.py:42 SpamBlock.dead` mirror: pyre's walker
+            // marks orphan join-point blocks dead when the
+            // emitted_pc_starts skip fires.  Such blocks have no
+            // operations and no exits but still appear as link
+            // targets.  Emit `unreachable` instead of recursing so the
+            // SSARepr stays well-formed (the runtime never reaches the
+            // dead block — its entry pcN label is in a sibling alive
+            // block, and runtime gotos resolve via pcN).
+            if target.borrow().dead {
+                self.emitline(Insn::op("unreachable", Vec::new()));
+                self.emitline(Insn::Unreachable);
+                return;
+            }
             let target_is_final = target.borrow().exits.is_empty();
             let uses_last_exception = link_borrow.args.iter().any(|arg| {
                 arg.as_ref()

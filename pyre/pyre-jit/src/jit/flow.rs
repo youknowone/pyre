@@ -911,6 +911,13 @@ pub struct Block {
     pub exitswitch: Option<ExitSwitch>,
     /// `block.exits`.
     pub exits: Vec<LinkRef>,
+    /// Mirror of upstream `flowcontext.py:42 SpamBlock.dead`.  Pyre's
+    /// PC-sequential walker can leave orphan join-point blocks when the
+    /// outer pendingblocks loop skips a popped block whose start_pc was
+    /// already emitted by another block.  The walker marks such blocks
+    /// dead so flatten_graph (and any post-walker graph traversal) can
+    /// detect orphans without scanning operations / exits length.
+    pub dead: bool,
 }
 
 impl Block {
@@ -921,6 +928,7 @@ impl Block {
             is_final: false,
             exitswitch: None,
             exits: Vec::new(),
+            dead: false,
         }
     }
 
