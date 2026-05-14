@@ -8,8 +8,6 @@
 //! `make_type_of_exc_inst`, …) are intentionally absent; they get added
 //! one method at a time when a future port reads them.
 
-use std::collections::HashMap;
-
 use super::flatten::Kind;
 use super::flow::Constant;
 
@@ -48,14 +46,6 @@ const STANDARD_EXCEPTIONS: &[&str] = &[
 pub struct ExceptionData {
     /// `exceptiondata.py:14 standardexceptions = standardexceptions`.
     pub standardexceptions: &'static [&'static str],
-    /// Prebuilt opaque tokens for each standard exception, keyed by
-    /// class name.  `get_standard_ll_exc_instance_by_class` returns
-    /// clones of these so repeat calls for the same class produce
-    /// `Constant`s that compare equal at the `OpaqueConstant::id`
-    /// level — matching upstream's "reusable prebuilt LL instance
-    /// pointer" semantic from `exceptiondata.py:40` even without
-    /// pyre's missing LL type system.
-    prebuilt_instances: HashMap<&'static str, Constant>,
 }
 
 impl Default for ExceptionData {
@@ -71,13 +61,8 @@ impl ExceptionData {
     /// `lltype_of_exception_type`, `lltype_of_exception_value`) all
     /// belong to the LL type system that pyre-jit does not model.
     pub fn new() -> Self {
-        let prebuilt_instances = STANDARD_EXCEPTIONS
-            .iter()
-            .map(|&name| (name, Constant::opaque(name, Some(Kind::Ref))))
-            .collect();
         Self {
             standardexceptions: STANDARD_EXCEPTIONS,
-            prebuilt_instances,
         }
     }
 
@@ -85,23 +70,20 @@ impl ExceptionData {
     ///
     /// Upstream walks the bookkeeper to obtain `clsdef` then calls
     /// `get_standard_ll_exc_instance(rtyper, clsdef)` which returns the
-    /// reusable prebuilt LL instance pointer wrapped at the caller in
-    /// `Constant(ll_ovf, concretetype=lltype.typeOf(ll_ovf))`
-    /// (`flatten.py:168-169`).  Pyre has no LL type system; the
+    /// LL instance pointer wrapped at the caller in `Constant(ll_ovf,
+    /// concretetype=lltype.typeOf(ll_ovf))` (`flatten.py:168-169`).
+    /// Pyre has no LL type system or bookkeeper — instead, the
     /// production `lower_constant` closure threaded through
     /// `GraphFlattener` resolves the opaque `Constant` to the runtime
-    /// PyObject pointer for the exception class.  The returned Constant
-    /// shares an `OpaqueConstant::id` across calls for the same class —
-    /// the "reusable prebuilt" semantic — via the `prebuilt_instances`
-    /// intern table populated in `new`.
+    /// PyObject pointer for the exception class.
     pub fn get_standard_ll_exc_instance_by_class(
         &self,
         exceptionclass: &str,
     ) -> Result<Constant, UnknownException> {
-        self.prebuilt_instances
-            .get(exceptionclass)
-            .cloned()
-            .ok_or_else(|| UnknownException(exceptionclass.to_owned()))
+        if !self.standardexceptions.contains(&exceptionclass) {
+            return Err(UnknownException(exceptionclass.to_owned()));
+        }
+        Ok(Constant::opaque(exceptionclass, Some(Kind::Ref)))
     }
 }
 
@@ -154,19 +136,4 @@ mod tests {
         assert_eq!(err, UnknownException("NotAStandardException".to_owned()));
     }
 
-    #[test]
-    fn get_standard_ll_exc_instance_by_class_returns_reusable_prebuilt() {
-        let data = ExceptionData::new();
-        let first = data
-            .get_standard_ll_exc_instance_by_class("OverflowError")
-            .expect("OverflowError must be a standard exception");
-        let second = data
-            .get_standard_ll_exc_instance_by_class("OverflowError")
-            .expect("OverflowError must be a standard exception");
-        assert_eq!(
-            first, second,
-            "repeat calls for the same class must yield equal Constants \
-             (reusable prebuilt LL instance semantic per exceptiondata.py:40)"
-        );
-    }
 }
