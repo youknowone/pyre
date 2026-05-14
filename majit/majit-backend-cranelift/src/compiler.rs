@@ -2627,7 +2627,7 @@ fn register_call_assembler_target(
     if let Some(finish_descr) = compiled
         .fail_descrs
         .iter()
-        .find(|d| d.is_finish() && !d.is_exit_frame_with_exception)
+        .find(|d| FailDescr::is_finish(d.as_ref()) && !FailDescr::is_exit_frame_with_exception(d.as_ref()))
     {
         let result_type = finish_descr
             .fail_arg_types()
@@ -2724,7 +2724,7 @@ fn redirect_call_assembler_target(old_number: u64, new_number: u64) -> Result<()
     let new_finish_descr_ptr = new_target
         .fail_descrs
         .iter()
-        .find(|d| d.is_finish() && !d.is_exit_frame_with_exception)
+        .find(|d| FailDescr::is_finish(d.as_ref()) && !FailDescr::is_exit_frame_with_exception(d.as_ref()))
         .map(|d| {
             let result_type = d.fail_arg_types().first().copied().unwrap_or(Type::Void);
             attached_descrs.done_with_this_frame_descr_ptr_for_type(result_type) as i64
@@ -13280,7 +13280,7 @@ fn collect_guards(
             // The classifier path (`match_metainterp_finish_descr`) routes
             // the pointer back to a `CraneliftFailDescr` singleton for
             // downstream consumers that need `bridge_ref`/fail_arg_types.
-            if descr.is_exit_frame_with_exception {
+            if FailDescr::is_exit_frame_with_exception(descr.as_ref()) {
                 attached_descrs.exit_frame_with_exception_descr_ref as i64
             } else {
                 let result_type = descr
