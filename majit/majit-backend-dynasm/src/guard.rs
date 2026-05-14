@@ -147,7 +147,15 @@ pub struct DynasmFailDescr {
     pub fail_index: u32,
     pub trace_id: u64,
     pub fail_arg_types: Vec<Type>,
-    pub is_finish: bool,
+    // is_finish removed: `compile.py:624 final_descr=True` is a class
+    // attribute on `_DoneWithThisFrameDescr`/`ExitFrameWithExceptionDescrRef`.
+    // After Phase A, every DynasmFailDescr — production guard, FINISH,
+    // GuardNotForced pre-allocation, synthetic find_descr_by_ptr exit —
+    // carries meta_descr to the corresponding metainterp class
+    // (ResumeGuardDescr family for guards, DoneWithThisFrame*/
+    // ExitFrameWithExceptionDescrRef/PropagateExceptionDescr for finish-
+    // ish exits), so the FailDescr trait method answers via meta_descr
+    // forwarding instead of a backend-local mirror.
     // is_resume_guard removed: the predicate is answered by the
     // metainterp class hierarchy through `meta_descr` forwarding
     // (`compile.py:185` `isinstance(descr, ResumeDescr)` test against
@@ -277,13 +285,11 @@ impl DynasmFailDescr {
         fail_index: u32,
         trace_id: u64,
         fail_arg_types: Vec<Type>,
-        is_finish: bool,
     ) -> Self {
         DynasmFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
-            is_finish,
             is_exit_frame_with_exception: false,
             status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
@@ -348,7 +354,7 @@ impl DynasmFailDescr {
         majit_backend::FailDescrLayout {
             fail_index: self.fail_index,
             fail_arg_types: fail_arg_types.to_vec(),
-            is_finish: self.is_finish,
+            is_finish: <Self as FailDescr>::is_finish(self),
             trace_id: <Self as FailDescr>::trace_id(self),
             source_op_index: lookup_source_op_index(self as *const Self as usize),
             gc_ref_slots: fail_arg_types
@@ -375,7 +381,7 @@ impl std::fmt::Debug for DynasmFailDescr {
         f.debug_struct("DynasmFailDescr")
             .field("fail_index", &self.fail_index)
             .field("trace_id", &self.trace_id)
-            .field("is_finish", &self.is_finish)
+            .field("is_finish", &<Self as FailDescr>::is_finish(self))
             .field("status", &self.get_status())
             .field("adr_jump_offset", &self.adr_jump_offset())
             .finish()
@@ -463,14 +469,17 @@ impl FailDescr for DynasmFailDescr {
 
     fn is_finish(&self) -> bool {
         // `compile.py:624` `_DoneWithThisFrameDescr` family carries
-        // `final_descr = True`.  Forward through `meta_descr` so the
-        // metainterp class hierarchy answers the predicate; fall back
-        // to the local mirror for synthetic backend descrs minted by
-        // the runtime classifier (`meta_descr = None`).
-        match self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            Some(fd) => fd.is_finish(),
-            None => self.is_finish,
-        }
+        // `final_descr = True`.  After Phase A every DynasmFailDescr
+        // carries meta_descr (production codegen + synthetic
+        // find_descr_by_ptr exits both stamp it), so the metainterp
+        // class hierarchy answers the predicate.  Synthetic descrs
+        // without meta_descr (test scaffolding for the helper trampoline)
+        // take the trait default false; their FINISH-flavour predicate
+        // is irrelevant in those paths.
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(false, |fd| fd.is_finish())
     }
 
     fn is_exit_frame_with_exception(&self) -> bool {

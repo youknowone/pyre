@@ -807,7 +807,6 @@ mod tests {
             7,  // fail_index
             99, // trace_id
             vec![Type::Int, Type::Int],
-            false, // is_finish
         ));
         let descr_ptr = Arc::as_ptr(&descr) as i64;
 
@@ -830,7 +829,6 @@ mod tests {
             3,
             17,
             vec![Type::Int],
-            false, // is_finish
         ));
         let descr_ptr = Arc::as_ptr(&descr) as usize;
 

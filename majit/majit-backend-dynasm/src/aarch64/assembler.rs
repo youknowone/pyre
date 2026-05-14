@@ -2584,7 +2584,6 @@ impl<'a> AssemblerARM64<'a> {
                         fail_index,
                         self.trace_id,
                         fail_arg_types.clone(),
-                        true, // is_finish
                     );
                     // `compile.py:665-674` link to the metainterp class-distinct
                     // singleton so trait forwarding routes is_finish /
@@ -3394,7 +3393,6 @@ impl<'a> AssemblerARM64<'a> {
                 fail_index,
                 self.trace_id,
                 fail_arg_types,
-                false, // is_finish
             ))
         };
         if crate::majit_log_enabled() {
@@ -4105,7 +4103,6 @@ impl<'a> AssemblerARM64<'a> {
             fail_index,
             self.trace_id,
             fail_arg_types,
-            false, // is_finish
         ));
         let descr_ptr = Arc::as_ptr(&descr) as i64;
         self.pending_force_descr = Some(descr);
@@ -4342,7 +4339,6 @@ impl<'a> AssemblerARM64<'a> {
                 fail_index,
                 self.trace_id,
                 fail_arg_types.clone(),
-                true, // is_finish
             );
             d.meta_descr = self.done_with_this_frame_descr_arc_for_type(result_type);
             Arc::new(d)
