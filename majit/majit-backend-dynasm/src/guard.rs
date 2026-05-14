@@ -240,11 +240,14 @@ pub struct DynasmFailDescr {
     /// Unified-Descr endpoint collapses `DynasmFailDescr` into the
     /// metainterp descr.
     ///
-    /// `None` for synthetic backend descrs minted by the runtime
-    /// classifier (`runner.rs::find_descr_by_ptr` for FINISH /
-    /// PropagateExceptionDescr / ExitFrameWithExceptionDescr exits) —
-    /// those exits route through dedicated metainterp Done* descrs
-    /// owned by `MetaInterpStaticData`, not via `op.descr`.
+    /// Always `Some` in production codegen paths.  Production guard
+    /// descrs stamp `meta_descr = op.descr` immediately after
+    /// construction (`x86/aarch64 assembler.rs::append_guard_token_with_faillocs`);
+    /// FINISH descrs stamp the matching DoneWithThisFrameDescr* Arc
+    /// (`done_with_this_frame_descr_arc_for_type`); synthetic
+    /// `find_descr_by_ptr` exits stamp the cloned attached Arc from
+    /// `descr_attachments`.  Only test scaffolding (lib.rs:780/804
+    /// helper-trampoline tests) leaves it `None`.
     pub meta_descr: Option<DescrRef>,
 }
 
