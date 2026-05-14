@@ -4,7 +4,6 @@
 /// is accessed here via `meta_resume_fd()` forwarding.
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 /// Backend-static side-table mapping a `DynasmFailDescr` Arc's
@@ -156,6 +155,11 @@ pub struct DynasmFailDescr {
     // ExitFrameWithExceptionDescrRef/PropagateExceptionDescr for finish-
     // ish exits), so the FailDescr trait method answers via meta_descr
     // forwarding instead of a backend-local mirror.
+    // status removed: `compile.py:683 AbstractResumeGuardDescr._attrs_
+    // = ('status',)` — only ResumeGuardDescr family carries this slot.
+    // Done*/Exit/Propagate inherit AbstractFailDescr without status.
+    // After Phase A every backend descr forwards through meta_descr to
+    // the metainterp class, so the local AtomicU64 mirror is unused.
     // is_resume_guard removed: the predicate is answered by the
     // metainterp class hierarchy through `meta_descr` forwarding
     // (`compile.py:185` `isinstance(descr, ResumeDescr)` test against
@@ -204,9 +208,6 @@ pub struct DynasmFailDescr {
     // `AbstractFailDescr._attrs_` (`history.py:132`).  The structured
     // layout lives in `RECOVERY_LAYOUT_TABLE` keyed on
     // `Arc::as_ptr(&descr)`.
-
-    /// compile.py:685 status: packs ST_BUSY_FLAG + type tag + hash.
-    pub status: AtomicU64,
 
     // adr_jump_offset removed (Session 5e-1): the canonical
     // `history.py:132 _attrs_` slot lives on the metainterp
@@ -297,7 +298,6 @@ impl DynasmFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
-            status: AtomicU64::new(0),
             rd_loop_token_clt: UnsafeCell::new(None),
             meta_descr: None,
         }
@@ -541,55 +541,44 @@ impl FailDescr for DynasmFailDescr {
         DynasmFailDescr::set_rd_loop_token_clt(self, typed);
     }
 
-    /// `compile.py:741-745` `get_status`.  Forwards through the
-    /// metainterp `AbstractResumeGuardDescr` (`compile.py:683 _attrs_`
-    /// `('status',)`) when `meta_descr` is set; falls back to the
-    /// backend-local mirror for synthetic descrs minted outside the
-    /// optimizer (FINISH / `ExitFrameWithExceptionDescrRef` /
-    /// `PropagateExceptionDescr` from the runtime classifier).
+    /// `compile.py:741-745` `get_status`.  `compile.py:683`
+    /// `AbstractResumeGuardDescr._attrs_ = ('status',)` — only resume
+    /// guard descrs carry status.  Forwards through `meta_descr`;
+    /// non-ResumeGuardDescr targets (Done*/Exit/Propagate) return the
+    /// trait default 0, matching the upstream class hierarchy.
     fn get_status(&self) -> u64 {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            return meta_fd.get_status();
-        }
-        self.status.load(Ordering::Acquire)
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(0, |fd| fd.get_status())
     }
 
     /// `compile.py:786-788` `start_compiling`.
     fn start_compiling(&self) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.start_compiling();
-            return;
         }
-        self.status.fetch_or(Self::ST_BUSY_FLAG, Ordering::AcqRel);
     }
 
     /// `compile.py:790-795` `done_compiling`.
     fn done_compiling(&self) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.done_compiling();
-            return;
         }
-        self.status.fetch_and(!Self::ST_BUSY_FLAG, Ordering::AcqRel);
     }
 
     /// `compile.py:826-830` `store_hash`.
     fn store_hash(&self, hash: u64) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.store_hash(hash);
-            return;
         }
-        self.status
-            .store(hash & Self::ST_SHIFT_MASK, Ordering::Release);
     }
 
     /// `compile.py:813-824` `make_a_counter_per_value`.
     fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.make_a_counter_per_value(index, type_tag);
-            return;
         }
-        let status = type_tag | ((index as u64) << Self::ST_SHIFT);
-        self.status.store(status, Ordering::Release);
     }
 
     /// `assembler.py:966` — read `adr_jump_offset`.  Forwarded to the
