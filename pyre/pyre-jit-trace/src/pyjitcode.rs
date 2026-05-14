@@ -393,8 +393,15 @@ impl PyJitCode {
             PyJitCodeMetadata {
                 pc_map: Vec::new(),
                 depth_at_py_pc: Vec::new(),
-                portal_frame_reg: 0,
-                portal_ec_reg: 0,
+                // u16::MAX sentinel mirrors `canonical_bridge::install_portal_for`
+                // (canonical_bridge.rs:165-166). Encoder/decoder readers in
+                // `get_list_of_active_boxes`, `regalloc::external/input_indices`,
+                // and `setup_bridge_sym::portal_red_regs_at` sentinel-skip both
+                // values together. A real `0` here would alias every locals-
+                // bank color 0 read and silently substitute `sym.frame` for
+                // unrelated locals/stack slots.
+                portal_frame_reg: u16::MAX,
+                portal_ec_reg: u16::MAX,
                 stack_base: 0,
                 stack_slot_color_map: Vec::new(),
                 pyre_color_for_semantic_local: Vec::new(),

@@ -1269,25 +1269,6 @@ impl BlackholeInterpreter {
         self.reset_position_state(position);
     }
 
-    /// interp_jit.py:64 parity: fill dedicated portal red-arg registers
-    /// with virtualizable_ptr (frame) and ec (execution context).
-    ///
-    /// The register indices are produced by pyre's portal codewriter and
-    /// passed as side metadata. RPython `JitCode` has no portal-register
-    /// fields, so they must not be stored on `jitcode.py`'s Rust port.
-    ///
-    /// Must be called AFTER virtualizable_ptr is assigned — setposition()
-    /// runs before the caller sets virtualizable_ptr, so portal registers
-    /// are filled as a separate step.
-    pub fn fill_portal_registers(&mut self, frame_reg: u16, ec_reg: u16, ec: i64) {
-        if frame_reg != u16::MAX && (frame_reg as usize) < self.registers_r.len() {
-            self.registers_r[frame_reg as usize] = self.virtualizable_ptr;
-        }
-        if ec_reg != u16::MAX && (ec_reg as usize) < self.registers_r.len() {
-            self.registers_r[ec_reg as usize] = ec;
-        }
-    }
-
     /// blackhole.py:1095-1099 `get_portal_runner(jdindex)`.
     ///
     /// ```python

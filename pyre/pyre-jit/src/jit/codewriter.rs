@@ -2419,6 +2419,8 @@ fn filter_liveness_in_place(
     depth_at_pc: &[u16],
     local_color_map: &[u16],
     stack_slot_color_map: &[u16],
+    portal_frame_reg: u16,
+    portal_ec_reg: u16,
 ) {
     use super::flatten::{Kind as SsaKind, Operand as SsaOperand};
     super::liveness::compute_liveness(ssarepr);
@@ -2523,6 +2525,53 @@ fn filter_liveness_in_place(
         };
         if std::env::var_os("MAJIT_PHASE06_DROP_LV").is_none() {
             live_r.retain(|idx| lv_live.contains(idx));
+        }
+        // PRE-EXISTING-ADAPTATION (pyre architectural divergence, not a
+        // `compute_liveness` parity fix): keep portal red args
+        // (`pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`)
+        // alive at every `-live-` op for canonical installs.
+        //
+        // RPython does NOT special-case portal reds in liveness; its
+        // `compute_liveness` (`rpython/jit/codewriter/liveness.py:44-69`)
+        // discovers them naturally from SSA Register operands. That
+        // works in upstream because the canonical JitCode encodes the
+        // FULL interpreter — every bytecode handler, including
+        // `CALL_ASSEMBLER` emit sites — so ec appears as a Register
+        // operand at many points in the SSA stream.
+        //
+        // pyre's codewriter only encodes the dispatch-loop skeleton
+        // (vable reads, residual_call helpers, portal jit_merge_point).
+        // The per-Python-bytecode handlers (CALL_FUNCTION → CALL_ASSEMBLER,
+        // LOAD_FAST → vable_getarrayitem, etc.) are emitted by the
+        // tracer (`pyre-jit-trace/src/trace_opcode.rs:5124, 5262, 5661`)
+        // into the trace IR at trace time — they never enter the
+        // codewriter's SSARepr. The compiled trace, however, reads ec
+        // from register file slot `portal_ec_reg` at every
+        // CALL_ASSEMBLER, so that slot MUST be populated after BH
+        // resume (`consume_one_section` → `_prepare_next_section` →
+        // `_callback_r(portal_ec_reg)`). The slot is filled iff the
+        // jitcode's `-live-` op at the resume PC lists `portal_ec_reg`.
+        // Similarly frame must remain alive across tracer-injected
+        // vable reads.
+        //
+        // Two parity options exist:
+        //   (a) emit every Python bytecode handler into the codewriter
+        //       SSA so `compute_liveness` sees ec/frame uses naturally —
+        //       a structural refactor on the scale of porting the entire
+        //       interpreter to RPython-style SSA;
+        //   (b) inject placeholder Register operands referencing
+        //       portal_ec_reg / portal_frame_reg into the SSA before
+        //       `compute_liveness` runs — semantically equivalent to
+        //       this explicit append, only more indirect.
+        //
+        // The explicit append below is option (c): document the
+        // adaptation at the single site that needs it. Portal-bridge
+        // installs sentinel-skip (`u16::MAX`).
+        if portal_frame_reg != u16::MAX && !live_r.contains(&portal_frame_reg) {
+            live_r.push(portal_frame_reg);
+        }
+        if portal_ec_reg != u16::MAX && !live_r.contains(&portal_ec_reg) {
+            live_r.push(portal_ec_reg);
         }
 
         existing.clear();
@@ -7977,6 +8026,8 @@ impl CodeWriter {
             &depth_at_pc,
             &pyre_color_for_semantic_local,
             &stack_slot_color_map,
+            portal_frame_reg,
+            portal_ec_reg,
         );
         // Runtime entry/liveness lookups expect the byte offset of the
         // surviving `-live-` marker for each Python PC
@@ -9528,6 +9579,8 @@ mod tests {
             &depth_at_pc,
             &local_color_map,
             &stack_slot_color_map,
+            u16::MAX,
+            u16::MAX,
         );
 
         let live_idx = live_marker_indices_by_pc(&ssarepr, code.instructions.len())[reachable_pc];

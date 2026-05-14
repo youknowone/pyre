@@ -1536,9 +1536,31 @@ impl MIFrame {
             cursor = it.offset;
         }
         if length_r != 0 {
+            // PyPy parity: portal red args (`pypy/module/pypyjit/
+            // interp_jit.py:67 reds = ['frame', 'ec']`) are JitCode
+            // inputargs that appear in every `-live-` op's R-bank
+            // (`liveness.py compute_liveness`). pyre's MIFrame stores
+            // them on dedicated PyreSym fields (`sym.frame`,
+            // `sym.execution_context`) rather than at color positions
+            // in `sym.registers_r` — adapt by substituting at the
+            // encoder boundary. After guard capture the wire-format
+            // payload contains the OpRefs at the canonical portal
+            // color positions; `_prepare_next_section` (resume.py:1381)
+            // fills the BH bank from there, mirroring RPython exactly.
+            let portal_frame_reg = jc.payload.metadata.portal_frame_reg as u32;
+            let portal_ec_reg = jc.payload.metadata.portal_ec_reg as u32;
+            let sym_frame = self.sym().frame;
+            let sym_ec = self.sym().execution_context;
             let mut it = LivenessIterator::new(cursor, length_r, &all_liveness);
             while let Some(reg_idx) = it.next() {
-                boxes.push(registers_r_bank[reg_idx as usize]);
+                let opref = if reg_idx == portal_frame_reg {
+                    sym_frame
+                } else if reg_idx == portal_ec_reg {
+                    sym_ec
+                } else {
+                    registers_r_bank[reg_idx as usize]
+                };
+                boxes.push(opref);
             }
             cursor = it.offset;
         }
@@ -2868,9 +2890,8 @@ impl MIFrame {
             )
         };
         let mut args = vec![frame];
-        if extra_reds == 1 {
-            args.push(execution_context);
-        }
+        // NUM_EXTRA_REDS == 1 (crate const-assert): `reds = ['frame', 'ec']`.
+        args.push(execution_context);
         args.extend_from_slice(&[
             next_instr,
             code,
@@ -3036,7 +3057,8 @@ impl MIFrame {
                 if idx < total_scalar_prefix {
                     match idx {
                         0 => s.frame = new_opref,
-                        1 if extra_reds == 1 => s.execution_context = new_opref,
+                        // NUM_EXTRA_REDS == 1 (crate const-assert).
+                        1 => s.execution_context = new_opref,
                         _ => match idx - extra_reds {
                             1 => s.vable_last_instr = new_opref,
                             2 => s.vable_pycode = new_opref,
@@ -3125,9 +3147,9 @@ impl MIFrame {
         let mut fa =
             Vec::with_capacity(crate::virtualizable_gen::NUM_SCALAR_INPUTARGS + active_boxes.len());
         fa.push(s.frame);
-        if crate::virtualizable_gen::NUM_EXTRA_REDS > 0 {
-            fa.push(s.execution_context);
-        }
+        // NUM_EXTRA_REDS == 1 (crate const-assert in `lib.rs`).
+        // `interp_jit.py:67 reds = ['frame', 'ec']`.
+        fa.push(s.execution_context);
         fa.extend_from_slice(&[
             s.vable_last_instr,
             s.vable_pycode,
@@ -5248,9 +5270,10 @@ impl MIFrame {
                                 )?;
                             // pyjitpl.py:2017: do_residual_call step 1
                             this.vable_and_vrefs_before_residual_call(ctx);
+                            let ec = this.ensure_execution_context(ctx);
                             let ca_result = ctx.call_assembler_red_only_ref(
                                 token_number,
-                                &[callee_frame, this.sym().execution_context],
+                                &[callee_frame, ec],
                                 &[Type::Ref, Type::Ref],
                             );
                             // pyjitpl.py:2080-2081 direct_assembler_call:

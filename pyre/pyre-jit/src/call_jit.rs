@@ -1005,13 +1005,13 @@ pub fn resume_in_blackhole(
         bh.virtualizable_ptr = frame_ptr as i64;
         bh.virtualizable_info = crate::eval::get_virtualizable_info();
         bh.virtualizable_stack_base = nlocals + pyre_interpreter::pyframe::ncells(code);
-        // Portal red-arg registers must be filled AFTER virtualizable_ptr.
-        let ec = unsafe { (*frame_ptr).execution_context as i64 };
-        bh.fill_portal_registers(
-            pyjitcode.metadata.portal_frame_reg,
-            pyjitcode.metadata.portal_ec_reg,
-            ec,
-        );
+        // Portal red-arg registers (`pypy/module/pypyjit/interp_jit.py:67
+        // reds = ['frame', 'ec']`) are filled by `consume_one_section`
+        // (resume.py:1381 / `_prepare_next_section` resume.py:1017) from
+        // the regular `-live-` op slot list — the codewriter now seeds
+        // `portal_frame_reg` / `portal_ec_reg` into every -live- op's
+        // R-bank via `filter_liveness_in_place` (jit/codewriter.rs:2364).
+        // No separate fill step is needed; RPython has no counterpart.
 
         // resume.py:1342 `curbh.handle_rvmprof_enter()` — runs the rvmprof
         // `entering=0` hook immediately after consume_one_section. For the
@@ -1956,36 +1956,15 @@ pub fn blackhole_resume_via_rd_numb(
         mainjitcode_calldescr: bh.jitcode.calldescr.clone(),
     }];
 
-    // interp_jit.py:64 parity (pyre-adaptation): fill dedicated portal
-    // red-arg registers (frame_ptr, execution_context) for each jitcode
-    // in the chain. RPython encodes these as regular inputargs of the
-    // portal jitcode, so `_prepare_next_section` fills them during
-    // `consume_one_section` without a side channel. Pyre's codewriter
-    // assigns portal registers separately (PyJitCodeMetadata
-    // .portal_frame_reg / .portal_ec_reg) and omits them from liveness,
-    // so the orthodox `blackhole_from_resumedata` path leaves them zero.
-    // Walk the chain and fill them explicitly until the codewriter
-    // change lands; chains are short (typically 1–3 frames) so the
-    // O(jitcodes) scan per frame is inexpensive.
-    let callcontrol = crate::jit::codewriter::CodeWriter::instance().callcontrol();
-    let mut cur: Option<&mut majit_metainterp::blackhole::BlackholeInterpreter> = Some(&mut bh);
-    while let Some(bh_ref) = cur {
-        let jitcode_ptr = std::sync::Arc::as_ptr(&bh_ref.jitcode);
-        if let Some(pyjit) = callcontrol.find_pyjitcode_by_jitcode_ptr(jitcode_ptr) {
-            let vable_ptr = bh_ref.virtualizable_ptr;
-            let ec = if vable_ptr != 0 {
-                unsafe { (*(vable_ptr as *const PyFrame)).execution_context as i64 }
-            } else {
-                0
-            };
-            bh_ref.fill_portal_registers(
-                pyjit.metadata.portal_frame_reg,
-                pyjit.metadata.portal_ec_reg,
-                ec,
-            );
-        }
-        cur = bh_ref.nextblackholeinterp.as_deref_mut();
-    }
+    // Portal red-arg registers (`pypy/module/pypyjit/interp_jit.py:67
+    // reds = ['frame', 'ec']`) are filled per-frame by
+    // `consume_one_section` from each section's `-live-` op (resume.py
+    // :1381 / `_prepare_next_section` resume.py:1017). With the
+    // codewriter now seeding `portal_frame_reg` / `portal_ec_reg` into
+    // every -live- op's R-bank (jit/codewriter.rs:2364), each chained
+    // `BlackholeInterpreter` gets its frame_ptr + ec values via the
+    // regular `setarg_r` callback path. No pyre-side fixup is needed;
+    // RPython has no chain fill-up step either.
 
     if majit_metainterp::majit_log_enabled() {
         eprintln!("[blackhole-resume] rd_numb path, chain built, running _run_forever",);

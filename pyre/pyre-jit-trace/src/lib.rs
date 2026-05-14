@@ -26,6 +26,19 @@ pub mod trace;
 pub mod virtualizable_gen;
 pub mod virtualizable_spec;
 
+// pyre-jit-trace local invariant: PyFrame's `_virtualizable_` declares
+// exactly one extra red (ec, see `virtualizable_gen.rs:29-31` and
+// `pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`).
+// `majit-macros::virtualizable!` itself is generic over `extra_reds.len()`
+// (mod.rs:515), so this assertion is *pyre-local*. Tracing-time helpers
+// that seed/push the ec slot rely on this invariant; bumping it requires
+// re-auditing every ec wiring callsite — see the v3 plan at
+// `~/.claude/plans/ec-wiring-gentle-wave.md`.
+const _: () = assert!(
+    virtualizable_gen::NUM_EXTRA_REDS == 1,
+    "pyre's PyFrame virtualizable layout requires exactly one extra red (ec)",
+);
+
 /// Auto-generated trace functions from majit-translate.
 #[allow(dead_code, unsafe_op_in_unsafe_fn, unused_imports, unused_variables)]
 pub mod generated {

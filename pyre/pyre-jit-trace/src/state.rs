@@ -1103,6 +1103,32 @@ pub fn stack_slot_color_map_at(jitcode_index: i32) -> Vec<u16> {
     })
 }
 
+/// Return the post-regalloc Ref-bank colors of the portal red args
+/// (`pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`) for
+/// the registered jitcode at `jitcode_index`. Both `u16::MAX` for
+/// portal-bridge installs that skip per-CodeObject regalloc.
+///
+/// Used by bridge resume to thread the ec OpRef from
+/// `sym.registers_r[portal_ec_reg]` (populated by the liveness-driven
+/// `consume_boxes` fill) back into `sym.execution_context`, mirroring
+/// `resume.py:1077-1081 _callback_r` which writes the same slot in
+/// RPython's BH register bank.
+pub fn portal_red_regs_at(jitcode_index: i32) -> (u16, u16) {
+    ensure_finish_setup();
+    METAINTERP_SD.with(|r| {
+        let sd = r.borrow();
+        sd.jitcodes
+            .get(jitcode_index as usize)
+            .map(|jc| {
+                (
+                    jc.payload.metadata.portal_frame_reg,
+                    jc.payload.metadata.portal_ec_reg,
+                )
+            })
+            .unwrap_or((u16::MAX, u16::MAX))
+    })
+}
+
 /// Map a post-regalloc Ref-bank color back to the semantic
 /// `locals_cells_stack_w` slot it denotes at the current PC.
 ///
@@ -3256,7 +3282,10 @@ impl PyreJitState {
     fn pypyjit_collect_jump_args(sym: &PyreSym) -> Vec<OpRef> {
         let base = sym.vable_collect_jump_args();
         let Some((&frame, tail)) = base.split_first() else {
-            return vec![sym.execution_context];
+            unreachable!(
+                "vable_collect_jump_args returned empty — virtualizable macro \
+                 did not emit frame_field push (see majit-macros/.../derive.rs:381)"
+            );
         };
         let mut args = Vec::with_capacity(base.len() + 1);
         args.push(frame);
@@ -3269,7 +3298,11 @@ impl PyreJitState {
     fn pypyjit_collect_typed_jump_args(sym: &PyreSym) -> Vec<(OpRef, Type)> {
         let base = sym.vable_collect_typed_jump_args();
         let Some(&(frame, frame_tp)) = base.first() else {
-            return vec![(sym.execution_context, Type::Ref)];
+            unreachable!(
+                "vable_collect_typed_jump_args returned empty — virtualizable \
+                 macro did not emit frame_field push \
+                 (see majit-macros/.../derive.rs:389)"
+            );
         };
         let mut args = Vec::with_capacity(base.len() + 1);
         args.push((frame, frame_tp));
@@ -4546,11 +4579,9 @@ impl JitState for PyreJitState {
             // `extra_reds = { ec: Ref }` in virtualizable_gen.rs places ec
             // at OpRef::from_raw(1). `init_vable_indices` shifts the vable static
             // field + array_base OpRefs but does not own the extra_red
-            // sym storage; initialize it explicitly when the constant
-            // declares an ec slot.
-            if crate::virtualizable_gen::NUM_EXTRA_REDS > 0 {
-                sym.execution_context = OpRef::input_arg_typed(1, Type::Ref);
-            }
+            // sym storage; initialize it explicitly. NUM_EXTRA_REDS == 1 is
+            // a crate-level const-assertion (see `lib.rs`).
+            sym.execution_context = OpRef::input_arg_typed(1, Type::Ref);
             sym.become_active_vable_owner();
             sym.nlocals = _meta.num_locals;
             sym.valuestackdepth = _meta.valuestackdepth;
@@ -4941,39 +4972,33 @@ impl JitState for PyreJitState {
         // the vable_array_base branch uses the heap-array path instead
         // of synthesizing parent OpRefs.
         sym.clear_active_vable();
-        // pypy/module/pypyjit/interp_jit.py:68 `reds = ['frame', 'ec']`:
-        // PyPy threads ec as a JIT red so it survives guard resume.
-        // pyre's macro flip lands the same shape (`extra_reds = { ec:
-        // Ref }`, `_meta.trace_extra_reds = 1` at state.rs:4967) and the
-        // root portal seeds `sym.execution_context = OpRef::from_raw(1)` from the
-        // ec inputarg.
+        // `pypy/module/pypyjit/interp_jit.py:67 reds = ['frame', 'ec']`:
+        // ec is a portal red arg, hence a JitCode inputarg present in
+        // every `-live-` op's R-bank. After the codewriter Step 1 fix
+        // (jit/codewriter.rs:2364 `filter_liveness_in_place` seeds
+        // `portal_ec_reg` into `lv_live`), bridge resume's liveness-
+        // driven `consume_boxes` fill at lines 4880-4893 has already
+        // written the resolved ec OpRef into
+        // `bridge_registers_r[portal_ec_reg]` — the same slot
+        // `_callback_r(register_index)` (resume.py:1077-1081) writes
+        // in RPython's BH register bank.
         //
-        // Bridge resume in pyre rebuilds the MIFrame register banks from
-        // `frame0.values` via jitcode liveness (see the int/ref/float
-        // loops above): each value lands in `sym.registers_{i,r,f}` at
-        // its register-bank index, not at a fixed trace inputarg
-        // position.  ec is a TRACE inputarg, not a frame register, so it
-        // does not appear in any bank — there is no "ec slot" in
-        // `frame0.values` to read out.  Recovering ec from
-        // `frame0.values` would require either Box identity (so the
-        // optimizer's forwarding chain for the original OpRef::from_raw(1) survives
-        // through to the bridge resume layout) or a side-table on the
-        // guard descr recording "ec lives at fail_arg[X]" — both touch
-        // the resume encoder and the optimizer across crates.
-        //
-        // Read ec from `PyFrame.execution_context` instead.  This is a
-        // pyre layout that PyPy does not have (PyPy fetches ec via
-        // `space.getexecutioncontext()` thread-local in
-        // `pyframe.py:282`); pyre stores it on the frame at frame entry
-        // (`pyre-interpreter/src/pyframe.rs:51`).  The load is
-        // semantically identical to RPython's resume-data ec recovery
-        // because ec is invariant during a `dispatch()` call and PyPy's
-        // and pyre's frame entries both seed it from the same source.
-        sym.execution_context = ctx.record_op_with_descr(
-            OpCode::GetfieldGcR,
-            &[sym.frame],
-            crate::descr::pyframe_execution_context_descr(),
-        );
+        // Thread that slot back into the dedicated `sym.execution_context`
+        // field so the symbolic state retains pyre's split shape (ec
+        // accessed through a named field rather than by register index).
+        // The OpRef value is identical to what RPython's ec inputarg
+        // OpRef would be after resume.
+        let (_pfr, portal_ec_reg) = crate::state::portal_red_regs_at(frame0.jitcode_index);
+        if portal_ec_reg != u16::MAX {
+            let slot = portal_ec_reg as usize;
+            assert!(
+                slot < sym.registers_r.len(),
+                "setup_bridge_sym: portal_ec_reg={} out of registers_r range (len={})",
+                slot,
+                sym.registers_r.len(),
+            );
+            sym.execution_context = sym.registers_r[slot];
+        }
         // pyjitpl.py:3400-3430 rebuild_state_after_failure parity: after
         // a guard failure the tracing-time `virtualizable_boxes` mirror
         // must be rebuilt from the resume data so subsequent vable
