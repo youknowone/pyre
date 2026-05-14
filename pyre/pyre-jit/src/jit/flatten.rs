@@ -1133,41 +1133,20 @@ pub fn is_ssa_only_artifact(insn: &Insn) -> bool {
     if opname == "abort_permanent" {
         return true;
     }
-    // `*_copy` / `*_push` / `*_pop` are flatten-only opnames per
-    // upstream: `flatten.py:319-333 insert_renamings` emits them at
-    // link-rename time only, and `reorder_renaming_list`
-    // (`flatten.py:395-413`) breaks cycles via the push/pop pair.
-    // The opnames have NO `SpaceOperation` counterpart in upstream's
-    // flow graph — they exist purely at the SSARepr layer.
+    // `*_push` / `*_pop` are flatten-only opnames per upstream:
+    // `reorder_renaming_list` (`flatten.py:395-413`) breaks cycles
+    // in `insert_renamings` via the push/pop pair.  The opnames have
+    // NO `SpaceOperation` counterpart in upstream's flow graph.
     //
-    // Pyre's walker emits `*_copy` directly at walker time for
-    // stack / local / call-argument shuffles (`emit_pushvalue_ref!`,
-    // `emit_popvalue_ref!`, `emit_ref_copy!`, ...) as a
-    // PRE-EXISTING-ADAPTATION: pyre's bytecode-1:1 walk doesn't
-    // model the stack via `flowcontext.py`-style `currentstate.stack`
-    // FrameState merges that upstream uses to drop ref_copy entirely
-    // from the walker.  The emitted Insn shape (`ref_copy <src> -> dst`)
-    // is byte-identical to upstream's flatten-time emit; the only
-    // divergence is when (walker time vs flatten time).
-    //
-    // Classifying every `*_copy` as `ssa-only` matches upstream's
-    // "this opname has no graph counterpart by design" semantic
-    // regardless of when pyre's walker emits it.  Convergence path:
-    // Phase 4 walker restructure (Task #227) moves stack / local
-    // shuffles onto Variables threaded through `currentstate.stack`,
-    // letting `insert_renamings` produce ALL `*_copy` ops at
-    // flatten time per upstream.
+    // `*_copy` is NOT in this classifier.  Upstream emits `*_copy` at
+    // flatten time only (`flatten.py:319-333 insert_renamings`); pyre's
+    // walker emits them directly at walker time for stack / local /
+    // call-argument shuffles.  Filtering them here would mask the real
+    // walker→graph gap that the `[phase4-graph-shape]` probe is meant
+    // to surface.
     matches!(
         opname.as_str(),
-        "int_push"
-            | "ref_push"
-            | "float_push"
-            | "int_pop"
-            | "ref_pop"
-            | "float_pop"
-            | "int_copy"
-            | "ref_copy"
-            | "float_copy"
+        "int_push" | "ref_push" | "float_push" | "int_pop" | "ref_pop" | "float_pop"
     )
 }
 
@@ -1312,45 +1291,19 @@ pub fn is_graph_only_artifact(insn: &Insn) -> bool {
     if opname == "type" {
         return true;
     }
-    // PRE-EXISTING-ADAPTATION (pyre walker NEW-DEVIATION):
-    // `last_exc_value` SpaceOps recorded at catch-landing sites
-    // (codewriter.rs:6594 `emit_graph_op_with_result("last_exc_value",
-    // ...)`) are pyre-only.  Upstream emits `last_exc_value` ONLY at
-    // flatten time via `insert_renamings → generate_last_exc`
-    // (`flatten.py:336-352`), never as a graph SpaceOperation; the
-    // exception value flows through `link.last_exc_value` Variables
-    // and the flatten-time emit reads them.
+    // `last_exc_value` and `*_copy` are intentionally NOT filtered
+    // here.  Upstream emits both at flatten time only — never as
+    // graph SpaceOperations.  pyre's walker currently records them
+    // as graph SpaceOps (`last_exc_value` at catch-landing sites,
+    // `int_copy(ConstInt(depth))` for vable-array depth threading);
+    // those graph emits are NEW-DEVIATIONS from upstream that the
+    // `[phase4-graph-shape]` probe should surface, not mask.
     //
-    // Convergence: Phase 4 walker restructure retires the graph
-    // emit, threading the catch-landing's `last_exc_value` Variable
-    // through the link directly so `insert_renamings` produces the
-    // SSARepr emit at flatten time per upstream.  Until then, flag
-    // as graph-only-by-design so `[phase4-graph-shape]` doesn't
-    // surface it as a coverage gap.
-    if opname == "last_exc_value" {
-        return true;
-    }
-    // PRE-EXISTING-ADAPTATION (pyre walker NEW-DEVIATION):
-    // pyre's walker records `int_copy(ConstInt(depth_value))` SpaceOps
-    // (`emit_pushvalue_ref!`, `emit_popvalue_ref!`,
-    // `emit_vable_setarrayitem_ref!` macros at codewriter.rs:4078,
-    // 4260, 4316, 4396, …) as synthetic graph-level identity tokens
-    // that thread the vable-array depth index through downstream
-    // `setarrayitem_vable_r` / `getarrayitem_vable_r` graph
-    // SpaceOps.  Upstream RPython does not have these synthetic
-    // SpaceOps because its vable depth flows through Variables
-    // directly — `do_fixed_list_setitem`/`do_fixed_list_getitem`
-    // (`jtransform.py:1882-1898`) consume the depth Variable from
-    // `flowcontext.py`'s `currentstate.stack`.
-    //
-    // Convergence: Phase 4 walker restructure (Task #227) ports the
-    // pyre walker to thread depth Variables through
-    // `currentstate.stack` matches upstream's `flowcontext.py`,
-    // retiring these synthetic int_copy / ref_copy / float_copy
-    // graph SpaceOps.  Until then, classify them as graph-only-by-
-    // design so `[phase4-graph-shape]` doesn't surface them as
-    // false gap.
-    matches!(opname.as_str(), "int_copy" | "ref_copy" | "float_copy")
+    // Convergence path: retire the walker graph emits in favour of
+    // threading Variables through `link.last_exc_value` /
+    // `currentstate.stack`, letting flatten-time `generate_last_exc`
+    // and `insert_renamings` produce the SSARepr emit per upstream.
+    false
 }
 
 /// Instruction tuple (`ssarepr.insns[i]`).
