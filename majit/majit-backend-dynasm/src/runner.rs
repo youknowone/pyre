@@ -1129,43 +1129,39 @@ impl DynasmBackend {
                 || ptr == attached.done_with_this_frame_descr_ref
                 || ptr == attached.done_with_this_frame_descr_float)
         {
-            // Determine type from which variant matched
-            let (types, meta) = {
-                let att = self.descr_attachments.read().unwrap();
-                if ptr == attached.done_with_this_frame_descr_void {
-                    (vec![], att.done_with_this_frame_descr_void.clone())
-                } else if ptr == attached.done_with_this_frame_descr_float {
-                    (vec![Type::Float], att.done_with_this_frame_descr_float.clone())
-                } else if ptr == attached.done_with_this_frame_descr_ref {
-                    (vec![Type::Ref], att.done_with_this_frame_descr_ref.clone())
-                } else {
-                    (vec![Type::Int], att.done_with_this_frame_descr_int.clone())
-                }
+            // Return the metainterp `DoneWithThisFrameDescr*` Arc directly.
+            // `compile.py:618-672` class hierarchy answers
+            // `is_finish`/`fail_arg_types` via its own FailDescr impl —
+            // no backend wrapper needed (Phase C-1 cascade endpoint).
+            let att = self.descr_attachments.read().unwrap();
+            let meta = if ptr == attached.done_with_this_frame_descr_void {
+                att.done_with_this_frame_descr_void.clone()
+            } else if ptr == attached.done_with_this_frame_descr_float {
+                att.done_with_this_frame_descr_float.clone()
+            } else if ptr == attached.done_with_this_frame_descr_ref {
+                att.done_with_this_frame_descr_ref.clone()
+            } else {
+                att.done_with_this_frame_descr_int.clone()
             };
-            let mut d = DynasmFailDescr::new(u32::MAX, 0, types);
-            d.meta_descr = meta;
-            return Arc::new(d);
+            return meta.expect(
+                "matched Done*WithThisFrameDescr ptr but slot is unattached — \
+                 attach_default_test_descrs / MetaInterp::new must have installed it",
+            );
         }
 
-        // compile.py:658-662 ExitFrameWithExceptionDescrRef — route to
-        // jitexc.ExitFrameWithExceptionRef via the metainterp Arc's class
-        // identity. `is_exit_frame_with_exception()` forwards through
-        // `meta_descr` to the metainterp ExitFrameWithExceptionDescrRef
-        // singleton.
+        // compile.py:658-662 ExitFrameWithExceptionDescrRef — return the
+        // attached metainterp Arc directly; its class identity carries
+        // is_exit_frame_with_exception()=true.
         if ptr != 0 && ptr == attached.exit_frame_with_exception_descr_ref {
-            let meta = self
+            return self
                 .descr_attachments
                 .read()
                 .unwrap()
                 .exit_frame_with_exception_descr_ref
-                .clone();
-            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref]);
-            // is_exit_frame_with_exception() forwards through meta_descr;
-            // ExitFrameWithExceptionDescrRef in `compile.rs` answers true
-            // via its FailDescr trait impl (compile.py:658-662 class
-            // identity).  No local mirror assignment needed.
-            d.meta_descr = meta;
-            return Arc::new(d);
+                .clone()
+                .expect(
+                    "matched exit_frame_with_exception ptr but slot is unattached",
+                );
         }
 
         // pyjitpl.py:2283 propagate_exception_descr — stamped into
@@ -1206,23 +1202,19 @@ impl DynasmBackend {
             // get_ref_value(0) path (compile.py:660).
             unsafe { crate::llmodel::set_int_value(frame_ptr, 0, exc_val as isize) };
             // `compile.py:1092-1098 PropagateExceptionDescr.handle_fail`
-            // raises `jitexc.ExitFrameWithExceptionRef(exception)`.  pyre
-            // has no descr-class polymorphic `handle_fail`; the flat
-            // dispatcher reads `is_exit_frame_with_exception()` to route
-            // exception exits.  Carry the metainterp
-            // `ExitFrameWithExceptionDescrRef` Arc as meta_descr so trait
-            // forwarding answers the predicate via the upstream class
-            // identity that handle_fail would have raised, instead of the
-            // PropagateException class identity (which would answer false).
-            let meta = self
+            // raises `jitexc.ExitFrameWithExceptionRef(exception)`.  pyre's
+            // flat dispatcher reads `is_exit_frame_with_exception()`, so
+            // return the ExitFrameWithExceptionDescrRef metainterp Arc
+            // directly (its class identity answers the predicate true).
+            return self
                 .descr_attachments
                 .read()
                 .unwrap()
                 .exit_frame_with_exception_descr_ref
-                .clone();
-            let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref]);
-            d.meta_descr = meta;
-            return Arc::new(d);
+                .clone()
+                .expect(
+                    "Propagate path requires exit_frame_with_exception_descr_ref to be attached",
+                );
         }
 
         // Search root loop
