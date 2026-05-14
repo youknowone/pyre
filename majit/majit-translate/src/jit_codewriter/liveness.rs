@@ -47,24 +47,29 @@ pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, Re
 ///
 /// **RPython invariant** (`flatten.py:382` `getcolor`): every
 /// `Variable` has a single `(kind, color)` via
-/// `getkind(v.concretetype)` + `regallocs[kind]`.  The strict port
-/// would assert that exactly one class colors `v` and use that
-/// class's color; multiple matches would panic.
-///
-/// **Known divergence (TODO #71/#74)**: pyre's annotator/rtyper
-/// coverage gaps occasionally let the same `ValueId` pick up
-/// colorings in more than one class (typically through synthetic
-/// helper graphs whose result type was inferred separately by the
-/// caller and the callee).  Returning the first match preserves the
-/// pre-Phase-3 behavior so the gap doesn't escalate into a build
-/// break; RPython would never reach the multi-class case.
+/// `getkind(v.concretetype)` + `regallocs[kind]`.  Iterates the
+/// per-kind regalloc results in [`KINDS`] order (NOT the
+/// nondeterministic `HashMap` iteration order) and panics on
+/// multi-class hits — RPython would never reach that case because
+/// `getkind` picks exactly one class per Variable.
 fn value_to_register(v: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> Option<Register> {
-    for (&kind, ra) in regallocs {
-        if let Some(&color) = ra.coloring.get(&v) {
-            return Some(Register::new(kind, color));
+    let mut found: Option<Register> = None;
+    for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+        if let Some(ra) = regallocs.get(&kind) {
+            if let Some(&color) = ra.coloring.get(&v) {
+                if let Some(prev) = found {
+                    panic!(
+                        "value_to_register: ValueId {v:?} colored in multiple regalloc \
+                         classes ({:?} and {kind:?}) — RPython `getkind` must give \
+                         exactly one",
+                        prev.kind,
+                    );
+                }
+                found = Some(Register::new(kind, color));
+            }
         }
     }
-    None
+    found
 }
 
 /// RPython liveness.py:82-116: remove_repeated_live.
@@ -191,15 +196,14 @@ fn compute_liveness_pass(
                 }
             }
             FlatOp::GotoIfNot { cond, target } => {
-                let cond = *cond;
                 let target = *target;
-                use_value(&mut alive, cond);
+                alive.insert(*cond);
                 if let Some(alive_at_target) = label2alive.get(&target) {
                     alive.extend(alive_at_target.iter());
                 }
             }
             FlatOp::Switch { value, targets } => {
-                use_value(&mut alive, *value);
+                alive.insert(*value);
                 for (_, target) in targets {
                     if let Some(alive_at_target) = label2alive.get(target) {
                         alive.extend(alive_at_target.iter());
@@ -213,9 +217,9 @@ fn compute_liveness_pass(
                 dst,
                 ..
             } => {
-                def_value(&mut alive, *dst);
-                use_value(&mut alive, *lhs);
-                use_value(&mut alive, *rhs);
+                alive.remove(dst);
+                alive.insert(*lhs);
+                alive.insert(*rhs);
                 if let Some(alive_at_target) = label2alive.get(target) {
                     alive.extend(alive_at_target.iter());
                 }
@@ -240,13 +244,20 @@ fn compute_liveness_pass(
                 alive.remove(dst);
             }
             FlatOp::LastException { dst } | FlatOp::LastExcValue { dst } => {
-                def_value(&mut alive, *dst);
+                // Register operand carries (kind, color); the alive
+                // set is Register-keyed so the def removes the
+                // matching slot directly without any ValueId bridge.
+                alive.remove(dst);
             }
             FlatOp::Reraise => {}
             FlatOp::IntReturn(v) | FlatOp::RefReturn(v) | FlatOp::FloatReturn(v) => {
+                // Backward: the return value is alive at this point;
+                // after it (forward) nothing is.  RegOrConst::Reg
+                // contributes its Register to the alive set;
+                // Constants don't.
                 alive.clear();
-                if let Some(value) = v.as_value() {
-                    use_value(&mut alive, value);
+                if let crate::flatten::RegOrConst::Reg(r) = v {
+                    alive.insert(*r);
                 }
             }
             FlatOp::VoidReturn => {
@@ -254,8 +265,8 @@ fn compute_liveness_pass(
             }
             FlatOp::Raise(v) => {
                 alive.clear();
-                if let Some(value) = v.as_value() {
-                    use_value(&mut alive, value);
+                if let crate::flatten::RegOrConst::Reg(r) = v {
+                    alive.insert(*r);
                 }
             }
         }

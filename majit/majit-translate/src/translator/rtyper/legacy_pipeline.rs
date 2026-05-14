@@ -290,9 +290,9 @@ mod tests {
     fn serialized_program_pipeline_skips_flattened_ssa_consts() {
         let flattened = SSARepr {
             name: "consts".into(),
-            insns: vec![FlatOp::RefReturn(LinkArg::Const(ConstValue::byte_str(
-                "hello",
-            )))],
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                ConstValue::byte_str("hello"),
+            ))],
             num_values: 0,
             num_blocks: 1,
             insns_pos: None,

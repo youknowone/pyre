@@ -133,11 +133,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
             }
             FlatOp::GotoIfNot { cond, target } => {
                 let num = name_label(*target, &mut seenlabels, &mut next_label);
-                let _ = writeln!(
-                    out,
-                    "{prefix}goto_if_not {}, L{num}",
-                    register_repr_for_kind(*cond, RegKind::Int)
-                );
+                let _ = writeln!(out, "{prefix}goto_if_not {}, L{num}", cond.repr());
             }
             FlatOp::Switch { value, targets } => {
                 let cases: Vec<String> = targets
@@ -150,7 +146,7 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let _ = writeln!(
                     out,
                     "{prefix}switch {}, <SwitchDictDescr {}>",
-                    register_repr_for_kind(*value, RegKind::Int),
+                    value.repr(),
                     cases.join(", ")
                 );
             }
@@ -170,9 +166,9 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let _ = writeln!(
                     out,
                     "{prefix}{opname} L{num}, {}, {} -> {}",
-                    register_repr_for_kind(*lhs, RegKind::Int),
-                    register_repr_for_kind(*rhs, RegKind::Int),
-                    register_repr_for_kind(*dst, RegKind::Int)
+                    lhs.repr(),
+                    rhs.repr(),
+                    dst.repr()
                 );
             }
             // `flatten.py:333-335` — opnames are kind-prefixed
@@ -200,18 +196,10 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let _ = writeln!(out, "{prefix}{kind}_pop -> {}", dst.repr());
             }
             FlatOp::LastException { dst } => {
-                let _ = writeln!(
-                    out,
-                    "{prefix}last_exception -> {}",
-                    register_repr_for_kind(*dst, RegKind::Int)
-                );
+                let _ = writeln!(out, "{prefix}last_exception -> {}", dst.repr());
             }
             FlatOp::LastExcValue { dst } => {
-                let _ = writeln!(
-                    out,
-                    "{prefix}last_exc_value -> {}",
-                    register_repr_for_kind(*dst, RegKind::Ref)
-                );
+                let _ = writeln!(out, "{prefix}last_exc_value -> {}", dst.repr());
             }
             FlatOp::Live { live_values } => {
                 let mut names: Vec<String> = live_values.iter().map(|reg| reg.repr()).collect();
@@ -223,35 +211,19 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
                 let _ = writeln!(out, "{prefix}reraise");
             }
             FlatOp::IntReturn(v) => {
-                let _ = writeln!(
-                    out,
-                    "{prefix}int_return {}",
-                    linkarg_repr_for_kind(v, RegKind::Int)
-                );
+                let _ = writeln!(out, "{prefix}int_return {}", regorconst_repr(v));
             }
             FlatOp::RefReturn(v) => {
-                let _ = writeln!(
-                    out,
-                    "{prefix}ref_return {}",
-                    linkarg_repr_for_kind(v, RegKind::Ref)
-                );
+                let _ = writeln!(out, "{prefix}ref_return {}", regorconst_repr(v));
             }
             FlatOp::FloatReturn(v) => {
-                let _ = writeln!(
-                    out,
-                    "{prefix}float_return {}",
-                    linkarg_repr_for_kind(v, RegKind::Float)
-                );
+                let _ = writeln!(out, "{prefix}float_return {}", regorconst_repr(v));
             }
             FlatOp::VoidReturn => {
                 let _ = writeln!(out, "{prefix}void_return");
             }
             FlatOp::Raise(v) => {
-                let _ = writeln!(
-                    out,
-                    "{prefix}raise {}",
-                    linkarg_repr_for_kind(v, RegKind::Ref)
-                );
+                let _ = writeln!(out, "{prefix}raise {}", regorconst_repr(v));
             }
             FlatOp::EndOfBlock => {
                 let _ = writeln!(out, "{prefix}---");
@@ -636,28 +608,54 @@ fn op_args_repr(op: &crate::model::SpaceOperation) -> String {
             out.push(' ');
         }
         out.push_str("-> ");
-        // Result kind defaults to Ref when the OpKind doesn't pin it
-        // explicitly.  Phase 3 dropped value_kinds so the per-result
-        // kind comes from the variant when known (e.g. CallElidable
-        // carries `result_kind`); the fallback `register_repr_for_kind`
-        // call mirrors the previous "default Ref when missing" path.
-        let result_kind = match &op.kind {
-            crate::model::OpKind::CallElidable { result_kind, .. }
-            | crate::model::OpKind::CallResidual { result_kind, .. }
-            | crate::model::OpKind::CallMayForce { result_kind, .. }
-            | crate::model::OpKind::InlineCall { result_kind, .. }
-            | crate::model::OpKind::RecursiveCall { result_kind, .. } => match result_kind {
-                'i' => RegKind::Int,
-                'f' => RegKind::Float,
-                _ => RegKind::Ref,
-            },
-            crate::model::OpKind::ConstInt(_) => RegKind::Int,
-            crate::model::OpKind::ConstFloat(_) => RegKind::Float,
-            _ => RegKind::Ref,
-        };
+        // RPython parity: result kind comes from the OpKind variant's
+        // typed result slot.  Each producer variant pins it via
+        // either `result_kind: char` (call family) or `result_ty:
+        // ValueType` (BinOp/CompareOp/Cast/etc.); the [`value_type_kind`]
+        // helper folds those into the canonical [`RegKind`] via
+        // `getkind(concretetype)` parity.  `_ => RegKind::Ref` is a
+        // last-resort fallback for the small handful of non-result-
+        // bearing variants (no debug consumers exercise them today).
+        let result_kind = op_result_kind(&op.kind);
         out.push_str(&register_repr_for_kind(result, result_kind));
     }
     out
+}
+
+/// `getkind(v.concretetype)` parity for pyre's [`crate::model::ValueType`].
+///
+/// `Int | Unsigned | Bool` map to [`RegKind::Int`]; `Float` maps to
+/// [`RegKind::Float`]; everything else (heap-tracking,
+/// pointer-shaped) maps to [`RegKind::Ref`].
+fn value_type_kind(ty: &crate::model::ValueType) -> RegKind {
+    use crate::model::ValueType;
+    match ty {
+        ValueType::Int | ValueType::Unsigned | ValueType::Bool => RegKind::Int,
+        ValueType::Float => RegKind::Float,
+        _ => RegKind::Ref,
+    }
+}
+
+/// `getkind(op.result.concretetype)` derived from the OpKind variant.
+fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
+    use crate::model::OpKind;
+    match kind {
+        OpKind::CallElidable { result_kind, .. }
+        | OpKind::CallResidual { result_kind, .. }
+        | OpKind::CallMayForce { result_kind, .. }
+        | OpKind::InlineCall { result_kind, .. }
+        | OpKind::RecursiveCall { result_kind, .. } => match result_kind {
+            'i' => RegKind::Int,
+            'f' => RegKind::Float,
+            _ => RegKind::Ref,
+        },
+        OpKind::ConstInt(_) => RegKind::Int,
+        OpKind::ConstFloat(_) => RegKind::Float,
+        OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
+            value_type_kind(result_ty)
+        }
+        _ => RegKind::Ref,
+    }
 }
 
 #[cfg(test)]
@@ -698,7 +696,7 @@ mod tests {
     fn format_switch_uses_switchdictdescr_repr() {
         let mut ssa = empty_ssa();
         ssa.insns.push(FlatOp::Switch {
-            value: ValueId(0),
+            value: crate::flatten::Register::new(RegKind::Int, 0),
             targets: vec![(4, Label(2)), (5, Label(1))],
         });
         let text = format_assembler(&ssa);

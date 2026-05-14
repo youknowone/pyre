@@ -109,25 +109,31 @@ pub enum FlatOp {
     Jump(Label),
     /// Conditional jump: if cond is false (zero), jump to label.
     /// RPython: `('goto_if_not', cond, TLabel(false_path))`.
-    /// There is NO goto_if_true — RPython only uses goto_if_not.
-    /// The true path is always the fallthrough.
-    GotoIfNot { cond: ValueId, target: Label },
+    /// `cond` is always Int-kinded (`block.exitswitch.concretetype ==
+    /// lltype.Bool` at flow-graph build time).  There is NO
+    /// goto_if_true — RPython only uses goto_if_not; the true path is
+    /// the fall-through.
+    GotoIfNot { cond: Register, target: Label },
     /// RPython `flatten.py:278-308` integer switch:
-    /// `('switch', value, SwitchDictDescr)` after a preceding `-live-`.
-    /// The default path is the fall-through after the switch op; each
-    /// `(key, label)` entry jumps to the corresponding case landing pad.
+    /// `('switch', value, SwitchDictDescr)` after a preceding
+    /// `-live-`.  `value` is always Int-kinded (asserted in
+    /// `flatten.py:276`).  The default path is the fall-through after
+    /// the switch op; each `(key, label)` entry jumps to the
+    /// corresponding case landing pad.
     Switch {
-        value: ValueId,
+        value: Register,
         targets: Vec<(i64, Label)>,
     },
     /// RPython `flatten.py:190-197`
     /// `int_add_jump_if_ovf` / `int_sub_jump_if_ovf` / `int_mul_jump_if_ovf`.
+    /// All three operands are Int-kinded (overflow-checked integer
+    /// arithmetic).
     IntBinOpJumpIfOvf {
         op: IntOvfOp,
         target: Label,
-        lhs: ValueId,
-        rhs: ValueId,
-        dst: ValueId,
+        lhs: Register,
+        rhs: Register,
+        dst: Register,
     },
     /// Exception setup for a can-raise block.
     /// RPython: `('catch_exception', TLabel(normal_link))`.
@@ -165,10 +171,15 @@ pub enum FlatOp {
     /// RPython `flatten.py:331` `self.emitline('%s_pop' % kind, "->", w)`.
     /// Blackhole handler: `blackhole.py:671-679` `bhimpl_{int,ref,float}_pop`.
     Pop(Register),
-    /// RPython: `('last_exception', '->', result)`.
-    LastException { dst: ValueId },
-    /// RPython: `('last_exc_value', '->', result)`.
-    LastExcValue { dst: ValueId },
+    /// RPython: `('last_exception', '->', result)`.  `dst` is always
+    /// Int-kinded (the exception class identity); the [`Register`]
+    /// operand carries that kind directly so format/assembler can
+    /// emit `last_exception/>i` without a side-table lookup.
+    LastException { dst: Register },
+    /// RPython: `('last_exc_value', '->', result)`.  `dst` is always
+    /// Ref-kinded (the exception instance pointer); same kind-on-
+    /// operand contract as [`Self::LastException`].
+    LastExcValue { dst: Register },
     /// Liveness marker — expanded by `compute_liveness()` to include
     /// all values alive at this point.
     ///
@@ -181,23 +192,23 @@ pub enum FlatOp {
     /// RPython: `('reraise',)`.
     Reraise,
     /// RPython `flatten.py:130-138` `make_return`:
-    ///   `{kind}_return` with a single arg when the final block returns
-    ///   a non-void value.  Blackhole: `blackhole.py:841-857` sets
-    ///   `_return_type = kind` and raises `LeaveFrame`.
-    IntReturn(LinkArg),
-    /// RPython `flatten.py:137` `ref_return` — blackhole at
-    /// `blackhole.py:847-851`.
-    RefReturn(LinkArg),
-    /// RPython `flatten.py:137` `float_return` — blackhole at
-    /// `blackhole.py:853-857`.
-    FloatReturn(LinkArg),
+    ///   `{kind}_return` with a single arg when the final block
+    ///   returns a non-void value.  The operand is `getcolor(arg)` —
+    ///   a [`Register`] (`Int`-kinded for `IntReturn`) or a
+    ///   [`ConstValue`] verbatim — so the assembler emits
+    ///   `int_return/i` without a side-table kind lookup.
+    IntReturn(RegOrConst),
+    /// RPython `flatten.py:137` `ref_return` — Ref-kinded operand.
+    RefReturn(RegOrConst),
+    /// RPython `flatten.py:137` `float_return` — Float-kinded operand.
+    FloatReturn(RegOrConst),
     /// RPython `flatten.py:136` `void_return` — blackhole at
     /// `blackhole.py:859-863`.
     VoidReturn,
     /// RPython `flatten.py:139-143` `make_return` with a 2-inputarg
     /// final block: emit `raise` on the `evalue` (second inputarg).
-    /// Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.
-    Raise(LinkArg),
+    /// Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.  Ref-kinded.
+    Raise(RegOrConst),
     /// RPython `flatten.py:146` / `:238` / `:293` `emitline('---')`.
     /// End-of-block marker placed after every terminator (return /
     /// raise / reraise / unreachable / goto-back-to-seen-block).
@@ -367,9 +378,19 @@ pub fn flatten(graph: &FunctionGraph, regallocs: &HashMap<RegKind, RegAllocResul
 /// being built, the `seen_blocks` set for the recursive
 /// `make_bytecode_block` walk, and the `block_labels` cache that gives
 /// every visited block a stable [`Label`] for back-edges).
+///
+/// `types` mirrors RPython's `Variable.concretetype` source of truth:
+/// when supplied, [`Self::getcolor`] reads the kind from
+/// `types.get(v)` first (`getkind(v.concretetype)` parity) and only
+/// then asks `regallocs[kind]` for the color.  Test fixtures that
+/// drive `flatten_graph` without a TypeResolutionState fall back to
+/// scanning regallocs in [`KINDS`] order with a multi-class panic;
+/// well-typed production graphs always go through the `types`-first
+/// path.
 pub struct GraphFlattener<'a> {
     pub graph: &'a FunctionGraph,
     pub regallocs: &'a HashMap<RegKind, RegAllocResult>,
+    pub types: Option<&'a crate::jit_codewriter::type_state::TypeResolutionState>,
     pub _include_all_exc_links: bool,
     /// `flatten.py:103 self.seen_blocks = {}` — set of block ids already
     /// emitted; second visits become `goto + ---` (back-edge).
@@ -393,9 +414,26 @@ impl<'a> GraphFlattener<'a> {
         regallocs: &'a HashMap<RegKind, RegAllocResult>,
         _include_all_exc_links: bool,
     ) -> Self {
+        Self::with_types(graph, regallocs, None, _include_all_exc_links)
+    }
+
+    /// Construct a [`GraphFlattener`] that consults a
+    /// [`TypeResolutionState`] for the
+    /// `getkind(v.concretetype)` source-of-truth lookup before falling
+    /// back to regalloc-class scanning.  The post-rtyper pipeline
+    /// (`flatten_with_types`) always supplies `types`; bare
+    /// `flatten_graph` callers (test fixtures, hand-built graphs) pass
+    /// `None`.
+    pub fn with_types(
+        graph: &'a FunctionGraph,
+        regallocs: &'a HashMap<RegKind, RegAllocResult>,
+        types: Option<&'a crate::jit_codewriter::type_state::TypeResolutionState>,
+        _include_all_exc_links: bool,
+    ) -> Self {
         Self {
             graph,
             regallocs,
+            types,
             _include_all_exc_links,
             seen_blocks: std::collections::HashSet::new(),
             registers: HashMap::new(),
@@ -413,14 +451,30 @@ impl<'a> GraphFlattener<'a> {
 
     /// `flatten.py:382-391 def getcolor(self, v)`.
     ///
-    /// Resolves a [`ValueId`] (Variable analogue) to its dedup'd
-    /// [`Register`] — `(kind, color)` pair.  Constants are NOT handled
-    /// here (RPython returns the Constant unchanged for that case);
-    /// see [`Self::getoperand`] for the union form.
+    /// ```py
+    /// def getcolor(self, v):
+    ///     if isinstance(v, Constant):
+    ///         return v
+    ///     kind = getkind(v.concretetype)
+    ///     col = self.regallocs[kind].getcolor(v)
+    ///     try:
+    ///         r = self.registers[kind, col]
+    ///     except KeyError:
+    ///         r = self.registers[kind, col] = Register(kind, col)
+    ///     return r
+    /// ```
+    ///
+    /// `kind` comes from `getkind(v.concretetype)` first
+    /// ([`crate::jit_codewriter::type_state::TypeResolutionState`] is
+    /// pyre's `concretetype` analogue; consulted via [`Self::types`]).
+    /// Only when no `types` table is supplied (test fixtures, hand-built
+    /// graphs) does the lookup fall back to scanning regallocs in
+    /// [`KINDS`] order.  The strict path mirrors RPython's
+    /// "kind-then-color" 1:1 invariant.
     pub fn getcolor(&mut self, v: ValueId) -> Register {
-        let (kind, color) = lookup_kind_color(v, self.regallocs).unwrap_or_else(|| {
-            panic!("getcolor: ValueId {:?} not assigned a color by regalloc", v)
-        });
+        let (kind, color) = self
+            .kind_color_of(v)
+            .unwrap_or_else(|| panic!("getcolor: ValueId {v:?} not assigned a color by regalloc"));
         let key = (
             kind,
             u16::try_from(color).expect("register color > u16::MAX"),
@@ -429,6 +483,38 @@ impl<'a> GraphFlattener<'a> {
             .registers
             .entry(key)
             .or_insert_with(|| Register::new(kind, color))
+    }
+
+    /// `getkind(v.concretetype)` + `regallocs[kind].coloring[v]` —
+    /// the strict `flatten.py:386` lookup with a fallback for callers
+    /// that don't have a `TypeResolutionState`.  Returns `None` for
+    /// Void slots (RPython skips them at `flatten.py:325`).
+    fn kind_color_of(&self, v: ValueId) -> Option<(RegKind, usize)> {
+        if let Some(types) = self.types {
+            use crate::jit_codewriter::type_state::ConcreteType;
+            let kind = match types.get(v) {
+                ConcreteType::Signed => Some(RegKind::Int),
+                ConcreteType::GcRef => Some(RegKind::Ref),
+                ConcreteType::Float => Some(RegKind::Float),
+                // `Void` (`flatten.py:325`) and `Unknown` (pyre-only
+                // pre-rtyper placeholder) skip the regalloc lookup
+                // and fall through to the bare regalloc scan as a
+                // safety net for upstream coverage gaps.
+                ConcreteType::Void | ConcreteType::Unknown => None,
+            };
+            if let Some(kind) = kind {
+                if let Some(ra) = self.regallocs.get(&kind) {
+                    if let Some(&color) = ra.coloring.get(&v) {
+                        return Some((kind, color));
+                    }
+                }
+                // `types` says `kind` but regallocs disagrees — fall
+                // through to the per-kind scan below as a documented
+                // divergence (TODO: tighten once annotator/rtyper
+                // gaps close).
+            }
+        }
+        lookup_kind_color(v, self.regallocs)
     }
 
     /// Companion to [`Self::getcolor`] that mirrors upstream's
@@ -530,28 +616,61 @@ impl<'a> GraphFlattener<'a> {
 
     /// `flatten.py:130-146 def make_return(self, args)`.
     pub fn make_return(&mut self, args: &[LinkArg]) {
-        let arg_kind = |arg: &LinkArg, fallback: Option<ValueId>, context: &str| match arg {
-            LinkArg::Value(value) => value_kind(*value, self.regallocs),
-            LinkArg::Const(_) => fallback
-                .map(|value| value_kind(value, self.regallocs))
-                .unwrap_or_else(|| panic!("{context}: missing target inputarg kind for Constant")),
+        // `flatten.py:131-138`: read the kind from the return value's
+        // `concretetype` (`getkind(v.concretetype)`), then emit the
+        // matching `{kind}_return` with `getcolor(v)` as the operand.
+        // For Constant args RPython preserves the Constant verbatim;
+        // pyre's `RegOrConst::Const` mirrors that.  When the only
+        // available kind source is the fallback inputarg (Constant
+        // arg case), fall back to that just like upstream's
+        // `getkind(args[0].concretetype)` does.
+        let resolve_arg_kind = |this: &Self, arg: &LinkArg, fallback: Option<ValueId>| -> char {
+            match arg {
+                LinkArg::Value(value) => this
+                    .kind_color_of(*value)
+                    .map(|(k, _)| match k {
+                        RegKind::Int => 'i',
+                        RegKind::Ref => 'r',
+                        RegKind::Float => 'f',
+                    })
+                    .unwrap_or('v'),
+                LinkArg::Const(_) => fallback
+                    .and_then(|value| this.kind_color_of(value))
+                    .map(|(k, _)| match k {
+                        RegKind::Int => 'i',
+                        RegKind::Ref => 'r',
+                        RegKind::Float => 'f',
+                    })
+                    .unwrap_or_else(|| {
+                        panic!("make_return: missing target inputarg kind for Constant")
+                    }),
+            }
         };
         match args.len() {
             1 => {
-                let kind = arg_kind(
+                let kind = resolve_arg_kind(
+                    self,
                     &args[0],
                     self.graph
                         .block(self.graph.returnblock)
                         .inputargs
                         .first()
                         .copied(),
-                    "make_return",
                 );
                 match kind {
                     'v' => self.emitline(FlatOp::VoidReturn),
-                    'i' => self.emitline(FlatOp::IntReturn(args[0].clone())),
-                    'r' => self.emitline(FlatOp::RefReturn(args[0].clone())),
-                    'f' => self.emitline(FlatOp::FloatReturn(args[0].clone())),
+                    'i' => {
+                        let operand = self.return_operand(&args[0], RegKind::Int);
+                        self.emitline(FlatOp::IntReturn(operand));
+                    }
+                    'r' => {
+                        let operand = self.return_operand(&args[0], RegKind::Ref);
+                        self.emitline(FlatOp::RefReturn(operand));
+                    }
+                    'f' => {
+                        let operand = self.return_operand(&args[0], RegKind::Float);
+                        self.emitline(FlatOp::FloatReturn(operand));
+                    }
                     _ => unreachable!("unexpected kind {kind} for return value"),
                 }
             }
@@ -559,16 +678,17 @@ impl<'a> GraphFlattener<'a> {
                 self.emitline(FlatOp::Live {
                     live_values: Vec::new(),
                 });
-                let _ = arg_kind(
+                let _ = resolve_arg_kind(
+                    self,
                     &args[1],
                     self.graph
                         .block(self.graph.exceptblock)
                         .inputargs
                         .get(1)
                         .copied(),
-                    "make_return",
                 );
-                self.emitline(FlatOp::Raise(args[1].clone()));
+                let operand = self.return_operand(&args[1], RegKind::Ref);
+                self.emitline(FlatOp::Raise(operand));
             }
             0 => {
                 // Pyre adaptation for declared-void final blocks without
@@ -582,6 +702,17 @@ impl<'a> GraphFlattener<'a> {
         }
         // `flatten.py:146 self.emitline('---')`.
         self.emitline(FlatOp::EndOfBlock);
+    }
+
+    /// Build the `RegOrConst` operand for a return / raise op.
+    /// Variables go through [`Self::getcolor`] (RPython
+    /// `getcolor(v)`); Constants pass through verbatim with their
+    /// surrounding variant fixing the kind.
+    fn return_operand(&mut self, arg: &LinkArg, _expected_kind: RegKind) -> RegOrConst {
+        match arg {
+            LinkArg::Value(value) => RegOrConst::Reg(self.getcolor(*value)),
+            LinkArg::Const(cv) => RegOrConst::Const(cv.clone()),
+        }
     }
 
     /// `flatten.py:148-155 def make_link(self, link, handling_ovf)`.
@@ -740,6 +871,45 @@ impl<'a> GraphFlattener<'a> {
         self.generate_last_exc(link, target_inputargs);
     }
 
+    /// `flatten.py:189-204` overflow-arithmetic guard rewrite.
+    ///
+    /// When `block.canraise` is paired with a trailing `add_ovf` /
+    /// `sub_ovf` / `mul_ovf` op, RPython collapses the
+    /// `op + catch_exception` pair into a single
+    /// `int_{add,sub,mul}_jump_if_ovf` opcode that jumps directly to
+    /// the ovf-handling exception link's landing pad.  Each operand
+    /// (lhs, rhs, dst) is Int-kinded, so the operands are fed
+    /// through `getcolor` to materialize the per-kind [`Register`].
+    fn overflow_jump_op(
+        &mut self,
+        kind: &crate::model::OpKind,
+        result: Option<ValueId>,
+        target: Label,
+    ) -> Option<FlatOp> {
+        let (name, lhs_vid, rhs_vid) = match kind {
+            crate::model::OpKind::BinOp { op, lhs, rhs, .. } => (op.as_str(), *lhs, *rhs),
+            _ => return None,
+        };
+        let opcode = match name {
+            "add_ovf" => IntOvfOp::Add,
+            "sub_ovf" => IntOvfOp::Sub,
+            "mul_ovf" => IntOvfOp::Mul,
+            _ => return None,
+        };
+        let dst_vid =
+            result.expect("overflow-checked arithmetic op needs a result for flatten parity");
+        let lhs = self.getcolor(lhs_vid);
+        let rhs = self.getcolor(rhs_vid);
+        let dst = self.getcolor(dst_vid);
+        Some(FlatOp::IntBinOpJumpIfOvf {
+            op: opcode,
+            target,
+            lhs,
+            rhs,
+            dst,
+        })
+    }
+
     /// `flatten.py:336-347 def generate_last_exc(self, link, inputargs)`.
     pub fn generate_last_exc(&mut self, link: &Link, target_inputargs: &[ValueId]) {
         if link.last_exception.is_none() && link.last_exc_value.is_none() {
@@ -747,12 +917,14 @@ impl<'a> GraphFlattener<'a> {
         }
         for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
             if Some(v) == link.last_exception.as_ref() {
-                self.emitline(FlatOp::LastException { dst: *w });
+                let dst = self.getcolor(*w);
+                self.emitline(FlatOp::LastException { dst });
             }
         }
         for (v, w) in link.args.iter().zip(target_inputargs.iter()) {
             if Some(v) == link.last_exc_value.as_ref() {
-                self.emitline(FlatOp::LastExcValue { dst: *w });
+                let dst = self.getcolor(*w);
+                self.emitline(FlatOp::LastExcValue { dst });
             }
         }
     }
@@ -761,7 +933,7 @@ impl<'a> GraphFlattener<'a> {
     /// `None` for Void slots that regalloc skipped.  Companion to
     /// [`Self::getcolor`] which panics in that case.
     fn try_getcolor(&mut self, v: ValueId) -> Option<Register> {
-        let (kind, color) = lookup_kind_color(v, self.regallocs)?;
+        let (kind, color) = self.kind_color_of(v)?;
         let key = (
             kind,
             u16::try_from(color).expect("register color > u16::MAX"),
@@ -789,7 +961,7 @@ impl<'a> GraphFlattener<'a> {
         {
             if handling_ovf {
                 // `c = Constant(ll_ovf, ...); self.emitline("raise", c)`.
-                self.emitline(FlatOp::Raise(LinkArg::Const(overflow_error_instance())));
+                self.emitline(FlatOp::Raise(RegOrConst::Const(overflow_error_instance())));
             } else {
                 // `self.emitline("reraise")`.
                 self.emitline(FlatOp::Reraise);
@@ -827,7 +999,7 @@ impl<'a> GraphFlattener<'a> {
             // matches.
             let ovf_landing_target = Label(self.next_label);
             let ovf_op = last_op_kind.as_ref().and_then(|kind| {
-                overflow_jump_op_from_kind(kind, last_op_result(block), ovf_landing_target)
+                self.overflow_jump_op(kind, last_op_result(block), ovf_landing_target)
             });
             if let Some(ovf_op) = ovf_op {
                 self.next_label += 1;
@@ -911,8 +1083,9 @@ impl<'a> GraphFlattener<'a> {
             });
             let false_landing = Label(self.next_label);
             self.next_label += 1;
+            let cond_reg = self.getcolor(cond);
             self.emitline(FlatOp::GotoIfNot {
-                cond,
+                cond: cond_reg,
                 target: false_landing,
             });
             // `flatten.py:264-267`:
@@ -971,8 +1144,9 @@ impl<'a> GraphFlattener<'a> {
             self.emitline(FlatOp::Live {
                 live_values: Vec::new(),
             });
+            let value_reg = self.getcolor(cond);
             self.emitline(FlatOp::Switch {
-                value: cond,
+                value: value_reg,
                 targets: targets.clone(),
             });
             // `flatten.py:289-293`:
@@ -1030,41 +1204,41 @@ fn last_op_result(block: &crate::model::Block) -> Option<ValueId> {
     block.operations.last().and_then(|op| op.result)
 }
 
-fn overflow_jump_op_from_kind(
-    kind: &crate::model::OpKind,
-    result: Option<ValueId>,
-    target: Label,
-) -> Option<FlatOp> {
-    let (name, lhs, rhs) = match kind {
-        crate::model::OpKind::BinOp { op, lhs, rhs, .. } => (op.as_str(), *lhs, *rhs),
-        _ => return None,
-    };
-    let opcode = match name {
-        "add_ovf" => IntOvfOp::Add,
-        "sub_ovf" => IntOvfOp::Sub,
-        "mul_ovf" => IntOvfOp::Mul,
-        _ => return None,
-    };
-    let dst = result.expect("overflow-checked arithmetic op needs a result for flatten parity");
-    Some(FlatOp::IntBinOpJumpIfOvf {
-        op: opcode,
-        target,
-        lhs,
-        rhs,
-        dst,
-    })
-}
+// `overflow_jump_op` was promoted to a method on
+// [`GraphFlattener`] so it can resolve operand `(kind, color)` via
+// `getcolor` for line-by-line `flatten.py:382` parity.
 
+/// Resolve `(kind, color)` for a [`ValueId`] in the per-kind regalloc
+/// results.
+///
+/// **RPython invariant** (`flatten.py:382` `getcolor`): the kind comes
+/// from `getkind(v.concretetype)` first, then `regallocs[kind]`
+/// supplies the color.  Pyre's [`ValueId`] does not yet carry
+/// `concretetype`, so this helper recovers the same answer by
+/// walking the per-kind regalloc results in [`KINDS`] order (NOT the
+/// nondeterministic `HashMap` iteration order) and asserting that at
+/// most one class colors `v`.  Multi-class hits panic — a kind-
+/// provenance bug upstream — to preserve the RPython 1:1 invariant.
 fn lookup_kind_color(
     v: ValueId,
     regallocs: &HashMap<RegKind, RegAllocResult>,
 ) -> Option<(RegKind, usize)> {
-    for (&kind, ra) in regallocs {
-        if let Some(&color) = ra.coloring.get(&v) {
-            return Some((kind, color));
+    let mut found: Option<(RegKind, usize)> = None;
+    for kind in KINDS {
+        if let Some(ra) = regallocs.get(&kind) {
+            if let Some(&color) = ra.coloring.get(&v) {
+                if let Some((prev_kind, _)) = found {
+                    panic!(
+                        "lookup_kind_color: ValueId {v:?} colored in multiple regalloc \
+                         classes ({prev_kind:?} and {kind:?}) — RPython `getkind` must \
+                         give exactly one",
+                    );
+                }
+                found = Some((kind, color));
+            }
         }
     }
-    None
+    found
 }
 
 fn compute_num_values(graph: &FunctionGraph, ops: &[FlatOp]) -> usize {
@@ -1094,35 +1268,22 @@ fn compute_num_values(graph: &FunctionGraph, ops: &[FlatOp]) -> usize {
                 }
             }
             FlatOp::Push(_) | FlatOp::Pop(_) => {}
-            FlatOp::GotoIfNot {
-                cond: ValueId(c), ..
+            FlatOp::GotoIfNot { .. } | FlatOp::Switch { .. } | FlatOp::IntBinOpJumpIfOvf { .. } => {
+                // Phase 3 — cond/value/lhs/rhs/dst are Register
+                // operands carrying (kind, color); no ValueId
+                // contribution to the pre-regalloc num_values count.
             }
-            | FlatOp::Switch {
-                value: ValueId(c), ..
-            } => {
-                max_value = max_value.max(*c + 1);
+            FlatOp::LastException { .. } | FlatOp::LastExcValue { .. } => {
+                // Phase 3 — Register operand carries (kind, color);
+                // no ValueId contribution to the pre-regalloc
+                // num_values count.
             }
-            FlatOp::IntBinOpJumpIfOvf {
-                lhs: ValueId(lhs),
-                rhs: ValueId(rhs),
-                dst: ValueId(dst),
-                ..
-            } => {
-                max_value = max_value.max(*lhs + 1);
-                max_value = max_value.max(*rhs + 1);
-                max_value = max_value.max(*dst + 1);
-            }
-            FlatOp::LastException { dst: ValueId(d) }
-            | FlatOp::LastExcValue { dst: ValueId(d) } => {
-                max_value = max_value.max(*d + 1);
-            }
-            FlatOp::IntReturn(v)
-            | FlatOp::RefReturn(v)
-            | FlatOp::FloatReturn(v)
-            | FlatOp::Raise(v) => {
-                if let Some(ValueId(v)) = v.as_value() {
-                    max_value = max_value.max(v + 1);
-                }
+            FlatOp::IntReturn(_)
+            | FlatOp::RefReturn(_)
+            | FlatOp::FloatReturn(_)
+            | FlatOp::Raise(_) => {
+                // Phase 3 — operand is RegOrConst (Register or
+                // Constant); no ValueId to fold into num_values.
             }
             _ => {}
         }
@@ -1130,18 +1291,27 @@ fn compute_num_values(graph: &FunctionGraph, ops: &[FlatOp]) -> usize {
     max_value
 }
 
-/// Backward-compatible alias kept for callers that previously needed
-/// the `value_kinds` projection.  After Phase 3 this is identical to
-/// [`flatten_graph`] — the types parameter is discarded since each
-/// register operand carries its own kind via [`Register`] now.  The
-/// caller is still responsible for running [`crate::jit_codewriter::
-/// type_state::build_value_kinds`] beforehand to feed regalloc.
+/// Type-aware sibling of [`flatten_graph`] used by the post-rtyper
+/// pipeline.
+///
+/// Carries the [`TypeResolutionState`](crate::jit_codewriter::type_state::TypeResolutionState)
+/// into [`GraphFlattener::with_types`] so [`GraphFlattener::getcolor`]
+/// reads `kind` from `getkind(v.concretetype)` first
+/// (`flatten.py:386`), only falling back to regalloc-class scanning
+/// for values whose `ConcreteType` is `Void` / `Unknown`.  This gives
+/// well-typed graphs the same strict 1:1 kind-color resolution PyPy
+/// gets via `Variable.concretetype`.
 pub fn flatten_with_types(
     graph: &FunctionGraph,
-    _types: &crate::jit_codewriter::type_state::TypeResolutionState,
+    types: &crate::jit_codewriter::type_state::TypeResolutionState,
     regallocs: &HashMap<RegKind, RegAllocResult>,
 ) -> SSARepr {
-    flatten_graph(graph, regallocs)
+    let mut flattener = GraphFlattener::with_types(graph, regallocs, Some(types), false);
+    flattener.enforce_input_args();
+    flattener.generate_ssa_form();
+    let mut ssarepr = flattener.ssarepr;
+    ssarepr.num_values = compute_num_values(graph, &ssarepr.insns);
+    ssarepr
 }
 
 // `generate_last_exc` is a method on [`GraphFlattener`] (see
@@ -1149,19 +1319,33 @@ pub fn flatten_with_types(
 // `flatten.py:336-347 def generate_last_exc(self, link, inputargs)`
 // line-by-line.
 
+/// `flatten.py:325` — kind char for a [`ValueId`] derived from the
+/// regalloc result.  Iterates [`KINDS`] in fixed order (NOT the
+/// nondeterministic `HashMap` order) and panics on multi-class hits
+/// to mirror RPython's `getkind(v.concretetype)` 1:1 invariant.
+/// Returns `'v'` for Void-typed values that regalloc skipped.
 fn value_kind(value: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> char {
-    for (kind, ra) in regallocs {
-        if ra.coloring.contains_key(&value) {
-            return match kind {
-                RegKind::Int => 'i',
-                RegKind::Ref => 'r',
-                RegKind::Float => 'f',
-            };
+    let mut found: Option<RegKind> = None;
+    for kind in KINDS {
+        if let Some(ra) = regallocs.get(&kind) {
+            if ra.coloring.contains_key(&value) {
+                if let Some(prev) = found {
+                    panic!(
+                        "value_kind: ValueId {value:?} colored in multiple regalloc \
+                         classes ({prev:?} and {kind:?}) — RPython `getkind` must \
+                         give exactly one",
+                    );
+                }
+                found = Some(kind);
+            }
         }
     }
-    // `lltype.Void` is not assigned a color by regalloc
-    // (`flatten.py:325 if v.concretetype is not lltype.Void`).
-    'v'
+    match found {
+        Some(RegKind::Int) => 'i',
+        Some(RegKind::Ref) => 'r',
+        Some(RegKind::Float) => 'f',
+        None => 'v',
+    }
 }
 
 /// Kind of a [`LinkArg`] for opname selection — upstream `assembler.py:168-170`
@@ -1479,11 +1663,13 @@ mod tests {
         );
 
         let flat = flatten(&graph, &identity_regallocs(8));
+        let expected_value = Register::new(RegKind::Int, cond.0);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
                 FlatOp::Switch { value, targets }
-                    if *value == cond && targets.iter().map(|(key, _)| *key).collect::<Vec<_>>() == vec![0, 1]
+                    if *value == expected_value
+                        && targets.iter().map(|(key, _)| *key).collect::<Vec<_>>() == vec![0, 1]
             )),
             "integer switch should emit a Switch op: {:?}",
             flat.insns
@@ -1799,19 +1985,25 @@ mod tests {
             )),
             "typed exception link should emit goto_if_exception_mismatch"
         );
+        // identity_regallocs maps ValueId(n) → Int color n.  After
+        // Phase 3, LastException/LastExcValue carry [`Register`]
+        // operands so the assertion compares against the materialized
+        // Register identity directly.
+        let expected_exc_type_reg = Register::new(RegKind::Int, handler_exc_type.0);
+        let expected_exc_value_reg = Register::new(RegKind::Int, handler_exc_value.0);
         assert!(
-            flat.insns
-                .iter()
-                .any(|op| matches!(op, FlatOp::LastException { dst } if *dst == handler_exc_type)),
+            flat.insns.iter().any(
+                |op| matches!(op, FlatOp::LastException { dst } if *dst == expected_exc_type_reg)
+            ),
             "typed exception link should materialize last_exception at target inputarg"
         );
         // RPython `flatten.py:336-347 generate_last_exc` writes the
         // exception value into the TARGET inputarg's register, not the
         // prevblock-side `link.last_exc_value` Variable.
         assert!(
-            flat.insns
-                .iter()
-                .any(|op| matches!(op, FlatOp::LastExcValue { dst } if *dst == handler_exc_value)),
+            flat.insns.iter().any(
+                |op| matches!(op, FlatOp::LastExcValue { dst } if *dst == expected_exc_value_reg)
+            ),
             "typed exception link should materialize last_exc_value at target inputarg"
         );
     }
@@ -1824,10 +2016,17 @@ mod tests {
         graph.set_goto(entry, exc_block, vec![last_exception, last_exc_value]);
 
         let flat = flatten(&graph, &identity_regallocs(16));
+        // identity_regallocs colors ValueId(n) as Int n; Raise carries
+        // the exception value's Register (always Ref-kinded).  The
+        // test fixture uses identity coloring so the matching Register
+        // is `Register::new(Int, last_exc_value.0)`.
+        let expected_raise_reg = Register::new(RegKind::Int, last_exc_value.0);
         let raise_idx = flat
             .insns
             .iter()
-            .position(|op| matches!(op, FlatOp::Raise(LinkArg::Value(v)) if *v == last_exc_value))
+            .position(
+                |op| matches!(op, FlatOp::Raise(RegOrConst::Reg(r)) if *r == expected_raise_reg),
+            )
             .expect("final exceptblock should flatten to raise");
         assert!(
             matches!(
@@ -1858,9 +2057,10 @@ mod tests {
 
         let flat = flatten(&graph, &identity_regallocs(16));
         assert!(
-            flat.insns
-                .iter()
-                .any(|op| matches!(op, FlatOp::IntReturn(LinkArg::Const(ConstValue::Int(42))))),
+            flat.insns.iter().any(|op| matches!(
+                op,
+                FlatOp::IntReturn(RegOrConst::Const(ConstValue::Int(42)))
+            )),
             "final return should preserve Constant link args"
         );
     }
@@ -1916,6 +2116,9 @@ mod tests {
         );
 
         let flat = flatten(&graph, &identity_regallocs(16));
+        let expected_lhs = Register::new(RegKind::Int, lhs.0);
+        let expected_rhs = Register::new(RegKind::Int, rhs.0);
+        let expected_dst = Register::new(RegKind::Int, sum.0);
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -1925,7 +2128,7 @@ mod tests {
                     rhs: r,
                     dst,
                     ..
-                } if *l == lhs && *r == rhs && *dst == sum
+                } if *l == expected_lhs && *r == expected_rhs && *dst == expected_dst
             )),
             "ovf arithmetic should flatten to int_add_jump_if_ovf"
         );
@@ -1987,7 +2190,7 @@ mod tests {
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
-                FlatOp::Raise(LinkArg::Const(ConstValue::HostObject(obj))) if *obj == standard_overflow
+                FlatOp::Raise(RegOrConst::Const(ConstValue::HostObject(obj))) if *obj == standard_overflow
             )),
             "overflow direct reraises should emit raise Constant(OverflowError-instance)"
         );

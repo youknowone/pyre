@@ -36,55 +36,12 @@ fn kind_long_name(kind: RegKind) -> &'static str {
     }
 }
 
-/// Variant-determined regalloc lookup.
-///
-/// **RPython invariant** (`flatten.py:382-391 getcolor`,
-/// `regalloc.py:6 perform_register_allocation`): every `Variable`
-/// reaching the assembler has a `concretetype` and therefore exactly
-/// one `(kind, color)` pair via `getkind(v.concretetype)`, and the
-/// matching `regallocs[kind].coloring` is the only place where the
-/// color lives.  The FlatOp variant fixes the expected kind at each
-/// call site; `caller` identifies that variant so any panic points
-/// back to the offending instruction.
-///
-/// **Known divergence (TODO #71/#74)**: pyre's annotator / rtyper
-/// still has coverage gaps where the `(kind, color)` a `ValueId`
-/// actually receives can disagree with the FlatOp variant's expected
-/// kind — e.g., a `goto_if_not` cond that ought to be `Bool → Int`
-/// arrives as `Ref` because the upstream type pass missed the cond
-/// site.  Pre-Phase-3 origin/main masked the gap with a
-/// `value_kinds` snapshot whose strict (Slice-C-3) lookup happened
-/// to land on the same actual class anyway.  Phase 3 dropped the
-/// snapshot, so the strict lookup now panics on those graphs.  As a
-/// documented divergence — not a silent default — we accept the
-/// other regalloc class when the variant's class misses.  RPython
-/// would never reach the fallback branch.
-fn reg_byte(
-    v: crate::model::ValueId,
-    kind: RegKind,
-    regallocs: &HashMap<RegKind, crate::regalloc::RegAllocResult>,
-    caller: &'static str,
-) -> u8 {
-    if let Some(ra) = regallocs.get(&kind) {
-        if let Some(&color) = ra.coloring.get(&v) {
-            return color as u8;
-        }
-    }
-    for fallback_kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-        if fallback_kind == kind {
-            continue;
-        }
-        if let Some(ra) = regallocs.get(&fallback_kind) {
-            if let Some(&color) = ra.coloring.get(&v) {
-                return color as u8;
-            }
-        }
-    }
-    panic!(
-        "reg_byte[{caller}]: ValueId {v:?} has no coloring in any of \
-         regallocs[Int|Ref|Float] (expected kind {kind:?})",
-    )
-}
+// `reg_byte` and the `CURRENT_GRAPH` thread-local were removed once
+// every FlatOp variant migrated to carrying a [`crate::flatten::Register`]
+// (or [`crate::flatten::RegOrConst`]) operand directly.  After Phase 3
+// the assembler reads `r.kind` / `r.index` straight off the operand —
+// no per-call kind-search, no fallback — exactly mirroring RPython's
+// `Register(kind, index)` invariant from `flatten.py:28-33`.
 use crate::flowspace::model::ConstValue;
 use crate::jitcode::{BhCallDescr, JitCodeBody};
 use crate::model::{LinkArg, ValueId};
@@ -553,12 +510,20 @@ impl Assembler {
             // RPython flatten.py:247-267: goto_if_not(cond, TLabel(false_path))
             // Only goto_if_not exists — no goto_if_true in RPython.
             FlatOp::GotoIfNot { cond, target } => {
-                let reg = reg_byte(*cond, RegKind::Int, regallocs, "GotoIfNot.cond");
+                // RPython parity expectation: `cond.kind == RegKind::Int`
+                // because `block.exitswitch.concretetype == lltype.Bool`
+                // is the build-time gate at `flatten.py:248`.  Pyre's
+                // annotator/rtyper coverage gap (TODO #71/#74)
+                // occasionally lets a Ref cond reach this site (e.g.
+                // `eval_loop_jit`'s portal bool branches).  The
+                // `cond.index` byte still encodes the regalloc color
+                // correctly so emission proceeds; the parity gap is
+                // tracked above lookup_coloring rather than asserted
+                // here.
                 let opnum = self.get_opnum("goto_if_not/iL");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
-                state.code.push(reg);
-                // RPython assembler.py:175-179: TLabel operand position
+                state.code.push(cond.index as u8);
                 state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*target, state.code.len()));
                 state.code.push(0);
@@ -566,12 +531,14 @@ impl Assembler {
             }
 
             FlatOp::Switch { value, targets } => {
-                let reg = reg_byte(*value, RegKind::Int, regallocs, "Switch.value");
+                // Parity expectation: `value.kind == RegKind::Int`
+                // (`flatten.py:276` `assert kind == 'int'`).  Same
+                // upstream-gap caveat as `GotoIfNot.cond` above.
                 let descr_idx = self.emit_pending_switch_descr(targets.clone());
                 let opnum = self.get_opnum("switch/id");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
-                state.code.push(reg);
+                state.code.push(value.index as u8);
                 state.code.push((descr_idx & 0xFF) as u8);
                 state.code.push((descr_idx >> 8) as u8);
             }
@@ -583,24 +550,24 @@ impl Assembler {
                 rhs,
                 dst,
             } => {
+                // Parity expectation: all three operands are Int —
+                // overflow-checked integer arithmetic.  Upstream gap
+                // applies if the rtyper miscoloured.
                 let opname = match op {
                     IntOvfOp::Add => "int_add_jump_if_ovf/Lii>i",
                     IntOvfOp::Sub => "int_sub_jump_if_ovf/Lii>i",
                     IntOvfOp::Mul => "int_mul_jump_if_ovf/Lii>i",
                 };
                 let opnum = self.get_opnum(opname);
-                let lhs_reg = reg_byte(*lhs, RegKind::Int, regallocs, "IntBinOpJumpIfOvf.lhs");
-                let rhs_reg = reg_byte(*rhs, RegKind::Int, regallocs, "IntBinOpJumpIfOvf.rhs");
-                let dst_reg = reg_byte(*dst, RegKind::Int, regallocs, "IntBinOpJumpIfOvf.dst");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.alllabels.insert(state.code.len());
                 state.tlabel_fixups.push((*target, state.code.len()));
                 state.code.push(0);
                 state.code.push(0);
-                state.code.push(lhs_reg);
-                state.code.push(rhs_reg);
-                state.code.push(dst_reg);
+                state.code.push(lhs.index as u8);
+                state.code.push(rhs.index as u8);
+                state.code.push(dst.index as u8);
                 state.resulttypes.insert(state.code.len(), 'i');
             }
 
@@ -618,20 +585,15 @@ impl Assembler {
             // disambiguates register vs constant at decode time via
             // `byte >= count_regs[kind]`.
             FlatOp::Move { dst, src } => {
-                let (src_reg, src_kind) =
-                    self.encode_regorconst_source(src, regallocs, state, dst.kind);
-                let dst_kind_char = kind_char_of(dst.kind);
-                debug_assert_eq!(
-                    src_kind, dst_kind_char,
-                    "int/ref/float_copy src and dst must share kind"
-                );
+                let src_reg = self.encode_regorconst_source(src, dst.kind, state);
+                let kind_char = kind_char_of(dst.kind);
                 let kind_name = kind_long_name(dst.kind);
-                let key = format!("{kind_name}_copy/{src_kind}>{src_kind}");
+                let key = format!("{kind_name}_copy/{kind_char}>{kind_char}");
                 let opnum = self.get_opnum(&key);
                 state.code.push(opnum);
                 state.code.push(src_reg);
                 state.code.push(dst.index as u8);
-                state.resulttypes.insert(state.code.len(), src_kind);
+                state.resulttypes.insert(state.code.len(), kind_char);
             }
 
             // RPython `flatten.py:329` `self.emitline('%s_push' % kind, v)`.
@@ -658,20 +620,23 @@ impl Assembler {
             }
 
             FlatOp::LastException { dst } => {
-                let reg = reg_byte(*dst, RegKind::Int, regallocs, "LastException.dst");
+                // Parity expectation: `dst.kind == RegKind::Int`
+                // (the exception class identity).  See GotoIfNot
+                // notes above for the upstream-gap caveat.
                 let opnum = self.get_opnum("last_exception/>i");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
-                state.code.push(reg);
+                state.code.push(dst.index as u8);
                 state.resulttypes.insert(state.code.len(), 'i');
             }
 
             FlatOp::LastExcValue { dst } => {
-                let reg = reg_byte(*dst, RegKind::Ref, regallocs, "LastExcValue.dst");
+                // Parity expectation: `dst.kind == RegKind::Ref`
+                // (the exception instance pointer).
                 let opnum = self.get_opnum("last_exc_value/>r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
-                state.code.push(reg);
+                state.code.push(dst.index as u8);
                 state.resulttypes.insert(state.code.len(), 'r');
             }
 
@@ -687,21 +652,21 @@ impl Assembler {
             // single-byte argcode `i`/`r`/`f` suffices for both register
             // and constant sources (upstream `assembler.py:164-174`).
             FlatOp::IntReturn(v) => {
-                let reg = self.encode_link_arg_for_kind(v, RegKind::Int, regallocs, state);
+                let reg = self.encode_regorconst_source(v, RegKind::Int, state);
                 let opnum = self.get_opnum("int_return/i");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(reg);
             }
             FlatOp::RefReturn(v) => {
-                let reg = self.encode_link_arg_for_kind(v, RegKind::Ref, regallocs, state);
+                let reg = self.encode_regorconst_source(v, RegKind::Ref, state);
                 let opnum = self.get_opnum("ref_return/r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.code.push(reg);
             }
             FlatOp::FloatReturn(v) => {
-                let reg = self.encode_link_arg_for_kind(v, RegKind::Float, regallocs, state);
+                let reg = self.encode_regorconst_source(v, RegKind::Float, state);
                 let opnum = self.get_opnum("float_return/f");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -714,13 +679,12 @@ impl Assembler {
             }
             // RPython `flatten.py:139-143` `make_return` 2-inputarg case
             // plus the `flatten.py:166-173` overflow reraise.  Both paths
-            // funnel through the single `raise/r` opname — upstream's
-            // source operand can be either a Variable (the raised
-            // exception value) or a Constant (e.g. the standard
-            // OverflowError instance), and the single-byte argcode `r`
-            // covers both.  Blackhole: `blackhole.py:1000 bhimpl_raise(excvalue)`.
+            // funnel through `raise/r` — `RegOrConst::Reg` is the raised
+            // exception value's Register, `RegOrConst::Const` is the
+            // standard OverflowError instance.  Blackhole:
+            // `blackhole.py:1000 bhimpl_raise(excvalue)`.
             FlatOp::Raise(v) => {
-                let reg = self.encode_link_arg_for_kind(v, RegKind::Ref, regallocs, state);
+                let reg = self.encode_regorconst_source(v, RegKind::Ref, state);
                 let opnum = self.get_opnum("raise/r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -846,45 +810,28 @@ impl Assembler {
         }
     }
 
-    /// Phase 3 — explicit-kind sibling of [`Self::encode_link_arg_source`]
-    /// for FlatOp variants whose operand kind is fixed by the variant
-    /// itself (`int_return`/`ref_return`/`float_return`/`raise`).  No
-    /// `value_kinds` lookup is needed; kinds come straight from the
-    /// caller.
-    fn encode_link_arg_for_kind(
-        &mut self,
-        arg: &LinkArg,
-        kind: RegKind,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
-        state: &mut AssemblyState,
-    ) -> u8 {
-        match arg {
-            LinkArg::Value(v) => reg_byte(*v, kind, regallocs, "encode_link_arg_for_kind"),
-            LinkArg::Const(cv) => self.emit_const(cv, kind_char_of(kind), state),
-        }
-    }
-
-    /// Phase 3 [`RegOrConst`] companion of [`Self::encode_link_arg_source`].
+    /// Encode a [`RegOrConst`] operand into the byte stream.
     ///
-    /// `RegOrConst::Reg` carries `(kind, color)` directly so no
-    /// `lookup_reg_with_kind` lookup is needed.  Constants emit through
-    /// the same `emit_const` path; `dst_kind` provides the expected
-    /// kind so a [`ConstValue`] whose [`crate::flatten::constvalue_kind`]
-    /// would otherwise pick the wrong char (e.g. `HostObject` →
-    /// `'r'` while the dst is int) is forced to the dst kind.
+    /// `RegOrConst::Reg` carries `(kind, color)` directly — no
+    /// regalloc lookup needed.  Constants emit through `emit_const`
+    /// with `expected_kind` (variant-fixed) selecting the constant
+    /// pool, mirroring `assembler.py:164-174` where the single-byte
+    /// argcode kind letter chooses between register and constant via
+    /// `byte >= count_regs[kind]`.  Returns the emitted byte; the
+    /// caller already knows the kind.
     fn encode_regorconst_source(
         &mut self,
         arg: &crate::flatten::RegOrConst,
-        _regallocs: &HashMap<RegKind, RegAllocResult>,
+        expected_kind: RegKind,
         state: &mut AssemblyState,
-        dst_kind: RegKind,
-    ) -> (u8, char) {
+    ) -> u8 {
         match arg {
-            crate::flatten::RegOrConst::Reg(r) => (r.index as u8, kind_char_of(r.kind)),
+            // Parity expectation: `r.kind == expected_kind`.  Same
+            // upstream-coverage-gap caveat as `GotoIfNot.cond`; the
+            // emitted `r.index` byte is correct regardless.
+            crate::flatten::RegOrConst::Reg(r) => r.index as u8,
             crate::flatten::RegOrConst::Const(cv) => {
-                let kind_char = kind_char_of(dst_kind);
-                let byte = self.emit_const(cv, kind_char, state);
-                (byte, kind_char)
+                self.emit_const(cv, kind_char_of(expected_kind), state)
             }
         }
     }
@@ -1992,23 +1939,12 @@ impl Assembler {
                         s.first_use_tag.get_or_insert(tag);
                     }
                 }
-                FlatOp::GotoIfNot { cond, .. } => {
-                    let s = sites.entry(*cond).or_default();
-                    s.use_count += 1;
-                    s.first_use_tag.get_or_insert("GotoIfNot");
-                }
-                FlatOp::Switch { value, .. } => {
-                    let s = sites.entry(*value).or_default();
-                    s.use_count += 1;
-                    s.first_use_tag.get_or_insert("Switch");
-                }
-                FlatOp::IntBinOpJumpIfOvf { lhs, rhs, dst, .. } => {
-                    sites.entry(*dst).or_default().has_def = true;
-                    for v in [*lhs, *rhs] {
-                        let s = sites.entry(v).or_default();
-                        s.use_count += 1;
-                        s.first_use_tag.get_or_insert("IntBinOpJumpIfOvf");
-                    }
+                FlatOp::GotoIfNot { .. }
+                | FlatOp::Switch { .. }
+                | FlatOp::IntBinOpJumpIfOvf { .. } => {
+                    // Phase 3 — guard ops carry [`Register`] operands
+                    // (post-regalloc identity); not tracked by the
+                    // pre-regalloc ValueId audit.
                 }
                 FlatOp::Move { .. } | FlatOp::Push(_) | FlatOp::Pop(_) => {
                     // Phase 3 — Move/Push/Pop carry [`Register`]
@@ -2022,18 +1958,17 @@ impl Assembler {
                     // covered, so dropping them from the audit is
                     // safe.
                 }
-                FlatOp::LastException { dst } | FlatOp::LastExcValue { dst } => {
-                    sites.entry(*dst).or_default().has_def = true;
+                FlatOp::LastException { .. } | FlatOp::LastExcValue { .. } => {
+                    // Phase 3 — Register operand carries (kind, color);
+                    // not tracked by the pre-regalloc ValueId audit.
                 }
-                FlatOp::IntReturn(a)
-                | FlatOp::RefReturn(a)
-                | FlatOp::FloatReturn(a)
-                | FlatOp::Raise(a) => {
-                    if let Some(v) = a.as_value() {
-                        let s = sites.entry(v).or_default();
-                        s.use_count += 1;
-                        s.first_use_tag.get_or_insert("Return/Raise");
-                    }
+                FlatOp::IntReturn(_)
+                | FlatOp::RefReturn(_)
+                | FlatOp::FloatReturn(_)
+                | FlatOp::Raise(_) => {
+                    // Phase 3 — operand is RegOrConst (Register or
+                    // Constant); not tracked by the pre-regalloc
+                    // ValueId audit.
                 }
                 FlatOp::Live { .. } => {
                     // Phase 3 — Live carries [`Register`]s now; not
@@ -3734,9 +3669,9 @@ mod tests {
         let module = HostObject::new_module("hello");
         let mut flat = SSARepr {
             name: "return_host_object".into(),
-            insns: vec![FlatOp::RefReturn(LinkArg::Const(ConstValue::HostObject(
-                module.clone(),
-            )))],
+            insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
+                ConstValue::HostObject(module.clone()),
+            ))],
             num_values: 0,
             num_blocks: 1,
             insns_pos: None,

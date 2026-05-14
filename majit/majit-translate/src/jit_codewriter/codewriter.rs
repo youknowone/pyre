@@ -375,24 +375,35 @@ impl CodeWriter {
         {
             let start_block = rewritten.graph.block(rewritten.graph.startblock);
             let mut arg_classes = String::new();
+            // RPython `call.py:181-187 get_jitcode_calldescr` derives
+            // `FUNC.ARGS` from `lltype.typeOf(fnptr).TO.ARGS` directly.
+            // Pyre approximates by reading the regalloc class each
+            // start-block inputarg lands in — strict (KINDS order,
+            // panic on multi-class) so a kind-provenance gap upstream
+            // surfaces here rather than getting a silent `'i'`
+            // default.  Missing coloring → `'v'` (Void inputarg that
+            // regalloc skipped, matching `flatten.py:325`).
             for arg_id in &start_block.inputargs {
-                let class = if regallocs
-                    .get(&RegKind::Int)
-                    .is_some_and(|ra| ra.coloring.contains_key(arg_id))
-                {
-                    'i'
-                } else if regallocs
-                    .get(&RegKind::Ref)
-                    .is_some_and(|ra| ra.coloring.contains_key(arg_id))
-                {
-                    'r'
-                } else if regallocs
-                    .get(&RegKind::Float)
-                    .is_some_and(|ra| ra.coloring.contains_key(arg_id))
-                {
-                    'f'
-                } else {
-                    'i'
+                let mut found: Option<RegKind> = None;
+                for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+                    if let Some(ra) = regallocs.get(&kind) {
+                        if ra.coloring.contains_key(arg_id) {
+                            if let Some(prev) = found {
+                                panic!(
+                                    "calldescr: start_block inputarg {arg_id:?} colored \
+                                     in multiple regalloc classes ({prev:?} and \
+                                     {kind:?}) — RPython `getkind` must give exactly one",
+                                );
+                            }
+                            found = Some(kind);
+                        }
+                    }
+                }
+                let class = match found {
+                    Some(RegKind::Int) => 'i',
+                    Some(RegKind::Ref) => 'r',
+                    Some(RegKind::Float) => 'f',
+                    None => 'v',
                 };
                 arg_classes.push(class);
             }
@@ -596,14 +607,28 @@ fn graph_result_kind(
     let Some(vid) = returnblock.inputargs.first() else {
         return 'v';
     };
-    for (&kind, ra) in regallocs {
-        if ra.coloring.contains_key(vid) {
-            return match kind {
-                RegKind::Int => 'i',
-                RegKind::Ref => 'r',
-                RegKind::Float => 'f',
-            };
+    // KINDS-ordered scan with single-class assertion mirrors
+    // `flatten.py:382 getcolor`: every Variable has exactly one
+    // `(kind, color)` via `getkind(v.concretetype)`.
+    let mut found: Option<RegKind> = None;
+    for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+        if let Some(ra) = regallocs.get(&kind) {
+            if ra.coloring.contains_key(vid) {
+                if let Some(prev) = found {
+                    panic!(
+                        "graph_result_kind: returnblock inputarg {vid:?} colored in \
+                         multiple regalloc classes ({prev:?} and {kind:?}) — RPython \
+                         `getkind` must give exactly one",
+                    );
+                }
+                found = Some(kind);
+            }
         }
     }
-    'v'
+    match found {
+        Some(RegKind::Int) => 'i',
+        Some(RegKind::Ref) => 'r',
+        Some(RegKind::Float) => 'f',
+        None => 'v',
+    }
 }
