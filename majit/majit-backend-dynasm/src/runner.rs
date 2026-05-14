@@ -1115,7 +1115,7 @@ impl DynasmBackend {
         token: &JitCellToken,
         ptr: usize,
         frame_ptr: *mut JitFrame,
-    ) -> Arc<DynasmFailDescr> {
+    ) -> majit_ir::DescrRef {
         let attached = self.attached_descr_ptrs();
         // compile.py:618-669 done_with_this_frame_descr — check all 4 variants.
         // Forward through `meta_descr` so the metainterp class hierarchy
@@ -1867,15 +1867,19 @@ impl Backend for DynasmBackend {
         // llmodel.py:412-420 get_latest_descr: read jf_descr from frame.
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
+        let descr_addr = Arc::as_ptr(&descr) as *const () as usize;
+        let descr_fd = descr
+            .as_fail_descr()
+            .expect("find_descr_by_ptr result must implement FailDescr");
         let fail_arg_locs =
-            crate::guard::lookup_fail_arg_locs(Arc::as_ptr(&descr) as usize).unwrap_or_default();
+            crate::guard::lookup_fail_arg_locs(descr_addr).unwrap_or_default();
 
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] descr: fi={} finish={} types={} locs={:?}",
-                descr.fail_index,
-                <crate::guard::DynasmFailDescr as FailDescr>::is_finish(&descr),
-                descr.fail_arg_types().len(),
+                descr_fd.fail_index_per_trace(),
+                descr_fd.is_finish(),
+                descr_fd.fail_arg_types().len(),
                 &fail_arg_locs
             );
         }
@@ -1908,12 +1912,8 @@ impl Backend for DynasmBackend {
         majit_gc::shadow_stack::unregister_libc_jitframe(jf_ptr as usize);
         unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
 
-        // FrameData::fail_descr is now DescrRef (Phase C-1 cascade);
-        // upcast the backend Arc identity at the boundary so FailDescr
-        // trait operations route through `as_fail_descr()` thereafter.
-        let descr_ref: majit_ir::DescrRef = descr;
         DeadFrame {
-            data: Box::new(FrameData::new(raw_values, descr_ref, None)),
+            data: Box::new(FrameData::new(raw_values, descr, None)),
         }
     }
 
@@ -1959,14 +1959,18 @@ impl Backend for DynasmBackend {
 
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
+        let descr_addr = Arc::as_ptr(&descr) as *const () as usize;
+        let descr_fd = descr
+            .as_fail_descr()
+            .expect("find_descr_by_ptr result must implement FailDescr");
 
-        let fail_arg_types = descr.fail_arg_types();
+        let fail_arg_types = descr_fd.fail_arg_types();
         let num_fail_args = fail_arg_types.len();
         let mut outputs: Vec<i64> = Vec::with_capacity(num_slots);
         for i in 0..num_slots {
             outputs.push(unsafe { crate::llmodel::get_int_value_direct(result_jf, i) as i64 });
         }
-        let fail_arg_locs = crate::guard::lookup_fail_arg_locs(Arc::as_ptr(&descr) as usize);
+        let fail_arg_locs = crate::guard::lookup_fail_arg_locs(descr_addr);
         let mut typed_outputs = Vec::with_capacity(num_fail_args);
         for i in 0..num_fail_args {
             let raw = match fail_arg_locs.as_ref().and_then(|l| l.get(i).copied()) {
@@ -1987,13 +1991,12 @@ impl Backend for DynasmBackend {
                 Type::Int => Value::Int(raw),
             });
         }
-        let exit_layout = Some(descr.layout());
+        let exit_layout = Some(crate::guard::layout_for_fail_descr(descr_fd, descr_addr));
 
         majit_gc::shadow_stack::unregister_libc_jitframe(jf_ptr as usize);
         unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
 
-        let descr_addr = Arc::as_ptr(&descr) as usize;
-        let descr_arc: Arc<dyn FailDescr> = descr.clone();
+        let descr_arc: majit_ir::DescrRef = descr.clone();
         majit_backend::RawExecResult {
             outputs,
             typed_outputs,
@@ -2001,18 +2004,11 @@ impl Backend for DynasmBackend {
             force_token_slots: Vec::new(),
             savedata: None,
             exception_value: GcRef::NULL,
-            fail_index: descr.fail_index,
-            trace_id: descr.trace_id(),
-            // `compile.py:185 isinstance(descr, ResumeDescr)` /
-            // `compile.py:624 final_descr=True` semantics live on the
-            // metainterp class hierarchy reached via meta_descr; defer to
-            // the FailDescr trait method instead of the backend-local
-            // mirror field so synthetic Done*/Exit*/Propagate descrs
-            // resolve through the upstream class identity.
-            is_finish: <crate::guard::DynasmFailDescr as FailDescr>::is_finish(&descr),
-            is_exit_frame_with_exception:
-                <crate::guard::DynasmFailDescr as FailDescr>::is_exit_frame_with_exception(&descr),
-            status: descr.get_status(),
+            fail_index: descr_fd.fail_index_per_trace(),
+            trace_id: descr_fd.trace_id(),
+            is_finish: descr_fd.is_finish(),
+            is_exit_frame_with_exception: descr_fd.is_exit_frame_with_exception(),
+            status: descr_fd.get_status(),
             descr_addr,
             descr_arc,
         }

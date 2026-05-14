@@ -338,35 +338,42 @@ impl DynasmFailDescr {
 
     /// Build a FailDescrLayout for this descriptor (parity with CraneliftFailDescr::layout).
     pub fn layout(&self) -> majit_backend::FailDescrLayout {
-        // resume.py:450-488 propagate rd_* so `compiled_exit_layout_from_backend`
-        // can reach them after the frontend trace cache evicts the owning
-        // `CompiledTrace` entry (pyjitpl/mod.rs:817-845).  Read through
-        // `meta_resume_fd()` — gated on isinstance(descr, ResumeDescr)
-        // per `record_loop_or_bridge` (compile.py:183-185).
-        let meta_fd = self.meta_resume_fd();
-        let fail_arg_types = <Self as FailDescr>::fail_arg_types(self);
-        majit_backend::FailDescrLayout {
-            fail_index: self.fail_index,
-            fail_arg_types: fail_arg_types.to_vec(),
-            is_finish: <Self as FailDescr>::is_finish(self),
-            trace_id: <Self as FailDescr>::trace_id(self),
-            source_op_index: lookup_source_op_index(self as *const Self as usize),
-            gc_ref_slots: fail_arg_types
-                .iter()
-                .enumerate()
-                .filter_map(|(i, tp)| (*tp == Type::Ref).then_some(i))
-                .collect(),
-            force_token_slots: Vec::new(),
-            frame_stack: None,
-            recovery_layout: self.recovery_layout(),
-            trace_info: None,
-            rd_numb: meta_fd.and_then(|fd| fd.rd_numb()).map(|s| s.to_vec()),
-            rd_consts: meta_fd.and_then(|fd| fd.rd_consts()).map(|s| s.to_vec()),
-            rd_virtuals: meta_fd.and_then(|fd| fd.rd_virtuals()).map(|s| s.to_vec()),
-            rd_pendingfields: meta_fd
-                .and_then(|fd| fd.rd_pendingfields())
-                .map(|s| s.to_vec()),
-        }
+        layout_for_fail_descr(self, self as *const Self as *const () as usize)
+    }
+}
+
+/// `compile.py:849` build a FailDescrLayout snapshot for any FailDescr
+/// descr identity (post Phase C-1 cascade — `find_descr_by_ptr` returns
+/// `DescrRef`, so the layout extractor takes the trait object plus the
+/// data-pointer address used to key backend-static side-tables
+/// (`SOURCE_OP_INDEX_TABLE`, `RECOVERY_LAYOUT_TABLE`)).
+pub fn layout_for_fail_descr(
+    fd: &dyn FailDescr,
+    descr_addr: usize,
+) -> majit_backend::FailDescrLayout {
+    // resume.py:450-488 propagate rd_* so `compiled_exit_layout_from_backend`
+    // can reach them after the frontend trace cache evicts the owning
+    // `CompiledTrace` entry (pyjitpl/mod.rs:817-845).
+    let fail_arg_types = fd.fail_arg_types();
+    majit_backend::FailDescrLayout {
+        fail_index: fd.fail_index_per_trace(),
+        fail_arg_types: fail_arg_types.to_vec(),
+        is_finish: fd.is_finish(),
+        trace_id: fd.trace_id(),
+        source_op_index: lookup_source_op_index(descr_addr),
+        gc_ref_slots: fail_arg_types
+            .iter()
+            .enumerate()
+            .filter_map(|(i, tp)| (*tp == Type::Ref).then_some(i))
+            .collect(),
+        force_token_slots: Vec::new(),
+        frame_stack: None,
+        recovery_layout: lookup_recovery_layout(descr_addr),
+        trace_info: None,
+        rd_numb: fd.rd_numb().map(|s| s.to_vec()),
+        rd_consts: fd.rd_consts().map(|s| s.to_vec()),
+        rd_virtuals: fd.rd_virtuals().map(|s| s.to_vec()),
+        rd_pendingfields: fd.rd_pendingfields().map(|s| s.to_vec()),
     }
 }
 
