@@ -1405,13 +1405,39 @@ pub struct ResolvedPendingFieldWrite {
 }
 
 /// Encoded pending field write stored alongside an encoded resume snapshot.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `resume.py:87-92 PENDINGFIELDSTRUCT` parity — the encoded form
+/// carries `lldescr` (the descriptor object itself) so decoding can
+/// hand back a live `Arc<dyn Descr>` via `descr.clone()` rather than
+/// rebuilding it through an index lookup
+/// (`resume.py:1000-1001 cast_base_ptr_to_instance`).
+///
+/// `descr_index` is a pyre-only transitional serialization handle
+/// used by `jit_state::replay_pending_field_writes` for
+/// `pending_field_write_layout(meta, descr_index, ...)` dispatch,
+/// kept until the dispatch path is rewritten to call methods on the
+/// descr Arc directly (RPython `resume.py:1010-1014`
+/// `arraydescr.is_array_of_pointers()` etc.).
+#[derive(Debug, Clone)]
 pub struct EncodedPendingFieldWrite {
+    /// `resume.py:88 lldescr` — the field/array descriptor itself.
+    pub descr: Option<majit_ir::DescrRef>,
     pub descr_index: u32,
     pub target: i64,
     pub value: i64,
     pub item_index: Option<usize>,
 }
+
+impl PartialEq for EncodedPendingFieldWrite {
+    fn eq(&self, other: &Self) -> bool {
+        // `history.py:125 id(descr)` parity — descr identity via Arc::ptr_eq.
+        majit_ir::resumedata::opt_descr_arc_ptr_eq(&self.descr, &other.descr)
+            && self.target == other.target
+            && self.value == other.value
+            && self.item_index == other.item_index
+    }
+}
+impl Eq for EncodedPendingFieldWrite {}
 
 impl EncodedResumeData {
     pub fn encode(rd: &ResumeData) -> Self {
@@ -1431,10 +1457,11 @@ impl EncodedResumeData {
     /// `ResumeData` after compilation. The production path obtains the
     /// same fields directly from `ResumeDataVirtualAdder::finish`.
     ///
-    /// `EncodedResumeData` carries pending fields without their live
-    /// field/array descriptors, so this helper cannot safely synthesize
-    /// `GuardPendingFieldEntry` replay entries. Production pending-field
-    /// replay still comes from `store_final_boxes_in_guard`.
+    /// Pending-field replay still comes from `store_final_boxes_in_guard`
+    /// in production. The encoded pending-field records do carry their
+    /// live descr Arc (`resume.py:88 PENDINGFIELDSTRUCT.lldescr`), but
+    /// this helper does not currently rebuild `GuardPendingFieldEntry`
+    /// from them — the production path attaches that elsewhere.
     pub fn to_resume_storage(&self) -> Arc<ResumeStorage> {
         fn const_pool_tag(c: &Const, rd_consts: &mut Vec<Const>) -> i16 {
             let idx = rd_consts
@@ -1785,6 +1812,9 @@ impl EncodedResumeData {
         let rd_pendingfields: Vec<_> = pending_fields
             .iter()
             .map(|pending| EncodedPendingFieldWrite {
+                // resume.py:547 lldescr = cast_instance_to_base_ptr(descr) —
+                // the encoded form carries the descr itself, not a handle.
+                descr: pending.descr.clone(),
                 descr_index: pending.descr_index,
                 target: memo.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
                 value: memo.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
@@ -1867,16 +1897,16 @@ impl EncodedResumeData {
             self.rd_numb.len(),
             "resume decoder left trailing data"
         );
-        // resume.py:926 _prepare_pendingfields
+        // resume.py:993-1001 _prepare_pendingfields — lldescr is restored
+        // directly from `PENDINGFIELDSTRUCT.lldescr` via
+        // `cast_base_ptr_to_instance(AbstractDescr, lldescr)`; pyre keeps
+        // the live `Arc<dyn Descr>` on the encoded record, so decoding is
+        // a clone.
         let pending_fields = self
             .rd_pendingfields
             .iter()
             .map(|pending| PendingFieldInfo {
-                // Decoder-side: the live `Arc<dyn Descr>` is recovered
-                // by callers via `descr_index → pool` lookup if needed.
-                // The encoded form (`EncodedPendingFieldWrite`) only
-                // persists the `descr_index` handle, not the Arc.
-                descr: None,
+                descr: pending.descr.clone(),
                 descr_index: pending.descr_index,
                 target: self.decode_box(pending.target),
                 value: self.decode_box(pending.value),
@@ -4053,6 +4083,9 @@ impl ResumeDataLoopMemo {
         let rd_pendingfields: Vec<_> = pending_fields_snapshot
             .into_iter()
             .map(|pending| EncodedPendingFieldWrite {
+                // resume.py:547 lldescr = cast_instance_to_base_ptr(descr) —
+                // the encoded form carries the descr itself, not a handle.
+                descr: pending.descr.clone(),
                 descr_index: pending.descr_index,
                 target: self.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
                 value: self.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
