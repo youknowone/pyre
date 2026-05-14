@@ -2980,120 +2980,13 @@ pub(crate) const STATUS_TY_INT: u64 = 0x02;
 pub(crate) const STATUS_TY_REF: u64 = 0x04;
 pub(crate) const STATUS_TY_FLOAT: u64 = 0x06;
 
-/// Per-guard backend FailDescr carrying a unique `fail_index`, the
-/// runtime fail-arg `Type` vector, and a vectorization accumulator
-/// chain.  Pyre-only adaptation: this is the bare backend descr used
-/// when a guard does not yet carry resume data
-/// (`ResumeGuardDescr` in this module is the resume-bearing variant).
-///
-/// **NOT** a port of RPython `history.py:156 BasicFailDescr`, which
-/// is a test-only identifier descr.  The closest RPython analogue is
-/// the abstract `AbstractFailDescr` (`history.py:131`) — pyre keeps
-/// the `fail_arg_types` and `vector_info` slots that RPython would
-/// otherwise host on `ResumeGuardDescr` so the bare and resume
-/// variants share the same backend interface.
-#[derive(Debug)]
-struct MetaFailDescr {
-    fail_index: u32,
-    /// `compile.py:869 store_final_boxes` mutates the descr's types in
-    /// place. Pyre uses `UnsafeCell` so the optimizer's
-    /// `store_final_boxes_in_guard` can rewrite types after numbering
-    /// without replacing the `Arc<dyn FailDescr>` (preserving identity
-    /// and `fail_index`). Single-threaded JIT, no atomic needed.
-    types: UnsafeCell<Vec<Type>>,
-    /// schedule.py:654: vector accumulation info attached during vectorization.
-    /// RPython history.py:127 rd_vector_info — no Mutex needed, single-threaded.
-    vector_info: UnsafeCell<Option<Box<AccumInfo>>>,
-    /// `history.py:132` `AbstractFailDescr._attrs_` — every
-    /// `AbstractFailDescr` instance has this slot, populated by
-    /// `assembler.py:849 patch_pending_failure_recoveries` when the
-    /// guard's recovery stub gets a final address.  `0` until stamped
-    /// (and `0` again after `assembler.py:987 patch_jump_for_descr`
-    /// redirects to a bridge).
-    adr_jump_offset: UnsafeCell<usize>,
-    /// `history.py:132` `AbstractFailDescr._attrs_` `rd_locs` — the
-    /// per-fail-arg jitframe slot positions written by
-    /// `llsupport/assembler.py:279 guardtok.faildescr.rd_locs =
-    /// positions`.  Empty until backend codegen stamps it.
-    rd_locs: UnsafeCell<Vec<u16>>,
-    /// FINISH-vs-guard discriminator. Set by `make_finish_fail_descr_typed`
-    /// when this descr stands in for an evicted FINISH op (terminal exit
-    /// previous-token fallback) or for a test fallback that bypasses
-    /// `MetaInterp::new`'s FINISH-singleton attachment. Default `false`
-    /// matches the guard-exit case used by `make_fail_descr_typed`.
-    is_finish: bool,
-}
-
-// Safety: JIT is single-threaded. UnsafeCell replaces Mutex for rd_vector_info.
-unsafe impl Send for MetaFailDescr {}
-unsafe impl Sync for MetaFailDescr {}
-
-impl majit_ir::Descr for MetaFailDescr {
-    fn index(&self) -> u32 {
-        self.fail_index
-    }
-    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
-        Some(self)
-    }
-    fn clone_descr(&self) -> Option<DescrRef> {
-        // RPython: clone() preserves the concrete subtype.
-        // MetaFailDescr.clone() → MetaFailDescr (same type, new fail_index).
-        Some(Arc::new(MetaFailDescr {
-            fail_index: alloc_fail_index(),
-            types: UnsafeCell::new(unsafe { (&*self.types.get()).clone() }),
-            vector_info: UnsafeCell::new(unsafe { (&*self.vector_info.get()).clone() }),
-            adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
-            is_finish: self.is_finish,
-        }))
-    }
-}
-
-impl FailDescr for MetaFailDescr {
-    fn fail_index(&self) -> u32 {
-        self.fail_index
-    }
-    fn fail_arg_types(&self) -> &[Type] {
-        // Safety: single-threaded JIT, no concurrent writers.
-        unsafe { &*self.types.get() }
-    }
-    fn set_fail_arg_types(&self, types: Vec<Type>) {
-        // Safety: single-threaded JIT, no concurrent readers.
-        unsafe { *self.types.get() = types }
-    }
-    fn is_finish(&self) -> bool {
-        self.is_finish
-    }
-    fn attach_vector_info(&self, info: AccumInfo) {
-        push_vector_info(unsafe { &mut *self.vector_info.get() }, info);
-    }
-    fn vector_info(&self) -> Vec<AccumInfo> {
-        flatten_vector_info(unsafe { (&*self.vector_info.get()).as_deref() })
-    }
-    fn replace_vector_info(&self, chain: Vec<AccumInfo>) {
-        unsafe { *self.vector_info.get() = build_vector_info_chain(chain) }
-    }
-    fn adr_jump_offset(&self) -> usize {
-        // Safety: single-threaded JIT, no concurrent writers.
-        unsafe { *self.adr_jump_offset.get() }
-    }
-    fn set_adr_jump_offset(&self, offset: usize) {
-        // Safety: single-threaded JIT, no concurrent readers.
-        unsafe { *self.adr_jump_offset.get() = offset };
-    }
-    fn rd_locs(&self) -> &[u16] {
-        // Safety: single-threaded JIT, no concurrent writers.
-        unsafe { &*self.rd_locs.get() }
-    }
-    fn set_rd_locs(&self, locs: Vec<u16>) {
-        // Safety: single-threaded JIT, no concurrent readers.
-        unsafe { *self.rd_locs.get() = locs };
-    }
-    // `compile.py:683` `AbstractResumeGuardDescr._attrs_ = ('status',)`
-    // — `status` is NOT inherited by `BasicFailDescr` /
-    // `MetaFailDescr` (these subclass `AbstractFailDescr` directly).
-    // Trait defaults (`get_status() -> 0`, no-op setters) are correct.
-}
+// MetaFailDescr removed: pyre-introduced placeholder for non-resume
+// FailDescr is no longer needed.  All factories
+// (`make_fail_descr_typed`, `make_fail_descr`, `make_fail_descr_with_index`)
+// now route through `make_resume_guard_descr_typed` to produce a
+// `ResumeGuardDescr` (compile.py:840), matching PyPy's class hierarchy
+// where placeholder guard descrs are the same `ResumeGuardDescr`
+// instances backfilled by `store_final_boxes_in_guard` (compile.py:869).
 
 /// Per-guard FailDescr that also carries resume data for deoptimization.
 ///
@@ -3356,41 +3249,49 @@ impl FailDescr for ResumeGuardDescr {
 /// Each call produces a distinct fail_index so the backend can identify
 /// which guard failed.
 pub fn make_fail_descr(num_live: usize) -> DescrRef {
-    Arc::new(MetaFailDescr {
-        fail_index: alloc_fail_index(),
-        types: UnsafeCell::new(vec![Type::Int; num_live]),
-        vector_info: UnsafeCell::new(None),
-        adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
-        is_finish: false,
-    })
+    make_resume_guard_descr_typed(vec![Type::Int; num_live])
 }
 
 /// Create a FailDescr with an explicit fail_index. Tests only — see
 /// `compile.rs::tests` for the invocation that needs a fixed fail_index
-/// to align against a synthesised bridge descr.
+/// to align against a synthesised bridge descr.  The result is a
+/// `ResumeGuardDescr` (PyPy `compile.py:840`) with the
+/// `Descr::index()` global fail_index set to the requested value
+/// instead of `alloc_fail_index()`.
 #[cfg(test)]
 pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef {
-    Arc::new(MetaFailDescr {
+    Arc::new(ResumeGuardDescr {
         fail_index,
         types: UnsafeCell::new(vec![Type::Int; num_live]),
+        resume_data: ResumeData {
+            vable_array: Vec::new(),
+            vref_array: Vec::new(),
+            frames: Vec::new(),
+            virtuals: Vec::new(),
+            pending_fields: Vec::new(),
+        },
+        payload: RdPayload::empty(),
         vector_info: UnsafeCell::new(None),
         adr_jump_offset: UnsafeCell::new(0),
         rd_locs: UnsafeCell::new(Vec::new()),
-        is_finish: false,
+        status: AtomicU64::new(0),
+        rd_loop_token_clt: UnsafeCell::new(None),
+        trace_id: AtomicU64::new(0),
+        fail_index_per_trace: AtomicU32::new(0),
     })
 }
 
-/// Create a FailDescr with explicit types and auto-assigned fail_index.
+/// Create a guard FailDescr with explicit types and auto-assigned fail_index.
+///
+/// `compile.py:840-843 ResumeGuardDescr` — pyre routes the
+/// non-finish guard-placeholder factory through the same
+/// `ResumeGuardDescr` constructor `make_resume_guard_descr_typed` uses;
+/// the result's `is_resume_guard()` returns true and the empty
+/// `payload` is filled later by `store_final_boxes_in_guard`
+/// (`compile.py:869`).  This collapses pyre's earlier
+/// `MetaFailDescr` placeholder into the PyPy class.
 pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
-    Arc::new(MetaFailDescr {
-        fail_index: alloc_fail_index(),
-        types: UnsafeCell::new(types),
-        vector_info: UnsafeCell::new(None),
-        adr_jump_offset: UnsafeCell::new(0),
-        rd_locs: UnsafeCell::new(Vec::new()),
-        is_finish: false,
-    })
+    make_resume_guard_descr_typed(types)
 }
 
 /// FINISH-flavored variant of [`make_fail_descr_typed`]. Used by the
