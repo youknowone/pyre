@@ -677,42 +677,6 @@ impl CraneliftFailDescr {
         gc_map
     }
 
-    /// Create a new fail descriptor.
-    pub fn new(fail_index: u32, fail_arg_types: Vec<Type>) -> Self {
-        Self::new_with_trace_and_kind_and_force_tokens(
-            fail_index,
-            0,
-            fail_arg_types,
-            false,
-            Vec::new(),
-        )
-    }
-
-    pub fn new_with_kind(fail_index: u32, fail_arg_types: Vec<Type>, _is_finish: bool) -> Self {
-        Self::new_with_trace_and_kind_and_force_tokens(
-            fail_index,
-            0,
-            fail_arg_types,
-            _is_finish,
-            Vec::new(),
-        )
-    }
-
-    pub fn new_with_kind_and_force_tokens(
-        fail_index: u32,
-        fail_arg_types: Vec<Type>,
-        _is_finish: bool,
-        force_token_slots: Vec<usize>,
-    ) -> Self {
-        Self::new_with_trace_and_kind_and_force_tokens(
-            fail_index,
-            0,
-            fail_arg_types,
-            _is_finish,
-            force_token_slots,
-        )
-    }
-
     /// Caller responsibility after `Arc::new(descr)`:
     ///   - if `recovery_layout` was previously passed: invoke
     ///     `descr.set_recovery_layout(layout)` to install the layout
