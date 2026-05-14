@@ -3714,6 +3714,7 @@ impl<'a> RegAlloc<'a> {
     /// result in the condition flags instead of materialising it via
     /// `setcc`+`movzx`; the guard emitter consumes those flags
     /// directly via `implement_guard`.
+    #[cfg(target_arch = "x86_64")]
     fn next_op_can_accept_cc(&self, ops: &[Op], i: usize, result: OpRef) -> bool {
         if i + 1 >= ops.len() {
             return false;
@@ -3757,13 +3758,21 @@ impl<'a> RegAlloc<'a> {
     /// in the CompOp emit and threads `guard_success_cc` through to the
     /// following guard. Otherwise force-allocate a general-purpose
     /// register (with `need_lower_byte` so `SETcc r8b` is encodable).
+    ///
+    /// The CC-sentinel path is x86-only: the aarch64 CompOp emit at
+    /// `aarch64/assembler.rs` unconditionally emits `setcc result_loc`
+    /// and has no `flush_cc` equivalent, so receiving `frame_reg` as
+    /// the result there would clobber x29 (the frame pointer). On
+    /// non-x86 architectures, fall through to a plain force-allocate.
     fn force_allocate_reg_or_cc(&mut self, result: OpRef, ops: &[Op], i: usize) -> Loc {
+        #[cfg(target_arch = "x86_64")]
         if self.next_op_can_accept_cc(ops, i, result) {
             self.rm.force_allocate_frame_reg(result);
-            Loc::Reg(crate::x86::regalloc::frame_reg())
-        } else {
-            Loc::Reg(self.force_allocate_reg(result, Type::Int, &[], None, true))
+            return Loc::Reg(arch_regalloc::frame_reg());
         }
+        #[cfg(not(target_arch = "x86_64"))]
+        let _ = (ops, i);
+        Loc::Reg(self.force_allocate_reg(result, Type::Int, &[], None, true))
     }
 
     /// x86/regalloc.py:636 _consider_compop

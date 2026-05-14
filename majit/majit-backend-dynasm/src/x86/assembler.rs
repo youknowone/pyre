@@ -2444,9 +2444,9 @@ impl<'a> Assembler386<'a> {
                                 ; mov Rq(scratch.value), QWORD base_i.value);
                             self.emit_op_gcload_regalloc(&scratch, ofs_loc, dst, nsize);
                         }
-                        other => panic!(
-                            "GcLoad base_loc must be Loc::Reg or Loc::Immed, got {other:?}",
-                        ),
+                        other => {
+                            panic!("GcLoad base_loc must be Loc::Reg or Loc::Immed, got {other:?}",)
+                        }
                     }
                 }
             }
@@ -3330,9 +3330,7 @@ impl<'a> Assembler386<'a> {
             }
         } else {
             let Loc::Immed(i) = class_loc else {
-                panic!(
-                    "GuardClass (typeid form): class_loc must be Loc::Immed, got {class_loc:?}",
-                );
+                panic!("GuardClass (typeid form): class_loc must be Loc::Immed, got {class_loc:?}",);
             };
             let expected_typeid = self
                 .lookup_typeid_from_classptr(i.value as usize)
@@ -3388,9 +3386,9 @@ impl<'a> Assembler386<'a> {
                 let expected_i32 = expected.value as i32;
                 dynasm!(self.mc ; .arch x64 ; cmp Rq(scratch), expected_i32);
             }
-            other => panic!(
-                "guard_gc_type: expected_typeid_loc must be Reg/Frame/Immed, got {other:?}",
-            ),
+            other => {
+                panic!("guard_gc_type: expected_typeid_loc must be Reg/Frame/Immed, got {other:?}",)
+            }
         }
     }
 
@@ -5129,9 +5127,7 @@ impl<'a> Assembler386<'a> {
             Loc::Reg(ofs_r) => {
                 self.emit_gcstore_sized(base, 0, Some(ofs_r), val, size);
             }
-            other => panic!(
-                "GcStore: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",
-            ),
+            other => panic!("GcStore: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",),
         }
     }
 
@@ -5164,9 +5160,9 @@ impl<'a> Assembler386<'a> {
                 Loc::Reg(ofs_r) => {
                     self.emit_gcstore_imm_sized(base, 0, Some(ofs_r), val, size);
                 }
-                other => panic!(
-                    "GcStore imm: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",
-                ),
+                other => {
+                    panic!("GcStore imm: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",)
+                }
             }
             return;
         }
@@ -5194,9 +5190,7 @@ impl<'a> Assembler386<'a> {
                     ; mov DWORD [Rq(base.value) + Rq(ofs_r.value)], lo
                     ; mov DWORD [Rq(base.value) + Rq(ofs_r.value) + 4], hi);
             }
-            other => panic!(
-                "GcStore imm: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",
-            ),
+            other => panic!("GcStore imm: ofs_loc must be Loc::Reg or Loc::Immed, got {other:?}",),
         }
     }
 
@@ -5722,19 +5716,15 @@ impl<'a> Assembler386<'a> {
             }
 
             // ── x86/assembler.py:2267 _call_assembler_emit_call ──
-            // simple_call(target, [argloc, threadlocal_loc]). The
-            // trampoline takes (callee_jf_ptr, callee_entry_addr) — the
-            // second arg is the resolved entry, NOT the threadlocal,
-            // because pyre routes the call through
-            // `call_assembler_execute_trampoline` instead of branching
-            // straight at descr._ll_function_addr.
-            let trampoline_addr = crate::call_assembler_execute_addr() as i64;
+            // simple_call(target, [argloc]).  Branch directly to the
+            // resolved callee entry — skip the Rust trampoline, which
+            // would otherwise add an extra indirect call and (when
+            // MAJIT_LOG was probed) a `std::env::var_os` per recursion.
             let pushed_gcmap = self.push_pending_call_gcmap();
             self.emit_load_to_rax(frame_loc); // rax = callee jf_ptr
             self.emit_abi_int_arg_from_reg(0, 0); // arg0 = jf (Windows: rcx = rax)
             if let Some(addr) = target_addr {
-                self.emit_abi_int_arg_from_imm(1, addr as i64);
-                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD trampoline_addr);
+                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD addr as i64);
                 self.emit_abi_call_rax_aligned();
             } else {
                 let addr_ptr = self.self_entry_addr_ptr as i64;
@@ -5742,8 +5732,6 @@ impl<'a> Assembler386<'a> {
                     ; mov rax, QWORD addr_ptr
                     ; mov rax, [rax]
                 );
-                self.emit_abi_int_arg_from_reg(1, 0);
-                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD trampoline_addr);
                 self.emit_abi_call_rax_aligned();
             }
             // Callee's _call_footer popped caller's rbp (= pre-GC
@@ -5983,24 +5971,19 @@ impl<'a> Assembler386<'a> {
                 );
             }
         } else {
-            // Resolved target: call callee via execute trampoline
-            // (stacker stack-growth protection for deep CALL_ASSEMBLER recursion).
-            let trampoline_addr = crate::call_assembler_execute_addr() as i64;
+            // Resolved target: branch directly to the compiled callee
+            // entry.  The previous trampoline indirection re-read
+            // MAJIT_LOG on every recursive call (Win32 env lookup is
+            // slow); a direct call matches cranelift's dispatch.
             if let Some(addr) = target_addr {
-                let addr = addr as i64;
-                self.emit_abi_int_arg_from_imm(1, addr);
-                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD trampoline_addr);
+                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD addr as i64);
                 self.emit_abi_call_rax_aligned();
             } else if self.self_entry_label.is_some() {
-                // Self-entry: load entry addr from self_entry_addr_ptr
-                // (written after finalization).
                 let addr_ptr = self.self_entry_addr_ptr as i64;
                 dynasm!(self.mc ; .arch x64
                     ; mov rax, QWORD addr_ptr
                     ; mov rax, [rax]
                 );
-                self.emit_abi_int_arg_from_reg(1, 0);
-                dynasm!(self.mc ; .arch x64 ; mov rax, QWORD trampoline_addr);
                 self.emit_abi_call_rax_aligned();
             }
 

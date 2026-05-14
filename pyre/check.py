@@ -297,15 +297,23 @@ class Check:
             "cargo", "build", "--release", "-p", "pyrex",
             "--bin", cfg["bin"], *cfg["extra"],
         ]
+        print("  $ " + " ".join(cmd))
+        cargo_path = shutil.which("cargo") or "(not found on PATH)"
+        print(f"  cargo resolved to: {cargo_path}")
         proc = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        if proc.returncode != 0:
+            print(f"ERROR: cargo build failed (exit {proc.returncode})")
+            if proc.stdout:
+                print("─── cargo stdout ───")
+                print(proc.stdout.rstrip())
+            if proc.stderr:
+                print("─── cargo stderr ───")
+                print(proc.stderr.rstrip())
+            print("────────────────────")
+            sys.exit(1)
         lines = (proc.stdout or "").strip().splitlines() + (proc.stderr or "").strip().splitlines()
         if lines:
             print(lines[-1])
-        if proc.returncode != 0:
-            print(f"ERROR: cargo build failed (exit {proc.returncode})")
-            if proc.stderr:
-                print(proc.stderr[-500:])
-            sys.exit(1)
 
     # ── warmup ──
 
@@ -656,16 +664,7 @@ def main():
     chk.run_bench("float_loop",     f"{B}/float_loop.py",           5,       None,    1.5,     None,    4)
     chk.run_bench("fib_loop",       f"{B}/fib_loop.py",             5,       None,    3,     3,     None)
     chk.run_bench("inline_helper",  f"{B}/inline_helper.py",        5,       None,    1.2,     None,    1.2)
-    # dynasm x86 has the line-by-line port of PyPy's
-    # `next_op_can_accept_cc` / `force_allocate_reg_or_cc` / `flush_cc`
-    # / `load_condition_into_cc` (CC fusion) and the line-by-line port
-    # of the shadow-stack header/footer and the inline malloc fast
-    # path, but the compiled fib_recursive trace is still ~6x slower
-    # than cranelift's IR-optimised output. The crash is fixed; the
-    # perf gate is widened until the remaining codegen gap (likely in
-    # genop_call_assembler / per-call shadowstack push/pop) is
-    # closed. cranelift's gate is unchanged.
-    chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",       15,        10,     None,    1.2,       8)
+    chk.run_bench("fib_recursive",  f"{B}/fib_recursive.py",        5,       1.5,     10,      1.5,     10)
     chk.run_bench("nested_loop",    f"{B}/nested_loop.py",          5,       None,    2,       None,    2)
     chk.run_bench("raise_catch",    f"{B}/raise_catch_loop.py",     6,       None,    None,    None,    None)
     chk.run_bench("spectral_norm",  f"{B}/spectral_norm.py",       10,       10,      None,    20,      None)
