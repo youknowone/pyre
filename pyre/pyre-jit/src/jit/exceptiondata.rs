@@ -8,6 +8,8 @@
 //! `make_type_of_exc_inst`, …) are intentionally absent; they get added
 //! one method at a time when a future port reads them.
 
+use std::collections::HashMap;
+
 use super::flatten::Kind;
 use super::flow::Constant;
 
@@ -16,16 +18,44 @@ use super::flow::Constant;
 pub struct UnknownException(pub String);
 
 /// `rpython/annotator/exception.py:standardexceptions` — names of the
-/// exceptions the rtyper preallocates an instance for.  Pyre only needs
-/// `OverflowError` today (`flatten.py:167`); other names are added when
-/// a future port consumes them.
-const STANDARD_EXCEPTIONS: &[&str] = &["OverflowError"];
+/// exceptions the rtyper preallocates an instance for.  Mirrors the
+/// upstream set verbatim: every exception that can be implicitly raised
+/// by some flow-space operation, in the same order upstream lists them.
+/// Today only `OverflowError` has a caller via the `_ovf` rewrite at
+/// `flatten.py:167`; the rest are present so future ports that read
+/// `standardexceptions` find a parity-complete table.
+const STANDARD_EXCEPTIONS: &[&str] = &[
+    "TypeError",
+    "OverflowError",
+    "ValueError",
+    "ZeroDivisionError",
+    "MemoryError",
+    "IOError",
+    "OSError",
+    "StopIteration",
+    "KeyError",
+    "IndexError",
+    "AssertionError",
+    "RuntimeError",
+    "UnicodeDecodeError",
+    "UnicodeEncodeError",
+    "NotImplementedError",
+    "_StackOverflow",
+];
 
 /// `rpython/rtyper/exceptiondata.py:11 class ExceptionData(object)`.
 #[derive(Debug)]
 pub struct ExceptionData {
     /// `exceptiondata.py:14 standardexceptions = standardexceptions`.
     pub standardexceptions: &'static [&'static str],
+    /// Prebuilt opaque tokens for each standard exception, keyed by
+    /// class name.  `get_standard_ll_exc_instance_by_class` returns
+    /// clones of these so repeat calls for the same class produce
+    /// `Constant`s that compare equal at the `OpaqueConstant::id`
+    /// level — matching upstream's "reusable prebuilt LL instance
+    /// pointer" semantic from `exceptiondata.py:40` even without
+    /// pyre's missing LL type system.
+    prebuilt_instances: HashMap<&'static str, Constant>,
 }
 
 impl Default for ExceptionData {
@@ -41,8 +71,13 @@ impl ExceptionData {
     /// `lltype_of_exception_type`, `lltype_of_exception_value`) all
     /// belong to the LL type system that pyre-jit does not model.
     pub fn new() -> Self {
+        let prebuilt_instances = STANDARD_EXCEPTIONS
+            .iter()
+            .map(|&name| (name, Constant::opaque(name, Some(Kind::Ref))))
+            .collect();
         Self {
             standardexceptions: STANDARD_EXCEPTIONS,
+            prebuilt_instances,
         }
     }
 
@@ -55,15 +90,18 @@ impl ExceptionData {
     /// (`flatten.py:168-169`).  Pyre has no LL type system; the
     /// production `lower_constant` closure threaded through
     /// `GraphFlattener` resolves the opaque `Constant` to the runtime
-    /// PyObject pointer for the exception class.
+    /// PyObject pointer for the exception class.  The returned Constant
+    /// shares an `OpaqueConstant::id` across calls for the same class —
+    /// the "reusable prebuilt" semantic — via the `prebuilt_instances`
+    /// intern table populated in `new`.
     pub fn get_standard_ll_exc_instance_by_class(
         &self,
         exceptionclass: &str,
     ) -> Result<Constant, UnknownException> {
-        if !self.standardexceptions.contains(&exceptionclass) {
-            return Err(UnknownException(exceptionclass.to_owned()));
-        }
-        Ok(Constant::opaque(exceptionclass, Some(Kind::Ref)))
+        self.prebuilt_instances
+            .get(exceptionclass)
+            .cloned()
+            .ok_or_else(|| UnknownException(exceptionclass.to_owned()))
     }
 }
 
@@ -114,5 +152,21 @@ mod tests {
             .get_standard_ll_exc_instance_by_class("NotAStandardException")
             .expect_err("non-standard class must error");
         assert_eq!(err, UnknownException("NotAStandardException".to_owned()));
+    }
+
+    #[test]
+    fn get_standard_ll_exc_instance_by_class_returns_reusable_prebuilt() {
+        let data = ExceptionData::new();
+        let first = data
+            .get_standard_ll_exc_instance_by_class("OverflowError")
+            .expect("OverflowError must be a standard exception");
+        let second = data
+            .get_standard_ll_exc_instance_by_class("OverflowError")
+            .expect("OverflowError must be a standard exception");
+        assert_eq!(
+            first, second,
+            "repeat calls for the same class must yield equal Constants \
+             (reusable prebuilt LL instance semantic per exceptiondata.py:40)"
+        );
     }
 }
