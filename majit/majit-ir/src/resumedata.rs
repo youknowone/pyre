@@ -97,6 +97,66 @@ pub enum ResumeVirtualKind {
     /// resume.py:856 VUniSliceInfo — virtual unicode slice.
     UniSlice,
 }
+
+/// Serialization-friendly summary of a `VirtualInfo`.
+///
+/// Moved here from `majit-metainterp::resume` (Phase C-1 cascade).
+/// Carries the same shape as `VirtualInfo` but with
+/// `ResumeValueLayoutSummary` instead of `ResumeValueSource` field
+/// values — enables round-trip through backend-side resume layout
+/// builders without depending on `majit-metainterp`.
+#[derive(Debug, Clone)]
+pub enum ResumeVirtualLayoutSummary {
+    Object {
+        /// resume.py:615 self.descr — live SizeDescr, preserved across summary round-trip.
+        descr: Option<crate::DescrRef>,
+        type_id: u32,
+        descr_index: u32,
+        /// info.py:318 _known_class — vtable pointer.
+        known_class: Option<i64>,
+        fields: Vec<(u32, ResumeValueLayoutSummary)>,
+        fielddescrs: Vec<crate::FieldDescrInfo>,
+        descr_size: usize,
+    },
+    Struct {
+        /// resume.py:631 self.typedescr — live SizeDescr, preserved across summary round-trip.
+        typedescr: Option<crate::DescrRef>,
+        type_id: u32,
+        descr_index: u32,
+        fields: Vec<(u32, ResumeValueLayoutSummary)>,
+        fielddescrs: Vec<crate::FieldDescrInfo>,
+        descr_size: usize,
+    },
+    /// resume.py:643-684 AbstractVArrayInfo
+    Array {
+        /// resume.py:646: self.arraydescr
+        arraydescr: Option<crate::DescrRef>,
+        descr_index: u32,
+        /// resume.py:680-683: VArrayInfoClear.clear=True / VArrayInfoNotClear.clear=False
+        clear: bool,
+        items: Vec<ResumeValueLayoutSummary>,
+    },
+    /// resume.py:736 VArrayStructInfo(arraydescr, size, fielddescrs)
+    ArrayStruct {
+        /// resume.py:739: self.arraydescr
+        arraydescr: Option<crate::DescrRef>,
+        descr_index: u32,
+        /// resume.py:740: self.fielddescrs
+        fielddescrs: Vec<crate::DescrRef>,
+        element_fields: Vec<Vec<(u32, ResumeValueLayoutSummary)>>,
+    },
+    RawBuffer {
+        /// resume.py:694: self.func
+        func: i64,
+        size: usize,
+        /// resume.py:695: self.offsets — signed (rawbuffer.py:14).
+        offsets: Vec<i64>,
+        /// resume.py:697: self.descrs
+        descrs: Vec<crate::ArrayDescrInfo>,
+        /// resume.py:693: fieldnums (decoded)
+        values: Vec<ResumeValueLayoutSummary>,
+    },
+}
 const TAGMASK: u8 = 3;
 
 pub const UNASSIGNED: i16 = ((-1i32 << 13) << 2 | TAGBOX as i32) as i16;

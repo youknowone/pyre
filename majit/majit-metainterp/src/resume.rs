@@ -578,58 +578,9 @@ pub struct ResumeFrameLayoutSummary {
 // cascade); re-exported for caller compatibility.
 pub use majit_ir::resumedata::ResumeVirtualKind;
 
-#[derive(Debug, Clone)]
-pub enum ResumeVirtualLayoutSummary {
-    Object {
-        /// resume.py:615 self.descr — live SizeDescr, preserved across summary round-trip.
-        descr: Option<majit_ir::DescrRef>,
-        type_id: u32,
-        descr_index: u32,
-        /// info.py:318 _known_class — vtable pointer.
-        known_class: Option<i64>,
-        fields: Vec<(u32, ResumeValueLayoutSummary)>,
-        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
-        descr_size: usize,
-    },
-    Struct {
-        /// resume.py:631 self.typedescr — live SizeDescr, preserved across summary round-trip.
-        typedescr: Option<majit_ir::DescrRef>,
-        type_id: u32,
-        descr_index: u32,
-        fields: Vec<(u32, ResumeValueLayoutSummary)>,
-        fielddescrs: Vec<majit_ir::FieldDescrInfo>,
-        descr_size: usize,
-    },
-    /// resume.py:643-684 AbstractVArrayInfo
-    Array {
-        /// resume.py:646: self.arraydescr
-        arraydescr: Option<majit_ir::DescrRef>,
-        descr_index: u32,
-        /// resume.py:680-683: VArrayInfoClear.clear=True / VArrayInfoNotClear.clear=False
-        clear: bool,
-        items: Vec<ResumeValueLayoutSummary>,
-    },
-    /// resume.py:736 VArrayStructInfo(arraydescr, size, fielddescrs)
-    ArrayStruct {
-        /// resume.py:739: self.arraydescr
-        arraydescr: Option<majit_ir::DescrRef>,
-        descr_index: u32,
-        /// resume.py:740: self.fielddescrs
-        fielddescrs: Vec<majit_ir::DescrRef>,
-        element_fields: Vec<Vec<(u32, ResumeValueLayoutSummary)>>,
-    },
-    RawBuffer {
-        /// resume.py:694: self.func
-        func: i64,
-        size: usize,
-        /// resume.py:695: self.offsets — signed (rawbuffer.py:14).
-        offsets: Vec<i64>,
-        /// resume.py:697: self.descrs
-        descrs: Vec<majit_ir::ArrayDescrInfo>,
-        /// resume.py:693: fieldnums (decoded)
-        values: Vec<ResumeValueLayoutSummary>,
-    },
-}
+// ResumeVirtualLayoutSummary moved to majit-ir::resumedata (Phase C-1
+// cascade); re-exported for caller compatibility.
+pub use majit_ir::resumedata::ResumeVirtualLayoutSummary;
 
 #[derive(Debug, Clone)]
 pub struct PendingFieldLayoutSummary {
@@ -740,9 +691,13 @@ impl ResumeFrameLayoutSummary {
 // majit-backend::resume_value as
 // `resume_value_layout_summary_from_exit_value_source` (cross-crate
 // orphan rule prevents inherent impl on the foreign type).
-impl ResumeVirtualLayoutSummary {
-    fn to_virtual_info(&self) -> VirtualInfo {
-        match self {
+// `to_virtual_info` / `to_exit_virtual_layout` extracted as free
+// functions after `ResumeVirtualLayoutSummary` moved to
+// `majit-ir::resumedata` (cross-crate orphan rule).
+fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) -> VirtualInfo {
+    let s = layout;
+    {
+        match s {
             ResumeVirtualLayoutSummary::Object {
                 descr,
                 type_id,
@@ -833,9 +788,15 @@ impl ResumeVirtualLayoutSummary {
             },
         }
     }
+}
 
-    fn to_exit_virtual_layout(&self, virtual_offset: usize) -> ExitVirtualLayout {
-        match self {
+fn resume_virtual_layout_to_exit_virtual_layout(
+    layout: &ResumeVirtualLayoutSummary,
+    virtual_offset: usize,
+) -> ExitVirtualLayout {
+    let s = layout;
+    {
+        match s {
             ResumeVirtualLayoutSummary::Object {
                 descr,
                 type_id,
@@ -974,7 +935,7 @@ impl ResumeLayoutSummary {
             virtuals: self
                 .virtual_layouts
                 .iter()
-                .map(|virt| virt.to_virtual_info())
+                .map(resume_virtual_layout_to_virtual_info)
                 .collect(),
             pending_fields: self
                 .pending_field_layouts
@@ -1034,7 +995,7 @@ impl ResumeLayoutSummary {
         virtual_layouts.extend(
             self.virtual_layouts
                 .iter()
-                .map(|virt| virt.to_exit_virtual_layout(virtual_offset)),
+                .map(|virt| resume_virtual_layout_to_exit_virtual_layout(virt, virtual_offset)),
         );
         pending_field_layouts.extend(
             self.pending_field_layouts
