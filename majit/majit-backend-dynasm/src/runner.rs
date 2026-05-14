@@ -1183,7 +1183,10 @@ impl DynasmBackend {
                 .exit_frame_with_exception_descr_ref
                 .clone();
             let mut d = DynasmFailDescr::new(u32::MAX, 0, vec![Type::Ref], true, false);
-            d.is_exit_frame_with_exception = true;
+            // is_exit_frame_with_exception() forwards through meta_descr;
+            // ExitFrameWithExceptionDescrRef in `compile.rs` answers true
+            // via its FailDescr trait impl (compile.py:658-662 class
+            // identity).  No local mirror assignment needed.
             d.meta_descr = meta;
             return Arc::new(d);
         }
