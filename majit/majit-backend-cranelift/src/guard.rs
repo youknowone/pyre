@@ -888,10 +888,6 @@ impl CraneliftFailDescr {
         Self::gc_map_for_types(&self.fail_arg_types, &force_token_slots)
     }
 
-    pub fn is_finish(&self) -> bool {
-        self.is_finish
-    }
-
     pub fn is_force_token_slot(&self, slot: usize) -> bool {
         // Vector stored in `FORCE_TOKEN_SLOTS_TABLE` is sorted+deduped
         // at register time, preserving the `binary_search` invariant.
