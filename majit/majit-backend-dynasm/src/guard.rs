@@ -313,46 +313,12 @@ impl DynasmFailDescr {
         unsafe { (*self.rd_loop_token_clt.get()).as_ref() }
     }
 
-    /// `compile.py:826-830` `store_hash`.  Prefers the metainterp
-    /// `AbstractResumeGuardDescr` (`compile.py:683 _attrs_`) reached
-    /// through `meta_descr`; falls back to the backend-local transitional
-    /// slot for test paths.
-    pub fn store_hash(&self, hash: u64) {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            meta_fd.store_hash(hash);
-            return;
-        }
-        self.status
-            .store(hash & Self::ST_SHIFT_MASK, Ordering::Release);
-    }
-
-    /// `compile.py:741-745` `get_status`.
-    pub fn get_status(&self) -> u64 {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            return meta_fd.get_status();
-        }
-        self.status.load(Ordering::Acquire)
-    }
-
-    /// `compile.py:786-788` `start_compiling`.
-    pub fn start_compiling(&self) {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            meta_fd.start_compiling();
-            return;
-        }
-        self.status.fetch_or(Self::ST_BUSY_FLAG, Ordering::AcqRel);
-    }
-
-    /// `compile.py:790-795` `done_compiling`.
-    pub fn done_compiling(&self) {
-        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            meta_fd.done_compiling();
-            return;
-        }
-        self.status.fetch_and(!Self::ST_BUSY_FLAG, Ordering::AcqRel);
-    }
-
-    /// `compile.py:813-824` `make_a_counter_per_value`.
+    /// `compile.py:813-824` `make_a_counter_per_value`.  Kept as an
+    /// inherent helper because it accepts the type-tag parameter the
+    /// `FailDescr` trait does not yet expose; remaining `store_hash` /
+    /// `get_status` / `start_compiling` / `done_compiling` redundancies
+    /// have been collapsed onto the trait dispatch (callers reach them
+    /// via `<Self as FailDescr>` already).
     pub fn make_a_counter_per_value(&self, index: u32, type_tag: u64) {
         if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
             meta_fd.make_a_counter_per_value(index, type_tag);
@@ -626,16 +592,45 @@ impl FailDescr for DynasmFailDescr {
         DynasmFailDescr::set_rd_loop_token_clt(self, typed);
     }
 
+    /// `compile.py:741-745` `get_status`.  Forwards through the
+    /// metainterp `AbstractResumeGuardDescr` (`compile.py:683 _attrs_`
+    /// `('status',)`) when `meta_descr` is set; falls back to the
+    /// backend-local mirror for synthetic descrs minted outside the
+    /// optimizer (FINISH / `ExitFrameWithExceptionDescrRef` /
+    /// `PropagateExceptionDescr` from the runtime classifier).
     fn get_status(&self) -> u64 {
-        self.get_status()
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            return meta_fd.get_status();
+        }
+        self.status.load(Ordering::Acquire)
     }
 
+    /// `compile.py:786-788` `start_compiling`.
     fn start_compiling(&self) {
-        self.start_compiling()
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.start_compiling();
+            return;
+        }
+        self.status.fetch_or(Self::ST_BUSY_FLAG, Ordering::AcqRel);
     }
 
+    /// `compile.py:790-795` `done_compiling`.
     fn done_compiling(&self) {
-        self.done_compiling()
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.done_compiling();
+            return;
+        }
+        self.status.fetch_and(!Self::ST_BUSY_FLAG, Ordering::AcqRel);
+    }
+
+    /// `compile.py:826-830` `store_hash`.
+    fn store_hash(&self, hash: u64) {
+        if let Some(meta_fd) = self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
+            meta_fd.store_hash(hash);
+            return;
+        }
+        self.status
+            .store(hash & Self::ST_SHIFT_MASK, Ordering::Release);
     }
 
     fn is_compiling(&self) -> bool {
