@@ -561,18 +561,9 @@ struct DecodedResumeLayout {
 // metainterp dependency.
 pub use majit_ir::resumedata::{ResumeValueKind, ResumeValueLayoutSummary};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResumeFrameLayoutSummary {
-    pub trace_id: Option<u64>,
-    pub header_pc: Option<u64>,
-    pub source_guard: Option<(u64, u32)>,
-    /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
-    pub jitcode_index: i32,
-    pub pc: u64,
-    pub slot_sources: Vec<ResumeValueKind>,
-    pub slot_layouts: Vec<ResumeValueLayoutSummary>,
-    pub slot_types: Option<Vec<Type>>,
-}
+// ResumeFrameLayoutSummary moved to majit-ir::resumedata (Phase C-1
+// cascade); re-exported for caller compatibility.
+pub use majit_ir::resumedata::ResumeFrameLayoutSummary;
 
 // ResumeVirtualKind moved to majit-ir::resumedata (Phase C-1
 // cascade); re-exported for caller compatibility.
@@ -608,57 +599,64 @@ pub struct ResumeLayoutSummary {
 // are available through the ResumeValueLayoutSummaryExt trait
 // re-exported above.
 
-impl ResumeFrameLayoutSummary {
-    fn to_frame_info(&self) -> FrameInfo {
-        FrameInfo {
-            jitcode_index: self.jitcode_index,
-            pc: self.pc,
-            slot_map: self
-                .slot_layouts
-                .iter()
-                .map(|slot| slot.to_resume_source())
-                .collect(),
-        }
-    }
-
-    fn to_exit_frame_layout(&self, virtual_offset: usize) -> ExitFrameLayout {
-        ExitFrameLayout {
-            trace_id: self.trace_id,
-            header_pc: self.header_pc,
-            source_guard: self.source_guard,
-            pc: self.pc,
-            jitcode_index: self.jitcode_index,
-            slots: self
-                .slot_layouts
-                .iter()
-                .map(|slot| slot.to_exit_source(virtual_offset))
-                .collect(),
-            slot_types: self.slot_types.clone(),
-        }
-    }
-
-    /// Build a `ResumeFrameLayoutSummary` from a backend-origin `ExitFrameLayout`.
-    ///
-    /// Each `ExitValueSourceLayout` slot is converted to the corresponding
-    /// `ResumeValueLayoutSummary`, preserving slot types when present.
-    pub fn from_exit_frame_layout(exit_frame: &ExitFrameLayout) -> Self {
-        let slot_layouts: Vec<ResumeValueLayoutSummary> = exit_frame
-            .slots
+// ResumeFrameLayoutSummary inherent impls extracted as free functions
+// (cross-crate orphan rule after the type moved to majit-ir::resumedata).
+fn resume_frame_layout_to_frame_info(layout: &ResumeFrameLayoutSummary) -> FrameInfo {
+    FrameInfo {
+        jitcode_index: layout.jitcode_index,
+        pc: layout.pc,
+        slot_map: layout
+            .slot_layouts
             .iter()
-            .map(majit_backend::resume_value_layout_summary_from_exit_value_source)
-            .collect();
-        let slot_sources: Vec<ResumeValueKind> = slot_layouts.iter().map(|s| s.kind).collect();
+            .map(|slot| slot.to_resume_source())
+            .collect(),
+    }
+}
 
-        Self {
-            trace_id: exit_frame.trace_id,
-            header_pc: exit_frame.header_pc,
-            source_guard: exit_frame.source_guard,
-            jitcode_index: exit_frame.jitcode_index,
-            pc: exit_frame.pc,
-            slot_sources,
-            slot_layouts,
-            slot_types: exit_frame.slot_types.clone(),
-        }
+fn resume_frame_layout_to_exit_frame_layout(
+    layout: &ResumeFrameLayoutSummary,
+    virtual_offset: usize,
+) -> ExitFrameLayout {
+    ExitFrameLayout {
+        trace_id: layout.trace_id,
+        header_pc: layout.header_pc,
+        source_guard: layout.source_guard,
+        pc: layout.pc,
+        jitcode_index: layout.jitcode_index,
+        slots: layout
+            .slot_layouts
+            .iter()
+            .map(|slot| slot.to_exit_source(virtual_offset))
+            .collect(),
+        slot_types: layout.slot_types.clone(),
+    }
+}
+
+/// Build a `ResumeFrameLayoutSummary` from a backend-origin `ExitFrameLayout`.
+///
+/// Each `ExitValueSourceLayout` slot is converted to the corresponding
+/// `ResumeValueLayoutSummary`, preserving slot types when present.
+/// Free function — `ResumeFrameLayoutSummary` lives in `majit-ir`
+/// (orphan rule prevents inherent impl outside of that crate).
+pub fn resume_frame_layout_from_exit_frame_layout(
+    exit_frame: &ExitFrameLayout,
+) -> ResumeFrameLayoutSummary {
+    let slot_layouts: Vec<ResumeValueLayoutSummary> = exit_frame
+        .slots
+        .iter()
+        .map(majit_backend::resume_value_layout_summary_from_exit_value_source)
+        .collect();
+    let slot_sources: Vec<ResumeValueKind> = slot_layouts.iter().map(|s| s.kind).collect();
+
+    ResumeFrameLayoutSummary {
+        trace_id: exit_frame.trace_id,
+        header_pc: exit_frame.header_pc,
+        source_guard: exit_frame.source_guard,
+        jitcode_index: exit_frame.jitcode_index,
+        pc: exit_frame.pc,
+        slot_sources,
+        slot_layouts,
+        slot_types: exit_frame.slot_types.clone(),
     }
 }
 
@@ -911,7 +909,7 @@ impl ResumeLayoutSummary {
             frames: self
                 .frame_layouts
                 .iter()
-                .map(|frame| frame.to_frame_info())
+                .map(resume_frame_layout_to_frame_info)
                 .collect(),
             virtuals: self
                 .virtual_layouts
@@ -971,7 +969,7 @@ impl ResumeLayoutSummary {
         frames.extend(
             self.frame_layouts
                 .iter()
-                .map(|frame| frame.to_exit_frame_layout(virtual_offset)),
+                .map(|frame| resume_frame_layout_to_exit_frame_layout(frame, virtual_offset)),
         );
         virtual_layouts.extend(
             self.virtual_layouts

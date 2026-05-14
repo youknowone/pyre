@@ -98,6 +98,24 @@ pub enum ResumeVirtualKind {
     UniSlice,
 }
 
+/// Per-frame layout summary used by `ResumeLayoutSummary`.
+///
+/// Moved here from `majit-metainterp::resume` (Phase C-1 cascade) —
+/// all field types (`Type`, `ResumeValueKind`, `ResumeValueLayoutSummary`)
+/// live in `majit-ir`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResumeFrameLayoutSummary {
+    pub trace_id: Option<u64>,
+    pub header_pc: Option<u64>,
+    pub source_guard: Option<(u64, u32)>,
+    /// resume.py:250 jitcode_index — index into metainterp_sd.jitcodes[].
+    pub jitcode_index: i32,
+    pub pc: u64,
+    pub slot_sources: Vec<ResumeValueKind>,
+    pub slot_layouts: Vec<ResumeValueLayoutSummary>,
+    pub slot_types: Option<Vec<Type>>,
+}
+
 /// Serialization-friendly summary of a `PendingFieldInfo`.
 ///
 /// Moved here from `majit-metainterp::resume` (Phase C-1 cascade);

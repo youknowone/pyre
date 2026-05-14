@@ -1292,7 +1292,7 @@ pub(crate) fn merge_frame_stack_into_resume_layout(
 
     let frame_layouts: Vec<ResumeFrameLayoutSummary> = frame_stack
         .iter()
-        .map(ResumeFrameLayoutSummary::from_exit_frame_layout)
+        .map(crate::resume::resume_frame_layout_from_exit_frame_layout)
         .collect();
 
     if let Some(ref mut resume_layout) = entry.resume_layout {
@@ -1375,7 +1375,7 @@ pub(crate) fn enrich_resume_layout_with_frame_stack(
 
     let frame_layouts: Vec<ResumeFrameLayoutSummary> = frame_stack
         .iter()
-        .map(ResumeFrameLayoutSummary::from_exit_frame_layout)
+        .map(crate::resume::resume_frame_layout_from_exit_frame_layout)
         .collect();
 
     if let Some(layout) = resume_layout {
