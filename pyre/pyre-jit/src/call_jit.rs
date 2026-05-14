@@ -1791,8 +1791,11 @@ fn jit_blackhole_resume_from_guard(
     let (driver, _) = crate::eval::driver_pair();
     let backend = driver.meta_interp().backend();
     let descr_arc = backend.fail_descr_arc_from_addr(descr_addr);
-    let trace_id = descr_arc.trace_id();
-    let fail_index = descr_arc.fail_index_per_trace();
+    let descr_fd = descr_arc
+        .as_fail_descr()
+        .expect("fail_descr_arc_from_addr returned non-FailDescr");
+    let trace_id = descr_fd.trace_id();
+    let fail_index = descr_fd.fail_index_per_trace();
 
     // `descr_owning_jct == None` is the giveup signal: the descr's
     // `rd_loop_token.loop_token_wref()` is dead (memmgr-evicted JCT —
@@ -1817,7 +1820,7 @@ fn jit_blackhole_resume_from_guard(
     // fail_index)` keying with descr identity — at which point this
     // whole recovery block collapses.
     let actual_green_key =
-        match majit_backend::descr_owning_jct(descr_arc.as_ref()).map(|j| j.green_key) {
+        match majit_backend::descr_owning_jct(descr_fd).map(|j| j.green_key) {
             Some(gk) => gk,
             None if num_fail_values >= 1 => {
                 let frame_ptr = fail_values[0] as *const pyre_interpreter::pyframe::PyFrame;
