@@ -191,7 +191,6 @@ pub struct DynasmFailDescr {
     // `AbstractFailDescr._attrs_` (`history.py:132`).  The codegen-
     // time trace-op index lives in `SOURCE_OP_INDEX_TABLE` keyed on
     // the descr's inner address.
-
     /// Backend-origin recovery layout, built at compile time from fail_arg_types.
     // recovery_layout removed (Session 7): not in PyPy
     // `AbstractFailDescr._attrs_` (`history.py:132`).  The structured
@@ -411,6 +410,17 @@ impl std::fmt::Debug for DynasmFailDescr {
 /// `cpu_handle` pointer.  There is no ambient thread-local — classifier
 /// results always identify which cpu they were resolved against.
 impl Descr for DynasmFailDescr {
+    /// Phase C-1 Step 1: downcast support for the upcoming
+    /// `Arc<dyn FailDescr>` cascade in `FrameData::fail_descr` /
+    /// `find_descr_by_ptr`.  Caller path:
+    ///   `arc.as_ref().as_any().and_then(|a| a.downcast_ref::<DynasmFailDescr>())`
+    /// recovers the concrete backend type so callers can still reach
+    /// inherent methods (`recovery_layout`, `layout`-via-trait, etc.)
+    /// that are not yet on the `FailDescr` trait surface.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
+
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
     }

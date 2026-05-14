@@ -3466,8 +3466,12 @@ fn call_assembler_fast_path_heap(
             fail_descr.recovery_layout_ref().as_ref(),
             bridge.num_inputs,
         );
-        let mut frame =
-            CraneliftBackend::execute_bridge(&bridge, &bridge_outputs, fail_arg_types, &attachments);
+        let mut frame = CraneliftBackend::execute_bridge(
+            &bridge,
+            &bridge_outputs,
+            fail_arg_types,
+            &attachments,
+        );
         let bridge_descr = get_latest_descr_from_deadframe(&frame)
             .expect("bridge deadframe must have a descriptor");
         if bridge_descr.is_finish() {
@@ -13824,7 +13828,8 @@ impl majit_backend::Backend for CraneliftBackend {
         if descr_addr == 0 {
             return;
         }
-        <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr).start_compiling();
+        <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr)
+            .start_compiling();
     }
 
     fn done_compiling_descr(&self, descr_addr: usize) {
@@ -13832,7 +13837,8 @@ impl majit_backend::Backend for CraneliftBackend {
         if descr_addr == 0 {
             return;
         }
-        <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr).done_compiling();
+        <Self as majit_backend::Backend>::fail_descr_arc_from_addr(self, descr_addr)
+            .done_compiling();
     }
 
     fn migrate_bridges(&self, old_token: &JitCellToken, new_token: &JitCellToken) {
