@@ -1140,7 +1140,7 @@ impl DynasmBackend {
         token: &JitCellToken,
         ptr: usize,
         frame_ptr: *mut JitFrame,
-    ) -> Arc<dyn FailDescr> {
+    ) -> Arc<DynasmFailDescr> {
         let attached = self.attached_descr_ptrs();
         // compile.py:618-669 done_with_this_frame_descr — check all 4 variants
         if ptr != 0
@@ -1854,14 +1854,13 @@ impl Backend for DynasmBackend {
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
         let fail_arg_locs =
-            crate::guard::lookup_fail_arg_locs(Arc::as_ptr(&descr) as *const () as usize)
-                .unwrap_or_default();
+            crate::guard::lookup_fail_arg_locs(Arc::as_ptr(&descr) as usize).unwrap_or_default();
 
         if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] descr: fi={} finish={} types={} locs={:?}",
-                descr.fail_index(),
-                descr.is_finish(),
+                descr.fail_index,
+                descr.is_finish,
                 descr.fail_arg_types().len(),
                 &fail_arg_locs
             );
@@ -1949,8 +1948,7 @@ impl Backend for DynasmBackend {
         for i in 0..num_slots {
             outputs.push(unsafe { crate::llmodel::get_int_value_direct(result_jf, i) as i64 });
         }
-        let fail_arg_locs =
-            crate::guard::lookup_fail_arg_locs(Arc::as_ptr(&descr) as *const () as usize);
+        let fail_arg_locs = crate::guard::lookup_fail_arg_locs(Arc::as_ptr(&descr) as usize);
         let mut typed_outputs = Vec::with_capacity(num_fail_args);
         for i in 0..num_fail_args {
             let raw = match fail_arg_locs.as_ref().and_then(|l| l.get(i).copied()) {
@@ -1971,17 +1969,12 @@ impl Backend for DynasmBackend {
                 Type::Int => Value::Int(raw),
             });
         }
-        // `layout` is an inherent method on `DynasmFailDescr`, not on the
-        // `FailDescr` trait — recover the concrete type via `as_any`.
-        let exit_layout = descr
-            .as_any()
-            .and_then(|a| a.downcast_ref::<DynasmFailDescr>())
-            .map(|d| d.layout());
+        let exit_layout = Some(descr.layout());
 
         majit_gc::shadow_stack::unregister_libc_jitframe(jf_ptr as usize);
         unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
 
-        let descr_addr = Arc::as_ptr(&descr) as *const () as usize;
+        let descr_addr = Arc::as_ptr(&descr) as usize;
         let descr_arc: Arc<dyn FailDescr> = descr.clone();
         majit_backend::RawExecResult {
             outputs,
@@ -1990,10 +1983,10 @@ impl Backend for DynasmBackend {
             force_token_slots: Vec::new(),
             savedata: None,
             exception_value: GcRef::NULL,
-            fail_index: descr.fail_index(),
+            fail_index: descr.fail_index,
             trace_id: descr.trace_id(),
-            is_finish: descr.is_finish(),
-            is_exit_frame_with_exception: descr.is_exit_frame_with_exception(),
+            is_finish: descr.is_finish,
+            is_exit_frame_with_exception: descr.is_exit_frame_with_exception,
             status: descr.get_status(),
             descr_addr,
             descr_arc,
