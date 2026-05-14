@@ -17711,36 +17711,18 @@ mod tests {
                 descr.as_fail_descr().map_or(false, |fd| fd.fail_index_per_trace() == fail_index)
             })
             .expect("fail descr");
-        // Backend rd_* accessors forward through `meta_descr` to the
-        // metainterp `AbstractFailDescr` Arc.  Test fixtures synthesise
-        // `DynasmFailDescr` through the codegen path without `op.descr`
-        // set, so `meta_descr` is `None`.  Stamp a fresh metainterp
-        // ResumeGuardDescr that carries the rd_* setters.
-        let backend_descr = unsafe {
-            &mut *(std::sync::Arc::as_ptr(descr_ref) as *const ()
-                as *mut majit_backend_dynasm::guard::DynasmFailDescr)
-        };
-        if backend_descr.meta_descr.is_none() {
-            let meta = crate::compile::make_resume_guard_descr_typed(
-                backend_descr.fail_arg_types.clone(),
-            );
-            if let Some(meta_fd) = meta.as_fail_descr() {
-                meta_fd.set_trace_id(backend_descr.trace_id);
-            }
-            backend_descr.meta_descr = Some(meta);
-        }
-        let meta_fd = backend_descr
-            .meta_descr
-            .as_ref()
-            .unwrap()
+        // After backend struct deletion, the `fail_descrs` vec stores
+        // `Arc<ResumeGuardDescr>` directly (production guards use op.descr;
+        // test scaffolds where op.descr is None mint a fresh metainterp
+        // ResumeGuardDescr at codegen time).  Either way, the rd_* setters
+        // route through the FailDescr trait surface on the descr Arc.
+        let descr_fd = descr_ref
             .as_fail_descr()
-            .expect("metainterp descr must implement FailDescr");
-        meta_fd.set_rd_numb(Some(rd_numb));
-        meta_fd.set_rd_consts(Some(rd_consts));
-        meta_fd.set_rd_virtuals(Some(vec![]));
-        meta_fd.set_rd_pendingfields(Some(vec![]));
-        // Re-run register_fail_descrs so the meta-keyed registry entry
-        // lands.  Idempotent: existing backend-keyed entries are preserved.
+            .expect("descr must implement FailDescr");
+        descr_fd.set_rd_numb(Some(rd_numb));
+        descr_fd.set_rd_consts(Some(rd_consts));
+        descr_fd.set_rd_virtuals(Some(vec![]));
+        descr_fd.set_rd_pendingfields(Some(vec![]));
         backend.register_fail_descrs(&compiled.fail_descrs);
     }
 
