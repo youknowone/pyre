@@ -3703,27 +3703,46 @@ impl CodeWriter {
                 // liveness pass (`liveness.py:68-69`) can reset the alive
                 // set.
                 push_walker_emit(&mut $ssarepr, &current_block, Insn::Unreachable);
-                // Step 6.1 Phase 2b: attach a single unconditional
-                // `Link` from the current block to the target PC's
-                // block. `flatten.py:161` `self.emitline('goto',
-                // TLabel(link.target))` is the serialised view of the
-                // same edge.
-                mergeblock(
-                    code,
-                    &mut graph,
-                    &mut joinpoints,
-                    &current_block,
-                    &{
-                        let mut branch_state = current_state.clone();
-                        branch_state.next_offset = target_py_pc;
-                        branch_state.blocklist = frame_blocks_for_offset(code, target_py_pc);
-                        branch_state
-                    },
-                    target_py_pc,
-                    &mut link_exit_states,
-                    &mut pendingblocks,
-                    &mut all_walker_blocks,
-                );
+                // Skip mergeblock when the goto target's start_pc has
+                // already been emitted (back-edge to PC walked earlier).
+                // Without the skip, mergeblock falls through to
+                // make_next_block (since A's framestate at start_pc
+                // doesn't union with currentstate at target_py_pc) and
+                // creates a fresh newblock that the outer loop then
+                // skips via emitted_pc_starts → orphan.
+                //
+                // With the skip: no orphan block created, no
+                // currentblock→orphan link added.  Runtime correctness is
+                // preserved because the SSARepr uses pc{N} labels; the
+                // emitted goto Label("pcN") + Unreachable above resolves
+                // to the existing block A's emitted pc{N} position via
+                // the linear label_positions map.
+                if !emitted_pc_starts
+                    .get(target_py_pc)
+                    .copied()
+                    .unwrap_or(false)
+                {
+                    // `flatten.py:161` `self.emitline('goto',
+                    // TLabel(link.target))` is the serialised view of
+                    // the same edge.
+                    mergeblock(
+                        code,
+                        &mut graph,
+                        &mut joinpoints,
+                        &current_block,
+                        &{
+                            let mut branch_state = current_state.clone();
+                            branch_state.next_offset = target_py_pc;
+                            branch_state.blocklist =
+                                frame_blocks_for_offset(code, target_py_pc);
+                            branch_state
+                        },
+                        target_py_pc,
+                        &mut link_exit_states,
+                        &mut pendingblocks,
+                        &mut all_walker_blocks,
+                    );
+                }
                 needs_fallthrough = false;
             }};
         }
@@ -4177,6 +4196,13 @@ impl CodeWriter {
                 // implicitly at the next `emit_mark_label_pc!` in a
                 // follow-up slice when pyre's walker learns to insert
                 // fallthrough Links for non-terminating blocks.
+                //
+                // Note: unlike `emit_goto!` we do NOT skip mergeblock
+                // for already-emitted back-edge targets here — the
+                // immediate `set_last_bool_exitcase(false)` callsites
+                // (PopJumpIfFalse / PopJumpIfTrue) require this
+                // mergeblock to have appended a fresh linkfalse exit
+                // so the case stamps onto the right link.
                 mergeblock(
                     code,
                     &mut graph,
