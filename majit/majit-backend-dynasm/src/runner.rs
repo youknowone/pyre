@@ -1908,8 +1908,12 @@ impl Backend for DynasmBackend {
         majit_gc::shadow_stack::unregister_libc_jitframe(jf_ptr as usize);
         unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
 
+        // FrameData::fail_descr is now DescrRef (Phase C-1 cascade);
+        // upcast the backend Arc identity at the boundary so FailDescr
+        // trait operations route through `as_fail_descr()` thereafter.
+        let descr_ref: majit_ir::DescrRef = descr;
         DeadFrame {
-            data: Box::new(FrameData::new(raw_values, descr, None)),
+            data: Box::new(FrameData::new(raw_values, descr_ref, None)),
         }
     }
 
@@ -2016,34 +2020,20 @@ impl Backend for DynasmBackend {
 
     fn get_latest_descr<'a>(&'a self, frame: &'a DeadFrame) -> &'a dyn FailDescr {
         let data = frame.data.downcast_ref::<FrameData>().unwrap();
-        &*data.fail_descr
+        data.fail_descr
+            .as_fail_descr()
+            .expect("FrameData::fail_descr must implement FailDescr")
     }
 
     fn get_latest_descr_arc(&self, frame: &DeadFrame) -> Arc<dyn majit_ir::Descr> {
         // `history.py:125` `cpu.get_latest_descr(deadframe)` returns the
-        // metainterp `AbstractFailDescr` object op.descr stamped — the
-        // same descr identity PyPy returns.  Walk through the backend
-        // Arc's `meta_descr` back-pointer to recover it.
-        //
-        // `register_fail_descrs` dual-indexes by backend addr + meta
-        // addr; test helpers that stamp `meta_descr` late re-run
-        // `register_fail_descrs` to land the meta-keyed entry.
-        // Downstream `descr_addr = Arc::as_ptr(arc)` lookups resolve
-        // to the backend Arc via either key for status/start_compiling
-        // dispatch.  `ResumeGuardDescr::fail_index()` returns the
-        // per-trace key matching the backend's `fail_index` field
-        // (assembler.py:227 self.faildescr.index = i parity), so
-        // `exit_layouts.get(&fail_index)` lookups resolve identically
-        // for both meta and backend Arc identities.
-        //
-        // Synthetic backend descrs (FINISH / `PropagateExceptionDescr`
-        // / `ExitFrameWithExceptionDescr`) without a meta back-pointer
-        // fall back to the backend Arc upcast.
+        // metainterp `AbstractFailDescr` object op.descr stamped.  After
+        // the FrameData::fail_descr type cascade to `DescrRef`, `fail_descr`
+        // *is* the metainterp Arc (production codegen + synthetic exits
+        // both stamp it via DescrRef directly), so we just clone the
+        // shared identity.
         let data = frame.data.downcast_ref::<FrameData>().unwrap();
-        if let Some(meta) = data.fail_descr.meta_descr.clone() {
-            return meta;
-        }
-        Arc::clone(&data.fail_descr) as Arc<dyn majit_ir::Descr>
+        Arc::clone(&data.fail_descr)
     }
 
     /// `fail_descr_registry` is the `addr → Arc<DynasmFailDescr>` table

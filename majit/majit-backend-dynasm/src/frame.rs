@@ -1,18 +1,21 @@
 /// jitframe.py / assembler.py frame parity:
 /// Stores saved values and descriptor reference from guard failure.
-use std::sync::Arc;
-
 use majit_ir::DescrRef;
 use majit_ir::GcRef;
 
-use crate::guard::DynasmFailDescr;
-
 /// Concrete data stored in DeadFrame by the dynasm backend.
+///
+/// `fail_descr` carries the metainterp class-distinct Arc identity
+/// (ResumeGuardDescr family for guards, DoneWithThisFrame*/
+/// ExitFrameWithExceptionDescrRef for FINISH exits) — Phase C-1 cascade
+/// step that retires the per-backend `DynasmFailDescr` wrapper at the
+/// `FrameData` boundary.  FailDescr-trait operations on the descr go
+/// through `DescrRef::as_fail_descr`.
 pub struct FrameData {
     /// Raw exit slot values.
     pub(crate) raw_values: Vec<i64>,
     /// Backend-local fail descriptor used for slot decoding / bridge data.
-    pub(crate) fail_descr: Arc<DynasmFailDescr>,
+    pub(crate) fail_descr: DescrRef,
     /// Original `jf_descr` object identity when the exit used an attached
     /// metainterp descr (`DoneWithThisFrame*` / `ExitFrameWithExceptionDescrRef`).
     pub(crate) latest_descr: Option<DescrRef>,
@@ -22,7 +25,7 @@ impl std::fmt::Debug for FrameData {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("FrameData")
             .field("num_values", &self.raw_values.len())
-            .field("fail_descr", &self.fail_descr)
+            .field("fail_descr", &self.fail_descr.repr())
             .field(
                 "latest_descr",
                 &self.latest_descr.as_ref().map(|descr| descr.repr()),
@@ -34,7 +37,7 @@ impl std::fmt::Debug for FrameData {
 impl FrameData {
     pub fn new(
         raw_values: Vec<i64>,
-        fail_descr: Arc<DynasmFailDescr>,
+        fail_descr: DescrRef,
         latest_descr: Option<DescrRef>,
     ) -> Self {
         FrameData {
