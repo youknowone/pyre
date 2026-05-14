@@ -285,11 +285,25 @@ impl DynasmFailDescr {
         trace_id: u64,
         fail_arg_types: Vec<Type>,
     ) -> Self {
+        Self::with_meta(fail_index, trace_id, fail_arg_types, None)
+    }
+
+    /// Construct with the metainterp `AbstractFailDescr` Arc already
+    /// stamped.  Production codegen sites stamp `meta_descr` immediately
+    /// after `Arc::new`; threading it through the constructor lets the
+    /// codegen sites avoid the post-wrap `unsafe { Arc::as_ptr as *mut }`
+    /// write to `descr_mut.meta_descr`.
+    pub fn with_meta(
+        fail_index: u32,
+        trace_id: u64,
+        fail_arg_types: Vec<Type>,
+        meta_descr: Option<DescrRef>,
+    ) -> Self {
         DynasmFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
-            meta_descr: None,
+            meta_descr,
         }
     }
 

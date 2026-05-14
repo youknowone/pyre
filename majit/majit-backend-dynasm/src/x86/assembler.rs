@@ -3085,15 +3085,12 @@ impl<'a> Assembler386<'a> {
                 };
                 // FINISH op exit (DoneWithThisFrame* / ExitFrameWithExceptionDescr).
                 // `compile.py:185` skips these — not a `ResumeDescr`.
-                let descr = {
-                    let mut d = DynasmFailDescr::new(
-                        fail_index,
-                        self.trace_id,
-                        fail_arg_types.clone(),
-                    );
-                    d.meta_descr = self.done_with_this_frame_descr_arc_for_type(result_type);
-                    Arc::new(d)
-                };
+                let descr = Arc::new(DynasmFailDescr::with_meta(
+                    fail_index,
+                    self.trace_id,
+                    fail_arg_types.clone(),
+                    self.done_with_this_frame_descr_arc_for_type(result_type),
+                ));
 
                 // Store result to jf_frame[0]
                 if let Some(result) = arglocs.first() {
@@ -5015,15 +5012,12 @@ impl<'a> Assembler386<'a> {
             fail_arg_types[0]
         };
         let global_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
-        let descr = {
-            let mut d = DynasmFailDescr::new(
-                fail_index,
-                self.trace_id,
-                fail_arg_types.clone(),
-            );
-            d.meta_descr = self.done_with_this_frame_descr_arc_for_type(result_type);
-            Arc::new(d)
-        };
+        let descr = Arc::new(DynasmFailDescr::with_meta(
+            fail_index,
+            self.trace_id,
+            fail_arg_types.clone(),
+            self.done_with_this_frame_descr_arc_for_type(result_type),
+        ));
 
         // If there's a result argument, store it to jf_frame[0].
         // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.
