@@ -492,7 +492,7 @@ pub fn intern_call_descr_stub(
 /// (assembler / blackhole / trace recorder) from reading `flavor`
 /// directly to reading `effect_info.extraeffect`.
 ///
-/// **Stub limitations (PRE-EXISTING-ADAPTATION on every variant).**
+/// **Stub limitations.**
 /// RPython `call.py:296-326 getcalldescr` constructs the EffectInfo
 /// from four static analyzers run over the callee graph:
 ///
@@ -2283,25 +2283,15 @@ pub fn flatten_graph_with_lowering<'a, F, C>(
 /// `cpu` through `make_exception_link` for `handling_ovf=True` reraise
 /// targets (`flatten.py:166-170`).
 ///
-/// **PRE-EXISTING-ADAPTATION** (Phase 4 of the issue #27 plan):
-/// upstream's `flatten_graph` does not take a `LoweringContext` — the
-/// rtyper rewrites the graph to post-rtype shape BEFORE flatten_graph
-/// runs, so the dispatcher (`flatten_op_to_insn_with_lowering`) has no
-/// upstream analog.  Pyre's flatten still needs the dispatcher because
-/// pyre's graph carries pre-rtype HLOps for the 4 retired families
-/// (BINARY_OP / COMPARE_OP / BOOL / SETITEM), so a
-/// `LoweringContext` parameter is threaded as a pyre-specific
-/// extension.  Phase 5 retires this once pyre's walker stops emitting
-/// HLOps in favour of post-rtype residual_calls on the graph too.
+/// **`LoweringContext` derivation.**
+/// Upstream's `flatten_graph` does not take a `LoweringContext` because
+/// the rtyper rewrites the graph to post-rtype shape BEFORE flatten_graph
+/// runs.  Pyre's graph carries pre-rtype HLOps (BINARY_OP / COMPARE_OP /
+/// BOOL / SETITEM families) directly; the canonical entry derives the
+/// dispatcher's `LoweringContext` from `cpu.lowering_ctx` (a pyre
+/// extension on `Cpu`) so the upstream `flatten_graph(graph, regallocs,
+/// _include_all_exc_links, cpu)` signature stays intact.
 ///
-/// **PRE-EXISTING-ADAPTATION**: the constant lowering closure used
-/// here is `flatten_constant_operand_for_probe`, which lowers
-/// `Opaque(Ref)` to `ConstRef(0)`.  Production callers needing real
-/// pycode/jitdriver pointers still go through
-/// `flatten_graph_with_lowering` directly with a production closure;
-/// the new orthodox entry is currently consumed by the
-/// `[phase4-flatten-graph]` probe and unit tests where the placeholder
-/// is acceptable.
 /// **Upstream-orthodox entry** matching
 /// `rpython/jit/codewriter/flatten.py:63-70 flatten_graph(graph,
 /// regallocs, _include_all_exc_links=False, cpu=None)` signature with
@@ -2320,12 +2310,7 @@ pub fn flatten_graph<'a>(
     // `flatten.py:68 flattener.enforce_input_args()`.  Upstream stores
     // `regallocs` on `self.regallocs` and the method mutates it
     // in place; pyre's `get_register` closure (constructed below)
-    // captures `&regallocs`, so the swap must run BEFORE the closure
-    // exists.  Once Task #227 Phase 4 makes regallocs a
-    // `GraphFlattener` field, this call collapses inside the
-    // construct-then-call sequence at the bottom of this function
-    // and matches the upstream order line-by-line.
-    // PRE-EXISTING-ADAPTATION (Task #227 Phase 4 convergence).
+    // captures `&regallocs`, so the swap runs BEFORE the closure exists.
     super::regalloc::enforce_input_args_simulation(graph, regallocs);
     // `flatten.py:67 flattener = GraphFlattener(graph, regallocs,
     // _include_all_exc_links, cpu)`.

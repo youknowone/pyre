@@ -41,7 +41,7 @@ use super::flatten::{
 /// vector; `var_num` from `LOAD_FAST`/`STORE_FAST` is already a direct
 /// offset into that vector (no indirection).
 ///
-/// PRE-EXISTING-ADAPTATION: explicit local→vable-array remap.
+/// Identity remap of local-index → vable-array slot.
 /// `jtransform.py:1877` `do_fixed_list_getitem` / `:1898`
 /// `do_fixed_list_setitem` derive the index implicitly from the
 /// `_virtualizable_` slot order on the W_Root subclass. Pyre's
@@ -788,8 +788,8 @@ fn exceptblock_link_args(source_state: &FrameState) -> Vec<super::flow::FlowValu
 /// Allocate the fresh `(exc_type, exc_value)` Variable pair that
 /// represents an exception edge's payload at the graph level.
 ///
-/// PRE-EXISTING-ADAPTATION vs `rpython/flowspace/flowcontext.py:1250-
-/// 1261 Raise.nomoreblocks`: RPython's flow analysis sees the Python
+/// vs `rpython/flowspace/flowcontext.py:1250-1261 Raise.nomoreblocks`:
+/// RPython's flow analysis sees the Python
 /// source form `raise SomeError("msg")` and builds an
 /// `OperationException(w_type=Constant(SomeError), w_value=...)` from
 /// which `Raise.nomoreblocks` projects `[w_exc.w_type, w_exc.w_value]`
@@ -1070,25 +1070,23 @@ fn mergeblock(
                 currentstate,
                 link_exit_states,
             );
-            // PRE-EXISTING-ADAPTATION — pyre-only head-of-list
-            // promotion.  Upstream `flowcontext.py:438-441` returns
-            // the matched block directly; the surrounding pendingblocks
-            // queue carries block objects so a PC-keyed joinpoint
-            // lookup never happens.  Pyre's walker is PC-sequential
-            // and reads "active block at PC N" through
-            // `joinpoints.get(&py_pc).and_then(|blocks|
-            // blocks.iter().find(|b| !b.dead()))` (codewriter.rs:3584).
-            // The loop above allows `continue` on union-None (line
-            // 957), so a match can land at `index > 0`; without this
-            // reorder the next joinpoint lookup at `next_offset` would
-            // return a sibling candidate instead of the one we just
-            // linked into, and the walker would emit subsequent ops
-            // against a different block's FrameState.  The supersede
-            // branch at codewriter.rs:1021-1022 and the fresh-path
-            // `candidates.insert(0, ...)` at codewriter.rs:1038 / 1080
-            // already preserve the head-of-list invariant; the match
-            // branch must do the same.  Retires when Task #227 Phase
-            // 4 replaces PC sequencing with a pendingblocks-driven
+            // Pyre-only head-of-list promotion.  Upstream
+            // `flowcontext.py:438-441` returns the matched block
+            // directly; the surrounding pendingblocks queue carries
+            // block objects so a PC-keyed joinpoint lookup never
+            // happens.  Pyre's walker is PC-sequential and reads
+            // "active block at PC N" through `joinpoints.get(&py_pc).
+            // and_then(|blocks| blocks.iter().find(|b| !b.dead()))`.
+            // The loop above allows `continue` on union-None, so a
+            // match can land at `index > 0`; without this reorder the
+            // next joinpoint lookup at `next_offset` would return a
+            // sibling candidate instead of the one we just linked
+            // into, and the walker would emit subsequent ops against
+            // a different block's FrameState.  The supersede branch
+            // and the fresh-path `candidates.insert(0, ...)` already
+            // preserve the head-of-list invariant; the match branch
+            // does the same.  Retires when the Task #227 walker
+            // restructure replaces PC sequencing with a pendingblocks-driven
             // walker.
             if index != 0 {
                 candidates.remove(index);
@@ -1124,15 +1122,13 @@ fn mergeblock(
         //     candidates.insert(0, newblock)
         //     self.pendingblocks.append(newblock)
         //
-        // PRE-EXISTING-ADAPTATION at the surrounding walker loop
-        // (codewriter.rs:3781 `emitted_pc_starts` skip) prevents the
-        // re-walk that upstream relies on after the
+        // The surrounding walker loop's `emitted_pc_starts` skip
+        // prevents the re-walk that upstream relies on after the
         // `pendingblocks.append(newblock)` below — RPython re-emits
         // the superseded range's operations into newblock under the
         // widened inputargs, while pyre keeps the first pass's
-        // ssarepr bytes verbatim.  Convergence: Task #227 Phase 4 +
-        // Task #212 walker CFG/Link restructure
-        // (`codewriter.py:44-67` target).
+        // ssarepr bytes verbatim.  The newblock is dead-marked at the
+        // outer-loop skip so flatten_graph traversals route around it.
         block.mark_dead();
         block.block().borrow_mut().operations.clear();
         block.block().borrow_mut().exitswitch = None;
@@ -1162,13 +1158,12 @@ fn mergeblock(
     newblock
 }
 
-/// PRE-EXISTING-ADAPTATION: Rust `FlowValue` is statically kinded
-/// (Int/Ref/Float) and requires `Kind::Ref` at construction. RPython
-/// `Variable()` (`flowspace/model.py`) is unkinded — flowgraph
-/// variables carry no type at construction; the annotator infers
-/// types in a later pass. The 1-line wrapper exists only because
-/// pyre's `Kind::Ref` parameter would otherwise repeat at every
-/// call site.
+/// Rust `FlowValue` is statically kinded (Int/Ref/Float) and requires
+/// `Kind::Ref` at construction. RPython `Variable()`
+/// (`flowspace/model.py`) is unkinded — flowgraph variables carry no
+/// type at construction; the annotator infers types in a later pass.
+/// The 1-line wrapper exists only because pyre's `Kind::Ref` parameter
+/// would otherwise repeat at every call site.
 fn fresh_ref_value(graph: &mut super::flow::FunctionGraph) -> super::flow::FlowValue {
     graph.fresh_variable(Kind::Ref).into()
 }
@@ -1774,8 +1769,8 @@ fn emit_frontend_bool(
     // `lltype.Bool` in control-flow positions as `Kind::Int`, matching
     // the existing `goto_if_not` / `goto_if_not_int_is_zero` SSA ops.
     //
-    // PRE-EXISTING-ADAPTATION: upstream's `op.bool(w_value).eval(self)`
-    // produces a single `lltype.Bool` Variable that flows into the
+    // Upstream's `op.bool(w_value).eval(self)` produces a single
+    // `lltype.Bool` Variable that flows into the
     // block's exitswitch AND is reused as the `goto_if_not` input by
     // `flatten.py:240-267`. pyre keeps two parallel value chains: the
     // graph-side Variable returned here (consumed only by the front-end
@@ -1886,8 +1881,8 @@ fn emit_frontend_compare(
     )
 }
 
-/// PRE-EXISTING-ADAPTATION: pyre's `ConstantData` enum is richer than
-/// RPython's flat `Constant(value)` — it carries variant-typed payloads
+/// Pyre's `ConstantData` enum is richer than RPython's flat
+/// `Constant(value)` — it carries variant-typed payloads
 /// (None/Boolean/Integer/Str/...) that not all map cleanly into a
 /// flowgraph `Constant`. Returns `None` for variants the shadow graph
 /// cannot represent (the caller falls back to `fresh_ref_value`).
@@ -1989,7 +1984,7 @@ fn attach_catch_exception_edge(
     let edge_state = exception_landing_state(graph, source_state);
 
     // Update the landing block's framestate / inputargs from the
-    // edge state.  PRE-EXISTING-ADAPTATION: RPython models each
+    // edge state.  Note: RPython models each
     // raise site with its own `EggBlock(vars2, block, case)`
     // (`flowcontext.py:138`), with `vars2 = [Variable(),
     // Variable()]` per case — the egg's body is responsible for
@@ -2114,7 +2109,7 @@ fn collect_block_states(
 /// `block.exits` → `zip(link.args, link.target.inputargs)` and unions
 /// each Variable pair via `_try_coalesce`.  RPython has no FrameState
 /// indirection — Variables carry their own UnionFind identity.
-/// pyre's regalloc is u16-register-keyed (PRE-EXISTING-ADAPTATION;
+/// pyre's regalloc is u16-register-keyed (Note;
 /// see `regalloc.rs:26-36`), so this helper projects Variables back
 /// onto slots through the per-link mergeable positions preserved when
 /// the Link was created.
@@ -2264,7 +2259,7 @@ struct HelperHandle {
 /// interned in a fixed order so the dispatch handlers can capture the
 /// indices once and reuse them across emit sites.
 ///
-/// PRE-EXISTING-ADAPTATION: the order matches the historical
+/// Note: the order matches the historical
 /// inline sequence (`call_fn`, then the per-opcode helpers, then the
 /// per-arity `call_fn_n`). Changing the order would shift every
 /// `assembler.add_fn_ptr` index — RPython's `assembler.see_raw_object`
@@ -2504,7 +2499,7 @@ fn register_helper_fn_pointers(
 /// produces one SSA-driven alive set as the sole authority, and
 /// `assembler.py:150-152` only splits that set by kind.
 ///
-/// PRE-EXISTING-ADAPTATION: `live_r` carries an extra LV∩SSA
+/// Note: `live_r` carries an extra LV∩SSA
 /// `retain` step on top of the SSA bank — see the inline comment
 /// in the loop body below.  Removing it requires extending the
 /// encoder + symbolic-state pair to track scratch Ref colors,
@@ -2686,7 +2681,7 @@ fn filter_liveness_in_place(
                 }
             }
         }
-        // PRE-EXISTING-ADAPTATION: LV∩SSA retain narrows the Ref bank
+        // Note: LV∩SSA retain narrows the Ref bank
         // to the post-rename colors that correspond to LV-live Python
         // locals or live stack slots at this PC.  After the slice
         // 3b-2/3b-3 flip the encoder reads `registers_r[color]`
@@ -2780,7 +2775,7 @@ fn filter_liveness_in_place(
 ///   when `push_lasti`); used by the dispatch loop to fix
 ///   `current_depth` at the handler's first instruction.
 ///
-/// PRE-EXISTING-ADAPTATION: RPython has no analog because RPython
+/// Note: RPython has no analog because RPython
 /// flow graphs already carry exception-handling links; pyre's input
 /// is raw CPython bytecode + the packed exception table, so this
 /// preprocessing step is pyre-specific.
@@ -2979,7 +2974,7 @@ impl CodeWriter {
     ///     self.callcontrol.virtualref_info = vrefinfo
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre has no `virtualref` machinery
+    /// Note: pyre has no `virtualref` machinery
     /// (no `@jit.virtual_ref`, no `vref_info` lookup); the slot is
     /// preserved so future warmspot wiring can call through with the
     /// same name.
@@ -2999,7 +2994,7 @@ impl CodeWriter {
     ///     self.callcontrol.jitdrivers_sd.append(jitdriver_sd)
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: RPython appends unconditionally because
+    /// Note: RPython appends unconditionally because
     /// each `@jit_callback` decoration calls `setup_jitdriver` exactly
     /// once at translation time. pyre's portal discovery is lazy and
     /// fires on every JIT entry, so the same `portal_graph` would be
@@ -3117,7 +3112,7 @@ impl CodeWriter {
         // killing the cross-arm conflated Variable that previously caused
         // scratch slots to appear "alive" at unrelated `-live-` markers.
         let scratch_ref_base: u16 = portal_ec_reg + 1;
-        // PRE-EXISTING-ADAPTATION: literal field indices crystallised at
+        // Note: literal field indices crystallised at
         // the codewriter call site. RPython looks up the index dynamically
         // through `VABLEINFO.static_field_descrs` since each backend may
         // reorder fields. Pyre's `_virtualizable_` order matches PyPy
@@ -3468,7 +3463,7 @@ impl CodeWriter {
         // `emitted_pc_starts` therefore requires completing Task #227
         // Phase 4 (production flip to post-walk flatten emission) —
         // it is not a standalone walker refactor.
-        // PRE-EXISTING-ADAPTATION (Task #227 Phase 4 convergence).
+        // Note: pending walker restructure.
 
         // interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` is called in
         // `jump_absolute` (`jumpto < next_instr` branch), i.e. at each
@@ -3552,7 +3547,7 @@ impl CodeWriter {
             };
         }
 
-        // PRE-EXISTING-ADAPTATION: the `BC_ABORT_PERMANENT` runtime
+        // Note: the `BC_ABORT_PERMANENT` runtime
         // bytecode does not appear in `rpython/jit/codewriter/` or
         // `rpython/jit/metainterp/`. RPython refuses to build jitcode for
         // bytecodes it cannot translate (the translator surfaces the
@@ -3583,7 +3578,7 @@ impl CodeWriter {
             }};
         }
 
-        // PRE-EXISTING-ADAPTATION: the `BC_JUMP_TARGET` runtime opcode
+        // Note: the `BC_JUMP_TARGET` runtime opcode
         // does not appear in `rpython/jit/codewriter/`. RPython marks
         // loop-header block entries with a plain `Insn::Label` and lets
         // the blackhole's dispatch loop recognise them via the label
@@ -3739,8 +3734,7 @@ impl CodeWriter {
                         &{
                             let mut branch_state = current_state.clone();
                             branch_state.next_offset = target_py_pc;
-                            branch_state.blocklist =
-                                frame_blocks_for_offset(code, target_py_pc);
+                            branch_state.blocklist = frame_blocks_for_offset(code, target_py_pc);
                             branch_state
                         },
                         target_py_pc,
@@ -4914,7 +4908,7 @@ impl CodeWriter {
                 .framestate()
                 .expect("pending block must carry a FrameState (flowcontext.py:408)");
             let start_pc = pending_state.next_offset;
-            // Task #227.5 item 2 (load-bearing PRE-EXISTING-ADAPTATION):
+            // Task #227.5 item 2 (load-bearing Note):
             // The `emitted_pc_starts` PC-index skip is required because
             // pyre's ssarepr emission is INLINE during the walker
             // pass.  When the walker re-pops a SpamBlock whose start_pc
@@ -4965,7 +4959,7 @@ impl CodeWriter {
             // start of every new block iteration so a previous
             // block's queued switch doesn't bleed into this one.
             block_switch_pending = false;
-            // PRE-EXISTING-ADAPTATION — upstream `flowcontext.py:407-416`
+            // Note — upstream `flowcontext.py:407-416`
             // drives per-block op accumulation via `while True:
             // handle_bytecode(...)` until a terminator, then
             // `record_block` assigns `block.operations` from the
@@ -7346,7 +7340,7 @@ impl CodeWriter {
         // inserts at every block-switch boundary (Phase 4 alignment
         // with `flatten.py:177-258 insert_exits`).
         {
-            // PRE-EXISTING-ADAPTATION (Phase 4 walker restructure
+            // Note (pending walker restructure
             // convergence): concatenate per-block accumulators, then
             // peel off redundant `goto Label("pcN") + Unreachable`
             // pairs whenever the immediately-following block opens
@@ -7670,7 +7664,7 @@ impl CodeWriter {
         // alongside the body in a single object construction step,
         // matching the upstream constructor order.  See
         // [`super::call::CallControl::get_jitcode_calldescr`] for the
-        // PRE-EXISTING-ADAPTATION rationale of the constant return value.
+        // Note rationale of the constant return value.
         let (fnaddr, calldescr) = self
             .callcontrol()
             .get_jitcode_calldescr(code as *const CodeObject);
@@ -7806,7 +7800,7 @@ impl CodeWriter {
             // codewriter.py:80 `self.transform_graph_to_jitcode(graph,
             //                     jitcode, verbose, len(all_jitcodes))`.
             //
-            // PRE-EXISTING-ADAPTATION: `transform_graph_to_jitcode`
+            // Note: `transform_graph_to_jitcode`
             // still returns a fresh `PyJitCode`, but `publish_jitcode`
             // replaces the cached skeleton's payload in place. That
             // matches RPython's "same JitCode object is filled later"
@@ -7932,7 +7926,7 @@ fn skip_caches(code: &CodeObject, mut pos: usize) -> usize {
 /// so this adapter fires per JIT entry. `setup_jitdriver` dedups by
 /// `portal_graph` so `jitdrivers_sd` stays bounded by the number of
 /// unique portals (see [`CodeWriter::setup_jitdriver`] for the
-/// PRE-EXISTING-ADAPTATION rationale).
+/// Note rationale).
 ///
 /// `make_jitcodes` is then the canonical RPython no-arg call: it
 /// pulls its seed list from `CallControl.jitdrivers_sd` and runs

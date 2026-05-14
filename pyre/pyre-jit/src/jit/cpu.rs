@@ -11,7 +11,7 @@
 //! convenience accessor `CodeWriter::cpu(&self)` so the upstream
 //! attribute access pattern still works.
 //!
-//! PRE-EXISTING-ADAPTATION: pyre's "cpu" is much smaller than RPython's
+//! Note: pyre's "cpu" is much smaller than RPython's
 //! `LLGraphCPU` — there is no `calldescrof`, no `setup_descrs`, no
 //! vector-extension support, and no GC integration at this layer.
 //! All those concerns either live in `pyre_jit_trace::state` (descrs)
@@ -79,7 +79,7 @@ pub struct Cpu {
     /// upstream's "cpu carries everything flatten needs" contract).
     /// Each `Option<u16>` is populated by `CodeWriter::transform_
     /// graph_to_jitcode` from `descrs.intern_int_method_index`.
-    /// **PRE-EXISTING-ADAPTATION**: upstream's `cpu` does not carry
+    /// **Note**: upstream's `cpu` does not carry
     /// these because upstream's rtyper rewrites the graph to post-
     /// rtype shape before `flatten_graph` runs, so the dispatcher has
     /// no upstream analog.  Phase 5 retires these fields once pyre's

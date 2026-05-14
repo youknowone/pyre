@@ -491,7 +491,7 @@ impl std::hash::Hash for IndirectCallTargetsByPtr {
 /// `AbstractDescr`), and `IndirectCallTargets` wraps pyre's
 /// `flatten::IndirectCallTargets` (upstream `IndirectCallTargets`).
 ///
-/// PRE-EXISTING-ADAPTATION: Rust needs a concrete sum type.  We cannot
+/// Note: Rust needs a concrete sum type.  We cannot
 /// simply extend `FlowValue` to cover ListOfKind/Descr/IndirectCallTargets
 /// because `FlowValue` is also the element type of `Block.inputargs`,
 /// `SpaceOperation.result`, `Link.args`, `Link.exitcase`, and

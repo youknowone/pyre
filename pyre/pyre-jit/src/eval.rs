@@ -288,7 +288,7 @@ thread_local! {
         // virtualref.py — JIT_VIRTUAL_REF as a proper GC type.
         // Layout: super_.typeptr(u64, offset 0) | virtual_token(*mut u8, offset 8) | forced(*mut u8, offset 16)
         //
-        // PRE-EXISTING-ADAPTATION (GC trace divergence).  Upstream
+        // Note (GC trace divergence).  Upstream
         // `virtualref.py:17-20` declares both `virtual_token` and
         // `forced` as GC slots (`llmemory.GCREF` / `OBJECTPTR`); pyre
         // registers only `forced` (offset 16) in `gc_ptr_offsets`.
@@ -2401,7 +2401,7 @@ fn eval_loop_jit(frame: &mut PyFrame) -> LoopResult {
     // check because module-level `<module>` frames lack the
     // function-scope PyFrame layout the JIT relies on.
     //
-    // PRE-EXISTING-ADAPTATION: pyre routes every function-scope
+    // Note: pyre routes every function-scope
     // CodeObject through `jit_merge_point_hook` and `can_enter_jit`
     // so that recursive calls into a previously-traced function reach
     // `maybe_compile_and_run` even before the function's own loop
@@ -3724,7 +3724,7 @@ fn allocate_struct(typedescr: &dyn majit_ir::SizeDescr) -> usize {
     let size = typedescr.size();
     let descr = majit_translate::jitcode::BhDescr::Size {
         size,
-        // PRE-EXISTING-ADAPTATION: BhDescr.type_id is the u64 cache key;
+        // Note: BhDescr.type_id is the u64 cache key;
         // `typedescr.type_id()` returns the u32 gc tid.  Widen via
         // `as u64` until `SizeDescr` exposes a `cache_key()` accessor.
         type_id: typedescr.type_id() as u64,
@@ -3807,7 +3807,7 @@ fn allocate_with_vtable(descr: &dyn majit_ir::SizeDescr) -> usize {
     let vtable = descr.vtable();
     let bh_descr = majit_translate::jitcode::BhDescr::Size {
         size,
-        // PRE-EXISTING-ADAPTATION: u32 gc tid widened to u64 cache key slot.
+        // Note: u32 gc tid widened to u64 cache key slot.
         type_id: descr.type_id() as u64,
         vtable,
         owner: String::new(),
@@ -5759,7 +5759,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             .expect("allocate_struct: not a SizeDescr");
         let bh_descr = majit_translate::jitcode::BhDescr::Size {
             size: sd.size(),
-            // PRE-EXISTING-ADAPTATION: u32 gc tid widened to u64 cache key slot.
+            // Note: u32 gc tid widened to u64 cache key slot.
             type_id: sd.type_id() as u64,
             vtable: 0,
             owner: String::new(),
@@ -5807,7 +5807,7 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             _ => {
                 let bh_descr = majit_translate::jitcode::BhDescr::Size {
                     size: descr_size,
-                    // PRE-EXISTING-ADAPTATION: u32 gc tid widened to u64 cache key slot.
+                    // Note: u32 gc tid widened to u64 cache key slot.
                     type_id: descr_index as u64,
                     vtable,
                     owner: String::new(),

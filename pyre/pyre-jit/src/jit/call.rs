@@ -23,7 +23,7 @@
 //! | `enum_pending_graphs()`     | `enum_pending_graphs()`     |
 //! | (n/a — pure-lookup helper)  | `find_jitcode()`            |
 //!
-//! PRE-EXISTING-ADAPTATION: RPython's CallControl is owned by a single
+//! Note: RPython's CallControl is owned by a single
 //! `CodeWriter` instance (`warmspot.py:245`) for the lifetime of the JIT.
 //! pyre mirrors that with a per-thread singleton accessed via
 //! `CodeWriter::instance()`; interior mutability of the queue/cache is
@@ -43,7 +43,7 @@ use super::cpu::Cpu;
 /// func_addr)` so `assembler.finished()` can register the raw helper addresses
 /// for symbolic debugging.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre has no `oopspec` system — every blackhole
+/// Note: pyre has no `oopspec` system — every blackhole
 /// helper goes through `bh_*` C ABI thunks declared on `CodeWriter` directly,
 /// not through an indirected `_callinfo_for_oopspec` lookup. The struct is an
 /// empty shell so `CallControl` and `Assembler::finished` keep their RPython
@@ -65,7 +65,7 @@ impl CallInfoCollection {
 /// `mainjitcode`, `_green_args_spec`, …); pyre adds only the fields
 /// the lazy portal-discovery path actually consumes today.
 ///
-/// PRE-EXISTING-ADAPTATION: pyre carries `w_code` and `merge_point_pc`
+/// Note: pyre carries `w_code` and `merge_point_pc`
 /// alongside `portal_graph` because pyre's "graph" is a Python
 /// CodeObject with no flow-graph identity. `w_code` is the wrapping
 /// `PyObjectRef`, threaded through so the runtime side keys its
@@ -123,7 +123,7 @@ pub struct JitDriverStaticData {
     /// `grab_initial_jitcodes` fires, matching RPython's
     /// `jd.mainjitcode = None` before call.py:147.
     ///
-    /// PRE-EXISTING-ADAPTATION (type-only): RPython types this as
+    /// Note (type-only): RPython types this as
     /// `JitCode`; pyre stores `Arc<PyJitCode>`, where `PyJitCode` is a
     /// thin wrapper around `Arc<RuntimeJitCode>` plus pyre-only
     /// metadata (`PyJitCodeMetadata`, `code_ptr`, `w_code`, `has_abort`,
@@ -170,14 +170,14 @@ pub struct CallControl {
     /// call.py:22 `virtualref_info = None` — class-level default,
     /// populated by `CodeWriter.setup_vrefinfo` (codewriter.py:91-94).
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre has no `virtualref` machinery yet
+    /// Note: pyre has no `virtualref` machinery yet
     /// (no `@jit.virtual_ref` annotations, no `vref_info` lookup); the
     /// slot is `None` and the setter is a no-op shell.
     pub virtualref_info: Option<()>,
 
     /// call.py:23 `has_libffi_call = False` — class-level default.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre has no `_call_aroundstate_target_`
+    /// Note: pyre has no `_call_aroundstate_target_`
     /// rewriting in `getcalldescr`, so this stays `false`.
     pub has_libffi_call: bool,
 
@@ -419,7 +419,7 @@ impl CallControl {
     ///     return (fnaddr, calldescr)
     /// ```
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's blackhole calls every Python
+    /// Note: pyre's blackhole calls every Python
     /// function through one `bh_portal_runner(frame: ref) -> ref`
     /// stub — the C-ABI is identical for every CodeObject because the
     /// portal runner unwraps the frame and dispatches dynamically. So
@@ -463,7 +463,7 @@ impl CallControl {
     /// the populated entry (codewriter.py:80
     /// `transform_graph_to_jitcode(graph, jitcode, ...)`).
     ///
-    /// PRE-EXISTING-ADAPTATION: `merge_point_pc` is a pyre-only refinement
+    /// Note: `merge_point_pc` is a pyre-only refinement
     /// — the first trace reveals the `MERGE_POINT` opcode's PC, which
     /// must be re-recorded on the cache entry. When it changes the
     /// entry is reset to a new skeleton and re-queued so the drain
@@ -509,7 +509,7 @@ impl CallControl {
     /// `call.py:168` before the drain re-runs `assembler.assemble`
     /// (codewriter.py:67) on it.
     ///
-    /// PRE-EXISTING-ADAPTATION: this entry point exists only because
+    /// Note: this entry point exists only because
     /// `get_jitcode` re-runs the drain when `merge_point_pc` is refined
     /// — RPython has no analog because portal PCs are statically known
     /// (call.py:155 `if graph in self.jitcodes: return self.jitcodes[graph]`

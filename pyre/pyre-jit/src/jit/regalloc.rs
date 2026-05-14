@@ -23,7 +23,7 @@
 //!     `JitCode`. Pyre's analog is `RegAllocator::num_colors` plus the
 //!     `AllocationResult.num_regs` field.
 //!
-//! Architecture difference (PRE-EXISTING-ADAPTATION): RPython's
+//! Architecture difference (Note): RPython's
 //! `RegAllocator` consumes a `FunctionGraph` (block + link.args
 //! structure). Pyre's input is a CPython `CodeObject` translated into
 //! a flat `SSARepr` by the dispatch loop, so `make_dependencies` works
@@ -448,7 +448,7 @@ pub(super) fn count_link_renamings_per_kind(
     graph: &FlowGraph,
     regallocs: &HashMap<Kind, GraphAllocationResult>,
 ) -> HashMap<Kind, usize> {
-    // PRE-EXISTING-ADAPTATION: the `regallocs` passed in come from
+    // Note: the `regallocs` passed in come from
     // `perform_graph_register_allocation_all_kinds`, which runs the
     // chordal coloring directly. Upstream `flatten_graph` follows
     // that with `enforce_input_args` (`flatten.py:88-100`), swapping
@@ -808,7 +808,7 @@ fn enforce_input_args(
 ///      construction — their `try_coalesce` is a no-op when
 ///      `src_slot == dst_slot`, but the call preserves RPython's
 ///      exact iteration shape.
-///   2. SSARepr `*_copy` scanner (PRE-EXISTING-ADAPTATION) — pyre's
+///   2. SSARepr `*_copy` scanner (Note) — pyre's
 ///      walker emits intra-block `int_copy` / `ref_copy` /
 ///      `float_copy` ops for stack shuffling / STORE_FAST sequences
 ///      that have no CFG / Link representation.  The scanner unions
@@ -1025,7 +1025,7 @@ impl RegAllocator {
     /// coloring assign them the same color, turning the copy into a
     /// runtime no-op when src == dst.
     ///
-    /// PRE-EXISTING-ADAPTATION: SSARepr-level copy coalescing instead
+    /// Note: SSARepr-level copy coalescing instead
     /// of FunctionGraph-level link.args coalescing. The effect is a
     /// strict subset of RPython's because pyre still does not see the
     /// original cross-block link representation.

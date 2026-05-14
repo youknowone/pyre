@@ -1766,7 +1766,7 @@ fn jit_blackhole_resume_from_guard(
     // `SwitchToBlackhole(ABORT_BRIDGE)` (compile.py:27-29) and falls
     // through here.
     //
-    // PRE-EXISTING-ADAPTATION (Pyre-only, Python-portal-specific):
+    // Note (pyre-only, Python-portal-specific):
     // pyre's resume storage is keyed by `(green_key, trace_id, fail_index)`,
     // so we MUST recover a green_key to look up the storage.  PyPy's
     // `resume_in_blackhole` uses descr identity directly (descr.rd_data),

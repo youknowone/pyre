@@ -37,7 +37,7 @@ pub struct NumRegs {
 /// at runtime. pyre-jit-trace cannot depend on pyre-jit, so we
 /// publish the latest `all_liveness` snapshot to
 /// `pyre_jit_trace::assembler::ASSEMBLER_STATE` after every write
-/// — PRE-EXISTING-ADAPTATION for the crate layering, not a state
+/// — Note for the crate layering, not a state
 /// relocation.
 #[derive(Debug, Default)]
 pub struct Assembler {
@@ -168,7 +168,7 @@ impl Assembler {
     /// into `list_of_addr2name` for `MetaInterpStaticData`'s
     /// debug-symbol map.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre has no `oopspec` system, so the
+    /// Note: pyre has no `oopspec` system, so the
     /// callinfocollection is empty (see
     /// [`super::call::CallInfoCollection`]) and the iteration is a
     /// no-op. The slot is preserved so `make_jitcodes` calls through
@@ -273,7 +273,7 @@ impl Assembler {
                 //
                 // RPython's `write_insn` iterates every operand and dispatches
                 // by Python type.  pyre's `dispatch_op` is keyed on `opname`
-                // (PRE-EXISTING-ADAPTATION — see below), so operand iteration
+                // (Note — see below), so operand iteration
                 // is split: `IndirectCallTargets` is collected here before the
                 // opcode-specific lowering runs.  The operand is purely
                 // metadata for the call — it is not written into the jitcode
@@ -300,7 +300,7 @@ impl Assembler {
 
     /// `assembler.py:250-263` `fix_labels()`.
     ///
-    /// PRE-EXISTING-ADAPTATION: pyre's runtime `JitCodeBuilder` patches
+    /// Note: pyre's runtime `JitCodeBuilder` patches
     /// jumps by symbolic label id rather than by rewriting raw bytes, so
     /// the label-position loop is folded into the builder. The per-descr
     /// switch patching that upstream runs here is handled through the
@@ -348,7 +348,7 @@ impl Assembler {
     /// After the per-instance update we publish the latest buffer to
     /// the `pyre_jit_trace::assembler::ASSEMBLER_STATE` thread-local so
     /// the blackhole reader (a lower-crate consumer that cannot depend
-    /// on `pyre_jit`) sees the same bytes. PRE-EXISTING-ADAPTATION for
+    /// on `pyre_jit`) sees the same bytes. Note for
     /// the crate layering, not a relocation of the RPython state.
     fn encode_liveness_info(
         &mut self,
@@ -862,7 +862,7 @@ fn dispatch_op(
         // `kind = getkind(...)[0]` in jtransform.py forces single-char
         // suffix everywhere — `getfield_vable_i` / `_r` / `_f` and
         // `setfield_vable_i` / `_r` / `_f`. pyre's JitCodeBuilder methods
-        // retain the `vable_*` prefix as a PRE-EXISTING-ADAPTATION so the
+        // retain the `vable_*` prefix as a Note so the
         // rename is scoped to the Insn::Op key.  Long-form `_int` /
         // `_ref` / `_float` aliases retired — no SSARepr emitter writes
         // them (codewriter.rs `emit_vable_*` macros use the short form).
@@ -979,9 +979,9 @@ fn dispatch_op(
             let (vable_reg, array_idx) = expect_vable_array_read_prefix(args);
             match &args[1] {
                 Operand::Register(r) if r.kind == Kind::Int => {
-                    state.builder.vable_getarrayitem_ref_with_base(
-                        dst, vable_reg, array_idx, r.index,
-                    );
+                    state
+                        .builder
+                        .vable_getarrayitem_ref_with_base(dst, vable_reg, array_idx, r.index);
                 }
                 Operand::ConstInt(value) => {
                     state.builder.vable_getarrayitem_ref_const_idx_with_base(
