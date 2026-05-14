@@ -132,7 +132,8 @@ static EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL: std::sync::LazyLock<Arc<Cranelift
             true,
             vec![],
         );
-        d.is_exit_frame_with_exception = true;
+        // is_exit_frame_with_exception() forwards through meta_descr to
+        // the metainterp ExitFrameWithExceptionDescrRef Arc.
         d.meta_descr = Some(Arc::new(majit_backend::ExitFrameWithExceptionDescrRef::new()));
         Arc::new(d)
     });

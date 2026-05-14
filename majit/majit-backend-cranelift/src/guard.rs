@@ -467,10 +467,14 @@ pub struct CraneliftFailDescr {
     // majit-backend types and codegen descrs carry meta_descr =
     // op.descr, every CraneliftFailDescr forwards is_finish through the
     // upstream class hierarchy.
-    /// compile.py:658-662 ExitFrameWithExceptionDescrRef parity.
-    /// True when this FINISH was emitted via
-    /// pyjitpl.py:3238-3245 compile_exit_frame_with_exception.
-    pub is_exit_frame_with_exception: bool,
+    // is_exit_frame_with_exception removed: `compile.py:658-662
+    // ExitFrameWithExceptionDescrRef` is a class identity on the
+    // metainterp side.  After cranelift singletons +
+    // EXIT_FRAME_WITH_EXCEPTION_DESCR_REF_CL carry meta_descr to the
+    // class-distinct majit-backend ExitFrameWithExceptionDescrRef and
+    // codegen descrs carry meta_descr=op.descr (or the propagate-into-
+    // exit synthesis route through the singleton), every
+    // CraneliftFailDescr forwards the predicate through meta_descr.
     /// history.py:470-499 TargetToken parity for cross-loop JUMP.
     /// True for external JUMP exits (JUMP whose target TargetToken lives in
     /// a different compiled function). assembler.py:2456-2462 closing_jump
@@ -731,7 +735,6 @@ impl CraneliftFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
-            is_exit_frame_with_exception: false,
             meta_descr: None,
         }
     }
@@ -760,7 +763,6 @@ impl CraneliftFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
-            is_exit_frame_with_exception: false,
             meta_descr: None,
         }
     }
@@ -1050,18 +1052,15 @@ impl FailDescr for CraneliftFailDescr {
 
     fn is_exit_frame_with_exception(&self) -> bool {
         // `compile.py:658-662 ExitFrameWithExceptionDescrRef`'s identity
-        // lives on the metainterp Arc (see
-        // `ExitFrameWithExceptionDescrRef` in `majit-metainterp/src/
-        // compile.rs:2311-2358`).  Forward through `meta_descr` so
-        // backend descrs constructed with `op.descr = Some(meta)` defer
-        // to the metainterp class hierarchy.  Synthetic backend descrs
-        // (runner classifier path, `meta_descr = None`) fall back to
-        // the local mirror — still needed for backend-only descrs that
-        // never visit the optimizer.
-        match self.meta_descr.as_ref().and_then(|d| d.as_fail_descr()) {
-            Some(fd) => fd.is_exit_frame_with_exception(),
-            None => self.is_exit_frame_with_exception,
-        }
+        // lives on the metainterp Arc (`ExitFrameWithExceptionDescrRef`
+        // in `majit-backend::finish_descrs`).  After cranelift
+        // singletons + codegen all stamp meta_descr, every production
+        // CraneliftFailDescr forwards through meta_descr.  Synthetic
+        // test descrs without meta_descr take the trait default false.
+        self.meta_descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .map_or(false, |fd| fd.is_exit_frame_with_exception())
     }
 
     fn is_external_jump(&self) -> bool {
