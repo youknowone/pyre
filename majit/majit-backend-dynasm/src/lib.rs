@@ -453,8 +453,22 @@ fn handle_fail_dispatch(
         return handle_fail_propagate_exception(frame_ptr);
     }
     // compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
-    let descr = unsafe { &*(descr_raw as *const guard::DynasmFailDescr) };
-    handle_fail_resume_guard(descr, descr_raw, frame_ptr, green_key)
+    // Recover the descr identity through the global Weak-registry that
+    // `DynasmBackend::register_fail_descrs` populates in lockstep with
+    // its per-backend table.  Avoids casting `descr_raw` to
+    // `*const DynasmFailDescr` — only the trait surface is consumed.
+    // Synthetic test descrs (lib.rs:781 / :803) never register, so the
+    // miss path returns 0, matching the prior cast-based path's "no
+    // blackhole hook installed" exit.
+    let descr_arc = match guard::lookup_fail_descr_global(descr_raw) {
+        Some(arc) => arc,
+        None => return 0,
+    };
+    let descr_fd = match descr_arc.as_fail_descr() {
+        Some(fd) => fd,
+        None => return 0,
+    };
+    handle_fail_resume_guard(descr_fd, descr_raw, frame_ptr, green_key)
 }
 
 /// compile.py:626-656 `DoneWithThisFrameDescr{Void,Int,Ref,Float}.handle_fail`.

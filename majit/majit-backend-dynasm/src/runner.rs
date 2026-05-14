@@ -769,6 +769,11 @@ impl DynasmBackend {
             let ptr = Arc::as_ptr(descr) as usize;
             let descr_ref: majit_ir::DescrRef = Arc::clone(descr) as majit_ir::DescrRef;
             reg.entry(ptr).or_insert_with(|| descr_ref.clone());
+            // Mirror into the trampoline-reachable global registry as a
+            // `Weak<dyn Descr>` so the JIT helper trampoline can recover
+            // the descr identity without dereferencing the raw pointer
+            // as `*const DynasmFailDescr`.
+            crate::guard::register_fail_descr_global(ptr, &descr_ref);
             // Unified-Descr Port Epic: also key the same backend Arc by
             // the metainterp `AbstractFailDescr` Arc's data pointer
             // (`history.py:125` identity).  After Phase B identity flip

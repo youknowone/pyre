@@ -41,6 +41,37 @@ pub fn lookup_source_op_index(descr_ptr: usize) -> Option<usize> {
 use majit_backend::ExitRecoveryLayout;
 use majit_ir::{Descr, DescrRef, FailDescr, Type};
 
+/// Backend-static descr-by-address registry, mirroring the per-backend
+/// `DynasmBackend::fail_descr_registry` so the `call_assembler_helper_trampoline`
+/// (which has no `&DynasmBackend` reachable from its `extern "C"` body)
+/// can recover the descr identity without dereferencing the raw pointer
+/// as `*const DynasmFailDescr`.  Stored as `Weak<dyn Descr>` so the
+/// global table does not keep evicted descrs alive past their owning
+/// `CompiledLoop`/`CompiledBridge`; the per-backend registry retains a
+/// strong reference for the live set.
+static FAIL_DESCR_REGISTRY_GLOBAL: OnceLock<Mutex<HashMap<usize, std::sync::Weak<dyn Descr>>>> =
+    OnceLock::new();
+
+fn fail_descr_registry_global() -> &'static Mutex<HashMap<usize, std::sync::Weak<dyn Descr>>> {
+    FAIL_DESCR_REGISTRY_GLOBAL.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub fn register_fail_descr_global(descr_ptr: usize, descr: &DescrRef) {
+    fail_descr_registry_global()
+        .lock()
+        .expect("FAIL_DESCR_REGISTRY_GLOBAL mutex poisoned")
+        .entry(descr_ptr)
+        .or_insert_with(|| std::sync::Arc::downgrade(descr));
+}
+
+pub fn lookup_fail_descr_global(descr_ptr: usize) -> Option<DescrRef> {
+    fail_descr_registry_global()
+        .lock()
+        .expect("FAIL_DESCR_REGISTRY_GLOBAL mutex poisoned")
+        .get(&descr_ptr)
+        .and_then(|w| w.upgrade())
+}
+
 /// Backend-static side-table mapping a `DynasmFailDescr` Arc's
 /// `Arc::as_ptr` address to its `ExitRecoveryLayout` (Session 7
 /// pre-flight, mirrors cranelift `RECOVERY_LAYOUT_TABLE`).
@@ -275,6 +306,15 @@ impl Drop for DynasmFailDescr {
         recovery_layout_table()
             .lock()
             .expect("RECOVERY_LAYOUT_TABLE mutex poisoned")
+            .remove(&ptr);
+        // `Self::drop` runs after the registry's strong ref is dropped,
+        // so if any other holders exist they hold a strong ref via
+        // `DescrRef` (the global mirror) — when the strong count reaches
+        // zero the global entry is the last holder.  Remove ourselves
+        // unconditionally to keep the global mirror in sync.
+        fail_descr_registry_global()
+            .lock()
+            .expect("FAIL_DESCR_REGISTRY_GLOBAL mutex poisoned")
             .remove(&ptr);
     }
 }
