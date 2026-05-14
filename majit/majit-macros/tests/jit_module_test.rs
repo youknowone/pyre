@@ -220,22 +220,28 @@ fn test_jit_module_emits_structured_impl_trace_fnaddrs() {
         .find(|(_, ty, m, _)| *ty == "Adder" && *m == "add")
         .expect("Adder::add entry");
     assert_eq!(add_entry.0, expected_module_path);
-    assert_eq!(
-        add_entry.3,
-        impl_walk_module::Adder::add as *const () as usize as i64,
-    );
+    // Rust does not guarantee that two `<Type>::method as *const ()`
+    // casts at different call sites yield the same numeric address —
+    // release-mode LLVM may instantiate the fn item per cast site
+    // (debug mode incidentally produces a single instance). Verify the
+    // recorded address is callable as the right function instead of
+    // comparing it against an independent cast.
+    let add_fn: fn(i64, i64) -> i64 = unsafe { std::mem::transmute(add_entry.3 as *const ()) };
+    assert_eq!(add_fn(3, 4), impl_walk_module::Adder::add(3, 4));
 
     let bump_entry = entries
         .iter()
         .find(|(_, ty, m, _)| *ty == "Adder" && *m == "bump")
         .expect("Adder::bump entry");
     assert_eq!(bump_entry.0, expected_module_path);
-    // Casting a `&self` associated fn to a plain `*const ()` works —
-    // confirms Rust allows the coercion the reviewer called out.
-    assert_eq!(
-        bump_entry.3,
-        impl_walk_module::Adder::bump as *const () as usize as i64,
-    );
+    // `&self` associated fn lowers to `fn(&Adder, i64) -> i64` — the
+    // cast through `*const ()` is still valid (the reviewer's
+    // structural concern); verify functionally for release-mode
+    // address stability.
+    let adder = impl_walk_module::Adder { value: 10 };
+    let bump_fn: fn(&impl_walk_module::Adder, i64) -> i64 =
+        unsafe { std::mem::transmute(bump_entry.3 as *const ()) };
+    assert_eq!(bump_fn(&adder, 5), adder.bump(5));
 }
 
 // Trait-impl disambiguation: when a type implements a trait method
@@ -435,19 +441,39 @@ fn test_passthrough_free_fn_discovery_uses_direct_fn_address() {
     let trace_fnaddrs = passthrough_free_fn_module::__majit_helper_trace_fnaddrs();
     assert_eq!(trace_fnaddrs.len(), 3);
     // No `__majit_call_policy_*` exists for any of these, so the only
-    // legal address is the function's direct cast.
-    assert!(trace_fnaddrs.iter().any(|(path, addr)| {
-        *path == concat!(module_path!(), "::passthrough_free_fn_module::pure_xor")
-            && *addr == passthrough_free_fn_module::pure_xor as *const () as usize as i64
-    }));
-    assert!(trace_fnaddrs.iter().any(|(path, addr)| {
-        *path == concat!(module_path!(), "::passthrough_free_fn_module::unrolled")
-            && *addr == passthrough_free_fn_module::unrolled as *const () as usize as i64
-    }));
-    assert!(trace_fnaddrs.iter().any(|(path, addr)| {
-        *path == concat!(module_path!(), "::passthrough_free_fn_module::out_of_trace")
-            && *addr == passthrough_free_fn_module::out_of_trace as *const () as usize as i64
-    }));
+    // legal address is the function's direct cast. Verify functionally
+    // by invoking through the recorded address — Rust does not
+    // guarantee numeric equality across independent fn-item casts in
+    // release mode (LLVM may instantiate the fn item per cast site),
+    // so a structural assertion via fn pointer equality is unreliable.
+    let pure_xor_entry = trace_fnaddrs
+        .iter()
+        .find(|(p, _)| *p == concat!(module_path!(), "::passthrough_free_fn_module::pure_xor"))
+        .expect("pure_xor entry");
+    let pure_xor_fn: fn(i64, i64) -> i64 =
+        unsafe { std::mem::transmute(pure_xor_entry.1 as *const ()) };
+    assert_eq!(
+        pure_xor_fn(0b1010, 0b0110),
+        passthrough_free_fn_module::pure_xor(0b1010, 0b0110),
+    );
+
+    let unrolled_entry = trace_fnaddrs
+        .iter()
+        .find(|(p, _)| *p == concat!(module_path!(), "::passthrough_free_fn_module::unrolled"))
+        .expect("unrolled entry");
+    let unrolled_fn: fn(i64) -> i64 = unsafe { std::mem::transmute(unrolled_entry.1 as *const ()) };
+    assert_eq!(unrolled_fn(7), passthrough_free_fn_module::unrolled(7));
+
+    let out_of_trace_entry = trace_fnaddrs
+        .iter()
+        .find(|(p, _)| *p == concat!(module_path!(), "::passthrough_free_fn_module::out_of_trace"))
+        .expect("out_of_trace entry");
+    let out_of_trace_fn: fn(i64) -> i64 =
+        unsafe { std::mem::transmute(out_of_trace_entry.1 as *const ()) };
+    assert_eq!(
+        out_of_trace_fn(5),
+        passthrough_free_fn_module::out_of_trace(5),
+    );
 }
 
 #[test]
