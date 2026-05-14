@@ -17707,7 +17707,7 @@ mod tests {
         let descr = compiled
             .fail_descrs
             .iter_mut()
-            .find(|descr| descr.fail_index() == fail_index)
+            .find(|descr| descr.fail_index == fail_index)
             .expect("fail descr");
         // Backend rd_* accessors forward through `meta_descr` to the
         // metainterp `AbstractFailDescr` Arc.  Test fixtures synthesise
