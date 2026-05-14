@@ -42,6 +42,22 @@ pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, Re
     remove_repeated_live(&mut flattened.insns);
 }
 
+/// Resolve a [`ValueId`] from a `FlatOp::Op` operand to its
+/// [`Register`].
+///
+/// **RPython invariant** (`flatten.py:382` `getcolor`): every
+/// `Variable` has a single `(kind, color)` via
+/// `getkind(v.concretetype)` + `regallocs[kind]`.  The strict port
+/// would assert that exactly one class colors `v` and use that
+/// class's color; multiple matches would panic.
+///
+/// **Known divergence (TODO #71/#74)**: pyre's annotator/rtyper
+/// coverage gaps occasionally let the same `ValueId` pick up
+/// colorings in more than one class (typically through synthetic
+/// helper graphs whose result type was inferred separately by the
+/// caller and the callee).  Returning the first match preserves the
+/// pre-Phase-3 behavior so the gap doesn't escalate into a build
+/// break; RPython would never reach the multi-class case.
 fn value_to_register(v: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> Option<Register> {
     for (&kind, ra) in regallocs {
         if let Some(&color) = ra.coloring.get(&v) {

@@ -36,22 +36,34 @@ fn kind_long_name(kind: RegKind) -> &'static str {
     }
 }
 
-/// Phase 3 replacement for `lookup_reg_with_kind` — the variant
-/// determines the expected kind, so the caller passes it in
-/// explicitly.  Falls back to "search all classes" when the expected
-/// kind misses, mirroring the pre-Phase-C-v2-Slice-C-3 behaviour the
-/// previous `lookup_coloring` exposed via `value_kinds`.  Pyre's
-/// annotator/rtyper still has known coverage gaps where a value's
-/// declared variant kind disagrees with its regalloc class (tracked
-/// alongside the value_kinds removal in
-/// `~/.claude/plans/delightful-cooking-salamander.md`); the fallback
-/// keeps the assembler robust until those root causes are fixed
-/// upstream.  The lookup ALWAYS prefers the requested kind first so
-/// well-typed graphs see the strict path.
+/// Variant-determined regalloc lookup.
+///
+/// **RPython invariant** (`flatten.py:382-391 getcolor`,
+/// `regalloc.py:6 perform_register_allocation`): every `Variable`
+/// reaching the assembler has a `concretetype` and therefore exactly
+/// one `(kind, color)` pair via `getkind(v.concretetype)`, and the
+/// matching `regallocs[kind].coloring` is the only place where the
+/// color lives.  The FlatOp variant fixes the expected kind at each
+/// call site; `caller` identifies that variant so any panic points
+/// back to the offending instruction.
+///
+/// **Known divergence (TODO #71/#74)**: pyre's annotator / rtyper
+/// still has coverage gaps where the `(kind, color)` a `ValueId`
+/// actually receives can disagree with the FlatOp variant's expected
+/// kind — e.g., a `goto_if_not` cond that ought to be `Bool → Int`
+/// arrives as `Ref` because the upstream type pass missed the cond
+/// site.  Pre-Phase-3 origin/main masked the gap with a
+/// `value_kinds` snapshot whose strict (Slice-C-3) lookup happened
+/// to land on the same actual class anyway.  Phase 3 dropped the
+/// snapshot, so the strict lookup now panics on those graphs.  As a
+/// documented divergence — not a silent default — we accept the
+/// other regalloc class when the variant's class misses.  RPython
+/// would never reach the fallback branch.
 fn reg_byte(
     v: crate::model::ValueId,
     kind: RegKind,
     regallocs: &HashMap<RegKind, crate::regalloc::RegAllocResult>,
+    caller: &'static str,
 ) -> u8 {
     if let Some(ra) = regallocs.get(&kind) {
         if let Some(&color) = ra.coloring.get(&v) {
@@ -69,9 +81,8 @@ fn reg_byte(
         }
     }
     panic!(
-        "reg_byte: ValueId {:?} has no coloring in any of regallocs[Int|Ref|Float] \
-         (expected kind {:?})",
-        v, kind
+        "reg_byte[{caller}]: ValueId {v:?} has no coloring in any of \
+         regallocs[Int|Ref|Float] (expected kind {kind:?})",
     )
 }
 use crate::flowspace::model::ConstValue;
@@ -542,7 +553,7 @@ impl Assembler {
             // RPython flatten.py:247-267: goto_if_not(cond, TLabel(false_path))
             // Only goto_if_not exists — no goto_if_true in RPython.
             FlatOp::GotoIfNot { cond, target } => {
-                let reg = reg_byte(*cond, RegKind::Int, regallocs);
+                let reg = reg_byte(*cond, RegKind::Int, regallocs, "GotoIfNot.cond");
                 let opnum = self.get_opnum("goto_if_not/iL");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -555,7 +566,7 @@ impl Assembler {
             }
 
             FlatOp::Switch { value, targets } => {
-                let reg = reg_byte(*value, RegKind::Int, regallocs);
+                let reg = reg_byte(*value, RegKind::Int, regallocs, "Switch.value");
                 let descr_idx = self.emit_pending_switch_descr(targets.clone());
                 let opnum = self.get_opnum("switch/id");
                 state.startpoints.insert(state.code.len());
@@ -578,9 +589,9 @@ impl Assembler {
                     IntOvfOp::Mul => "int_mul_jump_if_ovf/Lii>i",
                 };
                 let opnum = self.get_opnum(opname);
-                let lhs_reg = reg_byte(*lhs, RegKind::Int, regallocs);
-                let rhs_reg = reg_byte(*rhs, RegKind::Int, regallocs);
-                let dst_reg = reg_byte(*dst, RegKind::Int, regallocs);
+                let lhs_reg = reg_byte(*lhs, RegKind::Int, regallocs, "IntBinOpJumpIfOvf.lhs");
+                let rhs_reg = reg_byte(*rhs, RegKind::Int, regallocs, "IntBinOpJumpIfOvf.rhs");
+                let dst_reg = reg_byte(*dst, RegKind::Int, regallocs, "IntBinOpJumpIfOvf.dst");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
                 state.alllabels.insert(state.code.len());
@@ -647,7 +658,7 @@ impl Assembler {
             }
 
             FlatOp::LastException { dst } => {
-                let reg = reg_byte(*dst, RegKind::Int, regallocs);
+                let reg = reg_byte(*dst, RegKind::Int, regallocs, "LastException.dst");
                 let opnum = self.get_opnum("last_exception/>i");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -656,7 +667,7 @@ impl Assembler {
             }
 
             FlatOp::LastExcValue { dst } => {
-                let reg = reg_byte(*dst, RegKind::Ref, regallocs);
+                let reg = reg_byte(*dst, RegKind::Ref, regallocs, "LastExcValue.dst");
                 let opnum = self.get_opnum("last_exc_value/>r");
                 state.startpoints.insert(state.code.len());
                 state.code.push(opnum);
@@ -848,7 +859,7 @@ impl Assembler {
         state: &mut AssemblyState,
     ) -> u8 {
         match arg {
-            LinkArg::Value(v) => reg_byte(*v, kind, regallocs),
+            LinkArg::Value(v) => reg_byte(*v, kind, regallocs, "encode_link_arg_for_kind"),
             LinkArg::Const(cv) => self.emit_const(cv, kind_char_of(kind), state),
         }
     }
@@ -1822,6 +1833,24 @@ impl Assembler {
     /// graphs land in exactly one class.  A miss across all three
     /// classes panics with the full per-class coverage so the gap is
     /// debuggable.
+    /// Resolve `(register_index, kind)` for a [`ValueId`].
+    ///
+    /// **RPython invariant**: every Variable has exactly one
+    /// `(kind, color)` via `getkind(v.concretetype)` +
+    /// `regallocs[kind]`.  The strict port would receive the expected
+    /// kind from the caller (FlatOp variant) and read
+    /// `regallocs[expected].coloring[v]` directly.
+    ///
+    /// **Known divergence (TODO #71/#74)**: pyre's `encode_op`
+    /// callers do not yet thread the expected kind through to this
+    /// helper, and the underlying annotator/rtyper coverage gaps mean
+    /// the same `ValueId` can occasionally pick up coverage in more
+    /// than one class.  Returning the first match preserves the
+    /// pre-Phase-3 behaviour so the gap doesn't escalate into a build
+    /// break; the strict 1:1 read becomes possible once
+    /// `encode_op`'s call sites get migrated to pass an explicit
+    /// expected `RegKind` (the natural follow-up that finishes
+    /// Phase 3's RPython-`getcolor` parity).
     fn lookup_coloring(
         &self,
         v: ValueId,
