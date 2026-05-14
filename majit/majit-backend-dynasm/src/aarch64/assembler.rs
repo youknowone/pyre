@@ -3383,6 +3383,19 @@ impl<'a> AssemblerARM64<'a> {
         // If a CALL_ASSEMBLER already pre-allocated this guard's descr
         // (stored in pending_force_descr), reuse it — same Arc, same ptr
         // that was written to jf_force_descr.
+        // Stamp the per-trace fail_index and trace_id onto the metainterp
+        // ResumeGuardDescr (`op.descr`).  See x86 counterpart for rationale:
+        // routing the writes through the trait at codegen time lets readers
+        // consume the canonical metainterp identity before
+        // `build_guard_metadata` (`compile.rs:232`) re-stamps.
+        if let Some(d) = op.descr.as_ref() {
+            if d.is_resume_guard() || d.is_resume_guard_copied() {
+                if let Some(fd) = d.as_fail_descr() {
+                    fd.set_fail_index_per_trace(fail_index);
+                    fd.set_trace_id(self.trace_id);
+                }
+            }
+        }
         let descr = if let Some(pre) = self.pending_force_descr.take() {
             pre
         } else {
@@ -4092,6 +4105,14 @@ impl<'a> AssemblerARM64<'a> {
         // Stamp the metainterp `AbstractFailDescr` Arc from `next_op.descr`
         // here so `append_guard_token_with_faillocs` does not need a second
         // pass through `unsafe { Arc::as_ptr as *mut }`.
+        if let Some(d) = next_op.descr.as_ref() {
+            if d.is_resume_guard() || d.is_resume_guard_copied() {
+                if let Some(fd) = d.as_fail_descr() {
+                    fd.set_fail_index_per_trace(fail_index);
+                    fd.set_trace_id(self.trace_id);
+                }
+            }
+        }
         let descr = Arc::new(DynasmFailDescr::with_meta(
             fail_index,
             self.trace_id,
