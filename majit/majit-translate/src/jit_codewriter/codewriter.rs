@@ -357,9 +357,12 @@ impl CodeWriter {
         // In majit, assemble() calls compute_liveness() internally and now
         // returns the body so the codewriter can fill calldescr before
         // committing the shell via `set_body`.
-        let mut body =
-            self.assembler
-                .assemble_with_callcontrol(&mut ssarepr, &regallocs, Some(callcontrol));
+        let mut body = self.assembler.assemble_with_callcontrol_and_types(
+            &mut ssarepr,
+            &regallocs,
+            Some(callcontrol),
+            Some(&rewritten_type_state),
+        );
 
         // call.py:174-187 get_jitcode_calldescr:
         //   FUNC = lltype.typeOf(fnptr).TO
@@ -376,38 +379,25 @@ impl CodeWriter {
             let start_block = rewritten.graph.block(rewritten.graph.startblock);
             let mut arg_classes = String::new();
             // RPython `call.py:181-187 get_jitcode_calldescr` derives
-            // `FUNC.ARGS` from `lltype.typeOf(fnptr).TO.ARGS` directly.
-            // Pyre approximates by reading the regalloc class each
-            // start-block inputarg lands in — strict (KINDS order,
-            // panic on multi-class) so a kind-provenance gap upstream
-            // surfaces here rather than getting a silent `'i'`
-            // default.  Missing coloring → `'v'` (Void inputarg that
-            // regalloc skipped, matching `flatten.py:325`).
+            // `FUNC.ARGS` from `lltype.typeOf(fnptr).TO.ARGS`
+            // directly.  Pyre's source-of-truth analogue is the
+            // post-rtyper [`TypeResolutionState`]: each start-block
+            // inputarg's `ConcreteType` is `getkind(v.concretetype)`
+            // verbatim.  Reading from the type-state matches the
+            // upstream's "type-source" provenance instead of going
+            // through regalloc as a side-channel.
             for arg_id in &start_block.inputargs {
-                let mut found: Option<RegKind> = None;
-                for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-                    if let Some(ra) = regallocs.get(&kind) {
-                        if ra.coloring.contains_key(arg_id) {
-                            if let Some(prev) = found {
-                                panic!(
-                                    "calldescr: start_block inputarg {arg_id:?} colored \
-                                     in multiple regalloc classes ({prev:?} and \
-                                     {kind:?}) — RPython `getkind` must give exactly one",
-                                );
-                            }
-                            found = Some(kind);
-                        }
-                    }
-                }
-                let class = match found {
-                    Some(RegKind::Int) => 'i',
-                    Some(RegKind::Ref) => 'r',
-                    Some(RegKind::Float) => 'f',
-                    None => 'v',
+                use crate::jit_codewriter::type_state::ConcreteType;
+                let class = match rewritten_type_state.get(*arg_id) {
+                    ConcreteType::Signed => 'i',
+                    ConcreteType::GcRef => 'r',
+                    ConcreteType::Float => 'f',
+                    ConcreteType::Void => 'v',
+                    ConcreteType::Unknown => 'v',
                 };
                 arg_classes.push(class);
             }
-            let cfg_kind = graph_result_kind(&rewritten.graph, &regallocs);
+            let cfg_kind = graph_result_kind(&rewritten.graph, &rewritten_type_state);
             let declared_kind = callcontrol.declared_return_kind(path);
             let result_type = declared_kind.unwrap_or(cfg_kind);
             // Cross-check: when both sources are present they must agree,
@@ -596,39 +586,21 @@ impl Default for CodeWriter {
 /// pointer type; the graph-level surface is
 /// `flowspace/model.py:17-18` `graph.returnblock = Block([return_var])`,
 /// where `return_var.concretetype` carries the same information.
-/// Phase 3 dropped the `value_kinds` side-table — pyre now reads the
-/// kind from the regalloc result directly: the returnblock's
-/// inputarg appears in exactly one of `regallocs[Int|Ref|Float]`.
-fn graph_result_kind(
-    graph: &FunctionGraph,
-    regallocs: &std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult>,
-) -> char {
+/// Pyre's analogue of `concretetype` is the
+/// [`TypeResolutionState`] entry for the returnblock's inputarg — the
+/// type-source path matching upstream rather than going through
+/// regalloc.
+fn graph_result_kind(graph: &FunctionGraph, types: &TypeResolutionState) -> char {
     let returnblock = graph.block(graph.returnblock);
     let Some(vid) = returnblock.inputargs.first() else {
         return 'v';
     };
-    // KINDS-ordered scan with single-class assertion mirrors
-    // `flatten.py:382 getcolor`: every Variable has exactly one
-    // `(kind, color)` via `getkind(v.concretetype)`.
-    let mut found: Option<RegKind> = None;
-    for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-        if let Some(ra) = regallocs.get(&kind) {
-            if ra.coloring.contains_key(vid) {
-                if let Some(prev) = found {
-                    panic!(
-                        "graph_result_kind: returnblock inputarg {vid:?} colored in \
-                         multiple regalloc classes ({prev:?} and {kind:?}) — RPython \
-                         `getkind` must give exactly one",
-                    );
-                }
-                found = Some(kind);
-            }
-        }
-    }
-    match found {
-        Some(RegKind::Int) => 'i',
-        Some(RegKind::Ref) => 'r',
-        Some(RegKind::Float) => 'f',
-        None => 'v',
+    use crate::jit_codewriter::type_state::ConcreteType;
+    match types.get(*vid) {
+        ConcreteType::Signed => 'i',
+        ConcreteType::GcRef => 'r',
+        ConcreteType::Float => 'f',
+        ConcreteType::Void => 'v',
+        ConcreteType::Unknown => 'v',
     }
 }

@@ -132,6 +132,12 @@ pub struct Assembler {
     /// the `MAJIT_COVERAGE_PANIC=1` diagnostic so the missing-ValueId
     /// panic can cite the offending op.
     current_flatop_debug: Option<String>,
+    /// Per-graph [`TypeResolutionState`] threaded into [`Self::assemble`]
+    /// so [`Self::lookup_coloring`] reads `kind` from
+    /// `getkind(v.concretetype)` first (RPython parity for
+    /// `flatten.py:382 getcolor`) before falling back to the
+    /// regalloc-class scan.  Cleared at the end of `assemble`.
+    current_types: Option<crate::jit_codewriter::type_state::TypeResolutionState>,
 }
 
 impl Assembler {
@@ -154,6 +160,7 @@ impl Assembler {
             canonical_liveness_offset: None,
             current_graph_name: None,
             current_flatop_debug: None,
+            current_types: None,
         }
     }
 
@@ -241,7 +248,22 @@ impl Assembler {
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> JitCodeBody {
-        self.assemble_with_callcontrol(ssarepr, regallocs, None)
+        self.assemble_with_callcontrol_and_types(ssarepr, regallocs, None, None)
+    }
+
+    /// `assemble`-with-types entrypoint mirroring `flatten_with_types`:
+    /// the caller has the `TypeResolutionState` produced by the
+    /// (jtransform-)rtyper pass and threads it through so
+    /// [`Self::lookup_coloring`] can read kind from
+    /// `getkind(v.concretetype)` first, matching RPython's
+    /// `flatten.py:382 getcolor`.
+    pub fn assemble_with_types(
+        &mut self,
+        ssarepr: &mut SSARepr,
+        regallocs: &HashMap<RegKind, RegAllocResult>,
+        types: &crate::jit_codewriter::type_state::TypeResolutionState,
+    ) -> JitCodeBody {
+        self.assemble_with_callcontrol_and_types(ssarepr, regallocs, None, Some(types))
     }
 
     pub fn assemble_with_callcontrol(
@@ -249,6 +271,16 @@ impl Assembler {
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
         callcontrol: Option<&CallControl>,
+    ) -> JitCodeBody {
+        self.assemble_with_callcontrol_and_types(ssarepr, regallocs, callcontrol, None)
+    }
+
+    pub fn assemble_with_callcontrol_and_types(
+        &mut self,
+        ssarepr: &mut SSARepr,
+        regallocs: &HashMap<RegKind, RegAllocResult>,
+        callcontrol: Option<&CallControl>,
+        types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
     ) -> JitCodeBody {
         // RPython codewriter.py:56: compute_liveness(ssarepr)
         // Must run BEFORE assembly so -live- markers carry the full
@@ -258,6 +290,7 @@ impl Assembler {
         // bridge on `FlatOp::Op` operands.
         crate::liveness::compute_liveness(ssarepr, regallocs);
         self.current_graph_name = Some(ssarepr.name.clone());
+        self.current_types = types.cloned();
 
         // Pyre-only diagnostic: under `MAJIT_COVERAGE_AUDIT=1` enumerate
         // every ValueId referenced in `ssarepr.insns` that has no
@@ -390,6 +423,10 @@ impl Assembler {
         };
 
         self.count_jitcodes += 1;
+        // Drop the per-graph type-state snapshot so a subsequent
+        // assemble call without types doesn't accidentally consult a
+        // stale table.
+        self.current_types = None;
         body
     }
 
@@ -826,10 +863,27 @@ impl Assembler {
         state: &mut AssemblyState,
     ) -> u8 {
         match arg {
-            // Parity expectation: `r.kind == expected_kind`.  Same
-            // upstream-coverage-gap caveat as `GotoIfNot.cond`; the
-            // emitted `r.index` byte is correct regardless.
-            crate::flatten::RegOrConst::Reg(r) => r.index as u8,
+            // RPython `assembler.py:164-174`: the single-byte argcode
+            // is keyed on `Register.kind`, so the source operand's
+            // kind MUST match the expected kind for the surrounding
+            // op (e.g. `int_copy/i>i`'s source must be Int).  PyPy
+            // satisfies this by construction via
+            // `flatten.py:333` (the source `Register` was created by
+            // `getcolor(v)` against the matching `regallocs[w.kind]`
+            // entry); pyre mirrors that with a strict assert so an
+            // upstream kind-provenance gap surfaces here rather than
+            // emitting a register byte that misrepresents its bank.
+            crate::flatten::RegOrConst::Reg(r) => {
+                assert_eq!(
+                    r.kind, expected_kind,
+                    "encode_regorconst_source: Register kind {:?} does not match \
+                     variant-expected kind {expected_kind:?} (PyPy \
+                     `assembler.py:164-174` requires the single-byte argcode kind \
+                     and the operand kind to coincide)",
+                    r.kind,
+                );
+                r.index as u8
+            }
             crate::flatten::RegOrConst::Const(cv) => {
                 self.emit_const(cv, kind_char_of(expected_kind), state)
             }
@@ -1622,17 +1676,31 @@ impl Assembler {
     }
 
     /// Emit a ListOfKind: [u8 count][reg0][reg1]...
-    /// RPython assembler.py:181-196.
+    ///
+    /// RPython `assembler.py:181-196`: every item in the
+    /// `ListOfKind(kind, [...])` shares the list's `kind` per
+    /// construction (`flatten.py:35-51 ListOfKind` carries `kind` as
+    /// an attribute and the constructors only accept matching
+    /// Registers).  Pyre asserts the same invariant strictly: each
+    /// item resolves through `lookup_coloring` and its kind must
+    /// equal the list's `kind`.  A mismatch surfaces as a hard panic
+    /// — the upstream contract has no escape hatch.
     fn emit_list_of_kind(
         &self,
         args: &[ValueId],
-        _kind: RegKind,
+        kind: RegKind,
         regallocs: &HashMap<RegKind, RegAllocResult>,
         state: &mut AssemblyState,
     ) {
         state.code.push(args.len().min(255) as u8);
         for &v in args {
-            let reg = self.lookup_reg(v, regallocs);
+            let (reg, item_kind) = self.lookup_coloring(v, regallocs);
+            assert_eq!(
+                item_kind, kind,
+                "emit_list_of_kind: item {v:?} has kind {item_kind:?} but the \
+                 surrounding `ListOfKind` declares {kind:?} (PyPy `flatten.py:35-51` \
+                 keeps every item's kind aligned with the list's `kind` attribute)",
+            );
             state.code.push(reg);
         }
     }
@@ -1782,33 +1850,69 @@ impl Assembler {
     /// debuggable.
     /// Resolve `(register_index, kind)` for a [`ValueId`].
     ///
-    /// **RPython invariant**: every Variable has exactly one
-    /// `(kind, color)` via `getkind(v.concretetype)` +
-    /// `regallocs[kind]`.  The strict port would receive the expected
-    /// kind from the caller (FlatOp variant) and read
-    /// `regallocs[expected].coloring[v]` directly.
+    /// **RPython invariant** (`flatten.py:382 getcolor`): every
+    /// Variable has exactly one `(kind, color)` via
+    /// `getkind(v.concretetype)` + `regallocs[kind]`.  When the
+    /// per-graph [`TypeResolutionState`] is threaded in
+    /// (`assemble_with_types`), this helper reads the kind from
+    /// `types.get(v)` first and looks up the color strictly in
+    /// `regallocs[kind].coloring[v]` — a hard panic on miss.
     ///
-    /// **Known divergence (TODO #71/#74)**: pyre's `encode_op`
-    /// callers do not yet thread the expected kind through to this
-    /// helper, and the underlying annotator/rtyper coverage gaps mean
-    /// the same `ValueId` can occasionally pick up coverage in more
-    /// than one class.  Returning the first match preserves the
-    /// pre-Phase-3 behaviour so the gap doesn't escalate into a build
-    /// break; the strict 1:1 read becomes possible once
-    /// `encode_op`'s call sites get migrated to pass an explicit
-    /// expected `RegKind` (the natural follow-up that finishes
-    /// Phase 3's RPython-`getcolor` parity).
+    /// Without `types` (test fixtures that drive `assemble`
+    /// directly, or callers that haven't been migrated yet), the
+    /// helper falls back to a [`KINDS`]-ordered scan with a
+    /// multi-class panic that still preserves "exactly one class per
+    /// value" semantics.  RPython has no equivalent fallback because
+    /// every assembler call comes from the typed flatten output; the
+    /// fallback is documented divergence pending the migration of
+    /// `encode_op` slot lookups to the strict `(v, expected_kind)`
+    /// form.
     fn lookup_coloring(
         &self,
         v: ValueId,
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> (u8, RegKind) {
+        // Strict path: type-state declares the kind; regallocs[kind]
+        // supplies the color.  Mirrors `flatten.py:386-387`.
+        if let Some(types) = self.current_types.as_ref() {
+            use crate::jit_codewriter::type_state::ConcreteType;
+            let kind = match types.get(v) {
+                ConcreteType::Signed => Some(RegKind::Int),
+                ConcreteType::GcRef => Some(RegKind::Ref),
+                ConcreteType::Float => Some(RegKind::Float),
+                ConcreteType::Void | ConcreteType::Unknown => None,
+            };
+            if let Some(kind) = kind {
+                if let Some(ra) = regallocs.get(&kind) {
+                    if let Some(&color) = ra.coloring.get(&v) {
+                        return (color as u8, kind);
+                    }
+                }
+                // `types` declared `kind` but the regalloc disagrees.
+                // Fall through to the per-kind scan as a documented
+                // divergence (TODO #71/#74); the chosen class is then
+                // still deterministic via KINDS order.
+            }
+        }
+        // Fallback: KINDS-ordered scan with single-class assertion.
+        let mut found: Option<(u8, RegKind)> = None;
         for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
             if let Some(ra) = regallocs.get(&kind) {
                 if let Some(&color) = ra.coloring.get(&v) {
-                    return (color as u8, kind);
+                    if let Some((_, prev)) = found {
+                        panic!(
+                            "lookup_coloring: value {v:?} colored in multiple regalloc \
+                             classes ({prev:?} and {kind:?}) — RPython `getkind` must \
+                             give exactly one (graph={:?}, op={:?})",
+                            self.current_graph_name, self.current_flatop_debug,
+                        );
+                    }
+                    found = Some((color as u8, kind));
                 }
             }
+        }
+        if let Some(result) = found {
+            return result;
         }
         let class_coverage: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
             .iter()

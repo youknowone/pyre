@@ -637,6 +637,15 @@ fn value_type_kind(ty: &crate::model::ValueType) -> RegKind {
 }
 
 /// `getkind(op.result.concretetype)` derived from the OpKind variant.
+///
+/// RPython parity: every result-bearing op has a declared result
+/// type — either `result_kind: char` (call family) or
+/// `result_ty`/`ty`/`item_ty: ValueType` for typed read/write
+/// variants.  Pyre's `OpKind` carries the same information on each
+/// variant, so the formatter can answer `getkind(result.concretetype)`
+/// without consulting any side-table.  The `_ => RegKind::Ref` arm
+/// only catches result-less variants whose `op.result == None`
+/// branch in `op_args_repr` already short-circuits this lookup.
 fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
     use crate::model::OpKind;
     match kind {
@@ -651,9 +660,21 @@ fn op_result_kind(kind: &crate::model::OpKind) -> RegKind {
         },
         OpKind::ConstInt(_) => RegKind::Int,
         OpKind::ConstFloat(_) => RegKind::Float,
-        OpKind::BinOp { result_ty, .. } | OpKind::UnaryOp { result_ty, .. } => {
-            value_type_kind(result_ty)
-        }
+        OpKind::ConstBool(_) => RegKind::Int,
+        OpKind::BinOp { result_ty, .. }
+        | OpKind::UnaryOp { result_ty, .. }
+        | OpKind::Call { result_ty, .. }
+        | OpKind::IndirectCall { result_ty, .. } => value_type_kind(result_ty),
+        OpKind::Input { ty, .. }
+        | OpKind::FieldRead { ty, .. }
+        | OpKind::VableFieldRead { ty, .. } => value_type_kind(ty),
+        OpKind::ArrayRead { item_ty, .. }
+        | OpKind::InteriorFieldRead { item_ty, .. }
+        | OpKind::VableArrayRead { item_ty, .. } => value_type_kind(item_ty),
+        OpKind::IsConstant { .. } | OpKind::IsVirtual { .. } => RegKind::Int,
+        // Result-less or pyre-only debug variants — `op_args_repr`
+        // only reaches this fall-through when `op.result == Some(_)`,
+        // so any miss surfaces as a real coverage gap to extend.
         _ => RegKind::Ref,
     }
 }
