@@ -1,6 +1,7 @@
 use majit_ir::Const;
 use majit_metainterp::resume::{
-    FrameInfo, FrameSlotSource, ReconstructedValue, ResumeData, VirtualFieldSource, VirtualInfo,
+    FrameInfo, FrameSlotSource, ReconstructedValue, ResumeData, ResumeDataExt, VirtualFieldSource,
+    VirtualInfo,
 };
 
 const TAG_CONST: i64 = 0;

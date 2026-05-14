@@ -4,7 +4,7 @@ use majit_metainterp::{
     DeclarativeJitDriver, DriverRunOutcome, JitDriver, JitState, PendingFieldWriteLayout,
     TraceAction, TraceCtx,
     recorder::{Snapshot, SnapshotFrame, SnapshotTagged},
-    resume::{MaterializedValue, MaterializedVirtual, ResumeDataVirtualAdder},
+    resume::{MaterializedValue, MaterializedVirtual, ResumeDataExt, ResumeDataVirtualAdder},
     virtualizable::VirtualizableInfo,
 };
 

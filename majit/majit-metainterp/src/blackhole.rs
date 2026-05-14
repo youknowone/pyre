@@ -10,7 +10,7 @@ use std::collections::HashMap;
 
 use crate::jitexc::JitException;
 use crate::resume::{
-    MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData, ResumeLayoutSummary,
+    MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt, ResumeLayoutSummary,
 };
 use majit_ir::{GcRef, Op, OpCode};
 

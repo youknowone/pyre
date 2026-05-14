@@ -46,7 +46,7 @@ use crate::jitdriver::JitDriverStaticData;
 use crate::optimizeopt::snapshot_get;
 use crate::optimizeopt::{SnapshotBoxes, SnapshotFramePcs, SnapshotFrameSizes, snapshot_insert};
 use crate::resume::{
-    MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite, ResumeData,
+    MaterializedVirtual, ReconstructedState, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt,
     ResumeLayoutSummary, ResumeStorage, SnapshotBox,
 };
 use crate::trace_ctx::TraceCtx;

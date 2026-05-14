@@ -2075,9 +2075,71 @@ impl EncodedResumeData {
     }
 }
 
-impl ResumeData {
+/// Metainterp-side extension trait for `ResumeData` (which lives in
+/// `majit-backend::resume_value` after the Phase C-1 cascade).
+///
+/// All inherent methods on `ResumeData` move here as trait methods
+/// (with default impls) — the trait sits in metainterp because the
+/// methods reference metainterp-specific types (`EncodedResumeData`,
+/// `DecodedResumeLayout`, `ReconstructedState`, `ReconstructedFrame`,
+/// `MaterializedVirtual`, `MaterializedValue`, `ReconstructedValue`,
+/// `ResolvedPendingFieldWrite`) and the orphan rule forbids inherent
+/// impls on a foreign type.
+///
+/// Callers reach the methods through `use ResumeDataExt;` plus the
+/// usual receiver syntax (`data.encode()`, `data.reconstruct_state(...)`,
+/// etc.) or the static-method syntax (`ResumeData::simple(...)`,
+/// `ResumeData::resolve_field_source(...)`) — both work for trait
+/// associated items as long as the trait is in scope.
+pub trait ResumeDataExt {
     /// Create a simple ResumeData for a single-frame trace.
-    pub fn simple(pc: u64, num_slots: usize) -> Self {
+    fn simple(pc: u64, num_slots: usize) -> Self
+    where
+        Self: Sized;
+
+    /// Encode this resume snapshot into a compact RPython-style numbering.
+    fn encode(&self) -> EncodedResumeData;
+
+    /// Decode the encoded resume snapshot back into a layout summary.
+    fn decode_layout(&self) -> DecodedResumeLayout;
+
+    /// Reconstruct the full resume state from fail_args data.
+    fn reconstruct_state(&self, fail_values: &[i64]) -> ReconstructedState;
+
+    /// Reconstruct frame slots from fail_args data.
+    fn reconstruct(&self, fail_values: &[i64]) -> Vec<ReconstructedFrame>;
+
+    /// Materialize virtual objects from resume data.
+    fn materialize_virtuals(&self, fail_values: &[i64]) -> Vec<MaterializedVirtual>;
+
+    fn materialize_virtuals_from_infos(
+        virtuals: &[VirtualInfo],
+        fail_values: &[i64],
+    ) -> Vec<MaterializedVirtual>;
+
+    /// Resolve pending heap writes into concrete values.
+    fn resolve_pending_field_writes(
+        pending_fields: &[PendingFieldInfo],
+        fail_values: &[i64],
+    ) -> Vec<ResolvedPendingFieldWrite>;
+
+    /// Resolve a single VirtualFieldSource to a concrete i64 value.
+    fn resolve_field_source(source: &VirtualFieldSource, fail_values: &[i64]) -> i64;
+
+    fn resolve_materialized_source(
+        source: &VirtualFieldSource,
+        fail_values: &[i64],
+    ) -> MaterializedValue;
+
+    /// Resolve a single frame-slot source into a reconstructed value.
+    fn resolve_frame_slot_source(
+        source: &FrameSlotSource,
+        fail_values: &[i64],
+    ) -> ReconstructedValue;
+}
+
+impl ResumeDataExt for ResumeData {
+    fn simple(pc: u64, num_slots: usize) -> Self {
         let slot_map: Vec<FrameSlotSource> = (0..num_slots).map(FrameSlotSource::FailArg).collect();
         ResumeData {
             vable_array: Vec::new(),
@@ -2092,8 +2154,7 @@ impl ResumeData {
         }
     }
 
-    /// Encode this resume snapshot into a compact RPython-style numbering.
-    pub fn encode(&self) -> EncodedResumeData {
+    fn encode(&self) -> EncodedResumeData {
         EncodedResumeData::from_semantic(
             &self.vable_array,
             &self.vref_array,
@@ -2107,13 +2168,13 @@ impl ResumeData {
         self.encode().decode_layout()
     }
 
-    /// Reconstruct the full resume state from fail_args data.
-    ///
-    /// `fail_values` are the concrete values extracted from the DeadFrame.
-    pub fn reconstruct_state(&self, fail_values: &[i64]) -> ReconstructedState {
+    fn reconstruct_state(&self, fail_values: &[i64]) -> ReconstructedState {
         let decoded = self.decode_layout();
         let materialized_virtuals =
-            Self::materialize_virtuals_from_infos(&decoded.virtuals, fail_values);
+            <ResumeData as ResumeDataExt>::materialize_virtuals_from_infos(
+                &decoded.virtuals,
+                fail_values,
+            );
         let frames = decoded
             .frames
             .iter()
@@ -2121,7 +2182,12 @@ impl ResumeData {
                 let values = frame
                     .slot_map
                     .iter()
-                    .map(|slot| Self::resolve_frame_slot_source(slot, fail_values))
+                    .map(|slot| {
+                        <ResumeData as ResumeDataExt>::resolve_frame_slot_source(
+                            slot,
+                            fail_values,
+                        )
+                    })
                     .collect();
                 ReconstructedFrame {
                     trace_id: None,
@@ -2137,30 +2203,23 @@ impl ResumeData {
         ReconstructedState {
             frames,
             virtuals: materialized_virtuals,
-            pending_fields: Self::resolve_pending_field_writes(
+            pending_fields: <ResumeData as ResumeDataExt>::resolve_pending_field_writes(
                 &decoded.pending_fields,
                 fail_values,
             ),
         }
     }
 
-    /// Reconstruct frame slots from fail_args data.
-    pub fn reconstruct(&self, fail_values: &[i64]) -> Vec<ReconstructedFrame> {
+    fn reconstruct(&self, fail_values: &[i64]) -> Vec<ReconstructedFrame> {
         self.reconstruct_state(fail_values).frames
     }
 
-    /// Materialize virtual objects from resume data.
-    ///
-    /// When a guard fails and some fail_args slots hold virtual objects
-    /// (objects that were never allocated during optimized execution),
-    /// this method resolves each VirtualInfo into a `MaterializedVirtual`.
-    ///
-    /// `fail_values` are the concrete i64 values from the DeadFrame.
-    ///
-    /// Mirrors RPython's `ResumeDataVirtualAdder.finish()` → `virtual_materialize()`.
-    pub fn materialize_virtuals(&self, fail_values: &[i64]) -> Vec<MaterializedVirtual> {
+    fn materialize_virtuals(&self, fail_values: &[i64]) -> Vec<MaterializedVirtual> {
         let decoded = self.decode_layout();
-        Self::materialize_virtuals_from_infos(&decoded.virtuals, fail_values)
+        <ResumeData as ResumeDataExt>::materialize_virtuals_from_infos(
+            &decoded.virtuals,
+            fail_values,
+        )
     }
 
     fn materialize_virtuals_from_infos(
@@ -2168,21 +2227,16 @@ impl ResumeData {
         fail_values: &[i64],
     ) -> Vec<MaterializedVirtual> {
         let mut result = Vec::with_capacity(virtuals.len());
-        // First pass: create empty materialized shells (handles forward references)
         for vinfo in virtuals {
             result.push(MaterializedVirtual::from_info(vinfo));
         }
-
-        // Second pass: resolve field sources
         for (i, vinfo) in virtuals.iter().enumerate() {
             result[i].resolve_fields(vinfo, fail_values);
         }
-
         result
     }
 
-    /// Resolve pending heap writes into concrete values.
-    pub fn resolve_pending_field_writes(
+    fn resolve_pending_field_writes(
         pending_fields: &[PendingFieldInfo],
         fail_values: &[i64],
     ) -> Vec<ResolvedPendingFieldWrite> {
@@ -2190,26 +2244,27 @@ impl ResumeData {
             .iter()
             .map(|pending| ResolvedPendingFieldWrite {
                 descr_index: pending.descr_index,
-                target: Self::resolve_materialized_source(&pending.target, fail_values),
-                value: Self::resolve_materialized_source(&pending.value, fail_values),
+                target: <ResumeData as ResumeDataExt>::resolve_materialized_source(
+                    &pending.target,
+                    fail_values,
+                ),
+                value: <ResumeData as ResumeDataExt>::resolve_materialized_source(
+                    &pending.value,
+                    fail_values,
+                ),
                 item_index: pending.item_index,
             })
             .collect()
     }
 
-    /// Resolve a single VirtualFieldSource to a concrete i64 value.
-    ///
-    /// For `Virtual(idx)` references, returns 0 as a placeholder —
-    /// the actual object address is only known after allocation by the
-    /// interpreter's allocator.
-    pub fn resolve_field_source(source: &VirtualFieldSource, fail_values: &[i64]) -> i64 {
-        match Self::resolve_materialized_source(source, fail_values) {
+    fn resolve_field_source(source: &VirtualFieldSource, fail_values: &[i64]) -> i64 {
+        match <ResumeData as ResumeDataExt>::resolve_materialized_source(source, fail_values) {
             MaterializedValue::Value(value) => value,
             MaterializedValue::VirtualRef(_) => 0,
         }
     }
 
-    pub fn resolve_materialized_source(
+    fn resolve_materialized_source(
         source: &VirtualFieldSource,
         fail_values: &[i64],
     ) -> MaterializedValue {
@@ -2225,8 +2280,7 @@ impl ResumeData {
         }
     }
 
-    /// Resolve a single frame-slot source into a reconstructed value.
-    pub fn resolve_frame_slot_source(
+    fn resolve_frame_slot_source(
         source: &FrameSlotSource,
         fail_values: &[i64],
     ) -> ReconstructedValue {
