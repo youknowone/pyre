@@ -2190,6 +2190,29 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
     }
 }
 
+/// Production-side `lower_constant` for the canonical [`flatten_graph`]
+/// entry.  Recovers the runtime PyObject pointer from `Opaque(Ref)`
+/// constants whose name encodes the pointer in `<tag>@<hex>` form.
+/// Pyre's walker emits these via `Constant::opaque(format!("pycode@{w_code:p}"),
+/// Some(Kind::Ref))` (`codewriter.rs::portal_jit_merge_point_graph_args`),
+/// matching upstream's rtyper-resolved `Constant(ll_ovf, concretetype=...)`
+/// at `flatten.py:166-170` after rewrite.  Names without the `@<hex>`
+/// suffix fall through to [`flatten_constant_operand`]'s panic so
+/// silent miscompilation is impossible.
+fn flatten_canonical_constant(constant: &super::flow::Constant) -> Operand {
+    if let (ConstantValue::Opaque(opaque), Some(Kind::Ref)) = (&constant.value, constant.kind) {
+        let name = opaque.repr();
+        if let Some(idx) = name.find('@') {
+            let hex = &name[idx + 1..];
+            let hex = hex.strip_prefix("0x").unwrap_or(hex);
+            if let Ok(ptr) = i64::from_str_radix(hex, 16) {
+                return Operand::ConstRef(ptr);
+            }
+        }
+    }
+    flatten_constant_operand(constant)
+}
+
 /// Test-fixture lowering: same as [`flatten_constant_operand`] but
 /// returns a placeholder for `Opaque(Ref)` instead of panicking.
 ///
@@ -2328,7 +2351,15 @@ pub fn flatten_graph<'a>(
     // closure that resolves the opaque to the runtime PyObject
     // pointer.  Calling the canonical entry on such a graph surfaces
     // the divergence instead of silently materialising `ConstRef(0)`.
-    let lower_constant = flatten_constant_operand;
+    // `flatten_constant_operand` panics on `Opaque(Ref)` constants
+    // (upstream's rtyper would have pre-resolved them to typed
+    // `Constant(ll_ovf, concretetype=...)`).  Pyre's walker emits
+    // `Opaque(Ref)` directly with the runtime PyObject pointer encoded
+    // in the name (`pycode@0x...`); `flatten_canonical_constant`
+    // recovers the pointer at flatten time.  Names that don't match
+    // the recoverable patterns fall through to
+    // `flatten_constant_operand`'s panic.
+    let lower_constant = flatten_canonical_constant;
     let mut flattener = if let Some(ctx) = lowering_ctx {
         GraphFlattener::new_with_full_lowering(&mut ssarepr, get_register, lower_constant, ctx)
     } else {
