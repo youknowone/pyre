@@ -2410,14 +2410,16 @@ pub enum MaterializedVirtual {
         type_id: u32,
         fields: Vec<(u32, MaterializedValue)>,
     },
-    /// Array.
+    /// Array — resume.py:646 VArrayInfo*.
     Array {
-        descr_index: u32,
+        /// resume.py:646 self.arraydescr.
+        descr: Option<majit_ir::DescrRef>,
         items: Vec<MaterializedValue>,
     },
-    /// Array of structs.
+    /// Array of structs — resume.py:739 VArrayStructInfo.
     ArrayStruct {
-        descr_index: u32,
+        /// resume.py:739 self.arraydescr.
+        descr: Option<majit_ir::DescrRef>,
         /// Per-element: Vec<(field_index, value)>.
         elements: Vec<Vec<(u32, MaterializedValue)>>,
     },
@@ -2455,21 +2457,21 @@ impl MaterializedVirtual {
                 fields: Vec::new(),
             },
             VirtualInfo::VArray {
-                arraydescr: _,
-                descr_index,
+                arraydescr,
                 clear: _,
                 items,
+                ..
             } => MaterializedVirtual::Array {
-                descr_index: *descr_index,
+                descr: arraydescr.clone(),
                 items: vec![MaterializedValue::Value(0); items.len()],
             },
             VirtualInfo::VArrayStruct {
-                arraydescr: _,
-                descr_index,
+                arraydescr,
                 fielddescrs: _,
                 element_fields,
+                ..
             } => MaterializedVirtual::ArrayStruct {
-                descr_index: *descr_index,
+                descr: arraydescr.clone(),
                 elements: vec![Vec::new(); element_fields.len()],
             },
             VirtualInfo::VRawBuffer {
@@ -2620,8 +2622,8 @@ impl MaterializedVirtual {
                     })
                     .collect::<Option<Vec<_>>>()?,
             }),
-            MaterializedVirtual::Array { descr_index, items } => Some(MaterializedVirtual::Array {
-                descr_index: *descr_index,
+            MaterializedVirtual::Array { descr, items } => Some(MaterializedVirtual::Array {
+                descr: descr.clone(),
                 items: items
                     .iter()
                     .map(|value| {
@@ -2631,11 +2633,8 @@ impl MaterializedVirtual {
                     })
                     .collect::<Option<Vec<_>>>()?,
             }),
-            MaterializedVirtual::ArrayStruct {
-                descr_index,
-                elements,
-            } => Some(MaterializedVirtual::ArrayStruct {
-                descr_index: *descr_index,
+            MaterializedVirtual::ArrayStruct { descr, elements } => Some(MaterializedVirtual::ArrayStruct {
+                descr: descr.clone(),
                 elements: elements
                     .iter()
                     .map(|fields| {
