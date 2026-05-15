@@ -2195,10 +2195,9 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
 /// callers thread their per-call `lower_constant` closure
 /// (`codewriter.rs::transform_graph_to_jitcode`) to recover the real
 /// `w_code` pointer.  Tests pass this placeholder so they don't need a
-/// production-grade closure.  `shape_descriptor`
-/// (`codewriter.rs:1179-1215`) tags `Operand::ConstRef(_)` as
-/// `"const_ref"` regardless of value, so the placeholder still produces
-/// the same shape signature production would emit on the same op.
+/// production-grade closure.  Tests that compare two SSARepr streams
+/// only compare opname + register kinds, so the `ConstRef(0)` value
+/// doesn't matter for those assertions.
 pub(super) fn flatten_constant_operand_for_probe(constant: &super::flow::Constant) -> Operand {
     match (&constant.value, constant.kind) {
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => Operand::ConstRef(0),
