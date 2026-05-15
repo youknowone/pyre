@@ -174,6 +174,19 @@ impl Label {
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
+
+    /// `true` iff the label's name matches pyre's per-PC anchor
+    /// convention (`pc<N>` where N is a decimal Python PC index).
+    /// Encapsulates the prefix/suffix check so the per-PC label
+    /// shape stays single-sourced through [`pc_label_name`] (producer)
+    /// and [`label_pc_index`] (consumer / parser).
+    pub fn is_pc_anchor(&self) -> bool {
+        if let Some(rest) = self.name.strip_prefix("pc") {
+            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
+        } else {
+            false
+        }
+    }
 }
 
 /// `flatten.py:20-26` `class TLabel(object)`.
@@ -229,11 +242,14 @@ pub fn pc_tlabel(py_pc: usize) -> TLabel {
 /// into its Python PC index, or return `None` for any other Label
 /// shape (block labels, link labels, catch-landing labels).  Consumed
 /// by the runtime's `pc_anchor_positions` /
-/// `live_marker_indices_by_pc` scans.
+/// `live_marker_indices_by_pc` scans.  Uses [`Label::is_pc_anchor`]
+/// to gate parsing so accidentally-named labels like `"pc_helper"`
+/// (which would `strip_prefix("pc")` to `"_helper"` and parse to
+/// `None`) are still rejected explicitly.
 pub fn label_pc_index(insn: &Insn) -> Option<usize> {
     if let Insn::Label(label) = insn {
-        if let Some(rest) = label.name.strip_prefix("pc") {
-            return rest.parse().ok();
+        if label.is_pc_anchor() {
+            return label.name.strip_prefix("pc").and_then(|rest| rest.parse().ok());
         }
     }
     None
@@ -3675,6 +3691,46 @@ fn build_residual_call_ir_r_single_ref_plain_insn_from_operands(
 mod tests {
     use super::*;
     use crate::jit::flow::{FlowListOfKind, VariableId};
+
+    #[test]
+    fn pc_label_round_trip_matches_naming_convention() {
+        for py_pc in [0usize, 1, 42, 99, 123_456] {
+            let name = pc_label_name(py_pc);
+            assert_eq!(name, format!("pc{py_pc}"));
+            let label = Label::new(name);
+            assert!(label.is_pc_anchor(), "Label({:?}) must be a PC anchor", label.name);
+            let recovered = label_pc_index(&Insn::Label(label));
+            assert_eq!(recovered, Some(py_pc), "round-trip py_pc={py_pc}");
+        }
+    }
+
+    #[test]
+    fn non_pc_labels_are_not_pc_anchors() {
+        // Block names, link names, catch-landing names — none of these
+        // match pyre's `pc<digits>` convention and must be rejected.
+        for name in [
+            "block0",
+            "block42",
+            "link1",
+            "catch_landing_3",
+            "pc",          // empty suffix
+            "pc_foo",      // non-digit suffix
+            "pc1x",        // mixed digit / letter suffix
+            "Pc0",         // case-sensitive
+            "ppc0",        // extra prefix
+        ] {
+            let label = Label::new(name);
+            assert!(
+                !label.is_pc_anchor(),
+                "Label({name:?}) must NOT be a PC anchor"
+            );
+            assert_eq!(
+                label_pc_index(&Insn::Label(label)),
+                None,
+                "label_pc_index must reject {name:?}"
+            );
+        }
+    }
 
     #[test]
     fn call_flavor_round_trip_through_effect_info() {

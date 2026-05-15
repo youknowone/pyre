@@ -281,7 +281,7 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
             if next.is_live() {
                 lives.push(next);
                 i += 1;
-            } else if matches!(&next, Insn::Label(label) if label.name.starts_with("pc")) {
+            } else if matches!(&next, Insn::Label(label) if label.is_pc_anchor()) {
                 break;
             } else if matches!(next, Insn::Label(_)) {
                 labels.push(next);
