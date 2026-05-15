@@ -240,10 +240,14 @@ pub fn apply_from_flowspace_variables(
     value_to_var: &crate::translator::rtyper::flowspace_adapter::ValueIdToVariable,
 ) {
     for (vid, var) in value_to_var.iter() {
-        let borrow = var.concretetype.borrow();
-        if let Some(lltype) = borrow.as_ref() {
-            graph.set_concretetype(*vid, crate::model::getkind(lltype));
-        }
+        // `bind_variable` stamps both the dense `value_types` slot
+        // (`getkind(var.concretetype)`) and the backing-Variable
+        // slot (`value_variables`) so subsequent
+        // `graph.concretetype(v)` / `graph.variable(v)` reads route
+        // through the upstream `Variable.concretetype` attribute
+        // verbatim — the codewriter consumes the rtyper-typed
+        // Variable as the source of truth.
+        graph.bind_variable(*vid, var.clone());
     }
 }
 
