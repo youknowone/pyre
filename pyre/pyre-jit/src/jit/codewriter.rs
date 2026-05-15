@@ -3517,7 +3517,6 @@ impl CodeWriter {
                         -1,
                     );
                     emit_vable_setfield_int_const!(
-                        ssarepr,
                         portal_frame_reg,
                         VABLE_VALUESTACKDEPTH_FIELD_IDX,
                         depth_value
@@ -3546,7 +3545,7 @@ impl CodeWriter {
         // load the thread-local exception into the handler's input
         // register.
         macro_rules! emit_last_exc_value {
-            ($ssarepr:expr, $dst:expr) => {{
+            ($dst:expr) => {{
                 let dst = $dst;
                 let insn = Insn::op_with_result(
                     "last_exc_value",
@@ -3612,7 +3611,7 @@ impl CodeWriter {
         // caller-order list. See `B6_CODEWRITER_PIPELINE_PLAN.md`.
 
         macro_rules! emit_load_const_i {
-            ($ssarepr:expr, $dst:expr, $value:expr $(,)?) => {{
+            ($dst:expr, $value:expr $(,)?) => {{
                 let dst = $dst;
                 let value: i64 = $value;
                 let insn = Insn::op_with_result(
@@ -3636,7 +3635,7 @@ impl CodeWriter {
         // return path; `assembler.py:221` turns that into the `ref_return/r`
         // bytecode key.
         macro_rules! emit_ref_return {
-            ($ssarepr:expr, $src:expr, $retval:expr) => {{
+            ($src:expr, $retval:expr) => {{
                 let src = $src;
                 let retval = $retval;
                 let insn = Insn::op("ref_return", vec![Operand::reg(Kind::Ref, src)]);
@@ -3671,7 +3670,7 @@ impl CodeWriter {
         // Phase 3c dispatch (`assembler.rs::dispatch_op:345`) can resolve
         // it against `builder_label`.
         macro_rules! emit_goto {
-            ($ssarepr:expr, $target_py_pc:expr) => {{
+            ($target_py_pc:expr) => {{
                 let target_py_pc = $target_py_pc;
                 let insn = Insn::op(
                     "goto",
@@ -3725,7 +3724,7 @@ impl CodeWriter {
         // `"abort_permanent"` to the builder, so the external push is
         // an exact mirror of the pre-existing internal behavior.
         macro_rules! emit_abort_permanent {
-            ($ssarepr:expr) => {{
+            () => {{
                 let insn = Insn::op("abort_permanent", Vec::new());
                 push_walker_emit(&current_block, insn);
                 // pyre-only dead-end: the block has no successor in
@@ -3742,7 +3741,7 @@ impl CodeWriter {
         // into `raise/r`. pyre's single `emit_raise(exc_reg)` call site
         // (RAISE_VARARGS with argc >= 1) corresponds to the same edge.
         macro_rules! emit_raise {
-            ($ssarepr:expr, $src:expr, $evalue:expr, $offset:expr) => {{
+            ($src:expr, $evalue:expr, $offset:expr) => {{
                 let src = $src;
                 let evalue_fv: super::flow::FlowValue = $evalue;
                 let offset = $offset;
@@ -3790,7 +3789,7 @@ impl CodeWriter {
         // the re-raise edge; `assembler.py:220` turns it into
         // `reraise/`. pyre emits this for RAISE_VARARGS with argc == 0.
         macro_rules! emit_reraise {
-            ($ssarepr:expr) => {{
+            () => {{
                 let insn = Insn::op("reraise", Vec::new());
                 push_walker_emit(&current_block, insn);
                 // Step 6.1 Phase 2c: same edge as `emit_raise!` — the
@@ -3845,7 +3844,7 @@ impl CodeWriter {
         // `catch_landing_{landing_label}` — distinct from the
         // `pc{py_pc}` naming used for PC-indexed labels.
         macro_rules! emit_catch_exception {
-            ($ssarepr:expr, $catch_label:expr) => {{
+            ($catch_label:expr) => {{
                 let catch_label = $catch_label;
                 let insn = Insn::op(
                     "catch_exception",
@@ -3881,7 +3880,7 @@ impl CodeWriter {
         // `catch_landing_{u16}`) match the TLabel schemes used by
         // `emit_goto!` and `emit_catch_exception!`.
         macro_rules! emit_mark_label_pc {
-            ($ssarepr:expr, $py_pc:expr) => {{
+            ($py_pc:expr) => {{
                 let py_pc = $py_pc;
                 // NOTE: the program-wide `ssarepr.insns` Label push is
                 // DEFERRED until the switch check below.  When the
@@ -4104,7 +4103,7 @@ impl CodeWriter {
         // clause for the matching probe-side carveout and the
         // convergence path back to RPython orthodox emission.
         macro_rules! emit_live_placeholder {
-            ($ssarepr:expr) => {{
+            () => {{
                 // RPython force-alive mechanism (`liveness.py:11-12`):
                 //
                 //   You can also force extra variables to be alive by putting
@@ -4134,7 +4133,7 @@ impl CodeWriter {
         // exitswitch form; the polarity difference is encoded by which edge is
         // arranged as `linkfalse`, not by changing the opcode.
         macro_rules! emit_goto_if_not {
-            ($ssarepr:expr, $cond:expr, $py_pc:expr) => {{
+            ($cond:expr, $py_pc:expr) => {{
                 let cond = $cond;
                 let py_pc = $py_pc;
                 let insn = Insn::op(
@@ -4167,7 +4166,7 @@ impl CodeWriter {
             }};
         }
         macro_rules! emit_goto_if_not_int_is_zero {
-            ($ssarepr:expr, $cond:expr, $py_pc:expr) => {{
+            ($cond:expr, $py_pc:expr) => {{
                 let cond = $cond;
                 let py_pc = $py_pc;
                 let insn = Insn::op(
@@ -4243,7 +4242,7 @@ impl CodeWriter {
         // production emit site today; those arms already require the same
         // canonical `[v_inst, ... descr]` operand shape.
         macro_rules! emit_vable_getfield_ref {
-            ($ssarepr:expr, $vable_reg:expr, $dst:expr, $field_idx:expr) => {{
+            ($vable_reg:expr, $dst:expr, $field_idx:expr) => {{
                 let vable_reg: u16 = $vable_reg;
                 let dst = $dst;
                 let field_idx: u16 = $field_idx;
@@ -4286,7 +4285,7 @@ impl CodeWriter {
             }};
         }
         macro_rules! emit_vable_setfield_int {
-            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $src:expr) => {{
+            ($vable_reg:expr, $field_idx:expr, $src:expr) => {{
                 let vable_reg: u16 = $vable_reg;
                 let field_idx: u16 = $field_idx;
                 let src = $src;
@@ -4305,7 +4304,7 @@ impl CodeWriter {
             }};
         }
         macro_rules! emit_vable_setfield_int_const {
-            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $value:expr) => {{
+            ($vable_reg:expr, $field_idx:expr, $value:expr) => {{
                 let vable_reg: u16 = $vable_reg;
                 let field_idx: u16 = $field_idx;
                 let value: i64 = $value;
@@ -4370,7 +4369,7 @@ impl CodeWriter {
         // length is constant).  The arms already require the canonical
         // `[v_base, ... arrayfielddescr, arraydescr]` operand shape.
         macro_rules! emit_vable_getarrayitem_ref {
-            ($ssarepr:expr, $vable_reg:expr, $dst:expr, $field_idx:expr, $index:expr) => {{
+            ($vable_reg:expr, $dst:expr, $field_idx:expr, $index:expr) => {{
                 let vable_reg: u16 = $vable_reg;
                 let dst = $dst;
                 let field_idx: u16 = $field_idx;
@@ -4394,7 +4393,7 @@ impl CodeWriter {
             }};
         }
         macro_rules! emit_vable_setarrayitem_ref {
-            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $index:expr, $src:expr) => {{
+            ($vable_reg:expr, $field_idx:expr, $index:expr, $src:expr) => {{
                 let vable_reg: u16 = $vable_reg;
                 let field_idx: u16 = $field_idx;
                 let index = $index;
@@ -4429,7 +4428,7 @@ impl CodeWriter {
         // form can address const sources through the unified ref register
         // space after `const_patches_u8` resolution.
         macro_rules! emit_vable_setarrayitem_ref_const {
-            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $index:expr, $value:expr) => {{
+            ($vable_reg:expr, $field_idx:expr, $index:expr, $value:expr) => {{
                 let vable_reg: u16 = $vable_reg;
                 let field_idx: u16 = $field_idx;
                 let index = $index;
@@ -4457,7 +4456,7 @@ impl CodeWriter {
         // shape when the index is folded to a Const.  Assembler dispatch
         // routes to `vable_setarrayitem_ref_const_idx_with_base`.
         macro_rules! emit_vable_setarrayitem_ref_const_idx {
-            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $index_value:expr, $src:expr) => {{
+            ($vable_reg:expr, $field_idx:expr, $index_value:expr, $src:expr) => {{
                 let vable_reg: u16 = $vable_reg;
                 let field_idx: u16 = $field_idx;
                 let index_value: i64 = $index_value;
@@ -4480,7 +4479,7 @@ impl CodeWriter {
         // — both index and value as constants.  Assembler routes to
         // `vable_setarrayitem_ref_const_idx_const_value_with_base`.
         macro_rules! emit_vable_setarrayitem_ref_const_idx_const_value {
-            ($ssarepr:expr, $vable_reg:expr, $field_idx:expr, $index_value:expr, $src_value:expr) => {{
+            ($vable_reg:expr, $field_idx:expr, $index_value:expr, $src_value:expr) => {{
                 let vable_reg: u16 = $vable_reg;
                 let field_idx: u16 = $field_idx;
                 let index_value: i64 = $index_value;
@@ -4504,7 +4503,7 @@ impl CodeWriter {
         // shape when the index is folded.  Assembler dispatch routes to
         // `vable_getarrayitem_ref_const_idx_with_base`.
         macro_rules! emit_vable_getarrayitem_ref_const_idx {
-            ($ssarepr:expr, $vable_reg:expr, $dst:expr, $field_idx:expr, $index_value:expr) => {{
+            ($vable_reg:expr, $dst:expr, $field_idx:expr, $index_value:expr) => {{
                 let vable_reg: u16 = $vable_reg;
                 let dst = $dst;
                 let field_idx: u16 = $field_idx;
@@ -4535,7 +4534,7 @@ impl CodeWriter {
         // a flow graph SpaceOperation.  Walker MUST NOT record a
         // graph-side `ref_copy` op.
         macro_rules! emit_ref_copy {
-            ($ssarepr:expr, $dst:expr, $src:expr) => {{
+            ($dst:expr, $src:expr) => {{
                 let dst = $dst;
                 let src = $src;
                 let insn = Insn::op_with_result(
@@ -4552,7 +4551,7 @@ impl CodeWriter {
         // CALL `NULL` sentinel.  Same graph-side prohibition as
         // `emit_ref_copy!`.
         macro_rules! emit_ref_const_copy {
-            ($ssarepr:expr, $dst:expr, $value:expr) => {{
+            ($dst:expr, $value:expr) => {{
                 let dst = $dst;
                 let value = $value;
                 let insn = Insn::op_with_result(
@@ -4577,10 +4576,10 @@ impl CodeWriter {
         // reconstruction and the per-push cost is recovered only as the
         // optimizer port progresses.
         macro_rules! emit_pushvalue_ref {
-            ($ssarepr:expr, $depth:ident, $src:expr, $src_value:expr) => {{
+            ($depth:ident, $src:expr, $src_value:expr) => {{
                 let src_reg = $src;
                 let src_value: super::flow::FlowValue = $src_value;
-                emit_ref_copy!($ssarepr, stack_base + $depth, src_reg);
+                emit_ref_copy!(stack_base + $depth, src_reg);
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     // `pyframe.py:389 pushvalue` lowers to
@@ -4606,7 +4605,6 @@ impl CodeWriter {
                         -1,
                     );
                     emit_vable_setarrayitem_ref_const_idx!(
-                        $ssarepr,
                         portal_frame_reg,
                         0_u16,
                         depth_value,
@@ -4635,7 +4633,7 @@ impl CodeWriter {
         // All current callers pass `PY_NULL`; the parameter is retained
         // for surface symmetry with `emit_pushvalue_ref!`.
         macro_rules! emit_pushvalue_ref_const {
-            ($ssarepr:expr, $depth:ident, $value:expr) => {{
+            ($depth:ident, $value:expr) => {{
                 let value: i64 = $value;
                 debug_assert_eq!(
                     value,
@@ -4643,7 +4641,7 @@ impl CodeWriter {
                     "emit_pushvalue_ref_const: only PY_NULL is supported today; \
                      graph shadow uses Constant::none() per assembler.py:109",
                 );
-                emit_ref_const_copy!($ssarepr, stack_base + $depth, value);
+                emit_ref_const_copy!(stack_base + $depth, value);
                 if is_portal {
                     let depth_value = (stack_base_absolute + $depth as usize) as i64;
                     let v_idx: super::flow::FlowValue =
@@ -4660,7 +4658,6 @@ impl CodeWriter {
                         -1,
                     );
                     emit_vable_setarrayitem_ref_const_idx_const_value!(
-                        $ssarepr,
                         portal_frame_reg,
                         0_u16,
                         depth_value,
@@ -4689,7 +4686,7 @@ impl CodeWriter {
         // assembler.py:109 null ref handling). flatten.rs:1163 lowers
         // it to `ConstRef(0)`.
         macro_rules! emit_popvalue_ref {
-            ($ssarepr:expr, $depth:ident) => {{
+            ($depth:ident) => {{
                 // Do not change this to a plain `$depth -= 1` until the
                 // portal stack-depth model is fully aligned with PyPy's
                 // assert-on-underflow behavior.  The direct parity change
@@ -4714,7 +4711,6 @@ impl CodeWriter {
                         -1,
                     );
                     emit_vable_setarrayitem_ref_const_idx_const_value!(
-                        $ssarepr,
                         portal_frame_reg,
                         0_u16,
                         depth_value,
@@ -4734,13 +4730,12 @@ impl CodeWriter {
         // `locals_cells_stack_w` slot mirrors the value loaded into the
         // stack-side SSA register.
         macro_rules! emit_load_fast_ref {
-            ($ssarepr:expr, $depth:ident, $reg:expr) => {{
+            ($depth:ident, $reg:expr) => {{
                 let reg = $reg;
                 if is_portal {
                     let local_slot = local_to_vable_slot(reg as usize) as i64;
                     let stack_slot = (stack_base_absolute + $depth as usize) as i64;
                     emit_vable_getarrayitem_ref_const_idx!(
-                        $ssarepr,
                         portal_frame_reg,
                         stack_base + $depth,
                         0_u16,
@@ -4795,7 +4790,6 @@ impl CodeWriter {
                         -1,
                     );
                     emit_vable_setarrayitem_ref_const_idx!(
-                        $ssarepr,
                         portal_frame_reg,
                         0_u16,
                         stack_slot,
@@ -4811,7 +4805,7 @@ impl CodeWriter {
                         .and_then(|value| value.clone())
                         .unwrap_or_else(|| fresh_ref_value(&mut graph));
                     current_state.stack.push(loaded.clone());
-                    emit_pushvalue_ref!($ssarepr, $depth, reg, loaded);
+                    emit_pushvalue_ref!($depth, reg, loaded);
                 }
             }};
         }
@@ -4828,19 +4822,18 @@ impl CodeWriter {
         // here is the foundation for the LFLF vable flip — see
         // memo super_inst_candidate1_probe_scope_2026_04_23.
         macro_rules! emit_store_local_with_mirror {
-            ($ssarepr:expr, $reg:expr, $stored_reg:expr) => {{
+            ($reg:expr, $stored_reg:expr) => {{
                 let reg = $reg;
                 let stored_reg = $stored_reg;
                 if is_portal {
                     emit_vable_setarrayitem_ref_const_idx!(
-                        $ssarepr,
                         portal_frame_reg,
                         0_u16,
                         local_to_vable_slot(reg as usize) as i64,
                         stored_reg
                     );
                 }
-                emit_ref_copy!($ssarepr, reg, stored_reg);
+                emit_ref_copy!(reg, stored_reg);
             }};
         }
 
@@ -4903,7 +4896,7 @@ impl CodeWriter {
                     }
                 }
                 // RPython flatten.py: Label(block) at block entry
-                emit_mark_label_pc!(ssarepr, py_pc);
+                emit_mark_label_pc!(py_pc);
                 // Task #227.5 yield-on-switch: if `emit_mark_label_pc!`
                 // detected a block boundary at this PC and queued the
                 // new block to `pendingblocks`, break the inner loop
@@ -4925,7 +4918,7 @@ impl CodeWriter {
                 // with upstream RPython which has no per-PC anchor
                 // concept — Labels are the boundary markers.
                 depth_at_pc[py_pc] = current_depth;
-                emit_live_placeholder!(ssarepr);
+                emit_live_placeholder!();
 
                 if loop_header_pcs.contains(&py_pc) {
                     if is_portal {
@@ -4996,7 +4989,6 @@ impl CodeWriter {
                         // value rather than a build-time constant.
                         let scratch_pycode_reg = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         emit_vable_getfield_ref!(
-                            ssarepr,
                             portal_frame_reg,
                             scratch_pycode_reg,
                             VABLE_CODE_FIELD_IDX
@@ -5110,7 +5102,7 @@ impl CodeWriter {
                     // in scope).
                     Instruction::LoadFast { var_num } | Instruction::LoadFastBorrow { var_num } => {
                         let reg = var_num.get(op_arg).as_usize() as u16;
-                        emit_load_fast_ref!(ssarepr, current_depth, reg);
+                        emit_load_fast_ref!(current_depth, reg);
                     }
 
                     // jtransform.py:1898 do_fixed_list_setitem vable case:
@@ -5121,7 +5113,7 @@ impl CodeWriter {
                     // in scope).
                     Instruction::StoreFast { var_num } => {
                         let reg = var_num.get(op_arg).as_usize() as u16;
-                        let stored_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let stored_reg = emit_popvalue_ref!(current_depth);
                         let stored = current_state
                             .stack
                             .pop()
@@ -5147,7 +5139,7 @@ impl CodeWriter {
                                 -1,
                             );
                         }
-                        emit_store_local_with_mirror!(ssarepr, reg, stored_reg);
+                        emit_store_local_with_mirror!(reg, stored_reg);
                         if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                             *slot = Some(stored);
                         }
@@ -5239,7 +5231,6 @@ impl CodeWriter {
                         // opcode's pushvalue (LoadConst's existing A-slice 2
                         // elision documented at LoadGlobal's caveat).
                         let pycode_graph_var = emit_vable_getfield_ref!(
-                            ssarepr,
                             portal_frame_reg,
                             dst_slot,
                             VABLE_CODE_FIELD_IDX
@@ -5343,8 +5334,8 @@ impl CodeWriter {
                         let pair = var_nums.get(op_arg);
                         let reg_a = u32::from(pair.idx_1()) as u16;
                         let reg_b = u32::from(pair.idx_2()) as u16;
-                        emit_load_fast_ref!(ssarepr, current_depth, reg_a);
-                        emit_load_fast_ref!(ssarepr, current_depth, reg_b);
+                        emit_load_fast_ref!(current_depth, reg_a);
+                        emit_load_fast_ref!(current_depth, reg_b);
                     }
 
                     // Super-instruction STORE_FAST; LOAD_FAST: pop TOS into
@@ -5355,7 +5346,7 @@ impl CodeWriter {
                         let pair = var_nums.get(op_arg);
                         let store_reg = u32::from(pair.idx_1()) as u16;
                         let load_reg = u32::from(pair.idx_2()) as u16;
-                        let stored_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let stored_reg = emit_popvalue_ref!(current_depth);
                         let stored = current_state
                             .stack
                             .pop()
@@ -5384,14 +5375,13 @@ impl CodeWriter {
                         // macro's `ref_copy(store_reg, stored_reg)` is
                         // equivalent to the prior explicit
                         // `ref_copy(store_reg, stack_base + current_depth)`.
-                        emit_store_local_with_mirror!(ssarepr, store_reg, stored_reg);
+                        emit_store_local_with_mirror!(store_reg, stored_reg);
                         if is_portal {
                             let load_slot = local_to_vable_slot(load_reg as usize) as i64;
                             let stack_slot = (stack_base_absolute + current_depth as usize) as i64;
                             // LOAD_FAST half: read local, then pyframe.py:378-381
                             // pushvalue parity — mirror to the value-stack slot.
                             emit_vable_getarrayitem_ref_const_idx!(
-                                ssarepr,
                                 portal_frame_reg,
                                 stack_base + current_depth,
                                 0_u16,
@@ -5461,7 +5451,6 @@ impl CodeWriter {
                                 -1,
                             );
                             emit_vable_setarrayitem_ref_const_idx!(
-                                ssarepr,
                                 portal_frame_reg,
                                 0_u16,
                                 stack_slot,
@@ -5480,7 +5469,7 @@ impl CodeWriter {
                                 .and_then(|value| value.clone())
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             current_state.stack.push(loaded.clone());
-                            emit_pushvalue_ref!(ssarepr, current_depth, load_reg, loaded);
+                            emit_pushvalue_ref!(current_depth, load_reg, loaded);
                         }
                     }
 
@@ -5547,7 +5536,7 @@ impl CodeWriter {
                     }
 
                     Instruction::PopTop => {
-                        let _ = emit_popvalue_ref!(ssarepr, current_depth);
+                        let _ = emit_popvalue_ref!(current_depth);
                         let _ = current_state.stack.pop();
                         // flowcontext.py:891 `self.popvalue()`; regalloc.py:
                         // discard = just decrement depth, no bytecode.
@@ -5556,7 +5545,6 @@ impl CodeWriter {
                     Instruction::PushNull => {
                         current_state.stack.push(null_stack_sentinel());
                         emit_pushvalue_ref_const!(
-                            ssarepr,
                             current_depth,
                             pyre_object::PY_NULL as i64
                         );
@@ -5577,14 +5565,14 @@ impl CodeWriter {
                             .expect("unsupported binary op tag in jitcode lowering")
                             as i64;
                         // Pop rhs (blackhole will see vsd reflect this pop).
-                        let rhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let rhs_reg = emit_popvalue_ref!(current_depth);
                         let rhs_value = current_state
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         if let super::flow::FlowValue::Variable(v) = &rhs_value {}
                         // Pop lhs.
-                        let lhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let lhs_reg = emit_popvalue_ref!(current_depth);
                         let lhs_value = current_state
                             .stack
                             .pop()
@@ -5638,13 +5626,13 @@ impl CodeWriter {
                         // Same stack-direct pattern as BinaryOp — see its comment.
                         let op_kind = opname.get(op_arg);
                         let op_val = compare_op_tag(op_kind);
-                        let rhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let rhs_reg = emit_popvalue_ref!(current_depth);
                         let rhs_value = current_state
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         if let super::flow::FlowValue::Variable(v) = &rhs_value {}
-                        let lhs_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let lhs_reg = emit_popvalue_ref!(current_depth);
                         let lhs_value = current_state
                             .stack
                             .pop()
@@ -5703,7 +5691,7 @@ impl CodeWriter {
                         // TOS), so there is no staging copy — mirrors upstream
                         // flatten.py:240-260 which feeds the Variable straight to
                         // `goto_if_not`.
-                        let cond_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let cond_reg = emit_popvalue_ref!(current_depth);
                         let cond_value = current_state
                             .stack
                             .pop()
@@ -5754,7 +5742,7 @@ impl CodeWriter {
                         // `flatten.py:275`.
                         let fallthrough_py_pc = py_pc + 1;
                         if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
-                            emit_goto_if_not!(ssarepr, scratch_truth, target_py_pc);
+                            emit_goto_if_not!(scratch_truth, target_py_pc);
                             // Phase A.4 retired the back-edge gate;
                             // emit_goto_if_not's mergeblock now always
                             // appends a fresh linkfalse, so case stamp
@@ -5796,7 +5784,7 @@ impl CodeWriter {
                         );
                         // A-slice 7: see PopJumpIfFalse — no obj_tmp0 staging
                         // needed; the residual call reads the popped stack slot.
-                        let cond_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let cond_reg = emit_popvalue_ref!(current_depth);
                         let cond_value = current_state
                             .stack
                             .pop()
@@ -5841,9 +5829,9 @@ impl CodeWriter {
                             // Phase A.4 retired the back-edge gate;
                             // emit_goto's mergeblock now always appends
                             // linktrue, so case stamp always applies.
-                            emit_goto_if_not!(ssarepr, scratch_truth, fallthrough_py_pc);
+                            emit_goto_if_not!(scratch_truth, fallthrough_py_pc);
                             set_last_bool_exitcase(&current_block.block(), false);
-                            emit_goto!(ssarepr, target_py_pc);
+                            emit_goto!(target_py_pc);
                             set_last_bool_exitcase(&current_block.block(), true);
                         }
                     }
@@ -5857,7 +5845,7 @@ impl CodeWriter {
                             delta.get(op_arg).as_usize(),
                         );
                         if target_py_pc < num_instrs {
-                            emit_goto!(ssarepr, target_py_pc);
+                            emit_goto!(target_py_pc);
                         }
                     }
 
@@ -5865,14 +5853,14 @@ impl CodeWriter {
                         if let Some(target_py_pc) = backward_jump_target(code, py_pc, instr, op_arg)
                         {
                             if target_py_pc < num_instrs {
-                                emit_goto!(ssarepr, target_py_pc);
+                                emit_goto!(target_py_pc);
                             }
                         }
                     }
 
                     // flatten.py: int_return / ref_return
                     Instruction::ReturnValue => {
-                        let retval_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let retval_reg = emit_popvalue_ref!(current_depth);
                         let retval = current_state
                             .stack
                             .pop()
@@ -5880,7 +5868,7 @@ impl CodeWriter {
                         // A-slice 3: ref_return reads from the stack slot
                         // directly — the obj_tmp0 staging was redundant since
                         // this is the terminating op of the block.
-                        emit_ref_return!(ssarepr, retval_reg, retval);
+                        emit_ref_return!(retval_reg, retval);
                     }
 
                     // RPython jtransform.py: rewrite_op_direct_call (residual)
@@ -5898,14 +5886,12 @@ impl CodeWriter {
                         // jtransform.py: getfield_vable_r for w_globals (field 3)
                         // and pycode (field 1) — namespace for lookup, code for names.
                         let ns_graph_var = emit_vable_getfield_ref!(
-                            ssarepr,
                             portal_frame_reg,
                             scratch_ns,
                             VABLE_NAMESPACE_FIELD_IDX
                         );
                         if let Some(v) = &ns_graph_var {}
                         let code_graph_var = emit_vable_getfield_ref!(
-                            ssarepr,
                             portal_frame_reg,
                             scratch_code,
                             VABLE_CODE_FIELD_IDX
@@ -5987,13 +5973,12 @@ impl CodeWriter {
                         if raw_namei & 1 != 0 {
                             current_state.stack.push(null_stack_sentinel());
                             emit_pushvalue_ref_const!(
-                                ssarepr,
                                 current_depth,
                                 pyre_object::PY_NULL as i64
                             );
                         }
                         current_state.stack.push(result_value.clone());
-                        emit_pushvalue_ref!(ssarepr, current_depth, scratch_ns, result_value);
+                        emit_pushvalue_ref!(current_depth, scratch_ns, result_value);
                     }
 
                     // RPython jtransform.py: rewrite_op_direct_call →
@@ -6015,20 +6000,20 @@ impl CodeWriter {
                             .collect();
                         let mut graph_arg_values_rev = Vec::with_capacity(nargs);
                         for i in (0..nargs).rev() {
-                            let arg_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                            let arg_reg = emit_popvalue_ref!(current_depth);
                             let arg_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            emit_ref_copy!(ssarepr, arg_regs[i], arg_reg);
+                            emit_ref_copy!(arg_regs[i], arg_reg);
                             graph_arg_values_rev.push(arg_value);
                         }
-                        let callable_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let callable_reg = emit_popvalue_ref!(current_depth);
                         let callable_value = current_state
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        let _ = emit_popvalue_ref!(ssarepr, current_depth); // NULL (discard)
+                        let _ = emit_popvalue_ref!(current_depth); // NULL (discard)
                         let _null_or_self = current_state
                             .stack
                             .pop()
@@ -6059,7 +6044,7 @@ impl CodeWriter {
                             .into()
                         };
                         if nargs > 8 {
-                            emit_abort_permanent!(ssarepr);
+                            emit_abort_permanent!();
                         } else {
                             let fn_idx = match nargs {
                                 0 => call_fn_0_idx,
@@ -6145,7 +6130,7 @@ impl CodeWriter {
 
                     // RPython bhimpl_int_neg: -obj via binary_op(0, obj, NB_SUBTRACT)
                     Instruction::UnaryNegative => {
-                        let operand_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let operand_reg = emit_popvalue_ref!(current_depth);
                         let operand_value = current_state
                             .stack
                             .pop()
@@ -6243,7 +6228,7 @@ impl CodeWriter {
                         if let Some(target_py_pc) = backward_jump_target(code, py_pc, instr, op_arg)
                         {
                             if target_py_pc < num_instrs {
-                                emit_goto!(ssarepr, target_py_pc);
+                                emit_goto!(target_py_pc);
                             }
                         }
                     }
@@ -6259,13 +6244,13 @@ impl CodeWriter {
                         let argc = count.get(op_arg) as usize;
                         if argc > 3 {
                             for _ in 0..argc {
-                                let _ = emit_popvalue_ref!(ssarepr, current_depth);
+                                let _ = emit_popvalue_ref!(current_depth);
                                 let _ = current_state
                                     .stack
                                     .pop()
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
                             }
-                            emit_abort_permanent!(ssarepr);
+                            emit_abort_permanent!();
                             current_state.stack.push(fresh_ref_value(&mut graph));
                             current_depth += 1;
                             emit_vsd!(current_depth);
@@ -6276,12 +6261,12 @@ impl CodeWriter {
                             .collect();
                         let mut item_values_rev = Vec::with_capacity(argc);
                         for i in (0..argc).rev() {
-                            let item_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                            let item_reg = emit_popvalue_ref!(current_depth);
                             let item_value = current_state
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            emit_ref_copy!(ssarepr, arg_regs[i], item_reg);
+                            emit_ref_copy!(arg_regs[i], item_reg);
                             item_values_rev.push(item_value);
                         }
                         // build_list_fn(argc, item0, item1, item2) → list. The C ABI is
@@ -6340,7 +6325,7 @@ impl CodeWriter {
                             BuildSliceArgCount::Three => 3usize,
                         };
                         let step_info = if raw_argc == 3 {
-                            let reg = emit_popvalue_ref!(ssarepr, current_depth);
+                            let reg = emit_popvalue_ref!(current_depth);
                             let step_value = current_state
                                 .stack
                                 .pop()
@@ -6349,12 +6334,12 @@ impl CodeWriter {
                         } else {
                             None
                         };
-                        let stop_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let stop_reg = emit_popvalue_ref!(current_depth);
                         let stop_value = current_state
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        let start_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let start_reg = emit_popvalue_ref!(current_depth);
                         let start_value = current_state
                             .stack
                             .pop()
@@ -6402,7 +6387,7 @@ impl CodeWriter {
                                     .stack
                                     .pop()
                                     .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                                let cause_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                                let cause_reg = emit_popvalue_ref!(current_depth);
                                 super::flatten::Operand::Register(super::flatten::Register::new(
                                     super::flatten::Kind::Ref,
                                     cause_reg,
@@ -6428,7 +6413,7 @@ impl CodeWriter {
                                 .stack
                                 .pop()
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                            let exc_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                            let exc_reg = emit_popvalue_ref!(current_depth);
                             // pyopcode.py:711 `exception_is_valid_obj_as_class_w`
                             // normalization + `set_cause` attachment.  Call ABI
                             // reads inputs before writing the result; the
@@ -6462,10 +6447,10 @@ impl CodeWriter {
                                 ),
                             );
                             let normalized_exc_fv = fresh_ref_value(&mut graph);
-                            emit_raise!(ssarepr, exc_reg, normalized_exc_fv, py_pc as i64);
+                            emit_raise!(exc_reg, normalized_exc_fv, py_pc as i64);
                         } else {
                             // reraise: re-raise exception_last_value
-                            emit_reraise!(ssarepr);
+                            emit_reraise!();
                         }
                     }
 
@@ -6482,7 +6467,7 @@ impl CodeWriter {
                         // the interpreter; pushing `None` for `prev` breaks
                         // nested exception state (pyopcode.py:786 saves the
                         // previous sys_exc_info so `POP_EXCEPT` can restore it).
-                        let exc_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let exc_reg = emit_popvalue_ref!(current_depth);
                         let exc_value = current_state
                             .stack
                             .pop()
@@ -6494,7 +6479,7 @@ impl CodeWriter {
                         // `push(exc)` would read back `prev` instead of the
                         // caught exception.
                         let scratch_exc = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                        emit_ref_copy!(ssarepr, scratch_exc, exc_reg);
+                        emit_ref_copy!(scratch_exc, exc_reg);
                         let scratch_prev = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
                         // get_current_exception / set_current_exception are TLS read/write —
                         // EF_CANNOT_RAISE per `effectinfo.py:19` (matching call.py:296
@@ -6558,9 +6543,9 @@ impl CodeWriter {
                         );
                         let prev_value = fresh_ref_value(&mut graph);
                         current_state.stack.push(prev_value.clone());
-                        emit_pushvalue_ref!(ssarepr, current_depth, scratch_prev, prev_value);
+                        emit_pushvalue_ref!(current_depth, scratch_prev, prev_value);
                         current_state.stack.push(exc_value.clone());
-                        emit_pushvalue_ref!(ssarepr, current_depth, scratch_exc, exc_value);
+                        emit_pushvalue_ref!(current_depth, scratch_exc, exc_value);
                     }
 
                     Instruction::CheckExcMatch => {
@@ -6574,7 +6559,7 @@ impl CodeWriter {
                         // time, but pyre's shadow graph cannot observe the
                         // runtime exception type; the residual helper owns
                         // the check.
-                        let match_type_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let match_type_reg = emit_popvalue_ref!(current_depth);
                         let match_type_value = current_state
                             .stack
                             .pop()
@@ -6630,7 +6615,7 @@ impl CodeWriter {
                         );
                         let result_value = fresh_ref_value(&mut graph);
                         current_state.stack.push(result_value.clone());
-                        emit_pushvalue_ref!(ssarepr, current_depth, scratch_match, result_value);
+                        emit_pushvalue_ref!(current_depth, scratch_match, result_value);
                     }
 
                     Instruction::PopExcept => {
@@ -6643,7 +6628,7 @@ impl CodeWriter {
                         // `POP_EXCEPT` the outer handler's exception must be
                         // reinstated as the "current" one so a bare `raise`
                         // re-propagates it.
-                        let prev_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                        let prev_reg = emit_popvalue_ref!(current_depth);
                         let prev_value = current_state
                             .stack
                             .pop()
@@ -6681,7 +6666,7 @@ impl CodeWriter {
 
                     Instruction::Reraise { .. } => {
                         // Exception path: abort_permanent.
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                     }
 
                     Instruction::WithExceptStart => {
@@ -6690,7 +6675,7 @@ impl CodeWriter {
                         // result on top. Preserve the net `+1` stack effect in
                         // the shadow graph and fall back to the interpreter for
                         // the actual helper call semantics.
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                         current_state.stack.push(fresh_ref_value(&mut graph));
                         current_depth += 1;
                         emit_vsd!(current_depth);
@@ -6701,7 +6686,6 @@ impl CodeWriter {
                         if d == 1 {
                             let duplicated = duplicate_shadow_tos(&mut graph, &mut current_state);
                             emit_pushvalue_ref!(
-                                ssarepr,
                                 current_depth,
                                 stack_base + current_depth - 1,
                                 duplicated
@@ -6710,7 +6694,7 @@ impl CodeWriter {
                             // COPY(d>1): exception handler pattern only.
                             // Use abort_permanent (BC_ABORT_PERMANENT=14) so it
                             // doesn't trigger the has_abort(BC_ABORT=13) check.
-                            emit_abort_permanent!(ssarepr);
+                            emit_abort_permanent!();
                         }
                     }
 
@@ -6722,7 +6706,7 @@ impl CodeWriter {
                         // RPython resolves the name to a Constant during flow
                         // analysis; pyre cannot fold module namespace lookups at
                         // codewriter time, so do not invent a graph op here.
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                         current_depth += 1;
                         emit_vsd!(current_depth);
                     }
@@ -6730,14 +6714,14 @@ impl CodeWriter {
                         // flowcontext.py marks STORE_NAME unsupported, but the
                         // stack effect still consumes one value. STORE_GLOBAL
                         // follows the same shape in flowcontext.py:884-890.
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                         let _ = current_state.stack.pop();
                         current_depth = current_depth.saturating_sub(1);
                         emit_vsd!(current_depth);
                     }
                     Instruction::MakeFunction { .. } => {
                         // Module-level only: abort_permanent (won't block blackhole).
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                     }
                     Instruction::StoreAttr { namei } => {
                         let name_idx = namei.get(op_arg) as usize;
@@ -6763,7 +6747,7 @@ impl CodeWriter {
                             stored_value,
                             py_pc as i64,
                         );
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                     }
                     Instruction::LoadAttr { namei } => {
                         // PyPy assemble.py gives LOAD_ATTR a net-0 stack effect.
@@ -6784,7 +6768,7 @@ impl CodeWriter {
                             attr_name.into(),
                             py_pc as i64,
                         );
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                         current_state.stack.push(result_value.into());
                         if attr.is_method() {
                             current_state.stack.push(null_stack_sentinel());
@@ -6801,7 +6785,7 @@ impl CodeWriter {
                         let reg_a = u32::from(pair.idx_1()) as u16;
                         let reg_b = u32::from(pair.idx_2()) as u16;
                         for reg in [reg_a, reg_b] {
-                            let stored_reg = emit_popvalue_ref!(ssarepr, current_depth);
+                            let stored_reg = emit_popvalue_ref!(current_depth);
                             let stored = current_state
                                 .stack
                                 .pop()
@@ -6826,7 +6810,7 @@ impl CodeWriter {
                                     -1,
                                 );
                             }
-                            emit_store_local_with_mirror!(ssarepr, reg, stored_reg);
+                            emit_store_local_with_mirror!(reg, stored_reg);
                             if let Some(slot) = current_state.locals_w.get_mut(reg as usize) {
                                 *slot = Some(stored);
                             }
@@ -6839,7 +6823,7 @@ impl CodeWriter {
                     // underflow.
                     Instruction::UnpackSequence { count } => {
                         let n = count.get(op_arg) as u16;
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                         // Stack effect: pop 1 + push n = net (n - 1)
                         if current_depth > 0 {
                             current_depth -= 1;
@@ -6853,19 +6837,19 @@ impl CodeWriter {
                     // don't underflow.
                     Instruction::GetIter => {
                         // pop iterable, push iterator: net 0
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                     }
 
                     Instruction::ForIter { .. } => {
                         // push next item: net +1
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                         current_depth += 1;
                         emit_vsd!(current_depth);
                     }
 
                     Instruction::EndFor => {
                         // pop iterator + last value: net -2
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                         current_depth = current_depth.saturating_sub(2);
                         // No emit_vsd: after abort_permanent, depth is
                         // simulation-only for subsequent compile-time tracking.
@@ -6881,14 +6865,14 @@ impl CodeWriter {
                     // BC_ABORT_PERMANENT(14) so has_abort_opcode doesn't
                     // false-positive on functions with only module-level paths.
                     _other => {
-                        emit_abort_permanent!(ssarepr);
+                        emit_abort_permanent!();
                     }
                 }
                 sync_stack_state(&mut graph, &mut current_state, current_depth);
                 current_state.next_offset = py_pc + 1;
                 current_state.blocklist = frame_blocks_for_offset(code, current_state.next_offset);
                 if let Some(catch_label) = catch_for_pc[py_pc] {
-                    emit_catch_exception!(ssarepr, catch_label);
+                    emit_catch_exception!(catch_label);
                 }
             }
         } // end while-let pendingblocks
@@ -6998,7 +6982,6 @@ impl CodeWriter {
                         -1,
                     );
                     emit_vable_setarrayitem_ref_const_idx_const_value!(
-                        ssarepr,
                         portal_frame_reg,
                         0_u16,
                         depth_value,
@@ -7069,7 +7052,6 @@ impl CodeWriter {
                         );
                     }
                     emit_vable_setarrayitem_ref_const_idx!(
-                        ssarepr,
                         portal_frame_reg,
                         0_u16,
                         (stack_base_absolute + depth as usize) as i64,
@@ -7080,7 +7062,7 @@ impl CodeWriter {
                 emit_vsd!(depth);
                 exc_slot += 1;
             }
-            emit_last_exc_value!(ssarepr, exc_slot);
+            emit_last_exc_value!(exc_slot);
             if is_portal {
                 let depth_value = (stack_base_absolute + depth as usize) as i64;
                 // pyframe.py:378-387 `pushvalue` semantics — graph
@@ -7099,7 +7081,6 @@ impl CodeWriter {
                     -1,
                 );
                 emit_vable_setarrayitem_ref_const_idx!(
-                    ssarepr,
                     portal_frame_reg,
                     0_u16,
                     depth_value,
@@ -7145,7 +7126,7 @@ impl CodeWriter {
             // per-shape variant routing) lands.
             depth += 1;
             emit_vsd!(depth);
-            emit_goto!(ssarepr, site.handler_py_pc);
+            emit_goto!(site.handler_py_pc);
         }
 
         // Task #227.3 `[phase4-walker-drain]` probe is retired: with
