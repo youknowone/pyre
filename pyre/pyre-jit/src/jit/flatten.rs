@@ -2878,8 +2878,7 @@ pub fn build_load_global_fn_residual_call_ir_r_insn(
 }
 
 /// Construct the CALL-family `residual_call_r_r` Insn from raw
-/// register indices.  Production codewriter callsite (Slice #48.9
-/// factor refactor) replaces the prior `emit_residual_call(
+/// register indices.  Production codewriter callsite replaces the prior `emit_residual_call(
 /// call_fn_N_idx, ...)` SSARepr emit at codewriter.rs:5747-5754
 /// (the `nargs <= 8` branch of the Instruction::Call arm) with a
 /// single direct push of this helper's output.  The matching graph
@@ -2923,8 +2922,7 @@ pub fn build_call_fn_residual_call_r_r_insn(
 }
 
 /// Construct the get_current_exception-family `residual_call_r_r`
-/// Insn.  Production codewriter callsite (Slice #48.15 factor
-/// refactor) replaces the prior `emit_residual_call(
+/// Insn.  Production codewriter callsite replaces the prior `emit_residual_call(
 /// get_current_exception_fn_idx, ...)` SSARepr emit at
 /// codewriter.rs:6116-6123 (PushExcInfo).  The matching graph
 /// dual-write at codewriter.rs:6141-6152 stays in place.
@@ -3007,8 +3005,7 @@ fn build_residual_call_r_r_insn_from_operands(
 ///
 /// The shared shape constructor
 /// `build_residual_call_r_r_insn_from_operands` accepts arbitrary
-/// `ref_operands.len()` plus a `flavor` parameter (extended in
-/// Slice #48.15 from MayForce-only to support the
+/// `ref_operands.len()` plus a `flavor` parameter (extended from MayForce-only to support the
 /// PlainCannotRaiseNoHeap exception-family helpers); this caller
 /// passes `MayForce` matching the production source.
 pub fn build_normalize_raise_varargs_fn_residual_call_r_r_insn(
@@ -3026,8 +3023,7 @@ pub fn build_normalize_raise_varargs_fn_residual_call_r_r_insn(
 }
 
 /// Construct the box_int-family `residual_call_ir_r` Insn from raw
-/// register indices.  Production codewriter callsites (Slice #48.10
-/// factor refactor) replace three prior `emit_residual_call(
+/// register indices.  Production codewriter callsites replace three prior `emit_residual_call(
 /// box_int_fn_idx, ...)` SSARepr emits with single direct pushes of
 /// this helper's output:
 ///   * LoadSmallInt at codewriter.rs:4867-4874 (val = literal small
@@ -3404,7 +3400,7 @@ where
 /// the matching `lower_*_hlop_to_insn` helper, falling through to the
 /// passthrough [`flatten_op_to_insn`] for any other opname.
 ///
-/// Slice #48.17 (Option C pipeline-flip prep): a future post-walker
+/// A future post-walker
 /// `flatten_graph(graph, ssarepr, ctx)` driver calls this dispatcher
 /// once per `block.operations` entry to translate graph ops back into
 /// the SSARepr Insn stream the assembler consumes.  Today the
@@ -3412,7 +3408,7 @@ where
 /// via the `build_*_residual_call_*_insn` helpers at every walker
 /// callsite while the graph carries pre-rtype HLOps for the retired
 /// families and post-rtype `residual_call_*` ops for the
-/// factor-refactored families (Slice #48.7-#48.16).  After
+/// factor-refactored families.  After
 /// retirement the walker would only record graph ops; this dispatcher
 /// is the per-op core of the post-walker driver.
 ///
@@ -3455,7 +3451,7 @@ where
 /// `None` when no arm matches, instead of falling through to the
 /// passthrough [`flatten_op_to_insn`].
 ///
-/// Slice #48.18: `GraphFlattener::flatten_space_operation` uses this
+/// `GraphFlattener::flatten_space_operation` uses this
 /// variant to avoid double-handling of non-HLOp ops.  The dispatcher's
 /// passthrough fallback uses `flatten_arg_for_probe` (probe-side
 /// constant lowering, `Opaque(Ref) → ConstRef(0)` placeholder) which
@@ -3514,7 +3510,7 @@ pub fn build_store_subscr_fn_residual_call_r_v_insn(
 
 /// Construct the set_current_exception-family `residual_call_r_v`
 /// Insn from a raw register index.  Production codewriter callsites
-/// (Slice #48.15 factor refactor) replace the prior
+/// replace the prior
 /// `emit_residual_call(set_current_exception_fn_idx, ...)` SSARepr
 /// emits at codewriter.rs:6134-6144 (PushExcInfo) and
 /// codewriter.rs:6269-6279 (PopExcept).  Both sites' graph
@@ -3569,8 +3565,7 @@ fn build_residual_call_r_v_insn_from_operands(
 }
 
 /// Construct the LoadConst-family `residual_call_ir_r` Insn from raw
-/// register indices.  Production codewriter callsite (Slice #48.7
-/// factor refactor) replaces the prior `emit_residual_call(
+/// register indices.  Production codewriter callsite replaces the prior `emit_residual_call(
 /// load_const_fn_idx, ...)` SSARepr emit at codewriter.rs:4933-4946
 /// with a single direct push of this helper's output.  The matching
 /// graph dual-write at codewriter.rs:4954-4965 stays in place — this
@@ -4492,7 +4487,7 @@ mod tests {
 
     #[test]
     fn flatten_graph_with_lowering_lowers_retired_family_hlops() {
-        // Slice #48.18: a graph carrying one HLOp from each of the four
+        // a graph carrying one HLOp from each of the four
         // retired families must lower to the matching `residual_call_*`
         // Insn shape under `flatten_graph_with_lowering`.  Builds a
         // minimal start block with `add(lhs, rhs)` + `lt(lhs, rhs)` +
@@ -4627,7 +4622,7 @@ mod tests {
 
     #[test]
     fn flatten_graph_with_lowering_byte_equivalent_across_blocks() {
-        // Slice #48.19: the `[phase4-flatten-graph]` probe runs the
+        // the `[phase4-flatten-graph]` probe runs the
         // FULL `flatten_graph_with_lowering` driver end-to-end against
         // a fresh SSARepr.  Production graphs span multiple blocks, so
         // the per-family `(opname, fn_idx)` filter must survive the
@@ -4810,7 +4805,7 @@ mod tests {
 
     #[test]
     fn flatten_graph_without_lowering_ctx_preserves_passthrough() {
-        // Slice #48.18: when `flatten_graph` (no ctx) sees a retired-
+        // when `flatten_graph` (no ctx) sees a retired-
         // family HLOp like `add`, the legacy passthrough must still
         // emit `Insn::op("add", ...)` — no silent rewrite via the
         // dispatcher.  This guards the "default GraphFlattener
@@ -5497,7 +5492,7 @@ mod tests {
 
     #[test]
     fn flatten_op_to_insn_with_lowering_dispatches_binary_op_hlop() {
-        // Slice #48.17: the unified dispatcher must route a `add`
+        // the unified dispatcher must route a `add`
         // BINARY_OP HLOp through `lower_binary_op_hlop_to_insn` and
         // produce the same Insn shape the per-family helper produces
         // on its own.
@@ -5525,7 +5520,7 @@ mod tests {
 
     #[test]
     fn flatten_op_to_insn_with_lowering_dispatches_compare_op_hlop() {
-        // Slice #48.17: dispatcher routes `lt` through
+        // dispatcher routes `lt` through
         // `lower_compare_op_hlop_to_insn` even when binary_op /
         // truth / store_subscr fn indices are also set on the ctx.
         let lhs = Variable::new(VariableId(0), Kind::Ref);
@@ -5552,7 +5547,7 @@ mod tests {
 
     #[test]
     fn flatten_op_to_insn_with_lowering_dispatches_bool_hlop() {
-        // Slice #48.17: dispatcher routes `bool(v) → r` through
+        // dispatcher routes `bool(v) → r` through
         // `lower_bool_hlop_to_insn`.  Different residual_call shape
         // (`_r_i` vs `_ir_r`) and different result Kind (Int vs Ref)
         // from BINARY_OP/COMPARE_OP, so this is non-trivial coverage.
@@ -5578,7 +5573,7 @@ mod tests {
 
     #[test]
     fn flatten_op_to_insn_with_lowering_dispatches_setitem_hlop() {
-        // Slice #48.17: dispatcher routes void-result `setitem(obj,
+        // dispatcher routes void-result `setitem(obj,
         // key, value)` through `lower_setitem_hlop_to_insn`.  The
         // void-result arm exercises the dispatcher's no-result path,
         // distinct from the value-producing arms above.
@@ -5611,7 +5606,7 @@ mod tests {
 
     #[test]
     fn flatten_op_to_insn_with_lowering_falls_through_for_residual_call_op() {
-        // Slice #48.17: for opnames outside the four retired families
+        // for opnames outside the four retired families
         // (e.g. an already-lowered `residual_call_ir_r` SpaceOperation
         // as recorded by the factor-refactored families' graph
         // dual-write at codewriter.rs::record_residual_call_graph_op),
