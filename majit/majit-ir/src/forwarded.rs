@@ -93,4 +93,65 @@ impl Forwarded {
     pub fn is_none(&self) -> bool {
         matches!(self, Forwarded::None)
     }
+
+    /// True for `Forwarded::Info(_)` — corresponds to
+    /// `next_op.is_info_class` (`resoperation.py:64`).
+    pub fn is_info(&self) -> bool {
+        matches!(self, Forwarded::Info(_))
+    }
+
+    /// True for `Forwarded::Const(_)` — corresponds to
+    /// `next_op.is_constant()` on the Const branch
+    /// (`resoperation.py:65`).
+    pub fn is_constant(&self) -> bool {
+        matches!(self, Forwarded::Const(_))
+    }
+}
+
+/// `resoperation.py:233-242 AbstractResOpOrInputArg` reader/writer
+/// surface, expressed as a trait so `Op` and `InputArg` share the
+/// implementation.
+pub trait AbstractResOpOrInputArg {
+    /// Underlying `RefCell<Forwarded>` slot. The methods below operate
+    /// through this slot; implementors only need to return it.
+    fn forwarded_slot(&self) -> &std::cell::RefCell<Forwarded>;
+
+    /// `resoperation.py:237` `get_forwarded`.
+    fn get_forwarded(&self) -> std::cell::Ref<'_, Forwarded> {
+        self.forwarded_slot().borrow()
+    }
+
+    /// `resoperation.py:240` `set_forwarded(forwarded_to)`. Replaces
+    /// the slot wholesale.
+    fn set_forwarded(&self, forwarded_to: Forwarded) {
+        *self.forwarded_slot().borrow_mut() = forwarded_to;
+    }
+
+    /// `resoperation.py:240` `set_forwarded` Box-target form.
+    /// Convenience for `set_forwarded(Forwarded::OpRef(target))`.
+    fn set_forwarded_opref(&self, target: OpRef) {
+        self.set_forwarded(Forwarded::OpRef(target));
+    }
+
+    /// `optimizer.py:413` `make_constant` — replace with constbox.
+    fn set_forwarded_const(&self, c: Const) {
+        self.set_forwarded(Forwarded::Const(c));
+    }
+
+    /// `optimizer.py:393` setting an `AbstractInfo` instance.
+    fn set_forwarded_info(&self, info: Rc<dyn AbstractInfo>) {
+        self.set_forwarded(Forwarded::Info(info));
+    }
+}
+
+impl AbstractResOpOrInputArg for crate::value::InputArg {
+    fn forwarded_slot(&self) -> &std::cell::RefCell<Forwarded> {
+        &self.forwarded
+    }
+}
+
+impl AbstractResOpOrInputArg for crate::resoperation::Op {
+    fn forwarded_slot(&self) -> &std::cell::RefCell<Forwarded> {
+        &self.forwarded
+    }
 }

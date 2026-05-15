@@ -27,7 +27,9 @@ pub use effectinfo::{
     RandomEffectsAnalyzer, UnsupportedFieldExc, VirtualizableAnalyzer, consider_array,
     consider_struct, frozenset_or_none,
 };
-pub use forwarded::{AbstractInfo, AbstractValue as ForwardableValue, Forwarded};
+pub use forwarded::{
+    AbstractInfo, AbstractResOpOrInputArg, AbstractValue as ForwardableValue, Forwarded,
+};
 pub use op_type_index::OpTypeIndex;
 pub use resoperation::{
     AbstractValue, ArrayDescrInfo, BoxEnv, FieldDescrInfo, GuardPendingFieldEntry, OPCODE_COUNT,
