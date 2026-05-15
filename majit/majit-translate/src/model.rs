@@ -1030,8 +1030,17 @@ impl From<ConstValue> for LinkArg {
 pub struct Block {
     pub id: BlockId,
     /// Phi-node inputs: values provided by incoming Links.
-    /// RPython: `Block.inputargs` — each predecessor Link carries
-    /// values that map 1:1 to these inputargs.
+    ///
+    /// RPython parity target: `Block.inputargs: List[Variable]`
+    /// (`flowspace/model.py:21-25 Block([Variable("etype"),
+    /// Variable("evalue")])`).  Pyre currently stores the dense
+    /// `ValueId` index — the storage migration to `Vec<Variable>`
+    /// requires updating ~90 read sites across regalloc / flatten /
+    /// assembler / call / jtransform / inline / front-end and is
+    /// tracked separately.  The foundation
+    /// ([`FunctionGraph::variable_to_vid`] + [`Self::input_variables`]
+    /// + [`FunctionGraph::value_id_of`]) is in place so consumer
+    /// migration can land incrementally without re-doing this scan.
     pub inputargs: Vec<ValueId>,
     pub operations: Vec<SpaceOperation>,
     /// RPython `Block.exitswitch`.
@@ -1892,30 +1901,26 @@ impl Block {
 
     /// Variable-identity view of [`Self::inputargs`] — projects each
     /// `ValueId` through `graph.variable(v)` to its backing
-    /// [`crate::flowspace::model::Variable`].
-    ///
-    /// RPython parity: `Block.inputargs` upstream is `[Variable]`
-    /// (`flowspace/model.py:21-25 Block([Variable("etype"), Variable("evalue")])`);
-    /// pyre's adapter stores `Vec<ValueId>` and projects through the
-    /// graph at read time.  Consumers that key on Variable identity
-    /// (regalloc working set, format diagnostics) read this iterator
-    /// instead of `inputargs.iter().map(|v| graph.variable(*v))`.
+    /// [`crate::flowspace::model::Variable`].  Mirrors upstream
+    /// `Block.inputargs: List[Variable]`
+    /// (`flowspace/model.py:21-25`) at the read surface; the
+    /// storage migration that lets this method return
+    /// `self.inputargs.iter()` directly is tracked on
+    /// [`Self::inputargs`].
     pub fn input_variables<'a>(
         &'a self,
         graph: &'a FunctionGraph,
     ) -> impl Iterator<Item = &'a crate::flowspace::model::Variable> + 'a {
-        self.inputargs
-            .iter()
-            .map(move |v| {
-                graph.variable(*v).unwrap_or_else(|| {
-                    panic!(
-                        "Block::input_variables: ValueId {v:?} on block {:?} \
-                         has no backing Variable on graph {:?} — every \
-                         alloc_value_with_type slot must mint one",
-                        self.id, graph.name,
-                    )
-                })
+        self.inputargs.iter().map(move |v| {
+            graph.variable(*v).unwrap_or_else(|| {
+                panic!(
+                    "Block::input_variables: ValueId {v:?} on block {:?} \
+                     has no backing Variable on graph {:?} — every \
+                     alloc_value_with_type slot must mint one",
+                    self.id, graph.name,
+                )
             })
+        })
     }
 
     /// RPython `flowspace/model.py:247 closeblock` / `:250 recloseblock`
@@ -2265,6 +2270,22 @@ impl FunctionGraph {
         let return_value = ValueId(0);
         let last_exception = ValueId(1);
         let last_exc_value = ValueId(2);
+        // Canonical inputargs (returnvar / etype / evalue) get named
+        // Variables matching `flowspace/model.py:21-25`
+        // (`Variable("returnvar")`, `Variable("etype")`,
+        // `Variable("evalue")`).  Each one's `concretetype` cell
+        // stays `None` until the rtyper resolves it; until then
+        // `concretetype(v)` returns `ConcreteType::Unknown` (the
+        // sentinel for the pre-`setconcretetype` window), which
+        // matches the pre-rtyper Variable-with-no-`concretetype`
+        // shape upstream.
+        let var_returnvar = crate::flowspace::model::Variable::named("returnvar");
+        let var_etype = crate::flowspace::model::Variable::named("etype");
+        let var_evalue = crate::flowspace::model::Variable::named("evalue");
+        let mut variable_to_vid = std::collections::HashMap::new();
+        variable_to_vid.insert(var_returnvar.id(), return_value);
+        variable_to_vid.insert(var_etype.id(), last_exception);
+        variable_to_vid.insert(var_evalue.id(), last_exc_value);
         Self {
             name: name.into(),
             startblock: entry,
@@ -2307,22 +2328,13 @@ impl FunctionGraph {
             ],
             notes: Vec::new(),
             next_value: 3,
-            // Canonical inputargs get named Variables matching the
-            // upstream graph (`flowspace/model.py:21-25` —
-            // `Variable("returnvar")`, `Variable("etype")`,
-            // `Variable("evalue")`).  Each one's `concretetype` cell
-            // stays `None` until the rtyper resolves it; until then
-            // `concretetype(v)` returns `ConcreteType::Unknown` (the
-            // sentinel for the pre-`setconcretetype` window), which
-            // matches the pre-rtyper Variable-with-no-`concretetype`
-            // shape upstream.
             value_variables: vec![
-                Some(crate::flowspace::model::Variable::named("returnvar")),
-                Some(crate::flowspace::model::Variable::named("etype")),
-                Some(crate::flowspace::model::Variable::named("evalue")),
+                Some(var_returnvar),
+                Some(var_etype),
+                Some(var_evalue),
             ],
             value_names: std::collections::HashMap::new(),
-            variable_to_vid: std::collections::HashMap::new(),
+            variable_to_vid,
             return_type: None,
         }
     }
@@ -2422,6 +2434,7 @@ impl FunctionGraph {
         );
         let var = crate::flowspace::model::Variable::new();
         var.set_concretetype(concrete_to_canonical_lltype(ty));
+        self.variable_to_vid.insert(var.id(), id);
         self.value_variables.push(Some(var));
         id
     }
@@ -2443,6 +2456,7 @@ impl FunctionGraph {
             id.0,
             "value_variables length must equal the next ValueId index",
         );
+        self.variable_to_vid.insert(var.id(), id);
         self.value_variables.push(Some(var));
         id
     }
@@ -2458,8 +2472,21 @@ impl FunctionGraph {
     pub fn bind_variable(&mut self, v: ValueId, var: crate::flowspace::model::Variable) {
         if v.0 >= self.value_variables.len() {
             self.value_variables
-                .resize_with(v.0 + 1, || Some(crate::flowspace::model::Variable::new()));
+                .resize_with(v.0 + 1, || {
+                    let placeholder = crate::flowspace::model::Variable::new();
+                    Some(placeholder)
+                });
+            // Re-register the placeholders that just got minted so
+            // `value_id_of` lookups against them still succeed.
+            for (idx, slot) in self.value_variables.iter().enumerate() {
+                if let Some(placeholder) = slot {
+                    self.variable_to_vid
+                        .entry(placeholder.id())
+                        .or_insert(ValueId(idx));
+                }
+            }
         }
+        self.variable_to_vid.insert(var.id(), v);
         self.value_variables[v.0] = Some(var);
     }
 
@@ -2469,6 +2496,18 @@ impl FunctionGraph {
     /// jtransform synth values without a Variable backing.
     pub fn variable(&self, v: ValueId) -> Option<&crate::flowspace::model::Variable> {
         self.value_variables.get(v.0).and_then(|opt| opt.as_ref())
+    }
+
+    /// Reverse of [`Self::variable`] — recover the dense `ValueId`
+    /// for a backing [`crate::flowspace::model::Variable`].  Useful
+    /// when an upstream-orthodox Variable-keyed structure
+    /// (`Block.inputargs: Vec<Variable>`) needs to project back to
+    /// pyre's index-keyed slots (HashMap<ValueId, _> downstream).
+    pub fn value_id_of(
+        &self,
+        var: &crate::flowspace::model::Variable,
+    ) -> Option<ValueId> {
+        self.variable_to_vid.get(&var.id()).copied()
     }
 
     /// Slice Z2.5.A — get-or-mint the `ValueId` bridge for an upstream
