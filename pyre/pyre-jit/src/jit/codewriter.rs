@@ -3474,6 +3474,17 @@ impl CodeWriter {
         // `JumpBackward` opcodes and record their targets; each target PC
         // becomes a `loop_header` site.
         let loop_header_pcs = find_loop_header_pcs(code);
+        // Phase A.1/A.2: pre-scanned set of every block-entry PC.  Used
+        // by emit_mark_label_pc to force a block boundary (call
+        // mergeblock to close current_block + create/match a fresh
+        // SpamBlock for py_pc) when the walker reaches a branch
+        // target sequentially, instead of letting current_block span
+        // the boundary.  Mirrors upstream's `flowcontext.py:425-435
+        // set_branch` which creates `joinpoints[py_pc]` candidates at
+        // every branch destination — pyre's pre-scan front-loads the
+        // same set so the per-block walker iteration matches per-block
+        // record_block emission.
+        let branch_target_pcs = find_branch_target_pcs(code);
 
         // RPython: flatten_graph() walks blocks and emits instruction tuples.
         // RPython: assembler.assemble(ssarepr, jitcode, num_regs) emits bytecodes.
@@ -3949,7 +3960,24 @@ impl CodeWriter {
                 // when "entering" a block — pyre's PC-sequential walker
                 // is the adaptation, but the join check belongs only on
                 // PC transitions, not on PC entry.
-                let new_block = if needs_fallthrough && current_state.next_offset != py_pc {
+                // Phase A.2: force a block boundary when the walker
+                // reaches a pre-scanned branch target PC sequentially.
+                // Without this, current_block would continue past the
+                // boundary via arm 3's self-registration, and a later
+                // back-edge to py_pc would create an orphan via
+                // make_next_block (next_offset mismatch in mergeblock's
+                // union loop).  The block-start case is excluded by
+                // checking that current_block.framestate.next_offset !=
+                // py_pc — we are not yet at start, so we need to close
+                // current_block at the boundary.
+                let force_branch_boundary = needs_fallthrough
+                    && branch_target_pcs.contains(&py_pc)
+                    && current_block
+                        .framestate()
+                        .map_or(true, |fs| fs.next_offset != py_pc);
+                let new_block = if needs_fallthrough
+                    && (current_state.next_offset != py_pc || force_branch_boundary)
+                {
                     mergeblock(
                         code,
                         &mut graph,
@@ -4940,14 +4968,6 @@ impl CodeWriter {
             // regallocs)` emission); it is not a standalone walker
             // refactor.
             if emitted_pc_starts.get(start_pc).copied().unwrap_or(false) {
-                // Mark the orphan-prone newblock dead so downstream
-                // graph traversals (flatten_graph, post-walk scans)
-                // can skip it.  The block is reachable from upstream
-                // via the link mergeblock added (when emit_goto_if_not
-                // / mergeblock-from-emit_mark_label_pc fired), but its
-                // operations + exits stay empty — flatten_graph's
-                // make_return graceful arm (Phase 4.B) handles the
-                // empty-exits case.
                 pending_block.mark_dead();
                 continue;
             }
