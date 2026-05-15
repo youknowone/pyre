@@ -105,59 +105,25 @@ pub fn lookup_recovery_layout(descr_ptr: usize) -> Option<ExitRecoveryLayout> {
         .cloned()
 }
 
-/// Backend-static side-table that maps a `DynasmFailDescr` Arc's
-/// `Arc::as_ptr` address to the regalloc-derived `fail_arg_locs`
-/// (each fail-arg's absolute jitframe slot, or `None` for unmapped
-/// virtual / dead opref).
-///
-/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) does not
-/// carry a `fail_arg_locs` slot; PyPy `assembler.py:286-298`
-/// (`write_failure_recovery_description`) encodes the per-slot
-/// positions directly into the recovery stub's machine code via
-/// immediate operands, and `failure_recovery_func` reads them
-/// back from the instruction stream at fail-time.  Pyre's dynasm
-/// backend retains the equivalent regalloc output as a structured
-/// `Vec<Option<usize>>` keyed off the descr identity so the runtime
-/// helper (`handle_fail_resume_guard` in `lib.rs`) and the dead-frame
-/// build path (`runner.rs::execute_token`) can read jitframe slots
-/// without re-decoding machine code — equivalent semantics, different
-/// encoding.
-///
-/// Static because the trampoline (`handle_fail_resume_guard`) is
-/// reached from a JIT call site that has no backend reference, only
-/// the descr address.  The `DynasmBackend::fail_descr_registry`
-/// (also static-discipline via `Arc<Mutex<…>>`) has the same shape
-/// for the same reason.
-static FAIL_ARG_LOCS_TABLE: OnceLock<Mutex<HashMap<usize, Vec<Option<usize>>>>> = OnceLock::new();
+// FAIL_ARG_LOCS_TABLE removed (Slice MM): duplicates `rd_locs`
+// (`history.py:132 _attrs_`).  All readers (`lib.rs:handle_fail_*` and
+// `runner.rs::execute_token`) now decode `descr.rd_locs()` directly
+// via `decode_rd_loc_slot` below, matching PyPy's
+// `llmodel.py:422-424 _decode_pos`.
 
-fn fail_arg_locs_table() -> &'static Mutex<HashMap<usize, Vec<Option<usize>>>> {
-    FAIL_ARG_LOCS_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Codegen-time write: invoked from `append_guard_token_with_faillocs`
-/// (x86 + aarch64) right after regalloc finalises the per-fail-arg
-/// jitframe slot map.  Also invoked from `allocate_unmapped_fail_arg_slots`
-/// when guard ops carry unmapped (virtual / dead) oprefs and need a
-/// second-pass write.
-pub fn register_fail_arg_locs(descr_ptr: usize, locs: Vec<Option<usize>>) {
-    fail_arg_locs_table()
-        .lock()
-        .expect("FAIL_ARG_LOCS_TABLE mutex poisoned")
-        .insert(descr_ptr, locs);
-}
-
-/// Runtime / dead-frame read.  Returns `None` when the descr was
-/// constructed outside the assembler path (e.g. backend unit-tests
-/// that build a `DynasmFailDescr` directly without going through
-/// `Assembler386::append_guard_token_with_faillocs`).  Callers that
-/// observe `None` fall back to identity slot indexing (`slot == i`),
-/// matching the pre-table runner behaviour for synthetic test descrs.
-pub fn lookup_fail_arg_locs(descr_ptr: usize) -> Option<Vec<Option<usize>>> {
-    fail_arg_locs_table()
-        .lock()
-        .expect("FAIL_ARG_LOCS_TABLE mutex poisoned")
-        .get(&descr_ptr)
-        .cloned()
+/// PyPy `llmodel.py:422-424 _decode_pos` parity.  Translate one
+/// `rd_locs[index]` entry into the jitframe slot pyre's
+/// `get_int_value_direct(jf, slot)` consumes.  Returns `None` for
+/// 0xFFFF (unmapped — resume system handles via `rd_numb`
+/// TAGCONST/TAGVIRTUAL encoding) or for out-of-range indices.
+#[inline]
+pub fn decode_rd_loc_slot(descr: &dyn FailDescr, index: usize) -> Option<usize> {
+    let pos = *descr.rd_locs().get(index)?;
+    if pos == 0xFFFF {
+        None
+    } else {
+        Some(pos as usize)
+    }
 }
 
 /// Re-export the shared per-cpu descr attachment types so existing
@@ -213,16 +179,13 @@ pub struct DynasmFailDescr {
     // raises `jitexc.ExitFrameWithExceptionRef` — the dispatcher sees
     // the resulting class identity, not the originating Propagate.
 
-    // fail_arg_locs removed (Session 5h): not in PyPy
-    // `AbstractFailDescr._attrs_` (`history.py:132`).  PyPy encodes the
-    // per-fail-arg slot positions as immediate operands in the recovery
-    // stub's machine code (`assembler.py:286-298
-    // write_failure_recovery_description`); pyre's dynasm retains the
-    // structured `Vec<Option<usize>>` in a backend-static side-table
-    // (`fail_arg_locs_table()` in this module) keyed on
-    // `Arc::as_ptr(&descr)`.  Semantically equivalent, encoded
-    // differently.  Will be folded into machine-code embedding in
-    // future work; for now the side-table lookup is the bridge.
+    // fail_arg_locs removed (Slice MM): the per-fail-arg slot positions
+    // live in `rd_locs` (`history.py:132 _attrs_`) on the metainterp
+    // `AbstractFailDescr`.  PyPy `llsupport/assembler.py:248-279
+    // store_info_on_descr` writes them there; pyre matches.  Runtime
+    // readers (`runner.rs::execute_token`, `lib.rs::handle_fail_*`)
+    // decode `descr.rd_locs()[i]` via `decode_rd_loc_slot` —
+    // PyPy `llmodel.py:422-424 _decode_pos` parity.
     // rd_locs removed (Session 5g-1, paired with adr_jump_offset
     // 5e-1): canonical storage is on the metainterp
     // `AbstractFailDescr` Arc via `meta_descr`.  Backend access goes
@@ -286,18 +249,14 @@ unsafe impl Send for DynasmFailDescr {}
 unsafe impl Sync for DynasmFailDescr {}
 
 impl Drop for DynasmFailDescr {
-    /// Backend-static side-tables (`FAIL_ARG_LOCS_TABLE`,
-    /// `SOURCE_OP_INDEX_TABLE`) are keyed on the descr's inner address.
+    /// Backend-static side-table `SOURCE_OP_INDEX_TABLE` is keyed on
+    /// the descr's inner address.
     /// Without cleanup the entry would outlive the descr and a future
     /// descr at the same reused address would observe stale state.
     /// Same lifecycle discipline as `CraneliftFailDescr` (see its
     /// `Drop` impl).
     fn drop(&mut self) {
         let ptr = self as *const Self as usize;
-        fail_arg_locs_table()
-            .lock()
-            .expect("FAIL_ARG_LOCS_TABLE mutex poisoned")
-            .remove(&ptr);
         source_op_index_table()
             .lock()
             .expect("SOURCE_OP_INDEX_TABLE mutex poisoned")

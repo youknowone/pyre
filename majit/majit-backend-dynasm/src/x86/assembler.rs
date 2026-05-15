@@ -4065,34 +4065,21 @@ impl<'a> Assembler386<'a> {
             );
         }
 
-        // Convert regalloc faillocs to absolute jf_frame slots for the
-        // helper/runner. This matches the fixed-slot-inclusive coordinate
-        // system used by get_fp_offset() and compiled_loop_token._ll_initial_locs
-        // in RPython.
+        // `llsupport/assembler.py:248-276 store_info_on_descr` parity:
+        // encode each fail-arg location as a USHORT.  PyPy's encoding —
+        //   None              → 0xFFFF
+        //   GPR register      → position in `cpu.gen_regs`
+        //   float register    → len(gen_regs) + position in `cpu.float_regs`
+        //   stack             → (loc.value - base_ofs) // WORD
+        //                         (here: `f.position + JITFRAME_FIXED_SIZE`)
+        // PyPy regalloc never passes `Const` to `getfailargs()` — `loc()`
+        // returns the immediate inline.  Pyre allocates a const-store
+        // slot for `Loc::Immed` at codegen time and encodes the slot
+        // into `rd_locs` so the deopt path treats it as a normal stack
+        // position (`_decode_pos` in `llmodel.py:422-424`).
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
         let gpr_regs = all_gen_regs();
         let float_regs = all_float_regs();
-        let fail_arg_locs: Vec<Option<usize>> = faillocs
-            .iter()
-            .map(|fl| match fl {
-                Some(Loc::Reg(r)) => {
-                    if r.is_xmm {
-                        float_reg_position(*r)
-                    } else {
-                        core_reg_position(*r)
-                    }
-                }
-                Some(Loc::Frame(f)) => Some(f.position + JITFRAME_FIXED_SIZE),
-                Some(Loc::Immed(i)) => {
-                    // Allocate a slot for this constant in the save area.
-                    let slot = self.frame_depth;
-                    self.frame_depth += 1;
-                    const_stores.push((slot, i.value));
-                    Some(slot)
-                }
-                _ => None,
-            })
-            .collect();
         let rd_locs: Vec<u16> = faillocs
             .iter()
             .map(|fl| match fl {
@@ -4111,7 +4098,15 @@ impl<'a> Assembler386<'a> {
                     .position(|reg| *reg == *r)
                     .expect("rd_locs: register not in gen_regs")
                     as u16,
-                Some(Loc::Immed(_)) => 0xFFFF,
+                Some(Loc::Immed(i)) => {
+                    // Allocate a const-store slot at codegen time;
+                    // encode the slot into `rd_locs` (PyPy stack-position
+                    // form) so deopt reads it like any other stack fail-arg.
+                    let slot = self.frame_depth;
+                    self.frame_depth += 1;
+                    const_stores.push((slot, i.value));
+                    slot as u16
+                }
                 Some(Loc::Ebp(_)) | Some(Loc::Addr(_)) => 0xFFFF,
             })
             .collect();
@@ -4149,14 +4144,6 @@ impl<'a> Assembler386<'a> {
             Arc::as_ptr(&descr) as *const () as usize,
             recovery_layout,
         );
-        // Session 5h: fail_arg_locs lives on the backend-static side-table
-        // (`fail_arg_locs_table()` in guard.rs), not on the descr.  See the
-        // module-level comment for the PyPy machine-code immediate-embedding
-        // equivalence rationale.
-        crate::guard::register_fail_arg_locs(
-            Arc::as_ptr(&descr) as *const () as usize,
-            fail_arg_locs.clone(),
-        );
         // `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`
         // — write through the trait accessor so the metainterp
         // `AbstractFailDescr` (`history.py:132 _attrs_`) receives the
@@ -4164,9 +4151,8 @@ impl<'a> Assembler386<'a> {
         descr_fd.set_rd_locs(rd_locs);
         if crate::majit_log_enabled() {
             eprintln!(
-                "[dynasm] guard-token-slots: fail_index={} fail_arg_locs={:?} rd_locs={:?}",
+                "[dynasm] guard-token-slots: fail_index={} rd_locs={:?}",
                 fail_index,
-                &fail_arg_locs,
                 descr_fd.rd_locs()
             );
         }
@@ -4191,29 +4177,35 @@ impl<'a> Assembler386<'a> {
         self.fail_descrs.push(descr.clone());
     }
 
-    /// Update fail_arg_locs on all pending guard descriptors.
-    /// Unmapped (virtual/dead) OpRefs get None — the resume system
-    /// handles them via rd_numb TAGVIRTUAL/TAGCONST encoding.
+    /// Update `rd_locs` on all pending guard descriptors after the
+    /// regalloc opref→slot map is finalised.  Unmapped (virtual/dead)
+    /// OpRefs and constants get `0xFFFF` — the resume system handles
+    /// them via `rd_numb` TAGVIRTUAL/TAGCONST encoding
+    /// (`resume.py:450-488`).
+    ///
+    /// Parallels the pending_force path of PyPy
+    /// `regalloc.py::store_force_descr → assembler.store_info_on_descr`
+    /// (`llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`).
     fn allocate_unmapped_fail_arg_slots(&mut self) {
         for gt in &self.pending_guard_tokens {
-            let locs: Vec<Option<usize>> = gt
+            let positions: Vec<u16> = gt
                 .fail_args
                 .iter()
                 .map(|opref| {
                     if opref.is_none() || opref.is_constant() {
-                        None
+                        0xFFFFu16
                     } else {
                         self.opref_to_slot
                             .get(opref)
                             .copied()
-                            .map(|slot| slot + JITFRAME_FIXED_SIZE)
+                            .map(|slot| (slot + JITFRAME_FIXED_SIZE) as u16)
+                            .unwrap_or(0xFFFFu16)
                     }
                 })
                 .collect();
-            crate::guard::register_fail_arg_locs(
-                Arc::as_ptr(&gt.fail_descr) as *const () as usize,
-                locs,
-            );
+            if let Some(meta_fd) = gt.fail_descr.as_fail_descr() {
+                meta_fd.set_rd_locs(positions);
+            }
         }
     }
 

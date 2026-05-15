@@ -1863,28 +1863,28 @@ impl Backend for DynasmBackend {
         // llmodel.py:412-420 get_latest_descr: read jf_descr from frame.
         let jf_descr_raw = unsafe { crate::llmodel::get_latest_descr(result_jf) as i64 };
         let descr = self.find_descr_by_ptr(token, jf_descr_raw as usize, result_jf);
-        let descr_addr = Arc::as_ptr(&descr) as *const () as usize;
         let descr_fd = descr
             .as_fail_descr()
             .expect("find_descr_by_ptr result must implement FailDescr");
-        let fail_arg_locs = crate::guard::lookup_fail_arg_locs(descr_addr).unwrap_or_default();
 
         if crate::majit_log_enabled() {
             eprintln!(
-                "[dynasm] descr: fi={} finish={} types={} locs={:?}",
+                "[dynasm] descr: fi={} finish={} types={} rd_locs={:?}",
                 descr_fd.fail_index_per_trace(),
                 descr_fd.is_finish(),
                 descr_fd.fail_arg_types().len(),
-                &fail_arg_locs
+                descr_fd.rd_locs()
             );
         }
 
-        // RPython parity: remap jitframe values using fail_arg_locs.
-        let n_locs = fail_arg_locs.len();
+        // PyPy `llmodel.py:422-424 _decode_pos` parity: remap jitframe
+        // values via `descr.rd_locs[i]`.  Synthetic / out-of-range
+        // descrs fall back to identity slot indexing.
+        let rd_locs_len = descr_fd.rd_locs().len();
         let mut raw_values: Vec<i64> = Vec::with_capacity(num_slots);
         for i in 0..num_slots {
-            if i < n_locs {
-                match fail_arg_locs[i] {
+            if i < rd_locs_len {
+                match crate::guard::decode_rd_loc_slot(descr_fd, i) {
                     Some(slot) => {
                         let val =
                             unsafe { crate::llmodel::get_int_value_direct(result_jf, slot) as i64 };
@@ -1965,13 +1965,19 @@ impl Backend for DynasmBackend {
         for i in 0..num_slots {
             outputs.push(unsafe { crate::llmodel::get_int_value_direct(result_jf, i) as i64 });
         }
-        let fail_arg_locs = crate::guard::lookup_fail_arg_locs(descr_addr);
+        // PyPy `llmodel.py:422-424 _decode_pos` parity: read each
+        // fail-arg slot from `descr.rd_locs[i]`.  Out-of-range index
+        // (synthetic descrs without rd_locs) falls back to identity.
+        let rd_locs_len = descr_fd.rd_locs().len();
         let mut typed_outputs = Vec::with_capacity(num_fail_args);
         for i in 0..num_fail_args {
-            let raw = match fail_arg_locs.as_ref().and_then(|l| l.get(i).copied()) {
-                Some(Some(slot)) => outputs.get(slot).copied().unwrap_or(0),
-                Some(None) => 0,
-                None => outputs.get(i).copied().unwrap_or(0),
+            let raw = if i < rd_locs_len {
+                match crate::guard::decode_rd_loc_slot(descr_fd, i) {
+                    Some(slot) => outputs.get(slot).copied().unwrap_or(0),
+                    None => 0,
+                }
+            } else {
+                outputs.get(i).copied().unwrap_or(0)
             };
             typed_outputs.push(match fail_arg_types[i] {
                 Type::Ref => Value::Ref(GcRef(raw as usize)),

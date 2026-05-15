@@ -621,13 +621,13 @@ fn handle_fail_resume_guard(
     let trace_id = descr.trace_id();
     let fail_index = descr.fail_index_per_trace();
     let n_fail_args = descr.fail_arg_types().len();
-    let fail_arg_locs = guard::lookup_fail_arg_locs(descr_raw);
     let mut raw_values: Vec<i64> = Vec::with_capacity(n_fail_args);
     for i in 0..n_fail_args {
-        let slot = fail_arg_locs
-            .as_ref()
-            .and_then(|l| l.get(i).copied().flatten())
-            .unwrap_or(i);
+        // PyPy `llmodel.py:422-424 _decode_pos` parity: read the slot
+        // from `descr.rd_locs[i]`.  Synthetic descrs without `rd_locs`
+        // fall back to identity slot indexing — same shape as the
+        // pre-Slice-MM table-miss path.
+        let slot = guard::decode_rd_loc_slot(descr, i).unwrap_or(i);
         raw_values.push(unsafe { llmodel::get_int_value_direct(frame_ptr, slot) as i64 });
     }
 

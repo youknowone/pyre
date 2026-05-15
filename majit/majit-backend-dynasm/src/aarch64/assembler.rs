@@ -3423,34 +3423,14 @@ impl<'a> AssemblerARM64<'a> {
             );
         }
 
-        // Convert regalloc faillocs to absolute jf_frame slots for the
-        // helper/runner. This matches the fixed-slot-inclusive coordinate
-        // system used by get_fp_offset() and compiled_loop_token._ll_initial_locs
-        // in RPython.
+        // `llsupport/assembler.py:248-276 store_info_on_descr` parity.
+        // PyPy encodes each fail-arg location as a USHORT in `rd_locs`;
+        // pyre allocates a const-store slot for `Loc::Immed` and writes
+        // the slot into rd_locs so the deopt path reads it via PyPy's
+        // stack-position decode (`llmodel.py:422-424`).
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
         let gpr_regs = all_gen_regs();
         let float_regs = all_float_regs();
-        let fail_arg_locs: Vec<Option<usize>> = faillocs
-            .iter()
-            .map(|fl| match fl {
-                Some(Loc::Reg(r)) => {
-                    if r.is_xmm {
-                        float_reg_position(*r)
-                    } else {
-                        core_reg_position(*r)
-                    }
-                }
-                Some(Loc::Frame(f)) => Some(f.position + JITFRAME_FIXED_SIZE),
-                Some(Loc::Immed(i)) => {
-                    // Allocate a slot for this constant in the save area.
-                    let slot = self.frame_depth;
-                    self.frame_depth += 1;
-                    const_stores.push((slot, i.value));
-                    Some(slot)
-                }
-                _ => None,
-            })
-            .collect();
         let rd_locs: Vec<u16> = faillocs
             .iter()
             .map(|fl| match fl {
@@ -3469,7 +3449,12 @@ impl<'a> AssemblerARM64<'a> {
                     .position(|reg| *reg == *r)
                     .expect("rd_locs: register not in gen_regs")
                     as u16,
-                Some(Loc::Immed(_)) => 0xFFFF,
+                Some(Loc::Immed(i)) => {
+                    let slot = self.frame_depth;
+                    self.frame_depth += 1;
+                    const_stores.push((slot, i.value));
+                    slot as u16
+                }
                 Some(Loc::Ebp(_)) | Some(Loc::Addr(_)) => 0xFFFF,
             })
             .collect();
@@ -3507,12 +3492,6 @@ impl<'a> AssemblerARM64<'a> {
             Arc::as_ptr(&descr) as *const () as usize,
             recovery_layout,
         );
-        // Session 5h: see x86 counterpart — fail_arg_locs lives in
-        // `crate::guard::fail_arg_locs_table()`, not on the descr.
-        crate::guard::register_fail_arg_locs(
-            Arc::as_ptr(&descr) as *const () as usize,
-            fail_arg_locs.clone(),
-        );
         // `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`
         // — write through the trait accessor so the metainterp
         // `AbstractFailDescr` (`history.py:132 _attrs_`) receives the
@@ -3521,9 +3500,8 @@ impl<'a> AssemblerARM64<'a> {
         descr_fd.set_rd_locs(rd_locs);
         if crate::majit_log_enabled() {
             eprintln!(
-                "[dynasm] guard-token-slots: fail_index={} fail_arg_locs={:?} rd_locs={:?}",
+                "[dynasm] guard-token-slots: fail_index={} rd_locs={:?}",
                 fail_index,
-                &fail_arg_locs,
                 descr_fd.rd_locs()
             );
         }
