@@ -1309,13 +1309,21 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums } => {
             let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
-            VirtualInfo::VStrConcat { left, right }
+            // RdVirtualInfo does not yet carry the OS_STR_CONCAT funcptr;
+            // VirtualInfo defaults to 0 here and the compile.rs producer
+            // path fills the resolved funcptr into ExitVirtualLayout.
+            VirtualInfo::VStrConcat {
+                func: 0,
+                left,
+                right,
+            }
         }
         majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums } => {
             let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
             let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
             VirtualInfo::VStrSlice {
+                func: 0,
                 source,
                 start,
                 length,
@@ -1331,13 +1339,18 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
             let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
-            VirtualInfo::VUniConcat { left, right }
+            VirtualInfo::VUniConcat {
+                func: 0,
+                left,
+                right,
+            }
         }
         majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
             let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
             let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
             VirtualInfo::VUniSlice {
+                func: 0,
                 source,
                 start,
                 length,
@@ -1630,7 +1643,7 @@ impl EncodedResumeData {
                 VirtualInfo::VStrPlain { chars } => majit_ir::RdVirtualInfo::VStrPlainInfo {
                     fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
                 },
-                VirtualInfo::VStrConcat { left, right } => {
+                VirtualInfo::VStrConcat { left, right, .. } => {
                     majit_ir::RdVirtualInfo::VStrConcatInfo {
                         fieldnums: fieldnums(
                             [left.as_ref().clone(), right.as_ref().clone()],
@@ -1643,6 +1656,7 @@ impl EncodedResumeData {
                     source,
                     start,
                     length,
+                    ..
                 } => majit_ir::RdVirtualInfo::VStrSliceInfo {
                     fieldnums: fieldnums(
                         [
@@ -1657,7 +1671,7 @@ impl EncodedResumeData {
                 VirtualInfo::VUniPlain { chars } => majit_ir::RdVirtualInfo::VUniPlainInfo {
                     fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
                 },
-                VirtualInfo::VUniConcat { left, right } => {
+                VirtualInfo::VUniConcat { left, right, .. } => {
                     majit_ir::RdVirtualInfo::VUniConcatInfo {
                         fieldnums: fieldnums(
                             [left.as_ref().clone(), right.as_ref().clone()],
@@ -1670,6 +1684,7 @@ impl EncodedResumeData {
                     source,
                     start,
                     length,
+                    ..
                 } => majit_ir::RdVirtualInfo::VUniSliceInfo {
                     fieldnums: fieldnums(
                         [
@@ -5304,6 +5319,21 @@ pub trait VirtualInfoBlackholeExt {
     ) -> i64;
 }
 
+/// VStrConcat/VStrSlice/VUniConcat/VUniSlice's allocate paths thread
+/// the per-source value through `decoder.{concat,slice}_{strings,unicodes}`,
+/// which expect a resume.py-tagged i16 charnum.  Pyre stores the source
+/// as a `VirtualFieldSource`; project it back to a tag-shaped i16 by
+/// decoding into an int (decode_field_source_int) and casting — this
+/// matches the resume.py loop body where each source contributes one
+/// already-tagged fieldnum.
+fn encode_source_to_tagged(
+    decoder: &mut ResumeDataDirectReader,
+    source: &VirtualFieldSource,
+) -> i16 {
+    let value = decoder.decode_field_source_int(source);
+    value as i16
+}
+
 /// `resume.py:766-775 VStrPlainInfo.allocate` and `resume.py:821-830
 /// VUniPlainInfo.allocate` share the same loop body — the only
 /// difference is `decoder.allocate_string` vs `allocate_unicode` and
@@ -5547,11 +5577,50 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
             VirtualInfo::VUniPlain { chars } => {
                 vstr_plain_info_allocate(decoder, index, chars, /* is_unicode */ true)
             }
-            // resume.py:781-793 VStrConcatInfo / 836-848 VUniConcatInfo /
-            // 801-809 VStrSliceInfo / 856-864 VUniSliceInfo — these
-            // need an OS_STR_*/OS_UNI_* funcptr resolved at trace time
-            // and carried on the virtual layout; until that producer
-            // wiring is in place, fall back to the dummy materialization.
+            // resume.py:786-793 VStrConcatInfo.allocate
+            VirtualInfo::VStrConcat { func, left, right } => {
+                let left_num = encode_source_to_tagged(decoder, left);
+                let right_num = encode_source_to_tagged(decoder, right);
+                let string = decoder.concat_strings(*func, left_num, right_num);
+                decoder.virtuals_cache.set_ptr(index, string);
+                string
+            }
+            // resume.py:805-809 VStrSliceInfo.allocate
+            VirtualInfo::VStrSlice {
+                func,
+                source,
+                start,
+                length,
+            } => {
+                let str_num = encode_source_to_tagged(decoder, source);
+                let start_num = encode_source_to_tagged(decoder, start);
+                let len_num = encode_source_to_tagged(decoder, length);
+                let string = decoder.slice_string(*func, str_num, start_num, len_num);
+                decoder.virtuals_cache.set_ptr(index, string);
+                string
+            }
+            // resume.py:841-848 VUniConcatInfo.allocate
+            VirtualInfo::VUniConcat { func, left, right } => {
+                let left_num = encode_source_to_tagged(decoder, left);
+                let right_num = encode_source_to_tagged(decoder, right);
+                let string = decoder.concat_unicodes(*func, left_num, right_num);
+                decoder.virtuals_cache.set_ptr(index, string);
+                string
+            }
+            // resume.py:860-864 VUniSliceInfo.allocate
+            VirtualInfo::VUniSlice {
+                func,
+                source,
+                start,
+                length,
+            } => {
+                let str_num = encode_source_to_tagged(decoder, source);
+                let start_num = encode_source_to_tagged(decoder, start);
+                let len_num = encode_source_to_tagged(decoder, length);
+                let string = decoder.slice_unicode(*func, str_num, start_num, len_num);
+                decoder.virtuals_cache.set_ptr(index, string);
+                string
+            }
             _ => {
                 decoder.virtuals_cache.set_ptr(index, 0);
                 0

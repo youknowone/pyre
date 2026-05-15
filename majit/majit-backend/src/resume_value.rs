@@ -301,12 +301,19 @@ pub enum VirtualInfo {
         chars: Vec<VirtualFieldSource>,
     },
     /// resume.py:781 VStrConcatInfo — virtual string concat (left + right).
+    /// `func` is the OS_STR_CONCAT funcptr resolved at trace time
+    /// (resume.py:1467-1469 — RPython looks it up via
+    /// callinfocollection.funcptr_for_oopspec on every decode; pyre
+    /// carries it on the layout because the reader does not have a
+    /// callinfocollection wired up yet).
     VStrConcat {
+        func: i64,
         left: Box<VirtualFieldSource>,
         right: Box<VirtualFieldSource>,
     },
     /// resume.py:801 VStrSliceInfo — virtual string slice.
     VStrSlice {
+        func: i64,
         source: Box<VirtualFieldSource>,
         start: Box<VirtualFieldSource>,
         length: Box<VirtualFieldSource>,
@@ -315,11 +322,13 @@ pub enum VirtualInfo {
     VUniPlain { chars: Vec<VirtualFieldSource> },
     /// resume.py:836 VUniConcatInfo — virtual unicode concat.
     VUniConcat {
+        func: i64,
         left: Box<VirtualFieldSource>,
         right: Box<VirtualFieldSource>,
     },
     /// resume.py:856 VUniSliceInfo — virtual unicode slice.
     VUniSlice {
+        func: i64,
         source: Box<VirtualFieldSource>,
         start: Box<VirtualFieldSource>,
         length: Box<VirtualFieldSource>,
@@ -415,18 +424,25 @@ impl VirtualInfo {
             VirtualInfo::VStrPlain { chars } | VirtualInfo::VUniPlain { chars } => {
                 chars.iter().collect()
             }
-            VirtualInfo::VStrConcat { left, right } | VirtualInfo::VUniConcat { left, right } => {
+            VirtualInfo::VStrConcat {
+                left, right, ..
+            }
+            | VirtualInfo::VUniConcat {
+                left, right, ..
+            } => {
                 vec![left.as_ref(), right.as_ref()]
             }
             VirtualInfo::VStrSlice {
                 source,
                 start,
                 length,
+                ..
             }
             | VirtualInfo::VUniSlice {
                 source,
                 start,
                 length,
+                ..
             } => vec![source.as_ref(), start.as_ref(), length.as_ref()],
         }
     }
