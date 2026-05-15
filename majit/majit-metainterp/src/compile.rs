@@ -1049,7 +1049,6 @@ pub(crate) fn build_guard_metadata(
                             };
                             majit_backend::ExitPendingFieldLayout {
                                 descr: pf.descr.clone(),
-                                descr_index: pf.descr_index,
                                 is_array_item: item_index.is_some(),
                                 item_index,
                                 target: resolve_tagged_source(pf.target_tagged),

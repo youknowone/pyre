@@ -570,20 +570,16 @@ impl Eq for ExitVirtualLayout {}
 /// `lldescr` and the (target, value) tagged sources only.  Field
 /// metadata (offset / size / type) is *not* duplicated onto the
 /// layout: consumers (`pyre-jit::eval::replay_pending_fields`,
-/// `cranelift::compiler` guard recovery) call `descr.as_field_descr()`
-/// / `descr.as_array_descr()` and read `offset()` / `field_size()` /
-/// `field_type()` directly, mirroring `resume.py:1509-1518` and
-/// `resume.py:1531-1541`.
+/// `cranelift::compiler` guard recovery,
+/// `jitdriver::materialize_pending_fields`) call
+/// `descr.as_field_descr()` / `descr.as_array_descr()` and read
+/// `offset()` / `field_size()` / `field_type()` directly, mirroring
+/// `resume.py:1509-1518` and `resume.py:1531-1541`.
 #[derive(Debug, Clone)]
 pub struct ExitPendingFieldLayout {
     /// `resume.py:88 lldescr` — identity-compared via `Arc::ptr_eq`
     /// (`history.py:125`).
     pub descr: Option<majit_ir::DescrRef>,
-    /// pyre-only u32 handle used by the virtualizable magic-encoded
-    /// dispatch in `jitdriver::materialize_pending_fields` (encodes
-    /// virtualizable field offsets via the high `0x8000_0000` bit).
-    /// Will be removed once that path also routes through `descr`.
-    pub descr_index: u32,
     pub item_index: Option<usize>,
     pub is_array_item: bool,
     pub target: ExitValueSourceLayout,
@@ -605,7 +601,6 @@ impl ExitPendingFieldLayout {
     pub fn shifted_virtuals(&self, virtual_offset: usize) -> Self {
         Self {
             descr: self.descr.clone(),
-            descr_index: self.descr_index,
             item_index: self.item_index,
             is_array_item: self.is_array_item,
             target: self.target.shifted_virtuals(virtual_offset),

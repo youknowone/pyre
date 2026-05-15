@@ -890,7 +890,6 @@ fn pending_field_layout_to_exit_pending_field_layout(
 ) -> ExitPendingFieldLayout {
     ExitPendingFieldLayout {
         descr: layout.descr.clone(),
-        descr_index: layout.descr_index,
         item_index: layout.item_index,
         is_array_item: layout.is_array_item,
         target: layout.target.to_exit_source(virtual_offset),

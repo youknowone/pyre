@@ -16327,7 +16327,6 @@ mod tests {
             }],
             pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {
                 descr: None,
-                descr_index: 33,
                 item_index: Some(1),
                 is_array_item: true,
                 target: majit_backend::ExitValueSourceLayout::Virtual(0),
@@ -16476,7 +16475,6 @@ mod tests {
             }],
             pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {
                 descr: None,
-                descr_index: 33,
                 item_index: Some(0),
                 is_array_item: true,
                 target: majit_backend::ExitValueSourceLayout::Virtual(0),
@@ -16561,7 +16559,6 @@ mod tests {
             }],
             pending_field_layouts: vec![majit_backend::ExitPendingFieldLayout {
                 descr: None,
-                descr_index: 77,
                 item_index: Some(1),
                 is_array_item: true,
                 target: majit_backend::ExitValueSourceLayout::Virtual(0),
