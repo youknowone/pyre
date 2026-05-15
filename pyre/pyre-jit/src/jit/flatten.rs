@@ -2065,9 +2065,10 @@ where
     /// `flatten.py:355-371 flatten_list(arglist)` — iterate `arglist`
     /// and dispatch each arg via `flatten_arg`.  Upstream inlines the
     /// per-variant dispatch inside `flatten_list`; pyre splits the
-    /// per-arg dispatch into `flatten_arg` for reuse (e.g. probe-side
-    /// `flatten_arg_for_probe`).  The named wrapper matches upstream's
-    /// `serialize_op` call shape (`args = self.flatten_list(op.args)`).
+    /// per-arg dispatch into `flatten_arg` for reuse (e.g. by
+    /// `flatten_op_to_insn` via `flatten_arg_with_lowering`).  The
+    /// named wrapper matches upstream's `serialize_op` call shape
+    /// (`args = self.flatten_list(op.args)`).
     fn flatten_list(&mut self, arglist: &[SpaceOperationArg]) -> Vec<Operand> {
         arglist.iter().map(|arg| self.flatten_arg(arg)).collect()
     }
@@ -2186,21 +2187,18 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
     }
 }
 
-/// Probe-side lowering: same as [`flatten_constant_operand`] but
+/// Test-fixture lowering: same as [`flatten_constant_operand`] but
 /// returns a placeholder for `Opaque(Ref)` instead of panicking.
 ///
-/// `flatten_arg_for_probe` runs from a debug-only shape comparison
-/// pass that walks every graph op; portal `jit_merge_point` carries an
-/// `Opaque(Ref)` pycode constant
-/// (`pyre/pyre-jit/src/jit/codewriter.rs:4351-4356`), and production
-/// emission threads a per-call `lower_constant` closure
-/// (`codewriter.rs:4381-4396`) to recover the real `w_code` pointer.
-/// The probe has no such closure available, so route `Opaque(Ref)` to
-/// `Operand::ConstRef(0)`. `shape_descriptor`
+/// Test fixtures construct synthetic `SpaceOperation` shapes whose
+/// `Opaque(Ref)` constants don't have a real PyObject pointer; production
+/// callers thread their per-call `lower_constant` closure
+/// (`codewriter.rs::transform_graph_to_jitcode`) to recover the real
+/// `w_code` pointer.  Tests pass this placeholder so they don't need a
+/// production-grade closure.  `shape_descriptor`
 /// (`codewriter.rs:1179-1215`) tags `Operand::ConstRef(_)` as
-/// `"const_ref"` regardless of value, so the placeholder still
-/// produces the same shape signature production emits when its
-/// closure lowers the same op to `Operand::ConstRef(real_ptr)`.
+/// `"const_ref"` regardless of value, so the placeholder still produces
+/// the same shape signature production would emit on the same op.
 pub(super) fn flatten_constant_operand_for_probe(constant: &super::flow::Constant) -> Operand {
     match (&constant.value, constant.kind) {
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => Operand::ConstRef(0),
@@ -2422,21 +2420,12 @@ where
 /// caller-supplied `lower_constant` closure that decides how
 /// `FlowValue::Constant` values map to `Operand`s.
 ///
-/// Slice #48.18 (Option C pipeline-flip prep): the four
-/// `lower_*_hlop_to_insn` helpers used to call `flatten_arg_for_probe`
-/// directly, hardcoding probe-side constant lowering
-/// (`flatten_constant_operand_for_probe` — `Opaque(Ref) → ConstRef(0)`
-/// placeholder).  Production-side callers
-/// (`GraphFlattener::flatten_arg` via `self.lower_constant`) need a
-/// real pycode pointer for `Opaque(Ref)`, so this generalized version
-/// accepts the lowering closure as a parameter.  Variable / list /
-/// descr / indirect-call-targets handling is identical to
-/// `flatten_arg_for_probe`; only constant operand lowering is
-/// pluggable.
-///
-/// The probe-side wrapper [`flatten_arg_for_probe`] threads
-/// `flatten_constant_operand_for_probe` as `lower_constant`; the
-/// production side threads `&mut self.lower_constant`.
+/// Production callers (`GraphFlattener::flatten_arg` via
+/// `self.lower_constant`) thread the per-call closure that resolves
+/// `Opaque(Ref)` to the real `w_code` PyObject pointer.  Tests pass
+/// [`flatten_constant_operand_for_probe`] (a `ConstRef(0)` placeholder).
+/// Variable / list / descr / indirect-call-targets handling is the
+/// same in both cases; only constant operand lowering is pluggable.
 fn flatten_arg_with_lowering<F, LC>(
     arg: &super::flow::SpaceOperationArg,
     get_register: &mut F,
