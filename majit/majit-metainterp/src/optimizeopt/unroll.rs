@@ -1026,8 +1026,10 @@ impl UnrollOptimizer {
                                 continue;
                             }
                             let resolved = final_ctx.get_box_replacement(arg);
-                            let needs_force = final_ctx.potential_extra_ops.contains_key(&arg)
-                                || final_ctx.potential_extra_ops.contains_key(&resolved);
+                            let needs_force = final_ctx
+                                .potential_extra_ops
+                                .iter()
+                                .any(|(k, _)| *k == arg || *k == resolved);
                             if needs_force {
                                 let _ = opt_p2.force_box(arg, &mut final_ctx);
                             }
@@ -5861,7 +5863,7 @@ mod tests {
         // RPython `unroll.py:34-37` seeds `potential_extra_ops` so a later
         // `force_box` will run `add_preamble_op` (shortpreamble.py:432-440).
         assert!(
-            ctx.potential_extra_ops.contains_key(&OpRef::int_op(20)),
+            ctx.has_potential_extra_op(OpRef::int_op(20)),
             "force_op_from_preamble_op must seed potential_extra_ops"
         );
         // RPython parity: `force_op_from_preamble` does NOT call
@@ -5879,7 +5881,7 @@ mod tests {
         assert_eq!(sp.used_boxes, vec![OpRef::int_op(20)]);
         assert_eq!(sp.jump_args, vec![OpRef::int_op(20)]);
         assert!(
-            !ctx.potential_extra_ops.contains_key(&OpRef::int_op(20)),
+            !ctx.has_potential_extra_op(OpRef::int_op(20)),
             "force_box must consume the potential_extra_ops entry"
         );
     }
@@ -5957,7 +5959,7 @@ mod tests {
         // `force_op_from_preamble_op` keys potential_extra_ops by
         // `preamble_source` (non-invented) per `unroll.py:34-37`.
         assert!(
-            ctx.potential_extra_ops.contains_key(&OpRef::ref_op(19)),
+            ctx.has_potential_extra_op(OpRef::ref_op(19)),
             "force_op_from_preamble_op must seed potential_extra_ops by source"
         );
 
@@ -5972,7 +5974,7 @@ mod tests {
         assert_eq!(sp.used_boxes, vec![OpRef::ref_op(14)]);
         assert_eq!(sp.jump_args, vec![OpRef::ref_op(19)]);
         assert!(
-            !ctx.potential_extra_ops.contains_key(&OpRef::ref_op(19)),
+            !ctx.has_potential_extra_op(OpRef::ref_op(19)),
             "force_box must consume the potential_extra_ops entry"
         );
     }

@@ -628,9 +628,13 @@ pub struct OptContext {
     pub const_infos: HashMap<usize, crate::optimizeopt::info::PtrInfo>,
     /// Dedup imported short fact uses so the builder stays in first-use order.
     imported_short_preamble_used: HashSet<OpRef>,
-    /// unroll.py:37 / optimizer.py:354: potential_extra_ops[op] = preamble_op
-    /// Populated by force_op_from_preamble, consumed by force_box.
-    pub(crate) potential_extra_ops: HashMap<OpRef, crate::optimizeopt::info::PreambleOp>,
+    /// `unroll.py:37` `self.optunroll.potential_extra_ops[op] = preamble_op` /
+    /// `optimizer.py:354` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
+    /// PyPy uses a dict keyed by the box; pyre uses a Vec of `(OpRef,
+    /// PreambleOp)` with linear-scan insert/pop/contains. The pool stays
+    /// small per trace (one entry per imported pure short-preamble op),
+    /// so O(n) operations are acceptable.
+    pub(crate) potential_extra_ops: Vec<(OpRef, crate::optimizeopt::info::PreambleOp)>,
     /// RPython unroll.py: live ExtendedShortPreambleBuilder while replaying an
     /// existing target token's short preamble.
     active_short_preamble_producer:
@@ -1568,7 +1572,7 @@ impl OptContext {
             const_infos: HashMap::new(),
             imported_short_preamble_used: HashSet::new(),
 
-            potential_extra_ops: HashMap::new(),
+            potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
 
@@ -1696,7 +1700,7 @@ impl OptContext {
             const_infos: HashMap::new(),
             imported_short_preamble_used: HashSet::new(),
 
-            potential_extra_ops: HashMap::new(),
+            potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
             exported_short_boxes: Vec::new(),
 
@@ -2669,7 +2673,17 @@ impl OptContext {
                         preamble_op.invented_name
                     );
                 }
-                self.potential_extra_ops.insert(key, preamble_op.clone());
+                // `unroll.py:37` dict-assign semantics — overwrite if the
+                // key already exists, otherwise append.
+                if let Some(entry) = self
+                    .potential_extra_ops
+                    .iter_mut()
+                    .find(|(k, _)| *k == key)
+                {
+                    entry.1 = preamble_op.clone();
+                } else {
+                    self.potential_extra_ops.push((key, preamble_op.clone()));
+                }
             }
         }
         // unroll.py:38 `return preamble_op.op`. RPython's `preamble_op.op`
@@ -3258,12 +3272,39 @@ impl OptContext {
         }
     }
 
-    /// optimizer.py:354: potential_extra_ops.pop(op)
+    /// `optimizer.py:354` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
     pub fn take_potential_extra_op(
         &mut self,
         result: OpRef,
     ) -> Option<crate::optimizeopt::info::PreambleOp> {
-        self.potential_extra_ops.remove(&result)
+        let idx = self
+            .potential_extra_ops
+            .iter()
+            .position(|(k, _)| *k == result)?;
+        Some(self.potential_extra_ops.swap_remove(idx).1)
+    }
+
+    /// `unroll.py:37` `self.optunroll.potential_extra_ops[op] = preamble_op` —
+    /// dict-assign semantics: overwrite if `key` exists, else append.
+    pub fn set_potential_extra_op(
+        &mut self,
+        key: OpRef,
+        preamble_op: crate::optimizeopt::info::PreambleOp,
+    ) {
+        if let Some(entry) = self
+            .potential_extra_ops
+            .iter_mut()
+            .find(|(k, _)| *k == key)
+        {
+            entry.1 = preamble_op;
+        } else {
+            self.potential_extra_ops.push((key, preamble_op));
+        }
+    }
+
+    /// Dict-`in` parity for `potential_extra_ops`.
+    pub fn has_potential_extra_op(&self, key: OpRef) -> bool {
+        self.potential_extra_ops.iter().any(|(k, _)| *k == key)
     }
 
     pub fn activate_short_preamble_producer(

@@ -1371,9 +1371,7 @@ mod tests {
         // Keep the source result available to use_box() exactly like the
         // imported short preamble path does after unroll import.
         if source != OpRef::NONE {
-            ctx.potential_extra_ops.insert(
-                source,
-                crate::optimizeopt::info::PreambleOp {
+            ctx.set_potential_extra_op(source, crate::optimizeopt::info::PreambleOp {
                     op: source,
                     invented_name: false,
                     preamble_op: {
@@ -1381,8 +1379,7 @@ mod tests {
                         same_as.pos = source;
                         same_as
                     },
-                },
-            );
+                });
         }
     }
     use crate::optimizeopt::optimizer::Optimizer;

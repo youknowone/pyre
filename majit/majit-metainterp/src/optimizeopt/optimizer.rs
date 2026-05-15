@@ -5739,9 +5739,7 @@ mod tests {
                 same_as_source: None,
             }],
         );
-        ctx.potential_extra_ops.insert(
-            OpRef::int_op(14),
-            crate::optimizeopt::info::PreambleOp {
+        ctx.set_potential_extra_op(OpRef::int_op(14), crate::optimizeopt::info::PreambleOp {
                 op: OpRef::int_op(14),
                 invented_name: false,
                 preamble_op: {
@@ -5749,8 +5747,7 @@ mod tests {
                     op.pos = OpRef::op_typed(14, op.result_type());
                     op
                 },
-            },
-        );
+            });
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(14)]);
         guard.pos = OpRef::op_typed(15, guard.result_type());
