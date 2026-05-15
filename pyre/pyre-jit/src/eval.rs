@@ -5801,15 +5801,18 @@ fn bh_setfield_gc_byte_write(
 }
 
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
-    fn allocate_array(&self, length: usize, arraydescr: &majit_ir::DescrRef, clear: bool) -> i64 {
-        // resume.py:1444-1447 allocate_array(length, arraydescr, clear)
-        // delegates to the CPU; do not replace ArrayDescr with a
-        // kind/item-size side channel here.
-        bh_new_array_from_descr(length, arraydescr, clear)
+    fn bh_new_array_clear(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
+        // resume.py:1446 cpu.bh_new_array_clear(length, arraydescr)
+        bh_new_array_from_descr(length, arraydescr, /* clear */ true)
     }
 
-    fn allocate_struct(&self, typedescr: &majit_ir::DescrRef) -> i64 {
-        // resume.py:1441-1442 allocate_struct → cpu.bh_new(typedescr)
+    fn bh_new_array(&self, length: usize, arraydescr: &majit_ir::DescrRef) -> i64 {
+        // resume.py:1447 cpu.bh_new_array(length, arraydescr)
+        bh_new_array_from_descr(length, arraydescr, /* clear */ false)
+    }
+
+    fn bh_new(&self, typedescr: &majit_ir::DescrRef) -> i64 {
+        // resume.py:1442 cpu.bh_new(typedescr)
         // llmodel.py:775-776 bh_new(sizedescr): plain malloc, no vtable.
         let sd = typedescr
             .as_size_descr()
