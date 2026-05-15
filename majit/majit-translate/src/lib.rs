@@ -1645,7 +1645,6 @@ mod tests {
         crate::jit_codewriter::type_state::apply_to_graph(&types, &mut result.graph);
         crate::regalloc::augment_canonical_exceptblock_on_graph(&mut result.graph);
         let regallocs = crate::regalloc::perform_all_register_allocations(&result.graph);
-        let _ = &types; // graph already hydrated via apply_to_graph above
         let flattened = flatten::flatten_graph(&result.graph, &regallocs);
         eprintln!(
             "load_fast graph ops: {:?}",

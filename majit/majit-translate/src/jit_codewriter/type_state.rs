@@ -316,6 +316,53 @@ pub fn merge_synth_kinds(
     merged
 }
 
+/// Direct-to-graph variant of [`merge_synth_kinds`].
+///
+/// Same precedence stack (`stamped > post_result > post_resolve >
+/// original`) but writes the per-value result straight into
+/// [`crate::model::FunctionGraph::value_types`] instead of building
+/// a transitional [`TypeResolutionState`].  Production callers go
+/// through this entry so the graph IS the merge target — no
+/// intermediate side table to thread downstream.  Skips Unknown
+/// writes so the canonical-exceptblock stamp performed elsewhere
+/// (`augment_canonical_exceptblock_on_graph`) is not clobbered.
+pub fn merge_synth_kinds_into_graph(
+    graph: &mut crate::model::FunctionGraph,
+    original: &TypeResolutionState,
+    post_resolve: &TypeResolutionState,
+    post_result: &HashMap<ValueId, ConcreteType>,
+    stamped: &HashMap<ValueId, ConcreteType>,
+) {
+    use crate::model::ConcreteType;
+    // (0) `post_resolve` (lower precedence than `original` per the
+    // legacy comment, but `original` only fills slots `post_result`
+    // doesn't claim — so apply `post_resolve` first).
+    for (value, kind) in post_resolve.iter() {
+        if !matches!(kind, ConcreteType::Unknown) {
+            graph.set_concretetype(value, kind.clone());
+        }
+    }
+    // (1) `original` operand inferences fill unresolved slots, but
+    // never override `post_result`.
+    for (value, kind) in original.iter() {
+        if !post_result.contains_key(&value) && !matches!(kind, ConcreteType::Unknown) {
+            graph.set_concretetype(value, kind.clone());
+        }
+    }
+    // (2) Op-result kinds win over operand inferences.
+    for (value, kind) in post_result {
+        if !matches!(kind, ConcreteType::Unknown) {
+            graph.set_concretetype(*value, kind.clone());
+        }
+    }
+    // (3) Synth kinds (jtransform-stamped) override everything.
+    for (value, kind) in stamped {
+        if !matches!(kind, ConcreteType::Unknown) {
+            graph.set_concretetype(*value, kind.clone());
+        }
+    }
+}
+
 /// `ValueType` → `ConcreteType` projection used by both
 /// `resolve_types` (legacy graph walk) and `authoritative_result_types`
 /// (post-jtransform op-result projection).

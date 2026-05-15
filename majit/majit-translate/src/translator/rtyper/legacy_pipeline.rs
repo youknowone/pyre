@@ -109,7 +109,6 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     // any more — the graph IS the kind table.
     crate::regalloc::augment_canonical_exceptblock_on_graph(&mut transform_result.graph);
     let regallocs = crate::regalloc::perform_all_register_allocations(&transform_result.graph);
-    let _ = &rewritten_types; // graph already hydrated via apply_to_graph above
     let flattened = flatten::flatten_graph(&transform_result.graph, &regallocs);
 
     PipelineResult {

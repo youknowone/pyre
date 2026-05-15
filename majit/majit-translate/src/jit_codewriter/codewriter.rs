@@ -19,7 +19,7 @@ use std::sync::Arc;
 
 use crate::assembler::Assembler;
 use crate::call::CallControl;
-use crate::flatten::{RegKind, flatten_with_types};
+use crate::flatten::RegKind;
 use crate::jit_codewriter::type_state::TypeResolutionState;
 use crate::jitcode::JitCode;
 use crate::jtransform::GraphTransformConfig;
@@ -342,50 +342,32 @@ impl CodeWriter {
         // `stamped`).  Block inputargs introduced by jtransform pick
         // up types via `original` (jtransform reuses the pre-rewrite
         // inputarg ValueIds when splicing new control flow).
+        // Merge the four post-rtyper kind sources directly into
+        // `rewritten.graph.value_types` — pyre's analogue of
+        // RPython's "rtyper finishes, every Variable has
+        // `.concretetype` inline" handoff (`rtyper.py`).  Precedence
+        // stack `stamped > post_result > post_resolve > original`
+        // is preserved; the graph IS the merge target, no
+        // intermediate `TypeResolutionState` survives the call.
         let post_result_types =
             crate::jit_codewriter::type_state::authoritative_result_types(&rewritten.graph);
-        let rewritten_type_state = crate::jit_codewriter::type_state::merge_synth_kinds(
-            &type_state,
-            crate::jit_codewriter::type_state::TypeResolutionState::new(),
-            post_result_types,
-            &rewritten.synth_kinds,
-        );
-
-        // Hydrate the graph's per-value `concretetype` slots from the
-        // post-rtyper [`TypeResolutionState`] — pyre's analogue of
-        // RPython's "rtyper finishes, every Variable has
-        // `.concretetype` inline" handoff (`rtyper.py`).  After this
-        // call `rewritten.graph.concretetype(v)` is the single source
-        // of truth for kind; the `TypeResolutionState` instance is
-        // kept as a transient scratch for the legacy
-        // `build_value_kinds` projection that regalloc still consumes.
-        //
-        // **Long-term migration**: once `cutover::specialize_legacy_graph_with_registry_seed`
-        // surfaces the `FlowspaceAdapterOutput::value_to_var` map up
-        // to this layer, the canonical hydration becomes
-        // [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`]
-        // (graph reads `getkind(v.concretetype)` straight from the
-        // `RPythonTyper`-typed Variable, no transitional merge).
-        // The 4-source `merge_synth_kinds` above retires once every
-        // post-rewrite ValueId either reuses a pre-rewrite Variable
-        // identity (rtyper-typed) or carries a typed-result variant
-        // (`OpKind::result_ty`/`result_kind`) the rtyper can stamp
-        // back onto its Variable.
-        crate::jit_codewriter::type_state::apply_to_graph(
-            &rewritten_type_state,
+        crate::jit_codewriter::type_state::merge_synth_kinds_into_graph(
             &mut rewritten.graph,
+            &type_state,
+            &crate::jit_codewriter::type_state::TypeResolutionState::new(),
+            &post_result_types,
+            &rewritten.synth_kinds,
         );
         // Long-term parity hydration: when the dual-gate Match arm
         // surfaced a `ValueIdToVariable` map, project each
         // `Variable.concretetype` through `getkind` directly into
         // `graph.value_types`.  This is the upstream-faithful path
         // (`history.py:46-71 getkind` reads `v.concretetype`
-        // directly), eventually replacing the transitional
-        // `merge_synth_kinds` route above.  Per-`set_concretetype`
-        // calls overwrite any existing slot, so the Variable-typed
-        // result wins over the transitional projection when both
-        // know the kind — matching upstream's "rtyper is the source
-        // of truth" contract.
+        // directly).  Per-`set_concretetype` calls overwrite any
+        // existing slot, so the Variable-typed result wins over the
+        // transitional merge above when both know the kind —
+        // matching upstream's "rtyper is the source of truth"
+        // contract.
         if let Some(value_to_var) = real_value_to_var.as_ref() {
             crate::jit_codewriter::type_state::apply_from_flowspace_variables(
                 &mut rewritten.graph,
@@ -406,8 +388,7 @@ impl CodeWriter {
         // Step 3: flatten (codewriter.py:53)
         // RPython: ssarepr = flatten_graph(graph, regallocs, cpu=cpu)
         // graph.value_types is the kind source after the
-        // hydration steps above; flatten reads it directly.
-        let _ = &rewritten_type_state; // kept around for the assemble call below
+        // merge/hydration steps above; flatten reads it directly.
         let mut ssarepr = crate::flatten::flatten_graph(&rewritten.graph, &regallocs);
 
         // Step 3b + 4: liveness + assemble (codewriter.py:56,67)
@@ -445,8 +426,8 @@ impl CodeWriter {
             // upstream's "type-source" provenance instead of going
             // through regalloc as a side-channel.
             for arg_id in &start_block.inputargs {
-                use crate::jit_codewriter::type_state::ConcreteType;
-                let class = match rewritten_type_state.get(*arg_id) {
+                use crate::model::ConcreteType;
+                let class = match rewritten.graph.concretetype(*arg_id) {
                     ConcreteType::Signed => 'i',
                     ConcreteType::GcRef => 'r',
                     ConcreteType::Float => 'f',
@@ -455,7 +436,7 @@ impl CodeWriter {
                 };
                 arg_classes.push(class);
             }
-            let cfg_kind = graph_result_kind(&rewritten.graph, &rewritten_type_state);
+            let cfg_kind = graph_result_kind(&rewritten.graph);
             let declared_kind = callcontrol.declared_return_kind(path);
             let result_type = declared_kind.unwrap_or(cfg_kind);
             // Cross-check: when both sources are present they must agree,
@@ -644,17 +625,17 @@ impl Default for CodeWriter {
 /// pointer type; the graph-level surface is
 /// `flowspace/model.py:17-18` `graph.returnblock = Block([return_var])`,
 /// where `return_var.concretetype` carries the same information.
-/// Pyre's analogue of `concretetype` is the
-/// [`TypeResolutionState`] entry for the returnblock's inputarg — the
-/// type-source path matching upstream rather than going through
-/// regalloc.
-fn graph_result_kind(graph: &FunctionGraph, types: &TypeResolutionState) -> char {
+/// Pyre reads `graph.concretetype(returnblock.inputargs[0])` —
+/// the inline `Variable.concretetype` analogue stored on
+/// [`crate::model::FunctionGraph::value_types`].  No transitional
+/// `TypeResolutionState` parameter; the graph IS the type source.
+fn graph_result_kind(graph: &FunctionGraph) -> char {
     let returnblock = graph.block(graph.returnblock);
     let Some(vid) = returnblock.inputargs.first() else {
         return 'v';
     };
-    use crate::jit_codewriter::type_state::ConcreteType;
-    match types.get(*vid) {
+    use crate::model::ConcreteType;
+    match graph.concretetype(*vid) {
         ConcreteType::Signed => 'i',
         ConcreteType::GcRef => 'r',
         ConcreteType::Float => 'f',
