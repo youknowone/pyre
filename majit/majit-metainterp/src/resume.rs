@@ -5220,6 +5220,50 @@ pub trait VirtualInfoBlackholeExt {
     ) -> i64;
 }
 
+/// `resume.py:596-603 AbstractVirtualStructInfo.setfields(decoder, struct)`
+/// — iterate fielddescrs/fieldnums and call decoder.setfield per
+/// non-UNINITIALIZED entry.  pyre threads the spec-form `FieldDescrInfo`
+/// through `bh_setfield_gc_{i,r,f}` directly because the descr Arc
+/// is not interned alongside the spec on `VirtualInfo::{VirtualObj,
+/// VStruct}.fielddescrs` (a future slice can replace `Vec<FieldDescrInfo>`
+/// with `Vec<Arc<dyn FieldDescr>>` so this helper can call
+/// `decoder.setfield(struct, num, descr)` byte-for-byte with RPython).
+fn abstract_virtual_struct_info_setfields(
+    decoder: &mut ResumeDataDirectReader,
+    allocator: &dyn BlackholeAllocator,
+    struct_ptr: i64,
+    fielddescrs: &[majit_ir::FieldDescrInfo],
+    fields: &[(u32, VirtualFieldSource)],
+) {
+    for (i, (_field_descr, source)) in fields.iter().enumerate() {
+        let Some(descr_info) = fielddescrs.get(i) else {
+            continue;
+        };
+        // resume.py:601 if not tagged_eq(num, UNINITIALIZED)
+        if matches!(source, VirtualFieldSource::Uninitialized) {
+            continue;
+        }
+        // resume.py:602 decoder.setfield(struct, num, descr)
+        // — pyre dispatches by descr_info.field_type because pyre's
+        //   fielddescrs collection holds the spec form, not the live
+        //   FieldDescr Arc that RPython passes to decoder.setfield.
+        match descr_info.field_type {
+            majit_ir::Type::Ref => {
+                let value = decoder.decode_field_source(source);
+                allocator.bh_setfield_gc_r(struct_ptr, value, descr_info);
+            }
+            majit_ir::Type::Float => {
+                let value = decoder.decode_field_source_float(source);
+                allocator.bh_setfield_gc_f(struct_ptr, value, descr_info);
+            }
+            _ => {
+                let value = decoder.decode_field_source_int(source);
+                allocator.bh_setfield_gc_i(struct_ptr, value, descr_info);
+            }
+        }
+    }
+}
+
 impl VirtualInfoBlackholeExt for VirtualInfo {
     /// resume.py:576 kind attribute — REF for object/struct/array/string,
     /// INT for raw buffers.
@@ -5255,35 +5299,10 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                     .map(|d| allocator.allocate_with_vtable(d, vtable))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, obj);
-                for (i, (field_descr, source)) in fields.iter().enumerate() {
-                    let fd = fielddescrs.get(i);
-                    let field_type = fd.map(|fd| fd.field_type).unwrap_or(majit_ir::Type::Ref);
-                    let value = match field_type {
-                        majit_ir::Type::Ref => decoder.decode_field_source(source),
-                        majit_ir::Type::Float => decoder.decode_field_source_float(source),
-                        _ => decoder.decode_field_source_int(source),
-                    };
-                    // resume.py:1509-1518 setfield(struct, fieldnum, descr)
-                    // dispatches via descr methods; pyre threads the descr's
-                    // FieldDescrInfo (offset / field_size / field_type) so
-                    // the allocator can do the same dispatch without
-                    // re-extracting the spec.
-                    let _ = *field_descr; // pyre-only descr_index handle, superseded by fd.
-                    if let Some(descr_info) = fd {
-                        // resume.py:1509-1518 setfield(struct, fieldnum, descr)
-                        // dispatches via descr.is_pointer_field /
-                        // is_float_field to cpu.bh_setfield_gc_{i,r,f}.
-                        match descr_info.field_type {
-                            majit_ir::Type::Ref => {
-                                allocator.bh_setfield_gc_r(obj, value, descr_info)
-                            }
-                            majit_ir::Type::Float => {
-                                allocator.bh_setfield_gc_f(obj, value, descr_info)
-                            }
-                            _ => allocator.bh_setfield_gc_i(obj, value, descr_info),
-                        }
-                    }
-                }
+                // resume.py:621 return self.setfields(decoder, struct)
+                abstract_virtual_struct_info_setfields(
+                    decoder, allocator, obj, fielddescrs, fields,
+                );
                 obj
             }
             VirtualInfo::VStruct {
@@ -5298,30 +5317,10 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                     .map(|d| allocator.allocate_struct(d))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, obj);
-                for (i, (field_descr, source)) in fields.iter().enumerate() {
-                    let fd = fielddescrs.get(i);
-                    let field_type = fd.map(|fd| fd.field_type).unwrap_or(majit_ir::Type::Ref);
-                    let value = match field_type {
-                        majit_ir::Type::Ref => decoder.decode_field_source(source),
-                        majit_ir::Type::Float => decoder.decode_field_source_float(source),
-                        _ => decoder.decode_field_source_int(source),
-                    };
-                    let _ = *field_descr; // pyre-only descr_index handle, superseded by fd.
-                    if let Some(descr_info) = fd {
-                        // resume.py:1509-1518 setfield(struct, fieldnum, descr)
-                        // dispatches via descr.is_pointer_field /
-                        // is_float_field to cpu.bh_setfield_gc_{i,r,f}.
-                        match descr_info.field_type {
-                            majit_ir::Type::Ref => {
-                                allocator.bh_setfield_gc_r(obj, value, descr_info)
-                            }
-                            majit_ir::Type::Float => {
-                                allocator.bh_setfield_gc_f(obj, value, descr_info)
-                            }
-                            _ => allocator.bh_setfield_gc_i(obj, value, descr_info),
-                        }
-                    }
-                }
+                // resume.py:637 return self.setfields(decoder, struct)
+                abstract_virtual_struct_info_setfields(
+                    decoder, allocator, obj, fielddescrs, fields,
+                );
                 obj
             }
             VirtualInfo::VArray {
