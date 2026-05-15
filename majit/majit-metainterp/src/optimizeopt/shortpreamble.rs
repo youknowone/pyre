@@ -1629,7 +1629,20 @@ impl ProducedShortOp {
         let result_opref = *result_map.get(&source)?;
         let _ = result_type;
         ctx.replace_op(source, result_opref);
-        ctx.imported_loop_invariant_results.insert(func_ptr, source);
+        // `rewrite.py:31` `self.opt.loop_invariant_results[key] = old_op` —
+        // dict-as-map semantics; pyre's Vec-backed parity overwrites the
+        // entry when `func_ptr` already exists (PyPy dict behavior),
+        // otherwise appends.
+        if let Some(entry) = ctx
+            .imported_loop_invariant_results
+            .iter_mut()
+            .find(|(k, _)| *k == func_ptr)
+        {
+            entry.1 = source;
+        } else {
+            ctx.imported_loop_invariant_results
+                .push((func_ptr, source));
+        }
         // see produce_pure: extra_same_as collected lazily by
         // imported_short_preamble_builder; eager push would be a dual-write.
         Some(source)

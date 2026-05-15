@@ -5754,8 +5754,11 @@ mod tests {
         import_short_preamble_state(&targetargs, &label_args, &exported, &mut ctx2);
 
         assert_eq!(
-            ctx2.imported_loop_invariant_results.get(&func_ptr),
-            Some(&OpRef::int_op(11))
+            ctx2.imported_loop_invariant_results
+                .iter()
+                .find(|(k, _)| *k == func_ptr)
+                .map(|(_, v)| *v),
+            Some(OpRef::int_op(11))
         );
         assert_eq!(ctx2.get_constant(func), None);
         assert_eq!(
@@ -5802,8 +5805,11 @@ mod tests {
         // Phase 1 source directly (RPython `shortpreamble.py:120 op = self.res`).
         let _ = phase2_result;
         assert_eq!(
-            ctx.imported_loop_invariant_results.get(&func_ptr),
-            Some(&source)
+            ctx.imported_loop_invariant_results
+                .iter()
+                .find(|(k, _)| *k == func_ptr)
+                .map(|(_, v)| *v),
+            Some(source)
         );
     }
 

@@ -2876,7 +2876,11 @@ impl Optimization for OptRewrite {
                     // RPython: LoopInvariantOp.produce_op stores PreambleOp
                     // in loop_invariant_results during import. Transfer from
                     // ctx.imported_loop_invariant_results on first access.
-                    if let Some(&source) = ctx.imported_loop_invariant_results.get(&func_val) {
+                    if let Some(&(_, source)) = ctx
+                        .imported_loop_invariant_results
+                        .iter()
+                        .find(|(k, _)| *k == func_val)
+                    {
                         if !self.loop_invariant_results.contains_key(&func_val) {
                             // RPython shortpreamble.py:158-159. Cat-2.2 dual-slot:
                             // `produce_loop_invariant` installs

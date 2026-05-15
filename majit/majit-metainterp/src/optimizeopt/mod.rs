@@ -598,9 +598,12 @@ pub struct OptContext {
     /// (base_len, short_args): virtual field values start at base_len
     /// within short_args. Used by install_imported_virtuals.
     pub imported_virtual_args: Option<(usize, Vec<OpRef>)>,
-    /// RPython shortpreamble.py / rewrite.py: imported CALL_LOOPINVARIANT
-    /// results keyed by constant function pointer.
-    pub imported_loop_invariant_results: HashMap<i64, OpRef>,
+    /// `rewrite.py:39` `self.loop_invariant_results = {}` — keyed by
+    /// constant function pointer. PyPy uses a dict; pyre replaces it
+    /// with a Vec of `(func_ptr, source_opref)` pairs and linear-scan
+    /// dedup. CALL_LOOPINVARIANT is rare and the live set per trace is
+    /// tiny, so O(n) lookup is acceptable.
+    pub imported_loop_invariant_results: Vec<(i64, OpRef)>,
     /// Phase 2 imported virtuals (from Phase 1 export). Used by
     /// store_final_boxes_in_guard to resolve NONE positions
     /// inherited from Phase 1 virtualization.
@@ -1560,7 +1563,7 @@ impl OptContext {
             pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
             imported_virtual_args: None,
-            imported_loop_invariant_results: HashMap::new(),
+            imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
             const_infos: HashMap::new(),
             imported_short_preamble_used: HashSet::new(),
@@ -1688,7 +1691,7 @@ impl OptContext {
             pending_finish_guard_postprocess: None,
             imported_short_pure_ops: Vec::new(),
             imported_virtual_args: None,
-            imported_loop_invariant_results: HashMap::new(),
+            imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
             const_infos: HashMap::new(),
             imported_short_preamble_used: HashSet::new(),
