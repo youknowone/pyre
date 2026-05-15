@@ -706,16 +706,10 @@ impl std::hash::Hash for SpamBlockRef {
 /// `current_block`'s per-block accumulator.  The program-wide
 /// `ssarepr.insns` is populated post-walk via the drain swap at
 /// `transform_graph_to_jitcode`'s end (matching `codewriter.py:53
-/// flatten_graph(graph, regallocs, cpu)`).  The `ssarepr` parameter is
-/// retained on the signature for call-site symmetry but unused inside
-/// — once every walker emit site routes through this helper, the
-/// parameter can retire alongside any remaining direct
-/// `ssarepr.insns.push` consumers.
-fn push_walker_emit(
-    _ssarepr: &mut super::flatten::SSARepr,
-    current_block: &SpamBlockRef,
-    insn: super::flatten::Insn,
-) {
+/// flatten_graph(graph, regallocs, cpu)`).  Every walker emit site
+/// uniformly routes through this helper now — no direct
+/// `ssarepr.insns.push` calls remain in production.
+fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
     current_block.push_insn(insn);
 }
 
@@ -3559,7 +3553,7 @@ impl CodeWriter {
                     Vec::new(),
                     Register::new(Kind::Ref, dst),
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
 
@@ -3626,7 +3620,7 @@ impl CodeWriter {
                     vec![Operand::ConstInt(value)],
                     Register::new(Kind::Int, dst),
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
 
@@ -3646,11 +3640,11 @@ impl CodeWriter {
                 let src = $src;
                 let retval = $retval;
                 let insn = Insn::op("ref_return", vec![Operand::reg(Kind::Ref, src)]);
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
                 // `rpython/jit/codewriter/flatten.py:144-146`: terminators
                 // emit `('---',)` so the backward liveness pass clears its
                 // alive set.
-                push_walker_emit(&mut $ssarepr, &current_block, Insn::Unreachable);
+                push_walker_emit(&current_block, Insn::Unreachable);
                 // Step 6.1 Phase 2c: attach the return edge to
                 // `graph.returnblock` (`model.py:18`). The return value
                 // now comes from the symbolic `FrameState` stack,
@@ -3683,12 +3677,12 @@ impl CodeWriter {
                     "goto",
                     vec![Operand::TLabel(TLabel::new(format!("pc{}", target_py_pc)))],
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
                 // `rpython/jit/codewriter/flatten.py:111-112`: an
                 // unconditional goto implicitly ends a block so the
                 // liveness pass (`liveness.py:68-69`) can reset the alive
                 // set.
-                push_walker_emit(&mut $ssarepr, &current_block, Insn::Unreachable);
+                push_walker_emit(&current_block, Insn::Unreachable);
                 // `flatten.py:161` `self.emitline('goto',
                 // TLabel(link.target))` is the serialised view of the
                 // same edge.  Phase A.4 retired the back-edge skip
@@ -3733,7 +3727,7 @@ impl CodeWriter {
         macro_rules! emit_abort_permanent {
             ($ssarepr:expr) => {{
                 let insn = Insn::op("abort_permanent", Vec::new());
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
                 // pyre-only dead-end: the block has no successor in
                 // the shadow graph. Leaving `needs_fallthrough = false`
                 // blocks the auto-fallthrough at the next
@@ -3753,7 +3747,7 @@ impl CodeWriter {
                 let evalue_fv: super::flow::FlowValue = $evalue;
                 let offset = $offset;
                 let insn = Insn::op("raise", vec![Operand::reg(Kind::Ref, src)]);
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
                 // `flowcontext.py:1246-1261 Raise.nomoreblocks` shape:
                 //   link = Link([w_exc.w_type, w_exc.w_value],
                 //               ctx.graph.exceptblock)
@@ -3798,7 +3792,7 @@ impl CodeWriter {
         macro_rules! emit_reraise {
             ($ssarepr:expr) => {{
                 let insn = Insn::op("reraise", Vec::new());
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
                 // Step 6.1 Phase 2c: same edge as `emit_raise!` — the
                 // re-raise opname shares the `Block.exits` topology
                 // (`flatten.py` emits the two as alternative codings
@@ -3860,7 +3854,7 @@ impl CodeWriter {
                         catch_label
                     )))],
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
                 // Step 6.1 Phase 2b: attach the exception edge to the
                 // current PC's block. In RPython this is the
                 // `Constant(last_exception)` exit added by
@@ -4024,8 +4018,8 @@ impl CodeWriter {
                         let target_label = format!("pc{}", py_pc);
                         let goto_insn =
                             Insn::op("goto", vec![Operand::TLabel(TLabel::new(target_label))]);
-                        push_walker_emit(&mut $ssarepr, &current_block, goto_insn);
-                        push_walker_emit(&mut $ssarepr, &current_block, Insn::Unreachable);
+                        push_walker_emit(&current_block, goto_insn);
+                        push_walker_emit(&current_block, Insn::Unreachable);
                     }
                     block_switch_pending = true;
                 } else {
@@ -4035,9 +4029,7 @@ impl CodeWriter {
                     // bookkeeping needed because `current_block`
                     // doesn't change.
                     needs_fallthrough = true;
-                    push_walker_emit(
-                        &mut $ssarepr,
-                        &current_block,
+                    push_walker_emit(&current_block,
                         Insn::Label(super::flatten::Label::new(format!("pc{}", py_pc))),
                     );
                 }
@@ -4138,7 +4130,7 @@ impl CodeWriter {
                 if portal_ec_reg != u16::MAX {
                     force_alive.push(Operand::Register(Register::new(Kind::Ref, portal_ec_reg)));
                 }
-                push_walker_emit(&mut $ssarepr, &current_block, Insn::live(force_alive));
+                push_walker_emit(&current_block, Insn::live(force_alive));
             }};
         }
 
@@ -4159,7 +4151,7 @@ impl CodeWriter {
                         Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
                     ],
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
                 // `flatten.py:240-267` linkfalse mergeblock.  Phase A.4
                 // retired the back-edge skip so this fires on every
                 // emit, matching upstream's `set_branch` semantic.
@@ -4192,7 +4184,7 @@ impl CodeWriter {
                         Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
                     ],
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
                 // Step 6.1 Phase 2b: same as `emit_goto_if_not!` — the
                 // specialised `int_is_zero` form is the pyre-port of
                 // `flatten.py:247` `goto_if_not_int_is_zero`; Link
@@ -4276,7 +4268,7 @@ impl CodeWriter {
                     ],
                     Register::new(Kind::Ref, dst),
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
                 // Graph dual-write threads `frame_var.into()` which is
                 // only a startblock inputarg when `is_portal` (per
                 // `graph_entry_inputargs(code, is_portal)`).  Non-portal
@@ -4316,7 +4308,7 @@ impl CodeWriter {
                         Operand::descr_vable_static_field(field_idx),
                     ],
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
         macro_rules! emit_vable_setfield_int_const {
@@ -4337,7 +4329,7 @@ impl CodeWriter {
                         Operand::descr_vable_static_field(field_idx),
                     ],
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
         // RPython-orthodox vable arrayitem shapes (Slices 1+2+3+4
@@ -4405,7 +4397,7 @@ impl CodeWriter {
                     ],
                     Register::new(Kind::Ref, dst),
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
         macro_rules! emit_vable_setarrayitem_ref {
@@ -4431,7 +4423,7 @@ impl CodeWriter {
                         Operand::descr_vable_array(field_idx),
                     ],
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
 
@@ -4463,7 +4455,7 @@ impl CodeWriter {
                         Operand::descr_vable_array(field_idx),
                     ],
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
 
@@ -4487,7 +4479,7 @@ impl CodeWriter {
                         Operand::descr_vable_array(field_idx),
                     ],
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
 
@@ -4510,7 +4502,7 @@ impl CodeWriter {
                         Operand::descr_vable_array(field_idx),
                     ],
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
 
@@ -4534,7 +4526,7 @@ impl CodeWriter {
                     ],
                     Register::new(Kind::Ref, dst),
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
 
@@ -4558,7 +4550,7 @@ impl CodeWriter {
                     vec![Operand::reg(Kind::Ref, src)],
                     Register::new(Kind::Ref, dst),
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
 
@@ -4575,7 +4567,7 @@ impl CodeWriter {
                     vec![Operand::ConstRef(value)],
                     Register::new(Kind::Ref, dst),
                 );
-                push_walker_emit(&mut $ssarepr, &current_block, insn);
+                push_walker_emit(&current_block, insn);
             }};
         }
 
@@ -5195,9 +5187,7 @@ impl CodeWriter {
                         // source at codewriter.rs:2202.  Graph
                         // dual-write below is NOT retired in this
                         // slice — incremental factor refactor only.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_box_int_fn_residual_call_ir_r_insn(
                                 box_int_fn_idx,
                                 val,
@@ -5281,9 +5271,7 @@ impl CodeWriter {
                         // matching the production source at
                         // codewriter.rs:2215, so `load_const_fn_flavor`
                         // is no longer threaded into the SSARepr emit.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_load_const_fn_residual_call_ir_r_insn(
                                 load_const_fn_idx,
                                 idx as i64,
@@ -5555,9 +5543,7 @@ impl CodeWriter {
                         // carries only the void `setitem(obj, key,
                         // value)` HLOp from `emit_frontend_setitem`
                         // above.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_store_subscr_fn_residual_call_r_v_insn(
                                 store_subscr_fn_idx,
                                 obj_reg,
@@ -5640,9 +5626,7 @@ impl CodeWriter {
                         // round-trip — flatten-time reconstruction stays
                         // available for the probe and any future
                         // `flatten_graph(graph, regallocs)` driver.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_binary_op_residual_call_ir_r_insn(
                                 binary_op_fn_idx,
                                 op_val,
@@ -5694,9 +5678,7 @@ impl CodeWriter {
                         // SSARepr Insn is built by the helper that
                         // shares its shape with the probe-side
                         // `lower_compare_op_hlop_to_insn`.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_compare_op_residual_call_ir_r_insn(
                                 compare_fn_idx,
                                 op_val,
@@ -5756,9 +5738,7 @@ impl CodeWriter {
                         // `emit_residual_call_shape` output.  Graph
                         // carries only the `bool(cond_value)` HLOp
                         // from `emit_frontend_bool` above.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_truth_fn_residual_call_r_i_insn(
                                 truth_fn_idx,
                                 cond_reg,
@@ -5843,9 +5823,7 @@ impl CodeWriter {
                         // retirement (sibling of the PopJumpIfFalse
                         // closure above) — same `(Ref) → Int` shape
                         // helper, same probe coverage.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_truth_fn_residual_call_r_i_insn(
                                 truth_fn_idx,
                                 cond_reg,
@@ -5958,9 +5936,7 @@ impl CodeWriter {
                         // `flatten_graph(graph, regallocs)` migration.
                         // Helper hardcodes `CallFlavor::Plain` matching
                         // the production source at codewriter.rs:2184.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_load_global_fn_residual_call_ir_r_insn(
                                 load_global_fn_idx,
                                 raw_namei,
@@ -6128,9 +6104,7 @@ impl CodeWriter {
                             // production source at codewriter.rs:2175
                             // and 2238-2245 (every `call_fn_N` is
                             // bound MayForce).
-                            push_walker_emit(
-                                &mut ssarepr,
-                                &current_block,
+                            push_walker_emit(&current_block,
                                 super::flatten::build_call_fn_residual_call_r_r_insn(
                                     fn_idx,
                                     callable_reg,
@@ -6197,9 +6171,7 @@ impl CodeWriter {
                         // Task #48 micro-slice 10: box_int_fn factor
                         // refactor (UnaryNegative site).  See
                         // LoadSmallInt site for the shared rationale.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_box_int_fn_residual_call_ir_r_insn(
                                 box_int_fn_idx,
                                 0,
@@ -6216,9 +6188,7 @@ impl CodeWriter {
                         // matches BINARY_OP exactly: `(zero:Ref,
                         // operand:Ref, sub_tag:Int) → Ref` MayForce.
                         // Graph dual-write below is unchanged.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_binary_op_residual_call_ir_r_insn(
                                 binary_op_fn_idx,
                                 subtract_tag,
@@ -6351,9 +6321,7 @@ impl CodeWriter {
                         // HLOp recorded above).  Helper hardcodes
                         // `CallFlavor::Plain` matching the production
                         // source at codewriter.rs:2226.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_build_list_fn_residual_call_ir_r_insn(
                                 build_list_fn_idx,
                                 argc,
@@ -6408,9 +6376,7 @@ impl CodeWriter {
                             step_info.map(|(_, value)| value),
                             py_pc as i64,
                         );
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_build_slice_fn_residual_call_ir_r_insn(
                                 build_slice_fn_idx,
                                 raw_argc,
@@ -6494,9 +6460,7 @@ impl CodeWriter {
                             // `cause` Operand (Reg or ConstRef) is
                             // built inline above.  No graph dual-write
                             // exists for normalize_raise_varargs_fn.
-                            push_walker_emit(
-                                &mut ssarepr,
-                                &current_block,
+                            push_walker_emit(&current_block,
                                 super::flatten::build_normalize_raise_varargs_fn_residual_call_r_r_insn(
                                     normalize_raise_varargs_fn_idx,
                                     exc_reg,
@@ -6549,17 +6513,13 @@ impl CodeWriter {
                         // is 0-arg `() → Ref`; `set_current_exception`
                         // is 1-arg `(exc:Ref) → Void`.  Graph
                         // dual-writes below remain unchanged.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_get_current_exception_fn_residual_call_r_r_insn(
                                 get_current_exception_fn_idx,
                                 scratch_prev,
                             ),
                         );
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_set_current_exception_fn_residual_call_r_v_insn(
                                 set_current_exception_fn_idx,
                                 scratch_exc,
@@ -6651,9 +6611,7 @@ impl CodeWriter {
                         // already records the same `compare_fn(...,
                         // ISINSTANCE_OP:Int) → Ref` `residual_call_ir_r`
                         // shape (codewriter.rs:6219-6232).
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_compare_op_residual_call_ir_r_insn(
                                 compare_fn_idx,
                                 10,
@@ -6702,9 +6660,7 @@ impl CodeWriter {
                         // set_current_exception factor refactor.
                         // PlainCannotRaise TLS write `(prev:Ref) → Void`.
                         // Graph dual-write below unchanged.
-                        push_walker_emit(
-                            &mut ssarepr,
-                            &current_block,
+                        push_walker_emit(&current_block,
                             super::flatten::build_set_current_exception_fn_residual_call_r_v_insn(
                                 set_current_exception_fn_idx,
                                 prev_reg,
@@ -7074,9 +7030,7 @@ impl CodeWriter {
                 // Task #48 micro-slice 10: box_int_fn factor refactor
                 // (exception lasti site).  See LoadSmallInt site for
                 // the shared rationale.
-                push_walker_emit(
-                    &mut ssarepr,
-                    &current_block,
+                push_walker_emit(&current_block,
                     super::flatten::build_box_int_fn_residual_call_ir_r_insn(
                         box_int_fn_idx,
                         site.lasti_py_pc as i64,
