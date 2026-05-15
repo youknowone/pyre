@@ -5044,7 +5044,6 @@ impl CodeWriter {
                             ResKind::Ref,
                             py_pc as i64,
                         );
-                        if let Some(boxed_var) = &boxed {}
                         let stack_value = boxed
                             .map(super::flow::FlowValue::from)
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
@@ -5071,7 +5070,6 @@ impl CodeWriter {
                             dst_slot,
                             VABLE_CODE_FIELD_IDX
                         );
-                        if let Some(v) = &pycode_graph_var {}
                         // Task #48 micro-slice 7: LoadConst factor
                         // refactor.  The prior `emit_residual_call(
                         // load_const_fn_idx, ...)` call is replaced by
@@ -5145,7 +5143,6 @@ impl CodeWriter {
                                 ResKind::Ref,
                                 py_pc as i64,
                             );
-                            if let Some(loaded_var) = &loaded {}
                             loaded
                                 .map(super::flow::FlowValue::from)
                                 .unwrap_or_else(|| fresh_ref_value(&mut graph))
@@ -5323,7 +5320,6 @@ impl CodeWriter {
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         let key_reg = stack_base + current_depth;
-                        if let super::flow::FlowValue::Variable(v) = &key_value {}
                         current_depth -= 1;
                         emit_vsd!(current_depth);
                         let obj_value = current_state
@@ -5331,7 +5327,6 @@ impl CodeWriter {
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         let obj_reg = stack_base + current_depth;
-                        if let super::flow::FlowValue::Variable(v) = &obj_value {}
                         current_depth -= 1;
                         emit_vsd!(current_depth);
                         let stored_value = current_state
@@ -5339,7 +5334,6 @@ impl CodeWriter {
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
                         let value_reg = stack_base + current_depth;
-                        if let super::flow::FlowValue::Variable(v) = &stored_value {}
                         emit_frontend_setitem(
                             &mut graph,
                             &current_block.block(),
@@ -5406,14 +5400,12 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &rhs_value {}
                         // Pop lhs.
                         let lhs_reg = emit_popvalue_ref!(current_depth);
                         let lhs_value = current_state
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &lhs_value {}
                         let result_value = emit_frontend_binary(
                             &mut graph,
                             &current_block.block(),
@@ -5467,13 +5459,11 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &rhs_value {}
                         let lhs_reg = emit_popvalue_ref!(current_depth);
                         let lhs_value = current_state
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &lhs_value {}
                         let result_value = emit_frontend_compare(
                             &mut graph,
                             &current_block.block(),
@@ -5532,7 +5522,6 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &cond_value {}
                         let bool_value = emit_frontend_bool(
                             &mut graph,
                             &current_block.block(),
@@ -5625,7 +5614,6 @@ impl CodeWriter {
                             .stack
                             .pop()
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
-                        if let super::flow::FlowValue::Variable(v) = &cond_value {}
                         let bool_value = emit_frontend_bool(
                             &mut graph,
                             &current_block.block(),
@@ -5726,13 +5714,11 @@ impl CodeWriter {
                             scratch_ns,
                             VABLE_NAMESPACE_FIELD_IDX
                         );
-                        if let Some(v) = &ns_graph_var {}
                         let code_graph_var = emit_vable_getfield_ref!(
                             portal_frame_reg,
                             scratch_code,
                             VABLE_CODE_FIELD_IDX
                         );
-                        if let Some(v) = &code_graph_var {}
                         // Task #48 micro-slice 8: LoadGlobal factor
                         // refactor.  The prior `emit_residual_call(
                         // load_global_fn_idx, ...)` call is replaced by
@@ -5796,7 +5782,6 @@ impl CodeWriter {
                         } else {
                             None
                         };
-                        if let Some(loaded_var) = &loaded {}
                         let result_value = loaded
                             .map(super::flow::FlowValue::from)
                             .unwrap_or_else(|| fresh_ref_value(&mut graph));
