@@ -1802,7 +1802,6 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
     let virtual_index = resume.add_virtual_struct(
         Some(typedescr_7),
         0,
-        7,
         vec![(
             3,
             majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(55)),
@@ -1846,7 +1845,6 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
     let inner = resume.add_virtual_struct(
         Some(inner_typedescr),
         0,
-        10,
         vec![(
             0,
             majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(77)),
@@ -1857,7 +1855,6 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
     let outer = resume.add_virtual_obj(
         Some(outer_typedescr),
         0,
-        20,
         None,
         vec![
             (
@@ -1912,8 +1909,8 @@ fn jit_state_restore_guard_failure_replays_pending_writes_with_virtual_target_an
         std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(30, 0, 0));
     let child_typedescr: majit_ir::DescrRef =
         std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(31, 0, 0));
-    let parent = resume.add_virtual_struct(Some(parent_typedescr), 0, 30, vec![], vec![], 0);
-    let child = resume.add_virtual_struct(Some(child_typedescr), 0, 31, vec![], vec![], 0);
+    let parent = resume.add_virtual_struct(Some(parent_typedescr), 0, vec![], vec![], 0);
+    let child = resume.add_virtual_struct(Some(child_typedescr), 0, vec![], vec![], 0);
     resume.set_slot_virtual(0, parent);
     resume.set_slot_virtual(1, child);
     let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
@@ -2076,7 +2073,7 @@ fn declarative_driver_guard_failure_can_restore_multi_frame_state_via_generic_fr
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 300);
-    let virtual_index = resume.add_virtual_struct(None, 0, 55, vec![], vec![], 0);
+    let virtual_index = resume.add_virtual_struct(None, 0, vec![], vec![], 0);
     resume.set_slot_virtual(0, virtual_index);
     resume.set_slot_constant(1, majit_ir::Const::Int(1));
     resume.push_frame(0, 400);
@@ -2120,7 +2117,7 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 500);
-    let virtual_index = resume.add_virtual_struct(None, 0, 56, vec![], vec![], 0);
+    let virtual_index = resume.add_virtual_struct(None, 0, vec![], vec![], 0);
     resume.set_slot_virtual(0, virtual_index);
     resume.set_slot_constant(1, majit_ir::Const::Int(1));
     resume.push_frame(0, 600);
