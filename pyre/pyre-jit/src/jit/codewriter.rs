@@ -4017,13 +4017,13 @@ impl CodeWriter {
                     // live, so the walker stays in it and registers it
                     // at the joinpoint so a future cross-PC `mergeblock`
                     // / `set_branch` that targets `py_pc` finds the
-                    // correct block.  Phase A.2 covers conventional
-                    // branch targets via `branch_target_pcs`, but
-                    // exception edges + non-conventional jumps (FOR_ITER,
-                    // SEND, etc.) target PCs not in the pre-scan; the
-                    // self-registration covers those — load-bearing
-                    // until the pre-scan is extended to all branch
-                    // sources.
+                    // correct block.  Phase A.1 + A.2 cover most branch
+                    // targets via `branch_target_pcs`, but cranelift
+                    // backend has a tighter dependency on per-PC
+                    // joinpoints registration (fannkuch FAIL surfaces
+                    // when retired).  Keeping the self-registration as
+                    // a backup until the cranelift dependency is
+                    // identified.
                     joinpoints
                         .entry(py_pc)
                         .or_default()
@@ -8132,7 +8132,8 @@ pub fn find_branch_target_pcs(
         let forward_delta = match scan_instr {
             Instruction::PopJumpIfFalse { delta }
             | Instruction::PopJumpIfTrue { delta }
-            | Instruction::JumpForward { delta } => Some(delta.get(scan_arg).as_usize()),
+            | Instruction::JumpForward { delta }
+            | Instruction::ForIter { delta } => Some(delta.get(scan_arg).as_usize()),
             _ => None,
         };
         if let Some(delta) = forward_delta {
@@ -8150,10 +8151,30 @@ pub fn find_branch_target_pcs(
             let fallthrough = scan_pc + 1;
             if matches!(
                 scan_instr,
-                Instruction::PopJumpIfFalse { .. } | Instruction::PopJumpIfTrue { .. }
+                Instruction::PopJumpIfFalse { .. }
+                    | Instruction::PopJumpIfTrue { .. }
+                    | Instruction::ForIter { .. }
             ) && fallthrough < num_instrs
             {
                 targets.insert(fallthrough);
+            }
+        }
+        // Terminator-after pcs are block entries: PCs immediately
+        // following ReturnValue / RaiseVarargs / Reraise are reachable
+        // only from elsewhere (not from sequential fallthrough), so
+        // they are real block entries.  Mirrors upstream's block
+        // boundary at every terminator's `next_offset` candidate
+        // (`flowcontext.py:407-475 record_block` exits via terminator;
+        // the pendingblocks queue picks up the next block).
+        if matches!(
+            scan_instr,
+            Instruction::ReturnValue
+                | Instruction::RaiseVarargs { .. }
+                | Instruction::Reraise { .. }
+        ) {
+            let next_pc = scan_pc + 1;
+            if next_pc < num_instrs {
+                targets.insert(next_pc);
             }
         }
     }
