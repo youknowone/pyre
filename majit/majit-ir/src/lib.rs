@@ -29,6 +29,7 @@ pub use effectinfo::{
 };
 pub use forwarded::{
     AbstractInfo, AbstractResOpOrInputArg, AbstractValue as ForwardableValue, Forwarded,
+    get_box_replacement,
 };
 pub use op_type_index::OpTypeIndex;
 pub use resoperation::{

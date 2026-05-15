@@ -155,3 +155,77 @@ impl AbstractResOpOrInputArg for crate::resoperation::Op {
         &self.forwarded
     }
 }
+
+/// `resoperation.py:57-68` `AbstractValue.get_box_replacement(op,
+/// not_const=False)` — chain-walk through `_forwarded`.
+///
+/// ```text
+/// while isinstance(op, AbstractResOpOrInputArg):
+///     next_op = op._forwarded
+///     if (next_op is None or next_op.is_info_class or
+///         (not_const and next_op.is_constant())):
+///         return op
+///     op = next_op
+/// return op
+/// ```
+///
+/// `trace_ops` / `inputargs` resolve `Forwarded::OpRef(target)` to the
+/// concrete next `Op` / `InputArg`. `num_inputargs` is the index split
+/// (inputargs occupy the first `num_inputargs` positions; ops occupy
+/// `num_inputargs..`). Returns the terminal `OpRef` (which may equal
+/// the input if the chain is empty or stops immediately).
+pub fn get_box_replacement(
+    start: OpRef,
+    trace_ops: &[crate::resoperation::Op],
+    inputargs: &[crate::value::InputArg],
+    num_inputargs: u32,
+    not_const: bool,
+) -> OpRef {
+    let mut cur = start;
+    loop {
+        // `Const*` variants of OpRef and `OpRef::NONE` are not
+        // `AbstractResOpOrInputArg` in PyPy — the while-loop exits
+        // immediately for them.
+        let Some(slot) = forwarded_slot_at(cur, trace_ops, inputargs, num_inputargs) else {
+            return cur;
+        };
+        let step = match &*slot.borrow() {
+            Forwarded::None => StepOut::Stop,
+            Forwarded::Info(_) => StepOut::Stop,
+            Forwarded::Const(_) if not_const => StepOut::Stop,
+            Forwarded::Const(_) => StepOut::Stop, // Const itself isn't AbstractResOpOrInputArg
+            Forwarded::OpRef(target) => StepOut::Advance(*target),
+        };
+        match step {
+            StepOut::Stop => return cur,
+            StepOut::Advance(next) => cur = next,
+        }
+    }
+}
+
+enum StepOut {
+    Stop,
+    Advance(OpRef),
+}
+
+/// Look up the `_forwarded` slot for an OpRef. Returns None for
+/// non-AbstractResOpOrInputArg refs (constants, NONE, out-of-bounds).
+fn forwarded_slot_at<'a>(
+    opref: OpRef,
+    trace_ops: &'a [crate::resoperation::Op],
+    inputargs: &'a [crate::value::InputArg],
+    num_inputargs: u32,
+) -> Option<&'a std::cell::RefCell<Forwarded>> {
+    use crate::resoperation::OpRef as O;
+    match opref {
+        O::ConstInt(_) | O::ConstFloat(_) | O::ConstPtr(_) => None,
+        O::None => None,
+        O::InputArgInt(i) | O::InputArgFloat(i) | O::InputArgRef(i) => {
+            inputargs.get(i as usize).map(|ia| ia.forwarded_slot())
+        }
+        O::IntOp(p) | O::FloatOp(p) | O::RefOp(p) | O::VoidOp(p) => {
+            let idx = p.checked_sub(num_inputargs)?;
+            trace_ops.get(idx as usize).map(|op| op.forwarded_slot())
+        }
+    }
+}
