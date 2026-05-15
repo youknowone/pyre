@@ -16,7 +16,7 @@ use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to its attached `BridgeData` (if any).
@@ -31,23 +31,33 @@ use std::sync::{Mutex, OnceLock};
 ///
 /// Held as `Arc<BridgeData>` so `bridge_ref` can hand out a cloned
 /// reference without holding the table mutex across the read.
-static BRIDGE_TABLE: OnceLock<Mutex<HashMap<usize, Arc<BridgeData>>>> = OnceLock::new();
+///
+/// `RwLock` rather than `Mutex`: `lookup_bridge` is on the
+/// guard-failure dispatch hot path
+/// (`compiler.rs::execute_compiled_code` at every `fail_descr`
+/// observation, and `compiler.rs:6021-6116` runtime helpers).
+/// Writers (`register_bridge` / `take_bridge` / `Drop`) only run at
+/// bridge attach / detach time, so reader contention dominates.  A
+/// `Mutex` serialised every dispatch on a single atomic and showed up
+/// as a 2.7× regression in fannkuch (cranelift) per the macOS CI
+/// timeout — `RwLock` lets concurrent dispatches read in parallel.
+static BRIDGE_TABLE: OnceLock<RwLock<HashMap<usize, Arc<BridgeData>>>> = OnceLock::new();
 
-fn bridge_table() -> &'static Mutex<HashMap<usize, Arc<BridgeData>>> {
-    BRIDGE_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
+fn bridge_table() -> &'static RwLock<HashMap<usize, Arc<BridgeData>>> {
+    BRIDGE_TABLE.get_or_init(|| RwLock::new(HashMap::new()))
 }
 
 pub fn register_bridge(descr_ptr: usize, bridge: BridgeData) {
     bridge_table()
-        .lock()
-        .expect("BRIDGE_TABLE mutex poisoned")
+        .write()
+        .expect("BRIDGE_TABLE rwlock poisoned")
         .insert(descr_ptr, Arc::new(bridge));
 }
 
 pub fn lookup_bridge(descr_ptr: usize) -> Option<Arc<BridgeData>> {
     bridge_table()
-        .lock()
-        .expect("BRIDGE_TABLE mutex poisoned")
+        .read()
+        .expect("BRIDGE_TABLE rwlock poisoned")
         .get(&descr_ptr)
         .cloned()
 }
@@ -602,12 +612,14 @@ impl Drop for CraneliftFailDescr {
             .lock()
             .expect("BRIDGE_CACHES_TABLE mutex poisoned")
             .remove(&ptr);
-        // Take ownership of the bridge under a scoped lock, then drop
-        // the Arc outside it to avoid the non-reentrant deadlock when
-        // `BridgeData::fail_descrs`' inner Arcs cascade into descr
+        // Take ownership of the bridge under a scoped write lock, then
+        // drop the Arc outside it to avoid the non-reentrant deadlock
+        // when `BridgeData::fail_descrs`' inner Arcs cascade into descr
         // `Drop` calls that re-acquire `BRIDGE_TABLE`.
         let removed_bridge = {
-            let mut guard = bridge_table().lock().expect("BRIDGE_TABLE mutex poisoned");
+            let mut guard = bridge_table()
+                .write()
+                .expect("BRIDGE_TABLE rwlock poisoned");
             guard.remove(&ptr)
         };
         drop(removed_bridge);
