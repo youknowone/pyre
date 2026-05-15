@@ -1422,18 +1422,10 @@ impl Eq for ResolvedPendingFieldWrite {}
 /// hand back a live `Arc<dyn Descr>` via `descr.clone()` rather than
 /// rebuilding it through an index lookup
 /// (`resume.py:1000-1001 cast_base_ptr_to_instance`).
-///
-/// `descr_index` is a pyre-only transitional serialization handle
-/// used by `jit_state::replay_pending_field_writes` for
-/// `pending_field_write_layout(meta, descr_index, ...)` dispatch,
-/// kept until the dispatch path is rewritten to call methods on the
-/// descr Arc directly (RPython `resume.py:1010-1014`
-/// `arraydescr.is_array_of_pointers()` etc.).
 #[derive(Debug, Clone)]
 pub struct EncodedPendingFieldWrite {
     /// `resume.py:88 lldescr` — the field/array descriptor itself.
     pub descr: Option<majit_ir::DescrRef>,
-    pub descr_index: u32,
     pub target: i64,
     pub value: i64,
     pub item_index: Option<usize>,
@@ -1826,7 +1818,6 @@ impl EncodedResumeData {
                 // resume.py:547 lldescr = cast_instance_to_base_ptr(descr) —
                 // the encoded form carries the descr itself, not a handle.
                 descr: pending.descr.clone(),
-                descr_index: pending.descr.as_ref().map_or(0, |d| d.index()),
                 target: memo.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
                 value: memo.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
                 item_index: pending.item_index,
@@ -4101,7 +4092,6 @@ impl ResumeDataLoopMemo {
                 // resume.py:547 lldescr = cast_instance_to_base_ptr(descr) —
                 // the encoded form carries the descr itself, not a handle.
                 descr: pending.descr.clone(),
-                descr_index: pending.descr.as_ref().map_or(0, |d| d.index()),
                 target: self.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
                 value: self.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
                 item_index: pending.item_index,
