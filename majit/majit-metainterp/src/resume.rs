@@ -5226,16 +5226,17 @@ pub trait BlackholeAllocator {
         let _ = (buffer, offset, value, descr);
     }
     /// resume.py:1509-1528 setfield — write field value at known offset.
+    /// Pyre transitional shape (offset / size are caller-extracted from
+    /// the descr; the eventual RPython parity is to take `descr` directly
+    /// and dispatch via `descr.is_pointer_field()` / `is_float_field()`).
     fn setfield_typed(
         &self,
         struct_ptr: i64,
         value: i64,
-        descr: u32,
         field_offset: usize,
         field_size: usize,
     ) {
-        let _ = (field_offset, field_size);
-        self.setfield(struct_ptr, descr, value);
+        let _ = (struct_ptr, value, field_offset, field_size);
     }
     /// pendingfields: setarrayitem dispatch by descr_index (legacy u32 path).
     fn setarrayitem_typed(&self, array: i64, index: usize, value: i64, descr: u32) {
@@ -5331,7 +5332,8 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                     // through setfield_typed so the field actually lands.
                     let field_offset = fd.map(|fd| fd.offset).unwrap_or(0);
                     let field_size = fd.map(|fd| fd.field_size).unwrap_or(8);
-                    allocator.setfield_typed(obj, value, *field_descr, field_offset, field_size);
+                    let _ = *field_descr; // pyre-only descr_index handle, unused at this hook.
+                    allocator.setfield_typed(obj, value, field_offset, field_size);
                 }
                 obj
             }
@@ -5357,7 +5359,8 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                     };
                     let field_offset = fd.map(|fd| fd.offset).unwrap_or(0);
                     let field_size = fd.map(|fd| fd.field_size).unwrap_or(8);
-                    allocator.setfield_typed(obj, value, *field_descr, field_offset, field_size);
+                    let _ = *field_descr; // pyre-only descr_index handle, unused at this hook.
+                    allocator.setfield_typed(obj, value, field_offset, field_size);
                 }
                 obj
             }
@@ -5631,13 +5634,8 @@ impl<'a> ResumeDataDirectReader<'a> {
                     _ => self.decode_int(pf.value_tagged),
                 };
                 // resume.py:1005: self.setfield(struct, fieldnum, descr)
-                self.allocator.setfield_typed(
-                    struct_ptr,
-                    value,
-                    pf.descr_index,
-                    field_offset,
-                    field_size,
-                );
+                self.allocator
+                    .setfield_typed(struct_ptr, value, field_offset, field_size);
             } else {
                 // resume.py:1007-1015: self.setarrayitem dispatches by
                 // arraydescr and passes that same descriptor through.
