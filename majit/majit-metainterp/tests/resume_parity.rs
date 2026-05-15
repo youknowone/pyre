@@ -35,7 +35,6 @@ fn resume_py_public_encoding_uses_tagged_numbering() {
         }],
         virtuals: vec![VirtualInfo::VArray {
             arraydescr: None,
-            descr_index: 9,
             clear: false,
             items: vec![VirtualFieldSource::Constant(Const::Int(large_const))],
         }],
@@ -79,7 +78,6 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
                 3, 0, 0,
             ))),
             type_id: 1,
-            descr_index: 3,
             known_class: None,
             fields: vec![
                 (0, VirtualFieldSource::FailArg(1)),
@@ -157,7 +155,6 @@ fn resume_py_count_includes_virtual_and_pending_field_failargs() {
         virtuals: vec![VirtualInfo::VirtualObj {
             descr: None,
             type_id: 1,
-            descr_index: 0,
             known_class: None,
             fields: vec![(0, VirtualFieldSource::FailArg(1))],
             fielddescrs: vec![],

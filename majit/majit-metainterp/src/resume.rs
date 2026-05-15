@@ -674,7 +674,6 @@ fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) ->
             ResumeVirtualLayoutSummary::Object {
                 descr,
                 type_id,
-                descr_index,
                 known_class,
                 fields,
                 fielddescrs,
@@ -682,7 +681,6 @@ fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) ->
             } => VirtualInfo::VirtualObj {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 known_class: *known_class,
                 fields: fields
                     .iter()
@@ -694,14 +692,12 @@ fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) ->
             ResumeVirtualLayoutSummary::Struct {
                 typedescr,
                 type_id,
-                descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
             } => VirtualInfo::VStruct {
                 typedescr: typedescr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: fields
                     .iter()
                     .map(|(fd, src)| (*fd, src.to_resume_source()))
@@ -711,12 +707,10 @@ fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) ->
             },
             ResumeVirtualLayoutSummary::Array {
                 arraydescr,
-                descr_index,
                 clear,
                 items,
             } => VirtualInfo::VArray {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 clear: *clear,
                 items: items
                     .iter()
@@ -725,13 +719,11 @@ fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) ->
             },
             ResumeVirtualLayoutSummary::ArrayStruct {
                 arraydescr,
-                descr_index,
                 fielddescrs,
                 element_fields,
                 ..
             } => VirtualInfo::VArrayStruct {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 fielddescrs: fielddescrs.clone(),
                 element_fields: element_fields
                     .iter()
@@ -773,7 +765,6 @@ fn resume_virtual_layout_to_exit_virtual_layout(
             ResumeVirtualLayoutSummary::Object {
                 descr,
                 type_id,
-                descr_index,
                 known_class,
                 fields,
                 fielddescrs,
@@ -781,7 +772,6 @@ fn resume_virtual_layout_to_exit_virtual_layout(
             } => ExitVirtualLayout::Object {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 known_class: *known_class,
                 fields: fields
                     .iter()
@@ -794,14 +784,12 @@ fn resume_virtual_layout_to_exit_virtual_layout(
             ResumeVirtualLayoutSummary::Struct {
                 typedescr,
                 type_id,
-                descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
             } => ExitVirtualLayout::Struct {
                 typedescr: typedescr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: fields
                     .iter()
                     .map(|(field_descr, source)| {
@@ -814,12 +802,10 @@ fn resume_virtual_layout_to_exit_virtual_layout(
             },
             ResumeVirtualLayoutSummary::Array {
                 arraydescr,
-                descr_index,
                 clear,
                 items,
             } => ExitVirtualLayout::Array {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 clear: *clear,
                 // resume.py:656-670: element type from arraydescr
                 kind: array_kind_from_descr(arraydescr.as_ref()),
@@ -830,11 +816,9 @@ fn resume_virtual_layout_to_exit_virtual_layout(
             },
             ResumeVirtualLayoutSummary::ArrayStruct {
                 arraydescr,
-                descr_index,
                 fielddescrs,
                 element_fields,
             } => ExitVirtualLayout::ArrayStruct {
-                descr_index: *descr_index,
                 arraydescr: arraydescr.clone(),
                 fielddescrs: fielddescrs.clone(),
                 element_fields: element_fields
@@ -1186,7 +1170,6 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VirtualInfo {
             descr,
             type_id,
-            descr_index,
             known_class,
             fielddescrs,
             fieldnums,
@@ -1200,7 +1183,6 @@ pub fn rd_virtual_to_virtual_info(
             VirtualInfo::VirtualObj {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 known_class: *known_class,
                 fields,
                 fielddescrs: fielddescrs.clone(),
@@ -1210,7 +1192,6 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::VStructInfo {
             typedescr,
             type_id,
-            descr_index,
             fielddescrs,
             fieldnums,
             descr_size,
@@ -1223,7 +1204,6 @@ pub fn rd_virtual_to_virtual_info(
             VirtualInfo::VStruct {
                 typedescr: typedescr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields,
                 fielddescrs: fielddescrs.clone(),
                 descr_size: *descr_size,
@@ -1231,7 +1211,6 @@ pub fn rd_virtual_to_virtual_info(
         }
         majit_ir::RdVirtualInfo::VArrayInfoClear {
             arraydescr,
-            descr_index,
             fieldnums,
             ..
         } => {
@@ -1241,14 +1220,12 @@ pub fn rd_virtual_to_virtual_info(
                 .collect();
             VirtualInfo::VArray {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 clear: true,
                 items,
             }
         }
         majit_ir::RdVirtualInfo::VArrayInfoNotClear {
             arraydescr,
-            descr_index,
             fieldnums,
             ..
         } => {
@@ -1258,14 +1235,12 @@ pub fn rd_virtual_to_virtual_info(
                 .collect();
             VirtualInfo::VArray {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 clear: false,
                 items,
             }
         }
         majit_ir::RdVirtualInfo::VArrayStructInfo {
             arraydescr,
-            descr_index,
             size,
             fielddescrs: rd_fielddescrs,
             fieldnums,
@@ -1289,7 +1264,6 @@ pub fn rd_virtual_to_virtual_info(
             }
             VirtualInfo::VArrayStruct {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 fielddescrs: rd_fielddescrs.clone(),
                 element_fields,
             }
@@ -1372,7 +1346,6 @@ pub fn rd_virtual_to_virtual_info(
         majit_ir::RdVirtualInfo::Empty => VirtualInfo::VirtualObj {
             descr: None,
             type_id: 0,
-            descr_index: 0,
             known_class: None,
             fields: vec![],
             fielddescrs: vec![],
@@ -1522,7 +1495,6 @@ impl EncodedResumeData {
                 VirtualInfo::VirtualObj {
                     descr,
                     type_id,
-                    descr_index,
                     known_class,
                     fields,
                     fielddescrs,
@@ -1530,7 +1502,6 @@ impl EncodedResumeData {
                 } => majit_ir::RdVirtualInfo::VirtualInfo {
                     descr: descr.clone(),
                     type_id: *type_id,
-                    descr_index: *descr_index,
                     known_class: *known_class,
                     fielddescrs: fielddescrs.clone(),
                     fieldnums: fieldnums(
@@ -1543,14 +1514,12 @@ impl EncodedResumeData {
                 VirtualInfo::VStruct {
                     typedescr,
                     type_id,
-                    descr_index,
                     fields,
                     fielddescrs,
                     descr_size,
                 } => majit_ir::RdVirtualInfo::VStructInfo {
                     typedescr: typedescr.clone(),
                     type_id: *type_id,
-                    descr_index: *descr_index,
                     fielddescrs: fielddescrs.clone(),
                     fieldnums: fieldnums(
                         fields.iter().map(|(_, source)| source.clone()),
@@ -1561,7 +1530,6 @@ impl EncodedResumeData {
                 },
                 VirtualInfo::VArray {
                     arraydescr,
-                    descr_index,
                     clear,
                     items,
                 } => {
@@ -1569,14 +1537,12 @@ impl EncodedResumeData {
                     if *clear {
                         majit_ir::RdVirtualInfo::VArrayInfoClear {
                             arraydescr: arraydescr.clone(),
-                            descr_index: *descr_index,
                             kind: array_kind_from_descr(arraydescr.as_ref()),
                             fieldnums,
                         }
                     } else {
                         majit_ir::RdVirtualInfo::VArrayInfoNotClear {
                             arraydescr: arraydescr.clone(),
-                            descr_index: *descr_index,
                             kind: array_kind_from_descr(arraydescr.as_ref()),
                             fieldnums,
                         }
@@ -1584,7 +1550,6 @@ impl EncodedResumeData {
                 }
                 VirtualInfo::VArrayStruct {
                     arraydescr,
-                    descr_index,
                     fielddescrs,
                     element_fields,
                 } => {
@@ -1624,7 +1589,6 @@ impl EncodedResumeData {
                         .collect();
                     majit_ir::RdVirtualInfo::VArrayStructInfo {
                         arraydescr: arraydescr.clone(),
-                        descr_index: *descr_index,
                         size: element_fields.len(),
                         fielddescrs: fielddescrs.clone(),
                         fielddescr_indices: (0..fielddescrs.len()).map(|i| i as u32).collect(),
@@ -2777,7 +2741,6 @@ impl ResumeDataVirtualAdder {
         self.add_virtual(VirtualInfo::VirtualObj {
             descr,
             type_id,
-            descr_index,
             known_class,
             fields,
             fielddescrs,
@@ -2798,7 +2761,6 @@ impl ResumeDataVirtualAdder {
         self.add_virtual(VirtualInfo::VStruct {
             typedescr,
             type_id,
-            descr_index,
             fields,
             fielddescrs,
             descr_size,
@@ -2815,7 +2777,6 @@ impl ResumeDataVirtualAdder {
     ) -> usize {
         self.add_virtual(VirtualInfo::VArray {
             arraydescr,
-            descr_index,
             clear,
             items,
         })
@@ -2832,7 +2793,6 @@ impl ResumeDataVirtualAdder {
     ) -> usize {
         self.add_virtual(VirtualInfo::VArrayStruct {
             arraydescr,
-            descr_index,
             fielddescrs,
             element_fields,
         })

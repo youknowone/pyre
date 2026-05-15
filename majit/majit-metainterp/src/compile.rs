@@ -789,7 +789,6 @@ pub(crate) fn build_guard_metadata(
                                 majit_ir::RdVirtualInfo::VirtualInfo {
                                     descr,
                                     type_id,
-                                    descr_index,
                                     known_class,
                                     fielddescrs,
                                     fieldnums,
@@ -800,7 +799,6 @@ pub(crate) fn build_guard_metadata(
                                     majit_backend::ExitVirtualLayout::Object {
                                         descr: descr.clone(),
                                         type_id: *type_id,
-                                        descr_index: *descr_index,
                                         known_class: *known_class,
                                         fields: resolve_fieldnums(fieldnums, &idx),
                                         target_slot,
@@ -811,7 +809,6 @@ pub(crate) fn build_guard_metadata(
                                 majit_ir::RdVirtualInfo::VStructInfo {
                                     typedescr,
                                     type_id,
-                                    descr_index,
                                     fielddescrs,
                                     fieldnums,
                                     descr_size,
@@ -821,7 +818,6 @@ pub(crate) fn build_guard_metadata(
                                     majit_backend::ExitVirtualLayout::Struct {
                                         typedescr: typedescr.clone(),
                                         type_id: *type_id,
-                                        descr_index: *descr_index,
                                         fields: resolve_fieldnums(fieldnums, &idx),
                                         target_slot,
                                         fielddescrs: fielddescrs.clone(),
@@ -830,13 +826,11 @@ pub(crate) fn build_guard_metadata(
                                 }
                                 majit_ir::RdVirtualInfo::VArrayInfoClear {
                                     arraydescr,
-                                    descr_index,
                                     kind,
                                     fieldnums,
                                 }
                                 | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
                                     arraydescr,
-                                    descr_index,
                                     kind,
                                     fieldnums,
                                 } => {
@@ -850,7 +844,6 @@ pub(crate) fn build_guard_metadata(
                                         .collect();
                                     majit_backend::ExitVirtualLayout::Array {
                                         arraydescr: arraydescr.clone(),
-                                        descr_index: *descr_index,
                                         clear,
                                         kind: *kind,
                                         items,
@@ -858,7 +851,6 @@ pub(crate) fn build_guard_metadata(
                                 }
                                 majit_ir::RdVirtualInfo::VArrayStructInfo {
                                     arraydescr,
-                                    descr_index,
                                     fielddescrs,
                                     size,
                                     fielddescr_indices,
@@ -878,7 +870,6 @@ pub(crate) fn build_guard_metadata(
                                         })
                                         .collect();
                                     majit_backend::ExitVirtualLayout::ArrayStruct {
-                                        descr_index: *descr_index,
                                         arraydescr: arraydescr.clone(),
                                         fielddescrs: fielddescrs.clone(),
                                         element_fields,

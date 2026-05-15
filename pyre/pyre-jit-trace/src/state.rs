@@ -4220,14 +4220,12 @@ fn materialize_bridge_virtual(
         majit_ir::RdVirtualInfo::VArrayInfoClear {
             fieldnums,
             kind,
-            descr_index,
             arraydescr,
             ..
         }
         | majit_ir::RdVirtualInfo::VArrayInfoNotClear {
             fieldnums,
             kind,
-            descr_index,
             arraydescr,
             ..
         } => {
@@ -4236,7 +4234,7 @@ fn materialize_bridge_virtual(
                 majit_ir::RdVirtualInfo::VArrayInfoClear { .. }
             );
             let kind = *kind;
-            let descr_index = *descr_index;
+            let descr_index = arraydescr.as_ref().map_or(0, |d| d.index());
             let length = fieldnums.len();
             let len_ref = ctx.const_int(length as i64);
             // resume.py:653 decoder.allocate_array(length, arraydescr, self.clear)
@@ -4293,7 +4291,6 @@ fn materialize_bridge_virtual(
         // resume.py:747-760 VArrayStructInfo.allocate
         majit_ir::RdVirtualInfo::VArrayStructInfo {
             arraydescr,
-            descr_index,
             fielddescrs,
             size,
             base_size,
@@ -4304,7 +4301,8 @@ fn materialize_bridge_virtual(
             let len_ref = ctx.const_int(*size as i64);
             // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
             let array_descr = arraydescr.clone().unwrap_or_else(|| {
-                crate::descr::make_struct_array_descr(*descr_index, *base_size, *item_size)
+                let idx = arraydescr.as_ref().map_or(0, |d| d.index());
+                crate::descr::make_struct_array_descr(idx, *base_size, *item_size)
             });
             let new_op =
                 ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());

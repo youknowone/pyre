@@ -240,7 +240,6 @@ pub enum VirtualInfo {
         /// resume.py:615 self.descr — live SizeDescr.
         descr: Option<DescrRef>,
         type_id: u32,
-        descr_index: u32,
         /// info.py:318 _known_class — vtable pointer.
         known_class: Option<i64>,
         fields: Vec<(u32, VirtualFieldSource)>,
@@ -252,7 +251,6 @@ pub enum VirtualInfo {
         /// resume.py:631 self.typedescr — the full SizeDescr.
         typedescr: Option<DescrRef>,
         type_id: u32,
-        descr_index: u32,
         fields: Vec<(u32, VirtualFieldSource)>,
         fielddescrs: Vec<FieldDescrInfo>,
         descr_size: usize,
@@ -261,8 +259,6 @@ pub enum VirtualInfo {
     VArray {
         /// resume.py:646: self.arraydescr
         arraydescr: Option<DescrRef>,
-        /// Array descriptor index (serialization compat).
-        descr_index: u32,
         /// resume.py:680-683: VArrayInfoClear.clear / VArrayInfoNotClear.clear
         clear: bool,
         /// Element values.
@@ -272,8 +268,6 @@ pub enum VirtualInfo {
     VArrayStruct {
         /// resume.py:739: self.arraydescr
         arraydescr: Option<DescrRef>,
-        /// Array descriptor index (serialization compat).
-        descr_index: u32,
         /// resume.py:740: self.fielddescrs — live InteriorFieldDescr objects
         /// for setinteriorfield dispatch.
         fielddescrs: Vec<DescrRef>,
@@ -332,62 +326,71 @@ pub enum VirtualInfo {
     },
 }
 
-// PartialEq/Eq: compare by data fields, skip descr/typedescr (Arc<dyn Descr>).
+// `history.py:125 id(descr)` parity — descr identity via Arc::ptr_eq;
+// fields with no descr (None) compare equal only when both are None.
 impl PartialEq for VirtualInfo {
     fn eq(&self, other: &Self) -> bool {
         match (self, other) {
             (
                 VirtualInfo::VirtualObj {
-                    descr: None,
+                    descr: a_descr,
                     type_id: a1,
-                    descr_index: a2,
                     fields: a3,
                     fielddescrs: a4,
                     descr_size: a5,
                     ..
                 },
                 VirtualInfo::VirtualObj {
-                    descr: None,
+                    descr: b_descr,
                     type_id: b1,
-                    descr_index: b2,
                     fields: b3,
                     fielddescrs: b4,
                     descr_size: b5,
                     ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            ) => {
+                opt_descr_arc_ptr_eq(a_descr, b_descr)
+                    && a1 == b1
+                    && a3 == b3
+                    && a4 == b4
+                    && a5 == b5
+            }
             (
                 VirtualInfo::VStruct {
+                    typedescr: a_descr,
                     type_id: a1,
-                    descr_index: a2,
                     fields: a3,
                     fielddescrs: a4,
                     descr_size: a5,
                     ..
                 },
                 VirtualInfo::VStruct {
+                    typedescr: b_descr,
                     type_id: b1,
-                    descr_index: b2,
                     fields: b3,
                     fielddescrs: b4,
                     descr_size: b5,
                     ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            ) => {
+                opt_descr_arc_ptr_eq(a_descr, b_descr)
+                    && a1 == b1
+                    && a3 == b3
+                    && a4 == b4
+                    && a5 == b5
+            }
             (
                 VirtualInfo::VArray {
-                    arraydescr: _,
-                    descr_index: a1,
+                    arraydescr: a_descr,
                     clear: a_clear,
                     items: a2,
                 },
                 VirtualInfo::VArray {
-                    arraydescr: _,
-                    descr_index: b1,
+                    arraydescr: b_descr,
                     clear: b_clear,
                     items: b2,
                 },
-            ) => a1 == b1 && a_clear == b_clear && a2 == b2,
+            ) => opt_descr_arc_ptr_eq(a_descr, b_descr) && a_clear == b_clear && a2 == b2,
             _ => false,
         }
     }
@@ -451,7 +454,6 @@ impl VirtualInfo {
             VirtualInfo::VirtualObj {
                 descr,
                 type_id,
-                descr_index,
                 known_class,
                 fields,
                 fielddescrs,
@@ -459,7 +461,6 @@ impl VirtualInfo {
             } => ResumeVirtualLayoutSummary::Object {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 known_class: *known_class,
                 fields: fields
                     .iter()
@@ -471,14 +472,12 @@ impl VirtualInfo {
             VirtualInfo::VStruct {
                 typedescr,
                 type_id,
-                descr_index,
                 fields,
                 fielddescrs,
                 descr_size,
             } => ResumeVirtualLayoutSummary::Struct {
                 typedescr: typedescr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: fields
                     .iter()
                     .map(|(fd, src)| (*fd, src.layout_summary()))
@@ -488,23 +487,19 @@ impl VirtualInfo {
             },
             VirtualInfo::VArray {
                 arraydescr,
-                descr_index,
                 clear,
                 items,
             } => ResumeVirtualLayoutSummary::Array {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 clear: *clear,
                 items: items.iter().map(|source| source.layout_summary()).collect(),
             },
             VirtualInfo::VArrayStruct {
                 arraydescr,
-                descr_index,
                 fielddescrs,
                 element_fields,
             } => ResumeVirtualLayoutSummary::ArrayStruct {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 fielddescrs: fielddescrs.clone(),
                 element_fields: element_fields
                     .iter()
@@ -540,7 +535,6 @@ impl VirtualInfo {
             | VirtualInfo::VUniSlice { .. } => ResumeVirtualLayoutSummary::Struct {
                 typedescr: None,
                 type_id: 0,
-                descr_index: 0,
                 fields: vec![],
                 fielddescrs: vec![],
                 descr_size: 0,

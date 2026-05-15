@@ -133,7 +133,6 @@ pub enum ExitVirtualLayout {
         /// resume.py:615 self.descr — live SizeDescr for allocate_with_vtable.
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         /// info.py:318 _known_class — vtable pointer for allocate_with_vtable.
         known_class: Option<i64>,
         fields: Vec<(u32, ExitValueSourceLayout)>,
@@ -147,7 +146,6 @@ pub enum ExitVirtualLayout {
         /// resume.py:631 self.typedescr — live SizeDescr for allocate_struct.
         typedescr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         fields: Vec<(u32, ExitValueSourceLayout)>,
         target_slot: Option<usize>,
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
@@ -158,7 +156,6 @@ pub enum ExitVirtualLayout {
         /// `allocate_array`.  Identity-comparable via `Arc::ptr_eq`
         /// (`history.py:125`).
         arraydescr: Option<majit_ir::DescrRef>,
-        descr_index: u32,
         /// resume.py:653: allocate_array(length, arraydescr, self.clear)
         clear: bool,
         /// resume.py:656: arraydescr element kind (0=ref, 1=int, 2=float)
@@ -167,7 +164,6 @@ pub enum ExitVirtualLayout {
     },
     /// resume.py:736 VArrayStructInfo(arraydescr, size, fielddescrs)
     ArrayStruct {
-        descr_index: u32,
         /// resume.py:739: self.arraydescr — live ArrayDescr for allocate_array.
         arraydescr: Option<majit_ir::DescrRef>,
         /// resume.py:740: self.fielddescrs — live InteriorFieldDescr per field slot.
@@ -237,7 +233,6 @@ impl ExitVirtualLayout {
             Self::Object {
                 descr,
                 type_id,
-                descr_index,
                 known_class,
                 fields,
                 target_slot,
@@ -246,7 +241,6 @@ impl ExitVirtualLayout {
             } => Self::Object {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 known_class: *known_class,
                 fields: fields
                     .iter()
@@ -259,7 +253,6 @@ impl ExitVirtualLayout {
             Self::Struct {
                 typedescr,
                 type_id,
-                descr_index,
                 fields,
                 target_slot,
                 fielddescrs,
@@ -267,7 +260,6 @@ impl ExitVirtualLayout {
             } => Self::Struct {
                 typedescr: typedescr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: fields
                     .iter()
                     .map(|(field_index, source)| {
@@ -280,13 +272,11 @@ impl ExitVirtualLayout {
             },
             Self::Array {
                 arraydescr,
-                descr_index,
                 clear,
                 kind,
                 items,
             } => Self::Array {
                 arraydescr: arraydescr.clone(),
-                descr_index: *descr_index,
                 clear: *clear,
                 kind: *kind,
                 items: items
@@ -299,12 +289,10 @@ impl ExitVirtualLayout {
                 base: base.shifted_virtuals(virtual_offset),
             },
             Self::ArrayStruct {
-                descr_index,
                 arraydescr,
                 fielddescrs,
                 element_fields,
             } => Self::ArrayStruct {
-                descr_index: *descr_index,
                 arraydescr: arraydescr.clone(),
                 fielddescrs: fielddescrs.clone(),
                 element_fields: element_fields
@@ -398,7 +386,6 @@ impl PartialEq for ExitVirtualLayout {
                 Self::Object {
                     descr: a_descr,
                     type_id: a1,
-                    descr_index: _,
                     known_class: a7,
                     fields: a3,
                     target_slot: a4,
@@ -408,7 +395,6 @@ impl PartialEq for ExitVirtualLayout {
                 Self::Object {
                     descr: b_descr,
                     type_id: b1,
-                    descr_index: _,
                     known_class: b7,
                     fields: b3,
                     target_slot: b4,
@@ -428,7 +414,6 @@ impl PartialEq for ExitVirtualLayout {
                 Self::Struct {
                     typedescr: a_descr,
                     type_id: a1,
-                    descr_index: _,
                     fields: a3,
                     target_slot: a4,
                     fielddescrs: a5,
@@ -437,7 +422,6 @@ impl PartialEq for ExitVirtualLayout {
                 Self::Struct {
                     typedescr: b_descr,
                     type_id: b1,
-                    descr_index: _,
                     fields: b3,
                     target_slot: b4,
                     fielddescrs: b5,
@@ -454,14 +438,12 @@ impl PartialEq for ExitVirtualLayout {
             (
                 Self::Array {
                     arraydescr: a_ad,
-                    descr_index: _,
                     clear: a2,
                     kind: a3,
                     items: a4,
                 },
                 Self::Array {
                     arraydescr: b_ad,
-                    descr_index: _,
                     clear: b2,
                     kind: b3,
                     items: b4,
@@ -469,13 +451,11 @@ impl PartialEq for ExitVirtualLayout {
             ) => opt_descr_ptr_eq(a_ad, b_ad) && a2 == b2 && a3 == b3 && a4 == b4,
             (
                 Self::ArrayStruct {
-                    descr_index: _,
                     arraydescr: a_ad,
                     fielddescrs: a_fds,
                     element_fields: a2,
                 },
                 Self::ArrayStruct {
-                    descr_index: _,
                     arraydescr: b_ad,
                     fielddescrs: b_fds,
                     element_fields: b2,

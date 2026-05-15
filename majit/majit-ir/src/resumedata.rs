@@ -171,7 +171,6 @@ pub enum ResumeVirtualLayoutSummary {
         /// resume.py:615 self.descr — live SizeDescr, preserved across summary round-trip.
         descr: Option<crate::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         /// info.py:318 _known_class — vtable pointer.
         known_class: Option<i64>,
         fields: Vec<(u32, ResumeValueLayoutSummary)>,
@@ -182,7 +181,6 @@ pub enum ResumeVirtualLayoutSummary {
         /// resume.py:631 self.typedescr — live SizeDescr, preserved across summary round-trip.
         typedescr: Option<crate::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         fields: Vec<(u32, ResumeValueLayoutSummary)>,
         fielddescrs: Vec<crate::FieldDescrInfo>,
         descr_size: usize,
@@ -191,7 +189,6 @@ pub enum ResumeVirtualLayoutSummary {
     Array {
         /// resume.py:646: self.arraydescr
         arraydescr: Option<crate::DescrRef>,
-        descr_index: u32,
         /// resume.py:680-683: VArrayInfoClear.clear=True / VArrayInfoNotClear.clear=False
         clear: bool,
         items: Vec<ResumeValueLayoutSummary>,
@@ -200,7 +197,6 @@ pub enum ResumeVirtualLayoutSummary {
     ArrayStruct {
         /// resume.py:739: self.arraydescr
         arraydescr: Option<crate::DescrRef>,
-        descr_index: u32,
         /// resume.py:740: self.fielddescrs
         fielddescrs: Vec<crate::DescrRef>,
         element_fields: Vec<Vec<(u32, ResumeValueLayoutSummary)>>,

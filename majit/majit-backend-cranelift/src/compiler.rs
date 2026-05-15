@@ -12964,7 +12964,6 @@ fn collect_guards(
                         majit_ir::RdVirtualInfo::VirtualInfo {
                             descr,
                             type_id,
-                            descr_index,
                             known_class,
                             fielddescrs,
                             fieldnums,
@@ -12974,7 +12973,6 @@ fn collect_guards(
                             ExitVirtualLayout::Object {
                                 descr: descr.clone(),
                                 type_id: *type_id,
-                                descr_index: *descr_index,
                                 known_class: *known_class,
                                 fields: resolve_fieldnums(fieldnums, &indices),
                                 target_slot,
@@ -12985,7 +12983,6 @@ fn collect_guards(
                         majit_ir::RdVirtualInfo::VStructInfo {
                             typedescr,
                             type_id,
-                            descr_index,
                             fielddescrs,
                             fieldnums,
                             descr_size,
@@ -12994,7 +12991,6 @@ fn collect_guards(
                             ExitVirtualLayout::Struct {
                                 typedescr: typedescr.clone(),
                                 type_id: *type_id,
-                                descr_index: *descr_index,
                                 fields: resolve_fieldnums(fieldnums, &indices),
                                 target_slot,
                                 fielddescrs: fielddescrs.clone(),
@@ -13003,12 +12999,10 @@ fn collect_guards(
                         }
                         majit_ir::RdVirtualInfo::VArrayInfoClear {
                             arraydescr,
-                            descr_index,
                             kind,
                             fieldnums,
                         } => ExitVirtualLayout::Array {
                             arraydescr: arraydescr.clone(),
-                            descr_index: *descr_index,
                             clear: true,
                             kind: *kind,
                             items: fieldnums
@@ -13018,12 +13012,10 @@ fn collect_guards(
                         },
                         majit_ir::RdVirtualInfo::VArrayInfoNotClear {
                             arraydescr,
-                            descr_index,
                             kind,
                             fieldnums,
                         } => ExitVirtualLayout::Array {
                             arraydescr: arraydescr.clone(),
-                            descr_index: *descr_index,
                             clear: false,
                             kind: *kind,
                             items: fieldnums
@@ -13033,7 +13025,6 @@ fn collect_guards(
                         },
                         majit_ir::RdVirtualInfo::VArrayStructInfo {
                             arraydescr,
-                            descr_index,
                             fielddescrs,
                             size,
                             fielddescr_indices,
@@ -13046,7 +13037,6 @@ fn collect_guards(
                                 0
                             };
                             ExitVirtualLayout::ArrayStruct {
-                                descr_index: *descr_index,
                                 arraydescr: arraydescr.clone(),
                                 fielddescrs: fielddescrs.clone(),
                                 element_fields: (0..*size)
@@ -16317,7 +16307,6 @@ mod tests {
             ],
             virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
                 arraydescr: None,
-                descr_index: 17,
                 clear: false,
                 kind: 1,
                 items: vec![
@@ -16468,7 +16457,6 @@ mod tests {
             ],
             virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
                 arraydescr: None,
-                descr_index: 17,
                 clear: false,
                 kind: 1,
                 items: vec![majit_backend::ExitValueSourceLayout::ExitValue(0)],
@@ -16549,7 +16537,6 @@ mod tests {
             ],
             virtual_layouts: vec![majit_backend::ExitVirtualLayout::Array {
                 arraydescr: None,
-                descr_index: 99,
                 clear: false,
                 kind: 1,
                 items: vec![

@@ -437,7 +437,6 @@ pub enum RdVirtualInfo {
         descr: Option<crate::DescrRef>,
         /// descr.tid — GC type identifier for allocation dispatch.
         type_id: u32,
-        descr_index: u32,
         known_class: Option<i64>,
         fielddescrs: Vec<FieldDescrInfo>,
         fieldnums: Vec<i16>,
@@ -449,7 +448,6 @@ pub enum RdVirtualInfo {
         typedescr: Option<crate::DescrRef>,
         /// typedescr.tid — GC type identifier (cached for serialization).
         type_id: u32,
-        descr_index: u32,
         fielddescrs: Vec<FieldDescrInfo>,
         fieldnums: Vec<i16>,
         descr_size: usize,
@@ -458,7 +456,6 @@ pub enum RdVirtualInfo {
     VArrayInfoClear {
         /// resume.py:646 self.arraydescr — live ArrayDescr reference.
         arraydescr: Option<crate::DescrRef>,
-        descr_index: u32,
         /// resume.py:656: arraydescr element kind (ref/int/float).
         kind: u8, // 0=ref, 1=int, 2=float (ArrayDescr.flag parity)
         fieldnums: Vec<i16>,
@@ -467,7 +464,6 @@ pub enum RdVirtualInfo {
     VArrayInfoNotClear {
         /// resume.py:646 self.arraydescr — live ArrayDescr reference.
         arraydescr: Option<crate::DescrRef>,
-        descr_index: u32,
         /// resume.py:656: arraydescr element kind (ref/int/float).
         kind: u8, // 0=ref, 1=int, 2=float (ArrayDescr.flag parity)
         fieldnums: Vec<i16>,
@@ -476,7 +472,6 @@ pub enum RdVirtualInfo {
     VArrayStructInfo {
         /// resume.py:739 self.arraydescr — live ArrayDescr reference.
         arraydescr: Option<crate::DescrRef>,
-        descr_index: u32,
         size: usize,
         /// resume.py:740: self.fielddescrs — live InteriorFieldDescr objects.
         fielddescrs: Vec<crate::DescrRef>,
@@ -573,7 +568,6 @@ impl PartialEq for RdVirtualInfo {
                 Self::VirtualInfo {
                     descr: a_descr,
                     type_id: a0,
-                    descr_index: _,
                     known_class: a2,
                     fielddescrs: a3,
                     fieldnums: a4,
@@ -582,7 +576,6 @@ impl PartialEq for RdVirtualInfo {
                 Self::VirtualInfo {
                     descr: b_descr,
                     type_id: b0,
-                    descr_index: _,
                     known_class: b2,
                     fielddescrs: b3,
                     fieldnums: b4,
@@ -600,7 +593,6 @@ impl PartialEq for RdVirtualInfo {
                 Self::VStructInfo {
                     typedescr: a_descr,
                     type_id: a1,
-                    descr_index: _,
                     fielddescrs: a3,
                     fieldnums: a4,
                     descr_size: a5,
@@ -608,7 +600,6 @@ impl PartialEq for RdVirtualInfo {
                 Self::VStructInfo {
                     typedescr: b_descr,
                     type_id: b1,
-                    descr_index: _,
                     fielddescrs: b3,
                     fieldnums: b4,
                     descr_size: b5,
@@ -617,13 +608,11 @@ impl PartialEq for RdVirtualInfo {
             (
                 Self::VArrayInfoClear {
                     arraydescr: a_descr,
-                    descr_index: _,
                     kind: a2,
                     fieldnums: a3,
                 },
                 Self::VArrayInfoClear {
                     arraydescr: b_descr,
-                    descr_index: _,
                     kind: b2,
                     fieldnums: b3,
                 },
@@ -631,13 +620,11 @@ impl PartialEq for RdVirtualInfo {
             (
                 Self::VArrayInfoNotClear {
                     arraydescr: a_descr,
-                    descr_index: _,
                     kind: a2,
                     fieldnums: a3,
                 },
                 Self::VArrayInfoNotClear {
                     arraydescr: b_descr,
-                    descr_index: _,
                     kind: b2,
                     fieldnums: b3,
                 },
@@ -645,7 +632,6 @@ impl PartialEq for RdVirtualInfo {
             (
                 Self::VArrayStructInfo {
                     arraydescr: a_descr,
-                    descr_index: _,
                     size: a2,
                     fielddescrs: _,
                     fielddescr_indices: a3,
@@ -658,7 +644,6 @@ impl PartialEq for RdVirtualInfo {
                 },
                 Self::VArrayStructInfo {
                     arraydescr: b_descr,
-                    descr_index: _,
                     size: b2,
                     fielddescrs: _,
                     fielddescr_indices: b3,
