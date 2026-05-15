@@ -330,6 +330,23 @@ impl PyJitCode {
         !self.metadata.pc_map.is_empty()
     }
 
+    /// Resolve a Python bytecode PC to the JitCode byte offset where
+    /// blackhole resume / inline call tracing should restart execution.
+    /// Returns `None` if `py_pc` falls outside the populated range
+    /// (portal-bridge installs always return `None` because their
+    /// `pc_map` is empty by construction).
+    ///
+    /// This is pyre's analog of `blackhole.py:1712 self.setposition(
+    /// miframe.jitcode, miframe.pc)` where upstream stores the JitCode
+    /// PC directly in resume data (`miframe.pc`); pyre's resume data
+    /// stores the Python bytecode PC and translates here.  Centralizing
+    /// the lookup makes the resume-data write-side an obvious migration
+    /// target: once resume data stores `jitcode_pc` directly the
+    /// translation step (and the `pc_map` it depends on) can retire.
+    pub fn resume_jitcode_pc_for(&self, py_pc: usize) -> Option<usize> {
+        self.metadata.pc_map.get(py_pc).copied()
+    }
+
     /// Skeleton slot inserted by [`Self::skeleton`] — neither `code`
     /// nor `pc_map` populated yet. See the discriminator table on
     /// the module doc.

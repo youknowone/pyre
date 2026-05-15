@@ -862,7 +862,7 @@ pub fn resume_in_blackhole(
                 return BlackholeResult::Failed;
             }
         };
-        let jitcode_pc = if let Some(jitcode_pc) = pyjitcode.metadata.pc_map.get(py_pc).copied() {
+        let jitcode_pc = if let Some(jitcode_pc) = pyjitcode.resume_jitcode_pc_for(py_pc) {
             jitcode_pc
         } else {
             if nbody_debug {
@@ -1894,7 +1894,7 @@ pub fn blackhole_resume_via_rd_numb(
         if pyjitcode.has_abort_opcode() {
             return None;
         }
-        let jitcode_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
+        let jitcode_pc = pyjitcode.resume_jitcode_pc_for(pc as usize)?;
         // resume.py:1339 reads from one `jitcodes[]` store.  pyre's
         // `state::code_for_jitcode_index` indices name the runtime
         // `MetaInterpStaticData.jitcodes` table keyed by CodeObject; they
