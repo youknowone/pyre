@@ -4839,6 +4839,61 @@ mod tests {
         );
     }
 
+    #[test]
+    fn canonical_flatten_graph_lowers_rtyped_opaque_ref_link_arg() {
+        // End-to-end pipeline: graph carrying an `Opaque(Ref)` link
+        // arg is fed through `rtype_opaque_constants` (matches the
+        // upstream pre-flatten constant-resolution step) and then
+        // lowered by the canonical `flatten_graph(graph, regallocs,
+        // false, cpu=None)` entry.  Expected outcome: the rtyper
+        // rewrites the opaque to `Signed(0xfeed)` with Kind::Ref,
+        // `flatten_constant_operand` lowers that to
+        // `Operand::ConstRef(0xfeed)`, and `insert_renamings` emits
+        // a `ref_copy(ConstRef(0xfeed) -> Reg)` matching the
+        // returnblock inputarg's color.
+        use crate::jit::flow::{Block, FunctionGraph, Link};
+        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+        use crate::jit::rtyper::rtype_opaque_constants;
+
+        let start = Block::shared(Vec::new());
+        let graph = FunctionGraph::new("rtyped_canonical", start.clone(), None);
+        let opaque_ovf = super::super::flow::Constant::opaque("OverflowError", Some(Kind::Ref));
+        start.closeblock(vec![
+            Link::new(
+                vec![opaque_ovf.into()],
+                Some(graph.returnblock.clone()),
+                None,
+            )
+            .into_ref(),
+        ]);
+
+        rtype_opaque_constants(&graph, |c| match &c.value {
+            super::super::flow::ConstantValue::Opaque(opaque)
+                if opaque.repr() == "OverflowError" =>
+            {
+                0xfeed
+            }
+            other => panic!("unexpected opaque {other:?}"),
+        });
+
+        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, None);
+
+        let has_const_ref_feed = ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::Op { args, .. }
+                    if args.iter().any(|a| matches!(a, Operand::ConstRef(0xfeed)))
+            )
+        });
+        assert!(
+            has_const_ref_feed,
+            "canonical flatten_graph must lower rtyped Signed(0xfeed)/Ref to \
+             Operand::ConstRef(0xfeed): {:?}",
+            ssarepr.insns
+        );
+    }
+
     /// Helper: build a `get_register` closure that maps each
     /// `Variable` to a `Register` whose index equals the
     /// `VariableId`, kind taken from the variable.  Used by the
