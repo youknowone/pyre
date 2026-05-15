@@ -2010,64 +2010,78 @@ pub enum ConcreteType {
 ///         raise NotImplementedError("type %s not supported" % TYPE)
 /// ```
 pub fn getkind(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> ConcreteType {
-    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType};
     match ty {
         // `if TYPE is lltype.Void: return "void"`
         LowLevelType::Void => ConcreteType::Void,
-        // `elif isinstance(TYPE, lltype.Primitive): ...`
+        // `if TYPE is lltype.Float and supports_floats: return 'float'`
         LowLevelType::Float => ConcreteType::Float,
-        // `if TYPE is lltype.SingleFloat and supports_singlefloats: return 'int'`
-        // (singlefloats stored in an int register).
+        // `if TYPE is lltype.SingleFloat and supports_singlefloats:
+        //      return 'int'  # singlefloats are stored in an int`
         LowLevelType::SingleFloat => ConcreteType::Signed,
-        // `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed): ...
-        //   if supports_longlong and TYPE is not lltype.LongFloat: return 'float'`
-        // — the (UnsignedLongLongLong, SignedLongLongLong) 16-byte
-        // variants raise NotImplementedError upstream; pyre treats
-        // them as `Float` slots until the long-long backend lands.
-        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => ConcreteType::Float,
-        LowLevelType::LongFloat => ConcreteType::Float,
+        // `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed):
+        //      if supports_longlong and TYPE is not lltype.LongFloat:
+        //          assert rffi.sizeof(TYPE) == 8
+        //          return 'float'`
+        // — target-size dependent: on 64-bit `Signed` is 8 bytes so
+        // SignedLongLong (also 8) does NOT exceed it and falls through
+        // to `return "int"`.  On 32-bit `Signed` is 4 bytes so the
+        // 8-byte longlong variants take the `'float'` slot.  Pyre's
+        // host word size is `usize` / `isize`, mirrored via
+        // `std::mem::size_of`.
+        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => {
+            if std::mem::size_of::<i64>() > std::mem::size_of::<isize>() {
+                ConcreteType::Float
+            } else {
+                ConcreteType::Signed
+            }
+        }
         // Other Primitives → `"int"`.  Includes Signed, Unsigned,
         // Bool, Char, UniChar, Address.  RPython's
         // `rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed)` check
-        // only fires for the 16-byte longlonglong primitives below
-        // — every other primitive fits in an Int register.
+        // only fires for the longlong family handled above and the
+        // 16-byte longlonglong family handled below.
         LowLevelType::Signed
         | LowLevelType::Unsigned
         | LowLevelType::Bool
         | LowLevelType::Char
         | LowLevelType::UniChar
         | LowLevelType::Address => ConcreteType::Signed,
-        // `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed) and not supports_longlong:
+        // `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed) and not supports_longlong
+        //      or TYPE is lltype.LongFloat:
         //      raise NotImplementedError("type %s is too large" % TYPE)`
-        // — the 16-byte longlonglong variants surface as panics
-        // upstream too.  Keep parity by panicking pyre-side until
-        // the JIT supports them; production paths never reach this.
-        LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => {
-            panic!("getkind: type {ty:?} is too large (longlonglong unsupported)")
+        // — pyre panics with the same shape until the longlonglong /
+        // longfloat backends land; production paths never reach this.
+        LowLevelType::SignedLongLongLong
+        | LowLevelType::UnsignedLongLongLong
+        | LowLevelType::LongFloat => {
+            panic!("getkind: type {ty:?} not supported (history.py:62 NotImplementedError)")
         }
-        // `elif isinstance(TYPE, lltype.Ptr): ...`
+        // `elif isinstance(TYPE, lltype.Ptr):
+        //      if TYPE.TO._gckind == 'raw': return "int"
+        //      else: return "ref"`
         LowLevelType::Ptr(ptr) => match ptr_gckind(&ptr.TO) {
             GcKind::Raw => ConcreteType::Signed,
             GcKind::Gc | GcKind::Prebuilt => ConcreteType::GcRef,
         },
-        // RPython `lltype.InteriorPtr` is treated as a pointer — the
-        // codewriter never sees it as an operand top-level type, so
-        // mirror the `Ptr` arm conservatively.
+        // RPython does not place `InteriorPtr` directly on a
+        // Variable's `concretetype`; it reaches the JIT codewriter
+        // only as the source of a `getinteriorfield` op.  Treat as
+        // a pointer-shaped slot conservatively.
         LowLevelType::InteriorPtr(_) => ConcreteType::GcRef,
         // RPython `Func`/`Struct`/`Array`/`FixedSizeArray`/`Opaque`/
         // `ForwardReference` are not valid `concretetype` values for
-        // a Variable — they only appear as `TO` of a `Ptr`.  Reaching
-        // this arm means the rtyper handed the codewriter a
-        // non-pointer aggregate type, which would `NotImplementedError`
-        // upstream.  Panic with the same message shape so the upstream
-        // bug surfaces here.
+        // a Variable — they only appear as the `TO` of a `Ptr`.
+        // Reaching this arm means the rtyper handed the codewriter
+        // a non-pointer aggregate, which would `NotImplementedError`
+        // upstream.
         LowLevelType::Func(_)
         | LowLevelType::Struct(_)
         | LowLevelType::Array(_)
         | LowLevelType::FixedSizeArray(_)
         | LowLevelType::Opaque(_)
         | LowLevelType::ForwardReference(_) => {
-            panic!("getkind: type {ty:?} not supported as concretetype")
+            panic!("getkind: type {ty:?} not supported as concretetype (history.py:70)")
         }
     }
 }

@@ -77,60 +77,28 @@ use crate::translator::rtyper::rtyper::RPythonTyper;
 /// `ConcreteType` bucket the codewriter consumes (Signed / Float /
 /// GcRef / Void).
 ///
-/// Mapping follows RPython's JIT `history.getkind(TYPE)`
-/// (`rpython/jit/metainterp/history.py:46-71`):
-/// `Void -> void`, primitive float -> float, `SingleFloat -> int`,
-/// machine-word primitives and raw pointers -> int, GC pointers -> ref.
-/// `SignedLongLong` / `UnsignedLongLong` follow PyPy's target-size
-/// check: they are float kind only when they are wider than `Signed`
-/// (32-bit targets); on 64-bit targets they collapse to int kind.
-/// Unsupported container/non-pointer shapes return
-/// `Err(TyperError::missing_rtype_operation(..))`, mirroring
-/// `history.py:70 raise NotImplementedError("type %s not supported")`
-/// while routing the failure through the `specialize_legacy_graph`
-/// `Result<...>` channel rather than unwinding direct callers.
+/// `Result`-routing wrapper around [`crate::model::getkind`] for
+/// the `specialize_legacy_graph` callback channel.
+///
+/// `getkind` itself panics on the `NotImplementedError` cases
+/// (longlonglong / longfloat / non-pointer aggregates) — the
+/// upstream `history.py:62,70 raise NotImplementedError` shape.
+/// Pyre's legacy specialize callers want those failures routed
+/// through `Result<…, TyperError>` instead so a single unported
+/// rtype path doesn't unwind the whole `transform_graph_to_jitcode`
+/// driver; this wrapper catches the panic and converts it to a
+/// `TyperError::missing_rtype_operation` payload.
 pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType, TyperError> {
-    match ll {
-        LowLevelType::Void => Ok(ConcreteType::Void),
-        LowLevelType::Signed
-        | LowLevelType::Unsigned
-        | LowLevelType::Bool
-        | LowLevelType::Char
-        | LowLevelType::UniChar
-        | LowLevelType::SingleFloat
-        | LowLevelType::Address => Ok(ConcreteType::Signed),
-        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => {
-            Ok(longlong_getkind_concrete())
-        }
-        LowLevelType::Float => Ok(ConcreteType::Float),
-        LowLevelType::Ptr(ptr) => {
-            if ptr._gckind() == GcKind::Raw {
-                Ok(ConcreteType::Signed)
-            } else {
-                Ok(ConcreteType::GcRef)
-            }
-        }
-        LowLevelType::SignedLongLongLong
-        | LowLevelType::UnsignedLongLongLong
-        | LowLevelType::LongFloat
-        | LowLevelType::Func(_)
-        | LowLevelType::Struct(_)
-        | LowLevelType::Array(_)
-        | LowLevelType::FixedSizeArray(_)
-        | LowLevelType::Opaque(_)
-        | LowLevelType::ForwardReference(_)
-        | LowLevelType::InteriorPtr(_) => Err(TyperError::missing_rtype_operation(format!(
+    let ll_clone = ll.clone();
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::model::getkind(&ll_clone)
+    }));
+    match result {
+        Ok(kind) => Ok(kind),
+        Err(_) => Err(TyperError::missing_rtype_operation(format!(
             "lowleveltype_to_concrete: type {ll:?} not supported \
              (history.py:70 raise NotImplementedError)"
         ))),
-    }
-}
-
-fn longlong_getkind_concrete() -> ConcreteType {
-    if std::mem::size_of::<i64>() > std::mem::size_of::<isize>() {
-        ConcreteType::Float
-    } else {
-        ConcreteType::Signed
     }
 }
 
