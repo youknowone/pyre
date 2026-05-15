@@ -882,7 +882,9 @@ impl JitState for VirtualResumeState {
     ) -> Option<GcRef> {
         assert_eq!(virtual_index, 0);
         match materialized {
-            MaterializedVirtual::Struct { descr_index, .. } => assert_eq!(*descr_index, 7),
+            MaterializedVirtual::Struct { descr, .. } => {
+                assert_eq!(descr.as_ref().map(|d| d.index()), Some(7));
+            }
             other => panic!("unexpected virtual materialization: {other:?}"),
         }
         self.materialize_calls += 1;
@@ -1324,12 +1326,12 @@ impl JitState for PendingVirtualWriteState {
     ) -> Option<GcRef> {
         self.materialize_order.push(virtual_index);
         match (virtual_index, materialized) {
-            (0, MaterializedVirtual::Struct { descr_index, .. }) => {
-                assert_eq!(*descr_index, 30);
+            (0, MaterializedVirtual::Struct { descr, .. }) => {
+                assert_eq!(descr.as_ref().map(|d| d.index()), Some(30));
                 Some(GcRef(self.parent_ref))
             }
-            (1, MaterializedVirtual::Struct { descr_index, .. }) => {
-                assert_eq!(*descr_index, 31);
+            (1, MaterializedVirtual::Struct { descr, .. }) => {
+                assert_eq!(descr.as_ref().map(|d| d.index()), Some(31));
                 Some(GcRef(self.child_ref))
             }
             other => panic!("unexpected pending-write virtual materialization: {other:?}"),
@@ -1795,8 +1797,10 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 555);
+    let typedescr_7: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(7, 0, 0));
     let virtual_index = resume.add_virtual_struct(
-        None,
+        Some(typedescr_7),
         0,
         7,
         vec![(
@@ -1900,8 +1904,12 @@ fn jit_state_restore_guard_failure_replays_pending_writes_with_virtual_target_an
     let meta = TestMeta { header_pc: 557 };
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 557);
-    let parent = resume.add_virtual_struct(None, 0, 30, vec![], vec![], 0);
-    let child = resume.add_virtual_struct(None, 0, 31, vec![], vec![], 0);
+    let parent_typedescr: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(30, 0, 0));
+    let child_typedescr: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(31, 0, 0));
+    let parent = resume.add_virtual_struct(Some(parent_typedescr), 0, 30, vec![], vec![], 0);
+    let child = resume.add_virtual_struct(Some(child_typedescr), 0, 31, vec![], vec![], 0);
     resume.set_slot_virtual(0, parent);
     resume.set_slot_virtual(1, child);
     let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
