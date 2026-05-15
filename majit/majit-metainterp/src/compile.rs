@@ -3118,12 +3118,6 @@ fn build_vector_info_chain(chain: Vec<AccumInfo>) -> Option<Box<AccumInfo>> {
 /// report exactly which guard failed.
 static NEXT_FAIL_INDEX: AtomicU32 = AtomicU32::new(1);
 
-/// Reset the global fail_index counter (for testing).
-#[cfg(test)]
-pub fn reset_fail_index_counter() {
-    NEXT_FAIL_INDEX.store(1, Ordering::SeqCst);
-}
-
 /// Allocate the next unique fail_index.
 fn alloc_fail_index() -> u32 {
     NEXT_FAIL_INDEX.fetch_add(1, Ordering::SeqCst)
@@ -5153,7 +5147,12 @@ mod fail_descr_tests {
 
     #[test]
     fn test_fail_descr_unique_indices() {
-        reset_fail_index_counter();
+        // `NEXT_FAIL_INDEX` is a global atomic counter shared by every test
+        // that allocates a `FailDescr`. cargo test runs tests in parallel, so
+        // resetting the counter here would race against concurrent
+        // allocations in unrelated tests and let two descrs share the same
+        // fail_index. The check below only asserts pairwise uniqueness, so
+        // the starting value of the counter is irrelevant.
         let d1 = make_fail_descr(2);
         let d2 = make_fail_descr(3);
         let d3 = make_fail_descr(1);
