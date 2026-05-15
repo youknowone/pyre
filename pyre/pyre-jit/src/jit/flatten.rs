@@ -2384,17 +2384,24 @@ pub fn flatten_graph<'a>(
 /// `codewriter.rs::transform_graph_to_jitcode` whose goal is the
 /// narrower question "does the graph carry the SAME `family_opname`
 
-/// Lower one `SpaceOperation` to a single `Insn::Op` using probe-side
-/// argument flattening.  Used by [`flatten_op_to_insn_with_lowering`]
-/// as the passthrough fallback when no HLOp lowering matches.
-fn flatten_op_to_insn<F>(op: &super::flow::SpaceOperation, get_register: &mut F) -> Option<Insn>
+/// Lower one `SpaceOperation` to a single `Insn::Op`.  Used by
+/// [`flatten_op_to_insn_with_lowering`] as the passthrough fallback
+/// when no HLOp lowering matches.  Constant operands lower via the
+/// caller-supplied `lower_constant` closure (production threads its
+/// real `lower_constant`; tests pass `flatten_constant_operand_for_probe`).
+fn flatten_op_to_insn<F, LC>(
+    op: &super::flow::SpaceOperation,
+    get_register: &mut F,
+    lower_constant: &mut LC,
+) -> Option<Insn>
 where
     F: FnMut(Variable) -> Register,
+    LC: FnMut(&Constant) -> Operand,
 {
     let args: Vec<Operand> = op
         .args
         .iter()
-        .map(|arg| flatten_arg_for_probe(arg, get_register))
+        .map(|arg| flatten_arg_with_lowering(arg, get_register, lower_constant))
         .collect();
     let insn = match &op.result {
         None => Insn::op(op.opname.clone(), args),
@@ -2409,13 +2416,6 @@ where
         ),
     };
     Some(insn)
-}
-
-fn flatten_arg_for_probe<F>(arg: &super::flow::SpaceOperationArg, get_register: &mut F) -> Operand
-where
-    F: FnMut(Variable) -> Register,
-{
-    flatten_arg_with_lowering(arg, get_register, &mut flatten_constant_operand_for_probe)
 }
 
 /// Generalized `SpaceOperationArg → Operand` lowering with a
@@ -3465,7 +3465,7 @@ where
     {
         return Some(insn);
     }
-    flatten_op_to_insn(op, get_register)
+    flatten_op_to_insn(op, get_register, lower_constant)
 }
 
 /// Retired-family-only variant of [`flatten_op_to_insn_with_lowering`]:
@@ -5126,8 +5126,9 @@ mod tests {
             Some(result.into()),
             0,
         );
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual =
+            flatten_op_to_insn(&dual_op, &mut get_register, &mut flatten_constant_operand_for_probe)
+                .expect("residual_call SpaceOperation must lower");
 
         // Compare via Debug formatting — Insn does not derive Eq, but
         // the Debug output is structurally faithful for the variants
@@ -5666,8 +5667,12 @@ mod tests {
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("residual_call SpaceOperation must lower via dispatcher");
-        let direct = flatten_op_to_insn(&op, &mut get_register_b)
-            .expect("residual_call SpaceOperation must lower via passthrough");
+        let direct = flatten_op_to_insn(
+            &op,
+            &mut get_register_b,
+            &mut flatten_constant_operand_for_probe,
+        )
+        .expect("residual_call SpaceOperation must lower via passthrough");
         assert_eq!(format!("{dispatched:?}"), format!("{direct:?}"));
     }
 
@@ -5780,8 +5785,9 @@ mod tests {
         );
         let mut get_register = identity_register_mapper();
         let mut lower_constant = probe_constant_lowering();
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual =
+            flatten_op_to_insn(&dual_op, &mut get_register, &mut flatten_constant_operand_for_probe)
+                .expect("residual_call SpaceOperation must lower");
         let prod = build_load_const_fn_residual_call_ir_r_insn(9, 17, 4, 5);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
@@ -5912,8 +5918,9 @@ mod tests {
         );
         let mut get_register = identity_register_mapper();
         let mut lower_constant = probe_constant_lowering();
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual =
+            flatten_op_to_insn(&dual_op, &mut get_register, &mut flatten_constant_operand_for_probe)
+                .expect("residual_call SpaceOperation must lower");
         let prod = build_load_global_fn_residual_call_ir_r_insn(12, 5, 3, 4, 6, 7);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
@@ -6140,8 +6147,9 @@ mod tests {
         );
         let mut get_register = identity_register_mapper();
         let mut lower_constant = probe_constant_lowering();
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual =
+            flatten_op_to_insn(&dual_op, &mut get_register, &mut flatten_constant_operand_for_probe)
+                .expect("residual_call SpaceOperation must lower");
         let prod = build_call_fn_residual_call_r_r_insn(33, 5, &[6, 7, 8], 9);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
@@ -6266,8 +6274,9 @@ mod tests {
         );
         let mut get_register = identity_register_mapper();
         let mut lower_constant = probe_constant_lowering();
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual =
+            flatten_op_to_insn(&dual_op, &mut get_register, &mut flatten_constant_operand_for_probe)
+                .expect("residual_call SpaceOperation must lower");
         let prod = build_box_int_fn_residual_call_ir_r_insn(4, 42, 7);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
@@ -6475,8 +6484,9 @@ mod tests {
         );
         let mut get_register = identity_register_mapper();
         let mut lower_constant = probe_constant_lowering();
-        let dual = flatten_op_to_insn(&dual_op, &mut get_register)
-            .expect("residual_call SpaceOperation must lower");
+        let dual =
+            flatten_op_to_insn(&dual_op, &mut get_register, &mut flatten_constant_operand_for_probe)
+                .expect("residual_call SpaceOperation must lower");
         let prod = build_build_list_fn_residual_call_ir_r_insn(18, 2, &[3, 4], 5);
         assert_eq!(format!("{prod:?}"), format!("{dual:?}"));
     }
