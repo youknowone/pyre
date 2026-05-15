@@ -3100,6 +3100,24 @@ impl CodeWriter {
                 },
         } = register_helper_fn_pointers(&mut assembler, self.cpu());
 
+        // Populate `cpu.lowering_ctx` with the four retired-family fn
+        // indices so the canonical `flatten.rs::flatten_graph(graph,
+        // regallocs, _include_all_exc_links, cpu)` driver can dispatch
+        // pre-rtype HLOps (`add`/`lt`/`bool`/`setitem`) to the matching
+        // `residual_call_*` Insn shape (`flatten.rs::
+        // try_flatten_retired_family_hlop_to_insn`).  Upstream's
+        // `flatten_graph` doesn't take a `lowering_ctx` because its
+        // rtyper pre-rewrites these HLOps; pyre's lowering happens at
+        // flatten time so the dispatcher needs the indices.
+        if let Ok(mut guard) = self.cpu().lowering_ctx.write() {
+            *guard = Some(super::flatten::LoweringContext {
+                binary_op_fn_idx,
+                compare_op_fn_idx: compare_fn_idx,
+                truth_fn_idx,
+                store_subscr_fn_idx,
+            });
+        }
+
         // RPython flatten.py: pre-create labels for each block.
         // Python bytecodes are linear, so each instruction index gets a label.
         let num_instrs = code.instructions.len();
