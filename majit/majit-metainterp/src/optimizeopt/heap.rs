@@ -2298,37 +2298,24 @@ impl OptHeap {
         // otherwise escape the value immediately.
         self.escape_from_write(obj, new_value);
 
-        // heap.py:77-101: do_setfield — check write-after-write, aliasing, lazy set
-        // Check write-after-write first (before possible_aliasing).
+        // heap.py:77-101: do_setfield order is
+        //   (1) possible_aliasing → force_lazy_set
+        //   (2) _getfield(true_force=False) cached match → cancel lazy_set
+        // Step (2)'s _getfield check is intentionally AFTER the force,
+        // so the cancellation can null out the lazy_set without leaving
+        // a stale pending setfield behind it.
+        //
+        // Pre-aliasing write-after-write quick path: same obj + same
+        // value as the existing lazy_set is unambiguously a no-op
+        // regardless of aliasing — the lazy_set is the most recent
+        // pending write to this descr, and overwriting it with the
+        // same value changes nothing. Keep this as a fast path; do
+        // NOT consult `_getfield` here (that belongs after force).
         {
             let cf = self.field_cache(descr);
             if let Some((lazy_obj, lazy_op)) = &cf.lazy_set {
                 if *lazy_obj == obj && lazy_op.arg(1) == new_value {
                     return OptimizationResult::Remove;
-                }
-            } else if let Some(entry) = cf._getfield(obj, descr, field_idx, ctx) {
-                match entry {
-                    crate::optimizeopt::info::FieldEntry::Preamble(pop) => {
-                        // heap.py:84-101 do_setfield:
-                        //   cached_field = self._getfield(.., true_force=False)
-                        //     → cached_seen = pop.op (no force)
-                        //   if cached_field.same_box(arg1):
-                        //     self._getfield(.., true_force=True)
-                        //     → force, store forced result
-                        let cached_seen = ctx.get_box_replacement(pop.op);
-                        if cached_seen == new_value {
-                            let cached = ctx.force_op_from_preamble_op(&pop);
-                            ctx.structinfo_setfield(op, field_idx, cached);
-                            self.field_cache(descr).register_info(obj);
-                            return OptimizationResult::Remove;
-                        }
-                    }
-                    crate::optimizeopt::info::FieldEntry::Value(cached) => {
-                        let cached_resolved = ctx.get_box_replacement(cached);
-                        if cached_resolved == new_value {
-                            return OptimizationResult::Remove;
-                        }
-                    }
                 }
             }
         }
