@@ -1,6 +1,9 @@
 use majit_backend::ExitValueSourceLayout;
 
-/// RPython resume.py:993-1007: materialize deferred virtualizable SetfieldGc.
+/// `resume.py:993-1007 _prepare_pendingfields` parity for the bridge /
+/// deopt path — replay deferred SetfieldGc / SetarrayitemGc writes
+/// via descr-method dispatch (`resume.py:1509-1518` setfield,
+/// `resume.py:1531-1541` setarrayitem_int / _ref / _float).
 fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i64]) {
     let Some(ref recovery) = exit_layout.recovery_layout else {
         return;
@@ -21,21 +24,32 @@ fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i6
         if struct_ptr.is_null() {
             continue;
         }
-        // Virtualizable field offsets from descriptor index encoding:
-        // 0x8000_0003 = head (offset 0), 0x8000_0004 = size (offset 8)
-        let (offset, size) = match pf.descr_index {
-            idx if idx & 0x8000_0000 != 0 => match idx {
-                0x8000_0003 => (0, 8),
-                0x8000_0004 => (8, 8),
-                _ => continue,
-            },
-            idx => ((idx >> 2) as usize, 8),
+        // resume.py:1000 PENDINGFIELDSTRUCT.lldescr is always present in
+        // RPython.  Without descr the entry cannot be replayed correctly;
+        // skip it (this preserves the previous behavior for entries that
+        // were silently dropped in earlier branches of the magic dispatch).
+        let Some(descr) = pf.descr.as_ref() else {
+            continue;
+        };
+        let (offset, size) = if pf.is_array_item {
+            let Some(ad) = descr.as_array_descr() else {
+                continue;
+            };
+            let item_index = pf.item_index.unwrap_or(0);
+            (ad.base_size() + item_index * ad.item_size(), ad.item_size())
+        } else {
+            let Some(fd) = descr.as_field_descr() else {
+                continue;
+            };
+            (fd.offset(), fd.field_size())
         };
         unsafe {
             let p = struct_ptr.add(offset);
             match size {
                 8 => *(p as *mut i64) = value,
                 4 => *(p as *mut i32) = value as i32,
+                2 => *(p as *mut i16) = value as i16,
+                1 => *(p as *mut u8) = value as u8,
                 _ => {}
             }
         }
