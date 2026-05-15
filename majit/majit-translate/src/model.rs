@@ -983,6 +983,27 @@ impl LinkArg {
             Self::Const(_) => None,
         }
     }
+
+    /// Variable-identity sibling of [`Self::as_value`] — projects the
+    /// link-arg's `ValueId` through `graph.variable(v)` to its
+    /// backing [`crate::flowspace::model::Variable`].  Returns
+    /// `None` for constant args and for slots whose backing
+    /// Variable is missing on the graph (no `alloc_value_with_type`
+    /// minted one yet).
+    ///
+    /// RPython parity: `Link.args` upstream is `List[Hlvalue]` where
+    /// each `Hlvalue::Variable` carries the operand identity inline
+    /// (`flowspace/model.py:140`); pyre's adapter projects through
+    /// the graph instead of storing the Variable in the LinkArg.
+    pub fn as_variable(
+        &self,
+        graph: &FunctionGraph,
+    ) -> Option<crate::flowspace::model::Variable> {
+        match self {
+            Self::Value(value) => graph.variable(*value).cloned(),
+            Self::Const(_) => None,
+        }
+    }
 }
 
 impl From<ValueId> for LinkArg {
@@ -1867,6 +1888,34 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
 impl Block {
     pub fn canraise(&self) -> bool {
         matches!(self.exitswitch, Some(ExitSwitch::LastException))
+    }
+
+    /// Variable-identity view of [`Self::inputargs`] — projects each
+    /// `ValueId` through `graph.variable(v)` to its backing
+    /// [`crate::flowspace::model::Variable`].
+    ///
+    /// RPython parity: `Block.inputargs` upstream is `[Variable]`
+    /// (`flowspace/model.py:21-25 Block([Variable("etype"), Variable("evalue")])`);
+    /// pyre's adapter stores `Vec<ValueId>` and projects through the
+    /// graph at read time.  Consumers that key on Variable identity
+    /// (regalloc working set, format diagnostics) read this iterator
+    /// instead of `inputargs.iter().map(|v| graph.variable(*v))`.
+    pub fn input_variables<'a>(
+        &'a self,
+        graph: &'a FunctionGraph,
+    ) -> impl Iterator<Item = &'a crate::flowspace::model::Variable> + 'a {
+        self.inputargs
+            .iter()
+            .map(move |v| {
+                graph.variable(*v).unwrap_or_else(|| {
+                    panic!(
+                        "Block::input_variables: ValueId {v:?} on block {:?} \
+                         has no backing Variable on graph {:?} — every \
+                         alloc_value_with_type slot must mint one",
+                        self.id, graph.name,
+                    )
+                })
+            })
     }
 
     /// RPython `flowspace/model.py:247 closeblock` / `:250 recloseblock`

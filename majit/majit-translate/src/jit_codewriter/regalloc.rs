@@ -268,8 +268,8 @@ impl RegAllocator {
         // passes downstream operate on the upstream-orthodox identity
         // (`tool/algo/regalloc.py:31 coloring: dict[Variable, int]`).
         let mut die_at: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
-        for &v in &block.inputargs {
-            die_at.insert(Self::var(graph, v), 0);
+        for var in block.input_variables(graph) {
+            die_at.insert(var.clone(), 0);
         }
         for (i, op) in block.operations.iter().enumerate() {
             for v in crate::inline::op_value_refs(&op.kind) {
@@ -301,8 +301,9 @@ impl RegAllocator {
         let livevars: Vec<crate::flowspace::model::Variable> = block
             .inputargs
             .iter()
-            .filter(|v| consider(**v))
-            .map(|v| Self::var(graph, *v))
+            .zip(block.input_variables(graph))
+            .filter(|(v, _)| consider(**v))
+            .map(|(_, var)| var.clone())
             .collect();
         for (i, v) in livevars.iter().enumerate() {
             self.depgraph.add_node(v.clone());
@@ -354,14 +355,18 @@ impl RegAllocator {
                 if let Some(arg) = &link.last_exception {
                     if let Some(v) = arg.as_value() {
                         if consider(v) {
-                            self.depgraph.add_node(Self::var(graph, v));
+                            if let Some(var) = arg.as_variable(graph) {
+                                self.depgraph.add_node(var);
+                            }
                         }
                     }
                 }
                 if let Some(arg) = &link.last_exc_value {
                     if let Some(v) = arg.as_value() {
                         if consider(v) {
-                            self.depgraph.add_node(Self::var(graph, v));
+                            if let Some(var) = arg.as_variable(graph) {
+                                self.depgraph.add_node(var);
+                            }
                         }
                     }
                 }
