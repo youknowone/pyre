@@ -7034,36 +7034,6 @@ impl CodeWriter {
             ssarepr.insns = drained;
         }
 
-        // Phase 4 production-flip attempt — line-by-line port of
-        // `rpython/jit/codewriter/codewriter.py:44-67`:
-        //
-        //     regallocs = {}
-        //     for kind in KINDS:
-        //         regallocs[kind] = perform_register_allocation(graph, kind)
-        //     ssarepr = flatten_graph(graph, regallocs, cpu=self.callcontrol.cpu)
-        //
-        // Default-off via env gate: when PYRE_USE_FLATTEN_GRAPH=1, replace
-        // the walker's drained ssarepr with the canonical
-        // `flatten.rs::flatten_graph` output (block-identity Labels +
-        // graph-DFS ordering + graph-side regalloc colors).  This will
-        // diverge from runtime expectations on benches that depend on
-        // pyre's per-PC `Label("pcN")` dispatch — surfacing each
-        // divergence is the point.
-        if std::env::var("PYRE_USE_FLATTEN_GRAPH").is_ok() {
-            let mut graph_regallocs =
-                super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
-            let candidate =
-                super::flatten::flatten_graph(&graph, &mut graph_regallocs, false, Some(self.cpu()));
-            eprintln!(
-                "[phase4-flip] graph={} walker_drain={} candidate={} (delta={})",
-                graph.name,
-                ssarepr.insns.len(),
-                candidate.insns.len(),
-                candidate.insns.len() as i64 - ssarepr.insns.len() as i64,
-            );
-            ssarepr.insns = candidate.insns;
-        }
-
         // codewriter.py:45-47 `for kind in KINDS:
         //   regallocs[kind] = perform_register_allocation(graph, kind)`
         //
