@@ -5134,6 +5134,54 @@ pub trait BlackholeAllocator {
     ) {
         let _ = (array, index, value, descr);
     }
+    /// resume.py:1449-1450 allocate_string(length) → cpu.bh_newstr(length)
+    fn bh_newstr(&self, length: usize) -> i64 {
+        let _ = length;
+        0
+    }
+    /// resume.py:1458-1460 string_setitem(str, index, charnum) →
+    /// cpu.bh_strsetitem(str, index, char) — `char` is the decoded
+    /// integer from the tagged `charnum`.
+    fn bh_strsetitem(&self, string: i64, index: usize, char: i64) {
+        let _ = (string, index, char);
+    }
+    /// resume.py:1462-1470 concat_strings(str1, str2) — RPython calls
+    /// `funcptr_for_oopspec(OS_STR_CONCAT)`; pyre passes the resolved
+    /// `funcptr` and a `calldescr` so the allocator can dispatch to
+    /// `bh_call_r` (vstring.py-style oopspec invocation).
+    fn os_str_concat(&self, funcptr: i64, str1: i64, str2: i64) -> i64 {
+        let _ = (funcptr, str1, str2);
+        0
+    }
+    /// resume.py:1472-1480 slice_string(str, start, length) →
+    /// `funcptr_for_oopspec(OS_STR_SLICE)(str, start, start + length)`.
+    fn os_str_slice(&self, funcptr: i64, str: i64, start: i64, length: i64) -> i64 {
+        let _ = (funcptr, str, start, length);
+        0
+    }
+    /// resume.py:1482-1483 allocate_unicode(length) →
+    /// cpu.bh_newunicode(length)
+    fn bh_newunicode(&self, length: usize) -> i64 {
+        let _ = length;
+        0
+    }
+    /// resume.py:1485-1487 unicode_setitem(str, index, charnum) →
+    /// cpu.bh_unicodesetitem(str, index, char)
+    fn bh_unicodesetitem(&self, string: i64, index: usize, char: i64) {
+        let _ = (string, index, char);
+    }
+    /// resume.py:1489-1497 concat_unicodes(str1, str2) →
+    /// `funcptr_for_oopspec(OS_UNI_CONCAT)(str1, str2)`.
+    fn os_uni_concat(&self, funcptr: i64, str1: i64, str2: i64) -> i64 {
+        let _ = (funcptr, str1, str2);
+        0
+    }
+    /// resume.py:1499-1507 slice_unicode(str, start, length) →
+    /// `funcptr_for_oopspec(OS_UNI_SLICE)(str, start, start + length)`.
+    fn os_uni_slice(&self, funcptr: i64, str: i64, start: i64, length: i64) -> i64 {
+        let _ = (funcptr, str, start, length);
+        0
+    }
     /// resume.py:1452 allocate_raw_buffer(func, size)
     fn allocate_raw_buffer(&self, func: i64, size: usize) -> i64 {
         let _ = (func, size);
@@ -5636,6 +5684,78 @@ impl<'a> ResumeDataDirectReader<'a> {
             self.allocator
                 .bh_setfield_gc_i(struct_ptr, value, &descr_info);
         }
+    }
+
+    /// resume.py:1449-1450 allocate_string(length) — forward to allocator.
+    pub fn allocate_string(&self, length: usize) -> i64 {
+        self.allocator.bh_newstr(length)
+    }
+
+    /// resume.py:1458-1460 string_setitem(str, index, charnum) — decode
+    /// the tagged charnum and forward to the allocator.
+    pub fn string_setitem(&mut self, string: i64, index: usize, charnum: i16) {
+        let char = self.decode_int(charnum);
+        self.allocator.bh_strsetitem(string, index, char);
+    }
+
+    /// resume.py:1462-1470 concat_strings(str1num, str2num) — decode
+    /// the two tagged strings, dispatch to OS_STR_CONCAT funcptr.
+    /// `funcptr` is supplied by the caller (carried alongside the
+    /// VStrConcat virtual; pyre's RawSlice / VStrConcat layouts both
+    /// carry the funcptr resolved at trace time so the reader does
+    /// not need a callinfocollection).
+    pub fn concat_strings(&mut self, funcptr: i64, str1num: i16, str2num: i16) -> i64 {
+        let str1 = self.decode_ref(str1num);
+        let str2 = self.decode_ref(str2num);
+        self.allocator.os_str_concat(funcptr, str1, str2)
+    }
+
+    /// resume.py:1472-1480 slice_string(strnum, startnum, lengthnum) →
+    /// OS_STR_SLICE funcptr(str, start, start + length).
+    pub fn slice_string(
+        &mut self,
+        funcptr: i64,
+        strnum: i16,
+        startnum: i16,
+        lengthnum: i16,
+    ) -> i64 {
+        let str = self.decode_ref(strnum);
+        let start = self.decode_int(startnum);
+        let length = self.decode_int(lengthnum);
+        self.allocator.os_str_slice(funcptr, str, start, length)
+    }
+
+    /// resume.py:1482-1483 allocate_unicode(length) → cpu.bh_newunicode.
+    pub fn allocate_unicode(&self, length: usize) -> i64 {
+        self.allocator.bh_newunicode(length)
+    }
+
+    /// resume.py:1485-1487 unicode_setitem(str, index, charnum) — same
+    /// shape as string_setitem.
+    pub fn unicode_setitem(&mut self, string: i64, index: usize, charnum: i16) {
+        let char = self.decode_int(charnum);
+        self.allocator.bh_unicodesetitem(string, index, char);
+    }
+
+    /// resume.py:1489-1497 concat_unicodes(str1num, str2num).
+    pub fn concat_unicodes(&mut self, funcptr: i64, str1num: i16, str2num: i16) -> i64 {
+        let str1 = self.decode_ref(str1num);
+        let str2 = self.decode_ref(str2num);
+        self.allocator.os_uni_concat(funcptr, str1, str2)
+    }
+
+    /// resume.py:1499-1507 slice_unicode(strnum, startnum, lengthnum).
+    pub fn slice_unicode(
+        &mut self,
+        funcptr: i64,
+        strnum: i16,
+        startnum: i16,
+        lengthnum: i16,
+    ) -> i64 {
+        let str = self.decode_ref(strnum);
+        let start = self.decode_int(startnum);
+        let length = self.decode_int(lengthnum);
+        self.allocator.os_uni_slice(funcptr, str, start, length)
     }
 
     /// `resume.py:1009-1015 setarrayitem(array, index, fieldnum, descr)`
