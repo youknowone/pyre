@@ -4840,6 +4840,79 @@ mod tests {
     }
 
     #[test]
+    fn canonical_flatten_graph_resolves_ovf_via_pre_resolved_exception_pointers() {
+        // Combined Phase-4 pipeline: a graph with an `_ovf` rewrite
+        // (canraise int_add_ovf with two exits → normal/overflow)
+        // lowered through canonical `flatten_graph(graph, regallocs,
+        // false, Some(&cpu))`.  The `handling_ovf=true` arm of
+        // `make_exception_link` reaches `cpu.rtyper.exceptiondata.
+        // get_standard_ll_exc_instance_by_class("OverflowError")` per
+        // flatten.py:166-170 — when the exceptiondata has been
+        // pre-resolved via `resolve_standard_exception_pointers`, the
+        // returned Constant carries `Signed(pointer)` with `Kind::Ref`
+        // (rtyped form) and `flatten_constant_operand` lowers it to
+        // `Operand::ConstRef(pointer)` directly, without a per-flatten
+        // `lower_constant` closure.
+        use crate::jit::cpu::Cpu;
+        use crate::jit::flow::{Block, ExitSwitch, FunctionGraph, Link, c_last_exception};
+        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+
+        let lhs = Variable::new(VariableId(0), Kind::Int);
+        let rhs = Variable::new(VariableId(1), Kind::Int);
+        let res = Variable::new(VariableId(2), Kind::Int);
+        let except_etype = Variable::new(VariableId(3), Kind::Int);
+        let except_evalue = Variable::new(VariableId(4), Kind::Ref);
+
+        let start = Block::shared(vec![lhs.into(), rhs.into()]);
+        let graph = FunctionGraph::new("canonical_ovf_with_resolved", start.clone(), Some(res));
+
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("int_add_ovf", vec![lhs.into(), rhs.into()], Some(res.into()), 42),
+        );
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(c_last_exception().into()));
+
+        let normal_link =
+            Link::new(vec![res.into()], Some(graph.returnblock.clone()), None).into_ref();
+        let mut ovf_link = Link::new(
+            vec![except_etype.into(), except_evalue.into()],
+            Some(graph.exceptblock.clone()),
+            None,
+        );
+        ovf_link.extravars(Some(except_etype), Some(except_evalue));
+        start.closeblock(vec![normal_link, ovf_link.into_ref()]);
+
+        let mut cpu = Cpu::new();
+        cpu.rtyper
+            .exceptiondata
+            .resolve_standard_exception_pointers(|name| match name {
+                "OverflowError" => 0xface_beef,
+                _ => 0,
+            });
+
+        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
+
+        // handling_ovf=true emits `raise <ConstRef(pointer)>` per
+        // flatten.py:165-170; the pointer is the pre-resolved value.
+        let raise_args = ssarepr
+            .insns
+            .iter()
+            .find_map(|insn| match insn {
+                Insn::Op { opname, args, .. } if opname == "raise" => Some(args),
+                _ => None,
+            })
+            .expect("canonical flatten_graph handling_ovf=true must emit `raise <const>`");
+        assert_eq!(raise_args.len(), 1);
+        assert!(
+            matches!(raise_args[0], Operand::ConstRef(0xface_beef)),
+            "raise must carry the pre-resolved OverflowError pointer 0xface_beef \
+             (rtyped via resolve_standard_exception_pointers), got {:?}",
+            raise_args[0]
+        );
+    }
+
+    #[test]
     fn canonical_flatten_graph_lowers_retired_family_via_cpu_lowering_ctx() {
         // Production-shape pipeline: graph carries a BINARY_OP `add`
         // HLOp; canonical `flatten_graph(graph, regallocs, false,
