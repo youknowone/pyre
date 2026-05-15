@@ -2232,25 +2232,16 @@ pub fn flatten_graph_with_closures<F, C>(
     flattener.generate_ssa_form(graph);
 }
 
-/// Slice #48.18 (Option C pipeline-flip prep): variant of
-/// [`flatten_graph`] that threads a `LoweringContext` so the
-/// retired-family pre-rtype HLOps (`add` / `lt` / `bool` / `setitem`)
-/// lower to their post-rtype `residual_call_*` Insn shapes during the
-/// per-block walk.  Non-HLOp opnames retain the existing passthrough
-/// handling (`Insn::op(opname, args)`), so this driver is byte-equivalent
-/// to [`flatten_graph`] on graphs that contain no retired-family HLOps.
+/// Test-fixture variant of [`flatten_graph`] that takes
+/// `get_register` and `lower_constant` as explicit closures and a
+/// pre-built `LoweringContext`, rather than reading them off
+/// `regallocs` and `cpu`.  Used by the retired-family HLOp lowering
+/// tests where constructing a real `Cpu` and `regallocs` HashMap is
+/// disproportionate to the test's scope.
 ///
-/// The dispatcher routes constants through the caller-supplied
-/// `lower_constant` closure (matching the `flatten_arg` production
-/// path), so `Opaque(Ref)` constants on `jit_merge_point` etc. lower
-/// the same way they would through [`flatten_graph`].
-///
-/// **Still a Phase 1 SCAFFOLD**: production callers don't yet flip to
-/// this driver because most ops the walker emits inline (LoadConst,
-/// LoadGlobal, CALL, BuildList, ...) lack graph SpaceOperations.
-/// Subsequent slices (Slice #48.19+) introduce frontend HLOp recording
-/// at those walker arms; this driver becomes the production SSARepr
-/// producer once every walker emit point has a graph counterpart.
+/// Production callers should use [`flatten_graph`] (the canonical
+/// entry matching `flatten.py:63-70`); this helper exists only to
+/// keep test fixtures concise.
 pub fn flatten_graph_with_lowering<'a, F, C>(
     graph: &super::flow::FunctionGraph,
     ssarepr: &'a mut SSARepr,
