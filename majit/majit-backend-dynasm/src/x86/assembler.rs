@@ -2687,64 +2687,104 @@ impl<'a> Assembler386<'a> {
 
                 // assembler.py:1645 `load_from_mem`: dispatch by (resloc.is_xmm,
                 // size, sign). PyPy's `addr_add` returns `AddressLoc(base,
-                // ofs, scale, disp)` which the encoder materializes as SIB
-                // scaled-index. dynasm-rs needs the scale as a literal at
-                // expansion time, so we compute the effective address into
-                // the X86_64 scratch register (R11) via `lea` and then issue
-                // a single MOV. This is functionally equivalent to PyPy's
-                // direct AddressLoc encoding but easier to audit for the
-                // initial line-by-line port; future revisions can collapse
-                // to a true scaled-index template once parity is verified.
-                let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+                // ofs, scale, disp)` which the encoder materializes as a
+                // SIB scaled-index addressing mode straight on the MOV
+                // template. dynasm-rs requires the SIB scale as a literal
+                // at macro expansion time, so we dispatch (factor, size,
+                // sign) through a `match` arm — functionally identical to
+                // PyPy's single `mc.MOV*(resloc, src_addr)` once the
+                // factor is bound. xmm targets always use MOVSD per
+                // load_from_mem:1649; integer targets pick MOV /
+                // MOVZX{8,16} / MOVSX{8,16,32} based on size+sign.
+                macro_rules! emit_load_scaled {
+                    ($scale:tt) => {{
+                        if dst.is_xmm {
+                            dynasm!(self.mc ; .arch x64
+                                ; movsd Rx(dst.value), [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                        } else {
+                            match size {
+                                1 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movzx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    }
+                                }
+                                2 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movzx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    }
+                                }
+                                4 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsxd Rq(dst.value), DWORD [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; mov Rd(dst.value), [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
+                                    }
+                                }
+                                _ => dynasm!(self.mc ; .arch x64
+                                    ; mov Rq(dst.value), [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]),
+                            }
+                        }
+                    }};
+                }
+                macro_rules! emit_load_unscaled {
+                    () => {{
+                        if dst.is_xmm {
+                            dynasm!(self.mc ; .arch x64
+                                ; movsd Rx(dst.value), [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                        } else {
+                            match size {
+                                1 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movzx Rq(dst.value), BYTE [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    }
+                                }
+                                2 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movzx Rq(dst.value), WORD [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    }
+                                }
+                                4 => {
+                                    if sign {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; movsxd Rq(dst.value), DWORD [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    } else {
+                                        dynasm!(self.mc ; .arch x64
+                                            ; mov Rd(dst.value), [Rq(base.value) + Rq(ofs_reg.value) + offset]);
+                                    }
+                                }
+                                _ => dynasm!(self.mc ; .arch x64
+                                    ; mov Rq(dst.value), [Rq(base.value) + Rq(ofs_reg.value) + offset]),
+                            }
+                        }
+                    }};
+                }
                 match factor {
-                    1 => dynasm!(self.mc ; .arch x64
-                        ; lea Rq(scratch), [Rq(base.value) + Rq(ofs_reg.value) + offset]),
-                    2 => dynasm!(self.mc ; .arch x64
-                        ; lea Rq(scratch), [Rq(base.value) + Rq(ofs_reg.value) * 2 + offset]),
-                    4 => dynasm!(self.mc ; .arch x64
-                        ; lea Rq(scratch), [Rq(base.value) + Rq(ofs_reg.value) * 4 + offset]),
-                    8 => dynasm!(self.mc ; .arch x64
-                        ; lea Rq(scratch), [Rq(base.value) + Rq(ofs_reg.value) * 8 + offset]),
+                    1 => emit_load_unscaled!(),
+                    2 => emit_load_scaled!(2),
+                    4 => emit_load_scaled!(4),
+                    8 => emit_load_scaled!(8),
                     other => panic!(
                         "x86 GcLoadIndexed: unsupported factor {other}; \
                          load_supported_factors = (1, 2, 4, 8)"
                     ),
-                }
-                if dst.is_xmm {
-                    dynasm!(self.mc ; .arch x64
-                        ; movsd Rx(dst.value), [Rq(scratch)]);
-                } else {
-                    match size {
-                        1 => {
-                            if sign {
-                                dynasm!(self.mc ; .arch x64
-                                    ; movsx Rq(dst.value), BYTE [Rq(scratch)]);
-                            } else {
-                                dynasm!(self.mc ; .arch x64
-                                    ; movzx Rq(dst.value), BYTE [Rq(scratch)]);
-                            }
-                        }
-                        2 => {
-                            if sign {
-                                dynasm!(self.mc ; .arch x64
-                                    ; movsx Rq(dst.value), WORD [Rq(scratch)]);
-                            } else {
-                                dynasm!(self.mc ; .arch x64
-                                    ; movzx Rq(dst.value), WORD [Rq(scratch)]);
-                            }
-                        }
-                        4 => {
-                            if sign {
-                                dynasm!(self.mc ; .arch x64
-                                    ; movsxd Rq(dst.value), DWORD [Rq(scratch)]);
-                            } else {
-                                dynasm!(self.mc ; .arch x64
-                                    ; mov Rd(dst.value), [Rq(scratch)]);
-                            }
-                        }
-                        _ => dynasm!(self.mc ; .arch x64
-                            ; mov Rq(dst.value), [Rq(scratch)]),
-                    }
                 }
             }
             // Structural adaptation: PyPy's llsupport/rewrite.py:132-154
