@@ -174,19 +174,6 @@ impl Label {
     pub fn new(name: impl Into<String>) -> Self {
         Self { name: name.into() }
     }
-
-    /// `true` iff the label's name matches pyre's per-PC anchor
-    /// convention (`pc<N>` where N is a decimal Python PC index).
-    /// Encapsulates the prefix/suffix check so the per-PC label
-    /// shape stays single-sourced through [`pc_label_name`] (producer)
-    /// and [`label_pc_index`] (consumer / parser).
-    pub fn is_pc_anchor(&self) -> bool {
-        if let Some(rest) = self.name.strip_prefix("pc") {
-            !rest.is_empty() && rest.bytes().all(|b| b.is_ascii_digit())
-        } else {
-            false
-        }
-    }
 }
 
 /// `flatten.py:20-26` `class TLabel(object)`.
@@ -238,19 +225,20 @@ pub fn pc_tlabel(py_pc: usize) -> TLabel {
     TLabel::new(pc_label_name(py_pc))
 }
 
-/// Inverse of [`pc_label_name`]: recover the Python PC index from a
-/// `Insn::PcAnchor` (canonical pyre per-PC anchor shape) or a
-/// `Insn::Label("pc{N}")` (transitional shape for fixtures /
-/// hand-built SSARepr).  Returns `None` for any other Insn shape.
-/// Consumed by the runtime's `pc_anchor_positions` /
-/// `live_marker_indices_by_pc` scans.
+/// Recover the Python PC index from a `Insn::PcAnchor`, or `None`
+/// for any other Insn shape.  Consumed by the runtime's
+/// `pc_anchor_positions` / `live_marker_indices_by_pc` scans.
+///
+/// `Insn::Label("pc{N}")` was the transitional shape before the
+/// `Insn::PcAnchor` variant landed; every walker emit site and every
+/// in-tree test fixture now produces `Insn::PcAnchor` directly, so the
+/// recognition path is retired and `Insn::Label` is reserved purely
+/// for upstream-orthodox block / link / catch-landing labels.
 pub fn label_pc_index(insn: &Insn) -> Option<usize> {
-    match insn {
-        Insn::PcAnchor { py_pc } => Some(*py_pc),
-        Insn::Label(label) if label.is_pc_anchor() => {
-            label.name.strip_prefix("pc").and_then(|rest| rest.parse().ok())
-        }
-        _ => None,
+    if let Insn::PcAnchor { py_pc } = insn {
+        Some(*py_pc)
+    } else {
+        None
     }
 }
 
@@ -3711,43 +3699,31 @@ mod tests {
     use crate::jit::flow::{FlowListOfKind, VariableId};
 
     #[test]
-    fn pc_label_round_trip_matches_naming_convention() {
+    fn pc_anchor_round_trip_matches_py_pc() {
         for py_pc in [0usize, 1, 42, 99, 123_456] {
-            let name = pc_label_name(py_pc);
-            assert_eq!(name, format!("pc{py_pc}"));
-            let label = Label::new(name);
-            assert!(label.is_pc_anchor(), "Label({:?}) must be a PC anchor", label.name);
-            let recovered = label_pc_index(&Insn::Label(label));
-            assert_eq!(recovered, Some(py_pc), "round-trip py_pc={py_pc}");
+            assert_eq!(pc_label_name(py_pc), format!("pc{py_pc}"));
+            let insn = Insn::pc_anchor(py_pc);
+            assert_eq!(
+                label_pc_index(&insn),
+                Some(py_pc),
+                "round-trip py_pc={py_pc}"
+            );
         }
     }
 
     #[test]
-    fn non_pc_labels_are_not_pc_anchors() {
-        // Block names, link names, catch-landing names — none of these
-        // match pyre's `pc<digits>` convention and must be rejected.
-        for name in [
-            "block0",
-            "block42",
-            "link1",
-            "catch_landing_3",
-            "pc",          // empty suffix
-            "pc_foo",      // non-digit suffix
-            "pc1x",        // mixed digit / letter suffix
-            "Pc0",         // case-sensitive
-            "ppc0",        // extra prefix
-        ] {
-            let label = Label::new(name);
-            assert!(
-                !label.is_pc_anchor(),
-                "Label({name:?}) must NOT be a PC anchor"
-            );
+    fn label_pc_index_rejects_non_anchor_insns() {
+        // Block / link / catch-landing labels must be rejected — only
+        // `Insn::PcAnchor` returns Some(py_pc).
+        for name in ["block0", "block42", "link1", "catch_landing_3"] {
             assert_eq!(
-                label_pc_index(&Insn::Label(label)),
+                label_pc_index(&Insn::Label(Label::new(name))),
                 None,
-                "label_pc_index must reject {name:?}"
+                "label_pc_index must reject Label({name:?})"
             );
         }
+        assert_eq!(label_pc_index(&Insn::Unreachable), None);
+        assert_eq!(label_pc_index(&Insn::op("plain", vec![])), None);
     }
 
     #[test]
