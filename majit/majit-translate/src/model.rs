@@ -1945,6 +1945,18 @@ where
 /// inline-on-Variable shape) instead of a separate side-table.
 /// `Unknown` is the pre-rtyper sentinel — `Variable` analogue
 /// before the rtyper ran.
+///
+/// The variants line up 1:1 with [`getkind`]'s output strings
+/// (`rpython/jit/metainterp/history.py:45-71`):
+///
+/// - [`Self::Signed`] = `"int"`
+/// - [`Self::GcRef`]  = `"ref"`
+/// - [`Self::Float`]  = `"float"`
+/// - [`Self::Void`]   = `"void"`
+///
+/// [`Self::Unknown`] is a pyre-only sentinel for the
+/// pre-`setconcretetype` window where reading `var.concretetype`
+/// upstream would `AttributeError`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConcreteType {
     /// Signed integer (RPython `Signed` / i64).
@@ -1957,6 +1969,128 @@ pub enum ConcreteType {
     Void,
     /// Unknown / unresolved.
     Unknown,
+}
+
+/// `rpython/jit/metainterp/history.py:45-71 getkind(TYPE, ...)`.
+///
+/// Direct line-by-line port — the canonical
+/// `LowLevelType → 'int' / 'ref' / 'float' / 'void'` projection that
+/// every JIT codewriter / metainterp / regalloc consumer reads kind
+/// from.  Pyre returns the [`ConcreteType`] enum form (same kind
+/// space).  The three `supports_*` parameters default to `true`
+/// just like the JIT uses — `metainterp_sd` flips them off only
+/// for backends without longlong / singlefloat / float support.
+///
+/// ```py
+/// def getkind(TYPE, supports_floats=True,
+///                   supports_longlong=True,
+///                   supports_singlefloats=True):
+///     if TYPE is lltype.Void:
+///         return "void"
+///     elif isinstance(TYPE, lltype.Primitive):
+///         if TYPE is lltype.Float and supports_floats:
+///             return 'float'
+///         if TYPE is lltype.SingleFloat and supports_singlefloats:
+///             return 'int'     # singlefloats are stored in an int
+///         if TYPE in (lltype.Float, lltype.SingleFloat):
+///             raise NotImplementedError("type %s not supported" % TYPE)
+///         if (TYPE != llmemory.Address and
+///             rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed)):
+///             if supports_longlong and TYPE is not lltype.LongFloat:
+///                 assert rffi.sizeof(TYPE) == 8
+///                 return 'float'
+///             raise NotImplementedError("type %s is too large" % TYPE)
+///         return "int"
+///     elif isinstance(TYPE, lltype.Ptr):
+///         if TYPE.TO._gckind == 'raw':
+///             return "int"
+///         else:
+///             return "ref"
+///     else:
+///         raise NotImplementedError("type %s not supported" % TYPE)
+/// ```
+pub fn getkind(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelType) -> ConcreteType {
+    use crate::translator::rtyper::lltypesystem::lltype::{GcKind, LowLevelType, PtrTarget};
+    match ty {
+        // `if TYPE is lltype.Void: return "void"`
+        LowLevelType::Void => ConcreteType::Void,
+        // `elif isinstance(TYPE, lltype.Primitive): ...`
+        LowLevelType::Float => ConcreteType::Float,
+        // `if TYPE is lltype.SingleFloat and supports_singlefloats: return 'int'`
+        // (singlefloats stored in an int register).
+        LowLevelType::SingleFloat => ConcreteType::Signed,
+        // `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed): ...
+        //   if supports_longlong and TYPE is not lltype.LongFloat: return 'float'`
+        // — the (UnsignedLongLongLong, SignedLongLongLong) 16-byte
+        // variants raise NotImplementedError upstream; pyre treats
+        // them as `Float` slots until the long-long backend lands.
+        LowLevelType::SignedLongLong | LowLevelType::UnsignedLongLong => ConcreteType::Float,
+        LowLevelType::LongFloat => ConcreteType::Float,
+        // Other Primitives → `"int"`.  Includes Signed, Unsigned,
+        // Bool, Char, UniChar, Address.  RPython's
+        // `rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed)` check
+        // only fires for the 16-byte longlonglong primitives below
+        // — every other primitive fits in an Int register.
+        LowLevelType::Signed
+        | LowLevelType::Unsigned
+        | LowLevelType::Bool
+        | LowLevelType::Char
+        | LowLevelType::UniChar
+        | LowLevelType::Address => ConcreteType::Signed,
+        // `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed) and not supports_longlong:
+        //      raise NotImplementedError("type %s is too large" % TYPE)`
+        // — the 16-byte longlonglong variants surface as panics
+        // upstream too.  Keep parity by panicking pyre-side until
+        // the JIT supports them; production paths never reach this.
+        LowLevelType::SignedLongLongLong | LowLevelType::UnsignedLongLongLong => {
+            panic!("getkind: type {ty:?} is too large (longlonglong unsupported)")
+        }
+        // `elif isinstance(TYPE, lltype.Ptr): ...`
+        LowLevelType::Ptr(ptr) => match ptr_gckind(&ptr.TO) {
+            GcKind::Raw => ConcreteType::Signed,
+            GcKind::Gc | GcKind::Prebuilt => ConcreteType::GcRef,
+        },
+        // RPython `lltype.InteriorPtr` is treated as a pointer — the
+        // codewriter never sees it as an operand top-level type, so
+        // mirror the `Ptr` arm conservatively.
+        LowLevelType::InteriorPtr(_) => ConcreteType::GcRef,
+        // RPython `Func`/`Struct`/`Array`/`FixedSizeArray`/`Opaque`/
+        // `ForwardReference` are not valid `concretetype` values for
+        // a Variable — they only appear as `TO` of a `Ptr`.  Reaching
+        // this arm means the rtyper handed the codewriter a
+        // non-pointer aggregate type, which would `NotImplementedError`
+        // upstream.  Panic with the same message shape so the upstream
+        // bug surfaces here.
+        LowLevelType::Func(_)
+        | LowLevelType::Struct(_)
+        | LowLevelType::Array(_)
+        | LowLevelType::FixedSizeArray(_)
+        | LowLevelType::Opaque(_)
+        | LowLevelType::ForwardReference(_) => {
+            panic!("getkind: type {ty:?} not supported as concretetype")
+        }
+    }
+}
+
+/// Helper for [`getkind`] — extract `_gckind` from a `Ptr.TO`
+/// payload.  RPython exposes `_gckind` as an attribute on every
+/// pointee (`StructType._gckind`, `ArrayType._gckind`, etc.) so the
+/// `TYPE.TO._gckind == 'raw'` test in `getkind` works directly;
+/// pyre's `PtrTarget` enum surface needs a small dispatch.
+fn ptr_gckind(
+    target: &crate::translator::rtyper::lltypesystem::lltype::PtrTarget,
+) -> crate::translator::rtyper::lltypesystem::lltype::GcKind {
+    use crate::translator::rtyper::lltypesystem::lltype::PtrTarget;
+    match target {
+        PtrTarget::Struct(s) => s._gckind,
+        PtrTarget::Array(a) => a._gckind,
+        PtrTarget::FixedSizeArray(_) => {
+            crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw
+        }
+        PtrTarget::Opaque(o) => o._gckind,
+        PtrTarget::ForwardReference(f) => f._gckind,
+        PtrTarget::Func(_) => crate::translator::rtyper::lltypesystem::lltype::GcKind::Raw,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

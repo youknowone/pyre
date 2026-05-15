@@ -207,6 +207,36 @@ pub fn apply_to_graph(types: &TypeResolutionState, graph: &mut FunctionGraph) {
     }
 }
 
+/// Hydrate the graph's per-value `value_types` slots directly from
+/// the upstream-typed [`crate::flowspace::model::Variable.concretetype`]
+/// references in `value_to_var`.
+///
+/// **Long-term parity path** — this is the path the codewriter
+/// will use once every value has a backing flowspace `Variable`:
+/// the kind comes from `Variable.concretetype` (set by the
+/// `RPythonTyper`) projected through [`crate::model::getkind`],
+/// matching upstream's
+/// `getkind(v.concretetype)` access pattern bit for bit.  No
+/// transitional [`TypeResolutionState`] needed.
+///
+/// Variables whose `concretetype` is still `None` (rtyper hasn't
+/// processed them yet) leave the graph slot untouched —
+/// equivalent to RPython's "no `.concretetype` attribute" window
+/// before `setconcretetype` runs.  Pyre's
+/// [`crate::model::ConcreteType::Unknown`] sentinel covers that
+/// state.
+pub fn apply_from_flowspace_variables(
+    graph: &mut FunctionGraph,
+    value_to_var: &crate::translator::rtyper::flowspace_adapter::ValueIdToVariable,
+) {
+    for (vid, var) in value_to_var.iter() {
+        let borrow = var.concretetype.borrow();
+        if let Some(lltype) = borrow.as_ref() {
+            graph.set_concretetype(*vid, crate::model::getkind(lltype));
+        }
+    }
+}
+
 /// Post-jtransform 4-source merge of `ConcreteType` views into a
 /// single authoritative `TypeResolutionState`.
 ///
