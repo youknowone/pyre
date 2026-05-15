@@ -668,24 +668,32 @@ pub struct ResumedFrame {
     /// W_CodeObject pointer — same level as frame.pycode / getcode(func).
     pub code: *const (),
     /// Python bytecode PC the resume data carries (from `frame.pc =
-    /// orgpc` at trace time).  pyre's blackhole resume site
-    /// (`call_jit::resume_in_blackhole` near line 837) translates this
-    /// to the JitCode byte offset via
-    /// `PyJitCode::resume_jitcode_pc_for` before
-    /// `BlackholeInterpreter::setposition`.
+    /// orgpc` at trace time).  pyre's tracer records Python bytecode
+    /// PCs because it interprets Python bytecode (not JitCode); the
+    /// pseudo-instruction adjustment in `resume_in_blackhole` (Cache /
+    /// ExtendedArg / NotTaken backtracking near line 793) depends on
+    /// the raw `py_pc` so it stays the canonical pre-adjustment value.
+    pub py_pc: usize,
+    /// Pre-translated JitCode byte offset for the post-adjustment
+    /// `py_pc`, populated by `build_resumed_frames` via
+    /// `PyJitCode::resume_jitcode_pc_for`.  Consumers
+    /// (`call_jit::resume_in_blackhole`, `resolve_jitcode`) read this
+    /// directly instead of repeating `pc_map` lookups.
+    ///
+    /// `None` when the writer could not resolve `pyjitcode_for_code` /
+    /// the pc_map entry — readers fall back to recomputing the lookup
+    /// themselves and surface the same "pc_map miss" failure shape as
+    /// before this field landed.
     ///
     /// **NEW-DEVIATION**: upstream `blackhole.py:1712 setposition(
     /// miframe.jitcode, miframe.pc)` consumes a JitCode PC directly
-    /// (`miframe.pc` IS the JitCode position).  Pyre's tracer records
-    /// Python bytecode PCs because pyre's tracer interprets Python
-    /// bytecode (not JitCode), so the translation step exists.  The
-    /// migration target (single contributing crate: this struct's
-    /// writer in `pyre-jit::eval::build_resumed_frames` at line ~5429
-    /// and the readers in `call_jit.rs:773 / 779 / 793 / 909 / 928 /
-    /// 948`) is to store `jitcode_pc` directly once the resume-data
-    /// finalization step that translates `py_pc → jitcode_pc` lands at
-    /// JitCode-assemble time.
-    pub py_pc: usize,
+    /// (`miframe.pc` IS the JitCode position) because pypy's tracer
+    /// interprets JitCode bytecode.  Storing the translated value here
+    /// is the closest pyre can get without rewriting the tracer to
+    /// interpret JitCode instead of Python bytecode — and reduces the
+    /// downstream migration target to a single writer once
+    /// pseudo-instruction handling moves into resume-data finalization.
+    pub jitcode_pc: Option<usize>,
     /// Raw frame.pc from rd_numb (= orgpc from snapshot).
     /// Some(pc): snapshot guard — orgpc known, liveness-based filling.
     ///   pc=0 is valid (function start / loop header at bytecode 0).
@@ -879,7 +887,16 @@ pub fn resume_in_blackhole(
                 return BlackholeResult::Failed;
             }
         };
-        let jitcode_pc = if let Some(jitcode_pc) = pyjitcode.resume_jitcode_pc_for(py_pc) {
+        // Prefer the pre-translated jitcode_pc from the writer
+        // (`build_resumed_frames`) when the pseudo-instruction
+        // adjustment above did not move py_pc.  Otherwise re-translate
+        // via pc_map.
+        let cache_valid = section.jitcode_pc.is_some() && py_pc == section.py_pc;
+        let jitcode_pc = if let Some(jitcode_pc) = section
+            .jitcode_pc
+            .filter(|_| cache_valid)
+            .or_else(|| pyjitcode.resume_jitcode_pc_for(py_pc))
+        {
             jitcode_pc
         } else {
             if nbody_debug {

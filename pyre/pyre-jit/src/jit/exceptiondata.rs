@@ -115,7 +115,10 @@ impl ExceptionData {
             return Err(UnknownException(exceptionclass.to_owned()));
         }
         if let Some(&pointer) = self.instance_pointers.get(exceptionclass) {
-            return Ok(Constant::new(ConstantValue::Signed(pointer), Some(Kind::Ref)));
+            return Ok(Constant::new(
+                ConstantValue::Signed(pointer),
+                Some(Kind::Ref),
+            ));
         }
         Ok(Constant::opaque(exceptionclass, Some(Kind::Ref)))
     }

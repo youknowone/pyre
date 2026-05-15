@@ -5504,9 +5504,27 @@ fn build_resumed_frames(
             // Inner frames share the chain virtualizable's namespace.
             vable_ns
         };
+        // Pre-translate py_pc → jitcode_pc when the writer can resolve
+        // the pyjitcode + pc_map entry.  Mirrors upstream
+        // `blackhole.py:1712 setposition(miframe.jitcode, miframe.pc)`
+        // shape where the JitCode PC is what reaches the resume site.
+        // Pseudo-instruction adjustment (Cache / ExtendedArg / NotTaken
+        // backtracking, `call_jit.rs:793-803`) still runs at read time
+        // because it depends on the raw `py_pc` and the live code
+        // object — pre-applying it here would require duplicating the
+        // adjustment loop, so the cache stores the unadjusted lookup
+        // and falls through to the read-time path when the adjusted
+        // py_pc differs.
+        let jitcode_pc = if !w_code.is_null() {
+            pyre_jit_trace::state::pyjitcode_for_code(w_code)
+                .and_then(|pjc| pjc.resume_jitcode_pc_for(py_pc))
+        } else {
+            None
+        };
         result.push(crate::call_jit::ResumedFrame {
             code: w_code,
             py_pc,
+            jitcode_pc,
             rd_numb_pc: if frame.pc >= 0 {
                 Some(frame.pc as usize)
             } else {
