@@ -5852,17 +5852,17 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         &self,
         struct_ptr: i64,
         value: i64,
-        field_offset: usize,
-        field_size: usize,
+        descr_info: &majit_ir::FieldDescrInfo,
     ) {
-        // resume.py:1509-1518 setfield — write field at byte offset.
-        // field_offset > 0: offset 0 is the ob_type header set by
-        // allocate_struct/allocate_with_vtable; never let resume data
-        // overwrite it.
+        // resume.py:1509-1518 setfield — write field at byte offset
+        // recovered from the descr.  field_offset > 0: offset 0 is the
+        // ob_type header set by allocate_struct/allocate_with_vtable;
+        // never let resume data overwrite it.
+        let field_offset = descr_info.offset;
         if struct_ptr != 0 && field_offset > 0 {
             unsafe {
                 let ptr = (struct_ptr as *mut u8).add(field_offset);
-                match field_size {
+                match descr_info.field_size {
                     8 => (ptr as *mut i64).write(value),
                     4 => (ptr as *mut i32).write(value as i32),
                     2 => (ptr as *mut i16).write(value as i16),
