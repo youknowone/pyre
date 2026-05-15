@@ -13297,7 +13297,7 @@ fn collect_guards(
             force_token_slots_for_register,
         );
         if let Some(target) = external_jump_target {
-            crate::guard::register_external_jump_target(Arc::as_ptr(&descr) as usize, target);
+            descr.set_external_jump_target(target);
         }
         if std::env::var_os("MAJIT_LOG").is_some() && !is_finish && !is_external_jump {
             eprintln!(
