@@ -397,7 +397,7 @@ pub(crate) fn merge_backend_constants_from_ctx(
         let key = OptContext::op_ref_for_value(idx as u32, &value).raw();
         constants.entry(key).or_insert_with(|| value);
     }
-    for (&const_idx, value) in &ctx.const_pool {
+    for (const_idx, value) in ctx.const_pool.iter() {
         let key = OptContext::const_ref_for_value(const_idx, value).raw();
         constants.insert(key, value.clone());
     }
@@ -2103,7 +2103,7 @@ impl Optimizer {
         // so new allocations (intdiv, make_guards) don't collide with
         // constants inherited from a previous phase.
         if !ctx.const_pool.is_empty() {
-            let max_idx = ctx.const_pool.keys().max().copied().unwrap_or(0);
+            let max_idx = ctx.const_pool.max_index().unwrap_or(0);
             ctx.next_const_idx = ctx.next_const_idx.max(max_idx + 1);
         }
 

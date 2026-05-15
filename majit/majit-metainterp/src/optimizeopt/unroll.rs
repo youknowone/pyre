@@ -3089,7 +3089,7 @@ impl OptUnroll {
                             let mut loop_constants: HashMap<u32, i64> = HashMap::new();
                             let mut loop_constant_types: HashMap<u32, majit_ir::Type> =
                                 optimizer.constant_types.clone();
-                            for (&const_idx, val) in &ctx.const_pool {
+                            for (const_idx, val) in ctx.const_pool.iter() {
                                 let (raw, tp) = match val {
                                     majit_ir::Value::Int(v) => (*v, majit_ir::Type::Int),
                                     majit_ir::Value::Float(f) => {
@@ -3202,7 +3202,7 @@ impl OptUnroll {
             // Side-table type write keeps raw-u32 keyed readers in
             // lockstep (optimizer.py:Const.type is intrinsic on the
             // Box, history.py:220/261/307).
-            ctx.const_pool.entry(idx).or_insert(value);
+            ctx.const_pool.entry_or_insert_with(idx, || value);
             optimizer
                 .constant_types
                 .entry(typed_opref.raw())

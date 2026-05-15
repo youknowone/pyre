@@ -567,7 +567,7 @@ impl ShortBoxes {
         // Ordinary OpRefs that happen to be known-constant for the current
         // iteration must stay trace-local boxes, or short-preamble import can
         // leak one iteration's guard knowledge into the next.
-        for (&const_idx, value) in &ctx.const_pool {
+        for (const_idx, value) in ctx.const_pool.iter() {
             let tp = match value {
                 majit_ir::Value::Int(_) => majit_ir::Type::Int,
                 majit_ir::Value::Float(_) => majit_ir::Type::Float,

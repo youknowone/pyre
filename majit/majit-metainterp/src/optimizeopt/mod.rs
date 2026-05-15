@@ -6,6 +6,7 @@
 /// Operations flow through the chain: IntBounds → Rewrite → Virtualize → String →
 /// Pure → Guard → Simplify → Heap (configurable).
 pub mod bridgeopt;
+pub mod dense_value_pool;
 pub mod dependency;
 pub mod earlyforce;
 pub mod guard;
@@ -535,8 +536,15 @@ pub use crate::optimizeopt::info::{StringConstantAllocator, StringContentResolve
 pub struct OptContext {
     /// The output operation list being built.
     pub new_operations: Vec<Op>,
-    /// Constants for constant-namespace OpRefs, keyed by const_index().
-    pub const_pool: HashMap<u32, Value>,
+    /// Constants for constant-namespace OpRefs, indexed by
+    /// `OpRef::const_index()`. Vec-backed dense pool — replaces the
+    /// earlier `HashMap<u32, Value>`.
+    ///
+    /// `opencoder.py:482-486` upstream uses three per-type lists
+    /// (`_refs`, `_bigints`, `_floats`). Pyre's per-type split lands in
+    /// a follow-up slice; for now the single dense pool removes the
+    /// HashMap divergence without forcing the index-namespace split.
+    pub const_pool: crate::optimizeopt::dense_value_pool::DenseValuePool,
     /// RPython: mapping dict in inline_short_preamble — separate from _forwarded.
     /// Maps Phase 1 source OpRefs to Phase 2 short arg OpRefs.
     /// Number of input arguments, used to offset emitted op positions
@@ -1533,7 +1541,7 @@ impl OptContext {
     pub fn new(estimated_ops: usize) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
-            const_pool: HashMap::new(),
+            const_pool: crate::optimizeopt::dense_value_pool::DenseValuePool::new(),
             num_inputs: 0,
             inputarg_base: 0,
             next_pos: 0,
@@ -1661,7 +1669,7 @@ impl OptContext {
     ) -> Self {
         OptContext {
             new_operations: Vec::with_capacity(estimated_ops),
-            const_pool: HashMap::new(),
+            const_pool: crate::optimizeopt::dense_value_pool::DenseValuePool::new(),
             num_inputs: num_inputs as u32,
             inputarg_base,
             next_pos: start_next_pos,
@@ -2245,7 +2253,7 @@ impl OptContext {
             &produced,
             short_inputargs,
         );
-        for (&const_idx, value) in &self.const_pool {
+        for (const_idx, value) in self.const_pool.iter() {
             builder.note_known_constant(Self::const_ref_for_value(const_idx, value));
         }
         self.imported_short_preamble_builder = Some(builder);
@@ -2559,7 +2567,7 @@ impl OptContext {
         }
 
         let mut builder = ShortPreambleBuilder::new(short_args, &produced, short_inputargs);
-        for (&const_idx, value) in &self.const_pool {
+        for (const_idx, value) in self.const_pool.iter() {
             builder.note_known_constant(Self::const_ref_for_value(const_idx, value));
         }
         for &opref in imported_constants.values() {
@@ -3304,7 +3312,7 @@ impl OptContext {
                 let mut loop_constants: HashMap<u32, i64> = self
                     .const_pool
                     .iter()
-                    .map(|(&i, val)| (Self::const_ref_for_value(i, val).raw(), value_to_raw(val)))
+                    .map(|(i, val)| (Self::const_ref_for_value(i, val).raw(), value_to_raw(val)))
                     .collect();
                 // `initialize_imported_short_preamble_builder_from_exported_ops`
                 // (mod.rs:1693) imports cross-trace constants by allocating a
@@ -3326,7 +3334,7 @@ impl OptContext {
                     }
                 }
                 let mut loop_constant_types = self.constant_types.clone();
-                for (&i, val) in &self.const_pool {
+                for (i, val) in self.const_pool.iter() {
                     loop_constant_types
                         .entry(Self::const_ref_for_value(i, val).raw())
                         .or_insert(value_to_type(val));
