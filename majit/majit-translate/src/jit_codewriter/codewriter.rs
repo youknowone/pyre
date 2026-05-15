@@ -349,6 +349,18 @@ impl CodeWriter {
         // of truth for kind; the `TypeResolutionState` instance is
         // kept as a transient scratch for the legacy
         // `build_value_kinds` projection that regalloc still consumes.
+        //
+        // **Long-term migration**: once `cutover::specialize_legacy_graph_with_registry_seed`
+        // surfaces the `FlowspaceAdapterOutput::value_to_var` map up
+        // to this layer, the canonical hydration becomes
+        // [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`]
+        // (graph reads `getkind(v.concretetype)` straight from the
+        // `RPythonTyper`-typed Variable, no transitional merge).
+        // The 4-source `merge_synth_kinds` above retires once every
+        // post-rewrite ValueId either reuses a pre-rewrite Variable
+        // identity (rtyper-typed) or carries a typed-result variant
+        // (`OpKind::result_ty`/`result_kind`) the rtyper can stamp
+        // back onto its Variable.
         crate::jit_codewriter::type_state::apply_to_graph(
             &rewritten_type_state,
             &mut rewritten.graph,
