@@ -1012,23 +1012,12 @@ pub(crate) fn build_guard_metadata(
                 })
                 .unwrap_or_default();
             // resume.py:926,993: rd_pendingfields → pending_field_layouts.
-            // PENDINGFIELDSTRUCT.lldescr parity: derive field_offset /
-            // field_size / field_type from `pf.descr` (FieldDescr or
-            // ArrayDescr) at consume time. The cache used to live on
-            // GuardPendingFieldEntry; dropping it matches the RPython
-            // struct shape (lldescr / num / fieldnum / itemindex).
-            //
-            // resume.py:993 _prepare_pendingfields parity:
-            //   if itemindex < 0: setfield(struct, fieldnum, descr)
-            //   else:             setarrayitem(struct, itemindex, fieldnum, descr)
-            // The layout carries the RPython shape verbatim — `field_offset`
-            // is the descr's base offset (struct field offset for FieldDescr,
-            // array base offset for ArrayDescr), `is_array_item` mirrors
-            // RPython's `itemindex >= 0` test, and `item_index` is the array
-            // index when present.  Consumers (eval.rs:5009-5016 dynasm,
-            // compiler.rs:1314 cranelift) reconstruct the address per
-            // resume.py:1509-1530 (`base + offset + item_index * item_size`
-            // for arrays, `base + offset` for fields).
+            // PENDINGFIELDSTRUCT carries (lldescr / num / fieldnum /
+            // itemindex); the layout mirrors that shape and consumers
+            // (`pyre-jit::eval::replay_pending_fields`,
+            // `cranelift::compiler` guard recovery) call descr methods at
+            // dispatch time, matching `resume.py:1509-1518` (setfield) and
+            // `resume.py:1531-1541` (setarrayitem_int / _ref / _float).
             let pending_field_layouts: Vec<majit_backend::ExitPendingFieldLayout> = op
                 .resolved_rd_pendingfields()
                 .map(|entries| {
@@ -1047,23 +1036,17 @@ pub(crate) fn build_guard_metadata(
                                 .descr
                                 .as_ref()
                                 .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
-                            let (field_offset, field_size, field_type, item_index) =
-                                if let Some(fd) = descr.as_field_descr() {
-                                    // setfield: itemindex < 0 in RPython.
-                                    (fd.offset(), fd.field_size(), fd.field_type(), None)
-                                } else if let Some(ad) = descr.as_array_descr() {
-                                    // setarrayitem: itemindex >= 0.  Carry
-                                    // base_size as the offset and item_index
-                                    // separately; consumers add
-                                    // `item_index * item_size`.
-                                    let idx = pf.item_index.max(0) as usize;
-                                    (ad.base_size(), ad.item_size(), ad.item_type(), Some(idx))
-                                } else {
-                                    panic!(
-                                        "pending field descr must be FieldDescr or ArrayDescr (descr_index={})",
-                                        pf.descr_index,
-                                    );
-                                };
+                            // resume.py:1003-1007: itemindex >= 0 → setarrayitem.
+                            let item_index = if descr.as_array_descr().is_some() {
+                                Some(pf.item_index.max(0) as usize)
+                            } else if descr.as_field_descr().is_some() {
+                                None
+                            } else {
+                                panic!(
+                                    "pending field descr must be FieldDescr or ArrayDescr (descr_index={})",
+                                    pf.descr_index,
+                                );
+                            };
                             majit_backend::ExitPendingFieldLayout {
                                 descr: pf.descr.clone(),
                                 descr_index: pf.descr_index,
@@ -1071,9 +1054,6 @@ pub(crate) fn build_guard_metadata(
                                 item_index,
                                 target: resolve_tagged_source(pf.target_tagged),
                                 value: resolve_tagged_source(pf.value_tagged),
-                                field_offset,
-                                field_size,
-                                field_type,
                             }
                         })
                         .collect()

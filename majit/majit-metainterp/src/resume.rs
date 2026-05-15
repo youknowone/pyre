@@ -895,9 +895,6 @@ fn pending_field_layout_to_exit_pending_field_layout(
         is_array_item: layout.is_array_item,
         target: layout.target.to_exit_source(virtual_offset),
         value: layout.value.to_exit_source(virtual_offset),
-        field_offset: 0,
-        field_size: 0,
-        field_type: majit_ir::Type::Int,
     }
 }
 

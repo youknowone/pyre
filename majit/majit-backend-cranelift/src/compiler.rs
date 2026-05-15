@@ -16332,9 +16332,6 @@ mod tests {
                 is_array_item: true,
                 target: majit_backend::ExitValueSourceLayout::Virtual(0),
                 value: majit_backend::ExitValueSourceLayout::ExitValue(0),
-                field_offset: 0,
-                field_size: 8,
-                field_type: Type::Int,
             }],
         };
         assert!(backend.update_fail_descr_recovery_layout(&token, 190, 0, source_layout.clone()));
@@ -16484,9 +16481,6 @@ mod tests {
                 is_array_item: true,
                 target: majit_backend::ExitValueSourceLayout::Virtual(0),
                 value: majit_backend::ExitValueSourceLayout::ExitValue(0),
-                field_offset: 0,
-                field_size: 8,
-                field_type: Type::Int,
             }],
         };
         assert!(backend.update_fail_descr_recovery_layout(&token, 290, 0, root_layout));
@@ -16572,9 +16566,6 @@ mod tests {
                 is_array_item: true,
                 target: majit_backend::ExitValueSourceLayout::Virtual(0),
                 value: majit_backend::ExitValueSourceLayout::ExitValue(0),
-                field_offset: 0,
-                field_size: 8,
-                field_type: Type::Int,
             }],
         };
         assert!(backend.update_fail_descr_recovery_layout(

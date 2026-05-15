@@ -565,24 +565,29 @@ impl PartialEq for ExitVirtualLayout {
 impl Eq for ExitVirtualLayout {}
 
 /// Backend-neutral deferred heap write recovered from an exit.
+///
+/// `resume.py:88 PENDINGFIELDSTRUCT` parity — carries the live
+/// `lldescr` and the (target, value) tagged sources only.  Field
+/// metadata (offset / size / type) is *not* duplicated onto the
+/// layout: consumers (`pyre-jit::eval::replay_pending_fields`,
+/// `cranelift::compiler` guard recovery) call `descr.as_field_descr()`
+/// / `descr.as_array_descr()` and read `offset()` / `field_size()` /
+/// `field_type()` directly, mirroring `resume.py:1509-1518` and
+/// `resume.py:1531-1541`.
 #[derive(Debug, Clone)]
 pub struct ExitPendingFieldLayout {
     /// `resume.py:88 lldescr` — identity-compared via `Arc::ptr_eq`
     /// (`history.py:125`).
     pub descr: Option<majit_ir::DescrRef>,
-    /// Stable u32 handle for serialization sinks.  Equals
-    /// `descr.as_ref().map_or(0, |d| d.index())` when both are set.
+    /// pyre-only u32 handle used by the virtualizable magic-encoded
+    /// dispatch in `jitdriver::materialize_pending_fields` (encodes
+    /// virtualizable field offsets via the high `0x8000_0000` bit).
+    /// Will be removed once that path also routes through `descr`.
     pub descr_index: u32,
     pub item_index: Option<usize>,
     pub is_array_item: bool,
     pub target: ExitValueSourceLayout,
     pub value: ExitValueSourceLayout,
-    /// Byte offset from start of struct (from FieldDescr).
-    pub field_offset: usize,
-    /// Size of the field in bytes.
-    pub field_size: usize,
-    /// Type of the value being stored.
-    pub field_type: majit_ir::Type,
 }
 
 impl PartialEq for ExitPendingFieldLayout {
@@ -592,9 +597,6 @@ impl PartialEq for ExitPendingFieldLayout {
             && self.is_array_item == other.is_array_item
             && self.target == other.target
             && self.value == other.value
-            && self.field_offset == other.field_offset
-            && self.field_size == other.field_size
-            && self.field_type == other.field_type
     }
 }
 impl Eq for ExitPendingFieldLayout {}
@@ -608,9 +610,6 @@ impl ExitPendingFieldLayout {
             is_array_item: self.is_array_item,
             target: self.target.shifted_virtuals(virtual_offset),
             value: self.value.shifted_virtuals(virtual_offset),
-            field_offset: self.field_offset,
-            field_size: self.field_size,
-            field_type: self.field_type,
         }
     }
 }
