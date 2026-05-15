@@ -141,6 +141,13 @@ pub struct Assembler {
     /// for `flatten.py:382 getcolor`) before falling back to the
     /// regalloc-class scan.  Cleared at the end of `assemble`.
     current_concretetypes: Option<Vec<crate::model::ConcreteType>>,
+    /// Per-graph snapshot of [`crate::model::FunctionGraph::value_variables`]
+    /// — needed by [`Self::lookup_coloring`] so the Variable-keyed
+    /// `RegAllocResult::coloring` lookup can project a `ValueId`
+    /// through `value_variables[v.0]` without re-borrowing the
+    /// graph.  Indexed by `ValueId.0`; out-of-range or `None` slots
+    /// surface as "no Variable bound".
+    current_value_variables: Option<Vec<Option<crate::flowspace::model::Variable>>>,
 }
 
 impl Assembler {
@@ -164,6 +171,7 @@ impl Assembler {
             current_graph_name: None,
             current_flatop_debug: None,
             current_concretetypes: None,
+            current_value_variables: None,
         }
     }
 
@@ -327,6 +335,7 @@ impl Assembler {
         // assembler reads a per-Variable attribute identical to
         // pyre's per-`ValueId` slice index.
         self.current_concretetypes = graph.map(|g| g.concretetype_snapshot());
+        self.current_value_variables = graph.map(|g| g.value_variables.clone());
 
         // Pyre-only diagnostic: under `MAJIT_COVERAGE_AUDIT=1` enumerate
         // every ValueId referenced in `ssarepr.insns` that has no
@@ -478,6 +487,7 @@ impl Assembler {
         // assemble call without a graph doesn't accidentally consult
         // a stale table.
         self.current_concretetypes = None;
+        self.current_value_variables = None;
         body
     }
 
@@ -1923,6 +1933,19 @@ impl Assembler {
         v: ValueId,
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> (u8, RegKind) {
+        // Project `v` through the snapshotted `value_variables` slice
+        // to its backing Variable — the Variable-keyed `coloring` map
+        // (RPython `tool/algo/regalloc.py:31 coloring: dict[Variable, int]`)
+        // takes a `&Variable` for lookup.  Out-of-range reads (synth
+        // values minted past the snapshotted graph) and slots without
+        // a backing Variable surface as `None`, falling through to
+        // the slow per-snapshot scan path that matches by Variable
+        // identity in each regalloc class's coloring keys.
+        let variable: Option<&crate::flowspace::model::Variable> = self
+            .current_value_variables
+            .as_ref()
+            .and_then(|slice| slice.get(v.0).and_then(|opt| opt.as_ref()));
+
         // Strict path: type-state declares the kind; regallocs[kind]
         // supplies the color.  Mirrors `flatten.py:386-387` — PyPy
         // never falls back to other classes here, and neither do we
@@ -1930,19 +1953,11 @@ impl Assembler {
         // upstream type ↔ regalloc mismatch surfaces immediately.
         if let Some(types) = self.current_concretetypes.as_ref() {
             use crate::model::ConcreteType;
-            // The snapshot is indexed by `ValueId.0` (matches
-            // `FunctionGraph::value_variables`); out-of-range reads
-            // (synth values minted past the snapshotted graph)
-            // collapse to `Unknown` so the fallback scan kicks in.
             let declared = types.get(v.0).cloned().unwrap_or(ConcreteType::Unknown);
             let kind = match declared {
                 ConcreteType::Signed => Some(RegKind::Int),
                 ConcreteType::GcRef => Some(RegKind::Ref),
                 ConcreteType::Float => Some(RegKind::Float),
-                // Void inputargs / Unknown placeholders skip regalloc
-                // (`flatten.py:325`); fall through to the bare
-                // KINDS-scan path below as the documented escape
-                // hatch for those cases only.
                 ConcreteType::Void | ConcreteType::Unknown => None,
             };
             if let Some(kind) = kind {
@@ -1953,24 +1968,27 @@ impl Assembler {
                         self.current_graph_name, self.current_flatop_debug,
                     )
                 });
-                let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
-                    let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
-                        .iter()
-                        .filter(|k| **k != kind)
-                        .filter(|k| {
-                            regallocs
-                                .get(*k)
-                                .is_some_and(|ra| ra.coloring.contains_key(&v))
-                        })
-                        .copied()
-                        .collect();
-                    panic!(
-                        "lookup_coloring: type-state declared kind {kind:?} for {v:?} \
-                         but regallocs[{kind:?}] has no coloring (other classes with a \
-                         coloring: {other_classes:?}; graph={:?}, op={:?})",
-                        self.current_graph_name, self.current_flatop_debug,
-                    )
-                });
+                let color = variable
+                    .and_then(|var| ra.coloring.get(var).copied())
+                    .unwrap_or_else(|| {
+                        let other_classes: Vec<_> =
+                            [RegKind::Int, RegKind::Ref, RegKind::Float]
+                                .iter()
+                                .filter(|k| **k != kind)
+                                .filter(|k| {
+                                    regallocs.get(*k).is_some_and(|ra| {
+                                        variable.is_some_and(|var| ra.coloring.contains_key(var))
+                                    })
+                                })
+                                .copied()
+                                .collect();
+                        panic!(
+                            "lookup_coloring: type-state declared kind {kind:?} for {v:?} \
+                             but regallocs[{kind:?}] has no coloring (other classes with a \
+                             coloring: {other_classes:?}; graph={:?}, op={:?})",
+                            self.current_graph_name, self.current_flatop_debug,
+                        )
+                    });
                 return (color as u8, kind);
             }
         }
@@ -1979,18 +1997,20 @@ impl Assembler {
         // Fall back to a KINDS-ordered scan with a single-class
         // assertion; a multi-class hit is still a hard error.
         let mut found: Option<(u8, RegKind)> = None;
-        for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-            if let Some(ra) = regallocs.get(&kind) {
-                if let Some(&color) = ra.coloring.get(&v) {
-                    if let Some((_, prev)) = found {
-                        panic!(
-                            "lookup_coloring: value {v:?} colored in multiple regalloc \
-                             classes ({prev:?} and {kind:?}) — RPython `getkind` must \
-                             give exactly one (graph={:?}, op={:?})",
-                            self.current_graph_name, self.current_flatop_debug,
-                        );
+        if let Some(var) = variable {
+            for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+                if let Some(ra) = regallocs.get(&kind) {
+                    if let Some(&color) = ra.coloring.get(var) {
+                        if let Some((_, prev)) = found {
+                            panic!(
+                                "lookup_coloring: value {v:?} colored in multiple regalloc \
+                                 classes ({prev:?} and {kind:?}) — RPython `getkind` must \
+                                 give exactly one (graph={:?}, op={:?})",
+                                self.current_graph_name, self.current_flatop_debug,
+                            );
+                        }
+                        found = Some((color as u8, kind));
                     }
-                    found = Some((color as u8, kind));
                 }
             }
         }
@@ -2000,11 +2020,7 @@ impl Assembler {
         let class_coverage: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
             .iter()
             .filter_map(|k| regallocs.get(k).map(|ra| (*k, ra)))
-            .map(|(k, ra)| {
-                let min = ra.coloring.keys().map(|v| v.0).min();
-                let max = ra.coloring.keys().map(|v| v.0).max();
-                (k, ra.coloring.len(), min, max)
-            })
+            .map(|(k, ra)| (k, ra.coloring.len()))
             .collect();
         panic!(
             "lookup_coloring: value {v:?} has no coloring in any regalloc class \
@@ -2174,13 +2190,25 @@ impl Assembler {
 
         let mut gaps: Vec<(ValueId, &ValueSites)> = Vec::new();
         for (v, s) in &sites {
-            let covered = [RegKind::Int, RegKind::Ref, RegKind::Float]
-                .iter()
-                .any(|k| {
-                    regallocs
-                        .get(k)
-                        .is_some_and(|ra| ra.coloring.contains_key(v))
-                });
+            // Project ValueId → backing Variable via the snapshot so
+            // the Variable-keyed `coloring` map can be consulted.
+            // Slots without a backing Variable (front-end allocated
+            // outside `alloc_value_with_type`) cannot be looked up
+            // and surface as gaps.
+            let variable = self
+                .current_value_variables
+                .as_ref()
+                .and_then(|slice| slice.get(v.0).and_then(|opt| opt.as_ref()));
+            let covered = match variable {
+                Some(var) => [RegKind::Int, RegKind::Ref, RegKind::Float]
+                    .iter()
+                    .any(|k| {
+                        regallocs
+                            .get(k)
+                            .is_some_and(|ra| ra.coloring.contains_key(var))
+                    }),
+                None => false,
+            };
             if !covered {
                 gaps.push((*v, s));
             }
@@ -3990,7 +4018,7 @@ mod tests {
         // contract requires the same authoritative table that
         // `perform_all_register_allocations` consumed.
         let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
+        let _ = asm.assemble_with_graph(&mut flat, &regallocs, &rewritten);
 
         let key_count = asm
             .insns
@@ -4114,7 +4142,7 @@ mod tests {
         let mut flat = flatten_graph(&rewritten, &regallocs);
 
         let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
+        let _ = asm.assemble_with_graph(&mut flat, &regallocs, &rewritten);
 
         assert!(
             asm.insns.contains_key("setfield_gc_i/rid"),
@@ -4233,7 +4261,7 @@ mod tests {
         let mut flat = flatten_graph(&rewritten, &regallocs);
 
         let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
+        let _ = asm.assemble_with_graph(&mut flat, &regallocs, &rewritten);
 
         assert!(
             asm.insns.contains_key("getfield_gc_i/rd>i"),
@@ -4318,11 +4346,6 @@ mod tests {
 
         let regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = flatten_graph(&graph, &regallocs);
-        // Slice C-3: `flatten()` (the typed-state-less variant used
-        // by this test) leaves `SSARepr.value_kinds` empty.  Seed it
-        // with the canonical-exceptblock-augmented map so
-        // `lookup_coloring` finds every operand including the
-        // synthetic `(etype, evalue)` pair.
         assert!(
             !flat.insns.iter().any(|op| matches!(
                 op,
@@ -4336,7 +4359,7 @@ mod tests {
         );
 
         let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
+        let _ = asm.assemble_with_graph(&mut flat, &regallocs, &graph);
 
         assert!(
             !asm.insns.keys().any(|key| key.starts_with("input_")),
@@ -4361,14 +4384,9 @@ mod tests {
             num_blocks: 1,
             insns_pos: None,
         };
-        let mut regallocs = HashMap::new();
-        regallocs.insert(
-            RegKind::Int,
-            regalloc::RegAllocResult {
-                coloring: HashMap::from([(ValueId(0), 0usize)]),
-                num_regs: 1,
-            },
-        );
+        // Empty regallocs — the test panics before any coloring lookup
+        // runs (the assembler rejects OpKind::Input outright).
+        let regallocs = HashMap::new();
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);

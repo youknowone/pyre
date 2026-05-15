@@ -522,14 +522,14 @@ impl<'a> GraphFlattener<'a> {
                     self.graph.name,
                 )
             });
-            let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
+            let color = ra.color_for(self.graph, v).unwrap_or_else(|| {
                 let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
                     .iter()
                     .filter(|k| **k != kind)
                     .filter(|k| {
                         self.regallocs
                             .get(*k)
-                            .is_some_and(|ra| ra.coloring.contains_key(&v))
+                            .is_some_and(|ra| ra.contains_value(self.graph, v))
                     })
                     .copied()
                     .collect();
@@ -542,7 +542,7 @@ impl<'a> GraphFlattener<'a> {
             });
             return Some((kind, color));
         }
-        lookup_kind_color(v, self.regallocs)
+        lookup_kind_color(v, self.graph, self.regallocs)
     }
 
     /// Companion to [`Self::getcolor`] that mirrors upstream's
@@ -571,7 +571,7 @@ impl<'a> GraphFlattener<'a> {
         let inputargs = &self.graph.block(self.graph.startblock).inputargs;
         let mut numkinds: HashMap<RegKind, usize> = HashMap::new();
         for &v in inputargs {
-            let Some((kind, _curcol)) = lookup_kind_color(v, self.regallocs) else {
+            let Some((kind, _curcol)) = lookup_kind_color(v, self.graph, self.regallocs) else {
                 continue;
             };
             let realcol = numkinds.get(&kind).copied().unwrap_or(0);
@@ -1134,7 +1134,7 @@ impl<'a> GraphFlattener<'a> {
                 Some(ExitSwitch::Value(cond)) => cond,
                 _ => unreachable!(),
             };
-            let kind = value_kind(cond, self.regallocs);
+            let kind = value_kind(cond, self.graph, self.regallocs);
             assert_eq!(kind, 'i', "switch exitswitch must be int");
             // `switches = [link for link in block.exits if link.exitcase != 'default']`.
             // `switches.sort(key=lambda link: link.llexitcase)`.
@@ -1249,12 +1249,13 @@ fn last_op_result(block: &crate::model::Block) -> Option<ValueId> {
 /// provenance bug upstream — to preserve the RPython 1:1 invariant.
 fn lookup_kind_color(
     v: ValueId,
+    graph: &FunctionGraph,
     regallocs: &HashMap<RegKind, RegAllocResult>,
 ) -> Option<(RegKind, usize)> {
     let mut found: Option<(RegKind, usize)> = None;
     for kind in KINDS {
         if let Some(ra) = regallocs.get(&kind) {
-            if let Some(&color) = ra.coloring.get(&v) {
+            if let Some(color) = ra.color_for(graph, v) {
                 if let Some((prev_kind, _)) = found {
                     panic!(
                         "lookup_kind_color: ValueId {v:?} colored in multiple regalloc \
@@ -1350,11 +1351,15 @@ pub fn flatten_with_types(
 /// nondeterministic `HashMap` order) and panics on multi-class hits
 /// to mirror RPython's `getkind(v.concretetype)` 1:1 invariant.
 /// Returns `'v'` for Void-typed values that regalloc skipped.
-fn value_kind(value: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> char {
+fn value_kind(
+    value: ValueId,
+    graph: &FunctionGraph,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+) -> char {
     let mut found: Option<RegKind> = None;
     for kind in KINDS {
         if let Some(ra) = regallocs.get(&kind) {
-            if ra.coloring.contains_key(&value) {
+            if ra.contains_value(graph, value) {
                 if let Some(prev) = found {
                     panic!(
                         "value_kind: ValueId {value:?} colored in multiple regalloc \
@@ -1379,9 +1384,13 @@ fn value_kind(value: ValueId, regallocs: &HashMap<RegKind, RegAllocResult>) -> c
 ///
 /// Returns `'i'` / `'r'` / `'f'` / `'v'` matching RPython `KINDS`.
 #[allow(dead_code)]
-pub(crate) fn linkarg_kind(arg: &LinkArg, regallocs: &HashMap<RegKind, RegAllocResult>) -> char {
+pub(crate) fn linkarg_kind(
+    arg: &LinkArg,
+    graph: &FunctionGraph,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+) -> char {
     match arg {
-        LinkArg::Value(v) => value_kind(*v, regallocs),
+        LinkArg::Value(v) => value_kind(*v, graph, regallocs),
         LinkArg::Const(cv) => constvalue_kind(cv),
     }
 }
@@ -1535,15 +1544,28 @@ mod tests {
     use crate::model::{ExitCase, FunctionGraph, OpKind, SpaceOperation, exception_exitcase};
 
     /// Test helper — build a `regallocs` map that assigns each
-    /// `ValueId(n)` the color `n` in `RegKind::Int`. This turns the
-    /// color-based `insert_renamings` cycle-break into pure ValueId
-    /// identity, matching the pre-regalloc reasoning used by the
-    /// `insert_renamings_*` unit tests below.
+    /// `ValueId(n)` the color `n` in `RegKind::Int`.  Pulls the
+    /// backing `Variable` for each `ValueId` from `graph.value_variables`
+    /// so the resulting coloring is keyed on the upstream-orthodox
+    /// Variable identity (matches `RegAllocResult.coloring:
+    /// HashMap<Variable, usize>` shape).  Iterates only the
+    /// ValueIds that already have a backing Variable on the graph;
+    /// callers minting ValueIds past the canonical `[returnvar,
+    /// etype, evalue]` triple need not allocate the entire
+    /// `[0..=max_id]` range up front.
     fn identity_regallocs(
+        graph: &FunctionGraph,
         max_id: usize,
     ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult> {
-        let coloring: std::collections::HashMap<ValueId, usize> =
-            (0..=max_id).map(|n| (ValueId(n), n)).collect();
+        let mut coloring: std::collections::HashMap<
+            crate::flowspace::model::Variable,
+            usize,
+        > = std::collections::HashMap::new();
+        for n in 0..=max_id {
+            if let Some(var) = graph.variable(ValueId(n)) {
+                coloring.insert(var.clone(), n);
+            }
+        }
         let num_regs = max_id + 1;
         let mut m = std::collections::HashMap::new();
         m.insert(
@@ -1560,7 +1582,7 @@ mod tests {
         let v = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
         graph.set_return(entry, Some(v));
 
-        let flat = flatten(&graph, &identity_regallocs(8));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
         assert_eq!(flat.name, "simple");
         // Label + ConstInt op = 2 flat ops
         assert!(flat.insns.len() >= 2);
@@ -1581,7 +1603,7 @@ mod tests {
         graph.set_goto(else_block, merge, vec![]);
         graph.set_return(merge, None);
 
-        let flat = flatten(&graph, &identity_regallocs(8));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
         // Should have labels + jumps
         let has_jump = flat
             .insns
@@ -1631,7 +1653,7 @@ mod tests {
             ],
         );
 
-        let flat = flatten_graph(&graph, &identity_regallocs(8));
+        let flat = flatten_graph(&graph, &identity_regallocs(&graph, 8));
         // RPython `flatten.py:264-267` lays out the true (fall-through)
         // body INLINE after the `goto_if_not`; the false side then
         // appears at the `Label(linkfalse)` landing pad.  After the
@@ -1688,7 +1710,7 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(8));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
         let expected_value = Register::new(RegKind::Int, cond.0);
         assert!(
             flat.insns.iter().any(|op| matches!(
@@ -1730,7 +1752,7 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(8));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -1762,7 +1784,7 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(8));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
         assert!(
             flat.insns
                 .iter()
@@ -1794,7 +1816,7 @@ mod tests {
         graph.set_goto(body, header, vec![]);
         graph.set_return(exit, None);
 
-        let flat = flatten_graph(&graph, &identity_regallocs(8));
+        let flat = flatten_graph(&graph, &identity_regallocs(&graph, 8));
         // RPython `flatten.py:106-128 make_bytecode_block` falls through
         // for unseen targets and only emits `goto, TLabel(block); ---`
         // when re-entering an already-emitted block.  In this loop only
@@ -1850,7 +1872,7 @@ mod tests {
 
         graph.set_goto(entry, target, vec![val]);
 
-        let flat = flatten(&graph, &identity_regallocs(8));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
         let moves: Vec<_> = flat
             .insns
             .iter()
@@ -1888,7 +1910,7 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(sum));
 
-        let flat = flatten(&graph, &identity_regallocs(8));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 8));
         assert!(
             !flat.insns.iter().any(|op| matches!(
                 op,
@@ -1936,7 +1958,7 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(16));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
         assert!(
             flat.insns
                 .iter()
@@ -2000,7 +2022,7 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(16));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -2041,7 +2063,7 @@ mod tests {
         let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
         graph.set_goto(entry, exc_block, vec![last_exception, last_exc_value]);
 
-        let flat = flatten(&graph, &identity_regallocs(16));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
         // identity_regallocs colors ValueId(n) as Int n; Raise carries
         // the exception value's Register (always Ref-kinded).  The
         // test fixture uses identity coloring so the matching Register
@@ -2081,7 +2103,7 @@ mod tests {
             )],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(16));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
@@ -2141,7 +2163,7 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(16));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
         let expected_lhs = Register::new(RegKind::Int, lhs.0);
         let expected_rhs = Register::new(RegKind::Int, rhs.0);
         let expected_dst = Register::new(RegKind::Int, sum.0);
@@ -2209,7 +2231,7 @@ mod tests {
             ],
         );
 
-        let flat = flatten(&graph, &identity_regallocs(16));
+        let flat = flatten(&graph, &identity_regallocs(&graph, 16));
         let standard_overflow = crate::flowspace::model::HOST_ENV
             .lookup_standard_exception_instance("OverflowError")
             .expect("missing standard OverflowError instance");
@@ -2305,16 +2327,106 @@ mod tests {
         Link::new(args.to_vec(), BlockId(0), None)
     }
 
+    /// Run `insert_renamings` against a freshly-built graph + identity
+    /// coloring.  The graph allocates enough ValueIds so every operand
+    /// referenced in `link.args` / `target_inputargs` has a backing
+    /// Variable; the coloring is built from `graph.value_variables`
+    /// so the Variable-keyed lookup matches.
     fn run_insert_renamings(
-        regallocs: &HashMap<RegKind, RegAllocResult>,
         link: &Link,
         target_inputargs: &[ValueId],
     ) -> Vec<FlatOp> {
-        let graph = FunctionGraph::new("renamings_test");
-        let mut f = GraphFlattener::new(&graph, regallocs, false);
+        let max_id = link
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                LinkArg::Value(v) => Some(v.0),
+                _ => None,
+            })
+            .chain(target_inputargs.iter().map(|v| v.0))
+            .max()
+            .unwrap_or(0);
+        let mut graph = FunctionGraph::new("renamings_test");
+        while graph.next_value() <= max_id {
+            graph.alloc_value_with_type(crate::model::ConcreteType::Signed);
+        }
+        let regallocs = identity_regallocs(&graph, max_id);
+        let mut f = GraphFlattener::new(&graph, &regallocs, false);
         f.insert_renamings(link, target_inputargs);
         f.ssarepr.insns
     }
+
+    /// `run_insert_renamings` variant that lets the test author
+    /// stamp arbitrary per-Variable colorings (used by the coalesce /
+    /// cycle / multi-kind tests).  Builds a graph with enough
+    /// ValueIds, then constructs each kind's `coloring` from
+    /// `graph.value_variables` so the Variable-keyed lookup matches.
+    fn run_insert_renamings_with_coloring(
+        link: &Link,
+        target_inputargs: &[ValueId],
+        kind_colors: &[(RegKind, &[(usize, usize)])],
+    ) -> Vec<FlatOp> {
+        let max_id = link
+            .args
+            .iter()
+            .filter_map(|a| match a {
+                LinkArg::Value(v) => Some(v.0),
+                _ => None,
+            })
+            .chain(target_inputargs.iter().map(|v| v.0))
+            .chain(
+                kind_colors
+                    .iter()
+                    .flat_map(|(_, pairs)| pairs.iter().map(|(vid, _)| *vid)),
+            )
+            .max()
+            .unwrap_or(0);
+        // Per-ValueId kind: walk the spec so we can stamp each
+        // backing Variable's `concretetype` with the matching
+        // `ConcreteType` (Signed/GcRef/Float).  Without this stamp,
+        // `graph.concretetype(v)` would default to `Unknown` and
+        // `kind_color_of` would skip the strict path.
+        let mut value_kinds: HashMap<usize, RegKind> = HashMap::new();
+        for (kind, pairs) in kind_colors {
+            for (vid, _) in *pairs {
+                value_kinds.insert(*vid, *kind);
+            }
+        }
+        let mut graph = FunctionGraph::new("renamings_test");
+        while graph.next_value() <= max_id {
+            let vid = graph.next_value();
+            let kind = value_kinds.get(&vid).copied().unwrap_or(RegKind::Int);
+            let concrete = match kind {
+                RegKind::Int => crate::model::ConcreteType::Signed,
+                RegKind::Ref => crate::model::ConcreteType::GcRef,
+                RegKind::Float => crate::model::ConcreteType::Float,
+            };
+            graph.alloc_value_with_type(concrete);
+        }
+        let mut regallocs = HashMap::new();
+        for (kind, pairs) in kind_colors {
+            let mut coloring: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
+            let mut max_color = 0usize;
+            for (vid, color) in *pairs {
+                let var = graph.variable(ValueId(*vid)).unwrap().clone();
+                coloring.insert(var, *color);
+                if *color + 1 > max_color {
+                    max_color = *color + 1;
+                }
+            }
+            regallocs.insert(
+                *kind,
+                crate::regalloc::RegAllocResult {
+                    coloring,
+                    num_regs: max_color,
+                },
+            );
+        }
+        let mut f = GraphFlattener::new(&graph, &regallocs, false);
+        f.insert_renamings(link, target_inputargs);
+        f.ssarepr.insns
+    }
+
 
     fn int_reg(color: usize) -> Register {
         Register::new(RegKind::Int, color)
@@ -2326,18 +2438,16 @@ mod tests {
     #[test]
     fn insert_renamings_emits_nothing_for_identity() {
         // `for i, v in enumerate(link.args): if v == w: continue`.
-        let regallocs = identity_regallocs(8);
         let args = [ValueId(0), ValueId(1), ValueId(2)];
         let link = plain_link(&args);
-        let ops = run_insert_renamings(&regallocs, &link, &args);
+        let ops = run_insert_renamings(&link, &args);
         assert_eq!(ops, Vec::<FlatOp>::new());
     }
 
     #[test]
     fn insert_renamings_emits_move_for_acyclic_rename() {
-        let regallocs = identity_regallocs(8);
         let link = plain_link(&[ValueId(0)]);
-        let ops = run_insert_renamings(&regallocs, &link, &[ValueId(1)]);
+        let ops = run_insert_renamings(&link, &[ValueId(1)]);
         assert_eq!(
             ops,
             vec![FlatOp::Move {
@@ -2349,9 +2459,8 @@ mod tests {
 
     #[test]
     fn insert_renamings_emits_move_for_constant_source() {
-        let regallocs = identity_regallocs(8);
         let link = Link::new_mixed(vec![LinkArg::Const(ConstValue::Int(7))], BlockId(0), None);
-        let ops = run_insert_renamings(&regallocs, &link, &[ValueId(1)]);
+        let ops = run_insert_renamings(&link, &[ValueId(1)]);
         assert_eq!(
             ops,
             vec![FlatOp::Move {
@@ -2363,9 +2472,8 @@ mod tests {
 
     #[test]
     fn insert_renamings_breaks_swap_cycle_with_push_pop() {
-        let regallocs = identity_regallocs(8);
         let link = plain_link(&[ValueId(0), ValueId(1)]);
-        let ops = run_insert_renamings(&regallocs, &link, &[ValueId(1), ValueId(0)]);
+        let ops = run_insert_renamings(&link, &[ValueId(1), ValueId(0)]);
         assert_eq!(
             ops,
             vec![
@@ -2384,42 +2492,24 @@ mod tests {
     /// tests color identity, not ValueId identity.
     #[test]
     fn insert_renamings_skips_coalesced_same_color() {
-        let mut coloring: std::collections::HashMap<ValueId, usize> =
-            std::collections::HashMap::new();
-        coloring.insert(ValueId(0), 7);
-        coloring.insert(ValueId(1), 7);
-        let mut regallocs = std::collections::HashMap::new();
-        regallocs.insert(
-            RegKind::Int,
-            crate::regalloc::RegAllocResult {
-                coloring,
-                num_regs: 8,
-            },
-        );
         let link = plain_link(&[ValueId(0)]);
-        let ops = run_insert_renamings(&regallocs, &link, &[ValueId(1)]);
+        let ops = run_insert_renamings_with_coloring(
+            &link,
+            &[ValueId(1)],
+            &[(RegKind::Int, &[(0, 7), (1, 7)])],
+        );
         assert_eq!(ops, Vec::<FlatOp>::new());
     }
 
     /// Color-level 2-cycle must emit Push/Move/Pop, not two naive Moves.
     #[test]
     fn insert_renamings_detects_cycle_at_color_level() {
-        let mut coloring: std::collections::HashMap<ValueId, usize> =
-            std::collections::HashMap::new();
-        coloring.insert(ValueId(0), 0);
-        coloring.insert(ValueId(1), 1);
-        coloring.insert(ValueId(2), 1);
-        coloring.insert(ValueId(3), 0);
-        let mut regallocs = std::collections::HashMap::new();
-        regallocs.insert(
-            RegKind::Int,
-            crate::regalloc::RegAllocResult {
-                coloring,
-                num_regs: 2,
-            },
-        );
         let link = plain_link(&[ValueId(0), ValueId(2)]);
-        let ops = run_insert_renamings(&regallocs, &link, &[ValueId(1), ValueId(3)]);
+        let ops = run_insert_renamings_with_coloring(
+            &link,
+            &[ValueId(1), ValueId(3)],
+            &[(RegKind::Int, &[(0, 0), (1, 1), (2, 1), (3, 0)])],
+        );
         assert!(
             ops.iter().any(|o| matches!(o, FlatOp::Push(_))),
             "color-level 2-cycle must emit a Push, got {:?}",
@@ -2436,33 +2526,15 @@ mod tests {
     /// float.  Within a kind, sort by dst color.
     #[test]
     fn insert_renamings_groups_by_kind_and_sorts_by_dst() {
-        let mut int_coloring: std::collections::HashMap<ValueId, usize> =
-            std::collections::HashMap::new();
-        int_coloring.insert(ValueId(0), 0);
-        int_coloring.insert(ValueId(1), 3);
-        int_coloring.insert(ValueId(2), 1);
-        int_coloring.insert(ValueId(3), 2);
-        let mut ref_coloring: std::collections::HashMap<ValueId, usize> =
-            std::collections::HashMap::new();
-        ref_coloring.insert(ValueId(10), 0);
-        ref_coloring.insert(ValueId(11), 5);
-        let mut regallocs = std::collections::HashMap::new();
-        regallocs.insert(
-            RegKind::Int,
-            crate::regalloc::RegAllocResult {
-                coloring: int_coloring,
-                num_regs: 4,
-            },
-        );
-        regallocs.insert(
-            RegKind::Ref,
-            crate::regalloc::RegAllocResult {
-                coloring: ref_coloring,
-                num_regs: 6,
-            },
-        );
         let link = plain_link(&[ValueId(0), ValueId(10), ValueId(2)]);
-        let ops = run_insert_renamings(&regallocs, &link, &[ValueId(1), ValueId(11), ValueId(3)]);
+        let ops = run_insert_renamings_with_coloring(
+            &link,
+            &[ValueId(1), ValueId(11), ValueId(3)],
+            &[
+                (RegKind::Int, &[(0, 0), (1, 3), (2, 1), (3, 2)]),
+                (RegKind::Ref, &[(10, 0), (11, 5)]),
+            ],
+        );
         assert_eq!(
             ops,
             vec![
@@ -2504,7 +2576,7 @@ mod tests {
     use crate::jit_codewriter::format::format_assembler;
 
     fn flat_to_text(graph: &FunctionGraph) -> String {
-        let ssa = flatten_graph(graph, &identity_regallocs(16));
+        let ssa = flatten_graph(graph, &identity_regallocs(&graph, 16));
         format_assembler(&ssa)
     }
 

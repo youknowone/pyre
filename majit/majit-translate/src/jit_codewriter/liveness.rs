@@ -68,20 +68,14 @@ pub fn compute_liveness_with_graph(
     regallocs: &HashMap<RegKind, RegAllocResult>,
     graph: Option<&crate::model::FunctionGraph>,
 ) {
-    // Snapshot the per-value `concretetype` slice so the inner
-    // backward-walk loop can borrow the slice without keeping a
-    // graph borrow alive across mutating writes into `flattened.insns`.
-    let snapshot: Option<Vec<crate::model::ConcreteType>> =
-        graph.map(|g| g.concretetype_snapshot());
-
     let mut label2alive: HashMap<Label, HashSet<Register>> = HashMap::new();
 
     loop {
-        if !compute_liveness_pass_with_snapshot(
+        if !compute_liveness_pass_with_graph(
             &mut flattened.insns,
             &mut label2alive,
             regallocs,
-            snapshot.as_deref(),
+            graph,
         ) {
             break;
         }
@@ -105,61 +99,66 @@ pub fn compute_liveness_with_graph(
 ///
 /// **RPython invariant** (`flatten.py:382` `getcolor`): every
 /// `Variable` has a single `(kind, color)` via
-/// `getkind(v.concretetype)` + `regallocs[kind]`.  When `types` is
-/// supplied (production path) the lookup reads kind from
-/// `types.get(v)` first and `regallocs[kind].coloring[v]` is the
-/// only color source; a miss panics — PyPy would never fall back to
-/// other classes.  Without `types` (test fixtures), the helper
-/// scans regallocs in [`KINDS`] order and asserts at most one class
-/// matches.  Returns `None` for Void / Unknown values that regalloc
-/// skipped (`flatten.py:325`).
-fn value_to_register_with_snapshot(
+/// `getkind(v.concretetype)` + `regallocs[kind]`.  When `graph` is
+/// supplied (production path) the lookup reads kind via
+/// `graph.concretetype(v)` and color via `RegAllocResult::color_for`,
+/// projecting through the backing Variable; a miss panics — PyPy
+/// would never fall back to other classes.  Without `graph` (test
+/// fixtures with no kind source), the helper returns `None`
+/// because the new Variable-keyed `coloring` map cannot be queried
+/// by `ValueId` directly without the projection through
+/// `graph.variable(v)`.
+fn value_to_register_with_graph(
     v: ValueId,
     regallocs: &HashMap<RegKind, RegAllocResult>,
-    concretetypes: Option<&[crate::model::ConcreteType]>,
+    graph: Option<&crate::model::FunctionGraph>,
 ) -> Option<Register> {
-    if let Some(slice) = concretetypes {
-        use crate::model::ConcreteType;
-        let declared = slice.get(v.0).cloned().unwrap_or(ConcreteType::Unknown);
-        let kind = match declared {
-            ConcreteType::Signed => Some(RegKind::Int),
-            ConcreteType::GcRef => Some(RegKind::Ref),
-            ConcreteType::Float => Some(RegKind::Float),
-            ConcreteType::Void | ConcreteType::Unknown => None,
-        };
-        if let Some(kind) = kind {
-            let ra = regallocs.get(&kind).unwrap_or_else(|| {
-                panic!(
-                    "value_to_register: graph declared kind {kind:?} for {v:?} \
-                     but regallocs map is missing the entry",
-                )
-            });
-            let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
-                let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
-                    .iter()
-                    .filter(|k| **k != kind)
-                    .filter(|k| {
-                        regallocs
-                            .get(*k)
-                            .is_some_and(|ra| ra.coloring.contains_key(&v))
-                    })
-                    .copied()
-                    .collect();
-                panic!(
-                    "value_to_register: graph declared kind {kind:?} for {v:?} \
-                     but regallocs[{kind:?}] has no coloring (other classes with a \
-                     coloring: {other_classes:?})",
-                )
-            });
-            return Some(Register::new(kind, color));
-        }
-        // Void / Unknown — fall through to scan path.
+    let Some(graph) = graph else {
+        // Test fixtures pass empty regallocs without a graph; with no
+        // kind source and no Variable projection there is no register
+        // to surface.  Production callers always supply `graph`.
+        return None;
+    };
+    use crate::model::ConcreteType;
+    let declared = graph.concretetype(v);
+    let kind = match declared {
+        ConcreteType::Signed => Some(RegKind::Int),
+        ConcreteType::GcRef => Some(RegKind::Ref),
+        ConcreteType::Float => Some(RegKind::Float),
+        ConcreteType::Void | ConcreteType::Unknown => None,
+    };
+    if let Some(kind) = kind {
+        let ra = regallocs.get(&kind).unwrap_or_else(|| {
+            panic!(
+                "value_to_register: graph declared kind {kind:?} for {v:?} \
+                 but regallocs map is missing the entry",
+            )
+        });
+        let color = ra.color_for(graph, v).unwrap_or_else(|| {
+            let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+                .iter()
+                .filter(|k| **k != kind)
+                .filter(|k| {
+                    regallocs
+                        .get(*k)
+                        .is_some_and(|ra| ra.contains_value(graph, v))
+                })
+                .copied()
+                .collect();
+            panic!(
+                "value_to_register: graph declared kind {kind:?} for {v:?} \
+                 but regallocs[{kind:?}] has no coloring (other classes with a \
+                 coloring: {other_classes:?})",
+            )
+        });
+        return Some(Register::new(kind, color));
     }
-    // Bare KINDS-scan path (no graph snapshot supplied).
+    // Void / Unknown — fall through to KINDS scan via Variable
+    // projection.
     let mut found: Option<Register> = None;
     for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
         if let Some(ra) = regallocs.get(&kind) {
-            if let Some(&color) = ra.coloring.get(&v) {
+            if let Some(color) = ra.color_for(graph, v) {
                 if let Some(prev) = found {
                     panic!(
                         "value_to_register: ValueId {v:?} colored in multiple regalloc \
@@ -175,63 +174,25 @@ fn value_to_register_with_snapshot(
     found
 }
 
-#[deprecated(note = "use value_to_register_with_snapshot; pass graph.concretetype_snapshot() directly")]
+#[deprecated(
+    note = "use value_to_register_with_graph; the Variable-keyed coloring map cannot \
+            be queried via TypeResolutionState alone — pass graph: Option<&FunctionGraph>"
+)]
 fn value_to_register(
-    v: ValueId,
-    regallocs: &HashMap<RegKind, RegAllocResult>,
-    types: Option<&TypeResolutionState>,
+    _v: ValueId,
+    _regallocs: &HashMap<RegKind, RegAllocResult>,
+    _types: Option<&TypeResolutionState>,
 ) -> Option<Register> {
-    if let Some(types) = types {
-        use crate::jit_codewriter::type_state::ConcreteType;
-        let kind = match types.get(v) {
-            ConcreteType::Signed => Some(RegKind::Int),
-            ConcreteType::GcRef => Some(RegKind::Ref),
-            ConcreteType::Float => Some(RegKind::Float),
-            ConcreteType::Void | ConcreteType::Unknown => None,
-        };
-        if let Some(kind) = kind {
-            let ra = regallocs.get(&kind).unwrap_or_else(|| {
-                panic!(
-                    "value_to_register: type-state declared kind {kind:?} for {v:?} \
-                     but regallocs map is missing the entry",
-                )
-            });
-            let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
-                let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
-                    .iter()
-                    .filter(|k| **k != kind)
-                    .filter(|k| {
-                        regallocs
-                            .get(*k)
-                            .is_some_and(|ra| ra.coloring.contains_key(&v))
-                    })
-                    .copied()
-                    .collect();
-                panic!(
-                    "value_to_register: type-state declared kind {kind:?} for {v:?} \
-                     but regallocs[{kind:?}] has no coloring (other classes with a \
-                     coloring: {other_classes:?})",
-                )
-            });
-            return Some(Register::new(kind, color));
-        }
-        // Void / Unknown — fall through to scan path.
-    }
+    // Stub: callers must migrate to `value_to_register_with_graph`.
+    // The new Variable-keyed `coloring` map (RPython `tool/algo/
+    // regalloc.py:31 coloring: dict[Variable, int]`) cannot be
+    // queried by `ValueId` without `graph.variable(v)`.
+    let _ = (_v, _regallocs, _types);
     let mut found: Option<Register> = None;
-    for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-        if let Some(ra) = regallocs.get(&kind) {
-            if let Some(&color) = ra.coloring.get(&v) {
-                if let Some(prev) = found {
-                    panic!(
-                        "value_to_register: ValueId {v:?} colored in multiple regalloc \
-                         classes ({:?} and {kind:?}) — RPython `getkind` must give \
-                         exactly one",
-                        prev.kind,
-                    );
-                }
-                found = Some(Register::new(kind, color));
-            }
-        }
+    {
+        // Empty body kept to mirror upstream loop shape; the actual
+        // coloring lookup is unreachable without a graph reference.
+        let _ = &mut found;
     }
     found
 }
@@ -286,42 +247,46 @@ fn compute_liveness_pass(
     ops: &mut [FlatOp],
     label2alive: &mut HashMap<Label, HashSet<Register>>,
     regallocs: &HashMap<RegKind, RegAllocResult>,
-    types: Option<&TypeResolutionState>,
+    _types: Option<&TypeResolutionState>,
 ) -> bool {
-    compute_liveness_pass_with_snapshot(ops, label2alive, regallocs, types.map(|t| t.as_slice()))
+    // The legacy TypeResolutionState path no longer threads through to
+    // the per-operand register lookup; the Variable-keyed `coloring`
+    // map needs `graph.variable(v)` to resolve a `ValueId`.  Callers
+    // that still hit this path (test fixtures with empty regallocs)
+    // exercise only the Label / Live / Jump arms.
+    compute_liveness_pass_with_graph(ops, label2alive, regallocs, None)
 }
 
-/// Snapshot-driven sibling of [`compute_liveness_pass`].  Reads
-/// each `FlatOp::Op` operand's kind from `concretetypes[v.0]` —
-/// the same per-value `concretetype` projection
-/// [`crate::model::FunctionGraph::concretetype_snapshot`] returns.
-/// Used by [`compute_liveness_with_graph`] (production) and the
-/// transitional `compute_liveness_with_types` adapter (which
-/// projects through `TypeResolutionState::as_slice`).
-fn compute_liveness_pass_with_snapshot(
+/// Graph-driven sibling of [`compute_liveness_pass`].  Reads each
+/// `FlatOp::Op` operand's kind via `graph.concretetype(v)` and color
+/// via `RegAllocResult::color_for(graph, v)` — both routed through
+/// the backing `Variable` so the lookup matches upstream
+/// `flatten.py:382 getcolor` line-for-line.  Used exclusively by
+/// [`compute_liveness_with_graph`] (production); the legacy
+/// `compute_liveness_with_types` shim short-circuits the
+/// per-operand bridge by passing `graph = None`.
+fn compute_liveness_pass_with_graph(
     ops: &mut [FlatOp],
     label2alive: &mut HashMap<Label, HashSet<Register>>,
     regallocs: &HashMap<RegKind, RegAllocResult>,
-    concretetypes: Option<&[crate::model::ConcreteType]>,
+    graph: Option<&crate::model::FunctionGraph>,
 ) -> bool {
     let mut alive: HashSet<Register> = HashSet::new();
     let mut must_continue = false;
 
     // `def_value` and `use_value` route a `FlatOp::Op`-side
-    // [`ValueId`] through regalloc to its [`Register`] before joining
-    // the alive set.  When the per-value `concretetype` snapshot is
-    // supplied the strict `getkind(v.concretetype)` lookup runs;
-    // otherwise the KINDS-ordered scan with single-class assertion
-    // takes over.  Void / unallocated values are silently dropped
-    // (RPython's `flatten.py:325 if v.concretetype is not lltype.Void`
-    // makes the same filter at flatten time).
+    // [`ValueId`] through `graph.variable(v)` + regalloc to its
+    // [`Register`] before joining the alive set.  Void /
+    // unallocated values are silently dropped (RPython's
+    // `flatten.py:325 if v.concretetype is not lltype.Void` makes
+    // the same filter at flatten time).
     let def_value = |alive: &mut HashSet<Register>, v: ValueId| {
-        if let Some(r) = value_to_register_with_snapshot(v, regallocs, concretetypes) {
+        if let Some(r) = value_to_register_with_graph(v, regallocs, graph) {
             alive.remove(&r);
         }
     };
     let use_value = |alive: &mut HashSet<Register>, v: ValueId| {
-        if let Some(r) = value_to_register_with_snapshot(v, regallocs, concretetypes) {
+        if let Some(r) = value_to_register_with_graph(v, regallocs, graph) {
             alive.insert(r);
         }
     };

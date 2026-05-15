@@ -388,10 +388,46 @@ impl RegAllocator {
 // ── Public API ────────────────────────────────────────────────────
 
 /// Result of register allocation for one kind.
+///
+/// `coloring` is keyed on the backing
+/// [`crate::flowspace::model::Variable`] for each `ValueId` —
+/// matching upstream RPython's `coloring: dict[Variable, int]`
+/// (`tool/algo/regalloc.py:31`).  Consumers project a `ValueId` to
+/// its Variable via [`crate::model::FunctionGraph::variable`]; the
+/// helpers [`Self::color_for`] / [`Self::contains_value`] perform
+/// the projection in one call so call sites stay terse.
 #[derive(Debug, Clone)]
 pub struct RegAllocResult {
-    pub coloring: HashMap<ValueId, usize>,
+    pub coloring: HashMap<crate::flowspace::model::Variable, usize>,
     pub num_regs: usize,
+}
+
+impl RegAllocResult {
+    /// Look up the register color assigned to `v` — projects
+    /// through `graph.variable(v)` to the backing Variable, then
+    /// reads `coloring[var]`.  Returns `None` when the slot has no
+    /// backing Variable or no coloring (Void / Unknown / different
+    /// kind class).
+    pub fn color_for(
+        &self,
+        graph: &crate::model::FunctionGraph,
+        v: ValueId,
+    ) -> Option<usize> {
+        let var = graph.variable(v)?;
+        self.coloring.get(var).copied()
+    }
+
+    /// `true` iff `v` has a coloring in this kind class.
+    pub fn contains_value(
+        &self,
+        graph: &crate::model::FunctionGraph,
+        v: ValueId,
+    ) -> bool {
+        match graph.variable(v) {
+            Some(var) => self.coloring.contains_key(var),
+            None => false,
+        }
+    }
 }
 
 // `perform_register_allocation` previously took a
@@ -461,15 +497,26 @@ pub fn perform_register_allocation(
     allocator.coalesce_variables(graph, &consider);
     allocator.find_node_coloring();
 
-    let mut coloring = HashMap::new();
+    let mut coloring: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
     let mut max_reg = 0usize;
     // Walk every ValueId minted on the graph and pick those whose
-    // graph-side concretetype lands in `kind`.
+    // graph-side concretetype lands in `kind`.  Project each chosen
+    // ValueId through `graph.variable(vid)` to its backing
+    // `flowspace::Variable` so the result `coloring` map is keyed
+    // on the upstream-orthodox identity (`tool/algo/regalloc.py:31`
+    // `coloring: dict[Variable, int]`).
     for idx in 0..graph.next_value() {
         let vid = ValueId(idx);
         if concretetype_to_regkind(&graph.concretetype(vid)) == Some(kind) {
             if let Some(color) = allocator.getcolor(vid) {
-                coloring.insert(vid, color);
+                let Some(var) = graph.variable(vid) else {
+                    panic!(
+                        "perform_register_allocation: ValueId {vid:?} has a regalloc \
+                         color but no backing Variable on the graph; alloc_value_with_type \
+                         must mint a Variable for every slot"
+                    );
+                };
+                coloring.insert(var.clone(), color);
                 if color + 1 > max_reg {
                     max_reg = color + 1;
                 }
@@ -582,8 +629,8 @@ mod tests {
         graph.set_concretetype(v2, ConcreteType::Signed);
         let result = perform_register_allocation(&graph, RegKind::Int);
         assert_ne!(
-            result.coloring.get(&v0),
-            result.coloring.get(&v1),
+            result.color_for(&graph, v0),
+            result.color_for(&graph, v1),
             "v0 and v1 are simultaneously alive → different registers"
         );
         // v2 can share with v0 or v1 (they die before v2's definition)
@@ -612,7 +659,7 @@ mod tests {
         graph.set_concretetype(v0, ConcreteType::Signed);
         graph.set_concretetype(v1, ConcreteType::Signed);
         let result = perform_register_allocation(&graph, RegKind::Int);
-        assert_eq!(result.coloring.get(&v0), result.coloring.get(&v1));
+        assert_eq!(result.color_for(&graph, v0), result.color_for(&graph, v1));
         assert_eq!(result.num_regs, 1);
     }
 
