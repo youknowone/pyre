@@ -941,7 +941,6 @@ impl JitState for PendingWriteState {
         &self,
         _meta: &Self::Meta,
         descr: Option<&majit_ir::DescrRef>,
-        _descr_index: u32,
         _is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
         let fd = descr?.as_field_descr()?;
@@ -1003,7 +1002,6 @@ impl JitState for PendingArrayWriteState {
         &self,
         _meta: &Self::Meta,
         descr: Option<&majit_ir::DescrRef>,
-        _descr_index: u32,
         _is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
         let ad = descr?.as_array_descr()?;
@@ -1178,7 +1176,6 @@ impl JitState for GenericMultiFrameResumeState {
         &self,
         _meta: &Self::Meta,
         descr: Option<&majit_ir::DescrRef>,
-        _descr_index: u32,
         _is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
         let fd = descr?.as_field_descr()?;
@@ -1343,7 +1340,6 @@ impl JitState for PendingVirtualWriteState {
         &self,
         _meta: &Self::Meta,
         descr: Option<&majit_ir::DescrRef>,
-        _descr_index: u32,
         _is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
         let fd = descr?.as_field_descr()?;

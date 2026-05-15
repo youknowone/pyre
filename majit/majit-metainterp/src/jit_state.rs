@@ -540,14 +540,11 @@ pub trait JitState: Sized {
     /// parity — RPython dispatches via `descr.is_pointer_field()` /
     /// `arraydescr.is_array_of_pointers()`.  pyre passes the live
     /// `descr` Arc so the driver can call the same `FieldDescr` /
-    /// `ArrayDescr` trait methods directly; `descr_index` is kept for
-    /// drivers whose layout tables still key on the legacy handle
-    /// (Slice C migrates them).
+    /// `ArrayDescr` trait methods directly.
     fn pending_field_write_layout(
         &self,
         _meta: &Self::Meta,
         _descr: Option<&majit_ir::DescrRef>,
-        _descr_index: u32,
         _is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
         None
@@ -1126,7 +1123,6 @@ pub trait JitState: Sized {
             let Some(layout) = self.pending_field_write_layout(
                 meta,
                 pending.descr.as_ref(),
-                pending.descr_index,
                 pending.item_index.is_some(),
             ) else {
                 continue;
