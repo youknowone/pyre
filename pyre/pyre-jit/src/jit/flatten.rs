@@ -1109,14 +1109,17 @@ pub struct GraphFlattener<'a, F, C = fn(&Constant) -> Operand> {
     /// the overflow path leave it `None`, matching upstream's
     /// `cpu=None` default at `flatten.py:64`.
     cpu: Option<&'a super::cpu::Cpu>,
-    /// Slice #48.18 (Option C pipeline-flip prep): when `Some`,
-    /// `flatten_space_operation` routes pre-rtype HLOp opnames from
-    /// the four retired families (BINARY_OP / COMPARE_OP / BOOL /
-    /// SETITEM) through `try_flatten_retired_family_hlop_to_insn`,
-    /// producing the post-rtype `residual_call_*` Insn the assembler
-    /// expects.  When `None`, the legacy opname-passthrough behaves
-    /// as before (emitting `Insn::op("add", ...)` etc. — useful for
-    /// tests and structural-only graphs).
+    /// When `Some`, `flatten_space_operation` routes pre-rtype HLOp
+    /// opnames from the four retired families (BINARY_OP / COMPARE_OP
+    /// / BOOL / SETITEM) through
+    /// `try_flatten_retired_family_hlop_to_insn`, producing the
+    /// post-rtype `residual_call_*` Insn the assembler expects.  When
+    /// `None`, the legacy opname-passthrough emits `Insn::op("add",
+    /// ...)` etc. directly — used by tests against structural-only
+    /// graphs.
+    ///
+    /// Production callers populate it via `cpu.lowering_ctx`
+    /// (`codewriter.rs::transform_graph_to_jitcode`).
     lowering_ctx: Option<LoweringContext>,
 }
 
@@ -1164,16 +1167,16 @@ where
         }
     }
 
-    /// Slice #48.18 (Option C pipeline-flip prep): GraphFlattener
-    /// constructor that enables retired-family HLOp lowering.  Routes
-    /// `add` / `lt` / ... / `bool` / `setitem` SpaceOperations through
-    /// `try_flatten_retired_family_hlop_to_insn` (which lowers them to
-    /// the matching `residual_call_*` Insn shape) before the
-    /// passthrough opname-emit fallback.  Non-HLOp opnames (structural
-    /// ops like `loop_header` / `jit_merge_point`, post-rtype
-    /// `residual_call_*` ops recorded by factor-refactored families'
-    /// graph dual-writes) keep their existing passthrough handling
-    /// because the dispatcher's `try_*` returns `None` for them.
+    /// GraphFlattener constructor that enables retired-family HLOp
+    /// lowering.  Routes `add` / `lt` / ... / `bool` / `setitem`
+    /// SpaceOperations through `try_flatten_retired_family_hlop_to_insn`
+    /// (which lowers them to the matching `residual_call_*` Insn
+    /// shape) before the passthrough opname-emit fallback.  Non-HLOp
+    /// opnames (structural ops like `loop_header` /
+    /// `jit_merge_point`, post-rtype `residual_call_*` ops recorded
+    /// by factor-refactored families' graph dual-writes) keep their
+    /// existing passthrough handling because the dispatcher's `try_*`
+    /// returns `None` for them.
     pub fn new_with_full_lowering(
         ssarepr: &'a mut SSARepr,
         get_register: F,
@@ -1996,12 +1999,12 @@ where
     }
 
     fn flatten_space_operation(&mut self, op: &SpaceOperation) -> Insn {
-        // Slice #48.18: if the GraphFlattener was constructed with a
-        // `LoweringContext`, retired-family HLOp opnames (`add` / `lt`
-        // / ... / `bool` / `setitem`) lower to the matching
-        // `residual_call_*` Insn shape via the dispatcher.  Non-HLOp
-        // opnames return `None` from the dispatcher and fall through
-        // to the legacy opname-passthrough below.
+        // If the GraphFlattener was constructed with a `LoweringContext`,
+        // retired-family HLOp opnames (`add` / `lt` / ... / `bool` /
+        // `setitem`) lower to the matching `residual_call_*` Insn shape
+        // via the dispatcher.  Non-HLOp opnames return `None` from the
+        // dispatcher and fall through to the legacy opname-passthrough
+        // below.
         if let Some(ref ctx) = self.lowering_ctx {
             // Borrow-split: the dispatcher needs `&mut self.get_register`
             // and `&mut self.lower_constant` simultaneously, which Rust
