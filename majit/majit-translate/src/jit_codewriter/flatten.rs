@@ -550,7 +550,13 @@ impl<'a> GraphFlattener<'a> {
     /// or the [`ConstValue`] verbatim (Constant case).
     pub fn getoperand(&mut self, arg: &LinkArg) -> RegOrConst {
         match arg {
-            LinkArg::Value(v) => RegOrConst::Reg(self.getcolor(*v)),
+            LinkArg::Value(var) => {
+                let vid = self
+                    .graph
+                    .value_id_of(var)
+                    .expect("getoperand: link-arg Variable must be registered on graph");
+                RegOrConst::Reg(self.getcolor(vid))
+            }
             LinkArg::Const(cv) => RegOrConst::Const(cv.clone()),
         }
     }
@@ -595,10 +601,11 @@ impl<'a> GraphFlattener<'a> {
         let block = self.graph.block(bid);
         // `if block.exits == (): self.make_return(block.inputargs); return`.
         if block.exits.is_empty() {
+            let graph = self.graph;
             let final_args: Vec<LinkArg> = block
-                .inputarg_value_ids(self.graph)
+                .inputarg_value_ids(graph)
                 .into_iter()
-                .map(LinkArg::from)
+                .map(|v| LinkArg::value(graph, v))
                 .collect();
             self.make_return(&final_args);
             return;
@@ -660,8 +667,10 @@ impl<'a> GraphFlattener<'a> {
         // `getkind(args[0].concretetype)` does.
         let resolve_arg_kind = |this: &Self, arg: &LinkArg, fallback: Option<ValueId>| -> char {
             match arg {
-                LinkArg::Value(value) => this
-                    .kind_color_of(*value)
+                LinkArg::Value(var) => this
+                    .graph
+                    .value_id_of(var)
+                    .and_then(|vid| this.kind_color_of(vid))
                     .map(|(k, _)| match k {
                         RegKind::Int => 'i',
                         RegKind::Ref => 'r',
@@ -744,7 +753,13 @@ impl<'a> GraphFlattener<'a> {
     /// surrounding variant fixing the kind.
     fn return_operand(&mut self, arg: &LinkArg, _expected_kind: RegKind) -> RegOrConst {
         match arg {
-            LinkArg::Value(value) => RegOrConst::Reg(self.getcolor(*value)),
+            LinkArg::Value(var) => {
+                let vid = self
+                    .graph
+                    .value_id_of(var)
+                    .expect("return_operand: link-arg Variable must be registered on graph");
+                RegOrConst::Reg(self.getcolor(vid))
+            }
             LinkArg::Const(cv) => RegOrConst::Const(cv.clone()),
         }
     }
@@ -838,10 +853,15 @@ impl<'a> GraphFlattener<'a> {
                 None => continue,
             };
             let src = match v {
-                LinkArg::Value(value) => match self.try_getcolor(*value) {
-                    Some(r) => RegOrConst::Reg(r),
-                    None => continue,
-                },
+                LinkArg::Value(var) => {
+                    let Some(value) = self.graph.value_id_of(var) else {
+                        continue;
+                    };
+                    match self.try_getcolor(value) {
+                        Some(r) => RegOrConst::Reg(r),
+                        None => continue,
+                    }
+                }
                 LinkArg::Const(cv) => RegOrConst::Const(cv.clone()),
             };
             // `flatten.py:314 if v == w: continue` — color-level
@@ -1396,7 +1416,10 @@ pub(crate) fn linkarg_kind(
     regallocs: &HashMap<RegKind, RegAllocResult>,
 ) -> char {
     match arg {
-        LinkArg::Value(v) => value_kind(*v, graph, regallocs),
+        LinkArg::Value(var) => match graph.value_id_of(var) {
+            Some(v) => value_kind(v, graph, regallocs),
+            None => 'v',
+        },
         LinkArg::Const(cv) => constvalue_kind(cv),
     }
 }
@@ -1563,10 +1586,8 @@ mod tests {
         graph: &FunctionGraph,
         max_id: usize,
     ) -> std::collections::HashMap<RegKind, crate::regalloc::RegAllocResult> {
-        let mut coloring: std::collections::HashMap<
-            crate::flowspace::model::Variable,
-            usize,
-        > = std::collections::HashMap::new();
+        let mut coloring: std::collections::HashMap<crate::flowspace::model::Variable, usize> =
+            std::collections::HashMap::new();
         for n in 0..=max_id {
             if let Some(var) = graph.variable(ValueId(n)) {
                 coloring.insert(var.clone(), n);
@@ -1652,9 +1673,9 @@ mod tests {
             entry,
             Some(ExitSwitch::Value(cond)),
             vec![
-                Link::new(Vec::new(), true_block, Some(ExitCase::Bool(false)))
+                Link::new(&graph, Vec::new(), true_block, Some(ExitCase::Bool(false)))
                     .with_llexitcase(ConstValue::Bool(true)),
-                Link::new(Vec::new(), false_block, Some(ExitCase::Bool(true)))
+                Link::new(&graph, Vec::new(), false_block, Some(ExitCase::Bool(true)))
                     .with_llexitcase(ConstValue::Bool(false)),
             ],
         );
@@ -1951,15 +1972,16 @@ mod tests {
             entry,
             Some(crate::model::ExitSwitch::LastException),
             vec![
-                crate::model::Link::new(vec![call_result], continuation, None),
+                crate::model::Link::new(&graph, vec![call_result], continuation, None),
                 crate::model::Link::new(
+                    &graph,
                     vec![last_exception, last_exc_value],
                     exc_block,
                     Some(exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::from(last_exception)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exception)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
             ],
         );
@@ -2002,11 +2024,11 @@ mod tests {
             entry,
             Some(crate::model::ExitSwitch::LastException),
             vec![
-                crate::model::Link::new(vec![call_result], graph.returnblock, None),
+                crate::model::Link::new(&graph, vec![call_result], graph.returnblock, None),
                 crate::model::Link::new_mixed(
                     vec![
                         LinkArg::from(value_error.clone()),
-                        LinkArg::from(last_exc_value),
+                        LinkArg::value(&graph, last_exc_value),
                     ],
                     handler,
                     Some(ExitCase::Const(value_error.clone())),
@@ -2014,16 +2036,17 @@ mod tests {
                 .with_llexitcase(ConstValue::Int(123))
                 .extravars(
                     Some(LinkArg::from(value_error)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
                 crate::model::Link::new(
+                    &graph,
                     vec![last_exception, last_exc_value],
                     exc_block,
                     Some(exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::from(last_exception)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exception)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
             ],
         );
@@ -2153,18 +2176,18 @@ mod tests {
             entry,
             Some(crate::model::ExitSwitch::LastException),
             vec![
-                crate::model::Link::new(vec![sum], graph.returnblock, None),
+                crate::model::Link::new(&graph, vec![sum], graph.returnblock, None),
                 crate::model::Link::new_mixed(
                     vec![
                         LinkArg::from(overflow_error.clone()),
-                        LinkArg::from(last_exc_value),
+                        LinkArg::value(&graph, last_exc_value),
                     ],
                     handler,
                     Some(ExitCase::Const(overflow_error.clone())),
                 )
                 .extravars(
                     Some(LinkArg::from(overflow_error)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
             ],
         );
@@ -2221,18 +2244,18 @@ mod tests {
             entry,
             Some(crate::model::ExitSwitch::LastException),
             vec![
-                crate::model::Link::new(vec![sum], graph.returnblock, None),
+                crate::model::Link::new(&graph, vec![sum], graph.returnblock, None),
                 crate::model::Link::new_mixed(
                     vec![
                         LinkArg::from(overflow_error.clone()),
-                        LinkArg::from(last_exc_value),
+                        LinkArg::value(&graph, last_exc_value),
                     ],
                     exc_block,
                     Some(ExitCase::Const(overflow_error.clone())),
                 )
                 .extravars(
                     Some(LinkArg::from(overflow_error)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
             ],
         );
@@ -2329,36 +2352,44 @@ mod tests {
     // operands; `run_insert_renamings` provides a parameterised harness
     // that builds a flattener over an empty graph, runs the helper,
     // and returns the produced ops for comparison.
-    fn plain_link(args: &[ValueId]) -> Link {
-        Link::new(args.to_vec(), BlockId(0), None)
-    }
-
-    /// Run `insert_renamings` against a freshly-built graph + identity
-    /// coloring.  The graph allocates enough ValueIds so every operand
-    /// referenced in `link.args` / `target_inputargs` has a backing
-    /// Variable; the coloring is built from `graph.value_variables`
-    /// so the Variable-keyed lookup matches.
-    fn run_insert_renamings(
-        link: &Link,
-        target_inputargs: &[ValueId],
-    ) -> Vec<FlatOp> {
-        let max_id = link
-            .args
+    /// Test helper: build link args from raw ValueIds, project to
+    /// the freshly-built graph's Variables.  Each test-fixture call
+    /// site uses this directly to avoid the cross-graph Variable
+    /// mismatch that a standalone `plain_link` helper would
+    /// introduce (the link's Variables would belong to a throwaway
+    /// graph, not the renamings runner's graph).
+    fn run_insert_renamings(args: &[ValueId], target_inputargs: &[ValueId]) -> Vec<FlatOp> {
+        let max_id = args
             .iter()
-            .filter_map(|a| match a {
-                LinkArg::Value(v) => Some(v.0),
-                _ => None,
-            })
-            .chain(target_inputargs.iter().map(|v| v.0))
+            .chain(target_inputargs.iter())
+            .map(|v| v.0)
             .max()
             .unwrap_or(0);
         let mut graph = FunctionGraph::new("renamings_test");
         while graph.next_value() <= max_id {
             graph.alloc_value_with_type(crate::model::ConcreteType::Signed);
         }
+        let link = Link::new(&graph, args.to_vec(), BlockId(0), None);
         let regallocs = identity_regallocs(&graph, max_id);
         let mut f = GraphFlattener::new(&graph, &regallocs, false);
-        f.insert_renamings(link, target_inputargs);
+        f.insert_renamings(&link, target_inputargs);
+        f.ssarepr.insns
+    }
+
+    /// `run_insert_renamings` variant for constant-source link args.
+    fn run_insert_renamings_with_const(
+        link_args: Vec<LinkArg>,
+        target_inputargs: &[ValueId],
+    ) -> Vec<FlatOp> {
+        let max_id = target_inputargs.iter().map(|v| v.0).max().unwrap_or(0);
+        let mut graph = FunctionGraph::new("renamings_test");
+        while graph.next_value() <= max_id {
+            graph.alloc_value_with_type(crate::model::ConcreteType::Signed);
+        }
+        let link = Link::new_mixed(link_args, BlockId(0), None);
+        let regallocs = identity_regallocs(&graph, max_id);
+        let mut f = GraphFlattener::new(&graph, &regallocs, false);
+        f.insert_renamings(&link, target_inputargs);
         f.ssarepr.insns
     }
 
@@ -2368,18 +2399,14 @@ mod tests {
     /// ValueIds, then constructs each kind's `coloring` from
     /// `graph.value_variables` so the Variable-keyed lookup matches.
     fn run_insert_renamings_with_coloring(
-        link: &Link,
+        args: &[ValueId],
         target_inputargs: &[ValueId],
         kind_colors: &[(RegKind, &[(usize, usize)])],
     ) -> Vec<FlatOp> {
-        let max_id = link
-            .args
+        let max_id = args
             .iter()
-            .filter_map(|a| match a {
-                LinkArg::Value(v) => Some(v.0),
-                _ => None,
-            })
-            .chain(target_inputargs.iter().map(|v| v.0))
+            .chain(target_inputargs.iter())
+            .map(|v| v.0)
             .chain(
                 kind_colors
                     .iter()
@@ -2428,11 +2455,11 @@ mod tests {
                 },
             );
         }
+        let link = Link::new(&graph, args.to_vec(), BlockId(0), None);
         let mut f = GraphFlattener::new(&graph, &regallocs, false);
-        f.insert_renamings(link, target_inputargs);
+        f.insert_renamings(&link, target_inputargs);
         f.ssarepr.insns
     }
-
 
     fn int_reg(color: usize) -> Register {
         Register::new(RegKind::Int, color)
@@ -2445,15 +2472,13 @@ mod tests {
     fn insert_renamings_emits_nothing_for_identity() {
         // `for i, v in enumerate(link.args): if v == w: continue`.
         let args = [ValueId(0), ValueId(1), ValueId(2)];
-        let link = plain_link(&args);
-        let ops = run_insert_renamings(&link, &args);
+        let ops = run_insert_renamings(&args, &args);
         assert_eq!(ops, Vec::<FlatOp>::new());
     }
 
     #[test]
     fn insert_renamings_emits_move_for_acyclic_rename() {
-        let link = plain_link(&[ValueId(0)]);
-        let ops = run_insert_renamings(&link, &[ValueId(1)]);
+        let ops = run_insert_renamings(&[ValueId(0)], &[ValueId(1)]);
         assert_eq!(
             ops,
             vec![FlatOp::Move {
@@ -2465,8 +2490,10 @@ mod tests {
 
     #[test]
     fn insert_renamings_emits_move_for_constant_source() {
-        let link = Link::new_mixed(vec![LinkArg::Const(ConstValue::Int(7))], BlockId(0), None);
-        let ops = run_insert_renamings(&link, &[ValueId(1)]);
+        let ops = run_insert_renamings_with_const(
+            vec![LinkArg::Const(ConstValue::Int(7))],
+            &[ValueId(1)],
+        );
         assert_eq!(
             ops,
             vec![FlatOp::Move {
@@ -2478,8 +2505,7 @@ mod tests {
 
     #[test]
     fn insert_renamings_breaks_swap_cycle_with_push_pop() {
-        let link = plain_link(&[ValueId(0), ValueId(1)]);
-        let ops = run_insert_renamings(&link, &[ValueId(1), ValueId(0)]);
+        let ops = run_insert_renamings(&[ValueId(0), ValueId(1)], &[ValueId(1), ValueId(0)]);
         assert_eq!(
             ops,
             vec![
@@ -2498,9 +2524,8 @@ mod tests {
     /// tests color identity, not ValueId identity.
     #[test]
     fn insert_renamings_skips_coalesced_same_color() {
-        let link = plain_link(&[ValueId(0)]);
         let ops = run_insert_renamings_with_coloring(
-            &link,
+            &[ValueId(0)],
             &[ValueId(1)],
             &[(RegKind::Int, &[(0, 7), (1, 7)])],
         );
@@ -2510,9 +2535,8 @@ mod tests {
     /// Color-level 2-cycle must emit Push/Move/Pop, not two naive Moves.
     #[test]
     fn insert_renamings_detects_cycle_at_color_level() {
-        let link = plain_link(&[ValueId(0), ValueId(2)]);
         let ops = run_insert_renamings_with_coloring(
-            &link,
+            &[ValueId(0), ValueId(2)],
             &[ValueId(1), ValueId(3)],
             &[(RegKind::Int, &[(0, 0), (1, 1), (2, 1), (3, 0)])],
         );
@@ -2532,9 +2556,8 @@ mod tests {
     /// float.  Within a kind, sort by dst color.
     #[test]
     fn insert_renamings_groups_by_kind_and_sorts_by_dst() {
-        let link = plain_link(&[ValueId(0), ValueId(10), ValueId(2)]);
         let ops = run_insert_renamings_with_coloring(
-            &link,
+            &[ValueId(0), ValueId(10), ValueId(2)],
             &[ValueId(1), ValueId(11), ValueId(3)],
             &[
                 (RegKind::Int, &[(0, 0), (1, 3), (2, 1), (3, 2)]),
@@ -2669,9 +2692,9 @@ mod tests {
             entry,
             Some(ExitSwitch::Value(cond)),
             vec![
-                Link::new(Vec::new(), true_block, Some(ExitCase::Bool(true)))
+                Link::new(&graph, Vec::new(), true_block, Some(ExitCase::Bool(true)))
                     .with_llexitcase(ConstValue::Bool(true)),
-                Link::new(Vec::new(), false_block, Some(ExitCase::Bool(false)))
+                Link::new(&graph, Vec::new(), false_block, Some(ExitCase::Bool(false)))
                     .with_llexitcase(ConstValue::Bool(false)),
             ],
         );
@@ -2764,35 +2787,42 @@ mod tests {
             entry,
             Some(crate::model::ExitSwitch::LastException),
             vec![
-                Link::new(vec![result], graph.returnblock, None),
+                Link::new(&graph, vec![result], graph.returnblock, None),
                 Link::new_mixed(
-                    vec![LinkArg::from(value_error.clone()), LinkArg::from(ha_v)],
+                    vec![
+                        LinkArg::from(value_error.clone()),
+                        LinkArg::value(&graph, ha_v),
+                    ],
                     handler_a,
                     Some(ExitCase::Const(value_error.clone())),
                 )
                 .with_llexitcase(ConstValue::Int(1))
                 .extravars(
                     Some(LinkArg::from(value_error)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
                 Link::new_mixed(
-                    vec![LinkArg::from(key_error.clone()), LinkArg::from(hb_v)],
+                    vec![
+                        LinkArg::from(key_error.clone()),
+                        LinkArg::value(&graph, hb_v),
+                    ],
                     handler_b,
                     Some(ExitCase::Const(key_error.clone())),
                 )
                 .with_llexitcase(ConstValue::Int(2))
                 .extravars(
                     Some(LinkArg::from(key_error)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
                 Link::new(
+                    &graph,
                     vec![last_exception, last_exc_value],
                     exc_block,
                     Some(crate::model::exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::from(last_exception)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exception)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
             ],
         );

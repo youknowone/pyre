@@ -1489,7 +1489,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1529,7 +1529,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1577,7 +1577,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1835,7 +1835,7 @@ fn id(x: &Foo) -> &Foo { x }
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1890,7 +1890,7 @@ fn id(x: &Foo) -> &Foo { x }
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -1998,7 +1998,7 @@ fn fib(n: i64) -> i64 {
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -2052,7 +2052,7 @@ fn fib(n: i64) -> i64 {
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -2120,7 +2120,7 @@ fn fib(n: i64) -> i64 {
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             dead: false,
@@ -2161,7 +2161,7 @@ fn fib(n: i64) -> i64 {
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(10))],
+                vec![LinkArg::value(&callee_graph, ValueId(10))],
                 callee_graph.returnblock,
             )],
             dead: false,

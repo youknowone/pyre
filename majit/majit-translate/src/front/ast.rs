@@ -2024,9 +2024,10 @@ fn allocate_loop_header_phis(
             .expect("OpKind::Input always produces a result");
         graph.name_value(phi_vid, name.clone());
         graph.push_inputarg(header_entry, phi_vid);
+        let entry_arg = LinkArg::value(graph, entry_vid);
         graph.block_mut(pre_loop_block).exits[0]
             .args
-            .push(LinkArg::from(entry_vid));
+            .push(entry_arg);
         ctx.bind_local_id(name.clone(), phi_vid, header_entry);
         ctx.local_value_types.insert(name.clone(), value_type);
         header_phi_names.push(name);
@@ -2758,7 +2759,9 @@ fn lazy_install_local_at_current_block(
         );
         let popped_inputarg = block.inputargs.pop();
         debug_assert_eq!(
-            popped_inputarg.as_ref().and_then(|var| graph.value_id_of(var)),
+            popped_inputarg
+                .as_ref()
+                .and_then(|var| graph.value_id_of(var)),
             Some(new_vid),
         );
         match prior_ctx_lvi {
@@ -2794,9 +2797,8 @@ fn lazy_install_local_at_current_block(
     }
 
     for (pred_block, exit_idx, pred_vid) in pred_link_args {
-        graph.block_mut(pred_block).exits[exit_idx]
-            .args
-            .push(crate::model::LinkArg::Value(pred_vid));
+        let arg = crate::model::LinkArg::value(graph, pred_vid);
+        graph.block_mut(pred_block).exits[exit_idx].args.push(arg);
     }
 
     Some(new_vid)
@@ -5687,26 +5689,21 @@ fn lower_expr(
             let last_exc_value = graph.alloc_value();
             let exc_block = graph.exceptblock;
             graph.set_goto(*block, continuation, vec![inner]);
+            let normal_link = Link::new(graph, vec![inner], continuation, None);
+            let exc_link = Link::new(
+                graph,
+                vec![last_exception, last_exc_value],
+                exc_block,
+                Some(exception_exitcase()),
+            )
+            .extravars(
+                Some(LinkArg::value(graph, last_exception)),
+                Some(LinkArg::value(graph, last_exc_value)),
+            );
             graph.set_control_flow_metadata(
                 *block,
                 Some(ExitSwitch::LastException),
-                vec![
-                    // RPython `flowcontext.py:141` `Link(vars=[], egg, case=None)`
-                    // for the normal fall-through.
-                    Link::new(vec![inner], continuation, None),
-                    // RPython `flowcontext.py:141-143` `link = Link(vars, egg, case)`
-                    // + `link.extravars(last_exception=..., last_exc_value=...)`
-                    // with `case is Exception`.
-                    Link::new(
-                        vec![last_exception, last_exc_value],
-                        exc_block,
-                        Some(exception_exitcase()),
-                    )
-                    .extravars(
-                        Some(LinkArg::from(last_exception)),
-                        Some(LinkArg::from(last_exc_value)),
-                    ),
-                ],
+                vec![normal_link, exc_link],
             );
             *block = continuation;
             Ok(Lowered::value(continuation_arg))
@@ -7353,10 +7350,15 @@ fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<
                     continue;
                 }
                 let source_ty = match link.args.get(arg_index)? {
-                    LinkArg::Value(source) => match graph_result_value_type(graph, *source) {
-                        Some(ty) => ty,
-                        None => continue,
-                    },
+                    arg @ LinkArg::Value(_) => {
+                        let Some(source) = arg.as_value(graph) else {
+                            continue;
+                        };
+                        match graph_result_value_type(graph, source) {
+                            Some(ty) => ty,
+                            None => continue,
+                        }
+                    }
                     // RPython `flowspace/model.py:Constant.concretetype`
                     // — `Link.args` may carry constants whose lltype is
                     // determined by the constant's Python class; the
@@ -11327,7 +11329,8 @@ mod tests {
         assert_eq!(entry.exits[0].target, func.graph.returnblock);
         assert_eq!(
             entry.exits[0].args,
-            vec![crate::model::LinkArg::from(
+            vec![crate::model::LinkArg::value(
+                &func.graph,
                 entry.operations[0].result.expect("const result"),
             )],
         );
@@ -11350,7 +11353,10 @@ mod tests {
         // RPython `flowcontext.py` emits a fresh Variable on the
         // prevblock side for `return None`; the returnblock's own
         // inputarg stays distinct.
-        let returnblock_arg = func.graph.block(func.graph.returnblock).inputarg_value_ids(&func.graph)[0];
+        let returnblock_arg = func
+            .graph
+            .block(func.graph.returnblock)
+            .inputarg_value_ids(&func.graph)[0];
         // Upstream `flowspace/model.py:171-180` keeps the void return shape
         // in Block.exits: a single Link([fresh_void], graph.returnblock)
         // with exitswitch=None.
@@ -11360,7 +11366,7 @@ mod tests {
         assert_eq!(entry.exits[0].target, func.graph.returnblock);
         assert_eq!(entry.exits[0].args.len(), 1);
         assert_ne!(
-            entry.exits[0].args[0].as_value(),
+            entry.exits[0].args[0].as_value(&func.graph),
             Some(returnblock_arg),
             "void return must allocate a fresh prevblock-side ValueId (`flowspace/model.py:114`), \
              not reuse the returnblock's own inputarg"
@@ -11964,7 +11970,7 @@ mod tests {
         let pre_exit = &graph.block(pre_loop_block).exits[0];
         assert_eq!(
             pre_exit.args,
-            vec![LinkArg::Value(pre_x)],
+            vec![LinkArg::value(&graph, pre_x)],
             "forward-edge link arg for `x` must carry the pre-loop vid"
         );
 
@@ -12088,7 +12094,9 @@ mod tests {
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OpKind::Input { name, .. } if header_inputarg_vids.contains(&op.result.unwrap()) => {
+                OpKind::Input { name, .. }
+                    if header_inputarg_vids.contains(&op.result.unwrap()) =>
+                {
                     Some(name.as_str())
                 }
                 _ => None,
@@ -12151,7 +12159,9 @@ mod tests {
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OpKind::Input { name, .. } if header_inputarg_vids.contains(&op.result.unwrap()) => {
+                OpKind::Input { name, .. }
+                    if header_inputarg_vids.contains(&op.result.unwrap()) =>
+                {
                     Some(name.as_str())
                 }
                 _ => None,
@@ -12335,7 +12345,10 @@ mod tests {
             let inputarg_vids = b.inputarg_value_ids(&graph);
             b.operations.iter().any(|op| {
                 matches!(&op.kind, OpKind::Input { name, .. } if name == "x")
-                    && op.result.map(|r| inputarg_vids.contains(&r)).unwrap_or(false)
+                    && op
+                        .result
+                        .map(|r| inputarg_vids.contains(&r))
+                        .unwrap_or(false)
             })
         });
         assert!(
@@ -12526,10 +12539,7 @@ mod tests {
         let pred_link: Option<(BlockId, ValueId)> = graph.blocks.iter().find_map(|b| {
             b.exits.iter().find_map(|exit| {
                 if exit.target == returnblock_id {
-                    let arg_vid = match &exit.args[0] {
-                        crate::model::LinkArg::Value(v) => *v,
-                        _ => return None,
-                    };
+                    let arg_vid = exit.args[0].as_value(&graph)?;
                     Some((b.id, arg_vid))
                 } else {
                     None

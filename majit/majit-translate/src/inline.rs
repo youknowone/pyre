@@ -144,6 +144,8 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             let remapped_after_ops = remap_value_in_ops(&after_ops, original_result, args[0]);
             graph.blocks[id.0].operations = remapped_after_ops;
             let (remapped_switch, remapped_exits) = remap_control_flow_metadata(
+                graph,
+                graph,
                 &after_exitswitch,
                 &after_exits,
                 |v| if v == original_result { args[0] } else { v },
@@ -154,8 +156,14 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         } else {
             let id = graph.create_block();
             graph.blocks[id.0].operations = after_ops;
-            let (remapped_switch, remapped_exits) =
-                remap_control_flow_metadata(&after_exitswitch, &after_exits, |v| v, |b| b);
+            let (remapped_switch, remapped_exits) = remap_control_flow_metadata(
+                graph,
+                graph,
+                &after_exitswitch,
+                &after_exits,
+                |v| v,
+                |b| b,
+            );
             graph.set_control_flow_metadata(id, remapped_switch, remapped_exits);
             (id, vec![])
         };
@@ -240,6 +248,8 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             // stamps `prevblock` on every link per
             // `flowspace/model.py:120`.
             let (exitswitch, exits) = remap_control_flow_metadata(
+                &callee,
+                graph,
                 &callee_block.exitswitch,
                 &callee_block.exits,
                 |v| value_map[&v],
@@ -311,17 +321,17 @@ fn remap_callee_values(
         // the value map before `remap_control_flow_metadata` runs.
         for link in &block.exits {
             for arg in &link.args {
-                if let Some(v) = arg.as_value() {
+                if let Some(v) = arg.as_value(callee) {
                     map.entry(v).or_insert_with(|| graph.alloc_value());
                 }
             }
             if let Some(arg) = &link.last_exception {
-                if let Some(v) = arg.as_value() {
+                if let Some(v) = arg.as_value(callee) {
                     map.entry(v).or_insert_with(|| graph.alloc_value());
                 }
             }
             if let Some(arg) = &link.last_exc_value {
-                if let Some(v) = arg.as_value() {
+                if let Some(v) = arg.as_value(callee) {
                     map.entry(v).or_insert_with(|| graph.alloc_value());
                 }
             }
@@ -1257,14 +1267,19 @@ fn remap_value_in_graph(
 ) {
     let target_blocks: Vec<BlockId> = block_map.values().copied().collect();
     for &bid in &target_blocks {
+        let (exitswitch, exits) = {
+            let block = &graph.blocks[bid.0];
+            remap_control_flow_metadata(
+                graph,
+                graph,
+                &block.exitswitch,
+                &block.exits,
+                |v| if v == old { new } else { v },
+                |b| b,
+            )
+        };
         let block = &mut graph.blocks[bid.0];
         block.operations = remap_value_in_ops(&block.operations, old, new);
-        let (exitswitch, exits) = remap_control_flow_metadata(
-            &block.exitswitch,
-            &block.exits,
-            |v| if v == old { new } else { v },
-            |b| b,
-        );
         block.exitswitch = exitswitch;
         block.exits = exits;
     }

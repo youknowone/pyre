@@ -77,10 +77,7 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
                     ns.remove(&vold);
                     if n != vnew {
                         ns.insert(vnew.clone());
-                        self.neighbours
-                            .entry(vnew.clone())
-                            .or_default()
-                            .insert(n);
+                        self.neighbours.entry(vnew.clone()).or_default().insert(n);
                     }
                 }
             }
@@ -90,9 +87,7 @@ impl<N: Eq + std::hash::Hash + Clone> DependencyGraph<N> {
     /// RPython: `regalloc.py:105` `v0 not in dg.neighbours[w0]`.
     /// Returns true iff there is an interference edge between `v1` and `v2`.
     pub fn has_edge(&self, v1: &N, v2: &N) -> bool {
-        self.neighbours
-            .get(v1)
-            .map_or(false, |ns| ns.contains(v2))
+        self.neighbours.get(v1).map_or(false, |ns| ns.contains(v2))
     }
 
     fn getnodes(&self) -> Vec<N> {
@@ -196,11 +191,7 @@ impl<N: Eq + std::hash::Hash + Clone> UnionFind<N> {
         }
         let w1 = self.weight.get(&rep1).copied().unwrap_or(1);
         let w2 = self.weight.get(&rep2).copied().unwrap_or(1);
-        let (winner, loser) = if w1 >= w2 {
-            (rep1, rep2)
-        } else {
-            (rep2, rep1)
-        };
+        let (winner, loser) = if w1 >= w2 { (rep1, rep2) } else { (rep2, rep1) };
         self.parent.insert(loser.clone(), winner.clone());
         self.weight.remove(&loser);
         *self.weight.entry(winner.clone()).or_insert(0) = w1 + w2;
@@ -285,8 +276,8 @@ impl RegAllocator {
         // branch condition.
         for link in &block.exits {
             for arg in &link.args {
-                if let Some(var) = arg.as_variable(graph) {
-                    die_at.remove(&var);
+                if let Some(var) = arg.as_variable() {
+                    die_at.remove(var);
                 }
             }
         }
@@ -312,8 +303,7 @@ impl RegAllocator {
                 self.depgraph.add_edge(livevars[j].clone(), v.clone());
             }
         }
-        let mut alive: HashSet<crate::flowspace::model::Variable> =
-            livevars.into_iter().collect();
+        let mut alive: HashSet<crate::flowspace::model::Variable> = livevars.into_iter().collect();
 
         // Scan ops, kill at die_at, add interference edges
         let mut die_index = 0;
@@ -354,19 +344,19 @@ impl RegAllocator {
                 // it (`color.py:25-27 getnodes()` filters
                 // `all_nodes` by `neighbours.contains_key`).
                 if let Some(arg) = &link.last_exception {
-                    if let Some(v) = arg.as_value() {
+                    if let Some(v) = arg.as_value(graph) {
                         if consider(v) {
-                            if let Some(var) = arg.as_variable(graph) {
-                                self.depgraph.add_node(var);
+                            if let Some(var) = arg.as_variable() {
+                                self.depgraph.add_node(var.clone());
                             }
                         }
                     }
                 }
                 if let Some(arg) = &link.last_exc_value {
-                    if let Some(v) = arg.as_value() {
+                    if let Some(v) = arg.as_value(graph) {
                         if consider(v) {
-                            if let Some(var) = arg.as_variable(graph) {
-                                self.depgraph.add_node(var);
+                            if let Some(var) = arg.as_variable() {
+                                self.depgraph.add_node(var.clone());
                             }
                         }
                     }
@@ -374,7 +364,7 @@ impl RegAllocator {
                 let target_block = graph.block(link.target);
                 let target_vids = target_block.inputarg_value_ids(graph);
                 for (v, &w) in link.args.iter().zip(target_vids.iter()) {
-                    if let Some(v) = v.as_value() {
+                    if let Some(v) = v.as_value(graph) {
                         if consider(v) {
                             self.depgraph.add_node(Self::var(graph, v));
                         }
@@ -452,21 +442,13 @@ impl RegAllocResult {
     /// reads `coloring[var]`.  Returns `None` when the slot has no
     /// backing Variable or no coloring (Void / Unknown / different
     /// kind class).
-    pub fn color_for(
-        &self,
-        graph: &crate::model::FunctionGraph,
-        v: ValueId,
-    ) -> Option<usize> {
+    pub fn color_for(&self, graph: &crate::model::FunctionGraph, v: ValueId) -> Option<usize> {
         let var = graph.variable(v)?;
         self.coloring.get(var).copied()
     }
 
     /// `true` iff `v` has a coloring in this kind class.
-    pub fn contains_value(
-        &self,
-        graph: &crate::model::FunctionGraph,
-        v: ValueId,
-    ) -> bool {
+    pub fn contains_value(&self, graph: &crate::model::FunctionGraph, v: ValueId) -> bool {
         match graph.variable(v) {
             Some(var) => self.coloring.contains_key(var),
             None => false,
@@ -497,9 +479,7 @@ impl RegAllocResult {
 /// `Variable.concretetype` cell via `graph.set_concretetype`
 /// instead of returning a transitional HashMap.
 pub fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
-    let except_args = graph
-        .block(graph.exceptblock)
-        .inputarg_value_ids(graph);
+    let except_args = graph.block(graph.exceptblock).inputarg_value_ids(graph);
     if except_args.len() == 2 {
         if matches!(graph.concretetype(except_args[0]), ConcreteType::Unknown) {
             graph.set_concretetype(except_args[0], ConcreteType::Signed);
@@ -519,9 +499,7 @@ pub fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
 /// `&HashMap<ValueId, RegKind>` parameter — the graph IS the table
 /// now.  Canonical exceptblock inputargs are stamped on the graph
 /// up-front via [`augment_canonical_exceptblock_on_graph`].
-pub fn perform_all_register_allocations(
-    graph: &FunctionGraph,
-) -> HashMap<RegKind, RegAllocResult> {
+pub fn perform_all_register_allocations(graph: &FunctionGraph) -> HashMap<RegKind, RegAllocResult> {
     let mut result = HashMap::new();
     for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
         result.insert(kind, perform_register_allocation(graph, kind));
@@ -533,11 +511,9 @@ pub fn perform_all_register_allocations(
 /// port.  Runs on FunctionGraph (Block structure), BEFORE flatten.
 /// Reads kind from `graph.concretetype(v)` exactly like upstream
 /// reads `getkind(v.concretetype)`.
-pub fn perform_register_allocation(
-    graph: &FunctionGraph,
-    kind: RegKind,
-) -> RegAllocResult {
-    let consider = |v: ValueId| -> bool { concretetype_to_regkind(&graph.concretetype(v)) == Some(kind) };
+pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegAllocResult {
+    let consider =
+        |v: ValueId| -> bool { concretetype_to_regkind(&graph.concretetype(v)) == Some(kind) };
     let mut allocator = RegAllocator::new();
     allocator.make_dependencies(graph, &consider);
     allocator.coalesce_variables(graph, &consider);

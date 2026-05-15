@@ -904,9 +904,21 @@ pub struct Link {
 }
 
 impl Link {
-    pub fn new(args: Vec<ValueId>, target: BlockId, exitcase: Option<ExitCase>) -> Self {
+    /// `Link::new` — convenience constructor that projects each
+    /// `ValueId` arg through [`FunctionGraph::variable`] to its
+    /// backing [`crate::flowspace::model::Variable`] for the
+    /// upstream-orthodox `Link.args: List[Hlvalue]` shape
+    /// (`flowspace/model.py:140`).  The graph parameter is
+    /// load-bearing — without it the `ValueId → Variable`
+    /// projection cannot happen at construction.
+    pub fn new(
+        graph: &FunctionGraph,
+        args: Vec<ValueId>,
+        target: BlockId,
+        exitcase: Option<ExitCase>,
+    ) -> Self {
         Self::new_mixed(
-            args.into_iter().map(LinkArg::from).collect(),
+            args.into_iter().map(|v| LinkArg::value(graph, v)).collect(),
             target,
             exitcase,
         )
@@ -971,76 +983,61 @@ pub fn exception_exitcase() -> ExitCase {
 
 /// RPython `Link.args` items are Variables or Constants —
 /// `Link.args: List[Hlvalue]` (`flowspace/model.py:140`) where
-/// `Hlvalue = Variable | Constant`.  Pyre currently stores the
-/// dense `ValueId` index in the `Value` arm — the upstream-orthodox
-/// `Variable` storage flip requires threading
-/// `&FunctionGraph` through `Link::new` (510 call sites) so the
-/// `ValueId → Variable` projection happens at construction.  The
-/// foundation ([`Self::value`] constructor + [`Self::as_variable`]
-/// accessor + [`Self::as_value_id`] projection sibling) is in place
-/// so production readers can adopt Variable-identity reads
-/// incrementally.
+/// `Hlvalue = Variable | Constant`.  Pyre stores the
+/// upstream-orthodox `flowspace::model::Variable` directly so
+/// operand identity at link sites matches upstream line-for-line;
+/// the dense `ValueId` index is projected back via
+/// `graph.value_id_of(&var)` when downstream readers still key
+/// HashMap<ValueId, _> structures on the legacy index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkArg {
-    Value(ValueId),
+    Value(crate::flowspace::model::Variable),
     Const(ConstValue),
 }
 
 impl LinkArg {
-    /// Read the link-arg's `ValueId` directly from storage — the
-    /// pre-storage-migration accessor.  Once `LinkArg::Value`
-    /// flips to `Variable` storage, this becomes the projection
-    /// path through [`FunctionGraph::value_id_of`].
-    pub fn as_value(&self) -> Option<ValueId> {
+    /// Construct a `LinkArg::Value` from a [`ValueId`] — looks up
+    /// the backing Variable via [`FunctionGraph::variable`].
+    /// Replaces the lossy `From<ValueId>` impl that could not carry
+    /// the Variable identity.
+    pub fn value(graph: &FunctionGraph, vid: ValueId) -> Self {
+        let var = graph
+            .variable(vid)
+            .unwrap_or_else(|| {
+                panic!(
+                    "LinkArg::value: ValueId {vid:?} must have a backing Variable on graph {:?}",
+                    graph.name,
+                )
+            })
+            .clone();
+        Self::Value(var)
+    }
+
+    /// Project the link-arg's backing Variable to pyre's dense
+    /// `ValueId` via [`FunctionGraph::value_id_of`].  Returns
+    /// `None` for constants and for Variables not registered on the
+    /// graph.  This is the migration path for legacy ValueId-keyed
+    /// readers; pure Variable-identity readers should use
+    /// [`Self::as_variable`] instead.
+    pub fn as_value(&self, graph: &FunctionGraph) -> Option<ValueId> {
         match self {
-            Self::Value(value) => Some(*value),
+            Self::Value(var) => graph.value_id_of(var),
             Self::Const(_) => None,
         }
     }
 
-    /// Variable-identity sibling of [`Self::as_value`] — projects
-    /// the link-arg's `ValueId` through `graph.variable(v)` to its
-    /// backing [`crate::flowspace::model::Variable`].  Returns
-    /// `None` for constant args and for slots whose backing
-    /// Variable is missing on the graph.  Once `LinkArg::Value`
-    /// flips to `Variable` storage this becomes a direct read of
-    /// the stored Variable, no graph projection needed.
+    /// Read the backing [`crate::flowspace::model::Variable`] for a
+    /// `LinkArg::Value`; `None` for constants.  Direct over the
+    /// upstream-orthodox storage — no graph projection needed.
     ///
     /// RPython parity: `Link.args` upstream is `List[Hlvalue]` where
     /// each `Hlvalue::Variable` carries the operand identity inline
-    /// (`flowspace/model.py:140`); pyre's adapter projects through
-    /// the graph instead of storing the Variable in the LinkArg
-    /// (until the storage flip lands).
-    pub fn as_variable(
-        &self,
-        graph: &FunctionGraph,
-    ) -> Option<crate::flowspace::model::Variable> {
+    /// (`flowspace/model.py:140`).
+    pub fn as_variable(&self) -> Option<&crate::flowspace::model::Variable> {
         match self {
-            Self::Value(value) => graph.variable(*value).cloned(),
+            Self::Value(var) => Some(var),
             Self::Const(_) => None,
         }
-    }
-
-    /// Construct a `LinkArg::Value` from a [`ValueId`] — looks up
-    /// the backing Variable via [`FunctionGraph::variable`] and
-    /// debug-asserts it exists on the graph.  Identity wrapper
-    /// over the current `Self::Value(vid)` storage; once the storage
-    /// flips to `Variable` this becomes the canonical constructor
-    /// (the lossy [`From<ValueId>`] impl is removed at the same
-    /// time).
-    pub fn value(graph: &FunctionGraph, vid: ValueId) -> Self {
-        debug_assert!(
-            graph.variable(vid).is_some(),
-            "LinkArg::value: ValueId {vid:?} must have a backing Variable on graph {:?}",
-            graph.name,
-        );
-        Self::Value(vid)
-    }
-}
-
-impl From<ValueId> for LinkArg {
-    fn from(value: ValueId) -> Self {
-        Self::Value(value)
     }
 }
 
@@ -1534,9 +1531,9 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
                 let new_args: Vec<LinkArg> = target_exit
                     .args
                     .iter()
-                    .map(|arg| match arg {
-                        LinkArg::Value(v) => subst.get(v).cloned().unwrap_or_else(|| arg.clone()),
-                        LinkArg::Const(_) => arg.clone(),
+                    .map(|arg| match arg.as_value(graph) {
+                        Some(v) => subst.get(&v).cloned().unwrap_or_else(|| arg.clone()),
+                        None => arg.clone(),
                     })
                     .collect();
                 // upstream: `link.target = exit.target`.
@@ -1798,8 +1795,8 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
             );
             let target_vids = target_block.inputarg_value_ids(graph);
             for (arg, target_iarg) in link.args.iter().zip(target_vids.iter().copied()) {
-                if let LinkArg::Value(arg_vid) = arg {
-                    dependencies.entry(target_iarg).or_default().push(*arg_vid);
+                if let Some(arg_vid) = arg.as_value(graph) {
+                    dependencies.entry(target_iarg).or_default().push(arg_vid);
                 }
             }
         }
@@ -1987,6 +1984,8 @@ impl Block {
 /// can reshape both the exitswitch variable and every exit link in one
 /// call.
 pub fn remap_control_flow_metadata<FValue, FBlock>(
+    source: &FunctionGraph,
+    target: &FunctionGraph,
     exitswitch: &Option<ExitSwitch>,
     exits: &[Link],
     remap_value: FValue,
@@ -1996,6 +1995,15 @@ where
     FValue: Fn(ValueId) -> ValueId,
     FBlock: Fn(BlockId) -> BlockId,
 {
+    let remap_link_arg = |arg: &LinkArg| -> LinkArg {
+        match arg {
+            LinkArg::Value(_) => match arg.as_value(source) {
+                Some(vid) => LinkArg::value(target, remap_value(vid)),
+                None => arg.clone(),
+            },
+            LinkArg::Const(value) => LinkArg::Const(value.clone()),
+        }
+    };
     let exitswitch = exitswitch.as_ref().map(|switch| match switch {
         ExitSwitch::Value(value) => ExitSwitch::Value(remap_value(*value)),
         ExitSwitch::LastException => ExitSwitch::LastException,
@@ -2003,26 +2011,13 @@ where
     let exits = exits
         .iter()
         .map(|link| Link {
-            args: link
-                .args
-                .iter()
-                .map(|arg| match arg {
-                    LinkArg::Value(value) => LinkArg::Value(remap_value(*value)),
-                    LinkArg::Const(value) => LinkArg::Const(value.clone()),
-                })
-                .collect(),
+            args: link.args.iter().map(&remap_link_arg).collect(),
             target: remap_block(link.target),
             exitcase: link.exitcase.clone(),
             prevblock: link.prevblock.map(&remap_block),
             llexitcase: link.llexitcase.clone(),
-            last_exception: link.last_exception.as_ref().map(|arg| match arg {
-                LinkArg::Value(value) => LinkArg::Value(remap_value(*value)),
-                LinkArg::Const(value) => LinkArg::Const(value.clone()),
-            }),
-            last_exc_value: link.last_exc_value.as_ref().map(|arg| match arg {
-                LinkArg::Value(value) => LinkArg::Value(remap_value(*value)),
-                LinkArg::Const(value) => LinkArg::Const(value.clone()),
-            }),
+            last_exception: link.last_exception.as_ref().map(&remap_link_arg),
+            last_exc_value: link.last_exc_value.as_ref().map(&remap_link_arg),
         })
         .collect();
     (exitswitch, exits)
@@ -2207,9 +2202,7 @@ fn concrete_to_canonical_lltype(
         ConcreteType::Signed => Some(LowLevelType::Signed),
         ConcreteType::Float => Some(LowLevelType::Float),
         ConcreteType::Void => Some(LowLevelType::Void),
-        ConcreteType::GcRef => {
-            Some(crate::translator::rtyper::rclass::OBJECTPTR.clone())
-        }
+        ConcreteType::GcRef => Some(crate::translator::rtyper::rclass::OBJECTPTR.clone()),
         ConcreteType::Unknown => None,
     }
 }
@@ -2367,11 +2360,7 @@ impl FunctionGraph {
             ],
             notes: Vec::new(),
             next_value: 3,
-            value_variables: vec![
-                Some(var_returnvar),
-                Some(var_etype),
-                Some(var_evalue),
-            ],
+            value_variables: vec![Some(var_returnvar), Some(var_etype), Some(var_evalue)],
             value_names: std::collections::HashMap::new(),
             variable_to_vid,
             return_type: None,
@@ -2492,10 +2481,7 @@ impl FunctionGraph {
     /// [`crate::flowspace::model::Variable::concretetype`] is the
     /// authoritative kind source for this slot via
     /// [`Self::concretetype`].
-    pub fn alloc_value_with_variable(
-        &mut self,
-        var: crate::flowspace::model::Variable,
-    ) -> ValueId {
+    pub fn alloc_value_with_variable(&mut self, var: crate::flowspace::model::Variable) -> ValueId {
         let id = ValueId(self.next_value);
         self.next_value += 1;
         debug_assert_eq!(
@@ -2518,11 +2504,10 @@ impl FunctionGraph {
     /// the kind source for the slot.
     pub fn bind_variable(&mut self, v: ValueId, var: crate::flowspace::model::Variable) {
         if v.0 >= self.value_variables.len() {
-            self.value_variables
-                .resize_with(v.0 + 1, || {
-                    let placeholder = crate::flowspace::model::Variable::new();
-                    Some(placeholder)
-                });
+            self.value_variables.resize_with(v.0 + 1, || {
+                let placeholder = crate::flowspace::model::Variable::new();
+                Some(placeholder)
+            });
             // Re-register the placeholders that just got minted so
             // `value_id_of` lookups against them still succeed.
             for (idx, slot) in self.value_variables.iter().enumerate() {
@@ -2550,10 +2535,7 @@ impl FunctionGraph {
     /// when an upstream-orthodox Variable-keyed structure
     /// (`Block.inputargs: Vec<Variable>`) needs to project back to
     /// pyre's index-keyed slots (HashMap<ValueId, _> downstream).
-    pub fn value_id_of(
-        &self,
-        var: &crate::flowspace::model::Variable,
-    ) -> Option<ValueId> {
+    pub fn value_id_of(&self, var: &crate::flowspace::model::Variable) -> Option<ValueId> {
         self.variable_to_vid.get(&var.id()).copied()
     }
 
@@ -2672,9 +2654,7 @@ impl FunctionGraph {
             // &[ValueId(N)])` for a slot grown via `set_next_value`.
             for idx in starting_len..next {
                 if let Some(Some(var)) = self.value_variables.get(idx) {
-                    self.variable_to_vid
-                        .entry(var.id())
-                        .or_insert(ValueId(idx));
+                    self.variable_to_vid.entry(var.id()).or_insert(ValueId(idx));
                 }
             }
         }
@@ -2753,7 +2733,8 @@ impl FunctionGraph {
     /// equivalent: `block.closeblock(Link(args, target))`
     /// (`flowspace/model.py:304`).
     pub fn set_goto(&mut self, block: BlockId, target: BlockId, args: Vec<ValueId>) {
-        self.set_control_flow_metadata(block, None, vec![Link::new(args, target, None)]);
+        let link = Link::new(self, args, target, None);
+        self.set_control_flow_metadata(block, None, vec![link]);
     }
 
     /// Shorthand for the boolean-branch shape — two Links with
@@ -2772,15 +2753,14 @@ impl FunctionGraph {
         if_false: BlockId,
         false_args: Vec<ValueId>,
     ) {
+        let false_link = Link::new(self, false_args, if_false, Some(ExitCase::Bool(false)))
+            .with_llexitcase_from_exitcase();
+        let true_link = Link::new(self, true_args, if_true, Some(ExitCase::Bool(true)))
+            .with_llexitcase_from_exitcase();
         self.set_control_flow_metadata(
             block,
             Some(ExitSwitch::Value(cond)),
-            vec![
-                Link::new(false_args, if_false, Some(ExitCase::Bool(false)))
-                    .with_llexitcase_from_exitcase(),
-                Link::new(true_args, if_true, Some(ExitCase::Bool(true)))
-                    .with_llexitcase_from_exitcase(),
-            ],
+            vec![false_link, true_link],
         );
     }
 
@@ -3043,7 +3023,7 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let entry = graph.startblock;
         let next = graph.create_block();
-        graph.set_control_flow_metadata(entry, None, vec![Link::new(vec![], next, None)]);
+        graph.set_control_flow_metadata(entry, None, vec![Link::new(&graph, vec![], next, None)]);
         assert_eq!(graph.block(entry).exits[0].prevblock, Some(entry));
     }
 
@@ -3070,7 +3050,10 @@ mod tests {
         assert_eq!(entry_block.exits.len(), 1);
         assert_eq!(entry_block.exits[0].prevblock, Some(entry));
         assert_eq!(entry_block.exits[0].target, graph.returnblock);
-        assert_eq!(entry_block.exits[0].args, vec![LinkArg::from(value)]);
+        assert_eq!(
+            entry_block.exits[0].args,
+            vec![LinkArg::value(&graph, value)]
+        );
     }
 
     #[test]
@@ -3090,7 +3073,7 @@ mod tests {
         let target = graph.create_block();
         graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
 
-        graph.recloseblock(entry, vec![Link::new(vec![], target, None)]);
+        graph.recloseblock(entry, vec![Link::new(&graph, vec![], target, None)]);
 
         assert_eq!(graph.block(entry).exitswitch, Some(ExitSwitch::Value(cond)));
         assert_eq!(graph.block(entry).exits[0].prevblock, Some(entry));
@@ -3104,8 +3087,8 @@ mod tests {
         let first = graph.create_block();
         let second = graph.create_block();
 
-        graph.closeblock(entry, vec![Link::new(vec![], first, None)]);
-        graph.closeblock(entry, vec![Link::new(vec![], second, None)]);
+        graph.closeblock(entry, vec![Link::new(&graph, vec![], first, None)]);
+        graph.closeblock(entry, vec![Link::new(&graph, vec![], second, None)]);
     }
 
     #[test]
@@ -3424,16 +3407,15 @@ mod tests {
         // but for the test we need only the link arity to match.
         let etype = graph.push_op(entry, OpKind::ConstInt(0), true).unwrap();
         let evalue = graph.push_op(entry, OpKind::ConstInt(0), true).unwrap();
+        let normal_arg = LinkArg::value(&graph, raising);
+        let exc_etype_arg = LinkArg::value(&graph, etype);
+        let exc_evalue_arg = LinkArg::value(&graph, evalue);
         {
             let block = graph.block_mut(entry);
             block.exitswitch = Some(ExitSwitch::LastException);
             block.exits = vec![
-                Link::new_mixed(vec![LinkArg::Value(raising)], returnblock, None),
-                Link::new_mixed(
-                    vec![LinkArg::Value(etype), LinkArg::Value(evalue)],
-                    exceptblock,
-                    None,
-                ),
+                Link::new_mixed(vec![normal_arg], returnblock, None),
+                Link::new_mixed(vec![exc_etype_arg, exc_evalue_arg], exceptblock, None),
             ];
         }
 

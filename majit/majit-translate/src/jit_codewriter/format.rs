@@ -332,9 +332,17 @@ fn register_repr_for_kind(v: ValueId, kind: RegKind) -> String {
     format!("%{prefix}{}", v.0)
 }
 
-fn linkarg_repr_for_kind(arg: &crate::model::LinkArg, kind: RegKind) -> String {
+#[allow(dead_code)]
+fn linkarg_repr_for_kind(
+    arg: &crate::model::LinkArg,
+    graph: &crate::model::FunctionGraph,
+    kind: RegKind,
+) -> String {
     match arg {
-        crate::model::LinkArg::Value(v) => register_repr_for_kind(*v, kind),
+        crate::model::LinkArg::Value(_) => arg
+            .as_value(graph)
+            .map(|v| register_repr_for_kind(v, kind))
+            .unwrap_or_else(|| "<unbound>".to_string()),
         crate::model::LinkArg::Const(cv) => format!("${cv}"),
     }
 }
@@ -514,7 +522,9 @@ fn op_args_repr(
         OpKind::Call { args, .. } => {
             let parts: Vec<String> = args
                 .iter()
-                .map(|v| register_repr_for_kind(*v, value_id_kind(*v, types).unwrap_or(RegKind::Ref)))
+                .map(|v| {
+                    register_repr_for_kind(*v, value_id_kind(*v, types).unwrap_or(RegKind::Ref))
+                })
                 .collect();
             out.push_str(&parts.join(", "));
         }

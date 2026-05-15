@@ -331,13 +331,13 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
         }
         for link in &block.exits {
             for arg in &link.args {
-                if let crate::model::LinkArg::Value(v) = arg {
-                    seen.insert(*v);
+                if let Some(v) = arg.as_value(graph) {
+                    seen.insert(v);
                 }
             }
             for arg in link.last_exception.iter().chain(link.last_exc_value.iter()) {
-                if let crate::model::LinkArg::Value(v) = arg {
-                    seen.insert(*v);
+                if let Some(v) = arg.as_value(graph) {
+                    seen.insert(v);
                 }
             }
         }
@@ -410,16 +410,16 @@ fn convert_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &L
     let target_block = graph.block(link.target);
     let target_vids = target_block.inputarg_value_ids(graph);
     for (dst, src) in target_vids.iter().zip(link.args.iter()) {
-        let _ = maybe_seed_concrete_type(state, *dst, link_arg_concrete_type(state, src));
+        let _ = maybe_seed_concrete_type(state, *dst, link_arg_concrete_type(state, graph, src));
     }
 }
 
 fn convert_raise_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &Link) {
-    if let Some(LinkArg::Value(value)) = link.last_exception.as_ref() {
-        let _ = maybe_seed_concrete_type(state, *value, ConcreteType::Signed);
+    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_value(graph)) {
+        let _ = maybe_seed_concrete_type(state, value, ConcreteType::Signed);
     }
-    if let Some(LinkArg::Value(value)) = link.last_exc_value.as_ref() {
-        let _ = maybe_seed_concrete_type(state, *value, ConcreteType::GcRef);
+    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_value(graph)) {
+        let _ = maybe_seed_concrete_type(state, value, ConcreteType::GcRef);
     }
 
     let target_block = graph.block(link.target);
@@ -430,7 +430,7 @@ fn convert_raise_link(state: &mut TypeResolutionState, graph: &FunctionGraph, li
         } else if Some(src) == link.last_exc_value.as_ref() {
             ConcreteType::GcRef
         } else {
-            link_arg_concrete_type(state, src)
+            link_arg_concrete_type(state, graph, src)
         };
         let _ = maybe_seed_concrete_type(state, *dst, src_ty);
     }
@@ -442,11 +442,14 @@ fn converge_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &
     let target_vids = target_block.inputarg_value_ids(graph);
     for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         match src {
-            LinkArg::Value(src) => {
-                let src_ty = state.get(*src).clone();
+            LinkArg::Value(_) => {
+                let Some(src_vid) = src.as_value(graph) else {
+                    continue;
+                };
+                let src_ty = state.get(src_vid).clone();
                 let dst_ty = state.get(*dst).clone();
                 changed |= maybe_seed_concrete_type(state, *dst, src_ty);
-                changed |= maybe_seed_concrete_type(state, *src, dst_ty);
+                changed |= maybe_seed_concrete_type(state, src_vid, dst_ty);
             }
             LinkArg::Const(value) => {
                 changed |= maybe_seed_concrete_type(state, *dst, const_value_to_concrete(value));
@@ -462,11 +465,11 @@ fn converge_raise_link(
     link: &Link,
 ) -> bool {
     let mut changed = false;
-    if let Some(LinkArg::Value(value)) = link.last_exception.as_ref() {
-        changed |= maybe_seed_concrete_type(state, *value, ConcreteType::Signed);
+    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_value(graph)) {
+        changed |= maybe_seed_concrete_type(state, value, ConcreteType::Signed);
     }
-    if let Some(LinkArg::Value(value)) = link.last_exc_value.as_ref() {
-        changed |= maybe_seed_concrete_type(state, *value, ConcreteType::GcRef);
+    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_value(graph)) {
+        changed |= maybe_seed_concrete_type(state, value, ConcreteType::GcRef);
     }
 
     let target_block = graph.block(link.target);
@@ -477,20 +480,27 @@ fn converge_raise_link(
         } else if Some(src) == link.last_exc_value.as_ref() {
             ConcreteType::GcRef
         } else {
-            link_arg_concrete_type(state, src)
+            link_arg_concrete_type(state, graph, src)
         };
         changed |= maybe_seed_concrete_type(state, *dst, src_ty);
-        if let LinkArg::Value(src_vid) = src {
+        if let Some(src_vid) = src.as_value(graph) {
             let dst_ty = state.get(*dst).clone();
-            changed |= maybe_seed_concrete_type(state, *src_vid, dst_ty);
+            changed |= maybe_seed_concrete_type(state, src_vid, dst_ty);
         }
     }
     changed
 }
 
-fn link_arg_concrete_type(state: &TypeResolutionState, src: &LinkArg) -> ConcreteType {
+fn link_arg_concrete_type(
+    state: &TypeResolutionState,
+    graph: &FunctionGraph,
+    src: &LinkArg,
+) -> ConcreteType {
     match src {
-        LinkArg::Value(src) => state.get(*src).clone(),
+        LinkArg::Value(_) => src
+            .as_value(graph)
+            .map(|v| state.get(v).clone())
+            .unwrap_or(ConcreteType::Unknown),
         LinkArg::Const(value) => const_value_to_concrete(value),
     }
 }
@@ -933,13 +943,14 @@ mod tests {
             Some(ExitSwitch::LastException),
             vec![
                 Link::new(
+                    &graph,
                     vec![last_exception, last_exc_value],
                     exc_block,
                     Some(exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::from(last_exception)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exception)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
             ],
         );

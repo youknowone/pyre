@@ -445,8 +445,9 @@ impl<'a> Transformer<'a> {
         self.next_synthetic_value = rewritten.next_value();
 
         let exceptblock = rewritten.exceptblock;
-        for block in &mut rewritten.blocks {
-            self.optimize_block(block, &graph.name, exceptblock);
+        let graph_name = rewritten.name.clone();
+        for block_idx in 0..rewritten.blocks.len() {
+            self.optimize_block(&mut rewritten, block_idx, &graph_name, exceptblock);
         }
 
         rewritten.set_next_value(self.next_synthetic_value);
@@ -463,13 +464,15 @@ impl<'a> Transformer<'a> {
     /// RPython: Transformer.optimize_block()
     fn optimize_block(
         &mut self,
-        block: &mut crate::model::Block,
+        graph: &mut crate::model::FunctionGraph,
+        block_idx: usize,
         graph_name: &str,
         exceptblock: crate::model::BlockId,
     ) {
-        let mut new_ops = Vec::with_capacity(block.operations.len());
+        let mut new_ops = Vec::with_capacity(graph.blocks[block_idx].operations.len());
 
-        for original_op in &block.operations {
+        let original_ops = graph.blocks[block_idx].operations.clone();
+        for original_op in &original_ops {
             let op = remap_op(original_op, &self.aliases);
             match self.rewrite_operation(&op, graph_name) {
                 RewriteResult::Replace(ops) => {
@@ -487,13 +490,19 @@ impl<'a> Transformer<'a> {
             }
         }
 
+        let (exitswitch, exits) = {
+            let block = &graph.blocks[block_idx];
+            remap_control_flow_metadata(
+                graph,
+                graph,
+                &block.exitswitch,
+                &block.exits,
+                |v| remap_value(v, &self.aliases),
+                |b| b,
+            )
+        };
+        let block = &mut graph.blocks[block_idx];
         block.operations = new_ops;
-        let (exitswitch, exits) = remap_control_flow_metadata(
-            &block.exitswitch,
-            &block.exits,
-            |v| remap_value(v, &self.aliases),
-            |b| b,
-        );
         block.exitswitch = exitswitch;
         block.exits = exits;
 
@@ -4184,7 +4193,7 @@ mod tests {
         );
         assert_eq!(block.exits.len(), 1);
         assert_eq!(block.exits[0].target, transformed.graph.returnblock);
-        assert_eq!(block.exits[0].args, vec![LinkArg::from(input)]);
+        assert_eq!(block.exits[0].args, vec![LinkArg::value(&graph, input)]);
     }
 
     #[test]

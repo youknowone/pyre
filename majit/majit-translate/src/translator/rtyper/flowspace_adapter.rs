@@ -244,18 +244,26 @@ pub(crate) fn build_value_to_variable_map(
         // Class 2 — link-side sentinels.
         for link in &block.exits {
             for arg in &link.args {
-                if let LinkArg::Value(vid) = arg {
-                    map.entry(*vid)
-                        .or_insert_with(|| seed_variable(*vid, annotations));
+                if let Some(vid) = arg.as_value(legacy) {
+                    map.entry(vid)
+                        .or_insert_with(|| seed_variable(vid, annotations));
                 }
             }
-            if let Some(LinkArg::Value(vid)) = &link.last_exception {
-                map.entry(*vid)
-                    .or_insert_with(|| seed_variable(*vid, annotations));
+            if let Some(vid) = link
+                .last_exception
+                .as_ref()
+                .and_then(|a| a.as_value(legacy))
+            {
+                map.entry(vid)
+                    .or_insert_with(|| seed_variable(vid, annotations));
             }
-            if let Some(LinkArg::Value(vid)) = &link.last_exc_value {
-                map.entry(*vid)
-                    .or_insert_with(|| seed_variable(*vid, annotations));
+            if let Some(vid) = link
+                .last_exc_value
+                .as_ref()
+                .and_then(|a| a.as_value(legacy))
+            {
+                map.entry(vid)
+                    .or_insert_with(|| seed_variable(vid, annotations));
             }
         }
     }
@@ -1211,13 +1219,14 @@ fn legacy_const_define_hlvalue(op: &SpaceOperation) -> Option<(ValueId, Hlvalue)
 /// (`cutover.rs:441`).
 fn link_arg_to_hlvalue(
     arg: &LinkArg,
+    graph: &FunctionGraph,
     value_map: &HashMap<ValueId, Hlvalue>,
     source_block_id: BlockId,
     target_block_id: BlockId,
     arg_index: usize,
 ) -> Result<Hlvalue, TyperError> {
-    match arg {
-        LinkArg::Value(vid) => value_map.get(vid).cloned().ok_or_else(|| {
+    match arg.as_value(graph) {
+        Some(vid) => value_map.get(&vid).cloned().ok_or_else(|| {
             TyperError::message(format!(
                 "translate_op: undefined operand {vid:?} as Link.args[{arg_index}] entry \
                  (source block {source_block_id:?} -> target block {target_block_id:?}) — \
@@ -1225,7 +1234,13 @@ fn link_arg_to_hlvalue(
                  defined as a block inputarg or op result)"
             ))
         }),
-        LinkArg::Const(cv) => Ok(Hlvalue::Constant(constant_from_constvalue(cv.clone()))),
+        None => match arg {
+            LinkArg::Const(cv) => Ok(Hlvalue::Constant(constant_from_constvalue(cv.clone()))),
+            LinkArg::Value(_) => Err(TyperError::message(format!(
+                "translate_op: Link.args[{arg_index}] LinkArg::Value Variable not registered \
+                 on graph (source block {source_block_id:?} -> target block {target_block_id:?})"
+            ))),
+        },
     }
 }
 
@@ -1239,22 +1254,28 @@ fn link_arg_to_hlvalue(
 /// a per-link map instead of requiring a block-local definition.
 fn link_extravar_to_hlvalue(
     arg: &LinkArg,
+    graph: &FunctionGraph,
     value_map: &mut HashMap<ValueId, Hlvalue>,
     value_to_var: &mut ValueIdToVariable,
     annotations: &AnnotationState,
 ) -> Result<Hlvalue, TyperError> {
-    match arg {
-        LinkArg::Value(vid) => {
-            if let Some(existing) = value_map.get(vid).cloned() {
+    match arg.as_value(graph) {
+        Some(vid) => {
+            if let Some(existing) = value_map.get(&vid).cloned() {
                 return Ok(existing);
             }
-            let var = seed_variable(*vid, annotations);
-            value_to_var.entry(*vid).or_insert_with(|| var.clone());
+            let var = seed_variable(vid, annotations);
+            value_to_var.entry(vid).or_insert_with(|| var.clone());
             let hlvalue = Hlvalue::Variable(var);
-            value_map.insert(*vid, hlvalue.clone());
+            value_map.insert(vid, hlvalue.clone());
             Ok(hlvalue)
         }
-        LinkArg::Const(cv) => Ok(Hlvalue::Constant(constant_from_constvalue(cv.clone()))),
+        None => match arg {
+            LinkArg::Const(cv) => Ok(Hlvalue::Constant(constant_from_constvalue(cv.clone()))),
+            LinkArg::Value(_) => Err(TyperError::message(
+                "link_extravar_to_hlvalue: extravar Variable not registered on graph".to_string(),
+            )),
+        },
     }
 }
 
@@ -1466,19 +1487,19 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
             if link.target != legacy.returnblock {
                 continue;
             }
-            let Some(LinkArg::Value(vid)) = link.args.first() else {
+            let Some(vid) = link.args.first().and_then(|a| a.as_value(legacy)) else {
                 continue;
             };
-            if !is_synthetic_return_void_value(legacy, *vid) {
+            if !is_synthetic_return_void_value(legacy, vid) {
                 continue;
             }
             let var = Variable::new();
             if let Some(shell) = valuetype_to_someshell(&crate::model::ValueType::Void) {
                 *var.annotation.borrow_mut() = Some(Rc::new(shell));
             }
-            value_to_var.entry(*vid).or_insert_with(|| var.clone());
+            value_to_var.entry(vid).or_insert_with(|| var.clone());
             synthetic_void_hlvalues
-                .entry(*vid)
+                .entry(vid)
                 .or_insert(Hlvalue::Variable(var));
         }
     }
@@ -1718,6 +1739,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                 .map(|arg| {
                     link_extravar_to_hlvalue(
                         arg,
+                        legacy,
                         &mut link_value_map,
                         &mut value_to_var,
                         annotations,
@@ -1730,6 +1752,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                 .map(|arg| {
                     link_extravar_to_hlvalue(
                         arg,
+                        legacy,
                         &mut link_value_map,
                         &mut value_to_var,
                         annotations,
@@ -1750,6 +1773,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                 .map(|(idx, arg)| {
                     link_arg_to_hlvalue(
                         arg,
+                        legacy,
                         &link_value_map,
                         legacy_block.id,
                         legacy_link.target,
@@ -2825,7 +2849,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -2905,7 +2929,7 @@ mod tests {
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(1))],
+                vec![LinkArg::value(&graph, ValueId(1))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -2968,7 +2992,7 @@ mod tests {
             exitswitch: None,
             // Return ValueId(2), the ConstInt define.
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             framestate: None,
@@ -3022,6 +3046,7 @@ mod tests {
         annotations.set(ValueId(11), ValueType::Ref);
 
         let mut graph = LegacyGraph::new("canraise_with_extravars");
+        graph.set_next_value(12); // pre-allocate up to ValueId(11) for extravars
         let startblock = Block {
             id: graph.startblock,
             inputargs: block_inputargs(&mut graph, &[ValueId(1), ValueId(2)]),
@@ -3036,15 +3061,18 @@ mod tests {
             }],
             exitswitch: Some(crate::model::ExitSwitch::LastException),
             exits: vec![
-                link_to_returnblock(vec![LinkArg::Value(ValueId(3))], graph.returnblock),
+                link_to_returnblock(vec![LinkArg::value(&graph, ValueId(3))], graph.returnblock),
                 crate::model::Link::new_mixed(
-                    vec![LinkArg::Value(ValueId(10)), LinkArg::Value(ValueId(11))],
+                    vec![
+                        LinkArg::value(&graph, ValueId(10)),
+                        LinkArg::value(&graph, ValueId(11)),
+                    ],
                     graph.exceptblock,
                     Some(crate::model::exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::Value(ValueId(10))),
-                    Some(LinkArg::Value(ValueId(11))),
+                    Some(LinkArg::value(&graph, ValueId(10))),
+                    Some(LinkArg::value(&graph, ValueId(11))),
                 ),
             ],
             framestate: None,
@@ -3117,7 +3145,7 @@ mod tests {
             }],
             exitswitch: None,
             exits: vec![link_to_returnblock(
-                vec![LinkArg::Value(ValueId(2))],
+                vec![LinkArg::value(&graph, ValueId(2))],
                 graph.returnblock,
             )],
             framestate: None,

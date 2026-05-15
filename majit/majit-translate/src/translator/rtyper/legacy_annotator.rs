@@ -63,10 +63,10 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
                 if link.target != graph.returnblock {
                     continue;
                 }
-                if let Some(LinkArg::Value(src)) = link.args.first()
-                    && is_synthetic_return_void_value(graph, *src)
+                if let Some(src) = link.args.first().and_then(|a| a.as_value(graph))
+                    && is_synthetic_return_void_value(graph, src)
                 {
-                    state.set(*src, ValueType::Void);
+                    state.set(src, ValueType::Void);
                     state.set(ret, ValueType::Void);
                 }
             }
@@ -123,18 +123,18 @@ fn follow_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &Link) 
     let target_block = graph.block(link.target);
     let target_vids = target_block.inputarg_value_ids(graph);
     for (dst, src) in target_vids.iter().zip(link.args.iter()) {
-        changed |= merge_value_type(state, *dst, link_arg_type(state, src));
+        changed |= merge_value_type(state, *dst, link_arg_type(state, graph, src));
     }
     changed
 }
 
 fn follow_raise_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
-    if let Some(LinkArg::Value(value)) = link.last_exc_value.as_ref() {
-        changed |= merge_value_type(state, *value, ValueType::Ref);
+    if let Some(value) = link.last_exc_value.as_ref().and_then(|a| a.as_value(graph)) {
+        changed |= merge_value_type(state, value, ValueType::Ref);
     }
-    if let Some(LinkArg::Value(value)) = link.last_exception.as_ref() {
-        changed |= merge_value_type(state, *value, ValueType::Int);
+    if let Some(value) = link.last_exception.as_ref().and_then(|a| a.as_value(graph)) {
+        changed |= merge_value_type(state, value, ValueType::Int);
     }
 
     let target_block = graph.block(link.target);
@@ -145,16 +145,19 @@ fn follow_raise_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &
         } else if Some(src) == link.last_exc_value.as_ref() {
             ValueType::Ref
         } else {
-            link_arg_type(state, src)
+            link_arg_type(state, graph, src)
         };
         changed |= merge_value_type(state, *dst, src_ty);
     }
     changed
 }
 
-fn link_arg_type(state: &AnnotationState, src: &LinkArg) -> ValueType {
+fn link_arg_type(state: &AnnotationState, graph: &FunctionGraph, src: &LinkArg) -> ValueType {
     match src {
-        LinkArg::Value(src) => state.get(*src).clone(),
+        LinkArg::Value(_) => src
+            .as_value(graph)
+            .map(|v| state.get(v).clone())
+            .unwrap_or(ValueType::Unknown),
         LinkArg::Const(value) => const_value_type(value),
     }
 }
@@ -478,13 +481,14 @@ mod tests {
             Some(ExitSwitch::LastException),
             vec![
                 Link::new(
+                    &graph,
                     vec![last_exception, last_exc_value],
                     exc_block,
                     Some(exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::from(last_exception)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&graph, last_exception)),
+                    Some(LinkArg::value(&graph, last_exc_value)),
                 ),
             ],
         );

@@ -899,7 +899,19 @@ impl Assembler {
         state: &mut AssemblyState,
     ) -> (u8, char) {
         match arg {
-            LinkArg::Value(v) => self.lookup_reg_with_kind(*v, regallocs),
+            LinkArg::Value(var) => {
+                let vid = self
+                    .current_value_variables
+                    .as_ref()
+                    .and_then(|slice| {
+                        slice.iter().enumerate().find_map(|(idx, slot)| {
+                            slot.as_ref().filter(|v| v.id() == var.id())
+                                .map(|_| ValueId(idx))
+                        })
+                    })
+                    .expect("encode_link_arg_source: link arg Variable must be registered on the graph snapshot");
+                self.lookup_reg_with_kind(vid, regallocs)
+            }
             LinkArg::Const(cv) => {
                 let kind = crate::flatten::constvalue_kind(cv);
                 let byte = self.emit_const(cv, kind, state);
@@ -1971,17 +1983,16 @@ impl Assembler {
                 let color = variable
                     .and_then(|var| ra.coloring.get(var).copied())
                     .unwrap_or_else(|| {
-                        let other_classes: Vec<_> =
-                            [RegKind::Int, RegKind::Ref, RegKind::Float]
-                                .iter()
-                                .filter(|k| **k != kind)
-                                .filter(|k| {
-                                    regallocs.get(*k).is_some_and(|ra| {
-                                        variable.is_some_and(|var| ra.coloring.contains_key(var))
-                                    })
+                        let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+                            .iter()
+                            .filter(|k| **k != kind)
+                            .filter(|k| {
+                                regallocs.get(*k).is_some_and(|ra| {
+                                    variable.is_some_and(|var| ra.coloring.contains_key(var))
                                 })
-                                .copied()
-                                .collect();
+                            })
+                            .copied()
+                            .collect();
                         panic!(
                             "lookup_coloring: type-state declared kind {kind:?} for {v:?} \
                              but regallocs[{kind:?}] has no coloring (other classes with a \

@@ -39,7 +39,9 @@ pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, Re
 /// [`TypeResolutionState`] so [`value_to_register`] reads kind from
 /// `getkind(v.concretetype)` first — `flatten.py:382 getcolor`
 /// strict 1:1 parity for the `FlatOp::Op` operand bridge.
-#[deprecated(note = "use compute_liveness_with_graph; graph.concretetype(v) is the kind source now")]
+#[deprecated(
+    note = "use compute_liveness_with_graph; graph.concretetype(v) is the kind source now"
+)]
 pub fn compute_liveness_with_types(
     flattened: &mut SSARepr,
     regallocs: &HashMap<RegKind, RegAllocResult>,

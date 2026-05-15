@@ -4491,6 +4491,7 @@ fn subtract_index_set(read: &[u32], write: &[u32]) -> Vec<u32> {
 /// 3. Phi/link source chain (limited depth)
 /// 4. None (conservative: falls back to item_ty-only keying)
 fn resolve_array_identity(
+    graph: &crate::model::FunctionGraph,
     base: &crate::model::ValueId,
     op_array_type_id: &Option<String>,
     value_producers: &HashMap<crate::model::ValueId, &crate::model::OpKind>,
@@ -4547,14 +4548,17 @@ fn resolve_array_identity(
     }
     // 3. Phi/link: RPython concretetype propagates through block boundaries.
     // Follow inputarg → source link-arg chain (limited depth to avoid cycles).
-    let mut source = LinkArg::Value(*base);
+    let mut source = LinkArg::value(graph, *base);
     for _ in 0..4 {
         match &source {
-            LinkArg::Value(vid) => {
-                if let Some(identity) = producer_array_identity(*vid, value_producers, cc) {
+            LinkArg::Value(var) => {
+                let Some(vid) = graph.value_id_of(var) else {
+                    break;
+                };
+                if let Some(identity) = producer_array_identity(vid, value_producers, cc) {
                     return Some(identity);
                 }
-                let Some(next) = phi_sources.get(vid) else {
+                let Some(next) = phi_sources.get(&vid) else {
                     break;
                 };
                 source = next.clone();
@@ -4747,6 +4751,7 @@ fn collect_readwrite_effects(
                 } => {
                     // RPython: op.args[0].concretetype → cpu.arraydescrof(ARRAY)
                     let resolved_id = resolve_array_identity(
+                        graph,
                         base,
                         array_type_id,
                         &value_producers,
@@ -4794,6 +4799,7 @@ fn collect_readwrite_effects(
                     ..
                 } => {
                     let resolved_id = resolve_array_identity(
+                        graph,
                         base,
                         array_type_id,
                         &value_producers,
@@ -4845,6 +4851,7 @@ fn collect_readwrite_effects(
                     ..
                 } => {
                     let resolved_id = resolve_array_identity(
+                        graph,
                         base,
                         array_type_id,
                         &value_producers,
@@ -4914,6 +4921,7 @@ fn collect_readwrite_effects(
                     ..
                 } => {
                     let resolved_id = resolve_array_identity(
+                        graph,
                         base,
                         array_type_id,
                         &value_producers,
@@ -5531,9 +5539,7 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
 fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
     use crate::model::LinkArg;
 
-    let exceptblock_vids = graph
-        .block(graph.exceptblock)
-        .inputarg_value_ids(graph);
+    let exceptblock_vids = graph.block(graph.exceptblock).inputarg_value_ids(graph);
     let Some(&except_value) = exceptblock_vids.get(1) else {
         return false;
     };
@@ -5544,8 +5550,8 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
         for link in &block.exits {
             let target_vids = graph.block(link.target).inputarg_value_ids(graph);
             for (arg, &target_arg) in link.args.iter().zip(target_vids.iter()) {
-                if let LinkArg::Value(value) = arg {
-                    families.union(*value, target_arg);
+                if let Some(value) = arg.as_value(graph) {
+                    families.union(value, target_arg);
                 }
             }
         }
@@ -5555,7 +5561,11 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
         .blocks
         .iter()
         .flat_map(|block| block.exits.iter())
-        .filter_map(|link| link.last_exc_value.as_ref().and_then(|arg| arg.as_value()))
+        .filter_map(|link| {
+            link.last_exc_value
+                .as_ref()
+                .and_then(|arg| arg.as_value(graph))
+        })
         .any(|value| families.find_rep(value) == except_rep)
 }
 
@@ -6198,15 +6208,16 @@ mod tests {
             entry,
             Some(ExitSwitch::LastException),
             vec![
-                Link::new(vec![continuation_arg], continuation, None),
+                Link::new(&g, vec![continuation_arg], continuation, None),
                 Link::new(
+                    &g,
                     vec![last_exception, last_exc_value],
                     g.exceptblock,
                     Some(exception_exitcase()),
                 )
                 .extravars(
-                    Some(LinkArg::from(last_exception)),
-                    Some(LinkArg::from(last_exc_value)),
+                    Some(LinkArg::value(&g, last_exception)),
+                    Some(LinkArg::value(&g, last_exc_value)),
                 ),
             ],
         );
@@ -6660,11 +6671,13 @@ mod tests {
     #[test]
     fn resolve_array_identity_follows_phi_chain_to_constant_link_arg() {
         let cc = CallControl::new();
+        let mut graph = FunctionGraph::new("phi_chain_test");
+        graph.set_next_value(3);
         let base = ValueId(1);
         let forwarded = ValueId(2);
         let value_producers: HashMap<ValueId, &OpKind> = HashMap::new();
         let mut phi_sources: HashMap<ValueId, LinkArg> = HashMap::new();
-        phi_sources.insert(base, LinkArg::Value(forwarded));
+        phi_sources.insert(base, LinkArg::value(&graph, forwarded));
         phi_sources.insert(
             forwarded,
             LinkArg::Const(crate::flowspace::model::ConstValue::List(vec![])),
@@ -6672,6 +6685,7 @@ mod tests {
 
         assert_eq!(
             resolve_array_identity(
+                &graph,
                 &base,
                 &Option::<String>::None,
                 &value_producers,
