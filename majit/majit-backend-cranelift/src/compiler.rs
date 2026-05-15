@@ -5741,13 +5741,14 @@ fn emit_attached_bridge_dispatch(
     // Cranelift cannot patch finalized code, so guard exits do the
     // equivalent descriptor-cache dispatch before returning a deadframe to
     // the caller/interpreter.
-    let _ = unsafe { &*(fail_descr_ptr as *const CraneliftFailDescr) }; // assert pointer alive
-    // Session 5i-cl: lazy-allocate boxed AtomicUsize cells in
-    // `BRIDGE_CACHES_TABLE`.  The returned addresses are heap-pinned
-    // and stable for the descr's lifetime, so it is safe to bake them
-    // into the machine code as immediates.
+    let fail_descr_ref = unsafe { &*(fail_descr_ptr as *const CraneliftFailDescr) };
+    // Slice JJ: bridge code_ptr / frame_depth cells live on the descr
+    // as `Box<AtomicUsize>`.  Box gives them a heap-pinned address that
+    // survives the descr being moved into `Arc::new(...)`, so the
+    // returned addresses are stable for the descr's lifetime and safe
+    // to bake into machine code as immediates.
     let (bridge_code_cache_addr, bridge_frame_depth_cache_addr) =
-        crate::guard::bridge_cache_addrs(fail_descr_ptr as usize);
+        fail_descr_ref.bridge_cache_addrs();
     let bridge_code_cache_ptr = builder
         .ins()
         .iconst(ptr_type, bridge_code_cache_addr as i64);

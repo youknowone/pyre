@@ -15,89 +15,16 @@ use majit_ir::{AccumInfo, Const, DescrRef, FailDescr, GcRef, Type};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
-/// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
-/// `Arc::as_ptr` address to its `Box<AtomicUsize>` bridge caches.
-///
-/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) carries no
-/// `bridge_code_ptr_cache` / `bridge_frame_depth_cache`; upstream
-/// `assembler.py:987 patch_jump_for_descr` patches the failing
-/// guard's jump in place to point at the bridge entry (so no
-/// per-descr cache is ever loaded by the dispatch path).  Cranelift
-/// cannot patch finalised code; instead the guard exit emits a
-/// `load` from these atomic cells.  Each cell's address must be
-/// stable for the descr's lifetime because the JIT bakes it into
-/// the machine code (`compiler.rs::emit_attached_bridge_dispatch`).
-/// Boxing the atomics gives them a heap-pinned address that survives
-/// even after the descr struct is moved into its owning `Arc`.
-///
-/// Cells are dropped when the descr is dropped (`Drop for
-/// CraneliftFailDescr`); the JIT code holding the baked address has
-/// already been invalidated because the owning trace is evicted
-/// before the descr's last `Arc` clone drops (`compile.py:185-203
-/// record_loop_or_bridge` lifecycle).
-struct BridgeCaches {
-    code_ptr: Box<std::sync::atomic::AtomicUsize>,
-    frame_depth: Box<std::sync::atomic::AtomicUsize>,
-}
-
-static BRIDGE_CACHES_TABLE: OnceLock<Mutex<HashMap<usize, BridgeCaches>>> = OnceLock::new();
-
-fn bridge_caches_table() -> &'static Mutex<HashMap<usize, BridgeCaches>> {
-    BRIDGE_CACHES_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Lazily allocate the bridge cache cells for `descr_ptr` and return
-/// stable pointers to the boxed atomics.  Returns
-/// `(code_ptr_addr, frame_depth_addr)`.  Repeated calls for the same
-/// descr return the same addresses — required because the JIT code
-/// embeds them as immediates.
-pub fn bridge_cache_addrs(descr_ptr: usize) -> (usize, usize) {
-    let mut table = bridge_caches_table()
-        .lock()
-        .expect("BRIDGE_CACHES_TABLE mutex poisoned");
-    let entry = table.entry(descr_ptr).or_insert_with(|| BridgeCaches {
-        code_ptr: Box::new(std::sync::atomic::AtomicUsize::new(0)),
-        frame_depth: Box::new(std::sync::atomic::AtomicUsize::new(0)),
-    });
-    (
-        entry.code_ptr.as_ref() as *const _ as usize,
-        entry.frame_depth.as_ref() as *const _ as usize,
-    )
-}
-
-/// Load the current bridge code pointer cache value.  Returns `0` for
-/// descrs with no entry (no bridge ever attached).
-pub fn load_bridge_code_ptr(descr_ptr: usize) -> usize {
-    bridge_caches_table()
-        .lock()
-        .expect("BRIDGE_CACHES_TABLE mutex poisoned")
-        .get(&descr_ptr)
-        .map(|c| c.code_ptr.load(std::sync::atomic::Ordering::Acquire))
-        .unwrap_or(0)
-}
-
-/// Store the bridge code pointer + frame depth caches atomically.
-/// Lazily allocates the boxed cells if they don't yet exist so the
-/// JIT-baked addresses remain stable across the runtime's first
-/// `bridge_cache_addrs` call.
-pub fn store_bridge_caches(descr_ptr: usize, code_ptr: usize, frame_depth: usize) {
-    let mut table = bridge_caches_table()
-        .lock()
-        .expect("BRIDGE_CACHES_TABLE mutex poisoned");
-    let entry = table.entry(descr_ptr).or_insert_with(|| BridgeCaches {
-        code_ptr: Box::new(std::sync::atomic::AtomicUsize::new(0)),
-        frame_depth: Box::new(std::sync::atomic::AtomicUsize::new(0)),
-    });
-    entry
-        .frame_depth
-        .store(frame_depth, std::sync::atomic::Ordering::Release);
-    entry
-        .code_ptr
-        .store(code_ptr, std::sync::atomic::Ordering::Release);
-}
+// BRIDGE_CACHES_TABLE removed (Slice JJ): the per-descr
+// `Box<AtomicUsize>` cells for bridge code_ptr / frame_depth now live
+// on CraneliftFailDescr directly.  Box gives each cell a heap-pinned
+// address that survives the descr being moved into `Arc::new(...)`;
+// the JIT bakes those addresses into the machine code
+// (`compiler.rs::emit_attached_bridge_dispatch`), so they must remain
+// stable for the descr's lifetime.
 
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to its force-token slot vector.
@@ -484,6 +411,17 @@ pub struct CraneliftFailDescr {
     /// invariant used by `is_force_token_slot`.  Empty vectors are
     /// elided (the cell stays unset).
     pub force_token_slots_cell: OnceLock<Vec<usize>>,
+    /// Bridge code-pointer cache.  JIT-baked into the dispatch path
+    /// (`emit_attached_bridge_dispatch`).  `Box` gives the
+    /// `AtomicUsize` a heap-pinned address that survives the descr
+    /// being moved into `Arc::new(...)`.  `0` = no bridge attached.
+    ///
+    /// Moved here from `BRIDGE_CACHES_TABLE` (Slice JJ).
+    pub bridge_code_ptr_cache: Box<AtomicUsize>,
+    /// Bridge frame-depth cache.  Same shape as
+    /// `bridge_code_ptr_cache`; baked into the dispatch path so the
+    /// runtime can grow the JIT frame before re-entering the bridge.
+    pub bridge_frame_depth_cache: Box<AtomicUsize>,
 }
 
 impl Drop for CraneliftFailDescr {
@@ -531,10 +469,8 @@ impl Drop for CraneliftFailDescr {
         // naturally with self.
         // force_token_slots_cell is descr-local (Slice II): drops
         // naturally with self.
-        bridge_caches_table()
-            .lock()
-            .expect("BRIDGE_CACHES_TABLE mutex poisoned")
-            .remove(&ptr);
+        // bridge_code_ptr_cache / bridge_frame_depth_cache are descr-
+        // local Box<AtomicUsize> (Slice JJ): drop naturally with self.
         // Reclaim the published `Arc<BridgeData>` (if any) from the
         // descr-local dispatch cell.  Swap-to-null first so any
         // concurrent `bridge_ref` reader either sees the still-live
@@ -624,6 +560,8 @@ impl CraneliftFailDescr {
             external_jump_target_cell: OnceLock::new(),
             source_op_index_cell: OnceLock::new(),
             force_token_slots_cell: OnceLock::new(),
+            bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
+            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
         };
         descr.set_force_token_slots(force_token_slots);
         descr
@@ -658,6 +596,8 @@ impl CraneliftFailDescr {
             external_jump_target_cell: OnceLock::new(),
             source_op_index_cell: OnceLock::new(),
             force_token_slots_cell: OnceLock::new(),
+            bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
+            bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
         };
         descr.set_force_token_slots(force_token_slots);
         descr
@@ -753,16 +693,25 @@ impl CraneliftFailDescr {
         self.fail_count.load(Ordering::Relaxed)
     }
 
-    /// Whether a bridge has been attached to this guard.  Reads
-    /// through the backend-static `BRIDGE_CACHES_TABLE` (Session 5i-cl).
+    /// Descr-local atomic read (Slice JJ) — whether a bridge has been
+    /// attached to this guard.
     pub fn has_bridge(&self) -> bool {
-        load_bridge_code_ptr(self as *const Self as usize) != 0
+        self.bridge_code_ptr_cache.load(Ordering::Acquire) != 0
     }
 
-    /// Get bridge code_ptr without Mutex lock (atomic read via boxed
-    /// `AtomicUsize` in the side-table).
+    /// Descr-local atomic read (Slice JJ) — bridge code_ptr.
     pub fn bridge_code_ptr(&self) -> *const u8 {
-        load_bridge_code_ptr(self as *const Self as usize) as *const u8
+        self.bridge_code_ptr_cache.load(Ordering::Acquire) as *const u8
+    }
+
+    /// Heap-pinned addresses of the two bridge-cache atomic cells,
+    /// suitable for baking into JIT machine code as immediates.
+    /// Returns `(code_ptr_addr, frame_depth_addr)`.
+    pub fn bridge_cache_addrs(&self) -> (usize, usize) {
+        (
+            self.bridge_code_ptr_cache.as_ref() as *const _ as usize,
+            self.bridge_frame_depth_cache.as_ref() as *const _ as usize,
+        )
     }
 
     /// `compile.py:attach_bridge` / `assembler.py:987 patch_jump_for_descr`
@@ -789,7 +738,9 @@ impl CraneliftFailDescr {
             // reclaim ownership and drop.
             unsafe { drop(Arc::from_raw(old_ptr as *const BridgeData)) };
         }
-        store_bridge_caches(self as *const Self as usize, code_ptr, frame_depth);
+        self.bridge_frame_depth_cache
+            .store(frame_depth, Ordering::Release);
+        self.bridge_code_ptr_cache.store(code_ptr, Ordering::Release);
     }
 
     /// Descr-local write-once cell (Slice GG).  Publishes the
