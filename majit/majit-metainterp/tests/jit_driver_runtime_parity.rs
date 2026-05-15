@@ -1417,24 +1417,24 @@ impl JitState for NestedVirtualResumeState {
             (
                 0,
                 MaterializedVirtual::Struct {
-                    descr_index,
+                    descr,
                     fields,
                     ..
                 },
             ) => {
-                assert_eq!(*descr_index, 10);
+                assert_eq!(descr.as_ref().map(|d| d.index()), Some(10));
                 assert_eq!(fields, &vec![(0, MaterializedValue::Value(77))]);
                 Some(GcRef(self.inner_ref))
             }
             (
                 1,
                 MaterializedVirtual::Obj {
-                    descr_index,
+                    descr,
                     fields,
                     ..
                 },
             ) => {
-                assert_eq!(*descr_index, 20);
+                assert_eq!(descr.as_ref().map(|d| d.index()), Some(20));
                 assert_eq!(fields[0], (0, MaterializedValue::VirtualRef(0)));
                 assert_eq!(fields[1], (1, MaterializedValue::Value(99)));
                 assert_eq!(
@@ -1839,8 +1839,12 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
     let meta = TestMeta { header_pc: 556 };
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 556);
+    let inner_typedescr: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(10, 0, 0));
+    let outer_typedescr: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(20, 0, 0));
     let inner = resume.add_virtual_struct(
-        None,
+        Some(inner_typedescr),
         0,
         10,
         vec![(
@@ -1851,7 +1855,7 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
         0,
     );
     let outer = resume.add_virtual_obj(
-        None,
+        Some(outer_typedescr),
         0,
         20,
         None,

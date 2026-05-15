@@ -1331,13 +1331,11 @@ mod tests {
             MaterializedVirtual::Obj {
                 descr: None,
                 type_id: 1,
-                descr_index: 0,
                 fields: vec![(0, MaterializedValue::Value(100))],
             },
             MaterializedVirtual::Obj {
                 descr: None,
                 type_id: 2,
-                descr_index: 1,
                 fields: vec![(0, MaterializedValue::Value(200))],
             },
         ];
@@ -1372,13 +1370,11 @@ mod tests {
             MaterializedVirtual::Obj {
                 descr: None,
                 type_id: 1,
-                descr_index: 0,
                 fields: vec![(0, MaterializedValue::Value(100))],
             },
             MaterializedVirtual::Obj {
                 descr: None,
                 type_id: 2,
-                descr_index: 1,
                 fields: vec![(0, MaterializedValue::Value(200))],
             },
         ];
@@ -1393,19 +1389,16 @@ mod tests {
             MaterializedVirtual::Obj {
                 descr: None,
                 type_id: 1,
-                descr_index: 0,
                 fields: vec![(0, MaterializedValue::Value(100))],
             },
             MaterializedVirtual::Obj {
                 descr: None,
                 type_id: 2,
-                descr_index: 1,
                 fields: vec![(0, MaterializedValue::Value(200))],
             },
             MaterializedVirtual::Obj {
                 descr: None,
                 type_id: 3,
-                descr_index: 2,
                 fields: vec![(0, MaterializedValue::Value(300))],
             },
         ];
@@ -1427,7 +1420,6 @@ mod tests {
         let virt = MaterializedVirtual::Obj {
             descr: None,
             type_id: 1,
-            descr_index: 0,
             fields: vec![(0, MaterializedValue::Value(42))],
         };
 

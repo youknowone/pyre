@@ -75,7 +75,9 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
             ],
         }],
         virtuals: vec![VirtualInfo::VirtualObj {
-            descr: None,
+            descr: Some(std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(
+                3, 0, 0,
+            ))),
             type_id: 1,
             descr_index: 3,
             known_class: None,
@@ -117,13 +119,12 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
     );
     match &state.virtuals[0] {
         majit_metainterp::resume::MaterializedVirtual::Obj {
+            descr,
             type_id,
-            descr_index,
             fields,
-            ..
         } => {
             assert_eq!(*type_id, 1);
-            assert_eq!(*descr_index, 3);
+            assert_eq!(descr.as_ref().map(|d| d.index()), Some(3));
             assert_eq!(
                 fields,
                 &vec![

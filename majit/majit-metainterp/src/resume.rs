@@ -2400,7 +2400,6 @@ pub enum MaterializedVirtual {
         /// SizeDescr for allocation (exposes vtable + obj_size).
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         /// (field_descr_index, concrete_value).
         fields: Vec<(u32, MaterializedValue)>,
     },
@@ -2409,7 +2408,6 @@ pub enum MaterializedVirtual {
         /// resume.py:631 self.typedescr.
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
         fields: Vec<(u32, MaterializedValue)>,
     },
     /// Array.
@@ -2441,23 +2439,19 @@ impl MaterializedVirtual {
             VirtualInfo::VirtualObj {
                 descr,
                 type_id,
-                descr_index,
                 ..
             } => MaterializedVirtual::Obj {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: Vec::new(),
             },
             VirtualInfo::VStruct {
                 typedescr,
                 type_id,
-                descr_index,
                 ..
             } => MaterializedVirtual::Struct {
                 descr: typedescr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: Vec::new(),
             },
             VirtualInfo::VArray {
@@ -2494,7 +2488,6 @@ impl MaterializedVirtual {
             VirtualInfo::VRawSlice { .. } => MaterializedVirtual::Struct {
                 descr: None,
                 type_id: 0,
-                descr_index: 0,
                 fields: Vec::new(),
             },
             // resume.py:763-870 VStr/VUni*Info — virtual string shells
@@ -2510,7 +2503,6 @@ impl MaterializedVirtual {
             | VirtualInfo::VUniSlice { .. } => MaterializedVirtual::Struct {
                 descr: None,
                 type_id: 0,
-                descr_index: 0,
                 fields: Vec::new(),
             },
         }
@@ -2597,12 +2589,10 @@ impl MaterializedVirtual {
             MaterializedVirtual::Obj {
                 descr,
                 type_id,
-                descr_index,
                 fields,
             } => Some(MaterializedVirtual::Obj {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: fields
                     .iter()
                     .map(|(idx, value)| {
@@ -2616,12 +2606,10 @@ impl MaterializedVirtual {
             MaterializedVirtual::Struct {
                 descr,
                 type_id,
-                descr_index,
                 fields,
             } => Some(MaterializedVirtual::Struct {
                 descr: descr.clone(),
                 type_id: *type_id,
-                descr_index: *descr_index,
                 fields: fields
                     .iter()
                     .map(|(idx, value)| {

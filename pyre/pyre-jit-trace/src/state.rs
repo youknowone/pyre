@@ -7530,7 +7530,6 @@ mod tests {
         let materialized = MaterializedVirtual::Obj {
             descr: Some(descr.clone()),
             type_id: crate::descr::W_FLOAT_GC_TYPE_ID,
-            descr_index: descr.index(),
             fields: vec![(
                 crate::descr::float_floatval_descr().index(),
                 MaterializedValue::Value(value.to_bits() as i64),
@@ -7564,7 +7563,6 @@ mod tests {
         let materialized = MaterializedVirtual::Obj {
             descr: Some(descr.clone()),
             type_id: 0,
-            descr_index: descr.index(),
             fields: vec![(
                 crate::descr::bool_boolval_descr().index(),
                 MaterializedValue::Value(1),
@@ -7598,7 +7596,6 @@ mod tests {
         let materialized = MaterializedVirtual::Obj {
             descr: Some(descr.clone()),
             type_id: 0,
-            descr_index: descr.index(),
             fields: vec![
                 (
                     crate::descr::range_iter_current_descr().index(),
@@ -7686,7 +7683,6 @@ mod tests {
         let list_virtual = MaterializedVirtual::Obj {
             descr: None,
             type_id: 0,
-            descr_index: 0,
             fields: vec![
                 (
                     crate::descr::ob_type_descr().index(),
