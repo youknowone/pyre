@@ -1031,17 +1031,16 @@ pub struct Block {
     pub id: BlockId,
     /// Phi-node inputs: values provided by incoming Links.
     ///
-    /// RPython parity target: `Block.inputargs: List[Variable]`
+    /// RPython parity: `Block.inputargs: List[Variable]`
     /// (`flowspace/model.py:21-25 Block([Variable("etype"),
-    /// Variable("evalue")])`).  Pyre currently stores the dense
-    /// `ValueId` index — the storage migration to `Vec<Variable>`
-    /// requires updating dozens of test fixtures that build `Block`
-    /// struct literals; the ~15-file production migration to
-    /// route reads through [`Self::input_variables`] /
+    /// Variable("evalue")])`) — each predecessor Link carries
+    /// values that map 1:1 to these inputargs.  Pyre stores the
+    /// upstream-orthodox `Variable` directly; consumers needing
+    /// pyre's dense `ValueId` index project via
+    /// [`FunctionGraph::value_id_of`] (helper accessors
     /// [`Self::inputarg_value_ids`] / [`FunctionGraph::push_inputarg`]
-    /// is in place so the storage flip lands once test fixtures
-    /// adopt the helper-style construction.
-    pub inputargs: Vec<ValueId>,
+    /// wrap the projection at high-traffic call sites).
+    pub inputargs: Vec<crate::flowspace::model::Variable>,
     pub operations: Vec<SpaceOperation>,
     /// RPython `Block.exitswitch`.
     pub exitswitch: Option<ExitSwitch>,
@@ -1900,37 +1899,35 @@ impl Block {
         matches!(self.exitswitch, Some(ExitSwitch::LastException))
     }
 
-    /// Variable-identity view of [`Self::inputargs`] — projects each
-    /// `ValueId` through `graph.variable(v)` to its backing
-    /// [`crate::flowspace::model::Variable`].  Mirrors upstream
-    /// `Block.inputargs: List[Variable]`
-    /// (`flowspace/model.py:21-25`) at the read surface; the
-    /// storage migration that lets this method return
-    /// `self.inputargs.iter()` directly is tracked on
-    /// [`Self::inputargs`].
+    /// Variable-identity iter over [`Self::inputargs`] — direct
+    /// over the upstream-orthodox `Vec<Variable>` storage, matching
+    /// `Block.inputargs: List[Variable]` (`flowspace/model.py:21-25`).
+    /// The `_graph` parameter is vestigial, kept for the existing
+    /// call signature now that the storage migration has landed.
     pub fn input_variables<'a>(
         &'a self,
-        graph: &'a FunctionGraph,
+        _graph: &'a FunctionGraph,
     ) -> impl Iterator<Item = &'a crate::flowspace::model::Variable> + 'a {
-        self.inputargs.iter().map(move |v| {
-            graph.variable(*v).unwrap_or_else(|| {
-                panic!(
-                    "Block::input_variables: ValueId {v:?} on block {:?} \
-                     has no backing Variable on graph {:?} — every \
-                     alloc_value_with_type slot must mint one",
-                    self.id, graph.name,
-                )
-            })
-        })
+        self.inputargs.iter()
     }
 
-    /// Identity helper kept for symmetric naming with
-    /// [`Self::input_variables`] — `inputargs` is currently stored
-    /// as `Vec<ValueId>` so the projection is just a clone.  Once
-    /// the storage flips to `Vec<Variable>` this becomes the
-    /// `graph.value_id_of` projection.
-    pub fn inputarg_value_ids(&self, _graph: &FunctionGraph) -> Vec<ValueId> {
-        self.inputargs.clone()
+    /// Project [`Self::inputargs`] to pyre's dense `ValueId` index
+    /// via [`FunctionGraph::value_id_of`].  Used by callers that
+    /// still key downstream structures (HashMap<ValueId, …>,
+    /// link.args zips) on the legacy ValueId surface.
+    pub fn inputarg_value_ids(&self, graph: &FunctionGraph) -> Vec<ValueId> {
+        self.inputargs
+            .iter()
+            .map(|var| {
+                graph.value_id_of(var).unwrap_or_else(|| {
+                    panic!(
+                        "Block::inputarg_value_ids: Variable on block {:?} not registered \
+                         in graph.variable_to_vid (graph {:?})",
+                        self.id, graph.name,
+                    )
+                })
+            })
+            .collect()
     }
 
     /// RPython `flowspace/model.py:247 closeblock` / `:250 recloseblock`
@@ -2319,7 +2316,7 @@ impl FunctionGraph {
                 },
                 Block {
                     id: returnblock,
-                    inputargs: vec![return_value],
+                    inputargs: vec![var_returnvar.clone()],
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
@@ -2328,7 +2325,7 @@ impl FunctionGraph {
                 },
                 Block {
                     id: exceptblock,
-                    inputargs: vec![last_exception, last_exc_value],
+                    inputargs: vec![var_etype.clone(), var_evalue.clone()],
                     operations: Vec::new(),
                     exitswitch: None,
                     exits: Vec::new(),
@@ -2367,7 +2364,7 @@ impl FunctionGraph {
     /// two inputargs, `(etype, evalue)`, and exists eagerly on every
     /// graph.
     pub fn exceptblock_args(&self) -> (BlockId, ValueId, ValueId) {
-        let args = &self.block(self.exceptblock).inputargs;
+        let args = self.block(self.exceptblock).inputarg_value_ids(self);
         (self.exceptblock, args[0], args[1])
     }
 
@@ -2376,7 +2373,7 @@ impl FunctionGraph {
     /// RPython parity: `FunctionGraph.getreturnvar()` reads
     /// `graph.returnblock.inputargs[0]`.
     pub fn returnblock_arg(&self) -> (BlockId, ValueId) {
-        let args = &self.block(self.returnblock).inputargs;
+        let args = self.block(self.returnblock).inputarg_value_ids(self);
         (self.returnblock, args[0])
     }
 
@@ -2398,9 +2395,17 @@ impl FunctionGraph {
     pub fn create_block_with_args(&mut self, num_args: usize) -> (BlockId, Vec<ValueId>) {
         let id = BlockId(self.blocks.len());
         let args: Vec<ValueId> = (0..num_args).map(|_| self.alloc_value()).collect();
+        let inputargs: Vec<crate::flowspace::model::Variable> = args
+            .iter()
+            .map(|v| {
+                self.variable(*v)
+                    .expect("alloc_value mints backing Variable")
+                    .clone()
+            })
+            .collect();
         self.blocks.push(Block {
             id,
-            inputargs: args.clone(),
+            inputargs,
             operations: Vec::new(),
             exitswitch: None,
             exits: Vec::new(),
@@ -2624,9 +2629,22 @@ impl FunctionGraph {
         // `concretetype` cell is `None` — `concretetype()` returns
         // `Unknown` for it until the rtyper / jtransform follows up
         // with `set_concretetype` / `bind_variable`.
-        if next > self.value_variables.len() {
+        let starting_len = self.value_variables.len();
+        if next > starting_len {
             self.value_variables
                 .resize_with(next, || Some(crate::flowspace::model::Variable::new()));
+            // Register every freshly-minted Variable in variable_to_vid
+            // so `value_id_of` lookups against them succeed.  Without
+            // this, `Block::inputarg_value_ids` would panic when
+            // tests build inputargs via `block_inputargs(graph,
+            // &[ValueId(N)])` for a slot grown via `set_next_value`.
+            for idx in starting_len..next {
+                if let Some(Some(var)) = self.value_variables.get(idx) {
+                    self.variable_to_vid
+                        .entry(var.id())
+                        .or_insert(ValueId(idx));
+                }
+            }
         }
         self.next_value = next;
     }
@@ -2851,19 +2869,17 @@ impl FunctionGraph {
         &mut self.blocks[block.0]
     }
 
-    /// Append `vid` to `block.inputargs`.  Currently a thin wrapper
-    /// around `block_mut(block).inputargs.push(vid)` so call sites
-    /// that thread `(graph, block, vid)` already match the
-    /// post-storage-migration call shape (`block.inputargs:
-    /// Vec<Variable>` will require the helper to look up the
-    /// backing Variable at push time — see [`Block::inputargs`]).
+    /// Append `vid`'s backing `Variable` to `block.inputargs` —
+    /// callers that synthesise inputargs at front-end / merge time
+    /// pass the freshly minted ValueId; the helper looks up the
+    /// backing Variable and pushes it onto the upstream-orthodox
+    /// `Vec<Variable>` storage.
     pub fn push_inputarg(&mut self, block: BlockId, vid: ValueId) {
-        debug_assert!(
-            self.variable(vid).is_some(),
-            "push_inputarg: ValueId {vid:?} must have a backing Variable on graph {:?}",
-            self.name,
-        );
-        self.block_mut(block).inputargs.push(vid);
+        let var = self
+            .variable(vid)
+            .expect("push_inputarg: ValueId must have a backing Variable on the graph")
+            .clone();
+        self.block_mut(block).inputargs.push(var);
     }
 
     // ── RPython FunctionGraph iteration methods ──────────────────
@@ -3193,7 +3209,7 @@ mod tests {
         prune_dead_phis(&mut graph);
 
         assert_eq!(
-            graph.block(merge).inputargs,
+            graph.block(merge).inputarg_value_ids(&graph),
             vec![phi_x],
             "phi with a live downstream reader must stay"
         );
@@ -3324,17 +3340,17 @@ mod tests {
         prune_dead_phis(&mut graph);
 
         assert_eq!(
-            graph.block(entry).inputargs,
+            graph.block(entry).inputarg_value_ids(&graph),
             vec![unused_param],
             "startblock inputargs are calling-convention; never pruned"
         );
         assert_eq!(
-            graph.block(graph.returnblock).inputargs,
+            graph.block(graph.returnblock).inputargs.clone(),
             pre_returnblock_args,
             "returnblock inputargs are runtime contract; never pruned"
         );
         assert_eq!(
-            graph.block(graph.exceptblock).inputargs,
+            graph.block(graph.exceptblock).inputargs.clone(),
             pre_exceptblock_args,
             "exceptblock inputargs are runtime contract; never pruned"
         );
@@ -3435,7 +3451,7 @@ mod tests {
         prune_dead_phis(&mut graph);
 
         assert_eq!(
-            graph.block(orphan_entry).inputargs,
+            graph.block(orphan_entry).inputarg_value_ids(&graph),
             vec![unused_param],
             "non-canonical entry block (no incoming link) must keep its inputargs"
         );

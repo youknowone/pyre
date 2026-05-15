@@ -187,9 +187,10 @@ pub(crate) fn build_value_to_variable_map(
     let mut map: ValueIdToVariable = HashMap::new();
     for block in &legacy.blocks {
         // Class 1a — block-inputarg definitions.
-        for &vid in &block.inputargs {
-            map.entry(vid)
-                .or_insert_with(|| seed_variable(vid, annotations));
+        let inputarg_vids = block.inputarg_value_ids(legacy);
+        for vid in &inputarg_vids {
+            map.entry(*vid)
+                .or_insert_with(|| seed_variable(*vid, annotations));
         }
 
         // Per-block name → inputarg-Variable lookup for `OpKind::Input`
@@ -208,7 +209,7 @@ pub(crate) fn build_value_to_variable_map(
         for op in &block.operations {
             if let OpKind::Input { name, .. } = &op.kind {
                 if let Some(result) = op.result {
-                    if block.inputargs.contains(&result) {
+                    if inputarg_vids.contains(&result) {
                         if let Some(var) = map.get(&result) {
                             name_to_inputarg_var
                                 .entry(name.as_str())
@@ -1818,6 +1819,29 @@ mod tests {
     };
     use crate::translator::rtyper::pyre_call_registry::PyreCallRegistry;
 
+    /// Test helper — project ValueIds to backing Variables for
+    /// `Block { inputargs: ..., .. }` literals.  Auto-grows the
+    /// graph via `set_next_value` when ValueIds past the canonical 3
+    /// slots are referenced so each has a backing Variable.
+    fn block_inputargs(
+        graph: &mut LegacyGraph,
+        vids: &[ValueId],
+    ) -> Vec<crate::flowspace::model::Variable> {
+        if let Some(max) = vids.iter().map(|v| v.0).max() {
+            if max >= graph.next_value() {
+                graph.set_next_value(max + 1);
+            }
+        }
+        vids.iter()
+            .map(|v| {
+                graph
+                    .variable(*v)
+                    .expect("block_inputargs: set_next_value must have minted a Variable")
+                    .clone()
+            })
+            .collect()
+    }
+
     /// Helper: empty `PyreCallRegistry` for tests that don't exercise
     /// the Slice A.2/A.3 Call resolution path.  The registry's
     /// bookkeeper is freshly minted because translate_op tests don't
@@ -1968,7 +1992,7 @@ mod tests {
         let mut graph = LegacyGraph::new("test");
         let mut block = Block {
             id: BlockId(0),
-            inputargs: vec![input],
+            inputargs: block_inputargs(&mut graph, &[input]),
             operations: vec![SpaceOperation {
                 result: Some(result),
                 kind: OpKind::ConstInt(0),
@@ -2034,7 +2058,7 @@ mod tests {
         let mut graph = LegacyGraph::new("dedup_test");
         let mut block = Block {
             id: BlockId(0),
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![
                 SpaceOperation {
                     result: Some(ValueId(2)),
@@ -2081,7 +2105,7 @@ mod tests {
         let mut graph = LegacyGraph::new("rebind_alias");
         let mut block = Block {
             id: BlockId(0),
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![
                 // Leading definition: result IS the inputarg.
                 SpaceOperation {
@@ -2128,7 +2152,7 @@ mod tests {
         let mut graph = LegacyGraph::new("const_inline");
         let mut block = Block {
             id: BlockId(0),
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![
                 SpaceOperation {
                     result: Some(ValueId(2)),
@@ -2797,7 +2821,7 @@ mod tests {
         let mut graph = LegacyGraph::new("identity_return");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
@@ -2809,7 +2833,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2877,7 +2901,7 @@ mod tests {
         let mut graph = LegacyGraph::new("with_return_var");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
@@ -2889,7 +2913,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(2)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2936,7 +2960,7 @@ mod tests {
         let mut graph = LegacyGraph::new("const_link_arg");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: OpKind::ConstInt(7),
@@ -2952,7 +2976,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(3)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(3)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -3000,7 +3024,7 @@ mod tests {
         let mut graph = LegacyGraph::new("canraise_with_extravars");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1), ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1), ValueId(2)]),
             operations: vec![SpaceOperation {
                 result: Some(ValueId(3)),
                 kind: OpKind::BinOp {
@@ -3028,7 +3052,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(4)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(4)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -3037,7 +3061,7 @@ mod tests {
         };
         let exceptblock = Block {
             id: graph.exceptblock,
-            inputargs: vec![ValueId(10), ValueId(11)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(10), ValueId(11)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -3079,7 +3103,7 @@ mod tests {
         let mut graph = LegacyGraph::new("unported_op");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: OpKind::Call {
@@ -3101,7 +3125,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(3)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(3)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],

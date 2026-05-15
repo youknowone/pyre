@@ -2757,7 +2757,10 @@ fn lazy_install_local_at_current_block(
             "rollback expected Input op for {name:?} at the operations tail",
         );
         let popped_inputarg = block.inputargs.pop();
-        debug_assert_eq!(popped_inputarg, Some(new_vid));
+        debug_assert_eq!(
+            popped_inputarg.as_ref().and_then(|var| graph.value_id_of(var)),
+            Some(new_vid),
+        );
         match prior_ctx_lvi {
             Some((vid, def_block)) => {
                 ctx.bind_local_id(name.to_string(), vid, def_block);
@@ -9662,8 +9665,9 @@ mod tests {
         // eagerly by the iterative fold's fresh-phi step (the
         // disagreeing-vid branch of 2-way `union`).
         let phi_block = graph.blocks.iter().find(|block| {
+            let inputarg_vids = block.inputarg_value_ids(&graph);
             block.operations.iter().any(|op| {
-                op.result.is_some_and(|r| block.inputargs.contains(&r))
+                op.result.is_some_and(|r| inputarg_vids.contains(&r))
                     && matches!(
                         &op.kind,
                         OpKind::Input { name, .. } if name == "x"
@@ -9743,8 +9747,9 @@ mod tests {
         // inputarg — that's the merge-block phi the lazy installer
         // allocates when the post-match `x` read fires.
         let phi_block = graph.blocks.iter().find(|block| {
+            let inputarg_vids = block.inputarg_value_ids(&graph);
             block.operations.iter().any(|op| {
-                op.result.is_some_and(|r| block.inputargs.contains(&r))
+                op.result.is_some_and(|r| inputarg_vids.contains(&r))
                     && matches!(
                         &op.kind,
                         OpKind::Input { name, .. } if name == "x"
@@ -9820,9 +9825,10 @@ mod tests {
             if block.inputargs.is_empty() {
                 continue;
             }
+            let inputarg_vids = block.inputarg_value_ids(&graph);
             let has_i_input = block.operations.iter().any(|op| {
                 matches!(&op.kind, OpKind::Input { name, .. } if name == "i")
-                    && op.result.is_some_and(|r| block.inputargs.contains(&r))
+                    && op.result.is_some_and(|r| inputarg_vids.contains(&r))
             });
             if !has_i_input {
                 continue;
@@ -11344,7 +11350,7 @@ mod tests {
         // RPython `flowcontext.py` emits a fresh Variable on the
         // prevblock side for `return None`; the returnblock's own
         // inputarg stays distinct.
-        let returnblock_arg = func.graph.block(func.graph.returnblock).inputargs[0];
+        let returnblock_arg = func.graph.block(func.graph.returnblock).inputarg_value_ids(&func.graph)[0];
         // Upstream `flowspace/model.py:171-180` keeps the void return shape
         // in Block.exits: a single Link([fresh_void], graph.returnblock)
         // with exitswitch=None.
@@ -11940,9 +11946,10 @@ mod tests {
         // filtered out (None-killed: not in pre-loop snapshot).
         assert_eq!(header_phi_names, vec!["x".to_string()]);
 
+        let header_inputarg_vids = graph.block(header_entry).inputarg_value_ids(&graph);
+        assert_eq!(header_inputarg_vids.len(), 1);
+        let phi_vid = header_inputarg_vids[0];
         let header = graph.block(header_entry);
-        assert_eq!(header.inputargs.len(), 1);
-        let phi_vid = header.inputargs[0];
         assert_eq!(header.operations.len(), 1);
         let phi_op = &header.operations[0];
         match &phi_op.kind {
@@ -12076,11 +12083,12 @@ mod tests {
                     && b.id != graph.exceptblock
             })
             .expect("loop header must exist");
+        let header_inputarg_vids = header.inputarg_value_ids(&graph);
         let header_phi_names: Vec<&str> = header
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OpKind::Input { name, .. } if header.inputargs.contains(&op.result.unwrap()) => {
+                OpKind::Input { name, .. } if header_inputarg_vids.contains(&op.result.unwrap()) => {
                     Some(name.as_str())
                 }
                 _ => None,
@@ -12138,11 +12146,12 @@ mod tests {
                     && b.id != graph.exceptblock
             })
             .expect("loop header must exist");
+        let header_inputarg_vids = header.inputarg_value_ids(&graph);
         let header_phi_names: Vec<&str> = header
             .operations
             .iter()
             .filter_map(|op| match &op.kind {
-                OpKind::Input { name, .. } if header.inputargs.contains(&op.result.unwrap()) => {
+                OpKind::Input { name, .. } if header_inputarg_vids.contains(&op.result.unwrap()) => {
                     Some(name.as_str())
                 }
                 _ => None,
@@ -12205,11 +12214,12 @@ mod tests {
         // inner loop headers).
         let mut loop_headers_with_outer = 0;
         for header in &graph.blocks {
+            let header_inputarg_vids = header.inputarg_value_ids(&graph);
             let has_outer_phi = header.operations.iter().any(|op| {
                 matches!(&op.kind, OpKind::Input { name, .. } if name == "outer")
                     && op
                         .result
-                        .map(|r| header.inputargs.contains(&r))
+                        .map(|r| header_inputarg_vids.contains(&r))
                         .unwrap_or(false)
             });
             if !has_outer_phi {
@@ -12322,9 +12332,10 @@ mod tests {
         // `x`.  Today the loop header carries one because the AST
         // scan collapses both `let x` bindings into the same name.
         let any_x_phi = graph.blocks.iter().any(|b| {
+            let inputarg_vids = b.inputarg_value_ids(&graph);
             b.operations.iter().any(|op| {
                 matches!(&op.kind, OpKind::Input { name, .. } if name == "x")
-                    && op.result.map(|r| b.inputargs.contains(&r)).unwrap_or(false)
+                    && op.result.map(|r| inputarg_vids.contains(&r)).unwrap_or(false)
             })
         });
         assert!(
@@ -12528,14 +12539,15 @@ mod tests {
         let (post_loop_id, ret_value_vid) =
             pred_link.expect("returnblock must have one closing predecessor");
         let post_loop_block = graph.block(post_loop_id);
-        let is_inputarg = post_loop_block.inputargs.contains(&ret_value_vid);
+        let post_loop_vids = post_loop_block.inputarg_value_ids(&graph);
+        let is_inputarg = post_loop_vids.contains(&ret_value_vid);
         assert!(
             is_inputarg,
             "post-loop block must own `y` as an inputarg threaded back to \
              pre-loop; got naked-`Input` fallback (vid {:?} not in \
              inputargs {:?}). graph:\n{}",
             ret_value_vid,
-            post_loop_block.inputargs,
+            post_loop_vids,
             graph.dump()
         );
         // Audit Cat 2-1 also stamps continue + body_tail framestate
@@ -12549,9 +12561,10 @@ mod tests {
             .blocks
             .iter()
             .find_map(|b| {
+                let inputarg_vids = b.inputarg_value_ids(&graph);
                 let owns_count_phi = b.operations.iter().any(|op| {
                     matches!(&op.kind, OpKind::Input { name, .. } if name == "count")
-                        && op.result.is_some_and(|r| b.inputargs.contains(&r))
+                        && op.result.is_some_and(|r| inputarg_vids.contains(&r))
                 });
                 let pred_count = graph
                     .blocks

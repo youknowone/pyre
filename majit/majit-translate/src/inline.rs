@@ -171,14 +171,20 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     for callee_block in &callee.blocks {
         let new_block_id = block_map[&callee_block.id];
 
-        // Remap inputargs (callee Variables → caller-graph Variables
-        // via value_map; storage stays Vec<ValueId> until the
-        // upstream-orthodox Vec<Variable> migration lands across
-        // every test fixture).
-        let new_inputargs: Vec<ValueId> = callee_block
+        // Remap inputargs (callee ValueIds → caller-graph ValueIds
+        // via value_map, then project to the caller's backing
+        // Variable for the upstream-orthodox `Vec<Variable>`
+        // storage shape).
+        let new_inputargs: Vec<crate::flowspace::model::Variable> = callee_block
             .inputarg_value_ids(&callee)
             .into_iter()
-            .map(|v| value_map[&v])
+            .map(|v| {
+                let mapped = value_map[&v];
+                graph
+                    .variable(mapped)
+                    .expect("alloc_value mints backing Variable")
+                    .clone()
+            })
             .collect();
         graph.blocks[new_block_id.0].inputargs = new_inputargs;
 

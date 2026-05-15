@@ -516,7 +516,7 @@ mod tests {
         graph.set_return(entry, Some(result));
 
         let state = annotate(&graph);
-        let ret = graph.block(graph.returnblock).inputargs[0];
+        let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
         assert_eq!(state.get(result), &ValueType::Float);
         assert_eq!(state.get(ret), &ValueType::Float);
     }
@@ -528,7 +528,7 @@ mod tests {
         graph.set_return(entry, None);
 
         let state = annotate(&graph);
-        let ret = graph.block(graph.returnblock).inputargs[0];
+        let ret = graph.block(graph.returnblock).inputarg_value_ids(&graph)[0];
         assert_eq!(state.get(ret), &ValueType::Void);
     }
 }

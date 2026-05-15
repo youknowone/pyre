@@ -1358,6 +1358,31 @@ mod tests {
         crate::model::Link::new_mixed(args, returnblock_id, None)
     }
 
+    /// Test helper — project ValueIds to their backing Variables on
+    /// the graph so a `Block { inputargs: ..., .. }` struct literal
+    /// can carry the upstream-orthodox `Vec<Variable>` shape.
+    /// Auto-grows the graph via `set_next_value` when ValueIds past
+    /// the canonical 3 slots are referenced so each has a backing
+    /// Variable registered in `variable_to_vid`.
+    fn block_inputargs(
+        graph: &mut LegacyGraph,
+        vids: &[ValueId],
+    ) -> Vec<crate::flowspace::model::Variable> {
+        if let Some(max) = vids.iter().map(|v| v.0).max() {
+            if max >= graph.next_value() {
+                graph.set_next_value(max + 1);
+            }
+        }
+        vids.iter()
+            .map(|v| {
+                graph
+                    .variable(*v)
+                    .expect("block_inputargs: set_next_value must have minted a Variable")
+                    .clone()
+            })
+            .collect()
+    }
+
     #[test]
     fn lowleveltype_to_concrete_signed_family_collapses_to_signed() {
         for ll in [
@@ -1460,7 +1485,7 @@ mod tests {
         let mut graph = LegacyGraph::new("identity_int");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
@@ -1472,7 +1497,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -1500,7 +1525,7 @@ mod tests {
         let mut graph = LegacyGraph::new("identity_float");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
@@ -1512,7 +1537,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -1548,7 +1573,7 @@ mod tests {
         let mut graph = LegacyGraph::new("identity_ref");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
@@ -1560,7 +1585,7 @@ mod tests {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -1799,7 +1824,7 @@ fn id(x: &Foo) -> &Foo { x }
         let mut graph = LegacyGraph::new("not_int");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: crate::model::OpKind::UnaryOp {
@@ -1818,7 +1843,7 @@ fn id(x: &Foo) -> &Foo { x }
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(2)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -1854,7 +1879,7 @@ fn id(x: &Foo) -> &Foo { x }
         let mut graph = LegacyGraph::new("deref_int");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: crate::model::OpKind::UnaryOp {
@@ -1873,7 +1898,7 @@ fn id(x: &Foo) -> &Foo { x }
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(2)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -1963,7 +1988,7 @@ fn fib(n: i64) -> i64 {
         let mut graph = LegacyGraph::new("guard_passthrough");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
                 result: None,
                 kind: crate::model::OpKind::GuardValue {
@@ -1981,7 +2006,7 @@ fn fib(n: i64) -> i64 {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2013,7 +2038,7 @@ fn fib(n: i64) -> i64 {
         let mut graph = LegacyGraph::new("unported_call");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: crate::model::OpKind::Call {
@@ -2035,7 +2060,7 @@ fn fib(n: i64) -> i64 {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(2)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2082,7 +2107,7 @@ fn fib(n: i64) -> i64 {
         let mut graph = LegacyGraph::new("call_resolved");
         let startblock = Block {
             id: graph.startblock,
-            inputargs: vec![ValueId(1)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
             operations: vec![crate::model::SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: crate::model::OpKind::Call {
@@ -2103,7 +2128,7 @@ fn fib(n: i64) -> i64 {
         };
         let returnblock = Block {
             id: graph.returnblock,
-            inputargs: vec![ValueId(2)],
+            inputargs: block_inputargs(&mut graph, &[ValueId(2)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
@@ -2132,7 +2157,7 @@ fn fib(n: i64) -> i64 {
         let mut callee_graph = LegacyGraph::new("foo");
         let foo_start = Block {
             id: callee_graph.startblock,
-            inputargs: vec![ValueId(10)],
+            inputargs: block_inputargs(&mut callee_graph, &[ValueId(10)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![link_to_returnblock(
@@ -2144,7 +2169,7 @@ fn fib(n: i64) -> i64 {
         };
         let foo_return = Block {
             id: callee_graph.returnblock,
-            inputargs: vec![ValueId(10)],
+            inputargs: block_inputargs(&mut callee_graph, &[ValueId(10)]),
             operations: vec![],
             exitswitch: None,
             exits: vec![],
