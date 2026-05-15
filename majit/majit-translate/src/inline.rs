@@ -884,6 +884,40 @@ pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
     }
 }
 
+/// Variable-identity sibling of [`op_value_refs`] —
+/// each `ValueId` operand is projected through
+/// [`crate::model::FunctionGraph::variable`] to its backing
+/// [`crate::flowspace::model::Variable`].  Slots without a backing
+/// Variable surface as `None` so callers can decide whether the gap
+/// is acceptable (e.g. format diagnostics) or should panic
+/// (e.g. assembler that requires upstream-typed identity).
+///
+/// RPython parity — upstream `SpaceOperation.args` is already a
+/// `Vec<Hlvalue>` where each `Hlvalue::Variable` carries the
+/// authoritative operand identity (`flowspace/model.py:140`).  This
+/// helper is pyre's bridge from the legacy `ValueId`-keyed shape to
+/// the upstream-orthodox Variable-keyed reads.
+pub fn op_variable_refs(
+    kind: &OpKind,
+    graph: &crate::model::FunctionGraph,
+) -> Vec<Option<crate::flowspace::model::Variable>> {
+    op_value_refs(kind)
+        .into_iter()
+        .map(|vid| graph.variable(vid).cloned())
+        .collect()
+}
+
+/// Variable-identity accessor for an op's result slot — returns
+/// `Some(var)` when the op produces a result and that result has a
+/// backing Variable on the graph.  Mirrors upstream
+/// `SpaceOperation.result: Hlvalue` (`flowspace/model.py:140`).
+pub fn op_result_variable(
+    op: &crate::model::SpaceOperation,
+    graph: &crate::model::FunctionGraph,
+) -> Option<crate::flowspace::model::Variable> {
+    op.result.and_then(|vid| graph.variable(vid).cloned())
+}
+
 /// `true` iff `kind` is side-effect-free and may be removed from the
 /// graph when its result has no readers.  Direct port of RPython
 /// `simplify.py:405-417 CanRemove` set + the lltype-level
@@ -1480,6 +1514,53 @@ mod tests {
                     block.id,
                     link.target
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn op_variable_refs_projects_each_value_id_to_its_backing_variable() {
+        // ArrayRead(base, index) — two operand ValueIds, each minted by
+        // alloc_value_with_type so the graph holds a backing
+        // flowspace::Variable per slot.  op_variable_refs must surface
+        // those Variables in the same order op_value_refs returns the
+        // ValueIds.
+        let g = make_simple_callee();
+        let entry = g.block(g.startblock);
+        let array_read = entry
+            .operations
+            .iter()
+            .find(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
+            .expect("simple callee has the ArrayRead op");
+        let value_ids = op_value_refs(&array_read.kind);
+        let variables = op_variable_refs(&array_read.kind, &g);
+        assert_eq!(value_ids.len(), variables.len(), "len parity");
+        for (vid, var_opt) in value_ids.iter().zip(variables.iter()) {
+            let direct = g
+                .variable(*vid)
+                .expect("alloc_value_with_type binds a Variable per slot");
+            let projected = var_opt
+                .as_ref()
+                .expect("op_variable_refs preserves the bound Variable");
+            assert_eq!(direct.id(), projected.id(), "Variable identity preserved");
+        }
+    }
+
+    #[test]
+    fn op_result_variable_returns_some_for_result_carrying_ops() {
+        let g = make_simple_callee();
+        let entry = g.block(g.startblock);
+        for op in &entry.operations {
+            let result_var = op_result_variable(op, &g);
+            match op.result {
+                Some(vid) => {
+                    let direct = g
+                        .variable(vid)
+                        .expect("op result ValueId has a backing Variable");
+                    let projected = result_var.expect("op_result_variable returns Some");
+                    assert_eq!(direct.id(), projected.id());
+                }
+                None => assert!(result_var.is_none()),
             }
         }
     }
