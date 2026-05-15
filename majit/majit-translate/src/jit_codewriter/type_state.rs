@@ -79,10 +79,11 @@ use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
 /// Re-export the canonical [`ConcreteType`] from [`crate::model`].
 ///
 /// The kind enum used to live here as a side-table value type;
-/// after the medium-term parity push it lives directly on
-/// [`FunctionGraph::value_types`] (mirroring upstream
-/// `Variable.concretetype`).  The alias keeps existing imports
-/// working while consumers migrate to reading
+/// after the medium-term parity push it lives on each backing
+/// `Variable.concretetype` cell stored in
+/// [`FunctionGraph::value_variables`] (mirroring upstream
+/// `Variable.concretetype` line-for-line).  The alias keeps existing
+/// imports working while consumers migrate to reading
 /// `graph.concretetype(v)`.
 pub use crate::model::ConcreteType;
 
@@ -108,13 +109,17 @@ const UNKNOWN: ConcreteType = ConcreteType::Unknown;
 /// `var.concretetype` / `setattr` / `hasattr` patterns; the Vec is
 /// an implementation detail.
 ///
-/// **Transitional role (post-fb710a42dc)** — once
-/// [`apply_to_graph`] writes every non-Unknown slot through to
-/// [`FunctionGraph::value_types`], downstream consumers read kinds
-/// via `graph.concretetype(v)` and this scratch buffer can be
-/// dropped from the call chain.  Collapsed to the four-way
-/// `Signed` / `GcRef` / `Float` / `Void` axis used by the JIT
-/// codewriter, per `rpython/jit/metainterp/history.py:45-71 getkind`.
+/// **Long-term role** — this struct is the build-time scratch buffer
+/// used by jtransform / legacy-resolve while they compute per-value
+/// kinds.  The authoritative store after the rtyper handoff is each
+/// backing `Variable.concretetype` cell on
+/// [`FunctionGraph::value_variables`]: [`apply_to_graph`] writes
+/// every non-Unknown slot through `graph.set_concretetype`, after
+/// which downstream consumers read kinds via `graph.concretetype(v)`.
+///
+/// Collapsed to the four-way `Signed` / `GcRef` / `Float` / `Void` axis
+/// used by the JIT codewriter, per `rpython/jit/metainterp/history.py:45-71
+/// getkind`.
 #[derive(Debug, Default, Clone)]
 pub struct TypeResolutionState {
     slots: Vec<ConcreteType>,
@@ -198,10 +203,12 @@ impl TypeResolutionState {
 }
 
 /// Bulk-write every entry of a transitional [`TypeResolutionState`]
-/// into the graph's per-value `value_types` slot.  After this call
+/// into each `ValueId`'s backing Variable via
+/// `graph.set_concretetype` (which writes through to
+/// `Variable.concretetype`).  After this call
 /// `graph.concretetype(v) == types.get(v)` for every `v` covered by
 /// the transitional table; values absent from `types` keep their
-/// existing graph-side kind (`Unknown` for fresh allocations).
+/// existing kind (`Unknown` for fresh allocations).
 ///
 /// Mirrors RPython's "rtyper finishes, every Variable now has
 /// `.concretetype`" handoff — pyre's scratch table is the staging
@@ -217,9 +224,11 @@ pub fn apply_to_graph(types: &TypeResolutionState, graph: &mut FunctionGraph) {
     }
 }
 
-/// Hydrate the graph's per-value `value_types` slots directly from
-/// the upstream-typed [`crate::flowspace::model::Variable.concretetype`]
-/// references in `value_to_var`.
+/// Rebind each ValueId's backing
+/// [`crate::flowspace::model::Variable`] to the upstream-typed
+/// Variable in `value_to_var`, so subsequent
+/// `graph.concretetype(v)` reads route through the rtyper's
+/// `Variable.concretetype` directly.
 ///
 /// **Long-term parity path** — this is the path the codewriter
 /// will use once every value has a backing flowspace `Variable`:
@@ -240,13 +249,12 @@ pub fn apply_from_flowspace_variables(
     value_to_var: &crate::translator::rtyper::flowspace_adapter::ValueIdToVariable,
 ) {
     for (vid, var) in value_to_var.iter() {
-        // `bind_variable` stamps both the dense `value_types` slot
-        // (`getkind(var.concretetype)`) and the backing-Variable
-        // slot (`value_variables`) so subsequent
-        // `graph.concretetype(v)` / `graph.variable(v)` reads route
-        // through the upstream `Variable.concretetype` attribute
-        // verbatim — the codewriter consumes the rtyper-typed
-        // Variable as the source of truth.
+        // `bind_variable` replaces the slot's backing
+        // `value_variables[vid]` with the upstream Variable so
+        // subsequent `graph.concretetype(v)` / `graph.variable(v)`
+        // reads route through the rtyper-typed Variable's
+        // `concretetype` attribute verbatim — the codewriter
+        // consumes the rtyper-typed Variable as the source of truth.
         graph.bind_variable(*vid, var.clone());
     }
 }
@@ -323,12 +331,13 @@ pub fn merge_synth_kinds(
 /// Direct-to-graph variant of [`merge_synth_kinds`].
 ///
 /// Same precedence stack (`stamped > post_result > post_resolve >
-/// original`) but writes the per-value result straight into
-/// [`crate::model::FunctionGraph::value_types`] instead of building
-/// a transitional [`TypeResolutionState`].  Production callers go
-/// through this entry so the graph IS the merge target — no
-/// intermediate side table to thread downstream.  Skips Unknown
-/// writes so the canonical-exceptblock stamp performed elsewhere
+/// original`) but writes the per-value result straight through to
+/// each backing `Variable.concretetype` cell via
+/// `graph.set_concretetype` instead of building a transitional
+/// [`TypeResolutionState`].  Production callers go through this entry
+/// so the graph IS the merge target — no intermediate side table to
+/// thread downstream.  Skips Unknown writes so the
+/// canonical-exceptblock stamp performed elsewhere
 /// (`augment_canonical_exceptblock_on_graph`) is not clobbered.
 pub fn merge_synth_kinds_into_graph(
     graph: &mut crate::model::FunctionGraph,
@@ -465,8 +474,9 @@ pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Value
 
 // `build_value_kinds` retired — the regalloc / flatten / assemble
 // pipeline now reads kinds straight off `graph.concretetype(v)`
-// (the [`FunctionGraph::value_types`] inline analogue of upstream
-// `Variable.concretetype`).  Per-`ValueId` `RegKind` projections
+// (which routes to each `ValueId`'s backing
+// `Variable.concretetype` cell, the upstream-orthodox source).
+// Per-`ValueId` `RegKind` projections
 // happen at the use site via `regalloc::perform_register_allocation`'s
 // internal `concretetype_to_regkind`, matching RPython's
 // `getkind(v.concretetype)` access pattern bit for bit.

@@ -132,12 +132,14 @@ pub struct Assembler {
     /// the `MAJIT_COVERAGE_PANIC=1` diagnostic so the missing-ValueId
     /// panic can cite the offending op.
     current_flatop_debug: Option<String>,
-    /// Per-graph snapshot of [`crate::model::FunctionGraph::value_types`]
-    /// — pyre's analogue of upstream `Variable.concretetype`.
-    /// Threaded into [`Self::assemble`] so [`Self::lookup_coloring`]
-    /// reads `kind` from `getkind(v.concretetype)` first (RPython
-    /// parity for `flatten.py:382 getcolor`) before falling back to
-    /// the regalloc-class scan.  Cleared at the end of `assemble`.
+    /// Per-graph snapshot of every `ValueId`'s
+    /// [`crate::model::ConcreteType`], computed from
+    /// [`crate::model::FunctionGraph::concretetype_snapshot`] (which
+    /// reads each backing `Variable.concretetype` cell).  Threaded
+    /// into [`Self::assemble`] so [`Self::lookup_coloring`] reads
+    /// `kind` from `getkind(v.concretetype)` first (RPython parity
+    /// for `flatten.py:382 getcolor`) before falling back to the
+    /// regalloc-class scan.  Cleared at the end of `assemble`.
     current_concretetypes: Option<Vec<crate::model::ConcreteType>>,
 }
 
@@ -273,10 +275,11 @@ impl Assembler {
 
     /// `assemble`-with-graph entrypoint — the production path.
     ///
-    /// `graph.value_types` (pyre's `Variable.concretetype`
-    /// analogue) is the kind source: [`Self::lookup_coloring`]
-    /// reads it via the snapshotted slice on `current_concretetypes`
-    /// just like RPython's `flatten.py:382 getcolor` reads
+    /// Each `ValueId`'s backing `Variable.concretetype` is the kind
+    /// source: [`Self::lookup_coloring`] reads it via the snapshotted
+    /// slice on `current_concretetypes` (built from
+    /// [`crate::model::FunctionGraph::concretetype_snapshot`]) just
+    /// like RPython's `flatten.py:382 getcolor` reads
     /// `getkind(v.concretetype)`.
     pub fn assemble_with_graph(
         &mut self,
@@ -323,7 +326,7 @@ impl Assembler {
         // every Variable carries its kind by attribute, so the
         // assembler reads a per-Variable attribute identical to
         // pyre's per-`ValueId` slice index.
-        self.current_concretetypes = graph.map(|g| g.value_types.clone());
+        self.current_concretetypes = graph.map(|g| g.concretetype_snapshot());
 
         // Pyre-only diagnostic: under `MAJIT_COVERAGE_AUDIT=1` enumerate
         // every ValueId referenced in `ssarepr.insns` that has no
@@ -1928,7 +1931,7 @@ impl Assembler {
         if let Some(types) = self.current_concretetypes.as_ref() {
             use crate::model::ConcreteType;
             // The snapshot is indexed by `ValueId.0` (matches
-            // `FunctionGraph::value_types`); out-of-range reads
+            // `FunctionGraph::value_variables`); out-of-range reads
             // (synth values minted past the snapshotted graph)
             // collapse to `Unknown` so the fallback scan kicks in.
             let declared = types.get(v.0).cloned().unwrap_or(ConcreteType::Unknown);

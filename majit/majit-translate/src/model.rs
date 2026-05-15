@@ -1939,12 +1939,12 @@ where
 /// jit_codewriter needs.
 ///
 /// RPython stores `.concretetype` inline on each `Variable` after
-/// `RPythonTyper.specialize()` rewrites the graph; pyre's
-/// [`ValueId`] is an opaque index, so the per-value attribute lives
-/// in [`FunctionGraph::value_types`] (mirroring upstream's
-/// inline-on-Variable shape) instead of a separate side-table.
-/// `Unknown` is the pre-rtyper sentinel — `Variable` analogue
-/// before the rtyper ran.
+/// `RPythonTyper.specialize()` rewrites the graph; pyre routes the
+/// same attribute through the backing `Variable` held in
+/// [`FunctionGraph::value_variables`], so [`FunctionGraph::concretetype`]
+/// reads `getkind(var.concretetype.borrow())` line-for-line with
+/// upstream.  `Unknown` is the pre-rtyper sentinel — `Variable`
+/// analogue before the rtyper ran.
 ///
 /// The variants line up 1:1 with [`getkind`]'s output strings
 /// (`rpython/jit/metainterp/history.py:45-71`):
@@ -2099,9 +2099,8 @@ pub fn getkind(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelTyp
 /// - `GcRef`  → [`crate::translator::rtyper::rclass::OBJECTPTR`]
 ///   (`Ptr(OBJECT)`, the canonical GC pointer the rtyper itself
 ///   stamps onto exception-block `evalue` Variables).
-/// - `Unknown` → `None` (Variable.concretetype stays unset; the
-///   dense [`FunctionGraph::value_types`] vec retains the
-///   `Unknown` sentinel for legacy readers).
+/// - `Unknown` → `None` (Variable.concretetype stays unset;
+///   [`FunctionGraph::concretetype`] reads `Unknown` for the slot).
 ///
 /// Lossy for richer Ptr-of-specific-Struct values, so
 /// [`FunctionGraph::set_concretetype`] only writes through when the
@@ -2157,16 +2156,6 @@ pub struct FunctionGraph {
     pub blocks: Vec<Block>,
     pub notes: Vec<String>,
     next_value: usize,
-    /// Per-value [`ConcreteType`] indexed by [`ValueId`] — the
-    /// pyre analogue of RPython's `Variable.concretetype` inline
-    /// field.  `value_types[v.0]` is the kind for `ValueId(v)`,
-    /// kept in lockstep with the [`Self::next_value`] allocator so
-    /// every live `ValueId` always has a matching slot
-    /// (`ConcreteType::Unknown` until the rtyper writes the real
-    /// kind).  Replaces the previous `TypeResolutionState` side
-    /// table (`AGENTS.md §2`: type information must live on the
-    /// "box itself", not in a parallel `HashMap`).
-    pub value_types: Vec<ConcreteType>,
     /// Per-`ValueId` backing [`crate::flowspace::model::Variable`].
     ///
     /// **Variable identity bridge** — RPython's IR is keyed on
@@ -2176,11 +2165,11 @@ pub struct FunctionGraph {
     /// through `Variable.concretetype` directly (the upstream
     /// inline attribute), and so future passes can adopt
     /// Variable-keyed lookups (`replace`, `name`, etc.) without
-    /// further churn.  `None` denotes a `ValueId` minted before
-    /// the rtyper handoff or a synth value the front-end has not
-    /// yet wired up to a Variable; the [`Self::value_types`]
-    /// fallback covers those.  Indexed by `ValueId.0` like
-    /// `value_types`.
+    /// further churn.  Every freshly minted `ValueId` (via
+    /// [`Self::alloc_value_with_type`], [`Self::set_next_value`]
+    /// grow paths, etc.) gets a `Some(Variable::new())` so this
+    /// vec is the single source of truth — no parallel kind
+    /// side-table backs it.  Indexed by `ValueId.0`.
     pub value_variables: Vec<Option<crate::flowspace::model::Variable>>,
     /// Variable names for debugging (RPython Variable._name).
     pub value_names: std::collections::HashMap<ValueId, String>,
@@ -2269,24 +2258,15 @@ impl FunctionGraph {
             ],
             notes: Vec::new(),
             next_value: 3,
-            // Canonical inputargs (returnblock inputarg, exceptblock
-            // etype, exceptblock evalue) start as `Unknown`.  The
-            // rtyper / `regalloc::augment_value_kinds_with_canonical_exceptblock`
-            // populates them with `(_, Signed, GcRef)` later in the
-            // pipeline; until then `kind_color_of` falls through to
-            // its bare regalloc-class scan path, matching the
-            // pre-rtyper Variable-with-no-`concretetype` shape.
-            value_types: vec![
-                ConcreteType::Unknown,
-                ConcreteType::Unknown,
-                ConcreteType::Unknown,
-            ],
             // Canonical inputargs get named Variables matching the
             // upstream graph (`flowspace/model.py:21-25` —
             // `Variable("returnvar")`, `Variable("etype")`,
             // `Variable("evalue")`).  Each one's `concretetype` cell
-            // stays `None` until the rtyper resolves it; the legacy
-            // `value_types` slot above mirrors that pre-resolved shape.
+            // stays `None` until the rtyper resolves it; until then
+            // `concretetype(v)` returns `ConcreteType::Unknown` (the
+            // sentinel for the pre-`setconcretetype` window), which
+            // matches the pre-rtyper Variable-with-no-`concretetype`
+            // shape upstream.
             value_variables: vec![
                 Some(crate::flowspace::model::Variable::named("returnvar")),
                 Some(crate::flowspace::model::Variable::named("etype")),
@@ -2373,39 +2353,36 @@ impl FunctionGraph {
     /// Every freshly minted `ValueId` is paired with a backing
     /// [`crate::flowspace::model::Variable`] (RPython parity:
     /// `flowspace/model.py:280` — every IR slot is a `Variable`
-    /// instance).  The Variable's `concretetype` cell stays `None`
-    /// until [`Self::set_concretetype`] writes through it; the
-    /// legacy [`Self::value_types`] dense vec mirrors the kind in
-    /// lockstep so readers that index ValueId → kind continue to work
-    /// during the multi-step migration.
+    /// instance).  The Variable's `concretetype` cell receives the
+    /// canonical `LowLevelType` representative for `ty` (see
+    /// [`concrete_to_canonical_lltype`]); a subsequent
+    /// [`Self::bind_variable`] from the rtyper handoff overrides
+    /// this synthetic type with the upstream-authoritative one.
     pub fn alloc_value_with_type(&mut self, ty: ConcreteType) -> ValueId {
         let id = ValueId(self.next_value);
         self.next_value += 1;
-        // Keep `value_types` and `value_variables` in lockstep with
-        // `next_value`.  Any gap means a downstream
-        // `concretetype(v)` would silently see `Unknown` — keep the
-        // invariant explicit.
+        // Keep `value_variables` in lockstep with `next_value`.  Any
+        // gap means a downstream `concretetype(v)` would silently see
+        // `Unknown` — keep the invariant explicit.
         debug_assert_eq!(
-            self.value_types.len(),
+            self.value_variables.len(),
             id.0,
-            "value_types length must equal the next ValueId index ({} != {})",
-            self.value_types.len(),
+            "value_variables length must equal the next ValueId index ({} != {})",
+            self.value_variables.len(),
             id.0,
         );
-        self.value_types.push(ty);
-        self.value_variables
-            .push(Some(crate::flowspace::model::Variable::new()));
+        let var = crate::flowspace::model::Variable::new();
+        var.set_concretetype(concrete_to_canonical_lltype(ty));
+        self.value_variables.push(Some(var));
         id
     }
 
     /// Allocate a fresh [`ValueId`] backed by the given upstream
     /// `Variable` — pyre's analogue of `Variable()` followed by
     /// `setbinding(v)`.  The Variable's
-    /// [`crate::flowspace::model::Variable::concretetype`] becomes
-    /// the authoritative kind source for this slot via
-    /// [`Self::concretetype`]; the legacy `value_types` slot mirrors
-    /// the projection so passes that still index into the dense
-    /// `Vec<ConcreteType>` continue to work.
+    /// [`crate::flowspace::model::Variable::concretetype`] is the
+    /// authoritative kind source for this slot via
+    /// [`Self::concretetype`].
     pub fn alloc_value_with_variable(
         &mut self,
         var: crate::flowspace::model::Variable,
@@ -2413,15 +2390,10 @@ impl FunctionGraph {
         let id = ValueId(self.next_value);
         self.next_value += 1;
         debug_assert_eq!(
-            self.value_types.len(),
+            self.value_variables.len(),
             id.0,
-            "value_types length must equal the next ValueId index",
+            "value_variables length must equal the next ValueId index",
         );
-        let kind = match var.concretetype.borrow().as_ref() {
-            Some(lltype) => getkind(lltype),
-            None => ConcreteType::Unknown,
-        };
-        self.value_types.push(kind);
         self.value_variables.push(Some(var));
         id
     }
@@ -2430,17 +2402,14 @@ impl FunctionGraph {
     /// [`ValueId`] — used by [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`]
     /// when the adapter discovers the upstream Variable for a slot
     /// that was already allocated through the legacy front-end.
-    /// Re-stamps the `value_types` slot from `Variable.concretetype`
-    /// so the two views stay in lockstep.
+    /// The new Variable replaces whatever placeholder was put in by
+    /// [`Self::alloc_value_with_type`], so its
+    /// [`crate::flowspace::model::Variable::concretetype`] becomes
+    /// the kind source for the slot.
     pub fn bind_variable(&mut self, v: ValueId, var: crate::flowspace::model::Variable) {
         if v.0 >= self.value_variables.len() {
-            self.value_variables.resize(v.0 + 1, None);
-        }
-        if v.0 >= self.value_types.len() {
-            self.value_types.resize(v.0 + 1, ConcreteType::Unknown);
-        }
-        if let Some(lltype) = var.concretetype.borrow().as_ref() {
-            self.value_types[v.0] = getkind(lltype);
+            self.value_variables
+                .resize_with(v.0 + 1, || Some(crate::flowspace::model::Variable::new()));
         }
         self.value_variables[v.0] = Some(var);
     }
@@ -2473,50 +2442,55 @@ impl FunctionGraph {
         vid
     }
 
-    /// `Variable.concretetype` getter — returns by value to allow
-    /// the live read through `Variable.concretetype.borrow()`.
-    ///
-    /// When a backing [`crate::flowspace::model::Variable`] is
-    /// bound to the slot the kind comes straight from the
-    /// Variable's inline `concretetype` attribute via
-    /// `getkind(var.concretetype)` — RPython's
-    /// `getkind(v.concretetype)` access pattern verbatim, no dense
-    /// vec snapshot in the loop.  When no Variable backs the slot
-    /// (jtransform synth values, pre-rtyper graphs) the dense
-    /// [`Self::value_types`] fallback covers it.
+    /// `Variable.concretetype` getter — RPython's
+    /// `getkind(v.concretetype)` access pattern verbatim.  Reads
+    /// straight off the backing
+    /// [`crate::flowspace::model::Variable`]'s inline `concretetype`
+    /// attribute; returns [`ConcreteType::Unknown`] when no Variable
+    /// is bound (caller minted a `ValueId` outside the
+    /// [`Self::alloc_value`] / [`Self::set_next_value`] paths) or
+    /// when the Variable's cell is `None` (pre-rtyper window).
     pub fn concretetype(&self, v: ValueId) -> ConcreteType {
-        if let Some(Some(var)) = self.value_variables.get(v.0) {
-            if let Some(lltype) = var.concretetype.borrow().as_ref() {
-                return getkind(lltype);
-            }
+        match self.value_variables.get(v.0) {
+            Some(Some(var)) => match var.concretetype.borrow().as_ref() {
+                Some(lltype) => getkind(lltype),
+                None => ConcreteType::Unknown,
+            },
+            _ => ConcreteType::Unknown,
         }
-        self.value_types
-            .get(v.0)
-            .cloned()
-            .unwrap_or(ConcreteType::Unknown)
+    }
+
+    /// Snapshot every live `ValueId`'s [`ConcreteType`] into a dense
+    /// `Vec` indexed by `ValueId.0`.  Used by passes that need to
+    /// borrow the kind table while mutating the graph
+    /// (`liveness::compute_liveness_with_graph`,
+    /// `assembler::Assembler::assemble`).  The snapshot is computed
+    /// from `value_variables` on demand; the underlying source of
+    /// truth is each Variable's `concretetype` cell.
+    pub fn concretetype_snapshot(&self) -> Vec<ConcreteType> {
+        (0..self.value_variables.len())
+            .map(|i| self.concretetype(ValueId(i)))
+            .collect()
     }
 
     /// Late-stamp [`ValueId`] kind (e.g. after the rtyper resolved
-    /// a previously-`Unknown` slot).  When a backing Variable is
-    /// present, the upstream attribute is also updated via
-    /// `Variable.set_concretetype` so the two views stay coherent —
-    /// each [`ConcreteType`] maps to a canonical representative
-    /// `LowLevelType` (`Signed → Signed`, `Float → Float`,
-    /// `Void → Void`, `GcRef → rclass.OBJECTPTR`).  If the Variable
-    /// already carries a richer rtyper-written type whose
-    /// `getkind` matches `ty`, the richer type is preserved
-    /// (the kind-only adapter must not lossily flatten the rtyper's
-    /// real low-level structure).
+    /// a previously-`Unknown` slot).  Writes the canonical
+    /// `LowLevelType` representative for `ty` into the backing
+    /// Variable's `concretetype` cell — `Signed → Signed`,
+    /// `Float → Float`, `Void → Void`, `GcRef → rclass.OBJECTPTR`.
+    /// If the Variable already carries a richer rtyper-written
+    /// type whose `getkind` matches `ty`, the richer type is
+    /// preserved (the kind-only adapter must not lossily flatten
+    /// the rtyper's real low-level structure).
     pub fn set_concretetype(&mut self, v: ValueId, ty: ConcreteType) {
-        if v.0 >= self.value_types.len() {
-            // Grow both side-arrays if a value was minted via
-            // `set_next_value` (jtransform synthesises ValueIds
-            // outside the graph for a brief window).
-            self.value_types
-                .resize(v.0 + 1, ConcreteType::Unknown);
-            self.value_variables.resize(v.0 + 1, None);
+        if v.0 >= self.value_variables.len() {
+            // Grow when a value was minted via `set_next_value`
+            // (jtransform synthesises ValueIds outside the graph for
+            // a brief window).  Each new slot still gets a fresh
+            // backing Variable so `concretetype` reads stay direct.
+            self.value_variables
+                .resize_with(v.0 + 1, || Some(crate::flowspace::model::Variable::new()));
         }
-        self.value_types[v.0] = ty;
         if let Some(Some(var)) = self.value_variables.get(v.0) {
             let preserve_existing = match (ty, var.concretetype.borrow().as_ref()) {
                 (kind, Some(existing)) if getkind(existing) == kind => true,
@@ -2546,18 +2520,15 @@ impl FunctionGraph {
             self.next_value,
             next,
         );
-        // Grow the per-value kind table and Variable backing array
-        // to match the new cursor so the
-        // `value_types.len() == value_variables.len() == next_value`
-        // invariant holds.  The synthesised ValueIds default to
-        // `Unknown` (and `None` for the Variable backing); the
-        // rtyper / jtransform should follow up with
-        // `set_concretetype` / `bind_variable` once they resolve
-        // the kind.
-        if next > self.value_types.len() {
-            self.value_types
-                .resize(next, ConcreteType::Unknown);
-            self.value_variables.resize(next, None);
+        // Grow the Variable backing array to match the new cursor so
+        // the `value_variables.len() == next_value` invariant holds.
+        // Each synthesised slot gets a fresh `Variable::new()` whose
+        // `concretetype` cell is `None` — `concretetype()` returns
+        // `Unknown` for it until the rtyper / jtransform follows up
+        // with `set_concretetype` / `bind_variable`.
+        if next > self.value_variables.len() {
+            self.value_variables
+                .resize_with(next, || Some(crate::flowspace::model::Variable::new()));
         }
         self.next_value = next;
     }

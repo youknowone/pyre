@@ -242,12 +242,11 @@ pub enum DualGateOutcome {
         /// `ValueId → flowspace::Variable` mapping built by the
         /// flowspace adapter.  Each Variable carries the
         /// `RPythonTyper`-set `concretetype` inline (`flowspace/
-        /// model.py:280`), so codewriter callers can hydrate
-        /// `graph.value_types` straight from the upstream-typed
-        /// Variables via
-        /// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`]
-        /// instead of routing through the transitional
-        /// `merge_synth_kinds` projection.
+        /// model.py:280`), so codewriter callers rebind each slot to
+        /// the upstream-typed Variable via
+        /// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`];
+        /// `graph.concretetype(v)` then reads its `concretetype`
+        /// cell directly.
         real_value_to_var: ValueIdToVariable,
     },
     /// Real path failed on a known-unported feature — the gate
@@ -1052,8 +1051,8 @@ pub fn specialize_legacy_graph_with_registry(
 
 /// `specialize_legacy_graph_with_registry` extended return shape that
 /// also surfaces the [`ValueIdToVariable`] map produced by the
-/// flowspace adapter.  Codewriter callers use the map to hydrate
-/// `graph.value_types` directly from `Variable.concretetype` via
+/// flowspace adapter.  Codewriter callers rebind each slot's backing
+/// Variable from the map via
 /// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`]
 /// — the long-term parity path that retires the transitional
 /// `merge_synth_kinds` 4-source merge.

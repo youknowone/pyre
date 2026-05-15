@@ -488,14 +488,14 @@ impl<'a> GraphFlattener<'a> {
     /// `getkind(v.concretetype)` + `regallocs[kind].coloring[v]` —
     /// `flatten.py:386` strict 1:1 lookup.
     ///
-    /// The kind comes from `self.graph.concretetype(v)` —
-    /// pyre's [`crate::model::FunctionGraph::value_types`] is the
-    /// per-value attribute analogue of RPython's
-    /// `Variable.concretetype`, populated by the rtyper pass via
-    /// [`crate::jit_codewriter::type_state::apply_to_graph`] before
-    /// flatten.  The transitional [`TypeResolutionState`] argument
-    /// to [`Self::with_types`] is consulted only as a fallback for
-    /// values whose graph slot is still `Unknown` (test fixtures
+    /// The kind comes from `self.graph.concretetype(v)` — which
+    /// reads `getkind(var.concretetype.borrow())` directly off each
+    /// `ValueId`'s backing
+    /// [`crate::flowspace::model::Variable`], the upstream
+    /// `Variable.concretetype` access pattern verbatim.  The
+    /// transitional [`TypeResolutionState`] argument to
+    /// [`Self::with_types`] is consulted only as a fallback for
+    /// values whose Variable cell is still `None` (test fixtures
     /// that build SSARepr by hand without populating the graph).
     /// `Void` / `Unknown` fall through to the bare regalloc scan
     /// because both kinds skip regalloc partitioning entirely
@@ -1323,9 +1323,9 @@ fn compute_num_values(graph: &FunctionGraph, ops: &[FlatOp]) -> usize {
 /// callers migrate.
 ///
 /// The `_types` parameter is ignored: kind information now lives
-/// inline on the graph (`graph.value_types`, the
+/// inline on each backing
 /// [`Variable.concretetype`](crate::flowspace::model::Variable)
-/// analogue), and `flatten_graph` reads it via
+/// stored on the graph, and `flatten_graph` reads it via
 /// [`GraphFlattener::getcolor`] → `graph.concretetype(v)`.  Existing
 /// production callers can stop passing the
 /// [`TypeResolutionState`](crate::jit_codewriter::type_state::TypeResolutionState)

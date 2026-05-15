@@ -60,8 +60,9 @@ pub fn compute_liveness_with_types(
 /// reads each operand's kind via `graph.concretetype(v)` instead of
 /// the transitional [`TypeResolutionState`] table.  This is the
 /// production path.  RPython parity: `Variable.concretetype` is the
-/// inline source of truth; pyre's [`crate::model::FunctionGraph::value_types`]
-/// holds the same per-value kind by `ValueId.0` index.
+/// inline source of truth, and pyre routes the same attribute
+/// through each backing `Variable` stored on the graph's
+/// `value_variables`.
 pub fn compute_liveness_with_graph(
     flattened: &mut SSARepr,
     regallocs: &HashMap<RegKind, RegAllocResult>,
@@ -71,7 +72,7 @@ pub fn compute_liveness_with_graph(
     // backward-walk loop can borrow the slice without keeping a
     // graph borrow alive across mutating writes into `flattened.insns`.
     let snapshot: Option<Vec<crate::model::ConcreteType>> =
-        graph.map(|g| g.value_types.clone());
+        graph.map(|g| g.concretetype_snapshot());
 
     let mut label2alive: HashMap<Label, HashSet<Register>> = HashMap::new();
 
@@ -174,7 +175,7 @@ fn value_to_register_with_snapshot(
     found
 }
 
-#[deprecated(note = "use value_to_register_with_snapshot; pass graph.value_types directly")]
+#[deprecated(note = "use value_to_register_with_snapshot; pass graph.concretetype_snapshot() directly")]
 fn value_to_register(
     v: ValueId,
     regallocs: &HashMap<RegKind, RegAllocResult>,
@@ -292,9 +293,9 @@ fn compute_liveness_pass(
 
 /// Snapshot-driven sibling of [`compute_liveness_pass`].  Reads
 /// each `FlatOp::Op` operand's kind from `concretetypes[v.0]` —
-/// the same per-value `concretetype` slice
-/// [`crate::model::FunctionGraph::value_types`] holds.  Used by
-/// [`compute_liveness_with_graph`] (production) and the
+/// the same per-value `concretetype` projection
+/// [`crate::model::FunctionGraph::concretetype_snapshot`] returns.
+/// Used by [`compute_liveness_with_graph`] (production) and the
 /// transitional `compute_liveness_with_types` adapter (which
 /// projects through `TypeResolutionState::as_slice`).
 fn compute_liveness_pass_with_snapshot(

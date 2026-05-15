@@ -413,8 +413,9 @@ pub struct RegAllocResult {
 /// stamps the canonical Signed / GcRef kinds whenever the rtyper
 /// hand-off (`apply_to_graph` / `apply_from_flowspace_variables`)
 /// did not — equivalent to the previous `augment_value_kinds_*`
-/// helper but written directly onto `graph.value_types` instead of
-/// returning a transitional HashMap.
+/// helper but written directly through to each backing
+/// `Variable.concretetype` cell via `graph.set_concretetype`
+/// instead of returning a transitional HashMap.
 pub fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
     let except_args = graph.block(graph.exceptblock).inputargs.clone();
     if except_args.len() == 2 {
