@@ -5586,44 +5586,56 @@ impl<'a> ResumeDataDirectReader<'a> {
             let struct_ptr = self.decode_ref(pf.target_tagged);
 
             if pf.item_index < 0 {
-                let (field_offset, field_size, field_type) =
-                    field_info.expect("resume.py:1005 setfield pending entry requires FieldDescr");
-                let value = match field_type {
-                    majit_ir::Type::Ref => self.decode_ref(pf.value_tagged),
-                    majit_ir::Type::Float => self.decode_float(pf.value_tagged),
-                    _ => self.decode_int(pf.value_tagged),
-                };
-                // resume.py:1005: self.setfield(struct, fieldnum, descr).
-                // resume.py:1509-1518 setfield dispatches via descr methods
-                // to cpu.bh_setfield_gc_{i,r,f}.  Build the FieldDescrInfo
-                // spec on the fly from the descr metadata so the allocator
-                // hook receives the same shape as the virtual-allocate
-                // path (vinfo fielddescrs).
-                let descr_info = majit_ir::FieldDescrInfo {
-                    index: descr.index(),
-                    offset: field_offset,
-                    field_type,
-                    field_size,
-                };
-                match field_type {
-                    majit_ir::Type::Ref => {
-                        self.allocator
-                            .bh_setfield_gc_r(struct_ptr, value, &descr_info)
-                    }
-                    majit_ir::Type::Float => {
-                        self.allocator
-                            .bh_setfield_gc_f(struct_ptr, value, &descr_info)
-                    }
-                    _ => self
-                        .allocator
-                        .bh_setfield_gc_i(struct_ptr, value, &descr_info),
-                }
+                let _ = field_info; // setfield dispatcher reads descr directly.
+                // resume.py:1005: self.setfield(struct, fieldnum, descr)
+                self.setfield(struct_ptr, pf.value_tagged, descr);
             } else {
                 // resume.py:1007: self.setarrayitem(struct, itemindex,
                 //                  fieldnum, descr).
                 let index = pf.item_index as usize;
                 self.setarrayitem(struct_ptr, index, pf.value_tagged, descr);
             }
+        }
+    }
+
+    /// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` dispatcher:
+    /// forwards to `bh_setfield_gc_r` / `bh_setfield_gc_f` /
+    /// `bh_setfield_gc_i` based on `descr.is_pointer_field()` /
+    /// `is_float_field()`.  `fieldnum` is the resume.py-tagged value
+    /// to decode (decode_ref / decode_float / decode_int per kind).
+    pub fn setfield(
+        &mut self,
+        struct_ptr: i64,
+        fieldnum: i16,
+        descr: &majit_ir::DescrRef,
+    ) {
+        let fd = descr
+            .as_field_descr()
+            .expect("resume.py:1509 setfield requires FieldDescr");
+        let descr_info = majit_ir::FieldDescrInfo {
+            index: descr.index(),
+            offset: fd.offset(),
+            field_type: fd.field_type(),
+            field_size: fd.field_size(),
+        };
+        if fd.is_pointer_field() {
+            // resume.py:1511 newvalue = self.decode_ref(fieldnum)
+            // resume.py:1512 self.cpu.bh_setfield_gc_r(struct, newvalue, descr)
+            let value = self.decode_ref(fieldnum);
+            self.allocator
+                .bh_setfield_gc_r(struct_ptr, value, &descr_info);
+        } else if fd.is_float_field() {
+            // resume.py:1514 newvalue = self.decode_float(fieldnum)
+            // resume.py:1515 self.cpu.bh_setfield_gc_f(struct, newvalue, descr)
+            let value = self.decode_float(fieldnum);
+            self.allocator
+                .bh_setfield_gc_f(struct_ptr, value, &descr_info);
+        } else {
+            // resume.py:1517 newvalue = self.decode_int(fieldnum)
+            // resume.py:1518 self.cpu.bh_setfield_gc_i(struct, newvalue, descr)
+            let value = self.decode_int(fieldnum);
+            self.allocator
+                .bh_setfield_gc_i(struct_ptr, value, &descr_info);
         }
     }
 
