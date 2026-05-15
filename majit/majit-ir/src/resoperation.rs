@@ -518,13 +518,16 @@ pub enum RdVirtualInfo {
         fieldnums: Vec<i16>,
     },
     /// resume.py:781 `VStrConcatInfo` — virtual concatenation of two
-    /// strings. `fieldnums = [left, right]`.
+    /// strings. `fieldnums = [left, right]`.  `func` is the OS_STR_CONCAT
+    /// funcptr resolved at trace time via callinfocollection.
     VStrConcatInfo {
+        func: i64,
         fieldnums: Vec<i16>,
     },
     /// resume.py:801 `VStrSliceInfo` — virtual slice of a larger string.
-    /// `fieldnums = [largerstr, start, length]`.
+    /// `fieldnums = [largerstr, start, length]`.  `func` is OS_STR_SLICE.
     VStrSliceInfo {
+        func: i64,
         fieldnums: Vec<i16>,
     },
     /// resume.py:817 `VUniPlainInfo` — unicode counterpart of VStrPlain.
@@ -532,11 +535,15 @@ pub enum RdVirtualInfo {
         fieldnums: Vec<i16>,
     },
     /// resume.py:836 `VUniConcatInfo` — unicode counterpart of VStrConcat.
+    /// `func` is OS_UNI_CONCAT.
     VUniConcatInfo {
+        func: i64,
         fieldnums: Vec<i16>,
     },
     /// resume.py:856 `VUniSliceInfo` — unicode counterpart of VStrSlice.
+    /// `func` is OS_UNI_SLICE.
     VUniSliceInfo {
+        func: i64,
         fieldnums: Vec<i16>,
     },
     Empty,
@@ -692,15 +699,47 @@ impl PartialEq for RdVirtualInfo {
                 },
             ) => a1 == b1 && a2 == b2,
             (Self::VStrPlainInfo { fieldnums: a }, Self::VStrPlainInfo { fieldnums: b }) => a == b,
-            (Self::VStrConcatInfo { fieldnums: a }, Self::VStrConcatInfo { fieldnums: b }) => {
-                a == b
-            }
-            (Self::VStrSliceInfo { fieldnums: a }, Self::VStrSliceInfo { fieldnums: b }) => a == b,
+            (
+                Self::VStrConcatInfo {
+                    func: af,
+                    fieldnums: a,
+                },
+                Self::VStrConcatInfo {
+                    func: bf,
+                    fieldnums: b,
+                },
+            ) => af == bf && a == b,
+            (
+                Self::VStrSliceInfo {
+                    func: af,
+                    fieldnums: a,
+                },
+                Self::VStrSliceInfo {
+                    func: bf,
+                    fieldnums: b,
+                },
+            ) => af == bf && a == b,
             (Self::VUniPlainInfo { fieldnums: a }, Self::VUniPlainInfo { fieldnums: b }) => a == b,
-            (Self::VUniConcatInfo { fieldnums: a }, Self::VUniConcatInfo { fieldnums: b }) => {
-                a == b
-            }
-            (Self::VUniSliceInfo { fieldnums: a }, Self::VUniSliceInfo { fieldnums: b }) => a == b,
+            (
+                Self::VUniConcatInfo {
+                    func: af,
+                    fieldnums: a,
+                },
+                Self::VUniConcatInfo {
+                    func: bf,
+                    fieldnums: b,
+                },
+            ) => af == bf && a == b,
+            (
+                Self::VUniSliceInfo {
+                    func: af,
+                    fieldnums: a,
+                },
+                Self::VUniSliceInfo {
+                    func: bf,
+                    fieldnums: b,
+                },
+            ) => af == bf && a == b,
             (Self::Empty, Self::Empty) => true,
             _ => false,
         }
@@ -722,11 +761,11 @@ impl RdVirtualInfo {
             | Self::VRawBufferInfo { fieldnums, .. }
             | Self::VRawSliceInfo { fieldnums, .. }
             | Self::VStrPlainInfo { fieldnums }
-            | Self::VStrConcatInfo { fieldnums }
-            | Self::VStrSliceInfo { fieldnums }
+            | Self::VStrConcatInfo { fieldnums, .. }
+            | Self::VStrSliceInfo { fieldnums, .. }
             | Self::VUniPlainInfo { fieldnums }
-            | Self::VUniConcatInfo { fieldnums }
-            | Self::VUniSliceInfo { fieldnums } => Some(fieldnums),
+            | Self::VUniConcatInfo { fieldnums, .. }
+            | Self::VUniSliceInfo { fieldnums, .. } => Some(fieldnums),
             Self::Empty => None,
         }
     }
@@ -766,11 +805,11 @@ impl RdVirtualInfo {
             | Self::VRawBufferInfo { fieldnums, .. }
             | Self::VRawSliceInfo { fieldnums, .. }
             | Self::VStrPlainInfo { fieldnums }
-            | Self::VStrConcatInfo { fieldnums }
-            | Self::VStrSliceInfo { fieldnums }
+            | Self::VStrConcatInfo { fieldnums, .. }
+            | Self::VStrSliceInfo { fieldnums, .. }
             | Self::VUniPlainInfo { fieldnums }
-            | Self::VUniConcatInfo { fieldnums }
-            | Self::VUniSliceInfo { fieldnums } => *fieldnums = new_fieldnums,
+            | Self::VUniConcatInfo { fieldnums, .. }
+            | Self::VUniSliceInfo { fieldnums, .. } => *fieldnums = new_fieldnums,
             Self::Empty => {}
         }
     }

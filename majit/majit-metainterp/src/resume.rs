@@ -1306,24 +1306,21 @@ pub fn rd_virtual_to_virtual_info(
                 .collect();
             VirtualInfo::VStrPlain { chars }
         }
-        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrConcatInfo { func, fieldnums } => {
             let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
-            // RdVirtualInfo does not yet carry the OS_STR_CONCAT funcptr;
-            // VirtualInfo defaults to 0 here and the compile.rs producer
-            // path fills the resolved funcptr into ExitVirtualLayout.
             VirtualInfo::VStrConcat {
-                func: 0,
+                func: *func,
                 left,
                 right,
             }
         }
-        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrSliceInfo { func, fieldnums } => {
             let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
             let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
             VirtualInfo::VStrSlice {
-                func: 0,
+                func: *func,
                 source,
                 start,
                 length,
@@ -1336,21 +1333,21 @@ pub fn rd_virtual_to_virtual_info(
                 .collect();
             VirtualInfo::VUniPlain { chars }
         }
-        majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VUniConcatInfo { func, fieldnums } => {
             let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
             VirtualInfo::VUniConcat {
-                func: 0,
+                func: *func,
                 left,
                 right,
             }
         }
-        majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VUniSliceInfo { func, fieldnums } => {
             let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
             let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
             VirtualInfo::VUniSlice {
-                func: 0,
+                func: *func,
                 source,
                 start,
                 length,
@@ -1643,8 +1640,9 @@ impl EncodedResumeData {
                 VirtualInfo::VStrPlain { chars } => majit_ir::RdVirtualInfo::VStrPlainInfo {
                     fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
                 },
-                VirtualInfo::VStrConcat { left, right, .. } => {
+                VirtualInfo::VStrConcat { func, left, right } => {
                     majit_ir::RdVirtualInfo::VStrConcatInfo {
+                        func: *func,
                         fieldnums: fieldnums(
                             [left.as_ref().clone(), right.as_ref().clone()],
                             liveboxes,
@@ -1653,11 +1651,12 @@ impl EncodedResumeData {
                     }
                 }
                 VirtualInfo::VStrSlice {
+                    func,
                     source,
                     start,
                     length,
-                    ..
                 } => majit_ir::RdVirtualInfo::VStrSliceInfo {
+                    func: *func,
                     fieldnums: fieldnums(
                         [
                             source.as_ref().clone(),
@@ -1671,8 +1670,9 @@ impl EncodedResumeData {
                 VirtualInfo::VUniPlain { chars } => majit_ir::RdVirtualInfo::VUniPlainInfo {
                     fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
                 },
-                VirtualInfo::VUniConcat { left, right, .. } => {
+                VirtualInfo::VUniConcat { func, left, right } => {
                     majit_ir::RdVirtualInfo::VUniConcatInfo {
+                        func: *func,
                         fieldnums: fieldnums(
                             [left.as_ref().clone(), right.as_ref().clone()],
                             liveboxes,
@@ -1681,11 +1681,12 @@ impl EncodedResumeData {
                     }
                 }
                 VirtualInfo::VUniSlice {
+                    func,
                     source,
                     start,
                     length,
-                    ..
                 } => majit_ir::RdVirtualInfo::VUniSliceInfo {
+                    func: *func,
                     fieldnums: fieldnums(
                         [
                             source.as_ref().clone(),
@@ -2417,19 +2418,13 @@ impl MaterializedVirtual {
     /// Create an empty shell from a VirtualInfo (forward-reference safe).
     fn from_info(info: &VirtualInfo) -> Self {
         match info {
-            VirtualInfo::VirtualObj {
-                descr,
-                type_id,
-                ..
-            } => MaterializedVirtual::Obj {
+            VirtualInfo::VirtualObj { descr, type_id, .. } => MaterializedVirtual::Obj {
                 descr: descr.clone(),
                 type_id: *type_id,
                 fields: Vec::new(),
             },
             VirtualInfo::VStruct {
-                typedescr,
-                type_id,
-                ..
+                typedescr, type_id, ..
             } => MaterializedVirtual::Struct {
                 descr: typedescr.clone(),
                 type_id: *type_id,
@@ -2612,25 +2607,27 @@ impl MaterializedVirtual {
                     })
                     .collect::<Option<Vec<_>>>()?,
             }),
-            MaterializedVirtual::ArrayStruct { descr, elements } => Some(MaterializedVirtual::ArrayStruct {
-                descr: descr.clone(),
-                elements: elements
-                    .iter()
-                    .map(|fields| {
-                        fields
-                            .iter()
-                            .map(|(idx, value)| {
-                                Some((
-                                    *idx,
-                                    MaterializedValue::Value(
-                                        value.resolve_with_refs(materialized_refs)?,
-                                    ),
-                                ))
-                            })
-                            .collect::<Option<Vec<_>>>()
-                    })
-                    .collect::<Option<Vec<_>>>()?,
-            }),
+            MaterializedVirtual::ArrayStruct { descr, elements } => {
+                Some(MaterializedVirtual::ArrayStruct {
+                    descr: descr.clone(),
+                    elements: elements
+                        .iter()
+                        .map(|fields| {
+                            fields
+                                .iter()
+                                .map(|(idx, value)| {
+                                    Some((
+                                        *idx,
+                                        MaterializedValue::Value(
+                                            value.resolve_with_refs(materialized_refs)?,
+                                        ),
+                                    ))
+                                })
+                                .collect::<Option<Vec<_>>>()
+                        })
+                        .collect::<Option<Vec<_>>>()?,
+                })
+            }
             MaterializedVirtual::RawBuffer {
                 func,
                 size,
@@ -5252,32 +5249,17 @@ pub trait BlackholeAllocator {
     }
     /// `resume.py:1517 cpu.bh_setfield_gc_i(struct, value, descr)` —
     /// integer setfield dispatched from `resume.py:1509-1518 setfield`.
-    fn bh_setfield_gc_i(
-        &self,
-        struct_ptr: i64,
-        value: i64,
-        descr_info: &majit_ir::FieldDescrInfo,
-    ) {
+    fn bh_setfield_gc_i(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
         let _ = (struct_ptr, value, descr_info);
     }
     /// `resume.py:1512 cpu.bh_setfield_gc_r(struct, value, descr)` —
     /// pointer setfield dispatched when `descr.is_pointer_field()`.
-    fn bh_setfield_gc_r(
-        &self,
-        struct_ptr: i64,
-        value: i64,
-        descr_info: &majit_ir::FieldDescrInfo,
-    ) {
+    fn bh_setfield_gc_r(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
         let _ = (struct_ptr, value, descr_info);
     }
     /// `resume.py:1515 cpu.bh_setfield_gc_f(struct, value, descr)` —
     /// float setfield dispatched when `descr.is_float_field()`.
-    fn bh_setfield_gc_f(
-        &self,
-        struct_ptr: i64,
-        value: i64,
-        descr_info: &majit_ir::FieldDescrInfo,
-    ) {
+    fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
         let _ = (struct_ptr, value, descr_info);
     }
     /// Pyre-specific: box a raw int to a PyObject ref.
@@ -5467,7 +5449,11 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 decoder.virtuals_cache.set_ptr(index, obj);
                 // resume.py:621 return self.setfields(decoder, struct)
                 abstract_virtual_struct_info_setfields(
-                    decoder, allocator, obj, fielddescrs, fields,
+                    decoder,
+                    allocator,
+                    obj,
+                    fielddescrs,
+                    fields,
                 );
                 obj
             }
@@ -5485,7 +5471,11 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 decoder.virtuals_cache.set_ptr(index, obj);
                 // resume.py:637 return self.setfields(decoder, struct)
                 abstract_virtual_struct_info_setfields(
-                    decoder, allocator, obj, fielddescrs, fields,
+                    decoder,
+                    allocator,
+                    obj,
+                    fielddescrs,
+                    fields,
                 );
                 obj
             }
@@ -5831,12 +5821,7 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// `bh_setfield_gc_i` based on `descr.is_pointer_field()` /
     /// `is_float_field()`.  `fieldnum` is the resume.py-tagged value
     /// to decode (decode_ref / decode_float / decode_int per kind).
-    pub fn setfield(
-        &mut self,
-        struct_ptr: i64,
-        fieldnum: i16,
-        descr: &majit_ir::DescrRef,
-    ) {
+    pub fn setfield(&mut self, struct_ptr: i64, fieldnum: i16, descr: &majit_ir::DescrRef) {
         let fd = descr
             .as_field_descr()
             .expect("resume.py:1509 setfield requires FieldDescr");

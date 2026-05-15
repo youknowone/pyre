@@ -4505,8 +4505,8 @@ fn materialize_bridge_virtual(
         //     str1box = self.decode_box(str1num, REF)
         //     str2box = self.decode_box(str2num, REF)
         //     execute_and_record_varargs(CALL_R, [ConstInt(func), str1box, str2box], calldescr)
-        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
-        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums, .. }
+        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums, .. } => {
             let is_unicode = matches!(
                 entry.as_ref(),
                 majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
@@ -4553,8 +4553,8 @@ fn materialize_bridge_virtual(
         //     stopbox = execute_and_record(INT_ADD, startbox, lengthbox)
         //     execute_and_record_varargs(CALL_R,
         //         [ConstInt(func), strbox, startbox, stopbox], calldescr)
-        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
-        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums, .. }
+        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums, .. } => {
             let is_unicode = matches!(
                 entry.as_ref(),
                 majit_ir::RdVirtualInfo::VUniSliceInfo { .. }

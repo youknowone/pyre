@@ -931,8 +931,8 @@ pub(crate) fn build_guard_metadata(
                                 // resume.py:781 VStrConcatInfo /
                                 // resume.py:836 VUniConcatInfo —
                                 // decoder.concat_strings(left, right).
-                                majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
-                                | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+                                majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums, .. }
+                                | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums, .. } => {
                                     let is_unicode = matches!(
                                         entry,
                                         majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
@@ -963,8 +963,8 @@ pub(crate) fn build_guard_metadata(
                                 // resume.py:801 VStrSliceInfo /
                                 // resume.py:856 VUniSliceInfo —
                                 // decoder.slice_string(largerstr, start, length).
-                                majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
-                                | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+                                majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums, .. }
+                                | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums, .. } => {
                                     let is_unicode = matches!(
                                         entry,
                                         majit_ir::RdVirtualInfo::VUniSliceInfo { .. }

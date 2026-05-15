@@ -1414,26 +1414,12 @@ impl JitState for NestedVirtualResumeState {
     ) -> Option<GcRef> {
         self.materialize_order.push(virtual_index);
         match (virtual_index, materialized) {
-            (
-                0,
-                MaterializedVirtual::Struct {
-                    descr,
-                    fields,
-                    ..
-                },
-            ) => {
+            (0, MaterializedVirtual::Struct { descr, fields, .. }) => {
                 assert_eq!(descr.as_ref().map(|d| d.index()), Some(10));
                 assert_eq!(fields, &vec![(0, MaterializedValue::Value(77))]);
                 Some(GcRef(self.inner_ref))
             }
-            (
-                1,
-                MaterializedVirtual::Obj {
-                    descr,
-                    fields,
-                    ..
-                },
-            ) => {
+            (1, MaterializedVirtual::Obj { descr, fields, .. }) => {
                 assert_eq!(descr.as_ref().map(|d| d.index()), Some(20));
                 assert_eq!(fields[0], (0, MaterializedValue::VirtualRef(0)));
                 assert_eq!(fields[1], (1, MaterializedValue::Value(99)));

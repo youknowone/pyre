@@ -1549,8 +1549,7 @@ fn rebuild_state_after_failure(
                         .as_array_descr()
                         .expect("setarrayitem pending field must carry an ArrayDescr");
                     let item_index = pf.item_index.unwrap_or(0);
-                    let addr =
-                        target_ptr as usize + ad.base_size() + item_index * ad.item_size();
+                    let addr = target_ptr as usize + ad.base_size() + item_index * ad.item_size();
                     (addr, ad.item_type(), ad.item_size())
                 } else {
                     let fd = descr
@@ -13097,8 +13096,8 @@ fn collect_guards(
                         }
                         // resume.py:781 VStrConcatInfo / resume.py:836
                         // VUniConcatInfo — decoder.concat_strings(left, right).
-                        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
-                        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+                        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums, .. }
+                        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums, .. } => {
                             let is_unicode =
                                 matches!(entry, majit_ir::RdVirtualInfo::VUniConcatInfo { .. });
                             let oopspec = if is_unicode {
@@ -13125,8 +13124,8 @@ fn collect_guards(
                         }
                         // resume.py:801 VStrSliceInfo / resume.py:856
                         // VUniSliceInfo — decoder.slice_string(str, start, length).
-                        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
-                        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+                        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums, .. }
+                        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums, .. } => {
                             let is_unicode =
                                 matches!(entry, majit_ir::RdVirtualInfo::VUniSliceInfo { .. });
                             let oopspec = if is_unicode {

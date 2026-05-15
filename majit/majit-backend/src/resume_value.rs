@@ -424,12 +424,8 @@ impl VirtualInfo {
             VirtualInfo::VStrPlain { chars } | VirtualInfo::VUniPlain { chars } => {
                 chars.iter().collect()
             }
-            VirtualInfo::VStrConcat {
-                left, right, ..
-            }
-            | VirtualInfo::VUniConcat {
-                left, right, ..
-            } => {
+            VirtualInfo::VStrConcat { left, right, .. }
+            | VirtualInfo::VUniConcat { left, right, .. } => {
                 vec![left.as_ref(), right.as_ref()]
             }
             VirtualInfo::VStrSlice {

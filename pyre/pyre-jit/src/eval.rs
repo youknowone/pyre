@@ -4232,8 +4232,8 @@ fn materialize_virtual_from_rd(
         //     right = decoder.decode_ref(self.fieldnums[1])
         //     string = decoder.concat_strings(left, right)
         //     decoder.virtuals_cache.set_ptr(index, string)
-        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums }
-        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums, .. }
+        | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums, .. } => {
             let is_unicode = matches!(
                 entry.as_ref(),
                 majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
@@ -4296,8 +4296,8 @@ fn materialize_virtual_from_rd(
         //     length    = decoder.decode_int(self.fieldnums[2])
         //     string = decoder.slice_string(largerstr, start, length)
         //     decoder.virtuals_cache.set_ptr(index, string)
-        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums }
-        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums, .. }
+        | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums, .. } => {
             let is_unicode = matches!(
                 entry.as_ref(),
                 majit_ir::RdVirtualInfo::VUniSliceInfo { .. }
@@ -5779,11 +5779,7 @@ pub(crate) struct PyreBlackholeAllocator;
 /// shape (`cpu.bh_setfield_gc_i/r/f`).  `field_offset > 0` is enforced
 /// because offset 0 is the ob_type header set by `allocate_struct` /
 /// `allocate_with_vtable`; never let resume data overwrite it.
-fn bh_setfield_gc_byte_write(
-    struct_ptr: i64,
-    value: i64,
-    descr_info: &majit_ir::FieldDescrInfo,
-) {
+fn bh_setfield_gc_byte_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
     let field_offset = descr_info.offset;
     if struct_ptr == 0 || field_offset == 0 {
         return;
@@ -5879,42 +5875,45 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         }
     }
 
-    fn bh_setfield_gc_i(
-        &self,
-        struct_ptr: i64,
-        value: i64,
-        descr_info: &majit_ir::FieldDescrInfo,
-    ) {
+    fn bh_setfield_gc_i(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
         bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
     }
 
-    fn bh_setfield_gc_r(
-        &self,
-        struct_ptr: i64,
-        value: i64,
-        descr_info: &majit_ir::FieldDescrInfo,
-    ) {
+    fn bh_setfield_gc_r(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
         bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
     }
 
-    fn bh_setfield_gc_f(
-        &self,
-        struct_ptr: i64,
-        value: i64,
-        descr_info: &majit_ir::FieldDescrInfo,
-    ) {
+    fn bh_setfield_gc_f(&self, struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
         bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
     }
 
-    fn bh_setarrayitem_gc_i(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    fn bh_setarrayitem_gc_i(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         bh_setarrayitem_int_from_descr(array, index, value, descr);
     }
 
-    fn bh_setarrayitem_gc_r(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    fn bh_setarrayitem_gc_r(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         bh_setarrayitem_ref_from_descr(array, index, value, descr);
     }
 
-    fn bh_setarrayitem_gc_f(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    fn bh_setarrayitem_gc_f(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         bh_setarrayitem_float_from_descr(array, index, value, descr);
     }
 
