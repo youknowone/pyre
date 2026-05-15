@@ -8716,23 +8716,19 @@ mod tests {
     #[test]
     fn pc_anchor_and_live_marker_rescan_follow_final_ssarepr_order() {
         let mut ssarepr = SSARepr::new("t");
-        ssarepr
-            .insns
-            .push(Insn::Label(FlatLabel::new(super::super::flatten::pc_label_name(0))));
+        ssarepr.insns.push(Insn::pc_anchor(0));
         ssarepr
             .insns
             .push(Insn::live(vec![Operand::Register(Register::new(
                 Kind::Ref,
                 0,
             ))]));
-        // per-PC `Label("pcN")` is a merge boundary in
-        // `remove_repeated_live`, so each PC keeps its own `-live-`
-        // marker without cross-PC merge-then-reorder.  The anchor scan
-        // resolves each PC anchor at its Label position; the live
-        // marker for each PC stays at its pre-merge position.
-        ssarepr
-            .insns
-            .push(Insn::Label(FlatLabel::new(super::super::flatten::pc_label_name(1))));
+        // PcAnchor is a merge boundary in `remove_repeated_live`, so
+        // each PC keeps its own `-live-` marker without cross-PC
+        // merge-then-reorder.  The anchor scan resolves each PC anchor
+        // at its PcAnchor position; the live marker for each PC stays
+        // at its pre-merge position.
+        ssarepr.insns.push(Insn::pc_anchor(1));
         ssarepr
             .insns
             .push(Insn::live(vec![Operand::Register(Register::new(
@@ -8742,7 +8738,7 @@ mod tests {
 
         crate::jit::liveness::remove_repeated_live(&mut ssarepr);
 
-        // Anchor positions: Label("pc0")@0, Label("pc1")@2.
+        // Anchor positions: PcAnchor(0)@0, PcAnchor(1)@2.
         assert_eq!(pc_anchor_positions(&ssarepr, 2), vec![0, 2]);
         // Per-PC `-live-` boundaries: live(R0) at index 1,
         // live(R1) at index 3.
@@ -8759,9 +8755,7 @@ mod tests {
 
         let mut ssarepr = SSARepr::new("t");
         for py_pc in 0..code.instructions.len() {
-            ssarepr
-                .insns
-                .push(Insn::Label(FlatLabel::new(super::super::flatten::pc_label_name(py_pc))));
+            ssarepr.insns.push(Insn::pc_anchor(py_pc));
             ssarepr.insns.push(Insn::live(vec![
                 Operand::Register(Register::new(Kind::Ref, 0)),
                 Operand::Register(Register::new(Kind::Ref, 7)),
