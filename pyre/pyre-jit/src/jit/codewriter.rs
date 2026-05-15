@@ -7129,85 +7129,25 @@ impl CodeWriter {
             emit_goto!(site.handler_py_pc);
         }
 
-        // Task #227.3 `[phase4-walker-drain]` probe is retired: with
-        // the unconditional drain swap below + assert, any mismatch
-        // panics fail-loud at the assert site.  The probe's
-        // byte_equivalent reporting purpose is subsumed by the
-        // assertion.
+        // Drain per-block accumulators into ssarepr.insns in
+        // walker-block-creation order.  Mirrors `codewriter.py:53
+        // flatten_graph(graph, regallocs, cpu)` shape — block-by-block
+        // emit, no PC interleaving.  Walker-creation order is canonical
+        // because Phase A.4's first-wins `pc_anchor_positions` semantics
+        // depend on the dead block's emit landing before its supersede
+        // newblock's re-walked duplicate.
         //
-        // Task #227.4 production flip: drain per-block accumulators
-        // and swap into `ssarepr.insns` only when the drained stream
-        // byte-matches the walker emit exactly (regression fix —
-        // unconditional swap broke fannkuch after rebase onto main's
-        // multi-jit_merge_point change).  Walker direct
-        // `ssarepr.insns.push` restored; drain mirror remains for
-        // structural alignment with `codewriter.py:53 flatten_graph
-        // (graph, regallocs, cpu)`.
-        //
-        // The conditional swap (only when `byte_equivalent=true`)
-        // preserves production correctness: benches with walker
-        // re-entry (PC-sequential walker bouncing back into earlier
-        // blocks via `mergeblock` joinpoint match) produce
-        // non-byte-equivalent drain orderings; on those, the walker
-        // emit stays as the production source until the per-block
-        // contiguous walker restructure (Task #227.5) retires the
-        // re-entry path.
-        //
-        // `PYRE_TASK_227_FLIP_DRAIN_DFS=1` env switches drain order
-        // from walker-visit to `graph.iterblocks()` DFS order
-        // (`flowspace/model.py:66-77`); both orderings agree with
-        // ssarepr.insns on benches where walker emission is per-
-        // block contiguous, so the env is purely diagnostic.
-        // Task #227.4 Phase 4 production flip — `codewriter.py:53
-        // flatten_graph(graph, regallocs, cpu)` shape: ssarepr.insns
-        // becomes the post-walk drain of per-block accumulators in
-        // walker-block-creation order.  The walker's dual-write into
-        // ssarepr.insns above is preserved as the byte-equivalent
-        // mirror used by the assert; the actual installed ssarepr.insns
-        // comes from the drain.
-        //
-        // Block-grouped drain order differs from PC-interleaved walker
-        // order whenever the walker resumes an earlier block at a
-        // non-contiguous PC.  Correctness across both orders is
-        // preserved by the explicit `goto Label("pcN")` +
-        // `Insn::Unreachable` pair the `emit_mark_label_pc!` macro
-        // inserts at every block-switch boundary (Phase 4 alignment
-        // with `flatten.py:177-258 insert_exits`).
+        // Peel-off optimisation: at every block-switch boundary the
+        // walker emits a defensive `goto Label("pcN") + Unreachable`
+        // pair (the eventual drain order is not known at yield time
+        // since `pendingblocks` is mixed push_front / push_back).  This
+        // pass strips the pair when the next block actually opens with
+        // `Label("pcN")` for the SAME N — turning a runtime no-op
+        // branch into implicit fall-through.  Upstream `flatten.py:
+        // 106-155 make_link` skips the goto outright via recursive
+        // descent + `seen_blocks` (`flatten.py:110-113`); convergence
+        // arrives when production flips to post-walk `flatten_graph`.
         {
-            // Note (pending walker restructure
-            // convergence): concatenate per-block accumulators, then
-            // peel off redundant `goto Label("pcN") + Unreachable`
-            // pairs whenever the immediately-following block opens
-            // with `Label("pcN")` for the SAME N.
-            //
-            // Upstream `flatten.py:106-155 make_link` recurses into
-            // the link target via `make_bytecode_block` on first
-            // sight (no goto emitted, fall-through is implicit) and
-            // only emits `goto TLabel(block) + ---` for targets
-            // already in `seen_blocks` (`flatten.py:110-113`).  That
-            // seen-blocks decision is taken AT EMIT TIME because
-            // upstream's emission order is determined by the
-            // recursive descent itself.
-            //
-            // Pyre's walker is PC-sequential and uses a `pendingblocks`
-            // VecDeque populated by a mix of `push_front` (joinpoint
-            // re-entry, codewriter.rs:3897) and `push_back` (mergeblock
-            // newblock queueing, codewriter.rs:1035 / 1140); the eventual
-            // drain order is therefore not known at the moment the
-            // walker yields with `block_switch_pending`.  The walker
-            // emits goto+Unreachable defensively at every block-switch
-            // boundary, and this post-walk pass strips the pair when
-            // the actual drain order made the goto a no-op trampoline.
-            //
-            // Without the peel-off, every defensive goto+Unreachable
-            // would cost a runtime no-op branch, regressing
-            // fib_recursive on backends that don't fold trivial
-            // branches.  Convergence: Phase 4 retires the walker's
-            // inline SSARepr emit in favour of post-walk
-            // `flatten_graph(graph, regallocs, cpu)`, which produces
-            // the seen-blocks fall-through shape directly via its
-            // recursive `make_bytecode_block`; this peel-off goes
-            // away together with the walker's own SSARepr writes.
             let mut blocks: Vec<Vec<super::flatten::Insn>> = all_walker_blocks
                 .iter()
                 .map(|block| block.per_block_ssarepr())
