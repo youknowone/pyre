@@ -9,6 +9,7 @@ pub mod bridgeopt;
 pub mod dense_value_pool;
 pub mod dependency;
 pub mod earlyforce;
+pub mod vec_assoc;
 pub mod guard;
 pub mod heap;
 pub mod info;
@@ -622,10 +623,16 @@ pub struct OptContext {
     /// linear-scan dedup. Typical size is small (< a few dozen entries
     /// per trace), so O(n) inserts are acceptable.
     pub quasi_immutable_deps: Vec<(u64, u32)>,
-    /// info.py:716-721: ConstPtrInfo._get_info — const_infos stores
-    /// StructPtrInfo for constant GC objects, keyed by pointer address.
-    /// RPython: optheap.const_infos[ref] = StructPtrInfo(descr)
-    pub const_infos: HashMap<usize, crate::optimizeopt::info::PtrInfo>,
+    /// `info.py:722` `optheap.const_infos.get(ref, None)` /
+    /// `info.py:725` `optheap.const_infos[ref] = info`. Stores
+    /// `StructPtrInfo` / `ArrayPtrInfo` for constant GC objects keyed
+    /// by pointer address. PyPy uses `new_ref_dict()`; the house rule
+    /// forbids hash containers, so pyre uses a Vec-backed associative
+    /// container with linear-scan lookup.
+    pub const_infos: crate::optimizeopt::vec_assoc::VecAssoc<
+        usize,
+        crate::optimizeopt::info::PtrInfo,
+    >,
     /// Dedup imported short fact uses so the builder stays in first-use
     /// order. PyPy uses dict-as-set; pyre uses a Vec with linear-scan
     /// dedup (small per trace).
@@ -1571,7 +1578,7 @@ impl OptContext {
             imported_virtual_args: None,
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
-            const_infos: HashMap::new(),
+            const_infos: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: Vec::new(),
@@ -1699,7 +1706,7 @@ impl OptContext {
             imported_virtual_args: None,
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
-            const_infos: HashMap::new(),
+            const_infos: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: Vec::new(),
@@ -4558,7 +4565,7 @@ impl OptContext {
                     return;
                 };
                 let fields = v.fields.clone();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4573,7 +4580,7 @@ impl OptContext {
             PtrInfo::Struct(v) if !v.fields.is_empty() => {
                 let descr = v.descr.clone();
                 let fields = v.fields.clone();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4592,7 +4599,7 @@ impl OptContext {
                     .iter()
                     .map(|&(k, r)| (k, FieldEntry::Value(r)))
                     .collect();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4611,7 +4618,7 @@ impl OptContext {
                     .iter()
                     .map(|&(k, r)| (k, FieldEntry::Value(r)))
                     .collect();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Struct(StructPtrInfo {
                         descr,
                         fields: Vec::new(),
@@ -4629,7 +4636,7 @@ impl OptContext {
                 let descr = v.descr.clone();
                 let lenbound = v.lenbound.clone();
                 let items = v.items.clone();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Array(ArrayPtrInfo {
                         descr,
                         lenbound,
@@ -4646,7 +4653,7 @@ impl OptContext {
                 let len = v.items.len() as i64;
                 let items: Vec<FieldEntry> =
                     v.items.iter().map(|&r| FieldEntry::Value(r)).collect();
-                let ci = self.const_infos.entry(key).or_insert_with(|| {
+                let ci = self.const_infos.entry_or_insert_with(key, || {
                     PtrInfo::Array(ArrayPtrInfo {
                         descr,
                         lenbound: IntBound::from_constant(len),
@@ -6410,21 +6417,16 @@ impl OptContext {
             ));
         }
         let addr = gcref.0;
-        use std::collections::hash_map::Entry;
-        match self.const_infos.entry(addr) {
-            // info.py:722-725: info = optheap.const_infos.get(ref, None)
-            //                  if info is None: info = StructPtrInfo(descr)
-            //                  optheap.const_infos[ref] = info
-            Entry::Occupied(e) => Some(e.into_mut()),
-            Entry::Vacant(e) => {
-                // info.py:724: StructPtrInfo(descr)
-                let info = match parent_descr {
-                    Some(d) => PtrInfo::struct_ptr(d),
-                    None => PtrInfo::instance(None, None),
-                };
-                Some(e.insert(info))
+        // info.py:722-725: info = optheap.const_infos.get(ref, None)
+        //                  if info is None: info = StructPtrInfo(descr)
+        //                  optheap.const_infos[ref] = info
+        Some(self.const_infos.entry_or_insert_with(addr, || {
+            // info.py:724: StructPtrInfo(descr)
+            match parent_descr {
+                Some(d) => PtrInfo::struct_ptr(d),
+                None => PtrInfo::instance(None, None),
             }
-        }
+        }))
     }
 
     /// info.py:728-735 `ConstPtrInfo._get_array_info(descr, optheap)`
@@ -6473,14 +6475,12 @@ impl OptContext {
             ));
         }
         let addr = gcref.0;
-        use std::collections::hash_map::Entry;
-        match self.const_infos.entry(addr) {
-            Entry::Occupied(e) => Some(e.into_mut()),
-            Entry::Vacant(e) => Some(e.insert(crate::optimizeopt::info::PtrInfo::array(
+        Some(self.const_infos.entry_or_insert_with(addr, || {
+            crate::optimizeopt::info::PtrInfo::array(
                 descr,
                 crate::optimizeopt::intutils::IntBound::nonnegative(),
-            ))),
-        }
+            )
+        }))
     }
 
     /// info.py:750-752 `ConstPtrInfo.setfield` + info.py:203-211
