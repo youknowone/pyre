@@ -181,6 +181,33 @@ impl CodeWriter {
     ///   5. `jitcode.index = index` (codewriter.py:68)
     ///   6. `if self.debug: self.print_ssa_repr(ssarepr, portal_jd, verbose)`
     ///      (codewriter.py:71-72)
+    ///
+    /// **Type-source contract (post graph-side concretetype migration)**
+    ///
+    /// `regalloc`/`flatten`/`assemble`/`liveness`/`format` all read
+    /// kinds via `graph.concretetype(v)` —
+    /// [`crate::model::FunctionGraph::value_types`] is the inline
+    /// per-value attribute analogue of upstream
+    /// `Variable.concretetype` (`flowspace/model.py:280`).  No
+    /// `TypeResolutionState` parameter survives across stages: the
+    /// post-rtyper merge below (`merge_synth_kinds_into_graph`)
+    /// writes directly into `graph.value_types`, then
+    /// `apply_from_flowspace_variables` overrides per-Variable from
+    /// the `value_to_var` map so the rtyper's `Variable.concretetype`
+    /// is the authoritative source for every value with a Variable
+    /// backing.  Synth values (jtransform-introduced) without a
+    /// Variable backing fall back to the merge result.
+    ///
+    /// **Remaining structural divergence** — pyre's codewriter still
+    /// consumes [`crate::model::FunctionGraph`] (a `ValueId`-based
+    /// IR) instead of [`crate::flowspace::model::FunctionGraph`]
+    /// (the upstream `Variable`-based shape).  The graph-side
+    /// `value_types` array reproduces the per-value
+    /// `Variable.concretetype` attribute shape, but operand identity
+    /// is still `ValueId`.  Migrating to the `Variable`-based IR
+    /// throughout (long-term plan tier 3) would let pyre drop the
+    /// `value_to_var` bridge and consume the rtyper's Variable
+    /// graph directly — multi-week scope tracked separately.
     /// Slice 12.2 / 12.4 — shared dual-gate type-resolve entry.
     ///
     /// Runs [`dual_gate_check_with_registry`] against the
