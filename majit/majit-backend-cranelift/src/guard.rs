@@ -203,31 +203,11 @@ pub fn lookup_source_op_index(descr_ptr: usize) -> Option<usize> {
 /// per-trace metadata (input types / header_pc / source_guard tuple)
 /// is the equivalent state, parked here so the descr struct stays
 /// aligned with PyPy's surface.
-static TRACE_INFO_TABLE: OnceLock<Mutex<HashMap<usize, CompiledTraceInfo>>> = OnceLock::new();
-
-fn trace_info_table() -> &'static Mutex<HashMap<usize, CompiledTraceInfo>> {
-    TRACE_INFO_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Codegen-time write: invoked from `compile_loop` /
-/// `overlay_deadframe_fail_descr` once the descr Arc is materialised.
-pub fn register_trace_info(descr_ptr: usize, info: CompiledTraceInfo) {
-    trace_info_table()
-        .lock()
-        .expect("TRACE_INFO_TABLE mutex poisoned")
-        .insert(descr_ptr, info);
-}
-
-/// Layout / dispatch-time read.  Returns `None` when the descr has no
-/// associated trace info (synthetic descrs, descrs built outside the
-/// `compile_loop` path).
-pub fn lookup_trace_info(descr_ptr: usize) -> Option<CompiledTraceInfo> {
-    trace_info_table()
-        .lock()
-        .expect("TRACE_INFO_TABLE mutex poisoned")
-        .get(&descr_ptr)
-        .cloned()
-}
+// TRACE_INFO_TABLE removed (Slice FF): same descr-local atomic cell
+// pattern as `recovery_layout_cell` (Slice EE).  Per-trace
+// `CompiledTraceInfo` lives in the `trace_info_cell` field on
+// CraneliftFailDescr; PyPy recovers equivalent state from
+// `cpu.asmmemmgr_blocks` + `compiled_loop_token`.
 
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to its external-JUMP target `DescrRef`.
@@ -417,11 +397,10 @@ pub struct CraneliftFailDescr {
     // machine-code GC-map immediates; cranelift parks the per-descr
     // vector in `FORCE_TOKEN_SLOTS_TABLE` (this module) since
     // Cranelift IR has no equivalent inline encoding.
-    // trace_info removed (Session 5i-cl): not in PyPy
-    // `AbstractFailDescr._attrs_` (`history.py:132`).  Cranelift's
-    // per-trace `CompiledTraceInfo` now lives in `TRACE_INFO_TABLE`
-    // keyed on `Arc::as_ptr(&descr)`; RPython recovers the same
-    // information from `cpu.asmmemmgr_blocks`.
+    // trace_info was moved to `trace_info_cell` below (Slice FF):
+    // not in PyPy `AbstractFailDescr._attrs_` (`history.py:132`).
+    // RPython recovers the same information from
+    // `cpu.asmmemmgr_blocks` + `compiled_loop_token`.
     // recovery_layout was moved to `recovery_layout_cell` below
     // (Slice EE): not in PyPy `AbstractFailDescr._attrs_`
     // (`history.py:132`).  Upstream resume code decodes recovery on
@@ -518,6 +497,18 @@ pub struct CraneliftFailDescr {
     /// `compile.rs::patch_fail_descr_recovery_layout` may overwrite
     /// the cell — the previous Arc is reclaimed via swap.
     pub recovery_layout_cell: AtomicPtr<ExitRecoveryLayout>,
+    /// Per-descr `CompiledTraceInfo` cell.  PyPy recovers the same
+    /// state on demand from `cpu.asmmemmgr_blocks` +
+    /// `compiled_loop_token`.  Cranelift parks the per-trace metadata
+    /// (input types / header_pc / source_guard tuple) on the descr.
+    ///
+    /// Moved here from `TRACE_INFO_TABLE` (Slice FF) for the same
+    /// reason as `recovery_layout_cell` (Slice EE): Mutex+HashMap
+    /// lookup on the dispatch hot path.
+    ///
+    /// Null on construction.  Written via
+    /// `Arc::into_raw(Arc::new(info))`; `Drop` reclaims the Arc.
+    pub trace_info_cell: AtomicPtr<CompiledTraceInfo>,
 }
 
 impl Drop for CraneliftFailDescr {
@@ -541,10 +532,17 @@ impl Drop for CraneliftFailDescr {
             .expect("EXTERNAL_JUMP_TARGETS mutex poisoned")
             .remove(&ptr);
         // fail_count is descr-local (Slice DD): drops naturally with self.
-        trace_info_table()
-            .lock()
-            .expect("TRACE_INFO_TABLE mutex poisoned")
-            .remove(&ptr);
+        // trace_info_cell is descr-local (Slice FF): reclaim the
+        // published `Arc<CompiledTraceInfo>` by swapping the cell to
+        // null and reconstructing the Arc.
+        let info_ptr = self
+            .trace_info_cell
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !info_ptr.is_null() {
+            // Safety: produced by `Arc::into_raw(Arc::new(info))` in
+            // `set_trace_info`; reclaim ownership and drop.
+            unsafe { drop(Arc::from_raw(info_ptr as *const CompiledTraceInfo)) };
+        }
         // recovery_layout_cell is descr-local (Slice EE): reclaim the
         // published `Arc<ExitRecoveryLayout>` by swapping the cell to
         // null and reconstructing the Arc.
@@ -606,10 +604,7 @@ impl std::fmt::Debug for CraneliftFailDescr {
                 "force_token_slots",
                 &lookup_force_token_slots(self as *const Self as usize),
             )
-            .field(
-                "trace_info",
-                &lookup_trace_info(self as *const Self as usize),
-            )
+            .field("trace_info", &self.trace_info_ref())
             .field("recovery_layout", &self.recovery_layout_ref())
             .field("fail_count", &self.get_fail_count())
             .field(
@@ -664,6 +659,7 @@ impl CraneliftFailDescr {
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
             fail_count: AtomicU32::new(0),
             recovery_layout_cell: AtomicPtr::new(std::ptr::null_mut()),
+            trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -695,6 +691,7 @@ impl CraneliftFailDescr {
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
             fail_count: AtomicU32::new(0),
             recovery_layout_cell: AtomicPtr::new(std::ptr::null_mut()),
+            trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
         }
     }
 
@@ -731,11 +728,24 @@ impl CraneliftFailDescr {
     }
 
     #[inline]
-    /// Backend-static side-table read (Session 5i-cl).  Returns the
-    /// owned `CompiledTraceInfo` clone, or `None` when no trace info
-    /// has been registered for this descr.
+    /// Descr-local atomic read (Slice FF).  Returns the owned
+    /// `CompiledTraceInfo` clone, or `None` when no trace info has been
+    /// published for this descr.  Lock-free and HashMap-free.
     pub fn trace_info_ref(&self) -> Option<CompiledTraceInfo> {
-        lookup_trace_info(self as *const Self as usize)
+        let ptr = self.trace_info_cell.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            // Safety: `ptr` was produced by
+            // `Arc::into_raw(Arc::new(info))` in `set_trace_info`;
+            // increment_strong_count + from_raw yields an extra owning
+            // Arc the caller can deref + clone.
+            unsafe {
+                Arc::increment_strong_count(ptr as *const CompiledTraceInfo);
+                let arc = Arc::from_raw(ptr as *const CompiledTraceInfo);
+                Some((*arc).clone())
+            }
+        }
     }
 
     #[inline]
@@ -840,11 +850,20 @@ impl CraneliftFailDescr {
         register_source_op_index(Arc::as_ptr(self) as usize, source_op_index);
     }
 
-    /// Backend-static side-table write (Session 5i-cl).  Callers are
-    /// `compile_loop` (codegen finaliser) and
-    /// `overlay_deadframe_fail_descr` (CALL_ASSEMBLER prefix overlay).
+    /// Descr-local atomic write (Slice FF).  Callers are `compile_loop`
+    /// (codegen finaliser) and `overlay_deadframe_fail_descr`
+    /// (CALL_ASSEMBLER prefix overlay).  Publishes the trace info via
+    /// `Arc::into_raw(Arc::new(...))`; any previously published Arc is
+    /// reclaimed by the swap.
     pub fn set_trace_info(self: &Arc<Self>, trace_info: CompiledTraceInfo) {
-        register_trace_info(Arc::as_ptr(self) as usize, trace_info);
+        let new_ptr =
+            Arc::into_raw(Arc::new(trace_info)) as *mut CompiledTraceInfo;
+        let old_ptr = self.trace_info_cell.swap(new_ptr, Ordering::AcqRel);
+        if !old_ptr.is_null() {
+            // Safety: prior `set_trace_info` published this pointer;
+            // reclaim ownership and drop.
+            unsafe { drop(Arc::from_raw(old_ptr as *const CompiledTraceInfo)) };
+        }
     }
 
     /// Derive the `GcMap` on demand from `fail_arg_types` and the
@@ -921,7 +940,7 @@ impl CraneliftFailDescr {
             fail_index: self.fail_index,
             source_op_index: lookup_source_op_index(self as *const Self as usize),
             trace_id: <Self as FailDescr>::trace_id(self),
-            trace_info: lookup_trace_info(self as *const Self as usize),
+            trace_info: self.trace_info_ref(),
             fail_arg_types: fail_arg_types.to_vec(),
             is_finish: <Self as FailDescr>::is_finish(self),
             gc_ref_slots,
