@@ -626,8 +626,10 @@ pub struct OptContext {
     /// StructPtrInfo for constant GC objects, keyed by pointer address.
     /// RPython: optheap.const_infos[ref] = StructPtrInfo(descr)
     pub const_infos: HashMap<usize, crate::optimizeopt::info::PtrInfo>,
-    /// Dedup imported short fact uses so the builder stays in first-use order.
-    imported_short_preamble_used: HashSet<OpRef>,
+    /// Dedup imported short fact uses so the builder stays in first-use
+    /// order. PyPy uses dict-as-set; pyre uses a Vec with linear-scan
+    /// dedup (small per trace).
+    imported_short_preamble_used: Vec<OpRef>,
     /// `unroll.py:37` `self.optunroll.potential_extra_ops[op] = preamble_op` /
     /// `optimizer.py:354` `preamble_op = self.optunroll.potential_extra_ops.pop(op)`.
     /// PyPy uses a dict keyed by the box; pyre uses a Vec of `(OpRef,
@@ -1570,7 +1572,7 @@ impl OptContext {
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
             const_infos: HashMap::new(),
-            imported_short_preamble_used: HashSet::new(),
+            imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
@@ -1698,7 +1700,7 @@ impl OptContext {
             imported_loop_invariant_results: Vec::new(),
             imported_short_preamble_builder: None,
             const_infos: HashMap::new(),
-            imported_short_preamble_used: HashSet::new(),
+            imported_short_preamble_used: Vec::new(),
 
             potential_extra_ops: Vec::new(),
             active_short_preamble_producer: None,
@@ -2612,7 +2614,11 @@ impl OptContext {
         let result = self.get_box_replacement(preamble_op.op);
         let result_type = preamble_op.preamble_op.result_type();
         let is_constant = self.get_constant(preamble_source).is_some();
-        if self.imported_short_preamble_used.insert(preamble_source) {
+        let first_use = !self.imported_short_preamble_used.contains(&preamble_source);
+        if first_use {
+            self.imported_short_preamble_used.push(preamble_source);
+        }
+        if first_use {
             // unroll.py:32: use_box(op, preamble_op.preamble_op, self).
             // RPython passes the preamble_op directly — no lookup miss possible.
             // majit prefers the produced_short_boxes lookup (Phase-2 remapped pos)
