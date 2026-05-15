@@ -594,9 +594,9 @@ fn overlay_deadframe_fail_descr(
     );
     let descr = Arc::new(descr);
     // `set_source_op_index` / `set_recovery_layout` / `set_trace_info` /
-    // `register_force_token_slots` all write to backend-static side-tables
-    // keyed on `Arc::as_ptr(&descr)`, so they must follow Arc
-    // materialisation (Session 5i-cl).
+    // `set_force_token_slots` all publish into descr-local cells
+    // (Slices CC–II); they touch `self` so Arc materialisation must
+    // precede them.
     if let Some(source_op_index) = base_layout.source_op_index {
         descr.set_source_op_index(source_op_index);
     }
@@ -604,10 +604,6 @@ fn overlay_deadframe_fail_descr(
     if let Some(trace_info) = base_layout.trace_info.clone() {
         descr.set_trace_info(trace_info);
     }
-    crate::guard::register_force_token_slots(
-        Arc::as_ptr(&descr) as usize,
-        base_layout.force_token_slots.clone(),
-    );
     descr
 }
 
@@ -13206,11 +13202,6 @@ fn collect_guards(
         } else {
             None
         };
-        // Session 5i-cl: force_token_slots moved to a backend-static
-        // side-table.  Capture a clone now; the constructor consumes
-        // the original to compute `gc_map`, and we register the
-        // captured copy against the descr's Arc address below.
-        let force_token_slots_for_register = force_token_slots.clone();
         let mut descr = if is_external_jump {
             CraneliftFailDescr::new_external_jump(
                 fail_index,
@@ -13292,10 +13283,6 @@ fn collect_guards(
         if let Some(layout) = recovery_layout {
             descr.set_recovery_layout(layout);
         }
-        crate::guard::register_force_token_slots(
-            Arc::as_ptr(&descr) as usize,
-            force_token_slots_for_register,
-        );
         if let Some(target) = external_jump_target {
             descr.set_external_jump_target(target);
         }

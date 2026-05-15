@@ -110,36 +110,12 @@ pub fn store_bridge_caches(descr_ptr: usize, code_ptr: usize, frame_depth: usize
 /// vector in this side-table for runtime GC-root filtering.  The
 /// table is consulted by `FailDescr::force_token_slots()` and
 /// `is_force_token_slot()`.
-static FORCE_TOKEN_SLOTS_TABLE: OnceLock<Mutex<HashMap<usize, Vec<usize>>>> = OnceLock::new();
-
-fn force_token_slots_table() -> &'static Mutex<HashMap<usize, Vec<usize>>> {
-    FORCE_TOKEN_SLOTS_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Codegen-time write.  Sorts+dedupes the vector internally so the
-/// stored slot list satisfies the `binary_search` invariant used by
-/// `is_force_token_slot`.  Empty vectors are skipped — `lookup_*`
-/// returns an empty `Vec` when the descr has no entry.
-pub fn register_force_token_slots(descr_ptr: usize, mut slots: Vec<usize>) {
-    slots.sort_unstable();
-    slots.dedup();
-    if slots.is_empty() {
-        return;
-    }
-    force_token_slots_table()
-        .lock()
-        .expect("FORCE_TOKEN_SLOTS_TABLE mutex poisoned")
-        .insert(descr_ptr, slots);
-}
-
-pub fn lookup_force_token_slots(descr_ptr: usize) -> Vec<usize> {
-    force_token_slots_table()
-        .lock()
-        .expect("FORCE_TOKEN_SLOTS_TABLE mutex poisoned")
-        .get(&descr_ptr)
-        .cloned()
-        .unwrap_or_default()
-}
+// FORCE_TOKEN_SLOTS_TABLE removed (Slice II): write-once at codegen
+// (the slot positions are determined by the trace's force-token
+// produce/consume pairs and do not change after the descr is sealed).
+// Lives in `force_token_slots_cell: OnceLock<Vec<usize>>` on
+// CraneliftFailDescr.  Empty vectors are still elided
+// (`force_token_slots_view` returns `&[]` for unset cells).
 
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to its codegen-time `source_op_index`.
@@ -496,6 +472,18 @@ pub struct CraneliftFailDescr {
     /// at codegen via `set_source_op_index`; `None` for synthetic
     /// descrs that have no associated trace op.
     pub source_op_index_cell: OnceLock<usize>,
+    /// Force-token slot positions for runtime GC-root filtering.
+    /// PyPy encodes the same information into the machine code's
+    /// GC-map immediates (`assembler.py` handles force-token slot
+    /// produce/consume inline); cranelift IR has no equivalent inline
+    /// encoding so the vector lives on the descr.
+    ///
+    /// Moved here from `FORCE_TOKEN_SLOTS_TABLE` (Slice II).  Sorted
+    /// and deduped by `set_force_token_slots` so
+    /// `force_token_slots_view` satisfies the `binary_search`
+    /// invariant used by `is_force_token_slot`.  Empty vectors are
+    /// elided (the cell stays unset).
+    pub force_token_slots_cell: OnceLock<Vec<usize>>,
 }
 
 impl Drop for CraneliftFailDescr {
@@ -541,10 +529,8 @@ impl Drop for CraneliftFailDescr {
         }
         // source_op_index_cell is descr-local (Slice HH): drops
         // naturally with self.
-        force_token_slots_table()
-            .lock()
-            .expect("FORCE_TOKEN_SLOTS_TABLE mutex poisoned")
-            .remove(&ptr);
+        // force_token_slots_cell is descr-local (Slice II): drops
+        // naturally with self.
         bridge_caches_table()
             .lock()
             .expect("BRIDGE_CACHES_TABLE mutex poisoned")
@@ -580,10 +566,7 @@ impl std::fmt::Debug for CraneliftFailDescr {
                 "external_jump_target",
                 &self.external_jump_target_ref().map(|d| d.repr()),
             )
-            .field(
-                "force_token_slots",
-                &lookup_force_token_slots(self as *const Self as usize),
-            )
+            .field("force_token_slots", &self.force_token_slots_view())
             .field("trace_info", &self.trace_info_ref())
             .field("recovery_layout", &self.recovery_layout_ref())
             .field("fail_count", &self.get_fail_count())
@@ -627,11 +610,9 @@ impl CraneliftFailDescr {
         trace_id: u64,
         fail_arg_types: Vec<Type>,
         _is_finish: bool,
-        mut force_token_slots: Vec<usize>,
+        force_token_slots: Vec<usize>,
     ) -> Self {
-        force_token_slots.sort_unstable();
-        force_token_slots.dedup();
-        CraneliftFailDescr {
+        let descr = CraneliftFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
@@ -642,7 +623,10 @@ impl CraneliftFailDescr {
             trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
             source_op_index_cell: OnceLock::new(),
-        }
+            force_token_slots_cell: OnceLock::new(),
+        };
+        descr.set_force_token_slots(force_token_slots);
+        descr
     }
 
     /// Construct a fail descriptor for an external JUMP exit.
@@ -654,7 +638,7 @@ impl CraneliftFailDescr {
         fail_index: u32,
         trace_id: u64,
         fail_arg_types: Vec<Type>,
-        mut force_token_slots: Vec<usize>,
+        force_token_slots: Vec<usize>,
     ) -> Self {
         // Caller is expected to wrap the returned descr in `Arc::new(...)`
         // and immediately publish the external-JUMP target via
@@ -662,9 +646,7 @@ impl CraneliftFailDescr {
         // cannot do this itself because the callsite needs to perform
         // additional in-place mutations (`set_source_op_index`,
         // `meta_descr`) before sealing the descr behind `Arc`.
-        force_token_slots.sort_unstable();
-        force_token_slots.dedup();
-        CraneliftFailDescr {
+        let descr = CraneliftFailDescr {
             fail_index,
             trace_id,
             fail_arg_types,
@@ -675,7 +657,10 @@ impl CraneliftFailDescr {
             trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
             source_op_index_cell: OnceLock::new(),
-        }
+            force_token_slots_cell: OnceLock::new(),
+        };
+        descr.set_force_token_slots(force_token_slots);
+        descr
     }
 
     // UnsafeCell accessor helpers — single-threaded, no lock needed.
@@ -859,6 +844,30 @@ impl CraneliftFailDescr {
         self.source_op_index_cell.get().copied()
     }
 
+    /// Descr-local write-once cell (Slice II).  Sorts+dedups the
+    /// vector so the stored slot list satisfies `binary_search`
+    /// (used by `is_force_token_slot`).  Empty vectors are elided
+    /// (cell stays unset; `force_token_slots_view` returns `&[]`).
+    pub fn set_force_token_slots(&self, mut slots: Vec<usize>) {
+        slots.sort_unstable();
+        slots.dedup();
+        if slots.is_empty() {
+            return;
+        }
+        self.force_token_slots_cell
+            .set(slots)
+            .expect("force_token_slots_cell already published");
+    }
+
+    #[inline]
+    /// Descr-local read (Slice II).  Returns the published slot list
+    /// as a slice or `&[]` when no slots have been registered.
+    pub fn force_token_slots_view(&self) -> &[usize] {
+        self.force_token_slots_cell
+            .get()
+            .map_or(&[], Vec::as_slice)
+    }
+
     /// Descr-local atomic write (Slice FF).  Callers are `compile_loop`
     /// (codegen finaliser) and `overlay_deadframe_fail_descr`
     /// (CALL_ASSEMBLER prefix overlay).  Publishes the trace info via
@@ -876,21 +885,18 @@ impl CraneliftFailDescr {
     }
 
     /// Derive the `GcMap` on demand from `fail_arg_types` and the
-    /// side-table-stored `force_token_slots`.  Replaces the previous
-    /// `pub gc_map: GcMap` field (Session 5i-cl); upstream
+    /// descr-local `force_token_slots_cell` (Slice II).  Replaces the
+    /// previous `pub gc_map: GcMap` field (Session 5i-cl); upstream
     /// `assembler.py:write_failure_recovery_description` parity
     /// recomputes equivalent bits inline at codegen time.
     pub fn gc_map(&self) -> GcMap {
-        let force_token_slots = lookup_force_token_slots(self as *const Self as usize);
-        Self::gc_map_for_types(&self.fail_arg_types, &force_token_slots)
+        Self::gc_map_for_types(&self.fail_arg_types, self.force_token_slots_view())
     }
 
     pub fn is_force_token_slot(&self, slot: usize) -> bool {
-        // Vector stored in `FORCE_TOKEN_SLOTS_TABLE` is sorted+deduped
-        // at register time, preserving the `binary_search` invariant.
-        lookup_force_token_slots(self as *const Self as usize)
-            .binary_search(&slot)
-            .is_ok()
+        // Vector stored in `force_token_slots_cell` is sorted+deduped
+        // at set time, preserving the `binary_search` invariant.
+        self.force_token_slots_view().binary_search(&slot).is_ok()
     }
 
     /// `compile.py:185` `isinstance(descr, ResumeDescr)` gate for
@@ -953,7 +959,7 @@ impl CraneliftFailDescr {
             fail_arg_types: fail_arg_types.to_vec(),
             is_finish: <Self as FailDescr>::is_finish(self),
             gc_ref_slots,
-            force_token_slots: lookup_force_token_slots(self as *const Self as usize),
+            force_token_slots: self.force_token_slots_view().to_vec(),
             recovery_layout: recovery,
             frame_stack,
             rd_numb: meta_fd.and_then(|fd| fd.rd_numb()).map(|s| s.to_vec()),
@@ -1122,15 +1128,13 @@ impl FailDescr for CraneliftFailDescr {
         // semantics of `gc_map_for_types`: slot is a GC ref iff its
         // type is Ref AND the slot is not a force-token producer.
         match self.fail_arg_types.get(slot) {
-            Some(Type::Ref) => {
-                !lookup_force_token_slots(self as *const Self as usize).contains(&slot)
-            }
+            Some(Type::Ref) => !self.force_token_slots_view().contains(&slot),
             _ => false,
         }
     }
 
     fn force_token_slots(&self) -> Vec<usize> {
-        lookup_force_token_slots(self as *const Self as usize)
+        self.force_token_slots_view().to_vec()
     }
 
     fn vector_info(&self) -> Vec<AccumInfo> {
