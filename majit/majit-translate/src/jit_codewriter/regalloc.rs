@@ -454,7 +454,7 @@ pub fn perform_register_allocation(
     graph: &FunctionGraph,
     kind: RegKind,
 ) -> RegAllocResult {
-    let consider = |v: ValueId| -> bool { concretetype_to_regkind(graph.concretetype(v)) == Some(kind) };
+    let consider = |v: ValueId| -> bool { concretetype_to_regkind(&graph.concretetype(v)) == Some(kind) };
     let mut allocator = RegAllocator::new();
     allocator.make_dependencies(graph, &consider);
     allocator.coalesce_variables(graph, &consider);
@@ -466,7 +466,7 @@ pub fn perform_register_allocation(
     // graph-side concretetype lands in `kind`.
     for idx in 0..graph.next_value() {
         let vid = ValueId(idx);
-        if concretetype_to_regkind(graph.concretetype(vid)) == Some(kind) {
+        if concretetype_to_regkind(&graph.concretetype(vid)) == Some(kind) {
             if let Some(color) = allocator.getcolor(vid) {
                 coloring.insert(vid, color);
                 if color + 1 > max_reg {

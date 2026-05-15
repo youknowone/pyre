@@ -2420,32 +2420,27 @@ impl FunctionGraph {
         vid
     }
 
-    /// `Variable.concretetype` getter.
+    /// `Variable.concretetype` getter — returns by value to allow
+    /// the live read through `Variable.concretetype.borrow()`.
     ///
-    /// Routes through the backing [`crate::flowspace::model::Variable`]
-    /// when one is bound — that gives the codewriter the upstream
-    /// `getkind(v.concretetype)` access shape verbatim, no dense
-    /// `Vec<ConcreteType>` mirror in flight.  When no Variable
-    /// backs the slot (jtransform synth values, pre-rtyper graphs)
-    /// the dense [`Self::value_types`] fallback covers it.
-    pub fn concretetype(&self, v: ValueId) -> &ConcreteType {
+    /// When a backing [`crate::flowspace::model::Variable`] is
+    /// bound to the slot the kind comes straight from the
+    /// Variable's inline `concretetype` attribute via
+    /// `getkind(var.concretetype)` — RPython's
+    /// `getkind(v.concretetype)` access pattern verbatim, no dense
+    /// vec snapshot in the loop.  When no Variable backs the slot
+    /// (jtransform synth values, pre-rtyper graphs) the dense
+    /// [`Self::value_types`] fallback covers it.
+    pub fn concretetype(&self, v: ValueId) -> ConcreteType {
         if let Some(Some(var)) = self.value_variables.get(v.0) {
-            // Variable.concretetype is a `Rc<RefCell<Option<LowLevelType>>>` —
-            // matching upstream's mutable attribute model.  Read via
-            // a temporary scope so the borrow stays minimal.
-            // RPython's `getkind(v.concretetype)` returns the
-            // `'int'/'ref'/'float'/'void'` string straight from the
-            // attribute; pyre stores the projected `ConcreteType`
-            // mirror in `value_types` to avoid borrowing the RefCell
-            // every read (see `bind_variable` /
-            // `set_concretetype`).  The mirror is the source of
-            // truth that downstream callers see; the Variable is
-            // the source-of-source-of-truth that the rtyper writes.
-            let _ = var; // borrow guard documents the bridge
+            if let Some(lltype) = var.concretetype.borrow().as_ref() {
+                return getkind(lltype);
+            }
         }
         self.value_types
             .get(v.0)
-            .unwrap_or(&ConcreteType::Unknown)
+            .cloned()
+            .unwrap_or(ConcreteType::Unknown)
     }
 
     /// Late-stamp [`ValueId`] kind (e.g. after the rtyper resolved
