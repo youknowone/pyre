@@ -944,18 +944,25 @@ impl RegAllocator {
             let mut must_continue = false;
 
             for insn in ssarepr.insns.iter().rev() {
-                match insn {
-                    Insn::Label(label) => {
-                        let alive_at_point = label2alive.entry(label.name.clone()).or_default();
-                        let prevlength = alive_at_point.len();
-                        alive_at_point.extend(alive.iter().copied());
-                        if prevlength != alive_at_point.len() {
-                            must_continue = true;
-                        }
+                let label_name = match insn {
+                    Insn::Label(label) => Some(label.name.clone()),
+                    Insn::PcAnchor { py_pc } => Some(super::flatten::pc_label_name(*py_pc)),
+                    _ => None,
+                };
+                if let Some(name) = label_name {
+                    let alive_at_point = label2alive.entry(name).or_default();
+                    let prevlength = alive_at_point.len();
+                    alive_at_point.extend(alive.iter().copied());
+                    if prevlength != alive_at_point.len() {
+                        must_continue = true;
                     }
+                    continue;
+                }
+                match insn {
                     Insn::Unreachable => {
                         alive.clear();
                     }
+                    Insn::Label(_) | Insn::PcAnchor { .. } => unreachable!("handled above"),
                     Insn::Op { args, result, .. } => {
                         // Defs: `'->' result` interferes with everything
                         // currently alive (regalloc.py:70-76).
@@ -1173,7 +1180,7 @@ pub(super) fn apply_rename(ssarepr: &mut SSARepr, rename: &HashMap<(Kind, u16), 
                     rename_operand(op, rename);
                 }
             }
-            Insn::Label(_) | Insn::Unreachable => {}
+            Insn::Label(_) | Insn::PcAnchor { .. } | Insn::Unreachable => {}
         }
     }
 }

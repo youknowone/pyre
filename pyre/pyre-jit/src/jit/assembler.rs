@@ -244,6 +244,17 @@ impl Assembler {
                     .insert(label.name.clone(), state.builder.current_pos());
                 state.builder.mark_label(label_id);
             }
+            // pyre per-PC anchor — synthesizes the same byte-position
+            // recording as `Insn::Label(Label::new(pc_label_name(N)))`
+            // so `TLabel("pc{N}")` branches resolve identically.
+            Insn::PcAnchor { py_pc } => {
+                let name = super::flatten::pc_label_name(*py_pc);
+                let label_id = builder_label(state, &name);
+                state
+                    .label_positions
+                    .insert(name, state.builder.current_pos());
+                state.builder.mark_label(label_id);
+            }
             Insn::Op {
                 opname,
                 args,

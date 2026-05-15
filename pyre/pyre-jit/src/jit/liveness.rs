@@ -79,8 +79,19 @@ fn _compute_liveness_must_continue(
         let insn = ssarepr.insns[i].clone();
 
         // `liveness.py:36-42` `if isinstance(insn[0], Label)`.
-        if let Insn::Label(label) = &insn {
-            let alive_at_point = label2alive.entry(label.name.clone()).or_default();
+        //
+        // Pyre's `Insn::PcAnchor { py_pc }` is the per-PC anchor variant
+        // synthesized by the walker; it shares Label's snapshot-and-merge
+        // semantic, keyed on `pc_label_name(py_pc)` so the resulting
+        // `label2alive` entry matches what `TLabel("pc{N}")` branches
+        // resolve to.
+        let label_name = match &insn {
+            Insn::Label(label) => Some(label.name.clone()),
+            Insn::PcAnchor { py_pc } => Some(super::flatten::pc_label_name(*py_pc)),
+            _ => None,
+        };
+        if let Some(name) = label_name {
+            let alive_at_point = label2alive.entry(name).or_default();
             // `liveness.py:38` `prevlength = len(alive_at_point)`.
             let prevlength = alive_at_point.len();
             // `liveness.py:39` `alive_at_point.update(alive)`.
@@ -281,7 +292,9 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
             if next.is_live() {
                 lives.push(next);
                 i += 1;
-            } else if matches!(&next, Insn::Label(label) if label.is_pc_anchor()) {
+            } else if matches!(&next, Insn::PcAnchor { .. })
+                || matches!(&next, Insn::Label(label) if label.is_pc_anchor())
+            {
                 break;
             } else if matches!(next, Insn::Label(_)) {
                 labels.push(next);

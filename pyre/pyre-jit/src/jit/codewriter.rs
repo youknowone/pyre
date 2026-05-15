@@ -3868,12 +3868,7 @@ impl CodeWriter {
                     // bookkeeping needed because `current_block`
                     // doesn't change.
                     needs_fallthrough = true;
-                    push_walker_emit(
-                        &current_block,
-                        Insn::Label(super::flatten::Label::new(
-                            super::flatten::pc_label_name(py_pc),
-                        )),
-                    );
+                    push_walker_emit(&current_block, Insn::pc_anchor(py_pc));
                 }
             }};
         }
