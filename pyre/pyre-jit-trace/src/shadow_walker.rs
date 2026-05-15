@@ -441,17 +441,12 @@ mod tests {
     use majit_ir::{DescrRef, OpCode, OpRef};
 
     fn op(opcode: OpCode, args: &[OpRef], descr: Option<DescrRef>) -> Op {
-        Op {
-            opcode,
-            args: args.iter().copied().collect(),
-            descr,
-            pos: OpRef::op_typed(0, opcode.result_type()),
-            type_: opcode.result_type(),
-            fail_args: None,
-            fail_arg_types: None,
-            rd_resume_position: -1,
-            vecinfo: None,
-        }
+        let mut op = match descr {
+            Some(d) => Op::with_descr(opcode, args, d),
+            None => Op::new(opcode, args),
+        };
+        op.pos = OpRef::op_typed(0, opcode.result_type());
+        op
     }
 
     #[test]

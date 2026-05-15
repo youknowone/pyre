@@ -30,10 +30,7 @@ fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
 
 #[test]
 fn test_empty_trace() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let ops = vec![{
         let mut op = Op::new(OpCode::Finish, &[OpRef::input_arg_int(0)]);
         op.fail_args = Some(smallvec![OpRef::input_arg_int(0)]);
@@ -59,14 +56,8 @@ fn test_int_add_loop() {
     // Label(i, sum) -> IntAdd(sum, i) -> IntAdd(i, 1) -> IntLt(i, 100)
     // -> GuardTrue -> Jump(new_i, new_sum)
     let inputargs = vec![
-        InputArg {
-            index: 0,
-            tp: Type::Int,
-        }, // i
-        InputArg {
-            index: 1,
-            tp: Type::Int,
-        }, // sum
+        InputArg::from_type(Type::Int, 0), // i
+        InputArg::from_type(Type::Int, 1), // sum
     ];
 
     let const_1 = OpRef::const_int(0);
@@ -120,14 +111,8 @@ fn test_int_add_loop() {
 #[test]
 fn test_float_ops() {
     let inputargs = vec![
-        InputArg {
-            index: 0,
-            tp: Type::Float,
-        },
-        InputArg {
-            index: 1,
-            tp: Type::Float,
-        },
+        InputArg::from_type(Type::Float, 0),
+        InputArg::from_type(Type::Float, 1),
     ];
 
     let ops = vec![
@@ -181,10 +166,7 @@ fn test_float_ops() {
 
 #[test]
 fn test_call_generates_import() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     let func_ptr = OpRef::const_int(0);
     let mut constants = HashMap::new();
@@ -235,14 +217,8 @@ fn test_call_generates_import() {
 #[test]
 fn test_guard_types() {
     let inputargs = vec![
-        InputArg {
-            index: 0,
-            tp: Type::Int,
-        },
-        InputArg {
-            index: 1,
-            tp: Type::Int,
-        },
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
     ];
 
     let ops = vec![
@@ -320,10 +296,7 @@ fn test_guard_types() {
 /// classptr — no `mem32[obj + 0]` read, no classptr→typeid lookup.
 #[test]
 fn test_guard_gc_type_uses_immediate_typeid() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     // OpRef::const_int(0) holds the immediate typeid 0x42
     let mut constants = HashMap::new();
@@ -384,10 +357,7 @@ fn enabled_guard_gc_type_info() -> codegen::GuardGcTypeInfo {
 /// runs; the resulting module must validate as legal wasm.
 #[test]
 fn test_guard_is_object_lowers_to_typeinfo_test() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     let ops = vec![
         Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]),
@@ -421,10 +391,7 @@ fn test_guard_is_object_lowers_to_typeinfo_test() {
 /// lowering runs to completion.
 #[test]
 fn test_guard_subclass_lowers_to_subclassrange_check() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     // history.py:307 `ConstPtr.type = 'r'` — vtable pointers are
     // ref-typed Const boxes. Use the typed `OpRef::const_ptr` factory
@@ -472,10 +439,7 @@ fn test_guard_subclass_lowers_to_subclassrange_check() {
 
 #[test]
 fn test_sameas_and_conversions() {
-    let inputargs = vec![InputArg {
-        index: 0,
-        tp: Type::Int,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
 
     let ops = vec![
         make_op(
@@ -538,14 +502,8 @@ fn test_sameas_and_conversions() {
 #[test]
 fn test_overflow_ops() {
     let inputargs = vec![
-        InputArg {
-            index: 0,
-            tp: Type::Int,
-        },
-        InputArg {
-            index: 1,
-            tp: Type::Int,
-        },
+        InputArg::from_type(Type::Int, 0),
+        InputArg::from_type(Type::Int, 1),
     ];
 
     let ops = vec![

@@ -653,10 +653,7 @@ mod tests {
         jump.pos = OpRef::int_op(4);
 
         let plan = TracePlan::build(
-            &[InputArg {
-                tp: Type::Int,
-                index: 0,
-            }],
+            &[InputArg::from_type(Type::Int, 0)],
             &[label, add, lt, guard, jump],
         );
 
@@ -704,10 +701,7 @@ mod tests {
         finish.pos = OpRef::int_op(4);
 
         let plan = TracePlan::build(
-            &[InputArg {
-                tp: Type::Int,
-                index: 0,
-            }],
+            &[InputArg::from_type(Type::Int, 0)],
             &[add, is_true, guard, finish],
         );
 
@@ -747,10 +741,7 @@ mod tests {
         jump.pos = OpRef::int_op(4);
 
         let plan = TracePlan::build(
-            &[InputArg {
-                tp: Type::Int,
-                index: 0,
-            }],
+            &[InputArg::from_type(Type::Int, 0)],
             &[add, is_true, guard, jump],
         );
 
@@ -775,18 +766,9 @@ mod tests {
 
         let plan = TracePlan::build(
             &[
-                InputArg {
-                    tp: Type::Ref,
-                    index: base.raw(),
-                },
-                InputArg {
-                    tp: Type::Int,
-                    index: index.raw(),
-                },
-                InputArg {
-                    tp: Type::Int,
-                    index: value.raw(),
-                },
+                InputArg::from_type(Type::Ref, base.raw()),
+                InputArg::from_type(Type::Int, index.raw()),
+                InputArg::from_type(Type::Int, value.raw()),
             ],
             &[load, store],
         );
@@ -824,10 +806,7 @@ mod tests {
         let debug = Op::new(OpCode::JitDebug, &[]);
 
         let plan = TracePlan::build(
-            &[InputArg {
-                tp: Type::Int,
-                index: i0.raw(),
-            }],
+            &[InputArg::from_type(Type::Int, i0.raw())],
             &[same_as, debug],
         );
 
@@ -861,10 +840,7 @@ mod tests {
         future.fail_args = Some(vec![i0].into());
 
         let plan = TracePlan::build(
-            &[InputArg {
-                tp: Type::Ref,
-                index: i0.raw(),
-            }],
+            &[InputArg::from_type(Type::Ref, i0.raw())],
             &[is_object, future],
         );
 

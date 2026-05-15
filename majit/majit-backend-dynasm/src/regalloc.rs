@@ -6099,10 +6099,7 @@ mod tests {
         let _i2 = OpRef::int_op(1);
         let _i3 = OpRef::int_op(2);
 
-        let inputargs = vec![InputArg {
-            index: i0.raw(),
-            tp: Type::Int,
-        }];
+        let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
         let ops = vec![
             make_op(OpCode::IntAdd, 0, &[i0, i0]),
             make_guard(OpCode::GuardTrue, 1, &[i1], &[i0]),
@@ -6232,10 +6229,7 @@ mod tests {
         let i2 = OpRef::int_op(2);
         let c1 = OpRef::const_int(0);
 
-        let inputargs = vec![InputArg {
-            index: i0.raw(),
-            tp: Type::Int,
-        }];
+        let inputargs = vec![InputArg::from_type(Type::Int, i0.raw())];
 
         let mut add = Op::new(OpCode::IntAdd, &[i0, c1]);
         add.pos = i1;
@@ -6285,10 +6279,7 @@ mod tests {
         // by typed `OpRef::input_arg_ref` (variant-aware Eq).
         let i0 = OpRef::input_arg_ref(0);
         let c0 = OpRef::const_int(0);
-        let inputargs = vec![InputArg {
-            index: i0.raw(),
-            tp: Type::Ref,
-        }];
+        let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
 
         let store = Op::new(OpCode::GcStore, &[i0, c0, i0]);
         let ops = vec![store];
@@ -6331,14 +6322,8 @@ mod tests {
         let i2 = OpRef::int_op(2);
 
         let inputargs = vec![
-            InputArg {
-                index: i0.raw(),
-                tp: Type::Int,
-            },
-            InputArg {
-                index: i1.raw(),
-                tp: Type::Int,
-            },
+            InputArg::from_type(Type::Int, i0.raw()),
+            InputArg::from_type(Type::Int, i1.raw()),
         ];
 
         let mut raw = Op::new(OpCode::IntIsTrue, &[i0]);
@@ -6381,14 +6366,8 @@ mod tests {
         let i1 = OpRef::int_op(1);
 
         let inputargs = vec![
-            InputArg {
-                index: i0.raw(),
-                tp: Type::Int,
-            },
-            InputArg {
-                index: i1.raw(),
-                tp: Type::Int,
-            },
+            InputArg::from_type(Type::Int, i0.raw()),
+            InputArg::from_type(Type::Int, i1.raw()),
         ];
 
         let mut raw = Op::new(OpCode::GuardTrue, &[i0]);
@@ -6424,14 +6403,8 @@ mod tests {
         let c8 = OpRef::const_int(8);
 
         let inputargs = vec![
-            InputArg {
-                index: i0.raw(),
-                tp: Type::Ref,
-            },
-            InputArg {
-                index: i1.raw(),
-                tp: Type::Ref,
-            },
+            InputArg::from_type(Type::Ref, i0.raw()),
+            InputArg::from_type(Type::Ref, i1.raw()),
         ];
 
         let mut raw = Op::new(OpCode::GcLoadI, &[i0, c0, c8]);
@@ -6477,18 +6450,9 @@ mod tests {
         let c8 = OpRef::const_int(8);
 
         let inputargs = vec![
-            InputArg {
-                index: i0.raw(),
-                tp: Type::Ref,
-            },
-            InputArg {
-                index: i1.raw(),
-                tp: Type::Ref,
-            },
-            InputArg {
-                index: i2.raw(),
-                tp: Type::Int,
-            },
+            InputArg::from_type(Type::Ref, i0.raw()),
+            InputArg::from_type(Type::Ref, i1.raw()),
+            InputArg::from_type(Type::Int, i2.raw()),
         ];
 
         let raw = Op::new(OpCode::GcStore, &[i0, c0, i2, c8]);
@@ -6528,14 +6492,8 @@ mod tests {
         let i2 = OpRef::int_op(2);
 
         let inputargs = vec![
-            InputArg {
-                index: i0.raw(),
-                tp: Type::Int,
-            },
-            InputArg {
-                index: i1.raw(),
-                tp: Type::Int,
-            },
+            InputArg::from_type(Type::Int, i0.raw()),
+            InputArg::from_type(Type::Int, i1.raw()),
         ];
 
         let mut raw = Op::new(OpCode::SameAsI, &[i0]);
@@ -6574,10 +6532,7 @@ mod tests {
     #[ignore = "GuardNotForced2 frame-depth argloc emission (assembler.py:935 check_frame_depth wiring) not yet ported on side3; test added ahead of supporting code"]
     fn test_guard_not_forced_2_carries_frame_depth_argloc() {
         let i0 = OpRef::int_op(100);
-        let inputargs = vec![InputArg {
-            index: i0.raw(),
-            tp: Type::Ref,
-        }];
+        let inputargs = vec![InputArg::from_type(Type::Ref, i0.raw())];
         let ops = vec![make_guard(OpCode::GuardNotForced2, 0, &[], &[i0])];
 
         let mut ra = RegAlloc::new(HashMap::new(), HashMap::new(), &inputargs, &ops);

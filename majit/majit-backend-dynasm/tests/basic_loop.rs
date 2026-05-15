@@ -58,10 +58,7 @@ fn test_simple_int_add() {
     constants.insert(OpRef::const_int(1).raw(), 1i64);
     backend.set_constants(constants);
 
-    let inputargs = vec![InputArg {
-        tp: Type::Int,
-        index: 0,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let i0 = inputargs[0].opref();
 
     let mut add_op = Op::new(OpCode::IntAdd, &[i0, const_1]);
@@ -102,10 +99,7 @@ fn test_finish_infers_int_type_when_explicit_types_are_empty() {
     constants.insert(const_1.raw(), 1i64);
     backend.set_constants(constants);
 
-    let inputargs = vec![InputArg {
-        tp: Type::Int,
-        index: 0,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let i0 = inputargs[0].opref();
 
     let mut add_op = Op::new(OpCode::IntAdd, &[i0, const_1]);
@@ -142,10 +136,7 @@ fn test_float_add() {
     constants.insert(OpRef::const_float(1).raw(), 0.5f64.to_bits() as i64);
     backend.set_constants(constants);
 
-    let inputargs = vec![InputArg {
-        tp: Type::Float,
-        index: 0,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Float, 0)];
 
     let mut add_op = Op::new(OpCode::FloatAdd, &[i0, const_half]);
     add_op.pos = OpRef::float_op(1);
@@ -190,14 +181,8 @@ fn test_setarrayitem_raw_float_roundtrip() {
     let array_descr = make_array_descr(0, 8, Type::Float);
 
     let inputargs = vec![
-        InputArg {
-            tp: Type::Ref,
-            index: 0,
-        },
-        InputArg {
-            tp: Type::Float,
-            index: 1,
-        },
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Float, 1),
     ];
     let base = inputargs[0].opref();
     let value = inputargs[1].opref();
@@ -238,18 +223,9 @@ fn test_setarrayitem_raw_float_roundtrip_with_variable_index() {
     let array_descr = make_array_descr(0, 8, Type::Float);
 
     let inputargs = vec![
-        InputArg {
-            tp: Type::Ref,
-            index: 0,
-        },
-        InputArg {
-            tp: Type::Int,
-            index: 1,
-        },
-        InputArg {
-            tp: Type::Float,
-            index: 2,
-        },
+        InputArg::from_type(Type::Ref, 0),
+        InputArg::from_type(Type::Int, 1),
+        InputArg::from_type(Type::Float, 2),
     ];
     let base = inputargs[0].opref();
     let index = inputargs[1].opref();
@@ -303,10 +279,7 @@ fn test_guard_and_loop() {
     constants.insert(OpRef::const_int(5).raw(), 5i64);
     backend.set_constants(constants);
 
-    let inputargs = vec![InputArg {
-        tp: Type::Int,
-        index: 0,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let loop_descr = make_loop_target_descr(token.number, false);
 
     let mut label_op = Op::new(OpCode::Label, &[OpRef::input_arg_int(0)]);
@@ -361,14 +334,8 @@ fn test_float_loop_carried_across_jump() {
     backend.set_constants(constants);
 
     let inputargs = vec![
-        InputArg {
-            tp: Type::Float,
-            index: 0,
-        },
-        InputArg {
-            tp: Type::Int,
-            index: 1,
-        },
+        InputArg::from_type(Type::Float, 0),
+        InputArg::from_type(Type::Int, 1),
     ];
     let loop_descr = make_loop_target_descr(token.number, false);
 
@@ -461,10 +428,7 @@ fn test_gc_typeinfo_guards_use_dynasm_emit() {
     constants.insert(const_root_vtable.raw(), root_vtable as i64);
     backend.set_constants(constants);
 
-    let inputargs = vec![InputArg {
-        tp: Type::Ref,
-        index: 0,
-    }];
+    let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
     let i0 = inputargs[0].opref();
 
     let mut guard_gc_type = Op::new(OpCode::GuardGcType, &[i0, const_child_tid]);
@@ -516,10 +480,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         constants.insert(const_child_tid.raw(), child_tid as i64);
         backend.set_constants(constants);
 
-        let inputargs = vec![InputArg {
-            tp: Type::Ref,
-            index: 0,
-        }];
+        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
         let mut guard_gc_type = Op::new(OpCode::GuardGcType, &[i0, const_child_tid]);
         guard_gc_type.pos = OpRef::void_op(1);
@@ -550,10 +511,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         backend.set_gc_allocator(Box::new(gc));
         let mut token = JitCellToken::new(46);
 
-        let inputargs = vec![InputArg {
-            tp: Type::Ref,
-            index: 0,
-        }];
+        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
         let mut guard_is_object = Op::new(OpCode::GuardIsObject, &[i0]);
         guard_is_object.pos = OpRef::void_op(1);
@@ -594,10 +552,7 @@ fn test_gc_typeinfo_guards_side_exit_on_mismatch() {
         constants.insert(const_root_a_vtable.raw(), root_a_vtable as i64);
         backend.set_constants(constants);
 
-        let inputargs = vec![InputArg {
-            tp: Type::Ref,
-            index: 0,
-        }];
+        let inputargs = vec![InputArg::from_type(Type::Ref, 0)];
         let i0 = inputargs[0].opref();
         let mut guard_subclass = Op::new(OpCode::GuardSubclass, &[i0, const_root_a_vtable]);
         guard_subclass.pos = OpRef::void_op(1);

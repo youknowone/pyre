@@ -443,10 +443,7 @@ impl TreeLoop {
         let new_inputargs: Vec<InputArg> = new_ia_types
             .iter()
             .enumerate()
-            .map(|(i, &tp)| InputArg {
-                index: i as u32,
-                tp,
-            })
+            .map(|(i, &tp)| InputArg::from_type(tp, i as u32))
             .collect();
 
         // Build a fresh `box_pool` mirroring the new namespace. Inputargs
@@ -1357,18 +1354,9 @@ mod tests {
     #[test]
     fn test_inputarg_types_all() {
         let inputargs = vec![
-            InputArg {
-                index: 0,
-                tp: Type::Int,
-            },
-            InputArg {
-                index: 1,
-                tp: Type::Ref,
-            },
-            InputArg {
-                index: 2,
-                tp: Type::Float,
-            },
+            InputArg::new_int(0),
+            InputArg::new_ref(1),
+            InputArg::new_float(2),
         ];
         let trace = TreeLoop::new(inputargs, vec![Op::new(OpCode::Finish, &[])]);
         let types = trace.inputarg_types();
