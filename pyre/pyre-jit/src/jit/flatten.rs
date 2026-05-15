@@ -2201,8 +2201,21 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
         (ConstantValue::None, Some(Kind::Ref)) => Operand::ConstRef(0),
         (ConstantValue::Bool(value), Some(Kind::Int)) => Operand::ConstInt(i64::from(*value)),
         (ConstantValue::Signed(value), Some(Kind::Int)) => Operand::ConstInt(*value),
+        // RPython rtyper post-pass: a `Constant(ll_ptr, concretetype=
+        // lltype.Ptr(...))` carries an integer pointer in its `value`
+        // field with a `Ptr` concretetype.  Pyre's rtyper-equivalent
+        // (`rtype_opaque_constants`) rewrites pre-rtype
+        // `Constant(Opaque(...), Some(Ref))` shapes into this form so
+        // the canonical `flatten_graph` driver can lower them without
+        // a `lower_constant` closure parameter (matching `flatten.py:63`
+        // signature).
+        (ConstantValue::Signed(value), Some(Kind::Ref)) => Operand::ConstRef(*value),
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => {
-            panic!("GraphFlattener: opaque ref constants need runtime lowering support")
+            panic!(
+                "GraphFlattener: opaque ref constants need rtyper resolution \
+                 — call rtype_opaque_constants(graph, lower_constant) before \
+                 flatten_graph (matches rpython/rtyper/rtyper.py:specialize)"
+            )
         }
         other => panic!("GraphFlattener: unsupported constant operand {other:?}"),
     }
