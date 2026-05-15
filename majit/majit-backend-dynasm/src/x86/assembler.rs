@@ -1534,11 +1534,13 @@ impl<'a> Assembler386<'a> {
         }
     }
 
-    /// x86/assembler.py:1369-1377 `_reload_frame_if_necessary` parity:
+    /// x86/assembler.py:1369-1383 `_reload_frame_if_necessary` parity:
     ///
     /// ```python
     ///   MOV ecx, [rootstacktop]   // shadow stack top pointer
     ///   MOV ebp, [ecx - WORD]     // jf_ptr at top - WORD
+    ///   _write_barrier_fastpath(mc, wbdescr, [ebp], array=False,
+    ///                           is_frame=True)
     /// ```
     ///
     /// After a collecting helper call the GC may have copied the
@@ -1547,8 +1549,13 @@ impl<'a> Assembler386<'a> {
     /// `grow_jitframe` realloc path — so chasing `jf_forward` here
     /// reads the freed nursery slot. The shadow-stack entry IS
     /// rewritten by the GC visitor during copy, so the live jf_ptr
-    /// lives at `*(root_stack_top - WORD)`. Reload `rbp` from there
-    /// (matches the aarch64 and cranelift backends).
+    /// lives at `*(root_stack_top - WORD)`. Reload `rbp` from there.
+    ///
+    /// Then re-apply the non-array write barrier on the new jitframe
+    /// (`is_frame=True`): subsequent stores of nursery refs into
+    /// jitframe slots must be tracked by minor GC, otherwise an
+    /// old-gen jitframe holding a nursery pointer is missed during
+    /// the next collection and the slot ends up dangling.
     fn reload_frame_if_necessary(&mut self) {
         let rst_addr = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
         dynasm!(self.mc ; .arch x64
@@ -1556,6 +1563,15 @@ impl<'a> Assembler386<'a> {
             ; mov rcx, [rcx]            // rcx = *rst_addr = root_stack_top
             ; mov rbp, [rcx - 8]        // rbp = *(top - WORD) = jf_ptr
         );
+        if crate::runner::DYNASM_ACTIVE_GC.with(|cell| {
+            cell.borrow()
+                .as_ref()
+                .and_then(|gc| gc.get_write_barrier_descr())
+                .is_some()
+        }) {
+            let rbp_loc = Loc::Reg(crate::regloc::EBP);
+            self.emit_write_barrier_fastpath_kind(&[rbp_loc], false);
+        }
     }
 
     fn guard_gcmap_from_faillocs(
