@@ -607,7 +607,6 @@ impl PendingFieldInfo {
     pub fn layout_summary(&self) -> PendingFieldLayoutSummary {
         PendingFieldLayoutSummary {
             descr: self.descr.clone(),
-            descr_index: self.descr.as_ref().map_or(0, |d| d.index()),
             item_index: self.item_index,
             is_array_item: self.item_index.is_some(),
             target_kind: self.target.kind(),

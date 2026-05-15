@@ -126,10 +126,6 @@ pub struct PendingFieldLayoutSummary {
     /// `resume.py:88 lldescr` — identity-compared via `Arc::ptr_eq`
     /// (`history.py:125`).
     pub descr: Option<crate::DescrRef>,
-    /// Stable u32 handle for serialization sinks
-    /// (`ExitPendingFieldLayout`).  Equals `descr.as_ref().map_or(0,
-    /// |d| d.index())` when both are set.
-    pub descr_index: u32,
     pub item_index: Option<usize>,
     pub is_array_item: bool,
     pub target_kind: ResumeValueKind,
