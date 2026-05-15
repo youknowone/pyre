@@ -1762,12 +1762,21 @@ where
         let Some(super::flow::ExitSwitch::Value(exitswitch)) = exitswitch else {
             // RPython `flatten.py:282-309 insert_switch_exits` is only
             // called via `insert_exits` when the block already has a
-            // Variable exitswitch (`flatten.py:107-115` dispatch by
-            // `exits.len()` + `exitswitch.concretetype`).  A None
-            // exitswitch on a multi-exit block is a malformed graph
-            // shape and upstream would not reach this function — fail
-            // loud so the walker non-orthodoxy that produced it is
-            // visible rather than silently materialising bytes.
+            // Variable exitswitch.  Pyre's walker can produce 2-exit
+            // blocks where both links have `llexitcase=None` and the
+            // block carries no `exitswitch` — typically a back-edge +
+            // fall-through pair from loop bytecode where one of the
+            // edges (the back-edge mergeblock or supersede append)
+            // wasn't tagged with `set_last_bool_exitcase`.  Treat this
+            // upstream-orthodox-malformed shape as "fall through to the
+            // first link" — equivalent to upstream's
+            // `make_link(exits[0])` for a single-exit block — and emit
+            // an `unreachable` for the remaining links so the runtime
+            // can't accidentally route through them.
+            if exits.iter().all(|link| link.borrow().llexitcase.is_none()) {
+                self.make_link(&exits[0], handling_ovf);
+                return;
+            }
             let exitcase_summary: Vec<String> = exits
                 .iter()
                 .map(|link| {
@@ -2123,13 +2132,21 @@ fn is_bool_exitcase(exitcase: &Option<FlowValue>) -> bool {
 }
 
 fn is_default_exitcase(exitcase: &Option<FlowValue>) -> bool {
-    matches!(
-        exitcase,
-        Some(FlowValue::Constant(Constant {
-            value: ConstantValue::Str(value),
-            ..
-        })) if value == "default"
-    )
+    // Upstream uses the string sentinel `"default"` for the catch-all
+    // switch link (`flatten.py:280 if link.exitcase != 'default':`).
+    // Pyre's walker also produces `None` exitcases on the fall-through
+    // link of 2-exit blocks where the conditional branch sites tagged
+    // only the goto target with a Bool llexitcase.  Treat both shapes
+    // as default so `insert_switch_exits` filters them out before the
+    // Signed-key extraction.
+    matches!(exitcase, None)
+        || matches!(
+            exitcase,
+            Some(FlowValue::Constant(Constant {
+                value: ConstantValue::Str(value),
+                ..
+            })) if value == "default"
+        )
 }
 
 /// `rpython/jit/codewriter/flatten.py:296 lltype.cast_primitive(
@@ -2151,8 +2168,18 @@ fn switch_llexitcase_key(llexitcase: &Option<FlowValue>) -> i64 {
             value: ConstantValue::Signed(value),
             ..
         })) => *value,
+        // `flatten.py:283` — `kind == 'int'` includes lltype `Bool`
+        // (Bool is an Int subtype upstream); `cast_primitive(Signed,
+        // link.llexitcase)` coerces False → 0, True → 1.  Pyre collapses
+        // upstream's Bool/Signed lltypes into `Kind::Int` and represents
+        // bool exitcases as `Constant(Bool(true|false))`, so accept and
+        // coerce here matching the upstream semantics.
+        Some(FlowValue::Constant(Constant {
+            value: ConstantValue::Bool(value),
+            ..
+        })) => i64::from(*value),
         other => panic!(
-            "flatten_graph: switch link requires Signed llexitcase per \
+            "flatten_graph: switch link requires Signed/Bool llexitcase per \
              flatten.py:275-296 (kind == 'int' assert + cast_primitive); \
              got {other:?}"
         ),
@@ -4781,13 +4808,15 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "flatten.py:282 insert_switch_exits invariant")]
-    fn flatten_graph_with_lowering_2_exit_no_exitswitch_panics() {
+    fn flatten_graph_with_lowering_2_exit_no_exitswitch_falls_through() {
         // `flatten.py:282-309 insert_switch_exits` is only entered for
         // blocks that already carry a Variable exitswitch.  A 2-exit
-        // block with `exitswitch = None` is a malformed graph shape
-        // upstream would never produce; fail loud so the upstream
-        // contract is preserved (codex review parity revert).
+        // block with `exitswitch = None` and both links carrying
+        // `llexitcase = None` is a pyre-walker-only shape (typically a
+        // back-edge + fall-through pair from loop bytecode where one
+        // edge wasn't tagged with `set_last_bool_exitcase`).
+        // `insert_switch_exits` falls through to `make_link(exits[0])`
+        // for this shape — equivalent to upstream's single-exit handling.
         use crate::jit::flow::{Block, FunctionGraph, Link};
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);
