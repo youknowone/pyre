@@ -76,22 +76,15 @@ use std::collections::HashMap;
 
 use crate::model::{FunctionGraph, OpKind, ValueId, ValueType};
 
-/// Concrete low-level type. RPython `Repr.lowleveltype` collapsed to the
-/// four kinds the jit_codewriter needs (Signed / GcRef / Float / Void)
-/// plus `Unknown` for pre-resolution slots.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConcreteType {
-    /// Signed integer (RPython `Signed` / i64).
-    Signed,
-    /// GC reference (RPython `Ptr(GcStruct)`).
-    GcRef,
-    /// Float (RPython `Float` / f64).
-    Float,
-    /// Void (RPython `Void`).
-    Void,
-    /// Unknown / unresolved.
-    Unknown,
-}
+/// Re-export the canonical [`ConcreteType`] from [`crate::model`].
+///
+/// The kind enum used to live here as a side-table value type;
+/// after the medium-term parity push it lives directly on
+/// [`FunctionGraph::value_types`] (mirroring upstream
+/// `Variable.concretetype`).  The alias keeps existing imports
+/// working while consumers migrate to reading
+/// `graph.concretetype(v)`.
+pub use crate::model::ConcreteType;
 
 /// Returned by [`TypeResolutionState::get`] for slots that have not
 /// been populated.  Pyre's adapter returns this `Unknown` sentinel
@@ -114,6 +107,14 @@ const UNKNOWN: ConcreteType = ConcreteType::Unknown;
 /// shaped (`get` / `set` / `try_get` / `contains` / `iter`) to mirror
 /// `var.concretetype` / `setattr` / `hasattr` patterns; the Vec is
 /// an implementation detail.
+///
+/// **Transitional role (post-fb710a42dc)** — once
+/// [`apply_to_graph`] writes every non-Unknown slot through to
+/// [`FunctionGraph::value_types`], downstream consumers read kinds
+/// via `graph.concretetype(v)` and this scratch buffer can be
+/// dropped from the call chain.  Collapsed to the four-way
+/// `Signed` / `GcRef` / `Float` / `Void` axis used by the JIT
+/// codewriter, per `rpython/jit/metainterp/history.py:45-71 getkind`.
 #[derive(Debug, Default, Clone)]
 pub struct TypeResolutionState {
     slots: Vec<ConcreteType>,
@@ -183,6 +184,26 @@ impl TypeResolutionState {
                 Some((ValueId(idx), ct))
             }
         })
+    }
+}
+
+/// Bulk-write every entry of a transitional [`TypeResolutionState`]
+/// into the graph's per-value `value_types` slot.  After this call
+/// `graph.concretetype(v) == types.get(v)` for every `v` covered by
+/// the transitional table; values absent from `types` keep their
+/// existing graph-side kind (`Unknown` for fresh allocations).
+///
+/// Mirrors RPython's "rtyper finishes, every Variable now has
+/// `.concretetype`" handoff — pyre's scratch table is the staging
+/// area and `apply_to_graph` is the commit.
+pub fn apply_to_graph(types: &TypeResolutionState, graph: &mut FunctionGraph) {
+    // `iter()` already filters out `Unknown` slots so the graph
+    // keeps its existing per-value kind for unpopulated entries —
+    // the rtyper-finishes handoff only stamps positively-classified
+    // slots, mirroring upstream's `setconcretetype` only writing
+    // when a concretetype actually resolved.
+    for (v, ty) in types.iter() {
+        graph.set_concretetype(v, ty.clone());
     }
 }
 

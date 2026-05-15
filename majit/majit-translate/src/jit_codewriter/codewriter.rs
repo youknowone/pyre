@@ -300,7 +300,7 @@ impl CodeWriter {
 
         // Step 1: jtransform (codewriter.py:42)
         // RPython: transform_graph(graph, cpu, callcontrol, portal_jd)
-        let rewritten = {
+        let mut rewritten = {
             let mut transformer = crate::jtransform::Transformer::new(config)
                 .with_callcontrol(callcontrol)
                 .with_portal_jd(portal_jd_index)
@@ -339,6 +339,19 @@ impl CodeWriter {
             crate::jit_codewriter::type_state::TypeResolutionState::new(),
             post_result_types,
             &rewritten.synth_kinds,
+        );
+
+        // Hydrate the graph's per-value `concretetype` slots from the
+        // post-rtyper [`TypeResolutionState`] — pyre's analogue of
+        // RPython's "rtyper finishes, every Variable has
+        // `.concretetype` inline" handoff (`rtyper.py`).  After this
+        // call `rewritten.graph.concretetype(v)` is the single source
+        // of truth for kind; the `TypeResolutionState` instance is
+        // kept as a transient scratch for the legacy
+        // `build_value_kinds` projection that regalloc still consumes.
+        crate::jit_codewriter::type_state::apply_to_graph(
+            &rewritten_type_state,
+            &mut rewritten.graph,
         );
 
         // Step 2: regalloc (codewriter.py:45-47)

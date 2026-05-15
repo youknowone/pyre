@@ -1935,6 +1935,30 @@ where
     (exitswitch, exits)
 }
 
+/// `Variable.concretetype` analogue collapsed to the four kinds the
+/// jit_codewriter needs.
+///
+/// RPython stores `.concretetype` inline on each `Variable` after
+/// `RPythonTyper.specialize()` rewrites the graph; pyre's
+/// [`ValueId`] is an opaque index, so the per-value attribute lives
+/// in [`FunctionGraph::value_types`] (mirroring upstream's
+/// inline-on-Variable shape) instead of a separate side-table.
+/// `Unknown` is the pre-rtyper sentinel — `Variable` analogue
+/// before the rtyper ran.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConcreteType {
+    /// Signed integer (RPython `Signed` / i64).
+    Signed,
+    /// GC reference (RPython `Ptr(GcStruct)`).
+    GcRef,
+    /// Float (RPython `Float` / f64).
+    Float,
+    /// Void (RPython `Void`).
+    Void,
+    /// Unknown / unresolved.
+    Unknown,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FunctionGraph {
     pub name: String,
@@ -1949,6 +1973,16 @@ pub struct FunctionGraph {
     pub blocks: Vec<Block>,
     pub notes: Vec<String>,
     next_value: usize,
+    /// Per-value [`ConcreteType`] indexed by [`ValueId`] — the
+    /// pyre analogue of RPython's `Variable.concretetype` inline
+    /// field.  `value_types[v.0]` is the kind for `ValueId(v)`,
+    /// kept in lockstep with the [`Self::next_value`] allocator so
+    /// every live `ValueId` always has a matching slot
+    /// (`ConcreteType::Unknown` until the rtyper writes the real
+    /// kind).  Replaces the previous `TypeResolutionState` side
+    /// table (`AGENTS.md §2`: type information must live on the
+    /// "box itself", not in a parallel `HashMap`).
+    pub value_types: Vec<ConcreteType>,
     /// Variable names for debugging (RPython Variable._name).
     pub value_names: std::collections::HashMap<ValueId, String>,
     /// Slice Z2.5.A scaffolding — `flowspace::model::Variable.id` →
@@ -2036,6 +2070,18 @@ impl FunctionGraph {
             ],
             notes: Vec::new(),
             next_value: 3,
+            // Canonical inputargs (returnblock inputarg, exceptblock
+            // etype, exceptblock evalue) start as `Unknown`.  The
+            // rtyper / `regalloc::augment_value_kinds_with_canonical_exceptblock`
+            // populates them with `(_, Signed, GcRef)` later in the
+            // pipeline; until then `kind_color_of` falls through to
+            // its bare regalloc-class scan path, matching the
+            // pre-rtyper Variable-with-no-`concretetype` shape.
+            value_types: vec![
+                ConcreteType::Unknown,
+                ConcreteType::Unknown,
+                ConcreteType::Unknown,
+            ],
             value_names: std::collections::HashMap::new(),
             variable_to_vid: std::collections::HashMap::new(),
             return_type: None,
@@ -2104,8 +2150,29 @@ impl FunctionGraph {
     }
 
     pub fn alloc_value(&mut self) -> ValueId {
+        self.alloc_value_with_type(ConcreteType::Unknown)
+    }
+
+    /// Allocate a fresh [`ValueId`] with its [`ConcreteType`]
+    /// stamped at construction — pyre's analogue of upstream
+    /// `Variable(concretetype=...)` (RPython
+    /// `flowspace/model.py:Variable.__init__`).  Front-ends and the
+    /// rtyper should prefer this entry point so the per-value
+    /// kind never has to be back-filled via a second pass.
+    pub fn alloc_value_with_type(&mut self, ty: ConcreteType) -> ValueId {
         let id = ValueId(self.next_value);
         self.next_value += 1;
+        // Keep `value_types` in lockstep with `next_value`.  Any
+        // gap means a downstream `concretetype(v)` would silently
+        // see `Unknown` — keep the invariant explicit.
+        debug_assert_eq!(
+            self.value_types.len(),
+            id.0,
+            "value_types length must equal the next ValueId index ({} != {})",
+            self.value_types.len(),
+            id.0,
+        );
+        self.value_types.push(ty);
         id
     }
 
@@ -2129,6 +2196,30 @@ impl FunctionGraph {
         vid
     }
 
+    /// `Variable.concretetype` getter — every live [`ValueId`] has
+    /// a slot in [`Self::value_types`].
+    pub fn concretetype(&self, v: ValueId) -> &ConcreteType {
+        self.value_types
+            .get(v.0)
+            .unwrap_or(&ConcreteType::Unknown)
+    }
+
+    /// Late-stamp [`ValueId`] kind (e.g. after the rtyper resolved
+    /// a previously-`Unknown` slot).  Asserts the slot exists so
+    /// out-of-range writes surface immediately.
+    pub fn set_concretetype(&mut self, v: ValueId, ty: ConcreteType) {
+        if v.0 >= self.value_types.len() {
+            // Grow the type table if a value was minted via
+            // `set_next_value` (jtransform synthesises ValueIds
+            // outside the graph for a brief window).  Filling the
+            // gap with `Unknown` keeps the invariant
+            // `value_types.len() == next_value`.
+            self.value_types
+                .resize(v.0 + 1, ConcreteType::Unknown);
+        }
+        self.value_types[v.0] = ty;
+    }
+
     /// Read-only view of the ValueId allocator cursor.  Used by passes
     /// that need to mint fresh ValueIds outside the graph (e.g.
     /// `Transformer::allocate_synthetic_value` in `jtransform.rs`).
@@ -2146,6 +2237,15 @@ impl FunctionGraph {
             self.next_value,
             next,
         );
+        // Grow the per-value kind table to match the new cursor so
+        // the `value_types.len() == next_value` invariant holds.
+        // The synthesised ValueIds default to `Unknown` and the
+        // rtyper / jtransform should follow up with
+        // `set_concretetype` once they resolve the kind.
+        if next > self.value_types.len() {
+            self.value_types
+                .resize(next, ConcreteType::Unknown);
+        }
         self.next_value = next;
     }
 

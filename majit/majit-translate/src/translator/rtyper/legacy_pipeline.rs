@@ -91,6 +91,18 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
         &transform_result.synth_kinds,
     );
 
+    // Hydrate per-value `concretetype` slots on the graph itself
+    // — `model::FunctionGraph::value_types` is the pyre analogue of
+    // `Variable.concretetype`.  The transitional
+    // `TypeResolutionState` then becomes a scratch the regalloc
+    // projection still consumes; downstream consumers read kinds via
+    // `graph.concretetype(v)`.
+    let mut transform_result = transform_result;
+    crate::jit_codewriter::type_state::apply_to_graph(
+        &rewritten_types,
+        &mut transform_result.graph,
+    );
+
     // Pass 4: Flatten with type info (RPython flatten + regalloc)
     let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&rewritten_types);
     let regallocs =

@@ -488,52 +488,59 @@ impl<'a> GraphFlattener<'a> {
     /// `getkind(v.concretetype)` + `regallocs[kind].coloring[v]` —
     /// `flatten.py:386` strict 1:1 lookup.
     ///
-    /// When the [`TypeResolutionState`] is in scope (post-rtyper
-    /// production path) the kind comes straight from `types.get(v)`
-    /// and `regallocs[kind].coloring[v]` is the only color source.
-    /// A miss panics — PyPy never tries another class once
-    /// `getkind(v.concretetype)` has decided.  `Void` / `Unknown`
-    /// fall through to the bare regalloc scan because both kinds
-    /// skip regalloc partitioning entirely (`flatten.py:325`).  Test
-    /// fixtures that drive `flatten_graph` without a type-state also
-    /// reach the scan path.
+    /// The kind comes from `self.graph.concretetype(v)` —
+    /// pyre's [`crate::model::FunctionGraph::value_types`] is the
+    /// per-value attribute analogue of RPython's
+    /// `Variable.concretetype`, populated by the rtyper pass via
+    /// [`crate::jit_codewriter::type_state::apply_to_graph`] before
+    /// flatten.  The transitional [`TypeResolutionState`] argument
+    /// to [`Self::with_types`] is consulted only as a fallback for
+    /// values whose graph slot is still `Unknown` (test fixtures
+    /// that build SSARepr by hand without populating the graph).
+    /// `Void` / `Unknown` fall through to the bare regalloc scan
+    /// because both kinds skip regalloc partitioning entirely
+    /// (`flatten.py:325`).
     fn kind_color_of(&self, v: ValueId) -> Option<(RegKind, usize)> {
-        if let Some(types) = self.types {
-            use crate::jit_codewriter::type_state::ConcreteType;
-            let kind = match types.get(v) {
-                ConcreteType::Signed => Some(RegKind::Int),
-                ConcreteType::GcRef => Some(RegKind::Ref),
-                ConcreteType::Float => Some(RegKind::Float),
-                ConcreteType::Void | ConcreteType::Unknown => None,
-            };
-            if let Some(kind) = kind {
-                let ra = self.regallocs.get(&kind).unwrap_or_else(|| {
-                    panic!(
-                        "kind_color_of: type-state declared kind {kind:?} for {v:?} \
-                         but regallocs map is missing the entry (graph {:?})",
-                        self.graph.name,
-                    )
-                });
-                let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
-                    let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
-                        .iter()
-                        .filter(|k| **k != kind)
-                        .filter(|k| {
-                            self.regallocs
-                                .get(*k)
-                                .is_some_and(|ra| ra.coloring.contains_key(&v))
-                        })
-                        .copied()
-                        .collect();
-                    panic!(
-                        "kind_color_of: type-state declared kind {kind:?} for {v:?} \
-                         but regallocs[{kind:?}] has no coloring (other classes with a \
-                         coloring: {other_classes:?}; graph {:?})",
-                        self.graph.name,
-                    )
-                });
-                return Some((kind, color));
+        use crate::model::ConcreteType;
+        let mut declared = self.graph.concretetype(v).clone();
+        if matches!(declared, ConcreteType::Unknown) {
+            if let Some(types) = self.types {
+                declared = types.get(v).clone();
             }
+        }
+        let kind = match declared {
+            ConcreteType::Signed => Some(RegKind::Int),
+            ConcreteType::GcRef => Some(RegKind::Ref),
+            ConcreteType::Float => Some(RegKind::Float),
+            ConcreteType::Void | ConcreteType::Unknown => None,
+        };
+        if let Some(kind) = kind {
+            let ra = self.regallocs.get(&kind).unwrap_or_else(|| {
+                panic!(
+                    "kind_color_of: graph declared kind {kind:?} for {v:?} \
+                     but regallocs map is missing the entry (graph {:?})",
+                    self.graph.name,
+                )
+            });
+            let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
+                let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+                    .iter()
+                    .filter(|k| **k != kind)
+                    .filter(|k| {
+                        self.regallocs
+                            .get(*k)
+                            .is_some_and(|ra| ra.coloring.contains_key(&v))
+                    })
+                    .copied()
+                    .collect();
+                panic!(
+                    "kind_color_of: graph declared kind {kind:?} for {v:?} \
+                     but regallocs[{kind:?}] has no coloring (other classes with a \
+                     coloring: {other_classes:?}; graph {:?})",
+                    self.graph.name,
+                )
+            });
+            return Some((kind, color));
         }
         lookup_kind_color(v, self.regallocs)
     }

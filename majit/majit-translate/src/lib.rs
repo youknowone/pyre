@@ -1637,6 +1637,12 @@ mod tests {
 
         // Step 3: flatten the rewritten graph
         let types = rtype::resolve_types(&result.graph, &annotate::annotate(&result.graph));
+        // Hydrate per-value `concretetype` slots on the graph
+        // (pyre's `Variable.concretetype` analogue) so downstream
+        // consumers can read kinds via `graph.concretetype(v)`
+        // without a side-table lookup.
+        let mut result = result;
+        crate::jit_codewriter::type_state::apply_to_graph(&types, &mut result.graph);
         let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&types);
         let regallocs =
             crate::regalloc::perform_all_register_allocations(&result.graph, &value_kinds);
