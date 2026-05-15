@@ -4017,14 +4017,13 @@ impl CodeWriter {
                     // live, so the walker stays in it and registers it
                     // at the joinpoint so a future cross-PC `mergeblock`
                     // / `set_branch` that targets `py_pc` finds the
-                    // correct block (the one carrying the ops already
-                    // emitted at this PC).  RPython does not need this
-                    // step because its per-block walker
-                    // (`flowcontext.py:407-475`) processes a SpamBlock's
-                    // ops contiguously without re-entering joinpoint
-                    // logic on every byte; pyre's PC-sequential walker
-                    // is the adaptation, retired together with the
-                    // walker restructure (Task #227 Phase 4).
+                    // correct block.  Phase A.2 covers conventional
+                    // branch targets via `branch_target_pcs`, but
+                    // exception edges + non-conventional jumps (FOR_ITER,
+                    // SEND, etc.) target PCs not in the pre-scan; the
+                    // self-registration covers those — load-bearing
+                    // until the pre-scan is extended to all branch
+                    // sources.
                     joinpoints
                         .entry(py_pc)
                         .or_default()
