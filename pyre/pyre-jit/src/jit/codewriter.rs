@@ -4036,14 +4036,8 @@ impl CodeWriter {
             }};
         }
         macro_rules! emit_mark_label_catch_landing {
-            ($ssarepr:expr, $landing_label:expr) => {{
+            ($landing_label:expr) => {{
                 let landing_label = $landing_label;
-                $ssarepr
-                    .insns
-                    .push(Insn::Label(super::flatten::Label::new(format!(
-                        "catch_landing_{}",
-                        landing_label
-                    ))));
                 // Step 6.1 Phase 2a: switch the shadow graph's
                 // `current_block` into the pre-allocated catch-landing
                 // block. Matches `flatten.py:180` `Label(block)` being the
@@ -4071,17 +4065,16 @@ impl CodeWriter {
                 if !all_walker_blocks.iter().any(|b| b == &current_block) {
                     all_walker_blocks.push(current_block.clone());
                 }
-                // Task #227.1 per-block accumulator dual-write: record
-                // the catch-landing block's entry Label on its own
-                // accumulator so the post-walk `flatten_graph` driver
-                // can reproduce the SSARepr label sequence in graph-
-                // DFS order.  Mirrors `emit_mark_label_pc!`'s dual-
-                // write above; together they cover every block-entry
-                // label the walker emits.
-                current_block.push_insn(Insn::Label(super::flatten::Label::new(format!(
-                    "catch_landing_{}",
-                    landing_label
-                ))));
+                // Per-block accumulator entry Label — drain swap
+                // (line ~7319) reproduces it into ssarepr.insns in
+                // walker-block-creation order.
+                push_walker_emit(
+                    &current_block,
+                    Insn::Label(super::flatten::Label::new(format!(
+                        "catch_landing_{}",
+                        landing_label
+                    ))),
+                );
             }};
         }
 
@@ -6921,7 +6914,7 @@ impl CodeWriter {
         let has_abort = assembler.has_abort_flag();
 
         for site in catch_sites {
-            emit_mark_label_catch_landing!(ssarepr, site.landing_label);
+            emit_mark_label_catch_landing!(site.landing_label);
             // `emit_mark_label_catch_landing!` (codewriter.rs:3318)
             // reassigns `current_block` to the pre-allocated catch
             // landing block on every iteration, so subsequent graph
