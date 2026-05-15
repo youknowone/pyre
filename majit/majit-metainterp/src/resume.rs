@@ -2872,15 +2872,10 @@ impl ResumeDataVirtualAdder {
     /// Add a deferred field write to replay on resume.
     ///
     /// `resume.py:88 PENDINGFIELDSTRUCT.lldescr` — RPython always
-    /// captures a live descr off the originating SetfieldGc op.  The
-    /// `descr_index` argument is preserved transitionally for callers
-    /// that supplied it before `descr` carried the same identity; it
-    /// is now derived from `descr.index()` and the parameter is
-    /// ignored.
+    /// captures a live descr off the originating SetfieldGc op.
     pub fn add_pending_field_write(
         &mut self,
         descr: Option<majit_ir::DescrRef>,
-        _descr_index: u32,
         target: ResumeValueSource,
         value: ResumeValueSource,
     ) {
@@ -2896,7 +2891,6 @@ impl ResumeDataVirtualAdder {
     pub fn add_pending_arrayitem_write(
         &mut self,
         descr: Option<majit_ir::DescrRef>,
-        _descr_index: u32,
         target: ResumeValueSource,
         item_index: usize,
         value: ResumeValueSource,

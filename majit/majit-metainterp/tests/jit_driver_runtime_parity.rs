@@ -1909,7 +1909,6 @@ fn jit_state_restore_guard_failure_replays_pending_writes_with_virtual_target_an
     );
     resume.add_pending_field_write(
         Some(pending_descr),
-        21,
         majit_metainterp::resume::ResumeValueSource::Virtual(parent),
         majit_metainterp::resume::ResumeValueSource::Virtual(child),
     );
@@ -1953,7 +1952,6 @@ fn declarative_driver_guard_failure_replays_pending_field_writes() {
     );
     resume.add_pending_field_write(
         Some(pending_descr),
-        9,
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Ref(GcRef(
             state.obj as usize,
         ))),
@@ -1994,7 +1992,6 @@ fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook
     );
     resume.add_pending_arrayitem_write(
         Some(pending_descr),
-        12,
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Ref(GcRef(
             state.array as usize,
         ))),
@@ -2122,7 +2119,6 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
     );
     resume.add_pending_field_write(
         Some(pending_descr),
-        31,
         majit_metainterp::resume::ResumeValueSource::Virtual(virtual_index),
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(77)),
     );
