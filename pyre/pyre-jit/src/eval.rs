@@ -5903,21 +5903,21 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
     }
 
-    fn setarrayitem_int(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    fn bh_setarrayitem_gc_i(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
         bh_setarrayitem_int_from_descr(array, index, value, descr);
     }
 
-    fn setarrayitem_ref(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    fn bh_setarrayitem_gc_r(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
         bh_setarrayitem_ref_from_descr(array, index, value, descr);
     }
 
-    fn setarrayitem_float(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    fn bh_setarrayitem_gc_f(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
         bh_setarrayitem_float_from_descr(array, index, value, descr);
     }
 
     // resume.py:1520-1529: setinteriorfield dispatch by descr
     // llmodel.py:648-665: bh_setinteriorfield_gc_{i,r,f}
-    fn setinteriorfield_gc_i(
+    fn bh_setinteriorfield_gc_i(
         &self,
         array: i64,
         index: usize,
@@ -5935,24 +5935,24 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         }
     }
 
-    fn setinteriorfield_gc_r(
+    fn bh_setinteriorfield_gc_r(
         &self,
         array: i64,
         index: usize,
         value: i64,
         descr: &majit_ir::DescrRef,
     ) {
-        self.setinteriorfield_gc_i(array, index, value, descr);
+        self.bh_setinteriorfield_gc_i(array, index, value, descr);
     }
 
-    fn setinteriorfield_gc_f(
+    fn bh_setinteriorfield_gc_f(
         &self,
         array: i64,
         index: usize,
         value: i64,
         descr: &majit_ir::DescrRef,
     ) {
-        self.setinteriorfield_gc_i(array, index, value, descr);
+        self.bh_setinteriorfield_gc_i(array, index, value, descr);
     }
 
     /// resume.py:1452-1456 allocate_raw_buffer(func, size)

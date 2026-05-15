@@ -5093,21 +5093,39 @@ pub trait BlackholeAllocator {
         let _ = (length, arraydescr, clear);
         0
     }
-    /// resume.py:1531 setarrayitem_int(array, i, value, arraydescr)
-    fn setarrayitem_int(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    /// resume.py:1533 cpu.bh_setarrayitem_gc_i(array, i, value, arraydescr)
+    fn bh_setarrayitem_gc_i(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         let _ = (array, index, value, descr);
     }
-    /// resume.py:1535 setarrayitem_ref(array, i, value, arraydescr)
-    fn setarrayitem_ref(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    /// resume.py:1537 cpu.bh_setarrayitem_gc_r(array, i, value, arraydescr)
+    fn bh_setarrayitem_gc_r(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         let _ = (array, index, value, descr);
     }
-    /// resume.py:1539 setarrayitem_float(array, i, value, arraydescr)
-    fn setarrayitem_float(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
+    /// resume.py:1541 cpu.bh_setarrayitem_gc_f(array, i, value, arraydescr)
+    fn bh_setarrayitem_gc_f(
+        &self,
+        array: i64,
+        index: usize,
+        value: i64,
+        descr: &majit_ir::DescrRef,
+    ) {
         let _ = (array, index, value, descr);
     }
     /// resume.py:1520-1529 setinteriorfield(index, array, fieldnum, descr)
     /// RPython passes the live descr object; backend reads offset/size/type from it.
-    fn setinteriorfield_gc_i(
+    fn bh_setinteriorfield_gc_i(
         &self,
         array: i64,
         index: usize,
@@ -5116,7 +5134,7 @@ pub trait BlackholeAllocator {
     ) {
         let _ = (array, index, value, descr);
     }
-    fn setinteriorfield_gc_r(
+    fn bh_setinteriorfield_gc_r(
         &self,
         array: i64,
         index: usize,
@@ -5125,7 +5143,7 @@ pub trait BlackholeAllocator {
     ) {
         let _ = (array, index, value, descr);
     }
-    fn setinteriorfield_gc_f(
+    fn bh_setinteriorfield_gc_f(
         &self,
         array: i64,
         index: usize,
@@ -5448,17 +5466,17 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 if let Some(ad) = arraydescr.as_ref() {
                     for (i, source) in items.iter().enumerate() {
                         if is_pointers {
-                            // resume.py:659: decoder.setarrayitem_ref(array, i, num, arraydescr)
+                            // resume.py:659: decoder.bh_setarrayitem_gc_r(array, i, num, arraydescr)
                             let value = decoder.decode_field_source(source);
-                            allocator.setarrayitem_ref(array, i, value, ad);
+                            allocator.bh_setarrayitem_gc_r(array, i, value, ad);
                         } else if is_floats {
-                            // resume.py:664: decoder.setarrayitem_float(array, i, num, arraydescr)
+                            // resume.py:664: decoder.bh_setarrayitem_gc_f(array, i, num, arraydescr)
                             let value = decoder.decode_field_source_float(source);
-                            allocator.setarrayitem_float(array, i, value, ad);
+                            allocator.bh_setarrayitem_gc_f(array, i, value, ad);
                         } else {
-                            // resume.py:669: decoder.setarrayitem_int(array, i, num, arraydescr)
+                            // resume.py:669: decoder.bh_setarrayitem_gc_i(array, i, num, arraydescr)
                             let value = decoder.decode_field_source_int(source);
-                            allocator.setarrayitem_int(array, i, value, ad);
+                            allocator.bh_setarrayitem_gc_i(array, i, value, ad);
                         }
                     }
                 }
@@ -5839,20 +5857,20 @@ impl<'a> ResumeDataDirectReader<'a> {
             .as_array_descr()
             .expect("resume.py:1009 setarrayitem requires ArrayDescr");
         if ad.is_array_of_pointers() {
-            // resume.py:1011 self.setarrayitem_ref(array, index, fieldnum, arraydescr)
+            // resume.py:1011 self.bh_setarrayitem_gc_r(array, index, fieldnum, arraydescr)
             let value = self.decode_ref(fieldnum);
             self.allocator
-                .setarrayitem_ref(array, index, value, arraydescr);
+                .bh_setarrayitem_gc_r(array, index, value, arraydescr);
         } else if ad.is_array_of_floats() {
-            // resume.py:1013 self.setarrayitem_float(array, index, fieldnum, arraydescr)
+            // resume.py:1013 self.bh_setarrayitem_gc_f(array, index, fieldnum, arraydescr)
             let value = self.decode_float(fieldnum);
             self.allocator
-                .setarrayitem_float(array, index, value, arraydescr);
+                .bh_setarrayitem_gc_f(array, index, value, arraydescr);
         } else {
-            // resume.py:1015 self.setarrayitem_int(array, index, fieldnum, arraydescr)
+            // resume.py:1015 self.bh_setarrayitem_gc_i(array, index, fieldnum, arraydescr)
             let value = self.decode_int(fieldnum);
             self.allocator
-                .setarrayitem_int(array, index, value, arraydescr);
+                .bh_setarrayitem_gc_i(array, index, value, arraydescr);
         }
     }
 
@@ -6321,13 +6339,13 @@ impl<'a> ResumeDataDirectReader<'a> {
             .map_or(false, |ifd| ifd.field_descr().is_float_field());
         if is_pointer {
             let value = self.decode_field_source(source);
-            allocator.setinteriorfield_gc_r(array, index, value, descr);
+            allocator.bh_setinteriorfield_gc_r(array, index, value, descr);
         } else if is_float {
             let value = self.decode_field_source_float(source);
-            allocator.setinteriorfield_gc_f(array, index, value, descr);
+            allocator.bh_setinteriorfield_gc_f(array, index, value, descr);
         } else {
             let value = self.decode_field_source_int(source);
-            allocator.setinteriorfield_gc_i(array, index, value, descr);
+            allocator.bh_setinteriorfield_gc_i(array, index, value, descr);
         }
     }
 
