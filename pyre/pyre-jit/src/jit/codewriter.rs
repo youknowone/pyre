@@ -2972,7 +2972,7 @@ impl CodeWriter {
         // __init__ argument; majit's JitCodeBuilder::set_name mirrors that).
         let mut assembler = SSAReprEmitter::new();
         assembler.set_name(code.obj_name.to_string());
-        // B6 Phase 3b scaffolding: grow an `SSARepr` alongside the direct
+        // grow an `SSARepr` alongside the direct
         // `JitCodeBuilder` calls. Currently only a handful of handlers
         // (`ref_return` below) dual-emit an `Insn::Op`; the remaining
         // bytecode handlers still route through the builder only. When
@@ -3392,7 +3392,7 @@ impl CodeWriter {
         // `Label` for loop headers and `assembler.py:159` does not encode
         // unsupported bytecodes as named opnames.
 
-        // B6 Phase 3b dual emission for `last_exc_value`. RPython parity:
+        // RPython parity:
         // `flatten.py:347` `self.emitline("last_exc_value", "->",
         // self.getcolor(w))` — `assembler.py:220` turns it into
         // `last_exc_value/>r`. pyre emits this once per catch site to
@@ -3422,7 +3422,7 @@ impl CodeWriter {
         // SSARepr layer — `flatten.py:106` uses plain `Label` for loop
         // headers.
 
-        // B6 Phase 3b dual emission for `int_copy` / `ref_copy` /
+        // Dual emission for `int_copy` / `ref_copy` /
         // `float_copy` with a Constant source. RPython parity:
         // `flatten.py:333` `self.emitline('%s_copy' % kind, v, "->", w)`
         // — `v` is resolved via `getcolor(v)` which returns either a
@@ -3477,7 +3477,7 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for `ref_return`. Every site that used
+        // Every site that used
         // to invoke `assembler.ref_return(src)` now also appends an
         // `Insn::Op { opname: "ref_return", args: [Register(Ref, src)] }`
         // to the SSARepr so the future `Assembler::assemble` path
@@ -3516,7 +3516,7 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for `goto`. RPython parity:
+        // RPython parity:
         // `flatten.py:161` `self.emitline('goto', TLabel(link.target))` —
         // `assembler.py:220` turns the op into `goto/L`. Pyre labels are
         // integer indices into `labels[]`, one per Python PC; the
@@ -3563,7 +3563,7 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for `abort_permanent`. The opname is
+        // The opname is
         // a pyre-only runtime construct (`BC_ABORT_PERMANENT`) with no
         // counterpart in `rpython/jit/codewriter/*` or
         // `rpython/jit/metainterp/*` — pyre uses it to short-circuit the
@@ -3589,7 +3589,7 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for `raise`. RPython parity:
+        // RPython parity:
         // `flatten.py` emits `self.emitline("raise", self.getcolor(args[1]))`
         // inside the exception-link handler; `assembler.py:220` turns it
         // into `raise/r`. pyre's single `emit_raise(exc_reg)` call site
@@ -3638,7 +3638,7 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for `reraise`. RPython parity:
+        // RPython parity:
         // `flatten.py` emits the zero-arg `self.emitline("reraise")` for
         // the re-raise edge; `assembler.py:220` turns it into
         // `reraise/`. pyre emits this for RAISE_VARARGS with argc == 0.
@@ -3688,7 +3688,7 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for `catch_exception`. RPython parity:
+        // RPython parity:
         // `flatten.py` emits `self.emitline('catch_exception',
         // TLabel(block.exits[0]))` when a block has an exception edge;
         // `assembler.py:220` turns it into `catch_exception/L`. pyre
@@ -3725,7 +3725,7 @@ impl CodeWriter {
             }};
         }
 
-        // B6 Phase 3b dual emission for block `Label`. RPython parity:
+        // Dual emission for block `Label`. RPython parity:
         // `flatten.py:180` `self.emitline(Label(block))` marks block
         // entry; `assembler.py:157-158` records the label position in
         // `self.label_positions`. pyre marks a label at every Python PC
