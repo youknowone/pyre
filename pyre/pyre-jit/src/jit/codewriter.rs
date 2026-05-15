@@ -275,7 +275,7 @@ impl FrameState {
         data
     }
 
-    /// Step 6A slice S1 infrastructure: return the `mergeable()` position
+    /// return the `mergeable()` position
     /// at which a given Variable appears, or `None` if it is not present.
     ///
     /// `framestate.py:38-43` `mergeable` concatenates `locals_w + stack +
@@ -299,7 +299,7 @@ impl FrameState {
         )
     }
 
-    /// Step 6A slice S2 infrastructure: translate a `mergeable()` index
+    /// translate a `mergeable()` index
     /// (S1) into the SSARepr register slot that the walker emits for
     /// that FrameState position.
     ///
@@ -728,7 +728,7 @@ fn append_exit(block: &super::flow::BlockRef, link: super::flow::LinkRef) {
     block.borrow_mut().exits.push(link);
 }
 
-/// Step 6A slice S4a: atomically append `link` to `block.exits` and
+/// atomically append `link` to `block.exits` and
 /// snapshot `source_state` into `link_exit_states` so later passes
 /// (`collect_link_slot_pairs`) can resolve the source-side register
 /// slots at this link.
@@ -1859,7 +1859,7 @@ fn attach_catch_exception_edge(
     link
 }
 
-/// Step 6A slice S3b: collect `BlockRef → FrameState` entries from the
+/// collect `BlockRef → FrameState` entries from the
 /// walker's in-flight block catalogues.  Pure function, no side effects.
 ///
 /// After Phase P2c the walker maintains two `SpamBlockRef` containers:
@@ -1898,7 +1898,7 @@ fn collect_block_states(
     map
 }
 
-/// Step 6A slice S3 (S3c revision): CFG-level collection of
+/// CFG-level collection of
 /// `(source_slot, target_slot)` coalesce pairs.  Pure function, no
 /// side effects.
 ///
@@ -3144,7 +3144,7 @@ impl CodeWriter {
             .jitdriver_sd_from_portal_graph(code as *const CodeObject);
         let is_portal = portal_jd_index.is_some();
 
-        // Step 6.1 Phase 2a: shadow `FunctionGraph` alongside `ssarepr`.
+        // shadow `FunctionGraph` alongside `ssarepr`.
         //
         // RPython's flow space keeps `framestate` on each `SpamBlock`
         // (`flowcontext.py:38-44`) and derives `Link.args ↔
@@ -3174,7 +3174,7 @@ impl CodeWriter {
         // portal graphs).
         let mut graph = new_shadow_graph_with_portal_inputs(code, is_portal);
         let mut joinpoints: HashMap<usize, Vec<SpamBlockRef>> = HashMap::new();
-        // Step 6A slice S4a: snapshot the walker's `currentstate` at
+        // snapshot the walker's `currentstate` at
         // every terminator emission so `collect_link_slot_pairs` can
         // translate link-arg Variables to SSARepr register slots via
         // the positional walk.  RPython does not need this map because
@@ -3498,14 +3498,14 @@ impl CodeWriter {
                 // emit `('---',)` so the backward liveness pass clears its
                 // alive set.
                 push_walker_emit(&current_block, Insn::Unreachable);
-                // Step 6.1 Phase 2c: attach the return edge to
+                // attach the return edge to
                 // `graph.returnblock` (`model.py:18`). The return value
                 // now comes from the symbolic `FrameState` stack,
                 // matching `flatten.py:130-139` `make_return(args)`.
                 let link =
                     super::flow::Link::new(vec![retval], Some(graph.returnblock.clone()), None)
                         .into_ref();
-                // Step 6A slice S4a: snapshot the EXIT FrameState.
+                // snapshot the EXIT FrameState.
                 append_exit_with_state(
                     &current_block.block(),
                     link,
@@ -3646,7 +3646,7 @@ impl CodeWriter {
             () => {{
                 let insn = Insn::op("reraise", Vec::new());
                 push_walker_emit(&current_block, insn);
-                // Step 6.1 Phase 2c: same edge as `emit_raise!` — the
+                // same edge as `emit_raise!` — the
                 // re-raise opname shares the `Block.exits` topology
                 // (`flatten.py` emits the two as alternative codings
                 // of the same exception exit).
@@ -3676,7 +3676,7 @@ impl CodeWriter {
                 // link.last_exc_value]` matches and emits `reraise`.
                 link.extravars(Some(etype), Some(evalue));
                 let link = link.into_ref();
-                // Step 6A slice S4a: snapshot the EXIT state (same
+                // snapshot the EXIT state (same
                 // reasoning as `emit_raise!`).
                 append_exit_with_state(
                     &current_block.block(),
@@ -3708,7 +3708,7 @@ impl CodeWriter {
                     )))],
                 );
                 push_walker_emit(&current_block, insn);
-                // Step 6.1 Phase 2b: attach the exception edge to the
+                // attach the exception edge to the
                 // current PC's block. In RPython this is the
                 // `Constant(last_exception)` exit added by
                 // `flatten.py` when the block `canraise`; the matching
@@ -3743,7 +3743,7 @@ impl CodeWriter {
                 // the new block's outer iter will emit its own Label
                 // at PC=py_pc.  When no switch (gate off or same
                 // block), push Label to ssarepr + per_block.
-                // Step 6.1 Phase 2d: if the previous block still needs
+                // if the previous block still needs
                 // a fallthrough edge AND we're not already standing in
                 // the block for `py_pc`, attach one before switching
                 // `current_block`.
@@ -3891,7 +3891,7 @@ impl CodeWriter {
         macro_rules! emit_mark_label_catch_landing {
             ($landing_label:expr) => {{
                 let landing_label = $landing_label;
-                // Step 6.1 Phase 2a: switch the shadow graph's
+                // switch the shadow graph's
                 // `current_block` into the pre-allocated catch-landing
                 // block. Matches `flatten.py:180` `Label(block)` being the
                 // block-entry marker in RPython. Catch landings are
@@ -4031,7 +4031,7 @@ impl CodeWriter {
                     ],
                 );
                 push_walker_emit(&current_block, insn);
-                // Step 6.1 Phase 2b: same as `emit_goto_if_not!` — the
+                // same as `emit_goto_if_not!` — the
                 // specialised `int_is_zero` form is the pyre-port of
                 // `flatten.py:247` `goto_if_not_int_is_zero`; Link
                 // shape is identical.
@@ -7060,7 +7060,7 @@ impl CodeWriter {
         // graph remains topology-only until a pre-regalloc Variable
         // environment is introduced.
 
-        // Step 6A slice S4b: compute CFG-level link coalesce pairs
+        // compute CFG-level link coalesce pairs
         // (`regalloc.py:79-96` projected onto pyre's u16 slot space)
         // and feed them into `allocate_registers` alongside the
         // existing SSARepr `*_copy` scanner.  Consumers (this call):
