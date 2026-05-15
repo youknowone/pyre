@@ -5619,26 +5619,44 @@ impl<'a> ResumeDataDirectReader<'a> {
                         .bh_setfield_gc_i(struct_ptr, value, &descr_info),
                 }
             } else {
-                // resume.py:1007-1015: self.setarrayitem dispatches by
-                // arraydescr and passes that same descriptor through.
-                let ad = descr
-                    .as_array_descr()
-                    .expect("resume.py:1007 setarrayitem pending entry requires ArrayDescr");
+                // resume.py:1007: self.setarrayitem(struct, itemindex,
+                //                  fieldnum, descr).
                 let index = pf.item_index as usize;
-                if ad.is_array_of_pointers() {
-                    let value = self.decode_ref(pf.value_tagged);
-                    self.allocator
-                        .setarrayitem_ref(struct_ptr, index, value, descr);
-                } else if ad.is_array_of_floats() {
-                    let value = self.decode_float(pf.value_tagged);
-                    self.allocator
-                        .setarrayitem_float(struct_ptr, index, value, descr);
-                } else {
-                    let value = self.decode_int(pf.value_tagged);
-                    self.allocator
-                        .setarrayitem_int(struct_ptr, index, value, descr);
-                }
+                self.setarrayitem(struct_ptr, index, pf.value_tagged, descr);
             }
+        }
+    }
+
+    /// `resume.py:1009-1015 setarrayitem(array, index, fieldnum, descr)`
+    /// dispatcher: forwards to `setarrayitem_ref` /
+    /// `setarrayitem_float` / `setarrayitem_int` based on the live
+    /// `arraydescr.is_array_of_pointers()` / `is_array_of_floats()`
+    /// methods.  `fieldnum` is the resume.py-tagged value to decode.
+    pub fn setarrayitem(
+        &mut self,
+        array: i64,
+        index: usize,
+        fieldnum: i16,
+        arraydescr: &majit_ir::DescrRef,
+    ) {
+        let ad = arraydescr
+            .as_array_descr()
+            .expect("resume.py:1009 setarrayitem requires ArrayDescr");
+        if ad.is_array_of_pointers() {
+            // resume.py:1011 self.setarrayitem_ref(array, index, fieldnum, arraydescr)
+            let value = self.decode_ref(fieldnum);
+            self.allocator
+                .setarrayitem_ref(array, index, value, arraydescr);
+        } else if ad.is_array_of_floats() {
+            // resume.py:1013 self.setarrayitem_float(array, index, fieldnum, arraydescr)
+            let value = self.decode_float(fieldnum);
+            self.allocator
+                .setarrayitem_float(array, index, value, arraydescr);
+        } else {
+            // resume.py:1015 self.setarrayitem_int(array, index, fieldnum, arraydescr)
+            let value = self.decode_int(fieldnum);
+            self.allocator
+                .setarrayitem_int(array, index, value, arraydescr);
         }
     }
 
