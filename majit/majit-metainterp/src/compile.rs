@@ -1029,7 +1029,9 @@ pub(crate) fn build_guard_metadata(
                                 .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
                             // resume.py:1003-1007: itemindex >= 0 → setarrayitem.
                             let item_index = if descr.as_array_descr().is_some() {
-                                Some(pf.item_index.max(0) as usize)
+                                Some(usize::try_from(pf.item_index).expect(
+                                    "resume.py:1003 setarrayitem pending field requires non-negative item_index",
+                                ))
                             } else if descr.as_field_descr().is_some() {
                                 None
                             } else {

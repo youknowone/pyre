@@ -1544,7 +1544,9 @@ fn rebuild_state_after_failure(
                     let ad = descr
                         .as_array_descr()
                         .expect("setarrayitem pending field must carry an ArrayDescr");
-                    let item_index = pf.item_index.unwrap_or(0);
+                    let item_index = pf
+                        .item_index
+                        .expect("setarrayitem pending field must carry an item_index");
                     let addr = target_ptr as usize + ad.base_size() + item_index * ad.item_size();
                     (addr, ad.item_type(), ad.item_size())
                 } else {

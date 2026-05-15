@@ -5189,9 +5189,11 @@ pub trait BlackholeAllocator {
         0
     }
     /// resume.py:1472-1480 slice_string(str, start, length) →
-    /// `funcptr_for_oopspec(OS_STR_SLICE)(str, start, start + length)`.
-    fn os_str_slice(&self, funcptr: i64, str: i64, start: i64, length: i64) -> i64 {
-        let _ = (funcptr, str, start, length);
+    /// `funcptr_for_oopspec(OS_STR_SLICE)(str, start, stop)` where the
+    /// caller pre-computes `stop = start + length` (the OS_STR_SLICE
+    /// oopspec signature).
+    fn os_str_slice(&self, funcptr: i64, str: i64, start: i64, stop: i64) -> i64 {
+        let _ = (funcptr, str, start, stop);
         0
     }
     /// resume.py:1482-1483 allocate_unicode(length) →
@@ -5212,9 +5214,10 @@ pub trait BlackholeAllocator {
         0
     }
     /// resume.py:1499-1507 slice_unicode(str, start, length) →
-    /// `funcptr_for_oopspec(OS_UNI_SLICE)(str, start, start + length)`.
-    fn os_uni_slice(&self, funcptr: i64, str: i64, start: i64, length: i64) -> i64 {
-        let _ = (funcptr, str, start, length);
+    /// `funcptr_for_oopspec(OS_UNI_SLICE)(str, start, stop)` where the
+    /// caller pre-computes `stop = start + length`.
+    fn os_uni_slice(&self, funcptr: i64, str: i64, start: i64, stop: i64) -> i64 {
+        let _ = (funcptr, str, start, stop);
         0
     }
     /// resume.py:1452 allocate_raw_buffer(func, size)
@@ -5926,7 +5929,8 @@ impl<'a> ResumeDataDirectReader<'a> {
         let str = self.decode_ref(strnum);
         let start = self.decode_int(startnum);
         let length = self.decode_int(lengthnum);
-        self.allocator.os_str_slice(funcptr, str, start, length)
+        let stop = start.wrapping_add(length);
+        self.allocator.os_str_slice(funcptr, str, start, stop)
     }
 
     /// resume.py:1482-1483 allocate_unicode(length) → cpu.bh_newunicode.
@@ -5988,7 +5992,8 @@ impl<'a> ResumeDataDirectReader<'a> {
         let str = self.decode_ref(strnum);
         let start = self.decode_int(startnum);
         let length = self.decode_int(lengthnum);
-        self.allocator.os_uni_slice(funcptr, str, start, length)
+        let stop = start.wrapping_add(length);
+        self.allocator.os_uni_slice(funcptr, str, start, stop)
     }
 
     /// `resume.py:1009-1015 setarrayitem(array, index, fieldnum, descr)`

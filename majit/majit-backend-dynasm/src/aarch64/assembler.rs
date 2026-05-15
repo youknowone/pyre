@@ -3458,40 +3458,12 @@ impl<'a> AssemblerARM64<'a> {
                 Some(Loc::Ebp(_)) | Some(Loc::Addr(_)) => 0xFFFF,
             })
             .collect();
-        // Build identity recovery_layout (Cranelift identity_recovery_layout parity).
-        // `jitcode_index: 0` is a placeholder: every guard is later patched
-        // via `compile::patch_backend_guard_recovery_layouts_for_trace`
-        // (compile.rs:1596) with a resume_layout-derived layout whose
-        // jitcode_index originates from `Snapshot::single_frame`.
-        let recovery_layout = {
-            let slot_types = descr_fd.fail_arg_types();
-            ExitRecoveryLayout {
-                vable_array: vec![],
-                vref_array: vec![],
-                frames: vec![ExitFrameLayout {
-                    trace_id: Some(self.trace_id),
-                    header_pc: Some(self.header_pc),
-                    source_guard: None,
-                    pc: self.header_pc,
-                    jitcode_index: 0,
-                    slots: (0..slot_types.len())
-                        .map(ExitValueSourceLayout::ExitValue)
-                        .collect(),
-                    slot_types: Some(slot_types.to_vec()),
-                }],
-                virtual_layouts: vec![],
-                pending_field_layouts: vec![],
-            }
-        };
-        // Session 5i-cl parity: source_op_index moved to a backend-static
-        // side-table keyed on the descr Arc address.
+        // Slice KK/NN: source_op_index uses SOURCE_OP_INDEX_TABLE (kept
+        // pending source_op_index removal); recovery_layout caching is
+        // removed — the metainterp's `StoredExitLayout.recovery_layout`
+        // (populated by `patch_backend_guard_recovery_layouts_for_trace`)
+        // is the canonical store per `resume.py:450-488`.
         crate::guard::register_source_op_index(Arc::as_ptr(&descr) as *const () as usize, op_index);
-        // Session 7 parity: recovery_layout moved to a backend-static
-        // side-table keyed on the descr Arc address.
-        crate::guard::register_recovery_layout(
-            Arc::as_ptr(&descr) as *const () as usize,
-            recovery_layout,
-        );
         // `llsupport/assembler.py:279 guardtok.faildescr.rd_locs = positions`
         // — write through the trait accessor so the metainterp
         // `AbstractFailDescr` (`history.py:132 _attrs_`) receives the

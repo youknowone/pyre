@@ -345,7 +345,7 @@ impl FailDescr for ExitFrameWithExceptionDescrRef {
 /// `MetaInterpStaticData.propagate_exception_descr` so
 /// `compile_tmp_callback` can reference it when emitting the
 /// `GUARD_NO_EXCEPTION` descriptor.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct PropagateExceptionDescr {
     /// `history.py:122` `index = -1` default.
     descr_index: AtomicI32,

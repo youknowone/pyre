@@ -72,38 +72,16 @@ pub fn lookup_fail_descr_global(descr_ptr: usize) -> Option<DescrRef> {
         .and_then(|w| w.upgrade())
 }
 
-/// Backend-static side-table mapping a `DynasmFailDescr` Arc's
-/// `Arc::as_ptr` address to its `ExitRecoveryLayout` (Session 7
-/// pre-flight, mirrors cranelift `RECOVERY_LAYOUT_TABLE`).
-///
-/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) does not
-/// carry a `recovery_layout` slot.  Upstream resume code
-/// (`resume.py:450-488`) decodes recovery on demand from the four
-/// payload attributes (rd_numb / rd_consts / rd_virtuals /
-/// rd_pendingfields).  Pyre keeps the structured layout because the
-/// recovery path is shared across both backends via
-/// `ExitRecoveryLayout` rather than re-decoding the resume tagged
-/// numbering inline.
-static RECOVERY_LAYOUT_TABLE: OnceLock<Mutex<HashMap<usize, ExitRecoveryLayout>>> = OnceLock::new();
-
-fn recovery_layout_table() -> &'static Mutex<HashMap<usize, ExitRecoveryLayout>> {
-    RECOVERY_LAYOUT_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-pub fn register_recovery_layout(descr_ptr: usize, layout: ExitRecoveryLayout) {
-    recovery_layout_table()
-        .lock()
-        .expect("RECOVERY_LAYOUT_TABLE mutex poisoned")
-        .insert(descr_ptr, layout);
-}
-
-pub fn lookup_recovery_layout(descr_ptr: usize) -> Option<ExitRecoveryLayout> {
-    recovery_layout_table()
-        .lock()
-        .expect("RECOVERY_LAYOUT_TABLE mutex poisoned")
-        .get(&descr_ptr)
-        .cloned()
-}
+// RECOVERY_LAYOUT_TABLE removed (Slice NN): `recovery_layout` is not in
+// PyPy `AbstractFailDescr._attrs_` (`history.py:132`).  Upstream resume
+// code (`resume.py:450-488`) decodes recovery on demand from
+// `rd_numb / rd_consts / rd_virtuals / rd_pendingfields`.  Pyre's
+// metainterp `StoredExitLayout.recovery_layout` (populated by
+// `compile.rs::patch_backend_guard_recovery_layouts_for_trace` from
+// the resume snapshot) is the canonical store; the backend no longer
+// caches.  At deopt, `FailDescrLayout.recovery_layout` is `None` and
+// `pyjitpl/mod.rs:6322` falls back to `trace_layout_ref.recovery_layout`
+// which reads from the metainterp cache.
 
 // FAIL_ARG_LOCS_TABLE removed (Slice MM): duplicates `rd_locs`
 // (`history.py:132 _attrs_`).  All readers (`lib.rs:handle_fail_*` and
@@ -261,10 +239,7 @@ impl Drop for DynasmFailDescr {
             .lock()
             .expect("SOURCE_OP_INDEX_TABLE mutex poisoned")
             .remove(&ptr);
-        recovery_layout_table()
-            .lock()
-            .expect("RECOVERY_LAYOUT_TABLE mutex poisoned")
-            .remove(&ptr);
+        // recovery_layout no longer cached on backend (Slice NN).
         // `Self::drop` runs after the registry's strong ref is dropped,
         // so if any other holders exist they hold a strong ref via
         // `DescrRef` (the global mirror) — when the strong count reaches
@@ -295,15 +270,9 @@ impl DynasmFailDescr {
         }
     }
 
-    /// Read the recovery_layout from the backend-static side-table.
-    pub fn recovery_layout(&self) -> Option<ExitRecoveryLayout> {
-        lookup_recovery_layout(self as *const Self as usize)
-    }
-
-    /// Set the recovery_layout in the backend-static side-table.
-    pub fn set_recovery_layout(&self, layout: ExitRecoveryLayout) {
-        register_recovery_layout(self as *const Self as usize, layout);
-    }
+    // recovery_layout / set_recovery_layout removed (Slice NN): see
+    // module-level comment.  Backend no longer caches; metainterp
+    // `StoredExitLayout.recovery_layout` is the canonical store.
 
     /// `compile.py:185` `isinstance(descr, ResumeDescr)` gate for
     /// back-pointer forwarding.  See cranelift counterpart
@@ -360,7 +329,11 @@ pub fn layout_for_fail_descr(
             .collect(),
         force_token_slots: Vec::new(),
         frame_stack: None,
-        recovery_layout: lookup_recovery_layout(descr_addr),
+        // Slice NN: backend no longer caches recovery_layout.  The
+        // metainterp `pyjitpl/mod.rs:6322` falls back to
+        // `trace_layout_ref.recovery_layout` (read from
+        // `StoredExitLayout.recovery_layout`).
+        recovery_layout: None,
         trace_info: None,
         rd_numb: fd.rd_numb().map(|s| s.to_vec()),
         rd_consts: fd.rd_consts().map(|s| s.to_vec()),

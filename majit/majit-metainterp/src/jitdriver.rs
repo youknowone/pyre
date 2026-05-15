@@ -25,22 +25,24 @@ fn materialize_pending_fields(exit_layout: &CompiledExitLayout, raw_values: &[i6
             continue;
         }
         // resume.py:1000 PENDINGFIELDSTRUCT.lldescr is always present in
-        // RPython.  Without descr the entry cannot be replayed correctly;
-        // skip it (this preserves the previous behavior for entries that
-        // were silently dropped in earlier branches of the magic dispatch).
-        let Some(descr) = pf.descr.as_ref() else {
-            continue;
-        };
+        // RPython — fail loud if it's missing, the entry cannot be
+        // replayed without it.
+        let descr = pf
+            .descr
+            .as_ref()
+            .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
         let (offset, size) = if pf.is_array_item {
-            let Some(ad) = descr.as_array_descr() else {
-                continue;
-            };
-            let item_index = pf.item_index.unwrap_or(0);
+            let ad = descr
+                .as_array_descr()
+                .expect("setarrayitem pending field must carry an ArrayDescr");
+            let item_index = pf
+                .item_index
+                .expect("setarrayitem pending field must carry an item_index");
             (ad.base_size() + item_index * ad.item_size(), ad.item_size())
         } else {
-            let Some(fd) = descr.as_field_descr() else {
-                continue;
-            };
+            let fd = descr
+                .as_field_descr()
+                .expect("setfield pending field must carry a FieldDescr");
             (fd.offset(), fd.field_size())
         };
         unsafe {
@@ -3660,10 +3662,11 @@ impl<S: JitState> JitDriver<S> {
         // compile.py:725-729 `_trace_and_compile_from_bridge` raises
         // `compile.giveup()` when the descr's owning JitCellToken weakref
         // is dead (memmgr-evicted).  Pyre signals the same outcome by
-        // returning false.
-        let descr_fd = descr_arc
-            .as_fail_descr()
-            .expect("start_bridge_tracing: descr_arc must be a FailDescr");
+        // returning false; also returns false if the descr is not a
+        // FailDescr at all (e.g. a synthetic terminal-exit Descr).
+        let Some(descr_fd) = descr_arc.as_fail_descr() else {
+            return false;
+        };
         let Some(jct) = majit_backend::descr_owning_jct(descr_fd) else {
             return false;
         };

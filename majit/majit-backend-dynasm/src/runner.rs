@@ -2841,14 +2841,16 @@ impl Backend for DynasmBackend {
         token: &JitCellToken,
         trace_id: u64,
         fail_index: u32,
-        recovery_layout: ExitRecoveryLayout,
+        _recovery_layout: ExitRecoveryLayout,
     ) -> bool {
-        let descr = Self::find_descr(token, trace_id, fail_index);
-        crate::guard::register_recovery_layout(
-            Arc::as_ptr(&descr) as *const () as usize,
-            recovery_layout,
-        );
-        true
+        // Slice NN: backend no longer caches recovery_layout (PyPy parity —
+        // `resume.py:450-488` decodes on-demand).  The metainterp's
+        // `StoredExitLayout.recovery_layout` is the canonical store;
+        // `patch_backend_guard_recovery_layouts_for_trace` updates it
+        // directly without round-tripping through the backend.  Return
+        // `true` for descrs we know about so the patch loop's "did patch"
+        // tracking stays accurate.
+        Self::try_find_descr(token, trace_id, fail_index).is_some()
     }
 
     fn setup_once(&mut self) {}

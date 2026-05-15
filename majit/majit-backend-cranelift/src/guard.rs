@@ -740,7 +740,8 @@ impl CraneliftFailDescr {
         }
         self.bridge_frame_depth_cache
             .store(frame_depth, Ordering::Release);
-        self.bridge_code_ptr_cache.store(code_ptr, Ordering::Release);
+        self.bridge_code_ptr_cache
+            .store(code_ptr, Ordering::Release);
     }
 
     /// Descr-local write-once cell (Slice GG).  Publishes the
@@ -767,11 +768,8 @@ impl CraneliftFailDescr {
     /// `Arc::into_raw(Arc::new(...))` and atomically swaps it into the
     /// cell; any previously published Arc is reclaimed here.
     pub fn set_recovery_layout(&self, recovery_layout: ExitRecoveryLayout) {
-        let new_ptr =
-            Arc::into_raw(Arc::new(recovery_layout)) as *mut ExitRecoveryLayout;
-        let old_ptr = self
-            .recovery_layout_cell
-            .swap(new_ptr, Ordering::AcqRel);
+        let new_ptr = Arc::into_raw(Arc::new(recovery_layout)) as *mut ExitRecoveryLayout;
+        let old_ptr = self.recovery_layout_cell.swap(new_ptr, Ordering::AcqRel);
         if !old_ptr.is_null() {
             // Safety: prior `set_recovery_layout` published this pointer;
             // reclaim ownership and drop.
@@ -814,9 +812,7 @@ impl CraneliftFailDescr {
     /// Descr-local read (Slice II).  Returns the published slot list
     /// as a slice or `&[]` when no slots have been registered.
     pub fn force_token_slots_view(&self) -> &[usize] {
-        self.force_token_slots_cell
-            .get()
-            .map_or(&[], Vec::as_slice)
+        self.force_token_slots_cell.get().map_or(&[], Vec::as_slice)
     }
 
     /// Descr-local atomic write (Slice FF).  Callers are `compile_loop`
@@ -825,8 +821,7 @@ impl CraneliftFailDescr {
     /// `Arc::into_raw(Arc::new(...))`; any previously published Arc is
     /// reclaimed by the swap.
     pub fn set_trace_info(self: &Arc<Self>, trace_info: CompiledTraceInfo) {
-        let new_ptr =
-            Arc::into_raw(Arc::new(trace_info)) as *mut CompiledTraceInfo;
+        let new_ptr = Arc::into_raw(Arc::new(trace_info)) as *mut CompiledTraceInfo;
         let old_ptr = self.trace_info_cell.swap(new_ptr, Ordering::AcqRel);
         if !old_ptr.is_null() {
             // Safety: prior `set_trace_info` published this pointer;
