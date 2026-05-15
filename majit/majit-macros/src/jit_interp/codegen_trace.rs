@@ -434,12 +434,20 @@ fn generate_jitcode_arm(
                 None => quote! { None },
             }
         }
-        ArmPattern::AbortPermanent | ArmPattern::Halt => quote! {
+        ArmPattern::AbortPermanent => quote! {
             let mut __builder = majit_metainterp::JitCodeBuilder::new();
             __builder.abort_permanent();
             Some(__builder.finish())
         },
-        ArmPattern::Nop => quote! {
+        // `break` arms exit the dispatch loop in the source interpreter.
+        // RPython's codewriter has no `abort_permanent/`; the canonical
+        // shape is to leave the JitCode body empty so blackhole resume
+        // through this position is a clean LeaveFrame and the outer
+        // interpreter continues from the back-edge. Emitting
+        // `BC_ABORT_PERMANENT` here was a pyre-only divergence that
+        // failed list_pop_append-style loops whose guard tail resumed
+        // into the loop-exit arm during blackhole replay.
+        ArmPattern::Halt | ArmPattern::Nop => quote! {
             Some(majit_metainterp::JitCodeBuilder::new().finish())
         },
         ArmPattern::Unsupported(_reason) => {

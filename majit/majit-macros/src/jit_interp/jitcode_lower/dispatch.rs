@@ -1885,12 +1885,17 @@ pub(super) fn lower_dispatch_chain(
                     ),
                 }
             }
-            crate::jit_interp::classify::ArmPattern::Nop => (
+            // `break` arms (`Halt`) share the empty Nop body — RPython
+            // codewriter has no `abort_permanent/`, and emitting
+            // `BC_ABORT_PERMANENT` here was a pyre-only divergence that
+            // failed blackhole resume when a guard tail landed on the
+            // loop-exit arm of `while cond { ... }` patterns.
+            crate::jit_interp::classify::ArmPattern::Nop
+            | crate::jit_interp::classify::ArmPattern::Halt => (
                 quote::quote! { majit_metainterp::JitCodeBuilder::new().finish() },
                 dispatch_arm_inline_call_tokens(&[]),
             ),
-            crate::jit_interp::classify::ArmPattern::AbortPermanent
-            | crate::jit_interp::classify::ArmPattern::Halt => (
+            crate::jit_interp::classify::ArmPattern::AbortPermanent => (
                 quote::quote! {
                     {
                         let mut __sub_builder = majit_metainterp::JitCodeBuilder::new();
