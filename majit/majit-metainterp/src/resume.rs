@@ -5268,6 +5268,58 @@ pub trait VirtualInfoBlackholeExt {
     ) -> i64;
 }
 
+/// `resume.py:766-775 VStrPlainInfo.allocate` and `resume.py:821-830
+/// VUniPlainInfo.allocate` share the same loop body — the only
+/// difference is `decoder.allocate_string` vs `allocate_unicode` and
+/// `string_setitem` vs `unicode_setitem`.  The pyre helper takes an
+/// `is_unicode` flag to dispatch.  `chars` is the resume.py-tagged
+/// per-character source list (`fieldnums`); UNINITIALIZED entries
+/// (`VirtualFieldSource::Uninitialized`) skip the setitem call.
+fn vstr_plain_info_allocate(
+    decoder: &mut ResumeDataDirectReader,
+    index: usize,
+    chars: &[VirtualFieldSource],
+    is_unicode: bool,
+) -> i64 {
+    let length = chars.len();
+    // resume.py:769 string = decoder.allocate_string(length)
+    // resume.py:824 string = decoder.allocate_unicode(length)
+    let string = if is_unicode {
+        decoder.allocate_unicode(length)
+    } else {
+        decoder.allocate_string(length)
+    };
+    // resume.py:770 / 825 decoder.virtuals_cache.set_ptr(index, string)
+    decoder.virtuals_cache.set_ptr(index, string);
+    for (i, char_source) in chars.iter().enumerate() {
+        // resume.py:773 / 828 if not tagged_eq(charnum, UNINITIALIZED)
+        if matches!(char_source, VirtualFieldSource::Uninitialized) {
+            continue;
+        }
+        // pyre stores the per-character source as a tagged
+        // VirtualFieldSource; encode it back into the resume.py
+        // i16 charnum so the dispatcher can decode_int it.
+        let charnum = match char_source {
+            VirtualFieldSource::FailArg(_)
+            | VirtualFieldSource::Constant(_)
+            | VirtualFieldSource::Virtual(_) => decoder.decode_field_source_int(char_source),
+            VirtualFieldSource::Uninitialized | VirtualFieldSource::Unavailable => continue,
+        };
+        // resume.py:774 / 829 decoder.{string,unicode}_setitem(string, i, charnum)
+        // pyre's _setitem dispatchers re-decode the tagged charnum;
+        // since we already decoded it via decode_field_source_int,
+        // bypass the re-decode by writing through the allocator hook
+        // directly.  This preserves the resume.py shape while
+        // avoiding a second decode of the same source.
+        if is_unicode {
+            decoder.allocator.bh_unicodesetitem(string, i, charnum);
+        } else {
+            decoder.allocator.bh_strsetitem(string, i, charnum);
+        }
+    }
+    string
+}
+
 /// `resume.py:596-603 AbstractVirtualStructInfo.setfields(decoder, struct)`
 /// — iterate fielddescrs/fieldnums and call decoder.setfield per
 /// non-UNINITIALIZED entry.  pyre threads the spec-form `FieldDescrInfo`
@@ -5451,6 +5503,19 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 }
                 array
             }
+            // resume.py:766-775 VStrPlainInfo.allocate
+            VirtualInfo::VStrPlain { chars } => {
+                vstr_plain_info_allocate(decoder, index, chars, /* is_unicode */ false)
+            }
+            // resume.py:821-830 VUniPlainInfo.allocate
+            VirtualInfo::VUniPlain { chars } => {
+                vstr_plain_info_allocate(decoder, index, chars, /* is_unicode */ true)
+            }
+            // resume.py:781-793 VStrConcatInfo / 836-848 VUniConcatInfo /
+            // 801-809 VStrSliceInfo / 856-864 VUniSliceInfo — these
+            // need an OS_STR_*/OS_UNI_* funcptr resolved at trace time
+            // and carried on the virtual layout; until that producer
+            // wiring is in place, fall back to the dummy materialization.
             _ => {
                 decoder.virtuals_cache.set_ptr(index, 0);
                 0
