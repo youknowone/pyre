@@ -66,10 +66,23 @@ pub fn call_result_fpr() -> RegLoc {
     XMM0
 }
 
-/// `core_reg_index` returns the position of `reg` inside the canonical
-/// `all_core_regs` ordering for gcmap and jitframe slot tables.
+/// `core_reg_index` returns the canonical jitframe slot for `reg`.
+///
+/// regalloc.py `all_reg_indexes`: a FIXED 16-element table mapping
+/// every managed GPR to its slot, independent of Win64 (so R14 always
+/// hashes to slot 11 and R15 to slot 12).  `all_regs` itself drops R13
+/// on Win64 so the allocator never picks it, but `_push_all_regs_to_
+/// frame` / `_pop_all_regs_from_frame` / `get_gcmap` index slots via
+/// `all_reg_indexes`, *not* via the iteration position inside
+/// `all_regs`.  Mirroring that here keeps save_regs_label, the gcmap
+/// bitmap, and the post-call pop in agreement on Windows; an
+/// iteration-position scheme drifts by one for R14/R15 (and shifts the
+/// XMM base) once R13 is removed.
 pub fn core_reg_index(reg: RegLoc) -> Option<usize> {
-    all_core_regs()
+    const FIXED_ALL_REGS: [RegLoc; 13] = [
+        ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
+    ];
+    FIXED_ALL_REGS
         .iter()
         .position(|candidate| *candidate == reg)
 }

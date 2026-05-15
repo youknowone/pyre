@@ -1407,28 +1407,31 @@ impl<'a> Assembler386<'a> {
     /// (typically the slow-path's argument / result register, which
     /// holds non-Ref data across the call).
     ///
-    /// Indexes through `crate::x86::regalloc::all_core_regs()` /
-    /// `all_float_regs()` — the same ordering `regalloc::get_gcmap`
-    /// uses to encode bits via `core_reg_index`. The two lists diverge
-    /// on Windows (where R13 is removed from `all_core_regs`), so
-    /// indexing by `all_gen_regs` here would map R14/R15 to the wrong
-    /// slot relative to the gcmap.
+    /// Iterates `crate::x86::regalloc::all_core_regs()` / `all_float_regs()`
+    /// (the allocator pool — drops R13 and XMM5..XMM14 on Win64), but
+    /// indexes the slot via `core_reg_position` / `float_reg_position`,
+    /// matching `regalloc.py all_reg_indexes` — a FIXED table that pins
+    /// R14→11 / R15→12 regardless of whether R13 is in the iteration
+    /// pool.  An iteration-position scheme drifts by one for R14/R15
+    /// on Win64 (and shifts the XMM base too), desyncing this routine
+    /// from `save_regs_label` and the `core_reg_index`-driven gcmap.
     fn push_all_regs_to_jitframe(
         &mut self,
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        for (idx, reg) in crate::x86::regalloc::all_core_regs().iter().enumerate() {
+        for reg in crate::x86::regalloc::all_core_regs().iter() {
             if ignored_regs.contains(reg) {
                 continue;
             }
-            let ofs = Self::slot_offset(idx);
+            let slot = core_reg_position(*reg).expect("push_all_regs: managed x86_64 GPR");
+            let ofs = Self::slot_offset(slot);
             dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(reg.value));
         }
         if withfloats {
-            let gpr_count = crate::x86::regalloc::all_core_regs().len();
-            for (idx, reg) in crate::x86::regalloc::all_float_regs().iter().enumerate() {
-                let ofs = Self::slot_offset(gpr_count + idx);
+            for reg in crate::x86::regalloc::all_float_regs().iter() {
+                let slot = float_reg_position(*reg).expect("push_all_regs: managed x86_64 XMM");
+                let ofs = Self::slot_offset(slot);
                 dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(reg.value));
             }
         }
@@ -1440,17 +1443,18 @@ impl<'a> Assembler386<'a> {
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        for (idx, reg) in crate::x86::regalloc::all_core_regs().iter().enumerate() {
+        for reg in crate::x86::regalloc::all_core_regs().iter() {
             if ignored_regs.contains(reg) {
                 continue;
             }
-            let ofs = Self::slot_offset(idx);
+            let slot = core_reg_position(*reg).expect("pop_all_regs: managed x86_64 GPR");
+            let ofs = Self::slot_offset(slot);
             dynasm!(self.mc ; .arch x64 ; mov Rq(reg.value), [rbp + ofs]);
         }
         if withfloats {
-            let gpr_count = crate::x86::regalloc::all_core_regs().len();
-            for (idx, reg) in crate::x86::regalloc::all_float_regs().iter().enumerate() {
-                let ofs = Self::slot_offset(gpr_count + idx);
+            for reg in crate::x86::regalloc::all_float_regs().iter() {
+                let slot = float_reg_position(*reg).expect("pop_all_regs: managed x86_64 XMM");
+                let ofs = Self::slot_offset(slot);
                 dynasm!(self.mc ; .arch x64 ; movsd Rx(reg.value), [rbp + ofs]);
             }
         }
@@ -1764,6 +1768,29 @@ impl<'a> Assembler386<'a> {
 
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
+
+        if crate::majit_dump_enabled() {
+            let code = unsafe { std::slice::from_raw_parts(rawstart as *const u8, buffer.len()) };
+            eprintln!(
+                "[dynasm] BRIDGE CODE DUMP ({} bytes at {:#x}, entry +{:?}):",
+                code.len(),
+                rawstart,
+                entry
+            );
+            for (i, chunk) in code.chunks(4).enumerate() {
+                let word = u32::from_le_bytes([
+                    chunk.first().copied().unwrap_or(0),
+                    chunk.get(1).copied().unwrap_or(0),
+                    chunk.get(2).copied().unwrap_or(0),
+                    chunk.get(3).copied().unwrap_or(0),
+                ]);
+                eprint!("{:08x} ", word);
+                if (i + 1) % 8 == 0 {
+                    eprintln!();
+                }
+            }
+            eprintln!();
+        }
 
         // Load-bearing identity invariant for runtime dispatch: pyre's
         // guard-fail trampoline reads `jitframe.jf_descr_index` and indexes
@@ -2650,8 +2677,7 @@ impl<'a> Assembler386<'a> {
             // base-array pointer surviving a minor GC during the inline
             // jitframe-alloc fast path. Tracked separately as Task #21.
             OpCode::GcLoadIndexedI | OpCode::GcLoadIndexedR | OpCode::GcLoadIndexedF => {
-                let (base_loc, ofs_loc, scale_loc, offset_loc, size_loc, sign_loc) = match arglocs
-                {
+                let (base_loc, ofs_loc, scale_loc, offset_loc, size_loc, sign_loc) = match arglocs {
                     [b, o, sc, of, sz, sg] => (b, o, sc, of, sz, sg),
                     _ => panic!(
                         "GcLoadIndexed arglocs must be [base, ofs, scale, offset, size, sign] (got {} locs)",
@@ -2696,9 +2722,7 @@ impl<'a> Assembler386<'a> {
                 };
                 let dst = match result_loc {
                     Some(Loc::Reg(r)) => r,
-                    other => panic!(
-                        "GcLoadIndexed result_loc must be Loc::Reg, got {other:?}",
-                    ),
+                    other => panic!("GcLoadIndexed result_loc must be Loc::Reg, got {other:?}",),
                 };
 
                 // assembler.py:1645 `load_from_mem`: dispatch by (resloc.is_xmm,
@@ -2965,11 +2989,22 @@ impl<'a> Assembler386<'a> {
                     dynasm!(self.mc ; .arch x64 ; jmp =>label);
                 } else if let Some(target) = jump_descr.map(|descr| descr.ll_loop_code()) {
                     // External JUMP: direct JMP to target loop code.
-                    // assembler.py:2461 mc.JMP(imm(target))
+                    // assembler.py:2461 mc.JMP(imm(target)) — PyPy's
+                    // `LocationCodeBuilder._addr_as_reg_offset` (regloc.py:204)
+                    // stages a 64-bit absolute target through
+                    // `X86_64_SCRATCH_REG = r11`, never RAX.  Using RAX
+                    // here clobbers the loop-carried Ref that the
+                    // regalloc bound to it: a bridge whose body
+                    // succeeds and rejoins the trace loop returns with
+                    // RAX = `target` (a code address), and the next
+                    // iteration's GuardClass(RAX) then misreads RAX as
+                    // a Ref and SEGVs when it dereferences trace + 0x1B3
+                    // expecting a class pointer.
                     let addr = target as i64;
+                    let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
                     dynasm!(self.mc ; .arch x64
-                        ; mov rax, QWORD addr
-                        ; jmp rax
+                        ; mov Rq(scratch), QWORD addr
+                        ; jmp Rq(scratch)
                     );
                 }
             }
@@ -4878,11 +4913,15 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64 ; jmp =>label);
         } else if let Some(target) = jump_descr.map(|descr| descr.ll_loop_code()) {
             // assembler.py closing_jump parity: bridge jumps back to
-            // the original loop's LABEL via absolute address.
+            // the original loop's LABEL via absolute address. PyPy
+            // stages the 64-bit target through `X86_64_SCRATCH_REG`
+            // (r11), never RAX — using RAX here would clobber the
+            // loop-carried Ref the regalloc bound to it.
             let addr = target as i64;
+            let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
             dynasm!(self.mc ; .arch x64
-                ; mov rax, QWORD addr
-                ; jmp rax
+                ; mov Rq(scratch), QWORD addr
+                ; jmp Rq(scratch)
             );
         }
     }
