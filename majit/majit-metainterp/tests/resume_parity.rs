@@ -111,7 +111,6 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
         state.pending_fields,
         vec![majit_metainterp::resume::ResolvedPendingFieldWrite {
             descr: None,
-            descr_index: 5,
             target: majit_metainterp::resume::MaterializedValue::Value(7),
             value: majit_metainterp::resume::MaterializedValue::Value(123),
             item_index: Some(2),

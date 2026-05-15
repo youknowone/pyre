@@ -1392,16 +1392,11 @@ pub use majit_backend::PendingFieldInfo;
 /// `resume.py:1000-1007 _prepare_pendingfields` parity — RPython
 /// hands the live `descr` Arc into `setfield` / `setarrayitem` and
 /// they dispatch via `descr.is_pointer_field()` /
-/// `descr.is_array_of_pointers()` etc.  pyre keeps the Arc alongside
-/// the legacy `descr_index` handle while the dispatch path is
-/// rewritten (Slice B/C) to call methods on the Arc directly; once
-/// done, `descr_index` is removed (Slice D).
+/// `descr.is_array_of_pointers()` etc.
 #[derive(Debug, Clone)]
 pub struct ResolvedPendingFieldWrite {
     /// `resume.py:88 lldescr` — the field/array descriptor itself.
     pub descr: Option<majit_ir::DescrRef>,
-    /// Descriptor index identifying the field or array descriptor.
-    pub descr_index: u32,
     /// Concrete object/array pointer.
     pub target: MaterializedValue,
     /// Concrete value to write.
@@ -2263,7 +2258,6 @@ impl ResumeDataExt for ResumeData {
             .iter()
             .map(|pending| ResolvedPendingFieldWrite {
                 descr: pending.descr.clone(),
-                descr_index: pending.descr_index,
                 target: <ResumeData as ResumeDataExt>::resolve_materialized_source(
                     &pending.target,
                     fail_values,
