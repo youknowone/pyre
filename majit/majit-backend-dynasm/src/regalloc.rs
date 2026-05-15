@@ -4414,6 +4414,8 @@ impl<'a> RegAlloc<'a> {
         );
     }
 
+    /// aarch64/regalloc.py:562 _prepare_op_gc_load_indexed parity, j2plan path.
+    #[cfg(target_arch = "aarch64")]
     fn consider_gc_load_indexed_j2(
         &mut self,
         dst: OpRef,
@@ -4448,6 +4450,54 @@ impl<'a> RegAlloc<'a> {
                 Loc::Immed(ImmedLoc::new(ofs)),
             ],
             Some(res_loc),
+            output,
+        );
+    }
+
+    /// x86/regalloc.py:1173 _consider_gc_load_indexed parity, j2plan path.
+    /// Emits the same locs ordering as the regular path so the assembler
+    /// dispatch can be shared.
+    #[cfg(target_arch = "x86_64")]
+    fn consider_gc_load_indexed_j2(
+        &mut self,
+        dst: OpRef,
+        base: OpRef,
+        index: OpRef,
+        scale: OpRef,
+        offset: OpRef,
+        size: OpRef,
+        op: &Op,
+        i: usize,
+        output: &mut Vec<RegAllocOp>,
+    ) {
+        let args = [base, index, scale, offset, size];
+        // x86/regalloc.py:1175
+        let base_loc = self.make_sure_var_in_reg(base, Type::Ref, &args, None, false);
+        // x86/regalloc.py:1176
+        let ofs_loc = self.make_sure_var_in_reg(index, Type::Int, &args, None, false);
+        // x86/regalloc.py:1177
+        let tp = op.opcode.result_type();
+        let result_loc = Loc::Reg(self.force_allocate_reg(dst, tp, &[], None, false));
+        // x86/regalloc.py:1178-1186
+        let scale_value = self.const_value(scale);
+        let offset_value = self.const_value(offset);
+        let nsize = self.const_value(size);
+        // x86/regalloc.py:1187 `size_loc = imm(abs(nsize))`
+        let size_loc = Loc::Immed(ImmedLoc::new(nsize.unsigned_abs() as i64));
+        // x86/regalloc.py:1188-1191 sign_loc = imm1 if nsize < 0 else imm0
+        let sign_loc = Loc::Immed(ImmedLoc::new(if nsize < 0 { 1 } else { 0 }));
+        // x86/regalloc.py:1192-1193
+        self.perform(
+            i,
+            vec![
+                base_loc,
+                ofs_loc,
+                Loc::Immed(ImmedLoc::new(scale_value)),
+                Loc::Immed(ImmedLoc::new(offset_value)),
+                size_loc,
+                sign_loc,
+            ],
+            Some(result_loc),
             output,
         );
     }
@@ -4503,6 +4553,7 @@ impl<'a> RegAlloc<'a> {
 
     /// aarch64/regalloc.py:562 _prepare_op_gc_load_indexed parity.
     /// Returns [res_loc, base_loc, index_loc, imm(nsize), imm(ofs)].
+    #[cfg(target_arch = "aarch64")]
     fn consider_gc_load_indexed(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
         let args: Vec<OpRef> = op.args.iter().copied().collect();
         // aarch64/regalloc.py:564
@@ -4543,6 +4594,52 @@ impl<'a> RegAlloc<'a> {
                 Loc::Immed(ImmedLoc::new(ofs)),
             ],
             Some(res_loc),
+            output,
+        );
+    }
+
+    /// x86/regalloc.py:1173 _consider_gc_load_indexed parity.
+    /// Returns [base_loc, ofs_loc, imm(scale), imm(offset), size_loc, sign_loc]
+    /// + result_loc.
+    #[cfg(target_arch = "x86_64")]
+    fn consider_gc_load_indexed(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
+        let args: Vec<OpRef> = op.args.iter().copied().collect();
+        // x86/regalloc.py:1175
+        let base_loc = self.make_sure_var_in_reg(op.args[0], Type::Ref, &args, None, false);
+        // x86/regalloc.py:1176
+        let ofs_loc = self.make_sure_var_in_reg(op.args[1], Type::Int, &args, None, false);
+        // x86/regalloc.py:1177
+        let tp = op.opcode.result_type();
+        let result_loc = Loc::Reg(self.force_allocate_reg(op.pos, tp, &[], None, false));
+        // x86/regalloc.py:1178-1183: scale_box/offset_box/size_box are ConstInt
+        let scale = self.const_value(op.args[2]);
+        let offset = if op.args.len() > 3 {
+            self.const_value(op.args[3])
+        } else {
+            0
+        };
+        // x86/regalloc.py:1186 `nsize = size_box.value  # negative for "signed"`
+        let nsize = if op.args.len() > 4 {
+            self.const_value(op.args[4])
+        } else {
+            8
+        };
+        // x86/regalloc.py:1187 `size_loc = imm(abs(nsize))`
+        let size_loc = Loc::Immed(ImmedLoc::new(nsize.unsigned_abs() as i64));
+        // x86/regalloc.py:1188-1191 sign_loc = imm1 if nsize < 0 else imm0
+        let sign_loc = Loc::Immed(ImmedLoc::new(if nsize < 0 { 1 } else { 0 }));
+        // x86/regalloc.py:1192-1193
+        self.perform(
+            i,
+            vec![
+                base_loc,
+                ofs_loc,
+                Loc::Immed(ImmedLoc::new(scale)),
+                Loc::Immed(ImmedLoc::new(offset)),
+                size_loc,
+                sign_loc,
+            ],
+            Some(result_loc),
             output,
         );
     }
