@@ -2340,18 +2340,7 @@ fn register_helper_fn_pointers(
 /// `Label("pcN")` + `-live-` pair per Python PC, including dead
 /// bytecodes that never execute, whereas upstream RPython only
 /// flattens reachable flow-graph blocks.
-/// Parse `Label("pc{N}")` and return Some(N), else None.  Upstream
-/// RPython has no per-PC anchor concept; pyre derives the PC index
-/// from the `pc{X}` Label naming scheme that `emit_mark_label_pc!`
-/// already emits per Python PC.
-fn label_pc_index(insn: &Insn) -> Option<usize> {
-    if let Insn::Label(label) = insn {
-        if let Some(rest) = label.name.strip_prefix("pc") {
-            return rest.parse().ok();
-        }
-    }
-    None
-}
+use super::flatten::label_pc_index;
 
 fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
     // Per-PC anchor positions are resolved from `Label("pc{N}")` entries
@@ -3524,7 +3513,7 @@ impl CodeWriter {
                 let target_py_pc = $target_py_pc;
                 let insn = Insn::op(
                     "goto",
-                    vec![Operand::TLabel(TLabel::new(format!("pc{}", target_py_pc)))],
+                    vec![Operand::TLabel(super::flatten::pc_tlabel(target_py_pc))],
                 );
                 push_walker_emit(&current_block, insn);
                 // `rpython/jit/codewriter/flatten.py:111-112`: an
@@ -3864,9 +3853,10 @@ impl CodeWriter {
                     // fallthrough to whichever block lands next in
                     // walker-pop order.
                     if needs_fallthrough {
-                        let target_label = format!("pc{}", py_pc);
-                        let goto_insn =
-                            Insn::op("goto", vec![Operand::TLabel(TLabel::new(target_label))]);
+                        let goto_insn = Insn::op(
+                            "goto",
+                            vec![Operand::TLabel(super::flatten::pc_tlabel(py_pc))],
+                        );
                         push_walker_emit(&current_block, goto_insn);
                         push_walker_emit(&current_block, Insn::Unreachable);
                     }
@@ -3878,8 +3868,11 @@ impl CodeWriter {
                     // bookkeeping needed because `current_block`
                     // doesn't change.
                     needs_fallthrough = true;
-                    push_walker_emit(&current_block,
-                        Insn::Label(super::flatten::Label::new(format!("pc{}", py_pc))),
+                    push_walker_emit(
+                        &current_block,
+                        Insn::Label(super::flatten::Label::new(
+                            super::flatten::pc_label_name(py_pc),
+                        )),
                     );
                 }
             }};
@@ -3986,7 +3979,7 @@ impl CodeWriter {
                     "goto_if_not",
                     vec![
                         Operand::reg(Kind::Int, cond),
-                        Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
+                        Operand::TLabel(super::flatten::pc_tlabel(py_pc)),
                     ],
                 );
                 push_walker_emit(&current_block, insn);
@@ -4019,7 +4012,7 @@ impl CodeWriter {
                     "goto_if_not_int_is_zero",
                     vec![
                         Operand::reg(Kind::Int, cond),
-                        Operand::TLabel(TLabel::new(format!("pc{}", py_pc))),
+                        Operand::TLabel(super::flatten::pc_tlabel(py_pc)),
                     ],
                 );
                 push_walker_emit(&current_block, insn);
@@ -8728,19 +8721,23 @@ mod tests {
     #[test]
     fn pc_anchor_and_live_marker_rescan_follow_final_ssarepr_order() {
         let mut ssarepr = SSARepr::new("t");
-        ssarepr.insns.push(Insn::Label(FlatLabel::new("pc0")));
+        ssarepr
+            .insns
+            .push(Insn::Label(FlatLabel::new(super::super::flatten::pc_label_name(0))));
         ssarepr
             .insns
             .push(Insn::live(vec![Operand::Register(Register::new(
                 Kind::Ref,
                 0,
             ))]));
-        // Task #227.5 item 6: per-PC `Label("pcN")` is a merge boundary
-        // in `remove_repeated_live`, so each PC keeps its own `-live-`
+        // per-PC `Label("pcN")` is a merge boundary in
+        // `remove_repeated_live`, so each PC keeps its own `-live-`
         // marker without cross-PC merge-then-reorder.  The anchor scan
         // resolves each PC anchor at its Label position; the live
         // marker for each PC stays at its pre-merge position.
-        ssarepr.insns.push(Insn::Label(FlatLabel::new("pc1")));
+        ssarepr
+            .insns
+            .push(Insn::Label(FlatLabel::new(super::super::flatten::pc_label_name(1))));
         ssarepr
             .insns
             .push(Insn::live(vec![Operand::Register(Register::new(
@@ -8769,7 +8766,7 @@ mod tests {
         for py_pc in 0..code.instructions.len() {
             ssarepr
                 .insns
-                .push(Insn::Label(FlatLabel::new(format!("pc{py_pc}"))));
+                .push(Insn::Label(FlatLabel::new(super::super::flatten::pc_label_name(py_pc))));
             ssarepr.insns.push(Insn::live(vec![
                 Operand::Register(Register::new(Kind::Ref, 0)),
                 Operand::Register(Register::new(Kind::Ref, 7)),

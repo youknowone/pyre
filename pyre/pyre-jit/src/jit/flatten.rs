@@ -199,6 +199,46 @@ impl TLabel {
     }
 }
 
+/// pyre-only naming convention for the per-Python-PC anchor label that
+/// the walker emits at every PC entry.  Upstream RPython's `flatten.py`
+/// emits exactly one `Label(block)` per SpamBlock; the JIT resumes only
+/// at `jit_merge_point` boundaries (loop headers + guard fail bounce
+/// points) so per-PC anchors are unnecessary.  Pyre's runtime instead
+/// resumes at arbitrary Python PCs (blackhole bridge-resume, inline
+/// call tracing), which requires a per-PC byte-offset table populated
+/// from anchor positions in the assembled JitCode.
+///
+/// All five emit / branch sites that materialise the `pc{N}` naming
+/// route through these helpers so the convention is single-sourced.
+/// A future Phase 4 step can rename the marker shape (e.g.,
+/// `Insn::PcAnchor { py_pc }` distinct from `Insn::Label`) by changing
+/// only these two functions plus the runtime consumers
+/// (`pc_anchor_positions` / `live_marker_indices_by_pc`).
+pub fn pc_label_name(py_pc: usize) -> String {
+    format!("pc{py_pc}")
+}
+
+/// Companion to [`pc_label_name`] producing the matching `TLabel`
+/// branch target.  Walker `goto Label("pc{N}")` callsites build the
+/// target via this helper.
+pub fn pc_tlabel(py_pc: usize) -> TLabel {
+    TLabel::new(pc_label_name(py_pc))
+}
+
+/// Inverse of [`pc_label_name`]: parse a `Label("pc{N}")` insn back
+/// into its Python PC index, or return `None` for any other Label
+/// shape (block labels, link labels, catch-landing labels).  Consumed
+/// by the runtime's `pc_anchor_positions` /
+/// `live_marker_indices_by_pc` scans.
+pub fn label_pc_index(insn: &Insn) -> Option<usize> {
+    if let Insn::Label(label) = insn {
+        if let Some(rest) = label.name.strip_prefix("pc") {
+            return rest.parse().ok();
+        }
+    }
+    None
+}
+
 /// `flatten.py:28-33` `class Register(object)`.
 ///
 /// Python:
