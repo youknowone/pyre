@@ -5428,11 +5428,11 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 known_class,
                 ..
             } => {
-                // resume.py:619 allocate_with_vtable(descr=self.descr)
+                // resume.py:619 struct = decoder.allocate_with_vtable(descr=self.descr)
                 let vtable = known_class.unwrap_or(0) as usize;
                 let obj = descr
                     .as_ref()
-                    .map(|d| allocator.allocate_with_vtable(d, vtable))
+                    .map(|d| decoder.allocate_with_vtable(d, vtable))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, obj);
                 // resume.py:621 return self.setfields(decoder, struct)
@@ -5447,10 +5447,10 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 fielddescrs,
                 ..
             } => {
-                // resume.py:635 allocate_struct(self.typedescr) → cpu.bh_new
+                // resume.py:635 struct = decoder.allocate_struct(self.typedescr)
                 let obj = typedescr
                     .as_ref()
-                    .map(|d| allocator.bh_new(d))
+                    .map(|d| decoder.allocate_struct(d))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, obj);
                 // resume.py:637 return self.setfields(decoder, struct)
@@ -5466,18 +5466,10 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 ..
             } => {
                 let length = items.len();
-                // resume.py:653: array = decoder.allocate_array(length,
-                //   arraydescr, self.clear) — dispatches to bh_new_array_clear
-                //   (clear=True) or bh_new_array (resume.py:1444-1447).
+                // resume.py:653: array = decoder.allocate_array(length, arraydescr, self.clear)
                 let array = arraydescr
                     .as_ref()
-                    .map(|d| {
-                        if *clear {
-                            allocator.bh_new_array_clear(length, d)
-                        } else {
-                            allocator.bh_new_array(length, d)
-                        }
-                    })
+                    .map(|d| decoder.allocate_array(length, d, *clear))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, array);
                 // resume.py:656-670: dispatch by arraydescr element type
@@ -5516,11 +5508,10 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 ..
             } => {
                 let size = element_fields.len();
-                // resume.py:749: array = decoder.allocate_array(self.size,
-                //   self.arraydescr, clear=True) → cpu.bh_new_array_clear.
+                // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
                 let array = arraydescr
                     .as_ref()
-                    .map(|d| allocator.bh_new_array_clear(size, d))
+                    .map(|d| decoder.allocate_array(size, d, /* clear */ true))
                     .unwrap_or(0);
                 decoder.virtuals_cache.set_ptr(index, array);
                 // resume.py:752-759:
@@ -5586,7 +5577,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 assert_eq!(offsets.len(), descrs.len());
                 assert_eq!(offsets.len(), values.len());
                 // resume.py:703: buffer = decoder.allocate_raw_buffer(self.func, self.size)
-                let buffer = allocator.allocate_raw_buffer(*func, *size);
+                let buffer = decoder.allocate_raw_buffer(*func, *size);
                 // resume.py:704
                 decoder.virtuals_cache.set_int(index, buffer);
                 // resume.py:705-708: for i in range(len(self.offsets)):
@@ -5805,6 +5796,44 @@ impl<'a> ResumeDataDirectReader<'a> {
             self.allocator
                 .bh_setfield_gc_i(struct_ptr, value, &descr_info);
         }
+    }
+
+    /// resume.py:1437-1439 allocate_with_vtable(descr) →
+    /// `executor.exec_new_with_vtable(self.cpu, descr)` — pyre's
+    /// `vtable` argument is the resolved class pointer carried on the
+    /// virtual layout (info.py:318 _known_class).
+    pub fn allocate_with_vtable(&self, descr: &majit_ir::DescrRef, vtable: usize) -> i64 {
+        self.allocator.allocate_with_vtable(descr, vtable)
+    }
+
+    /// resume.py:1441-1442 allocate_struct(typedescr) → cpu.bh_new(typedescr).
+    pub fn allocate_struct(&self, typedescr: &majit_ir::DescrRef) -> i64 {
+        self.allocator.bh_new(typedescr)
+    }
+
+    /// resume.py:1444-1447 allocate_array(length, arraydescr, clear) →
+    /// `cpu.bh_new_array_clear` (clear=True) or `cpu.bh_new_array`.
+    pub fn allocate_array(
+        &self,
+        length: usize,
+        arraydescr: &majit_ir::DescrRef,
+        clear: bool,
+    ) -> i64 {
+        if clear {
+            self.allocator.bh_new_array_clear(length, arraydescr)
+        } else {
+            self.allocator.bh_new_array(length, arraydescr)
+        }
+    }
+
+    /// resume.py:1452-1456 allocate_raw_buffer(func, size) → calldescr =
+    /// `callinfo_for_oopspec(OS_RAW_MALLOC_VARSIZE_CHAR)`,
+    /// `cpu.bh_call_i(func, [size], None, None, calldescr)` — pyre's
+    /// `BlackholeAllocator::allocate_raw_buffer` keeps the wrapped form
+    /// (the calldescr / cic resolution lives inside the allocator impl
+    /// because pyre lacks a callinfocollection on the reader side).
+    pub fn allocate_raw_buffer(&self, func: i64, size: usize) -> i64 {
+        self.allocator.allocate_raw_buffer(func, size)
     }
 
     /// resume.py:1449-1450 allocate_string(length) — forward to allocator.
