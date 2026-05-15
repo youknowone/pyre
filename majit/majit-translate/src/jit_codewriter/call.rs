@@ -2530,9 +2530,9 @@ fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
     };
     if !start.inputargs.is_empty() {
         return start
-            .inputargs
-            .iter()
-            .filter_map(|&arg_id| {
+            .inputarg_value_ids(graph)
+            .into_iter()
+            .filter_map(|arg_id| {
                 let ty = start.operations.iter().find_map(|op| match &op.kind {
                     crate::model::OpKind::Input { ty, .. } if op.result == Some(arg_id) => Some(ty),
                     _ => None,
@@ -4693,7 +4693,8 @@ fn collect_readwrite_effects(
     for block in &graph.blocks {
         for link in &block.exits {
             if let Some(target_block) = graph.blocks.get(link.target.0) {
-                for (ia, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+                let target_vids = target_block.inputarg_value_ids(graph);
+                for (ia, src) in target_vids.iter().zip(link.args.iter()) {
                     phi_sources.insert(*ia, src.clone());
                 }
             }
@@ -5530,8 +5531,10 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
 fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
     use crate::model::LinkArg;
 
-    let except_value = graph.block(graph.exceptblock).inputargs.get(1).copied();
-    let Some(except_value) = except_value else {
+    let exceptblock_vids = graph
+        .block(graph.exceptblock)
+        .inputarg_value_ids(graph);
+    let Some(&except_value) = exceptblock_vids.get(1) else {
         return false;
     };
 
@@ -5539,11 +5542,8 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
         crate::tool::algo::unionfind::UnionFind::<crate::model::ValueId, ()>::new(|_| ());
     for block in &graph.blocks {
         for link in &block.exits {
-            for (arg, &target_arg) in link
-                .args
-                .iter()
-                .zip(graph.block(link.target).inputargs.iter())
-            {
+            let target_vids = graph.block(link.target).inputarg_value_ids(graph);
+            for (arg, &target_arg) in link.args.iter().zip(target_vids.iter()) {
                 if let LinkArg::Value(value) = arg {
                     families.union(*value, target_arg);
                 }
@@ -6191,7 +6191,7 @@ mod tests {
         let entry = g.startblock;
         let continuation = g.create_block();
         let continuation_arg = g.alloc_value();
-        g.block_mut(continuation).inputargs.push(continuation_arg);
+        g.push_inputarg(continuation, continuation_arg);
         let last_exception = g.alloc_value();
         let last_exc_value = g.alloc_value();
         g.set_control_flow_metadata(
@@ -6487,7 +6487,7 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("forcer");
         let frame = graph.alloc_value();
-        graph.block_mut(graph.startblock).inputargs.push(frame);
+        graph.push_inputarg(graph.startblock, frame);
         graph.push_op(graph.startblock, OpKind::VableForce { base: frame }, false);
         graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["forcer"]);

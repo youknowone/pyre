@@ -41,10 +41,11 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     // <result_type>` unconditionally; pyre mirrors that by seeding the
     // annotator state up front.
     if let Some(exceptblock) = graph.blocks.get(graph.exceptblock.0) {
-        if let Some(&etype) = exceptblock.inputargs.first() {
+        let exceptblock_vids = exceptblock.inputarg_value_ids(graph);
+        if let Some(&etype) = exceptblock_vids.first() {
             state.set(etype, ValueType::Int);
         }
-        if let Some(&evalue) = exceptblock.inputargs.get(1) {
+        if let Some(&evalue) = exceptblock_vids.get(1) {
             state.set(evalue, ValueType::Ref);
         }
     }
@@ -55,7 +56,7 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
     // `return None` placeholder values here; normal non-void returns
     // are inferred from the incoming Link args.
     if let Some(returnblock) = graph.blocks.get(graph.returnblock.0)
-        && let Some(&ret) = returnblock.inputargs.first()
+        && let Some(&ret) = returnblock.inputarg_value_ids(graph).first()
     {
         for block in &graph.blocks {
             for link in &block.exits {
@@ -120,7 +121,8 @@ fn link_is_raise_like(link: &Link) -> bool {
 fn follow_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         changed |= merge_value_type(state, *dst, link_arg_type(state, src));
     }
     changed
@@ -136,7 +138,8 @@ fn follow_raise_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &
     }
 
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         let src_ty = if Some(src) == link.last_exception.as_ref() {
             ValueType::Int
         } else if Some(src) == link.last_exc_value.as_ref() {
@@ -193,7 +196,7 @@ fn const_value_type(value: &ConstValue) -> ValueType {
 
 fn is_synthetic_return_void_value(graph: &FunctionGraph, value: ValueId) -> bool {
     for block in &graph.blocks {
-        if block.inputargs.contains(&value) {
+        if block.inputarg_value_ids(graph).contains(&value) {
             return false;
         }
         if block.operations.iter().any(|op| op.result == Some(value)) {

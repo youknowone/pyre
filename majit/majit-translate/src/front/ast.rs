@@ -2023,7 +2023,7 @@ fn allocate_loop_header_phis(
             )
             .expect("OpKind::Input always produces a result");
         graph.name_value(phi_vid, name.clone());
-        graph.block_mut(header_entry).inputargs.push(phi_vid);
+        graph.push_inputarg(header_entry, phi_vid);
         graph.block_mut(pre_loop_block).exits[0]
             .args
             .push(LinkArg::from(entry_vid));
@@ -2045,9 +2045,9 @@ fn allocate_loop_header_phis(
 fn header_phi_name_list(graph: &FunctionGraph, header: BlockId) -> Vec<String> {
     let header_block = graph.block(header);
     header_block
-        .inputargs
-        .iter()
-        .filter_map(|&iarg_vid| {
+        .inputarg_value_ids(graph)
+        .into_iter()
+        .filter_map(|iarg_vid| {
             header_block
                 .operations
                 .iter()
@@ -2528,10 +2528,11 @@ fn lazy_install_local_at_current_block(
     // ctx state.
     {
         let block = graph.block(current_block);
+        let block_inputarg_vids = block.inputarg_value_ids(graph);
         for op in &block.operations {
             if let (Some(result), OpKind::Input { name: op_name, .. }) = (op.result, &op.kind)
                 && op_name == name
-                && block.inputargs.contains(&result)
+                && block_inputarg_vids.contains(&result)
             {
                 return Some(result);
             }
@@ -2694,7 +2695,7 @@ fn lazy_install_local_at_current_block(
         )?
     };
     graph.name_value(new_vid, name.to_string());
-    graph.block_mut(current_block).inputargs.push(new_vid);
+    graph.push_inputarg(current_block, new_vid);
     ctx.bind_local_id(name.to_string(), new_vid, current_block);
     ctx.local_value_types
         .insert(name.to_string(), value_type.clone());
@@ -2813,7 +2814,7 @@ fn value_id_defined_in_block(
     block_id: BlockId,
 ) -> bool {
     let block = graph.block(block_id);
-    if block.inputargs.contains(&vid) {
+    if block.inputarg_value_ids(graph).contains(&vid) {
         return true;
     }
     block.operations.iter().any(|op| op.result == Some(vid))
@@ -2907,7 +2908,7 @@ fn build_function_graph(
                     true,
                 ) {
                     graph.name_value(vid, "self".to_string());
-                    graph.block_mut(entry).inputargs.push(vid);
+                    graph.push_inputarg(entry, vid);
                     // RPython `LOAD_FAST` parity: record the receiver
                     // binding so a body `Expr::Path` reference to
                     // `self` within the entry block reuses this
@@ -2968,7 +2969,7 @@ fn build_function_graph(
                     true,
                 ) {
                     graph.name_value(vid, name.clone());
-                    graph.block_mut(entry).inputargs.push(vid);
+                    graph.push_inputarg(entry, vid);
                     // RPython `LOAD_FAST` parity: record the parameter
                     // binding so a body `Expr::Path` reference within
                     // the entry block reuses this `ValueId` instead of
@@ -5676,10 +5677,7 @@ fn lower_expr(
             }
             let continuation = graph.create_block();
             let continuation_arg = graph.alloc_value();
-            graph
-                .block_mut(continuation)
-                .inputargs
-                .push(continuation_arg);
+            graph.push_inputarg(continuation, continuation_arg);
             // RPython `flowcontext.py:130-133` — fresh prevblock-side
             // `Variable('last_exception')` + `Variable('last_exc_value')`.
             let last_exception = graph.alloc_value();
@@ -7339,7 +7337,7 @@ fn retag_result_value_type(graph: &mut FunctionGraph, value: ValueId, ty: ValueT
 fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<ValueType> {
     for target_block in &graph.blocks {
         let Some(arg_index) = target_block
-            .inputargs
+            .inputarg_value_ids(graph)
             .iter()
             .position(|&inputarg| inputarg == value)
         else {

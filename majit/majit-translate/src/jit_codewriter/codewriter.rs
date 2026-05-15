@@ -454,9 +454,9 @@ impl CodeWriter {
             // verbatim.  Reading from the type-state matches the
             // upstream's "type-source" provenance instead of going
             // through regalloc as a side-channel.
-            for arg_id in &start_block.inputargs {
+            for arg_id in start_block.inputarg_value_ids(&rewritten.graph) {
                 use crate::model::ConcreteType;
-                let class = match rewritten.graph.concretetype(*arg_id) {
+                let class = match rewritten.graph.concretetype(arg_id) {
                     ConcreteType::Signed => 'i',
                     ConcreteType::GcRef => 'r',
                     ConcreteType::Float => 'f',
@@ -661,11 +661,12 @@ impl Default for CodeWriter {
 /// `TypeResolutionState` parameter; the Variable IS the type source.
 fn graph_result_kind(graph: &FunctionGraph) -> char {
     let returnblock = graph.block(graph.returnblock);
-    let Some(vid) = returnblock.inputargs.first() else {
+    let returnblock_vids = returnblock.inputarg_value_ids(graph);
+    let Some(&vid) = returnblock_vids.first() else {
         return 'v';
     };
     use crate::model::ConcreteType;
-    match graph.concretetype(*vid) {
+    match graph.concretetype(vid) {
         ConcreteType::Signed => 'i',
         ConcreteType::GcRef => 'r',
         ConcreteType::Float => 'f',

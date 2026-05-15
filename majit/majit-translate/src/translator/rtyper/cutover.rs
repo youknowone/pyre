@@ -701,12 +701,12 @@ pub fn populate_call_registry_from_call_graphs(
 fn signature_for_graph(graph: &LegacyGraph) -> Signature {
     let startblock = graph.block(graph.startblock);
     let argnames: Vec<String> = startblock
-        .inputargs
-        .iter()
+        .inputarg_value_ids(graph)
+        .into_iter()
         .enumerate()
         .map(|(idx, vid)| {
             graph
-                .value_name(*vid)
+                .value_name(vid)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("arg{idx}"))
         })
@@ -843,12 +843,12 @@ fn signature_for(func: &front::SemanticFunction) -> Signature {
     let graph = &func.graph;
     let startblock = graph.block(graph.startblock);
     let argnames: Vec<String> = startblock
-        .inputargs
-        .iter()
+        .inputarg_value_ids(graph)
+        .into_iter()
         .enumerate()
         .map(|(idx, vid)| {
             graph
-                .value_name(*vid)
+                .value_name(vid)
                 .map(str::to_string)
                 .unwrap_or_else(|| format!("arg{idx}"))
         })

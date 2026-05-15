@@ -1035,12 +1035,12 @@ pub struct Block {
     /// (`flowspace/model.py:21-25 Block([Variable("etype"),
     /// Variable("evalue")])`).  Pyre currently stores the dense
     /// `ValueId` index — the storage migration to `Vec<Variable>`
-    /// requires updating ~90 read sites across regalloc / flatten /
-    /// assembler / call / jtransform / inline / front-end and is
-    /// tracked separately.  The foundation
-    /// ([`FunctionGraph::variable_to_vid`] + [`Self::input_variables`]
-    /// + [`FunctionGraph::value_id_of`]) is in place so consumer
-    /// migration can land incrementally without re-doing this scan.
+    /// requires updating dozens of test fixtures that build `Block`
+    /// struct literals; the ~15-file production migration to
+    /// route reads through [`Self::input_variables`] /
+    /// [`Self::inputarg_value_ids`] / [`FunctionGraph::push_inputarg`]
+    /// is in place so the storage flip lands once test fixtures
+    /// adopt the helper-style construction.
     pub inputargs: Vec<ValueId>,
     pub operations: Vec<SpaceOperation>,
     /// RPython `Block.exitswitch`.
@@ -1482,7 +1482,7 @@ pub fn eliminate_empty_blocks(graph: &mut FunctionGraph) {
                     break;
                 }
                 // upstream: `exit = block1.exits[0]`.
-                let target_inputargs = target_block.inputargs.clone();
+                let target_inputargs = target_block.inputarg_value_ids(graph);
                 let target_exit = target_block.exits[0].clone();
                 // upstream: `assert block1 is not exit.target, "the
                 // graph contains an empty infinite loop"` (`simplify.py:64`).
@@ -1747,7 +1747,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
         // `simplify.py:459-462`: terminal blocks (no exits)
         // implicitly use every inputarg.
         if block.exits.is_empty() {
-            for &iarg in &block.inputargs {
+            for iarg in block.inputarg_value_ids(graph) {
                 read_vars.insert(iarg);
             }
         }
@@ -1765,7 +1765,8 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                 target_block.inputargs.len(),
                 "simplify.py:513 — len(link.args) == len(link.target.inputargs)",
             );
-            for (arg, &target_iarg) in link.args.iter().zip(target_block.inputargs.iter()) {
+            let target_vids = target_block.inputarg_value_ids(graph);
+            for (arg, target_iarg) in link.args.iter().zip(target_vids.iter().copied()) {
                 if let LinkArg::Value(arg_vid) = arg {
                     dependencies.entry(target_iarg).or_default().push(*arg_vid);
                 }
@@ -1778,7 +1779,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
     // comment).
     for &sb in &start_blocks {
         if let Some(&i) = block_index.get(&sb) {
-            for &iarg in &graph.blocks[i].inputargs {
+            for iarg in graph.blocks[i].inputarg_value_ids(graph) {
                 read_vars.insert(iarg);
             }
         }
@@ -1852,7 +1853,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                 let &i = block_index
                     .get(&target)
                     .expect("simplify.py:512 — link.target must be a graph block");
-                graph.blocks[i].inputargs.clone()
+                graph.blocks[i].inputarg_value_ids(graph)
             };
             assert_eq!(
                 graph.blocks[block_idx].exits[exit_idx].args.len(),
@@ -1876,7 +1877,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
         if !reachable.contains(&block_id) || block_id == return_block || block_id == except_block {
             continue;
         }
-        let inputargs = graph.blocks[block_idx].inputargs.clone();
+        let inputargs = graph.blocks[block_idx].inputarg_value_ids(graph);
         for i in (0..inputargs.len()).rev() {
             let vid = inputargs[i];
             if read_vars.contains(&vid) {
@@ -1921,6 +1922,15 @@ impl Block {
                 )
             })
         })
+    }
+
+    /// Identity helper kept for symmetric naming with
+    /// [`Self::input_variables`] — `inputargs` is currently stored
+    /// as `Vec<ValueId>` so the projection is just a clone.  Once
+    /// the storage flips to `Vec<Variable>` this becomes the
+    /// `graph.value_id_of` projection.
+    pub fn inputarg_value_ids(&self, _graph: &FunctionGraph) -> Vec<ValueId> {
+        self.inputargs.clone()
     }
 
     /// RPython `flowspace/model.py:247 closeblock` / `:250 recloseblock`
@@ -2841,6 +2851,21 @@ impl FunctionGraph {
         &mut self.blocks[block.0]
     }
 
+    /// Append `vid` to `block.inputargs`.  Currently a thin wrapper
+    /// around `block_mut(block).inputargs.push(vid)` so call sites
+    /// that thread `(graph, block, vid)` already match the
+    /// post-storage-migration call shape (`block.inputargs:
+    /// Vec<Variable>` will require the helper to look up the
+    /// backing Variable at push time — see [`Block::inputargs`]).
+    pub fn push_inputarg(&mut self, block: BlockId, vid: ValueId) {
+        debug_assert!(
+            self.variable(vid).is_some(),
+            "push_inputarg: ValueId {vid:?} must have a backing Variable on graph {:?}",
+            self.name,
+        );
+        self.block_mut(block).inputargs.push(vid);
+    }
+
     // ── RPython FunctionGraph iteration methods ──────────────────
 
     /// Iterate all blocks. RPython: `graph.iterblocks()`.
@@ -2898,7 +2923,11 @@ impl FunctionGraph {
             self.num_ops()
         );
         for block in &self.blocks {
-            let args: Vec<String> = block.inputargs.iter().map(|v| self.fmt_value(*v)).collect();
+            let args: Vec<String> = block
+                .inputarg_value_ids(self)
+                .into_iter()
+                .map(|v| self.fmt_value(v))
+                .collect();
             if args.is_empty() {
                 out.push_str(&format!("  Block {}:\n", block.id.0));
             } else {
@@ -3096,7 +3125,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.block_mut(block).inputargs.push(vid);
+        graph.push_inputarg(block, vid);
         vid
     }
 
@@ -3286,7 +3315,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.block_mut(entry).inputargs.push(unused_param);
+        graph.push_inputarg(entry, unused_param);
         graph.set_return(entry, None);
 
         let pre_returnblock_args = graph.block(graph.returnblock).inputargs.clone();
@@ -3401,7 +3430,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.block_mut(orphan_entry).inputargs.push(unused_param);
+        graph.push_inputarg(orphan_entry, unused_param);
 
         prune_dead_phis(&mut graph);
 

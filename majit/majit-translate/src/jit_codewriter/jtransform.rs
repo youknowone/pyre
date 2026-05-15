@@ -5207,7 +5207,7 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let frame = graph.alloc_value();
         let hinted = graph.alloc_value();
-        graph.block_mut(graph.startblock).inputargs.push(frame);
+        graph.push_inputarg(graph.startblock, frame);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -5259,7 +5259,7 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let frame = graph.alloc_value();
         let forced = graph.alloc_value();
-        graph.block_mut(graph.startblock).inputargs.push(frame);
+        graph.push_inputarg(graph.startblock, frame);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -5323,7 +5323,7 @@ mod tests {
         let v = graph.alloc_value();
         let promoted = graph.alloc_value();
         let consumed = graph.alloc_value();
-        graph.block_mut(graph.startblock).inputargs.push(v);
+        graph.push_inputarg(graph.startblock, v);
         // `hint_promote(v)` — mirrors `rlib/jit.py:101 promote(x)` after
         // lowering to the operator-level helper name.
         graph.push_op(
@@ -5392,7 +5392,7 @@ mod tests {
     fn rewrite_graph_keeps_hint_promote_on_void_arg() {
         let mut graph = FunctionGraph::new("demo");
         let v = graph.alloc_value();
-        graph.block_mut(graph.startblock).inputargs.push(v);
+        graph.push_inputarg(graph.startblock, v);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -6659,7 +6659,7 @@ mod tests {
     fn rewrite_graph_promote_or_string_picks_ref_guard_value_for_ref_arg() {
         let mut graph = FunctionGraph::new("demo");
         let v = graph.alloc_value();
-        graph.block_mut(graph.startblock).inputargs.push(v);
+        graph.push_inputarg(graph.startblock, v);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
@@ -6690,7 +6690,7 @@ mod tests {
     fn rewrite_graph_promote_or_string_picks_int_guard_value_for_int_arg() {
         let mut graph = FunctionGraph::new("demo");
         let v = graph.alloc_value();
-        graph.block_mut(graph.startblock).inputargs.push(v);
+        graph.push_inputarg(graph.startblock, v);
         graph.push_op(
             graph.startblock,
             OpKind::Call {

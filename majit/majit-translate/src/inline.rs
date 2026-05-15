@@ -171,11 +171,14 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     for callee_block in &callee.blocks {
         let new_block_id = block_map[&callee_block.id];
 
-        // Remap inputargs
+        // Remap inputargs (callee Variables → caller-graph Variables
+        // via value_map; storage stays Vec<ValueId> until the
+        // upstream-orthodox Vec<Variable> migration lands across
+        // every test fixture).
         let new_inputargs: Vec<ValueId> = callee_block
-            .inputargs
-            .iter()
-            .map(|v| value_map[v])
+            .inputarg_value_ids(&callee)
+            .into_iter()
+            .map(|v| value_map[&v])
             .collect();
         graph.blocks[new_block_id.0].inputargs = new_inputargs;
 
@@ -205,7 +208,11 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             // the inlined function's return value becomes the caller's
             // return value — still a Goto into a final block, matching
             // upstream's `exits=[Link(..., returnblock)]` shape.
-            let ret_val = callee_block.inputargs.first().map(|v| value_map[v]);
+            let ret_val = callee_block
+                .inputarg_value_ids(&callee)
+                .first()
+                .copied()
+                .map(|v| value_map[&v]);
             let caller_returnblock = graph.returnblock;
             let (target, args) = match (&merge_block_id, ret_val) {
                 (Some((merge_id, merge_args)), Some(remapped_ret)) => {
@@ -276,7 +283,7 @@ fn remap_callee_values(
     let mut map = HashMap::new();
     // Collect all ValueIds used in the callee
     for block in &callee.blocks {
-        for &v in &block.inputargs {
+        for v in block.inputarg_value_ids(&callee) {
             map.entry(v).or_insert_with(|| graph.alloc_value());
         }
         for op in &block.operations {

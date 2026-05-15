@@ -105,7 +105,7 @@ pub use crate::jit_codewriter::annotation_state::valuetype_to_someshell;
 /// remain fail-loud.
 fn is_synthetic_return_void_value(graph: &FunctionGraph, value: ValueId) -> bool {
     for block in &graph.blocks {
-        if block.inputargs.contains(&value) {
+        if block.inputarg_value_ids(graph).contains(&value) {
             return false;
         }
         if block.operations.iter().any(|op| op.result == Some(value)) {
@@ -1299,8 +1299,9 @@ pub(crate) fn derive_subject_inputcells(
             input_ty_by_result.insert(result, ty);
         }
     }
-    let mut cells = Vec::with_capacity(startblock.inputargs.len());
-    for (idx, vid) in startblock.inputargs.iter().enumerate() {
+    let startblock_vids = startblock.inputarg_value_ids(legacy);
+    let mut cells = Vec::with_capacity(startblock_vids.len());
+    for (idx, vid) in startblock_vids.iter().enumerate() {
         // 1. Explicit SomeValue seed (test fixtures and any caller
         //    that wants to bypass the ValueType projection).
         if let Some(seed) = seed_annotations {
@@ -1497,8 +1498,9 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
             continue;
         }
         let mut local_inputs: HashMap<ValueId, Variable> = HashMap::new();
-        let mut inputargs: Vec<Hlvalue> = Vec::with_capacity(legacy_block.inputargs.len());
-        for &vid in &legacy_block.inputargs {
+        let legacy_inputarg_vids = legacy_block.inputarg_value_ids(legacy);
+        let mut inputargs: Vec<Hlvalue> = Vec::with_capacity(legacy_inputarg_vids.len());
+        for vid in legacy_inputarg_vids {
             let var = seed_variable(vid, annotations);
             value_to_var.entry(vid).or_insert_with(|| var.clone());
             local_inputs.insert(vid, var.clone());
@@ -1533,7 +1535,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
         .blocks
         .iter()
         .find(|b| b.id == legacy.returnblock)
-        .and_then(|b| b.inputargs.first().copied())
+        .and_then(|b| b.inputarg_value_ids(legacy).first().copied())
         .map(|vid| {
             let var = seed_variable(vid, annotations);
             value_to_var.entry(vid).or_insert_with(|| var.clone());
@@ -1559,7 +1561,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
     if let Some(legacy_exceptblock) = legacy.blocks.iter().find(|b| b.id == legacy.exceptblock) {
         if legacy_exceptblock.inputargs.len() == 2 {
             let mut except_inputargs = Vec::with_capacity(2);
-            for &vid in &legacy_exceptblock.inputargs {
+            for vid in legacy_exceptblock.inputarg_value_ids(legacy) {
                 let var = seed_variable(vid, annotations);
                 value_to_var.entry(vid).or_insert_with(|| var.clone());
                 except_inputargs.push(Hlvalue::Variable(var));
@@ -1611,7 +1613,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
             if let (Some(result), OpKind::Input { name, ty: _ }) =
                 (legacy_op.result, &legacy_op.kind)
             {
-                if legacy_block.inputargs.contains(&result) {
+                if legacy_block.inputarg_value_ids(legacy).contains(&result) {
                     if let Some(existing) = value_map.get(&result).cloned() {
                         name_to_value.entry(name.clone()).or_insert(existing);
                     }
@@ -2223,9 +2225,9 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.block_mut(entry).inputargs.push(x_vid);
-        graph.block_mut(entry).inputargs.push(y_vid);
-        graph.block_mut(entry).inputargs.push(z_vid);
+        graph.push_inputarg(entry, x_vid);
+        graph.push_inputarg(entry, y_vid);
+        graph.push_inputarg(entry, z_vid);
 
         let cells = derive_subject_inputcells(&graph, None)
             .expect("typed Input ops must project to definite SomeValue cells");
@@ -2252,7 +2254,7 @@ mod tests {
         let mut graph = LegacyGraph::new("subject");
         let entry = graph.startblock;
         let orphan = graph.alloc_value();
-        graph.block_mut(entry).inputargs.push(orphan);
+        graph.push_inputarg(entry, orphan);
         let err = derive_subject_inputcells(&graph, None)
             .expect_err("inputarg without matching Input op must surface as TyperError");
         let msg = format!("{err}");
@@ -2276,7 +2278,7 @@ mod tests {
                 true,
             )
             .unwrap();
-        graph.block_mut(entry).inputargs.push(vid);
+        graph.push_inputarg(entry, vid);
         let err = derive_subject_inputcells(&graph, None)
             .expect_err("ValueType::Unknown has no SomeValue projection");
         let msg = format!("{err}");

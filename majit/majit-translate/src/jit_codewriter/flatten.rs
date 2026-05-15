@@ -568,9 +568,12 @@ impl<'a> GraphFlattener<'a> {
     /// downstream consumers must continue to derive the calling-
     /// convention slot from `regallocs[kind].coloring`.
     pub fn enforce_input_args(&mut self) {
-        let inputargs = &self.graph.block(self.graph.startblock).inputargs;
+        let inputargs = self
+            .graph
+            .block(self.graph.startblock)
+            .inputarg_value_ids(self.graph);
         let mut numkinds: HashMap<RegKind, usize> = HashMap::new();
-        for &v in inputargs {
+        for v in inputargs {
             let Some((kind, _curcol)) = lookup_kind_color(v, self.graph, self.regallocs) else {
                 continue;
             };
@@ -592,8 +595,11 @@ impl<'a> GraphFlattener<'a> {
         let block = self.graph.block(bid);
         // `if block.exits == (): self.make_return(block.inputargs); return`.
         if block.exits.is_empty() {
-            let final_args: Vec<LinkArg> =
-                block.inputargs.iter().copied().map(LinkArg::from).collect();
+            let final_args: Vec<LinkArg> = block
+                .inputarg_value_ids(self.graph)
+                .into_iter()
+                .map(LinkArg::from)
+                .collect();
             self.make_return(&final_args);
             return;
         }
@@ -681,7 +687,7 @@ impl<'a> GraphFlattener<'a> {
                     &args[0],
                     self.graph
                         .block(self.graph.returnblock)
-                        .inputargs
+                        .inputarg_value_ids(self.graph)
                         .first()
                         .copied(),
                 );
@@ -711,7 +717,7 @@ impl<'a> GraphFlattener<'a> {
                     &args[1],
                     self.graph
                         .block(self.graph.exceptblock)
-                        .inputargs
+                        .inputarg_value_ids(self.graph)
                         .get(1)
                         .copied(),
                 );
@@ -766,7 +772,7 @@ impl<'a> GraphFlattener<'a> {
             }
         }
         // `self.insert_renamings(link); self.make_bytecode_block(link.target, handling_ovf)`.
-        let target_inputargs = target.inputargs.clone();
+        let target_inputargs = target.inputarg_value_ids(self.graph);
         self.insert_renamings(link, &target_inputargs);
         self.make_bytecode_block(link.target, handling_ovf);
     }
@@ -1273,7 +1279,7 @@ fn lookup_kind_color(
 fn compute_num_values(graph: &FunctionGraph, ops: &[FlatOp]) -> usize {
     let mut max_value = 0usize;
     for block in &graph.blocks {
-        for &arg in &block.inputargs {
+        for arg in block.inputarg_value_ids(graph) {
             max_value = max_value.max(arg.0 + 1);
         }
         for op in &block.operations {
@@ -1936,7 +1942,7 @@ mod tests {
         graph.push_op(entry, OpKind::Live, false);
         let continuation = graph.create_block();
         let phi = graph.alloc_value();
-        graph.block_mut(continuation).inputargs.push(phi);
+        graph.push_inputarg(continuation, phi);
         graph.set_return(continuation, Some(phi));
 
         let (exc_block, last_exception, last_exc_value) = graph.exceptblock_args();
@@ -1981,8 +1987,8 @@ mod tests {
         let handler = graph.create_block();
         let handler_exc_type = graph.alloc_value();
         let handler_exc_value = graph.alloc_value();
-        graph.block_mut(handler).inputargs.push(handler_exc_type);
-        graph.block_mut(handler).inputargs.push(handler_exc_value);
+        graph.push_inputarg(handler, handler_exc_type);
+        graph.push_inputarg(handler, handler_exc_value);
         // Upstream invariant: typed catch handlers are not empty blocks.
         // Keep one op in the handler so the bare-reraise collapse remains
         // reserved for the empty exception block shape from flatten.py.
@@ -2136,8 +2142,8 @@ mod tests {
         let handler = graph.create_block();
         let handler_exc_type = graph.alloc_value();
         let handler_exc_value = graph.alloc_value();
-        graph.block_mut(handler).inputargs.push(handler_exc_type);
-        graph.block_mut(handler).inputargs.push(handler_exc_value);
+        graph.push_inputarg(handler, handler_exc_type);
+        graph.push_inputarg(handler, handler_exc_value);
         let forty_two = graph.push_op(handler, OpKind::ConstInt(42), true).unwrap();
         graph.set_return(handler, Some(forty_two));
 
@@ -2739,8 +2745,8 @@ mod tests {
             let block = graph.create_block();
             let exc_type = graph.alloc_value();
             let exc_value = graph.alloc_value();
-            graph.block_mut(block).inputargs.push(exc_type);
-            graph.block_mut(block).inputargs.push(exc_value);
+            graph.push_inputarg(block, exc_type);
+            graph.push_inputarg(block, exc_value);
             let marker = graph
                 .push_op(block, OpKind::ConstInt(marker_value), true)
                 .unwrap();

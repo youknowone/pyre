@@ -298,11 +298,12 @@ impl RegAllocator {
         die_list.sort_by_key(|(t, _)| *t);
 
         // inputargs all interfere with each other
-        let livevars: Vec<crate::flowspace::model::Variable> = block
-            .inputargs
+        let inputarg_vids = block.inputarg_value_ids(graph);
+        let livevars: Vec<crate::flowspace::model::Variable> = inputarg_vids
             .iter()
+            .copied()
             .zip(block.input_variables(graph))
-            .filter(|(v, _)| consider(**v))
+            .filter(|(v, _)| consider(*v))
             .map(|(_, var)| var.clone())
             .collect();
         for (i, v) in livevars.iter().enumerate() {
@@ -371,7 +372,8 @@ impl RegAllocator {
                     }
                 }
                 let target_block = graph.block(link.target);
-                for (v, &w) in link.args.iter().zip(target_block.inputargs.iter()) {
+                let target_vids = target_block.inputarg_value_ids(graph);
+                for (v, &w) in link.args.iter().zip(target_vids.iter()) {
                     if let Some(v) = v.as_value() {
                         if consider(v) {
                             self.depgraph.add_node(Self::var(graph, v));
@@ -495,7 +497,9 @@ impl RegAllocResult {
 /// `Variable.concretetype` cell via `graph.set_concretetype`
 /// instead of returning a transitional HashMap.
 pub fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
-    let except_args = graph.block(graph.exceptblock).inputargs.clone();
+    let except_args = graph
+        .block(graph.exceptblock)
+        .inputarg_value_ids(graph);
     if except_args.len() == 2 {
         if matches!(graph.concretetype(except_args[0]), ConcreteType::Unknown) {
             graph.set_concretetype(except_args[0], ConcreteType::Signed);

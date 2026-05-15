@@ -49,7 +49,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
     // Resolve from ops with explicit type info
     for block in &graph.blocks {
         // Resolve inputargs (Phi nodes) from annotations
-        for &vid in &block.inputargs {
+        for vid in block.inputarg_value_ids(graph) {
             if state.get(vid) == &ConcreteType::Unknown {
                 let vtype = annotations.types.get(&vid).unwrap_or(&ValueType::Unknown);
                 let concrete = valuetype_to_concrete(vtype);
@@ -318,8 +318,8 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
     // every reachable value.
     let mut seen: std::collections::HashSet<ValueId> = std::collections::HashSet::new();
     for block in &graph.blocks {
-        for v in &block.inputargs {
-            seen.insert(*v);
+        for v in block.inputarg_value_ids(graph) {
+            seen.insert(v);
         }
         for op in &block.operations {
             for v in crate::inline::op_value_refs(&op.kind) {
@@ -408,7 +408,8 @@ fn link_is_raise_like(link: &Link) -> bool {
 
 fn convert_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &Link) {
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         let _ = maybe_seed_concrete_type(state, *dst, link_arg_concrete_type(state, src));
     }
 }
@@ -422,7 +423,8 @@ fn convert_raise_link(state: &mut TypeResolutionState, graph: &FunctionGraph, li
     }
 
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         let src_ty = if Some(src) == link.last_exception.as_ref() {
             ConcreteType::Signed
         } else if Some(src) == link.last_exc_value.as_ref() {
@@ -437,7 +439,8 @@ fn convert_raise_link(state: &mut TypeResolutionState, graph: &FunctionGraph, li
 fn converge_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &Link) -> bool {
     let mut changed = false;
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         match src {
             LinkArg::Value(src) => {
                 let src_ty = state.get(*src).clone();
@@ -467,7 +470,8 @@ fn converge_raise_link(
     }
 
     let target_block = graph.block(link.target);
-    for (dst, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+    let target_vids = target_block.inputarg_value_ids(graph);
+    for (dst, src) in target_vids.iter().zip(link.args.iter()) {
         let src_ty = if Some(src) == link.last_exception.as_ref() {
             ConcreteType::Signed
         } else if Some(src) == link.last_exc_value.as_ref() {
