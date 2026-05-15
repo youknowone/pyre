@@ -8075,6 +8075,72 @@ pub fn find_loop_header_pcs(
     loop_header_pcs
 }
 
+/// All PCs that are block-entry points: PC 0, every forward jump
+/// target, every backward jump target, and every exception handler
+/// entry.  Mirrors upstream's set of `joinpoints` keys after
+/// `flowcontext.py:425-435 set_branch` has fired for every branch
+/// instruction (the `mergeblock` candidates list at PC X is
+/// non-empty iff PC X is an entry from at least one branch / fall-
+/// through / catch edge).  Pre-scanning lets the per-block walker
+/// pre-allocate one SpamBlock per boundary at walker entry, retiring
+/// the per-PC self-registration that pyre's PC-sequential walker
+/// previously needed at every emit_mark_label_pc fall-through arm.
+///
+/// PC 0 is always included (entry block).  Catch landings come from
+/// `code.exception_table` via `frame_blocks_for_offset` consumers;
+/// callers thread those in if they need them in the same set, but
+/// this scan focuses on the bytecode-derived branch destinations
+/// where upstream's `mergeblock` would create candidates.
+pub fn find_branch_target_pcs(
+    code: &pyre_interpreter::CodeObject,
+) -> std::collections::HashSet<usize> {
+    let num_instrs = code.instructions.len();
+    let mut targets: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    targets.insert(0);
+    let mut scan_state = OpArgState::default();
+    for scan_pc in 0..num_instrs {
+        let (scan_instr, scan_arg) = scan_state.get(code.instructions[scan_pc]);
+        // Backward jumps reuse the canonical helper.
+        if let Some(target) = backward_jump_target(code, scan_pc, scan_instr, scan_arg) {
+            if target < num_instrs {
+                targets.insert(target);
+            }
+        }
+        // Forward conditional / unconditional jumps.  Targets compute
+        // via `jump_target_forward(code, num_instrs, py_pc + 1, delta)`
+        // matching the walker's PopJumpIfFalse / PopJumpIfTrue /
+        // JumpForward arms.
+        let forward_delta = match scan_instr {
+            Instruction::PopJumpIfFalse { delta }
+            | Instruction::PopJumpIfTrue { delta }
+            | Instruction::JumpForward { delta } => Some(delta.get(scan_arg).as_usize()),
+            _ => None,
+        };
+        if let Some(delta) = forward_delta {
+            let target = jump_target_forward(code, num_instrs, scan_pc + 1, delta);
+            if target < num_instrs {
+                targets.insert(target);
+            }
+            // The fallthrough PC after a conditional branch is also a
+            // boundary (the linktrue / linkfalse fallthrough side).
+            // Unconditional JumpForward has no fallthrough but the
+            // PC after the next instruction may be reached from
+            // elsewhere; including it does not create false boundaries
+            // because the subsequent backward-jump scan / next-iteration
+            // branch will repopulate it as needed.
+            let fallthrough = scan_pc + 1;
+            if matches!(
+                scan_instr,
+                Instruction::PopJumpIfFalse { .. } | Instruction::PopJumpIfTrue { .. }
+            ) && fallthrough < num_instrs
+            {
+                targets.insert(fallthrough);
+            }
+        }
+    }
+    targets
+}
+
 // `liveness_regs_to_u8_sorted` tests removed alongside the helper.
 // The 256-register cap is now enforced inside `encode_liveness` and
 // covered by `majit_translate::liveness::encode_liveness*` tests.
