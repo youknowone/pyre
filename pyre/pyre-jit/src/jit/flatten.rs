@@ -2363,36 +2363,6 @@ pub fn flatten_graph<'a>(
     ssarepr
 }
 
-/// Phase 4 Session 18 (Task #227 prerequisite) — single-family parallel
-/// flatten probe.  Walks `graph.iterblocks()` (DFS from startblock per
-/// `flowspace/model.py:66-77 FunctionGraph.iterblocks`) and emits one
-/// `Insn::Op` per `block.operations` entry whose `opname` matches
-/// `family_opname`, using `get_register` to project graph Variables onto
-/// register slots.  Constants in arg position lower through
-/// `flatten_constant_operand`.
-///
-/// **NOT a `flatten_graph` replacement.**  `rpython/jit/codewriter/
-/// flatten.py:63 flatten_graph` runs `enforce_input_args()` followed by
-/// `generate_ssa_form()` (`flatten.py:88` + `:102`); the latter walks
-/// `make_bytecode_block`/`make_link`/`insert_exits` recursively and
-/// emits the canonical `Label` per block, `make_return` /
-/// `make_exception_link` per terminator, and `insert_renamings` per
-/// link.  This helper deliberately skips ALL of that:
-///   - no `enforce_input_args` simulation (start inputarg colors are
-///     left at their raw chordal-coloring assignment, which can differ
-///     from the canonical `0, 1, 2, …` per kind),
-///   - no `Label` emission (the SSARepr would interleave block-entry
-///     labels with the family ops),
-///   - no `insert_exits` / `make_link` / `insert_renamings` (link-arg
-///     rename `*_copy` / `*_push` / `*_pop` ops are absent),
-///   - no return / exception terminator emission (`make_return`,
-///     `make_exception_link`, `reraise`, `raise`),
-///   - no `last_exception` / `last_exc_value` book-keeping.
-///
-/// The helper exists for the `[phase4-flatten-family]` probe at
-/// `codewriter.rs::transform_graph_to_jitcode` whose goal is the
-/// narrower question "does the graph carry the SAME `family_opname`
-
 /// Lower one `SpaceOperation` to a single `Insn::Op`.  Used by
 /// [`flatten_op_to_insn_with_lowering`] as the passthrough fallback
 /// when no HLOp lowering matches.  Constant operands lower via the
@@ -2630,15 +2600,12 @@ fn binary_op_tag_for_opname(opname: &str) -> Option<i64> {
 /// HLOp (caller falls through to the default opname-passthrough Insn
 /// arm in `flatten_op_to_insn`).
 ///
-/// Task #48 micro-slice 1: BINARY_OP family lowering.  Not yet wired
-/// into `flatten_op_to_insn`; lives standalone with unit tests until
-/// micro-slice 2 introduces the `[phase4-flatten-lowering]`
-/// sequence_match probe that compares this helper's output against
-/// the existing dual-write residual_call across production fixtures.
-/// Once verified byte-equivalent, micro-slice 3 retires the inline
-/// `emit_residual_call(binary_op_fn_idx, ...)` callsite plus the
-/// matching graph dual-write — the graph then carries only the
-/// `add(...)` HLOp and flatten lowers it here into the SSARepr.
+/// BINARY_OP family lowering.  Production walker emits the lowered
+/// `residual_call_ir_r` Insn directly via
+/// [`build_binary_op_residual_call_ir_r_insn`] at the callsite; the
+/// graph carries only the pre-rtype `add(...)` HLOp.  This helper
+/// produces the same Insn from the HLOp for the post-walker
+/// `flatten_op_to_insn_with_lowering` dispatcher.
 pub fn lower_binary_op_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -2676,10 +2643,9 @@ where
 /// `emit_residual_call(binary_op_fn_idx, ...)` + matching graph
 /// dual-write at codewriter.rs:5335-5378.
 ///
-/// Mirrors [`lower_binary_op_hlop_to_insn`]'s output shape so the
-/// `[phase4-flatten-lowering]` probe's `sequence_match=true`
-/// invariant guarantees byte-equivalence with what
-/// `emit_residual_call_shape` produced before retirement.
+/// Mirrors [`lower_binary_op_hlop_to_insn`]'s output shape: the
+/// post-walker dispatcher and the walker-time direct push both produce
+/// the same `residual_call_ir_r` Insn bytes.
 ///
 /// `op_val` is the `binary_op_tag` integer derived from the
 /// `BinaryOperator` (e.g., `add → 0`, `sub → 1`); production
@@ -2780,13 +2746,11 @@ fn compare_op_tag_for_opname(opname: &str) -> Option<i64> {
 /// leading `fn_idx` literal.  Returns `None` for non-family opnames
 /// so the caller can fall through.
 ///
-/// Task #48 micro-slice 4 (COMPARE_OP retirement): same pattern as
-/// [`lower_binary_op_hlop_to_insn`].  The
-/// `[phase4-flatten-lowering]` probe gains a parallel COMPARE_OP
-/// arm; once `sequence_match=true` is verified the inline
-/// `emit_residual_call(compare_fn_idx, ...)` callsite plus its
-/// graph dual-write are retired in favour of the
-/// `build_compare_op_residual_call_ir_r_insn` helper.
+/// COMPARE_OP family lowering — same pattern as
+/// [`lower_binary_op_hlop_to_insn`].  Production walker emits via
+/// [`build_compare_op_residual_call_ir_r_insn`]; this helper
+/// reconstructs the same Insn from the HLOp for the post-walker
+/// dispatcher.
 pub fn lower_compare_op_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -3262,13 +3226,12 @@ pub fn build_build_slice_fn_residual_call_ir_r_insn(
 /// BINARY_OP / COMPARE_OP).  Returns `None` for non-`bool`
 /// opnames.
 ///
-/// Task #48 micro-slice 5 (BOOL retirement): same per-family
-/// pattern as micro-slices 3-4 but a different residual_call
-/// shape.  After the `[phase4-flatten-lowering]` probe verifies
-/// `sequence_match=true` on production fixtures, the inline
-/// `emit_residual_call(truth_fn_idx, ...)` callsites at
-/// PopJumpIfFalse / PopJumpIfTrue and their graph dual-writes
-/// retire in favour of `build_truth_fn_residual_call_r_i_insn`.
+/// BOOL family lowering — same per-family pattern as the BINARY_OP
+/// and COMPARE_OP retirements but a different residual_call shape.
+/// Production walker emits the lowered Insn via
+/// [`build_truth_fn_residual_call_r_i_insn`] at PopJumpIfFalse /
+/// PopJumpIfTrue; this helper reconstructs the same Insn from the
+/// `bool` HLOp for the post-walker dispatcher.
 pub fn lower_bool_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -3429,14 +3392,6 @@ where
 /// factor-refactored families.  After
 /// retirement the walker would only record graph ops; this dispatcher
 /// is the per-op core of the post-walker driver.
-///
-/// The `[phase4-flatten-driver]` probe at codewriter.rs verifies
-/// that walking `graph.iterblocks()` once through this dispatcher
-/// produces a residual_call_* Insn sequence (per retired family,
-/// filtered by `(opname, fn_idx)`) byte-equivalent in shape to the
-/// inline-emitted SSARepr.  Probe-positive answer is the precondition
-/// for switching production from inline emit to a post-walker
-/// `flatten_graph` driver that uses this dispatcher.
 ///
 /// Dispatch order is incidental — the four retired-family opname sets
 /// are disjoint (`binary_op_tag_for_opname` / `compare_op_tag_for_opname`
@@ -4640,16 +4595,12 @@ mod tests {
 
     #[test]
     fn flatten_graph_with_lowering_byte_equivalent_across_blocks() {
-        // the `[phase4-flatten-graph]` probe runs the
-        // FULL `flatten_graph_with_lowering` driver end-to-end against
-        // a fresh SSARepr.  Production graphs span multiple blocks, so
-        // the per-family `(opname, fn_idx)` filter must survive the
+        // Pin that the per-family `(opname, fn_idx)` lowering survives the
         // GraphFlattener's `make_link` / `insert_exits` block boundary
-        // emission (Labels, terminators, link renamings) without
-        // dropping or reordering the retired-family residual_calls.
-        // This test pins that invariant: a 2-block graph with one
-        // BINARY_OP `add` in the start block and one COMPARE_OP `lt`
-        // in the second block lowers to a single
+        // emission (Labels, terminators, link renamings) without dropping
+        // or reordering the retired-family residual_calls.  A 2-block
+        // graph with one BINARY_OP `add` in the start block and one
+        // COMPARE_OP `lt` in the second block must lower to a single
         // `residual_call_ir_r` per block in start-then-next order.
         use crate::jit::flow::{Block, FunctionGraph, Link};
         let lhs = Variable::new(VariableId(0), Kind::Ref);

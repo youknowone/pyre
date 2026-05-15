@@ -1019,10 +1019,9 @@ fn make_next_block(
     newstate.blocklist = frame_blocks_for_offset(code, next_offset);
     newstate.next_offset = next_offset;
     let newblock = SpamBlockRef::new(graph.new_block(Vec::new()), Some(newstate.clone()));
-    // Task #227.3 SpamBlockRef enumeration — track every walker-
-    // created block in walker-visit order so the post-walk drain
-    // probe (`[phase4-walker-drain]`) can iterate per-block
-    // accumulators byte-equivalent to program-wide `ssarepr.insns`.
+    // Track every walker-created block in walker-visit order so the
+    // post-walk drain can iterate per-block accumulators in the same
+    // order their emits reached the program-wide `ssarepr.insns`.
     all_walker_blocks.push(newblock.clone());
     newblock.block().borrow_mut().inputargs = newstate.getvariables();
     append_exit_with_state(
@@ -3183,14 +3182,11 @@ impl CodeWriter {
         // onto slots.  Keyed on `LinkRef` (Rc-pointer identity).
         let mut link_exit_states: HashMap<super::flow::LinkRef, FrameState> = HashMap::new();
         let start_state = entry_frame_state(code, is_portal);
-        // Task #227.3 SpamBlockRef enumeration — collects every walker-
-        // created block in walker-visit order so the post-walk drain
-        // probe (`[phase4-walker-drain]`) can iterate per-block
-        // accumulators and verify byte-equivalence with `ssarepr.insns`.
-        // Walker-visit order matches the order in which `ssarepr.insns`
-        // received their emits, since each block's per-block accumulator
-        // received pushes contiguously between the block's first
-        // `emit_mark_label_pc!` and its terminator.
+        // Collect every walker-created block in walker-visit order so the
+        // post-walk drain can iterate per-block accumulators in the same
+        // order their pushes reached `ssarepr.insns`.  Each block's
+        // accumulator receives emits contiguously between the block's
+        // first `emit_mark_label_pc!` and its terminator.
         let mut all_walker_blocks: Vec<SpamBlockRef> = Vec::new();
         if num_instrs > 0 {
             let start_block =
@@ -3951,11 +3947,7 @@ impl CodeWriter {
         // orthodox graph emission, and intentionally has no
         // `record_graph_op` companion — recording it graph-side at
         // every PC would create a `-live-` cluster the upstream graph
-        // never holds and would mask real walker→graph gaps in the
-        // `[phase4-graph-shape]` probe.  See
-        // `super::flatten::is_ssa_only_artifact`'s `OPNAME_LIVE`
-        // clause for the matching probe-side carveout and the
-        // convergence path back to RPython orthodox emission.
+        // never holds.
         macro_rules! emit_live_placeholder {
             () => {{
                 // RPython force-alive mechanism (`liveness.py:11-12`):
@@ -5360,19 +5352,12 @@ impl CodeWriter {
                             stored_value,
                             py_pc as i64,
                         );
-                        // Task #48 micro-slice 6: SETITEM family
-                        // retirement.  Mirror of slices 3-5: inline
-                        // `emit_residual_call(store_subscr_fn_idx, ...)`
-                        // plus its `is_portal`-gated graph dual-write
-                        // collapse to a single direct push via the
+                        // SETITEM family retirement: emit the lowered
+                        // `residual_call_r_v` Insn directly here via the
                         // `(Ref, Ref, Ref) → Void` shape constructor.
-                        // `[phase4-flatten-lowering]` probe `SETITEM
-                        // sequence_match=true` guarantees byte-
-                        // equivalence with the prior
-                        // `emit_residual_call_shape` output.  Graph
-                        // carries only the void `setitem(obj, key,
-                        // value)` HLOp from `emit_frontend_setitem`
-                        // above.
+                        // Graph carries only the void
+                        // `setitem(obj, key, value)` HLOp from
+                        // `emit_frontend_setitem` above.
                         push_walker_emit(&current_block,
                             super::flatten::build_store_subscr_fn_residual_call_r_v_insn(
                                 store_subscr_fn_idx,
@@ -5432,27 +5417,14 @@ impl CodeWriter {
                             rhs_value,
                             py_pc as i64,
                         );
-                        // Task #48 micro-slice 3: BINARY_OP family
-                        // retirement.  The prior `emit_residual_call(
-                        // binary_op_fn_idx, ...)` plus its `is_portal`-gated
-                        // graph dual-write at this site (Task #46
-                        // micro-slice 1) are replaced by a single direct
-                        // `build_binary_op_residual_call_ir_r_insn` push.
-                        // The `[phase4-flatten-lowering]` probe (micro-
-                        // slice 2) verified `sequence_match=true` on
-                        // int_loop + fannkuch fixtures for every
-                        // BINARY_OP HLOp `add(lhs, rhs)` lowered through
-                        // the helper, guaranteeing byte-equivalence with
-                        // the prior `emit_residual_call_shape` output.
+                        // BINARY_OP family retirement: emit the lowered
+                        // `residual_call_ir_r` Insn directly here via
+                        // `build_binary_op_residual_call_ir_r_insn`.
                         // Graph carries only the `add(lhs, rhs)` HLOp
-                        // (recorded by `emit_frontend_binary` above);
-                        // the helper consumes the same `(fn_idx, op_val,
-                        // lhs_reg, rhs_reg, dst)` tuple the dual-write
-                        // would have folded back into a `residual_call_ir_r`
-                        // SpaceOperation, but skips the SpaceOperation
-                        // round-trip — flatten-time reconstruction stays
-                        // available for the probe and any future
-                        // `flatten_graph(graph, regallocs)` driver.
+                        // recorded by `emit_frontend_binary` above; the
+                        // helper produces the same Insn bytes the
+                        // post-walker `flatten_graph(graph, regallocs)`
+                        // dispatcher would emit from that HLOp.
                         push_walker_emit(&current_block,
                             super::flatten::build_binary_op_residual_call_ir_r_insn(
                                 binary_op_fn_idx,
@@ -5490,19 +5462,12 @@ impl CodeWriter {
                             rhs_value,
                             py_pc as i64,
                         );
-                        // Task #48 micro-slice 4: COMPARE_OP family
-                        // retirement.  Mirrors micro-slice 3 BinaryOp
-                        // closure.  `[phase4-flatten-lowering]` probe
-                        // verified `sequence_match=true` on int_loop +
-                        // fannkuch portal fixtures across every
-                        // COMPARE_OP HLOp lowering, guaranteeing
-                        // byte-equivalence with the prior
-                        // `emit_residual_call_shape` output.  Graph
-                        // carries only the `lt(lhs, rhs)` (or sibling)
-                        // HLOp from `emit_frontend_compare`; the
-                        // SSARepr Insn is built by the helper that
-                        // shares its shape with the probe-side
-                        // `lower_compare_op_hlop_to_insn`.
+                        // COMPARE_OP family retirement: same closure as
+                        // BinaryOp above.  Graph carries only the
+                        // `lt(lhs, rhs)` (or sibling) HLOp from
+                        // `emit_frontend_compare`; the SSARepr Insn is
+                        // built here by the helper whose output shape
+                        // matches `lower_compare_op_hlop_to_insn`.
                         push_walker_emit(&current_block,
                             super::flatten::build_compare_op_residual_call_ir_r_insn(
                                 compare_fn_idx,
@@ -5550,18 +5515,11 @@ impl CodeWriter {
                         current_block.block().borrow_mut().exitswitch =
                             Some(super::flow::ExitSwitch::Value(bool_value.into()));
                         let scratch_truth = ssarepr.fresh_var(Kind::Int, scratch_int_base).0;
-                        // Task #48 micro-slice 5: BOOL family
-                        // retirement.  Mirror of slices 3-4: inline
-                        // `emit_residual_call(truth_fn_idx, ...)` plus
-                        // its `is_portal`-gated graph dual-write
-                        // collapse to a single direct push via the
-                        // `(Ref) → Int` shape constructor.
-                        // `[phase4-flatten-lowering]` probe `BOOL
-                        // sequence_match=true` guarantees byte-
-                        // equivalence with the prior
-                        // `emit_residual_call_shape` output.  Graph
-                        // carries only the `bool(cond_value)` HLOp
-                        // from `emit_frontend_bool` above.
+                        // BOOL family retirement: emit the lowered
+                        // `residual_call_r_i` Insn directly here via the
+                        // `(Ref) → Int` shape constructor.  Graph carries
+                        // only the `bool(cond_value)` HLOp from
+                        // `emit_frontend_bool` above.
                         push_walker_emit(&current_block,
                             super::flatten::build_truth_fn_residual_call_r_i_insn(
                                 truth_fn_idx,
