@@ -4840,6 +4840,71 @@ mod tests {
     }
 
     #[test]
+    fn canonical_flatten_graph_lowers_retired_family_via_cpu_lowering_ctx() {
+        // Production-shape pipeline: graph carries a BINARY_OP `add`
+        // HLOp; canonical `flatten_graph(graph, regallocs, false,
+        // Some(&cpu))` derives `LoweringContext` from
+        // `cpu.lowering_ctx` and lowers the HLOp via the dispatcher
+        // (`flatten_op_to_insn_with_lowering`) into the matching
+        // `residual_call_ir_r` Insn shape.  This pins the post-Phase-3
+        // pipeline equivalence between the walker's inline
+        // `build_binary_op_residual_call_ir_r_insn` push and the
+        // canonical entry's dispatcher-driven emission.
+        use crate::jit::cpu::Cpu;
+        use crate::jit::flow::{Block, FunctionGraph, Link};
+        use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
+
+        let lhs = Variable::new(VariableId(0), Kind::Ref);
+        let rhs = Variable::new(VariableId(1), Kind::Ref);
+        let add_res = Variable::new(VariableId(2), Kind::Ref);
+        let start = Block::shared(vec![lhs.into(), rhs.into()]);
+        let graph = FunctionGraph::new("canonical_retired_family", start.clone(), None);
+        super::super::flow::push_op(
+            &start,
+            SpaceOperation::new("add", vec![lhs.into(), rhs.into()], Some(add_res.into()), 0),
+        );
+        start.closeblock(vec![
+            Link::new(vec![add_res.into()], Some(graph.returnblock.clone()), None).into_ref(),
+        ]);
+
+        let cpu = Cpu::new();
+        *cpu.lowering_ctx.write().unwrap() = Some(LoweringContext {
+            binary_op_fn_idx: 11,
+            compare_op_fn_idx: 13,
+            truth_fn_idx: 17,
+            store_subscr_fn_idx: 19,
+        });
+
+        let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
+        let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, Some(&cpu));
+
+        let has_binary_op_lowered = ssarepr.insns.iter().any(|insn| {
+            matches!(
+                insn,
+                Insn::Op { opname, args, .. }
+                    if opname == "residual_call_ir_r"
+                        && matches!(args.first(), Some(Operand::ConstInt(11)))
+            )
+        });
+        let has_raw_add = ssarepr
+            .insns
+            .iter()
+            .any(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "add"));
+        assert!(
+            has_binary_op_lowered,
+            "canonical flatten_graph with cpu.lowering_ctx must lower BINARY_OP \
+             `add` HLOp to residual_call_ir_r(fn_idx=11, ...): {:?}",
+            ssarepr.insns
+        );
+        assert!(
+            !has_raw_add,
+            "canonical flatten_graph must NOT passthrough `add` opname when \
+             LoweringContext is present: {:?}",
+            ssarepr.insns
+        );
+    }
+
+    #[test]
     fn canonical_flatten_graph_lowers_rtyped_opaque_ref_link_arg() {
         // End-to-end pipeline: graph carrying an `Opaque(Ref)` link
         // arg is fed through `rtype_opaque_constants` (matches the
