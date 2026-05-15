@@ -15,52 +15,8 @@ use majit_ir::{AccumInfo, Const, DescrRef, FailDescr, GcRef, Type};
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Mutex, OnceLock, RwLock};
-
-/// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
-/// `Arc::as_ptr` address to its attached `BridgeData` (if any).
-///
-/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) carries no
-/// `bridge` slot; upstream `compile.py:attach_bridge` patches the
-/// failing guard's machine-code JMP to point at the bridge entry,
-/// leaving the descr untouched.  Cranelift cannot patch finalised
-/// code, so it parks the per-descr `BridgeData` here and the JIT
-/// dispatch path reads it on guard failure (mediated by
-/// `BRIDGE_CACHES_TABLE` for the lock-free atomic cells).
-///
-/// Held as `Arc<BridgeData>` so `bridge_ref` can hand out a cloned
-/// reference without holding the table mutex across the read.
-///
-/// `RwLock` rather than `Mutex`: `lookup_bridge` is on the
-/// guard-failure dispatch hot path
-/// (`compiler.rs::execute_compiled_code` at every `fail_descr`
-/// observation, and `compiler.rs:6021-6116` runtime helpers).
-/// Writers (`register_bridge` / `take_bridge` / `Drop`) only run at
-/// bridge attach / detach time, so reader contention dominates.  A
-/// `Mutex` serialised every dispatch on a single atomic and showed up
-/// as a 2.7× regression in fannkuch (cranelift) per the macOS CI
-/// timeout — `RwLock` lets concurrent dispatches read in parallel.
-static BRIDGE_TABLE: OnceLock<RwLock<HashMap<usize, Arc<BridgeData>>>> = OnceLock::new();
-
-fn bridge_table() -> &'static RwLock<HashMap<usize, Arc<BridgeData>>> {
-    BRIDGE_TABLE.get_or_init(|| RwLock::new(HashMap::new()))
-}
-
-pub fn register_bridge(descr_ptr: usize, bridge: BridgeData) {
-    bridge_table()
-        .write()
-        .expect("BRIDGE_TABLE rwlock poisoned")
-        .insert(descr_ptr, Arc::new(bridge));
-}
-
-pub fn lookup_bridge(descr_ptr: usize) -> Option<Arc<BridgeData>> {
-    bridge_table()
-        .read()
-        .expect("BRIDGE_TABLE rwlock poisoned")
-        .get(&descr_ptr)
-        .cloned()
-}
+use std::sync::atomic::{AtomicPtr, AtomicU32, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to its `Box<AtomicUsize>` bridge caches.
@@ -567,21 +523,37 @@ pub struct CraneliftFailDescr {
     /// those exits route through dedicated metainterp Done* descrs
     /// owned by `MetaInterpStaticData`, not via `op.descr`.
     pub meta_descr: Option<DescrRef>,
+    /// `compile.py:attach_bridge` / `assembler.py:987 patch_jump_for_descr`
+    /// parity — descr-local atomic cell holding the published
+    /// `Arc<BridgeData>` raw pointer.  Equivalent to PyPy's
+    /// `adr_jump_offset` (`history.py:132 _attrs_`): a stable raw
+    /// memory cell whose contents are patched in-place at
+    /// `attach_bridge` time and read lock-free by the guard-failure
+    /// dispatch (PyPy: JMP rel32; pyre: `bridge_ref` atomic load +
+    /// `Arc::increment_strong_count`).  `Box` gives the cell a
+    /// heap-pinned address (descr is wrapped in `Arc::new` after
+    /// construction; without Box the cell address would change).
+    ///
+    /// Null on construction (no bridge attached).  Holds a raw pointer
+    /// from `Arc::into_raw(Arc::new(bridge_data))` after
+    /// `attach_bridge`; `Drop` reclaims the Arc.
+    pub bridge_dispatch_cell: Box<std::sync::atomic::AtomicPtr<BridgeData>>,
 }
 
 impl Drop for CraneliftFailDescr {
     /// Backend-static side-tables (`EXTERNAL_JUMP_TARGETS`,
     /// `FAIL_COUNT_TABLE`, `FORCE_TOKEN_SLOTS_TABLE`,
-    /// `BRIDGE_CACHES_TABLE`, `BRIDGE_TABLE`) are keyed on the descr's
-    /// inner address.  Without cleanup the entry would outlive the
-    /// descr and the allocator may reuse the freed address for a
-    /// future descr that would then observe stale state.
+    /// `BRIDGE_CACHES_TABLE`) are keyed on the descr's inner address.
+    /// Without cleanup the entry would outlive the descr and the
+    /// allocator may reuse the freed address for a future descr that
+    /// would then observe stale state.
     ///
-    /// Bridge cleanup must drop the removed `Arc<BridgeData>` AFTER
-    /// the `BRIDGE_TABLE` lock is released — `BridgeData::fail_descrs`
-    /// holds `Arc<CraneliftFailDescr>` clones whose own `Drop` will
-    /// recursively re-acquire the same mutex on the same thread, and
-    /// `std::sync::Mutex` is non-reentrant.
+    /// `bridge_dispatch_cell` lives directly on the descr; reclaim
+    /// the published `Arc<BridgeData>` by swapping the cell to null
+    /// and reconstructing the Arc.  `BridgeData::fail_descrs` may
+    /// hold `Arc<CraneliftFailDescr>` clones whose own `Drop` re-runs
+    /// this path on the same thread; the swap-to-null sequence is
+    /// reentrant (each descr touches only its own cell).
     fn drop(&mut self) {
         let ptr = self as *const Self as usize;
         external_jump_targets()
@@ -612,17 +584,18 @@ impl Drop for CraneliftFailDescr {
             .lock()
             .expect("BRIDGE_CACHES_TABLE mutex poisoned")
             .remove(&ptr);
-        // Take ownership of the bridge under a scoped write lock, then
-        // drop the Arc outside it to avoid the non-reentrant deadlock
-        // when `BridgeData::fail_descrs`' inner Arcs cascade into descr
-        // `Drop` calls that re-acquire `BRIDGE_TABLE`.
-        let removed_bridge = {
-            let mut guard = bridge_table()
-                .write()
-                .expect("BRIDGE_TABLE rwlock poisoned");
-            guard.remove(&ptr)
-        };
-        drop(removed_bridge);
+        // Reclaim the published `Arc<BridgeData>` (if any) from the
+        // descr-local dispatch cell.  Swap-to-null first so any
+        // concurrent `bridge_ref` reader either sees the still-live
+        // Arc (after `increment_strong_count`) or the null and skips.
+        let bridge_ptr = self
+            .bridge_dispatch_cell
+            .swap(std::ptr::null_mut(), Ordering::AcqRel);
+        if !bridge_ptr.is_null() {
+            // Safety: produced by `Arc::into_raw(Arc::new(bridge))` in
+            // `attach_bridge`; reconstruct the owning Arc and drop it.
+            unsafe { drop(Arc::from_raw(bridge_ptr as *const BridgeData)) };
+        }
     }
 }
 
@@ -660,7 +633,7 @@ impl std::fmt::Debug for CraneliftFailDescr {
             .field("fail_count", &get_fail_count(self as *const Self as usize))
             .field(
                 "has_bridge",
-                &lookup_bridge(self as *const Self as usize).is_some(),
+                &(!self.bridge_dispatch_cell.load(Ordering::Acquire).is_null()),
             )
             .finish()
     }
@@ -710,6 +683,7 @@ impl CraneliftFailDescr {
             trace_id,
             fail_arg_types,
             meta_descr: None,
+            bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
         }
     }
 
@@ -738,21 +712,40 @@ impl CraneliftFailDescr {
             trace_id,
             fail_arg_types,
             meta_descr: None,
+            bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
         }
     }
 
     // UnsafeCell accessor helpers — single-threaded, no lock needed.
     // RPython ResumeGuardDescr fields are plain attributes (GIL-protected).
 
-    /// Returns an owned `Option<Arc<BridgeData>>` (cloned from the
-    /// backend-static `BRIDGE_TABLE`).  Cheap clone — `Arc` bump only.
-    /// Signature changed from `&Option<BridgeData>` to
-    /// `Option<Arc<BridgeData>>` in Session 5i-cl when the field moved
-    /// off the descr struct (cannot hand out a borrow under the table
-    /// lock).
+    /// `assembler.py:987 patch_jump_for_descr` parity — read the
+    /// descr-local atomic dispatch cell.  PyPy's dispatch is a JMP
+    /// rel32 whose target is patched in-place by `attach_bridge`; pyre
+    /// reads the `Arc<BridgeData>` raw pointer the JIT thread wrote
+    /// there with `Arc::into_raw(Arc::new(...))`, then bumps the
+    /// strong count and reconstructs the `Arc`.  Lock-free and
+    /// HashMap-free (mirrors `adr_jump_offset` semantics).
     #[inline]
     pub fn bridge_ref(&self) -> Option<Arc<BridgeData>> {
-        lookup_bridge(self as *const Self as usize)
+        let ptr = self.bridge_dispatch_cell.load(Ordering::Acquire);
+        if ptr.is_null() {
+            None
+        } else {
+            // Safety: `ptr` was produced by `Arc::into_raw(Arc::new(bridge))`
+            // in `attach_bridge`; the cell only stores valid Arc raw
+            // pointers (or null).  `increment_strong_count` followed by
+            // `from_raw` produces an additional owning `Arc` without
+            // taking the original.  Drop ordering: the descr's `Drop`
+            // swaps the cell to null and reclaims the stored Arc only
+            // after no further `bridge_ref` reader can observe the old
+            // ptr (same release/acquire pairing as PyPy's GIL-protected
+            // descr access).
+            unsafe {
+                Arc::increment_strong_count(ptr as *const BridgeData);
+                Some(Arc::from_raw(ptr as *const BridgeData))
+            }
+        }
     }
 
     #[inline]
@@ -798,9 +791,12 @@ impl CraneliftFailDescr {
         load_bridge_code_ptr(self as *const Self as usize) as *const u8
     }
 
-    /// Attach a compiled bridge to this guard.  Writes the bridge
-    /// caches through the backend-static `BRIDGE_CACHES_TABLE` so the
-    /// JIT-embedded cell addresses stay stable.
+    /// `compile.py:attach_bridge` / `assembler.py:987 patch_jump_for_descr`
+    /// parity — atomic-store the bridge `Arc` raw pointer into the
+    /// descr-local dispatch cell.  PyPy patches the JMP rel32; pyre
+    /// patches the heap-pinned atomic cell.  Cell address is stable
+    /// for the descr's lifetime (heap-pinned via `Box`), so the
+    /// JIT-baked dispatch can read it lock-free.
     pub fn attach_bridge(&self, bridge: BridgeData) {
         let code_ptr = bridge.code_ptr as usize;
         let frame_depth = bridge
@@ -808,7 +804,17 @@ impl CraneliftFailDescr {
             .max(bridge.num_inputs)
             .max(1)
             .saturating_add(bridge.num_ref_roots);
-        register_bridge(self as *const Self as usize, bridge);
+        // `Arc::into_raw(Arc::new(bridge))` publishes the bridge data
+        // as a raw pointer the dispatch path can re-Arc via
+        // `increment_strong_count + Arc::from_raw`.  Swap atomically so
+        // a re-attach (unusual) reclaims the previous Arc.
+        let new_ptr = Arc::into_raw(Arc::new(bridge)) as *mut BridgeData;
+        let old_ptr = self.bridge_dispatch_cell.swap(new_ptr, Ordering::AcqRel);
+        if !old_ptr.is_null() {
+            // Safety: prior `attach_bridge` published this pointer;
+            // reclaim ownership and drop.
+            unsafe { drop(Arc::from_raw(old_ptr as *const BridgeData)) };
+        }
         store_bridge_caches(self as *const Self as usize, code_ptr, frame_depth);
     }
 
