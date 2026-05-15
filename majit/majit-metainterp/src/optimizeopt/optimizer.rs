@@ -79,7 +79,7 @@ pub struct Optimizer {
     /// pairs identifying the specific quasi-immutable slot that compiled
     /// code depends on. After compilation, each dependency gets the loop's
     /// invalidation flag registered as a per-slot watcher.
-    pub quasi_immutable_deps: std::collections::HashSet<(u64, u32)>,
+    pub quasi_immutable_deps: Vec<(u64, u32)>,
     /// Types of constant OpRefs from ConstantPool.constant_types.
     /// Used to distinguish Ref constants from Int in guard fail_args.
     pub constant_types: std::collections::HashMap<u32, majit_ir::Type>,
@@ -1145,7 +1145,7 @@ impl Optimizer {
             replaces_guard: std::collections::HashMap::new(),
             pendingfields: Vec::new(),
             can_replace_guards: true,
-            quasi_immutable_deps: std::collections::HashSet::new(),
+            quasi_immutable_deps: Vec::new(),
             constant_types: std::collections::HashMap::new(),
             imported_virtuals: Vec::new(),
             trace_inputarg_types: Vec::new(),
@@ -1374,12 +1374,13 @@ impl Optimizer {
         self.can_replace_guards = true;
     }
 
-    /// optimizer.py: quasi_immutable_deps[qmut] = None
-    /// Track a quasi-immutable field dependency. `dep` is (object_ptr,
-    /// field_index) identifying the specific slot the compiled loop
-    /// depends on. After compilation, a per-slot watcher is registered.
+    /// `optimizer.py:243` + `heap.py:807-808`
+    /// `self.quasi_immutable_deps[qmutdescr.qmut] = None`. Vec-backed
+    /// set with linear-scan dedup.
     pub fn add_quasi_immutable_dep(&mut self, dep: (u64, u32)) {
-        self.quasi_immutable_deps.insert(dep);
+        if !self.quasi_immutable_deps.contains(&dep) {
+            self.quasi_immutable_deps.push(dep);
+        }
     }
 
     /// optimizer.py: produce_potential_short_preamble_ops(sb)

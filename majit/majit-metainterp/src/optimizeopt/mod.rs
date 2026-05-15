@@ -611,11 +611,14 @@ pub struct OptContext {
     /// Tracks which imported short facts are actually consumed by the body.
     pub imported_short_preamble_builder:
         Option<crate::optimizeopt::shortpreamble::ShortPreambleBuilder>,
-    /// RPython optimizer.py: quasi_immutable_deps — collected during optimization.
-    /// (object_ptr, field_index) pairs identifying specific quasi-immutable
-    /// slots the trace depends on. After compilation, per-slot watchers
-    /// are registered.
-    pub quasi_immutable_deps: HashSet<(u64, u32)>,
+    /// `optimizer.py:243` `self.quasi_immutable_deps = None` (initialized
+    /// lazily as a dict in `heap.py:806-808`). Each entry pairs an
+    /// `(object_ptr, field_index)` quasi-immutable slot the trace
+    /// depends on; PyPy uses `dict[k] = None` for set semantics, but the
+    /// HashMap house rule forbids that — pyre uses a Vec with
+    /// linear-scan dedup. Typical size is small (< a few dozen entries
+    /// per trace), so O(n) inserts are acceptable.
+    pub quasi_immutable_deps: Vec<(u64, u32)>,
     /// info.py:716-721: ConstPtrInfo._get_info — const_infos stores
     /// StructPtrInfo for constant GC objects, keyed by pointer address.
     /// RPython: optheap.const_infos[ref] = StructPtrInfo(descr)
@@ -1493,9 +1496,14 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
 }
 
 impl OptContext {
-    /// RPython optimizer.py: add to quasi_immutable_deps
+    /// `optimizer.py:243` quasi-immutable dep registration with
+    /// dict-as-set semantics (`heap.py:807-808`
+    /// `self.optimizer.quasi_immutable_deps[qmutdescr.qmut] = None`).
+    /// Vec-backed set with linear-scan dedup.
     pub fn add_quasi_immutable_dep(&mut self, dep: (u64, u32)) {
-        self.quasi_immutable_deps.insert(dep);
+        if !self.quasi_immutable_deps.contains(&dep) {
+            self.quasi_immutable_deps.push(dep);
+        }
     }
 
     /// RPython Box.type invariant: each OpRef's type is fixed at creation
@@ -1579,7 +1587,7 @@ impl OptContext {
             string_length_resolver: None,
             string_content_resolver: None,
             string_constant_alloc: None,
-            quasi_immutable_deps: HashSet::new(),
+            quasi_immutable_deps: Vec::new(),
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),
@@ -1707,7 +1715,7 @@ impl OptContext {
             string_length_resolver: None,
             string_content_resolver: None,
             string_constant_alloc: None,
-            quasi_immutable_deps: HashSet::new(),
+            quasi_immutable_deps: Vec::new(),
             snapshot_boxes: Vec::new(),
             snapshot_frame_sizes: Vec::new(),
             snapshot_vable_boxes: Vec::new(),

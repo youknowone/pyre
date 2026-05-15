@@ -5832,7 +5832,7 @@ impl<M: Clone> MetaInterp<M> {
         optimizer.update_counters(&self.staticdata.profiler);
         // RPython compile.py:234 parity: transfer quasi-immutable deps
         // from optimizer to MetaInterp for post-compile watcher registration.
-        self.last_quasi_immutable_deps = optimizer.quasi_immutable_deps.drain().collect();
+        self.last_quasi_immutable_deps = std::mem::take(&mut optimizer.quasi_immutable_deps);
 
         if crate::majit_log_enabled() {
             eprintln!(
@@ -6223,7 +6223,7 @@ impl<M: Clone> MetaInterp<M> {
 
         // optimizer.py:557 self.resumedata_memo.update_counters(profiler)
         optimizer.update_counters(&self.staticdata.profiler);
-        self.last_quasi_immutable_deps = optimizer.quasi_immutable_deps.drain().collect();
+        self.last_quasi_immutable_deps = std::mem::take(&mut optimizer.quasi_immutable_deps);
 
         let num_ops_after = optimized_ops.len();
         if crate::majit_log_enabled() {

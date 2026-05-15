@@ -2473,8 +2473,10 @@ pub struct UnrollInfo {
     pub target_token: u64,
     /// Extra same_as ops added during finalization.
     pub extra_same_as: Vec<Op>,
-    /// Quasi-immutable dependencies discovered during optimization.
-    pub quasi_immutable_deps: std::collections::HashSet<(u64, u32)>,
+    /// Quasi-immutable dependencies discovered during optimization
+    /// (`optimizer.py:243` + `heap.py:807-808`). Vec-backed set with
+    /// linear-scan dedup.
+    pub quasi_immutable_deps: Vec<(u64, u32)>,
     /// Extra ops to insert before the label (from bridge inlining).
     pub extra_before_label: Vec<Op>,
 }
