@@ -1122,13 +1122,14 @@ fn mergeblock(
         //     candidates.insert(0, newblock)
         //     self.pendingblocks.append(newblock)
         //
-        // The surrounding walker loop's `emitted_pc_starts` skip
-        // prevents the re-walk that upstream relies on after the
-        // `pendingblocks.append(newblock)` below — RPython re-emits
-        // the superseded range's operations into newblock under the
-        // widened inputargs, while pyre keeps the first pass's
-        // ssarepr bytes verbatim.  The newblock is dead-marked at the
-        // outer-loop skip so flatten_graph traversals route around it.
+        // Phase A.4 matches upstream: the supersede newblock IS
+        // re-walked under widened inputargs.  Its emit appends a
+        // duplicate `Label("pcN")` + `-live-` pair to ssarepr.insns,
+        // but `pc_anchor_positions` (first-wins) and
+        // `live_marker_indices_by_pc` (first-takes) ensure the
+        // original dead block's bytes remain the runtime canonical
+        // emission for `pcN`.  The supersede re-walk's bytes are
+        // unreachable via pcN labels.
         block.mark_dead();
         block.block().borrow_mut().operations.clear();
         block.block().borrow_mut().exitswitch = None;
@@ -3427,51 +3428,16 @@ impl CodeWriter {
         // hygiene requires captured identifiers be in scope at the
         // macro DEFINITION site.
         let mut pendingblocks: VecDeque<SpamBlockRef> = VecDeque::new();
-        // Upstream `build_flow` relies on `block.dead` alone (flowcontext.py:404);
-        // a popped newblock with `dead=False` is re-recorded by
-        // `record_block` and its ops are written into `block.operations`
-        // (a per-block Python list). Duplicate emit is impossible because
-        // each re-record overwrites `block.operations` for a fresh block
-        // instance — ssarepr flattening is a separate later pass
-        // (`codewriter.py:53 flatten_graph`).
-        //
-        // Pyre's walker emits into the program-wide `ssarepr.insns`
-        // linearly during the walk, so a re-popped newblock at
-        // `start_pc=X` would push a second `Insn::Label("pcX")` into
-        // ssarepr.insns. The assembler's `label_positions.insert` would
-        // silently overwrite the first pass's label position, and
-        // `insns_pos[X]` would double-record, breaking backward goto
-        // targets + runtime PC lookup.
-        //
-        // Until Phase 4 flips ssarepr emission to a post-walk pass
-        // (consuming `graph.operations` per block, the upstream shape),
-        // this dense bit-vector (size = `num_instrs`) skips re-pops whose
-        // `start_pc` was already walked. Vec<bool> indexed by PC matches
-        // AGENTS.md's preference for dense-index carriers over HashSet
-        // when keys form a small contiguous integer range.
-        let mut emitted_pc_starts: Vec<bool> = vec![false; num_instrs];
-        // Task #227.5 item 2 — diagnosis after fannkuch first-iteration
-        // regression (output 19288 vs expected 8629 with env gate on):
-        // the legacy `emitted_pc_starts` PC-index skip is structurally
-        // load-bearing for the PC-sequential walker.  Block-identity
-        // dedup ALONE (e.g. a `processed_blocks: HashSet<SpamBlockRef>`)
-        // is insufficient because the ssarepr emission protocol relies
-        // on PC-contiguous walker order: when a block yields mid-PC
-        // to a successor, its ssarepr stream ends WITHOUT an explicit
-        // goto/jump; the next block's stream is appended later in
-        // walker order, and the assembler's linear bytecode layout
-        // would route the old block's fallthrough to whichever block
-        // happens to come next in ssarepr — not necessarily the
-        // graph-level supersede successor.  Upstream `flowcontext.py:
-        // 407-475` sidesteps this entirely because ssarepr emission is
-        // a SEPARATE post-walk pass (`codewriter.py:44-67 flatten_graph
-        // (graph, regallocs)`) that walks the graph in DFS order and
-        // inserts explicit `goto TLabel(block.exits[0])` between
-        // blocks via `flatten.py:148-155 make_link`.  Retiring
-        // `emitted_pc_starts` therefore requires completing Task #227
-        // Phase 4 (production flip to post-walk flatten emission) —
-        // it is not a standalone walker refactor.
-        // Note: pending walker restructure.
+        // Upstream `build_flow` relies on `block.dead` alone
+        // (`flowcontext.py:404 if not block.dead: record_block(block)`).
+        // Pyre matched this in Phase A.4: the per-PC `emitted_pc_starts`
+        // skip is retired; supersede may re-walk a PC under widened
+        // framestate, producing duplicate `Label("pcN")` + `-live-`
+        // pairs.  Both `pc_anchor_positions` and
+        // `live_marker_indices_by_pc` use first-wins / first-takes
+        // semantics so the runtime canonical bytes are the dead
+        // block's emit; the supersede newblock's re-walk emit is
+        // unreachable via pcN labels.
 
         // interp_jit.py:118 `pypyjitdriver.can_enter_jit(...)` is called in
         // `jump_absolute` (`jumpto < next_instr` branch), i.e. at each
@@ -3723,45 +3689,29 @@ impl CodeWriter {
                 // liveness pass (`liveness.py:68-69`) can reset the alive
                 // set.
                 push_walker_emit(&mut $ssarepr, &current_block, Insn::Unreachable);
-                // Skip mergeblock when the goto target's start_pc has
-                // already been emitted (back-edge to PC walked earlier).
-                // Without the skip, mergeblock falls through to
-                // make_next_block (since A's framestate at start_pc
-                // doesn't union with currentstate at target_py_pc) and
-                // creates a fresh newblock that the outer loop then
-                // skips via emitted_pc_starts → orphan.
-                //
-                // With the skip: no orphan block created, no
-                // currentblock→orphan link added.  Runtime correctness is
-                // preserved because the SSARepr uses pc{N} labels; the
-                // emitted goto Label("pcN") + Unreachable above resolves
-                // to the existing block A's emitted pc{N} position via
-                // the linear label_positions map.
-                if !emitted_pc_starts
-                    .get(target_py_pc)
-                    .copied()
-                    .unwrap_or(false)
-                {
-                    // `flatten.py:161` `self.emitline('goto',
-                    // TLabel(link.target))` is the serialised view of
-                    // the same edge.
-                    mergeblock(
-                        code,
-                        &mut graph,
-                        &mut joinpoints,
-                        &current_block,
-                        &{
-                            let mut branch_state = current_state.clone();
-                            branch_state.next_offset = target_py_pc;
-                            branch_state.blocklist = frame_blocks_for_offset(code, target_py_pc);
-                            branch_state
-                        },
-                        target_py_pc,
-                        &mut link_exit_states,
-                        &mut pendingblocks,
-                        &mut all_walker_blocks,
-                    );
-                }
+                // `flatten.py:161` `self.emitline('goto',
+                // TLabel(link.target))` is the serialised view of the
+                // same edge.  Phase A.4 retired the back-edge skip
+                // (was Phase 4.C); back-edge mergeblock now creates a
+                // re-walked supersede block, which the relaxed
+                // `live_marker_indices_by_pc` first-takes semantics
+                // tolerates.
+                mergeblock(
+                    code,
+                    &mut graph,
+                    &mut joinpoints,
+                    &current_block,
+                    &{
+                        let mut branch_state = current_state.clone();
+                        branch_state.next_offset = target_py_pc;
+                        branch_state.blocklist = frame_blocks_for_offset(code, target_py_pc);
+                        branch_state
+                    },
+                    target_py_pc,
+                    &mut link_exit_states,
+                    &mut pendingblocks,
+                    &mut all_walker_blocks,
+                );
                 needs_fallthrough = false;
             }};
         }
@@ -4210,31 +4160,25 @@ impl CodeWriter {
                     ],
                 );
                 push_walker_emit(&mut $ssarepr, &current_block, insn);
-                // Skip mergeblock for already-emitted back-edge targets
-                // to prevent orphan creation (same rationale as
-                // `emit_goto!`).  Callers that pair this with
-                // `set_last_bool_exitcase(false)` (PopJumpIfFalse /
-                // PopJumpIfTrue) MUST gate the case-stamp on the same
-                // back-edge check, otherwise the case overwrites a
-                // pre-existing exit.
-                if !emitted_pc_starts.get(py_pc).copied().unwrap_or(false) {
-                    mergeblock(
-                        code,
-                        &mut graph,
-                        &mut joinpoints,
-                        &current_block,
-                        &{
-                            let mut branch_state = current_state.clone();
-                            branch_state.next_offset = py_pc;
-                            branch_state.blocklist = frame_blocks_for_offset(code, py_pc);
-                            branch_state
-                        },
-                        py_pc,
-                        &mut link_exit_states,
-                        &mut pendingblocks,
-                        &mut all_walker_blocks,
-                    );
-                }
+                // `flatten.py:240-267` linkfalse mergeblock.  Phase A.4
+                // retired the back-edge skip so this fires on every
+                // emit, matching upstream's `set_branch` semantic.
+                mergeblock(
+                    code,
+                    &mut graph,
+                    &mut joinpoints,
+                    &current_block,
+                    &{
+                        let mut branch_state = current_state.clone();
+                        branch_state.next_offset = py_pc;
+                        branch_state.blocklist = frame_blocks_for_offset(code, py_pc);
+                        branch_state
+                    },
+                    py_pc,
+                    &mut link_exit_states,
+                    &mut pendingblocks,
+                    &mut all_walker_blocks,
+                );
             }};
         }
         macro_rules! emit_goto_if_not_int_is_zero {
@@ -4929,46 +4873,14 @@ impl CodeWriter {
                 .framestate()
                 .expect("pending block must carry a FrameState (flowcontext.py:408)");
             let start_pc = pending_state.next_offset;
-            // Task #227.5 item 2 (load-bearing Note):
-            // The `emitted_pc_starts` PC-index skip is required because
-            // pyre's ssarepr emission is INLINE during the walker
-            // pass.  When the walker re-pops a SpamBlock whose start_pc
-            // overlaps a previously emitted block's PC range, naive
-            // re-processing emits duplicate `Label("pcN")` + live
-            // markers (breaking `live_marker_indices_by_pc`'s
-            // one-live-per-PC invariant) and concatenates the block's
-            // ops into ssarepr a second time — both wrong against
-            // upstream which writes block.operations once per
-            // block-identity (`flowcontext.py:407 record_block`).
-            //
-            // Block-identity dedup alone is insufficient: the
-            // structural divergence is the emission protocol, not the
-            // recorder.  Upstream's `flowcontext.py:404 if not
-            // block.dead: self.record_block(block)` works because
-            // record_block writes into `block.operations` (a per-block
-            // list), and ssarepr flattening is a SEPARATE later pass
-            // (`codewriter.py:44-67 flatten_graph(graph, regallocs)`)
-            // that walks the graph DFS and inserts explicit goto
-            // links between blocks (`flatten.py:148-155 make_link`).
-            // Pyre's walker pushes directly into program-wide
-            // `ssarepr.insns`, so cross-block fallthrough relies on
-            // PC-contiguous emission order — a property the
-            // `emitted_pc_starts` skip preserves by ensuring each PC
-            // index is written exactly once.
-            //
-            // Retiring this skip requires completing Task #227 Phase 4
-            // (production flip to post-walk `flatten_graph(graph,
-            // regallocs)` emission); it is not a standalone walker
-            // refactor.
-            // Phase A.4 retired the emitted_pc_starts skip + dead-mark.
-            // Mirrors upstream's `flowcontext.py:404 if not block.dead:
-            // record_block(block)` identity-only check.  Duplicate
-            // pcN Labels from re-walk under widened framestate are
-            // tolerated by `pc_anchor_positions` (first-wins) and
-            // `live_marker_indices_by_pc` (first-takes); runtime
-            // dispatches via the FIRST Label position so the dead
-            // block's bytes remain canonical.
-            let _ = start_pc;
+            // Phase A.4 mirrors upstream's `flowcontext.py:404 if not
+            // block.dead: record_block(block)` identity-only check.
+            // Supersede re-walks under widened framestate produce
+            // duplicate `Label("pcN")` + `-live-` pairs in ssarepr;
+            // `pc_anchor_positions` (first-wins) and
+            // `live_marker_indices_by_pc` (first-takes) keep the
+            // original dead block's bytes canonical for `pcN`
+            // dispatch.
             current_block = pending_block;
             current_state = pending_state;
             current_depth = current_state.stack.len() as u16;
@@ -5011,20 +4923,12 @@ impl CodeWriter {
                 // detected a block boundary at this PC and queued the
                 // new block to `pendingblocks`, break the inner loop
                 // and let the outer walker pop the new block in its
-                // own iteration.  The new block's outer iter sees
-                // `emitted_pc_starts[py_pc] = false` (we haven't
-                // marked it yet) so it'll process PC=py_pc fresh
-                // including its own `emit_mark_label_pc!(py_pc)`
-                // which now resolves to the new current_block.
-                // Production with gate off: dead branch.
+                // own iteration.  The new block's outer iter then
+                // re-enters at PC=py_pc and the same
+                // `emit_mark_label_pc!` resolves to the new
+                // current_block.
                 if block_switch_pending {
                     break;
-                }
-                // Mark this PC as emitted (AFTER the switch check so
-                // a yielded PC stays unmarked for the next outer
-                // iter to process from start_pc).
-                if let Some(slot) = emitted_pc_starts.get_mut(py_pc) {
-                    *slot = true;
                 }
                 // Task #227.5 item 6: PcAnchor walker emit retired.
                 // The `Label("pc{N}")` that `emit_mark_label_pc!`
@@ -5877,22 +5781,12 @@ impl CodeWriter {
                         // `flatten.py:275`.
                         let fallthrough_py_pc = py_pc + 1;
                         if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
-                            let target_is_back_edge = emitted_pc_starts
-                                .get(target_py_pc)
-                                .copied()
-                                .unwrap_or(false);
                             emit_goto_if_not!(ssarepr, scratch_truth, target_py_pc);
-                            // Stamp linkfalse case only when emit_goto_if_not's
-                            // mergeblock actually appended a fresh exit (i.e.
-                            // target is forward, not a back-edge to an
-                            // already-emitted PC).  Back-edge case skips both
-                            // the link creation and the case stamp; the
-                            // resulting block has only the linktrue exit, and
-                            // the dispatcher's 1-exit arm handles it via
-                            // `flatten.py:181 link.exitcase in (None, False, True)`.
-                            if !target_is_back_edge {
-                                set_last_bool_exitcase(&current_block.block(), false);
-                            }
+                            // Phase A.4 retired the back-edge gate;
+                            // emit_goto_if_not's mergeblock now always
+                            // appends a fresh linkfalse, so case stamp
+                            // always applies.
+                            set_last_bool_exitcase(&current_block.block(), false);
                             mergeblock(
                                 code,
                                 &mut graph,
@@ -5973,21 +5867,13 @@ impl CodeWriter {
                         if target_py_pc < num_instrs && fallthrough_py_pc < num_instrs {
                             // POP_JUMP_IF_TRUE: emit_goto_if_not(fallthrough)
                             // always targets PC+1 (forward, never emitted),
-                            // so its mergeblock always appends linkfalse.
-                            // emit_goto(target) may be a back-edge (target
-                            // already emitted) — in that case Phase 4.C's
-                            // skip prevents linktrue creation, and the
-                            // case stamp must be skipped too.
-                            let target_is_back_edge = emitted_pc_starts
-                                .get(target_py_pc)
-                                .copied()
-                                .unwrap_or(false);
+                            // Phase A.4 retired the back-edge gate;
+                            // emit_goto's mergeblock now always appends
+                            // linktrue, so case stamp always applies.
                             emit_goto_if_not!(ssarepr, scratch_truth, fallthrough_py_pc);
                             set_last_bool_exitcase(&current_block.block(), false);
                             emit_goto!(ssarepr, target_py_pc);
-                            if !target_is_back_edge {
-                                set_last_bool_exitcase(&current_block.block(), true);
-                            }
+                            set_last_bool_exitcase(&current_block.block(), true);
                         }
                     }
 
