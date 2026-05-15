@@ -6408,7 +6408,9 @@ impl CodeWriter {
                             step_info.map(|(_, value)| value),
                             py_pc as i64,
                         );
-                        ssarepr.insns.push(
+                        push_walker_emit(
+                            &mut ssarepr,
+                            &current_block,
                             super::flatten::build_build_slice_fn_residual_call_ir_r_insn(
                                 build_slice_fn_idx,
                                 raw_argc,
