@@ -132,12 +132,13 @@ pub struct Assembler {
     /// the `MAJIT_COVERAGE_PANIC=1` diagnostic so the missing-ValueId
     /// panic can cite the offending op.
     current_flatop_debug: Option<String>,
-    /// Per-graph [`TypeResolutionState`] threaded into [`Self::assemble`]
-    /// so [`Self::lookup_coloring`] reads `kind` from
-    /// `getkind(v.concretetype)` first (RPython parity for
-    /// `flatten.py:382 getcolor`) before falling back to the
-    /// regalloc-class scan.  Cleared at the end of `assemble`.
-    current_types: Option<crate::jit_codewriter::type_state::TypeResolutionState>,
+    /// Per-graph snapshot of [`crate::model::FunctionGraph::value_types`]
+    /// — pyre's analogue of upstream `Variable.concretetype`.
+    /// Threaded into [`Self::assemble`] so [`Self::lookup_coloring`]
+    /// reads `kind` from `getkind(v.concretetype)` first (RPython
+    /// parity for `flatten.py:382 getcolor`) before falling back to
+    /// the regalloc-class scan.  Cleared at the end of `assemble`.
+    current_concretetypes: Option<Vec<crate::model::ConcreteType>>,
 }
 
 impl Assembler {
@@ -160,7 +161,7 @@ impl Assembler {
             canonical_liveness_offset: None,
             current_graph_name: None,
             current_flatop_debug: None,
-            current_types: None,
+            current_concretetypes: None,
         }
     }
 
@@ -251,7 +252,7 @@ impl Assembler {
     /// [`Self::lookup_coloring`] is the only path RPython exercises.
     /// Pyre production callers go through
     /// [`Self::assemble_with_types`] /
-    /// [`Self::assemble_with_callcontrol_and_types`] which engage
+    /// [`Self::assemble_with_callcontrol_and_graph`] which engage
     /// the same strict path.
     ///
     /// This no-types overload is a pyre-only divergence retained for
@@ -267,27 +268,28 @@ impl Assembler {
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
     ) -> JitCodeBody {
-        self.assemble_with_callcontrol_and_types(ssarepr, regallocs, None, None)
+        self.assemble_with_callcontrol_and_graph(ssarepr, regallocs, None, None)
     }
 
-    /// `assemble`-with-types entrypoint mirroring `flatten_with_types`:
-    /// the caller has the `TypeResolutionState` produced by the
-    /// (jtransform-)rtyper pass and threads it through so
-    /// [`Self::lookup_coloring`] can read kind from
-    /// `getkind(v.concretetype)` first, matching RPython's
-    /// `flatten.py:382 getcolor`.
-    pub fn assemble_with_types(
+    /// `assemble`-with-graph entrypoint — the production path.
+    ///
+    /// `graph.value_types` (pyre's `Variable.concretetype`
+    /// analogue) is the kind source: [`Self::lookup_coloring`]
+    /// reads it via the snapshotted slice on `current_concretetypes`
+    /// just like RPython's `flatten.py:382 getcolor` reads
+    /// `getkind(v.concretetype)`.
+    pub fn assemble_with_graph(
         &mut self,
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
-        types: &crate::jit_codewriter::type_state::TypeResolutionState,
+        graph: &crate::model::FunctionGraph,
     ) -> JitCodeBody {
-        self.assemble_with_callcontrol_and_types(ssarepr, regallocs, None, Some(types))
+        self.assemble_with_callcontrol_and_graph(ssarepr, regallocs, None, Some(graph))
     }
 
     /// **Test-only entrypoint — DO NOT use in production code.**
     /// Production callers must use
-    /// [`Self::assemble_with_callcontrol_and_types`].  See
+    /// [`Self::assemble_with_callcontrol_and_graph`].  See
     /// [`Self::assemble`] for the rationale.
     #[doc(hidden)]
     pub fn assemble_with_callcontrol(
@@ -296,15 +298,15 @@ impl Assembler {
         regallocs: &HashMap<RegKind, RegAllocResult>,
         callcontrol: Option<&CallControl>,
     ) -> JitCodeBody {
-        self.assemble_with_callcontrol_and_types(ssarepr, regallocs, callcontrol, None)
+        self.assemble_with_callcontrol_and_graph(ssarepr, regallocs, callcontrol, None)
     }
 
-    pub fn assemble_with_callcontrol_and_types(
+    pub fn assemble_with_callcontrol_and_graph(
         &mut self,
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
         callcontrol: Option<&CallControl>,
-        types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
+        graph: Option<&crate::model::FunctionGraph>,
     ) -> JitCodeBody {
         // RPython codewriter.py:56: compute_liveness(ssarepr)
         // Must run BEFORE assembly so -live- markers carry the full
@@ -312,9 +314,16 @@ impl Assembler {
         // [`crate::flatten::Register`]-based identity, so liveness now
         // also takes the regalloc result for the `ValueId → Register`
         // bridge on `FlatOp::Op` operands.
-        crate::liveness::compute_liveness_with_types(ssarepr, regallocs, types);
+        crate::liveness::compute_liveness_with_graph(ssarepr, regallocs, graph);
         self.current_graph_name = Some(ssarepr.name.clone());
-        self.current_types = types.cloned();
+        // Snapshot the per-value `concretetype` slice so
+        // `lookup_coloring` can read it without keeping a graph
+        // borrow alive across the whole encode loop.  RPython's
+        // `Variable.concretetype` is implicitly the same snapshot:
+        // every Variable carries its kind by attribute, so the
+        // assembler reads a per-Variable attribute identical to
+        // pyre's per-`ValueId` slice index.
+        self.current_concretetypes = graph.map(|g| g.value_types.clone());
 
         // Pyre-only diagnostic: under `MAJIT_COVERAGE_AUDIT=1` enumerate
         // every ValueId referenced in `ssarepr.insns` that has no
@@ -444,14 +453,28 @@ impl Assembler {
             alllabels: Some(state.alllabels),
             resulttypes: Some(state.resulttypes),
             _ssarepr: Some(ssarepr.clone()),
-            _types: types.cloned(),
+            // Build a transitional TypeResolutionState from the
+            // per-value `concretetype` snapshot so JitCode::dump's
+            // existing `format_assembler_with_types` continues to
+            // resolve operand kinds for `OpKind::Call` argument
+            // formatting.  Long-term this becomes a `&FunctionGraph`
+            // borrow inside dump().
+            _types: self.current_concretetypes.as_ref().map(|slice| {
+                let mut state = crate::jit_codewriter::type_state::TypeResolutionState::new();
+                for (idx, ct) in slice.iter().enumerate() {
+                    if !matches!(ct, crate::model::ConcreteType::Unknown) {
+                        state.set(crate::model::ValueId(idx), ct.clone());
+                    }
+                }
+                state
+            }),
         };
 
         self.count_jitcodes += 1;
-        // Drop the per-graph type-state snapshot so a subsequent
-        // assemble call without types doesn't accidentally consult a
-        // stale table.
-        self.current_types = None;
+        // Drop the per-graph concretetype snapshot so a subsequent
+        // assemble call without a graph doesn't accidentally consult
+        // a stale table.
+        self.current_concretetypes = None;
         body
     }
 
@@ -1902,9 +1925,14 @@ impl Assembler {
         // never falls back to other classes here, and neither do we
         // when type-state is in scope.  A miss panics so an
         // upstream type ↔ regalloc mismatch surfaces immediately.
-        if let Some(types) = self.current_types.as_ref() {
-            use crate::jit_codewriter::type_state::ConcreteType;
-            let kind = match types.get(v) {
+        if let Some(types) = self.current_concretetypes.as_ref() {
+            use crate::model::ConcreteType;
+            // The snapshot is indexed by `ValueId.0` (matches
+            // `FunctionGraph::value_types`); out-of-range reads
+            // (synth values minted past the snapshotted graph)
+            // collapse to `Unknown` so the fallback scan kicks in.
+            let declared = types.get(v.0).cloned().unwrap_or(ConcreteType::Unknown);
+            let kind = match declared {
                 ConcreteType::Signed => Some(RegKind::Int),
                 ConcreteType::GcRef => Some(RegKind::Ref),
                 ConcreteType::Float => Some(RegKind::Float),
@@ -3881,13 +3909,11 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(v1));
 
-        let mut value_kinds = HashMap::new();
-        value_kinds.insert(v0, RegKind::Int);
-        value_kinds.insert(v1, RegKind::Int);
-        value_kinds.insert(v2, RegKind::Ref);
+        graph.set_concretetype(v0, crate::model::ConcreteType::Signed);
+        graph.set_concretetype(v1, crate::model::ConcreteType::Signed);
+        graph.set_concretetype(v2, crate::model::ConcreteType::GcRef);
 
-        let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
-        let _ = value_kinds; // Phase 3 dropped SSARepr.value_kinds
+        let regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = SSARepr {
             name: "add".into(),
             insns: vec![],
@@ -3949,12 +3975,11 @@ mod tests {
 
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_callcontrol(&mut cc);
-        let rewritten = transformer.transform(&graph).graph;
+        let mut rewritten = transformer.transform(&graph).graph;
 
-        let mut value_kinds = HashMap::new();
-        value_kinds.insert(base, RegKind::Ref);
-        value_kinds.insert(result, RegKind::Int);
-        let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
+        rewritten.set_concretetype(base, crate::model::ConcreteType::GcRef);
+        rewritten.set_concretetype(result, crate::model::ConcreteType::Signed);
+        let regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &regallocs);
         // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
         // exceptblock-augmented map — `flatten_graph` (without type
@@ -4076,16 +4101,14 @@ mod tests {
         );
 
         let config = GraphTransformConfig::default();
-        let rewritten = Transformer::new(&config)
+        let mut rewritten = Transformer::new(&config)
             .with_type_state(&type_state)
             .transform(&graph)
             .graph;
-        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&type_state);
-        let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
+        crate::jit_codewriter::type_state::apply_to_graph(&type_state, &mut rewritten);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &regallocs);
-        // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
-        // exceptblock-augmented map so `lookup_coloring` finds every
-        // operand including the synthetic `(etype, evalue)` pair.
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
@@ -4197,16 +4220,14 @@ mod tests {
         );
 
         let config = GraphTransformConfig::default();
-        let rewritten = Transformer::new(&config)
+        let mut rewritten = Transformer::new(&config)
             .with_type_state(&type_state)
             .transform(&graph)
             .graph;
-        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&type_state);
-        let regallocs = regalloc::perform_all_register_allocations(&rewritten, &value_kinds);
+        crate::jit_codewriter::type_state::apply_to_graph(&type_state, &mut rewritten);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
+        let regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &regallocs);
-        // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
-        // exceptblock-augmented map so `lookup_coloring` finds every
-        // operand including the synthetic `(etype, evalue)` pair.
 
         let mut asm = Assembler::new();
         let _ = asm.assemble(&mut flat, &regallocs);
@@ -4288,12 +4309,11 @@ mod tests {
             .unwrap();
         graph.set_return(graph.startblock, Some(sum));
 
-        let mut value_kinds = HashMap::new();
-        value_kinds.insert(lhs, RegKind::Int);
-        value_kinds.insert(rhs, RegKind::Int);
-        value_kinds.insert(sum, RegKind::Int);
+        graph.set_concretetype(lhs, crate::model::ConcreteType::Signed);
+        graph.set_concretetype(rhs, crate::model::ConcreteType::Signed);
+        graph.set_concretetype(sum, crate::model::ConcreteType::Signed);
 
-        let regallocs = regalloc::perform_all_register_allocations(&graph, &value_kinds);
+        let regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = flatten_graph(&graph, &regallocs);
         // Slice C-3: `flatten()` (the typed-state-less variant used
         // by this test) leaves `SSARepr.value_kinds` empty.  Seed it

@@ -39,6 +39,7 @@ pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, Re
 /// [`TypeResolutionState`] so [`value_to_register`] reads kind from
 /// `getkind(v.concretetype)` first — `flatten.py:382 getcolor`
 /// strict 1:1 parity for the `FlatOp::Op` operand bridge.
+#[deprecated(note = "use compute_liveness_with_graph; graph.concretetype(v) is the kind source now")]
 pub fn compute_liveness_with_types(
     flattened: &mut SSARepr,
     regallocs: &HashMap<RegKind, RegAllocResult>,
@@ -52,6 +53,38 @@ pub fn compute_liveness_with_types(
         }
     }
     // RPython liveness.py:23: remove_repeated_live(ssarepr)
+    remove_repeated_live(&mut flattened.insns);
+}
+
+/// Graph-driven sibling of [`compute_liveness_with_types`] —
+/// reads each operand's kind via `graph.concretetype(v)` instead of
+/// the transitional [`TypeResolutionState`] table.  This is the
+/// production path.  RPython parity: `Variable.concretetype` is the
+/// inline source of truth; pyre's [`crate::model::FunctionGraph::value_types`]
+/// holds the same per-value kind by `ValueId.0` index.
+pub fn compute_liveness_with_graph(
+    flattened: &mut SSARepr,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+    graph: Option<&crate::model::FunctionGraph>,
+) {
+    // Snapshot the per-value `concretetype` slice so the inner
+    // backward-walk loop can borrow the slice without keeping a
+    // graph borrow alive across mutating writes into `flattened.insns`.
+    let snapshot: Option<Vec<crate::model::ConcreteType>> =
+        graph.map(|g| g.value_types.clone());
+
+    let mut label2alive: HashMap<Label, HashSet<Register>> = HashMap::new();
+
+    loop {
+        if !compute_liveness_pass_with_snapshot(
+            &mut flattened.insns,
+            &mut label2alive,
+            regallocs,
+            snapshot.as_deref(),
+        ) {
+            break;
+        }
+    }
     remove_repeated_live(&mut flattened.insns);
 }
 
@@ -79,6 +112,69 @@ pub fn compute_liveness_with_types(
 /// scans regallocs in [`KINDS`] order and asserts at most one class
 /// matches.  Returns `None` for Void / Unknown values that regalloc
 /// skipped (`flatten.py:325`).
+fn value_to_register_with_snapshot(
+    v: ValueId,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+    concretetypes: Option<&[crate::model::ConcreteType]>,
+) -> Option<Register> {
+    if let Some(slice) = concretetypes {
+        use crate::model::ConcreteType;
+        let declared = slice.get(v.0).cloned().unwrap_or(ConcreteType::Unknown);
+        let kind = match declared {
+            ConcreteType::Signed => Some(RegKind::Int),
+            ConcreteType::GcRef => Some(RegKind::Ref),
+            ConcreteType::Float => Some(RegKind::Float),
+            ConcreteType::Void | ConcreteType::Unknown => None,
+        };
+        if let Some(kind) = kind {
+            let ra = regallocs.get(&kind).unwrap_or_else(|| {
+                panic!(
+                    "value_to_register: graph declared kind {kind:?} for {v:?} \
+                     but regallocs map is missing the entry",
+                )
+            });
+            let color = ra.coloring.get(&v).copied().unwrap_or_else(|| {
+                let other_classes: Vec<_> = [RegKind::Int, RegKind::Ref, RegKind::Float]
+                    .iter()
+                    .filter(|k| **k != kind)
+                    .filter(|k| {
+                        regallocs
+                            .get(*k)
+                            .is_some_and(|ra| ra.coloring.contains_key(&v))
+                    })
+                    .copied()
+                    .collect();
+                panic!(
+                    "value_to_register: graph declared kind {kind:?} for {v:?} \
+                     but regallocs[{kind:?}] has no coloring (other classes with a \
+                     coloring: {other_classes:?})",
+                )
+            });
+            return Some(Register::new(kind, color));
+        }
+        // Void / Unknown — fall through to scan path.
+    }
+    // Bare KINDS-scan path (no graph snapshot supplied).
+    let mut found: Option<Register> = None;
+    for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+        if let Some(ra) = regallocs.get(&kind) {
+            if let Some(&color) = ra.coloring.get(&v) {
+                if let Some(prev) = found {
+                    panic!(
+                        "value_to_register: ValueId {v:?} colored in multiple regalloc \
+                         classes ({:?} and {kind:?}) — RPython `getkind` must give \
+                         exactly one",
+                        prev.kind,
+                    );
+                }
+                found = Some(Register::new(kind, color));
+            }
+        }
+    }
+    found
+}
+
+#[deprecated(note = "use value_to_register_with_snapshot; pass graph.value_types directly")]
 fn value_to_register(
     v: ValueId,
     regallocs: &HashMap<RegKind, RegAllocResult>,
@@ -191,24 +287,40 @@ fn compute_liveness_pass(
     regallocs: &HashMap<RegKind, RegAllocResult>,
     types: Option<&TypeResolutionState>,
 ) -> bool {
+    compute_liveness_pass_with_snapshot(ops, label2alive, regallocs, types.map(|t| t.as_slice()))
+}
+
+/// Snapshot-driven sibling of [`compute_liveness_pass`].  Reads
+/// each `FlatOp::Op` operand's kind from `concretetypes[v.0]` —
+/// the same per-value `concretetype` slice
+/// [`crate::model::FunctionGraph::value_types`] holds.  Used by
+/// [`compute_liveness_with_graph`] (production) and the
+/// transitional `compute_liveness_with_types` adapter (which
+/// projects through `TypeResolutionState::as_slice`).
+fn compute_liveness_pass_with_snapshot(
+    ops: &mut [FlatOp],
+    label2alive: &mut HashMap<Label, HashSet<Register>>,
+    regallocs: &HashMap<RegKind, RegAllocResult>,
+    concretetypes: Option<&[crate::model::ConcreteType]>,
+) -> bool {
     let mut alive: HashSet<Register> = HashSet::new();
     let mut must_continue = false;
 
     // `def_value` and `use_value` route a `FlatOp::Op`-side
     // [`ValueId`] through regalloc to its [`Register`] before joining
-    // the alive set.  When `types` is supplied (production path) the
-    // strict `getkind(v.concretetype)` lookup runs; otherwise the
-    // KINDS-ordered scan with single-class assertion takes over.
-    // Void / unallocated values are silently dropped (RPython's
-    // `flatten.py:325 if v.concretetype is not lltype.Void` makes
-    // the same filter at flatten time).
+    // the alive set.  When the per-value `concretetype` snapshot is
+    // supplied the strict `getkind(v.concretetype)` lookup runs;
+    // otherwise the KINDS-ordered scan with single-class assertion
+    // takes over.  Void / unallocated values are silently dropped
+    // (RPython's `flatten.py:325 if v.concretetype is not lltype.Void`
+    // makes the same filter at flatten time).
     let def_value = |alive: &mut HashSet<Register>, v: ValueId| {
-        if let Some(r) = value_to_register(v, regallocs, types) {
+        if let Some(r) = value_to_register_with_snapshot(v, regallocs, concretetypes) {
             alive.remove(&r);
         }
     };
     let use_value = |alive: &mut HashSet<Register>, v: ValueId| {
-        if let Some(r) = value_to_register(v, regallocs, types) {
+        if let Some(r) = value_to_register_with_snapshot(v, regallocs, concretetypes) {
             alive.insert(r);
         }
     };

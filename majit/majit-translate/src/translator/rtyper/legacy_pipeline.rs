@@ -104,11 +104,13 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
     );
 
     // Pass 4: Flatten with type info (RPython flatten + regalloc)
-    let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&rewritten_types);
-    let regallocs =
-        crate::regalloc::perform_all_register_allocations(&transform_result.graph, &value_kinds);
-    let flattened =
-        flatten::flatten_with_types(&transform_result.graph, &rewritten_types, &regallocs);
+    // Reads kinds straight off `graph.concretetype(v)` after the
+    // canonical exceptblock stamp.  No `value_kinds` HashMap surface
+    // any more — the graph IS the kind table.
+    crate::regalloc::augment_canonical_exceptblock_on_graph(&mut transform_result.graph);
+    let regallocs = crate::regalloc::perform_all_register_allocations(&transform_result.graph);
+    let _ = &rewritten_types; // graph already hydrated via apply_to_graph above
+    let flattened = flatten::flatten_graph(&transform_result.graph, &regallocs);
 
     PipelineResult {
         name: func.name.clone(),

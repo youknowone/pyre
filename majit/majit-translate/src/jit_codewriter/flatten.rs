@@ -1319,27 +1319,25 @@ fn compute_num_values(graph: &FunctionGraph, ops: &[FlatOp]) -> usize {
     max_value
 }
 
-/// Type-aware sibling of [`flatten_graph`] used by the post-rtyper
-/// pipeline.
+/// Backward-compatible alias for [`flatten_graph`] kept while
+/// callers migrate.
 ///
-/// Carries the [`TypeResolutionState`](crate::jit_codewriter::type_state::TypeResolutionState)
-/// into [`GraphFlattener::with_types`] so [`GraphFlattener::getcolor`]
-/// reads `kind` from `getkind(v.concretetype)` first
-/// (`flatten.py:386`), only falling back to regalloc-class scanning
-/// for values whose `ConcreteType` is `Void` / `Unknown`.  This gives
-/// well-typed graphs the same strict 1:1 kind-color resolution PyPy
-/// gets via `Variable.concretetype`.
+/// The `_types` parameter is ignored: kind information now lives
+/// inline on the graph (`graph.value_types`, the
+/// [`Variable.concretetype`](crate::flowspace::model::Variable)
+/// analogue), and `flatten_graph` reads it via
+/// [`GraphFlattener::getcolor`] → `graph.concretetype(v)`.  Existing
+/// production callers can stop passing the
+/// [`TypeResolutionState`](crate::jit_codewriter::type_state::TypeResolutionState)
+/// argument and call [`flatten_graph`] directly; this shim survives
+/// only to keep imports compiling during the migration.
+#[deprecated(note = "use flatten_graph; graph.concretetype(v) is the kind source now")]
 pub fn flatten_with_types(
     graph: &FunctionGraph,
-    types: &crate::jit_codewriter::type_state::TypeResolutionState,
+    _types: &crate::jit_codewriter::type_state::TypeResolutionState,
     regallocs: &HashMap<RegKind, RegAllocResult>,
 ) -> SSARepr {
-    let mut flattener = GraphFlattener::with_types(graph, regallocs, Some(types), false);
-    flattener.enforce_input_args();
-    flattener.generate_ssa_form();
-    let mut ssarepr = flattener.ssarepr;
-    ssarepr.num_values = compute_num_values(graph, &ssarepr.insns);
-    ssarepr
+    flatten_graph(graph, regallocs)
 }
 
 // `generate_last_exc` is a method on [`GraphFlattener`] (see

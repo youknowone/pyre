@@ -1643,10 +1643,10 @@ mod tests {
         // without a side-table lookup.
         let mut result = result;
         crate::jit_codewriter::type_state::apply_to_graph(&types, &mut result.graph);
-        let value_kinds = crate::jit_codewriter::type_state::build_value_kinds(&types);
-        let regallocs =
-            crate::regalloc::perform_all_register_allocations(&result.graph, &value_kinds);
-        let flattened = flatten_with_types(&result.graph, &types, &regallocs);
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut result.graph);
+        let regallocs = crate::regalloc::perform_all_register_allocations(&result.graph);
+        let _ = &types; // graph already hydrated via apply_to_graph above
+        let flattened = flatten::flatten_graph(&result.graph, &regallocs);
         eprintln!(
             "load_fast graph ops: {:?}",
             load_fast_graph.block(load_fast_graph.startblock).operations

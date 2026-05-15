@@ -395,25 +395,31 @@ impl CodeWriter {
 
         // Step 2: regalloc (codewriter.py:45-47)
         // RPython: for kind in KINDS: regallocs[kind] = perform_register_allocation(graph, kind)
-        let value_kinds =
-            crate::jit_codewriter::type_state::build_value_kinds(&rewritten_type_state);
-        let regallocs =
-            crate::regalloc::perform_all_register_allocations(&rewritten.graph, &value_kinds);
+        // Pyre reads each per-value kind via `graph.concretetype(v)`
+        // (set up by `apply_to_graph` / `apply_from_flowspace_variables`
+        // above), matching upstream's `getkind(v.concretetype)` access.
+        // Stamp canonical exceptblock kinds first so the rtyper-skip
+        // path still gets `(etype=Int, evalue=Ref)`.
+        crate::regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten.graph);
+        let regallocs = crate::regalloc::perform_all_register_allocations(&rewritten.graph);
 
         // Step 3: flatten (codewriter.py:53)
         // RPython: ssarepr = flatten_graph(graph, regallocs, cpu=cpu)
-        let mut ssarepr = flatten_with_types(&rewritten.graph, &rewritten_type_state, &regallocs);
+        // graph.value_types is the kind source after the
+        // hydration steps above; flatten reads it directly.
+        let _ = &rewritten_type_state; // kept around for the assemble call below
+        let mut ssarepr = crate::flatten::flatten_graph(&rewritten.graph, &regallocs);
 
         // Step 3b + 4: liveness + assemble (codewriter.py:56,67)
         // RPython: compute_liveness(ssarepr) then assembler.assemble(ssarepr, jitcode, num_regs)
         // In majit, assemble() calls compute_liveness() internally and now
         // returns the body so the codewriter can fill calldescr before
         // committing the shell via `set_body`.
-        let mut body = self.assembler.assemble_with_callcontrol_and_types(
+        let mut body = self.assembler.assemble_with_callcontrol_and_graph(
             &mut ssarepr,
             &regallocs,
             Some(callcontrol),
-            Some(&rewritten_type_state),
+            Some(&rewritten.graph),
         );
 
         // call.py:174-187 get_jitcode_calldescr:

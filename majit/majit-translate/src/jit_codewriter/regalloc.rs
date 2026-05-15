@@ -13,7 +13,7 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flatten::RegKind;
-use crate::model::{Block, FunctionGraph, ValueId};
+use crate::model::{Block, ConcreteType, FunctionGraph, ValueId};
 
 // ── DependencyGraph (RPython tool/algo/color.py) ──────────────────
 
@@ -394,16 +394,67 @@ pub struct RegAllocResult {
     pub num_regs: usize,
 }
 
-/// Perform register allocation for a single kind on a graph.
+// `perform_register_allocation` previously took a
+// `value_kinds: &HashMap<ValueId, RegKind>` side table; it now reads
+// kinds directly from `graph.concretetype(v)`, matching upstream's
+// `regalloc.py::perform_register_allocation(graph, kind)` shape
+// where every Variable's kind comes from `getkind(v.concretetype)`.
+// See [`perform_register_allocation`] below.
+
+/// Stamp the canonical `exceptblock.inputargs` kinds onto the graph
+/// when they are still `Unknown`.
 ///
-/// RPython: `regalloc.py::perform_register_allocation(graph, kind)`.
-/// Runs on FunctionGraph (Block structure), BEFORE flatten.
+/// Upstream `rpython/rtyper/rclass.py` assigns `(etype, evalue)`
+/// concretetypes `Ptr(OBJECT_VTABLE)` / `Ptr(OBJECT)` so
+/// `flatten.py:143 raise %r`, `flatten.py:220-231 last_exception/>i`
+/// + `goto_if_exception_mismatch/i` see canonical kinds.  Pyre's
+/// codewriter creates the canonical exceptblock eagerly in
+/// `FunctionGraph::new` with `Unknown` placeholders; this helper
+/// stamps the canonical Signed / GcRef kinds whenever the rtyper
+/// hand-off (`apply_to_graph` / `apply_from_flowspace_variables`)
+/// did not — equivalent to the previous `augment_value_kinds_*`
+/// helper but written directly onto `graph.value_types` instead of
+/// returning a transitional HashMap.
+pub fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
+    let except_args = graph.block(graph.exceptblock).inputargs.clone();
+    if except_args.len() == 2 {
+        if matches!(graph.concretetype(except_args[0]), ConcreteType::Unknown) {
+            graph.set_concretetype(except_args[0], ConcreteType::Signed);
+        }
+        if matches!(graph.concretetype(except_args[1]), ConcreteType::Unknown) {
+            graph.set_concretetype(except_args[1], ConcreteType::GcRef);
+        }
+    }
+}
+
+/// Perform register allocation for all three kinds — `&FunctionGraph`-only.
+///
+/// RPython parity: every `Variable.concretetype` is the source of
+/// kind; pyre reads each per-value kind via `graph.concretetype(v)`,
+/// projecting the [`ConcreteType`] enum onto the JIT codewriter's
+/// [`RegKind`] partitioning axis.  Drops the historical
+/// `&HashMap<ValueId, RegKind>` parameter — the graph IS the table
+/// now.  Canonical exceptblock inputargs are stamped on the graph
+/// up-front via [`augment_canonical_exceptblock_on_graph`].
+pub fn perform_all_register_allocations(
+    graph: &FunctionGraph,
+) -> HashMap<RegKind, RegAllocResult> {
+    let mut result = HashMap::new();
+    for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
+        result.insert(kind, perform_register_allocation(graph, kind));
+    }
+    result
+}
+
+/// `regalloc.py::perform_register_allocation(graph, kind)` direct
+/// port.  Runs on FunctionGraph (Block structure), BEFORE flatten.
+/// Reads kind from `graph.concretetype(v)` exactly like upstream
+/// reads `getkind(v.concretetype)`.
 pub fn perform_register_allocation(
     graph: &FunctionGraph,
     kind: RegKind,
-    value_kinds: &HashMap<ValueId, RegKind>,
 ) -> RegAllocResult {
-    let consider = |v: ValueId| -> bool { value_kinds.get(&v).copied() == Some(kind) };
+    let consider = |v: ValueId| -> bool { concretetype_to_regkind(graph.concretetype(v)) == Some(kind) };
     let mut allocator = RegAllocator::new();
     allocator.make_dependencies(graph, &consider);
     allocator.coalesce_variables(graph, &consider);
@@ -411,8 +462,11 @@ pub fn perform_register_allocation(
 
     let mut coloring = HashMap::new();
     let mut max_reg = 0usize;
-    for (&vid, &vkind) in value_kinds {
-        if vkind == kind {
+    // Walk every ValueId minted on the graph and pick those whose
+    // graph-side concretetype lands in `kind`.
+    for idx in 0..graph.next_value() {
+        let vid = ValueId(idx);
+        if concretetype_to_regkind(graph.concretetype(vid)) == Some(kind) {
             if let Some(color) = allocator.getcolor(vid) {
                 coloring.insert(vid, color);
                 if color + 1 > max_reg {
@@ -427,42 +481,17 @@ pub fn perform_register_allocation(
     }
 }
 
-/// Augment a `value_kinds` table with the canonical `exceptblock.inputargs`
-/// kinds — upstream rtyper assigns `(etype, evalue)` concretetypes
-/// `Ptr(OBJECT_VTABLE)` / `Ptr(OBJECT)` in `rpython/rtyper/rclass.py`; the
-/// codewriter reads them as `i`-typed class identity and `r`-typed instance
-/// pointer respectively (`flatten.py:143` `raise %r`, `flatten.py:220-231`
-/// `last_exception/>i` + `goto_if_exception_mismatch/i`). pyre's codewriter
-/// creates the canonical exceptblock eagerly in `FunctionGraph::new`, so
-/// the matching kinds must be available whether or not the upstream rtyper
-/// pass populated them. Both `perform_all_register_allocations` and
-/// `flatten_with_types` apply this contract; exposing it as a helper lets
-/// test fixtures that drive `flatten()` directly seed the same augmented
-/// table that the assembler's `lookup_coloring` consumes.
-pub fn augment_value_kinds_with_canonical_exceptblock(
-    graph: &FunctionGraph,
-    value_kinds: &HashMap<ValueId, RegKind>,
-) -> HashMap<ValueId, RegKind> {
-    let mut augmented = value_kinds.clone();
-    let except_args = &graph.block(graph.exceptblock).inputargs;
-    if except_args.len() == 2 {
-        augmented.entry(except_args[0]).or_insert(RegKind::Int);
-        augmented.entry(except_args[1]).or_insert(RegKind::Ref);
+/// `getkind`'s [`ConcreteType`] → [`RegKind`] projection:
+/// Signed → Int, GcRef → Ref, Float → Float.  Void / Unknown have
+/// no register class (the same way RPython's regalloc skips Void
+/// Variables, `flatten.py:325`).
+fn concretetype_to_regkind(ty: &ConcreteType) -> Option<RegKind> {
+    match ty {
+        ConcreteType::Signed => Some(RegKind::Int),
+        ConcreteType::GcRef => Some(RegKind::Ref),
+        ConcreteType::Float => Some(RegKind::Float),
+        ConcreteType::Void | ConcreteType::Unknown => None,
     }
-    augmented
-}
-
-/// Perform register allocation for all three kinds.
-pub fn perform_all_register_allocations(
-    graph: &FunctionGraph,
-    value_kinds: &HashMap<ValueId, RegKind>,
-) -> HashMap<RegKind, RegAllocResult> {
-    let augmented = augment_value_kinds_with_canonical_exceptblock(graph, value_kinds);
-    let mut result = HashMap::new();
-    for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
-        result.insert(kind, perform_register_allocation(graph, kind, &augmented));
-    }
-    result
 }
 
 #[cfg(test)]
@@ -500,10 +529,9 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(v1));
 
-        let mut vk = HashMap::new();
-        vk.insert(v0, RegKind::Int);
-        vk.insert(v1, RegKind::Int);
-        let result = perform_register_allocation(&graph, RegKind::Int, &vk);
+        graph.set_concretetype(v0, ConcreteType::Signed);
+        graph.set_concretetype(v1, ConcreteType::Signed);
+        let result = perform_register_allocation(&graph, RegKind::Int);
         // v0 and v1 don't overlap → can share
         assert_eq!(result.num_regs, 1);
     }
@@ -548,11 +576,10 @@ mod tests {
             .unwrap();
         graph.set_return(entry, Some(v2));
 
-        let mut vk = HashMap::new();
-        vk.insert(v0, RegKind::Int);
-        vk.insert(v1, RegKind::Int);
-        vk.insert(v2, RegKind::Int);
-        let result = perform_register_allocation(&graph, RegKind::Int, &vk);
+        graph.set_concretetype(v0, ConcreteType::Signed);
+        graph.set_concretetype(v1, ConcreteType::Signed);
+        graph.set_concretetype(v2, ConcreteType::Signed);
+        let result = perform_register_allocation(&graph, RegKind::Int);
         assert_ne!(
             result.coloring.get(&v0),
             result.coloring.get(&v1),
@@ -581,10 +608,9 @@ mod tests {
         graph.set_goto(entry, block1, vec![v0]);
         graph.set_return(block1, Some(v1));
 
-        let mut vk = HashMap::new();
-        vk.insert(v0, RegKind::Int);
-        vk.insert(v1, RegKind::Int);
-        let result = perform_register_allocation(&graph, RegKind::Int, &vk);
+        graph.set_concretetype(v0, ConcreteType::Signed);
+        graph.set_concretetype(v1, ConcreteType::Signed);
+        let result = perform_register_allocation(&graph, RegKind::Int);
         assert_eq!(result.coloring.get(&v0), result.coloring.get(&v1));
         assert_eq!(result.num_regs, 1);
     }

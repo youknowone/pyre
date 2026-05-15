@@ -170,6 +170,16 @@ impl TypeResolutionState {
         self.slots[id.0] = ct;
     }
 
+    /// Read the per-`ValueId` slice directly — exposed so callers
+    /// that just need an indexable view (e.g. liveness /
+    /// assembler kind lookups) can avoid going through the
+    /// HashMap-shaped `get` accessor.  The slice is indexed by
+    /// `ValueId.0`; an out-of-range index denotes "not yet
+    /// populated", same as `Unknown`.
+    pub fn as_slice(&self) -> &[ConcreteType] {
+        &self.slots
+    }
+
     /// Iterate populated slots in ascending `ValueId` order.  Stable
     /// ordering is load-bearing for `cutover::compare_real_against_legacy`
     /// (`cutover.rs:408`) whose "first divergence" message must be
@@ -402,28 +412,13 @@ pub(crate) fn authoritative_result_types(graph: &FunctionGraph) -> HashMap<Value
     result
 }
 
-/// Build value kind map from type resolution state.
-///
-/// RPython: `getkind(v.concretetype)` — in RPython, types live directly
-/// on variables. In majit, we extract them from TypeResolutionState.
-///
-/// Used by both `perform_all_register_allocations()` (before flatten)
-/// and `flatten_with_types()` (populates SSARepr.value_kinds).
-pub fn build_value_kinds(types: &TypeResolutionState) -> HashMap<ValueId, crate::flatten::RegKind> {
-    use crate::flatten::RegKind;
-    types
-        .iter()
-        .filter_map(|(vid, ct)| {
-            let kind = match ct {
-                ConcreteType::Signed => RegKind::Int,
-                ConcreteType::GcRef => RegKind::Ref,
-                ConcreteType::Float => RegKind::Float,
-                _ => return None,
-            };
-            Some((vid, kind))
-        })
-        .collect()
-}
+// `build_value_kinds` retired — the regalloc / flatten / assemble
+// pipeline now reads kinds straight off `graph.concretetype(v)`
+// (the [`FunctionGraph::value_types`] inline analogue of upstream
+// `Variable.concretetype`).  Per-`ValueId` `RegKind` projections
+// happen at the use site via `regalloc::perform_register_allocation`'s
+// internal `concretetype_to_regkind`, matching RPython's
+// `getkind(v.concretetype)` access pattern bit for bit.
 
 #[cfg(test)]
 mod tests {
