@@ -142,8 +142,8 @@ fn _compute_liveness_must_continue(
         // consuming operands.
         let (args, result) = match &insn {
             Insn::Op { args, result, .. } => (args.as_slice(), result),
-            // `Label`, `-live-` (via `live_args`), `Unreachable`, and
-            // `PcAnchor` were handled above.
+            // `Label`, `-live-` (via `live_args`), and `Unreachable`
+            // were handled above.
             _ => unreachable!("non-Op insn after branches"),
         };
         if let Some(reg) = result {
@@ -275,7 +275,7 @@ pub fn remove_repeated_live(ssarepr: &mut SSARepr) {
         // mapping.  Other Labels (catch_landing, link-target) keep
         // merging per upstream `liveness.py:99-100`.  This carveout
         // is the necessary structural adaptation for pyre's per-PC
-        // Label model and enables Task #227 PcAnchor retirement.
+        // Label model.
         while i < ssarepr.insns.len() {
             let next = ssarepr.insns[i].clone();
             if next.is_live() {

@@ -1004,11 +1004,11 @@ pub const OPNAME_LIVE: &str = "-live-";
 
 /// Instruction tuple (`ssarepr.insns[i]`).
 ///
-/// The four RPython tuple shapes enumerated above (`Label`, `-live-`,
-/// `---`, regular op), plus one pyre-specific `PcAnchor` variant — see
-/// its docstring for rationale. `-live-` shares the `Op` variant with
-/// regular operations, matching RPython's tuple representation where
-/// `insn[0] == '-live-'` is the discriminator.
+/// The three RPython tuple shapes enumerated above: `Label`, `---`
+/// (`Unreachable`), and regular op (which also carries the `-live-`
+/// marker via `opname == OPNAME_LIVE`).  `-live-` shares the `Op`
+/// variant with regular operations, matching RPython's tuple
+/// representation where `insn[0] == '-live-'` is the discriminator.
 #[derive(Debug, Clone)]
 pub enum Insn {
     /// `(Label(name),)` — block-entry marker.
@@ -1762,21 +1762,12 @@ where
         let Some(super::flow::ExitSwitch::Value(exitswitch)) = exitswitch else {
             // RPython `flatten.py:282-309 insert_switch_exits` is only
             // called via `insert_exits` when the block already has a
-            // Variable exitswitch.  Pyre's walker can produce 2-exit
-            // blocks where both links have `llexitcase=None` and the
-            // block carries no `exitswitch` — typically a back-edge +
-            // fall-through pair from loop bytecode where one of the
-            // edges (the back-edge mergeblock or supersede append)
-            // wasn't tagged with `set_last_bool_exitcase`.  Treat this
-            // upstream-orthodox-malformed shape as "fall through to the
-            // first link" — equivalent to upstream's
-            // `make_link(exits[0])` for a single-exit block — and emit
-            // an `unreachable` for the remaining links so the runtime
-            // can't accidentally route through them.
-            if exits.iter().all(|link| link.borrow().llexitcase.is_none()) {
-                self.make_link(&exits[0], handling_ovf);
-                return;
-            }
+            // Variable exitswitch (`flatten.py:107-115` dispatch by
+            // `exits.len()` + `exitswitch.concretetype`).  A None
+            // exitswitch on a multi-exit block is a malformed graph
+            // shape upstream would never produce; fail loud so the
+            // walker non-orthodoxy that produced it is visible rather
+            // than silently materialising bytes.
             let exitcase_summary: Vec<String> = exits
                 .iter()
                 .map(|link| {
@@ -2217,29 +2208,6 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
     }
 }
 
-/// Production-side `lower_constant` for the canonical [`flatten_graph`]
-/// entry.  Recovers the runtime PyObject pointer from `Opaque(Ref)`
-/// constants whose name encodes the pointer in `<tag>@<hex>` form.
-/// Pyre's walker emits these via `Constant::opaque(format!("pycode@{w_code:p}"),
-/// Some(Kind::Ref))` (`codewriter.rs::portal_jit_merge_point_graph_args`),
-/// matching upstream's rtyper-resolved `Constant(ll_ovf, concretetype=...)`
-/// at `flatten.py:166-170` after rewrite.  Names without the `@<hex>`
-/// suffix fall through to [`flatten_constant_operand`]'s panic so
-/// silent miscompilation is impossible.
-fn flatten_canonical_constant(constant: &super::flow::Constant) -> Operand {
-    if let (ConstantValue::Opaque(opaque), Some(Kind::Ref)) = (&constant.value, constant.kind) {
-        let name = opaque.repr();
-        if let Some(idx) = name.find('@') {
-            let hex = &name[idx + 1..];
-            let hex = hex.strip_prefix("0x").unwrap_or(hex);
-            if let Ok(ptr) = i64::from_str_radix(hex, 16) {
-                return Operand::ConstRef(ptr);
-            }
-        }
-    }
-    flatten_constant_operand(constant)
-}
-
 /// Test-fixture lowering: same as [`flatten_constant_operand`] but
 /// returns a placeholder for `Opaque(Ref)` instead of panicking.
 ///
@@ -2378,15 +2346,7 @@ pub fn flatten_graph<'a>(
     // closure that resolves the opaque to the runtime PyObject
     // pointer.  Calling the canonical entry on such a graph surfaces
     // the divergence instead of silently materialising `ConstRef(0)`.
-    // `flatten_constant_operand` panics on `Opaque(Ref)` constants
-    // (upstream's rtyper would have pre-resolved them to typed
-    // `Constant(ll_ovf, concretetype=...)`).  Pyre's walker emits
-    // `Opaque(Ref)` directly with the runtime PyObject pointer encoded
-    // in the name (`pycode@0x...`); `flatten_canonical_constant`
-    // recovers the pointer at flatten time.  Names that don't match
-    // the recoverable patterns fall through to
-    // `flatten_constant_operand`'s panic.
-    let lower_constant = flatten_canonical_constant;
+    let lower_constant = flatten_constant_operand;
     let mut flattener = if let Some(ctx) = lowering_ctx {
         GraphFlattener::new_with_full_lowering(&mut ssarepr, get_register, lower_constant, ctx)
     } else {
@@ -4808,15 +4768,13 @@ mod tests {
     }
 
     #[test]
-    fn flatten_graph_with_lowering_2_exit_no_exitswitch_falls_through() {
+    #[should_panic(expected = "flatten.py:282 insert_switch_exits invariant")]
+    fn flatten_graph_with_lowering_2_exit_no_exitswitch_panics() {
         // `flatten.py:282-309 insert_switch_exits` is only entered for
         // blocks that already carry a Variable exitswitch.  A 2-exit
-        // block with `exitswitch = None` and both links carrying
-        // `llexitcase = None` is a pyre-walker-only shape (typically a
-        // back-edge + fall-through pair from loop bytecode where one
-        // edge wasn't tagged with `set_last_bool_exitcase`).
-        // `insert_switch_exits` falls through to `make_link(exits[0])`
-        // for this shape — equivalent to upstream's single-exit handling.
+        // block with `exitswitch = None` is a malformed graph shape
+        // upstream would never produce; fail loud so the upstream
+        // contract is preserved (codex review parity revert).
         use crate::jit::flow::{Block, FunctionGraph, Link};
         let lhs = Variable::new(VariableId(0), Kind::Ref);
         let rhs = Variable::new(VariableId(1), Kind::Ref);

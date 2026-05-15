@@ -2311,8 +2311,8 @@ fn register_helper_fn_pointers(
 ///
 /// The dataflow runs on the post-regalloc `SSARepr` via the upstream
 /// `liveness::compute_liveness`, including `remove_repeated_live`.
-/// pyre's `PcAnchor(py_pc)` markers survive that rewrite unchanged, so
-/// the follow-up filter rescans anchor-delimited ranges in the FINAL
+/// Pyre's per-PC `Label("pcN")` markers survive that rewrite unchanged,
+/// so the follow-up filter rescans label-delimited ranges in the FINAL
 /// `SSARepr` to find each Python PC's `-live-` marker instead of caching
 /// pre-rewrite insn indices.
 ///
@@ -2338,14 +2338,13 @@ fn register_helper_fn_pointers(
 ///
 /// Unreachable PCs still get emptied in place via the bytecode
 /// `LiveVars` analysis. The direct-dispatch walker emits one
-/// `PcAnchor`/`-live-` pair per Python PC, including dead bytecodes
-/// that never execute, whereas upstream RPython only flattens
-/// reachable flow-graph blocks.
-/// Parse `Label("pc{N}")` and return Some(N), else None.  Used by
-/// the post-walk PC-anchor reconstruction (Task #227 PcAnchor
-/// retirement) — upstream RPython has no per-PC anchor concept; pyre
-/// derives the PC index from the `pc{X}` Label naming scheme that
-/// `emit_mark_label_pc!` already emits per Python PC.
+/// `Label("pcN")` + `-live-` pair per Python PC, including dead
+/// bytecodes that never execute, whereas upstream RPython only
+/// flattens reachable flow-graph blocks.
+/// Parse `Label("pc{N}")` and return Some(N), else None.  Upstream
+/// RPython has no per-PC anchor concept; pyre derives the PC index
+/// from the `pc{X}` Label naming scheme that `emit_mark_label_pc!`
+/// already emits per Python PC.
 fn label_pc_index(insn: &Insn) -> Option<usize> {
     if let Insn::Label(label) = insn {
         if let Some(rest) = label.name.strip_prefix("pc") {
@@ -2401,7 +2400,7 @@ fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) 
     assert_eq!(
         anchors.len(),
         num_pcs,
-        "live_marker_indices_by_pc: expected {num_pcs} PcAnchors, found {}",
+        "live_marker_indices_by_pc: expected {num_pcs} per-PC Labels, found {}",
         anchors.len()
     );
     let mut live_indices = vec![usize::MAX; num_pcs];
@@ -3216,9 +3215,10 @@ impl CodeWriter {
         }
         // The walker emits into `current_block`; `emit_mark_label_pc!` and
         // `emit_mark_label_catch_landing!` reassign it as the walker enters
-        // each block. Initialised to the first PC block so the PcAnchor /
-        // live_placeholder / jit_merge_point emissions that precede the
-        // first `emit_mark_label_pc!` belong to it.
+        // each block. Initialised to the first PC block so the
+        // `Label("pcN")` / live_placeholder / jit_merge_point
+        // emissions that precede the first `emit_mark_label_pc!`
+        // belong to it.
         let mut current_block: SpamBlockRef = joinpoints
             .get(&0)
             .and_then(|blocks| blocks.first().cloned())
@@ -7219,8 +7219,8 @@ impl CodeWriter {
         // surviving `-live-` marker for each Python PC
         // (`jitcode.get_live_vars_info` first checks `code[pc] ==
         // op_live`). `remove_repeated_live` may move that marker away
-        // from the zero-byte `PcAnchor`, so record the final per-PC
-        // live-marker positions here instead of the anchor indices.
+        // from the per-PC `Label("pcN")` anchor, so record the final
+        // per-PC live-marker positions here instead of the label indices.
         let pc_map = live_marker_indices_by_pc(&ssarepr, num_instrs);
 
         // codewriter.py:62-67 num_regs[kind] = max(coloring)+1
