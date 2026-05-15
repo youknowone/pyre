@@ -5600,8 +5600,8 @@ impl<'a> ResumeDataDirectReader<'a> {
                 None
             } else {
                 panic!(
-                    "pending field descr must be FieldDescr or ArrayDescr (descr_index={})",
-                    pf.descr_index,
+                    "pending field descr must be FieldDescr or ArrayDescr (descr={:?})",
+                    descr,
                 );
             };
             // resume.py:1002-1007 tagged path. UNASSIGNED tags must
@@ -5609,11 +5609,11 @@ impl<'a> ResumeDataDirectReader<'a> {
             assert!(
                 pf.target_tagged != UNASSIGNED && pf.value_tagged != UNASSIGNED,
                 "GuardPendingFieldEntry reached prepare_guard_pendingfields with \
-                 UNASSIGNED tag (target_tagged={}, value_tagged={}, descr_index={}); \
+                 UNASSIGNED tag (target_tagged={}, value_tagged={}, descr={:?}); \
                  _add_pending_fields must have run before restore time",
                 pf.target_tagged,
                 pf.value_tagged,
-                pf.descr_index,
+                descr,
             );
             // resume.py:1002: struct = self.decode_ref(num)
             let struct_ptr = self.decode_ref(pf.target_tagged);

@@ -797,20 +797,13 @@ impl RdVirtualInfo {
 /// after virtual materialization.
 ///
 /// Fields mirror PENDINGFIELDSTRUCT (lldescr / num / fieldnum / itemindex).
-/// `target` / `value` are pyre-only (SSA position before resume numbering);
-/// `descr_index` is a stable handle for serialization paths
-/// (`PendingFieldLayoutSummary`, `ExitPendingFieldLayout`) that travel
-/// through layers without an `Arc<dyn Descr>` slot.
+/// `target` / `value` are pyre-only (SSA position before resume numbering).
 #[derive(Clone, Debug)]
 pub struct GuardPendingFieldEntry {
     /// resume.py:88 `lldescr`: the field/array descriptor itself. Carries
     /// `field_offset` / `field_size` / `field_type` via the trait, so the
     /// consumer never needs a precomputed cache.
     pub descr: Option<DescrRef>,
-    /// Stable u32 handle for serialization sinks
-    /// (`ExitPendingFieldLayout`, `PendingFieldLayoutSummary`).
-    /// Equals `descr.as_ref().map_or(0, |d| d.index())` when both are set.
-    pub descr_index: u32,
     /// resume.py:91 `itemindex` — for SETARRAYITEM_GC the constant array
     /// index, -1 for SETFIELD_GC.
     pub item_index: i32,

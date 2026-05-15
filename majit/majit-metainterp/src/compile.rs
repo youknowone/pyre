@@ -1043,8 +1043,8 @@ pub(crate) fn build_guard_metadata(
                                 None
                             } else {
                                 panic!(
-                                    "pending field descr must be FieldDescr or ArrayDescr (descr_index={})",
-                                    pf.descr_index,
+                                    "pending field descr must be FieldDescr or ArrayDescr (descr={:?})",
+                                    descr,
                                 );
                             };
                             majit_backend::ExitPendingFieldLayout {

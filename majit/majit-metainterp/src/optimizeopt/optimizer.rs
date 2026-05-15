@@ -3878,7 +3878,6 @@ impl Optimizer {
                         };
                         majit_ir::GuardPendingFieldEntry {
                             descr: pf_op.descr.clone(),
-                            descr_index: pf_op.descr.as_ref().map_or(0, |d| d.index()),
                             item_index,
                             target: ctx.get_box_replacement(target),
                             value: ctx.get_box_replacement(value),
