@@ -5093,10 +5093,6 @@ pub trait BlackholeAllocator {
         let _ = (length, arraydescr, clear);
         0
     }
-    /// resume.py:1509 setfield
-    fn setfield(&self, struct_ptr: i64, field_descr: u32, value: i64) {
-        let _ = (struct_ptr, field_descr, value);
-    }
     /// resume.py:1531 setarrayitem_int(array, i, value, arraydescr)
     fn setarrayitem_int(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {
         let _ = (array, index, value, descr);
@@ -5168,10 +5164,6 @@ pub trait BlackholeAllocator {
         descr_info: &majit_ir::FieldDescrInfo,
     ) {
         let _ = (struct_ptr, value, descr_info);
-    }
-    /// pendingfields: setarrayitem dispatch by descr_index (legacy u32 path).
-    fn setarrayitem_typed(&self, array: i64, index: usize, value: i64, descr: u32) {
-        let _ = (array, index, value, descr);
     }
     /// Pyre-specific: box a raw int to a PyObject ref.
     ///
