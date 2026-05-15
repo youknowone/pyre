@@ -940,18 +940,15 @@ impl JitState for PendingWriteState {
     fn pending_field_write_layout(
         &self,
         _meta: &Self::Meta,
-        _descr: Option<&majit_ir::DescrRef>,
-        descr_index: u32,
-        is_array_item: bool,
+        descr: Option<&majit_ir::DescrRef>,
+        _descr_index: u32,
+        _is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
-        if descr_index == 9 && !is_array_item {
-            Some(PendingFieldWriteLayout::Field {
-                offset: 0,
-                value_type: Type::Int,
-            })
-        } else {
-            None
-        }
+        let fd = descr?.as_field_descr()?;
+        Some(PendingFieldWriteLayout::Field {
+            offset: fd.offset(),
+            value_type: fd.field_type(),
+        })
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
@@ -1005,19 +1002,16 @@ impl JitState for PendingArrayWriteState {
     fn pending_field_write_layout(
         &self,
         _meta: &Self::Meta,
-        _descr: Option<&majit_ir::DescrRef>,
-        descr_index: u32,
-        is_array_item: bool,
+        descr: Option<&majit_ir::DescrRef>,
+        _descr_index: u32,
+        _is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
-        if descr_index == 12 && is_array_item {
-            Some(PendingFieldWriteLayout::ArrayItem {
-                base_offset: 0,
-                item_size: std::mem::size_of::<i64>(),
-                item_type: Type::Int,
-            })
-        } else {
-            None
-        }
+        let ad = descr?.as_array_descr()?;
+        Some(PendingFieldWriteLayout::ArrayItem {
+            base_offset: ad.base_size(),
+            item_size: ad.item_size(),
+            item_type: ad.item_type(),
+        })
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
@@ -1183,18 +1177,15 @@ impl JitState for GenericMultiFrameResumeState {
     fn pending_field_write_layout(
         &self,
         _meta: &Self::Meta,
-        _descr: Option<&majit_ir::DescrRef>,
-        descr_index: u32,
-        is_array_item: bool,
+        descr: Option<&majit_ir::DescrRef>,
+        _descr_index: u32,
+        _is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
-        if descr_index == 31 && !is_array_item {
-            Some(PendingFieldWriteLayout::Field {
-                offset: 0,
-                value_type: Type::Int,
-            })
-        } else {
-            None
-        }
+        let fd = descr?.as_field_descr()?;
+        Some(PendingFieldWriteLayout::Field {
+            offset: fd.offset(),
+            value_type: fd.field_type(),
+        })
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
@@ -1351,18 +1342,15 @@ impl JitState for PendingVirtualWriteState {
     fn pending_field_write_layout(
         &self,
         _meta: &Self::Meta,
-        _descr: Option<&majit_ir::DescrRef>,
-        descr_index: u32,
-        is_array_item: bool,
+        descr: Option<&majit_ir::DescrRef>,
+        _descr_index: u32,
+        _is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
-        if descr_index == 21 && !is_array_item {
-            Some(PendingFieldWriteLayout::Field {
-                offset: 0,
-                value_type: Type::Ref,
-            })
-        } else {
-            None
-        }
+        let fd = descr?.as_field_descr()?;
+        Some(PendingFieldWriteLayout::Field {
+            offset: fd.offset(),
+            value_type: fd.field_type(),
+        })
     }
 
     fn collect_jump_args(sym: &Self::Sym) -> Vec<OpRef> {
@@ -1920,8 +1908,11 @@ fn jit_state_restore_guard_failure_replays_pending_writes_with_virtual_target_an
     let child = resume.add_virtual_struct(None, 0, 31, vec![], vec![], 0);
     resume.set_slot_virtual(0, parent);
     resume.set_slot_virtual(1, child);
+    let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new(21, 0, 8, Type::Ref, false),
+    );
     resume.add_pending_field_write(
-        None,
+        Some(pending_descr),
         21,
         majit_metainterp::resume::ResumeValueSource::Virtual(parent),
         majit_metainterp::resume::ResumeValueSource::Virtual(child),
@@ -1961,8 +1952,11 @@ fn declarative_driver_guard_failure_replays_pending_field_writes() {
     resume.push_frame(0, 666);
     resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(state.obj as usize)));
     resume.map_slot(1, 0);
+    let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new(9, 0, 8, Type::Int, false),
+    );
     resume.add_pending_field_write(
-        None,
+        Some(pending_descr),
         9,
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Ref(GcRef(
             state.obj as usize,
@@ -1999,8 +1993,11 @@ fn declarative_driver_guard_failure_replays_pending_array_writes_via_layout_hook
     resume.push_frame(0, 888);
     resume.set_slot_constant(0, majit_ir::Const::Ref(GcRef(state.array as usize)));
     resume.map_slot(1, 0);
+    let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
+        majit_ir::descr::SimpleArrayDescr::new(12, 0, std::mem::size_of::<i64>(), 0, Type::Int),
+    );
     resume.add_pending_arrayitem_write(
-        None,
+        Some(pending_descr),
         12,
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Ref(GcRef(
             state.array as usize,
@@ -2124,8 +2121,11 @@ fn declarative_driver_generic_multi_frame_restore_reuses_virtual_cache_for_pendi
     resume.push_frame(0, 600);
     resume.set_slot_virtual(0, virtual_index);
     resume.map_slot(1, 0);
+    let pending_descr: majit_ir::DescrRef = std::sync::Arc::new(
+        majit_ir::descr::SimpleFieldDescr::new(31, 0, 8, Type::Int, false),
+    );
     resume.add_pending_field_write(
-        None,
+        Some(pending_descr),
         31,
         majit_metainterp::resume::ResumeValueSource::Virtual(virtual_index),
         majit_metainterp::resume::ResumeValueSource::Constant(majit_ir::Const::Int(77)),
