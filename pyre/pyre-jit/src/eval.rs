@@ -5670,35 +5670,50 @@ fn replay_pending_fields(
         if target_ptr == 0 {
             continue; // null target — skip
         }
-        // resume.py:1003-1007 _prepare_pendingfields parity:
+        // resume.py:1000 PENDINGFIELDSTRUCT.lldescr is always present in
+        // RPython — captured directly off the Setfield_gc / Setarrayitem_gc op
+        // that produced the pending field (heap.py force_lazy_sets_for_guard).
+        let descr = pf
+            .descr
+            .as_ref()
+            .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
+        // resume.py:1003-1007 _prepare_pendingfields:
         //   if itemindex < 0: setfield(struct, fieldnum, descr)
         //   else:             setarrayitem(struct, itemindex, fieldnum, descr)
         //
-        // resume.py:1509-1518 setfield / 1520-1530 setarrayitem:
-        //   descr.is_pointer_field() → bh_setfield_gc_r / bh_setarrayitem_gc_r
-        //   descr.is_float_field()   → bh_setfield_gc_f / bh_setarrayitem_gc_f
-        //   else                     → bh_setfield_gc_i / bh_setarrayitem_gc_i
-        let addr = if pf.is_array_item {
-            // setarrayitem: base + offset + item_index * item_size
+        // resume.py:1509-1518 setfield: descr.is_pointer_field()
+        //   → bh_setfield_gc_r; is_float_field() → bh_setfield_gc_f;
+        //   else → bh_setfield_gc_i.
+        // resume.py:1531-1541 setarrayitem_{int,ref,float}: dispatched by
+        //   resume.py:1009-1014 setarrayitem via arraydescr.is_array_of_pointers
+        //   / is_array_of_floats.
+        let (addr, value_type, value_size) = if pf.is_array_item {
+            let ad = descr
+                .as_array_descr()
+                .expect("setarrayitem pending field must carry an ArrayDescr");
             let item_index = pf.item_index.unwrap_or(0);
-            target_ptr as usize + pf.field_offset + item_index * pf.field_size
+            let addr = target_ptr as usize + ad.base_size() + item_index * ad.item_size();
+            (addr, ad.item_type(), ad.item_size())
         } else {
-            // setfield: base + offset
-            target_ptr as usize + pf.field_offset
+            let fd = descr
+                .as_field_descr()
+                .expect("setfield pending field must carry a FieldDescr");
+            let addr = target_ptr as usize + fd.offset();
+            (addr, fd.field_type(), fd.field_size())
         };
         unsafe {
-            match pf.field_type {
+            match value_type {
                 majit_ir::Type::Ref => {
-                    // bh_setfield_gc_r: store pointer
+                    // bh_setfield_gc_r / bh_setarrayitem_gc_r: store pointer.
                     std::ptr::write(addr as *mut usize, value_raw as usize);
                 }
                 majit_ir::Type::Float => {
-                    // bh_setfield_gc_f: store f64
+                    // bh_setfield_gc_f / bh_setarrayitem_gc_f: store f64.
                     std::ptr::write(addr as *mut u64, value_raw as u64);
                 }
                 majit_ir::Type::Int | majit_ir::Type::Void => {
-                    // bh_setfield_gc_i: store integer (size-aware)
-                    match pf.field_size {
+                    // bh_setfield_gc_i / bh_setarrayitem_gc_i: size-aware int.
+                    match value_size {
                         8 => std::ptr::write(addr as *mut i64, value_raw),
                         4 => std::ptr::write(addr as *mut i32, value_raw as i32),
                         2 => std::ptr::write(addr as *mut i16, value_raw as i16),
@@ -5710,12 +5725,8 @@ fn replay_pending_fields(
         }
         if majit_metainterp::majit_log_enabled() {
             eprintln!(
-                "[jit] replay_pending_field: type={:?} offset={} size={} target={:#x} value={:#x}",
-                pf.field_type,
-                pf.field_offset,
-                pf.field_size,
-                target_ptr as usize,
-                value_raw as usize
+                "[jit] replay_pending_field: type={:?} size={} target={:#x} value={:#x}",
+                value_type, value_size, target_ptr as usize, value_raw as usize
             );
         }
     }

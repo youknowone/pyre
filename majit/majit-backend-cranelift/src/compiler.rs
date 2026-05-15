@@ -1533,20 +1533,37 @@ fn rebuild_state_after_failure(
                 if target_ptr == 0 {
                     continue;
                 }
-                // resume.py:1003-1007 _prepare_pendingfields parity:
-                //   if itemindex < 0: setfield → base + offset
-                //   else:             setarrayitem → base + offset + idx * size
-                let addr = if pf.is_array_item {
+                // resume.py:1000 PENDINGFIELDSTRUCT.lldescr is always present
+                // in RPython.  Pending fields are produced from descr-bearing
+                // setfield / setarrayitem ops (heap.py force_lazy_sets_for_guard).
+                let descr = pf
+                    .descr
+                    .as_ref()
+                    .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
+                // resume.py:1003-1007 _prepare_pendingfields:
+                //   if itemindex < 0: setfield → descr.is_pointer_field /
+                //     is_float_field; else setarrayitem →
+                //     arraydescr.is_array_of_pointers / is_array_of_floats.
+                let (addr, value_type, value_size) = if pf.is_array_item {
+                    let ad = descr
+                        .as_array_descr()
+                        .expect("setarrayitem pending field must carry an ArrayDescr");
                     let item_index = pf.item_index.unwrap_or(0);
-                    target_ptr as usize + pf.field_offset + item_index * pf.field_size
+                    let addr =
+                        target_ptr as usize + ad.base_size() + item_index * ad.item_size();
+                    (addr, ad.item_type(), ad.item_size())
                 } else {
-                    target_ptr as usize + pf.field_offset
+                    let fd = descr
+                        .as_field_descr()
+                        .expect("setfield pending field must carry a FieldDescr");
+                    let addr = target_ptr as usize + fd.offset();
+                    (addr, fd.field_type(), fd.field_size())
                 };
-                if pf.field_type == majit_ir::Type::Ref {
+                if value_type == majit_ir::Type::Ref {
                     write_barrier_if_managed(GcRef(target_ptr as usize));
                 }
                 unsafe {
-                    match pf.field_size {
+                    match value_size {
                         8 => std::ptr::write(addr as *mut i64, value_raw),
                         4 => std::ptr::write(addr as *mut i32, value_raw as i32),
                         2 => std::ptr::write(addr as *mut i16, value_raw as i16),
