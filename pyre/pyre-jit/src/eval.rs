@@ -5772,6 +5772,34 @@ fn extract_interior_field_info(descr: &majit_ir::DescrRef) -> (usize, usize, u8)
 /// RPython delegates to self.cpu (metainterp_sd.cpu) for allocation.
 pub(crate) struct PyreBlackholeAllocator;
 
+/// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` byte-write
+/// helper.  Pyre's three `bh_setfield_gc_{i,r,f}` impls share the same
+/// size-aware byte-write because pyre objects are raw Rust structs;
+/// the type-keyed dispatch in the trait keeps RPython's call-site
+/// shape (`cpu.bh_setfield_gc_i/r/f`).  `field_offset > 0` is enforced
+/// because offset 0 is the ob_type header set by `allocate_struct` /
+/// `allocate_with_vtable`; never let resume data overwrite it.
+fn bh_setfield_gc_byte_write(
+    struct_ptr: i64,
+    value: i64,
+    descr_info: &majit_ir::FieldDescrInfo,
+) {
+    let field_offset = descr_info.offset;
+    if struct_ptr == 0 || field_offset == 0 {
+        return;
+    }
+    unsafe {
+        let ptr = (struct_ptr as *mut u8).add(field_offset);
+        match descr_info.field_size {
+            8 => (ptr as *mut i64).write(value),
+            4 => (ptr as *mut i32).write(value as i32),
+            2 => (ptr as *mut i16).write(value as i16),
+            1 => ptr.write(value as u8),
+            _ => (ptr as *mut i64).write(value),
+        }
+    }
+}
+
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
     fn allocate_array(&self, length: usize, arraydescr: &majit_ir::DescrRef, clear: bool) -> i64 {
         // resume.py:1444-1447 allocate_array(length, arraydescr, clear)
@@ -5848,29 +5876,31 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         }
     }
 
-    fn setfield_typed(
+    fn bh_setfield_gc_i(
         &self,
         struct_ptr: i64,
         value: i64,
         descr_info: &majit_ir::FieldDescrInfo,
     ) {
-        // resume.py:1509-1518 setfield — write field at byte offset
-        // recovered from the descr.  field_offset > 0: offset 0 is the
-        // ob_type header set by allocate_struct/allocate_with_vtable;
-        // never let resume data overwrite it.
-        let field_offset = descr_info.offset;
-        if struct_ptr != 0 && field_offset > 0 {
-            unsafe {
-                let ptr = (struct_ptr as *mut u8).add(field_offset);
-                match descr_info.field_size {
-                    8 => (ptr as *mut i64).write(value),
-                    4 => (ptr as *mut i32).write(value as i32),
-                    2 => (ptr as *mut i16).write(value as i16),
-                    1 => ptr.write(value as u8),
-                    _ => (ptr as *mut i64).write(value),
-                }
-            }
-        }
+        bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
+    }
+
+    fn bh_setfield_gc_r(
+        &self,
+        struct_ptr: i64,
+        value: i64,
+        descr_info: &majit_ir::FieldDescrInfo,
+    ) {
+        bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
+    }
+
+    fn bh_setfield_gc_f(
+        &self,
+        struct_ptr: i64,
+        value: i64,
+        descr_info: &majit_ir::FieldDescrInfo,
+    ) {
+        bh_setfield_gc_byte_write(struct_ptr, value, descr_info);
     }
 
     fn setarrayitem_int(&self, array: i64, index: usize, value: i64, descr: &majit_ir::DescrRef) {

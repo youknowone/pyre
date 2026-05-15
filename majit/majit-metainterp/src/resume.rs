@@ -5151,13 +5151,29 @@ pub trait BlackholeAllocator {
     ) {
         let _ = (buffer, offset, value, descr);
     }
-    /// `resume.py:1509-1518 setfield(struct, fieldnum, descr)` →
-    /// `cpu.bh_setfield_gc_{i,r,f}(struct, value, descr)`.  Pyre threads
-    /// the descr through as `FieldDescrInfo` (offset / field_size /
-    /// field_type) so the impl can dispatch by `descr.is_pointer_field`
-    /// (Type::Ref) / `is_float_field` (Type::Float) without duplicating
-    /// the descriptor on the call stack.
-    fn setfield_typed(
+    /// `resume.py:1517 cpu.bh_setfield_gc_i(struct, value, descr)` —
+    /// integer setfield dispatched from `resume.py:1509-1518 setfield`.
+    fn bh_setfield_gc_i(
+        &self,
+        struct_ptr: i64,
+        value: i64,
+        descr_info: &majit_ir::FieldDescrInfo,
+    ) {
+        let _ = (struct_ptr, value, descr_info);
+    }
+    /// `resume.py:1512 cpu.bh_setfield_gc_r(struct, value, descr)` —
+    /// pointer setfield dispatched when `descr.is_pointer_field()`.
+    fn bh_setfield_gc_r(
+        &self,
+        struct_ptr: i64,
+        value: i64,
+        descr_info: &majit_ir::FieldDescrInfo,
+    ) {
+        let _ = (struct_ptr, value, descr_info);
+    }
+    /// `resume.py:1515 cpu.bh_setfield_gc_f(struct, value, descr)` —
+    /// float setfield dispatched when `descr.is_float_field()`.
+    fn bh_setfield_gc_f(
         &self,
         struct_ptr: i64,
         value: i64,
@@ -5254,7 +5270,18 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                     // re-extracting the spec.
                     let _ = *field_descr; // pyre-only descr_index handle, superseded by fd.
                     if let Some(descr_info) = fd {
-                        allocator.setfield_typed(obj, value, descr_info);
+                        // resume.py:1509-1518 setfield(struct, fieldnum, descr)
+                        // dispatches via descr.is_pointer_field /
+                        // is_float_field to cpu.bh_setfield_gc_{i,r,f}.
+                        match descr_info.field_type {
+                            majit_ir::Type::Ref => {
+                                allocator.bh_setfield_gc_r(obj, value, descr_info)
+                            }
+                            majit_ir::Type::Float => {
+                                allocator.bh_setfield_gc_f(obj, value, descr_info)
+                            }
+                            _ => allocator.bh_setfield_gc_i(obj, value, descr_info),
+                        }
                     }
                 }
                 obj
@@ -5281,7 +5308,18 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                     };
                     let _ = *field_descr; // pyre-only descr_index handle, superseded by fd.
                     if let Some(descr_info) = fd {
-                        allocator.setfield_typed(obj, value, descr_info);
+                        // resume.py:1509-1518 setfield(struct, fieldnum, descr)
+                        // dispatches via descr.is_pointer_field /
+                        // is_float_field to cpu.bh_setfield_gc_{i,r,f}.
+                        match descr_info.field_type {
+                            majit_ir::Type::Ref => {
+                                allocator.bh_setfield_gc_r(obj, value, descr_info)
+                            }
+                            majit_ir::Type::Float => {
+                                allocator.bh_setfield_gc_f(obj, value, descr_info)
+                            }
+                            _ => allocator.bh_setfield_gc_i(obj, value, descr_info),
+                        }
                     }
                 }
                 obj
@@ -5556,17 +5594,30 @@ impl<'a> ResumeDataDirectReader<'a> {
                     _ => self.decode_int(pf.value_tagged),
                 };
                 // resume.py:1005: self.setfield(struct, fieldnum, descr).
-                // Build the FieldDescrInfo spec on the fly from the descr
-                // metadata so the allocator hook receives the same shape
-                // as the virtual-allocate path (vinfo fielddescrs).
+                // resume.py:1509-1518 setfield dispatches via descr methods
+                // to cpu.bh_setfield_gc_{i,r,f}.  Build the FieldDescrInfo
+                // spec on the fly from the descr metadata so the allocator
+                // hook receives the same shape as the virtual-allocate
+                // path (vinfo fielddescrs).
                 let descr_info = majit_ir::FieldDescrInfo {
                     index: descr.index(),
                     offset: field_offset,
                     field_type,
                     field_size,
                 };
-                self.allocator
-                    .setfield_typed(struct_ptr, value, &descr_info);
+                match field_type {
+                    majit_ir::Type::Ref => {
+                        self.allocator
+                            .bh_setfield_gc_r(struct_ptr, value, &descr_info)
+                    }
+                    majit_ir::Type::Float => {
+                        self.allocator
+                            .bh_setfield_gc_f(struct_ptr, value, &descr_info)
+                    }
+                    _ => self
+                        .allocator
+                        .bh_setfield_gc_i(struct_ptr, value, &descr_info),
+                }
             } else {
                 // resume.py:1007-1015: self.setarrayitem dispatches by
                 // arraydescr and passes that same descriptor through.
