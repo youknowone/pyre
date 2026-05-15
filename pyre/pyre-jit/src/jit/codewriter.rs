@@ -4012,22 +4012,8 @@ impl CodeWriter {
                     }
                     target
                 } else if !current_block.dead() {
-                    // Natural fall-through: previous opcode set
-                    // `next_offset = py_pc` and `current_block` is still
-                    // live, so the walker stays in it and registers it
-                    // at the joinpoint so a future cross-PC `mergeblock`
-                    // / `set_branch` that targets `py_pc` finds the
-                    // correct block.  Phase A.1 + A.2 cover most branch
-                    // targets via `branch_target_pcs`, but cranelift
-                    // backend has a tighter dependency on per-PC
-                    // joinpoints registration (fannkuch FAIL surfaces
-                    // when retired).  Keeping the self-registration as
-                    // a backup until the cranelift dependency is
-                    // identified.
-                    joinpoints
-                        .entry(py_pc)
-                        .or_default()
-                        .insert(0, current_block.clone());
+                    // Natural fall-through within current_block — Phase
+                    // A.1+A.2 cover branch targets via boundary force.
                     current_block.clone()
                 } else {
                     // `current_block` already closed and no joinpoint
