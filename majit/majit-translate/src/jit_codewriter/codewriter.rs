@@ -200,7 +200,10 @@ impl CodeWriter {
         graph: &FunctionGraph,
         callcontrol: &mut CallControl,
         diag_label: &str,
-    ) -> TypeResolutionState {
+    ) -> (
+        TypeResolutionState,
+        Option<crate::translator::rtyper::flowspace_adapter::ValueIdToVariable>,
+    ) {
         let dual_gate_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             let registry = self.dual_gate_registry(callcontrol);
             crate::translator::rtyper::cutover::dual_gate_check_with_registry(graph, &registry)
@@ -228,7 +231,8 @@ impl CodeWriter {
             Ok(crate::translator::rtyper::cutover::DualGateOutcome::Match {
                 real_state,
                 real_annotations: _,
-            }) => real_state,
+                real_value_to_var,
+            }) => (real_state, Some(real_value_to_var)),
             Ok(crate::translator::rtyper::cutover::DualGateOutcome::Skip(reason)) => {
                 if std::env::var_os("PYRE_RTYPER_VERBOSE").is_some_and(|v| v == "1") {
                     eprintln!(
@@ -237,7 +241,12 @@ impl CodeWriter {
                     );
                 }
                 let annotations = crate::translator::rtyper::legacy_annotator::annotate(graph);
-                crate::translator::rtyper::legacy_resolve::resolve_types(graph, &annotations)
+                let state =
+                    crate::translator::rtyper::legacy_resolve::resolve_types(graph, &annotations);
+                // Skip arm has no flowspace Variable surface — the
+                // legacy walker stays the only source of types for
+                // these graphs.
+                (state, None)
             }
             Err(diff) => panic!(
                 "PYRE_RTYPER real-path failure on graph {diag_label:?} ({:?}): {diff}",
@@ -268,7 +277,8 @@ impl CodeWriter {
         // debug snapshot in `build_canonical_opcode_dispatch`
         // (lib.rs:898) can route through the same path.
         let canonical_diag = path.canonical_key().to_string();
-        let mut type_state = self.dual_gate_type_state(graph, callcontrol, &canonical_diag);
+        let (mut type_state, real_value_to_var) =
+            self.dual_gate_type_state(graph, callcontrol, &canonical_diag);
 
         // Step 0b: rtyper-equivalent indirect_call lowering
         // (`translator/rtyper/rpbc.rs::lower_indirect_calls`).
@@ -365,6 +375,23 @@ impl CodeWriter {
             &rewritten_type_state,
             &mut rewritten.graph,
         );
+        // Long-term parity hydration: when the dual-gate Match arm
+        // surfaced a `ValueIdToVariable` map, project each
+        // `Variable.concretetype` through `getkind` directly into
+        // `graph.value_types`.  This is the upstream-faithful path
+        // (`history.py:46-71 getkind` reads `v.concretetype`
+        // directly), eventually replacing the transitional
+        // `merge_synth_kinds` route above.  Per-`set_concretetype`
+        // calls overwrite any existing slot, so the Variable-typed
+        // result wins over the transitional projection when both
+        // know the kind — matching upstream's "rtyper is the source
+        // of truth" contract.
+        if let Some(value_to_var) = real_value_to_var.as_ref() {
+            crate::jit_codewriter::type_state::apply_from_flowspace_variables(
+                &mut rewritten.graph,
+                value_to_var,
+            );
+        }
 
         // Step 2: regalloc (codewriter.py:45-47)
         // RPython: for kind in KINDS: regallocs[kind] = perform_register_allocation(graph, kind)

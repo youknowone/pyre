@@ -239,6 +239,16 @@ pub enum DualGateOutcome {
         /// orthodox post-jtransform merge consumes instead of the
         /// per-graph `legacy_annotator::annotate(graph)` recompute.
         real_annotations: AnnotationState,
+        /// `ValueId → flowspace::Variable` mapping built by the
+        /// flowspace adapter.  Each Variable carries the
+        /// `RPythonTyper`-set `concretetype` inline (`flowspace/
+        /// model.py:280`), so codewriter callers can hydrate
+        /// `graph.value_types` straight from the upstream-typed
+        /// Variables via
+        /// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`]
+        /// instead of routing through the transitional
+        /// `merge_synth_kinds` projection.
+        real_value_to_var: ValueIdToVariable,
     },
     /// Real path failed on a known-unported feature — the gate
     /// cannot validate this graph yet but the failure is *not* a
@@ -299,10 +309,10 @@ pub fn dual_gate_check_with_registry(
     // stringified error so the env-flag wrapper can decide whether
     // to panic, log, or skip.
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        specialize_legacy_graph_with_registry(legacy_graph, call_registry)
+        specialize_legacy_graph_with_registry_returning_value_to_var(legacy_graph, call_registry)
     }));
-    let (real_state, real_annotations) = match result {
-        Ok(Ok(pair)) => pair,
+    let (real_state, real_annotations, real_value_to_var) = match result {
+        Ok(Ok(triple)) => triple,
         Ok(Err(e)) => {
             let msg = format!("{e}");
             if is_known_unported(&msg) {
@@ -364,6 +374,7 @@ pub fn dual_gate_check_with_registry(
     Ok(DualGateOutcome::Match {
         real_state,
         real_annotations,
+        real_value_to_var,
     })
 }
 
@@ -945,7 +956,7 @@ pub(crate) fn specialize_legacy_graph_with_seed_annotations(
         crate::annotator::bookkeeper::Bookkeeper::new(),
     ));
     specialize_legacy_graph_with_registry_seed(legacy, Some(seed_annotations), &registry)
-        .map(|(state, _)| state)
+        .map(|(state, _, _)| state)
 }
 
 #[cfg(test)]
@@ -963,7 +974,7 @@ pub(crate) fn dual_gate_check_with_registry_seed(
         )
     }));
     match result {
-        Ok(Ok((real_state, real_annotations))) => {
+        Ok(Ok((real_state, real_annotations, real_value_to_var))) => {
             // Test-side regression diff against legacy — keeps anchor
             // tests honest until the orthodox `RPythonAnnotator::
             // processblock` port produces the same shape.
@@ -990,6 +1001,7 @@ pub(crate) fn dual_gate_check_with_registry_seed(
                 Ok(DualGateOutcome::Match {
                     real_state,
                     real_annotations,
+                    real_value_to_var,
                 })
             } else {
                 Err(divergences.join("; "))
@@ -1033,6 +1045,22 @@ pub fn specialize_legacy_graph_with_registry(
     legacy: &LegacyGraph,
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
 ) -> Result<(TypeResolutionState, AnnotationState), TyperError> {
+    let (state, annotations, _value_to_var) =
+        specialize_legacy_graph_with_registry_seed(legacy, None, call_registry)?;
+    Ok((state, annotations))
+}
+
+/// `specialize_legacy_graph_with_registry` extended return shape that
+/// also surfaces the [`ValueIdToVariable`] map produced by the
+/// flowspace adapter.  Codewriter callers use the map to hydrate
+/// `graph.value_types` directly from `Variable.concretetype` via
+/// [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`]
+/// — the long-term parity path that retires the transitional
+/// `merge_synth_kinds` 4-source merge.
+pub fn specialize_legacy_graph_with_registry_returning_value_to_var(
+    legacy: &LegacyGraph,
+    call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
+) -> Result<(TypeResolutionState, AnnotationState, ValueIdToVariable), TyperError> {
     specialize_legacy_graph_with_registry_seed(legacy, None, call_registry)
 }
 
@@ -1049,7 +1077,7 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
     legacy: &LegacyGraph,
     seed_annotations: Option<&AnnotationState>,
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
-) -> Result<(TypeResolutionState, AnnotationState), TyperError> {
+) -> Result<(TypeResolutionState, AnnotationState, ValueIdToVariable), TyperError> {
     // Slice 3 v2 — RPython parity path.
     //
     // Upstream `RPythonTyper.specialize` runs ONCE per `Translator`,
@@ -1260,7 +1288,7 @@ pub(crate) fn specialize_legacy_graph_with_registry_seed(
     // annotator carries the result of the bookkeeper-driven annotation
     // fixed-point.
     let real_annotations = read_annotations_from_value_to_var(&value_to_var);
-    Ok((state, real_annotations))
+    Ok((state, real_annotations, value_to_var))
 }
 
 /// Project per-session `Variable.annotation` SomeValue lattice nodes onto
