@@ -61,7 +61,7 @@ pub struct GraphAllocationResult {
 /// `tool/algo/unionfind.py UnionFind` port (`()` info, matching upstream
 /// `info_factory=None`).
 struct FlowGraphRegAllocator {
-    _depgraph: DependencyGraph,
+    _depgraph: DependencyGraph<ValueId>,
     _unionfind: UnionFind<super::flow::VariableId, ()>,
     _coloring: HashMap<super::flow::VariableId, u16>,
 }
@@ -219,7 +219,7 @@ impl FlowGraphRegAllocator {
         }
         if self
             ._depgraph
-            .has_edge(ValueId(v0.0 as usize), ValueId(w0.0 as usize))
+            .has_edge(&ValueId(v0.0 as usize), &ValueId(w0.0 as usize))
         {
             return;
         }
@@ -854,7 +854,7 @@ fn perform_register_allocation(
 ///     def swapcolors(self, col1, col2): ...
 /// ```
 struct RegAllocator {
-    depgraph: DependencyGraph,
+    depgraph: DependencyGraph<ValueId>,
     /// Union-find over register indices (RPython
     /// `tool.algo.unionfind.UnionFind.link_to_parent`). Created
     /// lazily; missing nodes self-rep.
@@ -1074,7 +1074,7 @@ impl RegAllocator {
         }
         if self
             .depgraph
-            .has_edge(ValueId(v0 as usize), ValueId(w0 as usize))
+            .has_edge(&ValueId(v0 as usize), &ValueId(w0 as usize))
         {
             return;
         }
