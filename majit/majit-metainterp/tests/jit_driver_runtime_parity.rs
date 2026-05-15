@@ -940,6 +940,7 @@ impl JitState for PendingWriteState {
     fn pending_field_write_layout(
         &self,
         _meta: &Self::Meta,
+        _descr: Option<&majit_ir::DescrRef>,
         descr_index: u32,
         is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
@@ -1004,6 +1005,7 @@ impl JitState for PendingArrayWriteState {
     fn pending_field_write_layout(
         &self,
         _meta: &Self::Meta,
+        _descr: Option<&majit_ir::DescrRef>,
         descr_index: u32,
         is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
@@ -1181,6 +1183,7 @@ impl JitState for GenericMultiFrameResumeState {
     fn pending_field_write_layout(
         &self,
         _meta: &Self::Meta,
+        _descr: Option<&majit_ir::DescrRef>,
         descr_index: u32,
         is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
@@ -1348,6 +1351,7 @@ impl JitState for PendingVirtualWriteState {
     fn pending_field_write_layout(
         &self,
         _meta: &Self::Meta,
+        _descr: Option<&majit_ir::DescrRef>,
         descr_index: u32,
         is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {

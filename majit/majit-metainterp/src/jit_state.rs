@@ -536,9 +536,17 @@ pub trait JitState: Sized {
         self.materialize_virtual_ref(meta, virtual_index, materialized)
     }
 
+    /// `resume.py:1009-1014 setarrayitem` / `resume.py:1190 setfield`
+    /// parity — RPython dispatches via `descr.is_pointer_field()` /
+    /// `arraydescr.is_array_of_pointers()`.  pyre passes the live
+    /// `descr` Arc so the driver can call the same `FieldDescr` /
+    /// `ArrayDescr` trait methods directly; `descr_index` is kept for
+    /// drivers whose layout tables still key on the legacy handle
+    /// (Slice C migrates them).
     fn pending_field_write_layout(
         &self,
         _meta: &Self::Meta,
+        _descr: Option<&majit_ir::DescrRef>,
         _descr_index: u32,
         _is_array_item: bool,
     ) -> Option<PendingFieldWriteLayout> {
@@ -1117,6 +1125,7 @@ pub trait JitState: Sized {
         for pending in pending_field_writes {
             let Some(layout) = self.pending_field_write_layout(
                 meta,
+                pending.descr.as_ref(),
                 pending.descr_index,
                 pending.item_index.is_some(),
             ) else {
