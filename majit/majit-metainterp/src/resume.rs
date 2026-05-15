@@ -1392,8 +1392,18 @@ pub fn rd_virtual_to_virtual_info(
 pub use majit_backend::PendingFieldInfo;
 
 /// Concrete pending heap write reconstructed from resume data.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `resume.py:1000-1007 _prepare_pendingfields` parity — RPython
+/// hands the live `descr` Arc into `setfield` / `setarrayitem` and
+/// they dispatch via `descr.is_pointer_field()` /
+/// `descr.is_array_of_pointers()` etc.  pyre keeps the Arc alongside
+/// the legacy `descr_index` handle while the dispatch path is
+/// rewritten (Slice B/C) to call methods on the Arc directly; once
+/// done, `descr_index` is removed (Slice D).
+#[derive(Debug, Clone)]
 pub struct ResolvedPendingFieldWrite {
+    /// `resume.py:88 lldescr` — the field/array descriptor itself.
+    pub descr: Option<majit_ir::DescrRef>,
     /// Descriptor index identifying the field or array descriptor.
     pub descr_index: u32,
     /// Concrete object/array pointer.
@@ -1403,6 +1413,17 @@ pub struct ResolvedPendingFieldWrite {
     /// Array item index. `None` means a plain field write.
     pub item_index: Option<usize>,
 }
+
+impl PartialEq for ResolvedPendingFieldWrite {
+    fn eq(&self, other: &Self) -> bool {
+        // `history.py:125 id(descr)` parity — descr identity via Arc::ptr_eq.
+        majit_ir::resumedata::opt_descr_arc_ptr_eq(&self.descr, &other.descr)
+            && self.target == other.target
+            && self.value == other.value
+            && self.item_index == other.item_index
+    }
+}
+impl Eq for ResolvedPendingFieldWrite {}
 
 /// Encoded pending field write stored alongside an encoded resume snapshot.
 ///
@@ -2245,6 +2266,7 @@ impl ResumeDataExt for ResumeData {
         pending_fields
             .iter()
             .map(|pending| ResolvedPendingFieldWrite {
+                descr: pending.descr.clone(),
                 descr_index: pending.descr_index,
                 target: <ResumeData as ResumeDataExt>::resolve_materialized_source(
                     &pending.target,
