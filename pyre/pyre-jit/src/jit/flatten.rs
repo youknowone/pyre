@@ -5772,7 +5772,6 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
         let dual =
             flatten_op_to_insn(&dual_op, &mut get_register, &mut flatten_constant_operand_for_probe)
                 .expect("residual_call SpaceOperation must lower");
@@ -5905,7 +5904,6 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
         let dual =
             flatten_op_to_insn(&dual_op, &mut get_register, &mut flatten_constant_operand_for_probe)
                 .expect("residual_call SpaceOperation must lower");
@@ -6134,7 +6132,6 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
         let dual =
             flatten_op_to_insn(&dual_op, &mut get_register, &mut flatten_constant_operand_for_probe)
                 .expect("residual_call SpaceOperation must lower");
@@ -6261,7 +6258,6 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
         let dual =
             flatten_op_to_insn(&dual_op, &mut get_register, &mut flatten_constant_operand_for_probe)
                 .expect("residual_call SpaceOperation must lower");
@@ -6471,7 +6467,6 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
         let dual =
             flatten_op_to_insn(&dual_op, &mut get_register, &mut flatten_constant_operand_for_probe)
                 .expect("residual_call SpaceOperation must lower");
