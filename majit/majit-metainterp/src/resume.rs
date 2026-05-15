@@ -877,7 +877,6 @@ fn pending_field_layout_to_pending_field_info(
 ) -> PendingFieldInfo {
     PendingFieldInfo {
         descr: layout.descr.clone(),
-        descr_index: layout.descr_index,
         target: layout.target.to_resume_source(),
         value: layout.value.to_resume_source(),
         item_index: layout.item_index,
@@ -1827,7 +1826,7 @@ impl EncodedResumeData {
                 // resume.py:547 lldescr = cast_instance_to_base_ptr(descr) —
                 // the encoded form carries the descr itself, not a handle.
                 descr: pending.descr.clone(),
-                descr_index: pending.descr_index,
+                descr_index: pending.descr.as_ref().map_or(0, |d| d.index()),
                 target: memo.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
                 value: memo.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
                 item_index: pending.item_index,
@@ -1919,7 +1918,6 @@ impl EncodedResumeData {
             .iter()
             .map(|pending| PendingFieldInfo {
                 descr: pending.descr.clone(),
-                descr_index: pending.descr_index,
                 target: self.decode_box(pending.target),
                 value: self.decode_box(pending.value),
                 item_index: pending.item_index,
@@ -2881,16 +2879,22 @@ impl ResumeDataVirtualAdder {
     }
 
     /// Add a deferred field write to replay on resume.
+    ///
+    /// `resume.py:88 PENDINGFIELDSTRUCT.lldescr` — RPython always
+    /// captures a live descr off the originating SetfieldGc op.  The
+    /// `descr_index` argument is preserved transitionally for callers
+    /// that supplied it before `descr` carried the same identity; it
+    /// is now derived from `descr.index()` and the parameter is
+    /// ignored.
     pub fn add_pending_field_write(
         &mut self,
         descr: Option<majit_ir::DescrRef>,
-        descr_index: u32,
+        _descr_index: u32,
         target: ResumeValueSource,
         value: ResumeValueSource,
     ) {
         self.pending_fields.push(PendingFieldInfo {
             descr,
-            descr_index,
             target,
             value,
             item_index: None,
@@ -2901,14 +2905,13 @@ impl ResumeDataVirtualAdder {
     pub fn add_pending_arrayitem_write(
         &mut self,
         descr: Option<majit_ir::DescrRef>,
-        descr_index: u32,
+        _descr_index: u32,
         target: ResumeValueSource,
         item_index: usize,
         value: ResumeValueSource,
     ) {
         self.pending_fields.push(PendingFieldInfo {
             descr,
-            descr_index,
             target,
             value,
             item_index: Some(item_index),
@@ -4098,7 +4101,7 @@ impl ResumeDataLoopMemo {
                 // resume.py:547 lldescr = cast_instance_to_base_ptr(descr) —
                 // the encoded form carries the descr itself, not a handle.
                 descr: pending.descr.clone(),
-                descr_index: pending.descr_index,
+                descr_index: pending.descr.as_ref().map_or(0, |d| d.index()),
                 target: self.encode_tagged_source(&pending.target, &mut liveboxes, &mut box_map),
                 value: self.encode_tagged_source(&pending.value, &mut liveboxes, &mut box_map),
                 item_index: pending.item_index,
