@@ -2732,7 +2732,7 @@ impl ResumeDataVirtualAdder {
         &mut self,
         descr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
+        _descr_index: u32,
         known_class: Option<i64>,
         fields: Vec<(u32, VirtualFieldSource)>,
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
@@ -2753,7 +2753,7 @@ impl ResumeDataVirtualAdder {
         &mut self,
         typedescr: Option<majit_ir::DescrRef>,
         type_id: u32,
-        descr_index: u32,
+        _descr_index: u32,
         fields: Vec<(u32, VirtualFieldSource)>,
         fielddescrs: Vec<majit_ir::FieldDescrInfo>,
         descr_size: usize,
@@ -2771,7 +2771,7 @@ impl ResumeDataVirtualAdder {
     pub fn add_virtual_array(
         &mut self,
         arraydescr: Option<majit_ir::DescrRef>,
-        descr_index: u32,
+        _descr_index: u32,
         clear: bool,
         items: Vec<VirtualFieldSource>,
     ) -> usize {
@@ -2787,7 +2787,7 @@ impl ResumeDataVirtualAdder {
     pub fn add_virtual_array_struct(
         &mut self,
         arraydescr: Option<majit_ir::DescrRef>,
-        descr_index: u32,
+        _descr_index: u32,
         fielddescrs: Vec<majit_ir::DescrRef>,
         element_fields: Vec<Vec<(u32, VirtualFieldSource)>>,
     ) -> usize {

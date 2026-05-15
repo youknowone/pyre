@@ -980,7 +980,6 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
             })
             .unwrap_or(0);
         let ad = Some(arraydescr.clone());
-        let descr_index = arraydescr.index();
         Some(if clear {
             majit_ir::RdVirtualInfo::VArrayInfoClear {
                 arraydescr: ad,
