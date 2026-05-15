@@ -1402,7 +1402,13 @@ mod tests {
 
     #[test]
     fn lowleveltype_to_concrete_longlong_follows_target_word_size() {
-        let expected = longlong_getkind_concrete();
+        // history.py:55-58 — `if rffi.sizeof(TYPE) > rffi.sizeof(lltype.Signed):
+        //   if supports_longlong and TYPE is not lltype.LongFloat: return 'float'`
+        let expected = if std::mem::size_of::<i64>() > std::mem::size_of::<isize>() {
+            ConcreteType::Float
+        } else {
+            ConcreteType::Signed
+        };
         for ll in [LowLevelType::SignedLongLong, LowLevelType::UnsignedLongLong] {
             assert_eq!(
                 lowleveltype_to_concrete(&ll).expect("supported lltype"),
@@ -2163,7 +2169,7 @@ fn fib(n: i64) -> i64 {
             pygraph,
         );
 
-        let (state, _annotations) =
+        let (state, _annotations, _value_to_var) =
             specialize_legacy_graph_with_registry_seed(&graph, Some(&annotations), &registry)
                 .expect("Slice A.4 cache pre-fill must let the leaf Call resolve end-to-end");
         // Slice A.4 closes the loop:
