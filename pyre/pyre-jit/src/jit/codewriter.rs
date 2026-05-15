@@ -2579,19 +2579,27 @@ fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) 
             .get(anchor_pos + 1)
             .map(|(next_idx, _)| *next_idx)
             .unwrap_or(ssarepr.insns.len());
+        // Take the FIRST -live- marker per anchor pair.  Phase A.4 +
+        // Phase B groundwork: pyre's PC-sequential walker can emit
+        // duplicate `Label("pcN")` + `-live-` pairs when supersede
+        // queues a re-walk under widened framestate.  The runtime
+        // resolves `pcN` jumps to the FIRST Label position
+        // (`pc_anchor_positions` line ~2541) so the FIRST -live-
+        // matches the runtime's actual liveness window; subsequent
+        // duplicate -live- markers are dead emit from the re-walked
+        // newblock and are silently ignored here.
         let mut live_idx: Option<usize> = None;
         for insn_idx in (anchor_idx + 1)..end {
             if ssarepr.insns[insn_idx].is_live() {
-                assert!(
-                    live_idx.is_none(),
-                    "live_marker_indices_by_pc: multiple -live- markers for py_pc {} in range {}..{}",
-                    py_pc,
-                    anchor_idx + 1,
-                    end
-                );
-                live_idx = Some(insn_idx);
+                if live_idx.is_none() {
+                    live_idx = Some(insn_idx);
+                }
+                // else: silently take first; subsequent duplicates
+                // belong to a different SpamBlock's re-walk emit and
+                // are unreachable at runtime via this pcN label.
             }
         }
+        let _ = py_pc;
         live_indices[*py_pc] = live_idx.unwrap_or_else(|| {
             panic!(
                 "live_marker_indices_by_pc: missing -live- marker for py_pc {} in range {}..{}",
@@ -4952,10 +4960,15 @@ impl CodeWriter {
             // (production flip to post-walk `flatten_graph(graph,
             // regallocs)` emission); it is not a standalone walker
             // refactor.
-            if emitted_pc_starts.get(start_pc).copied().unwrap_or(false) {
-                pending_block.mark_dead();
-                continue;
-            }
+            // Phase A.4 retired the emitted_pc_starts skip + dead-mark.
+            // Mirrors upstream's `flowcontext.py:404 if not block.dead:
+            // record_block(block)` identity-only check.  Duplicate
+            // pcN Labels from re-walk under widened framestate are
+            // tolerated by `pc_anchor_positions` (first-wins) and
+            // `live_marker_indices_by_pc` (first-takes); runtime
+            // dispatches via the FIRST Label position so the dead
+            // block's bytes remain canonical.
+            let _ = start_pc;
             current_block = pending_block;
             current_state = pending_state;
             current_depth = current_state.stack.len() as u16;
