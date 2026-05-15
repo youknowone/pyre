@@ -5973,9 +5973,8 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
             .bh_call_i(func, Some(&[size as i64]), None, None, &calldescr)
     }
 
-    /// resume.py:1543-1550 setrawbuffer_item
-    /// Concrete reader: descr-driven dispatch to cpu.bh_raw_store_f/i
-    fn setrawbuffer_item(
+    /// resume.py:1547 cpu.bh_raw_store_f(buffer, offset, value, descr).
+    fn bh_raw_store_f(
         &self,
         buffer: i64,
         offset: i64,
@@ -5983,24 +5982,23 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         descr: &majit_ir::ArrayDescrInfo,
     ) {
         let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(descr);
-        // resume.py:1544: assert not descr.is_array_of_pointers()
-        assert!(
-            !bh_descr.is_array_of_pointers(),
-            "raw buffer entry must not be pointer type"
-        );
         let (driver, _) = driver_pair();
         let backend = driver.meta_interp().backend();
-        if descr.item_type == 2 {
-            // resume.py:1545-1547: descr.is_array_of_floats()
-            //   newvalue = self.decode_float(fieldnum)
-            //   self.cpu.bh_raw_store_f(buffer, offset, newvalue, descr)
-            backend.bh_raw_store_f(buffer, offset, f64::from_bits(value as u64), &bh_descr);
-        } else {
-            // resume.py:1548-1550: else (int)
-            //   newvalue = self.decode_int(fieldnum)
-            //   self.cpu.bh_raw_store_i(buffer, offset, newvalue, descr)
-            backend.bh_raw_store_i(buffer, offset, value, &bh_descr);
-        }
+        backend.bh_raw_store_f(buffer, offset, f64::from_bits(value as u64), &bh_descr);
+    }
+
+    /// resume.py:1550 cpu.bh_raw_store_i(buffer, offset, value, descr).
+    fn bh_raw_store_i(
+        &self,
+        buffer: i64,
+        offset: i64,
+        value: i64,
+        descr: &majit_ir::ArrayDescrInfo,
+    ) {
+        let bh_descr = majit_translate::jitcode::BhDescr::from_array_descr_info(descr);
+        let (driver, _) = driver_pair();
+        let backend = driver.meta_interp().backend();
+        backend.bh_raw_store_i(buffer, offset, value, &bh_descr);
     }
 
     fn box_int(&self, value: i64) -> i64 {

@@ -5210,10 +5210,23 @@ pub trait BlackholeAllocator {
         let _ = (func, size);
         0
     }
-    /// resume.py:1543 setrawbuffer_item(buffer, fieldnum, offset, descr).
-    /// `offset` mirrors `RawBuffer.offsets[i]` and is signed
-    /// (rawbuffer.py:14).
-    fn setrawbuffer_item(
+    /// resume.py:1547 cpu.bh_raw_store_f(buffer, offset, value, descr) —
+    /// float raw store dispatched from setrawbuffer_item when
+    /// `descr.is_array_of_floats()`.  `offset` mirrors
+    /// `RawBuffer.offsets[i]` and is signed (rawbuffer.py:14).
+    fn bh_raw_store_f(
+        &self,
+        buffer: i64,
+        offset: i64,
+        value: i64,
+        descr: &majit_ir::ArrayDescrInfo,
+    ) {
+        let _ = (buffer, offset, value, descr);
+    }
+    /// resume.py:1550 cpu.bh_raw_store_i(buffer, offset, value, descr) —
+    /// integer raw store dispatched from setrawbuffer_item (default
+    /// branch — descr is not an array of pointers / floats).
+    fn bh_raw_store_i(
         &self,
         buffer: i64,
         offset: i64,
@@ -5579,22 +5592,33 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 // resume.py:705-708: for i in range(len(self.offsets)):
                 //     offset = self.offsets[i]; descr = self.descrs[i]
                 //     decoder.setrawbuffer_item(buffer, fieldnums[i], offset, descr)
+                //
+                // Pyre stores fieldnums[i] as a tagged
+                // VirtualFieldSource (the value lives on the virtual
+                // layout rather than in the resume tape), so we encode
+                // it back into the i16 charnum the dispatcher accepts
+                // via decode_field_source_{float,int} → tag.
                 for i in 0..offsets.len() {
                     let descr = &descrs[i];
                     let source = &values[i];
-                    // resume.py:1543-1550: dispatch by descr kind
+                    if matches!(source, VirtualFieldSource::Uninitialized) {
+                        continue;
+                    }
+                    // pyre extracts the per-entry value from the virtual
+                    // layout instead of the tagged fieldnum, then writes
+                    // through bh_raw_store_{i,f} per descr kind — same
+                    // dispatch as resume.py:1545-1550 setrawbuffer_item.
                     assert!(
                         descr.item_type != 0,
                         "raw buffer entry must not be pointer type"
                     );
-                    let value = if descr.item_type == 2 {
-                        // resume.py:1545: descr.is_array_of_floats() → decode_float
-                        decoder.decode_field_source_float(source)
+                    if descr.item_type == 2 {
+                        let value = decoder.decode_field_source_float(source);
+                        allocator.bh_raw_store_f(buffer, offsets[i], value, descr);
                     } else {
-                        // resume.py:1549: else → decode_int
-                        decoder.decode_field_source_int(source)
-                    };
-                    allocator.setrawbuffer_item(buffer, offsets[i], value, descr);
+                        let value = decoder.decode_field_source_int(source);
+                        allocator.bh_raw_store_i(buffer, offsets[i], value, descr);
+                    }
                 }
                 buffer
             }
@@ -5839,6 +5863,35 @@ impl<'a> ResumeDataDirectReader<'a> {
         let str1 = self.decode_ref(str1num);
         let str2 = self.decode_ref(str2num);
         self.allocator.os_uni_concat(funcptr, str1, str2)
+    }
+
+    /// resume.py:1543-1550 setrawbuffer_item(buffer, fieldnum, offset,
+    /// descr) dispatcher: `assert not descr.is_array_of_pointers()`,
+    /// then dispatch to `bh_raw_store_f` (float) or `bh_raw_store_i`
+    /// (default).
+    pub fn setrawbuffer_item(
+        &mut self,
+        buffer: i64,
+        fieldnum: i16,
+        offset: i64,
+        descr: &majit_ir::ArrayDescrInfo,
+    ) {
+        // resume.py:1544 assert not descr.is_array_of_pointers()
+        assert!(
+            descr.item_type != 0,
+            "setrawbuffer_item: descr must not be array_of_pointers"
+        );
+        if descr.item_type == 2 {
+            // resume.py:1546-1547 newvalue = self.decode_float(fieldnum)
+            //                    self.cpu.bh_raw_store_f(...)
+            let value = self.decode_float(fieldnum);
+            self.allocator.bh_raw_store_f(buffer, offset, value, descr);
+        } else {
+            // resume.py:1549-1550 newvalue = self.decode_int(fieldnum)
+            //                    self.cpu.bh_raw_store_i(...)
+            let value = self.decode_int(fieldnum);
+            self.allocator.bh_raw_store_i(buffer, offset, value, descr);
+        }
     }
 
     /// resume.py:1499-1507 slice_unicode(strnum, startnum, lengthnum).
