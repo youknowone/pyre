@@ -504,7 +504,7 @@ impl<'a> AssemblerARM64<'a> {
     /// assembler.py:1145 regalloc_mov(from_loc, to_loc).
     /// Emit a move between any two locations: reg↔reg, reg↔frame, imm→reg, imm→frame.
     pub(crate) fn regalloc_mov(&mut self, src: &Loc, dst: &Loc) {
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!("[dynasm] remap-mov: {:?} -> {:?}", src, dst);
         }
         match (src, dst) {
@@ -1434,7 +1434,7 @@ impl<'a> AssemblerARM64<'a> {
         _: &dyn FailDescr,
         arglocs: &[Loc],
     ) -> Result<CompiledCode, BackendError> {
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] assemble_bridge: input_types={:?} arglocs={:?}",
                 self.inputargs.iter().map(|ia| ia.tp).collect::<Vec<_>>(),
@@ -1461,7 +1461,7 @@ impl<'a> AssemblerARM64<'a> {
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
 
-        if std::env::var_os("MAJIT_DUMP").is_some() {
+        if crate::majit_dump_enabled() {
             let code = unsafe { std::slice::from_raw_parts(rawstart as *const u8, buffer.len()) };
             eprintln!(
                 "[dynasm] BRIDGE CODE DUMP ({} bytes at {:#x}, entry +{:?}):",
@@ -1576,7 +1576,7 @@ impl<'a> AssemblerARM64<'a> {
 
         let mut fail_index = 0u32;
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] _assemble: {} ops → {} ra_ops, frame_depth={}",
                 ops.len(),
@@ -1593,7 +1593,7 @@ impl<'a> AssemblerARM64<'a> {
                     continue;
                 }
                 RegAllocOp::Move { src, dst } => {
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         eprintln!("[dynasm] move: {:?} → {:?}", src, dst);
                     }
                     self.regalloc_mov(src, dst);
@@ -1606,7 +1606,7 @@ impl<'a> AssemblerARM64<'a> {
                     gcmap,
                 } => {
                     let op = &ops[*op_index];
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
                         eprintln!(
                             "[dynasm] emit[{}]: {:?} args=[{}] result={:?}",
@@ -1634,7 +1634,7 @@ impl<'a> AssemblerARM64<'a> {
                     faillocs,
                 } => {
                     let op = &ops[*op_index];
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         eprintln!(
                             "[dynasm] guard[{}]: {:?} args=[{}] faillocs={}",
                             op_index,
@@ -1659,7 +1659,7 @@ impl<'a> AssemblerARM64<'a> {
                 }
                 RegAllocOp::PerformDiscard { op_index, arglocs } => {
                     let op = &ops[*op_index];
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
                         eprintln!(
                             "[dynasm] discard[{}]: {:?} args=[{}]",
@@ -1676,7 +1676,7 @@ impl<'a> AssemblerARM64<'a> {
             }
         }
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] _assemble done: pending_guard_tokens={} fail_index={}",
                 self.pending_guard_tokens.len(),
@@ -2334,7 +2334,7 @@ impl<'a> AssemblerARM64<'a> {
                         "GcStore size_loc must be Loc::Immed (regalloc contract), got {other:?}",
                     ),
                 };
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if crate::majit_log_enabled() {
                     if let Loc::Immed(i) = ofs_loc {
                         let input0_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE);
                         let input1_ofs = Self::slot_offset(JITFRAME_FIXED_SIZE + 1);
@@ -2441,7 +2441,7 @@ impl<'a> AssemblerARM64<'a> {
                             .collect::<Vec<_>>()
                     })
                     .unwrap_or_default();
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if crate::majit_log_enabled() {
                     eprintln!(
                         "[dynasm] JUMP remap: src={:?} dst={:?}",
                         arglocs, target_arglocs
@@ -2575,7 +2575,7 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
                 let label_descr = loop_target_descr(op);
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if crate::majit_log_enabled() {
                     eprintln!(
                         "[dynasm] LABEL: new DynamicLabel({:?}) arglocs={:?}",
                         label, arglocs
@@ -2588,7 +2588,7 @@ impl<'a> AssemblerARM64<'a> {
                         .copied()
                         .map(target_argloc_from_loc)
                         .collect::<Vec<_>>();
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         eprintln!("[dynasm] LABEL target_arglocs={:?}", stored_arglocs);
                     }
                     descr.set_target_arglocs(stored_arglocs);
@@ -3339,7 +3339,7 @@ impl<'a> AssemblerARM64<'a> {
                 true,  // is_resume_guard
             ))
         };
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] guard-token: fail_index={} op_index={} opcode={:?} fail_args={:?} fail_arg_types={:?} faillocs={:?}",
                 fail_index,
@@ -3438,7 +3438,7 @@ impl<'a> AssemblerARM64<'a> {
             // through this Arc.
             descr_mut.meta_descr = op.descr.clone();
         }
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] guard-token-slots: fail_index={} fail_arg_locs={:?} rd_locs={:?}",
                 fail_index, &descr.fail_arg_locs, &descr.rd_locs
@@ -3474,7 +3474,7 @@ impl<'a> AssemblerARM64<'a> {
         let stub_start = self.mc.offset();
 
         let fail_label = guard_token.fail_label;
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!("[dynasm] recovery stub: binding {:?}", fail_label);
         }
         dynasm!(self.mc ; .arch aarch64 ; =>fail_label);
@@ -3519,7 +3519,7 @@ impl<'a> AssemblerARM64<'a> {
         }
         dynasm!(self.mc ; .arch aarch64 ; ret);
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] write_pending_failure_recoveries: {} tokens",
                 self.pending_guard_tokens.len()
@@ -3529,7 +3529,7 @@ impl<'a> AssemblerARM64<'a> {
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
             stub_offsets.push(self.generate_quick_failure(guard_token, save_regs_label));
         }
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!("[dynasm] write_pending done: {} stubs", stub_offsets.len());
         }
         stub_offsets
@@ -3576,7 +3576,7 @@ impl<'a> AssemblerARM64<'a> {
         flush_icache(stub_addr as *const u8, 16);
 
         // Verify patch was applied correctly
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             let word = unsafe { (stub_addr as *const u32).read() };
             eprintln!(
                 "[patch-verify] stub_addr={:#x} first_word={:#010x} target={:#x}",

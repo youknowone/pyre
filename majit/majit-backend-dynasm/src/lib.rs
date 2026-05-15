@@ -42,6 +42,32 @@ pub mod x86;
 
 use std::sync::atomic::{AtomicI64, AtomicU32, Ordering};
 
+/// Whether `MAJIT_LOG` is set, cached at first access.
+///
+/// `std::env::var_os` acquires a global env lock and walks the env table on
+/// every call. The flag never changes after process startup, so checking it
+/// from hot dispatch paths shows up in profiles. The `LazyLock` caches the
+/// boolean. Mirrors the equivalent helper in `majit-backend-cranelift`.
+pub fn majit_log_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_LOG").is_some());
+    *ENABLED
+}
+
+/// Whether `MAJIT_DUMP` is set, cached at first access.
+pub fn majit_dump_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_DUMP").is_some());
+    *ENABLED
+}
+
+/// Whether `MAJIT_J2PLAN_LOG` is set, cached at first access.
+pub fn majit_j2plan_log_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_J2PLAN_LOG").is_some());
+    *ENABLED
+}
+
 static JIT_EXC_VALUE: AtomicI64 = AtomicI64::new(0);
 static JIT_EXC_TYPE: AtomicI64 = AtomicI64::new(0);
 static JITFRAME_GC_TYPE_ID: AtomicU32 = AtomicU32::new(u32::MAX);
@@ -341,7 +367,7 @@ pub extern "C" fn call_assembler_helper_trampoline(
     green_key: u64,
 ) -> i64 {
     if callee_jf_ptr.is_null() {
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if majit_log_enabled() {
             eprintln!("[dynasm][ca-helper] null callee_jf_ptr green_key={green_key}");
         }
         return 0;
@@ -619,7 +645,7 @@ fn handle_fail_resume_guard(
             raw_values.as_ptr(),
             raw_values.len(),
         ) {
-            if std::env::var_os("MAJIT_LOG").is_some() {
+            if majit_log_enabled() {
                 eprintln!(
                     "[dynasm][ca-helper] resume-guard trace_id={trace_id} fail_index={fail_index} result=0x{bh_result:x}"
                 );
@@ -627,7 +653,7 @@ fn handle_fail_resume_guard(
             return bh_result;
         }
     }
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         eprintln!(
             "[dynasm][ca-helper] resume-guard trace_id={trace_id} fail_index={fail_index} fell through to 0 descr=0x{descr_raw:x} frame={frame_ptr:p}"
         );
@@ -660,7 +686,7 @@ pub extern "C" fn call_assembler_execute_trampoline(
     jf_ptr: *mut jitframe::JitFrame,
     callee_addr: usize,
 ) -> *mut jitframe::JitFrame {
-    if std::env::var_os("MAJIT_LOG").is_some() && !jf_ptr.is_null() {
+    if majit_log_enabled() && !jf_ptr.is_null() {
         let input0_ofs =
             jitframe::FIRST_ITEM_OFFSET + crate::arch::JITFRAME_FIXED_SIZE * jitframe::SIZEOFSIGNED;
         let input1_ofs = input0_ofs + jitframe::SIZEOFSIGNED;
@@ -680,7 +706,7 @@ pub extern "C" fn call_assembler_execute_trampoline(
     let func: unsafe extern "C" fn(*mut jitframe::JitFrame) -> *mut jitframe::JitFrame =
         unsafe { std::mem::transmute(callee_addr) };
     let result = unsafe { func(jf_ptr) };
-    if std::env::var_os("MAJIT_LOG").is_some() {
+    if majit_log_enabled() {
         eprintln!("[dynasm][ca-exec] leave jf={result:p}");
     }
     result

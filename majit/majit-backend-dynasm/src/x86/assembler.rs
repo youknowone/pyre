@@ -1792,7 +1792,7 @@ impl<'a> Assembler386<'a> {
 
         // ── Run register allocator ──
         // assembler.py:537 prepare_loop / assembler.py:638 prepare_bridge
-        if std::env::var_os("MAJIT_J2PLAN_LOG").is_some() {
+        if crate::majit_j2plan_log_enabled() {
             let plan = crate::j2plan::TracePlan::build(inputargs, ops);
             eprintln!("[dynasm:j2plan] {}", plan.summary());
         }
@@ -1839,7 +1839,7 @@ impl<'a> Assembler386<'a> {
 
         let mut fail_index = 0u32;
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] _assemble: {} ops → {} ra_ops, frame_depth={}",
                 ops.len(),
@@ -1856,7 +1856,7 @@ impl<'a> Assembler386<'a> {
                     continue;
                 }
                 RegAllocOp::Move { src, dst } => {
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         eprintln!("[dynasm] move: {:?} → {:?}", src, dst);
                     }
                     self.regalloc_mov(src, dst);
@@ -1869,7 +1869,7 @@ impl<'a> Assembler386<'a> {
                     gcmap,
                 } => {
                     let op = &ops[*op_index];
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
                         eprintln!(
                             "[dynasm] emit[{}]: {:?} args=[{}] result={:?}",
@@ -1897,7 +1897,7 @@ impl<'a> Assembler386<'a> {
                     faillocs,
                 } => {
                     let op = &ops[*op_index];
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         eprintln!(
                             "[dynasm] guard[{}]: {:?} args=[{}] faillocs={}",
                             op_index,
@@ -1922,7 +1922,7 @@ impl<'a> Assembler386<'a> {
                 }
                 RegAllocOp::PerformDiscard { op_index, arglocs } => {
                     let op = &ops[*op_index];
-                    if std::env::var_os("MAJIT_LOG").is_some() {
+                    if crate::majit_log_enabled() {
                         let al: Vec<String> = arglocs.iter().map(|l| format!("{:?}", l)).collect();
                         eprintln!(
                             "[dynasm] discard[{}]: {:?} args=[{}]",
@@ -1939,7 +1939,7 @@ impl<'a> Assembler386<'a> {
             }
         }
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] _assemble done: pending_guard_tokens={} fail_index={}",
                 self.pending_guard_tokens.len(),
@@ -2884,7 +2884,7 @@ impl<'a> Assembler386<'a> {
                 }
                 let tmpreg1 = Loc::Reg(crate::regloc::X86_64_SCRATCH_REG);
                 let tmpreg2 = Loc::Reg(crate::regloc::XMM15);
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if crate::majit_log_enabled() {
                     eprintln!(
                         "[dynasm] Jump remap: {} int src→dst, {} float src→dst",
                         src_locations1.len(),
@@ -2991,7 +2991,7 @@ impl<'a> Assembler386<'a> {
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
                 let label_descr = loop_target_descr(op);
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if crate::majit_log_enabled() {
                     eprintln!("[dynasm] LABEL: new DynamicLabel({:?})", label);
                 }
                 dynasm!(self.mc ; =>label);
@@ -3884,7 +3884,7 @@ impl<'a> Assembler386<'a> {
                 true,  // is_resume_guard
             ))
         };
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] guard-token: fail_index={} op_index={} opcode={:?} fail_args={:?} fail_arg_types={:?} faillocs={:?}",
                 fail_index,
@@ -3984,7 +3984,7 @@ impl<'a> Assembler386<'a> {
             // metainterp side, so no separate local copy is kept here.
             descr_mut.meta_descr = op.descr.clone();
         }
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] guard-token-slots: fail_index={} fail_arg_locs={:?} rd_locs={:?}",
                 fail_index, &descr.fail_arg_locs, &descr.rd_locs
@@ -4053,7 +4053,7 @@ impl<'a> Assembler386<'a> {
         let stub_start = self.mc.offset();
 
         let fail_label = guard_token.fail_label;
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!("[dynasm] recovery stub: binding {:?}", fail_label);
         }
         dynasm!(self.mc ; .arch x64 ; =>fail_label);
@@ -4108,7 +4108,7 @@ impl<'a> Assembler386<'a> {
         }
         dynasm!(self.mc ; .arch x64 ; ret);
 
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm] write_pending_failure_recoveries: {} tokens",
                 self.pending_guard_tokens.len()
@@ -4118,7 +4118,7 @@ impl<'a> Assembler386<'a> {
         for guard_token in std::mem::take(&mut self.pending_guard_tokens) {
             stub_offsets.push(self.generate_quick_failure(guard_token, save_regs_label));
         }
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!("[dynasm] write_pending done: {} stubs", stub_offsets.len());
         }
         stub_offsets
@@ -4173,7 +4173,7 @@ impl<'a> Assembler386<'a> {
         });
 
         // Verify patch was applied correctly
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             let word = unsafe { (stub_addr as *const u32).read() };
             eprintln!(
                 "[patch-verify] stub_addr={:#x} first_word={:#010x} target={:#x}",

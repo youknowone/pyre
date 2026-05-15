@@ -7,6 +7,33 @@ use std::cell::UnsafeCell;
 use std::mem::MaybeUninit;
 use std::sync::Once;
 
+/// Whether `PYRE_NBODY_DEBUG` is set, cached at first access.
+///
+/// `std::env::var_os` acquires a global env lock on every call. Caching
+/// here matches the equivalent helpers in `majit-backend-cranelift` and
+/// `majit-backend-dynasm`. These probes were added during nbody bring-up
+/// and are not part of PyPy.
+fn pyre_nbody_debug_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("PYRE_NBODY_DEBUG").is_some());
+    *ENABLED
+}
+
+/// Whether `MAJIT_PROBE_LIVENESS` is set, cached at first access.
+fn majit_probe_liveness_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> =
+        std::sync::LazyLock::new(|| std::env::var_os("MAJIT_PROBE_LIVENESS").is_some());
+    *ENABLED
+}
+
+/// Whether `PYRE_PROBE_BH_STARTUP=1` is set, cached at first access.
+fn pyre_probe_bh_startup_enabled() -> bool {
+    static ENABLED: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+        std::env::var("PYRE_PROBE_BH_STARTUP").ok().as_deref() == Some("1")
+    });
+    *ENABLED
+}
+
 use pyre_interpreter::bytecode::{Instruction, OpArgState};
 use pyre_interpreter::{
     PyResult, function_get_closure, function_get_globals, function_get_name, is_function,
@@ -679,7 +706,7 @@ pub fn resume_in_blackhole(
     _caller_frame: &mut PyFrame,
     frames: &[ResumedFrame],
 ) -> BlackholeResult {
-    let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
+    let nbody_debug = pyre_nbody_debug_enabled();
     if frames.is_empty() {
         if nbody_debug {
             eprintln!("[nbody-debug] resume_in_blackhole failed: empty frames");
@@ -940,7 +967,7 @@ pub fn resume_in_blackhole(
         // status. Goal P0-Q1: distinguish "trace export missing this
         // value" (section.values short / NULL entry) from "BH dispatch
         // can't find it" (later read-side issue). Default: off.
-        let probe_liveness = std::env::var_os("MAJIT_PROBE_LIVENESS").is_some();
+        let probe_liveness = majit_probe_liveness_enabled();
         if probe_liveness {
             eprintln!(
                 "[probe-A][consume_one_section] jitcode={} py_pc={} jit_pc={} live_i={:?} live_r={:?} live_f={:?} section.values.len={}",
@@ -964,7 +991,7 @@ pub fn resume_in_blackhole(
             }
             val_idx += 1;
         }
-        let probe_bh_startup = std::env::var("PYRE_PROBE_BH_STARTUP").ok().as_deref() == Some("1");
+        let probe_bh_startup = pyre_probe_bh_startup_enabled();
         for &reg_idx in &live_r {
             if let Some(val) = section.values.get(val_idx) {
                 let materialized = materialize_virtual(val);
@@ -1029,7 +1056,7 @@ pub fn resume_in_blackhole(
         // register-file) was broken by the optimizer/backend, OR the
         // build_resumed_frames materialization picked a stale dead_frame
         // slot for a register that the heap had moved past.
-        if std::env::var("PYRE_PROBE_BH_STARTUP").ok().as_deref() == Some("1") {
+        if pyre_probe_bh_startup_enabled() {
             let vinfo_ptr = bh.virtualizable_info;
             if !vinfo_ptr.is_null() && bh.virtualizable_ptr != 0 {
                 let vinfo = unsafe { &*vinfo_ptr };
@@ -1835,7 +1862,7 @@ pub fn blackhole_resume_via_rd_numb(
     rd_virtuals: Option<&[std::rc::Rc<majit_ir::RdVirtualInfo>]>,
     deadframe_types: Option<&[majit_ir::Type]>,
 ) -> BlackholeResult {
-    let nbody_debug = std::env::var_os("PYRE_NBODY_DEBUG").is_some();
+    let nbody_debug = pyre_nbody_debug_enabled();
     use majit_metainterp::resume;
 
     // Thread-local BH pool (RPython BlackholeInterpBuilder). Each access

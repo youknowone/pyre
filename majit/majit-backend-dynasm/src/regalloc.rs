@@ -1357,7 +1357,7 @@ impl RegisterManager {
             let to = fm.loc(v, tp, false, longevity);
             if let Some(r) = reg {
                 // RPython: self.assembler.regalloc_mov(reg, to)
-                if std::env::var_os("MAJIT_LOG").is_some() {
+                if crate::majit_log_enabled() {
                     eprintln!(
                         "[regalloc] _sync_var_to_stack: v={:?} reg={:?} → frame pos={}",
                         v, r, to.position
@@ -2217,7 +2217,7 @@ impl<'a> RegAlloc<'a> {
         mgr._sync_var_to_stack(arg, tp, longevity, fm);
         mgr.reg_bindings_del(arg, longevity);
         mgr.free_regs.push(reg);
-        if std::env::var_os("MAJIT_LOG").is_some() {
+        if crate::majit_log_enabled() {
             eprintln!(
                 "[dynasm:j2plan] spill deopt-only failarg {:?} from {:?}",
                 arg, reg
