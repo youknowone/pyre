@@ -6700,8 +6700,21 @@ impl<'a> Assembler386<'a> {
         );
         dynasm!(self.mc ; .arch x64 ; jmp =>done);
 
-        // Slow path: x86/assembler.py:2553 push_gcmap + call
+        // Slow path: x86/assembler.py:2553 push_gcmap + call.
+        // Bracket the slow-path call with `push_all_regs_to_jitframe` /
+        // `pop_all_regs_from_jitframe` so caller-save XMMs (notably the
+        // float accumulator the regalloc may have left in xmm3 across
+        // a NewWithVtable site — spectral_norm's `s = s + v[j]/div`)
+        // survive any Rust slowpath that touches SIMD scratch.  The
+        // `CallMallocNurseryVarsizeFrame` variant already does this;
+        // omitting it from the fixed-size path let the Rust nursery
+        // slowpath clobber xmm3 on traces that allocated a W_FloatObject
+        // every iteration, freezing the float accumulator on the
+        // pre-slowpath single-iteration value.
+        let ignored_regs: Vec<crate::regloc::RegLoc> =
+            if let Some(Loc::Reg(r)) = result_loc { vec![*r] } else { vec![] };
         dynasm!(self.mc ; .arch x64 ; =>slow_path);
+        self.push_all_regs_to_jitframe(&ignored_regs, true);
         let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
         // Push gcmap captured at regalloc time (via RegAllocOp::Perform.gcmap)
         // so the collector can trace live frame-resident Refs through the
@@ -6723,15 +6736,23 @@ impl<'a> Assembler386<'a> {
         // RPython x86 backend mirrors `_reload_frame_if_necessary`
         // here (assembler.py:2553-2557).
         self.reload_frame_if_necessary();
-
-        dynasm!(self.mc ; .arch x64 ; =>done);
+        // Move slowpath return into result_loc before pop_all_regs so
+        // the pop doesn't overwrite the freshly-allocated payload ptr.
         if let Some(Loc::Reg(r)) = result_loc {
             if r.value != 0 {
                 let rv = r.value;
                 dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
             }
         }
+        self.pop_all_regs_from_jitframe(&ignored_regs, true);
+
+        dynasm!(self.mc ; .arch x64 ; =>done);
         if !op.pos.is_none() {
+            if let Some(Loc::Reg(r)) = result_loc {
+                if r.value != 0 {
+                    dynasm!(self.mc ; .arch x64 ; mov rax, Rq(r.value));
+                }
+            }
             self.store_rax_to_result(op.pos);
         }
     }
