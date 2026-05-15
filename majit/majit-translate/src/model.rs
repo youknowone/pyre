@@ -1957,7 +1957,7 @@ where
 /// [`Self::Unknown`] is a pyre-only sentinel for the
 /// pre-`setconcretetype` window where reading `var.concretetype`
 /// upstream would `AttributeError`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum ConcreteType {
     /// Signed integer (RPython `Signed` / i64).
     Signed,
@@ -2083,6 +2083,42 @@ pub fn getkind(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelTyp
         | LowLevelType::ForwardReference(_) => {
             panic!("getkind: type {ty:?} not supported as concretetype (history.py:70)")
         }
+    }
+}
+
+/// Project a [`ConcreteType`] back to a canonical
+/// `LowLevelType` representative — the inverse direction of
+/// [`getkind`] for the kind-only adapter callers (regalloc canonical
+/// exceptblock, type_state synth merge, jit_codewriter test
+/// scaffolding).  Each branch chooses a representative that
+/// round-trips through `getkind`:
+///
+/// - `Signed` → `LowLevelType::Signed`.
+/// - `Float`  → `LowLevelType::Float`.
+/// - `Void`   → `LowLevelType::Void`.
+/// - `GcRef`  → [`crate::translator::rtyper::rclass::OBJECTPTR`]
+///   (`Ptr(OBJECT)`, the canonical GC pointer the rtyper itself
+///   stamps onto exception-block `evalue` Variables).
+/// - `Unknown` → `None` (Variable.concretetype stays unset; the
+///   dense [`FunctionGraph::value_types`] vec retains the
+///   `Unknown` sentinel for legacy readers).
+///
+/// Lossy for richer Ptr-of-specific-Struct values, so
+/// [`FunctionGraph::set_concretetype`] only writes through when the
+/// existing Variable type's `getkind` does NOT already match the
+/// requested kind (i.e. the rtyper's authoritative type wins).
+fn concrete_to_canonical_lltype(
+    ty: ConcreteType,
+) -> Option<crate::translator::rtyper::lltypesystem::lltype::LowLevelType> {
+    use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+    match ty {
+        ConcreteType::Signed => Some(LowLevelType::Signed),
+        ConcreteType::Float => Some(LowLevelType::Float),
+        ConcreteType::Void => Some(LowLevelType::Void),
+        ConcreteType::GcRef => {
+            Some(crate::translator::rtyper::rclass::OBJECTPTR.clone())
+        }
+        ConcreteType::Unknown => None,
     }
 }
 
@@ -2245,10 +2281,17 @@ impl FunctionGraph {
                 ConcreteType::Unknown,
                 ConcreteType::Unknown,
             ],
-            // Canonical inputargs (returnvalue, etype, evalue) start
-            // without a backing Variable.  The flowspace adapter wires
-            // them up once it lifts the graph for the rtyper.
-            value_variables: vec![None, None, None],
+            // Canonical inputargs get named Variables matching the
+            // upstream graph (`flowspace/model.py:21-25` —
+            // `Variable("returnvar")`, `Variable("etype")`,
+            // `Variable("evalue")`).  Each one's `concretetype` cell
+            // stays `None` until the rtyper resolves it; the legacy
+            // `value_types` slot above mirrors that pre-resolved shape.
+            value_variables: vec![
+                Some(crate::flowspace::model::Variable::named("returnvar")),
+                Some(crate::flowspace::model::Variable::named("etype")),
+                Some(crate::flowspace::model::Variable::named("evalue")),
+            ],
             value_names: std::collections::HashMap::new(),
             variable_to_vid: std::collections::HashMap::new(),
             return_type: None,
@@ -2326,6 +2369,15 @@ impl FunctionGraph {
     /// `flowspace/model.py:Variable.__init__`).  Front-ends and the
     /// rtyper should prefer this entry point so the per-value
     /// kind never has to be back-filled via a second pass.
+    ///
+    /// Every freshly minted `ValueId` is paired with a backing
+    /// [`crate::flowspace::model::Variable`] (RPython parity:
+    /// `flowspace/model.py:280` — every IR slot is a `Variable`
+    /// instance).  The Variable's `concretetype` cell stays `None`
+    /// until [`Self::set_concretetype`] writes through it; the
+    /// legacy [`Self::value_types`] dense vec mirrors the kind in
+    /// lockstep so readers that index ValueId → kind continue to work
+    /// during the multi-step migration.
     pub fn alloc_value_with_type(&mut self, ty: ConcreteType) -> ValueId {
         let id = ValueId(self.next_value);
         self.next_value += 1;
@@ -2341,7 +2393,8 @@ impl FunctionGraph {
             id.0,
         );
         self.value_types.push(ty);
-        self.value_variables.push(None);
+        self.value_variables
+            .push(Some(crate::flowspace::model::Variable::new()));
         id
     }
 
@@ -2446,7 +2499,14 @@ impl FunctionGraph {
     /// Late-stamp [`ValueId`] kind (e.g. after the rtyper resolved
     /// a previously-`Unknown` slot).  When a backing Variable is
     /// present, the upstream attribute is also updated via
-    /// `Variable.set_concretetype` so the two views stay coherent.
+    /// `Variable.set_concretetype` so the two views stay coherent —
+    /// each [`ConcreteType`] maps to a canonical representative
+    /// `LowLevelType` (`Signed → Signed`, `Float → Float`,
+    /// `Void → Void`, `GcRef → rclass.OBJECTPTR`).  If the Variable
+    /// already carries a richer rtyper-written type whose
+    /// `getkind` matches `ty`, the richer type is preserved
+    /// (the kind-only adapter must not lossily flatten the rtyper's
+    /// real low-level structure).
     pub fn set_concretetype(&mut self, v: ValueId, ty: ConcreteType) {
         if v.0 >= self.value_types.len() {
             // Grow both side-arrays if a value was minted via
@@ -2457,6 +2517,16 @@ impl FunctionGraph {
             self.value_variables.resize(v.0 + 1, None);
         }
         self.value_types[v.0] = ty;
+        if let Some(Some(var)) = self.value_variables.get(v.0) {
+            let preserve_existing = match (ty, var.concretetype.borrow().as_ref()) {
+                (kind, Some(existing)) if getkind(existing) == kind => true,
+                _ => false,
+            };
+            if !preserve_existing {
+                let synthetic = concrete_to_canonical_lltype(ty);
+                var.set_concretetype(synthetic);
+            }
+        }
     }
 
     /// Read-only view of the ValueId allocator cursor.  Used by passes
