@@ -285,47 +285,16 @@ pub fn lookup_external_jump_target(descr_ptr: usize) -> Option<DescrRef> {
         .cloned()
 }
 
-/// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
-/// `Arc::as_ptr` address to a `AtomicU32` failure counter.
-///
-/// PyPy's `AbstractFailDescr._attrs_` (`history.py:132`) does not
-/// carry a `fail_count` slot; RPython's bridge-compilation threshold
-/// is driven by the hashed `jitcounter.tick(status_hash)` slot
-/// (`compile.py:783-784`).  Pyre's cranelift keeps a raw per-descr
-/// counter as the bridge-decision input — equivalent intent,
-/// different mechanism.  Moving it off the descr is the surface-
-/// matching step toward eventually folding cranelift fail-count
-/// decisions into the shared metainterp `status` slot.
-static FAIL_COUNT_TABLE: OnceLock<Mutex<HashMap<usize, AtomicU32>>> = OnceLock::new();
-
-fn fail_count_table() -> &'static Mutex<HashMap<usize, AtomicU32>> {
-    FAIL_COUNT_TABLE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-/// Increment the per-descr failure counter, returning the new value.
-/// Lazily inserts an `AtomicU32(0)` entry on first access — descrs
-/// constructed without an explicit register call still observe a
-/// monotonically increasing count, matching the previous in-descr
-/// `AtomicU32::fetch_add` semantics.
-pub fn increment_fail_count(descr_ptr: usize) -> u32 {
-    let mut table = fail_count_table()
-        .lock()
-        .expect("FAIL_COUNT_TABLE mutex poisoned");
-    let entry = table.entry(descr_ptr).or_insert_with(|| AtomicU32::new(0));
-    entry.fetch_add(1, Ordering::Relaxed) + 1
-}
-
-/// Read the per-descr failure counter.  Returns `0` for descrs that
-/// have never failed (no entry yet), matching the previous in-descr
-/// initial value.
-pub fn get_fail_count(descr_ptr: usize) -> u32 {
-    fail_count_table()
-        .lock()
-        .expect("FAIL_COUNT_TABLE mutex poisoned")
-        .get(&descr_ptr)
-        .map(|c| c.load(Ordering::Relaxed))
-        .unwrap_or(0)
-}
+// FAIL_COUNT_TABLE removed (Slice DD): the per-descr failure counter
+// is the bridge-compilation threshold input
+// (`AbstractResumeGuardDescr.handle_fail` in `compile.py:701-717`
+// drives `must_compile` via `jitcounter.tick(status_hash)` in RPython).
+// Pyre's cranelift keeps a raw per-descr `AtomicU32` counter; moving
+// it from the backend-static `HashMap` mutex into a descr-local
+// atomic field follows the `patch_jump_for_descr` pattern (Slice CC):
+// the dispatch hot path (`compiler.rs:3065 fail_descr.increment_fail_count()`)
+// now executes a single `fetch_add(Relaxed)` with no lock, no
+// HashMap lookup, and no allocator.
 
 /// Compiled bridge data attached to a guard's fail descriptor.
 ///
@@ -538,6 +507,14 @@ pub struct CraneliftFailDescr {
     /// from `Arc::into_raw(Arc::new(bridge_data))` after
     /// `attach_bridge`; `Drop` reclaims the Arc.
     pub bridge_dispatch_cell: Box<std::sync::atomic::AtomicPtr<BridgeData>>,
+    /// `AbstractResumeGuardDescr.handle_fail` (`compile.py:701-717`)
+    /// drives `must_compile` via `jitcounter.tick(status_hash)` in
+    /// RPython.  Pyre's cranelift keeps a raw per-descr counter
+    /// (`compiler.rs:3065 fail_descr.increment_fail_count()`).
+    /// Moved here from `FAIL_COUNT_TABLE` (Slice DD) for the same
+    /// reason as `bridge_dispatch_cell`: dispatch hot path was
+    /// observing a Mutex+HashMap lookup per guard failure.
+    pub fail_count: AtomicU32,
 }
 
 impl Drop for CraneliftFailDescr {
@@ -560,10 +537,7 @@ impl Drop for CraneliftFailDescr {
             .lock()
             .expect("EXTERNAL_JUMP_TARGETS mutex poisoned")
             .remove(&ptr);
-        fail_count_table()
-            .lock()
-            .expect("FAIL_COUNT_TABLE mutex poisoned")
-            .remove(&ptr);
+        // fail_count is descr-local (Slice DD): drops naturally with self.
         trace_info_table()
             .lock()
             .expect("TRACE_INFO_TABLE mutex poisoned")
@@ -630,7 +604,7 @@ impl std::fmt::Debug for CraneliftFailDescr {
                 "recovery_layout",
                 &lookup_recovery_layout(self as *const Self as usize),
             )
-            .field("fail_count", &get_fail_count(self as *const Self as usize))
+            .field("fail_count", &self.get_fail_count())
             .field(
                 "has_bridge",
                 &(!self.bridge_dispatch_cell.load(Ordering::Acquire).is_null()),
@@ -684,6 +658,7 @@ impl CraneliftFailDescr {
             fail_arg_types,
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
+            fail_count: AtomicU32::new(0),
         }
     }
 
@@ -713,6 +688,7 @@ impl CraneliftFailDescr {
             fail_arg_types,
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
+            fail_count: AtomicU32::new(0),
         }
     }
 
@@ -766,17 +742,16 @@ impl CraneliftFailDescr {
     }
 
     /// Increment the failure counter and return the new value.
-    /// Backed by the `FAIL_COUNT_TABLE` side-table (Session 5i-cl) keyed
-    /// on the descr's inner address — identical to `Arc::as_ptr(&arc)`
-    /// for descrs constructed via `Arc::new(...)`.
+    /// Backed by the descr-local `fail_count: AtomicU32` field
+    /// (Slice DD) — single relaxed `fetch_add` on the dispatch hot
+    /// path (`compiler.rs:3065`).
     pub fn increment_fail_count(&self) -> u32 {
-        increment_fail_count(self as *const Self as usize)
+        self.fail_count.fetch_add(1, Ordering::Relaxed) + 1
     }
 
-    /// Get the current failure count.
-    /// Backed by the `FAIL_COUNT_TABLE` side-table (Session 5i-cl).
+    /// Get the current failure count (Slice DD: descr-local atomic).
     pub fn get_fail_count(&self) -> u32 {
-        get_fail_count(self as *const Self as usize)
+        self.fail_count.load(Ordering::Relaxed)
     }
 
     /// Whether a bridge has been attached to this guard.  Reads
