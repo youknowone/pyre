@@ -285,8 +285,8 @@ impl RegAllocator {
         // branch condition.
         for link in &block.exits {
             for arg in &link.args {
-                if let Some(v) = arg.as_value() {
-                    die_at.remove(&Self::var(graph, v));
+                if let Some(var) = arg.as_variable(graph) {
+                    die_at.remove(&var);
                 }
             }
         }

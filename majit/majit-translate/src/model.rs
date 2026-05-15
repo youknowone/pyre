@@ -969,7 +969,17 @@ pub fn exception_exitcase() -> ExitCase {
     ExitCase::Const(ConstValue::builtin("Exception"))
 }
 
-/// RPython `Link.args` items are Variables or Constants.
+/// RPython `Link.args` items are Variables or Constants —
+/// `Link.args: List[Hlvalue]` (`flowspace/model.py:140`) where
+/// `Hlvalue = Variable | Constant`.  Pyre currently stores the
+/// dense `ValueId` index in the `Value` arm — the upstream-orthodox
+/// `Variable` storage flip requires threading
+/// `&FunctionGraph` through `Link::new` (510 call sites) so the
+/// `ValueId → Variable` projection happens at construction.  The
+/// foundation ([`Self::value`] constructor + [`Self::as_variable`]
+/// accessor + [`Self::as_value_id`] projection sibling) is in place
+/// so production readers can adopt Variable-identity reads
+/// incrementally.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkArg {
     Value(ValueId),
@@ -977,6 +987,10 @@ pub enum LinkArg {
 }
 
 impl LinkArg {
+    /// Read the link-arg's `ValueId` directly from storage — the
+    /// pre-storage-migration accessor.  Once `LinkArg::Value`
+    /// flips to `Variable` storage, this becomes the projection
+    /// path through [`FunctionGraph::value_id_of`].
     pub fn as_value(&self) -> Option<ValueId> {
         match self {
             Self::Value(value) => Some(*value),
@@ -984,17 +998,19 @@ impl LinkArg {
         }
     }
 
-    /// Variable-identity sibling of [`Self::as_value`] — projects the
-    /// link-arg's `ValueId` through `graph.variable(v)` to its
+    /// Variable-identity sibling of [`Self::as_value`] — projects
+    /// the link-arg's `ValueId` through `graph.variable(v)` to its
     /// backing [`crate::flowspace::model::Variable`].  Returns
     /// `None` for constant args and for slots whose backing
-    /// Variable is missing on the graph (no `alloc_value_with_type`
-    /// minted one yet).
+    /// Variable is missing on the graph.  Once `LinkArg::Value`
+    /// flips to `Variable` storage this becomes a direct read of
+    /// the stored Variable, no graph projection needed.
     ///
     /// RPython parity: `Link.args` upstream is `List[Hlvalue]` where
     /// each `Hlvalue::Variable` carries the operand identity inline
     /// (`flowspace/model.py:140`); pyre's adapter projects through
-    /// the graph instead of storing the Variable in the LinkArg.
+    /// the graph instead of storing the Variable in the LinkArg
+    /// (until the storage flip lands).
     pub fn as_variable(
         &self,
         graph: &FunctionGraph,
@@ -1003,6 +1019,22 @@ impl LinkArg {
             Self::Value(value) => graph.variable(*value).cloned(),
             Self::Const(_) => None,
         }
+    }
+
+    /// Construct a `LinkArg::Value` from a [`ValueId`] — looks up
+    /// the backing Variable via [`FunctionGraph::variable`] and
+    /// debug-asserts it exists on the graph.  Identity wrapper
+    /// over the current `Self::Value(vid)` storage; once the storage
+    /// flips to `Variable` this becomes the canonical constructor
+    /// (the lossy [`From<ValueId>`] impl is removed at the same
+    /// time).
+    pub fn value(graph: &FunctionGraph, vid: ValueId) -> Self {
+        debug_assert!(
+            graph.variable(vid).is_some(),
+            "LinkArg::value: ValueId {vid:?} must have a backing Variable on graph {:?}",
+            graph.name,
+        );
+        Self::Value(vid)
     }
 }
 
