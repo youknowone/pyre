@@ -5098,8 +5098,8 @@ mod tests {
         cpu.rtyper
             .exceptiondata
             .resolve_standard_exception_pointers(|name| match name {
-                "OverflowError" => 0xface_beef,
-                _ => 0,
+                "OverflowError" => Some(0xface_beef),
+                _ => None,
             });
 
         let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
@@ -7170,7 +7170,17 @@ mod tests {
 
     #[test]
     fn flatten_ovf_canraise_rewrites_to_jump_if_ovf_two_exits() {
-        let cpu = super::super::cpu::Cpu::new();
+        let mut cpu = super::super::cpu::Cpu::new();
+        // ExceptionData fail-loud invariant: any caller of
+        // get_standard_ll_exc_instance_by_class must pre-resolve.
+        // Test pointer matches the `0xFFFF_FFFF` sentinel
+        // flatten_ovf_canraise_graph's lower_constant closure recognises.
+        cpu.rtyper
+            .exceptiondata
+            .resolve_standard_exception_pointers(|name| match name {
+                "OverflowError" => Some(0xFFFF_FFFF),
+                _ => None,
+            });
         let ssarepr = flatten_ovf_canraise_graph("int_add_ovf_2exit", "int_add_ovf", false, &cpu);
         // Expected shape after flatten_graph:
         //   Label(startblock)
@@ -7240,7 +7250,17 @@ mod tests {
 
     #[test]
     fn flatten_ovf_canraise_three_exits_emits_catch_all() {
-        let cpu = super::super::cpu::Cpu::new();
+        let mut cpu = super::super::cpu::Cpu::new();
+        // ExceptionData fail-loud invariant: any caller of
+        // get_standard_ll_exc_instance_by_class must pre-resolve.
+        // Test pointer matches the `0xFFFF_FFFF` sentinel
+        // flatten_ovf_canraise_graph's lower_constant closure recognises.
+        cpu.rtyper
+            .exceptiondata
+            .resolve_standard_exception_pointers(|name| match name {
+                "OverflowError" => Some(0xFFFF_FFFF),
+                _ => None,
+            });
         let ssarepr = flatten_ovf_canraise_graph("int_mul_ovf_3exit", "int_mul_ovf", true, &cpu);
         // Three-exit shape per flatten.py:201-203:
         //   - exits[1]: handling_ovf=true → raise <const>
@@ -7265,7 +7285,17 @@ mod tests {
     fn flatten_ovf_canraise_uses_seven_char_prefix() {
         // flatten.py:195 `opname[:7] + '_jump_if_ovf'` — verify the
         // prefix transform for each of the standard upstream `_ovf` ops.
-        let cpu = super::super::cpu::Cpu::new();
+        let mut cpu = super::super::cpu::Cpu::new();
+        // ExceptionData fail-loud invariant: any caller of
+        // get_standard_ll_exc_instance_by_class must pre-resolve.
+        // Test pointer matches the `0xFFFF_FFFF` sentinel
+        // flatten_ovf_canraise_graph's lower_constant closure recognises.
+        cpu.rtyper
+            .exceptiondata
+            .resolve_standard_exception_pointers(|name| match name {
+                "OverflowError" => Some(0xFFFF_FFFF),
+                _ => None,
+            });
         for (input, expected) in [
             ("int_add_ovf", "int_add_jump_if_ovf"),
             ("int_sub_ovf", "int_sub_jump_if_ovf"),

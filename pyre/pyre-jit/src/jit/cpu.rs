@@ -93,6 +93,27 @@ impl Cpu {
     /// `crate::call_jit`. Matches the implicit `cpu = LLGraphCPU(...)`
     /// constructor in `warmspot.py:243` for the standard JIT.
     pub fn new() -> Self {
+        let mut rtyper = super::exceptiondata::Rtyper::new();
+        // Resolve standard exception class pointers from the live
+        // interpreter registry.  Matches RPython's
+        // `RPythonTyper.specialize` -> `ExceptionData.make_helpers`
+        // (`exceptiondata.py:34-42`) where `get_standard_ll_exc_instance(
+        // rtyper, clsdef)` is invoked at rtyper construction so every
+        // downstream `get_standard_ll_exc_instance_by_class` returns
+        // the resolved LL instance pointer.  Pyre's analog reads the
+        // installed builtin exception class via
+        // `pyre_interpreter::lookup_exc_class(name)`; the lookup is
+        // thread-local and may return `None` when `Cpu::new` runs
+        // before `install_default_builtins` (test setup paths that
+        // never reach the `_ovf` rewrite are unaffected — the panic
+        // surfaces only if `get_standard_ll_exc_instance_by_class` is
+        // ever called while unresolved).
+        rtyper
+            .exceptiondata
+            .resolve_standard_exception_pointers(|name| {
+                let ptr = pyre_interpreter::lookup_exc_class(name)?;
+                Some(ptr as i64)
+            });
         Self {
             call_fn: crate::call_jit::bh_call_fn,
             call_fn_0: crate::call_jit::bh_call_fn_0,
@@ -115,7 +136,7 @@ impl Cpu {
             normalize_raise_varargs_fn: crate::call_jit::bh_normalize_raise_varargs_fn,
             get_current_exception_fn: crate::call_jit::bh_get_current_exception,
             set_current_exception_fn: crate::call_jit::bh_set_current_exception,
-            rtyper: super::exceptiondata::Rtyper::new(),
+            rtyper,
             lowering_ctx: std::sync::RwLock::new(None),
         }
     }

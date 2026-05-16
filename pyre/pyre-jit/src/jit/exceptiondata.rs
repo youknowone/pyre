@@ -8,8 +8,6 @@
 //! `make_type_of_exc_inst`, …) are intentionally absent; they get added
 //! one method at a time when a future port reads them.
 
-use std::collections::HashMap;
-
 use super::flatten::Kind;
 use super::flow::{Constant, ConstantValue};
 
@@ -44,24 +42,27 @@ const STANDARD_EXCEPTIONS: &[&str] = &[
 ];
 
 /// `rpython/rtyper/exceptiondata.py:11 class ExceptionData(object)`.
-#[derive(Debug)]
+///
+/// Mirrors upstream's attribute-based layout: each pre-allocated
+/// standard exception instance is held in a *named* field.  Today only
+/// `OverflowError` has a `_ovf`-rewrite caller (`flatten.py:167`); other
+/// `standardexceptions` entries lack a dedicated field until a future
+/// caller materialises.  This explicit-field shape (rather than a
+/// `HashMap<&'static str, i64>`) matches RPython's `exceptiondata.py`
+/// where each pre-allocated instance is stored as a class attribute
+/// (`self.ll_TypeError_inst`, `self.ll_OverflowError_inst`, ...).
+#[derive(Debug, Default)]
 pub struct ExceptionData {
     /// `exceptiondata.py:14 standardexceptions = standardexceptions`.
     pub standardexceptions: &'static [&'static str],
-    /// Pre-resolved class pointer per standard exception name.  When
-    /// populated, `get_standard_ll_exc_instance_by_class` returns the
-    /// rtyped form `Constant(Signed(pointer), Some(Ref))` matching
-    /// upstream's `Constant(ll_ovf, concretetype=lltype.typeOf(ll_ovf))`
-    /// at `flatten.py:168-169`.  When absent, the same call returns the
-    /// pre-rtype opaque shape, deferring resolution to the production
-    /// `lower_constant` closure threaded through `GraphFlattener`.
-    instance_pointers: HashMap<&'static str, i64>,
-}
-
-impl Default for ExceptionData {
-    fn default() -> Self {
-        Self::new()
-    }
+    /// Resolved runtime pointer for the OverflowError class instance —
+    /// the `ll_ovf` value at `flatten.py:167-169`.  `None` means
+    /// `resolve_standard_exception_pointers` has not been called yet;
+    /// calling `get_standard_ll_exc_instance_by_class("OverflowError")`
+    /// in that state panics (production invariant: every
+    /// `flatten_graph` reachable on the `_ovf` path must see a resolved
+    /// pointer).
+    overflow_error_instance: Option<i64>,
 }
 
 impl ExceptionData {
@@ -73,26 +74,32 @@ impl ExceptionData {
     pub fn new() -> Self {
         Self {
             standardexceptions: STANDARD_EXCEPTIONS,
-            instance_pointers: HashMap::new(),
+            overflow_error_instance: None,
         }
     }
 
-    /// Pre-resolve every standard exception class to its runtime
-    /// PyObject pointer via `resolve`, matching upstream's
+    /// Pre-resolve every standard exception class with a caller-side
+    /// pointer reachable through `resolve`, matching upstream's
     /// `get_standard_ll_exc_instance(rtyper, clsdef)` which materialises
     /// the LL instance pointer at rtyper construction time
     /// (`exceptiondata.py:34-42`).  Production callers invoke this
-    /// after the runtime exception classes are loaded so the canonical
-    /// `flatten_graph` driver's `handling_ovf=True` arm reaches
+    /// after the runtime exception classes are loaded (e.g. from
+    /// `Cpu::new` via `pyre_interpreter::lookup_exc_class`) so the
+    /// `handling_ovf=True` arm of `flatten_graph` reaches
     /// `get_standard_ll_exc_instance_by_class("OverflowError")` and
     /// receives the rtyped shape directly.
+    ///
+    /// Currently only the `OverflowError` slot is consumed —
+    /// `resolve(name)` may return `None` for the other entries until a
+    /// future caller wires a dedicated field for them; the resolver's
+    /// `Some` value for `"OverflowError"` is the only one currently
+    /// recorded.
     pub fn resolve_standard_exception_pointers<F>(&mut self, mut resolve: F)
     where
-        F: FnMut(&str) -> i64,
+        F: FnMut(&str) -> Option<i64>,
     {
-        for &name in self.standardexceptions {
-            let pointer = resolve(name);
-            self.instance_pointers.insert(name, pointer);
+        if let Some(pointer) = resolve("OverflowError") {
+            self.overflow_error_instance = Some(pointer);
         }
     }
 
@@ -103,10 +110,13 @@ impl ExceptionData {
     /// LL instance pointer wrapped at the caller in `Constant(ll_ovf,
     /// concretetype=lltype.typeOf(ll_ovf))` (`flatten.py:168-169`).
     ///
-    /// When `resolve_standard_exception_pointers` has been called, this
-    /// returns the rtyped shape `Constant(Signed(pointer), Some(Ref))`
-    /// directly.  Otherwise it returns the pre-rtype opaque shape and
-    /// expects the caller's `lower_constant` closure to resolve.
+    /// Pyre's contract: the standard pointer MUST be pre-resolved via
+    /// `resolve_standard_exception_pointers` before `flatten_graph`
+    /// reaches the `_ovf` rewrite (currently the only caller).  An
+    /// unresolved pointer panics — production must never return the
+    /// pre-rtype opaque shape because the canonical `lower_constant`
+    /// closure cannot recover a runtime pointer from an opaque token
+    /// the rtyper would have resolved upstream.
     pub fn get_standard_ll_exc_instance_by_class(
         &self,
         exceptionclass: &str,
@@ -114,13 +124,33 @@ impl ExceptionData {
         if !self.standardexceptions.contains(&exceptionclass) {
             return Err(UnknownException(exceptionclass.to_owned()));
         }
-        if let Some(&pointer) = self.instance_pointers.get(exceptionclass) {
-            return Ok(Constant::new(
-                ConstantValue::Signed(pointer),
-                Some(Kind::Ref),
-            ));
+        match exceptionclass {
+            "OverflowError" => {
+                let pointer = self.overflow_error_instance.unwrap_or_else(|| {
+                    panic!(
+                        "ExceptionData::get_standard_ll_exc_instance_by_class\
+                         (\"OverflowError\") called before \
+                         resolve_standard_exception_pointers — production \
+                         pipelines must wire Cpu::new -> \
+                         pyre_interpreter::lookup_exc_class(\"OverflowError\") \
+                         so flatten_graph never reaches an opaque shape per \
+                         rpython/rtyper/rtyper.py:specialize"
+                    )
+                });
+                Ok(Constant::new(
+                    ConstantValue::Signed(pointer),
+                    Some(Kind::Ref),
+                ))
+            }
+            other => panic!(
+                "ExceptionData: standard exception {other:?} has no resolved \
+                 instance field yet — add a dedicated field + \
+                 resolve_standard_exception_pointers branch when a caller \
+                 materialises (rpython/rtyper/exceptiondata.py stores each \
+                 standard instance as a named class attribute, not a generic \
+                 map)"
+            ),
         }
-        Ok(Constant::opaque(exceptionclass, Some(Kind::Ref)))
     }
 }
 
@@ -150,18 +180,28 @@ mod tests {
     use super::*;
 
     #[test]
-    fn get_standard_ll_exc_instance_by_class_returns_overflow_error() {
-        let data = ExceptionData::new();
+    fn get_standard_ll_exc_instance_by_class_returns_resolved_overflow_pointer() {
+        let mut data = ExceptionData::new();
+        data.resolve_standard_exception_pointers(|name| match name {
+            "OverflowError" => Some(0xc0de),
+            _ => None,
+        });
         let constant = data
             .get_standard_ll_exc_instance_by_class("OverflowError")
             .expect("OverflowError must be a standard exception");
-        match &constant.value {
-            crate::jit::flow::ConstantValue::Opaque(opaque) => {
-                assert_eq!(opaque.repr(), "OverflowError");
-            }
-            other => panic!("expected Opaque, got {other:?}"),
+        match (&constant.value, constant.kind) {
+            (ConstantValue::Signed(p), Some(Kind::Ref)) => assert_eq!(*p, 0xc0de),
+            other => panic!("expected Signed(0xc0de)/Ref after resolve, got {other:?}"),
         }
-        assert_eq!(constant.kind, Some(Kind::Ref));
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "called before resolve_standard_exception_pointers"
+    )]
+    fn get_standard_ll_exc_instance_by_class_panics_when_unresolved() {
+        let data = ExceptionData::new();
+        let _ = data.get_standard_ll_exc_instance_by_class("OverflowError");
     }
 
     #[test]
@@ -171,21 +211,5 @@ mod tests {
             .get_standard_ll_exc_instance_by_class("NotAStandardException")
             .expect_err("non-standard class must error");
         assert_eq!(err, UnknownException("NotAStandardException".to_owned()));
-    }
-
-    #[test]
-    fn resolve_standard_exception_pointers_returns_rtyped_signed_ref() {
-        let mut data = ExceptionData::new();
-        data.resolve_standard_exception_pointers(|name| match name {
-            "OverflowError" => 0xc0de,
-            _ => 0,
-        });
-        let constant = data
-            .get_standard_ll_exc_instance_by_class("OverflowError")
-            .expect("OverflowError must be a standard exception");
-        match (&constant.value, constant.kind) {
-            (ConstantValue::Signed(p), Some(Kind::Ref)) => assert_eq!(*p, 0xc0de),
-            other => panic!("expected Signed(0xc0de)/Ref after resolve, got {other:?}"),
-        }
     }
 }
