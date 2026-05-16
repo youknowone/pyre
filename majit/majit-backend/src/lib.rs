@@ -21,7 +21,7 @@ pub mod synthetic_cpu;
 pub use finish_descrs::{
     DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrMulti,
     DoneWithThisFrameDescrRef, DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef,
-    PropagateExceptionDescr,
+    PropagateExceptionDescr, get_or_attach_done_with_this_frame_descr_multi,
 };
 pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{

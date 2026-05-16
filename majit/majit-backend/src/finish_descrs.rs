@@ -10,6 +10,7 @@
 
 use std::cell::UnsafeCell;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use majit_ir::{Descr, FailDescr, Type};
 
@@ -289,6 +290,43 @@ impl DoneWithThisFrameDescrMulti {
     pub fn new(fail_arg_types: Vec<Type>) -> Self {
         Self(DoneWithThisFrameDescrBase::new(fail_arg_types))
     }
+}
+
+/// Canonical cache for multi-result `DoneWithThisFrameDescr*` instances,
+/// keyed by `fail_arg_types`.  `compile.py:626-656`'s 0/1-result family
+/// is `module-level singleton`; pyre extends it to N-ary tuples here
+/// (see `make_finish_fail_descr_typed`).  The cache restores the same
+/// pointer-identity contract: every multi-result FINISH of a given
+/// type list resolves to the same `Arc::ptr_eq` identity.
+///
+/// `Vec<(Vec<Type>, Arc<...>)>` instead of `HashMap` per project rules
+/// (`AGENTS.md` forbids HashMap/BTreeMap).  Linear scan is fine here —
+/// the cache size is bounded by the number of distinct FINISH result
+/// type lists in the program (typically a small handful).
+static DONE_MULTI_CACHE: OnceLock<Mutex<Vec<(Vec<Type>, Arc<DoneWithThisFrameDescrMulti>)>>> =
+    OnceLock::new();
+
+fn done_multi_cache() -> &'static Mutex<Vec<(Vec<Type>, Arc<DoneWithThisFrameDescrMulti>)>> {
+    DONE_MULTI_CACHE.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+/// Return the canonical `Arc<DoneWithThisFrameDescrMulti>` for a given
+/// `fail_arg_types` list.  Two callers with structurally equal type
+/// lists share one `Arc` (`Arc::ptr_eq` round-trip), restoring the
+/// singleton semantics that `compile.py:626-656` gives 0/1-result
+/// finishes.
+pub fn get_or_attach_done_with_this_frame_descr_multi(
+    fail_arg_types: Vec<Type>,
+) -> Arc<DoneWithThisFrameDescrMulti> {
+    let mut cache = done_multi_cache()
+        .lock()
+        .expect("done_multi_cache mutex poisoned");
+    if let Some((_, descr)) = cache.iter().find(|(k, _)| k == &fail_arg_types) {
+        return Arc::clone(descr);
+    }
+    let descr = Arc::new(DoneWithThisFrameDescrMulti::new(fail_arg_types.clone()));
+    cache.push((fail_arg_types, Arc::clone(&descr)));
+    descr
 }
 
 impl Descr for DoneWithThisFrameDescrMulti {

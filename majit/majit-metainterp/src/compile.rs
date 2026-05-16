@@ -2956,8 +2956,10 @@ pub fn make_finish_fail_descr_typed(types: Vec<Type>) -> DescrRef {
         [Type::Int] => Arc::new(DoneWithThisFrameDescrInt::new()),
         // Multi-result FINISH is a Pyre extension; preserve the terminal
         // layout even though PyPy's finish-descr class family has only
-        // 0/1-result concrete subclasses.
-        _ => Arc::new(DoneWithThisFrameDescrMulti::new(types)),
+        // 0/1-result concrete subclasses.  Route through a Vec<Type>-keyed
+        // cache so two callers with structurally equal type lists share
+        // one Arc (matching the singleton semantics of `compile.py:626-656`).
+        _ => majit_backend::get_or_attach_done_with_this_frame_descr_multi(types),
     }
 }
 
