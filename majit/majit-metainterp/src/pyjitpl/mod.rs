@@ -133,7 +133,7 @@ struct SimpleCompileViews<'a> {
 
 fn make_simple_compile_views<'a>(
     trace: &'a TreeLoop,
-    call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     enable_opts: &'a [String],
 ) -> SimpleCompileViews<'a> {
     let data = compile::SimpleCompileData::new(trace, None, call_pure_results, enable_opts);
@@ -8550,7 +8550,7 @@ impl<M: Clone> MetaInterp<M> {
         snapshot_vable_boxes: SnapshotBoxes,
         snapshot_vref_boxes: SnapshotBoxes,
         snapshot_frame_pcs: SnapshotFramePcs,
-        call_pure_results: HashMap<Vec<Value>, Value>,
+        call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     ) -> bool {
         if !self.compiled_loops.contains_key(&green_key) {
             return false;

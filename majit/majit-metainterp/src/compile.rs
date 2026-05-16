@@ -264,7 +264,7 @@ impl<'a> CompileData<'a> {
 pub struct PreambleCompileData<'a> {
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
-    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -272,7 +272,7 @@ impl<'a> PreambleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
         runtime_boxes: &'a [OpRef],
-        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -288,7 +288,7 @@ impl<'a> PreambleCompileData<'a> {
 pub struct SimpleCompileData<'a> {
     pub base: CompileData<'a>,
     pub resumestorage: Option<&'a ResumeStorage>,
-    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -296,7 +296,7 @@ impl<'a> SimpleCompileData<'a> {
     pub fn new(
         trace: &'a TreeLoop,
         resumestorage: Option<&'a ResumeStorage>,
-        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {
@@ -313,7 +313,7 @@ pub struct BridgeCompileData<'a> {
     pub base: CompileData<'a>,
     pub runtime_boxes: &'a [OpRef],
     pub resumestorage: Option<&'a ResumeStorage>,
-    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     pub inline_short_preamble: bool,
     pub enable_opts: &'a [String],
 }
@@ -323,7 +323,7 @@ impl<'a> BridgeCompileData<'a> {
         trace: &'a TreeLoop,
         runtime_boxes: &'a [OpRef],
         resumestorage: Option<&'a ResumeStorage>,
-        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
         inline_short_preamble: bool,
         enable_opts: &'a [String],
     ) -> Self {
@@ -343,7 +343,7 @@ pub struct UnrolledLoopData<'a> {
     pub base: CompileData<'a>,
     pub celltoken: &'a Arc<JitCellToken>,
     pub state: &'a crate::optimizeopt::unroll::ExportedState,
-    pub call_pure_results: &'a HashMap<Vec<Value>, Value>,
+    pub call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     pub enable_opts: &'a [String],
 }
 
@@ -352,7 +352,7 @@ impl<'a> UnrolledLoopData<'a> {
         trace: &'a TreeLoop,
         celltoken: &'a Arc<JitCellToken>,
         state: &'a crate::optimizeopt::unroll::ExportedState,
-        call_pure_results: &'a HashMap<Vec<Value>, Value>,
+        call_pure_results: &'a crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
         enable_opts: &'a [String],
     ) -> Self {
         Self {

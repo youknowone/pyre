@@ -128,7 +128,8 @@ pub struct UnrollOptimizer {
     pub callinfocollection: Option<std::sync::Arc<majit_ir::CallInfoCollection>>,
     /// compile.py:221 + optimizer.py:530: call_pure_results from tracing.
     /// Passed through to the inner Optimizer for cross-iteration CALL_PURE folding.
-    pub call_pure_results: std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    pub call_pure_results:
+        crate::optimizeopt::vec_assoc::VecAssoc<Vec<majit_ir::Value>, majit_ir::Value>,
     /// virtualstate.py:26-27 `GenerateGuardState.__init__: self.cpu =
     /// optimizer.cpu`. Propagated to the inner phase-1/phase-2
     /// `Optimizer.cls_of_box_fn` so virtualstate match can read the
@@ -169,7 +170,7 @@ impl UnrollOptimizer {
             phase1_patchguardop: None,
             next_global_opref: 0,
             callinfocollection: None,
-            call_pure_results: std::collections::HashMap::new(),
+            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             cls_of_box_fn: None,
         }
     }

@@ -48,7 +48,8 @@ pub struct Optimizer {
     /// (via get_constant_box) → result value, carried across
     /// loop iterations so the optimizer can constant-fold repeated
     /// pure calls. RPython uses value-based equality for keys.
-    pub call_pure_results: std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
+    pub call_pure_results:
+        crate::optimizeopt::vec_assoc::VecAssoc<Vec<majit_ir::Value>, majit_ir::Value>,
     /// optimizer.py: `_last_guard_op` — tracks the last emitted guard
     /// for guard sharing and descriptor fusion.
     ///
@@ -1140,7 +1141,7 @@ impl Optimizer {
             passes: Vec::new(),
             pureop_historylength: crate::jit::PARAMETERS.pureop_historylength as usize,
             final_num_inputs: 0,
-            call_pure_results: std::collections::HashMap::new(),
+            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             last_guard_op_idx: None,
             replaces_guard: std::collections::HashMap::new(),
             pendingfields: Vec::new(),
@@ -1201,7 +1202,10 @@ impl Optimizer {
 
     /// Look up a previously recorded CALL_PURE result.
     pub fn get_call_pure_result(&self, args: &[majit_ir::Value]) -> Option<&majit_ir::Value> {
-        self.call_pure_results.get(args)
+        self.call_pure_results
+            .iter()
+            .find(|(k, _)| k.as_slice() == args)
+            .map(|(_, v)| v)
     }
 
     /// bridgeopt.py:124-185: deserialize_optimizer_knowledge

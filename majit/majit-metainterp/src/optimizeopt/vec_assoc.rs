@@ -24,7 +24,7 @@ impl<K: Eq, V> Default for VecAssoc<K, V> {
     }
 }
 
-impl<K: Eq + Copy, V> VecAssoc<K, V> {
+impl<K: Eq, V> VecAssoc<K, V> {
     pub fn new() -> Self {
         Self {
             entries: Vec::new(),
@@ -57,7 +57,7 @@ impl<K: Eq + Copy, V> VecAssoc<K, V> {
     /// Dict-assignment semantics: overwrite existing value or append a
     /// fresh entry.
     pub fn insert(&mut self, key: K, value: V) {
-        if let Some(entry) = self.entries.iter_mut().find(|(k, _)| *k == key) {
+        if let Some(entry) = self.entries.iter_mut().find(|(k, _)| k == &key) {
             entry.1 = value;
         } else {
             self.entries.push((key, value));
@@ -66,7 +66,7 @@ impl<K: Eq + Copy, V> VecAssoc<K, V> {
 
     /// `HashMap::entry(k).or_insert_with(...)` parity.
     pub fn entry_or_insert_with<F: FnOnce() -> V>(&mut self, key: K, f: F) -> &mut V {
-        let idx = match self.entries.iter().position(|(k, _)| *k == key) {
+        let idx = match self.entries.iter().position(|(k, _)| k == &key) {
             Some(i) => i,
             None => {
                 self.entries.push((key, f()));

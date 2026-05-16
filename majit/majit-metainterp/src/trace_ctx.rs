@@ -230,7 +230,7 @@ pub struct TraceCtx {
     /// pyjitpl.py:2397: call_pure_results — maps constant argument tuples
     /// to their concrete result values, recorded during tracing.
     /// Passed to the optimizer for cross-iteration CALL_PURE folding.
-    pub(crate) call_pure_results: std::collections::HashMap<Vec<Value>, Value>,
+    pub(crate) call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value>,
     /// Cached `warmstate.trace_limit` snapshot for this tracing session.
     /// pyjitpl.py:2789 reads `self.jitdriver_sd.warmstate.trace_limit` each
     /// call; pyre snapshots it at `setup_tracing` time (warmstate owns the
@@ -548,7 +548,7 @@ impl TraceCtx {
             is_bridge_trace: false,
             portal_call_depth_fn: None,
             callinfocollection: None,
-            call_pure_results: std::collections::HashMap::new(),
+            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,
@@ -608,7 +608,7 @@ impl TraceCtx {
             is_bridge_trace: false,
             portal_call_depth_fn: None,
             callinfocollection: None,
-            call_pure_results: std::collections::HashMap::new(),
+            call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             trace_limit: DEFAULT_TRACE_LIMIT,
             snapshots: Vec::new(),
             resumekey_original_loop_token: None,

@@ -7073,7 +7073,7 @@ pub trait Optimization {
     /// Only OptPure consumes this; other passes ignore it.
     fn set_call_pure_results(
         &mut self,
-        _results: &std::collections::HashMap<Vec<majit_ir::Value>, majit_ir::Value>,
+        _results: &crate::optimizeopt::vec_assoc::VecAssoc<Vec<majit_ir::Value>, majit_ir::Value>,
     ) {
     }
 
