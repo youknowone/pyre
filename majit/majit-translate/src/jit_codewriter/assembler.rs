@@ -1639,7 +1639,11 @@ impl Assembler {
                 state.code[startposition] = opnum;
             }
             OpKind::VableForce { base } => {
-                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                let base_vid = graph
+                    .expect("encode_op for VableForce requires a graph")
+                    .value_id_of(base)
+                    .expect("VableForce.base must be a known Variable on graph");
+                let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
                 assert_eq!(kc, 'r', "hint_force_virtualizable expects a Ref base");
                 state.code.push(reg);
                 argcodes.push(kc);

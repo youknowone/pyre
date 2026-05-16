@@ -377,8 +377,8 @@ fn remap_op(
 fn remap_op_kind(
     kind: &OpKind,
     remap: &impl Fn(&ValueId) -> ValueId,
-    _source_graph: &FunctionGraph,
-    _target_graph: &FunctionGraph,
+    source_graph: &FunctionGraph,
+    target_graph: &FunctionGraph,
 ) -> OpKind {
     match kind {
         OpKind::Input { name, ty } => OpKind::Input {
@@ -582,7 +582,14 @@ fn remap_op_kind(
             operand: remap(operand),
             result_ty: result_ty.clone(),
         },
-        OpKind::VableForce { base } => OpKind::VableForce { base: remap(base) },
+        OpKind::VableForce { base } => {
+            let base_vid = source_graph
+                .value_id_of(base)
+                .expect("VableForce.base must have a backing ValueId in source graph");
+            OpKind::VableForce {
+                base: target_graph.must_variable(remap(&base_vid)),
+            }
+        }
         OpKind::JitDebug { args } => OpKind::JitDebug {
             args: args.iter().map(remap).collect(),
         },
@@ -761,10 +768,7 @@ fn remap_op_kind(
 /// projects the Variable back to its `ValueId` via `graph.value_id_of`.
 /// Callers without a graph context (deprecated test-only paths) pass
 /// `None`; once storage is flipped these paths must supply a graph.
-pub fn op_value_refs(
-    kind: &OpKind,
-    _graph: Option<&crate::model::FunctionGraph>,
-) -> Vec<ValueId> {
+pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>) -> Vec<ValueId> {
     match kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
@@ -776,7 +780,12 @@ pub fn op_value_refs(
         | OpKind::Abort { .. } => {
             vec![]
         }
-        OpKind::VableForce { base } => vec![*base],
+        OpKind::VableForce { base } => vec![
+            graph
+                .expect("VableForce requires a graph to project its Variable to ValueId")
+                .value_id_of(base)
+                .expect("VableForce.base must be a known Variable on graph"),
+        ],
         OpKind::JitMergePoint {
             greens_i,
             greens_r,

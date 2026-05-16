@@ -474,7 +474,7 @@ impl<'a> Transformer<'a> {
         let original_ops = graph.blocks[block_idx].operations.clone();
         for original_op in &original_ops {
             let op = remap_op(original_op, &self.aliases, graph);
-            match self.rewrite_operation(&op, graph_name) {
+            match self.rewrite_operation(&op, graph_name, graph) {
                 RewriteResult::Replace(ops) => {
                     new_ops.extend(ops);
                 }
@@ -637,11 +637,16 @@ impl<'a> Transformer<'a> {
     }
 
     /// RPython: Transformer.rewrite_operation() — dispatch to rewrite_op_*.
-    fn rewrite_operation(&mut self, op: &SpaceOperation, graph_name: &str) -> RewriteResult {
+    fn rewrite_operation(
+        &mut self,
+        op: &SpaceOperation,
+        graph_name: &str,
+        graph: &crate::model::FunctionGraph,
+    ) -> RewriteResult {
         match &op.kind {
             // ── rewrite_op_hint ──
             OpKind::Call { target, args, .. } if classify_vable_hint(target).is_some() => {
-                self.rewrite_op_hint(op, target, args, graph_name)
+                self.rewrite_op_hint(op, target, args, graph_name, graph)
             }
             // ── rewrite_op_getfield ──
             //
@@ -1601,6 +1606,7 @@ impl<'a> Transformer<'a> {
         target: &CallTarget,
         args: &[ValueId],
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         let hint_kind = match classify_vable_hint(target) {
             Some(k) => k,
@@ -1634,7 +1640,9 @@ impl<'a> Transformer<'a> {
                     }
                     RewriteResult::Replace(vec![SpaceOperation {
                         result: None,
-                        kind: OpKind::VableForce { base },
+                        kind: OpKind::VableForce {
+                            base: graph.must_variable(base),
+                        },
                     }])
                 } else {
                     RewriteResult::Keep
@@ -3627,7 +3635,7 @@ fn remap_call_funcptr(
 fn remap_op(
     op: &SpaceOperation,
     aliases: &std::collections::HashMap<ValueId, ValueId>,
-    _graph: &crate::model::FunctionGraph,
+    graph: &crate::model::FunctionGraph,
 ) -> SpaceOperation {
     let kind = match &op.kind {
         OpKind::Input { .. }
@@ -3640,9 +3648,14 @@ fn remap_op(
         | OpKind::GuardValue { .. }
         | OpKind::VtableMethodPtr { .. }
         | OpKind::Abort { .. } => op.kind.clone(),
-        OpKind::VableForce { base } => OpKind::VableForce {
-            base: remap_value(*base, aliases),
-        },
+        OpKind::VableForce { base } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("VableForce.base must have a backing ValueId");
+            OpKind::VableForce {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+            }
+        }
         OpKind::JitMergePoint {
             jitdriver_index,
             greens_i,
@@ -5310,10 +5323,10 @@ mod tests {
         );
 
         let ops = &result.graph.block(graph.startblock).operations;
-        assert!(matches!(
-            ops[0].kind,
-            OpKind::VableForce { base } if base == frame
-        ));
+        let OpKind::VableForce { base } = &ops[0].kind else {
+            panic!("expected ops[0] to be VableForce, got {:?}", ops[0].kind);
+        };
+        assert_eq!(result.graph.value_id_of(base), Some(frame));
         assert!(matches!(
             ops[1].kind,
             OpKind::VableFieldRead { field_index: 0, .. }
@@ -5430,7 +5443,7 @@ mod tests {
             .unwrap()
             .clone();
         assert!(matches!(
-            transformer.rewrite_operation(&op, "demo"),
+            transformer.rewrite_operation(&op, "demo", &graph),
             RewriteResult::Keep
         ));
     }

@@ -263,7 +263,10 @@ impl RegAllocator {
             die_at.insert(var.clone(), 0);
         }
         for (i, op) in block.operations.iter().enumerate() {
-            for var in crate::inline::op_variable_refs(&op.kind, graph).into_iter().flatten() {
+            for var in crate::inline::op_variable_refs(&op.kind, graph)
+                .into_iter()
+                .flatten()
+            {
                 die_at.insert(var, i);
             }
             if let Some(result) = op.result {
@@ -452,10 +455,7 @@ impl RegAllocResult {
     /// [`crate::flowspace::model::Variable`].  Matches upstream
     /// `coloring: dict[Variable, int]`
     /// (`tool/algo/regalloc.py:31`).
-    pub fn color_for_variable(
-        &self,
-        var: &crate::flowspace::model::Variable,
-    ) -> Option<usize> {
+    pub fn color_for_variable(&self, var: &crate::flowspace::model::Variable) -> Option<usize> {
         self.coloring.get(var).copied()
     }
 

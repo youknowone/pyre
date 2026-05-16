@@ -6499,7 +6499,12 @@ mod tests {
         let mut graph = FunctionGraph::new("forcer");
         let frame = graph.alloc_value();
         graph.push_inputarg(graph.startblock, frame);
-        graph.push_op(graph.startblock, OpKind::VableForce { base: frame }, false);
+        let frame_var = graph.must_variable(frame);
+        graph.push_op(
+            graph.startblock,
+            OpKind::VableForce { base: frame_var },
+            false,
+        );
         graph.set_return(graph.startblock, None);
         let path = CallPath::from_segments(["forcer"]);
         cc.register_function_graph(path, graph);
