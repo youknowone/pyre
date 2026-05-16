@@ -911,26 +911,44 @@ fn resume_virtual_layout_to_exit_virtual_layout(
                     .map(|source| source.to_exit_source(virtual_offset))
                     .collect(),
             },
-            // `ExitVirtualLayout::StrConcat` / `StrSlice` require a
-            // `calldescr` resolved from `CallInfoCollection`, which the
-            // metainterp-side `ResumeVirtualLayoutSummary` does not
-            // carry.  The production cranelift producer
-            // (`compiler.rs:13109`) builds these variants directly from
-            // `RdVirtualInfo` with `callinfocollection` in scope; this
-            // metainterp summary→ExitVirtualLayout path is reserved for
-            // synthetic / test scaffolding that should not contain VStr/
-            // VUni Concat/Slice virtuals.  Fail loud if reached so the
-            // gap is surfaced rather than producing a layout with a fake
-            // calldescr.
-            ResumeVirtualLayoutSummary::StrConcat { .. }
-            | ResumeVirtualLayoutSummary::StrSlice { .. }
-            | ResumeVirtualLayoutSummary::UniConcat { .. }
-            | ResumeVirtualLayoutSummary::UniSlice { .. } => panic!(
-                "resume_virtual_layout_to_exit_virtual_layout: VStr/VUni Concat/Slice \
-                 reconstruction requires a CallInfoCollection-resolved calldescr that \
-                 ResumeVirtualLayoutSummary does not carry; the production producer is \
-                 cranelift::compiler::collect_guards (resume.py:1462-1480 / 1489-1507)",
-            ),
+            // resume.py:781 VStrConcatInfo / resume.py:836 VUniConcatInfo
+            // — funcptr/calldescr resolved at materialization via
+            // `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT /
+            // OS_UNI_CONCAT)` (resume.py:1467-1468 / 1494-1495), so the
+            // exit layout carries no funcptr.
+            ResumeVirtualLayoutSummary::StrConcat { left, right } => ExitVirtualLayout::StrConcat {
+                is_unicode: false,
+                left: left.to_exit_source(virtual_offset),
+                right: right.to_exit_source(virtual_offset),
+            },
+            ResumeVirtualLayoutSummary::UniConcat { left, right } => ExitVirtualLayout::StrConcat {
+                is_unicode: true,
+                left: left.to_exit_source(virtual_offset),
+                right: right.to_exit_source(virtual_offset),
+            },
+            // resume.py:801 VStrSliceInfo / resume.py:856 VUniSliceInfo
+            // — funcptr/calldescr resolved via callinfocollection at
+            // materialization (resume.py:1477-1478 / 1504-1505).
+            ResumeVirtualLayoutSummary::StrSlice {
+                source,
+                start,
+                length,
+            } => ExitVirtualLayout::StrSlice {
+                is_unicode: false,
+                str_src: source.to_exit_source(virtual_offset),
+                start: start.to_exit_source(virtual_offset),
+                length: length.to_exit_source(virtual_offset),
+            },
+            ResumeVirtualLayoutSummary::UniSlice {
+                source,
+                start,
+                length,
+            } => ExitVirtualLayout::StrSlice {
+                is_unicode: true,
+                str_src: source.to_exit_source(virtual_offset),
+                start: start.to_exit_source(virtual_offset),
+                length: length.to_exit_source(virtual_offset),
+            },
         }
     }
 }

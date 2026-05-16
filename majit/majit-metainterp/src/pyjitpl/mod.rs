@@ -4518,7 +4518,6 @@ impl<M: Clone> MetaInterp<M> {
                     &compiled_ops,
                     green_key,
                     &compiled_constant_types,
-                    self.callinfocollection.as_deref(),
                 );
                 let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                     &inputargs,
@@ -5348,7 +5347,6 @@ impl<M: Clone> MetaInterp<M> {
                     &combined_ops,
                     green_key,
                     &compiled_constant_types,
-                    self.callinfocollection.as_deref(),
                 );
                 let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                     &inputargs,
@@ -5842,7 +5840,6 @@ impl<M: Clone> MetaInterp<M> {
                     &optimized_ops,
                     green_key,
                     &compiled_constant_types,
-                    self.callinfocollection.as_deref(),
                 );
                 let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                     &inputargs,
@@ -6209,7 +6206,6 @@ impl<M: Clone> MetaInterp<M> {
                     &compiled_ops,
                     green_key,
                     &compiled_constant_types,
-                    self.callinfocollection.as_deref(),
                 );
                 let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                     &inputargs,
@@ -8272,7 +8268,6 @@ impl<M: Clone> MetaInterp<M> {
                     &optimized_ops,
                     original_green_key,
                     &compiled_constant_types,
-                    self.callinfocollection.as_deref(),
                 );
                 let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                     bridge_inputargs,
@@ -8865,7 +8860,6 @@ impl<M: Clone> MetaInterp<M> {
                         &optimized_ops,
                         green_key,
                         &compiled_constant_types,
-                        self.callinfocollection.as_deref(),
                     );
                     let mut terminal_exit_layouts = compile::build_terminal_exit_layouts(
                         bridge_inputargs,
@@ -17934,13 +17928,8 @@ mod tests {
         meta.backend
             .compile_loop(inputargs, &ops, &mut token)
             .expect("loop should compile");
-        let (mut resume_data, mut exit_layouts) = compile::build_guard_metadata(
-            inputargs,
-            &ops,
-            green_key,
-            &HashMap::new(),
-            meta.callinfocollection.as_deref(),
-        );
+        let (mut resume_data, mut exit_layouts) =
+            compile::build_guard_metadata(inputargs, &ops, green_key, &HashMap::new());
         let mut terminal_exit_layouts =
             compile::build_terminal_exit_layouts(inputargs, &ops, &HashMap::new());
         if let Some(backend_layouts) = meta.backend.compiled_fail_descr_layouts(&token) {

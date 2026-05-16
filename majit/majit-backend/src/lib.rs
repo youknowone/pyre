@@ -201,27 +201,22 @@ pub enum ExitVirtualLayout {
         chars: Vec<ExitValueSourceLayout>,
     },
     /// resume.py:781 VStrConcatInfo + resume.py:836 VUniConcatInfo.
-    /// decoder.concat_strings(left, right) = cic.funcptr_for_oopspec(
-    /// OS_STR_CONCAT)(left, right).
+    /// decoder.concat_strings(left, right) looks up OS_STR_CONCAT (or
+    /// OS_UNI_CONCAT) via `callinfocollection.funcptr_for_oopspec(...)`
+    /// at materialization (resume.py:1467-1468 / 1494-1495); the layout
+    /// carries no funcptr / calldescr.
     StrConcat {
         is_unicode: bool,
-        /// OS_STR_CONCAT or OS_UNI_CONCAT func pointer (resume.py:1468).
-        func: i64,
-        /// calldescr for OS_STR_CONCAT/OS_UNI_CONCAT. Carried so pyre's
-        /// bh_call_r can dispatch to the right calling convention.
-        calldescr: majit_ir::DescrRef,
         left: ExitValueSourceLayout,
         right: ExitValueSourceLayout,
     },
     /// resume.py:801 VStrSliceInfo + resume.py:856 VUniSliceInfo.
-    /// decoder.slice_string(str, start, length) =
-    /// cic.funcptr_for_oopspec(OS_STR_SLICE)(str, start, start + length).
+    /// decoder.slice_string(str, start, length) looks up OS_STR_SLICE
+    /// (or OS_UNI_SLICE) via callinfocollection at materialization
+    /// (resume.py:1477-1478 / 1504-1505); the layout carries no
+    /// funcptr / calldescr.
     StrSlice {
         is_unicode: bool,
-        /// OS_STR_SLICE or OS_UNI_SLICE func pointer (resume.py:1478).
-        func: i64,
-        /// calldescr for OS_STR_SLICE/OS_UNI_SLICE.
-        calldescr: majit_ir::DescrRef,
         str_src: ExitValueSourceLayout,
         start: ExitValueSourceLayout,
         length: ExitValueSourceLayout,
@@ -333,28 +328,20 @@ impl ExitVirtualLayout {
             },
             Self::StrConcat {
                 is_unicode,
-                func,
-                calldescr,
                 left,
                 right,
             } => Self::StrConcat {
                 is_unicode: *is_unicode,
-                func: *func,
-                calldescr: calldescr.clone(),
                 left: left.shifted_virtuals(virtual_offset),
                 right: right.shifted_virtuals(virtual_offset),
             },
             Self::StrSlice {
                 is_unicode,
-                func,
-                calldescr,
                 str_src,
                 start,
                 length,
             } => Self::StrSlice {
                 is_unicode: *is_unicode,
-                func: *func,
-                calldescr: calldescr.clone(),
                 str_src: str_src.shifted_virtuals(virtual_offset),
                 start: start.shifted_virtuals(virtual_offset),
                 length: length.shifted_virtuals(virtual_offset),
@@ -508,44 +495,29 @@ impl PartialEq for ExitVirtualLayout {
             (
                 Self::StrConcat {
                     is_unicode: a1,
-                    func: a2,
-                    calldescr: a_cd,
                     left: a3,
                     right: a4,
                 },
                 Self::StrConcat {
                     is_unicode: b1,
-                    func: b2,
-                    calldescr: b_cd,
                     left: b3,
                     right: b4,
                 },
-            ) => a1 == b1 && a2 == b2 && std::sync::Arc::ptr_eq(a_cd, b_cd) && a3 == b3 && a4 == b4,
+            ) => a1 == b1 && a3 == b3 && a4 == b4,
             (
                 Self::StrSlice {
                     is_unicode: a1,
-                    func: a2,
-                    calldescr: a_cd,
                     str_src: a3,
                     start: a4,
                     length: a5,
                 },
                 Self::StrSlice {
                     is_unicode: b1,
-                    func: b2,
-                    calldescr: b_cd,
                     str_src: b3,
                     start: b4,
                     length: b5,
                 },
-            ) => {
-                a1 == b1
-                    && a2 == b2
-                    && std::sync::Arc::ptr_eq(a_cd, b_cd)
-                    && a3 == b3
-                    && a4 == b4
-                    && a5 == b5
-            }
+            ) => a1 == b1 && a3 == b3 && a4 == b4 && a5 == b5,
             _ => false,
         }
     }

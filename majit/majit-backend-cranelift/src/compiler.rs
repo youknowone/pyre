@@ -7074,7 +7074,6 @@ impl CraneliftBackend {
             caller_layout,
             &self.constants,
             &self.constant_types,
-            self.callinfocollection.as_deref(),
             attached_descrs,
         )?;
         // RPython jitframe layout parity: ref_root slots start AFTER all
@@ -12329,7 +12328,6 @@ fn collect_guards(
     caller_layout: Option<&ExitRecoveryLayout>,
     constants: &HashMap<u32, i64>,
     constant_types: &HashMap<u32, Type>,
-    callinfocollection: Option<&majit_ir::CallInfoCollection>,
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
@@ -12733,58 +12731,35 @@ fn collect_guards(
                             }
                         }
                         // resume.py:781 VStrConcatInfo / resume.py:836
-                        // VUniConcatInfo — decoder.concat_strings(left, right).
+                        // VUniConcatInfo — decoder.concat_strings(left, right);
+                        // funcptr/calldescr resolved at materialization via
+                        // `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT
+                        // / OS_UNI_CONCAT)` (resume.py:1467-1468 / 1494-1495).
                         majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums, .. }
                         | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums, .. } => {
                             let is_unicode =
                                 matches!(entry, majit_ir::RdVirtualInfo::VUniConcatInfo { .. });
-                            let oopspec = if is_unicode {
-                                majit_ir::effectinfo::OopSpecIndex::UniConcat
-                            } else {
-                                majit_ir::effectinfo::OopSpecIndex::StrConcat
-                            };
-                            let cic = callinfocollection.expect(
-                                "collect_guards: callinfocollection required for \
-                                 VStr/VUni Concat guard-exit recovery",
-                            );
-                            let (calldescr, func) = cic
-                                .callinfo_for_oopspec(oopspec)
-                                .expect("callinfo_for_oopspec missing OS_STR_CONCAT/OS_UNI_CONCAT");
                             let left = resolve_fieldnum(fieldnums[0]);
                             let right = resolve_fieldnum(fieldnums[1]);
                             ExitVirtualLayout::StrConcat {
                                 is_unicode,
-                                func: *func as i64,
-                                calldescr: calldescr.clone(),
                                 left,
                                 right,
                             }
                         }
                         // resume.py:801 VStrSliceInfo / resume.py:856
-                        // VUniSliceInfo — decoder.slice_string(str, start, length).
+                        // VUniSliceInfo — decoder.slice_string(str, start, length);
+                        // funcptr/calldescr resolved via callinfocollection at
+                        // materialization (resume.py:1477-1478 / 1504-1505).
                         majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums, .. }
                         | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums, .. } => {
                             let is_unicode =
                                 matches!(entry, majit_ir::RdVirtualInfo::VUniSliceInfo { .. });
-                            let oopspec = if is_unicode {
-                                majit_ir::effectinfo::OopSpecIndex::UniSlice
-                            } else {
-                                majit_ir::effectinfo::OopSpecIndex::StrSlice
-                            };
-                            let cic = callinfocollection.expect(
-                                "collect_guards: callinfocollection required for \
-                                 VStr/VUni Slice guard-exit recovery",
-                            );
-                            let (calldescr, func) = cic
-                                .callinfo_for_oopspec(oopspec)
-                                .expect("callinfo_for_oopspec missing OS_STR_SLICE/OS_UNI_SLICE");
                             let str_src = resolve_fieldnum(fieldnums[0]);
                             let start = resolve_fieldnum(fieldnums[1]);
                             let length = resolve_fieldnum(fieldnums[2]);
                             ExitVirtualLayout::StrSlice {
                                 is_unicode,
-                                func: *func as i64,
-                                calldescr: calldescr.clone(),
                                 str_src,
                                 start,
                                 length,
@@ -12885,50 +12860,49 @@ fn collect_guards(
         // metainterp DoneWithThisFrameDescr* matching the result type
         // so trait predicates (is_finish / fail_arg_types) resolve via
         // the upstream class hierarchy.
-        descr.meta_descr =
-            if is_external_jump {
-                // op.descr for external JUMP is the TargetToken (already
-                // captured in external_jump_target above).  TargetToken is
-                // not a FailDescr — leaving it in meta_descr would make
-                // get_latest_descr_arc_from_deadframe hand back a
-                // non-FailDescr to callers that downcast with
-                // as_fail_descr().expect(...).
-                None
-            } else if let Some(d) = op.descr.clone() {
-                Some(d)
-            } else if is_finish {
-                // `compile.py:626-656` `_DoneWithThisFrameDescr*` are
-                // module-level singletons.  Reuse the metainterp Arc
-                // stashed on the matching `DONE_WITH_THIS_FRAME_DESCR_*`
-                // singleton so every FINISH exit of a given result type
-                // resolves to the SAME `Arc::ptr_eq` identity (matching
-                // `make_and_attach_done_descrs` parity).
-                let result_type = descr.fail_arg_types.first().copied().unwrap_or(Type::Void);
-                let singleton: &Arc<CraneliftFailDescr> = match result_type {
-                    Type::Void => &DONE_WITH_THIS_FRAME_DESCR_VOID,
-                    Type::Int => &DONE_WITH_THIS_FRAME_DESCR_INT,
-                    Type::Ref => &DONE_WITH_THIS_FRAME_DESCR_REF,
-                    Type::Float => &DONE_WITH_THIS_FRAME_DESCR_FLOAT,
-                };
-                Some(
-                    singleton
-                        .meta_descr
-                        .as_ref()
-                        .cloned()
-                        .expect("DONE_WITH_THIS_FRAME singleton must carry a meta descr"),
-                )
-            } else {
-                // Guard ops without an explicit op.descr (test scaffolding
-                // bypassing the tracer/optimizer that normally stamps
-                // op.descr to a ResumeGuardDescr via store_final_boxes_in_guard)
-                // synthesize a ResumeGuardDescr meta so the recovery_layout
-                // slot has somewhere to land — orthodox Slice QQ-4: only the
-                // meta-side slot stores recovery_layout, no backend cell
-                // fallback.
-                Some(majit_backend::make_resume_guard_descr_typed(
-                    descr.fail_arg_types.clone(),
-                ))
+        descr.meta_descr = if is_external_jump {
+            // op.descr for external JUMP is the TargetToken (already
+            // captured in external_jump_target above).  TargetToken is
+            // not a FailDescr — leaving it in meta_descr would make
+            // get_latest_descr_arc_from_deadframe hand back a
+            // non-FailDescr to callers that downcast with
+            // as_fail_descr().expect(...).
+            None
+        } else if let Some(d) = op.descr.clone() {
+            Some(d)
+        } else if is_finish {
+            // `compile.py:626-656` `_DoneWithThisFrameDescr*` are
+            // module-level singletons.  Reuse the metainterp Arc
+            // stashed on the matching `DONE_WITH_THIS_FRAME_DESCR_*`
+            // singleton so every FINISH exit of a given result type
+            // resolves to the SAME `Arc::ptr_eq` identity (matching
+            // `make_and_attach_done_descrs` parity).
+            let result_type = descr.fail_arg_types.first().copied().unwrap_or(Type::Void);
+            let singleton: &Arc<CraneliftFailDescr> = match result_type {
+                Type::Void => &DONE_WITH_THIS_FRAME_DESCR_VOID,
+                Type::Int => &DONE_WITH_THIS_FRAME_DESCR_INT,
+                Type::Ref => &DONE_WITH_THIS_FRAME_DESCR_REF,
+                Type::Float => &DONE_WITH_THIS_FRAME_DESCR_FLOAT,
             };
+            Some(
+                singleton
+                    .meta_descr
+                    .as_ref()
+                    .cloned()
+                    .expect("DONE_WITH_THIS_FRAME singleton must carry a meta descr"),
+            )
+        } else {
+            // Guard ops without an explicit op.descr (test scaffolding
+            // bypassing the tracer/optimizer that normally stamps
+            // op.descr to a ResumeGuardDescr via store_final_boxes_in_guard)
+            // synthesize a ResumeGuardDescr meta so the recovery_layout
+            // slot has somewhere to land — orthodox Slice QQ-4: only the
+            // meta-side slot stores recovery_layout, no backend cell
+            // fallback.
+            Some(majit_backend::make_resume_guard_descr_typed(
+                descr.fail_arg_types.clone(),
+            ))
+        };
         // Stamp the per-trace fail_index and trace_id onto the metainterp
         // ResumeGuardDescr (`op.descr` or the synthesized
         // make_resume_guard_descr_typed above).  `compile.py:185` gates

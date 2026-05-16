@@ -374,7 +374,6 @@ pub(crate) fn build_guard_metadata(
     ops: &[majit_ir::Op],
     pc: u64,
     constant_types: &std::collections::HashMap<u32, Type>,
-    callinfocollection: Option<&majit_ir::CallInfoCollection>,
 ) -> (
     HashMap<u32, crate::resume::ResumeLayoutSummary>,
     HashMap<u32, StoredExitLayout>,
@@ -930,65 +929,40 @@ pub(crate) fn build_guard_metadata(
                                 }
                                 // resume.py:781 VStrConcatInfo /
                                 // resume.py:836 VUniConcatInfo —
-                                // decoder.concat_strings(left, right).
+                                // decoder.concat_strings(left, right); funcptr
+                                // resolved at materialization via
+                                // `callinfocollection.funcptr_for_oopspec(...)`
+                                // (resume.py:1467-1468 / 1494-1495).
                                 majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums, .. }
                                 | majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums, .. } => {
                                     let is_unicode = matches!(
                                         entry,
                                         majit_ir::RdVirtualInfo::VUniConcatInfo { .. }
                                     );
-                                    let oopspec = if is_unicode {
-                                        majit_ir::effectinfo::OopSpecIndex::UniConcat
-                                    } else {
-                                        majit_ir::effectinfo::OopSpecIndex::StrConcat
-                                    };
-                                    let cic = callinfocollection.expect(
-                                        "build_guard_metadata: callinfocollection \
-                                         required for VStr/VUni Concat recovery",
-                                    );
-                                    let (calldescr, func) =
-                                        cic.callinfo_for_oopspec(oopspec).expect(
-                                            "callinfo_for_oopspec missing OS_STR_CONCAT/OS_UNI_CONCAT",
-                                        );
                                     let left = resolve_tagged_source(fieldnums[0]);
                                     let right = resolve_tagged_source(fieldnums[1]);
                                     majit_backend::ExitVirtualLayout::StrConcat {
                                         is_unicode,
-                                        func: *func as i64,
-                                        calldescr: calldescr.clone(),
                                         left,
                                         right,
                                     }
                                 }
                                 // resume.py:801 VStrSliceInfo /
                                 // resume.py:856 VUniSliceInfo —
-                                // decoder.slice_string(largerstr, start, length).
+                                // decoder.slice_string(largerstr, start, length);
+                                // funcptr resolved via callinfocollection at
+                                // materialization (resume.py:1477-1478 / 1504-1505).
                                 majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums, .. }
                                 | majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums, .. } => {
                                     let is_unicode = matches!(
                                         entry,
                                         majit_ir::RdVirtualInfo::VUniSliceInfo { .. }
                                     );
-                                    let oopspec = if is_unicode {
-                                        majit_ir::effectinfo::OopSpecIndex::UniSlice
-                                    } else {
-                                        majit_ir::effectinfo::OopSpecIndex::StrSlice
-                                    };
-                                    let cic = callinfocollection.expect(
-                                        "build_guard_metadata: callinfocollection \
-                                         required for VStr/VUni Slice recovery",
-                                    );
-                                    let (calldescr, func) =
-                                        cic.callinfo_for_oopspec(oopspec).expect(
-                                            "callinfo_for_oopspec missing OS_STR_SLICE/OS_UNI_SLICE",
-                                        );
                                     let str_src = resolve_tagged_source(fieldnums[0]);
                                     let start = resolve_tagged_source(fieldnums[1]);
                                     let length = resolve_tagged_source(fieldnums[2]);
                                     majit_backend::ExitVirtualLayout::StrSlice {
                                         is_unicode,
-                                        func: *func as i64,
-                                        calldescr: calldescr.clone(),
                                         str_src,
                                         start,
                                         length,
@@ -2615,7 +2589,7 @@ mod tests {
         guard.fail_arg_types = Some(vec![Type::Ref, Type::Int]);
 
         let (_resume_data, exit_layouts) =
-            build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new(), None);
+            build_guard_metadata(&inputargs, &[guard], 8, &HashMap::new());
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         let resume_layout = exit.resume_layout.as_ref().expect("resume_layout");
@@ -2666,7 +2640,7 @@ mod tests {
         guard.fail_arg_types = Some(fail_arg_types);
 
         let (_resume_data, exit_layouts) =
-            build_guard_metadata(&inputargs, &[guard], 0, &HashMap::new(), None);
+            build_guard_metadata(&inputargs, &[guard], 0, &HashMap::new());
         let exit = exit_layouts.get(&0).expect("guard exit layout");
 
         assert_eq!(
