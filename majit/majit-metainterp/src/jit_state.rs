@@ -1120,11 +1120,19 @@ pub trait JitState: Sized {
         materialized_refs: &[Option<GcRef>],
     ) {
         for pending in pending_field_writes {
-            let Some(layout) = self.pending_field_write_layout(
-                meta,
-                pending.descr.as_ref(),
-                pending.item_index.is_some(),
-            ) else {
+            // `resume.py:1000 PENDINGFIELDSTRUCT.lldescr` is always
+            // present in RPython; a `None` here would mean the
+            // optimizer/recorder failed to attach the descr and replaying
+            // the write would corrupt memory.  Fail loud rather than
+            // silently skipping (parity with the `expect` at
+            // `compile.rs:1029`).
+            let descr = pending
+                .descr
+                .as_ref()
+                .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
+            let Some(layout) =
+                self.pending_field_write_layout(meta, Some(descr), pending.item_index.is_some())
+            else {
                 continue;
             };
             let Some(target) = materialized_value_to_i64(&pending.target, materialized_refs) else {
