@@ -617,7 +617,7 @@ pub(crate) struct CompiledEntry<M> {
     /// Trace id of the root compiled loop.
     pub(crate) root_trace_id: u64,
     /// Metadata for the root loop and any attached bridges, keyed by trace id.
-    pub(crate) traces: HashMap<u64, CompiledTrace>,
+    pub(crate) traces: crate::optimizeopt::vec_assoc::VecAssoc<u64, CompiledTrace>,
     /// RPython parity: previous compiled entries for this green_key.
     /// In RPython, JitCellToken keeps all target_tokens' code alive.
     /// In majit, each retrace produces a new Cranelift function;
@@ -814,7 +814,7 @@ pub struct ActiveTraceSession<M: Clone> {
 pub struct MetaInterp<M: Clone> {
     pub(crate) warm_state: WarmEnterState,
     pub(crate) backend: BackendImpl,
-    pub(crate) compiled_loops: HashMap<u64, CompiledEntry<M>>,
+    pub(crate) compiled_loops: crate::optimizeopt::vec_assoc::VecAssoc<u64, CompiledEntry<M>>,
     pub(crate) tracing: Option<TraceCtx>,
     pub(crate) next_trace_id: u64,
     /// RPython metainterp_sd.virtualref_info — shared VirtualRefInfo.
@@ -900,7 +900,7 @@ pub struct MetaInterp<M: Clone> {
     pub(crate) virtualref_boxes: Vec<(OpRef, usize)>,
     /// compile.py:288-290 parity: preamble target tokens saved from Phase 1
     /// even when Phase 2 raises InvalidLoop.
-    pending_preamble_tokens: HashMap<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
+    pending_preamble_tokens: crate::optimizeopt::vec_assoc::VecAssoc<u64, Vec<crate::optimizeopt::unroll::TargetToken>>,
     // pyjitpl.py:2289 `self.staticdata.all_descrs = self.cpu.setup_descrs()` now
     // lives on MetaInterpStaticData (RPython `metainterp_sd.all_descrs`).
     // Access via `self.staticdata.all_descrs` / `&mut self.staticdata.all_descrs`.
@@ -1363,14 +1363,16 @@ impl<M: Clone> MetaInterp<M> {
         &mut self,
         _owning_key: u64,
         entry: CompiledEntry<M>,
-        merged_traces: &mut HashMap<u64, CompiledTrace>,
+        merged_traces: &mut crate::optimizeopt::vec_assoc::VecAssoc<u64, CompiledTrace>,
     ) -> Vec<std::sync::Weak<JitCellToken>> {
         // `entry.token` is already `Weak<JitCellToken>`; push it directly.
         let mut previous_tokens = Vec::with_capacity(1 + entry.previous_tokens.len());
         previous_tokens.push(entry.token);
         previous_tokens.extend(entry.previous_tokens);
         for (tid, ct) in entry.traces {
-            merged_traces.entry(tid).or_insert(ct);
+            if !merged_traces.contains_key(&tid) {
+                merged_traces.insert(tid, ct);
+            }
         }
         previous_tokens
     }
@@ -1766,7 +1768,7 @@ impl<M: Clone> MetaInterp<M> {
         let mut this = MetaInterp {
             warm_state: WarmEnterState::new(threshold),
             backend: BackendImpl::new(),
-            compiled_loops: HashMap::new(),
+            compiled_loops: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             tracing: None,
             next_trace_id: 1,
             virtualref_info: crate::virtualref::VirtualRefInfo::new(),
@@ -1793,7 +1795,7 @@ impl<M: Clone> MetaInterp<M> {
             last_quasi_immutable_deps: Vec::new(),
             retrace_after_bridge: false,
             virtualref_boxes: Vec::new(),
-            pending_preamble_tokens: HashMap::new(),
+            pending_preamble_tokens: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             pending_frontend_boxes: None,
             cls_of_box: Some(default_cls_of_box),
             issubclass: Some(default_issubclass),
@@ -4574,8 +4576,9 @@ impl<M: Clone> MetaInterp<M> {
                         }
                     } else {
                         self.pending_preamble_tokens
-                            .entry(green_key)
-                            .or_insert_with(|| unroll_opt.target_tokens.clone());
+                            .entry_or_insert_with(green_key, || {
+                                unroll_opt.target_tokens.clone()
+                            });
                     }
                 }
                 self.warm_state.abort_tracing(green_key, !is_invalid_loop);
@@ -4656,7 +4659,7 @@ impl<M: Clone> MetaInterp<M> {
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &compiled_ops));
-                let mut traces = HashMap::new();
+                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -5503,7 +5506,7 @@ impl<M: Clone> MetaInterp<M> {
                 let mut next_global_opref = unroll_opt
                     .next_global_opref
                     .max(compute_next_global_opref(&inputargs, &combined_ops));
-                let mut traces = HashMap::new();
+                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -5991,7 +5994,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &optimized_ops);
-                let mut traces = HashMap::new();
+                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -6355,7 +6358,7 @@ impl<M: Clone> MetaInterp<M> {
                 );
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref = compute_next_global_opref(&inputargs, &compiled_ops);
-                let mut traces = HashMap::new();
+                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -8451,7 +8454,7 @@ impl<M: Clone> MetaInterp<M> {
                 self.take_back_all_descrs(std::mem::take(&mut optimizer.all_descrs));
                 let mut next_global_opref =
                     compute_next_global_opref(bridge_inputargs, &optimized_ops);
-                let mut traces = HashMap::new();
+                let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
                 traces.insert(
                     trace_id,
                     CompiledTrace {
@@ -17565,7 +17568,7 @@ mod tests {
         let mut constants = HashMap::new();
         constants.insert(100, 1);
         constants.insert(101, 2);
-        let mut traces = HashMap::new();
+        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
         traces.insert(
             trace_id,
             CompiledTrace {
@@ -17739,7 +17742,7 @@ mod tests {
             },
         );
 
-        let mut traces = HashMap::new();
+        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
         traces.insert(
             trace_id,
             CompiledTrace {
@@ -17835,7 +17838,7 @@ mod tests {
             },
         );
 
-        let mut traces = HashMap::new();
+        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
         traces.insert(
             trace_id,
             CompiledTrace {
@@ -18121,7 +18124,7 @@ mod tests {
             trace_id,
             &mut terminal_exit_layouts,
         );
-        let mut traces = HashMap::new();
+        let mut traces = crate::optimizeopt::vec_assoc::VecAssoc::new();
         traces.insert(
             trace_id,
             CompiledTrace {
@@ -18924,7 +18927,7 @@ mod tests {
                 meta: (),
                 front_target_tokens: Vec::new(),
                 root_trace_id: 0,
-                traces: HashMap::new(),
+                traces: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                 previous_tokens: Vec::new(),
                 next_global_opref: 0,
             },

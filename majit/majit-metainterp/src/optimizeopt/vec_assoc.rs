@@ -87,6 +87,13 @@ impl<K: Eq, V> VecAssoc<K, V> {
         Some(self.entries.remove(idx).1)
     }
 
+    /// `HashMap::retain(f)` parity: keep entries for which `f(&k, &mut v)`
+    /// returns `true`, drop the rest. Order of retained entries is
+    /// preserved (uses `Vec::retain_mut`).
+    pub fn retain<F: FnMut(&K, &mut V) -> bool>(&mut self, mut f: F) {
+        self.entries.retain_mut(|(k, v)| f(k, v));
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.entries.iter().map(|(k, v)| (k, v))
     }
