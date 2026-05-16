@@ -610,7 +610,12 @@ impl GuardStrengthenOpt {
             if let Some(ref descr) = op.descr {
                 if let Some(fd) = descr.as_fail_descr() {
                     if fd.loop_version() {
-                        info.track(fd.fail_index(), version.clone());
+                        // `version.py:32-36 leads_to[descr]` keys by descr
+                        // identity.  Use `Descr::index()` (the globally
+                        // unique `alloc_fail_index()` value) rather than
+                        // `FailDescr::fail_index()` (per-trace, 0 until
+                        // backend codegen).
+                        info.track(descr.index(), version.clone());
                     }
                 }
             }
@@ -706,16 +711,22 @@ impl GuardStrengthenOpt {
                     // guard.py:295: info.remove(other.op.getdescr())
                     // RPython: unconditional call. version.py:38-42 asserts
                     // descr is in leads_to — if not, it's a programming error.
-                    if let Some(fd) = other.op.descr.as_ref().and_then(|d| d.as_fail_descr()) {
-                        version_info.remove(fd.fail_index());
+                    // Key by `Descr::index()` (globally unique) rather than
+                    // `FailDescr::fail_index()` (per-trace, 0 pre-codegen).
+                    if let Some(descr) =
+                        other.op.descr.as_ref().filter(|d| d.as_fail_descr().is_some())
+                    {
+                        version_info.remove(descr.index());
                     }
                     // guard.py:296: other.set_to_none(info, loop)
                     other.set_to_none(&mut opt_ops);
                     // guard.py:297-299: info.track(transitive_guard, descr, version)
-                    if let Some(fd) = tg.descr.as_ref().and_then(|d| d.as_fail_descr()) {
+                    if let Some(descr) =
+                        tg.descr.as_ref().filter(|d| d.as_fail_descr().is_some())
+                    {
                         info_track_guard(
                             version_info,
-                            fd.fail_index(),
+                            descr.index(),
                             version.as_ref().unwrap().clone(),
                         );
                     }

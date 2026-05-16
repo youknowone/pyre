@@ -169,13 +169,16 @@ impl LoopVersion {
                 continue;
             };
             if new_fd.loop_version() {
-                let Some(old_fd) = old_descr.as_fail_descr() else {
-                    continue;
-                };
-                let old_fi = old_fd.fail_index();
+                // `version.py:32-36 leads_to[descr]` keys by descr object
+                // identity.  Pyre uses `Descr::index()` — the globally
+                // unique `alloc_fail_index()` value baked at descr
+                // construction — instead of `FailDescr::fail_index()`
+                // which now returns the per-trace index and is `0` until
+                // backend codegen assigns it.
+                let old_fi = old_descr.index();
                 let toversion = info.leads_to.get(&old_fi).cloned();
                 if let Some(tv) = toversion {
-                    info.track(new_fd.fail_index(), tv);
+                    info.track(new_descr.index(), tv);
                 } else {
                     panic!("version.py:114 olddescr must be found in leads_to");
                 }
