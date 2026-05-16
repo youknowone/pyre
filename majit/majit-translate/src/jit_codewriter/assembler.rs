@@ -325,7 +325,18 @@ impl Assembler {
         // [`crate::flatten::Register`]-based identity, so liveness now
         // also takes the regalloc result for the `ValueId → Register`
         // bridge on `FlatOp::Op` operands.
-        crate::liveness::compute_liveness_with_graph(ssarepr, regallocs, graph);
+        //
+        // The graph is required to project each operand `ValueId` to
+        // its backing `Variable` (for `getkind(v.concretetype)` +
+        // `coloring[Variable]`); when callers (e.g. the legacy
+        // graph-less `assemble` / `assemble_with_callcontrol`
+        // entrypoints kept for test fixtures) supply no graph, skip
+        // the liveness pass entirely — the test fixtures do not
+        // observe `FlatOp::Live` payloads.  Production always reaches
+        // here through `assemble_with_graph`.
+        if let Some(g) = graph {
+            crate::liveness::compute_liveness(ssarepr, regallocs, g);
+        }
         self.current_graph_name = Some(ssarepr.name.clone());
         // Snapshot the per-value `concretetype` slice so
         // `lookup_coloring` can read it without keeping a graph

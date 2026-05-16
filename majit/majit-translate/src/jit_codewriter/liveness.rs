@@ -12,7 +12,6 @@
 use std::collections::{HashMap, HashSet};
 
 use crate::flatten::{FlatOp, Label, RegKind, Register, SSARepr};
-use crate::jit_codewriter::type_state::TypeResolutionState;
 use crate::model::ValueId;
 use crate::regalloc::RegAllocResult;
 
@@ -31,44 +30,16 @@ use crate::regalloc::RegAllocResult;
 /// `getcolor`; pyre keeps `SpaceOperation` slots as `ValueId` for now,
 /// so the conversion happens here at the liveness boundary.
 /// RPython liveness.py:19-23.
-pub fn compute_liveness(flattened: &mut SSARepr, regallocs: &HashMap<RegKind, RegAllocResult>) {
-    compute_liveness_with_types(flattened, regallocs, None);
-}
-
-/// `compute_liveness` variant that also threads the per-graph
-/// [`TypeResolutionState`] so [`value_to_register`] reads kind from
-/// `getkind(v.concretetype)` first — `flatten.py:382 getcolor`
-/// strict 1:1 parity for the `FlatOp::Op` operand bridge.
-#[deprecated(
-    note = "use compute_liveness_with_graph; graph.concretetype(v) is the kind source now"
-)]
-pub fn compute_liveness_with_types(
+///
+/// `graph` is required: every `FlatOp::Op` operand's kind reads
+/// through `graph.concretetype(v)` (the upstream
+/// `Variable.concretetype` source of truth), so a `None` here would
+/// silently strip operand uses from the alive set — that regressed
+/// `main`-shaped parity before this API became graph-only.
+pub fn compute_liveness(
     flattened: &mut SSARepr,
     regallocs: &HashMap<RegKind, RegAllocResult>,
-    types: Option<&TypeResolutionState>,
-) {
-    let mut label2alive: HashMap<Label, HashSet<Register>> = HashMap::new();
-
-    loop {
-        if !compute_liveness_pass(&mut flattened.insns, &mut label2alive, regallocs, types) {
-            break;
-        }
-    }
-    // RPython liveness.py:23: remove_repeated_live(ssarepr)
-    remove_repeated_live(&mut flattened.insns);
-}
-
-/// Graph-driven sibling of [`compute_liveness_with_types`] —
-/// reads each operand's kind via `graph.concretetype(v)` instead of
-/// the transitional [`TypeResolutionState`] table.  This is the
-/// production path.  RPython parity: `Variable.concretetype` is the
-/// inline source of truth, and pyre routes the same attribute
-/// through each backing `Variable` stored on the graph's
-/// `value_variables`.
-pub fn compute_liveness_with_graph(
-    flattened: &mut SSARepr,
-    regallocs: &HashMap<RegKind, RegAllocResult>,
-    graph: Option<&crate::model::FunctionGraph>,
+    graph: &crate::model::FunctionGraph,
 ) {
     let mut label2alive: HashMap<Label, HashSet<Register>> = HashMap::new();
 
@@ -77,7 +48,7 @@ pub fn compute_liveness_with_graph(
             &mut flattened.insns,
             &mut label2alive,
             regallocs,
-            graph,
+            Some(graph),
         ) {
             break;
         }
@@ -176,29 +147,6 @@ fn value_to_register_with_graph(
     found
 }
 
-#[deprecated(
-    note = "use value_to_register_with_graph; the Variable-keyed coloring map cannot \
-            be queried via TypeResolutionState alone — pass graph: Option<&FunctionGraph>"
-)]
-fn value_to_register(
-    _v: ValueId,
-    _regallocs: &HashMap<RegKind, RegAllocResult>,
-    _types: Option<&TypeResolutionState>,
-) -> Option<Register> {
-    // Stub: callers must migrate to `value_to_register_with_graph`.
-    // The new Variable-keyed `coloring` map (RPython `tool/algo/
-    // regalloc.py:31 coloring: dict[Variable, int]`) cannot be
-    // queried by `ValueId` without `graph.variable(v)`.
-    let _ = (_v, _regallocs, _types);
-    let mut found: Option<Register> = None;
-    {
-        // Empty body kept to mirror upstream loop shape; the actual
-        // coloring lookup is unreachable without a graph reference.
-        let _ = &mut found;
-    }
-    found
-}
-
 /// RPython liveness.py:82-116: remove_repeated_live.
 ///
 /// Merges consecutive `-live-` markers into a single one (union of
@@ -245,28 +193,10 @@ fn remove_repeated_live(ops: &mut Vec<FlatOp>) {
 ///
 /// Walks backward through the instruction sequence. At each `-live-`
 /// marker, expands it to include all values alive at that point.
-fn compute_liveness_pass(
-    ops: &mut [FlatOp],
-    label2alive: &mut HashMap<Label, HashSet<Register>>,
-    regallocs: &HashMap<RegKind, RegAllocResult>,
-    _types: Option<&TypeResolutionState>,
-) -> bool {
-    // The legacy TypeResolutionState path no longer threads through to
-    // the per-operand register lookup; the Variable-keyed `coloring`
-    // map needs `graph.variable(v)` to resolve a `ValueId`.  Callers
-    // that still hit this path (test fixtures with empty regallocs)
-    // exercise only the Label / Live / Jump arms.
-    compute_liveness_pass_with_graph(ops, label2alive, regallocs, None)
-}
-
-/// Graph-driven sibling of [`compute_liveness_pass`].  Reads each
-/// `FlatOp::Op` operand's kind via `graph.concretetype(v)` and color
-/// via `RegAllocResult::color_for(graph, v)` — both routed through
-/// the backing `Variable` so the lookup matches upstream
-/// `flatten.py:382 getcolor` line-for-line.  Used exclusively by
-/// [`compute_liveness_with_graph`] (production); the legacy
-/// `compute_liveness_with_types` shim short-circuits the
-/// per-operand bridge by passing `graph = None`.
+/// Reads each `FlatOp::Op` operand's kind via `graph.concretetype(v)`
+/// and color via `RegAllocResult::color_for(graph, v)` — both routed
+/// through the backing `Variable` so the lookup matches upstream
+/// `flatten.py:382 getcolor` line-for-line.
 fn compute_liveness_pass_with_graph(
     ops: &mut [FlatOp],
     label2alive: &mut HashMap<Label, HashSet<Register>>,
@@ -595,9 +525,14 @@ mod tests {
         // Should not panic.  Phase 3 added the `regallocs` parameter
         // for the FlatOp::Op `ValueId → Register` bridge; pass an
         // empty map since this fixture has no inputargs that exercise
-        // the conversion.
+        // the conversion.  The graph is required so liveness can
+        // project each operand `ValueId` through its backing
+        // `Variable.concretetype` — supply a fresh FunctionGraph that
+        // covers ValueId(0..=2).
         let regallocs: HashMap<RegKind, RegAllocResult> = HashMap::new();
-        compute_liveness(&mut flat, &regallocs);
+        let mut graph = crate::model::FunctionGraph::new("liveness_basic_fixture");
+        graph.set_next_value(3);
+        compute_liveness(&mut flat, &regallocs, &graph);
     }
 
     #[test]

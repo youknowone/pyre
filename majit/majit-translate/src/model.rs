@@ -2597,10 +2597,9 @@ impl FunctionGraph {
     /// Snapshot every live `ValueId`'s [`ConcreteType`] into a dense
     /// `Vec` indexed by `ValueId.0`.  Used by passes that need to
     /// borrow the kind table while mutating the graph
-    /// (`liveness::compute_liveness_with_graph`,
-    /// `assembler::Assembler::assemble`).  The snapshot is computed
-    /// from `value_variables` on demand; the underlying source of
-    /// truth is each Variable's `concretetype` cell.
+    /// (`liveness::compute_liveness`, `assembler::Assembler::assemble`).
+    /// The snapshot is computed from `value_variables` on demand; the
+    /// underlying source of truth is each Variable's `concretetype` cell.
     pub fn concretetype_snapshot(&self) -> Vec<ConcreteType> {
         (0..self.value_variables.len())
             .map(|i| self.concretetype(ValueId(i)))
