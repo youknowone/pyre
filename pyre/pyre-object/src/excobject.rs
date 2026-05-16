@@ -17,8 +17,7 @@ pub static EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("BaseException")
 pub static EXC_EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("Exception");
 pub static EXC_ARITHMETIC_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ArithmeticError");
 pub static EXC_OVERFLOW_ERROR_TYPE: PyType = crate::pyobject::new_pytype("OverflowError");
-pub static EXC_ZERO_DIVISION_ERROR_TYPE: PyType =
-    crate::pyobject::new_pytype("ZeroDivisionError");
+pub static EXC_ZERO_DIVISION_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ZeroDivisionError");
 pub static EXC_TYPE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("TypeError");
 pub static EXC_VALUE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ValueError");
 pub static EXC_NAME_ERROR_TYPE: PyType = crate::pyobject::new_pytype("NameError");
@@ -35,8 +34,7 @@ pub static EXC_REFERENCE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("Refer
 pub static EXC_GENERATOR_EXIT_TYPE: PyType = crate::pyobject::new_pytype("GeneratorExit");
 pub static EXC_RECURSION_ERROR_TYPE: PyType = crate::pyobject::new_pytype("RecursionError");
 pub static EXC_OS_ERROR_TYPE: PyType = crate::pyobject::new_pytype("OSError");
-pub static EXC_FILE_NOT_FOUND_ERROR_TYPE: PyType =
-    crate::pyobject::new_pytype("FileNotFoundError");
+pub static EXC_FILE_NOT_FOUND_ERROR_TYPE: PyType = crate::pyobject::new_pytype("FileNotFoundError");
 pub static EXC_UNICODE_DECODE_ERROR_TYPE: PyType =
     crate::pyobject::new_pytype("UnicodeDecodeError");
 pub static EXC_UNICODE_ENCODE_ERROR_TYPE: PyType =

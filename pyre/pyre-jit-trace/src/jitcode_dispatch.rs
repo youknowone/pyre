@@ -461,7 +461,10 @@ pub enum DispatchOutcome {
     /// `raise/r` / `reraise/` reads the right concrete for GUARD_CLASS
     /// emission. Empty when the callee itself didn't track a concrete
     /// (e.g. shadow gap or `Null`-seeded raise).
-    SubRaise { exc: OpRef, exc_concrete: ConcreteValue },
+    SubRaise {
+        exc: OpRef,
+        exc_concrete: ConcreteValue,
+    },
     /// Trace recording must abort and resume in blackhole mode.
     ///
     /// RPython parity: `pyjitpl.py:2003-2006` routes
@@ -619,6 +622,12 @@ pub enum DispatchError {
     /// choosing a branch without a concrete value would record the wrong
     /// guard chain, so surface the missing concrete value explicitly.
     SwitchValueNotConcrete { pc: usize, value: OpRef },
+    /// `goto_if_not/iL` needs RPython's `box.getint()` at trace time
+    /// (`pyjitpl.py:511-526 opimpl_goto_if_not`).  Without the
+    /// concrete value the walker can't pick GUARD_TRUE vs GUARD_FALSE
+    /// or decide whether to jump to the label target, so surface the
+    /// missing concrete explicitly instead of guessing.
+    GotoIfNotValueNotConcrete { pc: usize, value: OpRef },
     /// `OS_NOT_IN_TRACE` must run the callee concretely and record no
     /// IR on the normal path (`pyjitpl.py:3683-3693`). The standalone
     /// symbolic walker has no concrete executor, so it must stop here
@@ -3446,10 +3455,7 @@ fn dispatch_inline_call_dr_kind(
                 ctx.last_exc_value_concrete = exc_concrete;
                 Ok((DispatchOutcome::Continue, target))
             } else {
-                Ok((
-                    DispatchOutcome::SubRaise { exc, exc_concrete },
-                    op.next_pc,
-                ))
+                Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
         DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
@@ -3619,10 +3625,7 @@ fn dispatch_inline_call_dir_kind(
                 ctx.last_exc_value_concrete = exc_concrete;
                 Ok((DispatchOutcome::Continue, target))
             } else {
-                Ok((
-                    DispatchOutcome::SubRaise { exc, exc_concrete },
-                    op.next_pc,
-                ))
+                Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
         DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
@@ -3814,10 +3817,7 @@ fn dispatch_inline_call_dirf_kind(
                 ctx.last_exc_value_concrete = exc_concrete;
                 Ok((DispatchOutcome::Continue, target))
             } else {
-                Ok((
-                    DispatchOutcome::SubRaise { exc, exc_concrete },
-                    op.next_pc,
-                ))
+                Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, op.next_pc))
             }
         }
         DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
@@ -3888,6 +3888,67 @@ fn handle(
             // agree that goto records nothing (pure control flow).
             let target = read_label(code, op, 0);
             Ok((DispatchOutcome::Continue, target))
+        }
+        "goto_if_not/iL" => {
+            // RPython `pyjitpl.py:511-526 opimpl_goto_if_not`:
+            //
+            //   @arguments("box", "label", "orgpc")
+            //   def opimpl_goto_if_not(self, box, target, orgpc, replace=True):
+            //       switchcase = box.getint()
+            //       if switchcase:
+            //           assert switchcase == 1
+            //           opnum = rop.GUARD_TRUE
+            //           promoted_box = CONST_1
+            //       else:
+            //           opnum = rop.GUARD_FALSE
+            //           promoted_box = CONST_0
+            //       self.metainterp.generate_guard(opnum, box, resumepc=orgpc)
+            //       if not switchcase:
+            //           self.pc = target
+            //       if isinstance(box, Const):
+            //           return
+            //       if replace:
+            //           self.metainterp.replace_box(box, promoted_box)
+            //
+            // Operand layout `iL`: 1B Int register + 2B LE label.
+            // Concrete branch value comes from `TraceCtx::concrete_of_opref`
+            // (same path `switch/id` uses); non-concrete OpRefs surface
+            // `GotoIfNotValueNotConcrete` rather than guess a direction.
+            let valuebox = read_int_reg(code, op, 0, ctx)?;
+            let target = read_label(code, op, 1);
+            let switchcase = match ctx.trace_ctx.concrete_of_opref(valuebox) {
+                Value::Int(v) => v,
+                _ => {
+                    return Err(DispatchError::GotoIfNotValueNotConcrete {
+                        pc: op.pc,
+                        value: valuebox,
+                    });
+                }
+            };
+            let (opcode, promoted) = if switchcase != 0 {
+                (OpCode::GuardTrue, ctx.trace_ctx.const_int(1))
+            } else {
+                (OpCode::GuardFalse, ctx.trace_ctx.const_int(0))
+            };
+            ctx.trace_ctx.record_guard(opcode, &[valuebox], 0);
+            // `pyjitpl.py:523-526` const-source short-circuit + `replace`
+            // fold: when `valuebox` is already a Const, the guard pins
+            // the existing constant and no rewrite is needed.  Otherwise
+            // rewrite downstream uses (trace history + walker register
+            // bank) to the promoted const — `trace_ctx.replace_box`
+            // handles the trace side; the Int bank loop handles the
+            // walker's symbolic registers analogously to `switch/id`
+            // (jitcode_dispatch.rs:~1189).
+            if !valuebox.is_constant() {
+                ctx.trace_ctx.replace_box(valuebox, promoted);
+                for slot in ctx.registers_i.iter_mut() {
+                    if *slot == valuebox {
+                        *slot = promoted;
+                    }
+                }
+            }
+            let next_pc = if switchcase != 0 { op.next_pc } else { target };
+            Ok((DispatchOutcome::Continue, next_pc))
         }
         "catch_exception/L" => {
             // RPython `blackhole.py:969-974 bhimpl_catch_exception(target)` —
@@ -4851,6 +4912,133 @@ mod tests {
         assert_eq!(
             err,
             DispatchError::SwitchValueNotConcrete {
+                pc: 0,
+                value: OpRef::input_arg_int(0),
+            }
+        );
+    }
+
+    #[test]
+    fn goto_if_not_truthy_records_guard_true_and_falls_through() {
+        // `goto_if_not/iL` with a concrete non-zero Int: emit GuardTrue,
+        // do NOT take the jump (pc advances past the 3-byte operand
+        // block).  RPython `pyjitpl.py:511-520 opimpl_goto_if_not`
+        // `if switchcase: opnum = rop.GUARD_TRUE; ... if not switchcase: self.pc = target`.
+        let goto_if_byte = *insns_opname_to_byte()
+            .get("goto_if_not/iL")
+            .expect("`goto_if_not/iL` must be in insns table");
+        let code = [
+            goto_if_byte,
+            0x00, // i register 0
+            0x40,
+            0x00, // L target = 0x0040
+        ];
+        let mut tc = fresh_trace_ctx();
+        let value = tc.const_int(1);
+        let mut regs_i = vec![value];
+        let descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+        };
+
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("truthy branch must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, code.len(), "truthy branch falls through");
+    }
+
+    #[test]
+    fn goto_if_not_falsy_records_guard_false_and_jumps() {
+        // `goto_if_not/iL` with a concrete zero Int: emit GuardFalse,
+        // jump to the label target (pc = target).
+        let goto_if_byte = *insns_opname_to_byte()
+            .get("goto_if_not/iL")
+            .expect("`goto_if_not/iL` must be in insns table");
+        let code = [
+            goto_if_byte,
+            0x00, // i register 0
+            0x40,
+            0x00, // L target = 0x0040
+        ];
+        let mut tc = fresh_trace_ctx();
+        let value = tc.const_int(0);
+        let mut regs_i = vec![value];
+        let descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+        };
+
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("falsy branch must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, 0x0040, "falsy branch jumps to label target");
+    }
+
+    #[test]
+    fn goto_if_not_requires_concrete_int_value() {
+        // Non-constant symbolic OpRef has no concrete: must surface
+        // `GotoIfNotValueNotConcrete` rather than guess a branch.
+        let goto_if_byte = *insns_opname_to_byte()
+            .get("goto_if_not/iL")
+            .expect("`goto_if_not/iL` must be in insns table");
+        let code = [
+            goto_if_byte,
+            0x00, // i register 0
+            0x40,
+            0x00, // L target = 0x0040
+        ];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_i = vec![OpRef::input_arg_int(0)];
+        let descr = done_descr_ref_for_tests();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+        };
+
+        let err = step(&code, 0, &mut wc).expect_err("non-constant branch value must not guess");
+
+        assert_eq!(
+            err,
+            DispatchError::GotoIfNotValueNotConcrete {
                 pc: 0,
                 value: OpRef::input_arg_int(0),
             }
