@@ -81,10 +81,10 @@ fn find_raise_args(
         for link in &block.exits {
             if link.target == exceptblock && link.args.len() == 2 {
                 let etype = link.args[0]
-                    .as_value()
+                    .as_value(graph)
                     .expect("raise link etype must be a ValueId, not a Const");
                 let evalue = link.args[1]
-                    .as_value()
+                    .as_value(graph)
                     .expect("raise link evalue must be a ValueId, not a Const");
                 seen.push((etype, evalue));
             }
