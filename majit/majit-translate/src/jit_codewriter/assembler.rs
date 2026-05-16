@@ -385,7 +385,7 @@ impl Assembler {
             if debug_enabled {
                 self.current_flatop_debug = Some(format!("{op:?}"));
             }
-            self.write_insn(op, regallocs, &mut state, callcontrol);
+            self.write_insn(op, regallocs, &mut state, callcontrol, graph);
         }
         self.current_flatop_debug = None;
         ssarepr.insns_pos = Some(insns_pos);
@@ -503,6 +503,7 @@ impl Assembler {
         regallocs: &HashMap<RegKind, RegAllocResult>,
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
+        graph: Option<&crate::model::FunctionGraph>,
     ) {
         match op {
             // RPython assembler.py:143-144: Label → record bytecode position
@@ -563,7 +564,7 @@ impl Assembler {
 
             // RPython assembler.py:159-223: regular operation
             FlatOp::Op(inner_op) => {
-                self.encode_op(inner_op, regallocs, state, callcontrol);
+                self.encode_op(inner_op, regallocs, state, callcontrol, graph);
             }
 
             // RPython flatten.py: 'goto' + TLabel
@@ -980,6 +981,7 @@ impl Assembler {
         regallocs: &HashMap<RegKind, RegAllocResult>,
         state: &mut AssemblyState,
         callcontrol: Option<&CallControl>,
+        graph: Option<&crate::model::FunctionGraph>,
     ) {
         use crate::model::OpKind;
 
@@ -1719,7 +1721,7 @@ impl Assembler {
             // Default: encode operand registers + result register (no descriptor)
             other => {
                 let mut operand_kinds = String::new();
-                for v in crate::inline::op_value_refs(other, None) {
+                for v in crate::inline::op_value_refs(other, graph) {
                     let (reg, kind_char) = self.lookup_reg_with_kind(v, regallocs);
                     state.code.push(reg);
                     argcodes.push(kind_char);
