@@ -525,7 +525,11 @@ pub enum RdVirtualInfo {
         fieldnums: Vec<i16>,
     },
     /// resume.py:801 `VStrSliceInfo` — virtual slice of a larger string.
-    /// `fieldnums = [largerstr, start, length]`.  `func` is OS_STR_SLICE.
+    /// `fieldnums = [largerstr, start, length]` (pyre stores `length`;
+    /// the backend reader converts to RPython's `(start, start + length)`
+    /// before calling the OS_STR_SLICE funcptr — see
+    /// `resume.py:1479` and `resume.rs::ResumeDataDirectReader::slice_string`).
+    /// `func` is OS_STR_SLICE.
     VStrSliceInfo {
         func: i64,
         fieldnums: Vec<i16>,
@@ -540,7 +544,9 @@ pub enum RdVirtualInfo {
         func: i64,
         fieldnums: Vec<i16>,
     },
-    /// resume.py:856 `VUniSliceInfo` — unicode counterpart of VStrSlice.
+    /// resume.py:856 `VUniSliceInfo` — unicode counterpart of `VStrSlice`
+    /// (same length-vs-stop convention; backend reader adds
+    /// `start + length` before calling the OS_UNI_SLICE funcptr).
     /// `func` is OS_UNI_SLICE.
     VUniSliceInfo {
         func: i64,
