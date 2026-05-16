@@ -3817,7 +3817,7 @@ pub fn cranelift_resumedata_deopt(
     outputs: &mut Vec<i64>,
     types: &[majit_ir::Type],
     _bridge_num_inputs: usize,
-) {
+) -> bool {
     use majit_backend::Backend;
     use majit_metainterp::resume;
 
@@ -3831,17 +3831,17 @@ pub fn cranelift_resumedata_deopt(
     //    payload upstream (compile.py:624-662) — they short-circuit
     //    here.  Callers fall back to the recovery_layout walker for
     //    these until the synthetic construction path is restructured.
-    let Some(any) = descr.as_any() else { return };
+    let Some(any) = descr.as_any() else { return false };
     let Some(rgd) = any.downcast_ref::<majit_backend::ResumeGuardDescr>() else {
-        return;
+        return false;
     };
 
     // 3. Extract resume payload.  Empty rd_numb → nothing to decode.
     let Some(rd_numb) = rgd.payload.rd_numb() else {
-        return;
+        return false;
     };
     if rd_numb.is_empty() {
-        return;
+        return false;
     }
     let rd_consts = rgd.payload.rd_consts().unwrap_or(&[]);
     let rd_virtuals_rcs = rgd.payload.rd_virtuals();
@@ -3896,7 +3896,7 @@ pub fn cranelift_resumedata_deopt(
     // which would break the per-section walk — short-circuit to the
     // recovery_layout fallback instead.
     if op_live_i32 < 0 || op_live_i32 > 255 {
-        return;
+        return false;
     }
     let op_live = op_live_i32 as u8;
     let resolve_jitcode = |jitcode_index: i32,
@@ -3925,11 +3925,12 @@ pub fn cranelift_resumedata_deopt(
     if !reader.consume_all_sections_into_vec(&resolve_jitcode, &mut rebuilt) {
         // resolve_jitcode failure — leave outputs as-is so the
         // recovery_layout fallback path can take over.
-        return;
+        return false;
     }
 
     // 9. Replace outputs with rebuilt.
     *outputs = rebuilt;
+    true
 }
 
 #[cfg(test)]

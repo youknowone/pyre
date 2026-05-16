@@ -1999,22 +1999,46 @@ static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(*const i64, usize, usize) -> bool> 
 /// materialisation to wrap raw refs into PyObject pointers).  This
 /// callback REPLACES the recovery_layout walker entirely.
 ///
-/// Args: `(descr_addr, outputs, types, bridge_num_inputs)` — the
-/// callback materialises virtuals + replays pending fields in place,
-/// matching the semantics of the existing
-/// `rebuild_state_after_failure(outputs, types, recovery, ...)` walker.
-/// Until QQ-2 migrates the consumer sites, the callback is registered
-/// but unused; the walker continues to drive deopt through the
-/// recovery_layout cache.
-static RESUMEDATA_DEOPT_FN: OnceLock<fn(usize, &mut Vec<i64>, &[Type], usize)> = OnceLock::new();
+/// Args: `(descr_addr, outputs, types, bridge_num_inputs) -> bool`.
+/// Returns `true` when the on-demand decode handled the descr (in
+/// which case `*outputs` has been replaced with the rebuilt vec).
+/// Returns `false` for synthetic FINISH / external-JUMP / Done* descrs
+/// without a downcastable `ResumeGuardDescr` — callers fall back to
+/// the recovery_layout walker.
+static RESUMEDATA_DEOPT_FN: OnceLock<fn(usize, &mut Vec<i64>, &[Type], usize) -> bool> =
+    OnceLock::new();
 
 /// Register the on-demand resume callback for cranelift deopt
 /// materialisation (Slice QQ-1).  pyre-jit calls this during JIT
 /// boot alongside `register_call_assembler_blackhole` so the
 /// callback is reachable when cranelift consumers migrate off the
 /// `ExitRecoveryLayout` cache.
-pub fn register_resumedata_deopt(f: fn(usize, &mut Vec<i64>, &[Type], usize)) {
+pub fn register_resumedata_deopt(f: fn(usize, &mut Vec<i64>, &[Type], usize) -> bool) {
     let _ = RESUMEDATA_DEOPT_FN.set(f);
+}
+
+/// Dispatch entry used by the six recovery_layout_ref() consumer
+/// sites (Slice QQ-3+).  Calls the on-demand callback when present
+/// and it claims the descr; otherwise falls back to the existing
+/// recovery_layout walker.  Returns when `outputs` has been updated.
+fn rebuild_state_after_failure_dispatch(
+    fail_descr: &Arc<CraneliftFailDescr>,
+    outputs: &mut Vec<i64>,
+    fail_arg_types: &[Type],
+    bridge_num_inputs: usize,
+) {
+    if let Some(cb) = RESUMEDATA_DEOPT_FN.get() {
+        let descr_addr = Arc::as_ptr(fail_descr) as *const () as usize;
+        if cb(descr_addr, outputs, fail_arg_types, bridge_num_inputs) {
+            return;
+        }
+    }
+    rebuild_state_after_failure(
+        outputs,
+        fail_arg_types,
+        fail_descr.recovery_layout_ref().as_ref(),
+        bridge_num_inputs,
+    );
 }
 
 // Thread-local raw local0 value from CallAssemblerI inputs,
@@ -3147,12 +3171,21 @@ fn execute_registered_loop_target(target: &RegisteredLoopTarget, inputs: &[i64])
                 return bridge_frame;
             }
             // Non-loop-reentry: materialize virtuals then dispatch.
+            // Slice QQ-3: route through rebuild_state_after_failure_dispatch
+            // so the on-demand `ResumeDataDirectReader` callback (when
+            // registered by pyre-jit) drives materialisation directly
+            // from `rd_numb` / `rd_consts` / `rd_virtuals` /
+            // `rd_pendingfields`; falls back to the recovery_layout
+            // walker for synthetic descrs or when the callback is
+            // unregistered.  Matches PyPy's `pyjitpl.py:3424
+            // MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)`
+            // shape.
             let mut mat_outputs = outputs.clone();
             let fail_arg_types = fail_descr.fail_arg_types();
-            rebuild_state_after_failure(
+            rebuild_state_after_failure_dispatch(
+                fail_descr,
                 &mut mat_outputs,
                 fail_arg_types,
-                fail_descr.recovery_layout_ref().as_ref(),
                 bridge.num_inputs,
             );
             return CraneliftBackend::execute_bridge(
@@ -3515,14 +3548,14 @@ fn call_assembler_fast_path_heap(
     fail_descr.increment_fail_count();
 
     if let Some(bridge) = fail_descr.bridge_ref() {
-        // rebuild_state_after_failure decodes recovery_layout to match
-        // what the bridge tracer saw via rebuild_from_resumedata.
+        // Slice QQ-3: dispatch routes on-demand ResumeDataDirectReader
+        // callback first; falls back to recovery_layout walker.
         let mut bridge_outputs = outputs;
         let fail_arg_types = fail_descr.fail_arg_types();
-        rebuild_state_after_failure(
+        rebuild_state_after_failure_dispatch(
+            fail_descr,
             &mut bridge_outputs,
             fail_arg_types,
-            fail_descr.recovery_layout_ref().as_ref(),
             bridge.num_inputs,
         );
         let mut frame = CraneliftBackend::execute_bridge(
@@ -3554,10 +3587,12 @@ fn call_assembler_fast_path_heap(
         let raw_num = fail_descr.fail_arg_types().len();
         let raw_outputs = outputs.to_vec();
         let mut bh_outputs = outputs.to_vec();
-        rebuild_state_after_failure(
+        // Slice QQ-3: same on-demand dispatch as the bridge path above.
+        let fail_arg_types_for_dispatch = fail_descr.fail_arg_types();
+        rebuild_state_after_failure_dispatch(
+            fail_descr,
             &mut bh_outputs,
-            fail_descr.fail_arg_types(),
-            fail_descr.recovery_layout_ref().as_ref(),
+            fail_arg_types_for_dispatch,
             raw_num,
         );
         let num_outputs = bh_outputs.len();
@@ -3684,11 +3719,19 @@ fn call_assembler_shim_inner(
         let raw_num = fail_types.len();
         let raw_outputs = fail_values.clone();
         let mut bh_outputs = fail_values;
-        let recovery = target
-            .fail_descrs
-            .get(fail_index as usize)
-            .and_then(|d| d.recovery_layout_ref().as_ref().cloned());
-        rebuild_state_after_failure(&mut bh_outputs, fail_types, recovery.as_ref(), raw_num);
+        // Slice QQ-3: dispatch through on-demand callback when the
+        // descr is reachable; otherwise fall back to the
+        // recovery_layout walker via the same dispatch helper.
+        if let Some(fail_descr_arc) = target.fail_descrs.get(fail_index as usize) {
+            rebuild_state_after_failure_dispatch(
+                fail_descr_arc,
+                &mut bh_outputs,
+                fail_types,
+                raw_num,
+            );
+        } else {
+            rebuild_state_after_failure(&mut bh_outputs, fail_types, None, raw_num);
+        }
         let num_outputs = bh_outputs.len();
         // `descr` is the deadframe's attached `&dyn FailDescr`; the
         // data portion of the fat pointer matches the `Arc::as_ptr`
