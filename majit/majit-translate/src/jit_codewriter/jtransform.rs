@@ -3162,6 +3162,7 @@ impl<'a> Transformer<'a> {
     #[allow(dead_code)]
     fn rewrite_op_jit_record_known_result(
         &mut self,
+        graph: &FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
@@ -3207,7 +3208,7 @@ impl<'a> Transformer<'a> {
         // jtransform.py:302-307: record_known_result_{i|r}
         let opname = format!("record_known_result_{result_kind}");
         // jtransform.py:308-310: rewrite_call with force_ir=True
-        let (args_i, args_r, args_f) = self.make_three_lists(func_args);
+        let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, func_args);
         assert!(
             args_f.is_empty(),
             "force_ir: no float args in record_known_result"
@@ -3221,7 +3222,7 @@ impl<'a> Transformer<'a> {
         let mut ops = vec![SpaceOperation {
             result: None, // record_known_result produces void
             kind: OpKind::RecordKnownResult {
-                result_value,
+                result_value: graph.must_variable(result_value),
                 funcptr: target.clone(),
                 descriptor: descriptor.clone(),
                 args_i,
@@ -4124,15 +4125,23 @@ fn remap_op(
             args_r,
             args_f,
             result_kind,
-        } => OpKind::RecordKnownResult {
-            result_value: remap_value(*result_value, aliases),
-            funcptr: funcptr.clone(),
-            descriptor: descriptor.clone(),
-            args_i: remap_list(args_i, aliases),
-            args_r: remap_list(args_r, aliases),
-            args_f: remap_list(args_f, aliases),
-            result_kind: *result_kind,
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = graph
+                    .value_id_of(var)
+                    .expect("RecordKnownResult arg/result_value must have a backing ValueId");
+                graph.must_variable(remap_value(vid, aliases))
+            };
+            OpKind::RecordKnownResult {
+                result_value: remap_var(result_value),
+                funcptr: funcptr.clone(),
+                descriptor: descriptor.clone(),
+                args_i: args_i.iter().map(remap_var).collect(),
+                args_r: args_r.iter().map(remap_var).collect(),
+                args_f: args_f.iter().map(remap_var).collect(),
+                result_kind: *result_kind,
+            }
+        }
         OpKind::AssertGreen { value, kind_char } => {
             let value_vid = graph
                 .value_id_of(value)

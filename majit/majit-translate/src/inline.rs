@@ -737,15 +737,23 @@ fn remap_op_kind(
             args_r,
             args_f,
             result_kind,
-        } => OpKind::RecordKnownResult {
-            result_value: remap(result_value),
-            funcptr: funcptr.clone(),
-            descriptor: descriptor.clone(),
-            args_i: args_i.iter().map(remap).collect(),
-            args_r: args_r.iter().map(remap).collect(),
-            args_f: args_f.iter().map(remap).collect(),
-            result_kind: *result_kind,
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("RecordKnownResult arg/result_value must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::RecordKnownResult {
+                result_value: remap_var(result_value),
+                funcptr: funcptr.clone(),
+                descriptor: descriptor.clone(),
+                args_i: args_i.iter().map(remap_var).collect(),
+                args_r: args_r.iter().map(remap_var).collect(),
+                args_f: args_f.iter().map(remap_var).collect(),
+                result_kind: *result_kind,
+            }
+        }
         OpKind::AssertGreen { value, kind_char } => {
             let value_vid = source_graph
                 .value_id_of(value)
@@ -1248,18 +1256,30 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_r,
             args_f,
             ..
-        }
-        | OpKind::RecordKnownResult {
-            result_value: value,
-            args_i,
-            args_r,
-            args_f,
-            ..
         } => {
             let mut refs = vec![*value];
             refs.extend(args_i);
             refs.extend(args_r);
             refs.extend(args_f);
+            refs
+        }
+        OpKind::RecordKnownResult {
+            result_value,
+            args_i,
+            args_r,
+            args_f,
+            ..
+        } => {
+            let g = graph
+                .expect("RecordKnownResult requires a graph to project Variable to ValueId");
+            let project = |var: &crate::flowspace::model::Variable| {
+                g.value_id_of(var)
+                    .expect("RecordKnownResult arg must be a known Variable on graph")
+            };
+            let mut refs = vec![project(result_value)];
+            refs.extend(args_i.iter().map(project));
+            refs.extend(args_r.iter().map(project));
+            refs.extend(args_f.iter().map(project));
             refs
         }
         OpKind::RecursiveCall {

@@ -783,12 +783,12 @@ pub enum OpKind {
     /// RPython layout: `record_known_result_{reskind}(result, funcptr, calldescr, [i], [r])`
     RecordKnownResult {
         /// The known result value (arg 0 of the jit_record_known_result llop).
-        result_value: ValueId,
+        result_value: crate::flowspace::model::Variable,
         funcptr: CallTarget,
         descriptor: crate::call::CallDescriptor,
-        args_i: Vec<ValueId>,
-        args_r: Vec<ValueId>,
-        args_f: Vec<ValueId>,
+        args_i: Vec<crate::flowspace::model::Variable>,
+        args_r: Vec<crate::flowspace::model::Variable>,
+        args_f: Vec<crate::flowspace::model::Variable>,
         /// 'i' or 'r' — kind of the known result (no float support).
         result_kind: char,
     },
