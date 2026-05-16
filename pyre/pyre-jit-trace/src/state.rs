@@ -1053,7 +1053,6 @@ pub fn seed_compiled_trace_jitcode_test_state(
         sym.setup_kind_register_banks(ctx);
     }
 
-    let nlocals = sym.nlocals;
     for &(depth, opref) in stack_slots {
         // Match production stack writes: keep `registers_r` as a
         // semantic frame mirror. The encoder builds the color-indexed
@@ -6156,25 +6155,20 @@ mod tests {
     //! upstream parity point, that reference is called out inline.
 
     use super::*;
-    use crate::descr::{list_float_items_len_descr, list_int_items_len_descr};
     use crate::helpers::TraceHelperAccess;
     use majit_metainterp::JitState;
     use majit_metainterp::resume::{MaterializedValue, MaterializedVirtual};
     use pyre_interpreter::bytecode::{BinaryOperator, CodeObject, ConstantData, Instruction};
     use pyre_interpreter::pyopcode::decode_instruction_at;
     use pyre_interpreter::{
-        BranchOpcodeHandler, IterOpcodeHandler, LocalOpcodeHandler, Mode, OpcodeStepExecutor,
-        PyErrorKind, SharedOpcodeHandler, compile_exec, compile_source,
+        LocalOpcodeHandler, Mode, OpcodeStepExecutor, PyErrorKind, SharedOpcodeHandler,
+        compile_exec, compile_source,
     };
     use pyre_object::OB_TYPE_OFFSET;
     use pyre_object::floatobject::w_float_get_value;
-    use pyre_object::listobject::{
-        w_list_can_append_without_realloc, w_list_getitem, w_list_uses_float_storage,
-        w_list_uses_int_storage,
-    };
+    use pyre_object::listobject::w_list_getitem;
     use pyre_object::pyobject::{INT_TYPE, LIST_TYPE, PyType, is_list};
     use std::cell::{Cell, UnsafeCell};
-    use std::rc::Rc;
 
     thread_local! {
         static TEST_CALLBACKS_INIT: Cell<bool> = const { Cell::new(false) };

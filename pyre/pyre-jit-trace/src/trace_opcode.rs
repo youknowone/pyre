@@ -8088,7 +8088,6 @@ impl OpcodeStepExecutor for MIFrame {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::rc::Rc;
 
     #[cfg(feature = "cranelift")]
     fn clear_pending_jit_exception() {
