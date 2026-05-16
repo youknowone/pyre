@@ -1493,6 +1493,24 @@ pub fn lookup_exc_class(name: &str) -> Option<PyObjectRef> {
     EXC_CLASS_REGISTRY.with(|r| r.borrow().get(name).copied())
 }
 
+/// Look up the reusable prebuilt instance for a builtin exception
+/// class, addressed by `ExcKind` name.  Mirrors RPython's
+/// `rpython/rtyper/exceptiondata.py:34-45 get_standard_ll_exc_instance`
+/// — the JIT's `_ovf` direct-raise rewrite
+/// (`rpython/jit/codewriter/flatten.py:165-170`) emits
+/// `raise <Constant(ll_ovf)>` with the prebuilt instance pointer (NOT
+/// the class pointer).  The instance lives forever; callers can stamp
+/// its pointer into a JIT constant pool.
+///
+/// Returns `None` when `name` is not one of the recognised `ExcKind`
+/// names (`exc_kind_from_name` returns `None`); standard exceptions
+/// listed by `pyre_jit::jit::exceptiondata::STANDARD_EXCEPTIONS` all
+/// map through.
+pub fn lookup_exc_instance(name: &str) -> Option<PyObjectRef> {
+    let kind = pyre_object::excobject::exc_kind_from_name(name)?;
+    Some(pyre_object::excobject::standard_exc_instance(kind))
+}
+
 thread_local! {
     static EXC_CLASS_REGISTRY: std::cell::RefCell<std::collections::HashMap<&'static str, PyObjectRef>>
         = std::cell::RefCell::new(std::collections::HashMap::new());

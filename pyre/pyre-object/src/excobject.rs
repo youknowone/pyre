@@ -399,6 +399,25 @@ pub fn memory_error_singleton() -> PyObjectRef {
         as PyObjectRef
 }
 
+/// `rpython/rtyper/exceptiondata.py:34-38 get_standard_ll_exc_instance`
+/// parity — return the reusable prebuilt instance for `kind`.  RPython's
+/// `r_inst.get_reusable_prebuilt_instance()` materialises a single
+/// instance per classdef at rtyper construction time and reuses it for
+/// every `flatten.py:165-170 self.emitline("raise", c)` call site (the
+/// `_ovf` direct raise path).
+///
+/// Pyre allocates per `ExcKind` lazily on first access; the resulting
+/// pointer is valid for the lifetime of the process and stable across
+/// calls so a JIT'd constant pool can carry it as an immediate pointer.
+/// Same `OnceLock<usize>` escape hatch as `memory_error_singleton`
+/// because `PyObjectRef` is neither `Send` nor `Sync`.
+pub fn standard_exc_instance(kind: ExcKind) -> PyObjectRef {
+    static INSTANCES: [std::sync::OnceLock<usize>; EXC_KIND_COUNT] =
+        [const { std::sync::OnceLock::new() }; EXC_KIND_COUNT];
+    let slot = &INSTANCES[kind as u8 as usize];
+    *slot.get_or_init(|| w_exception_new(kind, "") as usize) as PyObjectRef
+}
+
 /// Check if an object is an exception instance.
 ///
 /// # Safety
@@ -617,6 +636,34 @@ mod tests {
             assert!(is_exception(a));
             assert_eq!(w_exception_get_kind(a), ExcKind::MemoryError);
             assert_eq!(w_exception_get_message(a), "");
+        }
+    }
+
+    #[test]
+    fn standard_exc_instance_is_idempotent_and_per_kind_distinct() {
+        // RPython `get_standard_ll_exc_instance` returns the same
+        // prebuilt instance pointer across repeated lookups (it's the
+        // `_reusable_prebuilt_instance` slot on the InstanceRepr).
+        // Pyre matches by caching per-`ExcKind`; the test pins both
+        // the idempotence (same kind → same pointer) and the per-kind
+        // distinctness (different kinds → different pointers, so the
+        // JIT cannot accidentally merge `raise OverflowError` and
+        // `raise ZeroDivisionError` into the same singleton).
+        let overflow_a = standard_exc_instance(ExcKind::OverflowError);
+        let overflow_b = standard_exc_instance(ExcKind::OverflowError);
+        assert_eq!(
+            overflow_a as usize, overflow_b as usize,
+            "per-kind singleton must be stable across calls"
+        );
+        let zerodiv = standard_exc_instance(ExcKind::ZeroDivisionError);
+        assert_ne!(
+            overflow_a as usize, zerodiv as usize,
+            "distinct ExcKinds must yield distinct singleton pointers"
+        );
+        unsafe {
+            assert!(is_exception(overflow_a));
+            assert_eq!(w_exception_get_kind(overflow_a), ExcKind::OverflowError);
+            assert_eq!(w_exception_get_kind(zerodiv), ExcKind::ZeroDivisionError);
         }
     }
 

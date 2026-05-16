@@ -43,7 +43,7 @@ const STANDARD_EXCEPTIONS: &[&str] = &[
 /// Storage layout mirrors RPython's "pre-allocated standard exception
 /// instances on the rtyper" — each entry in `STANDARD_EXCEPTIONS` has
 /// a parallel slot in `instance_pointers`.  Resolution lookup walks
-/// `STANDARD_EXCEPTIONS` linearly (15 entries) and reads the matching
+/// `STANDARD_EXCEPTIONS` linearly (16 entries) and reads the matching
 /// slot, matching upstream's `get_standard_ll_exc_instance(clsdef)`
 /// shape where the clsdef key uniquely identifies the LL instance.
 /// Position-indexed parallel `Vec` matches RPython's `_bigints` /
@@ -52,17 +52,58 @@ const STANDARD_EXCEPTIONS: &[&str] = &[
 /// ever`).  Both `OverflowError` (the `_ovf` rewrite caller today) and
 /// any other future caller for a standard exception receive the same
 /// resolved-pointer shape.
-#[derive(Debug, Default)]
+///
+/// Resolution is **lazy**: `instance_pointers` is populated on the
+/// first `get_standard_ll_exc_instance_by_class` lookup per slot, by
+/// calling the resolver thunk installed via `set_lazy_resolver`.
+/// Production wires `Cpu::new` to install a resolver that hands out
+/// per-`ExcKind` singleton W_ExceptionObject instance pointers
+/// (`pyre_interpreter::lookup_exc_instance`); the singletons are
+/// allocated only when the resolver is actually invoked, which under
+/// the current walker-driven pipeline is never (the
+/// `handling_ovf=true` arm of `flatten.rs::make_exception_link` lives
+/// behind the canonical `flatten_graph` entry that production does
+/// not yet flip to).  Tests pre-populate by calling
+/// `resolve_standard_exception_pointers` directly — that path takes
+/// precedence over the lazy resolver because it writes the slot
+/// outright.
 pub struct ExceptionData {
     /// `exceptiondata.py:14 standardexceptions = standardexceptions`.
     pub standardexceptions: &'static [&'static str],
     /// Resolved runtime pointer per standard exception, indexed
     /// parallel to `standardexceptions`.  `None` means the resolver
-    /// has not populated this slot yet; calling
-    /// `get_standard_ll_exc_instance_by_class` for that name panics
-    /// (production invariant: every `flatten_graph` reachable on a
-    /// standard-exception rewrite path must see a resolved pointer).
-    instance_pointers: Vec<Option<i64>>,
+    /// has not been called for this slot yet (and no eager
+    /// `resolve_standard_exception_pointers` populated it).  The
+    /// interior mutability lets `get_standard_ll_exc_instance_by_class`
+    /// take `&self` while caching the lazy-resolver's first answer.
+    instance_pointers: std::cell::RefCell<Vec<Option<i64>>>,
+    /// Optional lazy resolver consulted by
+    /// `get_standard_ll_exc_instance_by_class` when a slot is unresolved.
+    /// `None` (default) means "fail loud on unresolved lookup"; production
+    /// callers install a resolver in `Cpu::new`.  Wrapped in `Box<dyn Fn>`
+    /// so the closure can capture per-`Cpu` state without leaking the
+    /// concrete callback type through the public API.
+    #[allow(clippy::type_complexity)]
+    lazy_resolver: Option<Box<dyn Fn(&str) -> Option<i64> + Send + Sync>>,
+}
+
+impl std::fmt::Debug for ExceptionData {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ExceptionData")
+            .field("standardexceptions", &self.standardexceptions)
+            .field("instance_pointers", &self.instance_pointers)
+            .field(
+                "lazy_resolver",
+                &self.lazy_resolver.as_ref().map(|_| "<closure>"),
+            )
+            .finish()
+    }
+}
+
+impl Default for ExceptionData {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl ExceptionData {
@@ -74,33 +115,48 @@ impl ExceptionData {
     pub fn new() -> Self {
         Self {
             standardexceptions: STANDARD_EXCEPTIONS,
-            instance_pointers: vec![None; STANDARD_EXCEPTIONS.len()],
+            instance_pointers: std::cell::RefCell::new(vec![None; STANDARD_EXCEPTIONS.len()]),
+            lazy_resolver: None,
         }
+    }
+
+    /// Install a lazy resolver that
+    /// `get_standard_ll_exc_instance_by_class` consults on the first
+    /// unresolved lookup per slot.  Used by `Cpu::new` to wire
+    /// `pyre_interpreter::lookup_exc_instance` without paying the
+    /// per-`ExcKind` `W_ExceptionObject` singleton allocation cost up
+    /// front (production walker doesn't reach the `_ovf` direct-raise
+    /// rewrite, so the singletons stay unallocated under today's
+    /// pipeline; deferring keeps the heap layout stable, which the
+    /// cranelift backend's trace compilation is sensitive to).
+    pub fn set_lazy_resolver<F>(&mut self, resolver: F)
+    where
+        F: Fn(&str) -> Option<i64> + Send + Sync + 'static,
+    {
+        self.lazy_resolver = Some(Box::new(resolver));
     }
 
     /// Pre-resolve every standard exception class with a caller-side
     /// pointer reachable through `resolve`, matching upstream's
     /// `get_standard_ll_exc_instance(rtyper, clsdef)` which materialises
     /// the LL instance pointer at rtyper construction time
-    /// (`exceptiondata.py:34-42`).  Production callers invoke this
-    /// after the runtime exception classes are loaded (e.g. from
-    /// `Cpu::new` via `pyre_interpreter::lookup_exc_class`) so the
-    /// `handling_ovf=True` arm of `flatten_graph` reaches
-    /// `get_standard_ll_exc_instance_by_class("OverflowError")` and
-    /// receives the rtyped shape directly.
+    /// (`exceptiondata.py:34-42`).  Pyre's lazy-resolver path
+    /// (`set_lazy_resolver`) is the production analog; this eager
+    /// variant exists for tests that want to control the pointer
+    /// values directly without going through the live interpreter.
     ///
     /// `resolve(name)` may return `None` for a `standardexceptions`
-    /// entry whose runtime registration isn't installed yet on this
-    /// thread (test paths that never reach the corresponding rewrite);
-    /// the slot stays `None` and `get_standard_ll_exc_instance_by_class`
-    /// panics if it's later queried for that name.
+    /// entry the caller doesn't want to populate; the slot stays
+    /// `None` and a subsequent `get_standard_ll_exc_instance_by_class`
+    /// falls back to the lazy resolver (or panics if none is installed).
     pub fn resolve_standard_exception_pointers<F>(&mut self, mut resolve: F)
     where
         F: FnMut(&str) -> Option<i64>,
     {
+        let mut slots = self.instance_pointers.borrow_mut();
         for (idx, &name) in self.standardexceptions.iter().enumerate() {
             if let Some(pointer) = resolve(name) {
-                self.instance_pointers[idx] = Some(pointer);
+                slots[idx] = Some(pointer);
             }
         }
     }
@@ -112,13 +168,12 @@ impl ExceptionData {
     /// LL instance pointer wrapped at the caller in `Constant(ll_ovf,
     /// concretetype=lltype.typeOf(ll_ovf))` (`flatten.py:168-169`).
     ///
-    /// Pyre's contract: the standard pointer MUST be pre-resolved via
-    /// `resolve_standard_exception_pointers` before `flatten_graph`
-    /// reaches the rewrite for `exceptionclass`.  An unresolved
-    /// pointer panics — production must never return the pre-rtype
-    /// opaque shape because the canonical `lower_constant` closure
-    /// cannot recover a runtime pointer from an opaque token the
-    /// rtyper would have resolved upstream.
+    /// Pyre lazily populates the slot from the resolver installed via
+    /// `set_lazy_resolver` on first lookup; once cached, subsequent
+    /// lookups reuse the cached pointer.  An unresolved slot with no
+    /// resolver panics — production must wire a resolver via
+    /// `set_lazy_resolver` before `flatten_graph` reaches the rewrite
+    /// for `exceptionclass`.
     pub fn get_standard_ll_exc_instance_by_class(
         &self,
         exceptionclass: &str,
@@ -130,17 +185,31 @@ impl ExceptionData {
         else {
             return Err(UnknownException(exceptionclass.to_owned()));
         };
-        let pointer = self.instance_pointers[idx].unwrap_or_else(|| {
-            panic!(
-                "ExceptionData::get_standard_ll_exc_instance_by_class\
-                 ({exceptionclass:?}) called before \
-                 resolve_standard_exception_pointers populated this \
-                 slot — production pipelines must wire Cpu::new -> \
-                 pyre_interpreter::lookup_exc_class so flatten_graph \
-                 never reaches an opaque shape per \
-                 rpython/rtyper/rtyper.py:specialize"
-            )
-        });
+        let mut slots = self.instance_pointers.borrow_mut();
+        let pointer = match slots[idx] {
+            Some(p) => p,
+            None => {
+                let resolved = self
+                    .lazy_resolver
+                    .as_ref()
+                    .and_then(|resolver| resolver(exceptionclass));
+                match resolved {
+                    Some(p) => {
+                        slots[idx] = Some(p);
+                        p
+                    }
+                    None => panic!(
+                        "ExceptionData::get_standard_ll_exc_instance_by_class\
+                         ({exceptionclass:?}) called before the slot was \
+                         populated and no lazy resolver yielded a pointer — \
+                         production pipelines must wire Cpu::new -> \
+                         set_lazy_resolver(lookup_exc_instance) so \
+                         flatten_graph never reaches an opaque shape per \
+                         rpython/rtyper/rtyper.py:specialize"
+                    ),
+                }
+            }
+        };
         Ok(Constant::new(
             ConstantValue::Signed(pointer),
             Some(Kind::Ref),
@@ -211,10 +280,49 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(expected = "called before resolve_standard_exception_pointers")]
+    #[should_panic(expected = "called before the slot was populated")]
     fn get_standard_ll_exc_instance_by_class_panics_when_unresolved() {
         let data = ExceptionData::new();
         let _ = data.get_standard_ll_exc_instance_by_class("OverflowError");
+    }
+
+    #[test]
+    fn get_standard_ll_exc_instance_by_class_lazy_resolver_fills_slot_on_demand() {
+        // Production wiring: a resolver installed via
+        // `set_lazy_resolver` is consulted on the first lookup per
+        // slot.  Subsequent lookups read the cached pointer without
+        // re-invoking the resolver, so a counting resolver here pins
+        // both the lazy fill (first call returns the resolver's
+        // pointer) and the cache (second call doesn't call the
+        // resolver a second time).
+        let calls = std::sync::Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let calls_in_closure = calls.clone();
+        let mut data = ExceptionData::new();
+        data.set_lazy_resolver(move |name| {
+            calls_in_closure.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            match name {
+                "OverflowError" => Some(0xdeadbeef),
+                _ => None,
+            }
+        });
+        let first = data
+            .get_standard_ll_exc_instance_by_class("OverflowError")
+            .expect("OverflowError must resolve via lazy resolver");
+        let second = data
+            .get_standard_ll_exc_instance_by_class("OverflowError")
+            .expect("second lookup must hit the cache");
+        match (&first.value, &second.value) {
+            (ConstantValue::Signed(a), ConstantValue::Signed(b)) => {
+                assert_eq!(*a, 0xdeadbeef);
+                assert_eq!(*a, *b);
+            }
+            other => panic!("expected Signed pointer pair, got {other:?}"),
+        }
+        assert_eq!(
+            calls.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "lazy resolver must be called exactly once per slot"
+        );
     }
 
     #[test]

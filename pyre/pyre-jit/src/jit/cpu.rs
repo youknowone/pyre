@@ -94,26 +94,39 @@ impl Cpu {
     /// constructor in `warmspot.py:243` for the standard JIT.
     pub fn new() -> Self {
         let mut rtyper = super::exceptiondata::Rtyper::new();
-        // Resolve standard exception class pointers from the live
-        // interpreter registry.  Matches RPython's
-        // `RPythonTyper.specialize` -> `ExceptionData.make_helpers`
-        // (`exceptiondata.py:34-42`) where `get_standard_ll_exc_instance(
-        // rtyper, clsdef)` is invoked at rtyper construction so every
-        // downstream `get_standard_ll_exc_instance_by_class` returns
-        // the resolved LL instance pointer.  Pyre's analog reads the
-        // installed builtin exception class via
-        // `pyre_interpreter::lookup_exc_class(name)`; the lookup is
-        // thread-local and may return `None` when `Cpu::new` runs
-        // before `install_default_builtins` (test setup paths that
-        // never reach the `_ovf` rewrite are unaffected — the panic
-        // surfaces only if `get_standard_ll_exc_instance_by_class` is
-        // ever called while unresolved).
-        rtyper
-            .exceptiondata
-            .resolve_standard_exception_pointers(|name| {
-                let ptr = pyre_interpreter::lookup_exc_class(name)?;
-                Some(ptr as i64)
-            });
+        // Install a **lazy** resolver for standard exception instance
+        // pointers — RPython's `RPythonTyper.specialize` ->
+        // `ExceptionData.finish` invokes `get_standard_ll_exc_instance(
+        // rtyper, clsdef)` at rtyper construction time
+        // (`rpython/rtyper/exceptiondata.py:34-38`), which calls
+        // `r_inst.get_reusable_prebuilt_instance()` and returns the
+        // **prebuilt INSTANCE** pointer (not the class pointer).
+        // Downstream `get_standard_ll_exc_instance_by_class` wraps
+        // that pointer in a `Constant` and `flatten.py:165-170` emits
+        // it directly as the operand of `raise/r`; feeding the
+        // **class** pointer here would be semantically wrong
+        // (`raise CLASS` is not the same as `raise INSTANCE`).
+        //
+        // Pyre's analog is `pyre_interpreter::lookup_exc_instance`
+        // which materialises a process-global singleton
+        // `W_ExceptionObject` per `ExcKind` (see
+        // `pyre_object::excobject::standard_exc_instance`).  We install
+        // the resolver here but defer the per-`ExcKind` singleton
+        // allocation to the first
+        // `get_standard_ll_exc_instance_by_class` lookup; under the
+        // current walker-driven pipeline the canonical
+        // `flatten_graph` `_ovf` direct-raise rewrite (the sole
+        // consumer of this table in production) never fires, so the
+        // singletons stay unallocated.  The deferral matters because
+        // the cranelift backend's trace compilation is sensitive to
+        // heap layout — eagerly allocating 16 `W_ExceptionObject`
+        // singletons at `Cpu::new` time shifts subsequent heap
+        // addresses enough to consistently push raise_catch_loop
+        // tracing into a slow recompile path.
+        rtyper.exceptiondata.set_lazy_resolver(|name| {
+            let ptr = pyre_interpreter::lookup_exc_instance(name)?;
+            Some(ptr as i64)
+        });
         Self {
             call_fn: crate::call_jit::bh_call_fn,
             call_fn_0: crate::call_jit::bh_call_fn_0,
