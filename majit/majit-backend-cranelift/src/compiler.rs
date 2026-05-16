@@ -585,13 +585,21 @@ fn overlay_deadframe_fail_descr(
     base_layout: &FailDescrLayout,
     recovery_layout: ExitRecoveryLayout,
 ) -> Arc<CraneliftFailDescr> {
-    let descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
+    let mut descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
         base_layout.fail_index,
         base_layout.trace_id,
         base_layout.fail_arg_types.clone(),
         base_layout.is_finish,
         base_layout.force_token_slots.clone(),
     );
+    // Stamp a synthesized ResumeGuardDescr as meta_descr so the
+    // recovery_layout publish/read routes through the meta-side slot —
+    // making the meta Arc the single source of truth for production
+    // descrs AND overlay synthetics alike, matching the Phase A
+    // `_attrs_` migration pattern.
+    descr.meta_descr = Some(majit_backend::make_resume_guard_descr_typed(
+        base_layout.fail_arg_types.clone(),
+    ));
     let descr = Arc::new(descr);
     // `set_source_op_index` / `set_recovery_layout` / `set_trace_info` /
     // `set_force_token_slots` all publish into descr-local cells
