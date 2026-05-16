@@ -2585,9 +2585,12 @@ impl<'a> AssemblerARM64<'a> {
                 };
                 // FINISH op exit (DoneWithThisFrame* / ExitFrameWithExceptionDescr).
                 // `compile.py:185` skips these — not a `ResumeDescr`.
-                // `compile.py:665-674` link to the metainterp class-distinct
-                // singleton so trait forwarding routes is_finish /
-                // is_exit_frame_with_exception through the upstream class.
+                // Singleton-direct push: machine code bakes the singleton
+                // ptr into jf_descr, and runner.rs::find_descr_by_ptr
+                // short-circuits FINISH/Exit/Propagate to the cpu-attached
+                // singleton before consulting the registry (see x86
+                // counterpart for full rationale).  Test scaffolds without
+                // cpu attachments fall back to the DynasmFailDescr wrapper.
                 let meta_descr = if is_exit_exc {
                     self.cpu_handle
                         .read()
@@ -2597,12 +2600,16 @@ impl<'a> AssemblerARM64<'a> {
                 } else {
                     self.done_with_this_frame_descr_arc_for_type(result_type)
                 };
-                let descr: majit_ir::DescrRef = Arc::new(DynasmFailDescr::with_meta(
-                    fail_index,
-                    self.trace_id,
-                    fail_arg_types.clone(),
-                    meta_descr,
-                ));
+                let descr: majit_ir::DescrRef = if let Some(singleton) = meta_descr.clone() {
+                    singleton
+                } else {
+                    Arc::new(DynasmFailDescr::with_meta(
+                        fail_index,
+                        self.trace_id,
+                        fail_arg_types.clone(),
+                        meta_descr,
+                    ))
+                };
 
                 // Store result to jf_frame[0]
                 if let Some(result) = arglocs.first() {
@@ -4346,12 +4353,18 @@ impl<'a> AssemblerARM64<'a> {
             fail_arg_types[0]
         };
         let global_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
-        let descr: majit_ir::DescrRef = Arc::new(DynasmFailDescr::with_meta(
-            fail_index,
-            self.trace_id,
-            fail_arg_types.clone(),
-            self.done_with_this_frame_descr_arc_for_type(result_type),
-        ));
+        // Singleton-direct push (see OpCode::Finish above for rationale).
+        let meta_descr = self.done_with_this_frame_descr_arc_for_type(result_type);
+        let descr: majit_ir::DescrRef = if let Some(singleton) = meta_descr.clone() {
+            singleton
+        } else {
+            Arc::new(DynasmFailDescr::with_meta(
+                fail_index,
+                self.trace_id,
+                fail_arg_types.clone(),
+                meta_descr,
+            ))
+        };
 
         // If there's a result argument, store it to jf_frame[0].
         // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.

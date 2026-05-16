@@ -5092,12 +5092,18 @@ impl<'a> Assembler386<'a> {
             fail_arg_types[0]
         };
         let global_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
-        let descr: majit_ir::DescrRef = Arc::new(DynasmFailDescr::with_meta(
-            fail_index,
-            self.trace_id,
-            fail_arg_types.clone(),
-            self.done_with_this_frame_descr_arc_for_type(result_type),
-        ));
+        // Singleton-direct push (see OpCode::Finish above for rationale).
+        let meta_descr = self.done_with_this_frame_descr_arc_for_type(result_type);
+        let descr: majit_ir::DescrRef = if let Some(singleton) = meta_descr.clone() {
+            singleton
+        } else {
+            Arc::new(DynasmFailDescr::with_meta(
+                fail_index,
+                self.trace_id,
+                fail_arg_types.clone(),
+                meta_descr,
+            ))
+        };
 
         // If there's a result argument, store it to jf_frame[0].
         // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.
