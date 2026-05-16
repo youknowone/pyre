@@ -50,14 +50,6 @@ fn stable_field_index(offset: usize, field_size: usize, field_type: Type, signed
         | type_bits(field_type)
 }
 
-fn stable_array_index(base_size: usize, item_size: usize, item_type: Type, signed: bool) -> u32 {
-    ARRAY_DESCR_TAG
-        | (((base_size as u32) & 0x0000_0fff) << 12)
-        | (((item_size as u32) & 0x0000_00ff) << 4)
-        | ((signed as u32) << 3)
-        | type_bits(item_type)
-}
-
 /// Concrete field descriptor for pyre object fields.
 /// RPython FieldDescr: describes a field in a GC/raw struct.
 #[derive(Debug)]

@@ -4856,6 +4856,13 @@ impl MIFrame {
     /// it to `trace_call_callable` so the residual emits `jit_call_callable_0`
     /// on the *method*, not on the receiver (calling the list itself would be
     /// a TypeError).
+    ///
+    /// Currently unused — paired with the `list.pop` tracing abort at
+    /// `trace_call_callable` (`trace_opcode.rs:5141`); becomes the trace-
+    /// time replacement for that abort once guard-failure blackhole
+    /// resume is complete.  Kept in sync with `list_append_value` /
+    /// `list_reverse_value` so the wire-up is a one-line edit.
+    #[allow(dead_code)]
     pub(crate) fn list_pop_value(
         &mut self,
         callable: OpRef,
