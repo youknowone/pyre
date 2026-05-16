@@ -31,8 +31,7 @@
 /// processes the preamble and finds guards/operations that establish facts
 /// the body depends on, it records them. At the Label, the builder finalizes
 /// into a `ShortPreamble` that is stored alongside the compiled loop.
-use std::collections::HashSet;
-
+use majit_ir::vec_set::VecSet;
 use majit_ir::{Op, OpCode, OpRef};
 
 use crate::optimizeopt::vec_assoc::VecAssoc;
@@ -442,11 +441,11 @@ pub struct ShortBoxes {
     /// RPython shortpreamble.py: Const boxes are directly admissible in
     /// produce_arg(). majit models constants as OpRef entries in OptContext,
     /// so we track which OpRefs correspond to constants here.
-    known_constants: HashSet<OpRef>,
+    known_constants: VecSet<OpRef>,
     /// shortpreamble.py: short_inputargs
     short_inputargs: Vec<OpRef>,
     /// shortpreamble.py: boxes_in_production
-    boxes_in_production: HashSet<OpRef>,
+    boxes_in_production: VecSet<OpRef>,
     /// The number of label args.
     pub num_label_args: usize,
 }
@@ -511,9 +510,9 @@ impl ShortBoxes {
             potential_ops: VecAssoc::new(),
             produced_short_boxes: VecAssoc::new(),
             const_short_boxes: Vec::new(),
-            known_constants: HashSet::new(),
+            known_constants: VecSet::new(),
             short_inputargs: Vec::new(),
-            boxes_in_production: HashSet::new(),
+            boxes_in_production: VecSet::new(),
             num_label_args,
         }
     }
@@ -1632,14 +1631,14 @@ impl ProducedShortOp {
 #[derive(Clone, Debug, Default)]
 struct AbstractShortPreambleBuilderState {
     short: Vec<Op>,
-    short_results: HashSet<OpRef>,
+    short_results: VecSet<OpRef>,
     used_boxes: Vec<OpRef>,
     short_preamble_jump: Vec<Op>,
     extra_same_as: Vec<Op>,
     short_inputargs: Vec<OpRef>,
     /// Known constant OpRefs. In RPython, isinstance(box, Const) is a type
     /// check. In majit, constant OpRefs must be explicitly tracked.
-    known_constants: HashSet<OpRef>,
+    known_constants: VecSet<OpRef>,
     /// B.6.4 canonical dedup for `record_imported_preamble_use`.
     /// `produced_short_boxes` is a dual-key map (source key + result_opref
     /// key both pointing at the same `ProducedShortOp`), so the source vs.
@@ -1649,7 +1648,7 @@ struct AbstractShortPreambleBuilderState {
     /// dedup here prevents two different lookup keys from pushing the
     /// same RPython Box twice into `used_boxes` /
     /// `short_preamble_jump` / `extra_same_as`.
-    recorded_canonical_results: HashSet<OpRef>,
+    recorded_canonical_results: VecSet<OpRef>,
 }
 
 impl AbstractShortPreambleBuilderState {
@@ -1719,7 +1718,7 @@ impl AbstractShortPreambleBuilderState {
     fn use_box(
         &mut self,
         preamble_op: &Op,
-        already_in_short: &HashSet<OpRef>,
+        already_in_short: &VecSet<OpRef>,
         all_produced: &VecAssoc<OpRef, ProducedShortOp>,
         pos_to_key: &VecAssoc<OpRef, OpRef>,
         arg_guards: &[Op],
@@ -1787,7 +1786,7 @@ fn build_short_preamble_struct_from_ops(
         short_inputargs.iter().position(|a| a == arg)
     };
     // Collect all OpRefs defined by the short preamble ops (as results).
-    let mut defined_by_ops: HashSet<OpRef> = HashSet::new();
+    let mut defined_by_ops: VecSet<OpRef> = VecSet::new();
     for ia in short_inputargs {
         defined_by_ops.insert(*ia);
     }
@@ -1940,7 +1939,7 @@ impl ShortPreambleBuilder {
         self.state.known_constants.insert(opref);
     }
 
-    fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
+    fn use_box_recursive(&mut self, result: OpRef, visiting: &mut VecSet<OpRef>) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
         let canonical_result = produced.preamble_op.pos.get();
         if self.state.short_results.contains(&canonical_result) {
@@ -1965,7 +1964,7 @@ impl ShortPreambleBuilder {
     /// shortpreamble.py:310: add_op_to_short — recursive, used during
     /// export-time create_short_boxes to resolve transitive dependencies.
     pub fn add_op_to_short(&mut self, result: OpRef) -> Option<Op> {
-        self.use_box_recursive(result, &mut HashSet::new())
+        self.use_box_recursive(result, &mut VecSet::new())
     }
 
     /// shortpreamble.py:382-407: use_box(box, preamble_op, optimizer)
@@ -1996,7 +1995,7 @@ impl ShortPreambleBuilder {
         let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
         self.state.use_box(
             preamble_op,
-            &HashSet::new(),
+            &VecSet::new(),
             &self.produced_short_boxes,
             &pos_to_key,
             arg_guards,
@@ -2112,9 +2111,9 @@ pub struct ExtendedShortPreambleBuilder {
     /// shortpreamble.py:460: self.short = short — single ops list (base + JUMP sentinel)
     short: Vec<Op>,
     /// Tracks which OpRefs are already in `short` (for dedup).
-    short_results: HashSet<OpRef>,
+    short_results: VecSet<OpRef>,
     /// Constants tracked for RPython isinstance(arg, Const) checks.
-    known_constants: HashSet<OpRef>,
+    known_constants: VecSet<OpRef>,
     extra_same_as: Vec<Op>,
     short_preamble_jump: Vec<Op>,
     base_extra_same_as: Vec<Op>,
@@ -2130,7 +2129,7 @@ pub struct ExtendedShortPreambleBuilder {
     /// result_opref-key) for the same RPython Box, so per-key dedup
     /// (`label_args` etc.) cannot catch a second add via the alternate
     /// key. RPython's Box identity collapses both paths to one entry.
-    recorded_canonical_results: HashSet<OpRef>,
+    recorded_canonical_results: VecSet<OpRef>,
 }
 
 impl ExtendedShortPreambleBuilder {
@@ -2139,8 +2138,8 @@ impl ExtendedShortPreambleBuilder {
             produced_short_boxes: sb.produced_short_boxes.clone(),
             short_inputargs: sb.short_inputargs().to_vec(),
             short: Vec::new(),
-            short_results: HashSet::new(),
-            known_constants: HashSet::new(),
+            short_results: VecSet::new(),
+            known_constants: VecSet::new(),
             extra_same_as: sb.extra_same_as().to_vec(),
             short_preamble_jump: Vec::new(),
             base_extra_same_as: sb.extra_same_as().to_vec(),
@@ -2149,7 +2148,7 @@ impl ExtendedShortPreambleBuilder {
             short_jump_args: Vec::new(),
             target_token,
             phase1_to_inputarg: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            recorded_canonical_results: HashSet::new(),
+            recorded_canonical_results: VecSet::new(),
         }
     }
 
@@ -2189,8 +2188,8 @@ impl ExtendedShortPreambleBuilder {
         // Instead, remap on-the-fly when reading from produced_short_boxes.
 
         // Build single short list with inline dep resolution.
-        let inputargs_set: HashSet<OpRef> = label_args.iter().copied().collect();
-        let constants_set: HashSet<u32> = short_preamble.constants.keys().copied().collect();
+        let inputargs_set: VecSet<OpRef> = label_args.iter().copied().collect();
+        let constants_set: VecSet<u32> = short_preamble.constants.keys().copied().collect();
         let pos_to_key = build_pos_to_key(&self.produced_short_boxes);
         self.short.clear();
         self.short_results.clear();
@@ -2249,8 +2248,8 @@ impl ExtendedShortPreambleBuilder {
     fn insert_dep_recursive(
         &mut self,
         arg: OpRef,
-        inputargs_set: &HashSet<OpRef>,
-        constants_set: &HashSet<u32>,
+        inputargs_set: &VecSet<OpRef>,
+        constants_set: &VecSet<u32>,
         pos_to_key: &VecAssoc<OpRef, OpRef>,
     ) -> bool {
         if self.short_results.contains(&arg)
@@ -2300,7 +2299,7 @@ impl ExtendedShortPreambleBuilder {
         true
     }
 
-    fn use_box_recursive(&mut self, result: OpRef, visiting: &mut HashSet<OpRef>) -> Option<Op> {
+    fn use_box_recursive(&mut self, result: OpRef, visiting: &mut VecSet<OpRef>) -> Option<Op> {
         let produced = self.produced_short_boxes.get(&result)?.clone();
         let canonical_result = produced.preamble_op.pos.get();
         if self.short_results.contains(&canonical_result) {
@@ -2405,7 +2404,7 @@ impl ExtendedShortPreambleBuilder {
 
     /// shortpreamble.py:310: add_op_to_short — recursive, export-time.
     pub fn add_op_to_short(&mut self, result: OpRef) -> Option<Op> {
-        self.use_box_recursive(result, &mut HashSet::new())
+        self.use_box_recursive(result, &mut VecSet::new())
     }
 
     /// Remap a preamble op's args using phase1_to_inputarg (on-the-fly, no mutation).
@@ -2561,7 +2560,7 @@ pub fn build_from_preamble_and_label(
     exported_state: Option<VirtualState>,
 ) -> ShortPreamble {
     let mut builder = CollectedShortPreambleBuilder::new();
-    let mut included_ovf_positions = HashSet::new();
+    let mut included_ovf_positions = VecSet::new();
     // Record all preamble ops
     for (idx, op) in preamble_ops.iter().enumerate() {
         if op.opcode.is_guard() {
@@ -2609,7 +2608,7 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
     // Pure ops whose results are used as label args must also be replayed
     // (e.g., GETFIELD from preamble that feeds into loop body).
     let mut entries = Vec::new();
-    let mut included_positions = HashSet::new();
+    let mut included_positions = VecSet::new();
     for (idx, op) in peeled_ops[..label_pos].iter().enumerate() {
         let mut included_overflow_producer = false;
         if op.opcode.is_guard_overflow() && idx > 0 {

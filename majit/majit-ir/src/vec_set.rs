@@ -10,9 +10,17 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct VecSet<T: Eq> {
     entries: Vec<T>,
+}
+
+impl<T: Eq> Default for VecSet<T> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
 }
 
 impl<T: Eq> VecSet<T> {
@@ -89,6 +97,14 @@ impl<T: Eq> FromIterator<T> for VecSet<T> {
             out.insert(v);
         }
         out
+    }
+}
+
+impl<T: Eq> Extend<T> for VecSet<T> {
+    fn extend<I: IntoIterator<Item = T>>(&mut self, iter: I) {
+        for v in iter {
+            self.insert(v);
+        }
     }
 }
 

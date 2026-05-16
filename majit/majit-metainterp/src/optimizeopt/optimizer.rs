@@ -845,7 +845,8 @@ impl Optimizer {
         // unroll.py:55: if op.get_forwarded() is not None: return
         // Skip heads that already have PtrInfo (duplicate entries from
         // aliased JUMP args sharing the same VirtualState position).
-        let mut installed_heads = std::collections::HashSet::new();
+        let mut installed_heads: majit_ir::vec_set::VecSet<OpRef> =
+            majit_ir::vec_set::VecSet::new();
         for entry in entries {
             if !installed_heads.insert(entry.head) {
                 continue;
@@ -1636,7 +1637,7 @@ impl Optimizer {
     /// The exported loop state should record the boxes that survive the end of
     /// the preamble after virtuals have been forced into a loop-carried shape.
     pub fn force_at_the_end_of_preamble(&mut self, opref: OpRef, ctx: &mut OptContext) -> OpRef {
-        let mut rec = std::collections::HashSet::new();
+        let mut rec: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
         self.force_at_the_end_of_preamble_rec(opref, ctx, &mut rec)
     }
 
@@ -1644,7 +1645,7 @@ impl Optimizer {
         &mut self,
         opref: OpRef,
         ctx: &mut OptContext,
-        rec: &mut std::collections::HashSet<OpRef>,
+        rec: &mut majit_ir::vec_set::VecSet<OpRef>,
     ) -> OpRef {
         let resolved = ctx.get_box_replacement(opref);
         let resolved_box = ctx.get_box_replacement_box(resolved);
@@ -2193,7 +2194,7 @@ impl Optimizer {
                     OpRef::input_arg_typed(pos, ctx.inputarg_type_at_strict(i))
                 })
                 .collect();
-            let source_set: std::collections::HashSet<OpRef> =
+            let source_set: majit_ir::vec_set::VecSet<OpRef> =
                 typed_inputargs.iter().copied().collect();
             let targetargs: Vec<OpRef> = (0..n)
                 .map(|i| {
@@ -2491,12 +2492,12 @@ impl Optimizer {
             // per phase; majit's flat OpRef space needs an explicit SameAs
             // alias so nia[j] points outside the body inputarg position range.
             {
-                let mut seen = std::collections::HashSet::new();
+                let mut seen: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
                 // RPython parity: positions already holding an emitted op
                 // are phase 1 results, not body inputarg sources. Only
                 // the UNUSED positions in 0..num_inputs correspond to
                 // trace inputargs (`InputArgRef/Int/Float` in RPython).
-                let emitted_positions: std::collections::HashSet<OpRef> = ctx
+                let emitted_positions: majit_ir::vec_set::VecSet<OpRef> = ctx
                     .new_operations
                     .iter()
                     .map(|op| op.pos.get())
@@ -4888,7 +4889,7 @@ mod tests {
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 3);
 
-        let call_positions: std::collections::HashSet<_> = result
+        let call_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::CallMayForceR)
             .map(|op| op.pos.get())
@@ -5286,7 +5287,7 @@ mod tests {
         let mut constants = std::collections::HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
-        let new_positions: std::collections::HashSet<_> = result
+        let new_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::New)
             .map(|op| op.pos.get().raw())
@@ -5296,7 +5297,7 @@ mod tests {
             "expected force-like New op in optimized trace; got {:?}",
             result
         );
-        for pos in &new_positions {
+        for pos in new_positions.iter() {
             assert!(
                 !constants.contains_key(pos),
                 "live New position v{pos} must not collide with exported int constant map {:?}; trace {:?}",
@@ -5334,16 +5335,16 @@ mod tests {
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(472));
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
-        let new_positions: std::collections::HashSet<_> = result
+        let new_positions: majit_ir::vec_set::VecSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::New)
             .map(|op| op.pos.get().raw())
             .collect();
         // With high-bit constant namespace, constant OpRefs never collide with
         // operation positions, so the New op lands at next_pos (68) directly.
-        assert_eq!(
-            new_positions,
-            std::collections::HashSet::from([68]),
+        assert_eq!(new_positions.len(), 1, "got {:?}", result);
+        assert!(
+            new_positions.contains(&68),
             "queued New should get next available slot; got {:?}",
             result
         );

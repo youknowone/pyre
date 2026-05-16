@@ -1005,8 +1005,8 @@ impl UnrollOptimizer {
                 // short_preamble_jump / extra_same_as fill via the
                 // canonical RPython path.
                 {
-                    let mut visited_force: std::collections::HashSet<OpRef> =
-                        std::collections::HashSet::new();
+                    let mut visited_force: majit_ir::vec_set::VecSet<OpRef> =
+                        majit_ir::vec_set::VecSet::new();
                     for op in p2_ops.iter() {
                         if op.opcode == OpCode::Jump {
                             // The terminal jump's args are already
@@ -1157,7 +1157,7 @@ impl UnrollOptimizer {
             // when two virtuals share the same OpRef. Allocate fresh
             // OpRefs for duplicates so the LABEL carries independent slots.
             {
-                let mut seen_used = std::collections::HashSet::new();
+                let mut seen_used = majit_ir::vec_set::VecSet::new();
                 let mut next_fresh = current_label_args
                     .iter()
                     .chain(initial_sp.used_boxes.iter())
@@ -1509,7 +1509,7 @@ impl UnrollOptimizer {
         // RPython Box parity: drop duplicate-position ops. In RPython
         // each Box is unique so collisions can't happen. Keep first.
         {
-            let mut seen: std::collections::HashSet<u32> = std::collections::HashSet::new();
+            let mut seen: majit_ir::vec_set::VecSet<u32> = majit_ir::vec_set::VecSet::new();
             combined.retain(|op| {
                 if op.pos.get().is_none() || op.result_type() == Type::Void {
                     return true;
@@ -4129,8 +4129,8 @@ fn assemble_peeled_trace_with_jump_args(
     // typed variants from `inputarg_types` so this set's OpRefs match the
     // typed mints used at trace start / Phase 2 import under variant-aware
     // Eq.
-    let preamble_defs: std::collections::HashSet<OpRef> = {
-        let mut s: std::collections::HashSet<OpRef> = (0..body_num_inputs)
+    let preamble_defs: majit_ir::vec_set::VecSet<OpRef> = {
+        let mut s: majit_ir::vec_set::VecSet<OpRef> = (0..body_num_inputs)
             .map(|i| {
                 let pos = inputarg_base + i as u32;
                 // history.py:220 box.type / resoperation.py:719/727/739
@@ -4204,8 +4204,8 @@ fn assemble_peeled_trace_with_jump_args(
     // OpRef can be appended directly to full_label_args — the JUMP's
     // mapped_base_args path picks up the corresponding fresh value on the
     // next iteration. The filter only needs to skip filtered_extra_jump_args.
-    let mut carried_source_slots: std::collections::HashSet<OpRef> =
-        std::collections::HashSet::new();
+    let mut carried_source_slots: majit_ir::vec_set::VecSet<OpRef> =
+        majit_ir::vec_set::VecSet::new();
     carried_source_slots.extend(filtered_extra_jump_args.iter().copied());
     // `label_set` tracks which OpRefs are already carried by the label so
     // that the body-use-before-def pass doesn't add the same OpRef twice
@@ -4215,10 +4215,10 @@ fn assemble_peeled_trace_with_jump_args(
     // is NOT the Issue 1 dedup — which drops distinct Boxes that happen
     // to share an OpRef — it is RPython parity: the same Box appears
     // once in the label arglist.
-    let mut label_set: std::collections::HashSet<OpRef> = full_label_args.iter().copied().collect();
+    let mut label_set: majit_ir::vec_set::VecSet<OpRef> = full_label_args.iter().copied().collect();
     let mut fallthrough_aliases = Vec::new();
     {
-        let mut seen_body_defs = std::collections::HashSet::new();
+        let mut seen_body_defs = majit_ir::vec_set::VecSet::new();
         for op in p2_ops {
             // compile.py assembles the loop LABEL from `label_op` plus
             // short-preamble `used_boxes`; the terminal JUMP's target-local
@@ -4327,8 +4327,9 @@ fn assemble_peeled_trace_with_jump_args(
             .max(max_p2_pos)
             .saturating_add(1),
     );
-    let mut body_result_remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
-    let visible_before_label: std::collections::HashSet<OpRef> = full_label_args
+    let mut body_result_remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
+    let visible_before_label: majit_ir::vec_set::VecSet<OpRef> = full_label_args
         .iter()
         .copied()
         .chain(preamble_defs.iter().copied())
@@ -4383,10 +4384,10 @@ fn assemble_peeled_trace_with_jump_args(
         }
     }
 
-    let mut seen_body_defs = std::collections::HashSet::new();
+    let mut seen_body_defs = majit_ir::vec_set::VecSet::new();
     let mut current_inner_label_index: Option<usize> = None;
-    let mut defs_since_inner_label: std::collections::HashSet<OpRef> =
-        std::collections::HashSet::new();
+    let mut defs_since_inner_label: majit_ir::vec_set::VecSet<OpRef> =
+        majit_ir::vec_set::VecSet::new();
     for (op_idx, op) in p2_ops.iter().enumerate() {
         let mut new_op = op.clone();
         let mut original_args = op.args.clone();
@@ -4401,8 +4402,8 @@ fn assemble_peeled_trace_with_jump_args(
         let remap_body_arg = |arg: OpRef,
                               assembly_alias_remap: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
                               body_result_remap: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
-                              seen_body_defs: &std::collections::HashSet<OpRef>,
-                              visible_before_label: &std::collections::HashSet<OpRef>|
+                              seen_body_defs: &majit_ir::vec_set::VecSet<OpRef>,
+                              visible_before_label: &majit_ir::vec_set::VecSet<OpRef>|
          -> OpRef {
             if let Some(&mapped) = assembly_alias_remap.get(&arg) {
                 return mapped;
@@ -4424,10 +4425,10 @@ fn assemble_peeled_trace_with_jump_args(
             );
         }
         if new_op.opcode == OpCode::Label {
-            let mut seen_after_label_defs = std::collections::HashSet::new();
+            let mut seen_after_label_defs = majit_ir::vec_set::VecSet::new();
             let mut extra_inner_sources = Vec::new();
-            let mut extra_inner_set = std::collections::HashSet::new();
-            let label_arg_set: std::collections::HashSet<OpRef> = original_args
+            let mut extra_inner_set = majit_ir::vec_set::VecSet::new();
+            let label_arg_set: majit_ir::vec_set::VecSet<OpRef> = original_args
                 .iter()
                 .copied()
                 .filter(|arg| !arg.is_none())
@@ -4591,7 +4592,7 @@ fn assemble_peeled_trace_with_jump_args(
                 extra_live_args.push(arg);
             }
             if !extra_live_args.is_empty() {
-                let existing: std::collections::HashSet<OpRef> =
+                let existing: majit_ir::vec_set::VecSet<OpRef> =
                     result[label_idx].args.iter().copied().collect();
                 result[label_idx].args.extend(
                     extra_live_args

@@ -656,7 +656,7 @@ impl VirtualState {
     /// next `enum_top_level` traversal mirrors a fresh RPython
     /// VirtualState.__init__ over fresh subclass instances.
     fn reset_positions(state: &[Rc<VirtualStateInfoNode>]) {
-        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let mut visited: majit_ir::vec_set::VecSet<usize> = majit_ir::vec_set::VecSet::new();
         for node in state {
             Self::reset_positions_walk(node, &mut visited);
         }
@@ -664,7 +664,7 @@ impl VirtualState {
 
     fn reset_positions_walk(
         node: &Rc<VirtualStateInfoNode>,
-        visited: &mut std::collections::HashSet<usize>,
+        visited: &mut majit_ir::vec_set::VecSet<usize>,
     ) {
         let key = Rc::as_ptr(node) as usize;
         if !visited.insert(key) {
@@ -2477,14 +2477,14 @@ pub fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
 /// callers.
 pub(crate) struct ExportCache {
     pub finished: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Rc<VirtualStateInfoNode>>,
-    pub in_progress: std::collections::HashSet<OpRef>,
+    pub in_progress: majit_ir::vec_set::VecSet<OpRef>,
 }
 
 impl ExportCache {
     pub fn new() -> Self {
         Self {
             finished: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            in_progress: std::collections::HashSet::new(),
+            in_progress: majit_ir::vec_set::VecSet::new(),
         }
     }
 }
