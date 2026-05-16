@@ -7,7 +7,7 @@
 use smallvec::SmallVec;
 
 use crate::descr::DescrRef;
-use crate::value::{Const, GcRef, Type};
+use crate::value::{GcRef, Type};
 
 /// Index into an operation list, used as a reference to an operation's
 /// result. Variant-tagged enum mirroring RPython's `AbstractValue` class

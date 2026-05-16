@@ -33,7 +33,7 @@ pub mod virtualstate;
 pub mod vstring;
 // walkvirtual moved to crate::walkvirtual (RPython: metainterp/walkvirtual.py)
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
 use crate::optimizeopt::intutils::IntBound;
 use crate::resume::SnapshotBox;
