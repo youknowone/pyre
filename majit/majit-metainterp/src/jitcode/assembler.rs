@@ -578,6 +578,33 @@ impl JitCodeBuilder {
         self.push_reg_u8(dest, "getarrayitem_vable_r result");
     }
 
+    /// `getarrayitem_vable_i` with a ConstInt index.  Parity with
+    /// `vable_getarrayitem_ref_const_idx_with_base` —
+    /// `rpython/jit/codewriter/assembler.py:162` accepts Constant
+    /// operands generically across all element types.
+    pub fn vable_getarrayitem_int_const_idx_with_base(
+        &mut self,
+        dest: u16,
+        vable_reg: u16,
+        array_idx: u16,
+        index_value: i64,
+    ) {
+        let const_idx = self.add_const_i(index_value);
+        self.touch_ref_reg(vable_reg);
+        self.touch_reg(dest);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Int, true);
+        self.write_insn("getarrayitem_vable_i/ridd>i");
+        self.push_reg_u8(vable_reg, "getarrayitem_vable_i base");
+        let idx_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((idx_offset, ConstKind::Int, const_idx));
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+        self.push_reg_u8(dest, "getarrayitem_vable_i result");
+    }
+
     pub fn vable_getarrayitem_float_with_base(
         &mut self,
         dest: u16,
@@ -593,6 +620,32 @@ impl JitCodeBuilder {
         self.write_insn("getarrayitem_vable_f/ridd>f");
         self.push_reg_u8(vable_reg, "getarrayitem_vable_f base");
         self.push_reg_u8(index_reg, "getarrayitem_vable_f index");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+        self.push_reg_u8(dest, "getarrayitem_vable_f result");
+    }
+
+    /// `getarrayitem_vable_f` with a ConstInt index.  Parity with
+    /// `vable_getarrayitem_ref_const_idx_with_base` per
+    /// `rpython/jit/codewriter/assembler.py:162`.
+    pub fn vable_getarrayitem_float_const_idx_with_base(
+        &mut self,
+        dest: u16,
+        vable_reg: u16,
+        array_idx: u16,
+        index_value: i64,
+    ) {
+        let const_idx = self.add_const_i(index_value);
+        self.touch_ref_reg(vable_reg);
+        self.touch_float_reg(dest);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Float, false);
+        self.write_insn("getarrayitem_vable_f/ridd>f");
+        self.push_reg_u8(vable_reg, "getarrayitem_vable_f base");
+        let idx_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((idx_offset, ConstKind::Int, const_idx));
         self.push_u16(field_descr);
         self.push_u16(array_descr);
         self.push_reg_u8(dest, "getarrayitem_vable_f result");
@@ -746,6 +799,32 @@ impl JitCodeBuilder {
         self.push_u16(array_descr);
     }
 
+    /// `setarrayitem_vable_i` with a ConstInt-sourced index.  Parity
+    /// with `vable_setarrayitem_ref_const_idx_with_base` per
+    /// `rpython/jit/codewriter/assembler.py:162`.
+    pub fn vable_setarrayitem_int_const_idx_with_base(
+        &mut self,
+        vable_reg: u16,
+        array_idx: u16,
+        index_value: i64,
+        src: u16,
+    ) {
+        let const_idx = self.add_const_i(index_value);
+        self.touch_ref_reg(vable_reg);
+        self.touch_reg(src);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Int, true);
+        self.write_insn("setarrayitem_vable_i/riidd");
+        self.push_reg_u8(vable_reg, "setarrayitem_vable_i base");
+        let idx_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((idx_offset, ConstKind::Int, const_idx));
+        self.push_reg_u8(src, "setarrayitem_vable_i value");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+    }
+
     /// pyjitpl.py:1236-1247 — float counterpart to
     /// `vable_setarrayitem_int_const_value_with_base`.
     pub fn vable_setarrayitem_float_const_value_with_base(
@@ -786,6 +865,32 @@ impl JitCodeBuilder {
         self.write_insn("setarrayitem_vable_f/rifdd");
         self.push_reg_u8(vable_reg, "setarrayitem_vable_f base");
         self.push_reg_u8(index_reg, "setarrayitem_vable_f index");
+        self.push_reg_u8(src, "setarrayitem_vable_f value");
+        self.push_u16(field_descr);
+        self.push_u16(array_descr);
+    }
+
+    /// `setarrayitem_vable_f` with a ConstInt-sourced index.  Parity
+    /// with `vable_setarrayitem_ref_const_idx_with_base` per
+    /// `rpython/jit/codewriter/assembler.py:162`.
+    pub fn vable_setarrayitem_float_const_idx_with_base(
+        &mut self,
+        vable_reg: u16,
+        array_idx: u16,
+        index_value: i64,
+        src: u16,
+    ) {
+        let const_idx = self.add_const_i(index_value);
+        self.touch_ref_reg(vable_reg);
+        self.touch_float_reg(src);
+        let field_descr = self.add_vable_array_field_descr(array_idx);
+        let array_descr = self.add_vable_array_descr(majit_ir::value::Type::Float, false);
+        self.write_insn("setarrayitem_vable_f/rifdd");
+        self.push_reg_u8(vable_reg, "setarrayitem_vable_f base");
+        let idx_offset = self.code.len();
+        self.push_u8(0);
+        self.const_patches_u8
+            .push((idx_offset, ConstKind::Int, const_idx));
         self.push_reg_u8(src, "setarrayitem_vable_f value");
         self.push_u16(field_descr);
         self.push_u16(array_descr);

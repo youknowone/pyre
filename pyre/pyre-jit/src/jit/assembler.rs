@@ -1009,10 +1009,23 @@ fn dispatch_op(
         }
         "getarrayitem_vable_i" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Int);
-            let (vable_reg, index_reg, array_idx) = expect_vable_array_read_args(args);
-            state
-                .builder
-                .vable_getarrayitem_int_with_base(dst, vable_reg, array_idx, index_reg);
+            let (vable_reg, array_idx) = expect_vable_array_read_prefix(args);
+            match &args[1] {
+                Operand::Register(r) if r.kind == Kind::Int => {
+                    state
+                        .builder
+                        .vable_getarrayitem_int_with_base(dst, vable_reg, array_idx, r.index);
+                }
+                Operand::ConstInt(value) => {
+                    state.builder.vable_getarrayitem_int_const_idx_with_base(
+                        dst, vable_reg, array_idx, *value,
+                    );
+                }
+                other => panic!(
+                    "getarrayitem_vable_i expects Register(Int) or ConstInt index, got {:?}",
+                    other,
+                ),
+            }
         }
         "getarrayitem_vable_r" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Ref);
@@ -1036,28 +1049,51 @@ fn dispatch_op(
         }
         "getarrayitem_vable_f" => {
             let dst = expect_result_or_first_reg(args, result, Kind::Float);
-            let (vable_reg, index_reg, array_idx) = expect_vable_array_read_args(args);
-            state
-                .builder
-                .vable_getarrayitem_float_with_base(dst, vable_reg, array_idx, index_reg);
-        }
-        "setarrayitem_vable_i" => {
-            // pyjitpl.py:1236-1247 — see setfield_vable_i ConstInt rationale.
-            let (vable_reg, index_reg, array_idx) = expect_vable_array_write_prefix(args);
-            match &args[2] {
+            let (vable_reg, array_idx) = expect_vable_array_read_prefix(args);
+            match &args[1] {
                 Operand::Register(r) if r.kind == Kind::Int => {
                     state
                         .builder
-                        .vable_setarrayitem_int_with_base(vable_reg, array_idx, index_reg, r.index);
+                        .vable_getarrayitem_float_with_base(dst, vable_reg, array_idx, r.index);
                 }
                 Operand::ConstInt(value) => {
-                    state.builder.vable_setarrayitem_int_const_value_with_base(
-                        vable_reg, array_idx, index_reg, *value,
+                    state.builder.vable_getarrayitem_float_const_idx_with_base(
+                        dst, vable_reg, array_idx, *value,
                     );
                 }
                 other => panic!(
-                    "setarrayitem_vable_i expects Register(Int) or ConstInt, got {:?}",
+                    "getarrayitem_vable_f expects Register(Int) or ConstInt index, got {:?}",
                     other,
+                ),
+            }
+        }
+        "setarrayitem_vable_i" => {
+            // pyjitpl.py:1236-1247 — see setfield_vable_i ConstInt rationale.
+            // ConstInt index is parity with `setarrayitem_vable_r` per
+            // `rpython/jit/codewriter/assembler.py:162`.
+            let (vable_reg, array_idx) = expect_vable_array_write_prefix_no_idx(args);
+            match (&args[1], &args[2]) {
+                (Operand::Register(idx), Operand::Register(src))
+                    if idx.kind == Kind::Int && src.kind == Kind::Int =>
+                {
+                    state.builder.vable_setarrayitem_int_with_base(
+                        vable_reg, array_idx, idx.index, src.index,
+                    );
+                }
+                (Operand::Register(idx), Operand::ConstInt(value)) if idx.kind == Kind::Int => {
+                    state.builder.vable_setarrayitem_int_const_value_with_base(
+                        vable_reg, array_idx, idx.index, *value,
+                    );
+                }
+                (Operand::ConstInt(idx_value), Operand::Register(src)) if src.kind == Kind::Int => {
+                    state.builder.vable_setarrayitem_int_const_idx_with_base(
+                        vable_reg, array_idx, *idx_value, src.index,
+                    );
+                }
+                (idx, src) => panic!(
+                    "setarrayitem_vable_i expects (Register(Int) | ConstInt) index and \
+                     (Register(Int) | ConstInt) value, got idx={:?} src={:?}",
+                    idx, src,
                 ),
             }
         }
@@ -1097,23 +1133,35 @@ fn dispatch_op(
         }
         "setarrayitem_vable_f" => {
             // pyjitpl.py:1236-1247 — see setfield_vable_i ConstInt rationale.
-            let (vable_reg, index_reg, array_idx) = expect_vable_array_write_prefix(args);
-            match &args[2] {
-                Operand::Register(r) if r.kind == Kind::Float => {
+            // ConstInt index is parity with `setarrayitem_vable_r` per
+            // `rpython/jit/codewriter/assembler.py:162`.
+            let (vable_reg, array_idx) = expect_vable_array_write_prefix_no_idx(args);
+            match (&args[1], &args[2]) {
+                (Operand::Register(idx), Operand::Register(src))
+                    if idx.kind == Kind::Int && src.kind == Kind::Float =>
+                {
                     state.builder.vable_setarrayitem_float_with_base(
-                        vable_reg, array_idx, index_reg, r.index,
+                        vable_reg, array_idx, idx.index, src.index,
                     );
                 }
-                Operand::ConstFloat(value) => {
+                (Operand::Register(idx), Operand::ConstFloat(value)) if idx.kind == Kind::Int => {
                     state
                         .builder
                         .vable_setarrayitem_float_const_value_with_base(
-                            vable_reg, array_idx, index_reg, *value,
+                            vable_reg, array_idx, idx.index, *value,
                         );
                 }
-                other => panic!(
-                    "setarrayitem_vable_f expects Register(Float) or ConstFloat, got {:?}",
-                    other,
+                (Operand::ConstInt(idx_value), Operand::Register(src))
+                    if src.kind == Kind::Float =>
+                {
+                    state.builder.vable_setarrayitem_float_const_idx_with_base(
+                        vable_reg, array_idx, *idx_value, src.index,
+                    );
+                }
+                (idx, src) => panic!(
+                    "setarrayitem_vable_f expects (Register(Int) | ConstInt) index and \
+                     (Register(Float) | ConstFloat) value, got idx={:?} src={:?}",
+                    idx, src,
                 ),
             }
         }
