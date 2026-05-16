@@ -358,7 +358,9 @@ fn remap_callee_values(
             }
         }
         if let Some(crate::model::ExitSwitch::Value(cond)) = &block.exitswitch {
-            map.entry(*cond).or_insert_with(|| graph.alloc_value());
+            if let Some(cond_vid) = callee.value_id_of(cond) {
+                map.entry(cond_vid).or_insert_with(|| graph.alloc_value());
+            }
         }
     }
     map

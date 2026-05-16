@@ -864,9 +864,9 @@ pub struct SpaceOperation {
 }
 
 /// RPython `Block.exitswitch`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ExitSwitch {
-    Value(ValueId),
+    Value(crate::flowspace::model::Variable),
     LastException,
 }
 
@@ -1768,8 +1768,10 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
                 }
             }
         }
-        if let Some(ExitSwitch::Value(vid)) = &block.exitswitch {
-            read_vars.insert(*vid);
+        if let Some(ExitSwitch::Value(var)) = &block.exitswitch {
+            if let Some(vid) = graph.value_id_of(var) {
+                read_vars.insert(vid);
+            }
         }
         // `simplify.py:459-462`: terminal blocks (no exits)
         // implicitly use every inputarg.
@@ -2004,7 +2006,12 @@ where
         }
     };
     let exitswitch = exitswitch.as_ref().map(|switch| match switch {
-        ExitSwitch::Value(value) => ExitSwitch::Value(remap_value(*value)),
+        ExitSwitch::Value(var) => {
+            let vid = source
+                .value_id_of(var)
+                .expect("ExitSwitch::Value must have a backing ValueId in source");
+            ExitSwitch::Value(target.must_variable(remap_value(vid)))
+        }
         ExitSwitch::LastException => ExitSwitch::LastException,
     });
     let exits = exits
@@ -2786,13 +2793,14 @@ impl FunctionGraph {
         if_false: BlockId,
         false_args: Vec<ValueId>,
     ) {
+        let cond_var = self.must_variable(cond);
         let false_link = Link::new(self, false_args, if_false, Some(ExitCase::Bool(false)))
             .with_llexitcase_from_exitcase();
         let true_link = Link::new(self, true_args, if_true, Some(ExitCase::Bool(true)))
             .with_llexitcase_from_exitcase();
         self.set_control_flow_metadata(
             block,
-            Some(ExitSwitch::Value(cond)),
+            Some(ExitSwitch::Value(cond_var)),
             vec![false_link, true_link],
         );
     }
@@ -3104,11 +3112,15 @@ mod tests {
             )
             .unwrap();
         let target = graph.create_block();
-        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond));
+        let cond_var = graph.must_variable(cond);
+        graph.block_mut(entry).exitswitch = Some(ExitSwitch::Value(cond_var.clone()));
 
         graph.recloseblock(entry, vec![Link::new(&graph, vec![], target, None)]);
 
-        assert_eq!(graph.block(entry).exitswitch, Some(ExitSwitch::Value(cond)));
+        assert_eq!(
+            graph.block(entry).exitswitch,
+            Some(ExitSwitch::Value(cond_var))
+        );
         assert_eq!(graph.block(entry).exits[0].prevblock, Some(entry));
     }
 

@@ -237,9 +237,11 @@ pub(crate) fn build_value_to_variable_map(
             map.insert(result, var);
         }
         // Class 3 — exitswitch-referenced values.
-        if let Some(crate::model::ExitSwitch::Value(vid)) = &block.exitswitch {
-            map.entry(*vid)
-                .or_insert_with(|| seed_variable(*vid, annotations));
+        if let Some(crate::model::ExitSwitch::Value(var)) = &block.exitswitch {
+            if let Some(vid) = legacy.value_id_of(var) {
+                map.entry(vid)
+                    .or_insert_with(|| seed_variable(vid, annotations));
+            }
         }
         // Class 2 — link-side sentinels.
         for link in &block.exits {
@@ -1849,19 +1851,28 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
         // Translate exitswitch.
         let translated_exitswitch = match &legacy_block.exitswitch {
             None => None,
-            Some(ExitSwitch::Value(vid)) => Some(value_map.get(vid).cloned().ok_or_else(|| {
-                // Inline counterpart of `lookup_operand` for the
-                // block.exitswitch path (no enclosing
-                // SpaceOperation). Required substring
-                // `"undefined operand ValueId"` is preserved
-                // verbatim for `is_known_unported`
-                // (`cutover.rs:441`).
-                TyperError::message(format!(
-                    "translate_op: undefined operand {vid:?} as block.exitswitch — \
+            Some(ExitSwitch::Value(var)) => {
+                let vid = legacy.value_id_of(var).ok_or_else(|| {
+                    TyperError::message(format!(
+                        "translate_op: undefined operand ValueId for Variable {var:?} \
+                         as block.exitswitch — adapter invariant broken (every \
+                         referenced Variable must have a backing ValueId in legacy graph)"
+                    ))
+                })?;
+                Some(value_map.get(&vid).cloned().ok_or_else(|| {
+                    // Inline counterpart of `lookup_operand` for the
+                    // block.exitswitch path (no enclosing
+                    // SpaceOperation). Required substring
+                    // `"undefined operand ValueId"` is preserved
+                    // verbatim for `is_known_unported`
+                    // (`cutover.rs:441`).
+                    TyperError::message(format!(
+                        "translate_op: undefined operand {vid:?} as block.exitswitch — \
                          adapter invariant broken (every referenced ValueId must be \
                          defined as a block inputarg or op result)"
-                ))
-            })?),
+                    ))
+                })?)
+            }
             Some(ExitSwitch::LastException) => Some(Hlvalue::Constant(c_last_exception())),
         };
 

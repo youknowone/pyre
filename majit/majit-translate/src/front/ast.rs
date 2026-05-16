@@ -5069,7 +5069,8 @@ fn lower_expr(
                         );
                     }
                 }
-                graph.set_control_flow_metadata(*block, Some(ExitSwitch::Value(scrutinee)), exits);
+                let scrutinee_var = graph.must_variable(scrutinee);
+                graph.set_control_flow_metadata(*block, Some(ExitSwitch::Value(scrutinee_var)), exits);
             } else if let Some(arm_exitcases) = switch_exitcases {
                 // RPython `flatten.py:278-308` switch shape:
                 // `exitswitch` is the scrutinee and each primitive arm
@@ -5085,7 +5086,8 @@ fn lower_expr(
                         );
                     }
                 }
-                graph.set_control_flow_metadata(*block, Some(ExitSwitch::Value(scrutinee)), exits);
+                let scrutinee_var = graph.must_variable(scrutinee);
+                graph.set_control_flow_metadata(*block, Some(ExitSwitch::Value(scrutinee_var)), exits);
             } else if m.arms.len() == 1 {
                 graph.set_goto(*block, arm_entries[0], vec![]);
             } else {

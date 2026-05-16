@@ -1130,6 +1130,10 @@ impl<'a> GraphFlattener<'a> {
                 Some(ExitSwitch::Value(cond)) => cond,
                 _ => unreachable!(),
             };
+            let cond_vid = self
+                .graph
+                .value_id_of(&cond)
+                .expect("bool-branch ExitSwitch::Value must have a backing ValueId");
             // `linkfalse, linktrue = block.exits;
             //  if linkfalse.llexitcase == True: linkfalse, linktrue = linktrue, linkfalse`.
             let (linkfalse, linktrue) = if bool_llexitcase(&exits[0]) == Some(true) {
@@ -1145,7 +1149,7 @@ impl<'a> GraphFlattener<'a> {
             });
             let false_landing = Label(self.next_label);
             self.next_label += 1;
-            let cond_reg = self.getcolor(cond);
+            let cond_reg = self.getcolor(cond_vid);
             self.emitline(FlatOp::GotoIfNot {
                 cond: cond_reg,
                 target: false_landing,
@@ -1168,7 +1172,11 @@ impl<'a> GraphFlattener<'a> {
                 Some(ExitSwitch::Value(cond)) => cond,
                 _ => unreachable!(),
             };
-            let kind = value_kind(cond, self.graph, self.regallocs);
+            let cond_vid = self
+                .graph
+                .value_id_of(&cond)
+                .expect("switch ExitSwitch::Value must have a backing ValueId");
+            let kind = value_kind(cond_vid, self.graph, self.regallocs);
             assert_eq!(kind, 'i', "switch exitswitch must be int");
             // `switches = [link for link in block.exits if link.exitcase != 'default']`.
             // `switches.sort(key=lambda link: link.llexitcase)`.
@@ -1206,7 +1214,7 @@ impl<'a> GraphFlattener<'a> {
             self.emitline(FlatOp::Live {
                 live_values: Vec::new(),
             });
-            let value_reg = self.getcolor(cond);
+            let value_reg = self.getcolor(cond_vid);
             self.emitline(FlatOp::Switch {
                 value: value_reg,
                 targets: targets.clone(),
@@ -1679,7 +1687,7 @@ mod tests {
         graph.set_return(false_block, Some(false_marker));
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(cond)),
+            Some(ExitSwitch::Value(graph.must_variable(cond))),
             vec![
                 Link::new(&graph, Vec::new(), true_block, Some(ExitCase::Bool(false)))
                     .with_llexitcase(ConstValue::Bool(true)),
@@ -1731,7 +1739,7 @@ mod tests {
         graph.set_return(default, None);
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(cond)),
+            Some(ExitSwitch::Value(graph.must_variable(cond))),
             vec![
                 Link::new_mixed(Vec::new(), case0, Some(ExitCase::Const(ConstValue::Int(0))))
                     .with_llexitcase(ConstValue::Int(0)),
@@ -1770,7 +1778,7 @@ mod tests {
         graph.set_return(case_lowlevel_1, None);
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(cond)),
+            Some(ExitSwitch::Value(graph.must_variable(cond))),
             vec![
                 Link::new_mixed(
                     Vec::new(),
@@ -1810,7 +1818,7 @@ mod tests {
         graph.set_return(case1, None);
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(cond)),
+            Some(ExitSwitch::Value(graph.must_variable(cond))),
             vec![
                 Link::new_mixed(Vec::new(), case0, Some(ExitCase::Const(ConstValue::Int(0))))
                     .with_llexitcase(ConstValue::Int(0)),
@@ -2704,7 +2712,7 @@ mod tests {
         // exits order: [true_link, false_link] with matching llexitcase.
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(cond)),
+            Some(ExitSwitch::Value(graph.must_variable(cond))),
             vec![
                 Link::new(&graph, Vec::new(), true_block, Some(ExitCase::Bool(true)))
                     .with_llexitcase(ConstValue::Bool(true)),
@@ -2743,7 +2751,7 @@ mod tests {
         graph.set_return(case1, Some(m1));
         graph.set_control_flow_metadata(
             entry,
-            Some(ExitSwitch::Value(cond)),
+            Some(ExitSwitch::Value(graph.must_variable(cond))),
             vec![
                 Link::new_mixed(Vec::new(), case0, Some(ExitCase::Const(ConstValue::Int(0))))
                     .with_llexitcase(ConstValue::Int(0)),

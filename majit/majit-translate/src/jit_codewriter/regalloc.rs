@@ -285,7 +285,7 @@ impl RegAllocator {
             }
         }
         if let Some(crate::model::ExitSwitch::Value(cond)) = &block.exitswitch {
-            die_at.remove(&Self::var(graph, *cond));
+            die_at.remove(cond);
         }
         let mut die_list: Vec<(usize, crate::flowspace::model::Variable)> =
             die_at.into_iter().map(|(v, t)| (t, v)).collect();
