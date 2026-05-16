@@ -5304,28 +5304,14 @@ pub trait VirtualInfoBlackholeExt {
     ) -> i64;
 }
 
-/// VStrConcat/VStrSlice/VUniConcat/VUniSlice's allocate paths thread
-/// the per-source value through `decoder.{concat,slice}_{strings,unicodes}`,
-/// which expect a resume.py-tagged i16 charnum.  Pyre stores the source
-/// as a `VirtualFieldSource`; project it back to a tag-shaped i16 by
-/// decoding into an int (decode_field_source_int) and casting — this
-/// matches the resume.py loop body where each source contributes one
-/// already-tagged fieldnum.
-fn encode_source_to_tagged(
-    decoder: &mut ResumeDataDirectReader,
-    source: &VirtualFieldSource,
-) -> i16 {
-    let value = decoder.decode_field_source_int(source);
-    value as i16
-}
-
 /// `resume.py:766-775 VStrPlainInfo.allocate` and `resume.py:821-830
 /// VUniPlainInfo.allocate` share the same loop body — the only
 /// difference is `decoder.allocate_string` vs `allocate_unicode` and
 /// `string_setitem` vs `unicode_setitem`.  The pyre helper takes an
-/// `is_unicode` flag to dispatch.  `chars` is the resume.py-tagged
-/// per-character source list (`fieldnums`); UNINITIALIZED entries
-/// (`VirtualFieldSource::Uninitialized`) skip the setitem call.
+/// `is_unicode` flag to dispatch.  `chars` carries one
+/// `VirtualFieldSource` per character (the pyre equivalent of RPython's
+/// tagged `fieldnums`); `VirtualFieldSource::Uninitialized` matches
+/// resume.py's `tagged_eq(charnum, UNINITIALIZED)` skip.
 fn vstr_plain_info_allocate(
     decoder: &mut ResumeDataDirectReader,
     index: usize,
@@ -5347,25 +5333,11 @@ fn vstr_plain_info_allocate(
         if matches!(char_source, VirtualFieldSource::Uninitialized) {
             continue;
         }
-        // pyre stores the per-character source as a tagged
-        // VirtualFieldSource; encode it back into the resume.py
-        // i16 charnum so the dispatcher can decode_int it.
-        let charnum = match char_source {
-            VirtualFieldSource::FailArg(_)
-            | VirtualFieldSource::Constant(_)
-            | VirtualFieldSource::Virtual(_) => decoder.decode_field_source_int(char_source),
-            VirtualFieldSource::Uninitialized | VirtualFieldSource::Unavailable => continue,
-        };
         // resume.py:774 / 829 decoder.{string,unicode}_setitem(string, i, charnum)
-        // pyre's _setitem dispatchers re-decode the tagged charnum;
-        // since we already decoded it via decode_field_source_int,
-        // bypass the re-decode by writing through the allocator hook
-        // directly.  This preserves the resume.py shape while
-        // avoiding a second decode of the same source.
         if is_unicode {
-            decoder.allocator.bh_unicodesetitem(string, i, charnum);
+            decoder.unicode_setitem(string, i, char_source);
         } else {
-            decoder.allocator.bh_strsetitem(string, i, charnum);
+            decoder.string_setitem(string, i, char_source);
         }
     }
     string
@@ -5572,9 +5544,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
             }
             // resume.py:786-793 VStrConcatInfo.allocate
             VirtualInfo::VStrConcat { func, left, right } => {
-                let left_num = encode_source_to_tagged(decoder, left);
-                let right_num = encode_source_to_tagged(decoder, right);
-                let string = decoder.concat_strings(*func, left_num, right_num);
+                let string = decoder.concat_strings(*func, left, right);
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
@@ -5585,18 +5555,13 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 start,
                 length,
             } => {
-                let str_num = encode_source_to_tagged(decoder, source);
-                let start_num = encode_source_to_tagged(decoder, start);
-                let len_num = encode_source_to_tagged(decoder, length);
-                let string = decoder.slice_string(*func, str_num, start_num, len_num);
+                let string = decoder.slice_string(*func, source, start, length);
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
             // resume.py:841-848 VUniConcatInfo.allocate
             VirtualInfo::VUniConcat { func, left, right } => {
-                let left_num = encode_source_to_tagged(decoder, left);
-                let right_num = encode_source_to_tagged(decoder, right);
-                let string = decoder.concat_unicodes(*func, left_num, right_num);
+                let string = decoder.concat_unicodes(*func, left, right);
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
@@ -5607,10 +5572,7 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 start,
                 length,
             } => {
-                let str_num = encode_source_to_tagged(decoder, source);
-                let start_num = encode_source_to_tagged(decoder, start);
-                let len_num = encode_source_to_tagged(decoder, length);
-                let string = decoder.slice_unicode(*func, str_num, start_num, len_num);
+                let string = decoder.slice_unicode(*func, source, start, length);
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
@@ -5899,21 +5861,30 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// resume.py:1458-1460 string_setitem(str, index, charnum) — decode
-    /// the tagged charnum and forward to the allocator.
-    pub fn string_setitem(&mut self, string: i64, index: usize, charnum: i16) {
-        let char = self.decode_int(charnum);
+    /// the per-character source and forward to the allocator.  Pyre
+    /// threads a `VirtualFieldSource` where resume.py threads a tagged
+    /// i16 charnum; the structural shape matches because both decoders
+    /// resolve to an integer character value before calling
+    /// bh_strsetitem.
+    pub fn string_setitem(&mut self, string: i64, index: usize, source: &VirtualFieldSource) {
+        let char = self.decode_field_source_int(source);
         self.allocator.bh_strsetitem(string, index, char);
     }
 
     /// resume.py:1462-1470 concat_strings(str1num, str2num) — decode
-    /// the two tagged strings, dispatch to OS_STR_CONCAT funcptr.
+    /// the two ref sources and dispatch to OS_STR_CONCAT funcptr.
     /// `funcptr` is supplied by the caller (carried alongside the
     /// VStrConcat virtual; pyre's RawSlice / VStrConcat layouts both
     /// carry the funcptr resolved at trace time so the reader does
     /// not need a callinfocollection).
-    pub fn concat_strings(&mut self, funcptr: i64, str1num: i16, str2num: i16) -> i64 {
-        let str1 = self.decode_ref(str1num);
-        let str2 = self.decode_ref(str2num);
+    pub fn concat_strings(
+        &mut self,
+        funcptr: i64,
+        str1_source: &VirtualFieldSource,
+        str2_source: &VirtualFieldSource,
+    ) -> i64 {
+        let str1 = self.decode_field_source(str1_source);
+        let str2 = self.decode_field_source(str2_source);
         self.allocator.os_str_concat(funcptr, str1, str2)
     }
 
@@ -5922,13 +5893,13 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn slice_string(
         &mut self,
         funcptr: i64,
-        strnum: i16,
-        startnum: i16,
-        lengthnum: i16,
+        str_source: &VirtualFieldSource,
+        start_source: &VirtualFieldSource,
+        length_source: &VirtualFieldSource,
     ) -> i64 {
-        let str = self.decode_ref(strnum);
-        let start = self.decode_int(startnum);
-        let length = self.decode_int(lengthnum);
+        let str = self.decode_field_source(str_source);
+        let start = self.decode_field_source_int(start_source);
+        let length = self.decode_field_source_int(length_source);
         let stop = start.wrapping_add(length);
         self.allocator.os_str_slice(funcptr, str, start, stop)
     }
@@ -5940,15 +5911,20 @@ impl<'a> ResumeDataDirectReader<'a> {
 
     /// resume.py:1485-1487 unicode_setitem(str, index, charnum) — same
     /// shape as string_setitem.
-    pub fn unicode_setitem(&mut self, string: i64, index: usize, charnum: i16) {
-        let char = self.decode_int(charnum);
+    pub fn unicode_setitem(&mut self, string: i64, index: usize, source: &VirtualFieldSource) {
+        let char = self.decode_field_source_int(source);
         self.allocator.bh_unicodesetitem(string, index, char);
     }
 
     /// resume.py:1489-1497 concat_unicodes(str1num, str2num).
-    pub fn concat_unicodes(&mut self, funcptr: i64, str1num: i16, str2num: i16) -> i64 {
-        let str1 = self.decode_ref(str1num);
-        let str2 = self.decode_ref(str2num);
+    pub fn concat_unicodes(
+        &mut self,
+        funcptr: i64,
+        str1_source: &VirtualFieldSource,
+        str2_source: &VirtualFieldSource,
+    ) -> i64 {
+        let str1 = self.decode_field_source(str1_source);
+        let str2 = self.decode_field_source(str2_source);
         self.allocator.os_uni_concat(funcptr, str1, str2)
     }
 
@@ -5985,13 +5961,13 @@ impl<'a> ResumeDataDirectReader<'a> {
     pub fn slice_unicode(
         &mut self,
         funcptr: i64,
-        strnum: i16,
-        startnum: i16,
-        lengthnum: i16,
+        str_source: &VirtualFieldSource,
+        start_source: &VirtualFieldSource,
+        length_source: &VirtualFieldSource,
     ) -> i64 {
-        let str = self.decode_ref(strnum);
-        let start = self.decode_int(startnum);
-        let length = self.decode_int(lengthnum);
+        let str = self.decode_field_source(str_source);
+        let start = self.decode_field_source_int(start_source);
+        let length = self.decode_field_source_int(length_source);
         let stop = start.wrapping_add(length);
         self.allocator.os_uni_slice(funcptr, str, start, stop)
     }
