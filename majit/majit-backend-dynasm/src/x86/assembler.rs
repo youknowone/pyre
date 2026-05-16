@@ -1572,6 +1572,122 @@ impl<'a> Assembler386<'a> {
         }
     }
 
+    /// `assembler.py:910 _check_frame_depth` parity — emitted at every
+    /// bridge entry to detect that the in-flight JITFRAME's variable
+    /// section is wide enough for the bridge's spill requirements, and
+    /// reallocate via `dynasm_realloc_frame` if not.
+    ///
+    /// Layout:
+    /// ```text
+    ///   CMP QWORD [rbp + JF_FRAME_OFS + LENGTHOFS], imm32_placeholder
+    ///                              ; → frame_depth_to_patch[]
+    ///   JGE  continue              ; fast path: frame large enough
+    ///   ;; --- inlined slowpath body ---
+    ///   push_all_regs_to_jitframe(&[], withfloats=true)
+    ///   push_gcmap(gcmap)          ; publish live Refs for the collector
+    ///   MOV  ARG0, rbp             ; old_jf
+    ///   MOV  ARG1_r32, imm32_placeholder
+    ///                              ; → frame_depth_to_patch[] (depth)
+    ///   MOV  rax, &dynasm_realloc_frame
+    ///   CALL rax                   ; rax = new_jf
+    ///   MOV  rbp, rax              ; switch frame pointer
+    ///   ;; update shadowstack top entry pushed by gen_shadowstack_header
+    ///   MOV  scratch, [root_stack_top]
+    ///   MOV  [scratch - WORD], rbp ; replace stale jf in shadow entry
+    ///   pop_gcmap                  ; clear JF_GCMAP_OFS on new frame
+    ///   pop_all_regs_from_jitframe(&[], withfloats=true)
+    /// continue:
+    /// ```
+    ///
+    /// The 32-bit `0xffffff` placeholder appears twice (CMP imm and the
+    /// MOV ARG1 imm); both offsets land in `frame_depth_to_patch` so
+    /// `patch_stack_checks` rewrites them in lockstep with the final
+    /// `frame_depth`.
+    ///
+    /// `_call_header` already published `rbp` on the shadow stack via
+    /// `gen_shadowstack_header`, so the entry at `[top - WORD]` holds
+    /// the old jitframe; the slowpath rewrites that slot so a minor GC
+    /// firing between this point and the next `gen_footer_shadowstack`
+    /// observes the live new-frame pointer rather than the freed old.
+    fn emit_check_frame_depth(&mut self, gcmap: *mut usize) {
+        let frame_len_ofs = (JF_FRAME_OFS + crate::jitframe::LENGTHOFS) as i32;
+        let placeholder: i32 = 0xffffff;
+
+        // assembler.py:918 — CMP_bi(ofs, 0xffffff).  dynasm encodes
+        // this as `48 81 7D disp8 imm32` (8 bytes) when the
+        // displacement fits in i8 — which it does for `JF_FRAME_OFS`
+        // (= 56).  The 4-byte immediate lives at the tail of the
+        // instruction, so `offset - 4` is its buffer position.
+        dynasm!(self.mc ; .arch x64
+            ; cmp QWORD [rbp + frame_len_ofs], placeholder
+        );
+        let cmp_imm_ofs = self.mc.offset().0 - 4;
+        self.frame_depth_to_patch.push(cmp_imm_ofs);
+
+        // assembler.py:921 — sp = IncreaseStackSlowPath(mc, 'L').
+        // PyPy uses condition 'L' (signed less than) for the slowpath
+        // entry; the fast-path fall-through is the JGE-skip equivalent.
+        let continue_label = self.mc.new_dynamic_label();
+        dynasm!(self.mc ; .arch x64 ; jge =>continue_label);
+
+        // ── inlined IncreaseStackSlowPath + _frame_realloc_slowpath ──
+        // assembler.py:145 _push_all_regs_to_frame(mc, [], supports_floats)
+        self.push_all_regs_to_jitframe(&[], true);
+        // assembler.py:907 push_gcmap(store=True) — pyre writes to
+        // [rbp + JF_GCMAP_OFS] rather than a stack slot, matching the
+        // existing `push_gcmap` helper (the `store=True` arg flavor in
+        // PyPy is a stack-slot variant that the shared trampoline
+        // reads back; the inlined slowpath here uses the frame slot
+        // directly since `dynasm_realloc_frame` does not need the
+        // gcmap in a register).
+        self.push_gcmap(gcmap);
+
+        // assembler.py:150-152 — MOV ARG0 = rbp, ARG1 = depth (from
+        // stack in PyPy's shared trampoline; here from a patched imm).
+        self.emit_abi_int_arg_from_reg(0, crate::regloc::EBP.value);
+        let arg1_reg = match Self::abi_int_arg(1) {
+            AbiArgPlacement::Gpr(r) => r,
+            _ => panic!("emit_check_frame_depth: ARG1 must be a GPR on x86_64"),
+        };
+        // `MOV r32, imm32` is `B8+rd imm32` (5 bytes) for low regs
+        // (rdx=2 on Win64, rsi=6 on Linux — both low).  The imm32
+        // zero-extends to r64, which is correct for a positive depth.
+        dynasm!(self.mc ; .arch x64 ; mov Rd(arg1_reg), placeholder);
+        let arg1_imm_ofs = self.mc.offset().0 - 4;
+        self.frame_depth_to_patch.push(arg1_imm_ofs);
+
+        // assembler.py:175 — CALL imm(self.cpu.realloc_frame).  Pyre
+        // bakes the C-ABI wrapper address as a 64-bit immediate
+        // (PyPy's `realloc_frame` is exposed via the JIT-frontend's
+        // cpu.realloc_frame pointer; the wrapper performs the same
+        // libc::calloc + write_barrier sequence).
+        let helper_addr = crate::runner::dynasm_realloc_frame as i64;
+        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD helper_addr);
+        self.emit_abi_call_rax();
+
+        // assembler.py:176 — MOV ebp, eax: rbp ← new jitframe.
+        dynasm!(self.mc ; .arch x64 ; mov rbp, rax);
+
+        // assembler.py:181-184 — update shadow-stack top entry.  The
+        // `gen_shadowstack_header` push writes the live jf at
+        // `[top - WORD]` after incrementing top by 2*WORD; the
+        // realloc must rewrite that slot so the GC visitor finds the
+        // post-realloc frame on the next minor collection.
+        let rst_addr = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+        let scratch = crate::regloc::X86_64_SCRATCH_REG.value;
+        dynasm!(self.mc ; .arch x64
+            ; mov Rq(scratch), QWORD rst_addr
+            ; mov Rq(scratch), [Rq(scratch)]
+            ; mov [Rq(scratch) - 8], rbp
+        );
+
+        // assembler.py:186-187 — pop_gcmap + _pop_all_regs_from_frame.
+        self.pop_gcmap();
+        self.pop_all_regs_from_jitframe(&[], true);
+
+        dynasm!(self.mc ; .arch x64 ; =>continue_label);
+    }
+
     /// x86/assembler.py:1422 `gen_shadowstack_header` parity (mirrors
     /// aarch64). Pushes two words onto the jitframe shadow stack on
     /// every JIT function entry: an `is_minor` marker (`1`) and the
@@ -1985,10 +2101,20 @@ impl<'a> Assembler386<'a> {
             inputargs,
             ops,
         );
+        let is_bridge = self.bridge_input_locs.is_some();
         if let Some(ref arglocs) = self.bridge_input_locs {
             ra.prepare_bridge(arglocs);
         } else {
             ra.prepare_loop();
+        }
+        // assembler.py:647 — bridges emit `_check_frame_depth` between
+        // `prepare_bridge` and `_update_at_exit` so the JIT can grow the
+        // in-flight JITFRAME if the bridge's frame_depth exceeds the
+        // loop's allocation.  Loops skip this (PyPy line 544 uses
+        // `_check_frame_depth_debug`, a no-op outside DEBUG_FRAME_DEPTH).
+        if is_bridge {
+            let gcmap = ra.get_gcmap(&[], false);
+            self.emit_check_frame_depth(gcmap);
         }
         // assembler.py:374 walk_operations — get allocation decisions.
         let ra_ops = ra.walk_operations();
