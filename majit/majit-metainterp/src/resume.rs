@@ -6225,6 +6225,65 @@ impl<'a> ResumeDataDirectReader<'a> {
         }
     }
 
+    /// Callback-driven sibling of `_prepare_next_section` — drives the
+    /// same `enumerate_vars(info, all_liveness, _callback_i/r/f)`
+    /// walk (`resume.py:1017-1026`) but lets the caller decide what to
+    /// do with each `(reg_idx, value)` pair.  The standard BH-write
+    /// path is the closure variant in `_prepare_next_section`; the
+    /// on-demand cranelift deopt callback (Slice QQ-2) uses a closure
+    /// that appends to a flat `Vec<i64>` mirroring the recovery_layout
+    /// walker's `rebuilt` output.
+    pub fn _prepare_next_section_with(
+        &mut self,
+        info: usize,
+        mut cb_i: impl FnMut(u32, i64),
+        mut cb_r: impl FnMut(u32, i64),
+        mut cb_f: impl FnMut(u32, i64),
+    ) {
+        use majit_translate::liveness::LivenessIterator;
+
+        // `self.all_liveness` is `&'a [u8]` — copying the reference does
+        // not borrow `self`, so the inner `self.next_*` calls below are
+        // free to take `&mut self`.
+        let all_liveness: &[u8] = self.all_liveness;
+
+        // jitcode.py:149-151 — three length bytes.
+        let length_i = all_liveness[info] as u32;
+        let length_r = all_liveness[info + 1] as u32;
+        let length_f = all_liveness[info + 2] as u32;
+        // jitcode.py:152
+        let mut offset = info + 3;
+
+        // resume.py:1028-1030 `_callback_i` / jitcode.py:153-157.
+        if length_i != 0 {
+            let mut it = LivenessIterator::new(offset, length_i, all_liveness);
+            while let Some(reg_idx) = it.next() {
+                let value = self.next_int();
+                cb_i(reg_idx, value);
+            }
+            offset = it.offset;
+        }
+        // resume.py:1032-1034 `_callback_r` / jitcode.py:158-162.
+        if length_r != 0 {
+            let mut it = LivenessIterator::new(offset, length_r, all_liveness);
+            while let Some(reg_idx) = it.next() {
+                let value = self.next_ref();
+                cb_r(reg_idx, value);
+            }
+            offset = it.offset;
+        }
+        // resume.py:1036-1038 `_callback_f` / jitcode.py:163-166.
+        if length_f != 0 {
+            let mut it = LivenessIterator::new(offset, length_f, all_liveness);
+            while let Some(reg_idx) = it.next() {
+                let value = self.next_float();
+                cb_f(reg_idx, value);
+            }
+            // `offset` is the end of the float section; no further use.
+            let _ = offset;
+        }
+    }
+
     /// resume.py:1386 consume_virtualref_info
     pub fn consume_virtualref_info(&mut self, vrefinfo: Option<&dyn VRefInfo>) {
         // resume.py:1389
