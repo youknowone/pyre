@@ -3571,6 +3571,8 @@ fn lower_expr(
                 // RPython: getinteriorfield_gc — arr[i].field as a single op.
                 let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
                 let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                let base_var = graph.must_variable(base);
+                let index_var = graph.must_variable(index);
                 let field_name = member_name(&field.member);
                 let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                 // Element struct type is the field owner for interiorfield descriptors.
@@ -3590,8 +3592,8 @@ fn lower_expr(
                 let result = graph.push_op(
                     *block,
                     OpKind::InteriorFieldRead {
-                        base,
-                        index,
+                        base: base_var,
+                        index: index_var,
                         field: crate::model::FieldDescriptor::new(field_name, elem_type),
                         item_ty,
                         array_type_id,
@@ -3672,6 +3674,9 @@ fn lower_expr(
                         // RPython: setinteriorfield_gc — arr[i].field = value.
                         let base = get_value!(lower_expr(graph, block, &idx.expr, options, ctx)?);
                         let index = get_value!(lower_expr(graph, block, &idx.index, options, ctx)?);
+                        let base_var = graph.must_variable(base);
+                        let index_var = graph.must_variable(index);
+                        let value_var = graph.must_variable(value);
                         let field_name = member_name(&field.member);
                         let array_type_id = array_type_id_from_expr(&idx.expr, ctx);
                         let elem_type = array_type_id
@@ -3687,10 +3692,10 @@ fn lower_expr(
                         graph.push_op(
                             *block,
                             OpKind::InteriorFieldWrite {
-                                base,
-                                index,
+                                base: base_var,
+                                index: index_var,
                                 field: crate::model::FieldDescriptor::new(field_name, elem_type),
-                                value,
+                                value: value_var,
                                 item_ty,
                                 array_type_id,
                             },

@@ -476,13 +476,21 @@ fn remap_op_kind(
             field,
             item_ty,
             array_type_id,
-        } => OpKind::InteriorFieldRead {
-            base: remap(base),
-            index: remap(index),
-            field: field.clone(),
-            item_ty: item_ty.clone(),
-            array_type_id: array_type_id.clone(),
-        },
+        } => {
+            let base_vid = source_graph
+                .value_id_of(base)
+                .expect("InteriorFieldRead.base must have a backing ValueId in source");
+            let index_vid = source_graph
+                .value_id_of(index)
+                .expect("InteriorFieldRead.index must have a backing ValueId in source");
+            OpKind::InteriorFieldRead {
+                base: target_graph.must_variable(remap(&base_vid)),
+                index: target_graph.must_variable(remap(&index_vid)),
+                field: field.clone(),
+                item_ty: item_ty.clone(),
+                array_type_id: array_type_id.clone(),
+            }
+        }
         OpKind::InteriorFieldWrite {
             base,
             index,
@@ -490,14 +498,25 @@ fn remap_op_kind(
             value,
             item_ty,
             array_type_id,
-        } => OpKind::InteriorFieldWrite {
-            base: remap(base),
-            index: remap(index),
-            field: field.clone(),
-            value: remap(value),
-            item_ty: item_ty.clone(),
-            array_type_id: array_type_id.clone(),
-        },
+        } => {
+            let base_vid = source_graph
+                .value_id_of(base)
+                .expect("InteriorFieldWrite.base must have a backing ValueId in source");
+            let index_vid = source_graph
+                .value_id_of(index)
+                .expect("InteriorFieldWrite.index must have a backing ValueId in source");
+            let value_vid = source_graph
+                .value_id_of(value)
+                .expect("InteriorFieldWrite.value must have a backing ValueId in source");
+            OpKind::InteriorFieldWrite {
+                base: target_graph.must_variable(remap(&base_vid)),
+                index: target_graph.must_variable(remap(&index_vid)),
+                field: field.clone(),
+                value: target_graph.must_variable(remap(&value_vid)),
+                item_ty: item_ty.clone(),
+                array_type_id: array_type_id.clone(),
+            }
+        }
         OpKind::Call {
             target,
             args,
@@ -959,10 +978,30 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                     .expect("ArrayWrite.value must be a known Variable on graph"),
             ]
         }
-        OpKind::InteriorFieldRead { base, index, .. } => vec![*base, *index],
+        OpKind::InteriorFieldRead { base, index, .. } => {
+            let g = graph
+                .expect("InteriorFieldRead requires a graph to project Variable to ValueId");
+            vec![
+                g.value_id_of(base)
+                    .expect("InteriorFieldRead.base must be a known Variable on graph"),
+                g.value_id_of(index)
+                    .expect("InteriorFieldRead.index must be a known Variable on graph"),
+            ]
+        }
         OpKind::InteriorFieldWrite {
             base, index, value, ..
-        } => vec![*base, *index, *value],
+        } => {
+            let g = graph
+                .expect("InteriorFieldWrite requires a graph to project Variable to ValueId");
+            vec![
+                g.value_id_of(base)
+                    .expect("InteriorFieldWrite.base must be a known Variable on graph"),
+                g.value_id_of(index)
+                    .expect("InteriorFieldWrite.index must be a known Variable on graph"),
+                g.value_id_of(value)
+                    .expect("InteriorFieldWrite.value must be a known Variable on graph"),
+            ]
+        }
         OpKind::Call { args, .. } => args.clone(),
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![
             graph

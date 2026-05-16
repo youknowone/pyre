@@ -477,8 +477,8 @@ pub enum OpKind {
     /// effectinfo.py:313-325: generates "readinteriorfield" effect.
     /// effectinfo.py:327-340: also implicitly generates "readarray" effect.
     InteriorFieldRead {
-        base: ValueId,
-        index: ValueId,
+        base: crate::flowspace::model::Variable,
+        index: crate::flowspace::model::Variable,
         field: FieldDescriptor,
         item_ty: ValueType,
         array_type_id: Option<String>,
@@ -487,10 +487,10 @@ pub enum OpKind {
     /// effectinfo.py:349-350: generates "interiorfield" effect.
     /// effectinfo.py:327-340: also implicitly generates "array" effect.
     InteriorFieldWrite {
-        base: ValueId,
-        index: ValueId,
+        base: crate::flowspace::model::Variable,
+        index: crate::flowspace::model::Variable,
         field: FieldDescriptor,
-        value: ValueId,
+        value: crate::flowspace::model::Variable,
         item_ty: ValueType,
         array_type_id: Option<String>,
     },

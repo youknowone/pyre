@@ -765,8 +765,14 @@ pub fn translate_op(
         OpKind::InteriorFieldRead {
             base, index, field, ..
         } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
-            let index_hl = lookup_operand(value_map, *index, op, "index")?;
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("InteriorFieldRead.base must have a backing ValueId");
+            let index_vid = graph
+                .value_id_of(index)
+                .expect("InteriorFieldRead.index must have a backing ValueId");
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
+            let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             let elem_var = Hlvalue::Variable(Variable::new());
             Ok(vec![
@@ -788,9 +794,18 @@ pub fn translate_op(
             value,
             ..
         } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
-            let index_hl = lookup_operand(value_map, *index, op, "index")?;
-            let value_hl = lookup_operand(value_map, *value, op, "value")?;
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("InteriorFieldWrite.base must have a backing ValueId");
+            let index_vid = graph
+                .value_id_of(index)
+                .expect("InteriorFieldWrite.index must have a backing ValueId");
+            let value_vid = graph
+                .value_id_of(value)
+                .expect("InteriorFieldWrite.value must have a backing ValueId");
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
+            let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
+            let value_hl = lookup_operand(value_map, value_vid, op, "value")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             let elem_var = Hlvalue::Variable(Variable::new());
             Ok(vec![
@@ -2784,17 +2799,17 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::InteriorFieldRead {
-                base: ValueId(1),
-                index: ValueId(2),
+                base: graph.must_variable(ValueId(1)),
+                index: graph.must_variable(ValueId(2)),
                 field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
                 item_ty: ValueType::Int,
                 array_type_id: None,
             },
         };
-        let graph = translate_op_test_graph(10);
         let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("InteriorFieldRead arm must lower");
         assert_eq!(translated.len(), 2);
@@ -2823,18 +2838,18 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: None,
             kind: OpKind::InteriorFieldWrite {
-                base: ValueId(1),
-                index: ValueId(2),
+                base: graph.must_variable(ValueId(1)),
+                index: graph.must_variable(ValueId(2)),
                 field: crate::model::FieldDescriptor::new("y", Some("Point".into())),
-                value: ValueId(3),
+                value: graph.must_variable(ValueId(3)),
                 item_ty: ValueType::Int,
                 array_type_id: None,
             },
         };
-        let graph = translate_op_test_graph(10);
         let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("InteriorFieldWrite arm must lower");
         assert_eq!(translated.len(), 2);

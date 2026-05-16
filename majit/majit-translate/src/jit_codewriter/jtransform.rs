@@ -3839,13 +3839,21 @@ fn remap_op(
             field,
             item_ty,
             array_type_id,
-        } => OpKind::InteriorFieldRead {
-            base: remap_value(*base, aliases),
-            index: remap_value(*index, aliases),
-            field: field.clone(),
-            item_ty: item_ty.clone(),
-            array_type_id: array_type_id.clone(),
-        },
+        } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("InteriorFieldRead.base must have a backing ValueId");
+            let index_vid = graph
+                .value_id_of(index)
+                .expect("InteriorFieldRead.index must have a backing ValueId");
+            OpKind::InteriorFieldRead {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+                index: graph.must_variable(remap_value(index_vid, aliases)),
+                field: field.clone(),
+                item_ty: item_ty.clone(),
+                array_type_id: array_type_id.clone(),
+            }
+        }
         OpKind::InteriorFieldWrite {
             base,
             index,
@@ -3853,14 +3861,25 @@ fn remap_op(
             value,
             item_ty,
             array_type_id,
-        } => OpKind::InteriorFieldWrite {
-            base: remap_value(*base, aliases),
-            index: remap_value(*index, aliases),
-            field: field.clone(),
-            value: remap_value(*value, aliases),
-            item_ty: item_ty.clone(),
-            array_type_id: array_type_id.clone(),
-        },
+        } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("InteriorFieldWrite.base must have a backing ValueId");
+            let index_vid = graph
+                .value_id_of(index)
+                .expect("InteriorFieldWrite.index must have a backing ValueId");
+            let value_vid = graph
+                .value_id_of(value)
+                .expect("InteriorFieldWrite.value must have a backing ValueId");
+            OpKind::InteriorFieldWrite {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+                index: graph.must_variable(remap_value(index_vid, aliases)),
+                field: field.clone(),
+                value: graph.must_variable(remap_value(value_vid, aliases)),
+                item_ty: item_ty.clone(),
+                array_type_id: array_type_id.clone(),
+            }
+        }
         OpKind::Call {
             target,
             args,
