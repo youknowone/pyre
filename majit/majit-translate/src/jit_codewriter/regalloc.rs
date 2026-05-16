@@ -263,8 +263,8 @@ impl RegAllocator {
             die_at.insert(var.clone(), 0);
         }
         for (i, op) in block.operations.iter().enumerate() {
-            for v in crate::inline::op_value_refs(&op.kind, Some(graph)) {
-                die_at.insert(Self::var(graph, v), i);
+            for var in crate::inline::op_variable_refs(&op.kind, graph).into_iter().flatten() {
+                die_at.insert(var, i);
             }
             if let Some(result) = op.result {
                 die_at.insert(Self::var(graph, result), i + 1);
