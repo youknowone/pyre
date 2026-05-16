@@ -138,6 +138,145 @@ pub(crate) fn pop_all_regs_from_jitframe_raw(
     }
 }
 
+/// `assembler.py:231 _build_malloc_slowpath(kind='fixed')` — process-
+/// scoped shared trampoline materialised lazily on first use.  PyPy
+/// builds the four kinds (fixed/var/str/unicode) at `setup_once`; pyre
+/// starts with the fixed-size kind which is the only `dynasm_nursery_slowpath`
+/// caller in the x86 emit path.
+///
+/// **Calling convention (matches PyPy line 233-236):**
+/// - Entry: `rbp` = jitframe, `rcx` = old `nursery_head`,
+///   `rdx` = `nursery_head + total_size` (set by the per-call-site
+///   fast path's `lea rdx, [rcx + total_size]`).  `total_size`
+///   recovered at runtime via `sub rdx, rcx`.  The caller has already
+///   pushed the gcmap to `[rbp + JF_GCMAP_OFS]`.
+/// - Exit: `rax` = payload pointer; `rbp` reloaded from shadow stack
+///   top in case a minor GC fired and moved the frame; all other
+///   GPR/XMM state restored from the jitframe save area.
+///
+/// `rax` and `rdx` are excluded from push_all_regs / pop_all_regs:
+/// `rax` carries the return value, `rdx` is the runtime size carrier
+/// and the caller does not read it after the slowpath returns.
+static MALLOC_SLOWPATH_FIXED: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+
+pub(crate) fn malloc_slowpath_fixed_addr() -> usize {
+    *MALLOC_SLOWPATH_FIXED.get_or_init(build_malloc_slowpath_fixed)
+}
+
+fn build_malloc_slowpath_fixed() -> usize {
+    let mut asm = Assembler::new().expect("malloc_slowpath: new Assembler");
+    let ignored = [crate::regloc::EAX, crate::regloc::EDX];
+
+    // assembler.py:264 `SUB_rr(edx, ecx)` — recover total_size at runtime.
+    dynasm!(asm ; .arch x64 ; sub rdx, rcx);
+
+    // assembler.py:247 `_push_all_regs_to_frame(mc, [ecx, edx], floats)`.
+    // Pyre's slow-path entry has already let the caller spill nothing
+    // through ECX (live only on the fast path's nursery_head load);
+    // EDX still holds the total_size we just computed.  Save all the
+    // rest so the slow-path call's caller-clobber set is contained.
+    push_all_regs_to_jitframe_raw(&mut asm, &ignored, true);
+
+    // assembler.py:258-261 — reserve Win64 shadow space (if any).  The
+    // caller's `call rax` arrives with rsp at 0-mod-16: pyre's JIT
+    // prologue leaves rsp at 8-mod-16, and the `call` push of the
+    // return address subtracts another 8 (→ 0-mod-16).  No extra
+    // alignment SUB is needed before the inner CALL on either ABI;
+    // Win64 still needs the 32-byte shadow space.
+    #[cfg(target_os = "windows")]
+    let align: i32 = 32;
+    #[cfg(not(target_os = "windows"))]
+    let align: i32 = 0;
+
+    // assembler.py:270 `MOV_rr(ARG0, edx)` — size argument.
+    #[cfg(target_os = "windows")]
+    let arg0_reg: u8 = 1; // rcx
+    #[cfg(not(target_os = "windows"))]
+    let arg0_reg: u8 = 7; // rdi
+
+    let slowpath_fn = crate::runner::dynasm_nursery_slowpath as *const () as i64;
+    if align != 0 {
+        dynasm!(asm ; .arch x64 ; sub rsp, align);
+    }
+    dynasm!(asm ; .arch x64
+        ; mov Rq(arg0_reg), rdx
+        ; mov rax, QWORD slowpath_fn
+        ; call rax
+    );
+    if align != 0 {
+        dynasm!(asm ; .arch x64 ; add rsp, align);
+    }
+
+    // assembler.py:296 `_reload_frame_if_necessary(mc)` — rebind rbp
+    // from the shadow stack in case a minor GC moved the jitframe.
+    let rst_addr = majit_gc::shadow_stack::get_root_stack_top_addr() as i64;
+    dynasm!(asm ; .arch x64
+        ; mov rcx, QWORD rst_addr
+        ; mov rcx, [rcx]
+        ; mov rbp, [rcx - 8]
+    );
+
+    // assembler.py:_reload_frame_if_necessary line 1376 (Win64 + Linux
+    // share): non-array write barrier on the reloaded jf so subsequent
+    // Ref writes into frame slots are tracked by minor GC.  The barrier
+    // body is conditional on the GC exposing a write-barrier descr.
+    let wb_descr = crate::runner::DYNASM_ACTIVE_GC.with(|cell| {
+        cell.borrow()
+            .as_ref()
+            .and_then(|gc| gc.get_write_barrier_descr())
+    });
+    if let Some(wb) = wb_descr {
+        let byteofs = wb.jit_wb_if_flag_byteofs;
+        let mask = wb.jit_wb_if_flag_singlebyte as i8;
+        let skip_wb = asm.new_dynamic_label();
+        dynasm!(asm ; .arch x64
+            ; test BYTE [rbp + byteofs], mask
+            ; jz =>skip_wb
+        );
+        // Inline WB helper call: rbp -> ARG0, save/restore rax across.
+        // Stack accounting at this point: helper entry rsp was
+        // 0-mod-16 (the caller's pre-CALL rsp was the JIT
+        // prologue-aligned 8-mod-16 and the CALL push of the return
+        // address subtracted another 8).  Push rax → 8-mod-16; for
+        // the inner CALL we need rsp 0-mod-16, so SUB rsp, 8 (Linux)
+        // or SUB rsp, 40 (Win64: 8 align + 32 shadow).
+        let wb_fn = crate::runner::dynasm_write_barrier as *const () as i64;
+        #[cfg(target_os = "windows")]
+        dynasm!(asm ; .arch x64
+            ; push rax
+            ; sub rsp, 40           // 8 align (push rax broke alignment) + 32 shadow
+            ; mov rcx, rbp
+            ; mov rax, QWORD wb_fn
+            ; call rax
+            ; add rsp, 40
+            ; pop rax
+        );
+        #[cfg(not(target_os = "windows"))]
+        dynasm!(asm ; .arch x64
+            ; push rax
+            ; sub rsp, 8            // alignment after push rax
+            ; mov rdi, rbp
+            ; mov rax, QWORD wb_fn
+            ; call rax
+            ; add rsp, 8
+            ; pop rax
+        );
+        dynasm!(asm ; .arch x64 ; =>skip_wb);
+    }
+
+    // assembler.py:307 `_pop_all_regs_from_frame(mc, [ecx, edx], floats)`.
+    pop_all_regs_from_jitframe_raw(&mut asm, &ignored, true);
+    dynasm!(asm ; .arch x64 ; ret);
+
+    let buffer = asm.finalize().expect("malloc_slowpath: finalize");
+    let ptr = crate::codebuf::buffer_ptr(&buffer) as usize;
+    // The helper code must stay mapped for the lifetime of the process.
+    // PyPy uses the shared `asmmemmgr` for the same role; pyre leaks the
+    // ExecutableBuffer so the underlying VirtualAlloc page is retained.
+    std::mem::forget(buffer);
+    ptr
+}
+
 /// Pointer-identity key for `target_tokens_currently_compiling`. PyPy
 /// x86/assembler.py:93 keys it by the descr Python object itself; we use
 /// the underlying allocation address of the `Arc<dyn Descr>` so two
@@ -6975,52 +7114,25 @@ impl<'a> Assembler386<'a> {
         );
         dynasm!(self.mc ; .arch x64 ; jmp =>done);
 
-        // Slow path: x86/assembler.py:2553 push_gcmap + call.
-        // Bracket the slow-path call with `push_all_regs_to_jitframe` /
-        // `pop_all_regs_from_jitframe` so caller-save XMMs (notably the
-        // float accumulator the regalloc may have left in xmm3 across
-        // a NewWithVtable site — spectral_norm's `s = s + v[j]/div`)
-        // survive any Rust slowpath that touches SIMD scratch.  The
-        // `CallMallocNurseryVarsizeFrame` variant already does this;
-        // omitting it from the fixed-size path let the Rust nursery
-        // slowpath clobber xmm3 on traces that allocated a W_FloatObject
-        // every iteration, freezing the float accumulator on the
-        // pre-slowpath single-iteration value.
-        let ignored_regs: Vec<crate::regloc::RegLoc> =
-            if let Some(Loc::Reg(r)) = result_loc { vec![*r] } else { vec![] };
+        // Slow path: helper extraction (PyPy assembler.py:295 `mc.CALL`).
         dynasm!(self.mc ; .arch x64 ; =>slow_path);
-        self.push_all_regs_to_jitframe(&ignored_regs, true);
         let gcmap_ofs = crate::jitframe::JF_GCMAP_OFS;
-        // Push gcmap captured at regalloc time (via RegAllocOp::Perform.gcmap)
-        // so the collector can trace live frame-resident Refs through the
-        // slow-path call. Fall back to NULL when not provided (degenerate).
         if let Some(gcmap) = self.pending_malloc_nursery_gcmap {
             self.push_gcmap(gcmap as *mut usize);
         } else {
             dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
         }
-        let slowpath_fn = crate::runner::dynasm_nursery_slowpath as *const () as i64;
-        self.emit_abi_int_arg_from_imm(0, total_size);
-        dynasm!(self.mc ; .arch x64 ; mov rax, QWORD slowpath_fn);
-        self.emit_abi_call_rax();
-        // x86/assembler.py:_build_malloc_slowpath order:
-        //   _reload_frame_if_necessary(mc) → _pop_all_regs_from_jitframe(...) → pop_gcmap(mc)
-        // A minor GC inside the slowpath may have moved the jitframe;
-        // reload rbp from the shadow stack first so every subsequent
-        // frame-relative store (pop_all_regs, pop_gcmap) lands on the
-        // new frame. Clearing JF_GCMAP_OFS before the reload would
-        // write into the stale (moved-from) frame.
-        self.reload_frame_if_necessary();
-        // Move slowpath return into result_loc before pop_all_regs so
-        // the pop doesn't overwrite the freshly-allocated payload ptr.
+        let helper_addr = malloc_slowpath_fixed_addr() as i64;
+        dynasm!(self.mc ; .arch x64
+            ; mov rax, QWORD helper_addr
+            ; call rax
+        );
         if let Some(Loc::Reg(r)) = result_loc {
             if r.value != 0 {
                 let rv = r.value;
                 dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
             }
         }
-        self.pop_all_regs_from_jitframe(&ignored_regs, true);
-        // pop_gcmap on the (post-reload) frame.
         dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
 
         dynasm!(self.mc ; .arch x64 ; =>done);
