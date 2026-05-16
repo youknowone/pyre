@@ -1301,7 +1301,9 @@ impl Optimization for OptPure {
                 .collect::<Vec<_>>();
             let mut imported_op = Op::new(entry.opcode, &imported_args);
             imported_op.pos.set(entry.result);
-            imported_op.descr = entry.descr.clone();
+            if let Some(d) = entry.descr.clone() {
+                imported_op.setdescr(d);
+            }
             self.short_preamble_pure_ops.push(imported_op);
             let resolved_args: Vec<OpRef> = entry
                 .args

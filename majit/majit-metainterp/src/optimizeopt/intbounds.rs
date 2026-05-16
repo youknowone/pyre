@@ -1797,7 +1797,9 @@ impl OptIntBounds {
         if b0.add_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_ADD) + send_extra_operation
             let mut new_op = Op::new(OpCode::IntAdd, &op.args);
-            new_op.descr = op.getdescr();
+            if let Some(d) = op.getdescr() {
+                new_op.setdescr(d);
+            }
             new_op.pos.set(op.pos.get());
             OptimizationResult::Emit(new_op)
         } else {
@@ -1832,7 +1834,9 @@ impl OptIntBounds {
         if b0.sub_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_SUB) + send_extra_operation
             let mut new_op = Op::new(OpCode::IntSub, &op.args);
-            new_op.descr = op.getdescr();
+            if let Some(d) = op.getdescr() {
+                new_op.setdescr(d);
+            }
             new_op.pos.set(op.pos.get());
             OptimizationResult::Emit(new_op)
         } else {
@@ -1854,7 +1858,9 @@ impl OptIntBounds {
         if b0.mul_bound_cannot_overflow(&b1) {
             // replace_op_with(op, INT_MUL) + send_extra_operation
             let mut new_op = Op::new(OpCode::IntMul, &op.args);
-            new_op.descr = op.getdescr();
+            if let Some(d) = op.getdescr() {
+                new_op.setdescr(d);
+            }
             new_op.pos.set(op.pos.get());
             OptimizationResult::Emit(new_op)
         } else {

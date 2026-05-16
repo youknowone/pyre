@@ -4288,8 +4288,12 @@ fn assemble_peeled_trace_with_jump_args(
     // shadows a real Box-bearing op at the same raw position, and
     // variant-aware Hash matches when downstream consumers compare
     // label_op.pos against Op-keyed maps.
-    label_op.pos.set(OpRef::op_typed(label_pos, label_op.result_type()));
-    label_op.descr = loop_label_descr;
+    label_op
+        .pos
+        .set(OpRef::op_typed(label_pos, label_op.result_type()));
+    if let Some(d) = loop_label_descr {
+        label_op.setdescr(d);
+    }
     result.extend(fallthrough_aliases);
     result.push(label_op);
 

@@ -27,7 +27,9 @@ impl OptSimplify {
     fn rewrite_call(op: &Op) -> Op {
         let new_opcode = OpCode::call_for_type(op.result_type());
         let mut new_op = Op::new(new_opcode, &op.args);
-        new_op.descr = op.getdescr();
+        if let Some(d) = op.getdescr() {
+            new_op.setdescr(d);
+        }
         new_op.pos.set(op.pos.get());
         new_op
     }

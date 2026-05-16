@@ -2700,7 +2700,9 @@ impl Optimization for OptRewrite {
                     if c != 0 {
                         let mut call_op = Op::new(OpCode::CallN, &op.args[1..]);
                         call_op.pos.set(op.pos.get());
-                        call_op.descr = op.getdescr();
+                        if let Some(d) = op.getdescr() {
+                            call_op.setdescr(d);
+                        }
                         ctx.last_op_removed = false;
                         return OptimizationResult::Replace(call_op);
                     }
@@ -2727,7 +2729,9 @@ impl Optimization for OptRewrite {
                     };
                     let mut call_op = Op::new(call_opcode, &op.args[1..]);
                     call_op.pos.set(op.pos.get());
-                    call_op.descr = op.getdescr();
+                    if let Some(d) = op.getdescr() {
+                        call_op.setdescr(d);
+                    }
                     ctx.last_op_removed = false;
                     return OptimizationResult::Replace(call_op);
                 }
@@ -2930,13 +2934,17 @@ impl Optimization for OptRewrite {
                     let call_opcode = OpCode::call_for_type(op.result_type());
                     let mut producer = Op::new(call_opcode, &op.args);
                     producer.pos.set(op.pos.get());
-                    producer.descr = op.getdescr();
+                    if let Some(d) = op.getdescr() {
+                        producer.setdescr(d);
+                    }
                     self.loop_invariant_producer.insert(func_val, producer);
                 }
                 let call_opcode = OpCode::call_for_type(op.result_type());
                 let mut new_op = Op::new(call_opcode, &op.args);
                 new_op.pos.set(op.pos.get());
-                new_op.descr = op.getdescr();
+                if let Some(d) = op.getdescr() {
+                    new_op.setdescr(d);
+                }
                 ctx.last_op_removed = false;
                 OptimizationResult::Emit(new_op)
             }

@@ -479,7 +479,9 @@ impl ImportedShortPureOp {
         //     pre-allocated body-visible OpRef (`result`) so it has its
         //     own slot.
         replay.pos.set(if invented_name { result } else { source });
-        replay.descr = descr.clone();
+        if let Some(d) = descr.clone() {
+            replay.setdescr(d);
+        }
         // shortpreamble.py:116-120: pop.op = self.orig_op.copy_and_change(...)
         // for invented (the alt identifier) or self.res for non-invented.
         // pyre's `source` IS the alt identifier for invented (the synthetic
@@ -2482,7 +2484,9 @@ impl OptContext {
                         &resolved_args,
                     );
                     op.pos.set(replay_pos(*source, produced_op));
-                    op.descr = produced_op.preamble_op.getdescr();
+                    if let Some(d) = produced_op.preamble_op.getdescr() {
+                        op.setdescr(d);
+                    }
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
                         preamble_op: op,

@@ -1748,7 +1748,9 @@ impl PtrInfo {
                         let subbox = force_child(value_ref, ctx);
                         let mut set_op =
                             Op::new(OpCode::SetinteriorfieldGc, &[alloc_ref, idx_ref, subbox]);
-                        set_op.descr = fielddescrs.get(field_idx as usize).cloned();
+                        if let Some(d) = fielddescrs.get(field_idx as usize).cloned() {
+                            set_op.setdescr(d);
+                        }
                         emit_op(ctx, set_op);
                     }
                 }
@@ -1767,7 +1769,9 @@ impl PtrInfo {
                 let size_ref = ctx.emit_constant_int(size as i64);
                 let mut call_op = Op::new(OpCode::CallI, &[func_ref, size_ref]);
                 call_op.pos.set(opref);
-                call_op.descr = calldescr;
+                if let Some(d) = calldescr {
+                    call_op.setdescr(d);
+                }
                 let alloc_ref = emit_op(ctx, call_op);
 
                 // info.py:152 unconditional set_forwarded.

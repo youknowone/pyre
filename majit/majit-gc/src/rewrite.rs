@@ -2628,7 +2628,9 @@ impl GcRewriterImpl {
             vec![frame]
         };
         let mut call_asm = Op::new(op.opcode, &new_args);
-        call_asm.descr = op.getdescr();
+        if let Some(d) = op.getdescr() {
+            call_asm.setdescr(d);
+        }
         call_asm.fail_args = op
             .fail_args
             .as_ref()
