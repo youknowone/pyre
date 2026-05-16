@@ -1918,6 +1918,47 @@ fn binop_ref_to_int_record(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// `ptr_nonzero/r>i` handler (operand layout `r>i`: 1B r-src + 1B i-dst).
+///
+/// RPython parity:
+/// `pyjitpl.py:378-380 opimpl_ptr_nonzero(box)`:
+/// ```python
+/// @arguments("box")
+/// def opimpl_ptr_nonzero(self, box):
+///     return self.execute(rop.PTR_NE, box, CONST_NULL)
+/// ```
+///
+/// Walker reads one `r` reg, records `OpCode::PtrNe` with
+/// `[box, CONST_NULL]` (via `trace_ctx.const_null()` —
+/// `history.py:361 CONST_NULL = ConstPtr(ConstPtr.value)`), and writes
+/// the recorder result into `registers_i[dst]`.  RPython does the
+/// same `b1 is b2` short-circuit at `pyjitpl.py:328-332` for
+/// `opimpl_ptr_eq` but `ptr_nonzero` against `CONST_NULL` cannot
+/// short-circuit because `box` is never the literal `CONST_NULL`
+/// constant (codewriter would have folded that).
+fn ptr_nonzero_record(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let box_ = read_ref_reg(code, op, 0, ctx)?;
+    let null_const = ctx.trace_ctx.const_null();
+    let result = ctx.trace_ctx.record_op(OpCode::PtrNe, &[box_, null_const]);
+    let dst = code[op.pc + 2] as usize;
+    let len = ctx.registers_i.len();
+    let slot = ctx
+        .registers_i
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc: op.pc,
+            reg: dst,
+            len,
+            bank: "i",
+        })?;
+    *slot = result;
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
 /// Generic float-pair-to-int handler for `float_<cmp>/ff>i` (operand
 /// layout `ff>i`: 1B f-src + 1B f-src + 1B i-dst).  RPython parity:
 /// `bhimpl_float_{lt,le,eq,ne,gt,ge}` (`blackhole.py:721-746`) — read
@@ -4146,6 +4187,7 @@ fn handle(
         }
         "ptr_eq/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrEq),
         "ptr_ne/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrNe),
+        "ptr_nonzero/r>i" => ptr_nonzero_record(code, op, ctx),
         // Heapcache-aware getfield reads. RPython
         // `pyjitpl.py:855-882 opimpl_getfield_gc_<i|r|f>` →
         // `_opimpl_getfield_gc_any_pureornot` (`pyjitpl.py:929-950`)
@@ -7991,17 +8033,18 @@ mod tests {
     fn unsupported_opname_surfaces_typed_error() {
         // Stable choice for exercising the catch-all `UnsupportedOpname`
         // error path while handler coverage continues to grow.  The
-        // `ptr_nonzero/r>i` opname is the next-in-line simple unary
-        // op the walker should gain a handler for (RPython
-        // `pyjitpl.py:378 opimpl_ptr_nonzero` + `blackhole.py:594
-        // bhimpl_ptr_nonzero`).  Until that lands, dispatching it
-        // surfaces `UnsupportedOpname` from the catch-all arm.
-        let opname = "ptr_nonzero/r>i";
+        // `abort/>r` opname is a pyre-only marker emitted by the
+        // rtyper's Abort→GcRef fallback
+        // (`majit-translate/src/translator/rtyper.rs::infer_concrete_from_op`).
+        // It has no PyPy analog — until walker design decides what to
+        // write to dst on an aborted callee, dispatching it surfaces
+        // `UnsupportedOpname` from the catch-all arm.
+        let opname = "abort/>r";
         let unsupported_byte = *insns_opname_to_byte()
             .get(opname)
             .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
-        // Operand encoding `r>i`: 1B r-reg + 1B i-reg-dst = 2B
-        let code = [unsupported_byte, 0, 0];
+        // Operand encoding `>r`: 0 input operands + 1B r-reg-dst = 1B
+        let code = [unsupported_byte, 0];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
@@ -8024,6 +8067,73 @@ mod tests {
         let err =
             step(&code, 0, &mut wc).expect_err("unsupported opname must hit UnsupportedOpname");
         assert_eq!(err, DispatchError::UnsupportedOpname { pc: 0, key: opname },);
+    }
+
+    /// `ptr_nonzero/r>i` records `PtrNe(box, CONST_NULL)` into the
+    /// int dst.  RPython parity: `pyjitpl.py:378-380 opimpl_ptr_nonzero`
+    /// returns `self.execute(rop.PTR_NE, box, CONST_NULL)`.
+    #[test]
+    fn ptr_nonzero_records_ptrne_with_box_and_null() {
+        let opname = "ptr_nonzero/r>i";
+        let byte = *insns_opname_to_byte()
+            .get(opname)
+            .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
+        // Operand encoding `r>i`: 1B r-reg + 1B i-reg-dst = 2B
+        let code = [byte, 0, 0];
+        let mut tc = fresh_trace_ctx();
+        let descr = done_descr_ref_for_tests();
+        // Seed `registers_r[0]` with a placeholder OpRef so the
+        // handler has something to read.
+        let box_opref = tc.const_ref(0xdeadbeef);
+        let mut regs_r = [box_opref];
+        let mut regs_i = [OpRef::None];
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ptr_nonzero must record PtrNe");
+        assert!(matches!(outcome, DispatchOutcome::Continue));
+        assert_eq!(next_pc, 3);
+        // `get_or_insert_typed` mints a fresh OpRef on every call (see
+        // `constant_pool.rs:87` — equality is `Const.same_constant`, not
+        // OpRef identity), so we cannot compare against a freshly-minted
+        // null_const.  Verify args[1] is a Ref-typed constant whose
+        // pooled value is 0 instead.
+        let last_args0;
+        let last_args1;
+        let last_opcode;
+        let last_args_len;
+        {
+            let ops = wc.trace_ctx.ops();
+            let last = ops.last().expect("ptr_nonzero must record one op");
+            last_opcode = last.opcode;
+            last_args_len = last.args.len();
+            last_args0 = last.args[0];
+            last_args1 = last.args[1];
+        }
+        assert_eq!(last_opcode, majit_ir::OpCode::PtrNe);
+        assert_eq!(last_args_len, 2);
+        assert_eq!(last_args0, box_opref);
+        assert_eq!(
+            wc.trace_ctx.const_value(last_args1),
+            Some(0),
+            "args[1] must point at the CONST_NULL pool entry (value=0)"
+        );
+        assert_eq!(wc.trace_ctx.const_type(last_args1), Some(Type::Ref));
+        assert_ne!(wc.registers_i[0], OpRef::None);
     }
 
     #[test]
