@@ -87,7 +87,10 @@ pub fn wire_clt_loop_token_wref(token: &Arc<JitCellToken>) {
 /// Box.type values available at the guard's numbering point, not later
 /// operations in the same trace. `value_types` is the incremental
 /// guard-point map maintained by `build_guard_metadata`.
-fn fail_arg_type(opref: &OpRef, value_types: &HashMap<u32, Type>) -> Type {
+fn fail_arg_type(
+    opref: &OpRef,
+    value_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, Type>,
+) -> Type {
     if *opref == OpRef::NONE {
         return Type::Ref;
     }
@@ -402,10 +405,12 @@ pub(crate) fn build_guard_metadata(
     // Mirror main's incremental walk: maintain `value_types` seeded
     // from inputargs + constants, then insert each op's result type
     // before consulting it.
-    let mut value_types: HashMap<u32, Type> =
+    let mut value_types: crate::optimizeopt::vec_assoc::VecAssoc<u32, Type> =
         inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
     for (&idx, &tp) in constant_types {
-        value_types.entry(idx).or_insert(tp);
+        if !value_types.contains_key(&idx) {
+            value_types.insert(idx, tp);
+        }
     }
 
     for (op_idx, op) in ops.iter().enumerate() {
