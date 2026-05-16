@@ -4300,9 +4300,19 @@ fn materialize_bridge_virtual(
         } => {
             let len_ref = ctx.const_int(*size as i64);
             // resume.py:749: array = decoder.allocate_array(self.size, self.arraydescr, clear=True)
+            //
+            // When `arraydescr` is missing from the resume payload (older
+            // serialization, test scaffolds), synthesize one keyed by
+            // shape (`base_size`, `item_size`, `size`) so distinct array
+            // shapes get distinct descriptor identities.  The previous
+            // `arraydescr.as_ref().map_or(0, ...)` always evaluated `0`
+            // inside the `None` branch and aliased every fallback descr
+            // to a single registry slot.
             let array_descr = arraydescr.clone().unwrap_or_else(|| {
-                let idx = arraydescr.as_ref().map_or(0, |d| d.index());
-                crate::descr::make_struct_array_descr(idx, *base_size, *item_size)
+                let shape_idx = (*base_size as u32).wrapping_mul(0x0001_0001)
+                    ^ (*item_size as u32).wrapping_mul(0x0100_0001)
+                    ^ (*size as u32);
+                crate::descr::make_struct_array_descr(shape_idx, *base_size, *item_size)
             });
             let new_op =
                 ctx.record_op_with_descr(OpCode::NewArrayClear, &[len_ref], array_descr.clone());
