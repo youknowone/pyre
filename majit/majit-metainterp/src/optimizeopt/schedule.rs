@@ -3,8 +3,6 @@
 //! Mirrors RPython's `schedule.py` and `costmodel.py`: pack groups,
 //! pack sets, accumulation tracking, guard analysis, and cost models.
 
-use std::collections::HashMap;
-
 use majit_ir::{Op, OpCode, OpRef, Type};
 
 use crate::optimizeopt::dependency::DependencyGraph;

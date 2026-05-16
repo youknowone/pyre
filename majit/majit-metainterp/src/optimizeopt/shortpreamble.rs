@@ -31,7 +31,7 @@
 /// processes the preamble and finds guards/operations that establish facts
 /// the body depends on, it records them. At the Label, the builder finalizes
 /// into a `ShortPreamble` that is stored alongside the compiled loop.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use majit_ir::{Op, OpCode, OpRef};
 

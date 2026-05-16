@@ -10,8 +10,6 @@
 /// - Cache invalidation on calls and side-effecting operations
 /// - Lazy set emission: SETFIELD_GC is delayed until a guard or side-effecting op forces it
 /// - GUARD_NOT_INVALIDATED deduplication
-use std::collections::HashMap;
-
 #[inline(always)]
 fn vb_set(v: &mut Vec<bool>, i: u32) {
     let i = i as usize;

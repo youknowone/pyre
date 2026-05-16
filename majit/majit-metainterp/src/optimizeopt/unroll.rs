@@ -17,7 +17,6 @@
 ///
 /// OpRefs in the peeled iteration are remapped to new positions so they
 /// don't collide with the original ops.
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use majit_ir::{DescrRef, Op, OpCode, OpRef, Type, Value};
@@ -4915,7 +4914,6 @@ mod tests {
     use super::*;
     use crate::optimizeopt::optimizer::Optimizer;
     use majit_ir::GcRef;
-    use std::collections::HashMap;
 
     /// Assign sequential positions to ops starting from `base`.
     fn assign_positions(ops: &mut [Op], base: u32) {

@@ -35,7 +35,7 @@
 /// Consecutive guards on different values are kept but, when both lack a
 /// descriptor, the second inherits the first's descriptor so the backend
 /// can share resume data.
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use majit_ir::{DescrRef, Op, OpCode, OpRef};
 

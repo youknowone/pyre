@@ -4,7 +4,7 @@
 //! between operations in a loop body. Used by the vector optimizer to
 //! identify independent operations that can be packed into SIMD instructions.
 
-use std::collections::{BinaryHeap, HashMap, HashSet};
+use std::collections::{BinaryHeap, HashSet};
 
 use crate::optimizeopt::schedule::Pack;
 use majit_ir::{Op, OpCode, OpRef};

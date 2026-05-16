@@ -30,7 +30,7 @@
 /// - Only operates on loop bodies (Label..Jump)
 /// - Requires array load/store patterns for memory access vectorization
 /// - Guards in the loop body prevent full vectorization (conservative)
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 
 use majit_ir::{Op, OpCode, OpRef};
 
@@ -129,7 +129,8 @@ impl VectorLoop {
 
         for u in 0..count {
             let offset = base_offset + (u as u32) * (original_body.len() as u32);
-            let mut remap = std::collections::HashMap::new();
+            let mut remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+                crate::optimizeopt::vec_assoc::VecAssoc::new();
 
             // Map label args → jump args (or remapped jump args)
             for (i, la) in label_args.iter().enumerate() {
