@@ -87,7 +87,7 @@ impl Guard {
         index: usize,
         guard_op: Op,
         cmp_op: Op,
-        index_vars: &HashMap<OpRef, IndexVar>,
+        index_vars: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
     ) -> Self {
         let lhs_arg = cmp_op.arg(0);
         let lhs = index_vars
@@ -117,7 +117,7 @@ impl Guard {
         index: usize,
         guard_op: &Op,
         cmp_op: &Op,
-        index_vars: &HashMap<OpRef, IndexVar>,
+        index_vars: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
     ) -> Option<Self> {
         if !guard_op.opcode.is_guard() {
             return None;
@@ -203,9 +203,9 @@ impl Guard {
         var: &IndexVar,
         old_arg: OpRef,
         new_ops: &mut Vec<Op>,
-        renamer: &mut HashMap<OpRef, OpRef>,
+        renamer: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut HashMap<OpRef, i64>,
+        const_values: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
     ) -> OpRef {
         if var.is_identity() {
             return var.var;
@@ -242,9 +242,9 @@ impl Guard {
         other: &Guard,
         label_args: &[OpRef],
         new_ops: &mut Vec<Op>,
-        renamer: &mut HashMap<OpRef, OpRef>,
+        renamer: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut HashMap<OpRef, i64>,
+        const_values: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
     ) -> Option<Op> {
         if self.op.opcode != other.op.opcode {
             return None;
@@ -364,9 +364,9 @@ impl Guard {
     pub fn emit_operations(
         &mut self,
         new_ops: &mut Vec<Op>,
-        renamer: &mut HashMap<OpRef, OpRef>,
+        renamer: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         next_const_pos: &mut u32,
-        const_values: &mut HashMap<OpRef, i64>,
+        const_values: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
     ) {
         // guard.py:136-137: lhs/rhs via emit_varops
         let lhs = Self::emit_varops(
@@ -423,36 +423,36 @@ impl Guard {
 /// proper descr/fail_args, and optionally eliminates array bound checks.
 pub struct GuardStrengthenOpt {
     /// guard.py:168
-    pub index_vars: HashMap<OpRef, IndexVar>,
+    pub index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
     /// guard.py:169
     _newoperations: Vec<Op>,
     /// guard.py:170
     pub strength_reduced: usize,
     /// guard.py:171
-    pub strongest_guards: HashMap<OpRef, Vec<Guard>>,
+    pub strongest_guards: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<Guard>>,
     /// guard.py:172
-    guards: HashMap<usize, Option<Guard>>,
+    guards: crate::optimizeopt::vec_assoc::VecAssoc<usize, Option<Guard>>,
     /// renamer.py: Renamer — maps old OpRef → new OpRef for renamed vars.
-    renamer: HashMap<OpRef, OpRef>,
+    renamer: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
     /// Zero-based counter for constant-namespace OpRef allocation.
     next_const_pos: u32,
     /// Materialized constant values: OpRef → i64.
     /// RPython uses ConstInt boxes inline; majit stores const values here.
-    pub const_values: HashMap<OpRef, i64>,
+    pub const_values: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
 }
 
 impl GuardStrengthenOpt {
     /// guard.py:167
-    pub fn new(index_vars: HashMap<OpRef, IndexVar>) -> Self {
+    pub fn new(index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>) -> Self {
         GuardStrengthenOpt {
             index_vars,
             _newoperations: Vec::new(),
             strength_reduced: 0,
-            strongest_guards: HashMap::new(),
-            guards: HashMap::new(),
-            renamer: HashMap::new(),
+            strongest_guards: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            guards: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            renamer: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             next_const_pos: 0,
-            const_values: HashMap::new(),
+            const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         }
     }
 
@@ -484,7 +484,7 @@ impl GuardStrengthenOpt {
         if key.is_none() {
             return;
         }
-        let others = self.strongest_guards.entry(key).or_default();
+        let others = self.strongest_guards.entry_or_insert_with(key, Vec::new);
         if !others.is_empty() {
             let mut replaced = false;
             for i in 0..others.len() {
@@ -514,7 +514,7 @@ impl GuardStrengthenOpt {
     /// guard.py:221-249: eliminate_guards(loop)
     pub fn eliminate_guards(&mut self, ops: &[Op]) -> Vec<Op> {
         // guard.py:222: self.renamer = Renamer()
-        self.renamer = HashMap::new();
+        self.renamer = crate::optimizeopt::vec_assoc::VecAssoc::new();
         self._newoperations = Vec::with_capacity(ops.len());
 
         // Take guards out of self to satisfy borrow checker.
@@ -591,7 +591,7 @@ impl GuardStrengthenOpt {
         info: &mut super::version::LoopVersionInfo,
         label_args: &[OpRef],
         user_code: bool,
-    ) -> (Vec<Op>, HashMap<OpRef, i64>) {
+    ) -> (Vec<Op>, crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>) {
         self.collect_guard_information(ops);
         let mut result = self.eliminate_guards(ops);
 
@@ -685,7 +685,7 @@ impl GuardStrengthenOpt {
 
         // guard.py:283-299
         let mut opt_ops: Vec<Option<Op>> = ops.drain(..).map(Some).collect();
-        let guards_snapshot: HashMap<OpRef, Vec<Guard>> = self.strongest_guards.clone();
+        let guards_snapshot: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<Guard>> = self.strongest_guards.clone();
         for guards in guards_snapshot.values() {
             if guards.len() <= 1 {
                 continue;
@@ -754,7 +754,7 @@ impl GuardStrengthenOpt {
 
 impl Default for GuardStrengthenOpt {
     fn default() -> Self {
-        Self::new(HashMap::new())
+        Self::new(crate::optimizeopt::vec_assoc::VecAssoc::new())
     }
 }
 
@@ -767,10 +767,10 @@ pub struct OptGuard {
     truthy_values: HashSet<OpRef>,
 
     /// guard.py: values with known class (from GuardClass/GuardNonnullClass).
-    known_classes: std::collections::HashMap<OpRef, majit_ir::GcRef>,
+    known_classes: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::GcRef>,
 
     /// guard.py: values known to be specific constants (from GuardValue).
-    known_constants: std::collections::HashMap<OpRef, i64>,
+    known_constants: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, i64>,
 
     /// Descriptor of the last emitted guard, used for consecutive-guard
     /// fusion.
@@ -782,8 +782,8 @@ impl OptGuard {
         OptGuard {
             seen: HashSet::new(),
             truthy_values: HashSet::new(),
-            known_classes: std::collections::HashMap::new(),
-            known_constants: std::collections::HashMap::new(),
+            known_classes: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            known_constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             last_guard_descr: None,
         }
     }
