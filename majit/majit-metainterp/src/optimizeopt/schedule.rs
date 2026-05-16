@@ -602,14 +602,15 @@ impl GuardAnalysis {
 /// Maps opcodes to their estimated cost in abstract units.
 pub struct GenericCostModel {
     /// Per-opcode cost overrides: opcode → cost.
-    per_opcode_cost: std::collections::HashMap<OpCode, i32>,
+    per_opcode_cost: crate::optimizeopt::vec_assoc::VecAssoc<OpCode, i32>,
     /// Default cost for opcodes not in the override map.
     default_cost: i32,
 }
 
 impl GenericCostModel {
     pub fn new() -> Self {
-        let mut costs = std::collections::HashMap::new();
+        let mut costs: crate::optimizeopt::vec_assoc::VecAssoc<OpCode, i32> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         // costmodel.py: memory ops are more expensive than ALU ops
         costs.insert(OpCode::GetarrayitemGcI, 3);
         costs.insert(OpCode::GetarrayitemGcR, 3);
@@ -751,7 +752,7 @@ impl Default for CostModel {
 /// pack/unpack/expand operations, and manages the output op list.
 pub struct VecScheduleState {
     /// Map from scalar OpRef → (index_in_vector, vector OpRef).
-    pub box_to_vbox: HashMap<OpRef, (usize, OpRef)>,
+    pub box_to_vbox: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, (usize, OpRef)>,
     /// Output operations (vector + remaining scalar).
     pub oplist: Vec<Op>,
     /// Renamer for SSA fixup during vectorization.
@@ -759,9 +760,9 @@ pub struct VecScheduleState {
     /// Cost model for profitability analysis.
     pub costmodel: CostModel,
     /// schedule.py:587-588: expanded_map — tracks expanded scalars.
-    pub expanded_map: HashMap<OpRef, Vec<(OpRef, i32)>>,
+    pub expanded_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<(OpRef, i32)>>,
     /// schedule.py:591: inputargs of the loop label.
-    pub inputargs: HashMap<OpRef, ()>,
+    pub inputargs: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, ()>,
     /// schedule.py:38,723: invariant_vector_vars — vector ops created by expand()
     /// for loop-invariant scalars (constants and inputargs). Populated in
     /// expand() (schedule.py:554-555), called from prepare_arguments().
@@ -769,29 +770,29 @@ pub struct VecScheduleState {
     /// schedule.py:532: invariant_oplist — ops to emit before the loop.
     pub invariant_oplist: Vec<Op>,
     /// schedule.py:595: accumulation info.
-    pub accumulation: HashMap<OpRef, AccumEntry>,
+    pub accumulation: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, AccumEntry>,
     /// Next OpRef counter for newly created vector ops.
     next_pos: u32,
     /// Type registry: OpRef → is_float for vector ops.
     /// Registered at creation time (before append_to_oplist),
     /// so is_float_vector works even before the op is in oplist.
-    vec_type_registry: HashMap<OpRef, bool>,
+    vec_type_registry: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, bool>,
 }
 
 impl VecScheduleState {
     pub fn new(start_pos: u32) -> Self {
         VecScheduleState {
-            box_to_vbox: HashMap::new(),
+            box_to_vbox: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             oplist: Vec::new(),
             renamer: super::renamer::Renamer::new(),
             costmodel: CostModel::new(),
-            expanded_map: HashMap::new(),
-            inputargs: HashMap::new(),
+            expanded_map: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            inputargs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             invariant_vector_vars: std::collections::HashSet::new(),
             invariant_oplist: Vec::new(),
-            accumulation: HashMap::new(),
+            accumulation: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             next_pos: start_pos,
-            vec_type_registry: HashMap::new(),
+            vec_type_registry: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         }
     }
 
@@ -885,8 +886,7 @@ impl VecScheduleState {
         }
         for arg in args {
             self.expanded_map
-                .entry(*arg)
-                .or_insert_with(Vec::new)
+                .entry_or_insert_with(*arg, Vec::new)
                 .push((vecop, index));
             index += 1;
         }
@@ -908,7 +908,8 @@ impl VecScheduleState {
         // schedule.py:614-632: multi-arg → intersect candidates at correct positions.
         // For each arg position i, collect vecops that expanded arg at index i.
         // A vecop is valid only if it appears at every position — intersect.
-        let mut possible: HashMap<OpRef, bool> = HashMap::new();
+        let mut possible: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, bool> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (i, arg) in args.iter().enumerate() {
             let expansions = match self.expanded_map.get(arg) {
                 Some(e) => e,
@@ -929,13 +930,15 @@ impl VecScheduleState {
             }
             // schedule.py:625: mark surviving candidates as valid
             for vecop in candidates {
-                possible.entry(vecop).or_insert(true);
+                if !possible.contains_key(&vecop) {
+                    possible.insert(vecop, true);
+                }
             }
             if possible.is_empty() {
                 return None;
             }
         }
-        possible.into_iter().find(|&(_, v)| v).map(|(k, _)| k)
+        possible.iter().find(|(_, v)| **v).map(|(k, _)| *k)
     }
 }
 
