@@ -3415,8 +3415,19 @@ impl<'a> AssemblerARM64<'a> {
         } else if let Some(d) = op.descr.clone() {
             // Guard exit — `compile.py:185` ResumeGuardDescr family.
             // Use the metainterp `AbstractFailDescr` Arc from `op.descr`
-            // directly; per-trace fail_index / trace_id were stamped above.
-            let _unused = fail_arg_types; // already stored on op.descr's types slot
+            // directly; per-trace fail_index / trace_id were stamped
+            // above.  Refresh the descr's `fail_arg_types` slot when the
+            // inferred list disagrees: `store_final_boxes_in_guard` is
+            // supposed to keep it in sync, but test scaffolds and earlier
+            // optimizer paths can leave it empty.  The GC map below
+            // (`guard_gcmap_from_faillocs(descr_fd.fail_arg_types(), ...)`)
+            // reads back through the descr, so a stale empty list would
+            // under-report `Type::Ref` slots and miss live roots.
+            if let Some(fd) = d.as_fail_descr() {
+                if fd.fail_arg_types() != fail_arg_types.as_slice() {
+                    fd.set_fail_arg_types(fail_arg_types);
+                }
+            }
             d
         } else {
             // Test scaffold: tests synthesise guard ops without op.descr.
@@ -4095,7 +4106,15 @@ impl<'a> AssemblerARM64<'a> {
             }
         }
         let descr: majit_ir::DescrRef = if let Some(d) = next_op.descr.clone() {
-            let _unused = fail_arg_types;
+            // Same staleness guard as the main guard-emission path: keep
+            // descriptor `fail_arg_types` in sync with the inferred list
+            // so downstream GC-map / rd_locs readers see the right Ref
+            // slots.
+            if let Some(fd) = d.as_fail_descr() {
+                if fd.fail_arg_types() != fail_arg_types.as_slice() {
+                    fd.set_fail_arg_types(fail_arg_types);
+                }
+            }
             d
         } else {
             let fresh = majit_backend::make_resume_guard_descr_typed(fail_arg_types);
