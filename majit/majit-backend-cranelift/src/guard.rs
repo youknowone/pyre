@@ -804,7 +804,14 @@ impl CraneliftFailDescr {
     /// `assembler.py:write_failure_recovery_description` parity
     /// recomputes equivalent bits inline at codegen time.
     pub fn gc_map(&self) -> GcMap {
-        Self::gc_map_for_types(&self.fail_arg_types, self.force_token_slots_view())
+        // Use the forwarded `fail_arg_types()` — when meta_descr carries
+        // an optimizer-stamped `ResumeGuardDescr`, its types are the
+        // canonical view that downstream GC root classification depends
+        // on (it may differ from the construction-time backend list).
+        Self::gc_map_for_types(
+            <Self as FailDescr>::fail_arg_types(self),
+            self.force_token_slots_view(),
+        )
     }
 
     pub fn is_force_token_slot(&self, slot: usize) -> bool {
@@ -1041,8 +1048,11 @@ impl FailDescr for CraneliftFailDescr {
         // force_token_slots (Session 5i-cl).  Match the inline
         // semantics of `gc_map_for_types`: slot is a GC ref iff its
         // type is Ref AND the slot is not a force-token producer.
-        match self.fail_arg_types.get(slot) {
-            Some(Type::Ref) => !self.force_token_slots_view().contains(&slot),
+        // Forward through `<Self as FailDescr>::fail_arg_types` so the
+        // meta_descr override (set by `store_final_boxes_in_guard`)
+        // drives classification.
+        match <Self as FailDescr>::fail_arg_types(self).get(slot) {
+            Some(Type::Ref) => !self.is_force_token_slot(slot),
             _ => false,
         }
     }
