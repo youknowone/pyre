@@ -4229,33 +4229,27 @@ fn handle(
             //   * sub-walk frame → propagate `SubRaise { exc }` to the
             //     caller's `inline_call_*` handler.
             //
-            // GUARD_CLASS emission (M4.Cutover Step 2.1): reads the
-            // concrete exception from `concrete_registers_r` (plumbed
-            // by Step 1), derefs `ob_header.ob_type`, and records
-            // `GuardClass(exc, cls_const)` when the heapcache hasn't
-            // yet pinned the class. Mirrors trait-side
-            // `seed_raised_exception` at `trace_opcode.rs:6617-6637`.
-            //
-            // The class-const-flag (line 1694) is set on writeback in
-            // `dispatch_via_miframe` when the walk's final last_exc is
-            // non-None.
+            // GUARD_CLASS emission deferred (was M4.Cutover Step 2.1):
+            // the previous attempt read the concrete exception from
+            // `concrete_registers_r` plumbed by Step 1, but that slice
+            // is a dispatch-entry snapshot and is never updated when
+            // a sibling handler (`last_exc_value/>r`, `int_copy/i>i`,
+            // etc.) rewrites `registers_r[dst]` later in the same
+            // frame's walk.  In exception-heavy flows the symbolic
+            // register carries the current exception OpRef while the
+            // concrete snapshot still holds an old/null value, so the
+            // guard was silently skipped and the walker's
+            // heapcache `class_now_known` state diverged from the
+            // trait-dispatch path that runs `seed_raised_exception`
+            // unconditionally (`trace_opcode.rs:6617-6637`).
+            // Re-enabling walker-side GUARD_CLASS needs a mutable
+            // concrete shadow that tracks every `registers_r[dst]`
+            // write — tracked as M4.Cutover Step 2.2.  Until then,
+            // GUARD_CLASS is emitted only on the trait path; the
+            // walker path is production-inert because
+            // `dispatch_via_miframe` is not yet the production
+            // dispatcher.
             let exc = read_ref_reg(code, op, 0, ctx)?;
-            let concrete_exc = read_ref_reg_concrete(code, op, 0, ctx);
-            if let ConcreteValue::Ref(exc_ptr) = concrete_exc {
-                if !exc_ptr.is_null() && !ctx.trace_ctx.heap_cache().is_class_known(exc) {
-                    let exc_class_ptr = unsafe {
-                        (*(exc_ptr as *const pyre_object::excobject::W_ExceptionObject))
-                            .ob_header
-                            .ob_type
-                    };
-                    let cls_const = ctx.trace_ctx.const_int(exc_class_ptr as usize as i64);
-                    ctx.trace_ctx
-                        .record_guard(OpCode::GuardClass, &[exc, cls_const], 0);
-                    ctx.trace_ctx
-                        .heap_cache_mut()
-                        .class_now_known(exc, majit_ir::GcRef(exc_class_ptr as usize));
-                }
-            }
             ctx.last_exc_value = Some(exc);
             if ctx.is_top_level {
                 ctx.trace_ctx
@@ -6049,15 +6043,19 @@ mod tests {
     }
 
     #[test]
-    fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
-        // M4.Cutover Step 2.1: with concrete_registers_r plumbed, the
-        // walker now reads `concrete_exc.ob_header.ob_type` and emits
-        // the orthodox `GuardClass(exc, cls_const)` per the heapcache
-        // `is_class_known` gate — mirroring trait-side
-        // `seed_raised_exception` (`trace_opcode.rs:6617-6637`).
-        //
-        // Allocate a real `W_ExceptionObject` so the deref is sound;
-        // its `ob_type` is `&EXCEPTION_TYPE` (set by `w_exception_new`).
+    fn raise_r_does_not_emit_guard_class_until_mutable_concrete_shadow_lands() {
+        // M4.Cutover Step 2.1 was reverted: the previous walker-side
+        // GUARD_CLASS read `concrete_registers_r` (a dispatch-entry
+        // snapshot), but a sibling handler such as `last_exc_value/>r`
+        // can rewrite `registers_r[dst]` mid-walk without updating the
+        // immutable concrete slice — so the guard was silently skipped
+        // on exception-heavy paths and the heapcache state diverged
+        // from the trait path (`trace_opcode.rs:6617-6637
+        // seed_raised_exception`).  Re-enabling walker-side emission
+        // needs a mutable concrete shadow that tracks every
+        // `registers_r[dst]` write (M4.Cutover Step 2.2).  Until then,
+        // the walker handler records only FINISH and the trait path
+        // remains the sole GUARD_CLASS emitter.
         let exc_ptr = pyre_object::excobject::w_exception_new(
             pyre_object::excobject::ExcKind::ValueError,
             "shadow-walker probe",
@@ -6067,11 +6065,6 @@ mod tests {
             .expect("`raise/r` must be in insns table");
         let code = [raise_byte, 0x02];
         let mut tc = fresh_trace_ctx();
-        // Use a non-constant OpRef so the heapcache class-known flag
-        // actually pins. pyre's `is_class_known(constant)` returns
-        // false (`heapcache.rs:1014`) while `class_now_known(constant)`
-        // is a no-op, so constants never round-trip through the
-        // class-pinned cache.
         let exc_box = OpRef::input_arg_ref(0);
         let mut regs: Vec<OpRef> = vec![OpRef::NONE, OpRef::NONE, exc_box, OpRef::NONE];
         let concrete = vec![
@@ -6103,28 +6096,20 @@ mod tests {
         assert_eq!(outcome, DispatchOutcome::Terminate);
         drop(wc);
 
-        // Expect two ops recorded: GuardClass(exc, cls_const) then
-        // Finish(exc) (the GUARD_CLASS precedes FINISH per
-        // `pyjitpl.py:1690-1696`).
         assert_eq!(
             tc.num_ops(),
-            ops_before + 2,
-            "raise/r with pinned concrete exc must record GuardClass + Finish",
+            ops_before + 1,
+            "raise/r must record only FINISH until M4.Cutover Step 2.2 \
+             (mutable concrete shadow) re-enables walker-side GUARD_CLASS",
         );
-        let ops = tc.ops();
-        let guard = &ops[ops_before];
-        assert_eq!(guard.opcode, majit_ir::OpCode::GuardClass);
         assert_eq!(
-            guard.args.as_slice()[0],
-            exc_box,
-            "GuardClass arg0 must be the exception OpRef",
+            tc.ops().last().expect("recorded op must exist").opcode,
+            majit_ir::OpCode::Finish,
         );
-        // After the guard, the heapcache must mark the class as known
-        // so a follow-on raise/r against the same exc_box wouldn't
-        // re-emit GuardClass.
         assert!(
-            tc.heap_cache().is_class_known(exc_box),
-            "heapcache.class_now_known must fire alongside GuardClass",
+            !tc.heap_cache().is_class_known(exc_box),
+            "heapcache.class_now_known must NOT fire from the walker \
+             path while GUARD_CLASS emission is deferred",
         );
     }
 
