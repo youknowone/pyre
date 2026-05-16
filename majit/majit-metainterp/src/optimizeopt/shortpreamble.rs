@@ -436,8 +436,6 @@ impl PreambleOp {
 /// the operations that produce them.
 #[derive(Clone, Debug, Default)]
 pub struct ShortBoxes {
-    /// Mapping from exported label arg box to its position.
-    pub label_arg_positions: HashMap<OpRef, usize>,
     /// shortpreamble.py: potential_ops
     potential_ops: HashMap<OpRef, PotentialShortOp>,
     /// Ordered insertion list for potential ops, matching shortpreamble.py's
@@ -519,7 +517,6 @@ impl PotentialShortOp {
 impl ShortBoxes {
     pub fn new(num_label_args: usize) -> Self {
         ShortBoxes {
-            label_arg_positions: HashMap::new(),
             potential_ops: HashMap::new(),
             potential_order: Vec::new(),
             produced_short_boxes: HashMap::new(),
@@ -534,20 +531,19 @@ impl ShortBoxes {
 
     pub fn with_label_args(label_args: &[OpRef]) -> Self {
         let mut boxes = Self::new(label_args.len());
-        for (idx, &arg) in label_args.iter().enumerate() {
-            boxes.label_arg_positions.insert(arg, idx);
+        for &arg in label_args.iter() {
             boxes.short_inputargs.push(arg);
         }
         boxes
     }
 
     pub fn lookup_label_arg(&self, opref: OpRef) -> Option<usize> {
-        self.label_arg_positions.get(&opref).copied()
+        self.short_inputargs.iter().position(|&a| a == opref)
     }
 
     /// RPython parity: check if opref is reachable in the short preamble.
     pub fn is_reachable(&self, opref: OpRef) -> bool {
-        self.label_arg_positions.contains_key(&opref)
+        self.short_inputargs.contains(&opref)
             || self.known_constants.contains(&opref)
             || self.potential_ops.contains_key(&opref)
     }
@@ -675,7 +671,7 @@ impl ShortBoxes {
                 .map(|produced| produced.preamble_op.pos.get());
         }
         // Label args are always available as inputs (RPython: isinstance(op, InputArgIntOp))
-        if self.label_arg_positions.contains_key(&opref) {
+        if self.short_inputargs.contains(&opref) {
             return Some(opref);
         }
         None
