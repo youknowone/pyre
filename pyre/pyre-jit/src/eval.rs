@@ -5699,6 +5699,11 @@ fn replay_pending_fields(
             match value_type {
                 majit_ir::Type::Ref => {
                     // bh_setfield_gc_r / bh_setarrayitem_gc_r: store pointer.
+                    // Emit the write barrier on the target object so a young
+                    // ref stored into an existing old object is tracked by
+                    // the next minor collection (`rd_pendingfields` can
+                    // target pre-existing deadframe objects).
+                    majit_gc::gc_write_barrier(majit_ir::GcRef(target_ptr as usize));
                     std::ptr::write(addr as *mut usize, value_raw as usize);
                 }
                 majit_ir::Type::Float => {
