@@ -60,22 +60,22 @@ enum Nullness {
 pub struct OptRewrite {
     /// rewrite.py: bool_result_cache — maps (opcode, arg0, arg1) → result OpRef.
     /// Used by find_rewritable_bool to check if inverse/reflex was computed.
-    bool_result_cache: std::collections::HashMap<(OpCode, OpRef, OpRef), OpRef>,
+    bool_result_cache: crate::optimizeopt::vec_assoc::VecAssoc<(OpCode, OpRef, OpRef), OpRef>,
     /// rewrite.py:39: loop_invariant_results — cache for CALL_LOOPINVARIANT results.
     /// Key: function pointer (arg0 as i64).
     /// Value: Direct(OpRef) or Preamble(PreambleOp) — RPython isinstance check.
-    loop_invariant_results: std::collections::HashMap<i64, LoopInvariantEntry>,
+    loop_invariant_results: crate::optimizeopt::vec_assoc::VecAssoc<i64, LoopInvariantEntry>,
     /// rewrite.py:40: loop_invariant_producer — maps func_ptr → emitted Call op.
     /// Used by produce_potential_short_preamble_ops (rewrite.py:45-47).
-    loop_invariant_producer: std::collections::HashMap<i64, Op>,
+    loop_invariant_producer: crate::optimizeopt::vec_assoc::VecAssoc<i64, Op>,
 }
 
 impl OptRewrite {
     pub fn new() -> Self {
         OptRewrite {
-            bool_result_cache: std::collections::HashMap::new(),
-            loop_invariant_results: std::collections::HashMap::new(),
-            loop_invariant_producer: std::collections::HashMap::new(),
+            bool_result_cache: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            loop_invariant_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            loop_invariant_producer: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         }
     }
 

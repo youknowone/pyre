@@ -4,9 +4,9 @@
 //! When a guard is known to fail frequently, a specialized version of
 //! the loop can be compiled and stitched directly to that guard.
 
-use std::collections::HashMap;
-
 use majit_ir::{Op, OpRef};
+
+use crate::optimizeopt::vec_assoc::VecAssoc;
 
 /// version.py:9-86: LoopVersionInfo(BasicLoopInfo)
 ///
@@ -17,7 +17,7 @@ pub struct LoopVersionInfo {
     /// version.py:19 — ordered list of fail indices for tracked guards.
     pub descrs: Vec<u32>,
     /// version.py:20 — maps fail_index → LoopVersion.
-    pub leads_to: HashMap<u32, LoopVersion>,
+    pub leads_to: VecAssoc<u32, LoopVersion>,
     /// version.py:21 — insertion index for track(). -1 means append.
     insert_index: i32,
     /// version.py:22 — compiled loop versions.
@@ -29,7 +29,7 @@ impl LoopVersionInfo {
     pub fn new() -> Self {
         LoopVersionInfo {
             descrs: Vec::new(),
-            leads_to: HashMap::new(),
+            leads_to: VecAssoc::new(),
             insert_index: -1,
             versions: Vec::new(),
         }

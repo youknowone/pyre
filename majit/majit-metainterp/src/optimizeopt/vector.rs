@@ -686,7 +686,8 @@ impl VectorizingOptimizer {
         }
 
         // Build node→pack mapping
-        let mut node_to_pack: HashMap<usize, usize> = HashMap::new();
+        let mut node_to_pack: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (pi, group) in profitable.iter().enumerate() {
             for &idx in &group.members {
                 node_to_pack.insert(idx, pi);
