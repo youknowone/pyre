@@ -725,7 +725,7 @@ pub enum OpKind {
     /// jtransform.py:1731 — `jit_debug(string, arg1, arg2, arg3, arg4)`.
     /// Emits debug info into the trace (like debug_merge_point).
     JitDebug {
-        args: Vec<ValueId>,
+        args: Vec<crate::flowspace::model::Variable>,
     },
     /// jtransform.py:1733 — `{kind}_assert_green(value)`.
     /// Asserts the value is compile-time constant during tracing.

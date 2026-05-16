@@ -2659,7 +2659,7 @@ impl<'a> Transformer<'a> {
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: None,
                     kind: OpKind::JitDebug {
-                        args: args.to_vec(),
+                        args: args.iter().map(|&v| graph.must_variable(v)).collect(),
                     },
                 }])
             }
@@ -4014,7 +4014,15 @@ fn remap_op(
             result_ty: result_ty.clone(),
         },
         OpKind::JitDebug { args } => OpKind::JitDebug {
-            args: remap_list(args, aliases),
+            args: args
+                .iter()
+                .map(|var| {
+                    let vid = graph
+                        .value_id_of(var)
+                        .expect("JitDebug arg must have a backing ValueId");
+                    graph.must_variable(remap_value(vid, aliases))
+                })
+                .collect(),
         },
         OpKind::RecordKnownResult {
             result_value,

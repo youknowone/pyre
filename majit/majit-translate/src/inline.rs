@@ -703,7 +703,15 @@ fn remap_op_kind(
             }
         }
         OpKind::JitDebug { args } => OpKind::JitDebug {
-            args: args.iter().map(remap).collect(),
+            args: args
+                .iter()
+                .map(|var| {
+                    let vid = source_graph
+                        .value_id_of(var)
+                        .expect("JitDebug arg must have a backing ValueId in source");
+                    target_graph.must_variable(remap(&vid))
+                })
+                .collect(),
         },
         OpKind::RecordKnownResult {
             result_value,
@@ -1040,7 +1048,15 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                 .value_id_of(base)
                 .expect("RecordQuasiImmutField.base must be a known Variable on graph"),
         ],
-        OpKind::JitDebug { args, .. } => args.clone(),
+        OpKind::JitDebug { args, .. } => {
+            let g = graph.expect("JitDebug requires a graph to project Variable to ValueId");
+            args.iter()
+                .map(|var| {
+                    g.value_id_of(var)
+                        .expect("JitDebug arg must be a known Variable on graph")
+                })
+                .collect()
+        }
         OpKind::VableFieldRead { base, .. } => vec![
             graph
                 .expect("VableFieldRead requires a graph to project Variable to ValueId")
