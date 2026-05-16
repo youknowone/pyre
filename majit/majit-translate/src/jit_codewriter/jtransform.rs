@@ -244,13 +244,6 @@ pub struct Transformer<'a> {
     /// RPython: DependencyTracker — caches transitive analysis results.
     /// Shared across all getcalldescr() calls within this transform pass.
     analysis_cache: crate::call::AnalysisCache,
-    /// Cursor into the running graph's `next_value` counter. Kept in
-    /// sync with `FunctionGraph::next_value`: seeded from
-    /// `graph.next_value` at `transform()` entry and written back at
-    /// exit so any future rewrite rule that needs to synthesize a fresh
-    /// ValueId can pull one without colliding with the rtyper-equivalent
-    /// pass output.
-    next_synthetic_value: usize,
     /// ValueId → ConcreteType for synthetic ValueIds allocated via
     /// `fresh_synthetic_value_typed` and for existing result ValueIds
     /// whose kind is changed by a rewrite in this pass.  RPython
@@ -396,7 +389,6 @@ impl<'a> Transformer<'a> {
             vable_rewrites: 0,
             calls_classified: 0,
             analysis_cache: crate::call::AnalysisCache::default(),
-            next_synthetic_value: 0,
             synth_kinds: std::collections::HashMap::new(),
         }
     }
@@ -440,17 +432,12 @@ impl<'a> Transformer<'a> {
     /// RPython: Transformer.transform() — process all blocks in the graph.
     pub fn transform(&mut self, graph: &FunctionGraph) -> GraphTransformResult {
         let mut rewritten = graph.clone();
-        // Keep the ValueId allocator in sync with the graph we're
-        // rewriting so rules that synthesize values stay unique.
-        self.next_synthetic_value = rewritten.next_value();
 
         let exceptblock = rewritten.exceptblock;
         let graph_name = rewritten.name.clone();
         for block_idx in 0..rewritten.blocks.len() {
             self.optimize_block(&mut rewritten, block_idx, &graph_name, exceptblock);
         }
-
-        rewritten.set_next_value(self.next_synthetic_value);
 
         GraphTransformResult {
             graph: rewritten,
@@ -521,20 +508,23 @@ impl<'a> Transformer<'a> {
         }
     }
 
-    fn fresh_synthetic_value(&mut self) -> ValueId {
-        let value = ValueId(self.next_synthetic_value);
-        self.next_synthetic_value += 1;
-        value
+    fn fresh_synthetic_value(&mut self, graph: &mut FunctionGraph) -> ValueId {
+        graph.alloc_value()
     }
 
     /// Allocate a fresh synthetic ValueId AND stamp its `ConcreteType`
     /// into `synth_kinds` (Phase C v2 Slice C-2).  Mirrors RPython's
     /// `Variable(concretetype=T)` (`flowmodel.py:Variable.__init__`).
+    /// The Variable backing this slot is created up-front via
+    /// `graph.alloc_value_with_type` so downstream consumers can
+    /// project the synthetic ValueId back to a Variable through
+    /// `graph.must_variable` without a follow-up backfill.
     fn fresh_synthetic_value_typed(
         &mut self,
+        graph: &mut FunctionGraph,
         ty: crate::jit_codewriter::type_state::ConcreteType,
     ) -> ValueId {
-        let value = self.fresh_synthetic_value();
+        let value = graph.alloc_value_with_type(ty);
         self.synth_kinds.insert(value, ty);
         value
     }
@@ -617,7 +607,11 @@ impl<'a> Transformer<'a> {
         ResolvedCallResult { kind, ir_type }
     }
 
-    fn direct_funcptr_value(&mut self, target: &CallTarget) -> (ValueId, SpaceOperation) {
+    fn direct_funcptr_value(
+        &mut self,
+        graph: &mut FunctionGraph,
+        target: &CallTarget,
+    ) -> (ValueId, SpaceOperation) {
         let fnaddr = self
             .callcontrol
             .as_deref()
@@ -625,8 +619,10 @@ impl<'a> Transformer<'a> {
             .unwrap_or_else(|| crate::call::symbolic_fnaddr_for_target(target));
         // Function pointer materialized as ConstInt — assembler emits it
         // through the `'i'` argcode so the kind is Signed.
-        let value = self
-            .fresh_synthetic_value_typed(crate::jit_codewriter::type_state::ConcreteType::Signed);
+        let value = self.fresh_synthetic_value_typed(
+            graph,
+            crate::jit_codewriter::type_state::ConcreteType::Signed,
+        );
         (
             value,
             SpaceOperation {
@@ -641,7 +637,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         op: &SpaceOperation,
         graph_name: &str,
-        graph: &crate::model::FunctionGraph,
+        graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
         match &op.kind {
             // ── rewrite_op_hint ──
@@ -916,8 +912,8 @@ impl<'a> Transformer<'a> {
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
-                let (lhs, mut ops) = self.coerce_operand_to_float_domain(*lhs);
-                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(*rhs);
+                let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, *lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, *rhs);
                 ops.extend(rhs_ops);
                 ops.push(SpaceOperation {
                     result: op.result,
@@ -944,8 +940,8 @@ impl<'a> Transformer<'a> {
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
-                let (lhs, mut ops) = self.coerce_operand_to_float_domain(*lhs);
-                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(*rhs);
+                let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, *lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, *rhs);
                 ops.extend(rhs_ops);
                 ops.push(SpaceOperation {
                     result: op.result,
@@ -974,11 +970,11 @@ impl<'a> Transformer<'a> {
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
-                let (lhs, mut ops) = self.coerce_operand_to_float_domain(*lhs);
-                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(*rhs);
+                let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, *lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, *rhs);
                 ops.extend(rhs_ops);
                 let target = CallTarget::function_path(["ll_math_fmod"]);
-                let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 ops.push(funcptr_op);
                 ops.push(SpaceOperation {
                     result: op.result,
@@ -1155,7 +1151,7 @@ impl<'a> Transformer<'a> {
                     "floordiv"
                 };
                 RewriteResult::Replace(
-                    self.emit_int_mod_or_floordiv_residual(helper_key, *lhs, *rhs, op.result),
+                    self.emit_int_mod_or_floordiv_residual(graph, helper_key, *lhs, *rhs, op.result),
                 )
             }
             // RPython `Transformer.rewrite_op_float_is_true(self, op)`
@@ -1200,6 +1196,7 @@ impl<'a> Transformer<'a> {
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
                 let zero_id = self.fresh_synthetic_value_typed(
+                    graph,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
                 let zero_op = SpaceOperation {
@@ -1284,7 +1281,7 @@ impl<'a> Transformer<'a> {
                 // `float_return %f0` with no intervening `-live-`
                 // (`test_flatten.py:1021-1023`).
                 let target = CallTarget::function_path(["cast_uint_to_float"]);
-                let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 self.stamp_value_kind(
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
@@ -1321,7 +1318,7 @@ impl<'a> Transformer<'a> {
                 // `ElidableCannotRaise`+`OopSpecIndex::None` → no
                 // `-live-` (`test_flatten.py:1007-1009`).
                 let target = CallTarget::function_path(["cast_float_to_uint"]);
-                let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
+                let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 self.stamp_value_kind(
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
@@ -1423,7 +1420,7 @@ impl<'a> Transformer<'a> {
                         && self.binop_result_is_int(op.result, result_ty)
                     {
                         return RewriteResult::Replace(
-                            self.emit_int_mod_or_floordiv_residual(key, *lhs, *rhs, op.result),
+                            self.emit_int_mod_or_floordiv_residual(graph, key, *lhs, *rhs, op.result),
                         );
                     }
                 }
@@ -1547,6 +1544,7 @@ impl<'a> Transformer<'a> {
     /// `lloperation.py:203-204`), so no `OpKind::Live` follows.
     fn emit_int_mod_or_floordiv_residual(
         &mut self,
+        graph: &mut FunctionGraph,
         helper_key: &str,
         lhs: ValueId,
         rhs: ValueId,
@@ -1558,7 +1556,7 @@ impl<'a> Transformer<'a> {
             "_ll_2_int_floordiv"
         };
         let target = CallTarget::function_path([helper_name]);
-        let (funcptr, funcptr_op) = self.direct_funcptr_value(&target);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
         let mut ops = Vec::with_capacity(2);
         ops.push(funcptr_op);
         ops.push(SpaceOperation {
@@ -1586,10 +1584,14 @@ impl<'a> Transformer<'a> {
     /// rewrite arms only enter when both operands are
     /// `is_float_rewrite_domain` (i.e. `'i'` or `'f'`); Ref operands do
     /// not reach this helper.
-    fn coerce_operand_to_float_domain(&mut self, value: ValueId) -> (ValueId, Vec<SpaceOperation>) {
+    fn coerce_operand_to_float_domain(
+        &mut self,
+        graph: &mut FunctionGraph,
+        value: ValueId,
+    ) -> (ValueId, Vec<SpaceOperation>) {
         match self.get_value_kind(value) {
             'f' => (value, Vec::new()),
-            'i' => self.coerce_operand_to_float(value),
+            'i' => self.coerce_operand_to_float(graph, value),
             _ => (value, Vec::new()),
         }
     }
@@ -1597,12 +1599,18 @@ impl<'a> Transformer<'a> {
     /// RPython's float rtyper calls `hop.inputargs(Float, Float)`, which
     /// inserts `cast_int_to_float` for mixed int/float operands before
     /// emitting `float_*` or the `math.fmod` helper call.
-    fn coerce_operand_to_float(&mut self, value: ValueId) -> (ValueId, Vec<SpaceOperation>) {
+    fn coerce_operand_to_float(
+        &mut self,
+        graph: &mut FunctionGraph,
+        value: ValueId,
+    ) -> (ValueId, Vec<SpaceOperation>) {
         if self.get_value_kind(value) != 'i' {
             return (value, Vec::new());
         }
-        let coerced = self
-            .fresh_synthetic_value_typed(crate::jit_codewriter::type_state::ConcreteType::Float);
+        let coerced = self.fresh_synthetic_value_typed(
+            graph,
+            crate::jit_codewriter::type_state::ConcreteType::Float,
+        );
         (
             coerced,
             vec![SpaceOperation {
@@ -2166,7 +2174,7 @@ impl<'a> Transformer<'a> {
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
-        graph: &crate::model::FunctionGraph,
+        graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
         // RPython `jtransform.py:406-408`:
         //   def rewrite_op_direct_call(op): ... handle_%s_call
@@ -2250,7 +2258,7 @@ impl<'a> Transformer<'a> {
                         &mut self.analysis_cache,
                         None,
                     );
-                    self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
+                    self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name)
                 }
                 crate::call::CallKind::Builtin => {
                     self.handle_builtin_call(op, target, args, result_ty, graph_name, graph)
@@ -2269,7 +2277,7 @@ impl<'a> Transformer<'a> {
                 &non_void_args,
                 self.resolve_call_result(op.result, result_ty).ir_type,
             );
-            self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
+            self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name)
         } else {
             RewriteResult::Keep
         }
@@ -2291,7 +2299,7 @@ impl<'a> Transformer<'a> {
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
-        graph: &crate::model::FunctionGraph,
+        graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
         // RPython `jtransform.py:484-485`:
         //   oopspec_name, args = support.decode_builtin_call(op)
@@ -2330,6 +2338,7 @@ impl<'a> Transformer<'a> {
                             // literals to `ConstFloat` below.
                             NormalizedArg::ConstInt(v) => {
                                 let vid = self.fresh_synthetic_value_typed(
+                                    graph,
                                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                                 );
                                 prefix.push(SpaceOperation {
@@ -2341,6 +2350,7 @@ impl<'a> Transformer<'a> {
                             // `support.py:723 Constant(obj, lltype.Float)`
                             NormalizedArg::ConstFloat(bits) => {
                                 let vid = self.fresh_synthetic_value_typed(
+                                    graph,
                                     crate::jit_codewriter::type_state::ConcreteType::Float,
                                 );
                                 prefix.push(SpaceOperation {
@@ -2453,7 +2463,7 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:2003-2007: __handle_oopspec_call always
         // produces residual_call_*, appends -live- if calldescr_canraise.
         // Effect is only in the calldescr, never in the opcode name.
-        let result = self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name);
+        let result = self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name);
         prepend_const_prefix(&mut const_prefix_ops, result)
     }
 
@@ -2650,7 +2660,7 @@ impl<'a> Transformer<'a> {
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
-        graph: &crate::model::FunctionGraph,
+        graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
         match oopspec_name {
             // jtransform.py:1731-1732
@@ -2727,6 +2737,7 @@ impl<'a> Transformer<'a> {
             }
             // jtransform.py:1744-1747
             "jit.force_virtual" => self._handle_oopspec_call(
+                graph,
                 op,
                 target,
                 args,
@@ -2744,6 +2755,7 @@ impl<'a> Transformer<'a> {
                     "jit.not_in_trace() function must return None"
                 );
                 self._handle_oopspec_call(
+                    graph,
                     op,
                     target,
                     args,
@@ -2768,6 +2780,7 @@ impl<'a> Transformer<'a> {
     /// and registers the function in the callinfocollection.
     fn _handle_oopspec_call(
         &mut self,
+        graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
@@ -2808,7 +2821,7 @@ impl<'a> Transformer<'a> {
             }
         }
         // jtransform.py:2003-2008: residual_call + optional -live-
-        self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
+        self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name)
     }
 
     // NOTE: rewrite_op_jit_conditional_call, _rewrite_op_cond_call, and
@@ -3174,6 +3187,7 @@ impl<'a> Transformer<'a> {
     /// kept separate from `descriptor` per jtransform.py:457.
     fn handle_residual_call(
         &mut self,
+        graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         descriptor: CallDescriptor,
@@ -3182,7 +3196,7 @@ impl<'a> Transformer<'a> {
         graph_name: &str,
     ) -> RewriteResult {
         self.handle_residual_call_with_targets(
-            op, target, descriptor, args, result_ty, graph_name, None,
+            graph, op, target, descriptor, args, result_ty, graph_name, None,
         )
     }
 
@@ -3194,6 +3208,7 @@ impl<'a> Transformer<'a> {
     /// `OpKind::CallResidual` twice.
     fn handle_residual_call_with_targets(
         &mut self,
+        graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         descriptor: CallDescriptor,
@@ -3226,7 +3241,7 @@ impl<'a> Transformer<'a> {
         // instead of falling back to `'r'` from the Unknown default.
         let result_kind = self.resolve_call_result(op.result, result_ty).kind;
         self.stamp_value_kind_from_value_type(op.result, result_ty);
-        let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         // RPython jtransform.py:469-470: residual_call followed by -live-
         // if the call can raise or may call jitcodes.
         // jtransform.py:547: `handle_regular_indirect_call` passes
@@ -3400,6 +3415,7 @@ impl<'a> Transformer<'a> {
     #[allow(dead_code)]
     fn handle_elidable_call(
         &mut self,
+        graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         descriptor: CallDescriptor,
@@ -3415,7 +3431,7 @@ impl<'a> Transformer<'a> {
         let (args_i, args_r, args_f) = self.make_three_lists(args);
         let result_kind = self.resolve_call_result(op.result, result_ty).kind;
         self.stamp_value_kind_from_value_type(op.result, result_ty);
-        let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         RewriteResult::Replace(vec![
             funcptr_op,
             SpaceOperation {
@@ -3439,6 +3455,7 @@ impl<'a> Transformer<'a> {
     #[allow(dead_code)]
     fn handle_may_force_call(
         &mut self,
+        graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         descriptor: CallDescriptor,
@@ -3454,7 +3471,7 @@ impl<'a> Transformer<'a> {
         let (args_i, args_r, args_f) = self.make_three_lists(args);
         let result_kind = self.resolve_call_result(op.result, result_ty).kind;
         self.stamp_value_kind_from_value_type(op.result, result_ty);
-        let (funcptr, funcptr_op) = self.direct_funcptr_value(target);
+        let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         // RPython: call_may_force always followed by -live-
         RewriteResult::Replace(vec![
             funcptr_op,
@@ -5620,7 +5637,7 @@ mod tests {
             .unwrap()
             .clone();
         assert!(matches!(
-            transformer.rewrite_operation(&op, "demo", &graph),
+            transformer.rewrite_operation(&op, "demo", &mut graph),
             RewriteResult::Keep
         ));
     }
