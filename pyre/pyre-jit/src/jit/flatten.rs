@@ -2304,7 +2304,7 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
 /// production-grade closure.  Tests that compare two SSARepr streams
 /// only compare opname + register kinds, so the `ConstRef(0)` value
 /// doesn't matter for those assertions.
-pub(super) fn flatten_constant_operand_for_probe(constant: &super::flow::Constant) -> Operand {
+pub(super) fn flatten_constant_operand_for_test(constant: &super::flow::Constant) -> Operand {
     match (&constant.value, constant.kind) {
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => Operand::ConstRef(0),
         _ => flatten_constant_operand(constant),
@@ -2452,7 +2452,7 @@ pub fn flatten_graph<'a>(
 /// [`flatten_op_to_insn_with_lowering`] as the passthrough fallback
 /// when no HLOp lowering matches.  Constant operands lower via the
 /// caller-supplied `lower_constant` closure (production threads its
-/// real `lower_constant`; tests pass `flatten_constant_operand_for_probe`).
+/// real `lower_constant`; tests pass `flatten_constant_operand_for_test`).
 fn flatten_op_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     get_register: &mut F,
@@ -2489,7 +2489,7 @@ where
 /// Production callers (`GraphFlattener::flatten_arg` via
 /// `self.lower_constant`) thread the per-call closure that resolves
 /// `Opaque(Ref)` to the real `w_code` PyObject pointer.  Tests pass
-/// [`flatten_constant_operand_for_probe`] (a `ConstRef(0)` placeholder).
+/// [`flatten_constant_operand_for_test`] (a `ConstRef(0)` placeholder).
 /// Variable / list / descr / indirect-call-targets handling is the
 /// same in both cases; only constant operand lowering is pluggable.
 fn flatten_arg_with_lowering<F, LC>(
@@ -3509,15 +3509,10 @@ where
 /// `None` when no arm matches, instead of falling through to the
 /// passthrough [`flatten_op_to_insn`].
 ///
-/// `GraphFlattener::flatten_space_operation` uses this
-/// variant to avoid double-handling of non-HLOp ops.  The dispatcher's
-/// passthrough fallback uses `flatten_arg_for_probe` (probe-side
-/// constant lowering, `Opaque(Ref) → ConstRef(0)` placeholder) which
-/// would silently corrupt production lowering of `jit_merge_point`'s
-/// pycode `Opaque(Ref)` constant; routing non-HLOp ops back into the
-/// existing `flatten_space_operation` passthrough preserves the
-/// production `self.lower_constant` behavior for those ops while still
-/// using the dispatcher for the four retired families.
+/// `GraphFlattener::flatten_space_operation` uses this variant to
+/// avoid double-handling of non-HLOp ops — the caller's own
+/// passthrough emits them, so the dispatcher must only claim the
+/// four retired families and leave everything else to the caller.
 pub fn try_flatten_retired_family_hlop_to_insn<F, LC>(
     op: &super::flow::SpaceOperation,
     ctx: &LoweringContext,
@@ -5257,12 +5252,12 @@ mod tests {
     /// Test helper companion to `identity_register_mapper`: returns a
     /// closure suitable for passing as `lower_constant` to the
     /// `lower_*_hlop_to_insn` / dispatcher helpers.  Wraps
-    /// `flatten_constant_operand_for_probe` (the probe-side default;
-    /// `Opaque(Ref) → ConstRef(0)` placeholder) — the production-side
+    /// `flatten_constant_operand_for_test`
+    /// (`Opaque(Ref) → ConstRef(0)` placeholder) — the production-side
     /// `flatten_constant_operand` would panic on the placeholder
     /// fixtures these tests use.
-    fn probe_constant_lowering() -> impl FnMut(&Constant) -> Operand {
-        flatten_constant_operand_for_probe
+    fn test_constant_lowering() -> impl FnMut(&Constant) -> Operand {
+        flatten_constant_operand_for_test
     }
 
     #[test]
@@ -5347,7 +5342,7 @@ mod tests {
             store_subscr_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
 
         let insn = lower_binary_op_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
             .expect("BINARY_OP HLOp must lower");
@@ -5429,7 +5424,7 @@ mod tests {
             store_subscr_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         assert!(
             lower_binary_op_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
                 .is_none()
@@ -5457,7 +5452,7 @@ mod tests {
 
         let hlop = SpaceOperation::new("sub", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let lowered =
             lower_binary_op_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
                 .expect("BINARY_OP HLOp must lower");
@@ -5490,7 +5485,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
 
@@ -5549,7 +5544,7 @@ mod tests {
             store_subscr_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
 
         let insn = lower_compare_op_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
             .expect("COMPARE_OP HLOp must lower");
@@ -5607,7 +5602,7 @@ mod tests {
             store_subscr_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         assert!(
             lower_compare_op_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
                 .is_none()
@@ -5632,7 +5627,7 @@ mod tests {
         };
         let hlop = SpaceOperation::new("eq", vec![lhs.into(), rhs.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let lowered =
             lower_compare_op_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
                 .expect("COMPARE_OP HLOp must lower");
@@ -5662,7 +5657,7 @@ mod tests {
             store_subscr_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
 
         let insn = lower_bool_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
             .expect("BOOL HLOp must lower");
@@ -5720,7 +5715,7 @@ mod tests {
             store_subscr_fn_idx: 0,
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         assert!(
             lower_bool_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant).is_none()
         );
@@ -5742,7 +5737,7 @@ mod tests {
         };
         let hlop = SpaceOperation::new("bool", vec![cond.into()], Some(result.into()), 0);
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let lowered = lower_bool_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
             .expect("BOOL HLOp must lower");
         let prod = build_truth_fn_residual_call_r_i_insn(31, 0, 1);
@@ -5776,7 +5771,7 @@ mod tests {
             store_subscr_fn_idx: 41,
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
 
         let insn = lower_setitem_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant)
             .expect("SETITEM HLOp must lower");
@@ -5827,7 +5822,7 @@ mod tests {
             store_subscr_fn_idx: 41,
         };
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         assert!(
             lower_setitem_hlop_to_insn(&op, &ctx, &mut get_register, &mut lower_constant).is_none()
         );
@@ -5869,7 +5864,7 @@ mod tests {
             0,
         );
         let mut get_register = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let lowered =
             lower_setitem_hlop_to_insn(&hlop, &ctx, &mut get_register, &mut lower_constant)
                 .expect("SETITEM HLOp must lower");
@@ -5895,7 +5890,7 @@ mod tests {
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("BINARY_OP HLOp must lower via dispatcher");
@@ -5922,7 +5917,7 @@ mod tests {
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("COMPARE_OP HLOp must lower via dispatcher");
@@ -5949,7 +5944,7 @@ mod tests {
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("BOOL HLOp must lower via dispatcher");
@@ -5981,7 +5976,7 @@ mod tests {
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("SETITEM HLOp must lower via dispatcher");
@@ -6027,14 +6022,14 @@ mod tests {
         };
         let mut get_register_a = identity_register_mapper();
         let mut get_register_b = identity_register_mapper();
-        let mut lower_constant = probe_constant_lowering();
+        let mut lower_constant = test_constant_lowering();
         let dispatched =
             flatten_op_to_insn_with_lowering(&op, &ctx, &mut get_register_a, &mut lower_constant)
                 .expect("residual_call SpaceOperation must lower via dispatcher");
         let direct = flatten_op_to_insn(
             &op,
             &mut get_register_b,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower via passthrough");
         assert_eq!(format!("{dispatched:?}"), format!("{direct:?}"));
@@ -6151,7 +6146,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
         let prod = build_load_const_fn_residual_call_ir_r_insn(9, 17, 4, 5);
@@ -6286,7 +6281,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
         let prod = build_load_global_fn_residual_call_ir_r_insn(12, 5, 3, 4, 6, 7);
@@ -6517,7 +6512,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
         let prod = build_call_fn_residual_call_r_r_insn(33, 5, &[6, 7, 8], 9);
@@ -6646,7 +6641,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
         let prod = build_box_int_fn_residual_call_ir_r_insn(4, 42, 7);
@@ -6858,7 +6853,7 @@ mod tests {
         let dual = flatten_op_to_insn(
             &dual_op,
             &mut get_register,
-            &mut flatten_constant_operand_for_probe,
+            &mut flatten_constant_operand_for_test,
         )
         .expect("residual_call SpaceOperation must lower");
         let prod = build_build_list_fn_residual_call_ir_r_insn(18, 2, &[3, 4], 5);
