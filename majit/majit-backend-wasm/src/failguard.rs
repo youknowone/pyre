@@ -3,7 +3,7 @@
 /// Simplified from CraneliftFailDescr — no bridge data, GC maps, or force tokens.
 use std::sync::Arc;
 
-use majit_ir::{Descr, FailDescr, Type};
+use majit_ir::{Descr, DescrRef, FailDescr, Type};
 
 /// Wasm-backend guard failure descriptor.
 #[derive(Debug)]
@@ -12,6 +12,15 @@ pub struct WasmFailDescr {
     pub trace_id: u64,
     pub fail_arg_types: Vec<Type>,
     pub is_finish: bool,
+    /// `history.py:125 id(descr)` parity — when the optimizer
+    /// (`store_final_boxes_in_guard` / `make_and_attach_done_descrs`)
+    /// stamps a metainterp `ResumeGuardDescr` / `DoneWithThisFrame*` /
+    /// `ExitFrameWithExceptionDescrRef` / `PropagateExceptionDescr` on
+    /// `op.descr`, we keep it here so `get_latest_descr_arc` returns the
+    /// canonical metainterp Arc (matching dynasm/cranelift).  `None`
+    /// for synthetic backend-only descrs (`compile_bridge` placeholders,
+    /// test scaffolds).
+    pub meta_descr: Option<DescrRef>,
 }
 
 impl Descr for WasmFailDescr {

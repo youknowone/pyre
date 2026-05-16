@@ -60,6 +60,10 @@ pub struct GuardExit {
     pub fail_arg_refs: Vec<OpRef>,
     pub fail_arg_types: Vec<Type>,
     pub is_finish: bool,
+    /// `op.descr` snapshot — passed through to `WasmFailDescr.meta_descr`
+    /// so `get_latest_descr_arc` can return the canonical metainterp Arc
+    /// (parity with dynasm/cranelift's `meta_descr` forwarding).
+    pub meta_descr: Option<majit_ir::DescrRef>,
 }
 
 /// Pre-fetched GC-type-guard metadata for the wasm codegen.
@@ -148,6 +152,7 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
                 fail_arg_refs: fail_args.to_vec(),
                 fail_arg_types,
                 is_finish: op.opcode == OpCode::Finish,
+                meta_descr: op.descr.clone(),
             });
             fail_index += 1;
         }
