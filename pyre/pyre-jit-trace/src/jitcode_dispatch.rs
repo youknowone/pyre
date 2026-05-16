@@ -180,7 +180,7 @@
 //!    rationale as items 2 and 5.
 
 use crate::jitcode_runtime::{DecodedOp, decode_op_at};
-use crate::state::MIFrame;
+use crate::state::{ConcreteValue, MIFrame};
 use majit_ir::{DescrRef, OopSpecIndex, OpCode, OpRef, Type, Value};
 use majit_metainterp::TraceCtx;
 
@@ -282,6 +282,28 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// `MIFrame.registers_f` (`pyjitpl.py:177-234`). Mutable so
     /// `float_<binop>/ff>f` and `float_neg/f>f` can land their dst.
     pub registers_f: &'frame mut [OpRef],
+    /// Concrete shadow mirror for `registers_r` (M4.Cutover Step 1).
+    ///
+    /// Semantic-slot indexed, length equals `registers_r.len()`. At
+    /// `dispatch_via_miframe` entry, populated by concatenating
+    /// `PyreSym.concrete_locals` + `PyreSym.concrete_stack`; sub-walks
+    /// allocate a fresh `Vec<ConcreteValue>` sized to the callee's
+    /// `num_regs_r` and fill arg slots from the parent's slice at the
+    /// arg byte indices.
+    ///
+    /// Read-only at dispatch time: walker handlers that consume this
+    /// (the M4.Cutover Step 2 set — `raise/r` GUARD_CLASS,
+    /// `last_exception/>i`, future `goto_if_not/iL` once Int-bank
+    /// concrete plumbing lands) read but do not write.
+    ///
+    /// Int / Float bank concrete shadow is deferred — those banks are
+    /// color-indexed rather than semantic-slot indexed, so they need a
+    /// codewriter-side color↔slot mapping that this Step doesn't
+    /// build. `goto_if_not/iL` and `switch/id` (which consume
+    /// concrete Int) wait on that follow-up slice.
+    ///
+    /// Reference: [[project-tracer-m4-cutover-decision]] memory.
+    pub concrete_registers_r: &'frame [ConcreteValue],
     /// Descr pool for `d`-coded operands. Each `d` argcode in the
     /// jitcode bytes resolves to `descr_refs[2-byte LE index]`.
     /// RPython `Assembler.descrs` (`assembler.py:23`) +
@@ -895,6 +917,53 @@ fn read_ref_var_list(
     Ok((out, 1 + len))
 }
 
+/// Read a Ref-bank register operand's concrete shadow value
+/// (M4.Cutover Step 1). Mirrors [`read_ref_reg`] but indexes into
+/// `ctx.concrete_registers_r`. Returns `ConcreteValue::Null` when the
+/// register is out of range — symmetric with `concrete_value_at`'s
+/// fallback at `state.rs:3225`. Out-of-range OpRef reads still surface
+/// `RegisterOutOfRange` via [`read_ref_reg`]; this helper assumes the
+/// OpRef read succeeded, so a missing concrete slot is "stack tail not
+/// yet seeded" not "register byte out of range".
+#[allow(dead_code)]
+fn read_ref_reg_concrete(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_>,
+) -> ConcreteValue {
+    let byte_pc = op.pc + 1 + operand_offset;
+    let reg = code[byte_pc] as usize;
+    ctx.concrete_registers_r
+        .get(reg)
+        .copied()
+        .unwrap_or(ConcreteValue::Null)
+}
+
+/// Read concrete shadow values for a Ref-bank variadic operand list
+/// (M4.Cutover Step 1). Parallels [`read_ref_var_list`] — reads the
+/// same byte indices but resolves through `ctx.concrete_registers_r`.
+/// Used by `inline_call_*` to propagate per-arg concrete shadow into
+/// the callee's fresh shadow Vec.
+fn read_ref_var_list_concrete(
+    code: &[u8],
+    op: &DecodedOp,
+    operand_offset: usize,
+    ctx: &WalkContext<'_, '_>,
+) -> Vec<ConcreteValue> {
+    let len_pc = op.pc + 1 + operand_offset;
+    let len = code[len_pc] as usize;
+    (0..len)
+        .map(|i| {
+            let reg = code[len_pc + 1 + i] as usize;
+            ctx.concrete_registers_r
+                .get(reg)
+                .copied()
+                .unwrap_or(ConcreteValue::Null)
+        })
+        .collect()
+}
+
 /// Read an Int-bank variadic operand list (`I` argcode). Same shape as
 /// [`read_ref_var_list`] but indexes into `registers_i`. RPython
 /// `assembler.py:write_varlist` emits a single shape regardless of
@@ -1143,11 +1212,39 @@ pub fn dispatch_via_miframe(
         Some(sym.last_exc_box)
     };
 
+    // M4.Cutover Step 1: snapshot concrete shadow for `registers_r`.
+    // `sym.registers_r` is the semantic frame mirror (locals first,
+    // then stack); the parallel concrete shadow lives split across
+    // `sym.concrete_locals` (size = nlocals) + `sym.concrete_stack`
+    // (size = current stack depth). Concatenate into a single
+    // semantic-slot indexed Vec sized to `registers_r.len()` so
+    // walker handlers can read by the same byte-indexed reg number.
+    // Any tail slots beyond `concrete_locals + concrete_stack` get
+    // `ConcreteValue::Null` (matches `concrete_value_at`'s fallback
+    // at `state.rs:3225`).
+    let concrete_r_snapshot: Vec<ConcreteValue> = {
+        let total = sym.registers_r.len();
+        let nlocals = sym.concrete_locals.len();
+        (0..total)
+            .map(|i| {
+                if i < nlocals {
+                    sym.concrete_locals[i]
+                } else {
+                    sym.concrete_stack
+                        .get(i - nlocals)
+                        .copied()
+                        .unwrap_or(ConcreteValue::Null)
+                }
+            })
+            .collect()
+    };
+
     let result = {
         let mut wc = WalkContext {
             registers_r: &mut sym.registers_r,
             registers_i: &mut sym.registers_i,
             registers_f: &mut sym.registers_f,
+            concrete_registers_r: &concrete_r_snapshot,
             descr_refs,
             trace_ctx,
             done_with_this_frame_descr_ref,
@@ -3126,10 +3223,12 @@ fn dispatch_inline_call_dr_kind(
             jitcode_index: sub_index,
         })?;
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
+    let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
     let mut callee_regs_r = vec![OpRef::NONE; sub_body.num_regs_r];
     let mut callee_regs_i = vec![OpRef::NONE; sub_body.num_regs_i];
     let mut callee_regs_f = vec![OpRef::NONE; sub_body.num_regs_f];
+    let mut callee_concrete_r = vec![ConcreteValue::Null; sub_body.num_regs_r];
 
     if args.len() > callee_regs_r.len() {
         return Err(DispatchError::InlineCallArityMismatch {
@@ -3141,12 +3240,16 @@ fn dispatch_inline_call_dr_kind(
     for (i, arg) in args.iter().enumerate() {
         callee_regs_r[i] = *arg;
     }
+    for (i, concrete) in arg_concretes.iter().enumerate() {
+        callee_concrete_r[i] = *concrete;
+    }
 
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
+            concrete_registers_r: &callee_concrete_r,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -3288,10 +3391,12 @@ fn dispatch_inline_call_dir_kind(
     let (int_args, int_width) = read_int_var_list(code, op, 2, ctx)?;
     // R-list immediately after the I-list.
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
+    let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
 
     let mut callee_regs_r = vec![OpRef::NONE; sub_body.num_regs_r];
     let mut callee_regs_i = vec![OpRef::NONE; sub_body.num_regs_i];
     let mut callee_regs_f = vec![OpRef::NONE; sub_body.num_regs_f];
+    let mut callee_concrete_r = vec![ConcreteValue::Null; sub_body.num_regs_r];
 
     if int_args.len() > callee_regs_i.len() {
         return Err(DispatchError::InlineCallIntArityMismatch {
@@ -3313,12 +3418,16 @@ fn dispatch_inline_call_dir_kind(
     for (i, arg) in ref_args.iter().enumerate() {
         callee_regs_r[i] = *arg;
     }
+    for (i, concrete) in ref_arg_concretes.iter().enumerate() {
+        callee_concrete_r[i] = *concrete;
+    }
 
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
+            concrete_registers_r: &callee_concrete_r,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -3448,11 +3557,13 @@ fn dispatch_inline_call_dirf_kind(
         })?;
     let (int_args, int_width) = read_int_var_list(code, op, 2, ctx)?;
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
+    let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
 
     let mut callee_regs_r = vec![OpRef::NONE; sub_body.num_regs_r];
     let mut callee_regs_i = vec![OpRef::NONE; sub_body.num_regs_i];
     let mut callee_regs_f = vec![OpRef::NONE; sub_body.num_regs_f];
+    let mut callee_concrete_r = vec![ConcreteValue::Null; sub_body.num_regs_r];
 
     if int_args.len() > callee_regs_i.len() {
         return Err(DispatchError::InlineCallIntArityMismatch {
@@ -3484,12 +3595,16 @@ fn dispatch_inline_call_dirf_kind(
     for (i, arg) in float_args.iter().enumerate() {
         callee_regs_f[i] = *arg;
     }
+    for (i, concrete) in ref_arg_concretes.iter().enumerate() {
+        callee_concrete_r[i] = *concrete;
+    }
 
     let (callee_outcome, _callee_end_pc) = {
         let mut sub_wc = WalkContext {
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
+            concrete_registers_r: &callee_concrete_r,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -4223,6 +4338,64 @@ mod tests {
         vec![std::sync::Arc::new(crate::descr::PyreSwitchDescr::new(dict)) as DescrRef]
     }
 
+    /// M4.Cutover Step 1 round-trip: a `WalkContext` built with
+    /// `concrete_registers_r` exposes each slot's `ConcreteValue` via
+    /// `read_ref_reg_concrete` indexed by the same byte the symbolic
+    /// `read_ref_reg` consults.  Verifies the parallel-slice plumbing
+    /// (slot N's OpRef in `registers_r` shares slot N in
+    /// `concrete_registers_r`).
+    #[test]
+    fn read_ref_reg_concrete_returns_slot_matching_symbolic_read() {
+        let exc_obj_ptr: pyre_object::PyObjectRef = 0xDEAD_BEEFusize as _;
+        let descr_pool: Vec<DescrRef> = Vec::new();
+        let mut tc = fresh_trace_ctx();
+        let oprefs = distinct_const_refs(&mut tc, 3);
+        let mut regs_r = oprefs.clone();
+        let concrete = vec![
+            ConcreteValue::Null,
+            ConcreteValue::Ref(exc_obj_ptr),
+            ConcreteValue::Int(42),
+        ];
+        let descr = done_descr_ref_for_tests();
+        let wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut [],
+            registers_f: &mut [],
+            concrete_registers_r: &concrete,
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+
+        // Synthesize a 2-byte op fixture: `<opcode_byte> <reg_idx>`.
+        // `read_ref_reg_concrete` reads `code[op.pc + 1 + operand_offset]`
+        // exactly like `read_ref_reg`, so encoding the reg byte at pc+1
+        // suffices.
+        for reg_idx in 0..3 {
+            let code = [0u8, reg_idx as u8];
+            let op = DecodedOp {
+                key: "fixture/r",
+                opname: "fixture",
+                argcodes: "r",
+                pc: 0,
+                next_pc: 2,
+            };
+            assert_eq!(
+                read_ref_reg_concrete(&code, &op, 0, &wc),
+                concrete[reg_idx],
+                "reg {} concrete shadow must match the parallel slot",
+                reg_idx,
+            );
+        }
+    }
+
     #[test]
     #[ignore = "T3 audit probe — dumps runtime opnames + walker-handled set + \
                 per-opname JitCode hit count. Run with \
@@ -4354,6 +4527,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4392,6 +4566,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4429,6 +4604,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4555,6 +4731,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4702,6 +4879,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4797,6 +4975,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4886,6 +5065,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4964,6 +5144,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5039,6 +5220,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -5096,6 +5278,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -5134,6 +5317,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -5168,6 +5352,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5210,6 +5395,7 @@ mod tests {
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5259,6 +5445,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5302,6 +5489,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -5351,6 +5539,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -5398,6 +5587,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -5450,6 +5640,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -5487,6 +5678,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5527,6 +5719,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5567,6 +5760,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5655,6 +5849,7 @@ mod tests {
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5691,6 +5886,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5739,6 +5935,7 @@ mod tests {
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -5801,6 +5998,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -5856,6 +6054,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -5891,6 +6090,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -6202,6 +6402,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done.clone(),
@@ -6297,6 +6498,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -6345,6 +6547,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6392,6 +6595,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6430,6 +6634,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6467,6 +6672,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [], // empty — index 7 must surface OOR
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6525,6 +6731,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6571,6 +6778,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6608,6 +6816,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6644,6 +6853,7 @@ mod tests {
             registers_r: &mut [], // empty — index 7 must surface OOR
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6690,6 +6900,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -6826,6 +7037,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut regs_f,
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -6890,6 +7102,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut regs_f,
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -6935,6 +7148,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7001,6 +7215,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7052,6 +7267,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7099,6 +7315,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7135,6 +7352,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7173,6 +7391,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7217,6 +7436,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -7287,6 +7507,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7432,6 +7653,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7485,6 +7707,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7529,6 +7752,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7568,6 +7792,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7616,6 +7841,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7666,6 +7892,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7735,6 +7962,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7793,6 +8021,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7850,6 +8079,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7890,6 +8120,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7968,6 +8199,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8041,6 +8273,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8126,6 +8359,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8239,6 +8473,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8286,6 +8521,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8325,6 +8561,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8388,6 +8625,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8498,6 +8736,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8579,6 +8818,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -8659,6 +8899,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8718,6 +8959,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8780,6 +9022,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8840,6 +9083,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8906,6 +9150,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8970,6 +9215,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -9025,6 +9271,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9099,6 +9346,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9153,6 +9401,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9189,6 +9438,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9243,6 +9493,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9315,6 +9566,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9377,6 +9629,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9419,6 +9672,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9483,6 +9737,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9528,6 +9783,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9587,6 +9843,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9637,6 +9894,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9890,6 +10148,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
+            concrete_registers_r: &[],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
