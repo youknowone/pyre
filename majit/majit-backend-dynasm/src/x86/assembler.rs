@@ -3142,10 +3142,17 @@ impl<'a> Assembler386<'a> {
                     self.done_with_this_frame_descr_ptr_for_type(result_type)
                 };
                 // FINISH op exit (DoneWithThisFrame* / ExitFrameWithExceptionDescr).
-                // `compile.py:185` skips these — not a `ResumeDescr`.  The
-                // metainterp singleton (`compile.py:665-674`) carries no
-                // per-trace `fail_arg_types`, so we still need a per-trace
-                // wrapper that holds the FINISH op's typed exit slots.
+                // `compile.py:185` skips these — not a `ResumeDescr`.  PyPy's
+                // `genop_finish` (assembler.py:2114-2156) stamps the
+                // metainterp singleton directly into `jf_descr` via the GC
+                // table index; pyre's runtime classifier (`runner.rs::
+                // find_descr_by_ptr` lines 1115-1151) short-circuits the
+                // FINISH/Exit/Propagate ptrs to the cpu-attached singleton
+                // before consulting the registry, so the per-emission
+                // wrapper has no jf_descr role.  Push the singleton Arc
+                // directly when attached; fall back to the wrapper for
+                // test scaffolds that bypass cpu attachment (per the
+                // `meta_descr.is_none()` invariant noted at guard.rs:225).
                 let meta_descr = if is_exit_exc {
                     self.cpu_handle
                         .read()
@@ -3155,13 +3162,16 @@ impl<'a> Assembler386<'a> {
                 } else {
                     self.done_with_this_frame_descr_arc_for_type(result_type)
                 };
-                let descr = Arc::new(DynasmFailDescr::with_meta(
-                    fail_index,
-                    self.trace_id,
-                    fail_arg_types.clone(),
-                    meta_descr,
-                ));
-                let descr: majit_ir::DescrRef = descr;
+                let descr: majit_ir::DescrRef = if let Some(singleton) = meta_descr.clone() {
+                    singleton
+                } else {
+                    Arc::new(DynasmFailDescr::with_meta(
+                        fail_index,
+                        self.trace_id,
+                        fail_arg_types.clone(),
+                        meta_descr,
+                    ))
+                };
 
                 // Store result to jf_frame[0]
                 if let Some(result) = arglocs.first() {
