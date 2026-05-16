@@ -20,7 +20,7 @@
 /// position-numbered enum_forced_boxes dedup (virtualstate.py:196, 274,
 /// 352) prevents revisiting it.
 use std::cell::Cell;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::ops::Deref;
 use std::rc::Rc;
 
@@ -75,7 +75,7 @@ impl VirtualStatesCantMatch {
 pub(crate) struct GenerateGuardState<'a> {
     pub ctx: &'a mut OptContext,
     pub extra_guards: &'a mut Vec<GuardRequirement>,
-    pub renum: HashMap<i32, i32>,
+    pub renum: crate::optimizeopt::vec_assoc::VecAssoc<i32, i32>,
     pub bad: HashSet<*const VirtualStateInfoNode>,
     pub force_boxes: bool,
 }
@@ -1248,7 +1248,7 @@ impl VirtualState {
         let mut state = GenerateGuardState {
             ctx,
             extra_guards: &mut guards,
-            renum: HashMap::new(),
+            renum: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             bad: HashSet::new(),
             force_boxes,
         };
@@ -1267,7 +1267,7 @@ impl VirtualState {
         // the same expected virtual node (the trace assumes two values
         // are aliased but the incoming disagrees), and short-circuits
         // duplicate visits to a node already proven compatible. The same
-        // `HashMap` instance is threaded through every recursive call
+        // `VecAssoc` instance is threaded through every recursive call
         // (virtualstate.py:174-176 struct field, :260-261 array item,
         // :325-326 interior field) so nested virtual nodes share the
         // alias namespace with their top-level parents. Now lives on
@@ -2162,10 +2162,10 @@ impl Clone for VirtualState {
     /// subclass instances per VirtualState — this manual impl reproduces
     /// that invariant.
     fn clone(&self) -> Self {
-        let mut cache: std::collections::HashMap<
+        let mut cache: crate::optimizeopt::vec_assoc::VecAssoc<
             *const VirtualStateInfoNode,
             Rc<VirtualStateInfoNode>,
-        > = std::collections::HashMap::new();
+        > = crate::optimizeopt::vec_assoc::VecAssoc::new();
         let cloned: Vec<Rc<VirtualStateInfoNode>> = self
             .state
             .iter()
@@ -2180,7 +2180,10 @@ impl Clone for VirtualState {
 /// `<VirtualState as Clone>::clone`.
 fn deep_clone_node(
     src: &Rc<VirtualStateInfoNode>,
-    cache: &mut std::collections::HashMap<*const VirtualStateInfoNode, Rc<VirtualStateInfoNode>>,
+    cache: &mut crate::optimizeopt::vec_assoc::VecAssoc<
+        *const VirtualStateInfoNode,
+        Rc<VirtualStateInfoNode>,
+    >,
 ) -> Rc<VirtualStateInfoNode> {
     let key = Rc::as_ptr(src);
     if let Some(hit) = cache.get(&key) {
@@ -2473,14 +2476,14 @@ pub fn export_state(oprefs: &[OpRef], ctx: &OptContext) -> VirtualState {
 /// then overwrite" pattern from leaking the stub to in-flight recursive
 /// callers.
 pub(crate) struct ExportCache {
-    pub finished: HashMap<OpRef, Rc<VirtualStateInfoNode>>,
+    pub finished: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Rc<VirtualStateInfoNode>>,
     pub in_progress: std::collections::HashSet<OpRef>,
 }
 
 impl ExportCache {
     pub fn new() -> Self {
         Self {
-            finished: HashMap::new(),
+            finished: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             in_progress: std::collections::HashSet::new(),
         }
     }
