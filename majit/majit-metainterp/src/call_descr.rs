@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -94,7 +93,9 @@ struct CallDescrKey {
     effect_info: EffectInfoKey,
 }
 
-static CALL_DESCR_CACHE: OnceLock<Mutex<HashMap<CallDescrKey, DescrRef>>> = OnceLock::new();
+static CALL_DESCR_CACHE: OnceLock<
+    Mutex<crate::optimizeopt::vec_assoc::VecAssoc<CallDescrKey, DescrRef>>,
+> = OnceLock::new();
 static NEXT_CALL_DESCR_HEAPCACHE_INDEX: AtomicU32 = AtomicU32::new(1_000_000_000);
 
 /// `compile.py:187 isinstance(descr, JitCellToken)` parity.
@@ -648,9 +649,10 @@ pub fn make_call_descr_with_effect(
 
     // descr.py:22 `GcCache._cache_call`: call descriptors are cached
     // structurally, so repeated construction of the same call shape
-    // yields the same descr identity.  The HashMap is that RPython
+    // yields the same descr identity.  The VecAssoc is that RPython
     // descriptor cache, not a side table for per-box optimizer state.
-    let cache = CALL_DESCR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = CALL_DESCR_CACHE
+        .get_or_init(|| Mutex::new(crate::optimizeopt::vec_assoc::VecAssoc::new()));
     let mut cache = cache.lock().unwrap();
     if let Some(descr) = cache.get(&key) {
         return descr.clone();
@@ -685,7 +687,8 @@ pub fn make_call_descr_with_effect(
 /// The returned `Vec` clones the cached `Arc<dyn Descr>` handles so
 /// the caller can release the cache lock before processing.
 pub fn cached_call_descrs() -> Vec<DescrRef> {
-    let cache = CALL_DESCR_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let cache = CALL_DESCR_CACHE
+        .get_or_init(|| Mutex::new(crate::optimizeopt::vec_assoc::VecAssoc::new()));
     let cache = cache.lock().unwrap();
     cache.values().cloned().collect()
 }
