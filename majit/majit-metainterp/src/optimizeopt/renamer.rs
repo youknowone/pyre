@@ -3,19 +3,19 @@
 //! Mirrors RPython's `optimizeopt/renamer.py`.
 //! Used during loop unrolling to rename OpRefs from one iteration to the next.
 
-use std::collections::HashMap;
-
 use majit_ir::{Op, OpRef};
+
+use crate::optimizeopt::vec_assoc::VecAssoc;
 
 /// renamer.py:3-58: Renamer — maps old OpRefs to new OpRefs during unrolling.
 pub struct Renamer {
-    rename_map: HashMap<OpRef, OpRef>,
+    rename_map: VecAssoc<OpRef, OpRef>,
 }
 
 impl Renamer {
     pub fn new() -> Self {
         Renamer {
-            rename_map: HashMap::new(),
+            rename_map: VecAssoc::new(),
         }
     }
 
