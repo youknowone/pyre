@@ -1609,6 +1609,50 @@ fn getfield_vable_via_metainterp(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// `setfield_vable_<i|r|f>/r<v>d` handler. Operand layout:
+/// 1B r-reg(vable_box) + 1B <v>-reg(value) + 2B descr(field).
+/// No dst byte (set, not get).
+///
+/// RPython parity: `pyjitpl.py:1188-1199 _opimpl_setfield_vable`:
+///
+///   def _opimpl_setfield_vable(self, box, valuebox, fielddescr, pc):
+///       if self._nonstandard_virtualizable(pc, box, fielddescr):
+///           return self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
+///       index = self._get_virtualizable_field_index(fielddescr)
+///       self.metainterp.virtualizable_boxes[index] = valuebox
+///       self.metainterp.synchronize_virtualizable()
+///       # XXX only the index'th field needs to be synchronized, really
+///
+/// The walker delegates to `TraceCtx::vable_setfield`
+/// (`majit-metainterp/src/trace_ctx.rs:1759`) which implements the
+/// full `_nonstandard_virtualizable` -> SETFIELD_GC fallback +
+/// `virtualizable_boxes[index] = valuebox` write + `synchronize_virtualizable`
+/// mirror.  The concrete `Value` is reconstructed via
+/// `TraceCtx::concrete_of_opref` (matches the trait-leg's
+/// `pyjitpl/dispatch.rs:1608-1609` shape `let (value, concrete) =
+/// self.read_<bank>_reg(src); ctx.vable_setfield(...)`).
+///
+/// `value_bank` selects the value register bank (`'i'`/`'r'`/`'f'`),
+/// mirroring `setfield_gc_via_heapcache`'s parameter shape.
+fn setfield_vable_via_metainterp(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    value_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let obj = read_ref_reg(code, op, 0, ctx)?;
+    let value = match value_bank {
+        'i' => read_int_reg(code, op, 1, ctx)?,
+        'r' => read_ref_reg(code, op, 1, ctx)?,
+        'f' => read_float_reg(code, op, 1, ctx)?,
+        _ => unreachable!("value_bank must be 'i', 'r' or 'f'"),
+    };
+    let descr = read_descr(code, op, 2, ctx)?;
+    let concrete = ctx.trace_ctx.concrete_of_opref(value);
+    ctx.trace_ctx.vable_setfield(obj, descr, value, concrete);
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
 /// Generic int-bank unary handler. Operand layout `i>i` (1B src + 1B
 /// dst). RPython parity: `pyjitpl.py:356-368` exec-generated
 /// `opimpl_int_<unary>` (int_neg / int_invert / int_is_zero etc.) +
@@ -3779,6 +3823,18 @@ fn handle(
         "getfield_vable_i/rd>i" => getfield_vable_via_metainterp(code, op, ctx, 'i'),
         "getfield_vable_r/rd>r" => getfield_vable_via_metainterp(code, op, ctx, 'r'),
         "getfield_vable_f/rd>f" => getfield_vable_via_metainterp(code, op, ctx, 'f'),
+        // Virtualizable setfield writes. RPython
+        // `pyjitpl.py:1188-1199 _opimpl_setfield_vable` — walker
+        // delegates to `TraceCtx::vable_setfield`
+        // (`majit-metainterp/src/trace_ctx.rs:1759`) which handles the
+        // `_nonstandard_virtualizable` fallback to SETFIELD_GC + the
+        // standard-vable `virtualizable_boxes[index] = valuebox` +
+        // `synchronize_virtualizable` mirror.  Operand shapes:
+        // `setfield_vable_i/rid`, `setfield_vable_r/rrd`,
+        // `setfield_vable_f/rfd` — value bank differs, no dst byte.
+        "setfield_vable_i/rid" => setfield_vable_via_metainterp(code, op, ctx, 'i'),
+        "setfield_vable_r/rrd" => setfield_vable_via_metainterp(code, op, ctx, 'r'),
+        "setfield_vable_f/rfd" => setfield_vable_via_metainterp(code, op, ctx, 'f'),
         // setfield_gc canonical shapes. `iid` / `ird` (int box)
         // shapes are pyre kind-flow Task #85 territory and stay
         // unsupported.
@@ -7021,17 +7077,17 @@ mod tests {
     fn unsupported_opname_surfaces_typed_error() {
         // Stable choice for exercising the catch-all `UnsupportedOpname`
         // error path while handler coverage continues to grow.  The
-        // `setfield_vable_i/rid` opname is the next-in-line for the
-        // vable mirror to gain a walker handler (T2 follow-on: pyjitpl.py
-        // :1188-1199 `_opimpl_setfield_vable` with
-        // `TraceCtx::vable_setfield`); until that lands, dispatching it
+        // `ptr_nonzero/r>i` opname is the next-in-line simple unary
+        // op the walker should gain a handler for (RPython
+        // `pyjitpl.py:378 opimpl_ptr_nonzero` + `blackhole.py:594
+        // bhimpl_ptr_nonzero`).  Until that lands, dispatching it
         // surfaces `UnsupportedOpname` from the catch-all arm.
-        let opname = "setfield_vable_i/rid";
+        let opname = "ptr_nonzero/r>i";
         let unsupported_byte = *insns_opname_to_byte()
             .get(opname)
             .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
-        // Operand encoding `rid`: 1B r-reg + 1B i-reg + 2B descr = 4B
-        let code = [unsupported_byte, 0, 0, 0, 0];
+        // Operand encoding `r>i`: 1B r-reg + 1B i-reg-dst = 2B
+        let code = [unsupported_byte, 0, 0];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
@@ -9106,6 +9162,73 @@ mod tests {
             "GetfieldGcI descr must be descr_refs[d] (the field descr)",
         );
         assert_eq!(dst_post, last.pos);
+    }
+
+    #[test]
+    fn setfield_vable_i_routes_through_metainterp_records_setfield_gc_fallback() {
+        // T2a sanity: `setfield_vable_i/rid` delegates to
+        // `TraceCtx::vable_setfield`.  With no `virtualizable_info`
+        // bound on the trace context, `is_nonstandard_virtualizable`
+        // returns true and the fallback records a `SetfieldGc` op
+        // with `[obj, value]` + the field descr — same shape
+        // `setfield_gc_via_heapcache` produces.  Exercises the
+        // walker -> trace_ctx boundary for the int-bank variant
+        // (the `r` and `f` variants share the handler body, varying
+        // only `value_bank`).
+        let byte = *insns_opname_to_byte()
+            .get("setfield_vable_i/rid")
+            .expect("`setfield_vable_i/rid` must be in insns table");
+        // Operand layout `rid`: 1B r-reg(2) + 1B i-reg(3) + 2B descr-index(LE 1).
+        let code = [byte, 0x02, 0x03, 0x01, 0x00];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let obj = regs_r[2];
+        let value = regs_i[3];
+        let descr = field_descr_with_index(1);
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
+        let frame_done = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) =
+            step(&code, 0, &mut wc).expect("setfield_vable_i must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, 5, "setfield_vable_i/rid operand layout = 4 bytes");
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before + 1,
+            "nonstandard-vable fallback records exactly one SetfieldGc op",
+        );
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::SetfieldGc);
+        assert_eq!(
+            last.args.as_slice(),
+            &[obj, value],
+            "SetfieldGc args must be [obj, value]",
+        );
+        let recorded_descr = last
+            .descr
+            .as_ref()
+            .expect("SetfieldGc must carry the field descr");
+        assert!(
+            std::sync::Arc::ptr_eq(recorded_descr, &descr),
+            "SetfieldGc descr must be descr_refs[d] (the field descr)",
+        );
     }
 
     #[test]
