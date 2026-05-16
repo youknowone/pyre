@@ -7678,13 +7678,20 @@ impl CodeWriter {
             inputs,
             &cfg_coalesce_pairs,
         );
-        // Phase 1 pilot (Task #224): run graph-based
-        // `perform_graph_register_allocation_all_kinds` in parallel
-        // for instrumentation.  Upstream `codewriter.py:44-46` runs
-        // regalloc on the CFG before flatten emits the SSARepr; pyre
-        // still drives regalloc off the SSARepr, and the two allocators
-        // see DIFFERENT Variable sets: graph regalloc sees the shadow
-        // graph (semantic ops + tmp_claim shadows + frame-state-threaded
+        // Phase 3 (b) Slice 1: run graph-side
+        // `perform_graph_register_allocation_all_kinds` +
+        // `enforce_input_args_simulation` post-walker on every
+        // production graph, matching upstream `codewriter.py:44-46`'s
+        // pre-flatten regalloc step.  The result is not consumed yet —
+        // Slice 2 will build the `(Kind, slot) → color` bridge map that
+        // the 5 SSA-side `alloc_result` consumers below currently rely
+        // on; Slice 3 will swap the source of truth.  Running the
+        // graph-side allocator unconditionally first surfaces any
+        // graph topology that the allocator can't process before any
+        // downstream code reads from it.
+        let mut _graph_regallocs =
+            super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
+        super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
 
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
 
