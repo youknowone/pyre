@@ -141,7 +141,8 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
             // Remap every reference to `original_result` → `args[0]` in
             // after-call ops and exit metadata so the phi-node-style
             // merge carries the callee's return value forward.
-            let remapped_after_ops = remap_value_in_ops(&after_ops, original_result, args[0]);
+            let remapped_after_ops =
+                remap_value_in_ops(&after_ops, original_result, args[0], graph);
             graph.blocks[id.0].operations = remapped_after_ops;
             let (remapped_switch, remapped_exits) = remap_control_flow_metadata(
                 graph,
@@ -200,7 +201,7 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
         let new_ops: Vec<SpaceOperation> = callee_block
             .operations
             .iter()
-            .map(|op| remap_op(op, &value_map))
+            .map(|op| remap_op(op, &value_map, &callee, graph))
             .collect();
         graph.blocks[new_block_id.0].operations = new_ops;
 
@@ -356,15 +357,29 @@ fn remap_callee_blocks(
     map
 }
 
-/// Remap a single Op's values.
-fn remap_op(op: &SpaceOperation, value_map: &HashMap<ValueId, ValueId>) -> SpaceOperation {
+/// Remap a single Op's values.  `source_graph` / `target_graph` are
+/// threaded so the upcoming OpKind storage flip can project a
+/// variant's `Variable` field across graphs (`source_graph.value_id_of`
+/// → `value_map` → `target_graph.must_variable`).  Today only the
+/// signature is graph-aware; the body still works on `ValueId`.
+fn remap_op(
+    op: &SpaceOperation,
+    value_map: &HashMap<ValueId, ValueId>,
+    source_graph: &FunctionGraph,
+    target_graph: &FunctionGraph,
+) -> SpaceOperation {
     let remap = |v: &ValueId| *value_map.get(v).unwrap_or(v);
     let result = op.result.map(|v| remap(&v));
-    let kind = remap_op_kind(&op.kind, &remap);
+    let kind = remap_op_kind(&op.kind, &remap, source_graph, target_graph);
     SpaceOperation { result, kind }
 }
 
-fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind {
+fn remap_op_kind(
+    kind: &OpKind,
+    remap: &impl Fn(&ValueId) -> ValueId,
+    _source_graph: &FunctionGraph,
+    _target_graph: &FunctionGraph,
+) -> OpKind {
     match kind {
         OpKind::Input { name, ty } => OpKind::Input {
             name: name.clone(),
@@ -1289,20 +1304,28 @@ fn remap_value_in_graph(
                 |b| b,
             )
         };
+        let new_ops = remap_value_in_ops(&graph.blocks[bid.0].operations, old, new, graph);
         let block = &mut graph.blocks[bid.0];
-        block.operations = remap_value_in_ops(&block.operations, old, new);
+        block.operations = new_ops;
         block.exitswitch = exitswitch;
         block.exits = exits;
     }
 }
 
 /// Replace all occurrences of `old` with `new` in a list of ops.
-fn remap_value_in_ops(ops: &[SpaceOperation], old: ValueId, new: ValueId) -> Vec<SpaceOperation> {
+/// `graph` is threaded so [`remap_op_kind`] can project Variable
+/// operands once the OpKind storage flip lands.
+fn remap_value_in_ops(
+    ops: &[SpaceOperation],
+    old: ValueId,
+    new: ValueId,
+    graph: &FunctionGraph,
+) -> Vec<SpaceOperation> {
     let remap = |v: &ValueId| if *v == old { new } else { *v };
     ops.iter()
         .map(|op| SpaceOperation {
             result: op.result,
-            kind: remap_op_kind(&op.kind, &remap),
+            kind: remap_op_kind(&op.kind, &remap, graph, graph),
         })
         .collect()
 }

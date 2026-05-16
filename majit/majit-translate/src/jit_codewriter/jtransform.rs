@@ -473,7 +473,7 @@ impl<'a> Transformer<'a> {
 
         let original_ops = graph.blocks[block_idx].operations.clone();
         for original_op in &original_ops {
-            let op = remap_op(original_op, &self.aliases);
+            let op = remap_op(original_op, &self.aliases, graph);
             match self.rewrite_operation(&op, graph_name) {
                 RewriteResult::Replace(ops) => {
                     new_ops.extend(ops);
@@ -3627,6 +3627,7 @@ fn remap_call_funcptr(
 fn remap_op(
     op: &SpaceOperation,
     aliases: &std::collections::HashMap<ValueId, ValueId>,
+    _graph: &crate::model::FunctionGraph,
 ) -> SpaceOperation {
     let kind = match &op.kind {
         OpKind::Input { .. }
