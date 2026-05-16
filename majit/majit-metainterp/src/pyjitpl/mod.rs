@@ -156,9 +156,9 @@ pub(crate) struct CompiledTrace {
     /// Constant types for the constant pool entries.
     pub(crate) constant_types: HashMap<u32, Type>,
     /// Static exit metadata for each guard/finish in this trace.
-    pub(crate) exit_layouts: HashMap<u32, StoredExitLayout>,
+    pub(crate) exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
     /// Static exit metadata for terminal FINISH/JUMP ops, keyed by op index.
-    pub(crate) terminal_exit_layouts: HashMap<usize, StoredExitLayout>,
+    pub(crate) terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
 }
 
 #[derive(Debug, Clone)]
@@ -17573,8 +17573,8 @@ mod tests {
                 ops,
                 constants,
                 constant_types: HashMap::new(),
-                exit_layouts: HashMap::new(),
-                terminal_exit_layouts: HashMap::new(),
+                exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+                terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             },
         );
         meta.warm_state_mut()
@@ -17719,7 +17719,7 @@ mod tests {
             pending_field_layouts: vec![],
         };
 
-        let mut exit_layouts = HashMap::new();
+        let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> = crate::optimizeopt::vec_assoc::VecAssoc::new();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -17748,7 +17748,7 @@ mod tests {
                 constants: HashMap::new(),
                 constant_types: HashMap::new(),
                 exit_layouts,
-                terminal_exit_layouts: HashMap::new(),
+                terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             },
         );
 
@@ -17809,7 +17809,7 @@ mod tests {
         writer.patch_current_size(0);
         let rd_numb = writer.create_numbering();
 
-        let mut exit_layouts = HashMap::new();
+        let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> = crate::optimizeopt::vec_assoc::VecAssoc::new();
         exit_layouts.insert(
             fail_index,
             StoredExitLayout {
@@ -17844,7 +17844,7 @@ mod tests {
                 constants: HashMap::new(),
                 constant_types: HashMap::new(),
                 exit_layouts,
-                terminal_exit_layouts: HashMap::new(),
+                terminal_exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             },
         );
 

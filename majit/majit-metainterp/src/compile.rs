@@ -384,11 +384,13 @@ pub(crate) fn build_guard_metadata(
     pc: u64,
     constant_types: &std::collections::HashMap<u32, Type>,
 ) -> (
-    HashMap<u32, crate::resume::ResumeLayoutSummary>,
-    HashMap<u32, StoredExitLayout>,
+    crate::optimizeopt::vec_assoc::VecAssoc<u32, crate::resume::ResumeLayoutSummary>,
+    crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
 ) {
-    let mut result = HashMap::new();
-    let mut exit_layouts = HashMap::new();
+    let mut result: crate::optimizeopt::vec_assoc::VecAssoc<u32, crate::resume::ResumeLayoutSummary> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
+    let mut exit_layouts: crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
     let mut fail_index = 0u32;
     let mut resume_memo = ResumeDataLoopMemo::new();
     // RPython box.type parity: type lookup is `inputarg.tp` /
@@ -1102,7 +1104,7 @@ pub(crate) fn build_guard_metadata(
 }
 
 pub(crate) fn merge_backend_exit_layouts(
-    exit_layouts: &mut HashMap<u32, StoredExitLayout>,
+    exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
     backend_layouts: &[FailDescrLayout],
     ops: &[majit_ir::Op],
 ) {
@@ -1152,17 +1154,15 @@ pub(crate) fn merge_backend_exit_layouts(
                 })
             });
         let entry: &mut StoredExitLayout =
-            exit_layouts
-                .entry(layout.fail_index)
-                .or_insert_with(|| StoredExitLayout {
-                    source_op_index: layout.source_op_index,
-                    gc_ref_slots: layout.gc_ref_slots.clone(),
-                    force_token_slots: layout.force_token_slots.clone(),
-                    recovery_layout: layout.recovery_layout.clone(),
-                    resume_layout: None,
-                    storage: storage_from_backend.clone(),
-                    descr: descr_from_op.clone(),
-                    op_arg_types_for_jump: None,
+            exit_layouts.entry_or_insert_with(layout.fail_index, || StoredExitLayout {
+                source_op_index: layout.source_op_index,
+                gc_ref_slots: layout.gc_ref_slots.clone(),
+                force_token_slots: layout.force_token_slots.clone(),
+                recovery_layout: layout.recovery_layout.clone(),
+                resume_layout: None,
+                storage: storage_from_backend.clone(),
+                descr: descr_from_op.clone(),
+                op_arg_types_for_jump: None,
                 });
         entry.source_op_index = layout.source_op_index;
         // Backfill descr if the entry was inserted before `op.descr` was
@@ -1199,7 +1199,7 @@ pub(crate) fn merge_backend_exit_layouts(
 /// Guards that HAVE recovery_layout (all production guards after backend
 /// merge) must satisfy the full invariant. Guards without (only possible
 /// in unit tests with mock backends) are warned but not fatal.
-pub(crate) fn validate_exit_layouts(exit_layouts: &HashMap<u32, StoredExitLayout>) {
+pub(crate) fn validate_exit_layouts(exit_layouts: &crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>) {
     for (&fail_index, layout) in exit_layouts {
         if layout.resolve_is_finish() {
             continue;
@@ -1403,7 +1403,7 @@ pub(crate) fn enrich_resume_layout_with_frame_stack(
 }
 
 pub(crate) fn merge_backend_terminal_exit_layouts(
-    terminal_exit_layouts: &mut HashMap<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
     backend_layouts: &[TerminalExitLayout],
     ops: &[majit_ir::Op],
 ) {
@@ -1437,9 +1437,8 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
             })
         });
         let op_arg_types_for_jump = is_jump.then(|| layout.exit_types.clone());
-        let entry = terminal_exit_layouts
-            .entry(layout.op_index)
-            .or_insert_with(|| StoredExitLayout {
+        let entry = terminal_exit_layouts.entry_or_insert_with(layout.op_index, || {
+            StoredExitLayout {
                 source_op_index: Some(layout.op_index),
                 gc_ref_slots: layout.gc_ref_slots.clone(),
                 force_token_slots: layout.force_token_slots.clone(),
@@ -1448,7 +1447,8 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
                 storage: None,
                 descr: descr_from_op.clone(),
                 op_arg_types_for_jump: op_arg_types_for_jump.clone(),
-            });
+            }
+        });
         entry.source_op_index = Some(layout.op_index);
         entry.gc_ref_slots = layout.gc_ref_slots.clone();
         entry.force_token_slots = layout.force_token_slots.clone();
@@ -1605,8 +1605,9 @@ pub(crate) fn build_terminal_exit_layouts(
     inputargs: &[InputArg],
     ops: &[majit_ir::Op],
     constant_types: &HashMap<u32, Type>,
-) -> HashMap<usize, StoredExitLayout> {
-    let mut layouts = HashMap::new();
+) -> crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout> {
+    let mut layouts: crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
     for (op_index, op) in ops.iter().enumerate() {
         if op.opcode != OpCode::Finish && op.opcode != OpCode::Jump {
             continue;
@@ -2119,8 +2120,11 @@ pub(crate) fn strip_stray_overflow_guards(ops: Vec<Op>) -> Vec<Op> {
 }
 
 pub(crate) fn enrich_guard_resume_layouts_for_trace(
-    resume_layouts: &mut HashMap<u32, crate::resume::ResumeLayoutSummary>,
-    exit_layouts: &mut HashMap<u32, StoredExitLayout>,
+    resume_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<
+        u32,
+        crate::resume::ResumeLayoutSummary,
+    >,
+    exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
     trace_id: u64,
     inputargs: &[InputArg],
     trace_info: Option<&CompiledTraceInfo>,
@@ -2143,7 +2147,7 @@ pub(crate) fn enrich_guard_resume_layouts_for_trace(
 }
 
 pub(crate) fn patch_guard_recovery_layouts_for_trace(
-    exit_layouts: &mut HashMap<u32, StoredExitLayout>,
+    exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<u32, StoredExitLayout>,
 ) {
     // Backend no longer caches a per-descr recovery layout; the
     // metainterp's `StoredExitLayout.recovery_layout` cache is the
@@ -2165,7 +2169,7 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
     backend: &mut dyn majit_backend::Backend,
     token: &majit_backend::JitCellToken,
     trace_id: u64,
-    terminal_exit_layouts: &mut HashMap<usize, StoredExitLayout>,
+    terminal_exit_layouts: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, StoredExitLayout>,
 ) {
     for (&op_index, exit_layout) in terminal_exit_layouts.iter_mut() {
         let Some(resume_layout) = exit_layout.resume_layout.as_ref() else {
