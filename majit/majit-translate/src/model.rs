@@ -2527,10 +2527,26 @@ impl FunctionGraph {
     /// [`ValueId`] — used by [`crate::jit_codewriter::type_state::apply_from_flowspace_variables`]
     /// when the adapter discovers the upstream Variable for a slot
     /// that was already allocated through the legacy front-end.
-    /// The new Variable replaces whatever placeholder was put in by
-    /// [`Self::alloc_value_with_type`], so its
-    /// [`crate::flowspace::model::Variable::concretetype`] becomes
-    /// the kind source for the slot.
+    ///
+    /// **RPython parity** — upstream `rtyper.setconcretetype(v)`
+    /// (`rpython/rtyper/rmodel.py:160`) performs `v.concretetype = T`
+    /// directly on the existing Variable.  Because Python attribute
+    /// writes propagate through every reference, the same write is
+    /// observed by `block.inputargs`, every `op.args` slot, and every
+    /// `link.args` entry that holds that Variable.  Pyre's
+    /// [`crate::flowspace::model::Variable::concretetype`] is wired as
+    /// `Rc<RefCell<…>>` for exactly that aliasing guarantee — so the
+    /// upstream-orthodox bind step is "copy the rtyper Variable's
+    /// concretetype into the existing placeholder's cell", not
+    /// "replace the slot".
+    ///
+    /// Replacing the slot would leave stale placeholders in
+    /// `Block.inputargs`, op operands, `Link.args`, `exitswitch`,
+    /// `last_exception`, and `last_exc_value` — Variable identity
+    /// matters downstream (regalloc keys colors on the Variable
+    /// pulled from `iter_variables()` while flatten looks them up via
+    /// the block/op references), so a divergent identity surfaces as
+    /// missing colors.
     pub fn bind_variable(&mut self, v: ValueId, var: crate::flowspace::model::Variable) {
         if v.0 >= self.value_variables.len() {
             self.value_variables.resize_with(v.0 + 1, || {
@@ -2547,8 +2563,29 @@ impl FunctionGraph {
                 }
             }
         }
-        self.variable_to_vid.insert(var.id(), v);
-        self.value_variables[v.0] = Some(var);
+        match self.value_variables[v.0].as_ref() {
+            Some(placeholder) if placeholder.id() != var.id() => {
+                // Mirror `v.concretetype = T` onto the existing
+                // placeholder's Rc-shared cell — every reference to
+                // the placeholder in `Block.inputargs`, op operands,
+                // `Link.args`, `exitswitch`, `last_exception`, and
+                // `last_exc_value` observes the new kind immediately.
+                if let Some(ct) = var.concretetype() {
+                    placeholder.set_concretetype(Some(ct));
+                }
+                // The placeholder identity remains authoritative; we
+                // also register the rtyper Variable's id so any
+                // downstream `value_id_of(rtyper_var)` lookup still
+                // resolves to this slot.
+                self.variable_to_vid.insert(var.id(), v);
+            }
+            _ => {
+                // No prior Variable for this slot — install the
+                // incoming one as the placeholder.
+                self.variable_to_vid.insert(var.id(), v);
+                self.value_variables[v.0] = Some(var);
+            }
+        }
     }
 
     /// Read the backing [`crate::flowspace::model::Variable`] for a
