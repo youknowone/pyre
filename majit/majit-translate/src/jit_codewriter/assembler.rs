@@ -1204,7 +1204,8 @@ impl Assembler {
                 let calldescr = descriptor.to_bh_calldescr();
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Call { calldescr });
                 // RPython jtransform.py:422-431: kind-separated sublists
-                let g = graph.expect("encode_op for Call{Elidable,Residual,MayForce} requires a graph");
+                let g =
+                    graph.expect("encode_op for Call{Elidable,Residual,MayForce} requires a graph");
                 let project = |args: &[crate::flowspace::model::Variable]| -> Vec<ValueId> {
                     args.iter()
                         .map(|v| {
@@ -1216,7 +1217,8 @@ impl Assembler {
                 let args_i_vids = project(args_i);
                 let args_r_vids = project(args_r);
                 let args_f_vids = project(args_f);
-                let kinds = self.kinds_suffix(&args_i_vids, &args_r_vids, &args_f_vids, *result_kind);
+                let kinds =
+                    self.kinds_suffix(&args_i_vids, &args_r_vids, &args_f_vids, *result_kind);
                 if kinds.contains('i') {
                     self.emit_list_of_kind(&args_i_vids, RegKind::Int, regallocs, state);
                     argcodes.push('I');

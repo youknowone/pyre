@@ -365,10 +365,8 @@ impl RegAllocator {
                     }
                 }
                 let target_block = graph.block(link.target);
-                let target_input_vars: Vec<crate::flowspace::model::Variable> = target_block
-                    .input_variables(graph)
-                    .cloned()
-                    .collect();
+                let target_input_vars: Vec<crate::flowspace::model::Variable> =
+                    target_block.input_variables(graph).cloned().collect();
                 for (arg, target_var) in link.args.iter().zip(target_input_vars.iter()) {
                     if let Some(arg_var) = arg.as_variable() {
                         // `consider` is still ValueId-keyed (it reads

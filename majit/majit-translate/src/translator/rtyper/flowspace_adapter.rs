@@ -872,7 +872,10 @@ pub fn translate_op(
                 .enumerate()
                 .map(|(i, v)| {
                     let role = format!("args[{i}]");
-                    lookup_operand(value_map, *v, op, &role)
+                    let vid = graph
+                        .value_id_of(v)
+                        .expect("Call arg must have a backing ValueId on graph");
+                    lookup_operand(value_map, vid, op, &role)
                 })
                 .collect();
             let arg_hls = arg_hls?;
@@ -2497,24 +2500,24 @@ mod tests {
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
-        let op = SpaceOperation {
-            result: Some(ValueId(2)),
-            kind: OpKind::Call {
-                target: crate::model::CallTarget::FunctionPath {
-                    segments: vec!["a".into(), "b".into()],
-                },
-                args: vec![ValueId(1)],
-                result_ty: ValueType::Int,
-            },
-        };
         let registry = empty_call_registry();
         registry.get_or_register(
             FunctionPathKey::from_segments(["a", "b"]),
             Signature::new(vec!["x".into()], None, None),
         );
         let graph = translate_op_test_graph(10);
-        let translated =
-            translate_op(&op, &value_map, &registry, &graph).expect("Call::FunctionPath must lower");
+        let op = SpaceOperation {
+            result: Some(ValueId(2)),
+            kind: OpKind::Call {
+                target: crate::model::CallTarget::FunctionPath {
+                    segments: vec!["a".into(), "b".into()],
+                },
+                args: vec![graph.must_variable(ValueId(1))],
+                result_ty: ValueType::Int,
+            },
+        };
+        let translated = translate_op(&op, &value_map, &registry, &graph)
+            .expect("Call::FunctionPath must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "simple_call");
@@ -2539,17 +2542,17 @@ mod tests {
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(2)),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::SyntheticTransparentCtor {
                     name: "Point".into(),
                 },
-                args: vec![ValueId(1)],
+                args: vec![graph.must_variable(ValueId(1))],
                 result_ty: ValueType::Ref,
             },
         };
-        let graph = translate_op_test_graph(10);
         let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("Call::SyntheticTransparentCtor must lower");
         assert_eq!(translated.len(), 1);
@@ -2573,15 +2576,15 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new())); // receiver
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new())); // arg
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new())); // result
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::Call {
                 target: crate::model::CallTarget::method("push", Some("Vec".into())),
-                args: vec![ValueId(1), ValueId(2)],
+                args: vec![graph.must_variable(ValueId(1)), graph.must_variable(ValueId(2))],
                 result_ty: ValueType::Int,
             },
         };
-        let graph = translate_op_test_graph(10);
         let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("Call::Method must lower");
         assert_eq!(translated.len(), 2);
@@ -2621,6 +2624,7 @@ mod tests {
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(2)),
             kind: OpKind::Call {
@@ -2628,11 +2632,10 @@ mod tests {
                     trait_root: "MyTrait".into(),
                     method_name: "do_it".into(),
                 },
-                args: vec![ValueId(1)],
+                args: vec![graph.must_variable(ValueId(1))],
                 result_ty: ValueType::Int,
             },
         };
-        let graph = translate_op_test_graph(10);
         let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect_err("Call::Indirect must surface rclass invariant break");
         let msg = format!("{err}");
@@ -3207,9 +3210,11 @@ mod tests {
         annotations.set(ValueId(2), ValueType::Int);
 
         let mut graph = LegacyGraph::new("unported_op");
+        let inputargs = block_inputargs(&mut graph, &[ValueId(1)]);
+        let arg_var = graph.must_variable(ValueId(1));
         let startblock = Block {
             id: graph.startblock,
-            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
+            inputargs,
             operations: vec![SpaceOperation {
                 result: Some(ValueId(2)),
                 kind: OpKind::Call {
@@ -3217,7 +3222,7 @@ mod tests {
                         trait_root: "MyTrait".into(),
                         method_name: "do_it".into(),
                     },
-                    args: vec![ValueId(1)],
+                    args: vec![arg_var],
                     result_ty: ValueType::Int,
                 },
             }],

@@ -106,7 +106,17 @@ fn inline_call_site(graph: &mut FunctionGraph, site: InlineSite) {
     let block = &graph.blocks[block_id.0];
     let call_op = &block.operations[op_index];
     let (call_args, call_result) = match &call_op.kind {
-        OpKind::Call { args, .. } => (args.clone(), call_op.result),
+        OpKind::Call { args, .. } => {
+            let arg_vids: Vec<ValueId> = args
+                .iter()
+                .map(|v| {
+                    graph
+                        .value_id_of(v)
+                        .expect("Call arg must have a backing ValueId on caller graph")
+                })
+                .collect();
+            (arg_vids, call_op.result)
+        }
         _ => unreachable!("InlineSite should point to a Call op"),
     };
 
@@ -521,11 +531,19 @@ fn remap_op_kind(
             target,
             args,
             result_ty,
-        } => OpKind::Call {
-            target: target.clone(),
-            args: args.iter().map(remap).collect(),
-            result_ty: result_ty.clone(),
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("Call arg must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::Call {
+                target: target.clone(),
+                args: args.iter().map(remap_var).collect(),
+                result_ty: result_ty.clone(),
+            }
+        }
         OpKind::GuardTrue { cond } => {
             let cond_vid = source_graph
                 .value_id_of(cond)
@@ -747,9 +765,9 @@ fn remap_op_kind(
             result_kind,
         } => {
             let remap_var = |var: &crate::flowspace::model::Variable| {
-                let vid = source_graph
-                    .value_id_of(var)
-                    .expect("RecordKnownResult arg/result_value must have a backing ValueId in source");
+                let vid = source_graph.value_id_of(var).expect(
+                    "RecordKnownResult arg/result_value must have a backing ValueId in source",
+                );
                 target_graph.must_variable(remap(&vid))
             };
             OpKind::RecordKnownResult {
@@ -1010,8 +1028,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             reds_f,
             ..
         } => {
-            let g = graph
-                .expect("JitMergePoint requires a graph to project Variable to ValueId");
+            let g = graph.expect("JitMergePoint requires a graph to project Variable to ValueId");
             let project = |var: &crate::flowspace::model::Variable| {
                 g.value_id_of(var)
                     .expect("JitMergePoint arg must be a known Variable on graph")
@@ -1039,8 +1056,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                 .expect("FieldRead.base must be a known Variable on graph"),
         ],
         OpKind::FieldWrite { base, value, .. } => {
-            let g = graph
-                .expect("FieldWrite requires a graph to project Variable to ValueId");
+            let g = graph.expect("FieldWrite requires a graph to project Variable to ValueId");
             vec![
                 g.value_id_of(base)
                     .expect("FieldWrite.base must be a known Variable on graph"),
@@ -1049,8 +1065,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             ]
         }
         OpKind::ArrayRead { base, index, .. } => {
-            let g = graph
-                .expect("ArrayRead requires a graph to project Variable to ValueId");
+            let g = graph.expect("ArrayRead requires a graph to project Variable to ValueId");
             vec![
                 g.value_id_of(base)
                     .expect("ArrayRead.base must be a known Variable on graph"),
@@ -1061,8 +1076,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
         OpKind::ArrayWrite {
             base, index, value, ..
         } => {
-            let g = graph
-                .expect("ArrayWrite requires a graph to project Variable to ValueId");
+            let g = graph.expect("ArrayWrite requires a graph to project Variable to ValueId");
             vec![
                 g.value_id_of(base)
                     .expect("ArrayWrite.base must be a known Variable on graph"),
@@ -1073,8 +1087,8 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             ]
         }
         OpKind::InteriorFieldRead { base, index, .. } => {
-            let g = graph
-                .expect("InteriorFieldRead requires a graph to project Variable to ValueId");
+            let g =
+                graph.expect("InteriorFieldRead requires a graph to project Variable to ValueId");
             vec![
                 g.value_id_of(base)
                     .expect("InteriorFieldRead.base must be a known Variable on graph"),
@@ -1085,8 +1099,8 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
         OpKind::InteriorFieldWrite {
             base, index, value, ..
         } => {
-            let g = graph
-                .expect("InteriorFieldWrite requires a graph to project Variable to ValueId");
+            let g =
+                graph.expect("InteriorFieldWrite requires a graph to project Variable to ValueId");
             vec![
                 g.value_id_of(base)
                     .expect("InteriorFieldWrite.base must be a known Variable on graph"),
@@ -1096,7 +1110,15 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                     .expect("InteriorFieldWrite.value must be a known Variable on graph"),
             ]
         }
-        OpKind::Call { args, .. } => args.clone(),
+        OpKind::Call { args, .. } => {
+            let g = graph.expect("Call requires a graph to project Variable to ValueId");
+            args.iter()
+                .map(|v| {
+                    g.value_id_of(v)
+                        .expect("Call arg must be a known Variable on graph")
+                })
+                .collect()
+        }
         OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![
             graph
                 .expect("Guard{True,False} requires a graph to project Variable to ValueId")
@@ -1124,8 +1146,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                 .expect("VtableMethodPtr.receiver must be a known Variable on graph"),
         ],
         OpKind::IndirectCall { funcptr, args, .. } => {
-            let g = graph
-                .expect("IndirectCall requires a graph to project Variable to ValueId");
+            let g = graph.expect("IndirectCall requires a graph to project Variable to ValueId");
             let project = |var: &crate::flowspace::model::Variable| {
                 g.value_id_of(var)
                     .expect("IndirectCall arg/funcptr must be a known Variable on graph")
@@ -1156,8 +1177,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                 .expect("VableFieldRead.base must be a known Variable on graph"),
         ],
         OpKind::VableFieldWrite { base, value, .. } => {
-            let g = graph
-                .expect("VableFieldWrite requires a graph to project Variable to ValueId");
+            let g = graph.expect("VableFieldWrite requires a graph to project Variable to ValueId");
             vec![
                 g.value_id_of(base)
                     .expect("VableFieldWrite.base must be a known Variable on graph"),
@@ -1168,8 +1188,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
         OpKind::VableArrayRead {
             base, elem_index, ..
         } => {
-            let g = graph
-                .expect("VableArrayRead requires a graph to project Variable to ValueId");
+            let g = graph.expect("VableArrayRead requires a graph to project Variable to ValueId");
             vec![
                 g.value_id_of(base)
                     .expect("VableArrayRead.base must be a known Variable on graph"),
@@ -1183,8 +1202,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             value,
             ..
         } => {
-            let g = graph
-                .expect("VableArrayWrite requires a graph to project Variable to ValueId");
+            let g = graph.expect("VableArrayWrite requires a graph to project Variable to ValueId");
             vec![
                 g.value_id_of(base)
                     .expect("VableArrayWrite.base must be a known Variable on graph"),
@@ -1195,8 +1213,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             ]
         }
         OpKind::BinOp { lhs, rhs, .. } => {
-            let g = graph
-                .expect("BinOp requires a graph to project Variable to ValueId");
+            let g = graph.expect("BinOp requires a graph to project Variable to ValueId");
             vec![
                 g.value_id_of(lhs)
                     .expect("BinOp.lhs must be a known Variable on graph"),
@@ -1205,8 +1222,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             ]
         }
         OpKind::UnaryOp { operand, .. } => {
-            let g = graph
-                .expect("UnaryOp requires a graph to project Variable to ValueId");
+            let g = graph.expect("UnaryOp requires a graph to project Variable to ValueId");
             vec![
                 g.value_id_of(operand)
                     .expect("UnaryOp.operand must be a known Variable on graph"),
@@ -1233,8 +1249,9 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let g = graph
-                .expect("Call{Elidable,Residual,MayForce} requires a graph to project Variable to ValueId");
+            let g = graph.expect(
+                "Call{Elidable,Residual,MayForce} requires a graph to project Variable to ValueId",
+            );
             let project = |var: &crate::flowspace::model::Variable| {
                 g.value_id_of(var)
                     .expect("Call arg must be a known Variable on graph")
@@ -1254,8 +1271,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let g = graph
-                .expect("InlineCall requires a graph to project Variable to ValueId");
+            let g = graph.expect("InlineCall requires a graph to project Variable to ValueId");
             let project = |var: &crate::flowspace::model::Variable| {
                 g.value_id_of(var)
                     .expect("InlineCall arg must be a known Variable on graph")
@@ -1298,8 +1314,8 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let g = graph
-                .expect("RecordKnownResult requires a graph to project Variable to ValueId");
+            let g =
+                graph.expect("RecordKnownResult requires a graph to project Variable to ValueId");
             let project = |var: &crate::flowspace::model::Variable| {
                 g.value_id_of(var)
                     .expect("RecordKnownResult arg must be a known Variable on graph")
@@ -1319,8 +1335,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             reds_f,
             ..
         } => {
-            let g = graph
-                .expect("RecursiveCall requires a graph to project Variable to ValueId");
+            let g = graph.expect("RecursiveCall requires a graph to project Variable to ValueId");
             let project = |var: &crate::flowspace::model::Variable| {
                 g.value_id_of(var)
                     .expect("RecursiveCall arg must be a known Variable on graph")
@@ -1783,11 +1798,12 @@ mod tests {
             },
             true,
         );
+        let base_var = caller.must_variable(base.unwrap());
         let result = caller.push_op(
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
-                args: vec![base.unwrap()],
+                args: vec![base_var],
                 result_ty: ValueType::Ref,
             },
             true,
@@ -1867,11 +1883,12 @@ mod tests {
             },
             true,
         );
+        let base_var = outer.must_variable(base.unwrap());
         let result = outer.push_op(
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
-                args: vec![base.unwrap()],
+                args: vec![base_var],
                 result_ty: ValueType::Ref,
             },
             true,
@@ -1889,11 +1906,12 @@ mod tests {
             },
             true,
         );
+        let x_var = caller.must_variable(x.unwrap());
         let result = caller.push_op(
             centry,
             OpKind::Call {
                 target: CallTarget::function_path(["outer"]),
-                args: vec![x.unwrap()],
+                args: vec![x_var],
                 result_ty: ValueType::Ref,
             },
             true,
@@ -1941,11 +1959,12 @@ mod tests {
             },
             true,
         );
+        let base_var = caller.must_variable(base.unwrap());
         let result = caller.push_op(
             entry,
             OpKind::Call {
                 target: CallTarget::function_path(["callee"]),
-                args: vec![base.unwrap()],
+                args: vec![base_var],
                 result_ty: ValueType::Ref,
             },
             true,

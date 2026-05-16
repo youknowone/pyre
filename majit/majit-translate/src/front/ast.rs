@@ -3829,11 +3829,13 @@ fn lower_expr(
             } else {
                 ValueType::Unknown
             };
+            let args_vars: Vec<crate::flowspace::model::Variable> =
+                args.iter().map(|v| graph.must_variable(*v)).collect();
             let result = graph.push_op(
                 *block,
                 OpKind::Call {
                     target,
-                    args,
+                    args: args_vars,
                     result_ty,
                 },
                 true,
@@ -3888,11 +3890,13 @@ fn lower_expr(
                         .map(type_string_to_value_type)
                 })
                 .unwrap_or(ValueType::Unknown);
+            let args_vars: Vec<crate::flowspace::model::Variable> =
+                args.iter().map(|v| graph.must_variable(*v)).collect();
             let result = graph.push_op(
                 *block,
                 OpKind::Call {
                     target,
-                    args,
+                    args: args_vars,
                     result_ty,
                 },
                 true,

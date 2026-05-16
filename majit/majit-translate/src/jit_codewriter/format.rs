@@ -372,10 +372,7 @@ fn list_of_kind_repr(kind_char: char, args: &[ValueId]) -> String {
 /// model.  Variables are rendered using their dense `id` (process-wide
 /// stable per identity), which matches the ValueId-derived numbering for
 /// graphs constructed through `alloc_value_with_variable`.
-fn list_of_kind_repr_vars(
-    kind_char: char,
-    args: &[crate::flowspace::model::Variable],
-) -> String {
+fn list_of_kind_repr_vars(kind_char: char, args: &[crate::flowspace::model::Variable]) -> String {
     let kind = match kind_char.to_ascii_lowercase() {
         'i' => RegKind::Int,
         'f' => RegKind::Float,
@@ -542,11 +539,15 @@ fn op_args_repr(
         // strict source PyPy uses.  Without types (test fixtures),
         // fall back to the Ref shape.
         OpKind::Call { args, .. } => {
+            // Project Variable.id() into the ValueId numbering used by
+            // `register_repr_for_kind`, matching the pattern used by
+            // [`list_of_kind_repr_vars`].  `types` is keyed by graph-local
+            // ValueId so it no longer resolves Variable-typed args; fall
+            // back to the Ref shape per the test-fixture path.
+            let _ = types;
             let parts: Vec<String> = args
                 .iter()
-                .map(|v| {
-                    register_repr_for_kind(*v, value_id_kind(*v, types).unwrap_or(RegKind::Ref))
-                })
+                .map(|v| register_repr_for_kind(ValueId(v.id() as usize), RegKind::Ref))
                 .collect();
             out.push_str(&parts.join(", "));
         }

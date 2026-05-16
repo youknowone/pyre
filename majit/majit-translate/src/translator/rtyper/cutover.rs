@@ -2048,7 +2048,7 @@ fn fib(n: i64) -> i64 {
                         trait_root: "MyTrait".into(),
                         method_name: "do_it".into(),
                     },
-                    args: vec![ValueId(1)],
+                    args: vec![graph.must_variable(ValueId(1))],
                     result_ty: ValueType::Int,
                 },
             }],
@@ -2116,7 +2116,7 @@ fn fib(n: i64) -> i64 {
                     target: crate::model::CallTarget::FunctionPath {
                         segments: vec!["foo".into()],
                     },
-                    args: vec![ValueId(1)],
+                    args: vec![graph.must_variable(ValueId(1))],
                     result_ty: ValueType::Int,
                 },
             }],

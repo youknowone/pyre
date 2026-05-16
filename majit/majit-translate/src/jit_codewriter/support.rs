@@ -143,10 +143,20 @@ pub static INLINE_CALLS_TO: &[(&str, &[Type], Type)] = &[
 pub fn decode_builtin_call(
     op: &SpaceOperation,
     call_control: &CallControl,
+    graph: &crate::model::FunctionGraph,
 ) -> (String, Vec<NormalizedArg>) {
     match &op.kind {
         // `support.py:756-759`: op.opname == 'direct_call' → resolve via fnobj
         OpKind::Call { target, args, .. } => {
+            let args: Vec<crate::model::ValueId> = args
+                .iter()
+                .map(|v| {
+                    graph
+                        .value_id_of(v)
+                        .expect("decode_builtin_call: arg must have a backing ValueId on graph")
+                })
+                .collect();
+            let args = args.as_slice();
             // `support.py:757 fnobj = op.args[0].value._obj` →
             // `:759 get_call_oopspec_opargs(fnobj, opargs)` →
             // `:707 operation_name, args = ll_func.oopspec.split('(', 1)`.
@@ -1079,15 +1089,27 @@ mod tests {
 
     // ───────── `decode_builtin_call` tests ─────────
 
-    fn make_call_op(target: crate::model::CallTarget, args: Vec<ValueId>) -> SpaceOperation {
-        SpaceOperation {
+    fn make_call_op(
+        target: crate::model::CallTarget,
+        args: Vec<ValueId>,
+    ) -> (SpaceOperation, crate::model::FunctionGraph) {
+        let mut graph = crate::model::FunctionGraph::new("decode_builtin_call_fixture");
+        if let Some(max_vid) = args.iter().map(|v| v.0).max() {
+            if max_vid + 1 > graph.next_value() {
+                graph.set_next_value(max_vid + 1);
+            }
+        }
+        let arg_vars: Vec<crate::flowspace::model::Variable> =
+            args.iter().map(|v| graph.must_variable(*v)).collect();
+        let op = SpaceOperation {
             result: None,
             kind: OpKind::Call {
                 target,
-                args,
+                args: arg_vars,
                 result_ty: crate::model::ValueType::Int,
             },
-        }
+        };
+        (op, graph)
     }
 
     #[test]
@@ -1098,11 +1120,11 @@ mod tests {
         let mut cc = CallControl::new();
         let path = CallPath::from_segments(["jit", "isconstant"]);
         cc.mark_oopspec(path.clone(), "jit.isconstant".to_string());
-        let op = make_call_op(
+        let (op, graph) = make_call_op(
             crate::model::CallTarget::function_path(["jit", "isconstant"]),
             vec![ValueId(7), ValueId(11)],
         );
-        let (name, opargs) = decode_builtin_call(&op, &cc);
+        let (name, opargs) = decode_builtin_call(&op, &cc, &graph);
         assert_eq!(name, "jit.isconstant");
         assert_eq!(
             opargs,
@@ -1125,11 +1147,11 @@ mod tests {
             CallPath::from_segments(["int", "py_mod"]),
             "int.py_mod(x, y)".to_string(),
         );
-        let op = make_call_op(
+        let (op, graph) = make_call_op(
             crate::model::CallTarget::function_path(["int", "py_mod"]),
             vec![ValueId(2), ValueId(3)],
         );
-        let (name, opargs) = decode_builtin_call(&op, &cc);
+        let (name, opargs) = decode_builtin_call(&op, &cc, &graph);
         assert_eq!(name, "int.py_mod");
         assert_eq!(
             opargs,
@@ -1149,11 +1171,11 @@ mod tests {
         // (per `jtransform.py:484 handle_builtin_call`) catch wiring
         // gaps loudly.
         let cc = CallControl::new();
-        let op = make_call_op(
+        let (op, graph) = make_call_op(
             crate::model::CallTarget::function_path(["some", "unregistered"]),
             vec![],
         );
-        let _ = decode_builtin_call(&op, &cc);
+        let _ = decode_builtin_call(&op, &cc, &graph);
     }
 
     #[test]
@@ -1175,7 +1197,8 @@ mod tests {
                 result_ty: crate::model::ValueType::Int,
             },
         };
-        let _ = decode_builtin_call(&op, &cc);
+        let graph = crate::model::FunctionGraph::new("non_call_fixture");
+        let _ = decode_builtin_call(&op, &cc, &graph);
     }
 
     // ── `parse_oopspec` + `normalize_opargs` pure-function ports ────
@@ -1320,11 +1343,11 @@ mod tests {
         let path = CallPath::from_segments(["my_helper"]);
         cc.mark_oopspec(path.clone(), "myop(y, x)".to_string());
         cc.mark_oopspec_argnames(path, vec!["x".to_string(), "y".to_string()]);
-        let op = make_call_op(
+        let (op, graph) = make_call_op(
             crate::model::CallTarget::function_path(["my_helper"]),
             vec![ValueId(10), ValueId(20)],
         );
-        let (name, opargs) = decode_builtin_call(&op, &cc);
+        let (name, opargs) = decode_builtin_call(&op, &cc, &graph);
         assert_eq!(name, "myop");
         // Argname `y` → Index(1) → opargs[1] = ValueId(20)
         // Argname `x` → Index(0) → opargs[0] = ValueId(10)
@@ -1353,11 +1376,11 @@ mod tests {
             path,
             vec!["i".to_string(), "marker".to_string(), "c".to_string()],
         );
-        let op = make_call_op(
+        let (op, graph) = make_call_op(
             crate::model::CallTarget::function_path(["foobar"]),
             vec![ValueId(11), ValueId(22), ValueId(33)],
         );
-        let (name, opargs) = decode_builtin_call(&op, &cc);
+        let (name, opargs) = decode_builtin_call(&op, &cc, &graph);
         assert_eq!(name, "foobar");
         assert_eq!(
             opargs,

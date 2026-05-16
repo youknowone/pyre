@@ -324,7 +324,7 @@ fn kind_char_to_value_type(kind: char) -> ValueType {
 
 fn infer_call_result_type(
     target: &crate::model::CallTarget,
-    _args: &[ValueId],
+    _args: &[crate::flowspace::model::Variable],
     _state: &AnnotationState,
 ) -> ValueType {
     if crate::call::is_int_arithmetic_target(target) {
@@ -400,12 +400,14 @@ mod tests {
         let entry = graph.startblock;
         let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
+        let a_var = graph.must_variable(a);
+        let b_var = graph.must_variable(b);
         let result = graph
             .push_op(
                 entry,
                 OpKind::Call {
                     target: CallTarget::function_path(["w_int_add"]),
-                    args: vec![a, b],
+                    args: vec![a_var, b_var],
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -425,12 +427,14 @@ mod tests {
         let entry = graph.startblock;
         let a = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let b = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
+        let a_var = graph.must_variable(a);
+        let b_var = graph.must_variable(b);
         let result = graph
             .push_op(
                 entry,
                 OpKind::Call {
                     target: CallTarget::function_path(["crate", "math", "w_int_add"]),
-                    args: vec![a, b],
+                    args: vec![a_var, b_var],
                     result_ty: ValueType::Unknown,
                 },
                 true,

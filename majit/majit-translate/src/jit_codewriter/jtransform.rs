@@ -642,7 +642,15 @@ impl<'a> Transformer<'a> {
         match &op.kind {
             // ── rewrite_op_hint ──
             OpKind::Call { target, args, .. } if classify_vable_hint(target).is_some() => {
-                self.rewrite_op_hint(op, target, args, graph_name, graph)
+                let args_vids: Vec<ValueId> = args
+                    .iter()
+                    .map(|v| {
+                        graph
+                            .value_id_of(v)
+                            .expect("Call arg must have a backing ValueId")
+                    })
+                    .collect();
+                self.rewrite_op_hint(op, target, &args_vids, graph_name, graph)
             }
             // ── rewrite_op_getfield ──
             //
@@ -707,7 +715,15 @@ impl<'a> Transformer<'a> {
                 args,
                 result_ty,
             } if self.config.classify_calls => {
-                self.rewrite_op_direct_call(op, target, args, result_ty, graph_name, graph)
+                let args_vids: Vec<ValueId> = args
+                    .iter()
+                    .map(|v| {
+                        graph
+                            .value_id_of(v)
+                            .expect("Call arg must have a backing ValueId")
+                    })
+                    .collect();
+                self.rewrite_op_direct_call(op, target, &args_vids, result_ty, graph_name, graph)
             }
             // ── rewrite_op_indirect_call ──
             // RPython jtransform.py:410-412. Pyre's rtyper-equivalent
@@ -951,7 +967,8 @@ impl<'a> Transformer<'a> {
             } if matches!(binop_name.as_str(), "lt" | "le" | "gt" | "ge" | "eq" | "ne")
                 && is_float_rewrite_domain(self.get_value_kind_var(graph, lhs))
                 && is_float_rewrite_domain(self.get_value_kind_var(graph, rhs))
-                && (self.get_value_kind_var(graph, lhs) == 'f' || self.get_value_kind_var(graph, rhs) == 'f') =>
+                && (self.get_value_kind_var(graph, lhs) == 'f'
+                    || self.get_value_kind_var(graph, rhs) == 'f') =>
             {
                 self.stamp_value_kind(
                     op.result,
@@ -1173,9 +1190,9 @@ impl<'a> Transformer<'a> {
                 let rhs_vid = graph
                     .value_id_of(rhs)
                     .expect("BinOp rhs has backing ValueId");
-                RewriteResult::Replace(
-                    self.emit_int_mod_or_floordiv_residual(graph, helper_key, lhs_vid, rhs_vid, op.result),
-                )
+                RewriteResult::Replace(self.emit_int_mod_or_floordiv_residual(
+                    graph, helper_key, lhs_vid, rhs_vid, op.result,
+                ))
             }
             // RPython `Transformer.rewrite_op_float_is_true(self, op)`
             // (`jtransform.py:1627-1631`):
@@ -1449,9 +1466,9 @@ impl<'a> Transformer<'a> {
                         let rhs_vid = graph
                             .value_id_of(rhs)
                             .expect("BinOp rhs has backing ValueId");
-                        return RewriteResult::Replace(
-                            self.emit_int_mod_or_floordiv_residual(graph, key, lhs_vid, rhs_vid, op.result),
-                        );
+                        return RewriteResult::Replace(self.emit_int_mod_or_floordiv_residual(
+                            graph, key, lhs_vid, rhs_vid, op.result,
+                        ));
                     }
                 }
                 RewriteResult::Replace(vec![SpaceOperation {
@@ -2331,7 +2348,9 @@ impl<'a> Transformer<'a> {
                         &mut self.analysis_cache,
                         None,
                     );
-                    self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name)
+                    self.handle_residual_call(
+                        graph, op, target, descriptor, args, result_ty, graph_name,
+                    )
                 }
                 crate::call::CallKind::Builtin => {
                     self.handle_builtin_call(op, target, args, result_ty, graph_name, graph)
@@ -2397,7 +2416,7 @@ impl<'a> Transformer<'a> {
         let (decoded_oopspec, effective_args, mut const_prefix_ops) =
             if let Some(cc) = self.callcontrol.as_deref() {
                 if cc.get_oopspec(target).is_some() {
-                    let (name, normalized) = decode_builtin_call(op, cc);
+                    let (name, normalized) = decode_builtin_call(op, cc, graph);
                     let mut eff = Vec::with_capacity(normalized.len());
                     let mut prefix: Vec<SpaceOperation> = Vec::new();
                     for slot in normalized {
@@ -2536,7 +2555,8 @@ impl<'a> Transformer<'a> {
         // RPython jtransform.py:2003-2007: __handle_oopspec_call always
         // produces residual_call_*, appends -live- if calldescr_canraise.
         // Effect is only in the calldescr, never in the opcode name.
-        let result = self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name);
+        let result =
+            self.handle_residual_call(graph, op, target, descriptor, args, result_ty, graph_name);
         prepend_const_prefix(&mut const_prefix_ops, result)
     }
 
@@ -3999,15 +4019,19 @@ fn remap_op(
             target,
             args,
             result_ty,
-        } => OpKind::Call {
-            target: target.clone(),
-            args: args
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            result_ty: result_ty.clone(),
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = graph
+                    .value_id_of(var)
+                    .expect("Call arg must have a backing ValueId");
+                graph.must_variable(remap_value(vid, aliases))
+            };
+            OpKind::Call {
+                target: target.clone(),
+                args: args.iter().map(remap_var).collect(),
+                result_ty: result_ty.clone(),
+            }
+        }
         OpKind::GuardTrue { cond } => {
             let cond_vid = graph
                 .value_id_of(cond)
@@ -5489,11 +5513,12 @@ mod tests {
                 true,
             )
             .unwrap();
+        let arg_var = graph.must_variable(arg);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: target.clone(),
-                args: vec![arg],
+                args: vec![arg_var],
                 result_ty: ValueType::Ref,
             },
             true,
@@ -5586,11 +5611,12 @@ mod tests {
         let frame = graph.alloc_value();
         let hinted = graph.alloc_value();
         graph.push_inputarg(graph.startblock, frame);
+        let frame_var = graph.must_variable(frame);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_access_directly"]),
-                args: vec![frame],
+                args: vec![frame_var],
                 result_ty: ValueType::Ref,
             },
             false,
@@ -5638,11 +5664,12 @@ mod tests {
         let frame = graph.alloc_value();
         let forced = graph.alloc_value();
         graph.push_inputarg(graph.startblock, frame);
+        let frame_var = graph.must_variable(frame);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_force_virtualizable"]),
-                args: vec![frame],
+                args: vec![frame_var],
                 result_ty: ValueType::Ref,
             },
             false,
@@ -5702,13 +5729,14 @@ mod tests {
         let promoted = graph.alloc_value();
         let consumed = graph.alloc_value();
         graph.push_inputarg(graph.startblock, v);
+        let v_var = graph.must_variable(v);
         // `hint_promote(v)` — mirrors `rlib/jit.py:101 promote(x)` after
         // lowering to the operator-level helper name.
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote"]),
-                args: vec![v],
+                args: vec![v_var],
                 result_ty: ValueType::Ref,
             },
             false,
@@ -5779,11 +5807,12 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let v = graph.alloc_value();
         graph.push_inputarg(graph.startblock, v);
+        let v_var = graph.must_variable(v);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote"]),
-                args: vec![v],
+                args: vec![v_var],
                 result_ty: ValueType::Void,
             },
             false,
@@ -6412,11 +6441,12 @@ mod tests {
                 true,
             )
             .unwrap();
+        let receiver_var = graph.must_variable(receiver);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("Handler", "run"),
-                args: vec![receiver],
+                args: vec![receiver_var],
                 result_ty: ValueType::Void,
             },
             true,
@@ -6507,11 +6537,12 @@ mod tests {
                 true,
             )
             .unwrap();
+        let receiver_var = graph.must_variable(receiver);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("Handler", "run"),
-                args: vec![receiver],
+                args: vec![receiver_var],
                 result_ty: ValueType::Void,
             },
             true,
@@ -6664,11 +6695,13 @@ mod tests {
             );
         }
         let has_result = !matches!(result_ty, ValueType::Void);
+        let args_vars: Vec<crate::flowspace::model::Variable> =
+            args.iter().map(|v| graph.must_variable(*v)).collect();
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("T", "m"),
-                args,
+                args: args_vars,
                 result_ty,
             },
             has_result,
@@ -6917,11 +6950,13 @@ mod tests {
             );
         }
         let has_result = !matches!(result_ty, ValueType::Void);
+        let args_vars: Vec<crate::flowspace::model::Variable> =
+            args.iter().map(|v| graph.must_variable(*v)).collect();
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::indirect("T", "m"),
-                args,
+                args: args_vars,
                 result_ty,
             },
             has_result,
@@ -7066,11 +7101,12 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let v = graph.alloc_value();
         graph.push_inputarg(graph.startblock, v);
+        let v_var = graph.must_variable(v);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote_or_string"]),
-                args: vec![v],
+                args: vec![v_var],
                 result_ty: ValueType::Ref,
             },
             false,
@@ -7097,11 +7133,12 @@ mod tests {
         let mut graph = FunctionGraph::new("demo");
         let v = graph.alloc_value();
         graph.push_inputarg(graph.startblock, v);
+        let v_var = graph.must_variable(v);
         graph.push_op(
             graph.startblock,
             OpKind::Call {
                 target: CallTarget::function_path(["hint_promote_or_string"]),
-                args: vec![v],
+                args: vec![v_var],
                 result_ty: ValueType::Int,
             },
             false,

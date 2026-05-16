@@ -169,8 +169,10 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         let rhs_vid = graph
                             .value_id_of(rhs)
                             .expect("BinOp.rhs has backing ValueId");
-                        changed |= maybe_seed_concrete_type(&mut state, lhs_vid, ConcreteType::Signed);
-                        changed |= maybe_seed_concrete_type(&mut state, rhs_vid, ConcreteType::Signed);
+                        changed |=
+                            maybe_seed_concrete_type(&mut state, lhs_vid, ConcreteType::Signed);
+                        changed |=
+                            maybe_seed_concrete_type(&mut state, rhs_vid, ConcreteType::Signed);
                         if let Some(result) = op.result {
                             // RPython rtyper resolves an `add` whose
                             // operands are both `lltype.Float` to

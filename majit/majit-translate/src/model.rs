@@ -496,7 +496,7 @@ pub enum OpKind {
     },
     Call {
         target: CallTarget,
-        args: Vec<ValueId>,
+        args: Vec<crate::flowspace::model::Variable>,
         result_ty: ValueType,
     },
     GuardTrue {

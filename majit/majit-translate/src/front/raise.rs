@@ -164,12 +164,16 @@ pub fn lower_exc_from_raise(
     // the module-level docstring for why it stands until the
     // `Vec<ValueId>` → `Vec<LinkArg>` migration lands.
     let simple_call_target = CallTarget::function_path(["simple_call", exc_class_name]);
+    let message_arg_vars: Vec<crate::flowspace::model::Variable> = message_args
+        .iter()
+        .map(|v| graph.must_variable(*v))
+        .collect();
     let evalue = graph
         .push_op(
             block,
             OpKind::Call {
                 target: simple_call_target,
-                args: message_args,
+                args: message_arg_vars,
                 result_ty: ValueType::Ref,
             },
             true,
@@ -178,12 +182,13 @@ pub fn lower_exc_from_raise(
     // `op.type(evalue)` — upstream `flowcontext.py:600` tail line
     // (`w_type = op.type(w_value).eval(self)`).
     let type_target = CallTarget::function_path(["type"]);
+    let evalue_var = graph.must_variable(evalue);
     let etype = graph
         .push_op(
             block,
             OpKind::Call {
                 target: type_target,
-                args: vec![evalue],
+                args: vec![evalue_var],
                 result_ty: ValueType::Ref,
             },
             true,
