@@ -3879,6 +3879,7 @@ fn handle(
         // plus the unary float_neg.
         "float_add/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatAdd),
         "float_sub/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatSub),
+        "float_mul/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatMul),
         "float_truediv/ff>f" => binop_float_record(code, op, ctx, OpCode::FloatTrueDiv),
         "float_neg/f>f" => unop_float_record(code, op, ctx, OpCode::FloatNeg),
         // Float-to-int comparisons — `bhimpl_float_{lt,le,eq,ne,gt,ge}`
@@ -3899,6 +3900,13 @@ fn handle(
         "int_neg/i>i" => unop_int_record(code, op, ctx, OpCode::IntNeg),
         "int_invert/i>i" => unop_int_record(code, op, ctx, OpCode::IntInvert),
         "int_same_as/i>i" => unop_int_record(code, op, ctx, OpCode::SameAsI),
+        // `int_is_true/i>i` mirrors `int_neg`/`int_invert`: a single
+        // i-coded source, a recorded IR op, an i-coded destination.
+        // RPython `pyjitpl.py:319-330 opimpl_int_is_true` records
+        // `rop.INT_IS_TRUE` via `_record_helper`. The result is
+        // semantically a bool but Int-typed on the bank (matches the
+        // codewriter's `>i` destination shape).
+        "int_is_true/i>i" => unop_int_record(code, op, ctx, OpCode::IntIsTrue),
         // `int_floordiv/ii>i` and `int_mod/ii>i` intentionally absent:
         // `jtransform.py:575-577` rewrites both to
         // `direct_call(ll_int_py_*)` before jitcode emission.  The
@@ -3911,6 +3919,44 @@ fn handle(
         // port lands) get a `setdefault`-allocated dynamic byte and
         // resolve through BH dispatch only.
         "cast_int_to_float/i>f" => cast_int_to_float_record(code, op, ctx),
+        // `cast_int_to_ptr/i>r`: RPython `pyjitpl.py:357` exec-generated
+        // unary, same shape as `cast_int_to_float` but result lands in
+        // the Ref bank. The recorded op is `CastIntToPtr`.
+        "cast_int_to_ptr/i>r" => {
+            let a = read_int_reg(code, op, 0, ctx)?;
+            let result = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[a]);
+            let dst = code[op.pc + 2] as usize;
+            let len = ctx.registers_r.len();
+            let slot = ctx
+                .registers_r
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "r",
+                })?;
+            *slot = result;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        // `cast_ptr_to_int/r>i`: Ref-bank → Int-bank cast.
+        "cast_ptr_to_int/r>i" => {
+            let a = read_ref_reg(code, op, 0, ctx)?;
+            let result = ctx.trace_ctx.record_op(OpCode::CastPtrToInt, &[a]);
+            let dst = code[op.pc + 2] as usize;
+            let len = ctx.registers_i.len();
+            let slot = ctx
+                .registers_i
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "i",
+                })?;
+            *slot = result;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         "ptr_eq/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrEq),
         "ptr_ne/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrNe),
         // Heapcache-aware getfield reads. RPython
@@ -4021,6 +4067,25 @@ fn handle(
                     reg: dst,
                     len,
                     bank: "i",
+                })?;
+            *slot = src_val;
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
+        "float_copy/f>f" => {
+            // Float-bank sibling of `int_copy/i>i` — pure SSA-level
+            // rename, no IR op recorded. Operand layout `f>f`: 1B src
+            // + 1B dst.
+            let src_val = read_float_reg(code, op, 0, ctx)?;
+            let dst = code[op.pc + 2] as usize;
+            let len = ctx.registers_f.len();
+            let slot = ctx
+                .registers_f
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
                 })?;
             *slot = src_val;
             Ok((DispatchOutcome::Continue, op.next_pc))
