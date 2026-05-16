@@ -2853,7 +2853,8 @@ mod tests {
 
             fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
                 let fd = majit_ir::make_field_descr(0, 8, Type::Ref, majit_ir::ArrayFlag::Pointer);
-                ctx.vable_setfield(0, 
+                ctx.vable_setfield(
+                    0,
                     self.vable_ref,
                     fd,
                     self.field_val,

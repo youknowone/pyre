@@ -7826,10 +7826,7 @@ mod tests {
     fn strip_walker_block_boundary_goto_strips_against_pc_anchor() {
         use super::super::flatten::{Insn, Operand, pc_label_name, pc_tlabel};
 
-        let goto = Insn::op(
-            "goto",
-            vec![Operand::TLabel(pc_tlabel(7))],
-        );
+        let goto = Insn::op("goto", vec![Operand::TLabel(pc_tlabel(7))]);
         let trailing_unreachable = Insn::Unreachable;
         let block_a = vec![
             Insn::live(Vec::new()),
@@ -7849,18 +7846,12 @@ mod tests {
             "expected [live, PcAnchor, live] after strip, got {drained:?}",
         );
         assert!(matches!(drained[0], Insn::Op { ref opname, .. } if opname == "-live-"));
-        assert!(matches!(
-            drained[1],
-            Insn::PcAnchor { py_pc: 7 },
-        ));
+        assert!(matches!(drained[1], Insn::PcAnchor { py_pc: 7 },));
         assert!(matches!(drained[2], Insn::Op { ref opname, .. } if opname == "-live-"));
 
         // The strip should NOT fire when the goto target doesn't
         // match the next block's anchor.
-        let goto_to_99 = Insn::op(
-            "goto",
-            vec![Operand::TLabel(pc_tlabel(99))],
-        );
+        let goto_to_99 = Insn::op("goto", vec![Operand::TLabel(pc_tlabel(99))]);
         let block_a = vec![Insn::live(Vec::new()), goto_to_99, Insn::Unreachable];
         let block_b = vec![Insn::pc_anchor(7)];
         let mut blocks = vec![block_a, block_b];
@@ -7875,10 +7866,7 @@ mod tests {
         // still works (R4 doesn't regress the Label case).
         use super::super::flatten::Label as FlatLabel;
         let label_name = pc_label_name(11);
-        let goto = Insn::op(
-            "goto",
-            vec![Operand::TLabel(pc_tlabel(11))],
-        );
+        let goto = Insn::op("goto", vec![Operand::TLabel(pc_tlabel(11))]);
         let block_a = vec![Insn::live(Vec::new()), goto, Insn::Unreachable];
         let block_b = vec![
             Insn::Label(FlatLabel::new(label_name)),

@@ -4488,8 +4488,7 @@ mod tests {
         // the file itself so this probe stays accurate as handlers
         // land/leave.
         let source = include_str!("jitcode_dispatch.rs");
-        let mut handled: std::collections::BTreeSet<String> =
-            std::collections::BTreeSet::new();
+        let mut handled: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
         // Heuristic: scan the literal patterns that appear ONLY in
         // dispatch arms of `handle()` — they look like
         // `"<opname>/[argcodes]" => ...`.  Filter to entries that are

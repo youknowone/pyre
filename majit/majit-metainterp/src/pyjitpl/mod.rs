@@ -18590,7 +18590,8 @@ mod tests {
         let fd24 =
             majit_ir::descr::make_field_descr(24, 8, Type::Int, majit_ir::descr::ArrayFlag::Signed);
         let adesc = majit_ir::make_array_descr(0, 8, Type::Int);
-        let _result = meta.opimpl_getarrayitem_vable_int(0, nonstandard_vable, index, 1, fd24, adesc);
+        let _result =
+            meta.opimpl_getarrayitem_vable_int(0, nonstandard_vable, index, 1, fd24, adesc);
 
         // pyjitpl.py:1219-1230 _opimpl_getarrayitem_vable falls back to
         // GETFIELD_GC_R(arraydescr) + GETARRAYITEM_GC_I(arraybox) when

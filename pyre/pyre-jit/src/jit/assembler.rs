@@ -238,22 +238,14 @@ impl Assembler {
         match insn {
             Insn::Unreachable => {}
             Insn::Label(label) => {
-                let label_id = builder_label(state, &label.name);
-                state
-                    .label_positions
-                    .insert(label.name.clone(), state.builder.current_pos());
-                state.builder.mark_label(label_id);
+                mark_label_first_wins(state, &label.name);
             }
             // pyre per-PC anchor — synthesizes the same byte-position
             // recording as `Insn::Label(Label::new(pc_label_name(N)))`
             // so `TLabel("pc{N}")` branches resolve identically.
             Insn::PcAnchor { py_pc } => {
                 let name = super::flatten::pc_label_name(*py_pc);
-                let label_id = builder_label(state, &name);
-                state
-                    .label_positions
-                    .insert(name, state.builder.current_pos());
-                state.builder.mark_label(label_id);
+                mark_label_first_wins(state, &name);
             }
             Insn::Op {
                 opname,
@@ -551,6 +543,43 @@ fn builder_label(state: &mut AssemblyState, name: &str) -> u16 {
     let label = state.builder.new_label();
     state.builder_labels.push((name.to_owned(), label));
     label
+}
+
+/// First-wins record of a `Label`/`PcAnchor` byte position.  When the
+/// same label name appears multiple times in the drained `SSARepr`
+/// stream (the supersede-newblock re-walk case under pyre's `pc{N}`
+/// PC-keyed labelling: both the original SpamBlock and the supersede
+/// newblock emit `Label("pcN")` for the same `N` when the supersede
+/// re-walks under a widened framestate), the FIRST occurrence wins
+/// for byte-position resolution.  This matches the runtime's
+/// `pc_anchor_positions` first-wins semantics in
+/// `codewriter.rs::pc_anchor_positions`, so the byte position that
+/// `pc{N}` resolves to via `TLabel("pcN")` branches agrees with the
+/// byte position recorded in the PC dispatch table.  Without this,
+/// `mark_label` would last-wins overwrite the builder's label slot
+/// (`majit-metainterp/jitcode/assembler.rs::mark_label` blindly sets
+/// `*slot = Some(code.len())`), so a back-edge via `TLabel(pcN)`
+/// would land on a different block than a fresh PC-dispatch through
+/// `pc_anchor_positions[N]`.  RPython's block-identity labels
+/// (`flatten.py:116 self.emitline(Label(block))`) sidestep this
+/// because two SpamBlocks reaching PC N carry distinct `Label`
+/// values; pyre's PC-keyed scheme reuses the same name, so we must
+/// enforce first-wins explicitly on the marking side too.
+///
+/// Eliminating the duplication entirely requires switching pyre's
+/// label key from `pc{N}` to block-identity (the Task #227 walker
+/// restructure noted in `pc_anchor_positions`); until then,
+/// first-wins on both the dispatch table and the assembler label
+/// slot keeps the two paths in sync.
+fn mark_label_first_wins(state: &mut AssemblyState, name: &str) {
+    let label_id = builder_label(state, name);
+    if state.label_positions.contains_key(name) {
+        return;
+    }
+    state
+        .label_positions
+        .insert(name.to_owned(), state.builder.current_pos());
+    state.builder.mark_label(label_id);
 }
 
 fn get_liveness_info(args: &[Operand], kind: Kind) -> VecSet<u8> {
