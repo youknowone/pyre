@@ -13,7 +13,6 @@
 //! difference vs upstream is the use of cells, not a separate module.
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -1704,7 +1703,7 @@ pub(crate) fn normalize_closing_jump_args(
         return ops;
     };
 
-    let defined: std::collections::HashSet<OpRef> = ops
+    let defined: majit_ir::vec_set::VecSet<OpRef> = ops
         .iter()
         .filter(|op| op.result_type() != majit_ir::Type::Void && !op.pos.get().is_none())
         .map(|op| op.pos.get())

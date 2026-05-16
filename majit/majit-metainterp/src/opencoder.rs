@@ -1,8 +1,6 @@
 //! Literal port of `rpython/jit/metainterp/opencoder.py` — the byte-
 //! stream trace recorder + iterator + snapshot chain reader used by
 //! the meta-interpreter.
-use std::collections::HashMap;
-
 use majit_ir::{InputArg, OPCODE_COUNT, Op, OpCode, OpRef, Type, Value};
 
 use crate::r#box::BoxRef;
@@ -3062,17 +3060,17 @@ mod tests {
         assert_eq!(p2_ops[2].args[0], iop(7));
 
         // No Phase 1 OpRef equals any Phase 2 OpRef.
-        let p1_set: std::collections::HashSet<u32> = p1_ops
+        let p1_positions: Vec<u32> = p1_ops
             .iter()
             .map(|op| op.pos.get().raw())
             .filter(|&p| p != u32::MAX)
             .collect();
-        let p2_set: std::collections::HashSet<u32> = p2_ops
+        let p2_positions: Vec<u32> = p2_ops
             .iter()
             .map(|op| op.pos.get().raw())
             .filter(|&p| p != u32::MAX)
             .collect();
-        assert!(p1_set.is_disjoint(&p2_set));
+        assert!(p1_positions.iter().all(|p| !p2_positions.contains(p)));
     }
 
     #[test]

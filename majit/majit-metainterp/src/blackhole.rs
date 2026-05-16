@@ -6,8 +6,6 @@
 //!
 //! This is the RPython equivalent of `rpython/jit/metainterp/blackhole.py`.
 
-use std::collections::HashMap;
-
 use crate::jitexc::JitException;
 use crate::resume::{
     MaterializedVirtual, ResolvedPendingFieldWrite, ResumeData, ResumeDataExt, ResumeLayoutSummary,
@@ -3840,7 +3838,6 @@ mod tests {
     mod bh_interp_tests {
         use super::super::*;
         use crate::jitcode::JitCodeBuilder;
-        use std::collections::HashMap;
 
         /// C.5.1 — strict-dispatch builder for bare-new() unit fixtures.
         ///
@@ -7268,7 +7265,6 @@ pub fn pyre_production_cpu() -> &'static dyn majit_backend::Backend {
 /// `pipeline.insns` ↔ `wellknown_bh_insns` table-unification epic
 /// that this minimal install side-steps.
 pub fn build_inline_call_only_bh_builder() -> BlackholeInterpBuilder {
-    use std::collections::HashMap;
     let mut builder = BlackholeInterpBuilder::new();
     // Sub-slice C.2.0 (`subslice_c2_attempt_failure_cpu_prereq_2026_05_07.md`):
     // wire the blackhole cpu BEFORE C.2.1 vable canonical routing.
