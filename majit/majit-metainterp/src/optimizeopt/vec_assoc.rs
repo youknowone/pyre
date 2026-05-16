@@ -31,6 +31,12 @@ impl<K: Eq, V> VecAssoc<K, V> {
         }
     }
 
+    pub fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
     pub fn len(&self) -> usize {
         self.entries.len()
     }
@@ -87,13 +93,6 @@ impl<K: Eq, V> VecAssoc<K, V> {
         Some(self.entries.remove(idx).1)
     }
 
-    /// `HashMap::retain(f)` parity: keep entries for which `f(&k, &mut v)`
-    /// returns `true`, drop the rest. Order of retained entries is
-    /// preserved (uses `Vec::retain_mut`).
-    pub fn retain<F: FnMut(&K, &mut V) -> bool>(&mut self, mut f: F) {
-        self.entries.retain_mut(|(k, v)| f(k, v));
-    }
-
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.entries.iter().map(|(k, v)| (k, v))
     }
@@ -112,6 +111,12 @@ impl<K: Eq, V> VecAssoc<K, V> {
 
     pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
         self.entries.iter_mut().map(|(_, v)| v)
+    }
+
+    /// `HashMap::retain(F)` parity: retain entries where the closure returns
+    /// `true`. The closure receives `(&K, &mut V)`.
+    pub fn retain<F: FnMut(&K, &mut V) -> bool>(&mut self, mut f: F) {
+        self.entries.retain_mut(|(k, v)| f(k, v));
     }
 }
 

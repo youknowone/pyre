@@ -1076,7 +1076,7 @@ pub struct MetaInterp<M: Clone> {
     /// Memoized symbolic names for boxes (debug/log output only).
     /// Pyre uses simple `OpRef → String` mapping; populated lazily by
     /// the on-demand log formatter.
-    pub box_names_memo: std::collections::HashMap<OpRef, String>,
+    pub box_names_memo: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, String>,
 
     /// pyjitpl.py:2412 `self.trace_length_at_last_tco = -1`.
     ///
@@ -1667,7 +1667,8 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_fail_descr_layouts(token, trace_id)
         }) {
-            let mut merged = HashMap::new();
+            let mut merged: crate::optimizeopt::vec_assoc::VecAssoc<u32, CompiledExitLayout> =
+                crate::optimizeopt::vec_assoc::VecAssoc::new();
             for layout in exit_layouts.drain(..) {
                 merged.insert(layout.fail_index, layout);
             }
@@ -1692,7 +1693,7 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
             }
-            exit_layouts = merged.into_values().collect();
+            exit_layouts = merged.into_iter().map(|(_, v)| v).collect();
             exit_layouts.sort_by_key(|layout| layout.fail_index);
         }
 
@@ -1720,7 +1721,10 @@ impl<M: Clone> MetaInterp<M> {
             self.backend
                 .compiled_trace_terminal_exit_layouts(token, trace_id)
         }) {
-            let mut merged = HashMap::new();
+            let mut merged: crate::optimizeopt::vec_assoc::VecAssoc<
+                usize,
+                CompiledTerminalExitLayout,
+            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
             for layout in terminal_exit_layouts.drain(..) {
                 merged.insert(layout.op_index, layout);
             }
@@ -1748,7 +1752,7 @@ impl<M: Clone> MetaInterp<M> {
                     },
                 );
             }
-            terminal_exit_layouts = merged.into_values().collect();
+            terminal_exit_layouts = merged.into_iter().map(|(_, v)| v).collect();
             terminal_exit_layouts.sort_by_key(|layout| layout.op_index);
         }
 
@@ -1815,7 +1819,7 @@ impl<M: Clone> MetaInterp<M> {
             class_of_last_exc_is_const: false,
             forced_virtualizable: 0,
             ovf_flag: false,
-            box_names_memo: std::collections::HashMap::new(),
+            box_names_memo: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             trace_length_at_last_tco: -1,
             active_trace_session: None,
         };
@@ -9651,7 +9655,8 @@ impl<M: Clone> MetaInterp<M> {
         let guard_op = trace.ops.get(guard_op_index)?;
         let fail_args = guard_op.getfailargs()?;
 
-        let mut initial_values = HashMap::with_capacity(fail_args.len());
+        let mut initial_values: crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> =
+            crate::optimizeopt::vec_assoc::VecAssoc::with_capacity(fail_args.len());
         for (arg, value) in fail_args.iter().zip(fail_values.iter().copied()) {
             initial_values.insert(arg.raw(), value);
         }
@@ -9678,10 +9683,12 @@ impl<M: Clone> MetaInterp<M> {
             ));
         }
 
+        let initial_values_hm: HashMap<u32, i64> =
+            initial_values.iter().map(|(&k, &v)| (k, v)).collect();
         Some(blackhole_execute_with_state_ca(
             &trace.ops,
             &trace.constants,
-            &initial_values,
+            &initial_values_hm,
             guard_op_index + 1,
             exception,
             call_assembler_fn,

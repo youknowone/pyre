@@ -3,8 +3,6 @@
 //! Mirrors RPython's `executor.py`: executes individual JIT IR operations
 //! by dispatching on the opcode and computing the result.
 
-use std::collections::HashMap;
-
 use majit_ir::{GcRef, Op, OpCode, OpRef};
 
 use crate::blackhole::ExceptionState;
@@ -35,7 +33,7 @@ fn read_typeid(obj_ptr: i64) -> Option<u32> {
 /// Op results (non-constant OpRef) → `results` Vec, direct indexed.
 /// Constants (constant-namespace OpRef) → `constants` Vec, indexed by const_index.
 ///
-/// Replaces `HashMap<u32, i64>` on the hot path with O(1) Vec indexing.
+/// Replaces `VecAssoc<u32, i64>` on the hot path with O(1) Vec indexing.
 pub(crate) struct TraceValues {
     /// Op results, indexed by OpRef.0 (operation namespace).
     pub results: Vec<i64>,
@@ -51,7 +49,27 @@ impl TraceValues {
         }
     }
 
-    pub fn from_hashmap(map: &HashMap<u32, i64>) -> Self {
+    pub fn from_hashmap(map: &std::collections::HashMap<u32, i64>) -> Self {
+        let max_op = map
+            .keys()
+            .filter(|&&k| !OpRef::raw_is_constant(k))
+            .max()
+            .copied()
+            .unwrap_or(0) as usize;
+        let max_const = map
+            .keys()
+            .filter(|&&k| OpRef::raw_is_constant(k))
+            .max()
+            .map(|&k| OpRef::raw_const_index(k) as usize)
+            .unwrap_or(0);
+        let mut tv = Self::new(max_op + 1, max_const + 1);
+        for (&k, &v) in map {
+            tv.set(k, v);
+        }
+        tv
+    }
+
+    pub fn from_vec_assoc(map: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>) -> Self {
         // Index-keyed pool namespace probe (Slice P3 category E):
         // raw u32 keys carry the constant-namespace bit directly, so use
         // the bit-helpers rather than minting a typed `OpRef` solely
@@ -118,12 +136,12 @@ impl TraceValues {
 }
 
 /// Trait for resolving OpRef → i64 values in trace execution.
-/// Allows both HashMap (legacy) and TraceValues (fast) backends.
+/// Allows both VecAssoc (legacy) and TraceValues (fast) backends.
 pub(crate) trait ValueStore {
     fn resolve(&self, opref: OpRef) -> i64;
 }
 
-impl ValueStore for HashMap<u32, i64> {
+impl ValueStore for crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> {
     #[inline(always)]
     fn resolve(&self, opref: OpRef) -> i64 {
         self.get(&opref.raw()).copied().unwrap_or(0)
