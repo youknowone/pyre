@@ -211,8 +211,8 @@ impl TreeLoop {
         if self.ops.is_empty() {
             return true;
         }
-        let mut seen = std::collections::HashSet::new();
-        let mut op_positions = std::collections::HashSet::new();
+        let mut seen: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
+        let mut op_positions: majit_ir::vec_set::VecSet<OpRef> = majit_ir::vec_set::VecSet::new();
         // history.py:564-565: inputargs must not contain constants
         for ia in &self.inputargs {
             let ia_ref = OpRef::input_arg_typed(ia.index, ia.tp);
@@ -340,7 +340,8 @@ impl TreeLoop {
         original_box_types: &[majit_ir::Type],
         inputarg_consts: &[OpRef],
     ) -> TreeLoop {
-        use std::collections::{HashSet, VecDeque};
+        use majit_ir::vec_set::VecSet;
+        use std::collections::VecDeque;
 
         let num_original_inputargs = self.inputargs.len() as u32;
         let cut_ops = &self.ops[start.op_index..];
@@ -349,7 +350,7 @@ impl TreeLoop {
         // Each new inputarg carries the type recorded in `original_box_types[i]`.
         let mut remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
             crate::optimizeopt::vec_assoc::VecAssoc::new();
-        let original_set: HashSet<OpRef> = original_boxes.iter().copied().collect();
+        let original_set: VecSet<OpRef> = original_boxes.iter().copied().collect();
         for (i, &old_ref) in original_boxes.iter().enumerate() {
             remap.insert(
                 old_ref,
@@ -358,7 +359,7 @@ impl TreeLoop {
         }
 
         // Collect all OpRefs defined by post-cut ops.
-        let defined_after_cut: HashSet<OpRef> = cut_ops
+        let defined_after_cut: VecSet<OpRef> = cut_ops
             .iter()
             .filter(|op| !op.pos.get().is_none())
             .map(|op| op.pos.get())
@@ -373,7 +374,7 @@ impl TreeLoop {
                 && !defined_after_cut.contains(r)
         };
 
-        let mut escaped_set: HashSet<OpRef> = HashSet::new();
+        let mut escaped_set: VecSet<OpRef> = VecSet::new();
         let mut queue: VecDeque<OpRef> = VecDeque::new();
 
         // Seed with refs used by post-cut ops (args only, not fail_args).

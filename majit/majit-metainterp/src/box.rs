@@ -796,7 +796,7 @@ mod tests {
     /// identity (`Rc::ptr_eq`) across every variant.
     #[test]
     fn boxref_eq_is_pointer_identity_for_every_variant() {
-        use std::collections::HashSet;
+        use majit_ir::vec_set::VecSet;
 
         // Const: two fresh allocations of the same value compare unequal —
         // identity (Rc pointer) differs. PyPy's value comparison is the
@@ -808,8 +808,8 @@ mod tests {
         // Clone preserves identity (Rc::clone shares the allocation).
         assert_eq!(a, a.clone());
 
-        // HashSet keys by pointer identity for Const.
-        let mut set: HashSet<BoxRef> = HashSet::new();
+        // Membership-set keys by pointer identity for Const.
+        let mut set: VecSet<BoxRef> = VecSet::new();
         set.insert(a.clone());
         assert!(set.contains(&a));
         assert!(!set.contains(&b));
@@ -840,16 +840,16 @@ mod tests {
     }
 
     #[test]
-    fn boxref_used_as_hashmap_key() {
-        use std::collections::HashMap;
+    fn boxref_used_as_assoc_key() {
+        use majit_ir::vec_assoc::VecAssoc;
         let a = BoxRef::new_resop(Type::Int, 0);
         let b = BoxRef::new_resop(Type::Int, 0);
-        let mut m: HashMap<BoxRef, i32> = HashMap::new();
+        let mut m: VecAssoc<BoxRef, i32> = VecAssoc::new();
         m.insert(a.clone(), 1);
         m.insert(b.clone(), 2);
         assert_eq!(m.get(&a), Some(&1));
         assert_eq!(m.get(&b), Some(&2));
-        // Clone shares the allocation, so it hashes to the same key.
+        // Clone shares the allocation, so it compares equal to the same key.
         assert_eq!(m.get(&a.clone()), Some(&1));
     }
 
