@@ -1220,6 +1220,26 @@ fn mergeblock(
         // original dead block's bytes remain the runtime canonical
         // emission for `pcN`.  The supersede re-walk's bytes are
         // unreachable via pcN labels.
+        if std::env::var_os("PYRE_PHASE3_SUPERSEDE_DIAG").is_some() {
+            let dead_exits_summary: Vec<String> = block
+                .block()
+                .borrow()
+                .exits
+                .iter()
+                .map(|l| {
+                    let lb = l.borrow();
+                    format!("(ec={:?},llec={:?})", lb.exitcase, lb.llexitcase)
+                })
+                .collect();
+            eprintln!(
+                "[phase3-supersede] at next_offset={} dead_exits_before={} \
+                 dead_shape={:?} dead_exitswitch={:?}",
+                next_offset,
+                block.block().borrow().exits.len(),
+                dead_exits_summary,
+                block.block().borrow().exitswitch,
+            );
+        }
         block.mark_dead();
         block.block().borrow_mut().operations.clear();
         block.block().borrow_mut().exitswitch = None;
@@ -7309,7 +7329,25 @@ impl CodeWriter {
                 current_state.next_offset = py_pc + 1;
                 current_state.blocklist = frame_blocks_for_offset(code, current_state.next_offset);
                 if let Some(catch_label) = catch_for_pc[py_pc] {
-                    emit_catch_exception!(catch_label);
+                    // RPython `flowcontext.py:130-156 guessexception`
+                    // attaches an exception edge only to **canraise**
+                    // ops — control-flow opcodes (POP_JUMP_IF_*,
+                    // JUMP_*, RETURN_*, RAISE_*, RERAISE) do not
+                    // canraise and close the block with their own
+                    // explicit exits.  Pyre's catch_for_pc map covers
+                    // every PC inside a Python exception_table range
+                    // (a coarser over-approximation), so without this
+                    // gate `emit_catch_exception!` would append a
+                    // stray catch link to a block whose exits the
+                    // just-emitted opcode already closed.
+                    let block_already_closed = !current_block
+                        .block()
+                        .borrow()
+                        .exits
+                        .is_empty();
+                    if !block_already_closed {
+                        emit_catch_exception!(catch_label);
+                    }
                 }
             }
         } // end while-let pendingblocks
@@ -7752,6 +7790,49 @@ impl CodeWriter {
                     acc.0,
                     acc.1,
                 );
+            }
+            // Pre-flight enumeration of multi-exit blocks whose
+            // exit-link shape may trip `flatten.py:272-296`
+            // `insert_switch_exits`.  Surfaces walker non-orthodoxies
+            // where multiple exits carry inconsistent llexitcase /
+            // exitcase pairs.
+            if std::env::var_os("PYRE_PHASE3_MULTIEXIT_DIAG").is_some() {
+                for (block_index, block_rc) in graph.iterblocks().iter().enumerate() {
+                    let b = block_rc.borrow();
+                    let last_ops: Vec<String> = b
+                        .operations
+                        .iter()
+                        .rev()
+                        .take(3)
+                        .rev()
+                        .map(|op| format!("{}@{}", op.opname, op.offset))
+                        .collect();
+                    let shape: Vec<String> = b
+                        .exits
+                        .iter()
+                        .map(|link| {
+                            let lb = link.borrow();
+                            format!(
+                                "(exitcase={:?}, llexitcase={:?})",
+                                lb.exitcase, lb.llexitcase
+                            )
+                        })
+                        .collect();
+                    eprintln!(
+                        "[phase3-block-diag] graph={:?} block#{} exits={} \
+                         is_final={} exitswitch={:?} inputargs_len={} ops={} \
+                         last_ops={:?} shape={:?}",
+                        code.obj_name.as_str(),
+                        block_index,
+                        b.exits.len(),
+                        b.is_final,
+                        b.exitswitch,
+                        b.inputargs.len(),
+                        b.operations.len(),
+                        last_ops,
+                        shape,
+                    );
+                }
             }
             let graph_ref = &graph;
             let cpu_ref = Some(self.cpu());

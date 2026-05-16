@@ -1838,11 +1838,35 @@ where
                     )
                 })
                 .collect();
+            // Describe the source block's last few operations so we
+            // can identify which walker emit site produced this shape.
+            let block_summary = exits
+                .first()
+                .and_then(|link| link.borrow().prevblock.clone())
+                .and_then(|weak| weak.upgrade())
+                .map(|block_rc| {
+                    let b = block_rc.borrow();
+                    let last_ops: Vec<String> = b
+                        .operations
+                        .iter()
+                        .rev()
+                        .take(3)
+                        .rev()
+                        .map(|op| format!("{}@{}", op.opname, op.offset))
+                        .collect();
+                    format!(
+                        "ops={} last_ops={:?}",
+                        b.operations.len(),
+                        last_ops,
+                    )
+                })
+                .unwrap_or_else(|| "<no-block>".to_string());
             eprintln!(
                 "[phase3-switch-diag] insert_switch_exits: exits={} \
-                 exitswitch={:?} shape={:?}",
+                 exitswitch={:?} {} shape={:?}",
                 exits.len(),
                 exitswitch,
+                block_summary,
                 exitcase_summary,
             );
         }
