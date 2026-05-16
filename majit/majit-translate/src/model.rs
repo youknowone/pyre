@@ -365,10 +365,10 @@ impl fmt::Display for CallTarget {
 /// RPython call ops always carry `op.args[0]` as the funcptr operand.
 /// Pyre keeps the same semantic slot but needs two Rust-level shapes:
 /// a symbolic direct-call target or a runtime `ValueId` for indirect calls.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CallFuncPtr {
     Target(CallTarget),
-    Value(ValueId),
+    Value(crate::flowspace::model::Variable),
 }
 
 /// RPython `flatten.py:53-57`:

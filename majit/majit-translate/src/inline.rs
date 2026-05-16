@@ -17,10 +17,20 @@ use crate::model::{
     remap_control_flow_metadata,
 };
 
-fn remap_call_funcptr<F: Fn(&ValueId) -> ValueId>(funcptr: &CallFuncPtr, remap: &F) -> CallFuncPtr {
+fn remap_call_funcptr<F: Fn(&ValueId) -> ValueId>(
+    funcptr: &CallFuncPtr,
+    remap: &F,
+    source_graph: &FunctionGraph,
+    target_graph: &FunctionGraph,
+) -> CallFuncPtr {
     match funcptr {
         CallFuncPtr::Target(target) => CallFuncPtr::Target(target.clone()),
-        CallFuncPtr::Value(value) => CallFuncPtr::Value(remap(value)),
+        CallFuncPtr::Value(var) => {
+            let vid = source_graph
+                .value_id_of(var)
+                .expect("CallFuncPtr::Value must have a backing ValueId in source");
+            CallFuncPtr::Value(target_graph.must_variable(remap(&vid)))
+        }
     }
 }
 
@@ -852,7 +862,7 @@ fn remap_op_kind(
                 target_graph.must_variable(remap(&vid))
             };
             OpKind::CallElidable {
-                funcptr: remap_call_funcptr(funcptr, &remap),
+                funcptr: remap_call_funcptr(funcptr, &remap, source_graph, target_graph),
                 descriptor: descriptor.clone(),
                 args_i: args_i.iter().map(remap_var).collect(),
                 args_r: args_r.iter().map(remap_var).collect(),
@@ -876,7 +886,7 @@ fn remap_op_kind(
                 target_graph.must_variable(remap(&vid))
             };
             OpKind::CallResidual {
-                funcptr: remap_call_funcptr(funcptr, &remap),
+                funcptr: remap_call_funcptr(funcptr, &remap, source_graph, target_graph),
                 descriptor: descriptor.clone(),
                 args_i: args_i.iter().map(remap_var).collect(),
                 args_r: args_r.iter().map(remap_var).collect(),
@@ -900,7 +910,7 @@ fn remap_op_kind(
                 target_graph.must_variable(remap(&vid))
             };
             OpKind::CallMayForce {
-                funcptr: remap_call_funcptr(funcptr, &remap),
+                funcptr: remap_call_funcptr(funcptr, &remap, source_graph, target_graph),
                 descriptor: descriptor.clone(),
                 args_i: args_i.iter().map(remap_var).collect(),
                 args_r: args_r.iter().map(remap_var).collect(),
@@ -1274,7 +1284,7 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             };
             let mut refs = match funcptr {
                 CallFuncPtr::Target(_) => Vec::new(),
-                CallFuncPtr::Value(value) => vec![*value],
+                CallFuncPtr::Value(var) => vec![project(var)],
             };
             refs.extend(args_i.iter().map(project));
             refs.extend(args_r.iter().map(project));

@@ -430,8 +430,12 @@ fn call_funcptr_repr(
         // `TypeResolutionState` we read kind from
         // `getkind(v.concretetype)`; otherwise we keep the upstream
         // default (`Ref`).
-        crate::model::CallFuncPtr::Value(value) => {
-            register_repr_for_kind(*value, value_id_kind(*value, types).unwrap_or(RegKind::Ref))
+        crate::model::CallFuncPtr::Value(var) => {
+            // `types` is keyed by graph-local ValueId so it cannot resolve
+            // Variable-typed funcptrs directly; render via Variable.id()
+            // matching the pattern used by [`list_of_kind_repr_vars`].
+            let _ = types;
+            register_repr_for_kind(ValueId(var.id() as usize), RegKind::Ref)
         }
     }
 }

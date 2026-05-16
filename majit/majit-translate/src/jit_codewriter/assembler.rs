@@ -1188,8 +1188,13 @@ impl Assembler {
                 // as `CallFuncPtr::Value(...)` and encodes the orthodox
                 // leading `i` operand.
                 match funcptr {
-                    crate::model::CallFuncPtr::Value(vid) => {
-                        let (reg, kc) = self.lookup_reg_with_kind(*vid, regallocs);
+                    crate::model::CallFuncPtr::Value(var) => {
+                        let g = graph
+                            .expect("encode_op for Call funcptr requires a graph");
+                        let vid = g
+                            .value_id_of(var)
+                            .expect("Call funcptr must be a known Variable on graph");
+                        let (reg, kc) = self.lookup_reg_with_kind(vid, regallocs);
                         state.code.push(reg);
                         argcodes.push(kc);
                     }

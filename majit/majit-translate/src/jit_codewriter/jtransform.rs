@@ -611,7 +611,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         graph: &mut FunctionGraph,
         target: &CallTarget,
-    ) -> (ValueId, SpaceOperation) {
+    ) -> (crate::flowspace::model::Variable, SpaceOperation) {
         let fnaddr = self
             .callcontrol
             .as_deref()
@@ -623,8 +623,9 @@ impl<'a> Transformer<'a> {
             graph,
             crate::jit_codewriter::type_state::ConcreteType::Signed,
         );
+        let var = graph.must_variable(value);
         (
-            value,
+            var,
             SpaceOperation {
                 result: Some(value),
                 kind: OpKind::ConstInt(fnaddr),
@@ -3450,7 +3451,7 @@ impl<'a> Transformer<'a> {
                 ops.push(SpaceOperation {
                     result: op.result,
                     kind: OpKind::CallResidual {
-                        funcptr: CallFuncPtr::Value(funcptr),
+                        funcptr: CallFuncPtr::Value(graph.must_variable(funcptr)),
                         descriptor,
                         args_i,
                         args_r,
@@ -3488,7 +3489,7 @@ impl<'a> Transformer<'a> {
                 let mut ops = vec![SpaceOperation {
                     result: op.result,
                     kind: OpKind::CallResidual {
-                        funcptr: CallFuncPtr::Value(funcptr),
+                        funcptr: CallFuncPtr::Value(graph.must_variable(funcptr)),
                         descriptor,
                         args_i,
                         args_r,
@@ -3801,10 +3802,16 @@ fn remap_list(
 fn remap_call_funcptr(
     funcptr: &CallFuncPtr,
     aliases: &std::collections::HashMap<ValueId, ValueId>,
+    graph: &FunctionGraph,
 ) -> CallFuncPtr {
     match funcptr {
         CallFuncPtr::Target(target) => CallFuncPtr::Target(target.clone()),
-        CallFuncPtr::Value(value) => CallFuncPtr::Value(remap_value(*value, aliases)),
+        CallFuncPtr::Value(var) => {
+            let vid = graph
+                .value_id_of(var)
+                .expect("CallFuncPtr::Value must have a backing ValueId on graph");
+            CallFuncPtr::Value(graph.must_variable(remap_value(vid, aliases)))
+        }
     }
 }
 
@@ -4247,7 +4254,7 @@ fn remap_op(
                 graph.must_variable(remap_value(vid, aliases))
             };
             OpKind::CallElidable {
-                funcptr: remap_call_funcptr(funcptr, aliases),
+                funcptr: remap_call_funcptr(funcptr, aliases, graph),
                 descriptor: descriptor.clone(),
                 args_i: args_i.iter().map(remap_var).collect(),
                 args_r: args_r.iter().map(remap_var).collect(),
@@ -4271,7 +4278,7 @@ fn remap_op(
                 graph.must_variable(remap_value(vid, aliases))
             };
             OpKind::CallResidual {
-                funcptr: remap_call_funcptr(funcptr, aliases),
+                funcptr: remap_call_funcptr(funcptr, aliases, graph),
                 descriptor: descriptor.clone(),
                 args_i: args_i.iter().map(remap_var).collect(),
                 args_r: args_r.iter().map(remap_var).collect(),
@@ -4295,7 +4302,7 @@ fn remap_op(
                 graph.must_variable(remap_value(vid, aliases))
             };
             OpKind::CallMayForce {
-                funcptr: remap_call_funcptr(funcptr, aliases),
+                funcptr: remap_call_funcptr(funcptr, aliases, graph),
                 descriptor: descriptor.clone(),
                 args_i: args_i.iter().map(remap_var).collect(),
                 args_r: args_r.iter().map(remap_var).collect(),

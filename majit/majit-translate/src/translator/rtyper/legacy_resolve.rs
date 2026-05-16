@@ -864,11 +864,12 @@ mod tests {
         let mut graph = FunctionGraph::new("rewritten_call_result");
         let entry = graph.startblock;
         let funcptr = graph.push_op(entry, OpKind::ConstInt(0), true).unwrap();
+        let funcptr_var = graph.must_variable(funcptr);
         let result = graph
             .push_op(
                 entry,
                 OpKind::CallResidual {
-                    funcptr: CallFuncPtr::Value(funcptr),
+                    funcptr: CallFuncPtr::Value(funcptr_var),
                     descriptor: CallDescriptor::known(EffectInfo::default()),
                     args_i: vec![],
                     args_r: vec![],
