@@ -322,12 +322,14 @@ pub fn layout_for_fail_descr(
         is_finish: fd.is_finish(),
         trace_id: fd.trace_id(),
         source_op_index: lookup_source_op_index(descr_addr),
-        gc_ref_slots: fail_arg_types
-            .iter()
-            .enumerate()
-            .filter_map(|(i, tp)| (*tp == Type::Ref).then_some(i))
+        // Forward through `FailDescr::is_gc_ref_slot` / `force_token_slots`
+        // so concrete descrs that override these (e.g. cranelift descrs
+        // that suppress force-token producer slots from GC classification)
+        // contribute correct metadata to the layout.
+        gc_ref_slots: (0..fail_arg_types.len())
+            .filter(|&i| fd.is_gc_ref_slot(i))
             .collect(),
-        force_token_slots: Vec::new(),
+        force_token_slots: fd.force_token_slots(),
         frame_stack: None,
         // Slice NN: backend no longer caches recovery_layout.  The
         // metainterp `pyjitpl/mod.rs:6322` falls back to
