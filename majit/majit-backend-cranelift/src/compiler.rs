@@ -1428,468 +1428,7 @@ fn write_barrier_if_managed(obj: GcRef) {
     });
 }
 
-/// RPython rebuild_state_after_failure parity: materialize virtual objects
-/// in raw fail_args before bridge/blackhole dispatch, using recovery_layout.
-///
-/// resume.py:1042-1057 rebuild_from_resumedata processes ALL frames in the
-/// recovery layout (outermost first). call_assembler prefixes caller frames
-/// via prefixed_by() at compiler.rs:512, so frames is [caller..., callee].
-/// The blackhole consumer at call_jit.rs:806 expects a full section chain.
-///
-/// After frame reconstruction, pending_field_layouts are replayed
-/// (resume.py:1003-1007 setfield/setarrayitem parity).
-fn rebuild_state_after_failure(
-    outputs: &mut Vec<i64>,
-    types: &[majit_ir::Type],
-    recovery: Option<&majit_backend::ExitRecoveryLayout>,
-    _bridge_num_inputs: usize,
-) {
-    // Phase 1: recovery_layout-based materialization (rd_virtuals parity).
-    // Process ALL frames, not just frames[0].
-    if let Some(recovery) = recovery {
-        if !recovery.frames.is_empty() {
-            if std::env::var_os("MAJIT_LOG").is_some() {
-                eprintln!(
-                    "[rebuild] outputs.len={} virtual_layouts.len={} pending={}",
-                    outputs.len(),
-                    recovery.virtual_layouts.len(),
-                    recovery.pending_field_layouts.len()
-                );
-                for (vi, vl) in recovery.virtual_layouts.iter().enumerate() {
-                    eprintln!("[rebuild] virtual_layout[{}]={:?}", vi, vl);
-                }
-            }
-            // Step 1: materialize all virtuals referenced by any frame.
-            // RPython liveboxes are GC-visible during resume decoding.  Pyre's
-            // backend holds them in raw i64 vectors, so register Ref-typed
-            // output slots and materialized virtual slots while allocation can
-            // trigger a nursery collection.
-            let mut materialized_roots: Vec<GcRef> =
-                vec![GcRef::NULL; recovery.virtual_layouts.len()];
-            let mut materialized_done: Vec<bool> = vec![false; recovery.virtual_layouts.len()];
-            let mut root_slots: Vec<*mut GcRef> = Vec::new();
-            for (i, tp) in types.iter().enumerate().take(outputs.len()) {
-                if *tp == majit_ir::Type::Ref {
-                    root_slots.push((&mut outputs[i]) as *mut i64 as *mut GcRef);
-                }
-            }
-            for root in materialized_roots.iter_mut() {
-                root_slots.push(root as *mut GcRef);
-            }
-            let _root_guard = GcRootSlotGuard::new(root_slots);
 
-            // Step 2: rebuild ALL frames' slots, concatenated in
-            // callee-first order. ExitRecoveryLayout stores frames
-            // outermost-first (caller, callee) per the
-            // `opencoder.py:217` `framestack.reverse()` parity, while
-            // the deadframe layout that downstream consumers
-            // (`restore_guard_failure_values`) read expects innermost-
-            // first concatenation, so reverse on read.
-            let mut rebuilt = Vec::new();
-            for frame_layout in recovery.frames.iter().rev() {
-                for slot in &frame_layout.slots {
-                    match slot {
-                        majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
-                            rebuilt.push(outputs.get(*idx).copied().unwrap_or(0));
-                        }
-                        majit_backend::ExitValueSourceLayout::Constant(c) => {
-                            rebuilt.push(*c);
-                        }
-                        majit_backend::ExitValueSourceLayout::Virtual(vidx) => {
-                            rebuilt.push(materialize_virtual_recursive(
-                                *vidx,
-                                &recovery.virtual_layouts,
-                                outputs,
-                                &mut materialized_roots,
-                                &mut materialized_done,
-                            ));
-                        }
-                        _ => rebuilt.push(0),
-                    }
-                }
-            }
-
-            // Step 3: replay pending field writes (resume.py:1003-1007).
-            // Must happen AFTER materialization so target/value virtuals
-            // resolve to concrete pointers.
-            let resolve_pending = |src: &majit_backend::ExitValueSourceLayout,
-                                   materialized: &[GcRef]|
-             -> Option<i64> {
-                match src {
-                    majit_backend::ExitValueSourceLayout::ExitValue(idx) => {
-                        outputs.get(*idx).copied()
-                    }
-                    majit_backend::ExitValueSourceLayout::Constant(c) => Some(*c),
-                    majit_backend::ExitValueSourceLayout::Virtual(vidx) => materialized
-                        .get(*vidx)
-                        .map(|root| root.0 as i64)
-                        .filter(|value| *value != 0),
-                    _ => None,
-                }
-            };
-            for pf in &recovery.pending_field_layouts {
-                let Some(target_ptr) = resolve_pending(&pf.target, &materialized_roots) else {
-                    continue;
-                };
-                let Some(value_raw) = resolve_pending(&pf.value, &materialized_roots) else {
-                    continue;
-                };
-                if target_ptr == 0 {
-                    continue;
-                }
-                // resume.py:1000 PENDINGFIELDSTRUCT.lldescr is always present
-                // in RPython.  Pending fields are produced from descr-bearing
-                // setfield / setarrayitem ops (heap.py force_lazy_sets_for_guard).
-                let descr = pf
-                    .descr
-                    .as_ref()
-                    .expect("resume.py:1000 PENDINGFIELDSTRUCT.lldescr must be set");
-                // resume.py:1003-1007 _prepare_pendingfields:
-                //   if itemindex < 0: setfield → descr.is_pointer_field /
-                //     is_float_field; else setarrayitem →
-                //     arraydescr.is_array_of_pointers / is_array_of_floats.
-                let (addr, value_type, value_size) = if pf.is_array_item {
-                    let ad = descr
-                        .as_array_descr()
-                        .expect("setarrayitem pending field must carry an ArrayDescr");
-                    let item_index = pf
-                        .item_index
-                        .expect("setarrayitem pending field must carry an item_index");
-                    let addr = target_ptr as usize + ad.base_size() + item_index * ad.item_size();
-                    (addr, ad.item_type(), ad.item_size())
-                } else {
-                    let fd = descr
-                        .as_field_descr()
-                        .expect("setfield pending field must carry a FieldDescr");
-                    let addr = target_ptr as usize + fd.offset();
-                    (addr, fd.field_type(), fd.field_size())
-                };
-                if value_type == majit_ir::Type::Ref {
-                    write_barrier_if_managed(GcRef(target_ptr as usize));
-                }
-                unsafe {
-                    match value_size {
-                        8 => std::ptr::write(addr as *mut i64, value_raw),
-                        4 => std::ptr::write(addr as *mut i32, value_raw as i32),
-                        2 => std::ptr::write(addr as *mut i16, value_raw as i16),
-                        1 => std::ptr::write(addr as *mut u8, value_raw as u8),
-                        _ => {}
-                    }
-                }
-            }
-
-            *outputs = rebuilt;
-            return;
-        }
-    }
-    // resume.py:945/993 parity: virtual materialization is handled by
-    // rd_virtuals (Phase 1 above). No virtual pair compaction needed.
-    REBUILD_STATE_AFTER_FAILURE.with(|c| {
-        if let Some(f) = c.get() {
-            f(outputs, types);
-        }
-    });
-}
-
-/// Materialize a single virtual from its layout and raw output values.
-/// Uses the REBUILD_STATE_AFTER_FAILURE callback for actual object allocation.
-/// resume.py:617-621 VirtualInfo.allocate parity: cycle-safe materialization.
-///
-/// Phase 1: allocate struct (allocate_with_vtable / allocate_struct)
-/// Phase 2: set_ptr(index, struct) — cache BEFORE setfields
-/// Phase 3: setfields — fill fields (may reference self via cycle)
-fn materialize_virtual_recursive(
-    vidx: usize,
-    virtual_layouts: &[majit_backend::ExitVirtualLayout],
-    outputs: &[i64],
-    materialized: &mut [GcRef],
-    materialized_done: &mut [bool],
-) -> i64 {
-    if materialized_done.get(vidx).copied().unwrap_or(false) {
-        return materialized.get(vidx).copied().unwrap_or(GcRef::NULL).0 as i64;
-    }
-    let Some(vl) = virtual_layouts.get(vidx) else {
-        return 0;
-    };
-
-    // Phase 1: allocate (without setfields)
-    let ptr = match vl {
-        // resume.py:617-621 VirtualInfo.allocate → allocate_with_vtable(descr).
-        majit_backend::ExitVirtualLayout::Object {
-            descr,
-            known_class,
-            fields,
-            fielddescrs,
-            descr_size,
-            type_id,
-            ..
-        } => {
-            let ob_type = known_class.unwrap_or(0);
-
-            // Fast path: W_IntObject/W_FloatObject (1 data field + known_class)
-            if fields.len() == 1 && ob_type != 0 {
-                let data_val = fields
-                    .first()
-                    .and_then(|(_, src)| resolve_virtual_field_value(src, outputs))
-                    .unwrap_or(0);
-                let mut temp = vec![0i64, ob_type, data_val];
-                let temp_types = vec![
-                    majit_ir::Type::Ref,
-                    majit_ir::Type::Int,
-                    majit_ir::Type::Int,
-                ];
-                {
-                    let _temp_root_guard =
-                        GcRootSlotGuard::new(vec![(&mut temp[0]) as *mut i64 as *mut GcRef]);
-                    REBUILD_STATE_AFTER_FAILURE.with(|c| {
-                        if let Some(f) = c.get() {
-                            f(&mut temp, &temp_types);
-                        }
-                    });
-                }
-                if temp[0] != 0 {
-                    if vidx < materialized.len() {
-                        materialized[vidx] = GcRef(temp[0] as usize);
-                    }
-                    if vidx < materialized_done.len() {
-                        materialized_done[vidx] = true;
-                    }
-                    return temp[0];
-                }
-            }
-
-            // resume.py:617 bh_new_with_vtable(descr): allocate via live SizeDescr.
-            let (alloc_size, alloc_tid) = descr
-                .as_ref()
-                .and_then(|d| d.as_size_descr())
-                .map(|sd| (sd.size(), sd.type_id()))
-                .unwrap_or((*descr_size, *type_id));
-            if fielddescrs.is_empty() && alloc_size == 0 && ob_type == 0 {
-                return 0;
-            }
-            let size = if alloc_size > 0 { alloc_size } else { 16 };
-            let ptr = if ob_type != 0 {
-                if let Some(p) =
-                    with_cranelift_gc(|gc| gc.alloc_nursery_typed(alloc_tid, size).0 as i64)
-                {
-                    if p != 0 {
-                        unsafe { *(p as *mut i64) = ob_type };
-                    }
-                    p
-                } else {
-                    let layout = match std::alloc::Layout::from_size_align(size, 8) {
-                        Ok(l) => l,
-                        Err(_) => return 0,
-                    };
-                    let p = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
-                    if p.is_null() {
-                        return 0;
-                    }
-                    unsafe { *(p as *mut i64) = ob_type };
-                    p as i64
-                }
-            } else {
-                let layout = match std::alloc::Layout::from_size_align(size, 8) {
-                    Ok(l) => l,
-                    Err(_) => return 0,
-                };
-                let p = unsafe { std::alloc::alloc_zeroed(layout) as *mut u8 };
-                if p.is_null() {
-                    return 0;
-                }
-                p as i64
-            };
-            ptr
-        }
-        // resume.py:634-637 VStructInfo.allocate → allocate_struct(typedescr).
-        majit_backend::ExitVirtualLayout::Struct {
-            typedescr,
-            type_id,
-            fielddescrs,
-            descr_size,
-            ..
-        } => {
-            // resume.py:635 allocate_struct(self.typedescr): use live SizeDescr.
-            let (alloc_size, alloc_tid) = typedescr
-                .as_ref()
-                .and_then(|d| d.as_size_descr())
-                .map(|sd| (sd.size(), sd.type_id()))
-                .unwrap_or((*descr_size, *type_id));
-            if fielddescrs.is_empty() && alloc_size == 0 {
-                return 0;
-            }
-            let size = if alloc_size > 0 { alloc_size } else { 16 };
-            if let Some(p) =
-                with_cranelift_gc(|gc| gc.alloc_nursery_typed(alloc_tid, size).0 as i64)
-            {
-                p
-            } else {
-                let layout = match std::alloc::Layout::from_size_align(size, 8) {
-                    Ok(l) => l,
-                    Err(_) => return 0,
-                };
-                unsafe { std::alloc::alloc_zeroed(layout) as i64 }
-            }
-        }
-        // resume.py:763-779 VStrPlainInfo.allocate /
-        // resume.py:817-829 VUniPlainInfo.allocate — bh_newstr/bh_newunicode
-        // + per-char bh_strsetitem/bh_unicodesetitem. Frontend-provided
-        // callback because the primitives live on pyre-jit's Backend impl.
-        majit_backend::ExitVirtualLayout::StrPlain { is_unicode, chars } => {
-            let resolved_chars: Vec<i64> = chars
-                .iter()
-                .map(|src| {
-                    resolve_virtual_field_value_with_materialized(src, outputs, materialized)
-                        .unwrap_or(0)
-                })
-                .collect();
-            let Some(f) = MATERIALIZE_STR_PLAIN_FN.with(|c| c.get()) else {
-                return 0;
-            };
-            f(*is_unicode, &resolved_chars)
-        }
-        // resume.py:781-796 VStrConcatInfo.allocate /
-        // resume.py:830-848 VUniConcatInfo.allocate —
-        //     left = decoder.decode_ref(fieldnums[0])
-        //     right = decoder.decode_ref(fieldnums[1])
-        //     return string_concat(metainterp_sd, left, right)
-        // string_concat: bh_call_r(func, [], [left, right], [], calldescr).
-        majit_backend::ExitVirtualLayout::StrConcat {
-            is_unicode,
-            func,
-            calldescr,
-            left,
-            right,
-        } => {
-            let left_val =
-                resolve_virtual_field_value_with_materialized(left, outputs, materialized)
-                    .unwrap_or(0);
-            let right_val =
-                resolve_virtual_field_value_with_materialized(right, outputs, materialized)
-                    .unwrap_or(0);
-            let Some(f) = MATERIALIZE_STR_CALL_FN.with(|c| c.get()) else {
-                return 0;
-            };
-            f(*is_unicode, *func, calldescr, &[], &[left_val, right_val])
-        }
-        // resume.py:799-813 VStrSliceInfo.allocate /
-        // resume.py:854-868 VUniSliceInfo.allocate —
-        //     largerstr = decoder.decode_ref(fieldnums[0])
-        //     start = decoder.decode_int(fieldnums[1])
-        //     length = decoder.decode_int(fieldnums[2])
-        //     return slice_string(metainterp_sd, largerstr, start, start + length)
-        // slice_string: bh_call_r(func, [start, stop], [str], [], calldescr).
-        majit_backend::ExitVirtualLayout::StrSlice {
-            is_unicode,
-            func,
-            calldescr,
-            str_src,
-            start,
-            length,
-        } => {
-            let str_val =
-                resolve_virtual_field_value_with_materialized(str_src, outputs, materialized)
-                    .unwrap_or(0);
-            let start_val =
-                resolve_virtual_field_value_with_materialized(start, outputs, materialized)
-                    .unwrap_or(0);
-            let length_val =
-                resolve_virtual_field_value_with_materialized(length, outputs, materialized)
-                    .unwrap_or(0);
-            // resume.py:1474 / 1501 — slice_string(str, start, start + length)
-            // passes the stop index, not the length.
-            let stop_val = start_val + length_val;
-            let Some(f) = MATERIALIZE_STR_CALL_FN.with(|c| c.get()) else {
-                return 0;
-            };
-            f(
-                *is_unicode,
-                *func,
-                calldescr,
-                &[start_val, stop_val],
-                &[str_val],
-            )
-        }
-        // Remaining variants — Array, ArrayStruct, RawBuffer, RawSlice
-        // — are still frontend-ceded because the host allocator
-        // (allocate_array / new_raw_buffer) is not yet exposed through
-        // a backend callback. The frontend's rebuild pass overwrites
-        // the null pointer produced here with the real allocation.
-        _ => return 0,
-    };
-
-    // Phase 2: set_ptr — cache BEFORE setfields (cycle-safe)
-    if vidx < materialized.len() {
-        materialized[vidx] = GcRef(ptr as usize);
-    }
-    if vidx < materialized_done.len() {
-        materialized_done[vidx] = true;
-    }
-
-    // Phase 3: setfields — may recurse into nested virtuals
-    match vl {
-        majit_backend::ExitVirtualLayout::Object {
-            fields,
-            fielddescrs,
-            ..
-        }
-        | majit_backend::ExitVirtualLayout::Struct {
-            fields,
-            fielddescrs,
-            ..
-        } => {
-            // ob_type is set from known_class during allocation (Phase 1).
-            // fields only contain data fields (ob_type excluded).
-            for (i, (_, src)) in fields.iter().enumerate() {
-                if let Some(fd) = fielddescrs.get(i) {
-                    {
-                        // Resolve with materialized (nested virtuals now available)
-                        let val = resolve_virtual_field_value_with_materialized(
-                            src,
-                            outputs,
-                            materialized,
-                        )
-                        .unwrap_or_else(|| {
-                            // Nested virtual not yet materialized — recurse
-                            if let majit_backend::ExitValueSourceLayout::Virtual(nv) = src {
-                                materialize_virtual_recursive(
-                                    *nv,
-                                    virtual_layouts,
-                                    outputs,
-                                    materialized,
-                                    materialized_done,
-                                )
-                            } else {
-                                0
-                            }
-                        });
-                        unsafe {
-                            let addr = (ptr as *mut u8).add(fd.offset);
-                            match fd.field_type {
-                                majit_ir::Type::Ref => {
-                                    write_barrier_if_managed(GcRef(ptr as usize));
-                                    std::ptr::write(addr as *mut i64, val)
-                                }
-                                majit_ir::Type::Float => {
-                                    std::ptr::write(addr as *mut u64, val as u64)
-                                }
-                                _ => match fd.field_size {
-                                    1 => std::ptr::write(addr, val as u8),
-                                    2 => std::ptr::write(addr as *mut u16, val as u16),
-                                    4 => std::ptr::write(addr as *mut u32, val as u32),
-                                    _ => std::ptr::write(addr as *mut i64, val),
-                                },
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        _ => {}
-    }
-
-    ptr
-}
 
 fn resolve_virtual_field_value(
     source: &majit_backend::ExitValueSourceLayout,
@@ -2017,28 +1556,47 @@ pub fn register_resumedata_deopt(f: fn(usize, &mut Vec<i64>, &[Type], usize) -> 
     let _ = RESUMEDATA_DEOPT_FN.set(f);
 }
 
-/// Dispatch entry used by the six recovery_layout_ref() consumer
-/// sites (Slice QQ-3+).  Calls the on-demand callback when present
-/// and it claims the descr; otherwise falls back to the existing
-/// recovery_layout walker.  Returns when `outputs` has been updated.
+/// Dispatch entry used by the four runtime-deopt callers
+/// (compiler.rs:3185, 3555, 3590, 3717) — drives the on-demand
+/// `ResumeDataDirectReader` callback (Slice QQ-2's
+/// `cranelift_resumedata_deopt`) which materialises virtuals + replays
+/// pending fields straight from `rd_numb` / `rd_consts` / `rd_virtuals`
+/// / `rd_pendingfields`, matching `pyjitpl.py:3424
+/// MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)` +
+/// `resume.py:1312 blackhole_from_resumedata`.  No recovery_layout
+/// walker fallback — production code paths always reach a
+/// `ResumeGuardDescr` meta_descr with populated `rd_numb`.
+///
+/// When the callback returns false the descr has neither a
+/// `ResumeGuardDescr` meta nor a populated `rd_numb`, which in the
+/// current cranelift pipeline only happens for synthetic descrs that
+/// never have a bridge attached and therefore never reach this
+/// dispatch helper at runtime.  Falling through here panics loudly
+/// instead of silently producing stale outputs — fixing the producer
+/// (synthesise the meta + populate rd_numb) is the right response,
+/// not reviving a backend-local cache.
 fn rebuild_state_after_failure_dispatch(
     fail_descr: &Arc<CraneliftFailDescr>,
     outputs: &mut Vec<i64>,
     fail_arg_types: &[Type],
     bridge_num_inputs: usize,
 ) {
-    if let Some(cb) = RESUMEDATA_DEOPT_FN.get() {
-        let descr_addr = Arc::as_ptr(fail_descr) as *const () as usize;
-        if cb(descr_addr, outputs, fail_arg_types, bridge_num_inputs) {
-            return;
-        }
-    }
-    rebuild_state_after_failure(
-        outputs,
-        fail_arg_types,
-        fail_descr.recovery_layout_ref().as_ref(),
-        bridge_num_inputs,
+    let cb = RESUMEDATA_DEOPT_FN.get().copied().expect(
+        "RESUMEDATA_DEOPT_FN not registered — pyre-jit's init_callbacks (eval.rs) must call \
+         register_resumedata_deopt before any guard can fail.",
     );
+    let descr_addr = Arc::as_ptr(fail_descr) as *const () as usize;
+    let _ = (fail_arg_types, bridge_num_inputs); // walker path removed
+    if !cb(descr_addr, outputs, fail_arg_types, bridge_num_inputs) {
+        panic!(
+            "cranelift_resumedata_deopt callback returned false for a runtime guard \
+             failure — descr's meta_descr is not a ResumeGuardDescr or rd_numb is empty. \
+             trace_id={} fail_index_per_trace={} fail_arg_types_len={}",
+            fail_descr.trace_id(),
+            <CraneliftFailDescr as FailDescr>::fail_index_per_trace(fail_descr),
+            fail_arg_types.len(),
+        );
+    }
 }
 
 // Thread-local raw local0 value from CallAssemblerI inputs,
@@ -3719,9 +3277,13 @@ fn call_assembler_shim_inner(
         let raw_num = fail_types.len();
         let raw_outputs = fail_values.clone();
         let mut bh_outputs = fail_values;
-        // Slice QQ-3: dispatch through on-demand callback when the
-        // descr is reachable; otherwise fall back to the
-        // recovery_layout walker via the same dispatch helper.
+        // Slice QQ-3 + QQ-4: dispatch through on-demand callback.  No
+        // recovery_layout walker fallback — if the descr can't be
+        // looked up in fail_descrs (shouldn't happen for in-bounds
+        // fail_index per the producer's invariant) we leave bh_outputs
+        // as the raw fail_values so the bh_fn sees the JITed exit code's
+        // stored values unchanged (matches walker's None-recovery
+        // early-out semantics).
         if let Some(fail_descr_arc) = target.fail_descrs.get(fail_index as usize) {
             rebuild_state_after_failure_dispatch(
                 fail_descr_arc,
@@ -3729,8 +3291,6 @@ fn call_assembler_shim_inner(
                 fail_types,
                 raw_num,
             );
-        } else {
-            rebuild_state_after_failure(&mut bh_outputs, fail_types, None, raw_num);
         }
         let num_outputs = bh_outputs.len();
         // `descr` is the deadframe's attached `&dyn FailDescr`; the
