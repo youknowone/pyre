@@ -494,7 +494,7 @@ impl UnrollOptimizer {
                         next_iteration_args: Vec::new(),
                         end_arg_types: Vec::new(),
                         virtual_state: state.virtual_state.clone(),
-                        exported_infos: std::collections::HashMap::new(),
+                        exported_infos: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                         exported_short_boxes: Vec::new(),
                         short_boxes: Vec::new(),
                         short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
@@ -1618,7 +1618,7 @@ pub struct ExportedState {
     /// dispatched via `isinstance` in `setinfo_from_preamble` (unroll.py:53-98).
     /// Majit uses the existing `OpInfo` enum (info.rs:137) as the discriminated
     /// union of these three cases.
-    pub exported_infos: HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+    pub exported_infos: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
     /// RPython shortpreamble.py: produced short boxes in preamble order.
     /// This preserves the original preamble ops so the active path can build
     /// short preambles without re-extracting them from the peeled trace.
@@ -1737,7 +1737,7 @@ impl ExportedState {
         end_args: Vec<OpRef>,
         next_iteration_args: Vec<OpRef>,
         virtual_state: crate::optimizeopt::virtualstate::VirtualState,
-        exported_infos: HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
         exported_short_boxes: Vec<crate::optimizeopt::shortpreamble::PreambleOp>,
         renamed_inputargs: Vec<OpRef>,
         renamed_inputarg_types: Vec<Type>,
@@ -1899,7 +1899,7 @@ impl ExportedState {
         let mut keys: Vec<OpRef> = self.exported_infos.keys().copied().collect();
         keys.sort_by_key(|k| k.raw());
         for key in keys {
-            if let OpInfo::Ptr(rc) = &self.exported_infos[&key] {
+            if let Some(OpInfo::Ptr(rc)) = self.exported_infos.get(&key) {
                 let info = rc.borrow();
                 match &*info {
                     // RPython ConstPtrInfo: GcRef constant stored directly in
@@ -2547,7 +2547,7 @@ impl OptUnroll {
         // the same post-force, post-flush state RPython feeds in.
         let virtual_state = crate::optimizeopt::virtualstate::export_state(&end_args, ctx);
         // unroll.py:459-461: infos = {}; for arg in end_args: _expand_info(arg, infos)
-        let mut infos: HashMap<OpRef, crate::optimizeopt::info::OpInfo> = HashMap::new();
+        let mut infos: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo> = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for &arg in &end_args {
             self.expand_info(arg, ctx, exported_int_bounds, &mut infos);
         }
@@ -2719,7 +2719,7 @@ impl OptUnroll {
         arg: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
-        infos: &mut HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
         let resolved = ctx.get_box_replacement(arg);
         if infos.contains_key(&resolved) {
@@ -2768,7 +2768,7 @@ impl OptUnroll {
         opref: OpRef,
         ctx: &OptContext,
         exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
-        infos: &mut HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        infos: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
         let opref_box = ctx.get_box_replacement_box(opref);
         let fields: Vec<OpRef> = match opref_box.as_ref().and_then(|b| ctx.peek_ptr_info(b)) {
@@ -3774,7 +3774,7 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
         ctx: &mut OptContext,
     ) {
         ctx.setinfo_from_preamble_item(opref, info, exported_infos);
@@ -4926,7 +4926,7 @@ mod tests {
             vec![OpRef::int_op(52)],
             vec![OpRef::int_op(109), OpRef::const_int(3)],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
-            HashMap::new(),
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
             Vec::new(),
             vec![OpRef::int_op(14)],
             Vec::new(),
@@ -5554,7 +5554,7 @@ mod tests {
         );
 
         assert_eq!(
-            match &exported.exported_infos[&OpRef::int_op(21)] {
+            match exported.exported_infos.get(&OpRef::int_op(21)).unwrap() {
                 crate::optimizeopt::info::OpInfo::IntBound(b) => {
                     let b = b.borrow();
                     Some((b.lower, b.upper))
@@ -5781,7 +5781,7 @@ mod tests {
             vec![source],
             vec![source],
             crate::optimizeopt::virtualstate::VirtualState::new(Vec::new()),
-            HashMap::new(),
+            crate::optimizeopt::vec_assoc::VecAssoc::new(),
             vec![crate::optimizeopt::shortpreamble::PreambleOp {
                 op: {
                     let mut op = Op::new(OpCode::CallLoopinvariantI, &[func]);

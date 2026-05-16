@@ -1194,7 +1194,7 @@ impl ProducedShortOp {
     pub fn produce_op(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &HashMap<OpRef, OpRef>,
@@ -1370,7 +1370,7 @@ impl ProducedShortOp {
     fn produce_heap_field(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &HashMap<OpRef, OpRef>,
@@ -1462,7 +1462,7 @@ impl ProducedShortOp {
     fn produce_heap_array_item(
         &self,
         ctx: &mut crate::optimizeopt::OptContext,
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
         result_map: &HashMap<OpRef, OpRef>,

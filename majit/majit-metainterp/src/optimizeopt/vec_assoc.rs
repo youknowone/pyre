@@ -103,3 +103,25 @@ impl<K: Eq, V> VecAssoc<K, V> {
         self.entries.iter().map(|(_, v)| v)
     }
 }
+
+impl<K: Eq, V> IntoIterator for VecAssoc<K, V> {
+    type Item = (K, V);
+    type IntoIter = std::vec::IntoIter<(K, V)>;
+    fn into_iter(self) -> Self::IntoIter {
+        self.entries.into_iter()
+    }
+}
+
+impl<'a, K: Eq, V> IntoIterator for &'a VecAssoc<K, V> {
+    type Item = (&'a K, &'a V);
+    type IntoIter = std::iter::Map<
+        std::slice::Iter<'a, (K, V)>,
+        fn(&'a (K, V)) -> (&'a K, &'a V),
+    >;
+    fn into_iter(self) -> Self::IntoIter {
+        fn split<'a, K, V>(t: &'a (K, V)) -> (&'a K, &'a V) {
+            (&t.0, &t.1)
+        }
+        self.entries.iter().map(split as fn(&'a (K, V)) -> (&'a K, &'a V))
+    }
+}

@@ -2312,7 +2312,7 @@ impl OptContext {
         short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
         result_map: &HashMap<OpRef, OpRef>,
         mut imported_constants: &mut HashMap<OpRef, OpRef>,
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
     ) -> bool {
         use crate::optimizeopt::shortpreamble::{
             PreambleOpKind, ProducedShortOp, ShortPreambleBuilder,
@@ -2997,7 +2997,7 @@ impl OptContext {
         &mut self,
         op: OpRef,
         preamble_info_handle: &std::rc::Rc<std::cell::RefCell<PtrInfo>>,
-        exported_infos: Option<&HashMap<OpRef, crate::optimizeopt::info::OpInfo>>,
+        exported_infos: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>>,
     ) {
         let op = self.get_box_replacement(op);
         // unroll.py:55: if op.get_forwarded() is not None: return
@@ -3149,7 +3149,7 @@ impl OptContext {
     fn setinfo_from_preamble_list(
         &mut self,
         items: &[OpRef],
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
         for &item in items {
             if item.is_none() {
@@ -3190,7 +3190,7 @@ impl OptContext {
         &mut self,
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
+        exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
         use crate::optimizeopt::info::OpInfo;
         // unroll.py:53-54 `op = get_box_replacement(op)`
@@ -3253,7 +3253,7 @@ impl OptContext {
         &mut self,
         op: OpRef,
         preamble_info: &crate::optimizeopt::info::OpInfo,
-        exported_infos: Option<&HashMap<OpRef, crate::optimizeopt::info::OpInfo>>,
+        exported_infos: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>>,
     ) {
         use crate::optimizeopt::info::OpInfo;
         let target = self.get_box_replacement(op);
