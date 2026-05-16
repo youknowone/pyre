@@ -4274,6 +4274,20 @@ fn handle(
         "ptr_ne/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrNe),
         "ptr_nonzero/r>i" => ptr_nonzero_record(code, op, ctx),
         "ref_guard_value/r" => ref_guard_value_record(code, op, ctx),
+        "abort/>r" => {
+            // pyre-only result marker: `Assembler::encode_op`'s default
+            // branch emits this when an untranslatable op's result is
+            // classified `Ref` by `infer_concrete_from_op`'s
+            // Abort→GcRef fallback.  Blackhole counterpart
+            // (`handler_abort_result_marker_r`, `blackhole.rs:5149`) is
+            // a pure PC bump — no operand read, no register write, no
+            // IR op recorded.  The actual abort signal is `abort/`
+            // (BC_ABORT = 13), not this; reaching `abort/>r` in normal
+            // flow is upstream-only an artefact of result-kind
+            // classification and the dst slot is never read in a
+            // post-abort code path.
+            Ok((DispatchOutcome::Continue, op.next_pc))
+        }
         // Heapcache-aware getfield reads. RPython
         // `pyjitpl.py:855-882 opimpl_getfield_gc_<i|r|f>` →
         // `_opimpl_getfield_gc_any_pureornot` (`pyjitpl.py:929-950`)
@@ -8132,19 +8146,20 @@ mod tests {
     #[test]
     fn unsupported_opname_surfaces_typed_error() {
         // Stable choice for exercising the catch-all `UnsupportedOpname`
-        // error path while handler coverage continues to grow.  The
-        // `abort/>r` opname is a pyre-only marker emitted by the
-        // rtyper's Abort→GcRef fallback
-        // (`majit-translate/src/translator/rtyper.rs::infer_concrete_from_op`).
-        // It has no PyPy analog — until walker design decides what to
-        // write to dst on an aborted callee, dispatching it surfaces
-        // `UnsupportedOpname` from the catch-all arm.
-        let opname = "abort/>r";
+        // error path.  `vtable_method_ptr/rd>i` is a pyre-only backend
+        // adaptation (emitted by `OpKind::VtableMethodPtr` /
+        // `assembler.rs:2762`) without a PyPy analog: Python dispatch
+        // resolves through `cpu.bh_call_*` at runtime rather than
+        // reifying a method pointer into the bytecode stream.  Zero
+        // JitCode hits in production traces (per
+        // `t3_audit_opname_gap_inventory`), so it's a durable choice
+        // for the "still unsupported" slot.
+        let opname = "vtable_method_ptr/rd>i";
         let unsupported_byte = *insns_opname_to_byte()
             .get(opname)
             .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
-        // Operand encoding `>r`: 0 input operands + 1B r-reg-dst = 1B
-        let code = [unsupported_byte, 0];
+        // Operand encoding `rd>i`: 1B r-reg + 2B descr + 1B i-reg-dst = 4B.
+        let code = [unsupported_byte, 0, 0, 0, 0];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
         let mut wc = WalkContext {
@@ -8234,6 +8249,47 @@ mod tests {
         );
         assert_eq!(wc.trace_ctx.const_type(last_args1), Some(Type::Ref));
         assert_ne!(wc.registers_i[0], OpRef::None);
+    }
+
+    /// `abort/>r` is a pyre-only no-op result marker — the walker
+    /// counterpart of blackhole's `handler_abort_result_marker_r`
+    /// (`blackhole.rs:5149`).  No operand read, no register write, no
+    /// IR op recorded; dispatch advances past the 1B dst slot only.
+    #[test]
+    fn abort_result_r_is_pure_pc_advance() {
+        let opname = "abort/>r";
+        let byte = *insns_opname_to_byte()
+            .get(opname)
+            .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
+        let code = [byte, 0x05]; // dst byte = 5 (intentionally out-of-range)
+        let mut tc = fresh_trace_ctx();
+        let descr = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut [],
+            registers_i: &mut [],
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("abort/>r must dispatch");
+        assert!(matches!(outcome, DispatchOutcome::Continue));
+        assert_eq!(next_pc, 2, "abort/>r operand layout = 1 byte (dst marker)");
+        assert_eq!(
+            wc.trace_ctx.num_ops(),
+            ops_before,
+            "abort/>r must not record any IR op",
+        );
     }
 
     /// `ref_guard_value/r` records `GuardValue(value, ConstPtr(concrete))`
