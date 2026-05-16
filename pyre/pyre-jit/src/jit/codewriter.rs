@@ -821,8 +821,36 @@ fn fresh_variable_for_state(
 }
 
 fn append_exit(block: &super::flow::BlockRef, link: super::flow::LinkRef) {
+    append_exit_tagged(block, link, "append_exit");
+}
+
+fn append_exit_tagged(
+    block: &super::flow::BlockRef,
+    link: super::flow::LinkRef,
+    tag: &'static str,
+) {
     link.borrow_mut().prevblock = Some(block.downgrade());
-    block.borrow_mut().exits.push(link);
+    block.borrow_mut().exits.push(link.clone());
+    if std::env::var_os("PYRE_PHASE3_APPEND_EXIT_DIAG").is_some() {
+        let b = block.borrow();
+        let exits_summary: Vec<String> = b
+            .exits
+            .iter()
+            .map(|l| {
+                let lb = l.borrow();
+                format!("(ec={:?},llec={:?})", lb.exitcase, lb.llexitcase)
+            })
+            .collect();
+        eprintln!(
+            "[phase3-append-exit] tag={tag} block_addr={:p} ops={} exits_now={} \
+             exitswitch={:?} shape={:?}",
+            &*b as *const _,
+            b.operations.len(),
+            b.exits.len(),
+            b.exitswitch,
+            exits_summary,
+        );
+    }
 }
 
 /// atomically append `link` to `block.exits` and
@@ -1143,6 +1171,16 @@ fn mergeblock(
     pendingblocks: &mut VecDeque<SpamBlockRef>,
     all_walker_blocks: &mut Vec<SpamBlockRef>,
 ) -> SpamBlockRef {
+    if std::env::var_os("PYRE_PHASE3_MERGEBLOCK_DIAG").is_some() {
+        eprintln!(
+            "[phase3-mergeblock] next_offset={} current_block_addr={:p} \
+             current_block_exits={} candidates_at_offset={}",
+            next_offset,
+            &*currentblock.block().borrow() as *const _,
+            currentblock.block().borrow().exits.len(),
+            joinpoints.get(&next_offset).map_or(0, |v| v.len()),
+        );
+    }
     let candidates = joinpoints.entry(next_offset).or_default();
     for index in 0..candidates.len() {
         let block = candidates[index].clone();
@@ -3881,11 +3919,33 @@ impl CodeWriter {
                 // checking that current_block.framestate.next_offset !=
                 // py_pc — we are not yet at start, so we need to close
                 // current_block at the boundary.
+                // `force_branch_boundary` is a pyre-walker adaptation to
+                // create an explicit block transition when the PC-
+                // sequential iterator reaches a branch target without
+                // an intervening branch (mirroring upstream's per-block
+                // walker boundary at branch entries).  It must NOT
+                // fire when `current_block` has already been closed by
+                // an explicit branch terminator (POP_JUMP_IF_*,
+                // emit_goto*, etc.), because those branches already
+                // appended both the linkfalse and linktrue exits with
+                // proper exitcase stamps — forcing another
+                // `mergeblock(currentblock=L1, target=fallthrough_pc)`
+                // here would append a stray `(None,None)` exit on top
+                // of the explicit bool branches, producing the 3-exit
+                // `[Bool(false), Bool(true), (None,None)]` shape that
+                // trips `flatten.py:275-296 insert_switch_exits`.
+                //
+                // Skipping the force when `current_block.exits` is
+                // non-empty falls into the `else if let Some(target) =
+                // joinpoints.get(&py_pc)` arm, which correctly switches
+                // to the joinpoint candidate POP_JUMP_IF_FALSE's
+                // mergeblock just created at `fallthrough_pc`.
                 let force_branch_boundary = needs_fallthrough
                     && branch_target_pcs.contains(&py_pc)
                     && current_block
                         .framestate()
-                        .map_or(true, |fs| fs.next_offset != py_pc);
+                        .map_or(true, |fs| fs.next_offset != py_pc)
+                    && current_block.block().borrow().exits.is_empty();
                 let new_block = if needs_fallthrough
                     && (current_state.next_offset != py_pc || force_branch_boundary)
                 {
