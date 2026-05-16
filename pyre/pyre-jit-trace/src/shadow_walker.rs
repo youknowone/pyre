@@ -257,6 +257,9 @@ pub fn shadow_validate_pre(
                 num_regs_r: jc.num_regs_r() as usize,
                 num_regs_i: jc.num_regs_i() as usize,
                 num_regs_f: jc.num_regs_f() as usize,
+                constants_i: jc.constants_i.as_slice(),
+                constants_r: jc.constants_r.as_slice(),
+                constants_f: jc.constants_f.as_slice(),
             })
     };
 
@@ -448,22 +451,26 @@ mod tests {
     }
 
     #[test]
-    fn pop_top_stays_out_of_shadow_allow_list_until_callee_register_banks_close() {
-        // PopTop's top-level arm decodes cleanly (every opname has a
-        // `dispatch_via_miframe` handler after M4.Cutover Steps 2.2/2.3 +
-        // T2's `getfield_vable_*` ports), but the recursive jitcode it
-        // inlines via `inline_call_r_r/dR>r` (descr[81] → jitcode_index 402)
-        // uses Int register #1 — the walker's sub-call setup only sizes
-        // the callee `WalkContext.registers_i` to length 1 (`reg=1`,
-        // `len=1`).  Under `MAJIT_SHADOW_WALKER=1 raise_catch_loop.py`
-        // this surfaces as `RegisterOutOfRange { pc: 14, reg: 1, len: 1,
-        // bank: "i" }` from inside the inlined arm.  Listing PopTop in
-        // the allow-list before the sub-jitcode register-bank sizing is
-        // fixed in `dispatch_inline_call_dirf_kind` (jitcode_dispatch.rs)
-        // panics the shadow harness on raise_catch.  Pending follow-up
-        // task: thread the callee's `num_regs_i/r/f` through the
-        // inline_call setup so each sub-walk frame gets correctly-sized
-        // register banks before dispatching.
+    fn pop_top_stays_out_of_shadow_allow_list_until_goto_if_not_handler_lands() {
+        // PopTop's prior blocker (sub-walk `registers_i` undersized at
+        // the callee constant-pool slot, surfacing as
+        // `RegisterOutOfRange { pc: 14, reg: 1, len: 1, bank: "i" }`
+        // on `raise_catch_loop.py`) is closed by T4 prerequisite #73 —
+        // `SubJitCodeBody` now carries `constants_{i,r,f}` and
+        // `dispatch_inline_call_d*_kind` sizes each sub-walk's
+        // `WalkContext.registers_X` to `num_regs_X + constants_X.len()`
+        // (RPython `num_regs_and_consts_X`), pre-populating the
+        // constant window via `TraceCtx::const_{int,ref,float}`
+        // matching `pyjitpl.py:98-119 MIFrame.copy_constants`.
+        //
+        // The next blocker, surfaced when PopTop joins the allow list
+        // and runs against `raise_catch_loop.py` under
+        // `MAJIT_SHADOW_WALKER=1`, is `UnsupportedOpname { pc: 21,
+        // key: "goto_if_not/iL" }` — the walker has no
+        // `goto_if_not/iL` handler yet (RPython
+        // `pyjitpl.py:_opimpl_goto_if_not`).  Adding PopTop to the
+        // allow list before that handler lands re-panics the shadow
+        // harness on every raise_catch shadow run.
         assert!(!opname_in_shadow_allow_list(&Instruction::PopTop));
     }
 

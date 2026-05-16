@@ -211,6 +211,18 @@ pub struct SubJitCodeBody {
     pub num_regs_i: usize,
     /// Number of Float-bank registers (`JitCode.num_regs_f`).
     pub num_regs_f: usize,
+    /// Callee's Int-bank constant pool (`JitCode.constants_i`).
+    /// The callee bytecode references constant slots via register
+    /// indices `[num_regs_i, num_regs_i + constants_i.len())`;
+    /// `setposition` (RPython `pyjitpl.py:98-119 copy_constants`)
+    /// pre-populates those slots with `ConstClass(constants_i[i])`.
+    pub constants_i: &'static [i64],
+    /// Callee's Ref-bank constant pool (`JitCode.constants_r`). Each
+    /// `i64` is the erased `PyObjectRef` of a const object resolved
+    /// at codewriter time.
+    pub constants_r: &'static [i64],
+    /// Callee's Float-bank constant pool (`JitCode.constants_f`).
+    pub constants_f: &'static [i64],
 }
 
 /// Caller-provided sub-jitcode lookup. RPython equivalent: descr
@@ -3251,6 +3263,44 @@ fn dispatch_residual_call_iIRFd_kind(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// Allocate the callee's three symbolic register banks for a sub-walk
+/// entered through any `inline_call_*` arm.
+///
+/// Each bank is sized to `num_regs_X + constants_X.len()`
+/// (RPython `JitCode.num_regs_and_consts_X`) so callee bytecode that
+/// reads the post-regs constant window (indices
+/// `[num_regs_X, num_regs_and_consts_X)`) finds a populated slot.
+/// Constant slots are filled via `TraceCtx::const_int` / `const_ref` /
+/// `const_float`, matching RPython
+/// `pyjitpl.py:98-119 MIFrame.copy_constants`.
+///
+/// Also returns a Ref-bank concrete shadow sized to match
+/// `registers_r` (constant slots seeded with `ConcreteValue::Null` —
+/// concrete propagation for the const pool would need a backing
+/// `PyObjectRef` materialisation that the sub-walk doesn't yet drive).
+fn allocate_callee_register_banks(
+    body: &SubJitCodeBody,
+    trace_ctx: &mut TraceCtx,
+) -> (Vec<OpRef>, Vec<OpRef>, Vec<OpRef>, Vec<ConcreteValue>) {
+    let total_r = body.num_regs_r + body.constants_r.len();
+    let total_i = body.num_regs_i + body.constants_i.len();
+    let total_f = body.num_regs_f + body.constants_f.len();
+    let mut regs_r = vec![OpRef::NONE; total_r];
+    let mut regs_i = vec![OpRef::NONE; total_i];
+    let mut regs_f = vec![OpRef::NONE; total_f];
+    let concrete_r = vec![ConcreteValue::Null; total_r];
+    for (i, &v) in body.constants_i.iter().enumerate() {
+        regs_i[body.num_regs_i + i] = trace_ctx.const_int(v);
+    }
+    for (i, &v) in body.constants_r.iter().enumerate() {
+        regs_r[body.num_regs_r + i] = trace_ctx.const_ref(v);
+    }
+    for (i, &v) in body.constants_f.iter().enumerate() {
+        regs_f[body.num_regs_f + i] = trace_ctx.const_float(v);
+    }
+    (regs_r, regs_i, regs_f, concrete_r)
+}
+
 /// Operand layout `dR>X`:
 ///   2B descr index + 1B varlen + N×1B Ref args + 1B `>X` dst.
 ///
@@ -3293,16 +3343,14 @@ fn dispatch_inline_call_dr_kind(
     let (args, arg_width) = read_ref_var_list(code, op, 2, ctx)?;
     let arg_concretes = read_ref_var_list_concrete(code, op, 2, ctx);
 
-    let mut callee_regs_r = vec![OpRef::NONE; sub_body.num_regs_r];
-    let mut callee_regs_i = vec![OpRef::NONE; sub_body.num_regs_i];
-    let mut callee_regs_f = vec![OpRef::NONE; sub_body.num_regs_f];
-    let mut callee_concrete_r = vec![ConcreteValue::Null; sub_body.num_regs_r];
+    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r) =
+        allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
-    if args.len() > callee_regs_r.len() {
+    if args.len() > sub_body.num_regs_r {
         return Err(DispatchError::InlineCallArityMismatch {
             pc: op.pc,
             provided: args.len(),
-            callee_num_regs_r: callee_regs_r.len(),
+            callee_num_regs_r: sub_body.num_regs_r,
         });
     }
     for (i, arg) in args.iter().enumerate() {
@@ -3468,23 +3516,21 @@ fn dispatch_inline_call_dir_kind(
     let (ref_args, ref_width) = read_ref_var_list(code, op, 2 + int_width, ctx)?;
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
 
-    let mut callee_regs_r = vec![OpRef::NONE; sub_body.num_regs_r];
-    let mut callee_regs_i = vec![OpRef::NONE; sub_body.num_regs_i];
-    let mut callee_regs_f = vec![OpRef::NONE; sub_body.num_regs_f];
-    let mut callee_concrete_r = vec![ConcreteValue::Null; sub_body.num_regs_r];
+    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r) =
+        allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
-    if int_args.len() > callee_regs_i.len() {
+    if int_args.len() > sub_body.num_regs_i {
         return Err(DispatchError::InlineCallIntArityMismatch {
             pc: op.pc,
             provided: int_args.len(),
-            callee_num_regs_i: callee_regs_i.len(),
+            callee_num_regs_i: sub_body.num_regs_i,
         });
     }
-    if ref_args.len() > callee_regs_r.len() {
+    if ref_args.len() > sub_body.num_regs_r {
         return Err(DispatchError::InlineCallArityMismatch {
             pc: op.pc,
             provided: ref_args.len(),
-            callee_num_regs_r: callee_regs_r.len(),
+            callee_num_regs_r: sub_body.num_regs_r,
         });
     }
     for (i, arg) in int_args.iter().enumerate() {
@@ -3642,30 +3688,28 @@ fn dispatch_inline_call_dirf_kind(
     let ref_arg_concretes = read_ref_var_list_concrete(code, op, 2 + int_width, ctx);
     let (float_args, float_width) = read_float_var_list(code, op, 2 + int_width + ref_width, ctx)?;
 
-    let mut callee_regs_r = vec![OpRef::NONE; sub_body.num_regs_r];
-    let mut callee_regs_i = vec![OpRef::NONE; sub_body.num_regs_i];
-    let mut callee_regs_f = vec![OpRef::NONE; sub_body.num_regs_f];
-    let mut callee_concrete_r = vec![ConcreteValue::Null; sub_body.num_regs_r];
+    let (mut callee_regs_r, mut callee_regs_i, mut callee_regs_f, mut callee_concrete_r) =
+        allocate_callee_register_banks(&sub_body, ctx.trace_ctx);
 
-    if int_args.len() > callee_regs_i.len() {
+    if int_args.len() > sub_body.num_regs_i {
         return Err(DispatchError::InlineCallIntArityMismatch {
             pc: op.pc,
             provided: int_args.len(),
-            callee_num_regs_i: callee_regs_i.len(),
+            callee_num_regs_i: sub_body.num_regs_i,
         });
     }
-    if ref_args.len() > callee_regs_r.len() {
+    if ref_args.len() > sub_body.num_regs_r {
         return Err(DispatchError::InlineCallArityMismatch {
             pc: op.pc,
             provided: ref_args.len(),
-            callee_num_regs_r: callee_regs_r.len(),
+            callee_num_regs_r: sub_body.num_regs_r,
         });
     }
-    if float_args.len() > callee_regs_f.len() {
+    if float_args.len() > sub_body.num_regs_f {
         return Err(DispatchError::InlineCallFloatArityMismatch {
             pc: op.pc,
             provided: float_args.len(),
-            callee_num_regs_f: callee_regs_f.len(),
+            callee_num_regs_f: sub_body.num_regs_f,
         });
     }
     for (i, arg) in int_args.iter().enumerate() {
@@ -4828,6 +4872,9 @@ mod tests {
             num_regs_r: jc.num_regs_r(),
             num_regs_i: jc.num_regs_i(),
             num_regs_f: jc.num_regs_f(),
+            constants_i: jc.constants_i.as_slice(),
+            constants_r: jc.constants_r.as_slice(),
+            constants_f: jc.constants_f.as_slice(),
         })
     }
 
@@ -4881,6 +4928,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 0,
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -5038,6 +5088,9 @@ mod tests {
             num_regs_r: 1, // callee accepts a Ref arg, then ignores it
             num_regs_i: 1,
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -5126,6 +5179,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 1, // accept one int arg
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -5210,6 +5266,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 1,
             num_regs_f: 1,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -5301,6 +5360,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 0, // overflow trigger
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -5382,6 +5444,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 0,
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -6648,6 +6713,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 0,
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = move |idx: usize| {
             if idx == 11 {
@@ -6761,6 +6829,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 0,
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = move |idx: usize| {
             if idx == 13 {
@@ -9132,6 +9203,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 0,
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = move |idx: usize| {
             if idx == 5 {
@@ -9204,6 +9278,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 0,
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -9267,6 +9344,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 0,
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -9326,6 +9406,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 1,
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -9390,6 +9473,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 1,
             num_regs_f: 0,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -9453,6 +9539,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 1,
             num_regs_f: 1,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
@@ -9521,6 +9610,9 @@ mod tests {
             num_regs_r: 1,
             num_regs_i: 1,
             num_regs_f: 1,
+            constants_i: &[],
+            constants_r: &[],
+            constants_f: &[],
         };
         let lookup = {
             let sub_body = sub_body.clone();
