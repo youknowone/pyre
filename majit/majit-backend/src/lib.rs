@@ -509,36 +509,49 @@ impl PartialEq for ExitVirtualLayout {
                 Self::StrConcat {
                     is_unicode: a1,
                     func: a2,
+                    calldescr: a_cd,
                     left: a3,
                     right: a4,
-                    ..
                 },
                 Self::StrConcat {
                     is_unicode: b1,
                     func: b2,
+                    calldescr: b_cd,
                     left: b3,
                     right: b4,
-                    ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4,
+            ) => {
+                a1 == b1
+                    && a2 == b2
+                    && std::sync::Arc::ptr_eq(a_cd, b_cd)
+                    && a3 == b3
+                    && a4 == b4
+            }
             (
                 Self::StrSlice {
                     is_unicode: a1,
                     func: a2,
+                    calldescr: a_cd,
                     str_src: a3,
                     start: a4,
                     length: a5,
-                    ..
                 },
                 Self::StrSlice {
                     is_unicode: b1,
                     func: b2,
+                    calldescr: b_cd,
                     str_src: b3,
                     start: b4,
                     length: b5,
-                    ..
                 },
-            ) => a1 == b1 && a2 == b2 && a3 == b3 && a4 == b4 && a5 == b5,
+            ) => {
+                a1 == b1
+                    && a2 == b2
+                    && std::sync::Arc::ptr_eq(a_cd, b_cd)
+                    && a3 == b3
+                    && a4 == b4
+                    && a5 == b5
+            }
             _ => false,
         }
     }
