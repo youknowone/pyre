@@ -12897,17 +12897,26 @@ fn collect_guards(
             } else if let Some(d) = op.descr.clone() {
                 Some(d)
             } else if is_finish {
+                // `compile.py:626-656` `_DoneWithThisFrameDescr*` are
+                // module-level singletons.  Reuse the metainterp Arc
+                // stashed on the matching `DONE_WITH_THIS_FRAME_DESCR_*`
+                // singleton so every FINISH exit of a given result type
+                // resolves to the SAME `Arc::ptr_eq` identity (matching
+                // `make_and_attach_done_descrs` parity).
                 let result_type = descr.fail_arg_types.first().copied().unwrap_or(Type::Void);
-                Some(match result_type {
-                    Type::Void => Arc::new(majit_backend::DoneWithThisFrameDescrVoid::new())
-                        as majit_ir::DescrRef,
-                    Type::Int => Arc::new(majit_backend::DoneWithThisFrameDescrInt::new())
-                        as majit_ir::DescrRef,
-                    Type::Ref => Arc::new(majit_backend::DoneWithThisFrameDescrRef::new())
-                        as majit_ir::DescrRef,
-                    Type::Float => Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new())
-                        as majit_ir::DescrRef,
-                })
+                let singleton: &Arc<CraneliftFailDescr> = match result_type {
+                    Type::Void => &DONE_WITH_THIS_FRAME_DESCR_VOID,
+                    Type::Int => &DONE_WITH_THIS_FRAME_DESCR_INT,
+                    Type::Ref => &DONE_WITH_THIS_FRAME_DESCR_REF,
+                    Type::Float => &DONE_WITH_THIS_FRAME_DESCR_FLOAT,
+                };
+                Some(
+                    singleton
+                        .meta_descr
+                        .as_ref()
+                        .cloned()
+                        .expect("DONE_WITH_THIS_FRAME singleton must carry a meta descr"),
+                )
             } else {
                 // Guard ops without an explicit op.descr (test scaffolding
                 // bypassing the tracer/optimizer that normally stamps
@@ -13165,7 +13174,11 @@ impl majit_backend::Backend for CraneliftBackend {
         // pyre-side parallel write that survives the eventual unification.
         if let Some(clt) = token.compiled_loop_token.as_ref() {
             for descr in &compiled.fail_descrs {
-                if !descr.is_resume_guard() {
+                // `compile.py:185` `isinstance(descr, ResumeDescr)`
+                // covers both `ResumeGuardDescr` and
+                // `ResumeGuardCopiedDescr`; copied descrs own their
+                // `rd_loop_token` directly per `history.py:127` `_attrs_`.
+                if !(descr.is_resume_guard() || descr.is_resume_guard_copied()) {
                     continue;
                 }
                 descr
@@ -13362,9 +13375,9 @@ impl majit_backend::Backend for CraneliftBackend {
             descr.set_trace_info(bridge_trace_info.clone());
             // `compile.py:183-186 record_loop_or_bridge`: a bridge's
             // ResumeDescrs inherit the original loop's CompiledLoopToken.
-            // `is_resume_guard()` restricts the stamp to guard descrs
-            // per `compile.py:185 isinstance(descr, ResumeDescr)`.
-            if !descr.is_resume_guard() {
+            // `compile.py:185 isinstance(descr, ResumeDescr)` covers
+            // both `ResumeGuardDescr` and `ResumeGuardCopiedDescr`.
+            if !(descr.is_resume_guard() || descr.is_resume_guard_copied()) {
                 continue;
             }
             if let Some(clt) = clt_arc.as_ref() {
@@ -13504,7 +13517,16 @@ impl majit_backend::Backend for CraneliftBackend {
                     // metainterp class hierarchy answers `final_descr`
                     // (Done*/Exit*/Propagate, compile.py:624 / 658-662 /
                     // 1092) instead of the backend-local mirror.
-                    if !FailDescr::is_finish(descr.as_ref()) && descr.get_status() == 0 {
+                    // `compile.py:826-829` `store_hash` only fires on
+                    // `AbstractResumeGuardDescr`.  `is_finish()` excludes
+                    // `Done*` finishes but still permits other final
+                    // non-guard descrs (`ExitFrameWithExceptionDescrRef`,
+                    // `PropagateExceptionDescr`) since they answer
+                    // `is_finish() == false`.  Gate on the canonical
+                    // `ResumeDescr` family instead.
+                    if (descr.is_resume_guard() || descr.is_resume_guard_copied())
+                        && descr.get_status() == 0
+                    {
                         descr.store_hash(hash);
                     }
                 }
@@ -13534,7 +13556,11 @@ impl majit_backend::Backend for CraneliftBackend {
                 if let Some(bridge) = descr.bridge_ref() {
                     for (i, &hash) in hashes.iter().enumerate() {
                         if let Some(bd) = bridge.fail_descrs.get(i) {
-                            if !FailDescr::is_finish(bd.as_ref()) && bd.get_status() == 0 {
+                            // Same `ResumeDescr`-family gate as in
+                            // `store_guard_hashes` above (compile.py:826-829).
+                            if (bd.is_resume_guard() || bd.is_resume_guard_copied())
+                                && bd.get_status() == 0
+                            {
                                 bd.store_hash(hash);
                             }
                         }
