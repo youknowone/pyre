@@ -126,7 +126,7 @@ fn assert_exc_from_raise_shape(
 ) -> (
     majit_translate::model::ValueId,
     majit_translate::model::ValueId,
-    Vec<majit_translate::model::ValueId>,
+    Vec<majit_translate::flowspace::model::Variable>,
 ) {
     let (etype, evalue) = find_raise_args(graph);
     let evalue_op = lookup_op_by_result(graph, evalue)
@@ -180,7 +180,7 @@ fn assert_exc_from_raise_shape(
             );
             assert_eq!(
                 args,
-                &vec![evalue],
+                &vec![graph.must_variable(evalue)],
                 "etype Call must take evalue as its single input (mirrors \
                  `op.type(w_value)` at flowcontext.py:600 tail)"
             );
