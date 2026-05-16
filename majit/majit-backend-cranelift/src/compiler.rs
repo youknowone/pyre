@@ -12886,7 +12886,15 @@ fn collect_guards(
         // so trait predicates (is_finish / fail_arg_types) resolve via
         // the upstream class hierarchy.
         descr.meta_descr =
-            if let Some(d) = op.descr.clone() {
+            if is_external_jump {
+                // op.descr for external JUMP is the TargetToken (already
+                // captured in external_jump_target above).  TargetToken is
+                // not a FailDescr — leaving it in meta_descr would make
+                // get_latest_descr_arc_from_deadframe hand back a
+                // non-FailDescr to callers that downcast with
+                // as_fail_descr().expect(...).
+                None
+            } else if let Some(d) = op.descr.clone() {
                 Some(d)
             } else if is_finish {
                 let result_type = descr.fail_arg_types.first().copied().unwrap_or(Type::Void);
@@ -12900,7 +12908,7 @@ fn collect_guards(
                     Type::Float => Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new())
                         as majit_ir::DescrRef,
                 })
-            } else if !is_external_jump {
+            } else {
                 // Guard ops without an explicit op.descr (test scaffolding
                 // bypassing the tracer/optimizer that normally stamps
                 // op.descr to a ResumeGuardDescr via store_final_boxes_in_guard)
@@ -12911,8 +12919,6 @@ fn collect_guards(
                 Some(majit_backend::make_resume_guard_descr_typed(
                     descr.fail_arg_types.clone(),
                 ))
-            } else {
-                None
             };
         // Stamp the per-trace fail_index and trace_id onto the metainterp
         // ResumeGuardDescr (`op.descr` or the synthesized
