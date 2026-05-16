@@ -2865,7 +2865,8 @@ impl Optimizer {
         // This ensures no position collisions between input block params and ops.
         if num_virtual_inputs > 0 {
             let fni = self.final_num_inputs as u32;
-            let mut remap = std::collections::HashMap::new();
+            let mut remap: crate::optimizeopt::vec_assoc::VecAssoc<u32, u32> =
+                crate::optimizeopt::vec_assoc::VecAssoc::new();
 
             // Virtual input positions: optimizer used num_inputs+k, backend needs num_inputs+k
             for k in 0..num_virtual_inputs {
@@ -5241,21 +5242,18 @@ mod tests {
         let mut constants = std::collections::HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
-        let op_index: std::collections::HashMap<_, _> = result
-            .iter()
-            .enumerate()
-            .map(|(idx, op)| (op.pos.get(), idx))
-            .collect();
-
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
             let alloc_ref = set_op.arg(0);
             let new_idx = result
                 .iter()
                 .position(|op| op.opcode == OpCode::New && op.pos.get() == alloc_ref)
                 .unwrap_or_else(|| panic!("missing New for {alloc_ref:?} in {result:?}"));
-            let set_idx = *op_index
-                .get(&set_op.pos.get())
-                .unwrap_or_else(|| panic!("missing setfield pos {:?} in {:?}", set_op.pos.get(), result));
+            let set_idx = result
+                .iter()
+                .position(|op| op.pos.get() == set_op.pos.get())
+                .unwrap_or_else(|| {
+                    panic!("missing setfield pos {:?} in {:?}", set_op.pos.get(), result)
+                });
             assert!(
                 new_idx < set_idx,
                 "matching New must appear before SetfieldGc; got {:?}",
