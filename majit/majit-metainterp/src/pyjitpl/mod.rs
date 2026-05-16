@@ -13847,8 +13847,9 @@ pub struct MetaInterpStaticData {
     /// Mutex-wrapped because `Arc<MetaInterpStaticData>` is shared
     /// across the metainterp / trace / bridge pipelines (mirroring
     /// `all_descrs` above).
-    pub dispatch_array_descr_cache:
-        std::sync::Mutex<std::collections::HashMap<DispatchArrayDescrKey, DescrRef>>,
+    pub dispatch_array_descr_cache: std::sync::Mutex<
+        crate::optimizeopt::vec_assoc::VecAssoc<DispatchArrayDescrKey, DescrRef>,
+    >,
     /// pyjitpl.py:2199-2200 `self.profiler = ProfilerClass()` —
     /// `metainterp_sd.profiler` is the shared counter sink hit from
     /// every metainterp / optimizer / heapcache / tracer site
@@ -13873,13 +13874,14 @@ pub struct MetaInterpStaticData {
 #[derive(Debug, Default)]
 pub struct MetaInterpGlobalData {
     /// pyjitpl.py:2308-2318 `addr2name`: `fnaddr → name` for debugging.
-    pub addr2name: Option<std::collections::HashMap<usize, String>>,
+    pub addr2name: Option<crate::optimizeopt::vec_assoc::VecAssoc<usize, String>>,
     /// pyjitpl.py:2326-2343 `indirectcall_dict`: `fnaddr → JitCode`.
     /// Stores the current runtime-adapter `JitCode`; the helper that
     /// builds this dict is intentionally type-agnostic so canonical
     /// codewriter jitcodes can reuse the same semantics.
-    pub indirectcall_dict:
-        Option<std::collections::HashMap<usize, std::sync::Arc<crate::jitcode::JitCode>>>,
+    pub indirectcall_dict: Option<
+        crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<crate::jitcode::JitCode>>,
+    >,
     /// pyjitpl.py:2293-2303 `initialized` — guards `_setup_once` so the
     /// runtime side-effects (profiler start, jitlog setup) fire once.
     pub initialized: bool,
@@ -13888,8 +13890,9 @@ pub struct MetaInterpGlobalData {
 fn build_indirectcall_dict<T>(
     targets: &[std::sync::Arc<T>],
     fnaddr_of: impl Fn(&T) -> usize,
-) -> std::collections::HashMap<usize, std::sync::Arc<T>> {
-    let mut d = std::collections::HashMap::new();
+) -> crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<T>> {
+    let mut d: crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<T>> =
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
     for jitcode in targets {
         let fnaddr = fnaddr_of(jitcode);
         debug_assert!(
@@ -13903,7 +13906,7 @@ fn build_indirectcall_dict<T>(
 
 fn bytecode_for_address_in_targets<T>(
     targets: &[std::sync::Arc<T>],
-    cache: &mut Option<std::collections::HashMap<usize, std::sync::Arc<T>>>,
+    cache: &mut Option<crate::optimizeopt::vec_assoc::VecAssoc<usize, std::sync::Arc<T>>>,
     fnaddress: usize,
     fnaddr_of: impl Fn(&T) -> usize,
 ) -> Option<std::sync::Arc<T>> {
@@ -14557,7 +14560,8 @@ impl MetaInterpStaticData {
     pub fn get_name_from_address(&self, addr: usize) -> String {
         let mut gd = self.globaldata.lock().unwrap();
         let dict = gd.addr2name.get_or_insert_with(|| {
-            let mut d = std::collections::HashMap::new();
+            let mut d: crate::optimizeopt::vec_assoc::VecAssoc<usize, String> =
+                crate::optimizeopt::vec_assoc::VecAssoc::new();
             for (i, key) in self._addr2name_keys.iter().enumerate() {
                 if let Some(value) = self._addr2name_values.get(i) {
                     d.insert(*key, value.clone());
