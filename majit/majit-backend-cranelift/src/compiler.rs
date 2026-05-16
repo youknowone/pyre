@@ -13318,20 +13318,6 @@ fn collect_guards(
         } else {
             Vec::new()
         };
-        // Stamp the per-trace fail_index and trace_id onto the metainterp
-        // ResumeGuardDescr (`op.descr`).  `compile.py:185` gates the
-        // setters at the ResumeDescr family; non-resume meta descrs
-        // (Done* / Exit* / Propagate / TargetToken for external JUMP)
-        // skip the trait calls so the trait-default panic path stays
-        // unreached.
-        if let Some(d) = op.descr.as_ref() {
-            if d.is_resume_guard() || d.is_resume_guard_copied() {
-                if let Some(fd) = d.as_fail_descr() {
-                    fd.set_fail_index_per_trace(fail_index);
-                    fd.set_trace_id(trace_id);
-                }
-            }
-        }
         // Capture the metainterp `AbstractFailDescr` Arc as a
         // back-pointer.  Backend accessors for `_attrs_` fields
         // (`history.py:132`: adr_jump_offset / rd_locs / rd_loop_token
@@ -13359,9 +13345,39 @@ fn collect_guards(
                     Type::Float => Arc::new(majit_backend::DoneWithThisFrameDescrFloat::new())
                         as majit_ir::DescrRef,
                 })
+            } else if !is_external_jump {
+                // Guard ops without an explicit op.descr (test scaffolding
+                // bypassing the tracer/optimizer that normally stamps
+                // op.descr to a ResumeGuardDescr via store_final_boxes_in_guard)
+                // synthesize a ResumeGuardDescr meta so the recovery_layout
+                // slot has somewhere to land — orthodox Slice QQ-4: only the
+                // meta-side slot stores recovery_layout, no backend cell
+                // fallback.
+                Some(majit_backend::make_resume_guard_descr_typed(
+                    descr.fail_arg_types.clone(),
+                ))
             } else {
                 None
             };
+        // Stamp the per-trace fail_index and trace_id onto the metainterp
+        // ResumeGuardDescr (`op.descr` or the synthesized
+        // make_resume_guard_descr_typed above).  `compile.py:185` gates
+        // the setters at the ResumeDescr family; non-resume meta descrs
+        // (Done* / Exit* / Propagate / TargetToken for external JUMP)
+        // skip the trait calls so the trait-default panic path stays
+        // unreached.  Stamp AFTER meta_descr is set so test-scaffolding
+        // guards (which would otherwise leave the meta-side
+        // trace_id/fail_index_per_trace at 0) get the right per-trace key
+        // — `FailDescr::trace_id` / `fail_index_per_trace` on
+        // `CraneliftFailDescr` forwards through meta after Slice OO-half-1.
+        if let Some(d) = descr.meta_descr.as_ref() {
+            if d.is_resume_guard() || d.is_resume_guard_copied() {
+                if let Some(fd) = d.as_fail_descr() {
+                    fd.set_fail_index_per_trace(fail_index);
+                    fd.set_trace_id(trace_id);
+                }
+            }
+        }
         let descr = Arc::new(descr);
         // Session 5i-cl: source_op_index / recovery_layout writes go to
         // backend-static side-tables keyed on `Arc::as_ptr(&descr)`, so
@@ -22129,19 +22145,33 @@ mod tests {
             .compiled_fail_descr_layouts(&token)
             .expect("compiled layouts should exist");
 
-        // All fail descriptors (2 guards + 1 finish) should have recovery_layout
+        // Guard fail_descrs (ResumeGuardDescr family upstream) must
+        // carry recovery_layout; FINISH `Done*` descrs do not have
+        // `rd_*` payload upstream (compile.py:624-647) so their
+        // recovery_layout slot is None after Slice QQ-4 removed the
+        // backend-local cell fallback.  Walk every layout and assert
+        // the guard subset has recovery_layout populated.
+        let mut guard_layouts_seen = 0;
         for (idx, layout) in layouts.iter().enumerate() {
+            if layout.is_finish {
+                assert!(
+                    layout.recovery_layout.is_none(),
+                    "fail_descr[{idx}] is FINISH; recovery_layout must be None per PyPy parity"
+                );
+                continue;
+            }
             assert!(
                 layout.recovery_layout.is_some(),
-                "fail_descr[{idx}] should have recovery_layout"
+                "guard fail_descr[{idx}] should have recovery_layout"
             );
             let recovery = layout.recovery_layout.as_ref().unwrap();
             assert!(!recovery.frames.is_empty());
             assert_eq!(recovery.frames[0].trace_id, Some(500));
             assert_eq!(recovery.frames[0].header_pc, Some(2000));
-            // slot_types should always be populated
             assert!(recovery.frames[0].slot_types.is_some());
+            guard_layouts_seen += 1;
         }
+        assert_eq!(guard_layouts_seen, 2, "expected 2 guards with recovery_layout");
     }
 
     #[test]
@@ -22259,8 +22289,12 @@ mod tests {
             .compiled_guard_frame_stacks(&token)
             .expect("compiled_guard_frame_stacks should return Some");
 
-        // 2 guards + 1 finish = 3 entries, all with frame stacks
-        assert_eq!(frame_stacks.len(), 3);
+        // 2 guards have recovery_layout (frame_stacks); the FINISH descr
+        // does NOT — PyPy's Done* descrs inherit AbstractFailDescr
+        // directly without `rd_*` payload, so they have no
+        // recovery_layout to expose (Slice QQ-4 dropped the
+        // backend-local cell that previously masked this parity gap).
+        assert_eq!(frame_stacks.len(), 2);
         for (fail_index, frames) in &frame_stacks {
             assert!(
                 !frames.is_empty(),
@@ -22273,10 +22307,6 @@ mod tests {
                 assert!(frame.slot_types.is_some());
             }
         }
-
-        // Verify fail indices are sequential
-        let indices: Vec<u32> = frame_stacks.iter().map(|(idx, _)| *idx).collect();
-        assert_eq!(indices, vec![0, 1, 2]);
     }
 
     /// Verify that the main opcode dispatch in compile_loop covers all OpCode

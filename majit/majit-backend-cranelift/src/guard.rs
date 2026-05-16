@@ -343,24 +343,6 @@ pub struct CraneliftFailDescr {
     /// reason as `bridge_dispatch_cell`: dispatch hot path was
     /// observing a Mutex+HashMap lookup per guard failure.
     pub fail_count: AtomicU32,
-    /// Per-descr `ExitRecoveryLayout` published as the raw pointer
-    /// half of an `Arc<ExitRecoveryLayout>` (`Arc::into_raw`).
-    /// PyPy decodes recovery on demand from the four payload
-    /// attributes (rd_numb / rd_consts / rd_virtuals / rd_pendingfields)
-    /// in `resume.py:450-488`; cranelift cannot decode the tagged
-    /// numbering inline so the materialised layout is kept per-descr.
-    ///
-    /// Moved here from `RECOVERY_LAYOUT_TABLE` (Slice EE) for the
-    /// same reason as `bridge_dispatch_cell` (Slice CC): the dispatch
-    /// hot path (`compiler.rs:3110`, `:3480`, `:3515`,
-    /// `recovery_layout_ref`) was observing a Mutex+HashMap lookup
-    /// per guard failure.
-    ///
-    /// Null on construction.  Written via
-    /// `Arc::into_raw(Arc::new(layout))`; `Drop` reclaims the Arc.
-    /// `compile.rs::patch_fail_descr_recovery_layout` may overwrite
-    /// the cell — the previous Arc is reclaimed via swap.
-    pub recovery_layout_cell: AtomicPtr<ExitRecoveryLayout>,
     /// Per-descr `CompiledTraceInfo` cell.  PyPy recovers the same
     /// state on demand from `cpu.asmmemmgr_blocks` +
     /// `compiled_loop_token`.  Cranelift parks the per-trace metadata
@@ -454,17 +436,8 @@ impl Drop for CraneliftFailDescr {
             // `set_trace_info`; reclaim ownership and drop.
             unsafe { drop(Arc::from_raw(info_ptr as *const CompiledTraceInfo)) };
         }
-        // recovery_layout_cell is descr-local (Slice EE): reclaim the
-        // published `Arc<ExitRecoveryLayout>` by swapping the cell to
-        // null and reconstructing the Arc.
-        let layout_ptr = self
-            .recovery_layout_cell
-            .swap(std::ptr::null_mut(), Ordering::AcqRel);
-        if !layout_ptr.is_null() {
-            // Safety: produced by `Arc::into_raw(Arc::new(layout))` in
-            // `set_recovery_layout`; reclaim ownership and drop.
-            unsafe { drop(Arc::from_raw(layout_ptr as *const ExitRecoveryLayout)) };
-        }
+        // recovery_layout moved to ResumeGuardDescr meta-side slot
+        // (Slice QQ-4); no backend-local cell to reclaim.
         // source_op_index_cell is descr-local (Slice HH): drops
         // naturally with self.
         // force_token_slots_cell is descr-local (Slice II): drops
@@ -555,7 +528,6 @@ impl CraneliftFailDescr {
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
             fail_count: AtomicU32::new(0),
-            recovery_layout_cell: AtomicPtr::new(std::ptr::null_mut()),
             trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
             source_op_index_cell: OnceLock::new(),
@@ -591,7 +563,6 @@ impl CraneliftFailDescr {
             meta_descr: None,
             bridge_dispatch_cell: Box::new(AtomicPtr::new(std::ptr::null_mut())),
             fail_count: AtomicU32::new(0),
-            recovery_layout_cell: AtomicPtr::new(std::ptr::null_mut()),
             trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
             source_op_index_cell: OnceLock::new(),
@@ -657,39 +628,20 @@ impl CraneliftFailDescr {
     }
 
     #[inline]
-    /// Read the cached recovery_layout, preferring the meta-side slot on
-    /// `ResumeGuardDescr` when reachable (Phase A consolidation — single
-    /// source of truth on the meta Arc).  Falls back to the backend-local
-    /// `recovery_layout_cell` for synthetic descrs (FINISH, external-JUMP,
-    /// `Done*`/`ExitExc`/`PropagateException`) where `meta_descr` is
-    /// absent or non-`ResumeGuardDescr`.
+    /// Read the recovery_layout from the meta-side `ResumeGuardDescr`
+    /// slot — single source of truth (Slice QQ-4: backend-local cell
+    /// removed).  Synthetic descrs without a `ResumeGuardDescr`
+    /// `meta_descr` (codegen-time FINISH `Done*` / external-JUMP
+    /// `None`) return `None`; the recovery_layout walker handles
+    /// `None` as the no-recovery path (no virtuals to materialise).
     pub fn recovery_layout_ref(&self) -> Option<ExitRecoveryLayout> {
-        if let Some(layout) = self
-            .meta_descr
+        self.meta_descr
             .as_ref()
             .and_then(|d| d.as_any())
             .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
             .and_then(|rgd| rgd.recovery_layout())
-        {
-            return Some(layout);
-        }
-        let ptr = self.recovery_layout_cell.load(Ordering::Acquire);
-        if ptr.is_null() {
-            None
-        } else {
-            // Safety: `ptr` was produced by
-            // `Arc::into_raw(Arc::new(layout))` in `set_recovery_layout`;
-            // the cell only stores valid Arc raw pointers (or null).
-            // `increment_strong_count` followed by `from_raw` produces
-            // an additional owning `Arc` without taking the original.
-            // The cloned `ExitRecoveryLayout` outlives the temporary Arc.
-            unsafe {
-                Arc::increment_strong_count(ptr as *const ExitRecoveryLayout);
-                let arc = Arc::from_raw(ptr as *const ExitRecoveryLayout);
-                Some((*arc).clone())
-            }
-        }
     }
+
 
     /// Increment the failure counter and return the new value.
     /// Backed by the descr-local `fail_count: AtomicU32` field
@@ -775,13 +727,14 @@ impl CraneliftFailDescr {
         self.external_jump_target_cell.get().cloned()
     }
 
-    /// Write the cached recovery_layout to the meta-side slot on
-    /// `ResumeGuardDescr` when reachable; otherwise dual-write through
-    /// the backend-local atomic cell for synthetic descrs without a
-    /// `ResumeGuardDescr` `meta_descr` (FINISH, external-JUMP, etc.).
-    /// Phase A consolidation — meta side becomes the single source of
-    /// truth, the local cell remains only as the fallback path for
-    /// non-`ResumeGuardDescr` synthetics until those routes are removed.
+    /// Write recovery_layout to the meta-side `ResumeGuardDescr` slot
+    /// (Slice QQ-4).  Silently skips synthetic descrs without a
+    /// `ResumeGuardDescr` `meta_descr` (codegen-time FINISH `Done*` /
+    /// external-JUMP `None`) — those descrs never reach the
+    /// recovery_layout readers in production (guard-failure deopt
+    /// only); when they do (test introspection, bridge-attach source
+    /// chase), `recovery_layout_ref()` returns `None` and the caller
+    /// handles the no-recovery path.
     pub fn set_recovery_layout(&self, recovery_layout: ExitRecoveryLayout) {
         if let Some(rgd) = self
             .meta_descr
@@ -790,14 +743,6 @@ impl CraneliftFailDescr {
             .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
         {
             rgd.set_recovery_layout(recovery_layout);
-            return;
-        }
-        let new_ptr = Arc::into_raw(Arc::new(recovery_layout)) as *mut ExitRecoveryLayout;
-        let old_ptr = self.recovery_layout_cell.swap(new_ptr, Ordering::AcqRel);
-        if !old_ptr.is_null() {
-            // Safety: prior `set_recovery_layout` published this pointer;
-            // reclaim ownership and drop.
-            unsafe { drop(Arc::from_raw(old_ptr as *const ExitRecoveryLayout)) };
         }
     }
 
