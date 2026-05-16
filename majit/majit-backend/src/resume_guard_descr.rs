@@ -134,6 +134,15 @@ pub struct ResumeGuardDescr {
     /// `assembler.py::rebuild_locs_from_resumedata` shape — no pre-baked
     /// `ExitRecoveryLayout`).
     pub recovery_layout: UnsafeCell<Option<Arc<ExitRecoveryLayout>>>,
+    /// Codegen-time trace-op index for the originating guard op
+    /// (`pyjitpl._compile_one_block` parity — the live op object passed
+    /// at compile time has an implicit index in `loop.operations`).
+    /// Used at the backend→metainterp interop boundary
+    /// (`FailDescrLayout::source_op_index`).  Migrated here from
+    /// `CraneliftFailDescr::source_op_index_cell` (Slice 7-Tβ6) so the
+    /// meta Arc is the single source of truth.  `None` for synthetic
+    /// FINISH / external-JUMP descrs that have no associated trace op.
+    pub source_op_index: UnsafeCell<Option<usize>>,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -171,6 +180,7 @@ impl Descr for ResumeGuardDescr {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             recovery_layout: UnsafeCell::new(None),
+            source_op_index: UnsafeCell::new(None),
         }))
     }
 }
@@ -323,6 +333,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         recovery_layout: UnsafeCell::new(None),
+        source_op_index: UnsafeCell::new(None),
     })
 }
 
@@ -347,5 +358,19 @@ impl ResumeGuardDescr {
     pub fn set_recovery_layout(&self, layout: ExitRecoveryLayout) {
         // Safety: single-threaded JIT.
         unsafe { *self.recovery_layout.get() = Some(Arc::new(layout)) };
+    }
+
+    /// Read the codegen-time `source_op_index` (Slice 7-Tβ6).  `None`
+    /// when codegen has not yet stamped one (synthetic descrs minted
+    /// outside `_compile_one_block`).
+    pub fn source_op_index(&self) -> Option<usize> {
+        // Safety: single-threaded JIT.
+        unsafe { *self.source_op_index.get() }
+    }
+
+    /// Write the codegen-time `source_op_index` (Slice 7-Tβ6).
+    pub fn set_source_op_index(&self, source_op_index: usize) {
+        // Safety: single-threaded JIT.
+        unsafe { *self.source_op_index.get() = Some(source_op_index) };
     }
 }

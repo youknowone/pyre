@@ -55,8 +55,8 @@ use std::sync::{Mutex, OnceLock};
 /// the index for the backend→metainterp interop boundary; storing it
 /// off the descr keeps the descr struct aligned with PyPy.
 // SOURCE_OP_INDEX_TABLE removed (Slice HH): write-once at codegen.
-// Lives in `source_op_index_cell: OnceLock<usize>` on
-// CraneliftFailDescr.
+// Lives in `ResumeGuardDescr::source_op_index` on the meta-side Arc
+// (Slice 7-Tβ6), reached via `as_any` downcast on `meta_descr`.
 
 /// Backend-static side-table mapping a `CraneliftFailDescr` Arc's
 /// `Arc::as_ptr` address to its `ExitRecoveryLayout`.
@@ -371,16 +371,11 @@ pub struct CraneliftFailDescr {
     /// at codegen finalisation.  `OnceLock` is the right primitive —
     /// the target is immutable for the descr's lifetime.
     pub external_jump_target_cell: OnceLock<DescrRef>,
-    /// Codegen-time trace-op index for the originating guard op.
-    /// Used at the backend→metainterp interop boundary
-    /// (`FailDescrLayout::source_op_index`).  PyPy does not need an
-    /// equivalent slot because `pyjitpl` carries the same identity via
-    /// the live op object passed to `_compile_one_block`.
-    ///
-    /// Moved here from `SOURCE_OP_INDEX_TABLE` (Slice HH).  Write-once
-    /// at codegen via `set_source_op_index`; `None` for synthetic
-    /// descrs that have no associated trace op.
-    pub source_op_index_cell: OnceLock<usize>,
+    // source_op_index_cell moved to ResumeGuardDescr (Slice 7-Tβ6):
+    // the meta Arc is the canonical home, reached via `as_any`
+    // downcast on `meta_descr` (precedent: Slice OO-half for
+    // recovery_layout).  Cranelift accessors `source_op_index_ref` /
+    // `set_source_op_index` now forward through that chain.
     /// Force-token slot positions for runtime GC-root filtering.
     /// PyPy encodes the same information into the machine code's
     /// GC-map immediates (`assembler.py` handles force-token slot
@@ -421,7 +416,6 @@ impl Drop for CraneliftFailDescr {
     /// this path on the same thread; the swap-to-null sequence is
     /// reentrant (each descr touches only its own cell).
     fn drop(&mut self) {
-        let ptr = self as *const Self as usize;
         // external_jump_target_cell is descr-local (Slice GG): drops
         // naturally with self.
         // fail_count is descr-local (Slice DD): drops naturally with self.
@@ -438,8 +432,8 @@ impl Drop for CraneliftFailDescr {
         }
         // recovery_layout moved to ResumeGuardDescr meta-side slot
         // (Slice QQ-4); no backend-local cell to reclaim.
-        // source_op_index_cell is descr-local (Slice HH): drops
-        // naturally with self.
+        // source_op_index moved to ResumeGuardDescr meta-side slot
+        // (Slice 7-Tβ6); no backend-local cell to reclaim.
         // force_token_slots_cell is descr-local (Slice II): drops
         // naturally with self.
         // bridge_code_ptr_cache / bridge_frame_depth_cache are descr-
@@ -530,7 +524,6 @@ impl CraneliftFailDescr {
             fail_count: AtomicU32::new(0),
             trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
-            source_op_index_cell: OnceLock::new(),
             force_token_slots_cell: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
@@ -565,7 +558,6 @@ impl CraneliftFailDescr {
             fail_count: AtomicU32::new(0),
             trace_info_cell: AtomicPtr::new(std::ptr::null_mut()),
             external_jump_target_cell: OnceLock::new(),
-            source_op_index_cell: OnceLock::new(),
             force_token_slots_cell: OnceLock::new(),
             bridge_code_ptr_cache: Box::new(AtomicUsize::new(0)),
             bridge_frame_depth_cache: Box::new(AtomicUsize::new(0)),
@@ -767,20 +759,51 @@ impl CraneliftFailDescr {
         }
     }
 
-    /// Descr-local write-once cell (Slice HH).  Publishes the codegen-
-    /// time trace-op index.  Idempotent on equal values; panics on a
-    /// conflicting re-set (caller bug — codegen records once).
+    /// Write the codegen-time trace-op index through to the meta-side
+    /// `ResumeGuardDescr` slot (Slice 7-Tβ6).  Silently skips synthetic
+    /// descrs without a `ResumeGuardDescr` `meta_descr` — those descrs
+    /// (FINISH `Done*` / external-JUMP TargetToken) have no associated
+    /// trace op upstream either.
     pub fn set_source_op_index(&self, source_op_index: usize) {
-        self.source_op_index_cell
-            .set(source_op_index)
-            .expect("source_op_index_cell already published");
+        // Match `recovery_layout_ref` shape: chase `prev_descr` through
+        // any `ResumeGuardCopiedDescr` chain to write into the donor.
+        let Some(mut current) = self.meta_descr.as_ref().cloned() else {
+            return;
+        };
+        loop {
+            if let Some(rgd) = current
+                .as_any()
+                .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+            {
+                rgd.set_source_op_index(source_op_index);
+                return;
+            }
+            match current.prev_descr() {
+                Some(next) => current = next,
+                None => return,
+            }
+        }
     }
 
     #[inline]
-    /// Descr-local read (Slice HH).  Returns the published trace-op
-    /// index or `None` for synthetic descrs that have none.
+    /// Read the codegen-time trace-op index from the meta-side
+    /// `ResumeGuardDescr` slot (Slice 7-Tβ6).  Returns `None` for
+    /// synthetic descrs without a `ResumeGuardDescr` meta or for
+    /// descrs whose codegen never stamped the slot.
     pub fn source_op_index_ref(&self) -> Option<usize> {
-        self.source_op_index_cell.get().copied()
+        let mut current = self.meta_descr.as_ref().cloned()?;
+        loop {
+            if let Some(rgd) = current
+                .as_any()
+                .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+            {
+                return rgd.source_op_index();
+            }
+            match current.prev_descr() {
+                Some(next) => current = next,
+                None => return None,
+            }
+        }
     }
 
     /// Descr-local write-once cell (Slice II).  Sorts+dedups the

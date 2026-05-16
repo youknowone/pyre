@@ -2898,6 +2898,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         recovery_layout: UnsafeCell::new(None),
+        source_op_index: UnsafeCell::new(None),
     })
 }
 
@@ -2981,6 +2982,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
         recovery_layout: UnsafeCell::new(None),
+        source_op_index: UnsafeCell::new(None),
     })
 }
 
@@ -3185,6 +3187,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             recovery_layout: UnsafeCell::new(None),
+            source_op_index: UnsafeCell::new(None),
         },
     })
 }
@@ -3395,6 +3398,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             recovery_layout: UnsafeCell::new(None),
+            source_op_index: UnsafeCell::new(None),
         },
     })
 }
@@ -3589,6 +3593,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
             recovery_layout: UnsafeCell::new(None),
+            source_op_index: UnsafeCell::new(None),
         },
     })
 }
