@@ -1435,8 +1435,29 @@ fn getarrayitem_gc_via_heapcache(
     opcode: OpCode,
     dst_bank: char,
 ) -> Result<(DispatchOutcome, usize), DispatchError> {
+    getarrayitem_gc_via_heapcache_with_index_bank(code, op, ctx, opcode, dst_bank, 'i')
+}
+
+/// Underlying handler for `getarrayitem_gc_<i|r|f>` shapes.
+/// `index_bank` selects whether the index operand is decoded from the
+/// `i` register bank (canonical RPython shape `rid>X`) or the `r`
+/// register bank (pyre-only `rrd>r` — see `pyre_extension_insns()`
+/// + `blackhole.rs::handler_getarrayitem_gc_r_refindex`, an artifact of
+/// the rtyper not yet classifying integer array indices as `Signed`).
+fn getarrayitem_gc_via_heapcache_with_index_bank(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    opcode: OpCode,
+    dst_bank: char,
+    index_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
     let array = read_ref_reg(code, op, 0, ctx)?;
-    let index = read_int_reg(code, op, 1, ctx)?;
+    let index = match index_bank {
+        'i' => read_int_reg(code, op, 1, ctx)?,
+        'r' => read_ref_reg(code, op, 1, ctx)?,
+        _ => unreachable!("index_bank must be 'i' or 'r'"),
+    };
     let descr = read_descr(code, op, 2, ctx)?;
     let descr_index = descr.index();
 
@@ -4320,6 +4341,20 @@ fn handle(
         "getarrayitem_gc_r/rid>r" => {
             getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcR, 'r')
         }
+        // pyre-only `rrd>r` variant: index lands in Ref bank (tagged-
+        // int-in-ref deviation, same root as the `/rr>i` arithmetic
+        // aliases — disappears once rtyper classifies integer array
+        // indices as `Signed`).  Sibling
+        // `blackhole.rs::handler_getarrayitem_gc_r_refindex` covers the
+        // dispatch table; this is the walker counterpart.
+        "getarrayitem_gc_r/rrd>r" => getarrayitem_gc_via_heapcache_with_index_bank(
+            code,
+            op,
+            ctx,
+            OpCode::GetarrayitemGcR,
+            'r',
+            'r',
+        ),
         "getarrayitem_gc_f/rid>f" => {
             getarrayitem_gc_via_heapcache(code, op, ctx, OpCode::GetarrayitemGcF, 'f')
         }
@@ -10783,6 +10818,72 @@ mod tests {
             dst_post, cached,
             "cache hit must write cached OpRef into registers_r[dst]",
         );
+    }
+
+    /// pyre-only `getarrayitem_gc_r/rrd>r` mirrors the canonical
+    /// `rid>r` shape — same heapcache lookup / `GetarrayitemGcR`
+    /// emission — but reads the index from the Ref register bank
+    /// (tagged-int-in-ref deviation; see
+    /// `blackhole.rs::handler_getarrayitem_gc_r_refindex`).  Should
+    /// behave identically to the canonical variant on a cache miss.
+    #[test]
+    fn getarrayitem_gc_r_refindex_cache_miss_records_op_and_writes_dst() {
+        let byte = *insns_opname_to_byte()
+            .get("getarrayitem_gc_r/rrd>r")
+            .expect("`getarrayitem_gc_r/rrd>r` must be in insns table");
+        // Operand layout `rrd>r`: 1B r-reg(2) + 1B r-reg(3) +
+        // 2B descr(LE 1) + 1B r-dst(5).
+        let code = [byte, 0x02, 0x03, 0x01, 0x00, 0x05];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_ints(&mut tc, 4);
+        let array = regs_r[2];
+        let index = regs_r[3];
+        let dst_pre = regs_r[5];
+        let descr = field_descr_with_index(1);
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
+        let frame_done = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+        };
+        let (outcome, next_pc) =
+            step(&code, 0, &mut wc).expect("getarrayitem_gc_r/rrd>r must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(
+            next_pc, 6,
+            "getarrayitem_gc_r/rrd>r operand layout = 5 bytes",
+        );
+        let dst_post = wc.registers_r[5];
+        assert_ne!(dst_post, dst_pre);
+        drop(wc);
+        assert_eq!(tc.num_ops(), ops_before + 1);
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::GetarrayitemGcR);
+        assert_eq!(
+            last.args.as_slice(),
+            &[array, index],
+            "GetarrayitemGcR args must be [array, index] read from r-bank",
+        );
+        assert!(std::sync::Arc::ptr_eq(
+            last.descr.as_ref().expect("must carry array descr"),
+            &descr,
+        ));
+        assert_eq!(dst_post, last.pos);
     }
 
     #[test]
