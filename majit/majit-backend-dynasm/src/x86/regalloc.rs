@@ -21,9 +21,7 @@ pub const ALL_CORE_REGS: &[RegLoc] = &[
     ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
 ];
 #[cfg(target_os = "windows")]
-pub const ALL_CORE_REGS: &[RegLoc] = &[
-    ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R14, R15,
-];
+pub const ALL_CORE_REGS: &[RegLoc] = &[ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R14, R15];
 
 pub fn all_core_regs() -> Vec<RegLoc> {
     ALL_CORE_REGS.to_vec()
@@ -41,13 +39,18 @@ pub fn save_around_call_core_regs() -> Vec<RegLoc> {
 }
 
 /// x86/regalloc.py X86_64_XMMRegisterManager.all_regs — XMM allocation
-/// pool (xmm15 reserved as scratch).  PyPy does NOT trim this on Win64;
-/// `save_around_call_regs = all_regs` for XMMs across both ABIs, so the
-/// JIT freely allocates XMM5..14 even on Win64 and the slot table /
-/// `_push_all_regs_to_frame` reflect all 15.
+/// pool.  On non-Win64 xmm15 is reserved as scratch.  On Win64 PyPy
+/// uses a separate `X86_64_WIN_XMMRegisterManager` (regalloc.py:128)
+/// with only `[xmm0..xmm4]`, reserving xmm5 as scratch and leaving
+/// xmm6..xmm15 callee-save untouched so the JIT prologue/epilogue
+/// does not need to save them.  `save_around_call_regs = all_regs`
+/// for XMMs across both ABIs.
+#[cfg(not(target_os = "windows"))]
 pub const ALL_FLOAT_REGS: &[RegLoc] = &[
     XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13, XMM14,
 ];
+#[cfg(target_os = "windows")]
+pub const ALL_FLOAT_REGS: &[RegLoc] = &[XMM0, XMM1, XMM2, XMM3, XMM4];
 
 pub fn all_float_regs() -> Vec<RegLoc> {
     ALL_FLOAT_REGS.to_vec()

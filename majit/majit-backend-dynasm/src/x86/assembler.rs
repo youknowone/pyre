@@ -2464,16 +2464,26 @@ impl<'a> Assembler386<'a> {
             // where `dst == arg0`: `lea dst, [dst + src]` is identical to
             // `add dst, src`.
             OpCode::IntAdd | OpCode::NurseryPtrIncrement => {
-                if let (Some(Loc::Reg(dst)), Some(Loc::Reg(a0)), Some(src)) =
+                if let (Some(Loc::Reg(dst)), Some(a0), Some(src)) =
                     (result_loc, arglocs.first(), arglocs.get(1))
                 {
-                    match src {
-                        Loc::Reg(s) => dynasm!(self.mc ; .arch x64
-                            ; lea Rq(dst.value), [Rq(a0.value) + Rq(s.value)]),
-                        Loc::Immed(i) => {
+                    match (a0, src) {
+                        (Loc::Reg(a), Loc::Reg(s)) => dynasm!(self.mc ; .arch x64
+                            ; lea Rq(dst.value), [Rq(a.value) + Rq(s.value)]),
+                        (Loc::Reg(a), Loc::Immed(i)) => {
                             let v = i.value as i32;
                             dynasm!(self.mc ; .arch x64
-                                ; lea Rq(dst.value), [Rq(a0.value) + v])
+                                ; lea Rq(dst.value), [Rq(a.value) + v])
+                        }
+                        (Loc::Immed(i), Loc::Reg(s)) => {
+                            let v = i.value as i32;
+                            dynasm!(self.mc ; .arch x64
+                                ; lea Rq(dst.value), [Rq(s.value) + v])
+                        }
+                        (Loc::Immed(i0), Loc::Immed(i1)) => {
+                            let sum = i0.value.wrapping_add(i1.value);
+                            dynasm!(self.mc ; .arch x64
+                                ; mov Rq(dst.value), QWORD sum)
                         }
                         _ => self.emit_binop_reg_loc(op.opcode, dst.value, src),
                     }
@@ -7112,6 +7122,21 @@ impl<'a> Assembler386<'a> {
             ; mov QWORD [rcx], 0       // zero GcHeader
             ; lea rax, [rcx + gc_header_size as i32]
         );
+        // Mirror the slow-path's copy of `rax` into the result register
+        // so the post-`done` read at the join (`mov rax, Rq(result_reg)`)
+        // observes the past-header payload pointer from both paths.
+        // Without this, the fast path leaves only `rax` updated and the
+        // join read reverts `rax` to the stale `result_reg`, causing
+        // subsequent `mov [result + (-WORD)], type_id` writes (which use
+        // the result-register-relative addressing for the GcHeader slot)
+        // to land outside the nursery — corrupting the heap-manager's
+        // HEAP_ENTRY metadata for the nursery block.
+        if let Some(Loc::Reg(r)) = result_loc {
+            if r.value != 0 {
+                let rv = r.value;
+                dynasm!(self.mc ; .arch x64 ; mov Rq(rv), rax);
+            }
+        }
         dynasm!(self.mc ; .arch x64 ; jmp =>done);
 
         // Slow path: helper extraction (PyPy assembler.py:295 `mc.CALL`).
