@@ -324,12 +324,16 @@ pub struct Assembler386<'a> {
     /// jf_force_descr before the call. Consumed by the subsequent
     /// GUARD_NOT_FORCED guard emission.
     pending_force_descr: Option<majit_ir::DescrRef>,
-    /// `compile.py:665-674` + `pyjitpl.py:2283`: snapshot of the six
-    /// descr pointers attached to the owning cpu instance.  Matches
-    /// RPython backend code that reads `self.cpu.done_with_this_frame_descr_*`
-    /// / `self.cpu.exit_frame_with_exception_descr_ref` /
-    /// `self.cpu.propagate_exception_descr` at every FINISH /
-    /// CALL_ASSEMBLER emission site.
+    /// `compile.py:665-674` + `pyjitpl.py:2283`: construction-time
+    /// snapshot of the six descr pointers attached to the owning cpu
+    /// instance.  Retained for constructor signature stability across
+    /// runner / call_assembler callsites — emission helpers
+    /// (`done_with_this_frame_descr_ptr_for_type`,
+    /// `exit_frame_with_exception_descr_ref_ptr`,
+    /// `propagate_exception_descr_ptr`) read live from `cpu_handle`
+    /// instead so the raw ptr baked into `JF_DESCR_OFS` and the Arc
+    /// stamped into `meta_descr` come from the same snapshot.
+    #[allow(dead_code)]
     attached_descrs: crate::guard::AttachedDescrPtrs,
     /// `Arc` clone of the owning cpu's attachment handle.  Its heap
     /// address is baked into the CALL_ASSEMBLER helper call site as a
@@ -482,9 +486,16 @@ impl<'a> Assembler386<'a> {
 
     /// `compile.py:665-674` parity: attach the six metainterp descrs on
     /// the emission side.  Mirrors `self.cpu.done_with_this_frame_descr_*`
-    /// reads in `rpython/jit/backend/x86/assembler.py`.
+    /// reads in `rpython/jit/backend/x86/assembler.py`.  Reads from the
+    /// live `cpu_handle` snapshot so the raw pointer baked into
+    /// `JF_DESCR_OFS` and the Arc returned by
+    /// `done_with_this_frame_descr_arc_for_type` resolve to the same
+    /// metainterp singleton.
     fn done_with_this_frame_descr_ptr_for_type(&self, tp: Type) -> i64 {
-        self.attached_descrs
+        self.cpu_handle
+            .read()
+            .unwrap()
+            .descr_ptrs()
             .done_with_this_frame_descr_ptr_for_type(tp) as i64
     }
 
@@ -506,7 +517,11 @@ impl<'a> Assembler386<'a> {
 
     /// `compile.py:658` parity: `self.cpu.exit_frame_with_exception_descr_ref`.
     fn exit_frame_with_exception_descr_ref_ptr(&self) -> i64 {
-        self.attached_descrs.exit_frame_with_exception_descr_ref as i64
+        self.cpu_handle
+            .read()
+            .unwrap()
+            .descr_ptrs()
+            .exit_frame_with_exception_descr_ref as i64
     }
 
     /// `pyjitpl.py:2283` parity: `self.cpu.propagate_exception_descr`.
@@ -514,7 +529,11 @@ impl<'a> Assembler386<'a> {
     /// `OpCode::CheckMemoryError` (assembler.py:1630-1641
     /// `genop_discard_check_memory_error`).
     fn propagate_exception_descr_ptr(&self) -> i64 {
-        self.attached_descrs.propagate_exception_descr as i64
+        self.cpu_handle
+            .read()
+            .unwrap()
+            .descr_ptrs()
+            .propagate_exception_descr as i64
     }
 
     // ----------------------------------------------------------------
