@@ -3692,7 +3692,9 @@ impl majit_ir::Descr for ResumeGuardCopiedDescr {
 
 impl FailDescr for ResumeGuardCopiedDescr {
     fn fail_index(&self) -> u32 {
-        self.fail_index
+        // Per-trace key (see ResumeGuardDescr::fail_index).  Global id
+        // remains available via Descr::index() / get_descr_index().
+        self.fail_index_per_trace.load(Ordering::Relaxed)
     }
     fn trace_id(&self) -> u64 {
         self.trace_id.load(Ordering::Relaxed)
@@ -4239,7 +4241,9 @@ impl majit_ir::Descr for CompileLoopVersionDescr {
 
 impl FailDescr for CompileLoopVersionDescr {
     fn fail_index(&self) -> u32 {
-        self.fail_index
+        // Per-trace key (see ResumeGuardDescr::fail_index).  Global id
+        // remains available via Descr::index() / get_descr_index().
+        self.fail_index_per_trace.load(Ordering::Relaxed)
     }
     fn trace_id(&self) -> u64 {
         self.trace_id.load(Ordering::Relaxed)
