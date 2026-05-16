@@ -3185,6 +3185,12 @@ mod tests {
     #[test]
     fn compile_loop_records_token_inputarg_types() {
         let mut backend = DynasmBackend::new();
+        // `compile.py:665-674 make_and_attach_done_descrs` parity:
+        // FINISH emission stamps the cpu-attached singleton Arc into
+        // `compiled.fail_descrs`; without attachment the backend has
+        // nothing to push.  Production reaches this state through
+        // `MetaInterp::new`; backend-only tests must invoke this helper.
+        backend.attach_default_test_descrs();
         let inputargs = vec![InputArg::new_ref(0), InputArg::new_int(1)];
         // Match the typed `InputArg{Ref,Int}` boxes registered by the
         // backend regalloc — variant-aware Eq makes Untyped(N) and

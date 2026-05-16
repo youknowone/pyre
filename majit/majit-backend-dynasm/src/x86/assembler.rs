@@ -3134,7 +3134,7 @@ impl<'a> Assembler386<'a> {
                     self.done_with_this_frame_descr_ptr_for_type(result_type)
                 };
                 // FINISH op exit (DoneWithThisFrame* / ExitFrameWithExceptionDescr).
-                // `compile.py:185` skips these — not a `ResumeDescr`.  PyPy's
+                // `compile.py:185` skips these — not a `ResumeDescr`.
                 // `genop_finish` (assembler.py:2114-2156) stamps the
                 // metainterp singleton directly into `jf_descr` via the GC
                 // table index; pyre's runtime classifier (`runner.rs::
@@ -3142,10 +3142,10 @@ impl<'a> Assembler386<'a> {
                 // FINISH/Exit/Propagate ptrs to the cpu-attached singleton
                 // before consulting the registry, so the per-emission
                 // wrapper has no jf_descr role.  Push the singleton Arc
-                // directly when attached; fall back to the wrapper for
-                // test scaffolds that bypass cpu attachment (per the
-                // `meta_descr.is_none()` invariant noted at guard.rs:225).
-                let meta_descr = if is_exit_exc {
+                // directly.  Test scaffolds must attach singletons (via
+                // `attach_default_test_descrs` or `MetaInterp::new` per
+                // `pyjitpl.py:2222 finish_setup`) before emitting FINISH.
+                let descr: majit_ir::DescrRef = if is_exit_exc {
                     self.cpu_handle
                         .read()
                         .unwrap()
@@ -3153,17 +3153,11 @@ impl<'a> Assembler386<'a> {
                         .clone()
                 } else {
                     self.done_with_this_frame_descr_arc_for_type(result_type)
-                };
-                let descr: majit_ir::DescrRef = if let Some(singleton) = meta_descr.clone() {
-                    singleton
-                } else {
-                    Arc::new(DynasmFailDescr::with_meta(
-                        fail_index,
-                        self.trace_id,
-                        fail_arg_types.clone(),
-                        meta_descr,
-                    ))
-                };
+                }
+                .expect(
+                    "FINISH emission requires cpu-attached singleton — \
+                     call `attach_default_test_descrs` or use `MetaInterp::new`",
+                );
 
                 // Store result to jf_frame[0]
                 if let Some(result) = arglocs.first() {
@@ -5093,17 +5087,12 @@ impl<'a> Assembler386<'a> {
         };
         let global_descr_ptr = self.done_with_this_frame_descr_ptr_for_type(result_type);
         // Singleton-direct push (see OpCode::Finish above for rationale).
-        let meta_descr = self.done_with_this_frame_descr_arc_for_type(result_type);
-        let descr: majit_ir::DescrRef = if let Some(singleton) = meta_descr.clone() {
-            singleton
-        } else {
-            Arc::new(DynasmFailDescr::with_meta(
-                fail_index,
-                self.trace_id,
-                fail_arg_types.clone(),
-                meta_descr,
-            ))
-        };
+        let descr: majit_ir::DescrRef = self
+            .done_with_this_frame_descr_arc_for_type(result_type)
+            .expect(
+                "genop_finish requires cpu-attached singleton — \
+                 call `attach_default_test_descrs` or use `MetaInterp::new`",
+            );
 
         // If there's a result argument, store it to jf_frame[0].
         // assembler.py:2291-2303 parity: float results use xmm0/MOVSD.
