@@ -2410,12 +2410,26 @@ fn register_helper_fn_pointers(
 use super::flatten::label_pc_index;
 
 fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    // Per-PC anchor positions are resolved from `Label("pc{N}")` entries
-    // — the same `Label(block)`-style marker shape RPython uses at
-    // block entry (`flatten.py:116 self.emitline(Label(block))`).
-    // Pyre names the labels `pc{N}` per Python bytecode index so the
-    // dispatcher can map `next_instr` to the JitCode byte offset
-    // post-assemble.
+    // Per-PC anchor positions are resolved from `Insn::PcAnchor { py_pc }`
+    // entries.
+    //
+    // Pyre vs RPython label keying (structural difference): RPython uses
+    // `Label(block)` per SpamBlock object (`flatten.py:116
+    // self.emitline(Label(block))`), so two SpamBlocks reaching the same
+    // Python PC carry distinct Label values. Pyre keys labels by Python
+    // PC (`pc{N}` via `pc_label_name`), so two alive SpamBlocks both
+    // joining at PC N emit `Insn::PcAnchor { py_pc: N }` independently —
+    // both can survive R5's dead-block filter when neither is superseded.
+    //
+    // The runtime resolves `pc{N}` to the FIRST anchor in the drained
+    // stream (first-wins below). Subsequent alive duplicates belong to
+    // sibling joinpoint blocks that are reachable from the first anchor
+    // via fall-through inside the walker's PC-sequential emission, so
+    // the first anchor is the canonical entry point per pyre's runtime
+    // dispatch contract. Eliminating duplicates entirely requires
+    // switching pyre's label key from `pc{N}` to block-identity (the
+    // Task #227 walker restructure), at which point this first-wins
+    // semantics retires.
     let mut positions = vec![usize::MAX; num_pcs];
     for (insn_idx, insn) in ssarepr.insns.iter().enumerate() {
         if let Some(py_pc) = label_pc_index(insn) {
@@ -2439,52 +2453,42 @@ fn pc_anchor_positions(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec
 }
 
 fn live_marker_indices_by_pc(ssarepr: &super::flatten::SSARepr, num_pcs: usize) -> Vec<usize> {
-    // Map py_pc → anchor insn_idx via `Label("pc{N}")` entries.
-    let mut anchor_for_pc: std::collections::HashMap<usize, usize> =
-        std::collections::HashMap::new();
-    for (insn_idx, insn) in ssarepr.insns.iter().enumerate() {
-        if let Some(py_pc) = label_pc_index(insn) {
-            anchor_for_pc.entry(py_pc).or_insert(insn_idx);
-        }
-    }
-    let mut anchors: Vec<(usize, usize)> = anchor_for_pc
-        .into_iter()
-        .map(|(py_pc, insn_idx)| (insn_idx, py_pc))
+    // Map py_pc → anchor insn_idx via `Insn::PcAnchor { py_pc }` entries.
+    // Reuses `pc_anchor_positions`'s first-wins semantics; the documented
+    // pyre-vs-RPython label-keying difference there applies here too.
+    // Position-indexed `Vec<usize>` matches the no-HashMap invariant
+    // (memory `feedback-no-hashmap-ever`).
+    let positions = pc_anchor_positions(ssarepr, num_pcs);
+    // Sort (anchor_idx, py_pc) by anchor_idx to compute scan boundaries
+    // for the per-anchor `-live-` lookup.
+    let mut anchors: Vec<(usize, usize)> = positions
+        .iter()
+        .enumerate()
+        .map(|(py_pc, &insn_idx)| (insn_idx, py_pc))
         .collect();
     anchors.sort_by_key(|(insn_idx, _)| *insn_idx);
-    assert_eq!(
-        anchors.len(),
-        num_pcs,
-        "live_marker_indices_by_pc: expected {num_pcs} per-PC Labels, found {}",
-        anchors.len()
-    );
     let mut live_indices = vec![usize::MAX; num_pcs];
     for (anchor_pos, (anchor_idx, py_pc)) in anchors.iter().enumerate() {
         let end = anchors
             .get(anchor_pos + 1)
             .map(|(next_idx, _)| *next_idx)
             .unwrap_or(ssarepr.insns.len());
-        // Take the FIRST -live- marker per anchor pair.  Phase A.4 +
-        // Phase B groundwork: pyre's PC-sequential walker can emit
-        // duplicate `Label("pcN")` + `-live-` pairs when supersede
-        // queues a re-walk under widened framestate.  The runtime
-        // resolves `pcN` jumps to the FIRST Label position
-        // (`pc_anchor_positions` line ~2541) so the FIRST -live-
-        // matches the runtime's actual liveness window; subsequent
-        // duplicate -live- markers are dead emit from the re-walked
-        // newblock and are silently ignored here.
+        // Take the FIRST -live- marker per anchor pair.  RPython emits
+        // one per block-entry (`flatten.py:107`); pyre's PC-sequential
+        // walker can emit multiple `-live-` markers in the scan range
+        // when sibling joinpoint blocks share a py_pc (same structural
+        // root as `pc_anchor_positions`'s first-wins).  The first
+        // marker matches the runtime's actual liveness window via the
+        // first-wins anchor; subsequent duplicates belong to sibling
+        // blocks reachable through fall-through after the first anchor.
         let mut live_idx: Option<usize> = None;
         for insn_idx in (anchor_idx + 1)..end {
             if ssarepr.insns[insn_idx].is_live() {
                 if live_idx.is_none() {
                     live_idx = Some(insn_idx);
                 }
-                // else: silently take first; subsequent duplicates
-                // belong to a different SpamBlock's re-walk emit and
-                // are unreachable at runtime via this pcN label.
             }
         }
-        let _ = py_pc;
         live_indices[*py_pc] = live_idx.unwrap_or_else(|| {
             panic!(
                 "live_marker_indices_by_pc: missing -live- marker for py_pc {} in range {}..{}",
