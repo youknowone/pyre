@@ -131,4 +131,77 @@ impl Op {
     pub fn resolved_rd_pendingfields(&self) -> Option<Arc<[GuardPendingFieldEntry]>> {
         self.descr.as_ref()?.as_fail_descr()?.rd_pendingfields_arc()
     }
+
+    /// `resoperation.py:299/489 AbstractResOp/GuardResOp.getfailargs`
+    /// parity. Returns a borrow into the fail_args slot — None for
+    /// non-guard ops.
+    pub fn getfailargs(&self) -> Option<&[crate::resoperation::OpRef]> {
+        self.fail_args.as_deref()
+    }
+
+    /// `resoperation.py:492 GuardResOp.getfailargs_copy` parity.
+    /// Returns an owned `Vec` copy of the fail_args slot — equivalent
+    /// to RPython's `self._fail_args[:]`.
+    pub fn getfailargs_copy(&self) -> Vec<crate::resoperation::OpRef> {
+        match &self.fail_args {
+            Some(fa) => fa.iter().copied().collect(),
+            None => Vec::new(),
+        }
+    }
+
+    /// `resoperation.py:495 GuardResOp.setfailargs` parity — overwrite
+    /// the fail_args slot.  Takes `&mut self` until the `Vec<Rc<Op>>`
+    /// migration flips the field to interior-mutable.
+    pub fn setfailargs<I>(&mut self, fail_args: I)
+    where
+        I: IntoIterator<Item = crate::resoperation::OpRef>,
+    {
+        let v: smallvec::SmallVec<[crate::resoperation::OpRef; 3]> =
+            fail_args.into_iter().collect();
+        self.fail_args = Some(v);
+    }
+
+    /// Clear the fail_args slot.  PyPy has no separate `clearfailargs`
+    /// method; the pattern is `op.setfailargs(None)` in RPython, but
+    /// pyre's signature distinguishes the two paths (set vs clear) for
+    /// clarity.
+    pub fn clearfailargs(&mut self) {
+        self.fail_args = None;
+    }
+
+    /// True iff the fail_args slot is populated.
+    pub fn has_failargs(&self) -> bool {
+        self.fail_args.is_some()
+    }
+
+    /// Per-failarg type vector accessor.  Pyre's `fail_arg_types` slot
+    /// caches the types the optimizer assigned to each `fail_arg` (the
+    /// `compile.py:855 _attrs_` set lives on the descr, but the
+    /// per-op view is kept here for backend dispatch convenience).
+    pub fn get_fail_arg_types(&self) -> Option<&[crate::value::Type]> {
+        self.fail_arg_types.as_deref()
+    }
+
+    /// Owned-clone variant — RPython would write `fail_arg_types[:]`.
+    pub fn get_fail_arg_types_copy(&self) -> Vec<crate::value::Type> {
+        match &self.fail_arg_types {
+            Some(t) => t.clone(),
+            None => Vec::new(),
+        }
+    }
+
+    /// Overwrite the per-failarg type vector.
+    pub fn set_fail_arg_types(&mut self, types: Vec<crate::value::Type>) {
+        self.fail_arg_types = Some(types);
+    }
+
+    /// Clear the per-failarg type vector.
+    pub fn clear_fail_arg_types(&mut self) {
+        self.fail_arg_types = None;
+    }
+
+    /// True iff the per-failarg type vector slot is populated.
+    pub fn has_fail_arg_types(&self) -> bool {
+        self.fail_arg_types.is_some()
+    }
 }
