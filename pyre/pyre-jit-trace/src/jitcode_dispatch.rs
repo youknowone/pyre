@@ -4325,8 +4325,12 @@ fn handle(
             // same semantics as the snapshot's tail).
             //
             // Mirrors trait-side `seed_raised_exception` at
-            // `trace_opcode.rs:6629-6643`.  Also stashes the concrete
-            // into `ctx.last_exc_value_concrete` so a downstream
+            // `trace_opcode.rs:seed_raised_exception`.  The read at
+            // `ob_header.ob_type` resolves to the per-`ExcKind` `PyType`
+            // static (`excobject.rs::exc_kind_to_pytype`), so the
+            // emitted `GuardClass` discriminates the actual subclass.
+            // Stashes the concrete into `ctx.last_exc_value_concrete`
+            // so a downstream
             // `last_exc_value/>r` can propagate it into its dst slot.
             let exc = read_ref_reg(code, op, 0, ctx)?;
             let concrete_exc = read_ref_reg_concrete(code, op, 0, ctx);

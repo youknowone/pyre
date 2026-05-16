@@ -6627,31 +6627,14 @@ impl MIFrame {
     /// PyPy `RAISE_VARARGS` materialization paired with RPython
     /// pyjitpl.py:1690-1696 `opimpl_raise` bookkeeping.
     ///
-    /// PRE-EXISTING-ADAPTATION (coarser than RPython): the emitted
-    /// `GuardClass(exc_box, cls_const)` reads `ob_header.ob_type` for
-    /// the class pointer, but every `W_ExceptionObject` shares the
-    /// same `ob_type = &EXCEPTION_TYPE` regardless of subclass — so
-    /// this guard discriminates "is an exception" but NOT
-    /// "ValueError vs OverflowError vs TypeError vs …".  RPython's
-    /// `opimpl_raise` (`pyjitpl.py:1687-1693`) goes through
-    /// `cls_of_box(exc)` which returns the actual exception class
-    /// because RPython's `OBJECT` header carries `typeptr = the
-    /// specific class`.  Pyre's per-subclass discriminator is
-    /// `ob_header.w_class` (populated by
-    /// `register_exc_class_for_kind` at builtin install time —
-    /// excobject.rs:189), but the backend's `_cmp_guard_class`
-    /// reads at `cpu.vtable_offset = OB_TYPE_OFFSET = 0`
-    /// (`eval.rs:1259`), so flipping the *write* side to `w_class`
-    /// without a paired backend change would compare an
-    /// `ob_type`-typeid against a `w_class` pointer literal.
-    /// Proper parity needs either a new
-    /// `GuardExceptionClass` opcode that reads at `W_CLASS_OFFSET`
-    /// or a per-descr vtable_offset override on the recorded op —
-    /// both span IR + cranelift/wasm codegen + heapcache.  Tracked
-    /// as a follow-up epic; the current shape correctly distinguishes
-    /// "exception object" from "non-exception object" which is the
-    /// only discrimination the existing optimizer pipeline relies
-    /// on.
+    /// `GuardClass(exc_box, cls_const)` reads `ob_header.ob_type` at
+    /// `cpu.vtable_offset = OB_TYPE_OFFSET = 0`.  Pyre allocates each
+    /// `W_ExceptionObject` with `ob_type` pointing at the per-`ExcKind`
+    /// `PyType` static (`EXC_VALUE_ERROR_TYPE`, `EXC_OVERFLOW_ERROR_TYPE`,
+    /// …; `excobject.rs::exc_kind_to_pytype`), so this guard
+    /// discriminates the actual subclass.  Matches RPython's
+    /// `OBJECT.typeptr = specific class` (`rclass.py:167-174`) and
+    /// `opimpl_raise`'s `cls_of_box(exc)` shape (`pyjitpl.py:1687-1693`).
     fn seed_raised_exception(&mut self, exc_box: OpRef, concrete_exc: PyObjectRef) {
         if !concrete_exc.is_null() {
             let exc_class_ptr = unsafe {
