@@ -1959,6 +1959,70 @@ fn ptr_nonzero_record(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// `ref_guard_value/r` handler (operand layout `r`: 1B r-src, no dst).
+///
+/// RPython parity: `pyjitpl.py:1494-1496 _opimpl_guard_value` →
+/// `pyjitpl.py:1916-1927 implement_guard_value`:
+///
+/// ```python
+/// def implement_guard_value(self, box, orgpc):
+///     if isinstance(box, Const):
+///         return box                     # no promotion needed
+///     else:
+///         promoted_box = executor.constant_from_op(box)
+///         self.metainterp.generate_guard(rop.GUARD_VALUE, box,
+///                                        promoted_box, resumepc=orgpc)
+///         self.metainterp.replace_box(box, promoted_box)
+///         return promoted_box
+/// ```
+///
+/// Walker behaviour:
+///   * Read 1B Ref operand and its concrete shadow.
+///   * If the symbolic OpRef is already a Const, skip (Const arm of
+///     `implement_guard_value`).
+///   * If the concrete shadow is `ConcreteValue::Null`, skip — the
+///     walker doesn't have a runtime value to mint the expected
+///     constant from.  This is the strictest mode (sibling
+///     `dispatch_switch_id` line 1207 falls into the same skip-guard
+///     branch when `valuebox.is_constant()`).
+///   * Otherwise mint `ConstPtr(concrete_ptr)` (executor.py:544-551
+///     `constant_from_op` for a Ref-typed Box), emit `GuardValue`
+///     with `[value, expected_ref]`, and call `replace_box(value,
+///     expected_ref)` (pyjitpl.py:1923).  Also rewrite every
+///     `registers_r` slot still pointing at `value` to `expected_ref`,
+///     matching `dispatch_switch_id:1198-1202`.
+///
+/// PRE-EXISTING-ADAPTATION: guards record with empty resume data
+/// (`record_guard(..., 0)`) — same caveat as `dispatch_switch_id`
+/// (no MIFrame liveness / framestack in the standalone walker).
+fn ref_guard_value_record(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let value = read_ref_reg(code, op, 0, ctx)?;
+    if value.is_constant() {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    let concrete = read_ref_reg_concrete(code, op, 0, ctx);
+    let ConcreteValue::Ref(ptr) = concrete else {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    };
+    if ptr.is_null() {
+        return Ok((DispatchOutcome::Continue, op.next_pc));
+    }
+    let expected = ctx.trace_ctx.const_ref(ptr as usize as i64);
+    ctx.trace_ctx
+        .record_guard(OpCode::GuardValue, &[value, expected], 0);
+    ctx.trace_ctx.replace_box(value, expected);
+    for slot in ctx.registers_r.iter_mut() {
+        if *slot == value {
+            *slot = expected;
+        }
+    }
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
 /// Generic float-pair-to-int handler for `float_<cmp>/ff>i` (operand
 /// layout `ff>i`: 1B f-src + 1B f-src + 1B i-dst).  RPython parity:
 /// `bhimpl_float_{lt,le,eq,ne,gt,ge}` (`blackhole.py:721-746`) — read
@@ -4188,6 +4252,7 @@ fn handle(
         "ptr_eq/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrEq),
         "ptr_ne/rr>i" => binop_ref_to_int_record(code, op, ctx, OpCode::PtrNe),
         "ptr_nonzero/r>i" => ptr_nonzero_record(code, op, ctx),
+        "ref_guard_value/r" => ref_guard_value_record(code, op, ctx),
         // Heapcache-aware getfield reads. RPython
         // `pyjitpl.py:855-882 opimpl_getfield_gc_<i|r|f>` →
         // `_opimpl_getfield_gc_any_pureornot` (`pyjitpl.py:929-950`)
@@ -8134,6 +8199,116 @@ mod tests {
         );
         assert_eq!(wc.trace_ctx.const_type(last_args1), Some(Type::Ref));
         assert_ne!(wc.registers_i[0], OpRef::None);
+    }
+
+    /// `ref_guard_value/r` records `GuardValue(value, ConstPtr(concrete))`
+    /// when the symbolic OpRef is non-Const and a concrete pointer is
+    /// available in the shadow.  Mirrors `pyjitpl.py:1916-1927
+    /// implement_guard_value`.
+    #[test]
+    fn ref_guard_value_records_guardvalue_with_concrete_constant() {
+        let opname = "ref_guard_value/r";
+        let byte = *insns_opname_to_byte()
+            .get(opname)
+            .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
+        // Operand encoding `r`: 1B r-src only.
+        let code = [byte, 0];
+        let mut tc = fresh_trace_ctx();
+        let descr = done_descr_ref_for_tests();
+        // Symbolic side: a recorded op OpRef (not a Const).
+        let value_opref = tc.record_op(majit_ir::OpCode::PtrEq, &[]);
+        let mut regs_r = [value_opref];
+        let mut regs_i = [OpRef::None];
+        let concrete_ptr: usize = 0xdead_beef;
+        let mut concrete_r = [ConcreteValue::Ref(
+            concrete_ptr as *mut pyre_object::pyobject::PyObject,
+        )];
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut concrete_r,
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+        };
+        let (outcome, next_pc) =
+            step(&code, 0, &mut wc).expect("ref_guard_value must record GuardValue");
+        assert!(matches!(outcome, DispatchOutcome::Continue));
+        assert_eq!(next_pc, 2);
+        let (last_opcode, last_args0, last_args1, last_args_len) = {
+            let ops = wc.trace_ctx.ops();
+            let last = ops.last().expect("ref_guard_value must record one op");
+            (last.opcode, last.args[0], last.args[1], last.args.len())
+        };
+        assert_eq!(last_opcode, majit_ir::OpCode::GuardValue);
+        assert_eq!(last_args_len, 2);
+        assert_eq!(last_args0, value_opref);
+        assert_eq!(
+            wc.trace_ctx.const_value(last_args1),
+            Some(concrete_ptr as i64),
+            "args[1] must point at the concrete pointer in the pool",
+        );
+        assert_eq!(wc.trace_ctx.const_type(last_args1), Some(Type::Ref));
+        assert_eq!(
+            wc.registers_r[0], last_args1,
+            "register slot still holding the original OpRef must be rewritten \
+             to the promoted constant (pyjitpl.py:1923 replace_box)",
+        );
+    }
+
+    /// Symbolic OpRef already a Const → `ref_guard_value/r` is a no-op
+    /// (`pyjitpl.py:1920-1921 if isinstance(box, Const): return box`).
+    #[test]
+    fn ref_guard_value_on_const_records_nothing() {
+        let opname = "ref_guard_value/r";
+        let byte = *insns_opname_to_byte()
+            .get(opname)
+            .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
+        let code = [byte, 0];
+        let mut tc = fresh_trace_ctx();
+        let descr = done_descr_ref_for_tests();
+        let value_opref = tc.const_ref(0xdead_beef);
+        let baseline_ops = tc.ops().len();
+        let mut regs_r = [value_opref];
+        let mut regs_i = [OpRef::None];
+        let mut concrete_r = [ConcreteValue::Ref(
+            0xdead_beef as *mut pyre_object::pyobject::PyObject,
+        )];
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            concrete_registers_r: &mut concrete_r,
+            descr_refs: &[],
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: descr.clone(),
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
+        };
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_guard_value Const arm");
+        assert!(matches!(outcome, DispatchOutcome::Continue));
+        assert_eq!(next_pc, 2);
+        assert_eq!(
+            wc.trace_ctx.ops().len(),
+            baseline_ops,
+            "no op should be recorded when input is already Const"
+        );
+        assert_eq!(wc.registers_r[0], value_opref);
     }
 
     #[test]
