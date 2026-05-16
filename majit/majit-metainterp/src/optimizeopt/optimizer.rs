@@ -3447,11 +3447,11 @@ impl Optimizer {
         &self,
         args: &[OpRef],
         ctx: &mut OptContext,
-    ) -> std::collections::HashMap<OpRef, crate::optimizeopt::intutils::IntBound> {
-        let mut exported = std::collections::HashMap::new();
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound> {
+        let mut exported = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for pass in &self.passes {
-            for (opref, bound) in pass.export_arg_int_bounds(args, ctx) {
-                exported.insert(opref, bound);
+            for (opref, bound) in pass.export_arg_int_bounds(args, ctx).iter() {
+                exported.insert(*opref, bound.clone());
             }
         }
         exported

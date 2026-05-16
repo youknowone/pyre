@@ -2530,7 +2530,7 @@ impl OptUnroll {
         renamed_inputargs: &[OpRef],
         optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
         ctx: &mut OptContext,
-        exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
+        exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
     ) -> ExportedState {
         // unroll.py:454: end_args = [force_at_the_end_of_preamble(a) ...]
         let end_args: Vec<OpRef> = ctx.preamble_end_args.clone().unwrap_or_else(|| {
@@ -2717,7 +2717,7 @@ impl OptUnroll {
         &self,
         arg: OpRef,
         ctx: &OptContext,
-        exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
+        exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
         infos: &mut HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
         let resolved = ctx.get_box_replacement(arg);
@@ -2766,7 +2766,7 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         ctx: &OptContext,
-        exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
+        exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
         infos: &mut HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
     ) {
         let opref_box = ctx.get_box_replacement_box(opref);
@@ -3689,7 +3689,7 @@ impl OptUnroll {
         &self,
         opref: OpRef,
         ctx: &OptContext,
-        exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
+        exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
     ) -> Option<crate::optimizeopt::info::OpInfo> {
         use crate::optimizeopt::info::{OpInfo, PtrInfo};
         let resolved = ctx.get_box_replacement(opref);
@@ -3786,7 +3786,7 @@ pub(crate) fn export_state(
     renamed_inputargs: &[OpRef],
     optimizer: &mut crate::optimizeopt::optimizer::Optimizer,
     ctx: &mut OptContext,
-    exported_int_bounds: Option<&HashMap<OpRef, crate::optimizeopt::intutils::IntBound>>,
+    exported_int_bounds: Option<&crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::intutils::IntBound>>,
 ) -> ExportedState {
     OptUnroll::new().export_state_with_bounds(
         jump_args,
@@ -5540,7 +5540,8 @@ mod tests {
         use crate::optimizeopt::intutils::IntBound;
 
         let mut ctx = crate::optimizeopt::OptContext::with_num_inputs(4, 0);
-        let mut exported_bounds = std::collections::HashMap::new();
+        let mut exported_bounds: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IntBound> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         exported_bounds.insert(OpRef::int_op(21), IntBound::bounded(10, 20));
 
         let exported = export_state(

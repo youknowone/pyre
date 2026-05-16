@@ -7159,8 +7159,8 @@ pub trait Optimization {
         &self,
         _args: &[OpRef],
         _ctx: &OptContext,
-    ) -> HashMap<OpRef, IntBound> {
-        HashMap::new()
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IntBound> {
+        crate::optimizeopt::vec_assoc::VecAssoc::new()
     }
 
     /// optimizer.py: is_virtual(opref)

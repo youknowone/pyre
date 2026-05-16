@@ -3012,8 +3012,8 @@ impl Optimization for OptIntBounds {
         &self,
         args: &[OpRef],
         ctx: &OptContext,
-    ) -> std::collections::HashMap<OpRef, IntBound> {
-        let mut exported = std::collections::HashMap::new();
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IntBound> {
+        let mut exported = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for &arg in args {
             let resolved = ctx.get_box_replacement(arg);
             if !matches!(ctx.opref_type(resolved), Some(majit_ir::Type::Int)) {
