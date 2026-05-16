@@ -673,7 +673,7 @@ impl<'a> Transformer<'a> {
                 item_ty,
                 ..
             } if self.config.lower_virtualizable => {
-                self.rewrite_op_getarrayitem(op, *base, *index, item_ty, graph_name)
+                self.rewrite_op_getarrayitem(op, *base, *index, item_ty, graph_name, graph)
             }
             // ── rewrite_op_setarrayitem ──
             OpKind::ArrayWrite {
@@ -683,7 +683,9 @@ impl<'a> Transformer<'a> {
                 item_ty,
                 ..
             } if self.config.lower_virtualizable => {
-                self.rewrite_op_setarrayitem(op, *base, *index, *value, item_ty, graph_name)
+                self.rewrite_op_setarrayitem(
+                    op, *base, *index, *value, item_ty, graph_name, graph,
+                )
             }
             // ── rewrite_op_direct_call ──
             OpKind::Call {
@@ -2024,6 +2026,7 @@ impl<'a> Transformer<'a> {
         index: ValueId,
         item_ty: &ValueType,
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         let typed_item_ty = op
             .result
@@ -2039,9 +2042,9 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableArrayRead {
-                    base: vable_base,
+                    base: graph.must_variable(vable_base),
                     array_index: arr_idx,
-                    elem_index: index,
+                    elem_index: graph.must_variable(index),
                     item_ty: typed_item_ty,
                     array_itemsize: itemsize,
                     array_is_signed: is_signed,
@@ -2078,6 +2081,7 @@ impl<'a> Transformer<'a> {
         value: ValueId,
         item_ty: &ValueType,
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         let typed_item_ty = self
             .get_value_type(value)
@@ -2092,10 +2096,10 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableArrayWrite {
-                    base: vable_base,
+                    base: graph.must_variable(vable_base),
                     array_index: arr_idx,
-                    elem_index: index,
-                    value,
+                    elem_index: graph.must_variable(index),
+                    value: graph.must_variable(value),
                     item_ty: typed_item_ty,
                     array_itemsize: itemsize,
                     array_is_signed: is_signed,
@@ -3871,14 +3875,22 @@ fn remap_op(
             item_ty,
             array_itemsize,
             array_is_signed,
-        } => OpKind::VableArrayRead {
-            base: remap_value(*base, aliases),
-            array_index: *array_index,
-            elem_index: remap_value(*elem_index, aliases),
-            item_ty: item_ty.clone(),
-            array_itemsize: *array_itemsize,
-            array_is_signed: *array_is_signed,
-        },
+        } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("VableArrayRead.base must have a backing ValueId");
+            let elem_vid = graph
+                .value_id_of(elem_index)
+                .expect("VableArrayRead.elem_index must have a backing ValueId");
+            OpKind::VableArrayRead {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+                array_index: *array_index,
+                elem_index: graph.must_variable(remap_value(elem_vid, aliases)),
+                item_ty: item_ty.clone(),
+                array_itemsize: *array_itemsize,
+                array_is_signed: *array_is_signed,
+            }
+        }
         OpKind::VableArrayWrite {
             base,
             array_index,
@@ -3887,15 +3899,26 @@ fn remap_op(
             item_ty,
             array_itemsize,
             array_is_signed,
-        } => OpKind::VableArrayWrite {
-            base: remap_value(*base, aliases),
-            array_index: *array_index,
-            elem_index: remap_value(*elem_index, aliases),
-            value: remap_value(*value, aliases),
-            item_ty: item_ty.clone(),
-            array_itemsize: *array_itemsize,
-            array_is_signed: *array_is_signed,
-        },
+        } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("VableArrayWrite.base must have a backing ValueId");
+            let elem_vid = graph
+                .value_id_of(elem_index)
+                .expect("VableArrayWrite.elem_index must have a backing ValueId");
+            let value_vid = graph
+                .value_id_of(value)
+                .expect("VableArrayWrite.value must have a backing ValueId");
+            OpKind::VableArrayWrite {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+                array_index: *array_index,
+                elem_index: graph.must_variable(remap_value(elem_vid, aliases)),
+                value: graph.must_variable(remap_value(value_vid, aliases)),
+                item_ty: item_ty.clone(),
+                array_itemsize: *array_itemsize,
+                array_is_signed: *array_is_signed,
+            }
+        }
         OpKind::BinOp {
             op,
             lhs,
@@ -4607,18 +4630,19 @@ mod tests {
         let result = rewrite_graph(&graph, &config);
         assert_eq!(result.vable_rewrites, 1);
         let rewritten_op = &result.graph.block(graph.startblock).operations[1];
-        assert!(
-            matches!(
-                &rewritten_op.kind,
-                OpKind::VableArrayRead {
-                    base: rewritten_base,
-                    array_index: 0,
-                    ..
-                } if *rewritten_base == base
-            ),
-            "expected VableArrayRead with explicit base, got {:?}",
-            rewritten_op.kind
-        );
+        let OpKind::VableArrayRead {
+            base: rewritten_base,
+            array_index,
+            ..
+        } = &rewritten_op.kind
+        else {
+            panic!(
+                "expected VableArrayRead with explicit base, got {:?}",
+                rewritten_op.kind
+            );
+        };
+        assert_eq!(*array_index, 0);
+        assert_eq!(result.graph.value_id_of(rewritten_base), Some(base));
     }
 
     #[test]

@@ -579,14 +579,22 @@ fn remap_op_kind(
             item_ty,
             array_itemsize,
             array_is_signed,
-        } => OpKind::VableArrayRead {
-            base: remap(base),
-            array_index: *array_index,
-            elem_index: remap(elem_index),
-            item_ty: item_ty.clone(),
-            array_itemsize: *array_itemsize,
-            array_is_signed: *array_is_signed,
-        },
+        } => {
+            let base_vid = source_graph
+                .value_id_of(base)
+                .expect("VableArrayRead.base must have a backing ValueId in source");
+            let elem_vid = source_graph
+                .value_id_of(elem_index)
+                .expect("VableArrayRead.elem_index must have a backing ValueId in source");
+            OpKind::VableArrayRead {
+                base: target_graph.must_variable(remap(&base_vid)),
+                array_index: *array_index,
+                elem_index: target_graph.must_variable(remap(&elem_vid)),
+                item_ty: item_ty.clone(),
+                array_itemsize: *array_itemsize,
+                array_is_signed: *array_is_signed,
+            }
+        }
         OpKind::VableArrayWrite {
             base,
             array_index,
@@ -595,15 +603,26 @@ fn remap_op_kind(
             item_ty,
             array_itemsize,
             array_is_signed,
-        } => OpKind::VableArrayWrite {
-            base: remap(base),
-            array_index: *array_index,
-            elem_index: remap(elem_index),
-            value: remap(value),
-            item_ty: item_ty.clone(),
-            array_itemsize: *array_itemsize,
-            array_is_signed: *array_is_signed,
-        },
+        } => {
+            let base_vid = source_graph
+                .value_id_of(base)
+                .expect("VableArrayWrite.base must have a backing ValueId in source");
+            let elem_vid = source_graph
+                .value_id_of(elem_index)
+                .expect("VableArrayWrite.elem_index must have a backing ValueId in source");
+            let value_vid = source_graph
+                .value_id_of(value)
+                .expect("VableArrayWrite.value must have a backing ValueId in source");
+            OpKind::VableArrayWrite {
+                base: target_graph.must_variable(remap(&base_vid)),
+                array_index: *array_index,
+                elem_index: target_graph.must_variable(remap(&elem_vid)),
+                value: target_graph.must_variable(remap(&value_vid)),
+                item_ty: item_ty.clone(),
+                array_itemsize: *array_itemsize,
+                array_is_signed: *array_is_signed,
+            }
+        }
         OpKind::BinOp {
             op,
             lhs,
@@ -935,13 +954,33 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
         }
         OpKind::VableArrayRead {
             base, elem_index, ..
-        } => vec![*base, *elem_index],
+        } => {
+            let g = graph
+                .expect("VableArrayRead requires a graph to project Variable to ValueId");
+            vec![
+                g.value_id_of(base)
+                    .expect("VableArrayRead.base must be a known Variable on graph"),
+                g.value_id_of(elem_index)
+                    .expect("VableArrayRead.elem_index must be a known Variable on graph"),
+            ]
+        }
         OpKind::VableArrayWrite {
             base,
             elem_index,
             value,
             ..
-        } => vec![*base, *elem_index, *value],
+        } => {
+            let g = graph
+                .expect("VableArrayWrite requires a graph to project Variable to ValueId");
+            vec![
+                g.value_id_of(base)
+                    .expect("VableArrayWrite.base must be a known Variable on graph"),
+                g.value_id_of(elem_index)
+                    .expect("VableArrayWrite.elem_index must be a known Variable on graph"),
+                g.value_id_of(value)
+                    .expect("VableArrayWrite.value must be a known Variable on graph"),
+            ]
+        }
         OpKind::BinOp { lhs, rhs, .. } => vec![*lhs, *rhs],
         OpKind::UnaryOp { operand, .. } => vec![*operand],
         OpKind::CallElidable {

@@ -1596,10 +1596,17 @@ impl Assembler {
                 array_itemsize,
                 array_is_signed,
             } => {
-                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                let g = graph.expect("encode_op for VableArrayRead requires a graph");
+                let base_vid = g
+                    .value_id_of(base)
+                    .expect("VableArrayRead.base must be a known Variable on graph");
+                let elem_vid = g
+                    .value_id_of(elem_index)
+                    .expect("VableArrayRead.elem_index must be a known Variable on graph");
+                let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, kc) = self.lookup_reg_with_kind(*elem_index, regallocs);
+                let (reg, kc) = self.lookup_reg_with_kind(elem_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
                 // RPython: two descriptors — fielddescr (vable array field) + arraydescr.
@@ -1638,13 +1645,23 @@ impl Assembler {
                 array_itemsize,
                 array_is_signed,
             } => {
-                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                let g = graph.expect("encode_op for VableArrayWrite requires a graph");
+                let base_vid = g
+                    .value_id_of(base)
+                    .expect("VableArrayWrite.base must be a known Variable on graph");
+                let elem_vid = g
+                    .value_id_of(elem_index)
+                    .expect("VableArrayWrite.elem_index must be a known Variable on graph");
+                let value_vid = g
+                    .value_id_of(value)
+                    .expect("VableArrayWrite.value must be a known Variable on graph");
+                let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, kc) = self.lookup_reg_with_kind(*elem_index, regallocs);
+                let (reg, kc) = self.lookup_reg_with_kind(elem_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, kc) = self.lookup_reg_with_kind(*value, regallocs);
+                let (reg, kc) = self.lookup_reg_with_kind(value_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
                 // RPython: two descriptors — fielddescr (vable array field) + arraydescr.

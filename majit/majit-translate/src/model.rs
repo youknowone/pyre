@@ -582,9 +582,9 @@ pub enum OpKind {
     /// Virtualizable array read → reads from boxes.
     /// RPython: `getarrayitem_vable_i/r/f`
     VableArrayRead {
-        base: ValueId,
+        base: crate::flowspace::model::Variable,
         array_index: usize,
-        elem_index: ValueId,
+        elem_index: crate::flowspace::model::Variable,
         item_ty: ValueType,
         /// RPython: arraydescr.itemsize from VirtualizableInfo.array_descrs.
         array_itemsize: usize,
@@ -594,10 +594,10 @@ pub enum OpKind {
     /// Virtualizable array write → writes to boxes.
     /// RPython: `setarrayitem_vable_i/r/f`
     VableArrayWrite {
-        base: ValueId,
+        base: crate::flowspace::model::Variable,
         array_index: usize,
-        elem_index: ValueId,
-        value: ValueId,
+        elem_index: crate::flowspace::model::Variable,
+        value: crate::flowspace::model::Variable,
         item_ty: ValueType,
         /// RPython: arraydescr.itemsize from VirtualizableInfo.array_descrs.
         array_itemsize: usize,
