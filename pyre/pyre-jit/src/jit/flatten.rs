@@ -4307,7 +4307,7 @@ mod tests {
         let cond = Variable::new(VariableId(0), Kind::Int);
         let retval = Variable::new(VariableId(1), Kind::Int);
         let start = Block::shared(vec![cond.into()]);
-        let mut graph = FunctionGraph::new("bool_branch", start.clone(), Some(retval));
+        let graph = FunctionGraph::new("bool_branch", start.clone(), Some(retval));
 
         start.borrow_mut().exitswitch = Some(ExitSwitch::Value(cond.into()));
         let false_link = Link::new(
@@ -7102,7 +7102,7 @@ mod tests {
         // `make_return` for the normal path expects the returnblock
         // input to be a single Variable; pass `res` as the return slot
         // (will be renamed via the normal link).
-        let mut graph = FunctionGraph::new(name, start.clone(), Some(res));
+        let graph = FunctionGraph::new(name, start.clone(), Some(res));
 
         super::super::flow::push_op(
             &start,
@@ -7390,7 +7390,7 @@ mod tests {
         let rhs = Variable::new(VariableId(1), Kind::Int);
         let res = Variable::new(VariableId(2), Kind::Int);
         let start = Block::shared(vec![lhs.into(), rhs.into()]);
-        let mut graph = FunctionGraph::new("ovf_no_catch", start.clone(), Some(res));
+        let graph = FunctionGraph::new("ovf_no_catch", start.clone(), Some(res));
         super::super::flow::push_op(
             &start,
             SpaceOperation::new(

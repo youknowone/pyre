@@ -8380,7 +8380,7 @@ mod tests {
         new_shadow_graph,
     };
     use crate::jit::assembler::ArcByPtr;
-    use crate::jit::flatten::{Insn, Kind, Label as FlatLabel, Operand, Register, SSARepr};
+    use crate::jit::flatten::{Insn, Kind, Operand, Register, SSARepr};
     use crate::jit::flow::{
         Block, Constant, ExitSwitch, FlowValue, FunctionGraph, Link, LinkArgPosition, LinkRef,
         SpaceOperationArg, Variable, VariableId, c_last_exception,

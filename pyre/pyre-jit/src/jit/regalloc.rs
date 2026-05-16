@@ -1276,7 +1276,7 @@ mod tests {
         let v0 = flow_var(0, Kind::Int);
         let v1 = flow_var(1, Kind::Int);
         let start = Block::shared(vec![v0.into()]);
-        let mut graph = FunctionGraph::new("graph_regalloc", start.clone(), Some(v1));
+        let graph = FunctionGraph::new("graph_regalloc", start.clone(), Some(v1));
         push_op(
             &start,
             SpaceOperation::new("same_as", vec![v0.into()], Some(v1.into()), 0),
@@ -1329,7 +1329,7 @@ mod tests {
         let v0 = flow_var(0, Kind::Int);
         let v1 = flow_var(1, Kind::Int);
         let start = Block::shared(vec![v0.into()]);
-        let mut graph = FunctionGraph::new("graph_listofkind", start.clone(), Some(v1));
+        let graph = FunctionGraph::new("graph_listofkind", start.clone(), Some(v1));
         push_op(
             &start,
             SpaceOperation::new(
@@ -1437,7 +1437,7 @@ mod tests {
             portal_inputs: true,
         };
         let result = allocate_registers(&ssarepr, 2, inputs, &[]);
-        let mut new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
+        let new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
         // locals 0,1 → colors 0,1; portal regs → 2,3.
         assert_eq!(new(0), 0, "local 0 must keep color 0 after enforce");
         assert_eq!(new(1), 1, "local 1 must keep color 1 after enforce");
@@ -1468,7 +1468,7 @@ mod tests {
             portal_inputs: false,
         };
         let result = allocate_registers(&ssarepr, 1, inputs, &[]);
-        let mut new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
+        let new = |old: u16| result.rename.get(&(Kind::Ref, old)).copied().unwrap_or(old);
         assert_eq!(new(0), 0, "local 0 stays at color 0 (enforce_input_args)");
         assert_eq!(
             new(100),
