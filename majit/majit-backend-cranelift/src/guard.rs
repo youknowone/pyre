@@ -657,11 +657,22 @@ impl CraneliftFailDescr {
     }
 
     #[inline]
-    /// Descr-local atomic read (Slice EE).  Loads the published
-    /// `Arc<ExitRecoveryLayout>` raw pointer, bumps the strong count,
-    /// and clones the inner layout so callers can hold it past the
-    /// brief Arc lifetime.  Lock-free and HashMap-free.
+    /// Read the cached recovery_layout, preferring the meta-side slot on
+    /// `ResumeGuardDescr` when reachable (Phase A consolidation — single
+    /// source of truth on the meta Arc).  Falls back to the backend-local
+    /// `recovery_layout_cell` for synthetic descrs (FINISH, external-JUMP,
+    /// `Done*`/`ExitExc`/`PropagateException`) where `meta_descr` is
+    /// absent or non-`ResumeGuardDescr`.
     pub fn recovery_layout_ref(&self) -> Option<ExitRecoveryLayout> {
+        if let Some(layout) = self
+            .meta_descr
+            .as_ref()
+            .and_then(|d| d.as_any())
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+            .and_then(|rgd| rgd.recovery_layout())
+        {
+            return Some(layout);
+        }
         let ptr = self.recovery_layout_cell.load(Ordering::Acquire);
         if ptr.is_null() {
             None
@@ -764,10 +775,23 @@ impl CraneliftFailDescr {
         self.external_jump_target_cell.get().cloned()
     }
 
-    /// Descr-local atomic write (Slice EE).  Publishes the layout via
-    /// `Arc::into_raw(Arc::new(...))` and atomically swaps it into the
-    /// cell; any previously published Arc is reclaimed here.
+    /// Write the cached recovery_layout to the meta-side slot on
+    /// `ResumeGuardDescr` when reachable; otherwise dual-write through
+    /// the backend-local atomic cell for synthetic descrs without a
+    /// `ResumeGuardDescr` `meta_descr` (FINISH, external-JUMP, etc.).
+    /// Phase A consolidation — meta side becomes the single source of
+    /// truth, the local cell remains only as the fallback path for
+    /// non-`ResumeGuardDescr` synthetics until those routes are removed.
     pub fn set_recovery_layout(&self, recovery_layout: ExitRecoveryLayout) {
+        if let Some(rgd) = self
+            .meta_descr
+            .as_ref()
+            .and_then(|d| d.as_any())
+            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+        {
+            rgd.set_recovery_layout(recovery_layout);
+            return;
+        }
         let new_ptr = Arc::into_raw(Arc::new(recovery_layout)) as *mut ExitRecoveryLayout;
         let old_ptr = self.recovery_layout_cell.swap(new_ptr, Ordering::AcqRel);
         if !old_ptr.is_null() {

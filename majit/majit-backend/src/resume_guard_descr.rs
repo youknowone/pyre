@@ -18,6 +18,7 @@ use majit_ir::{
 };
 
 use crate::CompiledLoopToken;
+use crate::ExitRecoveryLayout;
 use crate::rd_payload::RdPayload;
 use crate::resume_value::ResumeData;
 
@@ -121,6 +122,16 @@ pub struct ResumeGuardDescr {
     pub trace_id: AtomicU64,
     /// Pyre-only: per-trace `fail_index` assigned by `build_guard_metadata`.
     pub fail_index_per_trace: AtomicU32,
+    /// Pyre-only cache: cranelift bakes recovery decisions at codegen and
+    /// reads them back at deopt time through `recovery_layout_ref`.  Stored
+    /// here (rather than on `CraneliftFailDescr`) so the meta Arc is the
+    /// single source of truth, matching Phase A's `_attrs_` migration shape.
+    /// Will be removed entirely once `rebuild_state_after_failure` is
+    /// re-ported to drive `ResumeDataDirectReader` on-demand from `rd_numb`
+    /// / `rd_consts` / `rd_virtuals` / `rd_pendingfields` (PyPy's
+    /// `assembler.py::rebuild_locs_from_resumedata` shape — no pre-baked
+    /// `ExitRecoveryLayout`).
+    pub recovery_layout: UnsafeCell<Option<Arc<ExitRecoveryLayout>>>,
 }
 
 // Safety: single-threaded JIT (RPython GIL parity).
@@ -130,6 +141,9 @@ unsafe impl Sync for ResumeGuardDescr {}
 impl Descr for ResumeGuardDescr {
     fn index(&self) -> u32 {
         self.fail_index
+    }
+    fn as_any(&self) -> Option<&dyn Any> {
+        Some(self)
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
@@ -154,6 +168,7 @@ impl Descr for ResumeGuardDescr {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            recovery_layout: UnsafeCell::new(None),
         }))
     }
 }
@@ -305,5 +320,26 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
+        recovery_layout: UnsafeCell::new(None),
     })
+}
+
+impl ResumeGuardDescr {
+    /// Read the cached recovery_layout (clone of the stored `Arc` contents).
+    /// Returns `None` when codegen has not yet stamped a layout.  Pyre-only
+    /// cache (no PyPy counterpart); the eventual orthodox port replaces
+    /// callers with on-demand `ResumeDataDirectReader` decoding from `rd_*`.
+    pub fn recovery_layout(&self) -> Option<ExitRecoveryLayout> {
+        // Safety: single-threaded JIT (RPython GIL parity); same access
+        // contract as the sibling `vector_info` / `rd_locs` UnsafeCells.
+        unsafe { (*self.recovery_layout.get()).as_ref().map(|a| (**a).clone()) }
+    }
+
+    /// Write the cached recovery_layout.  Wraps the layout in an `Arc` to
+    /// keep `recovery_layout()`'s clone-on-read path cheap when consumers
+    /// only need a snapshot.
+    pub fn set_recovery_layout(&self, layout: ExitRecoveryLayout) {
+        // Safety: single-threaded JIT.
+        unsafe { *self.recovery_layout.get() = Some(Arc::new(layout)) };
+    }
 }

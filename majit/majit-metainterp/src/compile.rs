@@ -2918,6 +2918,7 @@ pub fn make_fail_descr_with_index(fail_index: u32, num_live: usize) -> DescrRef 
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
+        recovery_layout: UnsafeCell::new(None),
     })
 }
 
@@ -2992,6 +2993,7 @@ pub fn make_resume_guard_descr_typed(types: Vec<Type>) -> DescrRef {
         rd_loop_token_clt: UnsafeCell::new(None),
         trace_id: AtomicU64::new(0),
         fail_index_per_trace: AtomicU32::new(0),
+        recovery_layout: UnsafeCell::new(None),
     })
 }
 
@@ -3019,6 +3021,14 @@ unsafe impl Sync for ResumeAtPositionDescr {}
 impl majit_ir::Descr for ResumeAtPositionDescr {
     fn index(&self) -> u32 {
         self.inner.fail_index
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        // Hand out the inner ResumeGuardDescr so consumers that want to
+        // read meta-side cells (e.g. recovery_layout) can downcast
+        // uniformly across the subclass family — matching RPython's
+        // `compile.py:892` `class ResumeAtPositionDescr(ResumeGuardDescr)`
+        // shape where attribute access goes through the base.
+        Some(&self.inner)
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
@@ -3187,6 +3197,7 @@ pub fn make_resume_at_position_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            recovery_layout: UnsafeCell::new(None),
         },
     })
 }
@@ -3222,6 +3233,10 @@ unsafe impl Sync for ResumeGuardForcedDescr {}
 impl majit_ir::Descr for ResumeGuardForcedDescr {
     fn index(&self) -> u32 {
         self.inner.fail_index
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        // Hand out the inner ResumeGuardDescr — see ResumeAtPositionDescr.
+        Some(&self.inner)
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
@@ -3392,6 +3407,7 @@ pub fn make_resume_guard_forced_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            recovery_layout: UnsafeCell::new(None),
         },
     })
 }
@@ -3411,6 +3427,10 @@ unsafe impl Sync for ResumeGuardExcDescr {}
 impl majit_ir::Descr for ResumeGuardExcDescr {
     fn index(&self) -> u32 {
         self.inner.fail_index
+    }
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        // Hand out the inner ResumeGuardDescr — see ResumeAtPositionDescr.
+        Some(&self.inner)
     }
     fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
         Some(self)
@@ -3581,6 +3601,7 @@ pub fn make_resume_guard_exc_descr_typed(types: Vec<Type>) -> DescrRef {
             rd_loop_token_clt: UnsafeCell::new(None),
             trace_id: AtomicU64::new(0),
             fail_index_per_trace: AtomicU32::new(0),
+            recovery_layout: UnsafeCell::new(None),
         },
     })
 }
