@@ -2270,18 +2270,21 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
         (ConstantValue::Signed(value), Some(Kind::Int)) => Operand::ConstInt(*value),
         // RPython rtyper post-pass: a `Constant(ll_ptr, concretetype=
         // lltype.Ptr(...))` carries an integer pointer in its `value`
-        // field with a `Ptr` concretetype.  Pyre's rtyper-equivalent
-        // (`rtype_opaque_constants`) rewrites pre-rtype
-        // `Constant(Opaque(...), Some(Ref))` shapes into this form so
-        // the canonical `flatten_graph` driver can lower them without
-        // a `lower_constant` closure parameter (matching `flatten.py:63`
-        // signature).
+        // field with a `Ptr` concretetype.  Pyre's canonical
+        // `flatten_graph` consumes graphs that already carry this
+        // post-rtype shape (the production walker emits Signed(Ref)
+        // directly for resolved exception classes via `ExceptionData::
+        // get_standard_ll_exc_instance_by_class`, and other Opaque(Ref)
+        // sites resolve through the closure-based
+        // `flatten_graph_with_lowering` path used today).
         (ConstantValue::Signed(value), Some(Kind::Ref)) => Operand::ConstRef(*value),
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => {
             panic!(
-                "GraphFlattener: opaque ref constants need rtyper resolution \
-                 — call rtype_opaque_constants(graph, lower_constant) before \
-                 flatten_graph (matches rpython/rtyper/rtyper.py:specialize)"
+                "GraphFlattener: opaque ref constants must be resolved \
+                 before the canonical flatten_graph driver — production \
+                 callers run flatten_graph_with_lowering with a per-call \
+                 lower_constant closure (matches rpython/rtyper/rtyper.py\
+                 :specialize substep)"
             )
         }
         other => panic!("GraphFlattener: unsupported constant operand {other:?}"),
@@ -4541,9 +4544,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "flatten_graph: switch link requires Signed/Bool llexitcase"
-    )]
+    #[should_panic(expected = "flatten_graph: switch link requires Signed/Bool llexitcase")]
     fn flatten_graph_panics_on_none_exitcase_switch_link() {
         // RPython `flatten.py:280` recognises ONLY `Str("default")` as
         // the switch catch-all; `None` exitcase on a switch link is a
@@ -5190,41 +5191,35 @@ mod tests {
     }
 
     #[test]
-    fn canonical_flatten_graph_lowers_rtyped_opaque_ref_link_arg() {
-        // End-to-end pipeline: graph carrying an `Opaque(Ref)` link
-        // arg is fed through `rtype_opaque_constants` (matches the
-        // upstream pre-flatten constant-resolution step) and then
-        // lowered by the canonical `flatten_graph(graph, regallocs,
-        // false, cpu=None)` entry.  Expected outcome: the rtyper
-        // rewrites the opaque to `Signed(0xfeed)` with Kind::Ref,
-        // `flatten_constant_operand` lowers that to
+    fn canonical_flatten_graph_lowers_rtyped_signed_ref_link_arg() {
+        // End-to-end pipeline: graph carrying an already-rtyped
+        // `Signed(0xfeed)/Ref` link arg (the post-rtype shape the
+        // canonical `flatten_graph(graph, regallocs, false, cpu=None)`
+        // entry expects) is lowered by `flatten_constant_operand` to
         // `Operand::ConstRef(0xfeed)`, and `insert_renamings` emits
         // a `ref_copy(ConstRef(0xfeed) -> Reg)` matching the
-        // returnblock inputarg's color.
+        // returnblock inputarg's color.  Test fixtures construct
+        // post-rtype shapes directly; production callers route
+        // pre-rtype `Opaque(Ref)` through the closure-based
+        // `flatten_graph_with_lowering` path (a per-call
+        // `lower_constant` closure handles the resolution).
         use crate::jit::flow::{Block, FunctionGraph, Link};
         use crate::jit::regalloc::perform_graph_register_allocation_all_kinds;
-        use crate::jit::rtyper::rtype_opaque_constants;
 
         let start = Block::shared(Vec::new());
         let graph = FunctionGraph::new("rtyped_canonical", start.clone(), None);
-        let opaque_ovf = super::super::flow::Constant::opaque("OverflowError", Some(Kind::Ref));
+        let signed_ovf = super::super::flow::Constant::new(
+            super::super::flow::ConstantValue::Signed(0xfeed),
+            Some(Kind::Ref),
+        );
         start.closeblock(vec![
             Link::new(
-                vec![opaque_ovf.into()],
+                vec![signed_ovf.into()],
                 Some(graph.returnblock.clone()),
                 None,
             )
             .into_ref(),
         ]);
-
-        rtype_opaque_constants(&graph, |c| match &c.value {
-            super::super::flow::ConstantValue::Opaque(opaque)
-                if opaque.repr() == "OverflowError" =>
-            {
-                0xfeed
-            }
-            other => panic!("unexpected opaque {other:?}"),
-        });
 
         let mut regallocs = perform_graph_register_allocation_all_kinds(&graph);
         let ssarepr = super::flatten_graph(&graph, &mut regallocs, false, None);

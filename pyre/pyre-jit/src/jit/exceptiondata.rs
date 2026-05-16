@@ -196,9 +196,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic(
-        expected = "called before resolve_standard_exception_pointers"
-    )]
+    #[should_panic(expected = "called before resolve_standard_exception_pointers")]
     fn get_standard_ll_exc_instance_by_class_panics_when_unresolved() {
         let data = ExceptionData::new();
         let _ = data.get_standard_ll_exc_instance_by_class("OverflowError");

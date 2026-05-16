@@ -7,7 +7,6 @@ pub mod flatten;
 pub mod flow;
 pub mod liveness;
 pub mod regalloc;
-pub mod rtyper;
 mod ssa_emitter;
 pub use pyre_jit_trace::descr;
 pub mod executor;

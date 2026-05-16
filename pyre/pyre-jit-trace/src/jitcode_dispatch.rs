@@ -9131,8 +9131,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
         };
-        let (outcome, next_pc) =
-            step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
         assert_eq!(next_pc, 5, "getfield_vable_i/rd>i operand layout = 4 bytes");
         let dst_post = wc.registers_i[5];
@@ -9204,8 +9203,7 @@ mod tests {
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
         };
-        let (outcome, next_pc) =
-            step(&code, 0, &mut wc).expect("setfield_vable_i must dispatch");
+        let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
         assert_eq!(next_pc, 5, "setfield_vable_i/rid operand layout = 4 bytes");
         drop(wc);
