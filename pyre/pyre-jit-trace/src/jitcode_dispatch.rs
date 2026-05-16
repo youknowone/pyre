@@ -416,7 +416,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
 /// `DoneWithThisFrameRef`/`SwitchToBlackhole`/`ChangeFrame`. Pyre
 /// flattens that into an explicit enum because Rust has no analogous
 /// non-local exit and we want the walker to stay in plain Result form.
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DispatchOutcome {
     /// Step succeeded, continue with the next opcode at the returned pc.
     Continue,
@@ -442,7 +442,14 @@ pub enum DispatchOutcome {
     /// exceptiontable scan yet — that lives behind the
     /// `catch_exception/L` metadata pipe and is deferred until the
     /// per-PC exceptiontable plumb-through lands).
-    SubRaise { exc: OpRef },
+    ///
+    /// `exc_concrete` carries the callee's `last_exc_value_concrete`
+    /// across the frame boundary so the caller's `inline_call` SubRaise
+    /// arm can seed its own `last_exc_value_concrete` and a downstream
+    /// `raise/r` / `reraise/` reads the right concrete for GUARD_CLASS
+    /// emission. Empty when the callee itself didn't track a concrete
+    /// (e.g. shadow gap or `Null`-seeded raise).
+    SubRaise { exc: OpRef, exc_concrete: ConcreteValue },
     /// Trace recording must abort and resume in blackhole mode.
     ///
     /// RPython parity: `pyjitpl.py:2003-2006` routes
@@ -674,7 +681,7 @@ pub fn walk(
             | DispatchOutcome::SwitchToBlackhole { .. } => {
                 return Ok((outcome, pc));
             }
-            DispatchOutcome::SubRaise { exc } => {
+            DispatchOutcome::SubRaise { exc, exc_concrete } => {
                 if ctx.is_top_level {
                     // RPython parity: framestack exhausted with no
                     // handler match → `compile_exit_frame_with_exception(
@@ -683,7 +690,7 @@ pub fn walk(
                         .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
                     return Ok((DispatchOutcome::Terminate, pc));
                 } else {
-                    return Ok((DispatchOutcome::SubRaise { exc }, pc));
+                    return Ok((DispatchOutcome::SubRaise { exc, exc_concrete }, pc));
                 }
             }
         }
@@ -3379,23 +3386,22 @@ fn dispatch_inline_call_dr_kind(
             // reaching here is a codewriter shape mismatch.
             Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
         }
-        DispatchOutcome::SubRaise { exc } => {
+        DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
-                // Callee's `raise/r` knew the concrete (set on its own
-                // `last_exc_value_concrete`) but the inner WalkContext
-                // has been dropped — the concrete didn't cross the
-                // frame boundary because `DispatchOutcome::SubRaise`
-                // carries only the symbolic OpRef.  Set Null;
-                // downstream walker `raise/r` reading this slot will
-                // find Null and skip GUARD_CLASS, matching the
-                // pre-Step 2.2 fallback.  Threading the concrete
-                // through SubRaise is a follow-up (M4.Cutover Step
-                // 2.3).
-                ctx.last_exc_value_concrete = ConcreteValue::Null;
+                // M4.Cutover Step 2.3: thread the callee's concrete
+                // exception across the frame boundary.  Without this a
+                // downstream `raise/r` / `reraise/` in the caller's
+                // handler would read `Null` and skip GUARD_CLASS,
+                // losing the class-known pin that the callee's leg had
+                // already established.
+                ctx.last_exc_value_concrete = exc_concrete;
                 Ok((DispatchOutcome::Continue, target))
             } else {
-                Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
+                Ok((
+                    DispatchOutcome::SubRaise { exc, exc_concrete },
+                    op.next_pc,
+                ))
             }
         }
         DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
@@ -3555,23 +3561,22 @@ fn dispatch_inline_call_dir_kind(
             }
             Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
         }
-        DispatchOutcome::SubRaise { exc } => {
+        DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
-                // Callee's `raise/r` knew the concrete (set on its own
-                // `last_exc_value_concrete`) but the inner WalkContext
-                // has been dropped — the concrete didn't cross the
-                // frame boundary because `DispatchOutcome::SubRaise`
-                // carries only the symbolic OpRef.  Set Null;
-                // downstream walker `raise/r` reading this slot will
-                // find Null and skip GUARD_CLASS, matching the
-                // pre-Step 2.2 fallback.  Threading the concrete
-                // through SubRaise is a follow-up (M4.Cutover Step
-                // 2.3).
-                ctx.last_exc_value_concrete = ConcreteValue::Null;
+                // M4.Cutover Step 2.3: thread the callee's concrete
+                // exception across the frame boundary.  Without this a
+                // downstream `raise/r` / `reraise/` in the caller's
+                // handler would read `Null` and skip GUARD_CLASS,
+                // losing the class-known pin that the callee's leg had
+                // already established.
+                ctx.last_exc_value_concrete = exc_concrete;
                 Ok((DispatchOutcome::Continue, target))
             } else {
-                Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
+                Ok((
+                    DispatchOutcome::SubRaise { exc, exc_concrete },
+                    op.next_pc,
+                ))
             }
         }
         DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
@@ -3753,23 +3758,22 @@ fn dispatch_inline_call_dirf_kind(
             }
             Err(DispatchError::UnexpectedVoidSubReturn { pc: op.pc })
         }
-        DispatchOutcome::SubRaise { exc } => {
+        DispatchOutcome::SubRaise { exc, exc_concrete } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
-                // Callee's `raise/r` knew the concrete (set on its own
-                // `last_exc_value_concrete`) but the inner WalkContext
-                // has been dropped — the concrete didn't cross the
-                // frame boundary because `DispatchOutcome::SubRaise`
-                // carries only the symbolic OpRef.  Set Null;
-                // downstream walker `raise/r` reading this slot will
-                // find Null and skip GUARD_CLASS, matching the
-                // pre-Step 2.2 fallback.  Threading the concrete
-                // through SubRaise is a follow-up (M4.Cutover Step
-                // 2.3).
-                ctx.last_exc_value_concrete = ConcreteValue::Null;
+                // M4.Cutover Step 2.3: thread the callee's concrete
+                // exception across the frame boundary.  Without this a
+                // downstream `raise/r` / `reraise/` in the caller's
+                // handler would read `Null` and skip GUARD_CLASS,
+                // losing the class-known pin that the callee's leg had
+                // already established.
+                ctx.last_exc_value_concrete = exc_concrete;
                 Ok((DispatchOutcome::Continue, target))
             } else {
-                Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
+                Ok((
+                    DispatchOutcome::SubRaise { exc, exc_concrete },
+                    op.next_pc,
+                ))
             }
         }
         DispatchOutcome::Terminate => Ok((DispatchOutcome::Terminate, op.next_pc)),
@@ -4348,7 +4352,13 @@ fn handle(
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
-                Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
+                Ok((
+                    DispatchOutcome::SubRaise {
+                        exc,
+                        exc_concrete: concrete_exc,
+                    },
+                    op.next_pc,
+                ))
             }
         }
         "last_exc_value/>r" => {
@@ -4431,7 +4441,13 @@ fn handle(
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
                 Ok((DispatchOutcome::Terminate, op.next_pc))
             } else {
-                Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
+                Ok((
+                    DispatchOutcome::SubRaise {
+                        exc,
+                        exc_concrete: ctx.last_exc_value_concrete,
+                    },
+                    op.next_pc,
+                ))
             }
         }
         other => Err(DispatchError::UnsupportedOpname {
@@ -6788,7 +6804,10 @@ mod tests {
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
             outcome,
-            DispatchOutcome::SubRaise { exc: exc_arg },
+            DispatchOutcome::SubRaise {
+                exc: exc_arg,
+                exc_concrete: ConcreteValue::Null,
+            },
             "sub-walk frame with no caller-side catch must bubble SubRaise through",
         );
         drop(wc);
