@@ -388,6 +388,14 @@ impl CodeWriter {
         // `TypeResolutionState` survives the call.
         let post_result_types =
             crate::jit_codewriter::type_state::authoritative_result_types(&rewritten.graph);
+        // `post_resolve` is intentionally empty here: jtransform now
+        // writes resolved kinds straight to each backing
+        // `Variable.concretetype` (see `Transformer::transform` →
+        // `apply_to_graph`), so the legacy `resolve_rewritten_types`
+        // walk is structurally dead in the production path.  The
+        // parameter is kept on the API because legacy_pipeline.rs still
+        // funnels its `resolve_rewritten_types` output through this
+        // function for the dual-gate baseline comparison.
         crate::jit_codewriter::type_state::merge_synth_kinds_into_graph(
             &mut rewritten.graph,
             &type_state,

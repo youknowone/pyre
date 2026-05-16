@@ -1896,7 +1896,19 @@ impl Assembler {
         regallocs: &HashMap<RegKind, RegAllocResult>,
         state: &mut AssemblyState,
     ) {
-        state.code.push(args.len().min(255) as u8);
+        // RPython `assembler.py` writes the count as a single byte and
+        // does not silently truncate — clipping to 255 while still
+        // emitting every item would desync the decoder by N - 255 bytes.
+        // Fail loud here so the producer's contract violation surfaces
+        // at the codewriter rather than as garbled bytecode downstream.
+        assert!(
+            args.len() < 256,
+            "emit_list_of_kind: {} entries exceed the u8 count byte \
+             (kind {kind:?}); RPython parity requires the count to fit \
+             in a single byte",
+            args.len(),
+        );
+        state.code.push(args.len() as u8);
         for &v in args {
             let (reg, item_kind) = self.lookup_coloring(v, regallocs);
             assert_eq!(
@@ -4089,6 +4101,7 @@ mod tests {
         graph.set_concretetype(v1, crate::model::ConcreteType::Signed);
         graph.set_concretetype(v2, crate::model::ConcreteType::GcRef);
 
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = SSARepr {
             name: "add".into(),
@@ -4156,6 +4169,7 @@ mod tests {
 
         rewritten.set_concretetype(base, crate::model::ConcreteType::GcRef);
         rewritten.set_concretetype(result, crate::model::ConcreteType::Signed);
+        regalloc::augment_canonical_exceptblock_on_graph(&mut rewritten);
         let regallocs = regalloc::perform_all_register_allocations(&rewritten);
         let mut flat = flatten_graph(&rewritten, &regallocs);
         // Slice C-3: seed `SSARepr.value_kinds` with the canonical-
@@ -4498,6 +4512,7 @@ mod tests {
         graph.set_concretetype(rhs, crate::model::ConcreteType::Signed);
         graph.set_concretetype(sum, crate::model::ConcreteType::Signed);
 
+        regalloc::augment_canonical_exceptblock_on_graph(&mut graph);
         let regallocs = regalloc::perform_all_register_allocations(&graph);
         let mut flat = flatten_graph(&graph, &regallocs);
         assert!(

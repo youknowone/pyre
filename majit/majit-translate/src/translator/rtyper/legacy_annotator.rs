@@ -154,10 +154,22 @@ fn follow_raise_link(state: &mut AnnotationState, graph: &FunctionGraph, link: &
 
 fn link_arg_type(state: &AnnotationState, graph: &FunctionGraph, src: &LinkArg) -> ValueType {
     match src {
-        LinkArg::Value(_) => src
-            .as_value(graph)
-            .map(|v| state.get(v).clone())
-            .unwrap_or(ValueType::Unknown),
+        // After the Variable cutover, `as_value(graph)` returning
+        // `None` means the link references a `Variable` the graph
+        // never registered — i.e. malformed graph metadata.  Silently
+        // degrading to `Unknown` would mask that and could let the
+        // legacy-baseline dual-gate comparison pass with degraded
+        // types; fail loud so the producer's contract violation
+        // surfaces here.
+        LinkArg::Value(var) => {
+            let vid = src.as_value(graph).unwrap_or_else(|| {
+                panic!(
+                    "link_arg_type: LinkArg::Value references Variable {var:?} \
+                     that is not registered on the graph — malformed link.args"
+                )
+            });
+            state.get(vid).clone()
+        }
         LinkArg::Const(value) => const_value_type(&value.value),
     }
 }

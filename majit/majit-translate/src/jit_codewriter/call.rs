@@ -2529,13 +2529,24 @@ fn graph_non_void_arg_types(graph: &FunctionGraph) -> Vec<Type> {
         _ => Some(Type::Ref),
     };
     if !start.inputargs.is_empty() {
+        // Walk the raw `inputargs` list, not the
+        // `inputarg_value_ids(graph)` projection — the latter drops
+        // entries whose reverse `Variable → ValueId` bridge is
+        // missing, which would shorten the descriptor vec and
+        // surface as a bogus arity mismatch in `getcalldescr()`.
+        // Treat unresolved slots conservatively as `Type::Ref`
+        // (the same default the wildcard arm uses below).
         return start
-            .inputarg_value_ids(graph)
-            .into_iter()
-            .filter_map(|arg_id| {
-                let ty = start.operations.iter().find_map(|op| match &op.kind {
-                    crate::model::OpKind::Input { ty, .. } if op.result == Some(arg_id) => Some(ty),
-                    _ => None,
+            .inputargs
+            .iter()
+            .filter_map(|arg| {
+                let ty = graph.value_id_of(arg).and_then(|arg_id| {
+                    start.operations.iter().find_map(|op| match &op.kind {
+                        crate::model::OpKind::Input { ty, .. } if op.result == Some(arg_id) => {
+                            Some(ty)
+                        }
+                        _ => None,
+                    })
                 });
                 ty.map(map_ty).unwrap_or(Some(Type::Ref))
             })
@@ -4693,13 +4704,23 @@ fn collect_readwrite_effects(
     // `flowspace/model.py:244 renamevariables` walks `for link in
     // self.exits: link.args`), so resolve_array_identity can trace through
     // control-flow merges of any exit fan-out.
+    // Build the phi-sources map by walking each exit link's args
+    // against the unfiltered `Block.inputargs` list rather than the
+    // `inputarg_value_ids` projection — the latter drops entries when
+    // a Variable has no reverse `ValueId` mapping yet, which would
+    // shift every later `link.args[i]` onto the wrong destination
+    // slot and corrupt phi provenance.  RPython parity:
+    // `flowspace/model.py:244 renamevariables` walks `link.args`
+    // and `link.target.inputargs` positionally; missing-mapping
+    // entries are simply skipped here, never re-indexed.
     let mut phi_sources: HashMap<crate::model::ValueId, LinkArg> = HashMap::new();
     for block in &graph.blocks {
         for link in &block.exits {
             if let Some(target_block) = graph.blocks.get(link.target.0) {
-                let target_vids = target_block.inputarg_value_ids(graph);
-                for (ia, src) in target_vids.iter().zip(link.args.iter()) {
-                    phi_sources.insert(*ia, src.clone());
+                for (target_arg, src) in target_block.inputargs.iter().zip(link.args.iter()) {
+                    if let Some(ia) = graph.value_id_of(target_arg) {
+                        phi_sources.insert(ia, src.clone());
+                    }
                 }
             }
         }
@@ -4749,18 +4770,24 @@ fn collect_readwrite_effects(
                     nolength,
                     ..
                 } => {
-                    // RPython: op.args[0].concretetype → cpu.arraydescrof(ARRAY)
-                    let base_vid = graph
+                    // RPython: op.args[0].concretetype → cpu.arraydescrof(ARRAY).
+                    // When the reverse `Variable → ValueId` bridge is missing,
+                    // stay conservative — `resolve_array_identity` already
+                    // documents `None` as the "fall back to item_ty-only
+                    // keying" path, so propagate that instead of panicking.
+                    let resolved_id = graph
                         .value_id_of(base)
-                        .expect("ArrayRead.base must have a backing ValueId");
-                    let resolved_id = resolve_array_identity(
-                        graph,
-                        &base_vid,
-                        array_type_id,
-                        &value_producers,
-                        &phi_sources,
-                        cc,
-                    );
+                        .and_then(|base_vid| {
+                            resolve_array_identity(
+                                graph,
+                                &base_vid,
+                                array_type_id,
+                                &value_producers,
+                                &phi_sources,
+                                cc,
+                            )
+                        })
+                        .or_else(|| array_type_id.clone());
                     let len_offset = if *nolength { None } else { Some(0) };
                     let idx = descr_indices.array_index(
                         value_type_discriminant(item_ty),
@@ -4801,17 +4828,21 @@ fn collect_readwrite_effects(
                     nolength,
                     ..
                 } => {
-                    let base_vid = graph
+                    // Conservative fall-through when the reverse bridge is
+                    // missing — see the matching `ArrayRead` arm above.
+                    let resolved_id = graph
                         .value_id_of(base)
-                        .expect("ArrayWrite.base must have a backing ValueId");
-                    let resolved_id = resolve_array_identity(
-                        graph,
-                        &base_vid,
-                        array_type_id,
-                        &value_producers,
-                        &phi_sources,
-                        cc,
-                    );
+                        .and_then(|base_vid| {
+                            resolve_array_identity(
+                                graph,
+                                &base_vid,
+                                array_type_id,
+                                &value_producers,
+                                &phi_sources,
+                                cc,
+                            )
+                        })
+                        .or_else(|| array_type_id.clone());
                     let len_offset = if *nolength { None } else { Some(0) };
                     let idx = descr_indices.array_index(
                         value_type_discriminant(item_ty),
@@ -4856,17 +4887,21 @@ fn collect_readwrite_effects(
                     array_type_id,
                     ..
                 } => {
-                    let base_vid = graph
+                    // Conservative fall-through when the reverse bridge is
+                    // missing — see the matching `ArrayRead` arm above.
+                    let resolved_id = graph
                         .value_id_of(base)
-                        .expect("InteriorFieldRead.base must have a backing ValueId");
-                    let resolved_id = resolve_array_identity(
-                        graph,
-                        &base_vid,
-                        array_type_id,
-                        &value_producers,
-                        &phi_sources,
-                        cc,
-                    );
+                        .and_then(|base_vid| {
+                            resolve_array_identity(
+                                graph,
+                                &base_vid,
+                                array_type_id,
+                                &value_producers,
+                                &phi_sources,
+                                cc,
+                            )
+                        })
+                        .or_else(|| array_type_id.clone());
                     // Interior field bit — keyed on (ARRAY, fieldname),
                     // matching cpu.interiorfielddescrof(ARRAY, fieldname).
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
@@ -4929,17 +4964,21 @@ fn collect_readwrite_effects(
                     array_type_id,
                     ..
                 } => {
-                    let base_vid = graph
+                    // Conservative fall-through when the reverse bridge is
+                    // missing — see the matching `ArrayRead` arm above.
+                    let resolved_id = graph
                         .value_id_of(base)
-                        .expect("InteriorFieldWrite.base must have a backing ValueId");
-                    let resolved_id = resolve_array_identity(
-                        graph,
-                        &base_vid,
-                        array_type_id,
-                        &value_producers,
-                        &phi_sources,
-                        cc,
-                    );
+                        .and_then(|base_vid| {
+                            resolve_array_identity(
+                                graph,
+                                &base_vid,
+                                array_type_id,
+                                &value_producers,
+                                &phi_sources,
+                                cc,
+                            )
+                        })
+                        .or_else(|| array_type_id.clone());
                     // Interior field bit — keyed on (ARRAY, fieldname),
                     // matching cpu.interiorfielddescrof(ARRAY, fieldname).
                     let ifield_idx = descr_indices.interiorfield_index(&resolved_id, &field.name);
@@ -5551,8 +5590,12 @@ fn op_can_raise(op: &OpKind) -> RaiseClass {
 fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
     use crate::model::LinkArg;
 
-    let exceptblock_vids = graph.block(graph.exceptblock).inputarg_value_ids(graph);
-    let Some(&except_value) = exceptblock_vids.get(1) else {
+    // Read the exceptblock's `evalue` slot from the unfiltered
+    // `inputargs` so a missing reverse ValueId mapping does not shift
+    // index 1 onto the wrong Variable.  Same correctness concern as
+    // the `phi_sources` zip above.
+    let exceptblock_args = &graph.block(graph.exceptblock).inputargs;
+    let Some(except_value) = exceptblock_args.get(1).and_then(|arg| graph.value_id_of(arg)) else {
         return false;
     };
 
@@ -5560,10 +5603,16 @@ fn exceptblock_is_reraise_of_caught_exception(graph: &FunctionGraph) -> bool {
         crate::tool::algo::unionfind::UnionFind::<crate::model::ValueId, ()>::new(|_| ());
     for block in &graph.blocks {
         for link in &block.exits {
-            let target_vids = graph.block(link.target).inputarg_value_ids(graph);
-            for (arg, &target_arg) in link.args.iter().zip(target_vids.iter()) {
+            // Zip link args against the target block's raw `inputargs`
+            // (Variable identities) so unresolved entries are skipped
+            // in place, never re-indexed.
+            let target_inputargs = &graph.block(link.target).inputargs;
+            for (arg, target_arg) in link.args.iter().zip(target_inputargs.iter()) {
+                let Some(target_vid) = graph.value_id_of(target_arg) else {
+                    continue;
+                };
                 if let Some(value) = arg.as_value(graph) {
-                    families.union(value, target_arg);
+                    families.union(value, target_vid);
                 }
             }
         }

@@ -335,22 +335,31 @@ pub fn merge_synth_kinds_into_graph(
     post_result: &HashMap<ValueId, ConcreteType>,
 ) {
     use crate::model::ConcreteType;
-    // (0) `post_resolve` (lower precedence than `original` per the
-    // legacy comment, but `original` only fills slots `post_result`
-    // doesn't claim — so apply `post_resolve` first).
+    // Precedence per the signature docstring is
+    // `post_result > post_resolve > original`, so `post_resolve` is the
+    // base layer and `post_result` writes last.  Apply order matches
+    // precedence inverted — write the lowest-precedence layer first,
+    // then upper layers override:
+    //
+    //   (0) `post_resolve` — base layer; subsequent writes may
+    //       override.  Higher precedence than `original` because
+    //       `original` skips entries that `post_result` will
+    //       overwrite anyway, and otherwise carries
+    //       operand-inference kinds.
     for (value, kind) in post_resolve.iter() {
         if !matches!(kind, ConcreteType::Unknown) {
             graph.set_concretetype(value, kind.clone());
         }
     }
-    // (1) `original` operand inferences fill unresolved slots, but
-    // never override `post_result`.
+    //   (1) `original` operand inferences fill unresolved slots, but
+    //       skip `post_result`-claimed values so step (2) wins
+    //       unambiguously.
     for (value, kind) in original.iter() {
         if !post_result.contains_key(&value) && !matches!(kind, ConcreteType::Unknown) {
             graph.set_concretetype(value, kind.clone());
         }
     }
-    // (2) Op-result kinds win over operand inferences.
+    //   (2) Op-result kinds — highest precedence; last write wins.
     for (value, kind) in post_result {
         if !matches!(kind, ConcreteType::Unknown) {
             graph.set_concretetype(*value, kind.clone());

@@ -81,13 +81,15 @@ use crate::translator::rtyper::rtyper::RPythonTyper;
 /// the `specialize_legacy_graph` callback channel.
 ///
 /// `getkind` itself panics on the `NotImplementedError` cases
-/// (longlonglong / longfloat / non-pointer aggregates) — the
-/// upstream `history.py:62,70 raise NotImplementedError` shape.
-/// Pyre's legacy specialize callers want those failures routed
-/// through `Result<…, TyperError>` instead so a single unported
-/// rtype path doesn't unwind the whole `transform_graph_to_jitcode`
-/// driver; this wrapper catches the panic and converts it to a
-/// `TyperError::missing_rtype_operation` payload.
+/// (longlonglong / longfloat / non-pointer aggregates / InteriorPtr
+/// on a Variable's concretetype) — the upstream `history.py:62,70
+/// raise NotImplementedError` shape.  Pyre's legacy specialize
+/// callers want those failures routed through `Result<…, TyperError>`
+/// instead so a single unported rtype path doesn't unwind the whole
+/// `transform_graph_to_jitcode` driver; this wrapper catches the
+/// `getkind: …not supported…` payload only and re-raises everything
+/// else (so an assertion or logic bug inside `getkind` is NOT
+/// silently rebranded as a missing-rtype error in the dual gate).
 pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType, TyperError> {
     let ll_clone = ll.clone();
     let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -95,10 +97,25 @@ pub fn lowleveltype_to_concrete(ll: &LowLevelType) -> Result<ConcreteType, Typer
     }));
     match result {
         Ok(kind) => Ok(kind),
-        Err(_) => Err(TyperError::missing_rtype_operation(format!(
-            "lowleveltype_to_concrete: type {ll:?} not supported \
-             (history.py:70 raise NotImplementedError)"
-        ))),
+        Err(payload) => {
+            // `crate::model::getkind` raises its NotImplementedError-
+            // equivalent via `panic!("getkind: type … not supported …")`.
+            // Match that exact prefix + substring; resume_unwind anything
+            // else so we don't disguise real bugs as missing rtype ops.
+            let msg = payload
+                .downcast_ref::<&'static str>()
+                .map(|s| (*s).to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_default();
+            if msg.starts_with("getkind:") && msg.contains("not supported") {
+                Err(TyperError::missing_rtype_operation(format!(
+                    "lowleveltype_to_concrete: type {ll:?} not supported \
+                     (history.py:70 raise NotImplementedError)"
+                )))
+            } else {
+                std::panic::resume_unwind(payload)
+            }
+        }
     }
 }
 

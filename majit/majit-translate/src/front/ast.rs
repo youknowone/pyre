@@ -3611,6 +3611,13 @@ fn lower_if_expr(
     // only if then-arm is open (will `set_goto` to merge); a
     // closed arm's snapshot is unused.
     let then_exit_snapshot = ctx.getstate(0);
+    // Capture the full ctx as well so we can restore the surviving
+    // arm's `local_value_ids` / `local_value_types` if the other arm
+    // closes (return/raise/break).  Without this, e.g.
+    // `if cond { x = 1; } else { return 0; } x` would leave
+    // `ctx.local_value_ids["x"]` at the pre-branch state and the
+    // post-merge `x` read would lower to the wrong SSA value.
+    let then_exit_ctx = LocalBindingSnapshot::capture(ctx);
 
     // Stage B1: restore pre-branch ctx state before lowering
     // the else-arm so its `LOAD_FAST`-style reads see the
@@ -3633,6 +3640,9 @@ fn lower_if_expr(
         };
     }
     let else_exit_snapshot = ctx.getstate(0);
+    // Companion ctx capture for the else-arm — same rationale as
+    // `then_exit_ctx`.
+    let else_exit_ctx = LocalBindingSnapshot::capture(ctx);
 
     // RPython `flowspace/flowcontext.py` merges via Link: a
     // branch whose path is closed (`return`/`raise`/`break`)
@@ -3726,6 +3736,22 @@ fn lower_if_expr(
                 );
             }
         }
+    } else if then_open {
+        // The else-arm closed (return/raise/break) so the post-merge
+        // ctx must reflect the then-arm's `local_value_ids`/
+        // `local_value_types` rebinds.  At this point ctx still
+        // holds the else-arm's terminal state (or the pre-branch
+        // state if there was no else); restore the then-arm
+        // snapshot we captured before the pre-branch restore.
+        then_exit_ctx.restore(ctx);
+    } else if else_open {
+        // Symmetric case — then-arm closed, else-arm is the only
+        // reaching predecessor of the merge block.  `ctx` still
+        // holds the else-arm's terminal bindings via the chain of
+        // `lower_*` mutations, but be explicit so any future
+        // rearrangement of the lowering order does not silently
+        // break this contract.
+        else_exit_ctx.restore(ctx);
     }
 
     *block = merge_block;

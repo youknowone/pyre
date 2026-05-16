@@ -2175,9 +2175,17 @@ pub fn getkind(ty: &crate::translator::rtyper::lltypesystem::lltype::LowLevelTyp
         },
         // RPython does not place `InteriorPtr` directly on a
         // Variable's `concretetype`; it reaches the JIT codewriter
-        // only as the source of a `getinteriorfield` op.  Treat as
-        // a pointer-shaped slot conservatively.
-        LowLevelType::InteriorPtr(_) => ConcreteType::GcRef,
+        // only as the source of a `getinteriorfield` op.  Reaching
+        // this arm means the rtyper handed the codewriter an
+        // unsupported shape (same `NotImplementedError` family as
+        // upstream `history.py:62,70`).  Panic with the canonical
+        // `getkind: …not supported…` payload so
+        // [`crate::translator::rtyper::cutover::lowleveltype_to_concrete`]
+        // can route this to a fail-loud `TyperError::missing_rtype_operation`
+        // instead of silently coercing the operand to `GcRef`.
+        LowLevelType::InteriorPtr(_) => {
+            panic!("getkind: type {ty:?} not supported as concretetype (history.py:70)")
+        }
         // RPython `Func`/`Struct`/`Array`/`FixedSizeArray`/`Opaque`/
         // `ForwardReference` are not valid `concretetype` values for
         // a Variable — they only appear as the `TO` of a `Ptr`.

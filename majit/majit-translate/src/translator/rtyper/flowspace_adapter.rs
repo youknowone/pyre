@@ -574,6 +574,25 @@ fn normalize_binop_name(pyre_name: &str) -> Result<String, TyperError> {
 /// a Slice 1b followup commit. The error message names the specific
 /// variant so Slice 4's dual-gate failure cleanly identifies which
 /// followup needs to land.
+/// Project an operand `Variable` to its backing `ValueId` on `graph`,
+/// or surface the missing bridge as a `TyperError` so the dual-gate
+/// classifies the producer bug instead of unwinding the adapter.
+fn operand_value_id(
+    graph: &crate::model::FunctionGraph,
+    var: &Variable,
+    op: &SpaceOperation,
+    role: &str,
+) -> Result<ValueId, TyperError> {
+    graph.value_id_of(var).ok_or_else(|| {
+        TyperError::message(format!(
+            "translate_op: undefined operand ValueId for Variable {var:?} as {role} of {} \
+             (result {:?}) — graph.value_id_of returned None",
+            opkind_variant_name(&op.kind),
+            op.result,
+        ))
+    })
+}
+
 pub fn translate_op(
     op: &SpaceOperation,
     value_map: &HashMap<ValueId, Hlvalue>,
@@ -626,12 +645,8 @@ pub fn translate_op(
             rhs,
             ..
         } => {
-            let lhs_vid = graph
-                .value_id_of(lhs)
-                .expect("BinOp.lhs must have a backing ValueId on graph");
-            let rhs_vid = graph
-                .value_id_of(rhs)
-                .expect("BinOp.rhs must have a backing ValueId on graph");
+            let lhs_vid = operand_value_id(graph, lhs, op, "lhs")?;
+            let rhs_vid = operand_value_id(graph, rhs, op, "rhs")?;
             let l = lookup_operand(value_map, lhs_vid, op, "lhs")?;
             let r = lookup_operand(value_map, rhs_vid, op, "rhs")?;
             let result = resolve_result_hlvalue(op, value_map)?;
@@ -657,9 +672,7 @@ pub fn translate_op(
             operand,
             ..
         } => {
-            let operand_vid = graph
-                .value_id_of(operand)
-                .expect("UnaryOp.operand must have a backing ValueId on graph");
+            let operand_vid = operand_value_id(graph, operand, op, "operand")?;
             let v = lookup_operand(value_map, operand_vid, op, "operand")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
@@ -679,9 +692,7 @@ pub fn translate_op(
         // `getattr`/`setattr` op into a `getfield_*` / `setfield_*`
         // bytecode keyed on the field's lltype kind.
         OpKind::FieldRead { base, field, .. } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("FieldRead.base must have a backing ValueId");
+            let base_vid = operand_value_id(graph, base, op, "base")?;
             let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
@@ -696,12 +707,8 @@ pub fn translate_op(
         OpKind::FieldWrite {
             base, field, value, ..
         } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("FieldWrite.base must have a backing ValueId");
-            let value_vid = graph
-                .value_id_of(value)
-                .expect("FieldWrite.value must have a backing ValueId");
+            let base_vid = operand_value_id(graph, base, op, "base")?;
+            let value_vid = operand_value_id(graph, value, op, "value")?;
             let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
             let value_hl = lookup_operand(value_map, value_vid, op, "value")?;
             let result = resolve_result_hlvalue(op, value_map)?;
@@ -725,12 +732,8 @@ pub fn translate_op(
         // resolved type, lowering to `getarrayitem_gc_*` /
         // `setarrayitem_gc_*` bytecodes.
         OpKind::ArrayRead { base, index, .. } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("ArrayRead.base must have a backing ValueId");
-            let index_vid = graph
-                .value_id_of(index)
-                .expect("ArrayRead.index must have a backing ValueId");
+            let base_vid = operand_value_id(graph, base, op, "base")?;
+            let index_vid = operand_value_id(graph, index, op, "index")?;
             let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
             let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
             let result = resolve_result_hlvalue(op, value_map)?;
@@ -743,15 +746,9 @@ pub fn translate_op(
         OpKind::ArrayWrite {
             base, index, value, ..
         } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("ArrayWrite.base must have a backing ValueId");
-            let index_vid = graph
-                .value_id_of(index)
-                .expect("ArrayWrite.index must have a backing ValueId");
-            let value_vid = graph
-                .value_id_of(value)
-                .expect("ArrayWrite.value must have a backing ValueId");
+            let base_vid = operand_value_id(graph, base, op, "base")?;
+            let index_vid = operand_value_id(graph, index, op, "index")?;
+            let value_vid = operand_value_id(graph, value, op, "value")?;
             let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
             let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
             let value_hl = lookup_operand(value_map, value_vid, op, "value")?;
@@ -776,12 +773,8 @@ pub fn translate_op(
         OpKind::InteriorFieldRead {
             base, index, field, ..
         } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("InteriorFieldRead.base must have a backing ValueId");
-            let index_vid = graph
-                .value_id_of(index)
-                .expect("InteriorFieldRead.index must have a backing ValueId");
+            let base_vid = operand_value_id(graph, base, op, "base")?;
+            let index_vid = operand_value_id(graph, index, op, "index")?;
             let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
             let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
             let result = resolve_result_hlvalue(op, value_map)?;
@@ -805,15 +798,9 @@ pub fn translate_op(
             value,
             ..
         } => {
-            let base_vid = graph
-                .value_id_of(base)
-                .expect("InteriorFieldWrite.base must have a backing ValueId");
-            let index_vid = graph
-                .value_id_of(index)
-                .expect("InteriorFieldWrite.index must have a backing ValueId");
-            let value_vid = graph
-                .value_id_of(value)
-                .expect("InteriorFieldWrite.value must have a backing ValueId");
+            let base_vid = operand_value_id(graph, base, op, "base")?;
+            let index_vid = operand_value_id(graph, index, op, "index")?;
+            let value_vid = operand_value_id(graph, value, op, "value")?;
             let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
             let index_hl = lookup_operand(value_map, index_vid, op, "index")?;
             let value_hl = lookup_operand(value_map, value_vid, op, "value")?;
@@ -874,9 +861,7 @@ pub fn translate_op(
                 .enumerate()
                 .map(|(i, v)| {
                     let role = format!("args[{i}]");
-                    let vid = graph
-                        .value_id_of(v)
-                        .expect("Call arg must have a backing ValueId on graph");
+                    let vid = operand_value_id(graph, v, op, &role)?;
                     lookup_operand(value_map, vid, op, &role)
                 })
                 .collect();

@@ -59,7 +59,7 @@ fn regorconst_repr(arg: &RegOrConst) -> String {
 /// `OpKind::Call` argument lists print with `getkind(v.concretetype)`
 /// kinds instead of falling back to the Ref shape.
 pub fn format_assembler(ssarepr: &SSARepr) -> String {
-    format_assembler_with_types(ssarepr, None)
+    format_assembler_full(ssarepr, None, None)
 }
 
 /// Type-aware sibling of [`format_assembler`].  Mirrors
@@ -70,6 +70,28 @@ pub fn format_assembler(ssarepr: &SSARepr) -> String {
 pub fn format_assembler_with_types(
     ssarepr: &SSARepr,
     types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
+) -> String {
+    format_assembler_full(ssarepr, types, None)
+}
+
+/// Graph-aware sibling of [`format_assembler_with_types`].  When
+/// `graph` is supplied, Variable-typed operands resolve their render
+/// suffix via `graph.value_id_of(v)` (graph-local SSA numbering)
+/// rather than `Variable.id()` (process-wide identity).  Tests that
+/// need stable RPython-shaped `%i<n>` suffixes across runs should
+/// route through this entry point.
+pub fn format_assembler_with_graph(
+    ssarepr: &SSARepr,
+    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
+    graph: &crate::model::FunctionGraph,
+) -> String {
+    format_assembler_full(ssarepr, types, Some(graph))
+}
+
+fn format_assembler_full(
+    ssarepr: &SSARepr,
+    types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
+    graph: Option<&crate::model::FunctionGraph>,
 ) -> String {
     // First pass: collect every label that appears as a target so the
     // numbering matches format.py's getlabelname (labels are numbered in
@@ -126,7 +148,7 @@ pub fn format_assembler_with_types(
                 }
             }
             FlatOp::Op(space_op) => {
-                let args = op_args_repr(space_op, types);
+                let args = op_args_repr(space_op, types, graph);
                 if args.is_empty() {
                     let _ = writeln!(out, "{prefix}{}", op_name(space_op));
                 } else {
@@ -369,10 +391,18 @@ fn list_of_kind_repr(kind_char: char, args: &[ValueId]) -> String {
 /// Variable-typed sibling of [`list_of_kind_repr`].  Used by call-family
 /// `OpKind` variants whose argument slots have been flipped from
 /// `Vec<ValueId>` to `Vec<Variable>` per the upstream-orthodox storage
-/// model.  Variables are rendered using their dense `id` (process-wide
-/// stable per identity), which matches the ValueId-derived numbering for
-/// graphs constructed through `alloc_value_with_variable`.
-fn list_of_kind_repr_vars(kind_char: char, args: &[crate::flowspace::model::Variable]) -> String {
+/// model.  When `graph` is provided, each Variable's render suffix
+/// resolves via `graph.value_id_of(v)` — the graph-local SSA
+/// numbering RPython's `format_assembler` emits.  When it is `None`,
+/// fall back to `Variable.id()` (process-wide identity) which matches
+/// the SSA numbering for graphs constructed through
+/// `alloc_value_with_variable` but is unstable across run-time
+/// allocation order.
+fn list_of_kind_repr_vars(
+    kind_char: char,
+    args: &[crate::flowspace::model::Variable],
+    graph: Option<&crate::model::FunctionGraph>,
+) -> String {
     let kind = match kind_char.to_ascii_lowercase() {
         'i' => RegKind::Int,
         'f' => RegKind::Float,
@@ -380,9 +410,26 @@ fn list_of_kind_repr_vars(kind_char: char, args: &[crate::flowspace::model::Vari
     };
     let parts: Vec<String> = args
         .iter()
-        .map(|v| register_repr_for_kind(ValueId(v.id() as usize), kind))
+        .map(|v| register_repr_for_kind(variable_value_id(v, graph), kind))
         .collect();
     format!("{}[{}]", kind_char.to_ascii_uppercase(), parts.join(", "))
+}
+
+/// Resolve a [`crate::flowspace::model::Variable`] to its graph-local
+/// SSA [`ValueId`].  When `graph` is provided we look the bridge up
+/// via [`crate::model::FunctionGraph::value_id_of`]; failing that
+/// (and when no graph is supplied) we fall back to
+/// `ValueId(v.id() as usize)`.  The fallback matches the numbering
+/// established by `alloc_value_with_variable` for graphs built
+/// through pyre's frontend — sufficient for tests and JitCode.dump
+/// where the original graph is no longer accessible.
+fn variable_value_id(
+    v: &crate::flowspace::model::Variable,
+    graph: Option<&crate::model::FunctionGraph>,
+) -> ValueId {
+    graph
+        .and_then(|g| g.value_id_of(v))
+        .unwrap_or(ValueId(v.id() as usize))
 }
 
 /// format.py:20-23 — render a `funcptr` slot.
@@ -419,6 +466,7 @@ fn call_target_repr(target: &crate::model::CallTarget) -> String {
 fn call_funcptr_repr(
     funcptr: &crate::model::CallFuncPtr,
     types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
+    graph: Option<&crate::model::FunctionGraph>,
 ) -> String {
     match funcptr {
         crate::model::CallFuncPtr::Target(target) => call_target_repr(target),
@@ -426,16 +474,14 @@ fn call_funcptr_repr(
         // by construction.  Pyre's lowering, however, can
         // materialize a funcptr Variable as Int when the rtyper
         // chose the integer-indexed dispatch path (e.g. opcode
-        // dispatch tables).  When the caller supplies a
-        // `TypeResolutionState` we read kind from
-        // `getkind(v.concretetype)`; otherwise we keep the upstream
-        // default (`Ref`).
+        // dispatch tables).  When the caller supplies both a `graph`
+        // and a `TypeResolutionState` we resolve Variable → ValueId →
+        // kind through `getkind(v.concretetype)`; otherwise we keep
+        // the upstream default (`Ref`).
         crate::model::CallFuncPtr::Value(var) => {
-            // `types` is keyed by graph-local ValueId so it cannot resolve
-            // Variable-typed funcptrs directly; render via Variable.id()
-            // matching the pattern used by [`list_of_kind_repr_vars`].
-            let _ = types;
-            register_repr_for_kind(ValueId(var.id() as usize), RegKind::Ref)
+            let vid = variable_value_id(var, graph);
+            let kind = value_id_kind(vid, types).unwrap_or(RegKind::Ref);
+            register_repr_for_kind(vid, kind)
         }
     }
 }
@@ -532,6 +578,7 @@ fn kind_signature<T>(args_i: &[T], args_r: &[T], args_f: &[T]) -> String {
 fn op_args_repr(
     op: &crate::model::SpaceOperation,
     types: Option<&crate::jit_codewriter::type_state::TypeResolutionState>,
+    graph: Option<&crate::model::FunctionGraph>,
 ) -> String {
     use crate::model::OpKind;
     let mut out = String::new();
@@ -543,15 +590,18 @@ fn op_args_repr(
         // strict source PyPy uses.  Without types (test fixtures),
         // fall back to the Ref shape.
         OpKind::Call { args, .. } => {
-            // Project Variable.id() into the ValueId numbering used by
-            // `register_repr_for_kind`, matching the pattern used by
-            // [`list_of_kind_repr_vars`].  `types` is keyed by graph-local
-            // ValueId so it no longer resolves Variable-typed args; fall
-            // back to the Ref shape per the test-fixture path.
-            let _ = types;
+            // When a graph is provided we resolve Variable→ValueId via
+            // `value_id_of` so the render suffix matches RPython's
+            // graph-local SSA numbering.  Without it we fall back to
+            // `Variable.id()` (process-wide identity) — sufficient for
+            // tests that allocate Variables sequentially.
             let parts: Vec<String> = args
                 .iter()
-                .map(|v| register_repr_for_kind(ValueId(v.id() as usize), RegKind::Ref))
+                .map(|v| {
+                    let vid = variable_value_id(v, graph);
+                    let kind = value_id_kind(vid, types).unwrap_or(RegKind::Ref);
+                    register_repr_for_kind(vid, kind)
+                })
                 .collect();
             out.push_str(&parts.join(", "));
         }
@@ -594,17 +644,17 @@ fn op_args_repr(
             args_f,
             ..
         } => {
-            let mut parts = vec![call_funcptr_repr(funcptr, types)];
+            let mut parts = vec![call_funcptr_repr(funcptr, types, graph)];
             // jtransform.py:430-433 — emit each ListOfKind only when the
             // matching kind char is in the signature.
             if !args_i.is_empty() {
-                parts.push(list_of_kind_repr_vars('i', args_i));
+                parts.push(list_of_kind_repr_vars('i', args_i, graph));
             }
             if !args_r.is_empty() {
-                parts.push(list_of_kind_repr_vars('r', args_r));
+                parts.push(list_of_kind_repr_vars('r', args_r, graph));
             }
             if !args_f.is_empty() {
-                parts.push(list_of_kind_repr_vars('f', args_f));
+                parts.push(list_of_kind_repr_vars('f', args_f, graph));
             }
             // jtransform.py:434 — descr is the last sublist when set.
             parts.push(format!("{:?}", descriptor.extra_info));
@@ -628,13 +678,13 @@ fn op_args_repr(
             };
             let mut parts = vec![head];
             if !args_i.is_empty() {
-                parts.push(list_of_kind_repr_vars('i', args_i));
+                parts.push(list_of_kind_repr_vars('i', args_i, graph));
             }
             if !args_r.is_empty() {
-                parts.push(list_of_kind_repr_vars('r', args_r));
+                parts.push(list_of_kind_repr_vars('r', args_r, graph));
             }
             if !args_f.is_empty() {
-                parts.push(list_of_kind_repr_vars('f', args_f));
+                parts.push(list_of_kind_repr_vars('f', args_f, graph));
             }
             out.push_str(&parts.join(", "));
         }
@@ -652,12 +702,12 @@ fn op_args_repr(
             ..
         } => {
             let mut parts = vec![format!("${jd_index}")];
-            parts.push(list_of_kind_repr_vars('i', greens_i));
-            parts.push(list_of_kind_repr_vars('r', greens_r));
-            parts.push(list_of_kind_repr_vars('f', greens_f));
-            parts.push(list_of_kind_repr_vars('i', reds_i));
-            parts.push(list_of_kind_repr_vars('r', reds_r));
-            parts.push(list_of_kind_repr_vars('f', reds_f));
+            parts.push(list_of_kind_repr_vars('i', greens_i, graph));
+            parts.push(list_of_kind_repr_vars('r', greens_r, graph));
+            parts.push(list_of_kind_repr_vars('f', greens_f, graph));
+            parts.push(list_of_kind_repr_vars('i', reds_i, graph));
+            parts.push(list_of_kind_repr_vars('r', reds_r, graph));
+            parts.push(list_of_kind_repr_vars('f', reds_f, graph));
             out.push_str(&parts.join(", "));
         }
         _ => {

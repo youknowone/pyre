@@ -2049,16 +2049,34 @@ pub struct Variable {
     pub concretetype: Rc<std::cell::RefCell<Option<ConcretetypePlaceholder>>>,
 }
 
-// SAFETY: Variable holds `Rc<Cell<...>>` / `Rc<RefCell<...>>` cells that
-// are inherently `!Send + !Sync`.  pyre and majit-translate are
-// single-threaded throughout (no `std::thread::spawn`, no rayon, no
-// tokio), and the generated `static OnceLock<AllJitCodes>` is never
-// concurrently accessed across threads.  RPython upstream relies on the
-// CPython GIL for the same invariant.  Declaring `Send + Sync` lets
-// Variable flow through types that the compiler must prove `Sync` for
-// the static (e.g. `OpKind` variants carrying a `Variable` operand
-// field after the storage flip).  Any future introduction of real
-// multi-threading must revisit this invariant first.
+// SAFETY: `Variable` holds `Rc<Cell<...>>` / `Rc<RefCell<...>>` cells
+// that are inherently `!Send + !Sync`.  The `Send + Sync` assertion is
+// required because the generated `static OnceLock<AllJitCodes>` stores
+// `OpKind` variants whose operand fields carry `Variable` after the
+// storage flip — `OnceLock<T>` requires `T: Sync`.
+//
+// The invariant we rely on is "no live `Variable` ever crosses a
+// thread boundary".  This holds today because:
+//
+//   * `majit-translate` (the only producer of `Variable`) runs end-to-
+//     end on the main thread during translation; no `std::thread::spawn`
+//     / rayon / tokio inside this crate.
+//   * The one auxiliary thread spawned anywhere in the workspace
+//     (`majit-metainterp::JitDriver::new` →
+//     `std::thread::spawn` at jitdriver.rs:783) only touches a
+//     `QuasiImmut` instance behind `Arc<Mutex<…>>`; that struct does
+//     not embed any `Variable`.
+//   * The `static OnceLock<AllJitCodes>` stores read-only `JitCode`
+//     payloads after translation finishes; the immutable bytecode +
+//     constant pools are what downstream consumers read, not the
+//     `Variable` graph metadata that produced them.
+//
+// Adding any code path that lets a `Variable` (or any type embedding
+// one transitively) cross a thread boundary must first either (a)
+// convert `Variable`'s inner cells to `Arc<Atomic*>` / `Arc<Mutex<…>>`,
+// or (b) confine that path behind an owning thread-local equivalent.
+// Search for `unsafe impl Sync for Variable` before touching anything
+// that flows `Variable` into multi-threaded data.
 unsafe impl Send for Variable {}
 unsafe impl Sync for Variable {}
 

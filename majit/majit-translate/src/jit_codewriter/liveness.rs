@@ -249,7 +249,15 @@ fn compute_liveness_pass_with_graph(
             FlatOp::EndOfBlock => {
                 alive.clear();
             }
-            FlatOp::Unreachable => {}
+            FlatOp::Unreachable => {
+                // Same liveness semantics as `EndOfBlock`: the
+                // instruction stream past this point cannot execute,
+                // so registers that are only live in the dead tail
+                // must NOT leak backward into earlier `-live-`
+                // markers.  Without this clear, regalloc / resume
+                // would over-pin those slots for no observable use.
+                alive.clear();
+            }
             FlatOp::Op(inner_op) => {
                 if let Some(result) = inner_op.result {
                     def_value(&mut alive, result);

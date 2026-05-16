@@ -520,6 +520,23 @@ pub fn augment_canonical_exceptblock_on_graph(graph: &mut FunctionGraph) {
 /// now.  Canonical exceptblock inputargs are stamped on the graph
 /// up-front via [`augment_canonical_exceptblock_on_graph`].
 pub fn perform_all_register_allocations(graph: &FunctionGraph) -> HashMap<RegKind, RegAllocResult> {
+    // Fail loud if the canonical exceptblock inputargs are still
+    // `Unknown` — `variable_regkind` silently drops `Unknown` so a
+    // missed call to [`augment_canonical_exceptblock_on_graph`] would
+    // leave `last_exception` / `last_exc_value` un-coloured (no
+    // register class), and any later flatten/assembler pass would
+    // emit ops that reference uncolored values without any diagnostic.
+    let except_args = graph.block(graph.exceptblock).inputarg_value_ids(graph);
+    if except_args.len() == 2 {
+        assert!(
+            !matches!(graph.concretetype(except_args[0]), ConcreteType::Unknown)
+                && !matches!(graph.concretetype(except_args[1]), ConcreteType::Unknown),
+            "perform_all_register_allocations: canonical exceptblock inputargs are still \
+             Unknown — caller must run augment_canonical_exceptblock_on_graph() before \
+             register allocation (graph: {})",
+            graph.name,
+        );
+    }
     let mut result = HashMap::new();
     for kind in [RegKind::Int, RegKind::Ref, RegKind::Float] {
         result.insert(kind, perform_register_allocation(graph, kind));

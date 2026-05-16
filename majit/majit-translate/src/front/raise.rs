@@ -56,16 +56,17 @@
 //! self.args[1:]` — that is, `args[0]` is *itself* the Constant
 //! carrier, with no producing op.
 //!
-//! Pyre's `FunctionGraph` currently represents every SSA value
-//! through `ValueId(usize)` produced by a `SpaceOperation`; the
-//! op-args slot is `Vec<ValueId>` (no `LinkArg`-style mixed enum).
-//! The properly orthodox fix is to migrate `OpKind::Call.args` to
-//! `Vec<LinkArg>` (RPython parity rule #1: structural equivalence)
-//! and update every consumer (~80 sites across 14 files spanning
-//! `front/`, `inline.rs`, `jit_codewriter/{call,jtransform,liveness,
-//! regalloc,assembler,format,flatten,support}.rs`,
-//! `translator/rtyper/rpbc.rs`, plus tests).  That is a multi-
-//! session port and is **deferred**.
+//! Pyre's `FunctionGraph` represents every SSA value through
+//! `ValueId(usize)` produced by a `SpaceOperation`.  The op-args slot
+//! is currently `Vec<Variable>` (migrated from `Vec<ValueId>` as part
+//! of the Variable-based IR refactor) and still carries no
+//! `LinkArg`-style mixed enum.  The properly orthodox fix is to
+//! migrate `OpKind::Call.args` to `Vec<LinkArg>` (RPython parity rule
+//! #1: structural equivalence) and update every consumer (~80 sites
+//! across 14 files spanning `front/`, `inline.rs`,
+//! `jit_codewriter/{call,jtransform,liveness,regalloc,assembler,
+//! format,flatten,support}.rs`, `translator/rtyper/rpbc.rs`, plus
+//! tests).  That is a multi-session port and is **deferred**.
 //!
 //! Until the `Vec<LinkArg>` migration lands, this helper carries the
 //! constant exception class as the *second segment* of the
