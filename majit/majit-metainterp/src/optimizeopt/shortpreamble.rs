@@ -1108,7 +1108,7 @@ pub struct ProducedShortOp {
 /// closure inside the legacy `import_short_preamble_ops` (unroll.rs:3510).
 fn imported_const_opref(
     ctx: &mut crate::optimizeopt::OptContext,
-    imported_constants: &mut HashMap<OpRef, OpRef>,
+    imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
     source: OpRef,
     value: &majit_ir::Value,
 ) -> OpRef {
@@ -1137,8 +1137,8 @@ pub(crate) fn classify_short_arg(
     arg: OpRef,
     short_inputargs: &[OpRef],
     short_args: &[OpRef],
-    produced_results: &HashMap<OpRef, OpRef>,
-    imported_constants: &mut HashMap<OpRef, OpRef>,
+    produced_results: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+    imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
     short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
 ) -> Option<crate::optimizeopt::ImportedShortPureArg> {
     if let Some(slot) = short_inputargs.iter().position(|&i| i == arg) {
@@ -1197,9 +1197,9 @@ impl ProducedShortOp {
         exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
-        result_map: &HashMap<OpRef, OpRef>,
-        produced_results: &mut HashMap<OpRef, OpRef>,
-        imported_constants: &mut HashMap<OpRef, OpRef>,
+        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        produced_results: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let result = match self.kind {
@@ -1268,9 +1268,9 @@ impl ProducedShortOp {
         ctx: &mut crate::optimizeopt::OptContext,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
-        result_map: &HashMap<OpRef, OpRef>,
-        produced_results: &mut HashMap<OpRef, OpRef>,
-        imported_constants: &mut HashMap<OpRef, OpRef>,
+        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        produced_results: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
@@ -1373,9 +1373,9 @@ impl ProducedShortOp {
         exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
-        result_map: &HashMap<OpRef, OpRef>,
-        produced_results: &HashMap<OpRef, OpRef>,
-        imported_constants: &mut HashMap<OpRef, OpRef>,
+        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        produced_results: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
@@ -1465,9 +1465,9 @@ impl ProducedShortOp {
         exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
-        result_map: &HashMap<OpRef, OpRef>,
-        produced_results: &HashMap<OpRef, OpRef>,
-        imported_constants: &mut HashMap<OpRef, OpRef>,
+        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        produced_results: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
@@ -1572,9 +1572,9 @@ impl ProducedShortOp {
         ctx: &mut crate::optimizeopt::OptContext,
         short_inputargs: &[OpRef],
         short_args: &[OpRef],
-        result_map: &HashMap<OpRef, OpRef>,
-        produced_results: &HashMap<OpRef, OpRef>,
-        imported_constants: &mut HashMap<OpRef, OpRef>,
+        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        produced_results: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();

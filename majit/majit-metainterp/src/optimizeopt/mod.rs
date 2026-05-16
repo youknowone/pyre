@@ -2310,8 +2310,8 @@ impl OptContext {
         short_inputargs: &[OpRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
         short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
-        result_map: &HashMap<OpRef, OpRef>,
-        mut imported_constants: &mut HashMap<OpRef, OpRef>,
+        result_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+        mut imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         exported_infos: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, crate::optimizeopt::info::OpInfo>,
     ) -> bool {
         use crate::optimizeopt::shortpreamble::{
@@ -2397,7 +2397,7 @@ impl OptContext {
         }
 
         let mut produced: Vec<(OpRef, ProducedShortOp)> = Vec::with_capacity(short_boxes.len());
-        let mut produced_results: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut produced_results: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
         // shortpreamble.py:PreambleOp.add_op_to_short — Pure ops whose
         // opcode is a Call get rewritten to the CallPure* equivalent so
         // the short preamble can replay the cached call without
@@ -2431,8 +2431,8 @@ impl OptContext {
         // `produce_arg` path.
         let resolve_arg = |arg: OpRef,
                            ctx: &mut Self,
-                           produced_results: &HashMap<OpRef, OpRef>,
-                           imported_constants: &mut HashMap<OpRef, OpRef>|
+                           produced_results: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+                           imported_constants: &mut crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>|
          -> Option<OpRef> {
             crate::optimizeopt::shortpreamble::classify_short_arg(
                 ctx,

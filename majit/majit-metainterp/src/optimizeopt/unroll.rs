@@ -3580,7 +3580,7 @@ impl OptUnroll {
         // before `produce_op` runs; majit must allocate the result OpRef
         // with the typed allocator so `opref_type` resolution doesn't
         // depend on a downstream `register_value_type` patch.
-        let mut result_map: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut result_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (source, produced) in &exported_state.short_boxes {
             let result_type = produced.preamble_op.result_type();
             let result = match produced.kind {
@@ -3614,7 +3614,7 @@ impl OptUnroll {
                 result_map.insert(*source, result);
             }
         }
-        let mut imported_constants: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut imported_constants: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
         let from_short_boxes = ctx.initialize_imported_short_preamble_builder_from_short_boxes(
             &short_args,
             &exported_state.short_inputargs,
@@ -3641,7 +3641,7 @@ impl OptUnroll {
         // `Some(source)` (Phase 1 OpRef = `self.res`); for invented Pure the
         // value is the body-visible OpRef per `replay_pos` in
         // `initialize_imported_short_preamble_builder_from_short_boxes`.
-        let mut produced_results: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut produced_results: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (_, produced) in &exported_state.short_boxes {
             let produced_result = produced.produce_op(
                 ctx,
