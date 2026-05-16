@@ -4443,7 +4443,7 @@ mod tests {
         opt.constant_types.insert(101, majit_ir::Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
 
-        let new_positions: std::collections::HashSet<_> = result
+        let new_positions: Vec<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::New)
             .map(|op| op.pos.get())

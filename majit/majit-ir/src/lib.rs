@@ -10,6 +10,7 @@ pub mod resumecode;
 pub mod resumedata;
 pub mod value;
 pub mod vec_assoc;
+pub mod vec_set;
 
 // Re-export key types at crate root for convenience.
 pub use descr::{

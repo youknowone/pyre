@@ -26,7 +26,6 @@
 //! works for the warmstate side, but actual token frees only happen
 //! once Slices 3.5–3.6 prune the other strong owners.
 
-use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
@@ -62,7 +61,7 @@ pub struct MemoryManager {
     /// at `memmgr.py:13-14`).
     ///
     /// **Pointer-key soundness:** `*const JitCellToken` is used **only
-    /// as HashMap key**.  The Arc value held alongside guarantees the
+    /// as an associative-container key**. The Arc value held alongside guarantees the
     /// pointee is alive for the lifetime of the entry, so pointer
     /// identity is stable until removal.
     pub alive_loops:
@@ -233,7 +232,7 @@ impl MemoryManager {
     /// debug_print("Loop tokens left:  ", newtotal)
     /// debug_stop("jit-mem-collect")
     /// ```
-    /// Pyre uses `HashMap::retain` to fuse the iterate + delete steps.
+    /// Pyre uses `VecAssoc::retain` to fuse the iterate + delete steps.
     /// PRE-EXISTING-ADAPTATION: pyre uses a single `MAJIT_LOG` switch
     /// instead of `rlib/debug.py debug_start/stop` per-channel
     /// registry.  Channel name embedded in the message prefix

@@ -29,13 +29,13 @@ pub struct JitCodeBuilder {
     /// against runtime-emitted bytecode.  Recording happens through
     /// `start_instr` / `write_insn`; every helper that pushes an opcode
     /// byte goes through one of those.
-    startpoints: std::collections::HashSet<usize>,
+    startpoints: majit_ir::vec_set::VecSet<usize>,
     /// RPython `assembler.py:176` `self.alllabels.add(len(self.code))` —
     /// every TLabel emit records the bytecode offset of the 2-byte
     /// label slot so `JitCode.follow_jump` (RPython `jitcode.py:108-109`)
     /// can fire its non-translated `assert position in self._alllabels`
     /// debug check.  Populated by `push_label_ref`.
-    alllabels: std::collections::HashSet<usize>,
+    alllabels: majit_ir::vec_set::VecSet<usize>,
     num_regs_i: u16,
     num_regs_r: u16,
     num_regs_f: u16,

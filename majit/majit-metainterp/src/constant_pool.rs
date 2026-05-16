@@ -235,7 +235,7 @@ impl ConstantPool {
         }
     }
 
-    /// Update HashMap from shadow stack — GC may have moved Ref objects.
+    /// Update constants map from shadow stack — GC may have moved Ref objects.
     /// gcreftracer.py:gcrefs_trace parity.
     ///
     /// `rooted_refs` is populated only by `get_or_insert_typed` under

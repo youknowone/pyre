@@ -341,8 +341,8 @@ impl Assembler {
             num_regs_f,
             label_positions: HashMap::new(),
             tlabel_fixups: Vec::new(),
-            startpoints: std::collections::HashSet::new(),
-            alllabels: std::collections::HashSet::new(),
+            startpoints: majit_ir::vec_set::VecSet::new(),
+            alllabels: majit_ir::vec_set::VecSet::new(),
             resulttypes: majit_ir::vec_assoc::VecAssoc::new(),
         };
 
@@ -2545,10 +2545,10 @@ struct AssemblyState {
     num_regs_f: usize,
     label_positions: HashMap<Label, usize>,
     tlabel_fixups: Vec<(Label, usize)>,
-    startpoints: std::collections::HashSet<usize>,
+    startpoints: majit_ir::vec_set::VecSet<usize>,
     /// RPython assembler.py:176: positions in bytecode where TLabel operands
     /// are written. Used by JitCode.follow_jump() for verification.
-    alllabels: std::collections::HashSet<usize>,
+    alllabels: majit_ir::vec_set::VecSet<usize>,
     /// RPython assembler.py:217-219: map from bytecode offset (after `->`)
     /// to result kind character. Recorded when encoding result registers.
     resulttypes: majit_ir::vec_assoc::VecAssoc<usize, char>,
