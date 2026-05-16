@@ -6591,12 +6591,11 @@ impl<'a> ResumeDataDirectReader<'a> {
                     majit_ir::Type::Void => value,
                 }
             }
-            TAGINT => {
-                // RPython: decode_ref never sees TAGINT (assert tag == TAGBOX).
-                // Fires when optimizer produces TAGINT in ref-register snapshot.
-                self.allocator.box_int(num as i64)
-            }
             _ => {
+                // resume.py:1574 `assert tag == TAGBOX`: in a ref slot
+                // only TAGCONST / TAGVIRTUAL / TAGBOX are valid.  TAGINT
+                // here means the numbering stage produced an int-tagged
+                // entry in a ref position — a producer bug.
                 panic!("decode_ref: unexpected tag {tag}")
             }
         }
