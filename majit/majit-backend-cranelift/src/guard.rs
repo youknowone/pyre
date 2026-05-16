@@ -902,6 +902,17 @@ impl majit_ir::Descr for CraneliftFailDescr {
         Some(self)
     }
 
+    /// `cranelift_resumedata_deopt` (`pyre/pyre-jit/src/call_jit.rs:3837`)
+    /// receives the backend `CraneliftFailDescr` Arc from
+    /// `fail_descr_arc_from_addr` and needs to reach the metainterp
+    /// `ResumeGuardDescr` for the `rd_*` payload.  Forward through
+    /// `meta_descr` so the downstream `downcast_ref::<ResumeGuardDescr>()`
+    /// resolves against the metainterp Arc rather than failing on the
+    /// backend wrapper's trait default `None`.
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        self.meta_descr.as_ref().and_then(|d| d.as_any())
+    }
+
     /// `compile.py:185` `isinstance(descr, ResumeDescr)` parity. Backend
     /// `CraneliftFailDescr` plays the role of upstream's
     /// `ResumeGuardDescr` for guard-failure exits, of the
