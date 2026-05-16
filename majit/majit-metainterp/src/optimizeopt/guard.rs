@@ -710,27 +710,38 @@ impl GuardStrengthenOpt {
                     }
                     // guard.py:295: info.remove(other.op.getdescr())
                     // RPython: unconditional call. version.py:38-42 asserts
-                    // descr is in leads_to — if not, it's a programming error.
-                    // Key by `Descr::index()` (globally unique) rather than
-                    // `FailDescr::fail_index()` (per-trace, 0 pre-codegen).
-                    if let Some(descr) = other
+                    // descr is in leads_to — if not, it's a programming
+                    // error.  Key by `Descr::index()` (globally unique)
+                    // rather than `FailDescr::fail_index()` (per-trace, 0
+                    // pre-codegen).  Fail loud on missing/non-FailDescr
+                    // descr instead of silently desynchronizing
+                    // `version_info` (stale `leads_to` entry).
+                    let other_descr = other
                         .op
                         .descr
                         .as_ref()
-                        .filter(|d| d.as_fail_descr().is_some())
-                    {
-                        version_info.remove(descr.index());
-                    }
+                        .expect("guard.py:295 other.op.getdescr() must exist");
+                    assert!(
+                        other_descr.as_fail_descr().is_some(),
+                        "guard.py:295 other.op.getdescr() must be a FailDescr"
+                    );
+                    version_info.remove(other_descr.index());
                     // guard.py:296: other.set_to_none(info, loop)
                     other.set_to_none(&mut opt_ops);
                     // guard.py:297-299: info.track(transitive_guard, descr, version)
-                    if let Some(descr) = tg.descr.as_ref().filter(|d| d.as_fail_descr().is_some()) {
-                        info_track_guard(
-                            version_info,
-                            descr.index(),
-                            version.as_ref().unwrap().clone(),
-                        );
-                    }
+                    let tg_descr = tg
+                        .descr
+                        .as_ref()
+                        .expect("guard.py:297 transitive_guard.descr must exist");
+                    assert!(
+                        tg_descr.as_fail_descr().is_some(),
+                        "guard.py:297 transitive_guard.descr must be a FailDescr"
+                    );
+                    info_track_guard(
+                        version_info,
+                        tg_descr.index(),
+                        version.as_ref().unwrap().clone(),
+                    );
                 }
             }
         }
