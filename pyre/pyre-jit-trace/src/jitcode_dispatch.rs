@@ -1524,6 +1524,91 @@ fn getfield_gc_via_heapcache(
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 
+/// `getfield_vable_<i|r|f>/rd>X` handler. Operand layout `rd>X`:
+/// 1B r-reg(vable_box) + 2B descr(field) + 1B X-dst.
+///
+/// RPython parity: `pyjitpl.py:1167-1186 opimpl_getfield_vable_{i,r,f}`:
+///
+///   def opimpl_getfield_vable_i(self, box, fielddescr, pc):
+///       if self._nonstandard_virtualizable(pc, box, fielddescr):
+///           return self.opimpl_getfield_gc_i(box, fielddescr)
+///       self.metainterp.check_synchronized_virtualizable()
+///       index = self._get_virtualizable_field_index(fielddescr)
+///       return self.metainterp.virtualizable_boxes[index]
+///
+/// The walker delegates to the orthodox `TraceCtx::vable_getfield_{int,
+/// ref,float}` ports (`majit-metainterp/src/trace_ctx.rs:1715, 1801,
+/// 1839`) which already implement the full
+/// `_nonstandard_virtualizable` check + heapcache-aware GETFIELD_GC
+/// fallback + `virtualizable_boxes[index]` cache read.  Walker is the
+/// symbolic shadow validator (`shadow_walker.rs`); only the OpRef
+/// component of the `(OpRef, Value)` tuple is meaningful here, since
+/// register banks carry only OpRefs — the concrete `Value` is tracked
+/// on the trait-driven leg.  `dst_bank` selects the result bank
+/// (`'i'`/`'r'`/`'f'`) the walker writes back into, mirroring
+/// `getfield_gc_via_heapcache`'s shape.
+fn getfield_vable_via_metainterp(
+    code: &[u8],
+    op: &DecodedOp,
+    ctx: &mut WalkContext<'_, '_>,
+    dst_bank: char,
+) -> Result<(DispatchOutcome, usize), DispatchError> {
+    let obj = read_ref_reg(code, op, 0, ctx)?;
+    let descr = read_descr(code, op, 1, ctx)?;
+
+    let (result, _value) = match dst_bank {
+        'i' => ctx.trace_ctx.vable_getfield_int(obj, descr),
+        'r' => ctx.trace_ctx.vable_getfield_ref(obj, descr),
+        'f' => ctx.trace_ctx.vable_getfield_float(obj, descr),
+        _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
+    };
+
+    let dst = code[op.pc + 4] as usize;
+    match dst_bank {
+        'i' => {
+            let len = ctx.registers_i.len();
+            let slot = ctx
+                .registers_i
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "i",
+                })?;
+            *slot = result;
+        }
+        'r' => {
+            let len = ctx.registers_r.len();
+            let slot = ctx
+                .registers_r
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "r",
+                })?;
+            *slot = result;
+        }
+        'f' => {
+            let len = ctx.registers_f.len();
+            let slot = ctx
+                .registers_f
+                .get_mut(dst)
+                .ok_or(DispatchError::RegisterOutOfRange {
+                    pc: op.pc,
+                    reg: dst,
+                    len,
+                    bank: "f",
+                })?;
+            *slot = result;
+        }
+        _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
+    }
+    Ok((DispatchOutcome::Continue, op.next_pc))
+}
+
 /// Generic int-bank unary handler. Operand layout `i>i` (1B src + 1B
 /// dst). RPython parity: `pyjitpl.py:356-368` exec-generated
 /// `opimpl_int_<unary>` (int_neg / int_invert / int_is_zero etc.) +
@@ -3683,6 +3768,17 @@ fn handle(
         "getfield_gc_f_pure/rd>f" => {
             getfield_gc_via_heapcache(code, op, ctx, OpCode::GetfieldGcF, 'f')
         }
+        // Virtualizable getfield reads. RPython
+        // `pyjitpl.py:1167-1186 opimpl_getfield_vable_{i,r,f}` —
+        // walker delegates to `TraceCtx::vable_getfield_{int,ref,float}`
+        // which already implements `_nonstandard_virtualizable` fallback
+        // to GETFIELD_GC + standard-vable `virtualizable_boxes[index]`
+        // cache read (`majit-metainterp/src/trace_ctx.rs:1715/1801/1839`).
+        // Same `rd>X` operand shape as `getfield_gc_*`; only the
+        // semantic handler routes through the vable mirror.
+        "getfield_vable_i/rd>i" => getfield_vable_via_metainterp(code, op, ctx, 'i'),
+        "getfield_vable_r/rd>r" => getfield_vable_via_metainterp(code, op, ctx, 'r'),
+        "getfield_vable_f/rd>f" => getfield_vable_via_metainterp(code, op, ctx, 'f'),
         // setfield_gc canonical shapes. `iid` / `ird` (int box)
         // shapes are pyre kind-flow Task #85 territory and stay
         // unsupported.
@@ -6923,18 +7019,18 @@ mod tests {
 
     #[test]
     fn unsupported_opname_surfaces_typed_error() {
-        // Slice 2j added int arithmetic + comparison handlers. The
-        // `getfield_vable_i/rd>i` opname is the next blocker for the
-        // ignored `walk_return_value_arm_*` test (cf. test failure
-        // log) and remains unsupported pending Phase D-3 (MIFrame
-        // virtualizable_boxes + heapcache + vinfo prereqs). Stable
-        // choice for exercising the catch-all `UnsupportedOpname`
-        // error path while handler coverage continues to grow.
-        let opname = "getfield_vable_i/rd>i";
+        // Stable choice for exercising the catch-all `UnsupportedOpname`
+        // error path while handler coverage continues to grow.  The
+        // `setfield_vable_i/rid` opname is the next-in-line for the
+        // vable mirror to gain a walker handler (T2 follow-on: pyjitpl.py
+        // :1188-1199 `_opimpl_setfield_vable` with
+        // `TraceCtx::vable_setfield`); until that lands, dispatching it
+        // surfaces `UnsupportedOpname` from the catch-all arm.
+        let opname = "setfield_vable_i/rid";
         let unsupported_byte = *insns_opname_to_byte()
             .get(opname)
             .unwrap_or_else(|| panic!("`{opname}` must be in insns table"));
-        // Operand encoding `rd>i`: 1B r-reg + 2B descr + 1B dst = 4B
+        // Operand encoding `rid`: 1B r-reg + 1B i-reg + 2B descr = 4B
         let code = [unsupported_byte, 0, 0, 0, 0];
         let mut tc = fresh_trace_ctx();
         let descr = done_descr_ref_for_tests();
@@ -8935,6 +9031,81 @@ mod tests {
                 bank: "r",
             },
         );
+    }
+
+    #[test]
+    fn getfield_vable_i_routes_through_metainterp_and_writes_dst() {
+        // T2 sanity: `getfield_vable_i/rd>i` delegates to
+        // `TraceCtx::vable_getfield_int`.  With no `virtualizable_info`
+        // bound on the trace context, `is_nonstandard_virtualizable`
+        // returns true and the fallback emits a `GetfieldGcI` op +
+        // writes the recorder OpRef into `registers_i[dst]` — the same
+        // shape `getfield_gc_via_heapcache` produces on a cache miss.
+        // The handler itself stays orthodox to RPython
+        // `pyjitpl.py:1167-1172 opimpl_getfield_vable_i`; the
+        // GETFIELD_GC fallback is `vable_getfield_int`'s decision, not
+        // the walker's, so this test exercises the walker→trace_ctx
+        // boundary without depending on a `virtualizable_info` fixture.
+        let byte = *insns_opname_to_byte()
+            .get("getfield_vable_i/rd>i")
+            .expect("`getfield_vable_i/rd>i` must be in insns table");
+        // Operand layout `rd>i`: 1B r-reg(2) + 2B descr-index(LE 1) + 1B dst(5).
+        let code = [byte, 0x02, 0x01, 0x00, 0x05];
+        let mut tc = fresh_trace_ctx();
+        let mut regs_r = distinct_const_refs(&mut tc, 8);
+        let mut regs_i = distinct_const_refs(&mut tc, 8);
+        let obj = regs_r[2];
+        let dst_pre = regs_i[5];
+        let descr = field_descr_with_index(1);
+        let descr_pool: Vec<DescrRef> = vec![make_fail_descr(0), descr.clone()];
+        let frame_done = done_descr_ref_for_tests();
+        let ops_before = tc.num_ops();
+        let mut wc = WalkContext {
+            registers_r: &mut regs_r,
+            registers_i: &mut regs_i,
+            registers_f: &mut [],
+            descr_refs: &descr_pool,
+            trace_ctx: &mut tc,
+            done_with_this_frame_descr_ref: frame_done,
+            done_with_this_frame_descr_int: make_fail_descr(101),
+            done_with_this_frame_descr_float: make_fail_descr(102),
+            done_with_this_frame_descr_void: make_fail_descr(103),
+            exit_frame_with_exception_descr_ref: make_fail_descr(2),
+            is_top_level: true,
+            sub_jitcode_lookup: &no_sub_jitcodes,
+            last_exc_value: None,
+        };
+        let (outcome, next_pc) =
+            step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
+        assert_eq!(outcome, DispatchOutcome::Continue);
+        assert_eq!(next_pc, 5, "getfield_vable_i/rd>i operand layout = 4 bytes");
+        let dst_post = wc.registers_i[5];
+        assert_ne!(
+            dst_post, dst_pre,
+            "fallback must write a fresh recorder OpRef into registers_i[dst]",
+        );
+        drop(wc);
+        assert_eq!(
+            tc.num_ops(),
+            ops_before + 1,
+            "nonstandard-vable fallback records exactly one GetfieldGcI op",
+        );
+        let last = tc.ops().last().expect("recorded op must exist");
+        assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcI);
+        assert_eq!(
+            last.args.as_slice(),
+            &[obj],
+            "GetfieldGcI args must be [obj] (the r-reg source)",
+        );
+        let recorded_descr = last
+            .descr
+            .as_ref()
+            .expect("GetfieldGcI must carry the field descr");
+        assert!(
+            std::sync::Arc::ptr_eq(recorded_descr, &descr),
+            "GetfieldGcI descr must be descr_refs[d] (the field descr)",
+        );
+        assert_eq!(dst_post, last.pos);
     }
 
     #[test]
