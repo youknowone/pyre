@@ -220,6 +220,7 @@ fn forwarded_slot_at<'a>(
     match opref {
         O::ConstInt(_) | O::ConstFloat(_) | O::ConstPtr(_) => None,
         O::None => None,
+        O::TempVar(_) => None,
         O::InputArgInt(i) | O::InputArgFloat(i) | O::InputArgRef(i) => {
             inputargs.get(i as usize).map(|ia| ia.forwarded_slot())
         }

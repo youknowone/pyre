@@ -201,7 +201,7 @@ impl Trace {
         assert!(!opcode.is_guard(), "use record_guard for guard operations");
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         let mut op = Op::new(opcode, args);
-        op.pos = opref;
+        op.pos.set(opref);
         self.ops.push(op);
         // H-2.1 parallel BoxRef: `AbstractResOp` mirror.
         self.box_pool
@@ -224,7 +224,7 @@ impl Trace {
         assert!(!opcode.is_guard(), "use record_guard for guard operations");
         let opref = OpRef::op_typed(self.op_count, opcode.result_type());
         let mut op = Op::with_descr(opcode, args, descr);
-        op.pos = opref;
+        op.pos.set(opref);
         self.ops.push(op);
         self.box_pool
             .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
@@ -254,7 +254,7 @@ impl Trace {
             Some(d) => Op::with_descr(opcode, args, d),
             None => Op::new(opcode, args),
         };
-        op.pos = opref;
+        op.pos.set(opref);
         self.ops.push(op);
         self.box_pool
             .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
@@ -281,7 +281,7 @@ impl Trace {
             Some(d) => Op::with_descr(opcode, args, d),
             None => Op::new(opcode, args),
         };
-        op.pos = opref;
+        op.pos.set(opref);
         op.fail_args = Some(smallvec::SmallVec::from_slice(fail_args));
         self.ops.push(op);
         self.box_pool
@@ -316,7 +316,7 @@ impl Trace {
             .ops
             .iter_mut()
             .rev()
-            .find(|op| op.pos == opref)
+            .find(|op| op.pos.get() == opref)
             .unwrap_or_else(|| panic!("set_op_fail_args: no op with pos {:?}", opref));
         op.fail_args = Some(smallvec::SmallVec::from_slice(fail_args));
     }
@@ -351,7 +351,7 @@ impl Trace {
             Some(descr) => Op::with_descr(OpCode::Jump, jump_args, descr),
             None => Op::new(OpCode::Jump, jump_args),
         };
-        op.pos = opref;
+        op.pos.set(opref);
         self.ops.push(op);
         self.box_pool
             .push(BoxRef::new_resop(OpCode::Jump.result_type(), self.op_count));
@@ -366,7 +366,7 @@ impl Trace {
     pub fn finish(&mut self, finish_args: &[OpRef], descr: DescrRef) {
         let opref = OpRef::op_typed(self.op_count, OpCode::Finish.result_type());
         let mut op = Op::with_descr(OpCode::Finish, finish_args, descr);
-        op.pos = opref;
+        op.pos.set(opref);
         self.ops.push(op);
         self.box_pool.push(BoxRef::new_resop(
             OpCode::Finish.result_type(),
@@ -460,7 +460,7 @@ impl Trace {
 
     /// Get an operation by its OpRef position.
     pub fn get_op_by_pos(&self, pos: OpRef) -> Option<&Op> {
-        self.ops.iter().find(|op| op.pos == pos)
+        self.ops.iter().find(|op| op.pos.get() == pos)
     }
 
     /// Get an operation by its raw u32 position, ignoring the variant
@@ -468,7 +468,7 @@ impl Trace {
     /// knowing each op's RPython `box.type` upfront — the typed lookup
     /// `get_op_by_pos` requires the variant to match (variant-aware Eq).
     pub fn get_op_by_raw_pos(&self, raw: u32) -> Option<&Op> {
-        self.ops.iter().find(|op| op.pos.raw() == raw)
+        self.ops.iter().find(|op| op.pos.get().raw() == raw)
     }
 
     /// H-2.1: BoxRef for the value recorded at `position` (= `op_count`
@@ -732,10 +732,10 @@ mod tests {
         let trace = rec.get_trace();
 
         // The op's .pos should match
-        assert_eq!(trace.ops[0].pos, iop(2)); // IntAdd
-        assert_eq!(trace.ops[1].pos, vop(3)); // GuardTrue
-        assert_eq!(trace.ops[2].pos, iop(4)); // IntSub
-        assert_eq!(trace.ops[3].pos, vop(5)); // Jump
+        assert_eq!(trace.ops[0].pos.get(), iop(2)); // IntAdd
+        assert_eq!(trace.ops[1].pos.get(), vop(3)); // GuardTrue
+        assert_eq!(trace.ops[2].pos.get(), iop(4)); // IntSub
+        assert_eq!(trace.ops[3].pos.get(), vop(5)); // Jump
     }
 
     #[test]
@@ -861,7 +861,7 @@ mod tests {
         let trace = rec.get_trace();
 
         assert_eq!(trace.ops[0].opcode, OpCode::IntAdd);
-        assert_eq!(trace.ops[0].pos, iop(1)); // after 1 inputarg
+        assert_eq!(trace.ops[0].pos.get(), iop(1)); // after 1 inputarg
         assert_eq!(trace.ops[1].opcode, OpCode::IntSub);
         assert_eq!(trace.ops[1].args[0], add); // references the add result
         assert_eq!(trace.ops[1].args[1], i0); // references the input arg
@@ -885,7 +885,7 @@ mod tests {
         let trace = rec.get_trace();
         // Find the guard op.
         let guard_op = &trace.ops[1]; // after IntAdd
-        assert_eq!(guard_op.pos, guard);
+        assert_eq!(guard_op.pos.get(), guard);
         assert!(guard_op.opcode.is_guard());
         let fail_args = guard_op.fail_args.as_ref().unwrap();
         assert_eq!(fail_args.len(), 3);
@@ -1031,7 +1031,7 @@ mod tests {
         rec.close_loop(&[iarg(0), iarg(1), iarg(2)]);
         let trace = rec.get_trace();
         assert_eq!(trace.num_inputargs(), 3);
-        assert_eq!(trace.ops[0].pos, iop(3));
+        assert_eq!(trace.ops[0].pos.get(), iop(3));
     }
 
     #[test]
@@ -1243,7 +1243,7 @@ mod tests {
 
         // Find the guard
         let guard_op = trace.iter_guards().next().unwrap();
-        assert_eq!(guard_op.pos, guard);
+        assert_eq!(guard_op.pos.get(), guard);
         let fa = guard_op.fail_args.as_ref().unwrap();
         assert_eq!(fa.len(), 13);
 

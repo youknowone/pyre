@@ -694,7 +694,7 @@ fn compute_next_global_opref(inputargs: &[InputArg], ops: &[majit_ir::Op]) -> u3
     let from_ops = ops
         .iter()
         .map(|op| {
-            let mut hw = opref_high_water(op.pos);
+            let mut hw = opref_high_water(op.pos.get());
             for a in &op.args {
                 hw = hw.max(opref_high_water(*a));
             }
@@ -4384,7 +4384,7 @@ impl<M: Clone> MetaInterp<M> {
                     .map(|ia| ia.opref())
                     .collect::<Vec<_>>(),
             );
-            label_op.pos = majit_ir::OpRef::NONE;
+            label_op.pos.set(majit_ir::OpRef::NONE);
             optimized_ops.insert(0, label_op);
         }
         let (inputargs, optimized_ops) = match normalize_root_loop_entry_contract(
@@ -4486,7 +4486,7 @@ impl<M: Clone> MetaInterp<M> {
                     majit_ir::OpCode::Label,
                     &inputargs.iter().map(|ia| ia.opref()).collect::<Vec<_>>(),
                 );
-                label_op.pos = majit_ir::OpRef::NONE;
+                label_op.pos.set(majit_ir::OpRef::NONE);
                 label_op.descr = Some(target_token.as_jump_target_descr());
                 compiled_ops.insert(0, label_op);
             }
@@ -6276,7 +6276,7 @@ impl<M: Clone> MetaInterp<M> {
             majit_ir::OpCode::Label,
             &inputargs.iter().map(|ia| ia.opref()).collect::<Vec<_>>(),
         );
-        label_op.pos = majit_ir::OpRef::NONE;
+        label_op.pos.set(majit_ir::OpRef::NONE);
         label_op.descr = Some(target_token.as_jump_target_descr());
         compiled_ops.insert(0, label_op);
 
@@ -8374,7 +8374,7 @@ impl<M: Clone> MetaInterp<M> {
             for (i, op) in optimized_ops.iter().enumerate() {
                 eprintln!(
                     "[jit][entry-bridge] op[{i}] {:?} pos={:?} args={:?} descr={:?}",
-                    op.opcode, op.pos, op.args, op.descr
+                    op.opcode, op.pos.get(), op.args, op.descr
                 );
             }
         }
@@ -15749,7 +15749,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos, opref);
+        assert_eq!(op.pos.get(), opref);
     }
 
     extern "C" fn cond_call_void_helper(_cond: i64, _func_addr: i64) {}
@@ -16046,7 +16046,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos, opref);
+        assert_eq!(op.pos.get(), opref);
     }
 
     #[test]
@@ -16183,7 +16183,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallMayForceI)
             .expect("CallMayForceI must be recorded");
-        assert_eq!(call_op.pos, opref);
+        assert_eq!(call_op.pos.get(), opref);
         assert!(
             ctx.recorder
                 .ops()
@@ -16278,7 +16278,7 @@ mod metainterp_static_data_tests {
             .iter()
             .find(|op| op.opcode == OpCode::CallI)
             .expect("CallI must be recorded");
-        assert_eq!(op.pos, opref);
+        assert_eq!(op.pos.get(), opref);
         assert_eq!(op.args.len(), 3);
         assert_eq!(op.args[0], funcbox_ref);
         assert_eq!(op.args[1], OpRef::int_op(1));
@@ -16451,7 +16451,7 @@ mod metainterp_static_data_tests {
                 .constants_get_value(op.args[0])
                 .expect("typeptr constant");
             assert_eq!(typeptr, majit_ir::Value::Int(0xc1a55));
-            op.pos
+            op.pos.get()
         };
 
         // pyjitpl.py:3392: class_of_last_exc_is_const = True after.
@@ -17361,22 +17361,22 @@ mod tests {
     use std::sync::{Arc, Mutex, OnceLock};
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
-        let mut op = Op::new(opcode, args);
-        op.pos = if pos == OpRef::NONE.raw() {
+        let op = Op::new(opcode, args);
+        op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
         } else {
             OpRef::op_typed(pos, opcode.result_type())
-        };
+        });
         op
     }
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: DescrRef) -> Op {
-        let mut op = Op::with_descr(opcode, args, descr);
-        op.pos = if pos == OpRef::NONE.raw() {
+        let op = Op::with_descr(opcode, args, descr);
+        op.pos.set(if pos == OpRef::NONE.raw() {
             OpRef::NONE
         } else {
             OpRef::op_typed(pos, opcode.result_type())
-        };
+        });
         op
     }
 
@@ -17521,12 +17521,12 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(10, Type::Int), (11, Type::Ref)]
         );
-        assert_eq!(prepared.ops[0].pos, OpRef::ref_op(12));
+        assert_eq!(prepared.ops[0].pos.get(), OpRef::ref_op(12));
         assert_eq!(
             prepared.ops[0].args.to_vec(),
             vec![OpRef::input_arg_ref(11)]
         );
-        assert_eq!(prepared.ops[1].pos, OpRef::int_op(13));
+        assert_eq!(prepared.ops[1].pos.get(), OpRef::int_op(13));
         assert_eq!(
             prepared.ops[1].args.to_vec(),
             vec![OpRef::input_arg_int(10), OpRef::input_arg_int(10)]

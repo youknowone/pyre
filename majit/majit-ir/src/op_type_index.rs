@@ -125,22 +125,22 @@ impl<'a> OpTypeIndex<'a> {
     pub fn build_op_pos(ops: &[Op]) -> Vec<u32> {
         let max_raw = ops
             .iter()
-            .filter(|op| !op.pos.is_none() && op.type_ != Type::Void)
-            .map(|op| op.pos.raw())
+            .filter(|op| !op.pos.get().is_none() && op.type_ != Type::Void)
+            .map(|op| op.pos.get().raw())
             .max();
         let Some(max_raw) = max_raw else {
             return Vec::new();
         };
         let mut pos: Vec<u32> = vec![NO_POS; max_raw as usize + 1];
         for (idx, op) in ops.iter().enumerate() {
-            if op.pos.is_none() || op.type_ == Type::Void {
+            if op.pos.get().is_none() || op.type_ == Type::Void {
                 continue;
             }
-            let r = op.pos.raw() as usize;
+            let r = op.pos.get().raw() as usize;
             if pos[r] != NO_POS {
                 panic!(
                     "OpTypeIndex: raw {} bound to ops[{}] {:?} and ops[{}] {:?} — Box identity broken",
-                    op.pos.raw(),
+                    op.pos.get().raw(),
                     pos[r],
                     ops[pos[r] as usize].opcode,
                     idx,

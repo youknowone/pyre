@@ -319,8 +319,8 @@ impl IntBound {
             // pyre allocates a fresh Int OpRef into `op.pos` so the next
             // guard's arg vector captures the producer's result, not the
             // sentinel `OpRef::NONE` left over from `Op::new`.
-            op.pos = ctx.alloc_op_position_typed(Type::Int);
-            let op_pos = op.pos;
+            op.pos.set(ctx.alloc_op_position_typed(Type::Int));
+            let op_pos = op.pos.get();
             guards.push(op);
             guards.push(Op::new(OpCode::GuardTrue, &[op_pos]));
         }
@@ -328,8 +328,8 @@ impl IntBound {
             let bound = alloc_const(ctx, Value::Int(self.upper));
             let mut op = Op::new(OpCode::IntLe, &[box_ref, bound]);
             // intutils.py:1281 INT_LE producer identity — see comment above.
-            op.pos = ctx.alloc_op_position_typed(Type::Int);
-            let op_pos = op.pos;
+            op.pos.set(ctx.alloc_op_position_typed(Type::Int));
+            let op_pos = op.pos.get();
             guards.push(op);
             guards.push(Op::new(OpCode::GuardTrue, &[op_pos]));
         }
@@ -337,8 +337,8 @@ impl IntBound {
             let mask = alloc_const(ctx, Value::Int(!self.tmask as i64));
             let mut op = Op::new(OpCode::IntAnd, &[box_ref, mask]);
             // intutils.py:1286 INT_AND producer identity — see comment above.
-            op.pos = ctx.alloc_op_position_typed(Type::Int);
-            let op_pos = op.pos;
+            op.pos.set(ctx.alloc_op_position_typed(Type::Int));
+            let op_pos = op.pos.get();
             guards.push(op);
             let value = alloc_const(ctx, Value::Int(self.tvalue as i64));
             guards.push(Op::new(OpCode::GuardValue, &[op_pos, value]));

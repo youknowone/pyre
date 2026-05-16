@@ -480,7 +480,7 @@ impl ImportedShortPureOp {
         //     and the info would be lost. We move `replay.pos` to the
         //     pre-allocated body-visible OpRef (`result`) so it has its
         //     own slot.
-        replay.pos = if invented_name { result } else { source };
+        replay.pos.set(if invented_name { result } else { source });
         replay.descr = descr.clone();
         // shortpreamble.py:116-120: pop.op = self.orig_op.copy_and_change(...)
         // for invented (the alt identifier) or self.res for non-invented.
@@ -1551,7 +1551,7 @@ impl OptContext {
             );
         }
         #[cfg(debug_assertions)]
-        if let Some(producer) = self.new_operations.iter().rev().find(|o| o.pos == opref) {
+        if let Some(producer) = self.new_operations.iter().rev().find(|o| o.pos.get() == opref) {
             debug_assert_eq!(
                 producer.type_, tp,
                 "register_value_type: Op.type_ ({:?}) disagrees with \
@@ -1805,7 +1805,7 @@ impl OptContext {
     pub fn emit_constant_int(&mut self, value: i64) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Int);
         let mut op = Op::new(OpCode::SameAsI, &[pos_ref]);
-        op.pos = pos_ref;
+        op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         self.make_constant(opref, Value::Int(value));
         opref
@@ -1816,7 +1816,7 @@ impl OptContext {
     pub fn emit_constant_ref(&mut self, value: GcRef) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Ref);
         let mut op = Op::new(OpCode::SameAsR, &[pos_ref]);
-        op.pos = pos_ref;
+        op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         self.make_constant(opref, Value::Ref(value));
         opref
@@ -1827,7 +1827,7 @@ impl OptContext {
     pub fn emit_constant_float(&mut self, value: f64) -> OpRef {
         let pos_ref = self.reserve_pos_typed(Type::Float);
         let mut op = Op::new(OpCode::SameAsF, &[pos_ref]);
-        op.pos = pos_ref;
+        op.pos.set(pos_ref);
         let opref = self.emit_extra(self.current_pass_idx, op);
         self.make_constant(opref, Value::Float(value));
         opref
@@ -2082,6 +2082,7 @@ impl OptContext {
     /// debug-assertion site at the surviving emit/emit_extra
     /// producer surfaces.
     fn debug_assert_box_type_invariant(op: &Op) {
+        let pos = op.pos.get();
         debug_assert_eq!(
             op.type_,
             op.opcode.result_type(),
@@ -2089,16 +2090,16 @@ impl OptContext {
              {:?} (opcode={:?}) — Slice 0.1 dual-source contract violation",
             op.type_,
             op.opcode.result_type(),
-            op.pos,
+            pos,
             op.opcode,
         );
-        if let Some(variant_tp) = op.pos.ty() {
+        if let Some(variant_tp) = pos.ty() {
             debug_assert_eq!(
                 variant_tp, op.type_,
                 "OpRef variant tag ({:?}) disagrees with Op.type_ ({:?}) at \
                  {:?} (opcode={:?}) — typed-factory mismatch \
                  (history.py:220 / resoperation.py:1693 Box.type parity)",
-                variant_tp, op.type_, op.pos, op.opcode,
+                variant_tp, op.type_, pos, op.opcode,
             );
         }
     }
@@ -2108,12 +2109,12 @@ impl OptContext {
     /// If the op has no pos assigned (NONE), sets it to `num_inputs + idx`
     /// so the backend's variable numbering stays consistent.
     pub fn emit(&mut self, mut op: Op) -> OpRef {
-        if op.pos.is_none() || op.pos.is_constant() {
+        if op.pos.get().is_none() || op.pos.get().is_constant() {
             // Slice 0.5 follow-up: tag the freshly allocated position with
             // the producer op's result type so the variant-tag readers
             // (`opref_type`/`OptBoxEnv::get_type`) resolve at priority 0
             // (resoperation.py:1693 `opclasses[opnum].type` parity).
-            op.pos = self.reserve_pos_typed(op.result_type());
+            op.pos.set(self.reserve_pos_typed(op.result_type()));
         } else {
             // Step 2 Commit D1/D2 invariants (Box identity plan, Step 7):
             //
@@ -2148,14 +2149,14 @@ impl OptContext {
             // invariants here so any regression is caught at the emit
             // site rather than at a downstream symptom.
             debug_assert!(
-                !self.new_operations.iter().any(|e| e.pos == op.pos),
+                !self.new_operations.iter().any(|e| e.pos.get() == op.pos.get()),
                 "emit: OpRef collision at {:?} — new_operations already contains this position. \
                  Phase 2 should run through a fresh TraceIterator (Commit D1) and Phase 1's \
                  reserve_pos() should be monotonic above all raw trace positions.",
-                op.pos,
+                op.pos.get(),
             );
             let has_op_fwd = self
-                .get_box_replacement_box(op.pos)
+                .get_box_replacement_box(op.pos.get())
                 .map_or(false, |b| self.has_op_forwarding(&b));
             debug_assert!(
                 !(has_op_fwd && op.result_type() != majit_ir::Type::Void),
@@ -2163,11 +2164,11 @@ impl OptContext {
                  import_state should only forward inputarg slots in \
                  [inputarg_base..inputarg_base + num_inputs), and Phase 2 op results \
                  live in a disjoint range [p2_high_water..) (Commit D1).",
-                op.pos,
+                op.pos.get(),
             );
-            self.next_pos = self.next_pos.max(op.pos.raw().saturating_add(1));
+            self.next_pos = self.next_pos.max(op.pos.get().raw().saturating_add(1));
         }
-        let pos_ref = op.pos;
+        let pos_ref = op.pos.get();
         // RPython parity: emit() does NOT clear forwarding.
         // In RPython, Box._forwarded is never cleared by emit — each Box
         // has unique identity. The forwarding set by import_box must
@@ -2234,13 +2235,13 @@ impl OptContext {
     /// passes (including the caller) to avoid re-absorption loops.
     /// `after_pass_idx`: index of the calling pass (op starts from idx+1).
     pub fn emit_extra(&mut self, after_pass_idx: usize, mut op: Op) -> OpRef {
-        if op.pos.is_none() {
+        if op.pos.get().is_none() {
             // Slice 0.5 follow-up: typed allocation, same rationale as `emit`.
-            op.pos = self.reserve_pos_typed(op.result_type());
+            op.pos.set(self.reserve_pos_typed(op.result_type()));
         } else {
-            self.next_pos = self.next_pos.max(op.pos.raw().saturating_add(1));
+            self.next_pos = self.next_pos.max(op.pos.get().raw().saturating_add(1));
         }
-        let pos_ref = op.pos;
+        let pos_ref = op.pos.get();
         // Slice 0.5: queued ops carry their intrinsic `op.type_` (Slice
         // 0.1 / resoperation.py:1693 parity). Once the queued op flushes
         // through `propagate_one` into `new_operations`, `op_at` resolves
@@ -2262,7 +2263,7 @@ impl OptContext {
                 .iter()
                 .map(|entry| {
                     (
-                        entry.op.pos,
+                        entry.op.pos.get(),
                         crate::optimizeopt::shortpreamble::ProducedShortOp {
                             kind: entry.kind.clone(),
                             preamble_op: entry.op.clone(),
@@ -2471,7 +2472,7 @@ impl OptContext {
                         pure_call_opcode(produced_op.preamble_op.opcode),
                         &resolved_args,
                     );
-                    op.pos = replay_pos(*source, produced_op);
+                    op.pos.set(replay_pos(*source, produced_op));
                     op.descr = produced_op.preamble_op.descr.clone();
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::Pure,
@@ -2506,7 +2507,7 @@ impl OptContext {
                                 majit_ir::Type::Void => return false,
                             };
                             let mut op = Op::new(opcode, &[obj]);
-                            op.pos = replay_pos(*source, produced_op);
+                            op.pos.set(replay_pos(*source, produced_op));
                             op.descr = Some(descr);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
@@ -2542,7 +2543,7 @@ impl OptContext {
                                 None => return false,
                             };
                             let mut op = Op::new(opcode, &[obj, index_opref]);
-                            op.pos = replay_pos(*source, produced_op);
+                            op.pos.set(replay_pos(*source, produced_op));
                             op.descr = Some(descr);
                             ProducedShortOp {
                                 kind: PreambleOpKind::Heap,
@@ -2573,7 +2574,7 @@ impl OptContext {
                         return false;
                     }
                     let mut op = Op::new(loop_invariant_opcode(result_type), &[func_opref]);
-                    op.pos = replay_pos(*source, produced_op);
+                    op.pos.set(replay_pos(*source, produced_op));
                     let new_pop = ProducedShortOp {
                         kind: PreambleOpKind::LoopInvariant,
                         preamble_op: op,
@@ -2664,7 +2665,7 @@ impl OptContext {
             // alt) so the alt's `replace_op(...)` chain at
             // `forwarded[pop.op]` does not collide with the replay's
             // info at `forwarded[pop.preamble_op.pos]`.
-            if let Some(info) = self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos) {
+            if let Some(info) = self.take_preamble_forwarded_opinfo(preamble_op.preamble_op.pos.get()) {
                 self.setinfo_from_preamble_item_option(result, &info, None);
             }
             // RPython PreambleOp carries Box.type intrinsically. Slice 0.5:
@@ -2825,7 +2826,7 @@ impl OptContext {
             // returning None is the equivalent.
         }
         let result_info: Option<(OpRef, ForwardedInfo)> =
-            snapshot_forwarded(self, preamble_op.pos).map(|info| (preamble_op.pos, info));
+            snapshot_forwarded(self, preamble_op.pos.get()).map(|info| (preamble_op.pos.get(), info));
 
         // Phase 2 (mutable): clear non-input arg slots — PyPy
         // `arg.set_forwarded(None)` (shortpreamble.py:397). Branch 2 (input
@@ -3425,7 +3426,7 @@ impl OptContext {
                     .extra_same_as()
                     .iter()
                     .map(|op| ImportedShortAlias {
-                        result: op.pos,
+                        result: op.pos.get(),
                         same_as_source: op.arg(0),
                         same_as_opcode: op.opcode,
                     })
@@ -4807,7 +4808,7 @@ impl OptContext {
         // invent_fail_descr_for_op asserts copied_from_descr is None.
         let can_share = self.last_guard_idx.is_some()
             && op.descr.is_none()
-            && op.rd_resume_position < 0
+            && op.rd_resume_position.get() < 0
             && opnum != OpCode::GuardNotForced
             && opnum != OpCode::GuardNotForced2;
 
@@ -5075,7 +5076,7 @@ impl OptContext {
                  resume_pos={}) has no snapshot and no patchguardop \
                  ancestor — RPython resume.py:397 \
                  `assert resume_position >= 0` parity",
-                op.opcode, op.pos, op.rd_resume_position.get()
+                op.opcode, op.pos.get(), op.rd_resume_position.get()
             );
         }
 
@@ -5160,7 +5161,7 @@ impl OptContext {
                 .collect();
             eprintln!(
                 "[jit][guard-resume] pos={:?} snapshot={:?} vable={:?}",
-                op.pos, snapshot_debug, vable_debug
+                op.pos.get(), snapshot_debug, vable_debug
             );
         }
 
@@ -5179,7 +5180,7 @@ impl OptContext {
         if majit_log_enabled() && op.opcode == OpCode::GuardNotForced2 {
             eprintln!(
                 "[jit][guard-resume] pos={:?} liveboxes={:?} rd_virtuals={} livebox_types={:?}",
-                op.pos,
+                op.pos.get(),
                 liveboxes,
                 rd_virtuals.len(),
                 livebox_types
@@ -5353,7 +5354,7 @@ impl OptContext {
         let opref = self.get_box_replacement(opref);
         self.new_operations
             .iter()
-            .find(|op| op.pos == opref)
+            .find(|op| op.pos.get() == opref)
             .cloned()
     }
 
@@ -5518,7 +5519,7 @@ impl OptContext {
     /// (via a maintained index or layout invariant) is deferred to a
     /// later slice once those mutation patterns are stabilised.
     pub fn op_at(&self, opref: OpRef) -> Option<&Op> {
-        if let Some(op) = self.new_operations.iter().rev().find(|op| op.pos == opref) {
+        if let Some(op) = self.new_operations.iter().rev().find(|op| op.pos.get() == opref) {
             return Some(op);
         }
         // Phase 1 emit-op fallback (history.py:220 box.type parity for
@@ -5528,7 +5529,7 @@ impl OptContext {
         // / descr fields refer to Phase 1's namespace and should not be
         // dereferenced through this path (Phase 2 callers only consume
         // `op.type_` via `get_op_result_type` / `opref_type`).
-        self.phase1_emit_ops.iter().rev().find(|op| op.pos == opref)
+        self.phase1_emit_ops.iter().rev().find(|op| op.pos.get() == opref)
     }
 
     /// RPython box.type parity: find the result type of the operation
@@ -8488,7 +8489,7 @@ mod ensure_ptr_info_arg0_tests {
         // carry the Ref variant tag (resoperation.py:615 RefOp).
         let descr: DescrRef = Arc::new(TestFieldDescr { index: 0, parent });
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[OpRef::input_arg_ref(0)], descr);
-        op.pos = OpRef::int_op(1);
+        op.pos.set(OpRef::int_op(1));
         op
     }
 
@@ -8499,7 +8500,7 @@ mod ensure_ptr_info_arg0_tests {
             is_object: false,
         });
         let mut op = Op::with_descr(OpCode::ArraylenGc, &[OpRef::input_arg_ref(0)], descr);
-        op.pos = OpRef::int_op(1);
+        op.pos.set(OpRef::int_op(1));
         op
     }
 
@@ -8560,7 +8561,7 @@ mod ensure_ptr_info_arg0_tests {
                 is_object: false,
             });
             let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::input_arg_ref(0)], descr);
-            op.pos = OpRef::int_op(1);
+            op.pos.set(OpRef::int_op(1));
             op
         };
         let mut info = ctx.ensure_ptr_info_arg0(&op);
@@ -8589,7 +8590,7 @@ mod ensure_ptr_info_arg0_tests {
                 is_object: false,
             });
             let mut op = Op::with_descr(OpCode::Strlen, &[OpRef::input_arg_ref(0)], descr);
-            op.pos = OpRef::int_op(1);
+            op.pos.set(OpRef::int_op(1));
             op
         };
         let mut info = ctx.ensure_ptr_info_arg0(&op);
@@ -8902,7 +8903,7 @@ mod imported_short_preamble_fallback_tests {
         );
 
         let mut replay_op = Op::new(OpCode::IntAdd, &[OpRef::int_op(7), OpRef::int_op(8)]);
-        replay_op.pos = OpRef::int_op(14);
+        replay_op.pos.set(OpRef::int_op(14));
         // shortpreamble.py:120 non-invented PureOp.produce_op: `op = self.res`.
         // pop.op carries the body-visible OpRef directly (no forwarding chain
         // installed for non-invented Pure).
@@ -8924,7 +8925,7 @@ mod imported_short_preamble_fallback_tests {
             sp.ops[0].op.args.as_slice(),
             &[OpRef::int_op(7), OpRef::int_op(8)]
         );
-        assert_eq!(sp.ops[0].op.pos, OpRef::int_op(14));
+        assert_eq!(sp.ops[0].op.pos.get(), OpRef::int_op(14));
     }
 }
 

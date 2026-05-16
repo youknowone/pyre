@@ -13,7 +13,7 @@ fn validate_wasm(bytes: &[u8]) {
 
 fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
     let mut op = Op::new(opcode, args);
-    op.pos = pos;
+    op.pos.set(pos);
     op
 }
 

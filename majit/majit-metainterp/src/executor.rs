@@ -987,8 +987,8 @@ pub(crate) fn unop(values: &(impl ValueStore + ?Sized), op: &Op) -> i64 {
 pub(crate) fn same_as_value(values: &(impl ValueStore + ?Sized), op: &Op) -> i64 {
     if op.num_args() > 0 {
         unop(values, op)
-    } else if !op.pos.is_none() {
-        values.resolve(op.pos)
+    } else if !op.pos.get().is_none() {
+        values.resolve(op.pos.get())
     } else {
         0
     }

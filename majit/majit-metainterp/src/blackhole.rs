@@ -259,8 +259,8 @@ pub fn blackhole_execute_full(
 
         match result {
             OpResult::Value(v) => {
-                if !op.pos.is_none() {
-                    tv.set(op.pos.raw(), v);
+                if !op.pos.get().is_none() {
+                    tv.set(op.pos.get().raw(), v);
                 }
             }
             OpResult::Void => {}
@@ -654,8 +654,8 @@ pub(crate) fn blackhole_execute_with_state_ca(
 
         match result {
             OpResult::Value(v) => {
-                if !op.pos.is_none() {
-                    tv.set(op.pos.raw(), v);
+                if !op.pos.get().is_none() {
+                    tv.set(op.pos.get().raw(), v);
                 }
             }
             OpResult::Void => {}
@@ -667,8 +667,8 @@ pub(crate) fn blackhole_execute_with_state_ca(
                 let ca_fn = call_assembler_fn.unwrap();
                 let frame_ptr = tv.resolve(op.args[0]);
                 let result = ca_fn(frame_ptr);
-                if !op.pos.is_none() {
-                    tv.set(op.pos.raw(), result);
+                if !op.pos.get().is_none() {
+                    tv.set(op.pos.get().raw(), result);
                 }
             }
             OpResult::Finish(args) => {
@@ -3101,7 +3101,7 @@ mod tests {
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = OpRef::int_op(pos);
+        op.pos.set(OpRef::int_op(pos));
         op
     }
 
@@ -3835,12 +3835,12 @@ mod tests {
             let arity = opcode.arity().unwrap_or(3) as usize;
             let args = &dummy_args[..arity.min(3)];
             let mut op = Op::new(opcode, args);
-            op.pos = OpRef::int_op(opcode.as_u16() as u32 + 20_000);
+            op.pos.set(OpRef::int_op(opcode.as_u16() as u32 + 20_000));
 
             let result = execute_one(&op, &values, &mut exc);
             // Store the result so subsequent ops can reference it
             if let OpResult::Value(v) = &result {
-                values.insert(op.pos.raw(), *v);
+                values.insert(op.pos.get().raw(), *v);
             }
 
             match result {

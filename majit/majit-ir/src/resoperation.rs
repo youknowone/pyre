@@ -996,8 +996,11 @@ pub struct Op {
     pub opcode: OpCode,
     pub args: SmallVec<[OpRef; 3]>,
     pub descr: Option<DescrRef>,
-    /// Index of this op in the trace (set by the trace builder).
-    pub pos: OpRef,
+    /// Index of this op in the trace (set by the trace builder). `Cell`
+    /// so the position can be patched via `&Op` once the op is shared
+    /// (the trace-iterator finalizer and unroll's resume-position
+    /// retargeting both mutate `pos` after construction).
+    pub pos: std::cell::Cell<OpRef>,
     /// resoperation.py:1693 `opclasses[opnum].type` parity (Box.type intrinsic).
     /// Mirrors RPython's `op.type` class attribute set by `optypes[opnum]`
     /// (`resoperation.py:1597`). Populated at construction from
@@ -1038,7 +1041,7 @@ impl Clone for Op {
             opcode: self.opcode,
             args: self.args.clone(),
             descr: self.descr.clone(),
-            pos: self.pos,
+            pos: std::cell::Cell::new(self.pos.get()),
             type_: self.type_,
             fail_args: self.fail_args.clone(),
             fail_arg_types: self.fail_arg_types.clone(),
@@ -1121,7 +1124,7 @@ impl Op {
             opcode,
             args: SmallVec::from_slice(args),
             descr: None,
-            pos: OpRef::NONE,
+            pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,
@@ -1136,7 +1139,7 @@ impl Op {
             opcode,
             args: SmallVec::from_slice(args),
             descr: Some(descr),
-            pos: OpRef::NONE,
+            pos: std::cell::Cell::new(OpRef::NONE),
             type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,
@@ -1188,7 +1191,7 @@ impl Op {
             opcode,
             args: new_args,
             descr: new_descr,
-            pos: self.pos,
+            pos: std::cell::Cell::new(self.pos.get()),
             type_: opcode.result_type(),
             fail_args: None,
             fail_arg_types: None,
@@ -1280,7 +1283,7 @@ impl std::fmt::Display for Op {
             }
             Ok(())
         } else if self.result_type() != Type::Void {
-            write!(f, "v{} = {:?}(", self.pos.raw(), self.opcode)?;
+            write!(f, "v{} = {:?}(", self.pos.get().raw(), self.opcode)?;
             for (i, arg) in self.args.iter().enumerate() {
                 if i > 0 {
                     write!(f, ", ")?;
@@ -1318,7 +1321,7 @@ pub fn format_trace<V: std::fmt::Debug>(
         if op.opcode.is_guard() {
             write!(out, "{:?}(", op.opcode).unwrap();
         } else if op.type_ != Type::Void {
-            write!(out, "v{} = {:?}(", op.pos.raw(), op.opcode).unwrap();
+            write!(out, "v{} = {:?}(", op.pos.get().raw(), op.opcode).unwrap();
         } else {
             write!(out, "{:?}(", op.opcode).unwrap();
         }
@@ -4209,7 +4212,7 @@ mod tests {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(2)],
                 descr: None,
-                pos: OpRef::int_op(3),
+                pos: std::cell::Cell::new(OpRef::int_op(3)),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4219,7 +4222,7 @@ mod tests {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef::int_op(3), OpRef::int_op(10_000)],
                 descr: None,
-                pos: OpRef::int_op(4),
+                pos: std::cell::Cell::new(OpRef::int_op(4)),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4229,7 +4232,7 @@ mod tests {
                 opcode: OpCode::Jump,
                 args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(4), OpRef::int_op(3)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: None,
 
 
@@ -4251,7 +4254,7 @@ mod tests {
             opcode: OpCode::IntAdd,
             args: smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(2)],
             descr: None,
-            pos: OpRef::int_op(6),
+            pos: std::cell::Cell::new(OpRef::int_op(6)),
             fail_args: None,
 
             fail_arg_types: None,
@@ -4267,7 +4270,7 @@ mod tests {
             opcode: OpCode::SetfieldGc,
             args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)],
             descr: None,
-            pos: OpRef::NONE,
+            pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: None,
 
             fail_arg_types: None,
@@ -4283,7 +4286,7 @@ mod tests {
             opcode: OpCode::GuardTrue,
             args: smallvec::smallvec![OpRef::int_op(0)],
             descr: None,
-            pos: OpRef::NONE,
+            pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
 
 
@@ -4300,7 +4303,7 @@ mod tests {
             opcode: OpCode::GuardTrue,
             args: smallvec::smallvec![OpRef::int_op(0)],
             descr: None,
-            pos: OpRef::NONE,
+            pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: None,
 
             fail_arg_types: None,
@@ -4316,7 +4319,7 @@ mod tests {
             opcode: OpCode::IntAdd,
             args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)],
             descr: None,
-            pos: OpRef::int_op(1),
+            pos: std::cell::Cell::new(OpRef::int_op(1)),
             fail_args: None,
 
             fail_arg_types: None,
@@ -4336,7 +4339,7 @@ mod tests {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)],
                 descr: None,
-                pos: OpRef::int_op(1),
+                pos: std::cell::Cell::new(OpRef::int_op(1)),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4346,7 +4349,7 @@ mod tests {
                 opcode: OpCode::GuardTrue,
                 args: smallvec::smallvec![OpRef::int_op(0)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
 
                 fail_arg_types: None,
@@ -4356,7 +4359,7 @@ mod tests {
                 opcode: OpCode::Finish,
                 args: smallvec::smallvec![OpRef::int_op(1)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: None,
 
 
@@ -4376,7 +4379,7 @@ mod tests {
             opcode: OpCode::GuardTrue,
             args: smallvec::smallvec![OpRef::int_op(0)],
             descr: None,
-            pos: OpRef::NONE,
+            pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)]),
 
 
@@ -4408,7 +4411,7 @@ mod tests {
                 opcode: OpCode::Label,
                 args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4418,7 +4421,7 @@ mod tests {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(2)],
                 descr: None,
-                pos: OpRef::int_op(3),
+                pos: std::cell::Cell::new(OpRef::int_op(3)),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4428,7 +4431,7 @@ mod tests {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef::int_op(3), OpRef::int_op(10_000)],
                 descr: None,
-                pos: OpRef::int_op(4),
+                pos: std::cell::Cell::new(OpRef::int_op(4)),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4438,7 +4441,7 @@ mod tests {
                 opcode: OpCode::Jump,
                 args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(4), OpRef::int_op(3)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: None,
 
 
@@ -4471,7 +4474,7 @@ mod tests {
                 opcode: OpCode::IntSub,
                 args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_000)],
                 descr: None,
-                pos: OpRef::int_op(1),
+                pos: std::cell::Cell::new(OpRef::int_op(1)),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4481,7 +4484,7 @@ mod tests {
                 opcode: OpCode::IntGt,
                 args: smallvec::smallvec![OpRef::int_op(1), OpRef::int_op(10_001)],
                 descr: None,
-                pos: OpRef::int_op(2),
+                pos: std::cell::Cell::new(OpRef::int_op(2)),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4491,7 +4494,7 @@ mod tests {
                 opcode: OpCode::GuardTrue,
                 args: smallvec::smallvec![OpRef::int_op(2)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)]),
 
                 fail_arg_types: None,
@@ -4501,7 +4504,7 @@ mod tests {
                 opcode: OpCode::Finish,
                 args: smallvec::smallvec![OpRef::int_op(1)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: None,
 
 
@@ -4531,7 +4534,7 @@ mod tests {
             opcode: OpCode::DebugMergePoint,
             args: smallvec::smallvec![],
             descr: Some(descr),
-            pos: OpRef::NONE,
+            pos: std::cell::Cell::new(OpRef::NONE),
             fail_args: None,
 
             fail_arg_types: None,
@@ -4562,7 +4565,7 @@ mod tests {
                 opcode: OpCode::Label,
                 args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4572,7 +4575,7 @@ mod tests {
                 opcode: OpCode::IntAdd,
                 args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1)],
                 descr: None,
-                pos: OpRef::int_op(2),
+                pos: std::cell::Cell::new(OpRef::int_op(2)),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4582,7 +4585,7 @@ mod tests {
                 opcode: OpCode::IntLt,
                 args: smallvec::smallvec![OpRef::int_op(2), OpRef::int_op(10_000)],
                 descr: None,
-                pos: OpRef::int_op(3),
+                pos: std::cell::Cell::new(OpRef::int_op(3)),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4592,7 +4595,7 @@ mod tests {
                 opcode: OpCode::GuardTrue,
                 args: smallvec::smallvec![OpRef::int_op(3)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(2)]),
 
                 fail_arg_types: None,
@@ -4602,7 +4605,7 @@ mod tests {
                 opcode: OpCode::IntSub,
                 args: smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(10_001)],
                 descr: None,
-                pos: OpRef::int_op(4),
+                pos: std::cell::Cell::new(OpRef::int_op(4)),
                 fail_args: None,
 
                 fail_arg_types: None,
@@ -4612,7 +4615,7 @@ mod tests {
                 opcode: OpCode::Jump,
                 args: smallvec::smallvec![OpRef::int_op(4), OpRef::int_op(2)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: None,
 
 
@@ -4645,7 +4648,7 @@ mod tests {
                 opcode: OpCode::GuardTrue,
                 args: smallvec::smallvec![OpRef::int_op(0)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0)]),
 
                 fail_arg_types: None,
@@ -4655,7 +4658,7 @@ mod tests {
                 opcode: OpCode::GuardFalse,
                 args: smallvec::smallvec![OpRef::int_op(1)],
                 descr: None,
-                pos: OpRef::NONE,
+                pos: std::cell::Cell::new(OpRef::NONE),
                 fail_args: Some(smallvec::smallvec![OpRef::int_op(0), OpRef::int_op(1), OpRef::int_op(2)]),
 
 

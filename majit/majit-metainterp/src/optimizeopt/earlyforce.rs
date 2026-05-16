@@ -111,7 +111,7 @@ mod tests {
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
             let pos = i as u32;
-            op.pos = OpRef::op_typed(pos, op.result_type());
+            op.pos.set(OpRef::op_typed(pos, op.result_type()));
         }
     }
 

@@ -1005,14 +1005,14 @@ impl DynasmBackend {
             .enumerate()
             .map(|(op_idx, op)| {
                 let mut n = op.clone();
-                if n.result_type() != Type::Void && n.pos.is_none() {
+                if n.result_type() != Type::Void && n.pos.get().is_none() {
                     let pos = num_inputs + op_idx as u32;
-                    n.pos = match n.result_type() {
+                    n.pos.set(match n.result_type() {
                         Type::Int => OpRef::int_op(pos),
                         Type::Float => OpRef::float_op(pos),
                         Type::Ref => OpRef::ref_op(pos),
                         Type::Void => unreachable!("filtered above"),
-                    };
+                    });
                 }
                 n
             })
@@ -3217,7 +3217,7 @@ mod tests {
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = OpRef::op_typed(pos, opcode.result_type());
+        op.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         op
     }
 

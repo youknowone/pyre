@@ -259,7 +259,7 @@ impl DependencyGraph {
 
             // dependency.py:622-624: define result variable
             if op.opcode.result_type() != majit_ir::Type::Void {
-                tracker.define(op.pos, i);
+                tracker.define(op.pos.get(), i);
             }
 
             // dependency.py:626-644: build edges based on op type
@@ -424,7 +424,7 @@ impl DependencyGraph {
                 // Look up the defining op's result type
                 nodes_ref
                     .iter()
-                    .find(|n| n.op.pos == opref)
+                    .find(|n| n.op.pos.get() == opref)
                     .map(|n| n.op.opcode.result_type())
                     .unwrap_or(majit_ir::Type::Int)
             };
@@ -808,7 +808,7 @@ impl IndexVar {
             // dependency.py:1069: args = [var, ConstInt(self.coefficient_mul)]
             let c = next_const(self.coefficient_mul);
             let op = Op::new(OpCode::IntMul, &[var, c]);
-            var = op.pos;
+            var = op.pos.get();
             tolist.push(op);
         }
         // dependency.py:1072-1074: coefficient_div != 1 → assert 0
@@ -820,7 +820,7 @@ impl IndexVar {
             // dependency.py:1076: args = [var, ConstInt(self.constant)]
             let c = next_const(self.constant);
             let op = Op::new(OpCode::IntAdd, &[var, c]);
-            var = op.pos;
+            var = op.pos.get();
             tolist.push(op);
         }
         if self.constant < 0 {
@@ -829,7 +829,7 @@ impl IndexVar {
             let op = Op::new(OpCode::IntSub, &[var, c]);
             #[allow(unused_assignments)]
             {
-                var = op.pos;
+                var = op.pos.get();
             }
             tolist.push(op);
         }
@@ -853,7 +853,7 @@ impl IndexVar {
         let ops = self.get_operations(next_const);
         let mut last = self.var;
         for op in ops {
-            last = op.pos;
+            last = op.pos.get();
             new_ops.push(op);
         }
         last
@@ -1118,7 +1118,7 @@ impl<'a> IntegralForwardModification<'a> {
 
     /// dependency.py:896-920: operation_INT_ADD / operation_INT_SUB.
     fn inspect_additive(&mut self, op: &Op, is_sub: bool) {
-        let result = op.pos;
+        let result = op.pos.get();
         let a0 = op.args[0];
         let a1 = op.args[1];
         if Self::is_const(a0) && Self::is_const(a1) {
@@ -1158,7 +1158,7 @@ impl<'a> IntegralForwardModification<'a> {
 
     /// dependency.py:922-948: operation_INT_MUL.
     fn inspect_multiplicative(&mut self, op: &Op) {
-        let result = op.pos;
+        let result = op.pos.get();
         let a0 = op.args[0];
         let a1 = op.args[1];
         if Self::is_const(a0) && Self::is_const(a1) {

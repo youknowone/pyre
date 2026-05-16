@@ -353,7 +353,7 @@ impl OptVirtualize {
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
         let b = ctx
-            .ensure_box(source_op.pos)
+            .ensure_box(source_op.pos.get())
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&b, PtrInfo::VirtualRawSlice(opinfo));
     }
@@ -376,7 +376,7 @@ impl OptVirtualize {
             source_op.descr.clone(),
         );
         let b = ctx
-            .ensure_box(source_op.pos)
+            .ensure_box(source_op.pos.get())
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&b, PtrInfo::VirtualRawBuffer(opinfo));
     }
@@ -425,7 +425,7 @@ impl OptVirtualize {
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
         let b = ctx
-            .ensure_box(op.pos)
+            .ensure_box(op.pos.get())
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&b, PtrInfo::Virtual(vinfo));
         OptimizationResult::Remove
@@ -440,7 +440,7 @@ impl OptVirtualize {
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
         let b = ctx
-            .ensure_box(op.pos)
+            .ensure_box(op.pos.get())
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&b, PtrInfo::VirtualStruct(vinfo));
         OptimizationResult::Remove
@@ -479,7 +479,7 @@ impl OptVirtualize {
                         avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                     };
                     let b = ctx
-                        .ensure_box(op.pos)
+                        .ensure_box(op.pos.get())
                         .expect("body-namespace OpRef must have a BoxRef slot");
                     ctx.set_ptr_info(&b, PtrInfo::VirtualArrayStruct(vinfo));
                 } else {
@@ -492,7 +492,7 @@ impl OptVirtualize {
                         avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
                     };
                     let b = ctx
-                        .ensure_box(op.pos)
+                        .ensure_box(op.pos.get())
                         .expect("body-namespace OpRef must have a BoxRef slot");
                     ctx.set_ptr_info(&b, PtrInfo::VirtualArray(vinfo));
                 }
@@ -504,9 +504,9 @@ impl OptVirtualize {
         // pure-cache key so the reverse ARRAYLEN→size fold doesn't
         // collide across distinct array types.
         if let Some(descr) = op.descr.clone() {
-            ctx.register_pure_from_args1_with_descr(OpCode::ArraylenGc, op.pos, size_ref, descr);
+            ctx.register_pure_from_args1_with_descr(OpCode::ArraylenGc, op.pos.get(), size_ref, descr);
         } else {
-            ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos, size_ref);
+            ctx.register_pure_from_args1(OpCode::ArraylenGc, op.pos.get(), size_ref);
         }
         OptimizationResult::PassOn
     }
@@ -670,7 +670,7 @@ impl OptVirtualize {
                 if offset == Some(0) {
                     if let Some(gc_ref) = vinfo.known_class {
                         let class_val = gc_ref.as_usize() as i64;
-                        ctx.make_constant(op.pos, majit_ir::Value::Int(class_val));
+                        ctx.make_constant(op.pos.get(), majit_ir::Value::Int(class_val));
                         return OptimizationResult::Remove;
                     }
                 }
@@ -682,7 +682,7 @@ impl OptVirtualize {
                 _ => None,
             };
             if let Some(val_ref) = field_val {
-                ctx.replace_op(op.pos, val_ref);
+                ctx.replace_op(op.pos.get(), val_ref);
                 return OptimizationResult::Remove;
             }
             // heaptracker.py:66 typeptr exclusion: typeptr is excluded from
@@ -716,7 +716,7 @@ impl OptVirtualize {
                         _ => None,
                     };
                     if let Some(vtable) = vtable {
-                        ctx.make_constant(op.pos, Value::Int(vtable as i64));
+                        ctx.make_constant(op.pos.get(), Value::Int(vtable as i64));
                         return OptimizationResult::Remove;
                     }
                 }
@@ -799,7 +799,7 @@ impl OptVirtualize {
                     if item_ref.is_none() {
                         return OptimizationResult::InvalidLoop;
                     }
-                    ctx.replace_op(op.pos, item_ref);
+                    ctx.replace_op(op.pos.get(), item_ref);
                     return OptimizationResult::Remove;
                 }
             }
@@ -827,7 +827,7 @@ impl OptVirtualize {
             .and_then(|b| ctx.peek_ptr_info(b))
         {
             let len = vinfo.items.len() as i64;
-            ctx.make_constant(op.pos, Value::Int(len));
+            ctx.make_constant(op.pos.get(), Value::Int(len));
             return OptimizationResult::Remove;
         }
         // virtualize.py:273: self.make_nonnull(op.getarg(0))
@@ -869,7 +869,7 @@ impl OptVirtualize {
                 if fld.is_none() {
                     return OptimizationResult::InvalidLoop;
                 }
-                ctx.replace_op(op.pos, fld.unwrap());
+                ctx.replace_op(op.pos.get(), fld.unwrap());
                 return OptimizationResult::Remove;
             }
         }
@@ -1013,7 +1013,7 @@ impl OptVirtualize {
                 };
                 // rawbuffer.py:120: read_value(offset, length, descr)
                 if let Ok(val_ref) = vinfo.read_value(lookup_offset, ad.item_size(), descr) {
-                    ctx.replace_op(op.pos, val_ref);
+                    ctx.replace_op(op.pos.get(), val_ref);
                     return OptimizationResult::Remove;
                 }
             }
@@ -1193,7 +1193,7 @@ impl OptVirtualize {
                             // make_nonnull + emit.
                             if let Ok(val_ref) = vinfo.read_value(lookup_offset, itemsize_u, descr)
                             {
-                                ctx.replace_op(op.pos, val_ref);
+                                ctx.replace_op(op.pos.get(), val_ref);
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -1382,7 +1382,7 @@ impl OptVirtualize {
             avpi: crate::optimizeopt::info::AbstractVirtualPtrInfo::new(),
         };
         let b = ctx
-            .ensure_box(op.pos)
+            .ensure_box(op.pos.get())
             .expect("body-namespace OpRef must have a BoxRef slot");
         ctx.set_ptr_info(&b, PtrInfo::Virtual(vinfo));
 
@@ -1571,7 +1571,7 @@ impl OptVirtualize {
             return false;
         }
         // self.make_equal_to(op, forcedop)
-        ctx.make_equal_to(op.pos, forced_resolved);
+        ctx.make_equal_to(op.pos.get(), forced_resolved);
         // self.last_emitted_operation = REMOVED
         self.last_emitted_was_removed = true;
         true
@@ -2525,7 +2525,7 @@ mod tests {
             // (`opref.ty()`) resolves via the variant tag without
             // falling through to the inputarg-slot fallback (which
             // collides with low op-position raws).
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
     }
 
@@ -2821,7 +2821,7 @@ mod tests {
 
         let mut get = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
         get.descr = Some(make_field_index_descr(virtualizable_field_index(8)));
-        get.pos = OpRef::int_op(10);
+        get.pos.set(OpRef::int_op(10));
 
         let result = pass.propagate_forward(&get, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
@@ -2941,7 +2941,7 @@ mod tests {
 
         let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
         get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
-        get_field.pos = OpRef::int_op(10);
+        get_field.pos.set(OpRef::int_op(10));
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
             OptimizationResult::PassOn
@@ -2975,7 +2975,7 @@ mod tests {
 
         let mut get_field = Op::new(OpCode::GetfieldRawI, &[OpRef::input_arg_ref(0)]);
         get_field.descr = Some(make_field_index_descr(virtualizable_field_index(24)));
-        get_field.pos = OpRef::int_op(10);
+        get_field.pos.set(OpRef::int_op(10));
         assert!(matches!(
             pass.propagate_forward(&get_field, &mut ctx),
             OptimizationResult::PassOn
@@ -3107,7 +3107,7 @@ mod tests {
         pass.setup();
 
         let mut new_op = Op::with_descr(OpCode::NewWithVtable, &[], sd);
-        new_op.pos = OpRef::input_arg_ref(0);
+        new_op.pos.set(OpRef::input_arg_ref(0));
         assert!(matches!(
             pass.propagate_forward(&new_op, &mut ctx),
             OptimizationResult::Remove
@@ -3118,7 +3118,7 @@ mod tests {
             &[OpRef::input_arg_ref(0), OpRef::int_op(100)],
             fd,
         );
-        set_op.pos = OpRef::int_op(1);
+        set_op.pos.set(OpRef::int_op(1));
         assert!(matches!(
             pass.propagate_forward(&set_op, &mut ctx),
             OptimizationResult::Remove
@@ -4329,10 +4329,9 @@ mod tests {
             ),
             Op::new(OpCode::Jump, &[OpRef::input_arg_ref(0)]),
         ];
-        ops[0].pos = OpRef::ref_op(1);
-        ops[1].pos = OpRef::void_op(2);
-        ops[2].pos = OpRef::void_op(3);
-
+        ops[0].pos.set(OpRef::ref_op(1));
+        ops[1].pos.set(OpRef::void_op(2));
+        ops[2].pos.set(OpRef::void_op(3));
         let mut opt = Optimizer::default_pipeline();
         let mut constants: HashMap<u32, majit_ir::Value> = HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 1024);
@@ -4435,7 +4434,7 @@ mod tests {
             ),
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed((idx + 2) as u32, op.opcode.result_type());
+            op.pos.set(OpRef::op_typed((idx + 2) as u32, op.opcode.result_type()));
         }
 
         let mut opt = Optimizer::default_pipeline();
@@ -4449,7 +4448,7 @@ mod tests {
         let new_positions: std::collections::HashSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::New)
-            .map(|op| op.pos)
+            .map(|op| op.pos.get())
             .collect();
         assert_eq!(
             new_positions.len(),

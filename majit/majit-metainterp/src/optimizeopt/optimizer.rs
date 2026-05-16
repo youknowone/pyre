@@ -274,7 +274,7 @@ fn type_for_backend_constant(
         .copied()
         .or_else(|| {
             ops.iter()
-                .find(|op| op.pos.raw() == raw_key)
+                .find(|op| op.pos.get().raw() == raw_key)
                 .map(|op| op.result_type())
         })
         .unwrap_or(Type::Int)
@@ -337,14 +337,14 @@ pub(crate) fn value_to_backend_constant_bits(value: &majit_ir::Value) -> i64 {
 fn live_runtime_positions(ops: &[Op]) -> Vec<bool> {
     let live_limit = ops
         .iter()
-        .filter(|op| !op.pos.is_none() && !op.pos.is_constant())
-        .map(|op| op.pos.raw() as usize + 1)
+        .filter(|op| !op.pos.get().is_none() && !op.pos.get().is_constant())
+        .map(|op| op.pos.get().raw() as usize + 1)
         .max()
         .unwrap_or(0);
     let mut live_positions = vec![false; live_limit];
     for op in ops {
-        if !op.pos.is_none() && !op.pos.is_constant() {
-            live_positions[op.pos.raw() as usize] = true;
+        if !op.pos.get().is_none() && !op.pos.get().is_constant() {
+            live_positions[op.pos.get().raw() as usize] = true;
         }
     }
     live_positions
@@ -439,7 +439,7 @@ impl Optimizer {
         ) {
             return false;
         }
-        let idx = op.pos.raw() as usize;
+        let idx = op.pos.get().raw() as usize;
         let Some(b) = box_pool.get(idx) else {
             return false;
         };
@@ -829,8 +829,8 @@ impl Optimizer {
                 .expect("imported virtual leaf missing box.type");
             let same_as_op = majit_ir::OpCode::same_as_for_type(tp);
             let mut op = majit_ir::Op::new(same_as_op, &[*label_arg]);
-            op.pos = ctx.reserve_pos_typed(tp);
-            let fresh = op.pos;
+            op.pos.set(ctx.reserve_pos_typed(tp));
+            let fresh = op.pos.get();
             // Op.type_ carries `tp` intrinsically (resoperation.py:1693
             // SAME_AS_*.type parity); the immediate push below makes
             // op_at(fresh) the authoritative type source. No
@@ -1258,7 +1258,7 @@ impl Optimizer {
     /// the emit set even though it was substituted post-hoc rather
     /// than directly emitted via `_emit_operation`.
     pub fn replace_guard_op(&mut self, old_pos: OpRef, new_guard: Op) {
-        let new_pos = new_guard.pos;
+        let new_pos = new_guard.pos.get();
         self.replaces_guard.insert(old_pos, new_guard);
         self.emitted_operations.insert(new_pos);
     }
@@ -1933,7 +1933,7 @@ impl Optimizer {
         // force materializations) must not collide with them.
         let max_pos = ops
             .iter()
-            .map(|op| op.pos)
+            .map(|op| op.pos.get())
             .filter(|op| !op.is_none() && !op.is_constant())
             .map(|op| op.raw())
             .max()
@@ -2039,8 +2039,8 @@ impl Optimizer {
         // the Box.type retype invariant.
         let max_input = ops
             .iter()
-            .filter(|op| !op.pos.is_none() && op.result_type() != majit_ir::Type::Void)
-            .map(|op| op.pos.raw())
+            .filter(|op| !op.pos.get().is_none() && op.result_type() != majit_ir::Type::Void)
+            .map(|op| op.pos.get().raw())
             .max()
             .unwrap_or(0);
         let max_snapshot = self
@@ -2426,7 +2426,7 @@ impl Optimizer {
         // phase-wide OpRef→Type side table.
         self.phase1_emit_ops.clear();
         for op in &ctx.new_operations {
-            if !op.pos.is_none() && op.type_ != majit_ir::Type::Void {
+            if !op.pos.get().is_none() && op.type_ != majit_ir::Type::Void {
                 self.phase1_emit_ops.push(op.clone());
             }
         }
@@ -2498,7 +2498,7 @@ impl Optimizer {
                 let emitted_positions: std::collections::HashSet<OpRef> = ctx
                     .new_operations
                     .iter()
-                    .map(|op| op.pos)
+                    .map(|op| op.pos.get())
                     .filter(|p| !p.is_none())
                     .collect();
                 let original_args = resolved_args.clone();
@@ -2536,7 +2536,7 @@ impl Optimizer {
                     let same_as = OpCode::same_as_for_type(arg_type);
                     let fresh = ctx.alloc_op_position_typed(arg_type);
                     let mut op = Op::new(same_as, &[orig]);
-                    op.pos = fresh;
+                    op.pos.set(fresh);
                     // unroll.py:146 + compile.py:327 parity: accumulate the
                     // alias op in `extra_same_as` and splice it between the
                     // preamble body and the label at final assembly. Emitting
@@ -2674,7 +2674,7 @@ impl Optimizer {
                     // same resolved value. Independent get_box_replacement
                     // calls can diverge when forwarding chains differ.
                     // Use canonical_result (resolved key) for both.
-                    preamble_op.pos = canonical_result;
+                    preamble_op.pos.set(canonical_result);
                     for arg in &mut preamble_op.args {
                         *arg = ctx.get_box_replacement(*arg);
                     }
@@ -2697,7 +2697,7 @@ impl Optimizer {
                     eprintln!(
                         "[jit] exported_short_box: kind={:?} pos={:?} opcode={:?} args={:?} descr_idx={:?} invented={} same_as_source={:?}",
                         entry.kind,
-                        entry.op.pos,
+                        entry.op.pos.get(),
                         entry.op.opcode,
                         entry.op.args,
                         entry.op.descr.as_ref().map(|d| d.index()),
@@ -2878,9 +2878,9 @@ impl Optimizer {
             // Op positions: reassign ALL ops to start from final_num_inputs.
             for (new_idx, op) in ctx.new_operations.iter_mut().enumerate() {
                 let new_pos = fni + new_idx as u32;
-                if !op.pos.is_none() {
-                    remap.insert(op.pos.raw(), new_pos);
-                    op.pos = op.pos.with_raw(new_pos);
+                if !op.pos.get().is_none() {
+                    remap.insert(op.pos.get().raw(), new_pos);
+                    op.pos.set(op.pos.get().with_raw(new_pos));
                 }
             }
 
@@ -3051,7 +3051,7 @@ impl Optimizer {
                 }
                 // Remap exported short boxes
                 for entry in &mut state.exported_short_boxes {
-                    remap_opref(&mut entry.op.pos);
+                    remap_opref(&mut entry.op.pos.get());
                     for arg in &mut entry.op.args {
                         remap_opref(arg);
                     }
@@ -3115,7 +3115,7 @@ impl Optimizer {
             );
             if cmf_count == 0 && gnf_count > 0 {
                 for (i, op) in ops.iter().enumerate() {
-                    eprintln!("[opt] idx={} {:?} pos={:?}", i, op.opcode, op.pos);
+                    eprintln!("[opt] idx={} {:?} pos={:?}", i, op.opcode, op.pos.get());
                 }
             }
         }
@@ -3189,10 +3189,10 @@ impl Optimizer {
         let max_op_pos = ops
             .iter()
             .filter_map(|op| {
-                if op.pos.is_none() || op.pos.is_constant() {
+                if op.pos.get().is_none() || op.pos.get().is_constant() {
                     None
                 } else {
-                    Some(op.pos.raw())
+                    Some(op.pos.get().raw())
                 }
             })
             .max();
@@ -3534,7 +3534,7 @@ impl Optimizer {
             current_op.opcode,
             OpCode::SameAsI | OpCode::SameAsR | OpCode::SameAsF
         ) {
-            ctx.make_equal_to(current_op.pos, current_op.arg(0));
+            ctx.make_equal_to(current_op.pos.get(), current_op.arg(0));
             return;
         }
 
@@ -3702,14 +3702,14 @@ impl Optimizer {
 
             // optimizer.py:632-635: replaces_guard check BEFORE emit_guard_operation.
             if self.can_replace_guards {
-                if let Some(replacement) = self.replaces_guard.remove(&op.pos) {
-                    let target_pos = replacement.pos.raw() as usize;
+                if let Some(replacement) = self.replaces_guard.remove(&op.pos.get()) {
+                    let target_pos = replacement.pos.get().raw() as usize;
                     if target_pos < ctx.new_operations.len() {
                         if std::env::var_os("MAJIT_LOG").is_some() {
                             eprintln!(
                                 "[opt] guard replacement op={:?} pos={:?} target_index={} len={}",
                                 op.opcode,
-                                op.pos,
+                                op.pos.get(),
                                 target_pos,
                                 ctx.new_operations.len()
                             );
@@ -3770,14 +3770,14 @@ impl Optimizer {
                 majit_ir::Type::Int,
                 "returns_bool op must have int result: {:?} pos={:?} args={:?}",
                 op.opcode,
-                op.pos,
+                op.pos.get(),
                 op.args
             );
             // Slice 0.5: returns_bool ops are constructed Int-typed
             // (asserted above) and `Op.type_ == Int` already provides the
             // type to `opref_type` via the priority-2 op_at fast path.
             let op_pos_box = ctx
-                .ensure_box(op.pos)
+                .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
             ctx.with_intbound_mut(&op_pos_box, |bound| bound.make_bool());
         }
@@ -3913,7 +3913,7 @@ impl Optimizer {
         // sharing chain.  Mirrors the OptContext path at
         // optimizeopt/mod.rs:3061-3066.
         let shared = op.descr.is_none()
-            && op.rd_resume_position < 0
+            && op.rd_resume_position.get() < 0
             && self.last_guard_op_idx.is_some()
             && opcode != OpCode::GuardNotForced
             && opcode != OpCode::GuardNotForced2;
@@ -4287,7 +4287,7 @@ impl Optimizer {
         };
         // optimizer.py:776: replace_op_with(op, opnum, [op.getarg(0)], descr)
         let mut newop = Op::new(new_opcode, &[arg0]);
-        newop.pos = op.pos;
+        newop.pos.set(op.pos.get());
         newop.descr = op.descr.clone();
         newop.fail_args = op.fail_args.clone();
         newop.fail_arg_types = op.fail_arg_types.clone();
@@ -4387,7 +4387,7 @@ mod tests {
                 // Check if second arg is constant 0
                 if let Some(0) = ctx.get_constant_int(op.arg(1)) {
                     // Replace with first arg
-                    ctx.replace_op(op.pos, op.arg(0));
+                    ctx.replace_op(op.pos.get(), op.arg(0));
                     return OptimizationResult::Remove;
                 }
             }
@@ -4424,8 +4424,8 @@ mod tests {
 
     impl Optimization for RemoveAsConstant {
         fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-            if op.pos == self.target {
-                ctx.make_constant(op.pos, majit_ir::Value::Int(self.value));
+            if op.pos.get() == self.target {
+                ctx.make_constant(op.pos.get(), majit_ir::Value::Int(self.value));
                 return OptimizationResult::Remove;
             }
             OptimizationResult::PassOn
@@ -4461,8 +4461,8 @@ mod tests {
 
     impl Optimization for RemoveAsTypedConstant {
         fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-            if op.pos == self.target {
-                ctx.make_constant(op.pos, self.value.clone());
+            if op.pos.get() == self.target {
+                ctx.make_constant(op.pos.get(), self.value.clone());
                 return OptimizationResult::Remove;
             }
             OptimizationResult::PassOn
@@ -4480,8 +4480,8 @@ mod tests {
 
     impl Optimization for MarkAsTypedConstantButKeep {
         fn propagate_forward(&mut self, op: &Op, ctx: &mut OptContext) -> OptimizationResult {
-            if op.pos == self.target {
-                ctx.make_constant(op.pos, self.value.clone());
+            if op.pos.get() == self.target {
+                ctx.make_constant(op.pos.get(), self.value.clone());
             }
             OptimizationResult::PassOn
         }
@@ -4662,7 +4662,7 @@ mod tests {
         fn propagate_forward(&mut self, op: &Op, _ctx: &mut OptContext) -> OptimizationResult {
             if op.opcode == OpCode::IntAdd {
                 let mut restarted = Op::new(OpCode::IntSub, &[op.arg(0), op.arg(1)]);
-                restarted.pos = op.pos;
+                restarted.pos.set(op.pos.get());
                 return OptimizationResult::Restart(restarted);
             }
             OptimizationResult::PassOn
@@ -4702,7 +4702,7 @@ mod tests {
             OpCode::IntMul,
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
-        ops[0].pos = OpRef::int_op(2);
+        ops[0].pos.set(OpRef::int_op(2));
         let result =
             opt.optimize_with_constants_and_inputs(&ops, &mut std::collections::HashMap::new(), 2);
 
@@ -4745,7 +4745,7 @@ mod tests {
             Op::new(OpCode::Finish, &[OpRef::int_op(9)]),
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed((idx as u32) + 3, op.opcode.result_type());
+            op.pos.set(OpRef::op_typed((idx as u32) + 3, op.opcode.result_type()));
         }
 
         let mut opt = Optimizer::default_pipeline();
@@ -4876,10 +4876,10 @@ mod tests {
             finish,
         ];
         for (idx, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed((idx as u32) + 3, op.opcode.result_type());
+            op.pos.set(OpRef::op_typed((idx as u32) + 3, op.opcode.result_type()));
         }
-        call_a.pos = ops[0].pos;
-        call_b.pos = ops[4].pos;
+        call_a.pos.set(ops[0].pos.get());
+        call_b.pos.set(ops[4].pos.get());
 
         let mut opt = Optimizer::default_pipeline();
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
@@ -4890,10 +4890,10 @@ mod tests {
         let call_positions: std::collections::HashSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::CallMayForceR)
-            .map(|op| op.pos)
+            .map(|op| op.pos.get())
             .collect();
         assert!(
-            call_positions.contains(&call_a.pos) && call_positions.contains(&call_b.pos),
+            call_positions.contains(&call_a.pos.get()) && call_positions.contains(&call_b.pos.get()),
             "optimized trace lost CallMayForceR producer(s): {result:?}"
         );
         let guarded = result
@@ -4927,7 +4927,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
         let result = opt.optimize_with_constants_and_inputs(
             &ops,
@@ -4952,17 +4952,16 @@ mod tests {
             Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(4)]),
             Op::new(OpCode::IntGt, &[OpRef::int_op(5), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(3);
-        ops[1].pos = OpRef::int_op(4);
-        ops[2].pos = OpRef::int_op(5);
-        ops[3].pos = OpRef::int_op(6);
-
+        ops[0].pos.set(OpRef::int_op(3));
+        ops[1].pos.set(OpRef::int_op(4));
+        ops[2].pos.set(OpRef::int_op(5));
+        ops[3].pos.set(OpRef::int_op(6));
         let mut constants = std::collections::HashMap::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
         opt.constant_types.insert(1, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
-        let positions: Vec<_> = result.iter().map(|op| op.pos).collect();
+        let positions: Vec<_> = result.iter().map(|op| op.pos.get()).collect();
         assert_eq!(
             positions,
             vec![
@@ -4991,19 +4990,18 @@ mod tests {
             Op::new(OpCode::GetfieldRawI, &[OpRef::int_op(0)]),
             Op::new(OpCode::IntGt, &[OpRef::int_op(3), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(3);
-        ops[1].pos = OpRef::int_op(4);
-        ops[2].pos = OpRef::int_op(5);
-        ops[3].pos = OpRef::int_op(6);
-
+        ops[0].pos.set(OpRef::int_op(3));
+        ops[1].pos.set(OpRef::int_op(4));
+        ops[2].pos.set(OpRef::int_op(5));
+        ops[3].pos.set(OpRef::int_op(6));
         let mut constants = std::collections::HashMap::new();
         constants.insert(1u32, majit_ir::Value::Int(27));
         opt.constant_types.insert(1, Type::Int);
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
-        assert_eq!(result[0].pos, OpRef::int_op(5));
-        assert_eq!(result[1].pos, OpRef::int_op(6));
-        assert_eq!(result[2].pos, OpRef::int_op(7));
+        assert_eq!(result[0].pos.get(), OpRef::int_op(5));
+        assert_eq!(result[1].pos.get(), OpRef::int_op(6));
+        assert_eq!(result[2].pos.get(), OpRef::int_op(7));
         assert_eq!(result[2].arg(0), OpRef::int_op(5));
         assert_eq!(constants.get(&5), None);
         assert_eq!(constants.get(&8), Some(&majit_ir::Value::Int(123)));
@@ -5021,8 +5019,7 @@ mod tests {
             OpCode::IntGt,
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
-        ops[0].pos = OpRef::int_op(3);
-
+        ops[0].pos.set(OpRef::int_op(3));
         let mut constants = std::collections::HashMap::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
@@ -5031,7 +5028,7 @@ mod tests {
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].pos, OpRef::int_op(3));
+        assert_eq!(result[0].pos.get(), OpRef::int_op(3));
         assert_eq!(constants.get(&3), None);
     }
 
@@ -5043,8 +5040,7 @@ mod tests {
             OpCode::IntGt,
             &[OpRef::int_op(0), OpRef::int_op(1)],
         )];
-        ops[0].pos = OpRef::int_op(3);
-
+        ops[0].pos.set(OpRef::int_op(3));
         let mut constants = std::collections::HashMap::new();
         constants.insert(0u32, majit_ir::Value::Int(40));
         constants.insert(1u32, majit_ir::Value::Int(5));
@@ -5055,7 +5051,7 @@ mod tests {
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 3);
 
         assert_eq!(result.len(), 1);
-        assert_eq!(result[0].pos, OpRef::int_op(3));
+        assert_eq!(result[0].pos.get(), OpRef::int_op(3));
         assert_eq!(result[0].opcode, OpCode::IntGt);
         assert_eq!(constants.get(&3), None);
     }
@@ -5069,8 +5065,8 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(2)]),
         ];
-        ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::void_op(3);
+        ops[0].pos.set(OpRef::int_op(2));
+        ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants = std::collections::HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -5105,7 +5101,7 @@ mod tests {
             Op::new(OpCode::Finish, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
         let (ops, snapshots) = super::super::seed_empty_guard_snapshots(&ops);
         opt.snapshot_boxes = snapshots;
@@ -5173,8 +5169,8 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::void_op(3);
+        ops[0].pos.set(OpRef::int_op(2));
+        ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants = std::collections::HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -5239,8 +5235,8 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::void_op(3);
+        ops[0].pos.set(OpRef::int_op(2));
+        ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants = std::collections::HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -5248,18 +5244,18 @@ mod tests {
         let op_index: std::collections::HashMap<_, _> = result
             .iter()
             .enumerate()
-            .map(|(idx, op)| (op.pos, idx))
+            .map(|(idx, op)| (op.pos.get(), idx))
             .collect();
 
         for set_op in result.iter().filter(|op| op.opcode == OpCode::SetfieldGc) {
             let alloc_ref = set_op.arg(0);
             let new_idx = result
                 .iter()
-                .position(|op| op.opcode == OpCode::New && op.pos == alloc_ref)
+                .position(|op| op.opcode == OpCode::New && op.pos.get() == alloc_ref)
                 .unwrap_or_else(|| panic!("missing New for {alloc_ref:?} in {result:?}"));
             let set_idx = *op_index
-                .get(&set_op.pos)
-                .unwrap_or_else(|| panic!("missing setfield pos {:?} in {:?}", set_op.pos, result));
+                .get(&set_op.pos.get())
+                .unwrap_or_else(|| panic!("missing setfield pos {:?} in {:?}", set_op.pos.get(), result));
             assert!(
                 new_idx < set_idx,
                 "matching New must appear before SetfieldGc; got {:?}",
@@ -5286,8 +5282,8 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(2);
-        ops[1].pos = OpRef::void_op(3);
+        ops[0].pos.set(OpRef::int_op(2));
+        ops[1].pos.set(OpRef::void_op(3));
 
         let mut constants = std::collections::HashMap::new();
         let result = opt.optimize_with_constants_and_inputs(&ops, &mut constants, 2);
@@ -5295,7 +5291,7 @@ mod tests {
         let new_positions: std::collections::HashSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::New)
-            .map(|op| op.pos.raw())
+            .map(|op| op.pos.get().raw())
             .collect();
         assert!(
             !new_positions.is_empty(),
@@ -5333,8 +5329,8 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]),
             Op::new(OpCode::Jump, &[OpRef::int_op(0), OpRef::int_op(1)]),
         ];
-        ops[0].pos = OpRef::int_op(66);
-        ops[1].pos = OpRef::void_op(67);
+        ops[0].pos.set(OpRef::int_op(66));
+        ops[1].pos.set(OpRef::void_op(67));
 
         let mut constants = std::collections::HashMap::new();
         constants.insert(OpRef::const_int(0).raw(), majit_ir::Value::Int(472));
@@ -5343,7 +5339,7 @@ mod tests {
         let new_positions: std::collections::HashSet<_> = result
             .iter()
             .filter(|op| op.opcode == OpCode::New)
-            .map(|op| op.pos.raw())
+            .map(|op| op.pos.get().raw())
             .collect();
         // With high-bit constant namespace, constant OpRefs never collide with
         // operation positions, so the New op lands at next_pos (68) directly.
@@ -5404,7 +5400,7 @@ mod tests {
             Op::new(OpCode::Jump, &[]),
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
 
         let result = opt.optimize_with_constants_and_inputs(
@@ -5726,7 +5722,7 @@ mod tests {
         let mut ctx = OptContext::with_inputarg_types(16, &[Type::Ref]);
 
         let mut preamble_op = Op::new(OpCode::IntGe, &[OpRef::int_op(3), OpRef::int_op(10_000)]);
-        preamble_op.pos = OpRef::int_op(14);
+        preamble_op.pos.set(OpRef::int_op(14));
         ctx.make_constant(OpRef::int_op(10_000), majit_ir::Value::Int(0));
         ctx.initialize_imported_short_preamble_builder(
             &[OpRef::int_op(0)],
@@ -5744,13 +5740,13 @@ mod tests {
                 invented_name: false,
                 preamble_op: {
                     let mut op = majit_ir::Op::new(majit_ir::OpCode::SameAsI, &[OpRef::int_op(14)]);
-                    op.pos = OpRef::op_typed(14, op.result_type());
+                    op.pos.set(OpRef::op_typed(14, op.result_type()));
                     op
                 },
             });
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(14)]);
-        guard.pos = OpRef::op_typed(15, guard.result_type());
+        guard.pos.set(OpRef::op_typed(15, guard.result_type()));
         let (mut seeded_ops, snapshots) =
             super::super::seed_empty_guard_snapshots(std::slice::from_ref(&guard));
         ctx.snapshot_boxes = snapshots;
@@ -5781,7 +5777,7 @@ mod tests {
         ];
         ops[1].fail_args = Some(vec![OpRef::int_op(100), OpRef::int_op(101)].into());
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.opcode.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }
 
         let (ops, snapshots) = super::super::seed_guard_snapshots_with(&ops, |_| {

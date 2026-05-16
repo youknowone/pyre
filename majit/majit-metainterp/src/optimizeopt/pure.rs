@@ -451,7 +451,7 @@ impl OptPure {
     /// pure.py: pure(opnum, op)
     pub fn pure(&mut self, op: &Op) {
         let key = PureOpKey::from_op(op);
-        self.cache.insert(key, op.pos);
+        self.cache.insert(key, op.pos.get());
     }
 
     /// Record a pure operation with explicit args.
@@ -1011,7 +1011,7 @@ impl Optimization for OptPure {
             if op.opcode == OpCode::GuardNoOverflow {
                 // Try constant folding on the OVF op.
                 if let Some(folded) = try_constant_fold_int_value(&postponed, ctx) {
-                    ctx.find_or_record_constant_int(postponed.pos, folded);
+                    ctx.find_or_record_constant_int(postponed.pos.get(), folded);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
                 }
@@ -1019,7 +1019,7 @@ impl Optimization for OptPure {
                 // pure.py:50-55: force_preamble_op replaces the OVF op
                 // with the preamble's cached result.
                 if let Some(cached_ref) = self.force_preamble_op(&postponed, ctx) {
-                    ctx.replace_op(postponed.pos, cached_ref);
+                    ctx.replace_op(postponed.pos.get(), cached_ref);
                     self.last_emitted_was_removed = true;
                     return OptimizationResult::Remove; // guard also removed
                 }
@@ -1032,7 +1032,7 @@ impl Optimization for OptPure {
                 if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                     if Self::_can_reuse_oldop(postponed.opcode, postponed.opcode, true) {
                         let cached_ref = ctx.get_box_replacement(cached_ref);
-                        ctx.replace_op(postponed.pos, cached_ref);
+                        ctx.replace_op(postponed.pos.get(), cached_ref);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove; // guard also removed
                     }
@@ -1070,7 +1070,7 @@ impl Optimization for OptPure {
                     postponed.args[i] = self.force_box(arg, ctx);
                 }
                 // Record and emit both the OVF op and the guard.
-                self.cache.insert(key, postponed.pos);
+                self.cache.insert(key, postponed.pos.get());
                 ctx.emit(postponed);
                 return OptimizationResult::PassOn; // guard passes through
             } else {
@@ -1109,13 +1109,13 @@ impl Optimization for OptPure {
         if op.opcode.is_always_pure() {
             // Constant folding: all args are constants → compute at opt time.
             if let Some(folded_value) = try_constant_fold_pure_value(op, ctx) {
-                ctx.make_constant(op.pos, folded_value);
+                ctx.make_constant(op.pos.get(), folded_value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
 
             if let Some(cached_ref) = self.force_preamble_op(op, ctx) {
-                ctx.replace_op(op.pos, cached_ref);
+                ctx.replace_op(op.pos.get(), cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -1125,12 +1125,12 @@ impl Optimization for OptPure {
             // CSE: exact same operation already computed?
             if let Some(cached_ref) = self.lookup_pure(&key, ctx) {
                 let cached_ref = ctx.get_box_replacement(cached_ref);
-                ctx.replace_op(op.pos, cached_ref);
+                ctx.replace_op(op.pos.get(), cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
 
-            self.cache.insert(key, op.pos);
+            self.cache.insert(key, op.pos.get());
             self.short_preamble_pure_ops.push(op.clone());
             return OptimizationResult::PassOn;
         }
@@ -1144,7 +1144,7 @@ impl Optimization for OptPure {
 
             // pure.py:191-196: _can_optimize_call_pure(op, start_index=1).
             if let Some(value) = self.lookup_call_pure_result(op, start_index, ctx) {
-                ctx.make_constant(op.pos, value);
+                ctx.make_constant(op.pos.get(), value);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
@@ -1164,8 +1164,8 @@ impl Optimization for OptPure {
                         start_index,
                         ctx,
                     ) {
-                        let cached_ref = ctx.get_box_replacement(old_op.pos);
-                        ctx.replace_op(op.pos, cached_ref);
+                        let cached_ref = ctx.get_box_replacement(old_op.pos.get());
+                        ctx.replace_op(op.pos.get(), cached_ref);
                         self.last_emitted_was_removed = true;
                         return OptimizationResult::Remove;
                     }
@@ -1221,20 +1221,20 @@ impl Optimization for OptPure {
                     }
                 };
                 let cached_ref = ctx.get_box_replacement(entry_result);
-                ctx.replace_op(op.pos, cached_ref);
+                ctx.replace_op(op.pos.get(), cached_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
             // pure.py:211-220: known_result_call_pure.
             if let Some(result_ref) = self.lookup_known_result(op, start_index, ctx) {
                 let result_ref = ctx.get_box_replacement(result_ref);
-                ctx.replace_op(op.pos, result_ref);
+                ctx.replace_op(op.pos.get(), result_ref);
                 self.last_emitted_was_removed = true;
                 return OptimizationResult::Remove;
             }
 
             let key = PureOpKey::from_call_op(op, start_index);
-            self.cache.insert(key, op.pos);
+            self.cache.insert(key, op.pos.get());
             self.call_pure_positions.push(ctx.new_operations.len());
             if start_index == 0 {
                 // pure.py:222-225: replace CALL_PURE with CALL.
@@ -1305,7 +1305,7 @@ impl Optimization for OptPure {
                 })
                 .collect::<Vec<_>>();
             let mut imported_op = Op::new(entry.opcode, &imported_args);
-            imported_op.pos = entry.result;
+            imported_op.pos.set(entry.result);
             imported_op.descr = entry.descr.clone();
             self.short_preamble_pure_ops.push(imported_op);
             let resolved_args: Vec<OpRef> = entry
@@ -1352,7 +1352,7 @@ mod tests {
         preamble_op: Op,
         label_arg_idx: Option<usize>,
     ) {
-        let source = preamble_op.pos;
+        let source = preamble_op.pos.get();
         let short_inputargs: Vec<OpRef> = match label_arg_idx {
             Some(idx) => (0..=idx as u32).map(OpRef::int_op).collect(),
             None => vec![OpRef::int_op(0)],
@@ -1376,7 +1376,7 @@ mod tests {
                     invented_name: false,
                     preamble_op: {
                         let mut same_as = Op::new(OpCode::SameAsI, &[source]);
-                        same_as.pos = source;
+                        same_as.pos.set(source);
                         same_as
                     },
                 });
@@ -1393,7 +1393,7 @@ mod tests {
             // resoperation.py:1693 parity). Argument OpRefs in these
             // fixtures must use the matching typed factory at the same
             // raw N to satisfy variant-aware Eq against `op.pos`.
-            op.pos = OpRef::op_typed(i as u32, op.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
         }
     }
 
@@ -1687,14 +1687,14 @@ mod tests {
         // Simulate: op0 = int_add(a, b)
         let op0 = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
         let mut op0 = op0;
-        op0.pos = OpRef::int_op(2);
+        op0.pos.set(OpRef::int_op(2));
         let result0 = pass.propagate_forward(&op0, &mut ctx);
         assert!(matches!(result0, OptimizationResult::PassOn));
 
         // Simulate: op1 = int_add(a, b) with same args
         let op1 = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
         let mut op1 = op1;
-        op1.pos = OpRef::int_op(3);
+        op1.pos.set(OpRef::int_op(3));
         let result1 = pass.propagate_forward(&op1, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
     }
@@ -2115,7 +2115,7 @@ mod tests {
 
         let descr = make_field_descr_full(1, 0, 8, Type::Int, true);
         let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::ref_op(10)], descr);
-        op.pos = OpRef::int_op(0);
+        op.pos.set(OpRef::int_op(0));
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
@@ -2142,7 +2142,7 @@ mod tests {
 
         let descr = make_field_descr_full(2, 0, 8, Type::Float, true);
         let mut op = Op::with_descr(OpCode::GetfieldGcPureF, &[OpRef::ref_op(10)], descr);
-        op.pos = OpRef::float_op(0);
+        op.pos.set(OpRef::float_op(0));
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
@@ -2171,7 +2171,7 @@ mod tests {
 
         let descr = make_field_descr_full(3, 0, std::mem::size_of::<usize>(), Type::Ref, true);
         let mut op = Op::with_descr(OpCode::GetfieldGcPureR, &[OpRef::ref_op(10)], descr);
-        op.pos = OpRef::ref_op(0);
+        op.pos.set(OpRef::ref_op(0));
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
@@ -2198,7 +2198,7 @@ mod tests {
     fn test_constant_fold_getfield_gc_pure_does_not_treat_int_constant_as_gc_pointer() {
         let descr = make_field_descr_full(4, 0, 8, Type::Int, true);
         let mut op = Op::with_descr(OpCode::GetfieldGcPureI, &[OpRef::int_op(10)], descr);
-        op.pos = OpRef::int_op(0);
+        op.pos.set(OpRef::int_op(0));
 
         let mut pass = OptPure::new();
         let mut ctx = OptContext::with_num_inputs(4, 0);
@@ -2265,7 +2265,7 @@ mod tests {
         pass.pure_from_args2(OpCode::IntAdd, c5_a, x, OpRef::int_op(42));
 
         let mut q = Op::new(OpCode::IntAdd, &[c5_b, x]);
-        q.pos = OpRef::int_op(99);
+        q.pos.set(OpRef::int_op(99));
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
             Some(OpRef::int_op(42)),
@@ -2274,7 +2274,7 @@ mod tests {
 
         // A non-constant slot mismatch must still miss.
         let mut q_miss = Op::new(OpCode::IntAdd, &[c5_b, OpRef::int_op(8)]);
-        q_miss.pos = OpRef::int_op(100);
+        q_miss.pos.set(OpRef::int_op(100));
         assert_eq!(pass.get_pure_result(&q_miss, &ctx), None);
     }
 
@@ -2294,7 +2294,7 @@ mod tests {
         pass.pure_from_args2(OpCode::IntAdd, canonical_arg, other_arg, result);
 
         let mut q = Op::new(OpCode::IntAdd, &[query_arg, other_arg]);
-        q.pos = OpRef::int_op(99);
+        q.pos.set(OpRef::int_op(99));
         assert_eq!(
             pass.get_pure_result(&q, &ctx),
             Some(result),
@@ -2308,7 +2308,7 @@ mod tests {
 
         // Manually record a pure operation via the API
         let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(10), OpRef::int_op(20)]);
-        op.pos = OpRef::int_op(0);
+        op.pos.set(OpRef::int_op(0));
         pass.pure(&op);
 
         let ctx = OptContext::new(0);
@@ -2324,7 +2324,7 @@ mod tests {
             OpRef::int_op(5),
         );
         let mut lookup_mul = Op::new(OpCode::IntMul, &[OpRef::int_op(30), OpRef::int_op(40)]);
-        lookup_mul.pos = OpRef::int_op(99);
+        lookup_mul.pos.set(OpRef::int_op(99));
         assert!(pass.get_pure_result(&lookup_mul, &ctx).is_some());
     }
 
@@ -2431,7 +2431,7 @@ mod tests {
             crate::optimizeopt::shortpreamble::PreambleOpKind::Pure
         ));
         assert_eq!(collected[0].1.preamble_op.opcode, OpCode::IntAdd);
-        assert_eq!(collected[0].1.preamble_op.pos, OpRef::int_op(2));
+        assert_eq!(collected[0].1.preamble_op.pos.get(), OpRef::int_op(2));
     }
 
     #[test]
@@ -2472,7 +2472,7 @@ mod tests {
         pass.install_preamble_pure_ops(&ctx);
 
         let mut op = Op::new(OpCode::CallPureI, &[const_opref, OpRef::int_op(0)]);
-        op.pos = OpRef::int_op(2);
+        op.pos.set(OpRef::int_op(2));
         op.descr = Some(call_descr);
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
@@ -2486,7 +2486,7 @@ mod tests {
         pass.setup();
 
         let mut op = Op::new(OpCode::IntAdd, &[OpRef::int_op(0), OpRef::int_op(1)]);
-        op.pos = OpRef::int_op(2);
+        op.pos.set(OpRef::int_op(2));
         let result = pass.propagate_forward(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
 
@@ -2515,7 +2515,7 @@ mod tests {
             OpCode::CallPureI,
             &[OpRef::int_op(100), OpRef::int_op(0), OpRef::int_op(1)],
         );
-        op.pos = OpRef::int_op(2);
+        op.pos.set(OpRef::int_op(2));
         op.descr = Some(majit_ir::descr::make_call_descr(
             vec![
                 majit_ir::Type::Int,
@@ -2564,7 +2564,7 @@ mod tests {
             OpCode::CallLoopinvariantI,
             &[OpRef::int_op(100), OpRef::int_op(0)],
         );
-        op.pos = OpRef::int_op(2);
+        op.pos.set(OpRef::int_op(2));
         op.descr = Some(majit_ir::descr::make_call_descr(
             vec![majit_ir::Type::Int, majit_ir::Type::Int],
             majit_ir::Type::Int,
@@ -2717,7 +2717,7 @@ mod tests {
 
         assert!(result.is_empty());
         assert_eq!(
-            constants.get(&ops[0].pos.raw()),
+            constants.get(&ops[0].pos.get().raw()),
             Some(&majit_ir::Value::Int(42))
         );
     }

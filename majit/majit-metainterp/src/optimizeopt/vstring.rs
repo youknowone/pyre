@@ -498,7 +498,7 @@ impl OptString {
             if len >= 0 && (len as usize) <= MAX_CONST_LEN {
                 // vstring.py:450: self.make_vstring_plain(op, mode, length)
                 let b = ctx
-                    .ensure_box(op.pos)
+                    .ensure_box(op.pos.get())
                     .expect("body-namespace OpRef must have a BoxRef slot");
                 {
                     ctx.set_ptr_info(
@@ -521,7 +521,7 @@ impl OptString {
         }
         // vstring.py:452: self.make_nonnull_str(op, mode); return self.emit(op)
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
-        if let Some(op_box) = ctx.ensure_box(op.pos) {
+        if let Some(op_box) = ctx.ensure_box(op.pos.get()) {
             ctx.make_nonnull_str(&op_box, mode);
         }
         // vstring.py:455-459 postprocess_NEWSTR / postprocess_NEWUNICODE:
@@ -531,7 +531,7 @@ impl OptString {
         } else {
             OpCode::Strlen
         };
-        ctx.register_pure_from_args1(strlen_opcode, op.pos, len_ref);
+        ctx.register_pure_from_args1(strlen_opcode, op.pos.get(), len_ref);
         OptimizationResult::PassOn
     }
 
@@ -570,7 +570,7 @@ impl OptString {
         if let Some(idx) = ctx.get_constant_int(idx_ref) {
             if let Some(ch_ref) = self.strgetitem(str_ref, idx, ctx) {
                 let ch_resolved = ctx.get_box_replacement(ch_ref);
-                ctx.replace_op(op.pos, ch_resolved);
+                ctx.replace_op(op.pos.get(), ch_resolved);
                 return OptimizationResult::Remove;
             }
         }
@@ -597,7 +597,7 @@ impl OptString {
             // vstring.py:529: lgtop = opinfo.getstrlen(arg1, self, mode)
             let lgtop = ctx.getstrlen_opref(arg1, mode);
             // vstring.py:531: self.make_equal_to(op, lgtop)
-            ctx.make_equal_to(op.pos, lgtop);
+            ctx.make_equal_to(op.pos.get(), lgtop);
             return OptimizationResult::Remove;
         }
         // vstring.py:533: return self.emit(op)
@@ -814,7 +814,7 @@ impl OptString {
                 ctx.make_nonnull_str(&vright_box, mode);
             }
             let b = ctx
-                .ensure_box(op.pos)
+                .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
             ctx.set_ptr_info(
                 &b,
@@ -863,7 +863,7 @@ impl OptString {
             // vstring.py:220-225: VStringSliceInfo.__init__ sets
             // self.lgtop = length on the inherited StrPtrInfo field.
             let b = ctx
-                .ensure_box(op.pos)
+                .ensure_box(op.pos.get())
                 .expect("body-namespace OpRef must have a BoxRef slot");
             ctx.set_ptr_info(
                 &b,
@@ -924,7 +924,7 @@ impl OptString {
             let l2c = ctx.get_constant_int(l2);
             if let (Some(v1), Some(v2)) = (l1c, l2c) {
                 if v1 != v2 {
-                    ctx.make_constant(op.pos, Value::Int(0));
+                    ctx.make_constant(op.pos.get(), Value::Int(0));
                     return OptimizationResult::Remove;
                 }
             }
@@ -1005,7 +1005,7 @@ impl OptString {
                     let lengthbox = ctx.getstrlen_opref(arg1, mode);
                     let zero = ctx.emit_constant_int(0);
                     let mut eq_op = Op::new(OpCode::IntEq, &[lengthbox, zero]);
-                    eq_op.pos = op.pos;
+                    eq_op.pos.set(op.pos.get());
                     return Some(OptimizationResult::Emit(eq_op));
                 }
             }
@@ -1028,7 +1028,7 @@ impl OptString {
                     let c2 = self.strgetitem(arg2, 0, ctx);
                     if let (Some(ch1), Some(ch2)) = (c1, c2) {
                         let mut eq_op = Op::new(OpCode::IntEq, &[ch1, ch2]);
-                        eq_op.pos = op.pos;
+                        eq_op.pos.set(op.pos.get());
                         return Some(OptimizationResult::Emit(eq_op));
                     }
                 }
@@ -1052,17 +1052,17 @@ impl OptString {
         // vstring.py:776-787: arg2 is null
         if self.is_known_null(arg2, ctx) {
             if self.is_known_nonnull(arg1, ctx) {
-                ctx.make_constant(op.pos, Value::Int(0));
+                ctx.make_constant(op.pos.get(), Value::Int(0));
                 return Some(OptimizationResult::Remove);
             }
             if self.is_known_null(arg1, ctx) {
-                ctx.make_constant(op.pos, Value::Int(1));
+                ctx.make_constant(op.pos.get(), Value::Int(1));
                 return Some(OptimizationResult::Remove);
             }
             // vstring.py:784: PTR_EQ against CONST_NULL (ref-null, not int-zero)
             let null_const = ctx.emit_constant_ref(majit_ir::GcRef::NULL);
             let mut eq_op = Op::new(OpCode::PtrEq, &[arg1, null_const]);
-            eq_op.pos = op.pos;
+            eq_op.pos.set(op.pos.get());
             return Some(OptimizationResult::Emit(eq_op));
         }
         None
@@ -1160,7 +1160,7 @@ impl OptString {
         let mut call_args = vec![func_const];
         call_args.extend_from_slice(args);
         let mut call_op = Op::with_descr(OpCode::CallI, &call_args, calldescr.clone());
-        call_op.pos = result_op.pos;
+        call_op.pos.set(result_op.pos.get());
         Some(OptimizationResult::Emit(call_op))
     }
 
@@ -1205,7 +1205,7 @@ impl OptString {
                 self.strgetitem(op.arg(2), 0, ctx),
             ) {
                 let result = self.int_sub(char1, char2, ctx);
-                ctx.replace_op(op.pos, result);
+                ctx.replace_op(op.pos.get(), result);
                 return OptimizationResult::Remove;
             }
         }
@@ -1270,7 +1270,7 @@ impl OptString {
                     .unwrap_or(false);
                 if did_shrink {
                     // vstring.py:849: self.make_equal_to(op, op.getarg(1))
-                    ctx.replace_op(op.pos, arg1);
+                    ctx.replace_op(op.pos.get(), arg1);
                     return OptimizationResult::Remove;
                 }
             }
@@ -1378,7 +1378,7 @@ mod tests {
     /// Assign sequential positions to ops and pre-seed constants in OptContext.
     fn assign_positions(ops: &mut [Op]) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.type_);
+            op.pos.set(OpRef::op_typed(i as u32, op.type_));
         }
     }
 
@@ -1396,7 +1396,7 @@ mod tests {
         // (start_next_pos = max(num_inputs, max_pos + 1)).
         let max_pos = ops
             .iter()
-            .map(|op| op.pos)
+            .map(|op| op.pos.get())
             .filter(|op| !op.is_none() && !op.is_constant())
             .map(|op| op.raw())
             .max()
@@ -1783,7 +1783,7 @@ mod tests {
             .back()
             .expect("getstrlen must emit a len op");
 
-        assert_eq!(len_ref, last_op.pos);
+        assert_eq!(len_ref, last_op.pos.get());
         assert_eq!(last_op.opcode, OpCode::Unicodelen);
         assert_eq!(last_op.args.as_slice(), &[unicode_ref]);
     }
@@ -2092,7 +2092,7 @@ mod tests {
 
         // Simulate: NEWSTR(2) for left
         let mut left_op = Op::new(OpCode::Newstr, &[OpRef::int_op(200)]);
-        left_op.pos = left;
+        left_op.pos.set(left);
         let mut ctx = OptContext::new(10);
         ctx.make_constant(OpRef::int_op(200), Value::Int(2));
 
@@ -2315,7 +2315,7 @@ mod tests {
             .expect("should have emitted STRLEN");
         assert_eq!(strlen_op.opcode, OpCode::Strlen);
         assert_eq!(strlen_op.args.as_slice(), &[arg2]);
-        assert_eq!(strlen_ref, strlen_op.pos);
+        assert_eq!(strlen_ref, strlen_op.pos.get());
 
         // Subsequent call must return the cached lgtop.
         let strlen_ref2 = ctx.getstrlen_opref(arg2, 0);
@@ -2362,7 +2362,7 @@ mod tests {
             &[arg1],
             "STRLEN must use arg1 (op), not arg2 (info source)"
         );
-        assert_eq!(strlen_ref, strlen_op.pos);
+        assert_eq!(strlen_ref, strlen_op.pos.get());
 
         // lgtop is cached on arg2's info — second call returns cached value.
         let strlen_ref2 = ctx.getstrlen_for(arg2, arg1, 0);

@@ -222,7 +222,7 @@ impl Guard {
         });
         let mut last = var.var;
         for op in ops {
-            last = op.pos;
+            last = op.pos.get();
             new_ops.push(op);
         }
         // guard.py:131: opt.renamer.start_renaming(old_arg, box)
@@ -290,7 +290,7 @@ impl Guard {
         // make_compile_loop_version_descr_from reference-shares each
         // Arc<[T]> slot from the donor onto the fresh descr.
         let fresh_descr = crate::compile::make_compile_loop_version_descr_from(&self.op);
-        let mut guard_op = Op::new(self.op.opcode, &[compare.pos]);
+        let mut guard_op = Op::new(self.op.opcode, &[compare.pos.get()]);
         guard_op.descr = Some(fresh_descr);
         // guard.py:94: guard.setfailargs(loop.label.getarglist_copy())
         guard_op.fail_args = Some(label_args.into());
@@ -391,7 +391,7 @@ impl Guard {
         let cmp_op = Op::new(self.cmp_op.opcode, &[lhs, rhs]);
         new_ops.push(cmp_op.clone());
         // guard.py:142-144: guard = ResOperation(opnum, [cmp_op], descr)
-        let mut guard = Op::new(self.op.opcode, &[cmp_op.pos]);
+        let mut guard = Op::new(self.op.opcode, &[cmp_op.pos.get()]);
         guard.descr = self.op.descr.clone();
         guard.fail_args = self.op.fail_args.clone();
         guard.fail_arg_types = self.op.fail_arg_types.clone();
@@ -410,7 +410,7 @@ impl Guard {
         if self.index > 0 {
             // guard.py:154: if operations[self.index-1] is self.cmp_op
             if let Some(ref prev) = ops[self.index - 1] {
-                if prev.pos == self.cmp_op.pos {
+                if prev.pos.get() == self.cmp_op.pos.get() {
                     ops[self.index - 1] = None;
                 }
             }
@@ -469,7 +469,7 @@ impl GuardStrengthenOpt {
             }
             // guard.py:183: Guard.of(op.getarg(0), operations, i, self.index_vars)
             let bool_arg = op.arg(0);
-            let cmp_op = ops.iter().rfind(|o| o.pos == bool_arg);
+            let cmp_op = ops.iter().rfind(|o| o.pos.get() == bool_arg);
             if let Some(cmp) = cmp_op {
                 if let Some(guard) = Guard::of(i, op, cmp, &self.index_vars) {
                     let lk = guard.getleftkey();
@@ -553,7 +553,7 @@ impl GuardStrengthenOpt {
             }
             // guard.py:239-245: non-void index_var → emit_operations + rename
             if op.opcode.result_type() != majit_ir::Type::Void {
-                if let Some(index_var) = index_vars.get(&op.pos) {
+                if let Some(index_var) = index_vars.get(&op.pos.get()) {
                     if !index_var.is_identity() {
                         let ncp = &mut self.next_const_pos;
                         let cv = &mut self.const_values;
@@ -563,7 +563,7 @@ impl GuardStrengthenOpt {
                             cv.insert(cref, value);
                             cref
                         });
-                        self.renamer.insert(op.pos, result);
+                        self.renamer.insert(op.pos.get(), result);
                         continue;
                     }
                 }
@@ -1032,7 +1032,7 @@ mod tests {
     /// a missing donor.
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(base + i as u32, op.result_type());
+            op.pos.set(OpRef::op_typed(base + i as u32, op.result_type()));
             if op.opcode.is_guard() && op.descr.is_none() {
                 op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
             }
@@ -1439,12 +1439,12 @@ mod tests {
                     OpCode::GuardValue,
                     &[OpRef::int_op(100), OpRef::int_op(200)],
                 );
-                op.pos = OpRef::void_op(0);
+                op.pos.set(OpRef::void_op(0));
                 op
             },
             Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
         ];
-        ops[1].pos = OpRef::int_op(1);
+        ops[1].pos.set(OpRef::int_op(1));
 
         // Pre-seed constant 1 for OpRef::int_op(200)
         let mut opt = crate::optimizeopt::optimizer::Optimizer::new();

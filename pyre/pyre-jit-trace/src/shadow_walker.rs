@@ -445,7 +445,7 @@ mod tests {
             Some(d) => Op::with_descr(opcode, args, d),
             None => Op::new(opcode, args),
         };
-        op.pos = OpRef::op_typed(0, opcode.result_type());
+        op.pos.set(OpRef::op_typed(0, opcode.result_type()));
         op
     }
 

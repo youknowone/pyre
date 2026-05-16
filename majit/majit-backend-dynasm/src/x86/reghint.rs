@@ -63,7 +63,7 @@ impl RegisterHints {
         for (i, op) in operations.iter().enumerate() {
             let position = i as i32;
             // reghint.py:34-35 skip dead no-side-effect ops.
-            if op.opcode.has_no_side_effect() && !longevity.contains(op.pos) {
+            if op.opcode.has_no_side_effect() && !longevity.contains(op.pos.get()) {
                 continue;
             }
             self.dispatch(op.opcode, longevity, op, position);
@@ -144,7 +144,7 @@ impl RegisterHints {
 
     /// reghint.py:43-45 consider_int_neg / consider_int_invert.
     fn consider_int_neg(&self, longevity: &mut LifetimeManager, op: &Op, _position: i32) {
-        longevity.try_use_same_register(op.args[0], op.pos);
+        longevity.try_use_same_register(op.args[0], op.pos.get());
     }
 
     /// reghint.py:47-62 `_consider_binop_part`.
@@ -174,7 +174,7 @@ impl RegisterHints {
         }
 
         if !x.is_constant() {
-            longevity.try_use_same_register(x, op.pos);
+            longevity.try_use_same_register(x, op.pos.get());
         }
     }
 
@@ -215,7 +215,7 @@ impl RegisterHints {
     fn _consider_float_op(&self, longevity: &mut LifetimeManager, op: &Op, _position: i32) {
         let x = op.args[0];
         if !x.is_constant() {
-            longevity.try_use_same_register(x, op.pos);
+            longevity.try_use_same_register(x, op.pos.get());
         }
     }
 
@@ -232,7 +232,7 @@ impl RegisterHints {
             longevity.fixed_register(position, ECX, Some(y));
         }
         if !x.is_constant() {
-            longevity.try_use_same_register(x, op.pos);
+            longevity.try_use_same_register(x, op.pos.get());
         }
     }
 
@@ -254,7 +254,7 @@ impl RegisterHints {
         op: &Op,
         position: i32,
     ) {
-        longevity.fixed_register(position, ECX, Some(op.pos));
+        longevity.fixed_register(position, ECX, Some(op.pos.get()));
         longevity.fixed_register(position, EDX, None);
     }
 

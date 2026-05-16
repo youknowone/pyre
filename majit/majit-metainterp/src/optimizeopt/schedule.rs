@@ -368,7 +368,7 @@ impl PackSet {
                 OpCode::RawLoadI | OpCode::RawLoadF | OpCode::RawStore
             ))
             && packed.num_args() >= 2
-            && packed.args[1] == inquestion.pos
+            && packed.args[1] == inquestion.pos.get()
         {
             return true;
         }
@@ -429,7 +429,7 @@ impl PackSet {
 
         // vector.py:782-787: dependency only because of the scalar?
         for dep in &graph.nodes[lnode].adjacent_list {
-            if dep.to_idx == rnode && !dep.because_of(left.pos) {
+            if dep.to_idx == rnode && !dep.because_of(left.pos.get()) {
                 return None;
             }
         }
@@ -437,8 +437,8 @@ impl PackSet {
         // vector.py:789: scalar = left.getarg(index)  (original accumulator variable)
         // vector.py:793-796: other args must align with origin pack
         let other_index = (index + 1) % 2;
-        let origin_left_pos = graph.nodes[origin_pack.members[0]].op.pos;
-        let origin_right_pos = graph.nodes[*origin_pack.members.last().unwrap()].op.pos;
+        let origin_left_pos = graph.nodes[origin_pack.members[0]].op.pos.get();
+        let origin_right_pos = graph.nodes[*origin_pack.members.last().unwrap()].op.pos.get();
 
         if left.args.get(other_index).copied() != Some(origin_left_pos) {
             return None;
@@ -475,7 +475,7 @@ impl PackSet {
     /// is the result of left (the accumulator variable).
     fn getaccumulator_variable(left: &Op, right: &Op) -> (Option<OpRef>, i32) {
         for (i, arg) in right.args.iter().enumerate() {
-            if *arg == left.pos {
+            if *arg == left.pos.get() {
                 return (Some(*arg), i as i32);
             }
         }
@@ -558,8 +558,8 @@ impl GuardAnalysis {
     pub fn analyze(ops: &[Op]) -> Self {
         let mut body_results: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
         for op in ops {
-            if !op.pos.is_none() {
-                body_results.insert(op.pos);
+            if !op.pos.get().is_none() {
+                body_results.insert(op.pos.get());
             }
         }
 
@@ -823,12 +823,12 @@ impl VecScheduleState {
         count: usize,
     ) -> Op {
         let mut op = Op::new(opcode, args);
-        op.pos = self.alloc_op_pos(opcode.result_type());
+        op.pos.set(self.alloc_op_pos(opcode.result_type()));
         let mut vinfo = majit_ir::VectorizationInfo::new();
         vinfo.setinfo(datatype, bytesize as i8, signed);
         vinfo.count = count as i16;
         op.vecinfo = Some(Box::new(vinfo));
-        self.register_vec_type(op.pos, datatype == 'f');
+        self.register_vec_type(op.pos.get(), datatype == 'f');
         op
     }
 
@@ -989,7 +989,7 @@ pub fn unpack_from_vector(
         signed,
         count,
     );
-    let result = unpack_op.pos;
+    let result = unpack_op.pos.get();
     // schedule.py:484: costmodel.record_vector_unpack
     state.costmodel.record_vector_unpack(is_float, index, count);
     state.append_to_oplist(unpack_op);
@@ -1120,7 +1120,7 @@ fn gather(state: &mut VecScheduleState, vectors: &[(usize, OpRef)], count: usize
 /// Look up an OpRef's VectorizationInfo in state's oplists.
 fn find_vecinfo(state: &VecScheduleState, opref: OpRef) -> Option<majit_ir::VectorizationInfo> {
     for op in state.oplist.iter().chain(state.invariant_oplist.iter()) {
-        if op.pos == opref {
+        if op.pos.get() == opref {
             if let Some(ref vi) = op.vecinfo {
                 return Some((**vi).clone());
             }
@@ -1185,7 +1185,7 @@ fn pack_into_vector(
         signed,
         newcount,
     );
-    let result = vecop.pos;
+    let result = vecop.pos.get();
     state.append_to_oplist(vecop);
     // schedule.py:499: record cost
     state.costmodel.record_vector_pack(is_float, 0, scount);
@@ -1243,7 +1243,7 @@ fn crop_vector(
                 true, // signed
                 vec_count,
             );
-            let result = signext_op.pos;
+            let result = signext_op.pos.get();
             state.append_to_oplist(signext_op);
             // schedule.py:417: record cost
             state
@@ -1258,18 +1258,18 @@ fn crop_vector(
 fn get_op_bytesize_for_ref(state: &VecScheduleState, opref: OpRef, ops: &[Op]) -> i32 {
     // Check in the oplist first (newly created vector ops)
     for op in &state.oplist {
-        if op.pos == opref {
+        if op.pos.get() == opref {
             return get_op_bytesize(op);
         }
     }
     for op in &state.invariant_oplist {
-        if op.pos == opref {
+        if op.pos.get() == opref {
             return get_op_bytesize(op);
         }
     }
     // Check original ops
     for op in ops {
-        if op.pos == opref {
+        if op.pos.get() == opref {
             return get_op_bytesize(op);
         }
     }
@@ -1322,7 +1322,7 @@ fn expand(
         };
         // schedule.py:552: create_vec_expand(arg, bytesize, signed, numops)
         let vecop = state.create_vec_op(expand_opcode, &[arg], datatype, bytesize, signed, numops);
-        let vecop_pos = vecop.pos;
+        let vecop_pos = vecop.pos.get();
         if is_invariant {
             state.invariant_oplist.push(vecop);
             state.invariant_vector_vars.insert(vecop_pos);
@@ -1357,7 +1357,7 @@ fn expand(
     let vec_create_opcode = if is_float { OpCode::VecF } else { OpCode::VecI };
     let vec_create =
         state.create_vec_op(vec_create_opcode, &[], datatype, bytesize, signed, numops);
-    let mut current_vec = vec_create.pos;
+    let mut current_vec = vec_create.pos.get();
     if is_invariant {
         state.invariant_oplist.push(vec_create);
     } else {
@@ -1382,7 +1382,7 @@ fn expand(
             signed,
             i + 2, // schedule.py:576: vecinfo.count+1 (grows by 1 each iteration)
         );
-        current_vec = pack_op.pos;
+        current_vec = pack_op.pos.get();
         state.costmodel.record_vector_pack(is_float, 0, 1);
         if is_invariant {
             state.invariant_oplist.push(pack_op);
@@ -1438,14 +1438,14 @@ pub fn turn_into_vector(state: &mut VecScheduleState, pack: &Pack, ops: &[Op]) {
         state.create_vec_op(vec_opcode, &args, datatype, bytesize as i32, signed, count);
     vecop.descr = first_op.descr.clone();
 
-    let vecop_pos = vecop.pos;
+    let vecop_pos = vecop.pos.get();
     // schedule.py:340-346: map scalar ops to vector positions
     for (i, &member_idx) in pack.members.iter().enumerate() {
         let op = &ops[member_idx];
         if op.opcode.result_type() == majit_ir::Type::Void {
             continue; // schedule.py:342-343: skip void ops
         }
-        let scalar_pos = op.pos;
+        let scalar_pos = op.pos.get();
         if !scalar_pos.is_none() {
             state.setvector_of_box(scalar_pos, i, vecop_pos);
             // schedule.py:345-346: only rename for accumulating packs

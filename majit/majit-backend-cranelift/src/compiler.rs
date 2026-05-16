@@ -3973,10 +3973,10 @@ fn checked_cl_type_for_size(
 }
 
 fn op_var_index(op: &Op, op_idx: usize, num_inputs: usize) -> usize {
-    if op.pos.is_none() {
+    if op.pos.get().is_none() {
         num_inputs + op_idx
     } else {
-        op.pos.raw() as usize
+        op.pos.get().raw() as usize
     }
 }
 
@@ -4358,8 +4358,8 @@ fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> HashSet<u32> {
         known.insert(input.index);
     }
     for op in ops {
-        if op.result_type() != Type::Void && !op.pos.is_none() {
-            known.insert(op.pos.raw());
+        if op.result_type() != Type::Void && !op.pos.get().is_none() {
+            known.insert(op.pos.get().raw());
         }
     }
     known
@@ -4368,7 +4368,7 @@ fn build_known_values_set(inputargs: &[InputArg], ops: &[Op]) -> HashSet<u32> {
 fn build_force_token_set(inputargs: &[InputArg], ops: &[Op]) -> Result<HashSet<u32>, BackendError> {
     let mut force_tokens = HashSet::new();
     for (op_idx, op) in ops.iter().enumerate() {
-        if op.pos.is_none() {
+        if op.pos.get().is_none() {
             continue;
         }
         let result_var = op_var_index(op, op_idx, inputargs.len()) as u32;
@@ -4435,11 +4435,11 @@ fn build_type_overrides(
             // resolves by raw u32 (variant-blind) so a typed `IntOp(n)`
             // still finds the inputarg at slot n. Synthetic ops without
             // `.pos` cannot collide with an inputarg slot anyway.
-            if op.pos.is_none() {
+            if op.pos.get().is_none() {
                 continue;
             }
-            let var_idx = op.pos.raw();
-            if let Some(ia_type) = type_index.inputarg_type(op.pos) {
+            let var_idx = op.pos.get().raw();
+            if let Some(ia_type) = type_index.inputarg_type(op.pos.get()) {
                 if ia_type != result_type {
                     op_def_positions.insert(var_idx, op_idx);
                 }
@@ -4667,11 +4667,11 @@ fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<O
         .map(|(op_idx, op)| {
             let mut normalized = op.clone();
             let rt = normalized.result_type();
-            if rt != Type::Void && normalized.pos.is_none() {
+            if rt != Type::Void && normalized.pos.get().is_none() {
                 // op_typed mints the typed Int/Float/Ref variant
                 // (resoperation.py:564-638 AbstractResOp + IntOp/FloatOp/
                 // RefOp mixins) — the Void branch is filtered above.
-                normalized.pos = OpRef::op_typed(num_inputs + op_idx as u32, rt);
+                normalized.pos.set(OpRef::op_typed(num_inputs + op_idx as u32, rt));
             }
             normalized
         })
@@ -15577,7 +15577,7 @@ mod tests {
 
     fn mk_op(opcode: OpCode, args: &[OpRef], pos: u32) -> Op {
         let mut o = Op::new(opcode, args);
-        o.pos = OpRef::op_typed(pos, opcode.result_type());
+        o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         o
     }
 
@@ -15604,7 +15604,7 @@ mod tests {
 
     fn mk_op_with_descr(opcode: OpCode, args: &[OpRef], pos: u32, descr: majit_ir::DescrRef) -> Op {
         let mut o = Op::with_descr(opcode, args, descr);
-        o.pos = OpRef::op_typed(pos, opcode.result_type());
+        o.pos.set(OpRef::op_typed(pos, opcode.result_type()));
         o
     }
 
@@ -22325,7 +22325,7 @@ mod tests {
 
         // Build a guard with explicit fail_args so we can inspect them.
         let mut guard_op = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_op.pos = OpRef::int_op(OpRef::NONE.raw());
+        guard_op.pos.set(OpRef::int_op(OpRef::NONE.raw()));
         guard_op.fail_args = Some(smallvec::SmallVec::from_slice(&[
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1),
@@ -22377,7 +22377,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
 
         let mut guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_inv.pos = OpRef::int_op(OpRef::NONE.raw());
+        guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
         guard_inv.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::int_op(1)]));
 
         let ops = vec![
@@ -22428,7 +22428,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0)];
 
         let mut guard_inv = Op::new(OpCode::GuardNotInvalidated, &[]);
-        guard_inv.pos = OpRef::int_op(OpRef::NONE.raw());
+        guard_inv.pos.set(OpRef::int_op(OpRef::NONE.raw()));
         guard_inv.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(0)]));
 
         let ops = vec![

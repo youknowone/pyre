@@ -28,7 +28,7 @@ impl OptSimplify {
         let new_opcode = OpCode::call_for_type(op.result_type());
         let mut new_op = Op::new(new_opcode, &op.args);
         new_op.descr = op.descr.clone();
-        new_op.pos = op.pos;
+        new_op.pos.set(op.pos.get());
         new_op
     }
 }
@@ -56,7 +56,7 @@ impl Optimization for OptSimplify {
             // VIRTUAL_REF -> SAME_AS_R (just forward the first arg)
             OpCode::VirtualRefR => {
                 let mut new_op = Op::new(OpCode::SameAsR, &[op.arg(0)]);
-                new_op.pos = op.pos;
+                new_op.pos.set(op.pos.get());
                 OptimizationResult::Emit(new_op)
             }
 

@@ -7677,8 +7677,8 @@ mod tests {
             "`{opname}` args must be [registers_i[src1], registers_i[src2]] in source order",
         );
         assert_eq!(
-            dst_post, last.pos,
-            "`{opname}` dst must hold the recorder's result OpRef (op.pos)",
+            dst_post, last.pos.get(),
+            "`{opname}` dst must hold the recorder's result OpRef (op.pos.get())",
         );
     }
 
@@ -7806,7 +7806,7 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, expected_opcode);
         assert_eq!(last.args.as_slice(), &[arg0, arg1]);
-        assert_eq!(dst_post, last.pos);
+        assert_eq!(dst_post, last.pos.get());
     }
 
     #[test]
@@ -7868,7 +7868,7 @@ mod tests {
             &[arg],
             "FloatNeg args must be [registers_f[src]]",
         );
-        assert_eq!(dst_post, last.pos);
+        assert_eq!(dst_post, last.pos.get());
     }
 
     /// Drive a single `int_<unop>/i>i` handler. Same shape pattern as
@@ -7912,7 +7912,7 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, expected_opcode);
         assert_eq!(last.args.as_slice(), &[arg]);
-        assert_eq!(dst_post, last.pos);
+        assert_eq!(dst_post, last.pos.get());
     }
 
     #[test]
@@ -7987,7 +7987,7 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::CastIntToFloat);
         assert_eq!(last.args.as_slice(), &[arg]);
-        assert_eq!(dst_post, last.pos);
+        assert_eq!(dst_post, last.pos.get());
     }
 
     /// Drive `ptr_eq/rr>i` or `ptr_ne/rr>i`. Shape `rr>i`: read 2
@@ -8033,7 +8033,7 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, expected_opcode);
         assert_eq!(last.args.as_slice(), &[arg0, arg1]);
-        assert_eq!(dst_post, last.pos);
+        assert_eq!(dst_post, last.pos.get());
     }
 
     #[test]
@@ -8896,8 +8896,8 @@ mod tests {
             .find(|o| o.opcode == OpCode::CallR)
             .expect("a CallR op must be in the recorded trace");
         assert_eq!(
-            dst_ref, call_op.pos,
-            "registers_r[dst] must be the recorded CallR's OpRef (op.pos)",
+            dst_ref, call_op.pos.get(),
+            "registers_r[dst] must be the recorded CallR's OpRef (op.pos.get())",
         );
     }
 
@@ -8962,7 +8962,7 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::CallR)
             .expect("CallR must be in the trace")
-            .pos;
+            .pos.get();
         assert_ne!(regs_r[3], dst_pre, "dst must be overwritten");
         assert_eq!(
             regs_r[3], call_pos,
@@ -9022,7 +9022,7 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::CallR)
             .expect("CallR must be in the trace")
-            .pos;
+            .pos.get();
         assert_ne!(regs_r[2], dst_pre, "dst must be overwritten");
         assert_eq!(
             regs_r[2], call_pos,
@@ -9226,8 +9226,8 @@ mod tests {
             "registers_i[dst] must change from its pre-call value",
         );
         assert_eq!(
-            dst_post, call_op.pos,
-            "registers_i[dst] must be the recorded CallI's OpRef (op.pos)",
+            dst_post, call_op.pos.get(),
+            "registers_i[dst] must be the recorded CallI's OpRef (op.pos.get())",
         );
     }
 
@@ -9395,8 +9395,8 @@ mod tests {
         // dst writeback into registers_r[0].
         let dst_post = wc.registers_r[0];
         assert_eq!(
-            dst_post, call_op.pos,
-            "registers_r[dst] must be the recorded CallR's OpRef (op.pos)",
+            dst_post, call_op.pos.get(),
+            "registers_r[dst] must be the recorded CallR's OpRef (op.pos.get())",
         );
     }
 
@@ -10327,7 +10327,7 @@ mod tests {
             std::sync::Arc::ptr_eq(recorded_descr, &descr),
             "GetfieldGcI descr must be descr_refs[d] (the field descr)",
         );
-        assert_eq!(dst_post, last.pos);
+        assert_eq!(dst_post, last.pos.get());
     }
 
     #[test]
@@ -10438,7 +10438,7 @@ mod tests {
         let last = tc.ops().last().expect("recorded op must exist");
         assert_eq!(last.opcode, majit_ir::OpCode::GetfieldGcR);
         assert_eq!(last.args.as_slice(), &[obj]);
-        assert_eq!(dst_post, last.pos);
+        assert_eq!(dst_post, last.pos.get());
     }
 
     #[test]
@@ -10840,7 +10840,7 @@ mod tests {
             last.descr.as_ref().expect("must carry array descr"),
             &descr,
         ));
-        assert_eq!(dst_post, last.pos);
+        assert_eq!(dst_post, last.pos.get());
     }
 
     #[test]

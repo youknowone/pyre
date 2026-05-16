@@ -4003,11 +4003,11 @@ impl<'a> Assembler386<'a> {
                 }
                 self.pop_all_regs_from_jitframe(&[sizeloc, result_reg], true);
                 dynasm!(self.mc ; .arch x64 ; =>done);
-                if !op.pos.is_none() {
+                if !op.pos.get().is_none() {
                     if result_reg.value != 0 {
                         dynasm!(self.mc ; .arch x64 ; mov rax, Rq(result_reg.value));
                     }
-                    self.store_rax_to_result(op.pos);
+                    self.store_rax_to_result(op.pos.get());
                 }
             }
             // x86/assembler.py:2567 malloc_cond_varsize parity
@@ -4055,8 +4055,8 @@ impl<'a> Assembler386<'a> {
                 // result slot.
                 self.emit_propagate_exception_if_zero(0);
                 dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
-                if !op.pos.is_none() {
-                    self.store_rax_to_result(op.pos);
+                if !op.pos.get().is_none() {
+                    self.store_rax_to_result(op.pos.get());
                 }
             }
             // x86/assembler.py:1630-1641 `genop_discard_check_memory_error`
@@ -5086,7 +5086,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; add rax, rcx
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_SUB: result = arg0 - arg1
@@ -5097,7 +5097,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; sub rax, rcx
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_MUL: result = arg0 * arg1
@@ -5108,7 +5108,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; imul rax, rcx
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_AND: result = arg0 & arg1
@@ -5119,7 +5119,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; and rax, rcx
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_OR: result = arg0 | arg1
@@ -5130,7 +5130,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; or rax, rcx
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_XOR: result = arg0 ^ arg1
@@ -5141,7 +5141,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; xor rax, rcx
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_NEG: result = -arg0
@@ -5151,7 +5151,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; neg rax
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_INVERT: result = ~arg0
@@ -5161,7 +5161,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; not rax
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_LSHIFT: result = arg0 << arg1
@@ -5172,7 +5172,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; shl rax, cl
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_RSHIFT: result = arg0 >> arg1 (arithmetic/signed)
@@ -5183,7 +5183,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; sar rax, cl
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// UINT_RSHIFT: result = arg0 >> arg1 (logical/unsigned)
@@ -5194,7 +5194,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; shr rax, cl
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ----------------------------------------------------------------
@@ -5241,8 +5241,8 @@ impl<'a> Assembler386<'a> {
         self.guard_success_cc = Some(cc);
 
         // Also materialize the boolean result for non-guard consumers.
-        if !op.pos.is_none() {
-            self.emit_setcc_to_result(cc, op.pos);
+        if !op.pos.get().is_none() {
+            self.emit_setcc_to_result(cc, op.pos.get());
         }
     }
 
@@ -5280,8 +5280,8 @@ impl<'a> Assembler386<'a> {
             ; test rax, rax
         );
         self.guard_success_cc = Some(CC_NE);
-        if !op.pos.is_none() {
-            self.emit_setcc_to_result(CC_NE, op.pos);
+        if !op.pos.get().is_none() {
+            self.emit_setcc_to_result(CC_NE, op.pos.get());
         }
     }
 
@@ -5293,8 +5293,8 @@ impl<'a> Assembler386<'a> {
             ; test rax, rax
         );
         self.guard_success_cc = Some(CC_E);
-        if !op.pos.is_none() {
-            self.emit_setcc_to_result(CC_E, op.pos);
+        if !op.pos.get().is_none() {
+            self.emit_setcc_to_result(CC_E, op.pos.get());
         }
     }
 
@@ -5812,10 +5812,10 @@ impl<'a> Assembler386<'a> {
     fn genop_same_as(&mut self, op: &Op) {
         let arg = op.arg(0);
         if let Some(&slot) = self.opref_to_slot.get(&arg) {
-            self.opref_to_slot.insert(op.pos, slot);
+            self.opref_to_slot.insert(op.pos.get(), slot);
         } else {
             self.load_arg_to_rax(arg);
-            self.store_rax_to_result(op.pos);
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -5887,7 +5887,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; addsd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// FLOAT_SUB: result = arg0 - arg1
@@ -5898,7 +5898,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; subsd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// FLOAT_MUL: result = arg0 * arg1
@@ -5909,7 +5909,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; mulsd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// FLOAT_TRUEDIV: result = arg0 / arg1
@@ -5920,7 +5920,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; divsd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// FLOAT_NEG: result = -arg0
@@ -5937,7 +5937,7 @@ impl<'a> Assembler386<'a> {
             ; movq xmm1, rax
             ; xorpd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// CAST_INT_TO_FLOAT: result = (f64)arg0
@@ -5947,7 +5947,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; cvtsi2sd xmm0, rax
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// CAST_FLOAT_TO_INT: result = (i64)arg0 (truncation)
@@ -5957,7 +5957,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; cvttsd2si rax, xmm0
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ----------------------------------------------------------------
@@ -6014,7 +6014,7 @@ impl<'a> Assembler386<'a> {
             ),
         }
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// x86/assembler.py:1746 genop_discard_setfield — sized store via regalloc.
@@ -6379,7 +6379,7 @@ impl<'a> Assembler386<'a> {
             ),
         }
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// SETARRAYITEM_GC: array[index] = value
@@ -6465,7 +6465,7 @@ impl<'a> Assembler386<'a> {
             ; mov rax, [rax + len_offset]
         );
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ----------------------------------------------------------------
@@ -6650,15 +6650,15 @@ impl<'a> Assembler386<'a> {
     /// genop_call_i = genop_call_r = genop_call_f = genop_call_n
     fn genop_call(&mut self, op: &Op) {
         self._genop_call(op);
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
     fn genop_call_with_arglocs(&mut self, op: &Op, arglocs: &[Loc]) {
         self._genop_call_with_arglocs(op, arglocs);
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -6737,8 +6737,8 @@ impl<'a> Assembler386<'a> {
                 } else {
                     dynasm!(self.mc ; .arch x64 ; xor eax, eax);
                 }
-                if !op.pos.is_none() {
-                    self.store_rax_to_result(op.pos);
+                if !op.pos.get().is_none() {
+                    self.store_rax_to_result(op.pos.get());
                 }
                 return;
             }
@@ -6814,8 +6814,8 @@ impl<'a> Assembler386<'a> {
                     ; =>merge
                 );
             }
-            if !op.pos.is_none() {
-                self.store_rax_to_result(op.pos);
+            if !op.pos.get().is_none() {
+                self.store_rax_to_result(op.pos.get());
             }
             let _ = vable_loc;
             return;
@@ -7085,8 +7085,8 @@ impl<'a> Assembler386<'a> {
         } // end if is_resolved
 
         // Store result to the output slot (rax/x0 holds result).
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
 
         // Restore callee-saved regs clobbered by this sequence.
@@ -7415,13 +7415,13 @@ impl<'a> Assembler386<'a> {
         dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
 
         dynasm!(self.mc ; .arch x64 ; =>done);
-        if !op.pos.is_none() {
+        if !op.pos.get().is_none() {
             if let Some(Loc::Reg(r)) = result_loc {
                 if r.value != 0 {
                     dynasm!(self.mc ; .arch x64 ; mov rax, Rq(r.value));
                 }
             }
-            self.store_rax_to_result(op.pos);
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -7452,8 +7452,8 @@ impl<'a> Assembler386<'a> {
         );
         self.emit_abi_call_rax_after_one_push();
         dynasm!(self.mc ; .arch x64 ; pop rax); // restore ptr
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -7492,8 +7492,8 @@ impl<'a> Assembler386<'a> {
                 ; mov [rax], rcx
             );
         }
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -7520,7 +7520,7 @@ impl<'a> Assembler386<'a> {
             ; .arch x64
             ; mov rax, rbp
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// STRLEN / UNICODELEN: result = string.length
@@ -7537,7 +7537,7 @@ impl<'a> Assembler386<'a> {
             ; mov rax, [rax + offset]
         );
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// STRGETITEM / UNICODEGETITEM: result = string[index]
@@ -7591,7 +7591,7 @@ impl<'a> Assembler386<'a> {
             ),
         }
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ================================================================
@@ -7601,16 +7601,16 @@ impl<'a> Assembler386<'a> {
     /// assembler.py:1817 genop_save_exc_class — stub: returns 0.
     fn genop_save_exc_class(&mut self, op: &Op) {
         dynasm!(self.mc ; .arch x64 ; xor eax, eax);
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
     /// assembler.py:1827 genop_save_exception — stub: returns 0.
     fn genop_save_exception(&mut self, op: &Op) {
         dynasm!(self.mc ; .arch x64 ; xor eax, eax);
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -7626,7 +7626,7 @@ impl<'a> Assembler386<'a> {
             ; cqo
             ; idiv rcx
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_MOD: result = arg0 % arg1 (signed)
@@ -7638,7 +7638,7 @@ impl<'a> Assembler386<'a> {
             ; idiv rcx
             ; mov rax, rdx
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// UINT_MUL_HIGH: upper 64 bits of unsigned multiply
@@ -7649,7 +7649,7 @@ impl<'a> Assembler386<'a> {
             ; mul rcx
             ; mov rax, rdx
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// INT_SIGNEXT: sign-extend from num_bytes width to 64 bits.
@@ -7667,7 +7667,7 @@ impl<'a> Assembler386<'a> {
                 ; sar rax, sh
             );
         }
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ================================================================
@@ -7683,7 +7683,7 @@ impl<'a> Assembler386<'a> {
             ; movq xmm1, rax
             ; andpd xmm0, xmm1
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     /// FLOAT_LT/LE/EQ/NE/GT/GE: float comparison.
@@ -7722,8 +7722,8 @@ impl<'a> Assembler386<'a> {
         }
         dynasm!(self.mc ; .arch x64 ; test rax, rax);
         self.guard_success_cc = Some(CC_NE);
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -7734,7 +7734,7 @@ impl<'a> Assembler386<'a> {
             ; cvtsd2ss xmm0, xmm0
             ; movd eax, xmm0
         );
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// CAST_SINGLEFLOAT_TO_FLOAT: f32 (bits in lower 32) → f64
@@ -7744,7 +7744,7 @@ impl<'a> Assembler386<'a> {
             ; movd xmm0, eax
             ; cvtss2sd xmm0, xmm0
         );
-        self.store_d0_to_result(op.pos);
+        self.store_d0_to_result(op.pos.get());
     }
 
     // ================================================================
@@ -7797,7 +7797,7 @@ impl<'a> Assembler386<'a> {
 
         let itemsize = self.resolve_const_or(op.arg(2), 8) as i32;
         self.emit_load_from_rax_sized(itemsize);
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// GC_LOAD_INDEXED_I/R/F: load from base + base_offset + index * scale.
@@ -7819,7 +7819,7 @@ impl<'a> Assembler386<'a> {
         }
 
         self.emit_load_from_rax_sized(itemsize);
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// GC_STORE: store value to base + offset.
@@ -7873,7 +7873,7 @@ impl<'a> Assembler386<'a> {
 
         self.emit_load_from_rax_sized(size as i32);
         let _ = offset; // offset is in the descriptor, not used for raw_load
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// RAW_STORE: store value to base + offset using descriptor.
@@ -7924,7 +7924,7 @@ impl<'a> Assembler386<'a> {
         );
 
         self.emit_load_from_rax_sized(field_size as i32);
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     /// SETINTERIORFIELD_GC/RAW: write field in array-of-structs element.
@@ -8000,8 +8000,8 @@ impl<'a> Assembler386<'a> {
 
         dynasm!(self.mc ; .arch x64 ; =>skip_label);
 
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -8181,8 +8181,8 @@ impl<'a> Assembler386<'a> {
             ; mov [rax + 8], rcx
         );
 
-        if !op.pos.is_none() {
-            self.store_rax_to_result(op.pos);
+        if !op.pos.get().is_none() {
+            self.store_rax_to_result(op.pos.get());
         }
     }
 
@@ -8253,7 +8253,7 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64 ; add rax, baseofs);
         }
 
-        self.store_rax_to_result(op.pos);
+        self.store_rax_to_result(op.pos.get());
     }
 
     // ----------------------------------------------------------------

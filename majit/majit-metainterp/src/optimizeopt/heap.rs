@@ -393,7 +393,7 @@ impl CachedField {
                 .map(|fd| OpCode::getfield_for_type(fd.field_type()))
                 .unwrap_or(OpCode::GetfieldGcI);
             let mut op = Op::with_descr(opcode, &[structbox], descr.clone());
-            op.pos = cached_val;
+            op.pos.set(cached_val);
             sb.add_heap_op(op);
         }
     }
@@ -622,7 +622,7 @@ impl ArrayCachedItem {
                 .map(|array_descr| OpCode::getarrayitem_for_type(array_descr.item_type()))
                 .unwrap_or(OpCode::GetarrayitemGcI);
             let mut op = Op::with_descr(opcode, &[arraybox, idx_ref], descr.clone());
-            op.pos = cached_val;
+            op.pos.set(cached_val);
             sb.add_heap_op(op);
         }
     }
@@ -1596,14 +1596,14 @@ impl OptHeap {
                 }
             }
             // heap.py:525-527: make_equal_to + last_emitted_operation = REMOVED
-            ctx.make_equal_to(op.pos, res_v);
+            ctx.make_equal_to(op.pos.get(), res_v);
             self.last_emitted_removed = true;
             return true;
         }
 
         // heap.py:517-518: no hit — cache if FLAG_LOOKUP
         if flag == FLAG_LOOKUP {
-            d.insert(key, op.pos);
+            d.insert(key, op.pos.get());
         }
         false
     }
@@ -1710,7 +1710,7 @@ impl OptHeap {
         ctx: &mut OptContext,
     ) {
         let needs_postponed = self.postponed_op.as_ref().map_or(false, |postponed| {
-            op.args.iter().any(|arg| *arg == postponed.pos)
+            op.args.iter().any(|arg| *arg == postponed.pos.get())
         });
         if needs_postponed {
             if let Some(p) = self.postponed_op.take() {
@@ -1996,7 +1996,7 @@ impl OptHeap {
                 .is_some()
             {
                 if let Some(value) = ctx.constant_fold(&op) {
-                    ctx.make_constant(op.pos, value);
+                    ctx.make_constant(op.pos.get(), value);
                     return OptimizationResult::Remove;
                 }
             }
@@ -2025,7 +2025,7 @@ impl OptHeap {
                 if *lazy_obj == obj {
                     // MUST_ALIAS: lazy_set targets the same struct → return rhs
                     let cached = lazy_op.arg(1);
-                    ctx.replace_op(op.pos, cached);
+                    ctx.replace_op(op.pos.get(), cached);
                     return OptimizationResult::Remove;
                 }
                 // heap.py:67-75 possible_aliasing_two_infos:
@@ -2060,13 +2060,13 @@ impl OptHeap {
                             ctx.structinfo_setfield(op, field_idx, cached);
                             self.field_cache(descr).register_info(obj);
                             let cached = ctx.get_box_replacement(cached);
-                            ctx.replace_op(op.pos, cached);
+                            ctx.replace_op(op.pos.get(), cached);
                             return OptimizationResult::Remove;
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
                                 let cached = ctx.get_box_replacement(cached);
-                                ctx.replace_op(op.pos, cached);
+                                ctx.replace_op(op.pos.get(), cached);
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -2090,7 +2090,7 @@ impl OptHeap {
                     cf.invalidate(descr, ctx);
                 }
                 if let Some(ref postponed) = self.postponed_op {
-                    let ppos = postponed.pos;
+                    let ppos = postponed.pos.get();
                     if lazy_op.args.iter().any(|a| *a == ppos) {
                         if let Some(p) = self.postponed_op.take() {
                             ctx.emit_extra(ctx.current_pass_idx, p);
@@ -2122,7 +2122,7 @@ impl OptHeap {
         // Check immutable field cache first — these survive all invalidation.
         if let Some(&cached) = self.immutable_cached_fields.get(&key) {
             let cached = ctx.get_box_replacement(cached);
-            ctx.replace_op(op.pos, cached);
+            ctx.replace_op(op.pos.get(), cached);
             return OptimizationResult::Remove;
         }
 
@@ -2136,13 +2136,13 @@ impl OptHeap {
                         ctx.structinfo_setfield(op, field_idx, cached);
                         self.field_cache(descr).register_info(obj);
                         let cached = ctx.get_box_replacement(cached);
-                        ctx.replace_op(op.pos, cached);
+                        ctx.replace_op(op.pos.get(), cached);
                         return OptimizationResult::Remove;
                     }
                     crate::optimizeopt::info::FieldEntry::Value(cached) => {
                         if !cached.is_none() {
                             let cached = ctx.get_box_replacement(cached);
-                            ctx.replace_op(op.pos, cached);
+                            ctx.replace_op(op.pos.get(), cached);
                             return OptimizationResult::Remove;
                         }
                     }
@@ -2156,14 +2156,14 @@ impl OptHeap {
             if !qi_cached.is_none() {
                 // Subsequent read: reuse the cached value.
                 let qi_cached = ctx.get_box_replacement(qi_cached);
-                ctx.replace_op(op.pos, qi_cached);
+                ctx.replace_op(op.pos.get(), qi_cached);
                 return OptimizationResult::Remove;
             }
             // First read after QUASIIMMUT_FIELD: emit the load, then cache
             // the result so it survives calls (unlike normal mutable fields).
-            self.quasi_immut_cache.insert(key, op.pos);
+            self.quasi_immut_cache.insert(key, op.pos.get());
             self.cache_field(obj, descr);
-            ctx.structinfo_setfield(op, field_idx, op.pos);
+            ctx.structinfo_setfield(op, field_idx, op.pos.get());
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -2184,7 +2184,7 @@ impl OptHeap {
         // Save immutable fields in the permanent cache — they survive all
         // invalidation because the value never changes.
         if descr.is_always_pure() {
-            self.immutable_cached_fields.insert(key, op.pos);
+            self.immutable_cached_fields.insert(key, op.pos.get());
         }
         // heap.py postprocess_GETFIELD_GC_I: structinfo.setfield(descr, op)
         //
@@ -2196,7 +2196,7 @@ impl OptHeap {
         // `const_infos[gcref]` (constant) or
         // `ensure_ptr_info_arg0(op).as_mut()` (regular).
         if !is_vable_field {
-            ctx.structinfo_setfield(op, field_idx, op.pos);
+            ctx.structinfo_setfield(op, field_idx, op.pos.get());
         }
         // Virtualizable Ref fields (linked list head) need a null guard.
         let is_vable_ref =
@@ -2205,8 +2205,8 @@ impl OptHeap {
             ctx.emit(op.clone());
             let zero_ref = ctx.make_constant_int(0);
             let cmp_pos = ctx.alloc_op_position_typed(OpCode::IntNe.result_type());
-            let mut cmp_op = Op::new(OpCode::IntNe, &[op.pos, zero_ref]);
-            cmp_op.pos = cmp_pos;
+            let mut cmp_op = Op::new(OpCode::IntNe, &[op.pos.get(), zero_ref]);
+            cmp_op.pos.set(cmp_pos);
             ctx.emit(cmp_op);
             // unroll.py:409 parity: synthetic guards inherit
             // rd_resume_position from patchguardop (the optimizer's
@@ -2376,7 +2376,7 @@ impl OptHeap {
                 // heap.py:128 self._lazy_set = None — already done via take().
                 // heap.py:130-134 emit postponed_op if referenced.
                 if let Some(ref postponed) = self.postponed_op {
-                    let ppos = postponed.pos;
+                    let ppos = postponed.pos.get();
                     if lazy_op.args.iter().any(|a| *a == ppos) {
                         if let Some(p) = self.postponed_op.take() {
                             ctx.emit_extra(ctx.current_pass_idx, p);
@@ -2519,8 +2519,8 @@ impl OptHeap {
 
                 // heap.py:130-134 emit postponed_op if referenced.
                 if let Some(ref postponed) = self.postponed_op {
-                    let ppos = postponed.pos;
-                    if lazy_op.args.iter().any(|a| *a == ppos) {
+                    let ppos = postponed.pos.get();
+                    if lazy_op.args.iter().any(|&a| a == ppos) {
                         if let Some(p) = self.postponed_op.take() {
                             ctx.emit_extra(ctx.current_pass_idx, p);
                         }
@@ -2577,7 +2577,7 @@ impl OptHeap {
                     if *lazy_obj == array {
                         // MUST_ALIAS: lazy_set targets the same array → return rhs
                         let cached = lazy_op.arg(2);
-                        ctx.replace_op(op.pos, cached);
+                        ctx.replace_op(op.pos.get(), cached);
                         return OptimizationResult::Remove;
                     }
                     // heap.py:108 possible_aliasing_two_infos
@@ -2609,13 +2609,13 @@ impl OptHeap {
                                     .register_info(array);
                                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
                                 let cached = ctx.get_box_replacement(cached);
-                                ctx.replace_op(op.pos, cached);
+                                ctx.replace_op(op.pos.get(), cached);
                                 return OptimizationResult::Remove;
                             }
                             crate::optimizeopt::info::FieldEntry::Value(cached) => {
                                 if !cached.is_none() {
                                     let cached = ctx.get_box_replacement(cached);
-                                    ctx.replace_op(op.pos, cached);
+                                    ctx.replace_op(op.pos.get(), cached);
                                     return OptimizationResult::Remove;
                                 }
                             }
@@ -2634,7 +2634,7 @@ impl OptHeap {
                         submap.invalidate_index(const_index, ctx);
                     }
                     if let Some(ref postponed) = self.postponed_op {
-                        let ppos = postponed.pos;
+                        let ppos = postponed.pos.get();
                         if lazy_op.args.iter().any(|a| *a == ppos) {
                             if let Some(p) = self.postponed_op.take() {
                                 ctx.emit_extra(ctx.current_pass_idx, p);
@@ -2671,7 +2671,7 @@ impl OptHeap {
                     .register_info(array);
                 ctx.arrayinfo_setitem(op, const_index as usize, cached);
                 let cached = ctx.get_box_replacement(cached);
-                ctx.replace_op(op.pos, cached);
+                ctx.replace_op(op.pos.get(), cached);
                 return OptimizationResult::Remove;
             }
             if let Some(cai) = self
@@ -2687,13 +2687,13 @@ impl OptHeap {
                                 .register_info(array);
                             ctx.arrayinfo_setitem(op, const_index as usize, cached);
                             let cached = ctx.get_box_replacement(cached);
-                            ctx.replace_op(op.pos, cached);
+                            ctx.replace_op(op.pos.get(), cached);
                             return OptimizationResult::Remove;
                         }
                         crate::optimizeopt::info::FieldEntry::Value(cached) => {
                             if !cached.is_none() {
                                 let cached = ctx.get_box_replacement(cached);
-                                ctx.replace_op(op.pos, cached);
+                                ctx.replace_op(op.pos.get(), cached);
                                 return OptimizationResult::Remove;
                             }
                         }
@@ -2737,7 +2737,7 @@ impl OptHeap {
                     }
                 });
             }
-            ctx.arrayinfo_setitem(op, const_index as usize, op.pos);
+            ctx.arrayinfo_setitem(op, const_index as usize, op.pos.get());
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -2749,12 +2749,12 @@ impl OptHeap {
             let indexbox = ctx.get_box_replacement(op.arg(1));
             if let Some(submap) = self.get_cached_array_submap(descr_idx) {
                 if let Some(cached) = submap.lookup_cached(arrayinfo, indexbox, ctx) {
-                    ctx.replace_op(op.pos, cached);
+                    ctx.replace_op(op.pos.get(), cached);
                     return OptimizationResult::Remove;
                 }
             }
             self.arrayitem_submap(descr)
-                .cache_varindex_read(arrayinfo, indexbox, op.pos);
+                .cache_varindex_read(arrayinfo, indexbox, op.pos.get());
         }
 
         // heap.py line 701: make_nonnull(op.getarg(0))
@@ -2832,9 +2832,9 @@ impl OptHeap {
         // Track allocations for aliasing analysis.
         // Allocated objects are always non-null.
         if opcode.is_malloc() {
-            vb_set(&mut self.seen_allocation, op.pos.raw());
-            vb_set(&mut self.unescaped, op.pos.raw());
-            vb_set(&mut self.known_nonnull, op.pos.raw());
+            vb_set(&mut self.seen_allocation, op.pos.get().raw());
+            vb_set(&mut self.unescaped, op.pos.get().raw());
+            vb_set(&mut self.known_nonnull, op.pos.get().raw());
             return OptimizationResult::Emit(op.clone());
         }
 
@@ -2993,9 +2993,9 @@ impl OptHeap {
 
             // ── heap.py: Allocation tracking ──
             OpCode::New | OpCode::NewWithVtable | OpCode::NewArray | OpCode::NewArrayClear => {
-                vb_set(&mut self.seen_allocation, op.pos.raw());
-                vb_set(&mut self.unescaped, op.pos.raw());
-                vb_set(&mut self.known_nonnull, op.pos.raw());
+                vb_set(&mut self.seen_allocation, op.pos.get().raw());
+                vb_set(&mut self.unescaped, op.pos.get().raw());
+                vb_set(&mut self.known_nonnull, op.pos.get().raw());
                 OptimizationResult::PassOn
             }
 
@@ -3033,7 +3033,7 @@ impl OptHeap {
                 if std::env::var_os("MAJIT_LOG").is_some() {
                     eprintln!(
                         "[opt-heap] postpone {:?} pos={:?} descr={:?}",
-                        op.opcode, op.pos, op.descr
+                        op.opcode, op.pos.get(), op.descr
                     );
                 }
                 // RPython emitting_operation: calls go through
@@ -3065,7 +3065,7 @@ impl OptHeap {
                     if std::env::var_os("MAJIT_LOG").is_some() {
                         eprintln!(
                             "[opt-heap] emit postponed {:?} pos={:?} before {:?} pos={:?}",
-                            postponed.opcode, postponed.pos, op.opcode, op.pos
+                            postponed.opcode, postponed.pos.get(), op.opcode, op.pos.get()
                         );
                     }
                     // RPython emit_postponed_op: route through next_optimization
@@ -3073,7 +3073,7 @@ impl OptHeap {
                 } else if std::env::var_os("MAJIT_LOG").is_some() {
                     eprintln!(
                         "[opt-heap] no postponed op before {:?} pos={:?}",
-                        op.opcode, op.pos
+                        op.opcode, op.pos.get()
                     );
                 }
                 // RPython emitting_operation for guards:
@@ -3929,7 +3929,7 @@ mod tests {
         use crate::optimizeopt::info::{PreambleOp, PtrInfo};
 
         let mut preamble_op = Op::with_descr(opcode, &[object], descr.clone());
-        preamble_op.pos = source;
+        preamble_op.pos.set(source);
         ctx.initialize_imported_short_preamble_builder(
             &[object, resolved],
             &[object, resolved],
@@ -3998,7 +3998,7 @@ mod tests {
             // resoperation.py:1693) at priority 0 in `opref_type`. The
             // intrinsic `op.type_` field set at `Op::new` is the
             // authoritative source, surfaced via `Op::result_type`.
-            op.pos = OpRef::op_typed(i as u32, op.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
             if op.opcode.is_guard() && op.descr.is_none() {
                 op.descr = Some(crate::compile::make_resume_guard_descr_typed(Vec::new()));
             }
@@ -4094,7 +4094,7 @@ mod tests {
 
         let pos2 = ctx.reserve_pos_typed(Type::Int);
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[p0], d);
-        op.pos = pos2;
+        op.pos.set(pos2);
 
         let result = heap.optimize_getfield(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Remove));
@@ -4129,7 +4129,7 @@ mod tests {
         // First getfield on head: consumes the import, caches the value.
         let pos2 = ctx.reserve_pos_typed(Type::Ref);
         let mut op1 = Op::with_descr(OpCode::GetfieldGcR, &[p0], d_head.clone());
-        op1.pos = pos2;
+        op1.pos.set(pos2);
         let result1 = heap.optimize_getfield(&op1, &mut ctx);
         assert!(matches!(result1, OptimizationResult::Remove));
         assert_eq!(ctx.get_box_replacement(pos2), p1);
@@ -4141,7 +4141,7 @@ mod tests {
         // stale preamble value.  The import was consumed, so it should emit.
         let pos3 = ctx.reserve_pos_typed(Type::Ref);
         let mut op2 = Op::with_descr(OpCode::GetfieldGcR, &[p0], d_head.clone());
-        op2.pos = pos3;
+        op2.pos.set(pos3);
         let result2 = heap.optimize_getfield(&op2, &mut ctx);
         assert!(
             matches!(result2, OptimizationResult::Emit(_)),
@@ -4161,7 +4161,7 @@ mod tests {
 
         let pos1 = ctx.reserve_pos_typed(Type::Int);
         let mut op = Op::with_descr(OpCode::GetfieldGcI, &[p0], d);
-        op.pos = pos1;
+        op.pos.set(pos1);
 
         let result = heap.optimize_getfield(&op, &mut ctx);
         assert!(matches!(result, OptimizationResult::Emit(_)));
@@ -4352,7 +4352,7 @@ mod tests {
             &[OpRef::ref_op(100), idx],
             d.clone(),
         );
-        op.pos = OpRef::int_op(200);
+        op.pos.set(OpRef::int_op(200));
 
         let mut ctx = OptContext::new(256);
         ctx.make_constant(idx, majit_ir::Value::Int(3));
@@ -6662,14 +6662,14 @@ mod tests {
         let pos1 = ctx.reserve_pos_typed(Type::Int);
         let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
         op1.descr = Some(descr.clone());
-        op1.pos = pos1;
+        op1.pos.set(pos1);
         assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
 
         // Second lookup with same dict+key — should be cached.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
         let mut op2 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
         op2.descr = Some(descr.clone());
-        op2.pos = pos2;
+        op2.pos.set(pos2);
         assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
         assert_eq!(ctx.get_box_replacement(pos2), pos1);
         assert!(heap.last_emitted_removed);
@@ -6696,7 +6696,7 @@ mod tests {
         let pos1 = ctx.reserve_pos_typed(Type::Int);
         let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag_lookup]);
         op1.descr = Some(descr.clone());
-        op1.pos = pos1;
+        op1.pos.set(pos1);
         // Pretend the result is known >= 0.
         // OpRef → BoxRef shim until this caller migrates (Phase D-2).
         // `reserve_pos_typed` skips extending box_pool when the pool is
@@ -6714,7 +6714,7 @@ mod tests {
         let pos2 = ctx.reserve_pos_typed(Type::Int);
         let mut op2 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag_store]);
         op2.descr = Some(descr.clone());
-        op2.pos = pos2;
+        op2.pos.set(pos2);
         assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
         assert_eq!(ctx.get_box_replacement(pos2), pos1);
     }
@@ -6739,7 +6739,7 @@ mod tests {
         let pos1 = ctx.reserve_pos_typed(Type::Int);
         let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
         op1.descr = Some(descr.clone());
-        op1.pos = pos1;
+        op1.pos.set(pos1);
         heap._optimize_call_dict_lookup(&op1, &mut ctx);
         assert!(!heap.cached_dict_reads.is_empty());
 
@@ -6751,7 +6751,7 @@ mod tests {
         let pos2 = ctx.reserve_pos_typed(Type::Int);
         let mut op2 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag]);
         op2.descr = Some(descr.clone());
-        op2.pos = pos2;
+        op2.pos.set(pos2);
         assert!(!heap._optimize_call_dict_lookup(&op2, &mut ctx));
     }
 
@@ -6784,14 +6784,14 @@ mod tests {
         let pos1 = ctx.reserve_pos_typed(Type::Int);
         let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key_a, hash, flag]);
         op1.descr = Some(descr.clone());
-        op1.pos = pos1;
+        op1.pos.set(pos1);
         assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
 
         // Same value via a different const slot — must hit the cache.
         let pos2 = ctx.reserve_pos_typed(Type::Int);
         let mut op2 = Op::new(OpCode::CallI, &[func_addr, dict, key_b, hash, flag]);
         op2.descr = Some(descr.clone());
-        op2.pos = pos2;
+        op2.pos.set(pos2);
         assert!(heap._optimize_call_dict_lookup(&op2, &mut ctx));
         assert_eq!(ctx.get_box_replacement(pos2), pos1);
     }
@@ -6815,7 +6815,7 @@ mod tests {
         // OpCode::New is a PassOn arm in heap.rs (allocation tracking only).
         let new_pos = ctx.reserve_pos_typed(Type::Ref);
         let mut new_op = Op::new(OpCode::New, &[]);
-        new_op.pos = new_pos;
+        new_op.pos.set(new_pos);
         let result = heap.propagate_forward(&new_op, &mut ctx);
         assert!(matches!(result, OptimizationResult::PassOn));
         assert!(
@@ -6825,7 +6825,7 @@ mod tests {
 
         // Now a GUARD_NO_EXCEPTION must be emitted, not removed.
         let mut guard = Op::new(OpCode::GuardNoException, &[]);
-        guard.pos = ctx.reserve_pos_typed(Type::Void);
+        guard.pos.set(ctx.reserve_pos_typed(Type::Void));
         let guard_result = heap.propagate_forward(&guard, &mut ctx);
         assert!(
             matches!(guard_result, OptimizationResult::Emit(_)),
@@ -6852,7 +6852,7 @@ mod tests {
         let pos1 = ctx.reserve_pos_typed(Type::Int);
         let mut op1 = Op::new(OpCode::CallI, &[func_addr, dict, key, hash, flag_delete]);
         op1.descr = Some(descr.clone());
-        op1.pos = pos1;
+        op1.pos.set(pos1);
         assert!(!heap._optimize_call_dict_lookup(&op1, &mut ctx));
         assert!(heap.cached_dict_reads.is_empty());
     }

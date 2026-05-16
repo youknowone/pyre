@@ -122,7 +122,7 @@ impl VectorLoop {
 
         let base_offset = original_body
             .iter()
-            .map(|op| op.pos.raw())
+            .map(|op| op.pos.get().raw())
             .max()
             .unwrap_or(0)
             + 1;
@@ -146,11 +146,11 @@ impl VectorLoop {
                     continue;
                 }
                 let mut new_op = op.clone();
-                let new_pos = op.pos.with_raw(op.pos.raw() + offset);
-                if !op.pos.is_none() {
-                    remap.insert(op.pos, new_pos);
+                let new_pos = op.pos.get().with_raw(op.pos.get().raw() + offset);
+                if !op.pos.get().is_none() {
+                    remap.insert(op.pos.get(), new_pos);
                 }
-                new_op.pos = new_pos;
+                new_op.pos.set(new_pos);
                 for arg in &mut new_op.args {
                     if let Some(&mapped) = remap.get(arg) {
                         *arg = mapped;
@@ -181,7 +181,7 @@ impl VectorLoop {
 /// to find related vectorizable operations.
 pub fn follow_def_use_chain(ops: &[Op], start: usize, max_depth: usize) -> Vec<usize> {
     let mut chain = vec![start];
-    let result_ref = ops[start].pos;
+    let result_ref = ops[start].pos.get();
     if result_ref.is_none() {
         return chain;
     }
@@ -196,8 +196,8 @@ pub fn follow_def_use_chain(ops: &[Op], start: usize, max_depth: usize) -> Vec<u
             for arg in &op.args {
                 if current_refs.contains(arg) {
                     chain.push(i);
-                    if !op.pos.is_none() {
-                        next_refs.push(op.pos);
+                    if !op.pos.get().is_none() {
+                        next_refs.push(op.pos.get());
                     }
                     break;
                 }
@@ -410,7 +410,7 @@ impl VectorizingOptimizer {
     fn follow_def_uses(pack_set: &mut PackSet, pack: &Pack, graph: &DependencyGraph) {
         let left_idx = pack.members[0];
         let right_idx = *pack.members.last().unwrap();
-        let left_opref = graph.nodes[left_idx].op.pos;
+        let left_opref = graph.nodes[left_idx].op.pos.get();
 
         // vector.py:446-447: for ldep in pack.leftmost(node=True).provides()
         let l_users: Vec<usize> = graph.nodes[left_idx].users.clone();
@@ -452,7 +452,7 @@ impl VectorizingOptimizer {
                 // vector.py:434-437: left = lnode.getoperation();
                 // args = pack.leftmost().getarglist();
                 // if left not in args: continue
-                let dep_opref = graph.nodes[l_dep].op.pos;
+                let dep_opref = graph.nodes[l_dep].op.pos.get();
                 if !left_args.contains(&dep_opref) {
                     continue;
                 }
@@ -608,7 +608,7 @@ impl VectorizingOptimizer {
                     continue;
                 }
                 sched_state.accumulation.insert(
-                    op.pos,
+                    op.pos.get(),
                     AccumEntry {
                         seed,
                         operator,
@@ -627,7 +627,7 @@ impl VectorizingOptimizer {
             let bytesize: i32 = self
                 .body_ops
                 .iter()
-                .find(|op| op.pos == seed)
+                .find(|op| op.pos.get() == seed)
                 .and_then(|op| op.vecinfo.as_ref())
                 .map(|vi| vi.getbytesize() as i32)
                 .unwrap_or(8);
@@ -639,7 +639,7 @@ impl VectorizingOptimizer {
             // vector.py:844-853: create zero vector (reduce_init == 0 for '+')
             let vec_create =
                 sched_state.create_vec_op(OpCode::VecI, &[], datatype, bytesize, signed, count);
-            let zero_vec = vec_create.pos;
+            let zero_vec = vec_create.pos.get();
             sched_state.invariant_oplist.push(vec_create);
 
             // VEC_INT_XOR(zero_vec, zero_vec) → all zeros
@@ -651,7 +651,7 @@ impl VectorizingOptimizer {
                 signed,
                 count,
             );
-            let zeroed_vec = xor_op.pos;
+            let zeroed_vec = xor_op.pos.get();
             sched_state.invariant_oplist.push(xor_op);
 
             // vector.py:866-869: pack the seed scalar into position 0
@@ -665,7 +665,7 @@ impl VectorizingOptimizer {
                 signed,
                 count,
             );
-            let seed_vec = pack_op.pos;
+            let seed_vec = pack_op.pos.get();
             sched_state.invariant_oplist.push(pack_op);
 
             // vector.py:870-871: accumulation[seed] = pack
@@ -719,7 +719,7 @@ impl VectorizingOptimizer {
                         sched_state.renamer.rename(&mut member_op);
                         // unpack=False → skip ensure_args_unpacked
 
-                        seen.insert(member_op.pos);
+                        seen.insert(member_op.pos.get());
                         // Write renamed op back for turn_into_vector to use
                         self.body_ops[member_idx] = member_op;
                     }
@@ -740,7 +740,7 @@ impl VectorizingOptimizer {
                 ensure_args_unpacked(&mut sched_state, &mut scalar_op, &mut seen);
 
                 // schedule.py:136: seen[op] = None
-                seen.insert(scalar_op.pos);
+                seen.insert(scalar_op.pos.get());
                 sched_state.append_to_oplist(scalar_op);
             }
         }
@@ -855,7 +855,7 @@ mod tests {
 
     fn assign_positions(ops: &mut [Op], base: u32) {
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(base + i as u32, op.result_type());
+            op.pos.set(OpRef::op_typed(base + i as u32, op.result_type()));
         }
     }
 
@@ -1556,7 +1556,7 @@ mod tests {
         ];
         let mut positioned = ops;
         for (i, op) in positioned.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
         }
         let analysis = GuardAnalysis::analyze(&positioned);
         assert_eq!(analysis.hoistable.len(), 1);
@@ -1586,7 +1586,7 @@ mod tests {
             ), // 3: independent
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
         }
         let chain = follow_def_use_chain(&ops, 0, 10);
         assert!(chain.contains(&0));
@@ -1614,7 +1614,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(3)]),           // back-edge
         ];
         for (i, op) in ops.iter_mut().enumerate() {
-            op.pos = OpRef::op_typed(i as u32, op.result_type());
+            op.pos.set(OpRef::op_typed(i as u32, op.result_type()));
         }
         let vloop = VectorLoop::from_trace(&ops).unwrap();
         assert_eq!(vloop.body_len(), 2); // IntAdd + IntMul
