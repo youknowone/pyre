@@ -1783,11 +1783,9 @@ fn build_short_preamble_struct_from_ops(
     loop_constants: &HashMap<u32, i64>,
     loop_constant_types: &HashMap<u32, majit_ir::Type>,
 ) -> ShortPreamble {
-    let short_inputarg_positions: HashMap<OpRef, usize> = short_inputargs
-        .iter()
-        .enumerate()
-        .map(|(idx, &arg)| (arg, idx))
-        .collect();
+    let inputarg_idx = |arg: &OpRef| -> Option<usize> {
+        short_inputargs.iter().position(|a| a == arg)
+    };
     // Collect all OpRefs defined by the short preamble ops (as results).
     let mut defined_by_ops: HashSet<OpRef> = HashSet::new();
     for ia in short_inputargs {
@@ -1807,10 +1805,7 @@ fn build_short_preamble_struct_from_ops(
                 .iter()
                 .enumerate()
                 .filter_map(|(arg_pos, arg_ref)| {
-                    short_inputarg_positions
-                        .get(arg_ref)
-                        .copied()
-                        .map(|label_idx| (arg_pos, label_idx))
+                    inputarg_idx(arg_ref).map(|label_idx| (arg_pos, label_idx))
                 })
                 .collect();
             let fail_arg_mapping = op
@@ -1821,10 +1816,7 @@ fn build_short_preamble_struct_from_ops(
                         .iter()
                         .enumerate()
                         .filter_map(|(fail_arg_pos, fail_arg_ref)| {
-                            short_inputarg_positions
-                                .get(fail_arg_ref)
-                                .copied()
-                                .map(|label_idx| (fail_arg_pos, label_idx))
+                            inputarg_idx(fail_arg_ref).map(|label_idx| (fail_arg_pos, label_idx))
                         })
                         .collect()
                 })
@@ -2608,12 +2600,9 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
     };
 
     let label_args = &peeled_ops[label_pos].args;
-
-    // Build preamble-to-label-arg mapping
-    let mut preamble_to_label: HashMap<OpRef, usize> = HashMap::new();
-    for (i, arg) in label_args.iter().enumerate() {
-        preamble_to_label.insert(*arg, i);
-    }
+    let label_arg_idx = |arg: &OpRef| -> Option<usize> {
+        label_args.iter().position(|a| a == arg)
+    };
 
     // shortpreamble.py: Collect guards AND pure operations from the preamble.
     // Guards must be replayed so the body's assumptions hold.
@@ -2630,14 +2619,14 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
                     .args
                     .iter()
                     .enumerate()
-                    .filter_map(|(pos, arg)| preamble_to_label.get(arg).map(|&idx| (pos, idx)))
+                    .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
                     .collect();
                 let ovf_fail_arg_mapping: Vec<(usize, usize)> = ovf_op
                     .fail_args
                     .as_ref()
                     .into_iter()
                     .flat_map(|fail_args| fail_args.iter().enumerate())
-                    .filter_map(|(pos, arg)| preamble_to_label.get(arg).map(|&idx| (pos, idx)))
+                    .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
                     .collect();
                 if !ovf_arg_mapping.is_empty() || !ovf_fail_arg_mapping.is_empty() {
                     entries.push(ShortPreambleOp {
@@ -2663,14 +2652,14 @@ pub fn extract_short_preamble(peeled_ops: &[Op]) -> ShortPreamble {
             .args
             .iter()
             .enumerate()
-            .filter_map(|(pos, arg)| preamble_to_label.get(arg).map(|&idx| (pos, idx)))
+            .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
             .collect();
         let fail_arg_mapping: Vec<(usize, usize)> = op
             .fail_args
             .as_ref()
             .into_iter()
             .flat_map(|fail_args| fail_args.iter().enumerate())
-            .filter_map(|(pos, arg)| preamble_to_label.get(arg).map(|&idx| (pos, idx)))
+            .filter_map(|(pos, arg)| label_arg_idx(arg).map(|idx| (pos, idx)))
             .collect();
 
         // Only include ops that reference label args
@@ -2718,24 +2707,25 @@ pub fn produced_short_boxes_from_exported_boxes(
     short_inputargs: &[OpRef],
     exported_short_boxes: &[PreambleOp],
 ) -> Vec<(OpRef, ProducedShortOp)> {
-    let inputarg_map: HashMap<OpRef, OpRef> = label_args
-        .iter()
-        .copied()
-        .zip(short_inputargs.iter().copied())
-        .collect();
+    let inputarg_rename = |arg: OpRef| -> Option<OpRef> {
+        label_args
+            .iter()
+            .position(|&a| a == arg)
+            .and_then(|i| short_inputargs.get(i).copied())
+    };
     exported_short_boxes
         .iter()
         .filter(|entry| !entry.op.opcode.is_guard_overflow())
         .map(|entry| {
             let mut preamble_op = entry.op.clone();
             for arg in &mut preamble_op.args {
-                if let Some(&renamed) = inputarg_map.get(arg) {
+                if let Some(renamed) = inputarg_rename(*arg) {
                     *arg = renamed;
                 }
             }
             if let Some(fail_args) = preamble_op.fail_args.as_mut() {
                 for arg in fail_args {
-                    if let Some(&renamed) = inputarg_map.get(arg) {
+                    if let Some(renamed) = inputarg_rename(*arg) {
                         *arg = renamed;
                     }
                 }
