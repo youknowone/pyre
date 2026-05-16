@@ -1853,8 +1853,12 @@ where
                 self.set_int_reg(dst, Some(opref), Some(reg_concrete));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_I => {
-                let (vable_reg, array_idx, index_reg, dest) =
-                    self.frames.current_mut().read_vable_getarrayitem();
+                let (opcode_pc, vable_reg, array_idx, index_reg, dest) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    let (vable_reg, array_idx, index_reg, dest) = frame.read_vable_getarrayitem();
+                    (opcode_pc, vable_reg, array_idx, index_reg, dest)
+                };
                 let Some((vable_opref, fdescr, adescr)) =
                     self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
@@ -1862,6 +1866,7 @@ where
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (opref, value) = ctx.vable_getarrayitem_int_indexed(
+                    opcode_pc,
                     vable_opref,
                     index,
                     index_value,
@@ -1871,8 +1876,12 @@ where
                 self.set_int_reg(dest, Some(opref), Some(value_as_int_bits(value)));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_R => {
-                let (vable_reg, array_idx, index_reg, dest) =
-                    self.frames.current_mut().read_vable_getarrayitem();
+                let (opcode_pc, vable_reg, array_idx, index_reg, dest) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    let (vable_reg, array_idx, index_reg, dest) = frame.read_vable_getarrayitem();
+                    (opcode_pc, vable_reg, array_idx, index_reg, dest)
+                };
                 let Some((vable_opref, fdescr, adescr)) =
                     self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
@@ -1880,6 +1889,7 @@ where
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (opref, value) = ctx.vable_getarrayitem_ref_indexed(
+                    opcode_pc,
                     vable_opref,
                     index,
                     index_value,
@@ -1889,8 +1899,12 @@ where
                 self.set_ref_reg(dest, Some(opref), Some(value_as_ref_bits(value)));
             }
             jitcode::insns::BC_GETARRAYITEM_VABLE_F => {
-                let (vable_reg, array_idx, index_reg, dest) =
-                    self.frames.current_mut().read_vable_getarrayitem();
+                let (opcode_pc, vable_reg, array_idx, index_reg, dest) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    let (vable_reg, array_idx, index_reg, dest) = frame.read_vable_getarrayitem();
+                    (opcode_pc, vable_reg, array_idx, index_reg, dest)
+                };
                 let Some((vable_opref, fdescr, adescr)) =
                     self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
@@ -1898,6 +1912,7 @@ where
                 };
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (opref, value) = ctx.vable_getarrayitem_float_indexed(
+                    opcode_pc,
                     vable_opref,
                     index,
                     index_value,
@@ -1907,8 +1922,12 @@ where
                 self.set_float_reg(dest, Some(opref), Some(value_as_float_bits(value)));
             }
             jitcode::insns::BC_SETARRAYITEM_VABLE_I => {
-                let (vable_reg, array_idx, index_reg, src) =
-                    self.frames.current_mut().read_vable_setarrayitem();
+                let (opcode_pc, vable_reg, array_idx, index_reg, src) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    let (vable_reg, array_idx, index_reg, src) = frame.read_vable_setarrayitem();
+                    (opcode_pc, vable_reg, array_idx, index_reg, src)
+                };
                 let Some((vable_opref, fdescr, adescr)) =
                     self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
@@ -1917,6 +1936,7 @@ where
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, concrete) = self.read_int_reg(src);
                 ctx.vable_setarrayitem_indexed(
+                    opcode_pc,
                     vable_opref,
                     index,
                     index_value,
@@ -1927,8 +1947,12 @@ where
                 );
             }
             jitcode::insns::BC_SETARRAYITEM_VABLE_R => {
-                let (vable_reg, array_idx, index_reg, src) =
-                    self.frames.current_mut().read_vable_setarrayitem();
+                let (opcode_pc, vable_reg, array_idx, index_reg, src) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    let (vable_reg, array_idx, index_reg, src) = frame.read_vable_setarrayitem();
+                    (opcode_pc, vable_reg, array_idx, index_reg, src)
+                };
                 let Some((vable_opref, fdescr, adescr)) =
                     self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
@@ -1937,6 +1961,7 @@ where
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, concrete) = self.read_ref_reg(src);
                 ctx.vable_setarrayitem_indexed(
+                    opcode_pc,
                     vable_opref,
                     index,
                     index_value,
@@ -1947,8 +1972,12 @@ where
                 );
             }
             jitcode::insns::BC_SETARRAYITEM_VABLE_F => {
-                let (vable_reg, array_idx, index_reg, src) =
-                    self.frames.current_mut().read_vable_setarrayitem();
+                let (opcode_pc, vable_reg, array_idx, index_reg, src) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    let (vable_reg, array_idx, index_reg, src) = frame.read_vable_setarrayitem();
+                    (opcode_pc, vable_reg, array_idx, index_reg, src)
+                };
                 let Some((vable_opref, fdescr, adescr)) =
                     self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
@@ -1957,6 +1986,7 @@ where
                 let (index, index_value) = self.read_int_reg(index_reg);
                 let (value, concrete) = self.read_float_reg(src);
                 ctx.vable_setarrayitem_indexed(
+                    opcode_pc,
                     vable_opref,
                     index,
                     index_value,
@@ -1967,13 +1997,18 @@ where
                 );
             }
             jitcode::insns::BC_ARRAYLEN_VABLE => {
-                let (vable_reg, array_idx, dest) = self.frames.current_mut().read_vable_arraylen();
+                let (opcode_pc, vable_reg, array_idx, dest) = {
+                    let frame = self.frames.current_mut();
+                    let opcode_pc = frame.code_cursor - 1;
+                    let (vable_reg, array_idx, dest) = frame.read_vable_arraylen();
+                    (opcode_pc, vable_reg, array_idx, dest)
+                };
                 let Some((vable_opref, fdescr, adescr)) =
                     self.vable_array_descrs(ctx, vable_reg, array_idx)
                 else {
                     return TraceAction::Abort;
                 };
-                let result = ctx.vable_arraylen_vable(vable_opref, fdescr, adescr);
+                let result = ctx.vable_arraylen_vable(opcode_pc, vable_opref, fdescr, adescr);
                 // pyjitpl.py:1262-1263 `result =
                 // vinfo.get_array_length(virtualizable, arrayindex);
                 // return ConstInt(result)`.  RPython reads from the live

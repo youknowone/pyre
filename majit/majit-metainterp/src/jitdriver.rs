@@ -3487,6 +3487,7 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_getarrayitem_vable_int(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3494,6 +3495,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) -> (OpRef, Value) {
         self.meta.opimpl_getarrayitem_vable_int(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3504,6 +3506,7 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_getarrayitem_vable_ref(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3511,6 +3514,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) -> (OpRef, Value) {
         self.meta.opimpl_getarrayitem_vable_ref(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3521,6 +3525,7 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_getarrayitem_vable_float(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3528,6 +3533,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) -> (OpRef, Value) {
         self.meta.opimpl_getarrayitem_vable_float(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3538,6 +3544,7 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_setarrayitem_vable_int(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3547,6 +3554,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_int(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3559,6 +3567,7 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_setarrayitem_vable_ref(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3568,6 +3577,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_ref(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3580,6 +3590,7 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_setarrayitem_vable_float(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -3589,6 +3600,7 @@ impl<S: JitState> JitDriver<S> {
         adescr: DescrRef,
     ) {
         self.meta.opimpl_setarrayitem_vable_float(
+            pc,
             vable_opref,
             index,
             index_runtime_value,
@@ -3601,11 +3613,13 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_arraylen_vable(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> OpRef {
-        self.meta.opimpl_arraylen_vable(vable_opref, fdescr, adescr)
+        self.meta
+            .opimpl_arraylen_vable(pc, vable_opref, fdescr, adescr)
     }
 
     /// Start bridge tracing from a guard failure point.

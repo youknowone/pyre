@@ -1930,6 +1930,7 @@ impl TraceCtx {
     /// ```
     fn get_arrayitem_vable_index(
         &mut self,
+        pc: usize,
         index: OpRef,
         index_runtime_value: i64,
         fdescr: &DescrRef,
@@ -1938,7 +1939,7 @@ impl TraceCtx {
         let promoted_index = if index.is_constant() {
             index
         } else {
-            self.promote_int(index, index_runtime_value, 0)
+            self.promote_int(index, index_runtime_value, pc)
         };
         let _ = promoted_index;
         let item_index = usize::try_from(index_runtime_value).ok()?;
@@ -1963,6 +1964,7 @@ impl TraceCtx {
     /// ```
     pub fn vable_getarrayitem_int_indexed(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -1970,7 +1972,7 @@ impl TraceCtx {
         adescr: DescrRef,
     ) -> (OpRef, Value) {
         let concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(0, vable_opref, &fdescr, concrete) {
+        if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             // return self.opimpl_getarrayitem_gc_i(arraybox, indexbox, adescr)
             let array_opref =
@@ -1982,7 +1984,8 @@ impl TraceCtx {
         }
         // index = self._get_arrayitem_vable_index(pc, fdescr, indexbox)
         // return self.metainterp.virtualizable_boxes[index]
-        if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
+        if let Some(flat_idx) =
+            self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
         {
             if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
                 return entry;
@@ -2022,6 +2025,7 @@ impl TraceCtx {
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — ref variant.
     pub fn vable_getarrayitem_ref_indexed(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -2029,7 +2033,7 @@ impl TraceCtx {
         adescr: DescrRef,
     ) -> (OpRef, Value) {
         let concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(0, vable_opref, &fdescr, concrete) {
+        if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
             return (
@@ -2037,7 +2041,8 @@ impl TraceCtx {
                 Value::Void,
             );
         }
-        if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
+        if let Some(flat_idx) =
+            self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
         {
             if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
                 return entry;
@@ -2076,6 +2081,7 @@ impl TraceCtx {
     /// pyjitpl.py:1218-1234 `_opimpl_getarrayitem_vable` — float variant.
     pub fn vable_getarrayitem_float_indexed(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -2083,7 +2089,7 @@ impl TraceCtx {
         adescr: DescrRef,
     ) -> (OpRef, Value) {
         let concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(0, vable_opref, &fdescr, concrete) {
+        if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
             return (
@@ -2091,7 +2097,8 @@ impl TraceCtx {
                 Value::Void,
             );
         }
-        if let Some(flat_idx) = self.get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
+        if let Some(flat_idx) =
+            self.get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
         {
             if let Some(entry) = self.virtualizable_entry_at(flat_idx) {
                 return entry;
@@ -2128,6 +2135,7 @@ impl TraceCtx {
     /// pyjitpl.py:1236-1247 `_opimpl_setarrayitem_vable(box, indexbox, valuebox, fdescr, adescr, pc)`.
     pub fn vable_setarrayitem_indexed(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         index: OpRef,
         index_runtime_value: i64,
@@ -2137,7 +2145,7 @@ impl TraceCtx {
         concrete: Value,
     ) {
         let vable_concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(0, vable_opref, &fdescr, vable_concrete) {
+        if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, vable_concrete) {
             let array_opref =
                 self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fdescr);
             self.vable_setarrayitem_descr(array_opref, index, value, adescr);
@@ -2147,7 +2155,7 @@ impl TraceCtx {
         // self.metainterp.virtualizable_boxes[index] = valuebox
         // self.metainterp.synchronize_virtualizable()
         let flat_idx = self
-            .get_arrayitem_vable_index(index, index_runtime_value, &fdescr)
+            .get_arrayitem_vable_index(pc, index, index_runtime_value, &fdescr)
             .expect("vable_setarrayitem_indexed: virtualizable array slot missing");
         self.set_virtualizable_entry_at(flat_idx, value, concrete);
         self.synchronize_virtualizable();
@@ -2169,12 +2177,13 @@ impl TraceCtx {
     /// ```
     pub fn vable_arraylen_vable(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fdescr: DescrRef,
         adescr: DescrRef,
     ) -> OpRef {
         let concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(0, vable_opref, &fdescr, concrete) {
+        if self.is_nonstandard_virtualizable(pc, vable_opref, &fdescr, concrete) {
             // arraybox = self.opimpl_getfield_gc_r(box, fdescr)
             // return self.opimpl_arraylen_gc(arraybox, adescr)
             let array_opref =
