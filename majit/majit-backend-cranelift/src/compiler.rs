@@ -1525,6 +1525,53 @@ pub fn register_resumedata_deopt(f: fn(usize, &mut Vec<i64>, &[Type], usize) -> 
     let _ = RESUMEDATA_DEOPT_FN.set(f);
 }
 
+/// On-demand layout reconstruction callback (Path 1 Slice 1).  Returns
+/// an `ExitRecoveryLayout` for the descr at `descr_addr`, optionally
+/// prefixed by `caller_prefix`.  Implementation looks up the
+/// metainterp's `StoredExitLayout` cache (keyed by trace_id /
+/// fail_index_per_trace) and converts the cached `resume_layout` via
+/// `ResumeLayout::to_exit_recovery_layout_with_caller_prefix`.
+///
+/// Sibling of [`RESUMEDATA_DEOPT_FN`] but returns layout structure
+/// instead of replaying deopt — used by `recovery_layout_ref()` to
+/// produce `ExitRecoveryLayout` without depending on the meta-side
+/// `ResumeGuardDescr.recovery_layout` cache (Path 1 epic / task #70).
+///
+/// Returns `None` for descrs without a `ResumeGuardDescr` meta_descr
+/// (synthetic FINISH / external-JUMP) or when the StoredExitLayout
+/// lookup fails (descr not in metainterp cache, e.g. overlay
+/// synthetics).  Callers must handle `None`.
+static RECOVERY_LAYOUT_FN: OnceLock<
+    fn(usize, Option<&ExitRecoveryLayout>) -> Option<ExitRecoveryLayout>,
+> = OnceLock::new();
+
+/// Register the on-demand layout reconstruction callback for the
+/// Path 1 epic.  pyre-jit calls this during JIT boot alongside
+/// `register_resumedata_deopt`.
+pub fn register_recovery_layout(
+    f: fn(usize, Option<&ExitRecoveryLayout>) -> Option<ExitRecoveryLayout>,
+) {
+    let _ = RECOVERY_LAYOUT_FN.set(f);
+}
+
+/// Dispatch helper used by `CraneliftFailDescr::recovery_layout_ref`
+/// to consult the on-demand layout callback (Path 1 Slice 1).
+/// Returns `None` if the callback hasn't been registered yet —
+/// callers fall back to the meta-side slot read until Slice 3
+/// deletes the slot.
+///
+/// Wired-up readers land in Slice 2; Slice 1 ships infrastructure
+/// only so the cross-crate plumbing can be reviewed independently
+/// of the read-site migration risk.
+#[allow(dead_code)]
+pub(crate) fn recovery_layout_via_callback(
+    descr_addr: usize,
+    caller_prefix: Option<&ExitRecoveryLayout>,
+) -> Option<ExitRecoveryLayout> {
+    let cb = RECOVERY_LAYOUT_FN.get().copied()?;
+    cb(descr_addr, caller_prefix)
+}
+
 /// Dispatch entry used by the four runtime-deopt callers
 /// (compiler.rs:3185, 3555, 3590, 3717) — drives the on-demand
 /// `ResumeDataDirectReader` callback (Slice QQ-2's
@@ -6486,9 +6533,7 @@ impl CraneliftBackend {
             // dual indexing.
             if let Some(meta) = &descr.meta_descr {
                 let meta_ptr = Arc::as_ptr(meta) as *const () as usize;
-                registry
-                    .entry(meta_ptr)
-                    .or_insert_with(|| descr_ref.clone());
+                registry.insert(meta_ptr, descr_ref.clone());
             }
         }
     }

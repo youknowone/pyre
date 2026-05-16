@@ -3935,6 +3935,36 @@ pub fn cranelift_resumedata_deopt(
     true
 }
 
+/// Path 1 Slice 1 — pyre-jit side of the on-demand
+/// `ExitRecoveryLayout` reconstruction callback registered into
+/// cranelift via `register_recovery_layout` (eval.rs:init_callbacks).
+/// Used by `CraneliftFailDescr::recovery_layout_ref` to derive the
+/// layout from the metainterp-side `StoredExitLayout.resume_layout`
+/// summary instead of reading the
+/// `ResumeGuardDescr.recovery_layout` cache (Path 1 epic — eliminate
+/// the cache so the meta-side slot can be deleted).
+///
+/// Returns `None` for synthetic descrs (FINISH / external-JUMP /
+/// overlay) without a `ResumeGuardDescr` meta_descr or for descrs
+/// whose `compiled_loops` entry has been evicted; callers fall back
+/// to the meta-side slot read (current behaviour) until Slice 3
+/// deletes the slot entirely.
+#[cfg(feature = "cranelift")]
+pub fn cranelift_recovery_layout_for_descr(
+    descr_addr: usize,
+    caller_prefix: Option<&majit_backend::ExitRecoveryLayout>,
+) -> Option<majit_backend::ExitRecoveryLayout> {
+    use majit_backend::Backend;
+
+    let (driver, _) = crate::eval::driver_pair();
+    let backend = driver.meta_interp().backend();
+    let descr = backend.fail_descr_arc_from_addr(descr_addr);
+    let fd = descr.as_fail_descr()?;
+    driver
+        .meta_interp()
+        .compute_recovery_layout_for_descr(fd, caller_prefix)
+}
+
 #[cfg(test)]
 mod tests_bh_normalize_raise {
     use super::*;

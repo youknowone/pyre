@@ -2140,6 +2140,10 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     init_callbacks();
     #[cfg(feature = "cranelift")]
     majit_backend_cranelift::register_resumedata_deopt(crate::call_jit::cranelift_resumedata_deopt);
+    #[cfg(feature = "cranelift")]
+    majit_backend_cranelift::register_recovery_layout(
+        crate::call_jit::cranelift_recovery_layout_for_descr,
+    );
     frame.fix_array_ptrs();
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame);
