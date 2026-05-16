@@ -202,8 +202,9 @@ impl ShortPreamble {
 pub struct CollectedShortPreambleBuilder {
     /// Raw ops collected during the preamble phase (before Label).
     raw_ops: Vec<Op>,
-    /// Map from preamble OpRef to label arg index (set when Label is found).
-    preamble_to_label_arg: HashMap<OpRef, usize>,
+    /// Label args carried across the Label (set when Label is found).
+    /// The index into this Vec is the label arg index.
+    label_args: Vec<OpRef>,
     /// Whether the builder is still collecting (before Label).
     active: bool,
 }
@@ -212,7 +213,7 @@ impl CollectedShortPreambleBuilder {
     pub fn new() -> Self {
         CollectedShortPreambleBuilder {
             raw_ops: Vec::new(),
-            preamble_to_label_arg: HashMap::new(),
+            label_args: Vec::new(),
             active: true,
         }
     }
@@ -222,10 +223,7 @@ impl CollectedShortPreambleBuilder {
     /// Called when the Label is encountered. `label_args` are the OpRefs
     /// that the Label carries (= the loop-carried values from the preamble).
     pub fn set_label_args(&mut self, label_args: &[OpRef]) {
-        self.preamble_to_label_arg.clear();
-        for (i, opref) in label_args.iter().enumerate() {
-            self.preamble_to_label_arg.insert(*opref, i);
-        }
+        self.label_args = label_args.to_vec();
         self.active = false; // Switch from preamble to body phase
     }
 
@@ -261,20 +259,26 @@ impl CollectedShortPreambleBuilder {
     /// Called after the Label has been processed and the mapping is set.
     /// Computes arg mappings using the preamble-to-label-arg map.
     pub fn build(self, exported_state: Option<VirtualState>) -> ShortPreamble {
-        let entries = self
-            .raw_ops
+        let Self {
+            raw_ops,
+            label_args,
+            ..
+        } = self;
+        let entries = raw_ops
             .into_iter()
             .map(|op| {
                 let mut arg_mapping = Vec::new();
                 for (arg_pos, arg_ref) in op.args.iter().enumerate() {
-                    if let Some(&label_idx) = self.preamble_to_label_arg.get(arg_ref) {
+                    if let Some(label_idx) = label_args.iter().position(|a| a == arg_ref) {
                         arg_mapping.push((arg_pos, label_idx));
                     }
                 }
                 let mut fail_arg_mapping = Vec::new();
                 if let Some(fail_args) = &op.fail_args {
                     for (fail_arg_pos, fail_arg_ref) in fail_args.iter().enumerate() {
-                        if let Some(&label_idx) = self.preamble_to_label_arg.get(fail_arg_ref) {
+                        if let Some(label_idx) =
+                            label_args.iter().position(|a| a == fail_arg_ref)
+                        {
                             fail_arg_mapping.push((fail_arg_pos, label_idx));
                         }
                     }
@@ -287,18 +291,9 @@ impl CollectedShortPreambleBuilder {
             })
             .collect();
 
-        // Reconstruct label_args order from preamble_to_label_arg mapping
-        let mut inputargs_by_idx: Vec<(usize, OpRef)> = self
-            .preamble_to_label_arg
-            .iter()
-            .map(|(&opref, &idx)| (idx, opref))
-            .collect();
-        inputargs_by_idx.sort_by_key(|(idx, _)| *idx);
-        let inputargs: Vec<OpRef> = inputargs_by_idx.into_iter().map(|(_, r)| r).collect();
-
         ShortPreamble {
             ops: entries,
-            inputargs,
+            inputargs: label_args,
             used_boxes: Vec::new(),
             jump_args: Vec::new(),
             exported_state,
@@ -891,8 +886,9 @@ pub struct CollectedExtendedShortPreambleBuilder {
     pure_ops: Vec<PreambleOp>,
     /// Loop-invariant calls from the preamble.
     loopinvariant_ops: Vec<PreambleOp>,
-    /// Map from preamble OpRef to label arg index.
-    preamble_to_label_arg: HashMap<OpRef, usize>,
+    /// Label args carried across the Label. Index into this Vec is the label
+    /// arg index.
+    label_args: Vec<OpRef>,
 }
 
 impl CollectedExtendedShortPreambleBuilder {
@@ -902,21 +898,22 @@ impl CollectedExtendedShortPreambleBuilder {
             heap_ops: Vec::new(),
             pure_ops: Vec::new(),
             loopinvariant_ops: Vec::new(),
-            preamble_to_label_arg: HashMap::new(),
+            label_args: Vec::new(),
         }
     }
 
     /// Set the label args mapping.
     pub fn set_label_args(&mut self, label_args: &[OpRef]) {
-        self.preamble_to_label_arg.clear();
-        for (i, opref) in label_args.iter().enumerate() {
-            self.preamble_to_label_arg.insert(*opref, i);
-        }
+        self.label_args = label_args.to_vec();
+    }
+
+    fn lookup_label_arg(&self, opref: OpRef) -> Option<usize> {
+        self.label_args.iter().position(|&a| a == opref)
     }
 
     /// Add a guard operation.
     pub fn add_guard(&mut self, op: Op) {
-        let label_arg_idx = self.preamble_to_label_arg.get(&op.pos.get()).copied();
+        let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.guards.push(PreambleOp {
             op,
             kind: PreambleOpKind::Guard,
@@ -928,7 +925,7 @@ impl CollectedExtendedShortPreambleBuilder {
 
     /// Add a pure operation.
     pub fn add_pure_op(&mut self, op: Op) {
-        let label_arg_idx = self.preamble_to_label_arg.get(&op.pos.get()).copied();
+        let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.pure_ops.push(PreambleOp {
             op,
             kind: PreambleOpKind::Pure,
@@ -940,7 +937,7 @@ impl CollectedExtendedShortPreambleBuilder {
 
     /// Add a heap read.
     pub fn add_heap_op(&mut self, op: Op) {
-        let label_arg_idx = self.preamble_to_label_arg.get(&op.pos.get()).copied();
+        let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.heap_ops.push(PreambleOp {
             op,
             kind: PreambleOpKind::Heap,
@@ -952,7 +949,7 @@ impl CollectedExtendedShortPreambleBuilder {
 
     /// Add a loop-invariant call.
     pub fn add_loopinvariant_op(&mut self, op: Op) {
-        let label_arg_idx = self.preamble_to_label_arg.get(&op.pos.get()).copied();
+        let label_arg_idx = self.lookup_label_arg(op.pos.get());
         self.loopinvariant_ops.push(PreambleOp {
             op,
             kind: PreambleOpKind::LoopInvariant,
@@ -970,12 +967,18 @@ impl CollectedExtendedShortPreambleBuilder {
     /// Build into a ShortPreamble, emitting operations in order:
     /// guards first, then heap reads, then pure ops, then loop-invariant.
     pub fn build(self, exported_state: Option<VirtualState>) -> ShortPreamble {
-        let all_ops: Vec<PreambleOp> = self
-            .guards
+        let Self {
+            guards,
+            heap_ops,
+            pure_ops,
+            loopinvariant_ops,
+            label_args,
+        } = self;
+        let all_ops: Vec<PreambleOp> = guards
             .into_iter()
-            .chain(self.heap_ops)
-            .chain(self.pure_ops)
-            .chain(self.loopinvariant_ops)
+            .chain(heap_ops)
+            .chain(pure_ops)
+            .chain(loopinvariant_ops)
             .collect();
 
         let entries = all_ops
@@ -983,14 +986,16 @@ impl CollectedExtendedShortPreambleBuilder {
             .map(|preamble_op| {
                 let mut arg_mapping = Vec::new();
                 for (arg_pos, arg_ref) in preamble_op.op.args.iter().enumerate() {
-                    if let Some(&label_idx) = self.preamble_to_label_arg.get(arg_ref) {
+                    if let Some(label_idx) = label_args.iter().position(|a| a == arg_ref) {
                         arg_mapping.push((arg_pos, label_idx));
                     }
                 }
                 let mut fail_arg_mapping = Vec::new();
                 if let Some(fail_args) = &preamble_op.op.fail_args {
                     for (fail_arg_pos, fail_arg_ref) in fail_args.iter().enumerate() {
-                        if let Some(&label_idx) = self.preamble_to_label_arg.get(fail_arg_ref) {
+                        if let Some(label_idx) =
+                            label_args.iter().position(|a| a == fail_arg_ref)
+                        {
                             fail_arg_mapping.push((fail_arg_pos, label_idx));
                         }
                     }
