@@ -57,11 +57,16 @@ fn fail_descr_registry_global() -> &'static Mutex<HashMap<usize, std::sync::Weak
 }
 
 pub fn register_fail_descr_global(descr_ptr: usize, descr: &DescrRef) {
+    // `insert` (not `entry().or_insert_with`): after the original descr
+    // at this address is dropped, the allocator may reuse the address
+    // for a freshly registered descr.  `or_insert_with` would leave the
+    // stale `Weak` in place and `lookup_fail_descr_global` would keep
+    // upgrading to `None`, dropping live guard failures into the
+    // fallback `handle_fail_dispatch == 0` path.
     fail_descr_registry_global()
         .lock()
         .expect("FAIL_DESCR_REGISTRY_GLOBAL mutex poisoned")
-        .entry(descr_ptr)
-        .or_insert_with(|| std::sync::Arc::downgrade(descr));
+        .insert(descr_ptr, std::sync::Arc::downgrade(descr));
 }
 
 pub fn lookup_fail_descr_global(descr_ptr: usize) -> Option<DescrRef> {
