@@ -85,6 +85,59 @@ fn loop_target_descr(op: &Op) -> Option<&dyn LoopTargetDescr> {
         .and_then(majit_ir::Descr::as_loop_target_descr)
 }
 
+/// `x86/assembler.py:254 _push_all_regs_to_frame` parity — free-fn
+/// variant that emits into an arbitrary `dynasmrt::x64::Assembler`,
+/// for use by helper-buffer builders that operate outside of an
+/// `Assembler386` instance (e.g. `_build_malloc_slowpath`,
+/// `_build_wb_slowpath`).  Logic is identical to
+/// `Assembler386::push_all_regs_to_jitframe`; the per-arch slot table
+/// and `FIRST_ITEM_OFFSET`-relative addressing match.
+pub(crate) fn push_all_regs_to_jitframe_raw(
+    asm: &mut Assembler,
+    ignored_regs: &[crate::regloc::RegLoc],
+    withfloats: bool,
+) {
+    for reg in crate::x86::regalloc::ALL_CORE_REGS.iter() {
+        if ignored_regs.contains(reg) {
+            continue;
+        }
+        let slot = core_reg_position(*reg).expect("push_all_regs: managed x86_64 GPR");
+        let ofs = FIRST_ITEM_OFFSET as i32 + (slot * WORD) as i32;
+        dynasm!(asm ; .arch x64 ; mov [rbp + ofs], Rq(reg.value));
+    }
+    if withfloats {
+        for reg in crate::x86::regalloc::ALL_FLOAT_REGS.iter() {
+            let slot = float_reg_position(*reg).expect("push_all_regs: managed x86_64 XMM");
+            let ofs = FIRST_ITEM_OFFSET as i32 + (slot * WORD) as i32;
+            dynasm!(asm ; .arch x64 ; movsd [rbp + ofs], Rx(reg.value));
+        }
+    }
+}
+
+/// `x86/assembler.py:283 _pop_all_regs_from_frame` parity — free-fn
+/// variant; see `push_all_regs_to_jitframe_raw` for usage notes.
+pub(crate) fn pop_all_regs_from_jitframe_raw(
+    asm: &mut Assembler,
+    ignored_regs: &[crate::regloc::RegLoc],
+    withfloats: bool,
+) {
+    for reg in crate::x86::regalloc::ALL_CORE_REGS.iter() {
+        if ignored_regs.contains(reg) {
+            continue;
+        }
+        let slot = core_reg_position(*reg).expect("pop_all_regs: managed x86_64 GPR");
+        let ofs = FIRST_ITEM_OFFSET as i32 + (slot * WORD) as i32;
+        dynasm!(asm ; .arch x64 ; mov Rq(reg.value), [rbp + ofs]);
+    }
+    if withfloats {
+        for reg in crate::x86::regalloc::ALL_FLOAT_REGS.iter() {
+            let slot = float_reg_position(*reg).expect("pop_all_regs: managed x86_64 XMM");
+            let ofs = FIRST_ITEM_OFFSET as i32 + (slot * WORD) as i32;
+            dynasm!(asm ; .arch x64 ; movsd Rx(reg.value), [rbp + ofs]);
+        }
+    }
+}
+
 /// Pointer-identity key for `target_tokens_currently_compiling`. PyPy
 /// x86/assembler.py:93 keys it by the descr Python object itself; we use
 /// the underlying allocation address of the `Arc<dyn Descr>` so two
@@ -1532,21 +1585,7 @@ impl<'a> Assembler386<'a> {
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        for reg in crate::x86::regalloc::ALL_CORE_REGS.iter() {
-            if ignored_regs.contains(reg) {
-                continue;
-            }
-            let slot = core_reg_position(*reg).expect("push_all_regs: managed x86_64 GPR");
-            let ofs = Self::slot_offset(slot);
-            dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(reg.value));
-        }
-        if withfloats {
-            for reg in crate::x86::regalloc::ALL_FLOAT_REGS.iter() {
-                let slot = float_reg_position(*reg).expect("push_all_regs: managed x86_64 XMM");
-                let ofs = Self::slot_offset(slot);
-                dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(reg.value));
-            }
-        }
+        push_all_regs_to_jitframe_raw(&mut self.mc, ignored_regs, withfloats);
     }
 
     /// x86/assembler.py:283 `_pop_all_regs_from_jitframe` parity.
@@ -1555,21 +1594,7 @@ impl<'a> Assembler386<'a> {
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        for reg in crate::x86::regalloc::ALL_CORE_REGS.iter() {
-            if ignored_regs.contains(reg) {
-                continue;
-            }
-            let slot = core_reg_position(*reg).expect("pop_all_regs: managed x86_64 GPR");
-            let ofs = Self::slot_offset(slot);
-            dynasm!(self.mc ; .arch x64 ; mov Rq(reg.value), [rbp + ofs]);
-        }
-        if withfloats {
-            for reg in crate::x86::regalloc::ALL_FLOAT_REGS.iter() {
-                let slot = float_reg_position(*reg).expect("pop_all_regs: managed x86_64 XMM");
-                let ofs = Self::slot_offset(slot);
-                dynasm!(self.mc ; .arch x64 ; movsd Rx(reg.value), [rbp + ofs]);
-            }
-        }
+        pop_all_regs_from_jitframe_raw(&mut self.mc, ignored_regs, withfloats);
     }
 
     /// `assembler.py:910 _check_frame_depth` parity — emitted at every
