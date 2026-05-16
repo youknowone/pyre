@@ -14,7 +14,6 @@
 //!
 //! This module provides the Rust equivalent of RPython's `virtualizable.py`.
 
-use std::collections::HashMap;
 use std::sync::{Arc, Weak};
 
 use majit_ir::{DescrRef, Type, descr::descr_identity};
@@ -335,19 +334,15 @@ impl VirtualizableInfo {
             })
             .collect();
         // virtualizable.py:81-82: self.static_field_by_descrs = {descr: i ...}
-        self.static_field_by_descrs = self
-            ._static_field_descrs
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (descr_identity(d), i))
-            .collect();
+        self.static_field_by_descrs = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        for (i, d) in self._static_field_descrs.iter().enumerate() {
+            self.static_field_by_descrs.insert(descr_identity(d), i);
+        }
         // virtualizable.py:83-84: self.array_field_by_descrs = {descr: i ...}
-        self.array_field_by_descrs = self
-            ._array_field_descrs
-            .iter()
-            .enumerate()
-            .map(|(i, d)| (descr_identity(d), i))
-            .collect();
+        self.array_field_by_descrs = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        for (i, d) in self._array_field_descrs.iter().enumerate() {
+            self.array_field_by_descrs.insert(descr_identity(d), i);
+        }
     }
 
     /// Build a FieldDescr carrying parent_descr (+ optional vinfo backref).

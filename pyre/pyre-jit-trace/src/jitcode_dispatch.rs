@@ -7671,7 +7671,8 @@ mod tests {
             "`{opname}` args must be [registers_i[src1], registers_i[src2]] in source order",
         );
         assert_eq!(
-            dst_post, last.pos.get(),
+            dst_post,
+            last.pos.get(),
             "`{opname}` dst must hold the recorder's result OpRef (op.pos.get())",
         );
     }
@@ -8510,9 +8511,7 @@ mod tests {
             &[funcptr_expected, arg0_expected, arg1_expected],
             "CallR args must be [funcptr, ...args] from registers_i+registers_r",
         );
-        let recorded_descr = call_op
-            .getdescr()
-            .expect("CallR must carry the calldescr");
+        let recorded_descr = call_op.getdescr().expect("CallR must carry the calldescr");
         assert!(
             std::sync::Arc::ptr_eq(&recorded_descr, &call_descr),
             "CallR descr must be descr_refs[1] (not decoy at index 0)",
@@ -8534,7 +8533,8 @@ mod tests {
         // resume data — better than a wrong-layout snapshot the
         // optimizer would consume as truth.
         assert_eq!(
-            guard_op.rd_resume_position.get(), -1,
+            guard_op.rd_resume_position.get(),
+            -1,
             "walker guards stay at rd_resume_position=-1 by design (shadow validator; trait-leg captures resumedata)",
         );
     }
@@ -8889,7 +8889,8 @@ mod tests {
             .find(|o| o.opcode == OpCode::CallR)
             .expect("a CallR op must be in the recorded trace");
         assert_eq!(
-            dst_ref, call_op.pos.get(),
+            dst_ref,
+            call_op.pos.get(),
             "registers_r[dst] must be the recorded CallR's OpRef (op.pos.get())",
         );
     }
@@ -8955,7 +8956,8 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::CallR)
             .expect("CallR must be in the trace")
-            .pos.get();
+            .pos
+            .get();
         assert_ne!(regs_r[3], dst_pre, "dst must be overwritten");
         assert_eq!(
             regs_r[3], call_pos,
@@ -9015,7 +9017,8 @@ mod tests {
             .iter()
             .find(|o| o.opcode == OpCode::CallR)
             .expect("CallR must be in the trace")
-            .pos.get();
+            .pos
+            .get();
         assert_ne!(regs_r[2], dst_pre, "dst must be overwritten");
         assert_eq!(
             regs_r[2], call_pos,
@@ -9204,9 +9207,7 @@ mod tests {
             &[funcptr_expected, arg0_expected, arg1_expected],
             "CallI args must be [funcptr, ...args] from registers_i+registers_r",
         );
-        let recorded_descr = call_op
-            .getdescr()
-            .expect("CallI must carry the calldescr");
+        let recorded_descr = call_op.getdescr().expect("CallI must carry the calldescr");
         assert!(
             std::sync::Arc::ptr_eq(&recorded_descr, &call_descr),
             "CallI descr must be descr_refs[1] (not decoy at index 0)",
@@ -9218,7 +9219,8 @@ mod tests {
             "registers_i[dst] must change from its pre-call value",
         );
         assert_eq!(
-            dst_post, call_op.pos.get(),
+            dst_post,
+            call_op.pos.get(),
             "registers_i[dst] must be the recorded CallI's OpRef (op.pos.get())",
         );
     }
@@ -9376,9 +9378,7 @@ mod tests {
             "CallR args must be [funcptr, i0, i1, r0, r1] — identity \
              permutation when descr.arg_types=[Int, Int, Ref, Ref]",
         );
-        let recorded_descr = call_op
-            .getdescr()
-            .expect("CallR must carry the calldescr");
+        let recorded_descr = call_op.getdescr().expect("CallR must carry the calldescr");
         assert!(
             std::sync::Arc::ptr_eq(&recorded_descr, &call_descr),
             "CallR descr must be descr_refs[1] (not decoy at index 0)",
@@ -9386,7 +9386,8 @@ mod tests {
         // dst writeback into registers_r[0].
         let dst_post = wc.registers_r[0];
         assert_eq!(
-            dst_post, call_op.pos.get(),
+            dst_post,
+            call_op.pos.get(),
             "registers_r[dst] must be the recorded CallR's OpRef (op.pos.get())",
         );
     }

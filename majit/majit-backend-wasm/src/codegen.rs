@@ -124,7 +124,10 @@ fn collect_guards_and_vars(inputargs: &[InputArg], ops: &[Op]) -> (Vec<GuardExit
 
     let mut fail_index = 0u32;
     for op in ops {
-        if op.pos.get() != OpRef::NONE && !op.pos.get().is_constant() && op.pos.get().raw() + 1 > max_var {
+        if op.pos.get() != OpRef::NONE
+            && !op.pos.get().is_constant()
+            && op.pos.get().raw() + 1 > max_var
+        {
             max_var = op.pos.get().raw() + 1;
         }
         if op.opcode == OpCode::Label {

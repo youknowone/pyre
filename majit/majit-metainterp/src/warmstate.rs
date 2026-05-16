@@ -5,7 +5,6 @@
 /// complete, we compile it and cache the result.
 ///
 /// Reference: rpython/jit/metainterp/warmstate.py WarmEnterState, BaseBaseJitCell
-use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
@@ -318,7 +317,7 @@ pub struct WarmEnterState {
     /// a different threshold to tick_with_threshold().
     pub counter: JitCounter,
     /// Per-greenkey cells, keyed by the hash of the green key.
-    cells: HashMap<u64, BaseJitCell>,
+    cells: crate::optimizeopt::vec_assoc::VecAssoc<u64, BaseJitCell>,
     /// Compilation threshold (copied from counter for easy access).
     threshold: u32,
     /// warmstate.py: trace_eagerness parameter (integer, default 200).
@@ -346,7 +345,7 @@ pub struct WarmEnterState {
     /// Maps a quasi-immutable field key (hash of object_id + field_index)
     /// to the set of green_key_hashes whose compiled loops depend on that field.
     /// When a quasi-immutable field is mutated, all dependent loops are invalidated.
-    quasiimmut_deps: HashMap<u64, HashSet<u64>>,
+    quasiimmut_deps: crate::optimizeopt::vec_assoc::VecAssoc<u64, Vec<u64>>,
     // Function-entry hotness rides on the shared `counter: JitCounter`
     // below (warmstate.py:467 — maybe_compile_and_run's tick + reset
     // goes through the common timetable, not a separate HashMap).
@@ -418,8 +417,7 @@ impl WarmEnterState {
         let current_generation = self.tracing_generation;
         let cell = self
             .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+            .entry_or_insert_with(green_key_hash, BaseJitCell::new);
         cell.flags |= jc_flags::TRACING | jc_flags::TRACING_OCCURRED;
         cell.state = BaseJitCellState::Tracing;
         cell.tracing_generation = current_generation;
@@ -432,7 +430,7 @@ impl WarmEnterState {
     pub fn new(threshold: u32) -> Self {
         WarmEnterState {
             counter: JitCounter::new(threshold),
-            cells: HashMap::new(),
+            cells: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             threshold,
             trace_eagerness: DEFAULT_TRACE_EAGERNESS,
             increment_trace_eagerness: JitCounter::compute_threshold_static(
@@ -443,7 +441,7 @@ impl WarmEnterState {
             trace_limit: DEFAULT_TRACE_LIMIT,
             tracing_generation: 0,
             jitlog: Logger::from_env(),
-            quasiimmut_deps: HashMap::new(),
+            quasiimmut_deps: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             vectorize: false,
             vec_all: false,
             vec_cost: 0,
@@ -468,7 +466,7 @@ impl WarmEnterState {
     pub fn with_jitlog(threshold: u32, jitlog: Option<Logger>) -> Self {
         WarmEnterState {
             counter: JitCounter::new(threshold),
-            cells: HashMap::new(),
+            cells: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             threshold,
             trace_eagerness: DEFAULT_TRACE_EAGERNESS,
             increment_trace_eagerness: JitCounter::compute_threshold_static(
@@ -479,7 +477,7 @@ impl WarmEnterState {
             trace_limit: DEFAULT_TRACE_LIMIT,
             tracing_generation: 0,
             jitlog,
-            quasiimmut_deps: HashMap::new(),
+            quasiimmut_deps: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             vectorize: false,
             vec_all: false,
             vec_cost: 0,
@@ -785,8 +783,7 @@ impl WarmEnterState {
         let token = token.into();
         let cell = self
             .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+            .entry_or_insert_with(green_key_hash, BaseJitCell::new);
         cell.flags &= !jc_flags::TRACING;
         cell.set_procedure_token(token, false)
     }
@@ -803,8 +800,7 @@ impl WarmEnterState {
         let token = token.into();
         let cell = self
             .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+            .entry_or_insert_with(green_key_hash, BaseJitCell::new);
         let _old = cell.set_procedure_token(token, true);
     }
 
@@ -933,8 +929,7 @@ impl WarmEnterState {
     {
         let cell = self
             .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+            .entry_or_insert_with(green_key_hash, BaseJitCell::new);
         if let Some(token) = cell.get_procedure_token() {
             return Ok(token.clone());
         }
@@ -1187,8 +1182,7 @@ impl WarmEnterState {
     pub fn disable_noninlinable_function(&mut self, callee_key: u64) {
         let cell = self
             .cells
-            .entry(callee_key)
-            .or_insert_with(BaseJitCell::new);
+            .entry_or_insert_with(callee_key, BaseJitCell::new);
         cell.flags |= jc_flags::DONT_TRACE_HERE;
         if cell.flags & jc_flags::TRACING == 0 {
             cell.state = BaseJitCellState::DontTraceHere;
@@ -1201,8 +1195,7 @@ impl WarmEnterState {
     pub fn mark_as_being_traced(&mut self, callee_key: u64) {
         let cell = self
             .cells
-            .entry(callee_key)
-            .or_insert_with(BaseJitCell::new);
+            .entry_or_insert_with(callee_key, BaseJitCell::new);
         cell.flags |= jc_flags::TRACING;
         if cell.flags & jc_flags::TRACING_OCCURRED == 0 {
             cell.state = BaseJitCellState::Tracing;
@@ -1238,8 +1231,7 @@ impl WarmEnterState {
     pub fn mark_force_finish_tracing(&mut self, green_key_hash: u64) {
         let cell = self
             .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+            .entry_or_insert_with(green_key_hash, BaseJitCell::new);
         cell.flags |= jc_flags::FORCE_FINISH;
     }
 
@@ -1319,10 +1311,12 @@ impl WarmEnterState {
     ///
     /// `qmut_key` should be a hash of (object_id, field_index) or similar.
     pub fn register_quasiimmut_dependency(&mut self, qmut_key: u64, green_key_hash: u64) {
-        self.quasiimmut_deps
-            .entry(qmut_key)
-            .or_default()
-            .insert(green_key_hash);
+        let deps = self
+            .quasiimmut_deps
+            .entry_or_insert_with(qmut_key, Vec::new);
+        if !deps.contains(&green_key_hash) {
+            deps.push(green_key_hash);
+        }
     }
 
     /// Invalidate all compiled loops that depend on the quasi-immutable field
@@ -1386,8 +1380,7 @@ impl WarmEnterState {
     pub fn transition_cell(&mut self, green_key_hash: u64, new_state: BaseJitCellState) {
         let cell = self
             .cells
-            .entry(green_key_hash)
-            .or_insert_with(BaseJitCell::new);
+            .entry_or_insert_with(green_key_hash, BaseJitCell::new);
 
         match new_state {
             BaseJitCellState::NotHot => {

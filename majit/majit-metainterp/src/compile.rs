@@ -406,7 +406,10 @@ pub(crate) fn build_guard_metadata(
     // from inputargs + constants, then insert each op's result type
     // before consulting it.
     let mut value_types: crate::optimizeopt::vec_assoc::VecAssoc<u32, Type> =
-        inputargs.iter().map(|arg| (arg.index, arg.tp)).collect();
+        crate::optimizeopt::vec_assoc::VecAssoc::new();
+    for arg in inputargs.iter() {
+        value_types.insert(arg.index, arg.tp);
+    }
     for (&idx, &tp) in constant_types {
         if !value_types.contains_key(&idx) {
             value_types.insert(idx, tp);

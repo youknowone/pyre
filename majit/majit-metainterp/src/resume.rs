@@ -7,7 +7,6 @@
 //! This is the RPython equivalent of `rpython/jit/metainterp/resume.py`.
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::sync::Arc;
 
 use indexmap::IndexMap;
@@ -1843,7 +1842,8 @@ impl EncodedResumeData {
         let mut rd_numb = Vec::new();
         // resume.py:138 numb_state.liveboxes — compact TAGBOX numbering state.
         let mut liveboxes: Vec<usize> = Vec::new();
-        let mut box_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut box_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
 
         // resume.py:234-235: reserve slots for items_resume_section and count.
         rd_numb.push(0); // [0] = items_resume_section (patched later)
@@ -3348,7 +3348,10 @@ impl ResumeDataLoopMemo {
         &mut self,
         liveboxes: &mut Vec<Option<majit_ir::OpRef>>,
         new_liveboxes: &mut LiveboxMap,
-        virtual_fields: &crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::OpRef, majit_ir::VirtualFieldsInfo>,
+        virtual_fields: &crate::optimizeopt::vec_assoc::VecAssoc<
+            majit_ir::OpRef,
+            majit_ir::VirtualFieldsInfo,
+        >,
         num_env_virtuals: usize,
         numb_state: &NumberingState,
         env: &dyn majit_ir::BoxEnv,
@@ -3850,8 +3853,10 @@ impl ResumeDataLoopMemo {
         // (resume.py:419-426 visitor_walk_recursive pattern). Keyed by
         // typed OpRef so the same_box (resoperation.py:38) identity is
         // preserved end-to-end through the worklist drain.
-        let mut virtual_fields: crate::optimizeopt::vec_assoc::VecAssoc<majit_ir::OpRef, majit_ir::VirtualFieldsInfo> =
-            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut virtual_fields: crate::optimizeopt::vec_assoc::VecAssoc<
+            majit_ir::OpRef,
+            majit_ir::VirtualFieldsInfo,
+        > = crate::optimizeopt::vec_assoc::VecAssoc::new();
 
         // resume.py:419-426: visitor_walk_recursive — worklist for nested virtuals.
         let mut virtual_worklist: Vec<majit_ir::OpRef> = Vec::new();
@@ -4081,7 +4086,8 @@ impl ResumeDataLoopMemo {
         let mut rd_numb = Vec::new();
         // resume.py:138 compact TAGBOX numbering state.
         let mut liveboxes: Vec<usize> = Vec::new();
-        let mut box_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut box_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, usize> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
 
         // resume.py:234-235: reserve slots
         rd_numb.push(0); // [0] = items_resume_section

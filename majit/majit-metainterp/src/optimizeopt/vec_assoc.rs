@@ -102,6 +102,10 @@ impl<K: Eq, V> VecAssoc<K, V> {
     pub fn values(&self) -> impl Iterator<Item = &V> {
         self.entries.iter().map(|(_, v)| v)
     }
+
+    pub fn values_mut(&mut self) -> impl Iterator<Item = &mut V> {
+        self.entries.iter_mut().map(|(_, v)| v)
+    }
 }
 
 impl<K: Eq, V> IntoIterator for VecAssoc<K, V> {
@@ -114,14 +118,13 @@ impl<K: Eq, V> IntoIterator for VecAssoc<K, V> {
 
 impl<'a, K: Eq, V> IntoIterator for &'a VecAssoc<K, V> {
     type Item = (&'a K, &'a V);
-    type IntoIter = std::iter::Map<
-        std::slice::Iter<'a, (K, V)>,
-        fn(&'a (K, V)) -> (&'a K, &'a V),
-    >;
+    type IntoIter = std::iter::Map<std::slice::Iter<'a, (K, V)>, fn(&'a (K, V)) -> (&'a K, &'a V)>;
     fn into_iter(self) -> Self::IntoIter {
         fn split<'a, K, V>(t: &'a (K, V)) -> (&'a K, &'a V) {
             (&t.0, &t.1)
         }
-        self.entries.iter().map(split as fn(&'a (K, V)) -> (&'a K, &'a V))
+        self.entries
+            .iter()
+            .map(split as fn(&'a (K, V)) -> (&'a K, &'a V))
     }
 }

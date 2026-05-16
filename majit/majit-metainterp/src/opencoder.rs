@@ -489,7 +489,8 @@ impl<'a> TraceIterator<'a> {
         // bit-identical sequence of OpRefs (every op `i` gets
         // `OpRef::from_raw(num_inputs + i)`, matching `recorder.record_op`'s
         // monotonic `op_count`).
-        let is_void_result = src.pos.get().is_none() || src.opcode.result_type() == majit_ir::Type::Void;
+        let is_void_result =
+            src.pos.get().is_none() || src.opcode.result_type() == majit_ir::Type::Void;
         if !is_void_result {
             let orig = src.pos.get().raw() as usize;
             if orig >= self._cache.len() {

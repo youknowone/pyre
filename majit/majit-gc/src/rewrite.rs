@@ -585,7 +585,8 @@ impl RewriteState {
         } else {
             box_arg
         };
-        self._constant_additions.insert(op.pos.get(), (box_arg, constant));
+        self._constant_additions
+            .insert(op.pos.get(), (box_arg, constant));
     }
 
     /// rewrite.py:173-182 _try_use_older_box.
@@ -1641,7 +1642,9 @@ impl GcRewriterImpl {
     /// changes.
     fn consider_setfield_gc(&self, op: &Op, st: &mut RewriteState) {
         let Some(descr) = op.getdescr() else { return };
-        let Some(fd) = descr.as_field_descr() else { return };
+        let Some(fd) = descr.as_field_descr() else {
+            return;
+        };
         let offset = fd.offset() as i64;
         let base = st.resolve(op.arg(0));
         if let Some(entries) = st._delayed_zero_setfields.get_mut(&base) {
@@ -2741,9 +2744,7 @@ impl GcRewriter for GcRewriterImpl {
                 // upstream: NEW_ARRAY threads op.getdescr(); NEWSTR /
                 // NEWUNICODE thread self.gc_ll_descr.{str,unicode}_descr.
                 OpCode::NewArray | OpCode::NewArrayClear => {
-                    let descr_ref = op
-                        .getdescr()
-                        .expect("NEW_ARRAY must carry an ArrayDescr");
+                    let descr_ref = op.getdescr().expect("NEW_ARRAY must carry an ArrayDescr");
                     self.handle_new_array(descr_ref, op, &mut st, 0); // FLAG_ARRAY
                 }
                 OpCode::Newstr => {

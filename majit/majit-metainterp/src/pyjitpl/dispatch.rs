@@ -6441,7 +6441,8 @@ mod tests {
             .find(|op| op.opcode == OpCode::GuardFalse)
             .expect("BC_GOTO_IF_NOT_INT_LT must record a GuardFalse op");
         assert_eq!(
-            guard.rd_resume_position.get(), 0,
+            guard.rd_resume_position.get(),
+            0,
             "guard's rd_resume_position must point at the captured snapshot",
         );
     }
@@ -6481,7 +6482,8 @@ mod tests {
             .find(|op| op.opcode == OpCode::GuardFalse)
             .expect("guard recorded");
         assert_eq!(
-            guard.rd_resume_position.get(), -1,
+            guard.rd_resume_position.get(),
+            -1,
             "non-state-field guard keeps the -1 sentinel",
         );
     }

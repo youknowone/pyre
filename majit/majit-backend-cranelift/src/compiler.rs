@@ -4673,7 +4673,9 @@ fn normalize_ops_for_codegen_simple(inputargs: &[InputArg], ops: &[Op]) -> Vec<O
                 // op_typed mints the typed Int/Float/Ref variant
                 // (resoperation.py:564-638 AbstractResOp + IntOp/FloatOp/
                 // RefOp mixins) — the Void branch is filtered above.
-                normalized.pos.set(OpRef::op_typed(num_inputs + op_idx as u32, rt));
+                normalized
+                    .pos
+                    .set(OpRef::op_typed(num_inputs + op_idx as u32, rt));
             }
             normalized
         })
@@ -7901,11 +7903,7 @@ impl CraneliftBackend {
         // lower them as external jumps (rewriter.py LABEL/JUMP redirect parity).
         let label_arity_by_descr: HashMap<u32, usize> = label_indices
             .iter()
-            .filter_map(|&li| {
-                ops[li]
-                    .getdescr()
-                    .map(|d| (d.index(), ops[li].args.len()))
-            })
+            .filter_map(|&li| ops[li].getdescr().map(|d| (d.index(), ops[li].args.len())))
             .collect();
 
         if std::env::var_os("MAJIT_DUMP_CLIF").is_some() {
@@ -11115,9 +11113,7 @@ impl CraneliftBackend {
                     }
                 }
                 OpCode::RawLoadI | OpCode::RawLoadF => {
-                    let descr = op
-                        .getdescr()
-                        .expect("raw load op must have a descriptor");
+                    let descr = op.getdescr().expect("raw load op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
                         .expect("raw load descriptor must be an ArrayDescr");
@@ -11275,9 +11271,7 @@ impl CraneliftBackend {
                 | OpCode::GetfieldGcPureI
                 | OpCode::GetfieldGcPureR
                 | OpCode::GetfieldGcPureF => {
-                    let descr = op
-                        .getdescr()
-                        .expect("getfield op must have a descriptor");
+                    let descr = op.getdescr().expect("getfield op must have a descriptor");
                     let fd = descr
                         .as_field_descr()
                         .expect("getfield descriptor must be a FieldDescr");
@@ -11298,9 +11292,7 @@ impl CraneliftBackend {
                 // ── Field access (setfield) ──
                 // args[0] = base, args[1] = value
                 OpCode::SetfieldGc | OpCode::SetfieldRaw => {
-                    let descr = op
-                        .getdescr()
-                        .expect("setfield op must have a descriptor");
+                    let descr = op.getdescr().expect("setfield op must have a descriptor");
                     let fd = descr
                         .as_field_descr()
                         .expect("setfield descriptor must be a FieldDescr");
@@ -11447,9 +11439,7 @@ impl CraneliftBackend {
                 }
 
                 OpCode::RawStore => {
-                    let descr = op
-                        .getdescr()
-                        .expect("raw store op must have a descriptor");
+                    let descr = op.getdescr().expect("raw store op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
                         .expect("raw store descriptor must be an ArrayDescr");
@@ -11475,9 +11465,7 @@ impl CraneliftBackend {
                 // These load the length field from the object header using
                 // the array descriptor's len_descr.
                 OpCode::ArraylenGc => {
-                    let descr = op
-                        .getdescr()
-                        .expect("arraylen op must have a descriptor");
+                    let descr = op.getdescr().expect("arraylen op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
                         .expect("arraylen descriptor must be an ArrayDescr");
@@ -11689,9 +11677,7 @@ impl CraneliftBackend {
                 // [base + descr.base_size + start*scale_start,
                 //  base + descr.base_size + start*scale_start + size*scale_size)
                 OpCode::ZeroArray => {
-                    let descr = op
-                        .getdescr()
-                        .expect("zero_array op must have a descriptor");
+                    let descr = op.getdescr().expect("zero_array op must have a descriptor");
                     let ad = descr
                         .as_array_descr()
                         .expect("zero_array descriptor must be an ArrayDescr");
@@ -13155,7 +13141,9 @@ fn collect_guards(
         } else if let Some(ref fa) = op.fail_args {
             let refs: Vec<OpRef> = fa.iter().copied().collect();
             let __descr_arc_descr_fd = op.getdescr();
-            let descr_fd = __descr_arc_descr_fd.as_ref().and_then(|d| d.as_fail_descr());
+            let descr_fd = __descr_arc_descr_fd
+                .as_ref()
+                .and_then(|d| d.as_fail_descr());
             // store_final_boxes_in_guard (optimizeopt/mod.rs:3393-3404)
             // sets op.descr to a fresh ResumeGuardDescr whose
             // fail_arg_types match the reduced liveboxes — prefer the
@@ -13231,8 +13219,12 @@ fn collect_guards(
                 let fvc = get_frame_value_count_fn();
                 let fvc_ref: Option<&dyn Fn(i32, i32) -> usize> =
                     fvc.as_ref().map(|f| f as &dyn Fn(i32, i32) -> usize);
-                let (_nfa, _vable, _vref, frames) =
-                    rebuild_from_numbering(&rd_numb_bytes, &rd_consts_data, &fail_arg_types, fvc_ref);
+                let (_nfa, _vable, _vref, frames) = rebuild_from_numbering(
+                    &rd_numb_bytes,
+                    &rd_consts_data,
+                    &fail_arg_types,
+                    fvc_ref,
+                );
                 frames.last().map(|f| f.pc as u64)
             } else {
                 None

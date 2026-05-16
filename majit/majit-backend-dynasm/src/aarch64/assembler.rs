@@ -17,9 +17,7 @@ use dynasmrt::aarch64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
 use majit_backend::BackendError;
-use majit_ir::{
-    FailDescr, InputArg, Op, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type,
-};
+use majit_ir::{FailDescr, InputArg, Op, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type};
 
 use crate::arch::*;
 use crate::codebuf;
@@ -353,7 +351,11 @@ impl<'a> AssemblerARM64<'a> {
 
     #[inline]
     fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
-        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(
+            self.inputargs,
+            self.operations,
+            &self.inputarg_pos,
+            &self.op_pos,
         );
         match at_op_index {
             Some(at) => type_index.opref_type_at(opref, at),
@@ -2154,10 +2156,8 @@ impl<'a> AssemblerARM64<'a> {
             | OpCode::Strlen
             | OpCode::Unicodelen => {
                 if let (Some(Loc::Reg(base)), Some(Loc::Reg(dst))) = (arglocs.first(), result_loc) {
-                    let ofs = op.with_field_descr(|fd| fd.offset() as i32)
-                        .unwrap_or(0);
-                    let field_size = op.with_field_descr(|fd| fd.field_size())
-                        .unwrap_or(8);
+                    let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
+                    let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
                     if dst.is_xmm {
                         dynasm!(self.mc ; .arch aarch64 ; ldr D(dst.value), [X(base.value), ofs as u32]);
                     } else {
@@ -2191,7 +2191,8 @@ impl<'a> AssemblerARM64<'a> {
                 if let (Some(Loc::Reg(base)), Some(index_loc), Some(Loc::Reg(dst))) =
                     (arglocs.first(), arglocs.get(1), result_loc)
                 {
-                    let (base_size, item_size, signed) = op.with_array_descr(|ad| {
+                    let (base_size, item_size, signed) = op
+                        .with_array_descr(|ad| {
                             (
                                 ad.base_size() as i32,
                                 ad.item_size() as i32,
@@ -2245,7 +2246,8 @@ impl<'a> AssemblerARM64<'a> {
                 if let (Some(Loc::Reg(base)), Some(index_loc), Some(value_loc)) =
                     (arglocs.first(), arglocs.get(1), arglocs.get(2))
                 {
-                    let (base_size, item_size) = op.with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+                    let (base_size, item_size) = op
+                        .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
                         .unwrap_or((0, 8));
                     let index_reg = 16u8;
                     let value_reg = 17u8;
@@ -2308,10 +2310,8 @@ impl<'a> AssemblerARM64<'a> {
             // ── Memory stores: opassembler.rs emit_op_setfield_regalloc ──
             OpCode::SetfieldGc | OpCode::SetfieldRaw => {
                 if let (Some(Loc::Reg(base)), Some(val_loc)) = (arglocs.first(), arglocs.get(1)) {
-                    let ofs = op.with_field_descr(|fd| fd.offset() as i32)
-                        .unwrap_or(0);
-                    let field_size = op.with_field_descr(|fd| fd.field_size())
-                        .unwrap_or(8);
+                    let ofs = op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0);
+                    let field_size = op.with_field_descr(|fd| fd.field_size()).unwrap_or(8);
                     self.emit_op_setfield_regalloc(base, val_loc, ofs, field_size);
                 } else {
                     self.genop_discard_setfield(op);
@@ -2335,7 +2335,8 @@ impl<'a> AssemblerARM64<'a> {
                     };
                     let nsize = match arglocs.get(3) {
                         Some(Loc::Immed(i)) => i.value,
-                        _ => op.with_array_descr(|ad| {
+                        _ => op
+                            .with_array_descr(|ad| {
                                 let s = ad.item_size() as i64;
                                 if ad.is_item_signed() { -s } else { s }
                             })
@@ -2422,7 +2423,8 @@ impl<'a> AssemblerARM64<'a> {
                 {
                     let nsize = match arglocs.get(3) {
                         Some(Loc::Immed(i)) => i.value,
-                        _ => op.with_array_descr(|ad| {
+                        _ => op
+                            .with_array_descr(|ad| {
                                 let s = ad.item_size() as i64;
                                 if ad.is_item_signed() { -s } else { s }
                             })
@@ -2582,7 +2584,8 @@ impl<'a> AssemblerARM64<'a> {
                 // route to the metainterp `exit_frame_with_exception_descr_ref`
                 // when the FINISH was emitted for
                 // `pyjitpl.py:3238 compile_exit_frame_with_exception`.
-                let is_exit_exc = op.with_fail_descr(|fd| fd.is_exit_frame_with_exception())
+                let is_exit_exc = op
+                    .with_fail_descr(|fd| fd.is_exit_frame_with_exception())
                     .unwrap_or(false);
                 let global_descr_ptr = if is_exit_exc {
                     self.exit_frame_with_exception_descr_ref_ptr()
@@ -2643,9 +2646,7 @@ impl<'a> AssemblerARM64<'a> {
             OpCode::Label => {
                 let label = self.mc.new_dynamic_label();
                 let descr_arc = op.getdescr();
-                let label_descr = descr_arc
-                    .as_ref()
-                    .and_then(|d| d.as_loop_target_descr());
+                let label_descr = descr_arc.as_ref().and_then(|d| d.as_loop_target_descr());
                 if crate::majit_log_enabled() {
                     eprintln!(
                         "[dynasm] LABEL: new DynamicLabel({:?}) arglocs={:?}",
@@ -2834,8 +2835,7 @@ impl<'a> AssemblerARM64<'a> {
             // aarch64/assembler.py:738 malloc_cond_varsize
             // arglocs = [lengthloc, imm(itemsize), imm(kind)]
             OpCode::CallMallocNurseryVarsize => {
-                let base_size = op.with_array_descr(|ad| ad.base_size())
-                    .unwrap_or(16) as i64;
+                let base_size = op.with_array_descr(|ad| ad.base_size()).unwrap_or(16) as i64;
                 let itemsize = match arglocs.get(1) {
                     Some(Loc::Immed(i)) => i.value,
                     _ => 8,
@@ -3935,8 +3935,7 @@ impl<'a> AssemblerARM64<'a> {
     /// `op.fail_arg_types`.
     fn infer_fail_arg_types(&self, op: &Op, op_index: Option<usize>) -> Vec<Type> {
         if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
-            if let Some(descr_types) = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec())
-            {
+            if let Some(descr_types) = op.with_fail_descr(|fd| fd.fail_arg_types().to_vec()) {
                 if !descr_types.is_empty() {
                     return descr_types;
                 }
@@ -4528,15 +4527,13 @@ impl<'a> AssemblerARM64<'a> {
     /// Extract the byte offset from an op's FieldDescr.
     /// Returns 0 if no field descriptor is present.
     fn field_offset_from_descr(op: &Op) -> i32 {
-        op.with_field_descr(|fd| fd.offset() as i32)
-            .unwrap_or(0)
+        op.with_field_descr(|fd| fd.offset() as i32).unwrap_or(0)
     }
 
     /// Extract the field size from an op's FieldDescr.
     /// Returns 8 (WORD) if no field descriptor is present.
     fn field_size_from_descr(op: &Op) -> usize {
-        op.with_field_descr(|fd| fd.field_size())
-            .unwrap_or(8)
+        op.with_field_descr(|fd| fd.field_size()).unwrap_or(8)
     }
 
     /// GETFIELD_GC_*: result = [arg0 + offset]
@@ -4597,7 +4594,8 @@ impl<'a> AssemblerARM64<'a> {
     /// arg0 = array pointer, arg1 = index.
     /// The base_size and item_size come from the op's ArrayDescr.
     fn genop_getarrayitem(&mut self, op: &Op) {
-        let (base_size, item_size) = op.with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+        let (base_size, item_size) = op
+            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
             .unwrap_or((8, 8));
 
         // Load array pointer and index.
@@ -4642,7 +4640,8 @@ impl<'a> AssemblerARM64<'a> {
     /// SETARRAYITEM_GC: array[index] = value
     /// arg0 = array pointer, arg1 = index, arg2 = value.
     fn genop_discard_setarrayitem(&mut self, op: &Op) {
-        let (base_size, item_size) = op.with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+        let (base_size, item_size) = op
+            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
             .unwrap_or((8, 8));
 
         // Load array pointer.
@@ -4960,7 +4959,9 @@ impl<'a> AssemblerARM64<'a> {
     /// resolve_opref(), which drops register-carried values to Const(0).
     fn genop_call_assembler(&mut self, op: &Op, arglocs: &[Loc]) {
         let __descr_arc_call_descr = op.getdescr();
-        let call_descr = __descr_arc_call_descr.as_ref().and_then(|d| d.as_call_descr());
+        let call_descr = __descr_arc_call_descr
+            .as_ref()
+            .and_then(|d| d.as_call_descr());
         let expansion = call_descr.and_then(|d| d.vable_expansion());
         if expansion.is_none() {
             let frame_loc = arglocs
@@ -5749,8 +5750,7 @@ impl<'a> AssemblerARM64<'a> {
     /// aarch64/assembler.py:682 malloc_cond parity.
     /// Inline nursery bump allocation for NEW.
     fn genop_new(&mut self, op: &Op) {
-        let obj_size = op.with_size_descr(|sd| sd.size())
-            .unwrap_or(16) as i64;
+        let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
         self.emit_mov_imm64(0, obj_size);
         self.emit_mov_imm64(2, libc::malloc as *const () as i64);
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
@@ -5761,10 +5761,8 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     fn genop_new_with_vtable(&mut self, op: &Op) {
-        let obj_size = op.with_size_descr(|sd| sd.size())
-            .unwrap_or(16) as i64;
-        let vtable = op.with_size_descr(|sd| sd.vtable())
-            .unwrap_or(0) as i64;
+        let obj_size = op.with_size_descr(|sd| sd.size()).unwrap_or(16) as i64;
+        let vtable = op.with_size_descr(|sd| sd.vtable()).unwrap_or(0) as i64;
         self.emit_mov_imm64(0, obj_size);
         self.emit_mov_imm64(2, libc::malloc as *const () as i64);
         dynasm!(self.mc ; .arch aarch64 ; blr x2);
@@ -5780,7 +5778,8 @@ impl<'a> AssemblerARM64<'a> {
 
     /// NEW_ARRAY / NEW_ARRAY_CLEAR: allocate an array.
     fn genop_new_array(&mut self, op: &Op) {
-        let (base_size, item_size) = op.with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+        let (base_size, item_size) = op
+            .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((8, 8));
         self.genop_alloc_varsize(op, base_size, item_size);
     }
@@ -5828,7 +5827,8 @@ impl<'a> AssemblerARM64<'a> {
     /// `rewrite.py:295-306` — STR has `extra_item_after_alloc=1` so the
     /// token basesize overshoots the first char by 1.
     fn genop_strgetitem(&mut self, op: &Op) {
-        let (mut base_size, item_size) = op.with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+        let (mut base_size, item_size) = op
+            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
             .unwrap_or((17, 1)); // rstr.STR token defaults (basesize=17, itemsize=1)
         if op.opcode == OpCode::Strgetitem {
             debug_assert_eq!(item_size, 1, "STRGETITEM itemsize must be 1");
@@ -6263,7 +6263,8 @@ impl<'a> AssemblerARM64<'a> {
     /// `rewrite.py:307-318` — STR has `extra_item_after_alloc=1` so the
     /// token basesize overshoots the first char by 1; UNICODE does not.
     fn genop_discard_strsetitem(&mut self, op: &Op) {
-        let (mut base_size, item_size) = op.with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
+        let (mut base_size, item_size) = op
+            .with_array_descr(|ad| (ad.base_size() as i32, ad.item_size() as i32))
             .unwrap_or((17, 1));
         if op.opcode == OpCode::Strsetitem {
             debug_assert_eq!(item_size, 1, "STRSETITEM itemsize must be 1");
@@ -6297,7 +6298,8 @@ impl<'a> AssemblerARM64<'a> {
     /// backend directly on un-rewritten ops.  Mirrors upstream's basesize
     /// handling (`rewrite.py:1049-1053`).
     fn genop_discard_copystrcontent(&mut self, op: &Op) {
-        let (mut base_size, item_size) = op.with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+        let (mut base_size, item_size) = op
+            .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((16, 1));
         // rewrite.py:1049-1053 `rewrite_copy_str_content` — COPYSTRCONTENT
         // uses `str_descr.basesize - 1` to skip the `extra_item_after_alloc`
@@ -6426,7 +6428,8 @@ impl<'a> AssemblerARM64<'a> {
     /// ZERO_ARRAY: zero a range in an array.
     /// arg(0)=base, arg(1)=start, arg(2)=size, arg(3)=scale_start, arg(4)=scale_size.
     fn genop_discard_zero_array(&mut self, op: &Op) {
-        let (base_size, _) = op.with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
+        let (base_size, _) = op
+            .with_array_descr(|ad| (ad.base_size() as i64, ad.item_size() as i64))
             .unwrap_or((8, 8));
 
         let scale_start = self.resolve_const_or(op.arg(3), 1);

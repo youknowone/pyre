@@ -17,6 +17,7 @@
 ///
 /// OpRefs in the peeled iteration are remapped to new positions so they
 /// don't collide with the original ops.
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use majit_ir::{DescrRef, Op, OpCode, OpRef, Type, Value};

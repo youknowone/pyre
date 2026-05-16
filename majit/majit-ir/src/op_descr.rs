@@ -89,10 +89,7 @@ impl Op {
     }
 
     /// `as_loop_token_descr` shortcut.
-    pub fn with_loop_token_descr<R>(
-        &self,
-        f: impl FnOnce(&dyn LoopTokenDescr) -> R,
-    ) -> Option<R> {
+    pub fn with_loop_token_descr<R>(&self, f: impl FnOnce(&dyn LoopTokenDescr) -> R) -> Option<R> {
         self.project_descr(|d| d.as_loop_token_descr().map(f))
             .flatten()
     }
@@ -150,10 +147,7 @@ impl Op {
     /// `resoperation.py:495 GuardResOp.setfailargs` parity — overwrite
     /// the fail_args slot.  Takes `&mut self` until the `Vec<Rc<Op>>`
     /// migration flips the field to interior-mutable.
-    pub fn setfailargs(
-        &mut self,
-        fail_args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>,
-    ) {
+    pub fn setfailargs(&mut self, fail_args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>) {
         self.fail_args = Some(fail_args);
     }
 

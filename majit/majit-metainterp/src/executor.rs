@@ -719,9 +719,7 @@ pub(crate) fn execute_one(
         // IR blackhole may encounter New+SetfieldGc when the trace
         // contains unoptimized allocation (e.g. result_type=Ref finish).
         OpCode::New | OpCode::NewWithVtable => {
-            let size = op
-                .with_size_descr(|sd| sd.size())
-                .unwrap_or(16);
+            let size = op.with_size_descr(|sd| sd.size()).unwrap_or(16);
             let layout = std::alloc::Layout::from_size_align(size, 8)
                 .unwrap_or(std::alloc::Layout::new::<[u8; 16]>());
             let ptr = unsafe { std::alloc::alloc_zeroed(layout) };

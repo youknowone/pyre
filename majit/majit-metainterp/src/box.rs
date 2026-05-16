@@ -418,7 +418,6 @@ impl BoxRef {
         drop(outer);
         Some(IntBoundBorrowMut::new(rc))
     }
-
 }
 
 impl Clone for BoxRef {

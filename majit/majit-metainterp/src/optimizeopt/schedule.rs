@@ -436,7 +436,10 @@ impl PackSet {
         // vector.py:793-796: other args must align with origin pack
         let other_index = (index + 1) % 2;
         let origin_left_pos = graph.nodes[origin_pack.members[0]].op.pos.get();
-        let origin_right_pos = graph.nodes[*origin_pack.members.last().unwrap()].op.pos.get();
+        let origin_right_pos = graph.nodes[*origin_pack.members.last().unwrap()]
+            .op
+            .pos
+            .get();
 
         if left.args.get(other_index).copied() != Some(origin_left_pos) {
             return None;

@@ -550,7 +550,8 @@ impl DependencyGraph {
         let mut used: HashSet<usize> = HashSet::new();
 
         // Group by opcode
-        let mut by_opcode: crate::optimizeopt::vec_assoc::VecAssoc<OpCode, Vec<usize>> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+        let mut by_opcode: crate::optimizeopt::vec_assoc::VecAssoc<OpCode, Vec<usize>> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (i, node) in self.nodes.iter().enumerate() {
             if node.op.opcode.to_vector().is_some() && !node.op.opcode.is_guard() {
                 by_opcode

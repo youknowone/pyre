@@ -2663,7 +2663,9 @@ impl TraceCtx {
 
     /// pyjitpl.py:2397 + compile.py:221: take call_pure_results for
     /// passing to the optimizer.
-    pub fn take_call_pure_results(&mut self) -> crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value> {
+    pub fn take_call_pure_results(
+        &mut self,
+    ) -> crate::optimizeopt::vec_assoc::VecAssoc<Vec<Value>, Value> {
         std::mem::take(&mut self.call_pure_results)
     }
 
