@@ -15,6 +15,7 @@ pub(crate) use dispatch::{
 };
 pub use frame::{MIFrame, MIFrameStack};
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use crate::optimizeopt::optimizer::{Optimizer, PendingBridgeRd};

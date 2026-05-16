@@ -9,7 +9,6 @@
 use std::cell::UnsafeCell;
 use std::sync::Arc;
 
-use indexmap::IndexMap;
 use majit_backend::{
     ExitFrameLayout, ExitPendingFieldLayout, ExitRecoveryLayout, ExitValueSourceLayout,
     ExitVirtualLayout,
@@ -89,11 +88,13 @@ pub const TAG_CONST_OFFSET: i32 = 0;
 ///
 /// resume.py:137/370: RPython uses `dict` keyed by the actual Box object.
 /// In Python 3 that dict is insertion-ordered, and `_number_virtuals`
-/// iterates it directly. `IndexMap<OpRef, i16>` mirrors both properties:
-/// the full typed OpRef variant participates in identity
-/// (resoperation.py:38 `same_box`) and iteration follows first insertion
-/// order. A raw-position Vec would collapse `InputArgInt(0)` and
-/// `IntOp(0)`, which are distinct RPython Box objects.
+/// iterates it directly. The no-HashMap house rule replaces the Rust
+/// `IndexMap` backing with `VecAssoc<OpRef, i16>` (linear scan, dict-
+/// assignment semantics, preserved insertion order) — same observable
+/// shape for the four call sites here while keeping the full typed
+/// OpRef variant as the identity (resoperation.py:38 `same_box`).
+/// A raw-position Vec would collapse `InputArgInt(0)` and `IntOp(0)`,
+/// which are distinct RPython Box objects.
 ///
 /// Invariant: keys are never `Const*` OpRefs. Per `resume.py:204-205`
 /// `_number_boxes`, `isinstance(box, Const)` short-circuits to
@@ -104,13 +105,13 @@ pub const TAG_CONST_OFFSET: i32 = 0;
 /// debug builds rather than silently producing an out-of-RPython-shape
 /// numbering state.
 pub struct LiveboxMap {
-    entries: IndexMap<majit_ir::OpRef, i16>,
+    entries: majit_ir::vec_assoc::VecAssoc<majit_ir::OpRef, i16>,
 }
 
 impl LiveboxMap {
     pub fn new() -> Self {
         Self {
-            entries: IndexMap::new(),
+            entries: majit_ir::vec_assoc::VecAssoc::new(),
         }
     }
 
@@ -338,13 +339,13 @@ impl Snapshot {
 /// Re-export BoxEnv from majit-ir.
 pub use majit_ir::BoxEnv;
 
-/// Simple BoxEnv implementation backed by constant/type HashMaps.
+/// Simple BoxEnv implementation backed by constant/type associative containers.
 /// Used in tests and for simple snapshot numbering.
 pub struct SimpleBoxEnv {
     pub constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, (i64, majit_ir::Type)>,
     pub replacements: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::OpRef>,
     pub types: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
-    pub virtuals: std::collections::HashSet<u32>,
+    pub virtuals: majit_ir::vec_set::VecSet<u32>,
     pub virtual_fields: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::VirtualFieldsInfo>,
 }
 
@@ -354,7 +355,7 @@ impl SimpleBoxEnv {
             constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             replacements: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             types: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            virtuals: std::collections::HashSet::new(),
+            virtuals: majit_ir::vec_set::VecSet::new(),
             virtual_fields: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         }
     }
@@ -3835,7 +3836,7 @@ impl ResumeDataLoopMemo {
 
         // resume.py:414-426: iterate liveboxes_from_env, discover virtual
         // fields. RPython walks the dict in insertion order; pyre's
-        // `LiveboxMap` is built on `IndexMap` (resume.rs:98) so the
+        // `LiveboxMap` is built on `VecAssoc` (resume.rs:98) so the
         // `.iter()` sequence already matches that order, which the
         // virtual worklist drain below relies on for byte-identical
         // visitor_walk_recursive sequencing. Sorting by tag would
@@ -4650,7 +4651,7 @@ mod tests {
             constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, (i64, majit_ir::Type)>,
             replacements: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::OpRef>,
             types: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
-            virtuals: std::collections::HashSet<u32>,
+            virtuals: majit_ir::vec_set::VecSet<u32>,
             virtual_fields:
                 crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::VirtualFieldsInfo>,
         }
@@ -4661,7 +4662,7 @@ mod tests {
                     constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                     replacements: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                     types: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-                    virtuals: std::collections::HashSet::new(),
+                    virtuals: majit_ir::vec_set::VecSet::new(),
                     virtual_fields: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                 }
             }
