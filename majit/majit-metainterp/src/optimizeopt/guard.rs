@@ -713,17 +713,18 @@ impl GuardStrengthenOpt {
                     // descr is in leads_to — if not, it's a programming error.
                     // Key by `Descr::index()` (globally unique) rather than
                     // `FailDescr::fail_index()` (per-trace, 0 pre-codegen).
-                    if let Some(descr) =
-                        other.op.descr.as_ref().filter(|d| d.as_fail_descr().is_some())
+                    if let Some(descr) = other
+                        .op
+                        .descr
+                        .as_ref()
+                        .filter(|d| d.as_fail_descr().is_some())
                     {
                         version_info.remove(descr.index());
                     }
                     // guard.py:296: other.set_to_none(info, loop)
                     other.set_to_none(&mut opt_ops);
                     // guard.py:297-299: info.track(transitive_guard, descr, version)
-                    if let Some(descr) =
-                        tg.descr.as_ref().filter(|d| d.as_fail_descr().is_some())
-                    {
+                    if let Some(descr) = tg.descr.as_ref().filter(|d| d.as_fail_descr().is_some()) {
                         info_track_guard(
                             version_info,
                             descr.index(),

@@ -212,6 +212,45 @@ pub enum ResumeVirtualLayoutSummary {
         /// resume.py:693: fieldnums (decoded)
         values: Vec<ResumeValueLayoutSummary>,
     },
+    /// `resume.py: VRawSliceInfo` — a slice into a virtual raw buffer.
+    RawSlice {
+        offset: i64,
+        parent: ResumeValueLayoutSummary,
+    },
+    /// `resume.py:763 VStrPlainInfo` — virtual string (known characters).
+    StrPlain {
+        chars: Vec<ResumeValueLayoutSummary>,
+    },
+    /// `resume.py:781 VStrConcatInfo` — virtual string concat.
+    StrConcat {
+        func: i64,
+        left: ResumeValueLayoutSummary,
+        right: ResumeValueLayoutSummary,
+    },
+    /// `resume.py:801 VStrSliceInfo` — virtual slice of a larger string.
+    StrSlice {
+        func: i64,
+        source: ResumeValueLayoutSummary,
+        start: ResumeValueLayoutSummary,
+        length: ResumeValueLayoutSummary,
+    },
+    /// `resume.py:817 VUniPlainInfo` — unicode counterpart.
+    UniPlain {
+        chars: Vec<ResumeValueLayoutSummary>,
+    },
+    /// `resume.py:836 VUniConcatInfo` — unicode counterpart.
+    UniConcat {
+        func: i64,
+        left: ResumeValueLayoutSummary,
+        right: ResumeValueLayoutSummary,
+    },
+    /// `resume.py:856 VUniSliceInfo` — unicode counterpart.
+    UniSlice {
+        func: i64,
+        source: ResumeValueLayoutSummary,
+        start: ResumeValueLayoutSummary,
+        length: ResumeValueLayoutSummary,
+    },
 }
 const TAGMASK: u8 = 3;
 

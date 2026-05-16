@@ -520,13 +520,7 @@ impl PartialEq for ExitVirtualLayout {
                     left: b3,
                     right: b4,
                 },
-            ) => {
-                a1 == b1
-                    && a2 == b2
-                    && std::sync::Arc::ptr_eq(a_cd, b_cd)
-                    && a3 == b3
-                    && a4 == b4
-            }
+            ) => a1 == b1 && a2 == b2 && std::sync::Arc::ptr_eq(a_cd, b_cd) && a3 == b3 && a4 == b4,
             (
                 Self::StrSlice {
                     is_unicode: a1,

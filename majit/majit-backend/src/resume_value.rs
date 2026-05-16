@@ -536,20 +536,51 @@ impl VirtualInfo {
                 descrs: descrs.clone(),
                 values: values.iter().map(|src| src.layout_summary()).collect(),
             },
-            // String/unicode virtual infos — represented as structs
-            // with synthetic field indices for reconstruction.
-            VirtualInfo::VRawSlice { .. }
-            | VirtualInfo::VStrPlain { .. }
-            | VirtualInfo::VStrConcat { .. }
-            | VirtualInfo::VStrSlice { .. }
-            | VirtualInfo::VUniPlain { .. }
-            | VirtualInfo::VUniConcat { .. }
-            | VirtualInfo::VUniSlice { .. } => ResumeVirtualLayoutSummary::Struct {
-                typedescr: None,
-                type_id: 0,
-                fields: vec![],
-                fielddescrs: vec![],
-                descr_size: 0,
+            VirtualInfo::VRawSlice { offset, parent } => ResumeVirtualLayoutSummary::RawSlice {
+                offset: *offset,
+                parent: parent.layout_summary(),
+            },
+            VirtualInfo::VStrPlain { chars } => ResumeVirtualLayoutSummary::StrPlain {
+                chars: chars.iter().map(|src| src.layout_summary()).collect(),
+            },
+            VirtualInfo::VStrConcat { func, left, right } => {
+                ResumeVirtualLayoutSummary::StrConcat {
+                    func: *func,
+                    left: left.layout_summary(),
+                    right: right.layout_summary(),
+                }
+            }
+            VirtualInfo::VStrSlice {
+                func,
+                source,
+                start,
+                length,
+            } => ResumeVirtualLayoutSummary::StrSlice {
+                func: *func,
+                source: source.layout_summary(),
+                start: start.layout_summary(),
+                length: length.layout_summary(),
+            },
+            VirtualInfo::VUniPlain { chars } => ResumeVirtualLayoutSummary::UniPlain {
+                chars: chars.iter().map(|src| src.layout_summary()).collect(),
+            },
+            VirtualInfo::VUniConcat { func, left, right } => {
+                ResumeVirtualLayoutSummary::UniConcat {
+                    func: *func,
+                    left: left.layout_summary(),
+                    right: right.layout_summary(),
+                }
+            }
+            VirtualInfo::VUniSlice {
+                func,
+                source,
+                start,
+                length,
+            } => ResumeVirtualLayoutSummary::UniSlice {
+                func: *func,
+                source: source.layout_summary(),
+                start: start.layout_summary(),
+                length: length.layout_summary(),
             },
         }
     }

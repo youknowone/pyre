@@ -751,6 +751,58 @@ fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) ->
                     .map(|source| source.to_resume_source())
                     .collect(),
             },
+            ResumeVirtualLayoutSummary::RawSlice { offset, parent } => VirtualInfo::VRawSlice {
+                offset: *offset,
+                parent: parent.to_resume_source(),
+            },
+            ResumeVirtualLayoutSummary::StrPlain { chars } => VirtualInfo::VStrPlain {
+                chars: chars
+                    .iter()
+                    .map(|source| source.to_resume_source())
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::StrConcat { func, left, right } => {
+                VirtualInfo::VStrConcat {
+                    func: *func,
+                    left: Box::new(left.to_resume_source()),
+                    right: Box::new(right.to_resume_source()),
+                }
+            }
+            ResumeVirtualLayoutSummary::StrSlice {
+                func,
+                source,
+                start,
+                length,
+            } => VirtualInfo::VStrSlice {
+                func: *func,
+                source: Box::new(source.to_resume_source()),
+                start: Box::new(start.to_resume_source()),
+                length: Box::new(length.to_resume_source()),
+            },
+            ResumeVirtualLayoutSummary::UniPlain { chars } => VirtualInfo::VUniPlain {
+                chars: chars
+                    .iter()
+                    .map(|source| source.to_resume_source())
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::UniConcat { func, left, right } => {
+                VirtualInfo::VUniConcat {
+                    func: *func,
+                    left: Box::new(left.to_resume_source()),
+                    right: Box::new(right.to_resume_source()),
+                }
+            }
+            ResumeVirtualLayoutSummary::UniSlice {
+                func,
+                source,
+                start,
+                length,
+            } => VirtualInfo::VUniSlice {
+                func: *func,
+                source: Box::new(source.to_resume_source()),
+                start: Box::new(start.to_resume_source()),
+                length: Box::new(length.to_resume_source()),
+            },
         }
     }
 }
@@ -849,6 +901,46 @@ fn resume_virtual_layout_to_exit_virtual_layout(
                     .map(|source| source.to_exit_source(virtual_offset))
                     .collect(),
             },
+            ResumeVirtualLayoutSummary::RawSlice { offset, parent } => {
+                ExitVirtualLayout::RawSlice {
+                    offset: *offset,
+                    base: parent.to_exit_source(virtual_offset),
+                }
+            }
+            ResumeVirtualLayoutSummary::StrPlain { chars } => ExitVirtualLayout::StrPlain {
+                is_unicode: false,
+                chars: chars
+                    .iter()
+                    .map(|source| source.to_exit_source(virtual_offset))
+                    .collect(),
+            },
+            ResumeVirtualLayoutSummary::UniPlain { chars } => ExitVirtualLayout::StrPlain {
+                is_unicode: true,
+                chars: chars
+                    .iter()
+                    .map(|source| source.to_exit_source(virtual_offset))
+                    .collect(),
+            },
+            // `ExitVirtualLayout::StrConcat` / `StrSlice` require a
+            // `calldescr` resolved from `CallInfoCollection`, which the
+            // metainterp-side `ResumeVirtualLayoutSummary` does not
+            // carry.  The production cranelift producer
+            // (`compiler.rs:13109`) builds these variants directly from
+            // `RdVirtualInfo` with `callinfocollection` in scope; this
+            // metainterp summary→ExitVirtualLayout path is reserved for
+            // synthetic / test scaffolding that should not contain VStr/
+            // VUni Concat/Slice virtuals.  Fail loud if reached so the
+            // gap is surfaced rather than producing a layout with a fake
+            // calldescr.
+            ResumeVirtualLayoutSummary::StrConcat { .. }
+            | ResumeVirtualLayoutSummary::StrSlice { .. }
+            | ResumeVirtualLayoutSummary::UniConcat { .. }
+            | ResumeVirtualLayoutSummary::UniSlice { .. } => panic!(
+                "resume_virtual_layout_to_exit_virtual_layout: VStr/VUni Concat/Slice \
+                 reconstruction requires a CallInfoCollection-resolved calldescr that \
+                 ResumeVirtualLayoutSummary does not carry; the production producer is \
+                 cranelift::compiler::collect_guards (resume.py:1462-1480 / 1489-1507)",
+            ),
         }
     }
 }
