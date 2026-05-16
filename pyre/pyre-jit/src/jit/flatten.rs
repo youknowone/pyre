@@ -2187,19 +2187,24 @@ fn is_bool_exitcase(exitcase: &Option<FlowValue>) -> bool {
 fn is_default_exitcase(exitcase: &Option<FlowValue>) -> bool {
     // Upstream uses the string sentinel `"default"` for the catch-all
     // switch link (`flatten.py:280 if link.exitcase != 'default':`).
-    // Pyre's walker also produces `None` exitcases on the fall-through
-    // link of 2-exit blocks where the conditional branch sites tagged
-    // only the goto target with a Bool llexitcase.  Treat both shapes
-    // as default so `insert_switch_exits` filters them out before the
-    // Signed-key extraction.
-    matches!(exitcase, None)
-        || matches!(
-            exitcase,
-            Some(FlowValue::Constant(Constant {
-                value: ConstantValue::Str(value),
-                ..
-            })) if value == "default"
-        )
+    // RPython parity: ONLY `Str("default")` counts as the catch-all;
+    // `None` is a malformed shape upstream would never produce and
+    // must surface from `switch_llexitcase_key` as a fail-loud panic
+    // (caller `insert_switch_exits` filters defaults before the
+    // Signed-key extraction).  Any `None` reaching this point would
+    // be a walker non-orthodoxy that needs fixing at the graph-
+    // construction site rather than papered over here — either set
+    // `exitcase = Str("default")` for a true switch catch-all, or
+    // make both bool-branch links carry a `Bool` `llexitcase` so the
+    // bool-branch path (`flatten.rs:1761 is_bool_or_tuple_exitswitch`)
+    // fires instead of the switch path.
+    matches!(
+        exitcase,
+        Some(FlowValue::Constant(Constant {
+            value: ConstantValue::Str(value),
+            ..
+        })) if value == "default"
+    )
 }
 
 /// `rpython/jit/codewriter/flatten.py:296 lltype.cast_primitive(
@@ -4469,6 +4474,118 @@ mod tests {
             ssarepr.insns.get(switch_idx + 2),
             Some(Insn::Unreachable)
         ));
+    }
+
+    #[test]
+    fn flatten_graph_routes_str_default_link_to_default_branch() {
+        // `flatten.py:280 if link.exitcase != 'default':` — the
+        // catch-all switch link is identified by the string sentinel
+        // `"default"`.  Pyre's strict `is_default_exitcase`
+        // (flatten.rs::is_default_exitcase) recognises ONLY this shape
+        // (not `None`).  Verify a 3-exit switch with two Signed cases
+        // plus one `Str("default")` catch-all lowers to switch + the
+        // default link, not to switch + unreachable.
+        use crate::jit::flow::{Block, Constant, ExitSwitch, FunctionGraph, Link};
+
+        let selector = Variable::new(VariableId(0), Kind::Int);
+        let retval = Variable::new(VariableId(1), Kind::Int);
+        let start = Block::shared(vec![selector.into()]);
+        let graph = FunctionGraph::new("int_switch_with_default", start.clone(), Some(retval));
+
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(selector.into()));
+        let case_one = Link::new(
+            vec![Constant::signed(10).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::signed(1).into()),
+        )
+        .with_llexitcase(Constant::signed(1).into())
+        .into_ref();
+        let case_three = Link::new(
+            vec![Constant::signed(30).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::signed(3).into()),
+        )
+        .with_llexitcase(Constant::signed(3).into())
+        .into_ref();
+        let default = Link::new(
+            vec![Constant::signed(99).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::string("default").into()),
+        )
+        .into_ref();
+        // `insert_switch_exits` reads the default off `exits.last()` so
+        // place the catch-all at the tail of the exits vec.
+        start.closeblock(vec![case_three, case_one, default]);
+
+        let mut ssarepr = SSARepr::new("int_switch_with_default");
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
+            flatten_constant_operand,
+        );
+
+        let switch_idx = ssarepr
+            .insns
+            .iter()
+            .position(|insn| matches!(insn, Insn::Op { opname, .. } if opname == "switch"))
+            .expect("integer exits should lower to switch");
+        // No unreachable: default link supplies the catch-all branch.
+        assert!(
+            !matches!(
+                ssarepr.insns.get(switch_idx + 1),
+                Some(Insn::Op { opname, .. }) if opname == "unreachable"
+            ),
+            "Str(\"default\") link must replace the unreachable catch-all"
+        );
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "flatten_graph: switch link requires Signed/Bool llexitcase"
+    )]
+    fn flatten_graph_panics_on_none_exitcase_switch_link() {
+        // RPython `flatten.py:280` recognises ONLY `Str("default")` as
+        // the switch catch-all; `None` exitcase on a switch link is a
+        // walker non-orthodoxy.  After the strict
+        // `is_default_exitcase` change, a `None` link reaches
+        // `switch_llexitcase_key`, which fails loud on a non-
+        // Signed/Bool llexitcase.  The panic surfaces the malformed
+        // shape so the walker site producing `None` can be fixed
+        // (either to set `Str("default")` for true catch-alls, or to
+        // ensure both bool-branch links carry `Bool` `llexitcase` so
+        // the bool-branch path fires instead of the switch path).
+        use crate::jit::flow::{Block, Constant, ExitSwitch, FunctionGraph, Link};
+
+        let selector = Variable::new(VariableId(0), Kind::Int);
+        let retval = Variable::new(VariableId(1), Kind::Int);
+        let start = Block::shared(vec![selector.into()]);
+        let graph = FunctionGraph::new("int_switch_none_exitcase", start.clone(), Some(retval));
+
+        start.borrow_mut().exitswitch = Some(ExitSwitch::Value(selector.into()));
+        let case_one = Link::new(
+            vec![Constant::signed(10).into()],
+            Some(graph.returnblock.clone()),
+            Some(Constant::signed(1).into()),
+        )
+        .with_llexitcase(Constant::signed(1).into())
+        .into_ref();
+        // None exitcase + None llexitcase — the malformed shape.
+        let none_link = Link::new(
+            vec![Constant::signed(99).into()],
+            Some(graph.returnblock.clone()),
+            None,
+        )
+        .into_ref();
+        start.closeblock(vec![case_one, none_link]);
+
+        let mut ssarepr = SSARepr::new("int_switch_none_exitcase");
+        flatten_graph_with_closures(
+            &graph,
+            &mut ssarepr,
+            |v| Register::new(v.kind.expect("typed variable"), v.id.0 as u16),
+            flatten_constant_operand,
+        );
     }
 
     #[test]
