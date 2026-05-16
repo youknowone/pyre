@@ -535,7 +535,20 @@ pub fn exc_kind_from_name(name: &str) -> Option<ExcKind> {
         "AssertionError" => Some(ExcKind::AssertionError),
         "ReferenceError" => Some(ExcKind::ReferenceError),
         "GeneratorExit" => Some(ExcKind::GeneratorExit),
-        "RecursionError" => Some(ExcKind::RecursionError),
+        // `rpython/rlib/rstackovf.py:10-14 StackOverflow` is a
+        // `RuntimeError` subclass that RPython's rtyper synthesizes
+        // catch/convert code for; `rpython/annotator/exception.py:3`
+        // lists `_StackOverflow` in the standard set so
+        // `get_standard_ll_exc_instance_by_class` has a prebuilt
+        // instance for it.  Pyre doesn't have an LL-side StackOverflow
+        // class — the stack-check slowpath raises a Python-level
+        // `RecursionError` directly (`eval.rs:2979 stack_check_slow
+        // path → pos_exception()`) — so we alias the RPython name to
+        // pyre's `RecursionError` ExcKind: every consumer that looks
+        // up the standard pointer receives the singleton instance
+        // whose `kind` is the user-visible class, matching what user
+        // code would catch.
+        "RecursionError" | "_StackOverflow" | "StackOverflow" => Some(ExcKind::RecursionError),
         "OSError" | "IOError" | "EnvironmentError" => Some(ExcKind::OSError),
         "FileNotFoundError" => Some(ExcKind::FileNotFoundError),
         "UnicodeDecodeError" => Some(ExcKind::UnicodeDecodeError),
