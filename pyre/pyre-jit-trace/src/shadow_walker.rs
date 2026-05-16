@@ -111,6 +111,16 @@ pub fn opname_in_shadow_allow_list(instruction: &Instruction) -> bool {
             | Instruction::Cache
             | Instruction::NotTaken
     )
+    // M4.PoC.1 LoadFast attempt (2026-05-17) panicked on fib_loop with
+    // `GotoIfNotValueNotConcrete { pc: 28, value: IntOp(35) }`.  The
+    // codewriter-emitted LoadFastCheck arm body contains a
+    // `goto_if_not/iL` whose value lives in the Int register bank;
+    // walker `dispatch_goto_if_not` falls into the strict-mode
+    // fail-loud path because `concrete_registers_i` doesn't exist.
+    // Blocker is the Int-bank concrete shadow plumbing — see
+    // `[[project-tracer-m4-cutover-decision]]` "Architectural blocker
+    // for the Int-bank shadow" section.  Allow-list expansion past Nop
+    // is gated on that work.
 }
 
 /// Carrier for the symbolic walker's record output — the trace ops it
