@@ -713,6 +713,73 @@ fn push_walker_emit(current_block: &SpamBlockRef, insn: super::flatten::Insn) {
     current_block.push_insn(insn);
 }
 
+/// Drain per-block accumulators into a single contiguous `Insn`
+/// stream, stripping the defensive walker-emitted `goto pcN; ---`
+/// pair when the next block opens with that label (block boundary
+/// fall-through). RPython `flatten.py:106-155 make_link` falls through
+/// to the next block by recursive descent and never materialises the
+/// pair; pyre's walker emits both at block-switch boundaries (the
+/// drain order isn't known at yield time since `pendingblocks` is
+/// mixed push_front / push_back) so this pass undoes the materialisation
+/// when the layout makes it redundant.
+///
+/// The next-block label is recognised in two shapes:
+/// * `Insn::Label(L)` — upstream-orthodox block / link / catch-landing
+///   labels (`flatten.py:116 self.emit(Label(block))`).
+/// * `Insn::PcAnchor { py_pc }` — pyre's per-PC anchor introduced
+///   when the transitional `Label("pcN")` shape was retired. The
+///   matching `goto TLabel("pcN")` carries the name produced by
+///   `pc_label_name(py_pc)`; both shapes resolve to the same string
+///   key, so the strip recogniser unifies them.
+///
+/// **Mutates** each block's `Vec<Insn>` in place to drop the strip
+/// tail; appends moved (not cloned) into the output `Vec`.
+fn strip_walker_block_boundary_goto(
+    blocks: &mut [Vec<super::flatten::Insn>],
+) -> Vec<super::flatten::Insn> {
+    let total_capacity: usize = blocks.iter().map(|b| b.len()).sum();
+    let mut drained: Vec<super::flatten::Insn> = Vec::with_capacity(total_capacity);
+    let n = blocks.len();
+    for i in 0..n {
+        let next_label_name: Option<String> = blocks
+            .get(i + 1)
+            .and_then(|next| next.first())
+            .and_then(|first| match first {
+                super::flatten::Insn::Label(l) => Some(l.name.clone()),
+                super::flatten::Insn::PcAnchor { py_pc } => {
+                    Some(super::flatten::pc_label_name(*py_pc))
+                }
+                _ => None,
+            });
+        let block_insns = &mut blocks[i];
+        let len = block_insns.len();
+        let strip_tail = if len >= 2 {
+            match (
+                &block_insns[len - 2],
+                &block_insns[len - 1],
+                next_label_name.as_deref(),
+            ) {
+                (
+                    super::flatten::Insn::Op { opname, args, .. },
+                    super::flatten::Insn::Unreachable,
+                    Some(next_name),
+                ) if opname == "goto"
+                    && args.len() == 1
+                    && matches!(&args[0], Operand::TLabel(target) if target.name == next_name) =>
+                {
+                    2
+                }
+                _ => 0,
+            }
+        } else {
+            0
+        };
+        block_insns.truncate(len - strip_tail);
+        drained.append(block_insns);
+    }
+    drained
+}
+
 fn fresh_variable_for_state(
     graph: &mut super::flow::FunctionGraph,
     kind: Option<Kind>,
@@ -6949,47 +7016,7 @@ impl CodeWriter {
                 .iter()
                 .map(|block| block.per_block_ssarepr())
                 .collect();
-            let total_capacity: usize = blocks.iter().map(|b| b.len()).sum();
-            let mut drained: Vec<super::flatten::Insn> = Vec::with_capacity(total_capacity);
-            let n = blocks.len();
-            for i in 0..n {
-                let next_label_name: Option<String> = blocks
-                    .get(i + 1)
-                    .and_then(|next| next.first())
-                    .and_then(|first| match first {
-                        super::flatten::Insn::Label(l) => Some(l.name.clone()),
-                        _ => None,
-                    });
-                let block_insns = &mut blocks[i];
-                let len = block_insns.len();
-                let strip_tail = if len >= 2 {
-                    match (
-                        &block_insns[len - 2],
-                        &block_insns[len - 1],
-                        next_label_name.as_deref(),
-                    ) {
-                        (
-                            super::flatten::Insn::Op { opname, args, .. },
-                            super::flatten::Insn::Unreachable,
-                            Some(next_name),
-                        ) if opname == "goto"
-                            && args.len() == 1
-                            && matches!(&args[0], Operand::TLabel(target) if target.name == next_name) =>
-                        {
-                            2
-                        }
-                        _ => 0,
-                    }
-                } else {
-                    0
-                };
-                block_insns.truncate(len - strip_tail);
-                // Append moves elements (no per-Insn clone), saving one
-                // round of allocation/copy per block compared to the
-                // earlier `extend(iter().cloned())` formulation.
-                drained.append(block_insns);
-            }
-            ssarepr.insns = drained;
+            ssarepr.insns = strip_walker_block_boundary_goto(&mut blocks);
         }
 
         // codewriter.py:45-47 `for kind in KINDS:
@@ -7755,6 +7782,81 @@ mod tests {
     use pyre_interpreter::compile_exec;
     use std::collections::HashMap;
     use std::sync::Arc;
+
+    /// R4 regression test: tail-strip pass must recognise the
+    /// `Insn::PcAnchor { py_pc }` shape the walker emits at PC block
+    /// boundaries (commit 0b016d9bde retired the transitional
+    /// `Insn::Label("pcN")` shape, but the strip recogniser still
+    /// only matched `Insn::Label`, so the defensive
+    /// `goto pcN; ---` pair was left in the drained stream — extra
+    /// control-flow RPython's recursive `make_link` would never
+    /// emit per `flatten.py:106-155`).
+    #[test]
+    fn strip_walker_block_boundary_goto_strips_against_pc_anchor() {
+        use super::super::flatten::{Insn, Operand, pc_label_name, pc_tlabel};
+
+        let goto = Insn::op(
+            "goto",
+            vec![Operand::TLabel(pc_tlabel(7))],
+        );
+        let trailing_unreachable = Insn::Unreachable;
+        let block_a = vec![
+            Insn::live(Vec::new()),
+            goto.clone(),
+            trailing_unreachable.clone(),
+        ];
+        let block_b = vec![Insn::pc_anchor(7), Insn::live(Vec::new())];
+        let mut blocks = vec![block_a, block_b];
+
+        let drained = super::strip_walker_block_boundary_goto(&mut blocks);
+
+        // Block A's goto + Unreachable were stripped; block B's
+        // PcAnchor opens the fall-through directly.
+        assert_eq!(
+            drained.len(),
+            3,
+            "expected [live, PcAnchor, live] after strip, got {drained:?}",
+        );
+        assert!(matches!(drained[0], Insn::Op { ref opname, .. } if opname == "-live-"));
+        assert!(matches!(
+            drained[1],
+            Insn::PcAnchor { py_pc: 7 },
+        ));
+        assert!(matches!(drained[2], Insn::Op { ref opname, .. } if opname == "-live-"));
+
+        // The strip should NOT fire when the goto target doesn't
+        // match the next block's anchor.
+        let goto_to_99 = Insn::op(
+            "goto",
+            vec![Operand::TLabel(pc_tlabel(99))],
+        );
+        let block_a = vec![Insn::live(Vec::new()), goto_to_99, Insn::Unreachable];
+        let block_b = vec![Insn::pc_anchor(7)];
+        let mut blocks = vec![block_a, block_b];
+        let drained = super::strip_walker_block_boundary_goto(&mut blocks);
+        assert_eq!(
+            drained.len(),
+            4,
+            "goto/--- must remain when target != next block's PcAnchor",
+        );
+
+        // Sanity for the upstream-orthodox `Insn::Label` shape — strip
+        // still works (R4 doesn't regress the Label case).
+        use super::super::flatten::Label as FlatLabel;
+        let label_name = pc_label_name(11);
+        let goto = Insn::op(
+            "goto",
+            vec![Operand::TLabel(pc_tlabel(11))],
+        );
+        let block_a = vec![Insn::live(Vec::new()), goto, Insn::Unreachable];
+        let block_b = vec![
+            Insn::Label(FlatLabel::new(label_name)),
+            Insn::live(Vec::new()),
+        ];
+        let mut blocks = vec![block_a, block_b];
+        let drained = super::strip_walker_block_boundary_goto(&mut blocks);
+        assert_eq!(drained.len(), 3, "Insn::Label strip path must also fire");
+    }
 
     fn make_runtime_jitcode_with_fnaddr(fnaddr: usize) -> Arc<majit_metainterp::jitcode::JitCode> {
         let mut jitcode = majit_metainterp::jitcode::JitCodeBuilder::default().finish();
