@@ -324,7 +324,7 @@ fn compute_liveness_pass_with_graph(
                 if let Some(result) = inner_op.result {
                     def_value(&mut alive, result);
                 }
-                for vid in crate::inline::op_value_refs(&inner_op.kind) {
+                for vid in crate::inline::op_value_refs(&inner_op.kind, graph) {
                     use_value(&mut alive, vid);
                 }
             }

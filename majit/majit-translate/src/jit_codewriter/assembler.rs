@@ -1719,7 +1719,7 @@ impl Assembler {
             // Default: encode operand registers + result register (no descriptor)
             other => {
                 let mut operand_kinds = String::new();
-                for v in crate::inline::op_value_refs(other) {
+                for v in crate::inline::op_value_refs(other, None) {
                     let (reg, kind_char) = self.lookup_reg_with_kind(v, regallocs);
                     state.code.push(reg);
                     argcodes.push(kind_char);
@@ -2147,7 +2147,7 @@ impl Assembler {
                     if let Some(r) = inner.result {
                         sites.entry(r).or_default().has_def = true;
                     }
-                    for v in crate::inline::op_value_refs(&inner.kind) {
+                    for v in crate::inline::op_value_refs(&inner.kind, None) {
                         let s = sites.entry(v).or_default();
                         s.use_count += 1;
                         s.first_use_tag.get_or_insert(tag);

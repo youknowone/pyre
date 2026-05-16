@@ -322,7 +322,7 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
             seen.insert(v);
         }
         for op in &block.operations {
-            for v in crate::inline::op_value_refs(&op.kind) {
+            for v in crate::inline::op_value_refs(&op.kind, Some(graph)) {
                 seen.insert(v);
             }
             if let Some(r) = op.result {

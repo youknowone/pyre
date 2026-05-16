@@ -1754,7 +1754,7 @@ pub fn prune_dead_phis(graph: &mut FunctionGraph) {
             None
         };
         for (i, op) in block.operations.iter().enumerate() {
-            let operands = op_value_refs(&op.kind);
+            let operands = op_value_refs(&op.kind, Some(graph));
             // `simplify.py:441-445`:
             //   if not canremove(op, block):    read_vars.update(args)
             //   else:                           dependencies[result] += args

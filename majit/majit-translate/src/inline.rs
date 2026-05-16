@@ -306,7 +306,7 @@ fn remap_callee_values(
             if let Some(result) = op.result {
                 map.entry(result).or_insert_with(|| graph.alloc_value());
             }
-            for v in op_value_refs(&op.kind) {
+            for v in op_value_refs(&op.kind, Some(callee)) {
                 map.entry(v).or_insert_with(|| graph.alloc_value());
             }
         }
@@ -738,7 +738,18 @@ fn remap_op_kind(kind: &OpKind, remap: &impl Fn(&ValueId) -> ValueId) -> OpKind 
 }
 
 /// Collect all ValueId references used in an OpKind (not including result).
-pub fn op_value_refs(kind: &OpKind) -> Vec<ValueId> {
+///
+/// `graph` is threaded so callers can prepare for the upstream-shaped
+/// storage flip where each variant field carries a `flowspace::Variable`
+/// instead of a dense `ValueId`. The current body still reads `ValueId`
+/// directly out of the variant; once storage is flipped this function
+/// projects the Variable back to its `ValueId` via `graph.value_id_of`.
+/// Callers without a graph context (deprecated test-only paths) pass
+/// `None`; once storage is flipped these paths must supply a graph.
+pub fn op_value_refs(
+    kind: &OpKind,
+    _graph: Option<&crate::model::FunctionGraph>,
+) -> Vec<ValueId> {
     match kind {
         OpKind::Input { .. }
         | OpKind::ConstInt(_)
@@ -924,7 +935,7 @@ pub fn op_variable_refs(
     kind: &OpKind,
     graph: &crate::model::FunctionGraph,
 ) -> Vec<Option<crate::flowspace::model::Variable>> {
-    op_value_refs(kind)
+    op_value_refs(kind, Some(graph))
         .into_iter()
         .map(|vid| graph.variable(vid).cloned())
         .collect()
@@ -1560,7 +1571,7 @@ mod tests {
             .iter()
             .find(|op| matches!(op.kind, OpKind::ArrayRead { .. }))
             .expect("simple callee has the ArrayRead op");
-        let value_ids = op_value_refs(&array_read.kind);
+        let value_ids = op_value_refs(&array_read.kind, Some(&g));
         let variables = op_variable_refs(&array_read.kind, &g);
         assert_eq!(value_ids.len(), variables.len(), "len parity");
         for (vid, var_opt) in value_ids.iter().zip(variables.iter()) {
