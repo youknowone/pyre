@@ -1823,6 +1823,29 @@ where
         exitswitch: Option<super::flow::ExitSwitch>,
         handling_ovf: bool,
     ) {
+        // Diagnostic: surface walker-emitted switch shape on entry so
+        // the panic at `switch_llexitcase_key` includes the link
+        // inventory (exitcase + llexitcase per link) rather than
+        // forcing manual graph inspection.
+        if std::env::var_os("PYRE_PHASE3_SWITCH_DIAG").is_some() {
+            let exitcase_summary: Vec<String> = exits
+                .iter()
+                .map(|link| {
+                    let lb = link.borrow();
+                    format!(
+                        "(exitcase={:?}, llexitcase={:?})",
+                        lb.exitcase, lb.llexitcase
+                    )
+                })
+                .collect();
+            eprintln!(
+                "[phase3-switch-diag] insert_switch_exits: exits={} \
+                 exitswitch={:?} shape={:?}",
+                exits.len(),
+                exitswitch,
+                exitcase_summary,
+            );
+        }
         let Some(super::flow::ExitSwitch::Value(exitswitch)) = exitswitch else {
             // RPython `flatten.py:282-309 insert_switch_exits` is only
             // called via `insert_exits` when the block already has a

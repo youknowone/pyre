@@ -150,14 +150,22 @@ fn make_three_flow_lists(values: &[super::flow::FlowValue]) -> Vec<super::flow::
 fn portal_jit_merge_point_graph_args(
     graph: &super::flow::FunctionGraph,
     next_instr: usize,
-    w_code: *const (),
+    pycode_var: super::flow::Variable,
     jitdriver_index: usize,
 ) -> Vec<super::flow::SpaceOperationArg> {
     let (frame, ec) = portal_graph_inputvars_from_startblock(graph);
+    // `pypyjit/interp_jit.py:67-78` PyPyJitDriver greens =
+    // `['next_instr', 'is_being_profiled', 'pycode']`.  `pycode` is
+    // recovered from the live frame at every merge point via the
+    // `getfield_vable_r frame, PYCODE_FIELD_IDX → pycode_var` dual-
+    // write emitted immediately upstream in the walker; reference
+    // that per-SpaceOp Variable here so the canonical
+    // `flatten_graph` driver sees no unresolved `Opaque(Ref)`
+    // constants.
     let greens = vec![
         super::flow::Constant::signed(next_instr as i64).into(),
         super::flow::Constant::signed(0).into(),
-        super::flow::Constant::opaque(format!("pycode@{w_code:p}"), Some(Kind::Ref)).into(),
+        pycode_var.into(),
     ];
     let reds = vec![frame.into(), ec.into()];
     let mut args = vec![super::flow::Constant::signed(jitdriver_index as i64).into()];
@@ -4872,66 +4880,43 @@ impl CodeWriter {
                         // Assembler / blackhole / backend (`assembler.rs:712`)
                         // assert the canonical 7-arg form on the way out.
                         //
-                        // DEVIATION (β.2 migration target — see plan
-                        // `~/.claude/plans/inline-call-portal-migration.md`
-                        // + memory `inline_call_portal_beta2_audit_2026_05_03.md`):
+                        // pycode green arg: emit `getfield_vable_r frame,
+                        // PYCODE_FIELD_IDX → pycode_var` (graph dual-write
+                        // returns the per-SpaceOp Variable) and reference
+                        // that Variable from the `jit_merge_point` greens.
+                        // Matches `pypyjit/interp_jit.py:25 _virtualizable_=
+                        // ['..., 'pycode', ...]` + `:67-78 PyPyJitDriver
+                        // greens=['next_instr', 'is_being_profiled',
+                        // 'pycode']`: pycode is recovered from the live
+                        // frame at every merge point, not baked into the
+                        // per-CodeObject constants_r pool.
                         //
-                        // pycode is currently carried as an `Opaque(Ref)`
-                        // Constant at the graph layer, then lowered by the
-                        // `lower_constant` callback below to `Operand::ConstRef`
-                        // which routes through `builder.add_const_r` and bakes
-                        // the user CodeObject pointer into the per-CodeObject
-                        // jitcode's constants_r pool. This is one of the
-                        // primary sources of the `drained.r > portal_canonical.r`
-                        // divergence measured in
-                        // `inline_call_portal_b5_probe_a_2026_05_03.md`
-                        // (nbody drained.r=163 vs portal canonical.r=0).
-                        //
-                        // RPython orthodox: pycode is a green argument to
-                        // `portal_runner` (`pypyjit/interp_jit.py:67-78
-                        // PyPyJitDriver greens=['next_instr','is_being_profiled',
-                        // 'pycode']`), present at runtime in a calling-convention
-                        // register. To migrate, replace the `Constant::opaque(…)`
-                        // in `portal_jit_merge_point_graph_args` (line 152) with
-                        // a Variable produced by emitting `getfield_vable_r
-                        // frame, PYCODE_FIELD_IDX → pycode_var` immediately
-                        // before `serialize_op`. The `lower_variable`
-                        // closure (line 4361) gains a third arm mapping
-                        // `pycode_var.id` to the dst register of the new
-                        // getfield. Empirical Probe A re-run after the change
-                        // should show `drained.r` reduced by 1 per jit_merge_point
-                        // emission (~10-30 for nbody).
-                        //
-                        // Existing pattern reusable: the `emit_vable_getfield_ref!`
-                        // macro at line 3728 already emits the
-                        // `getfield_vable_r [vable_reg, descr_vable_static_field(idx)]
-                        // → Register(Ref, dst)` shape that this migration needs.
-                        // PYFRAME_VABLE_FIELDS in `virtualizable_spec.rs` enumerates
-                        // the field indices (pycode is field 1 per
-                        // `interp_jit.py:25-31`).
+                        // PYFRAME_VABLE_FIELDS in `virtualizable_spec.rs`
+                        // enumerates the field indices (pycode is field 1
+                        // per `interp_jit.py:25-31`).
                         let jdindex = portal_jd_index
                             .expect("portal jit_merge_point requires a registered jitdriver");
-                        // β.2.1 (plan inline-call-portal-migration.md): instead
-                        // of baking `w_code` into the runtime constants_r pool
-                        // via `Operand::ConstRef`, load `frame.pycode` at
-                        // runtime into a fresh scratch register and reference
-                        // that register from `jit_merge_point`'s pycode green
-                        // arg. RPython orthodox parity per
+                        // RPython orthodox parity per
                         // `pypyjit/interp_jit.py:67 reds=['frame','ec']` +
                         // `interp_jit.py:25 _virtualizable_=['..., 'pycode',
                         // ...]`: pycode is recovered from the live frame at
                         // every merge point, so the trace key is the runtime
                         // value rather than a build-time constant.
                         let scratch_pycode_reg = ssarepr.fresh_var(Kind::Ref, scratch_ref_base).0;
-                        emit_vable_getfield_ref!(
+                        let pycode_var = emit_vable_getfield_ref!(
                             portal_frame_reg,
                             scratch_pycode_reg,
                             VABLE_CODE_FIELD_IDX
+                        )
+                        .expect(
+                            "portal jit_merge_point requires is_portal=true; \
+                             emit_vable_getfield_ref! must return a per-SpaceOp \
+                             Variable for the `pycode` green arg",
                         );
                         let graph_args = portal_jit_merge_point_graph_args(
                             &graph,
                             py_pc,
-                            w_code as *const (),
+                            pycode_var,
                             jdindex,
                         );
                         let graph_op = emit_graph_op_void(
@@ -4952,28 +4937,26 @@ impl CodeWriter {
                                     Register::new(Kind::Ref, portal_frame_reg)
                                 } else if v.id == ec_var.id {
                                     Register::new(Kind::Ref, portal_ec_reg)
+                                } else if v.id == pycode_var.id {
+                                    // `pypyjit/interp_jit.py:67-78` PyPyJitDriver
+                                    // `greens=[..., 'pycode']`: pycode is read
+                                    // from the live frame at every merge point,
+                                    // via the `getfield_vable_r frame,
+                                    // PYCODE_FIELD_IDX → scratch_pycode_reg`
+                                    // emit above.  The graph Variable produced
+                                    // by that dual-write maps to the same
+                                    // register slot here.
+                                    Register::new(Kind::Ref, scratch_pycode_reg)
                                 } else {
                                     panic!(
                                         "portal jit_merge_point: unexpected graph Variable {v:?} \
-                                     (only portal frame/ec expected)"
+                                     (only portal frame/ec/pycode expected)"
                                     )
                                 }
                             },
                             |c: &super::flow::Constant| match (&c.value, c.kind) {
                                 (super::flow::ConstantValue::Signed(value), Some(Kind::Int)) => {
                                     Operand::ConstInt(*value)
-                                }
-                                (super::flow::ConstantValue::Opaque(_), Some(Kind::Ref)) => {
-                                    // β.2.1: pycode green arg references the
-                                    // scratch register pre-loaded with
-                                    // `frame.pycode` via `emit_vable_getfield_ref!`
-                                    // above. RPython orthodox parity
-                                    // (`pypyjit/interp_jit.py:67-78` PyPyJitDriver
-                                    // `greens=[..., 'pycode']`): pycode is read
-                                    // from the live frame at every merge point,
-                                    // not baked into the per-CodeObject
-                                    // constants_r pool.
-                                    Operand::reg(Kind::Ref, scratch_pycode_reg)
                                 }
                                 other => {
                                     panic!("portal jit_merge_point: unexpected Constant {other:?}")
@@ -7693,6 +7676,118 @@ impl CodeWriter {
             super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
         super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
 
+        // Phase 3 (b) Slice 4: env-gated invocation of the canonical
+        // `flatten_graph(graph, regallocs, _include_all_exc_links, cpu)`
+        // matching upstream `rpython/jit/codewriter/flatten.py:63-70`.
+        // The result is captured in `_canonical_ssarepr` and compared
+        // against the walker-emitted `ssarepr` via op-count diagnostic.
+        //
+        // This invocation surfaces the line-by-line porting gaps that
+        // block the production source-of-truth flip: any panic raised
+        // by `flatten_graph` identifies an upstream-orthodox primitive
+        // pyre's graph has not yet emitted (most likely a missing
+        // `record_graph_op` site for a walker-emit family, or an
+        // unconverted graph SpaceOp shape).
+        //
+        // Wrapped in `catch_unwind` so production stays stable while
+        // we surface the diagnostic; the wrap retires once
+        // `flatten_graph` is panic-free across all 14 production
+        // benches (upstream `codewriter.py:53` calls it
+        // unconditionally without any safety net).  Off-default;
+        // `PYRE_PHASE3_CANONICAL_FLATTEN=1` enables it.
+        if std::env::var_os("PYRE_PHASE3_CANONICAL_FLATTEN").is_some() {
+            // First pass: inventory of Opaque(Ref) constants per
+            // SpaceOp.  These are the line-by-line porting gaps that
+            // need either an upstream-orthodox `rtype_opaque_constants`
+            // pass (matching `rpython/rtyper/rtyper.py:specialize`
+            // substep) or per-call `lower_constant` closure.
+            fn count_opaque_in_arg(
+                arg: &super::flow::SpaceOperationArg,
+                opname: &str,
+                acc: &mut (usize, Vec<(String, String)>),
+            ) {
+                match arg {
+                    super::flow::SpaceOperationArg::Value(
+                        super::flow::FlowValue::Constant(c),
+                    ) => {
+                        if let super::flow::ConstantValue::Opaque(o) = &c.value {
+                            if c.kind == Some(super::flatten::Kind::Ref) || c.kind.is_none() {
+                                acc.0 += 1;
+                                if acc.1.len() < 8 {
+                                    acc.1.push((opname.to_string(), o.repr().to_string()));
+                                }
+                            }
+                        }
+                    }
+                    super::flow::SpaceOperationArg::ListOfKind(list) => {
+                        for inner in &list.content {
+                            if let super::flow::FlowValue::Constant(c) = inner {
+                                if let super::flow::ConstantValue::Opaque(o) = &c.value {
+                                    acc.0 += 1;
+                                    if acc.1.len() < 8 {
+                                        acc.1.push((
+                                            format!("{opname}[list]"),
+                                            o.repr().to_string(),
+                                        ));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            let mut acc: (usize, Vec<(String, String)>) = (0, Vec::new());
+            for block in graph.iterblocks() {
+                for op in &block.borrow().operations {
+                    for arg in &op.args {
+                        count_opaque_in_arg(arg, &op.opname, &mut acc);
+                    }
+                }
+            }
+            if acc.0 > 0 {
+                eprintln!(
+                    "[phase3-canonical-flatten] graph={:?} opaque_ref_count={} samples={:?}",
+                    code.obj_name.as_str(),
+                    acc.0,
+                    acc.1,
+                );
+            }
+            let graph_ref = &graph;
+            let cpu_ref = Some(self.cpu());
+            let regallocs_mut = &mut _graph_regallocs;
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                super::flatten::flatten_graph(graph_ref, regallocs_mut, false, cpu_ref)
+            }));
+            match result {
+                Ok(canonical_ssarepr) => {
+                    eprintln!(
+                        "[phase3-canonical-flatten] graph={:?} walker_insn_count={} \
+                         canonical_insn_count={} delta={:+}",
+                        code.obj_name.as_str(),
+                        ssarepr.insns.len(),
+                        canonical_ssarepr.insns.len(),
+                        canonical_ssarepr.insns.len() as i64
+                            - ssarepr.insns.len() as i64,
+                    );
+                }
+                Err(panic_info) => {
+                    let msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        (*s).to_string()
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "<non-string panic payload>".to_string()
+                    };
+                    eprintln!(
+                        "[phase3-canonical-flatten] graph={:?} PANIC: {}",
+                        code.obj_name.as_str(),
+                        msg,
+                    );
+                }
+            }
+        }
+
         // Phase 3 (b) Slice 2/3a: env-gated diagnostic that compares
         // the per-kind ceiling each allocator computes plus the
         // pre-color Variable set size each one sees.  Slice 3a's
@@ -9841,9 +9936,9 @@ mod tests {
         let code = first_nested_function_code(
             "def f(a):\n    while a:\n        a = a - 1\n    return a\n",
         );
-        let w_code = pyre_interpreter::box_code_constant(&code);
         let graph = new_shadow_graph_with_portal_inputs(&code, true);
-        let args = portal_jit_merge_point_graph_args(&graph, 17, w_code as *const (), 7);
+        let pycode_var = Variable::new(VariableId(9999), Kind::Ref);
+        let args = portal_jit_merge_point_graph_args(&graph, 17, pycode_var, 7);
 
         assert_eq!(args.len(), 7);
         match &args[0] {
@@ -9867,10 +9962,11 @@ mod tests {
                 assert_eq!(list.kind, Kind::Ref);
                 assert_eq!(list.content.len(), 1);
                 match &list.content[0] {
-                    FlowValue::Constant(constant) => {
-                        assert_eq!(constant.kind, Some(Kind::Ref));
+                    FlowValue::Variable(variable) => {
+                        assert_eq!(variable.id, pycode_var.id);
+                        assert_eq!(variable.kind, Some(Kind::Ref));
                     }
-                    other => panic!("expected pycode ref constant, got {other:?}"),
+                    other => panic!("expected pycode ref variable, got {other:?}"),
                 }
             }
             other => panic!("expected greens ref list, got {other:?}"),
