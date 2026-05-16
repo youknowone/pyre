@@ -155,32 +155,17 @@ fn loc_from_target_argloc(loc: &TargetArgLoc) -> Loc {
     }
 }
 
-fn all_gen_regs() -> &'static [crate::regloc::RegLoc] {
-    use crate::regloc::*;
-    &[
-        ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
-    ]
-}
-
-fn all_float_regs() -> &'static [crate::regloc::RegLoc] {
-    use crate::regloc::*;
-    &[
-        XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13,
-        XMM14,
-    ]
-}
-
 fn core_reg_position(reg: crate::regloc::RegLoc) -> Option<usize> {
-    all_gen_regs()
+    crate::x86::regalloc::ALL_CORE_REGS
         .iter()
         .position(|candidate| *candidate == reg)
 }
 
 fn float_reg_position(reg: crate::regloc::RegLoc) -> Option<usize> {
-    all_float_regs()
+    crate::x86::regalloc::ALL_FLOAT_REGS
         .iter()
         .position(|candidate| *candidate == reg)
-        .map(|idx| all_gen_regs().len() + idx)
+        .map(|idx| crate::x86::regalloc::ALL_CORE_REGS.len() + idx)
 }
 
 fn reg_position_in_jitframe(reg: crate::regloc::RegLoc) -> Option<usize> {
@@ -1061,6 +1046,21 @@ impl<'a> Assembler386<'a> {
     ///   ; fallthrough = real overflow → return rbp as jf_ptr
     /// ```
     fn _call_header(&mut self, inputargs: &[InputArg]) {
+        // x86/assembler.py:_call_header parity. PyPy iterates
+        // `self.cpu.CALLEE_SAVE_REGISTERS` and saves each into the
+        // FRAME_FIXED_SIZE stack area allocated by `SUB esp, FRAME_FIXED_SIZE*WORD`.
+        //
+        // Pyre uses an inline push-based prologue to keep the rest of the
+        // dynasm-based codegen unchanged; the saved set must still match
+        // PyPy's CALLEE_SAVE_REGISTERS per platform:
+        //   - x86_64 (System V): [ebx, r12, r13, r14, r15]
+        //   - x86_64 (Win64):    [ebx, esi, edi, r12, r14, r15]
+        // plus ebp, which is saved separately in both flavors.
+        //
+        // The extra saves go into a SUB-reserved stack slot so the body's
+        // rsp parity (mod 16 == 8 after prologue) is unchanged and the
+        // per-call adjustments in `emit_win64_call_adjust` /
+        // `abi_reserved_call_area_size` keep working.
         dynasm!(self.mc
             ; .arch x64
             ; push rbp
@@ -1069,11 +1069,26 @@ impl<'a> Assembler386<'a> {
         #[cfg(target_os = "windows")]
         dynasm!(self.mc
             ; .arch x64
+            // Win64 extra callee-save: rbx, rsi, rdi, r14, r15.  48 bytes
+            // (5 saves * 8 = 40 + 8 padding to keep mod 16 alignment).
+            ; sub rsp, 48
+            ; mov [rsp + 0], rbx
+            ; mov [rsp + 8], rsi
+            ; mov [rsp + 16], rdi
+            ; mov [rsp + 24], r14
+            ; mov [rsp + 32], r15
             ; mov rbp, rcx
         );
         #[cfg(not(target_os = "windows"))]
         dynasm!(self.mc
             ; .arch x64
+            // System V x86_64 extra callee-save: rbx, r13, r14, r15.
+            // 32 bytes (4 saves * 8 = 32, already 16-aligned).
+            ; sub rsp, 32
+            ; mov [rsp + 0], rbx
+            ; mov [rsp + 8], r13
+            ; mov [rsp + 16], r14
+            ; mov [rsp + 24], r15
             ; mov rbp, rdi
         );
         let propagate_descr = self.propagate_exception_descr_ptr();
@@ -1117,7 +1132,31 @@ impl<'a> Assembler386<'a> {
                     ; mov Rq(scratch), QWORD propagate_descr
                     ; mov [rbp + JF_DESCR_OFS], Rq(scratch)
                     // Overflow fallthrough: return rbp as jf_ptr.
+                    // Restore the extra callee-save regs the prologue
+                    // saved before the SUB-reserved slot, then pop r12/rbp.
                     ; mov rax, rbp
+                );
+                #[cfg(target_os = "windows")]
+                dynasm!(self.mc
+                    ; .arch x64
+                    ; mov rbx, [rsp + 0]
+                    ; mov rsi, [rsp + 8]
+                    ; mov rdi, [rsp + 16]
+                    ; mov r14, [rsp + 24]
+                    ; mov r15, [rsp + 32]
+                    ; add rsp, 48
+                );
+                #[cfg(not(target_os = "windows"))]
+                dynasm!(self.mc
+                    ; .arch x64
+                    ; mov rbx, [rsp + 0]
+                    ; mov r13, [rsp + 8]
+                    ; mov r14, [rsp + 16]
+                    ; mov r15, [rsp + 24]
+                    ; add rsp, 32
+                );
+                dynasm!(self.mc
+                    ; .arch x64
                     ; pop r12
                     ; pop rbp
                     ; ret
@@ -1424,10 +1463,37 @@ impl<'a> Assembler386<'a> {
 
     /// Emit the function epilogue: return jf_ptr in RAX/X0.
     fn _call_footer(&mut self) {
+        // x86/assembler.py:_call_footer parity. PyPy iterates
+        // `cpu.CALLEE_SAVE_REGISTERS` in reverse and restores from
+        // the FRAME_FIXED_SIZE area, then ADD esp, FRAME_FIXED_SIZE*WORD;
+        // RET.  Pyre mirrors the platform-specific save set established
+        // in `_call_header`.
         self.gen_footer_shadowstack();
         dynasm!(self.mc
             ; .arch x64
             ; mov rax, rbp
+        );
+        #[cfg(target_os = "windows")]
+        dynasm!(self.mc
+            ; .arch x64
+            ; mov rbx, [rsp + 0]
+            ; mov rsi, [rsp + 8]
+            ; mov rdi, [rsp + 16]
+            ; mov r14, [rsp + 24]
+            ; mov r15, [rsp + 32]
+            ; add rsp, 48
+        );
+        #[cfg(not(target_os = "windows"))]
+        dynasm!(self.mc
+            ; .arch x64
+            ; mov rbx, [rsp + 0]
+            ; mov r13, [rsp + 8]
+            ; mov r14, [rsp + 16]
+            ; mov r15, [rsp + 24]
+            ; add rsp, 32
+        );
+        dynasm!(self.mc
+            ; .arch x64
             ; pop r12                // restore r12
             ; pop rbp
             ; ret
@@ -1441,20 +1507,21 @@ impl<'a> Assembler386<'a> {
     /// (typically the slow-path's argument / result register, which
     /// holds non-Ref data across the call).
     ///
-    /// Iterates `crate::x86::regalloc::all_core_regs()` / `all_float_regs()`
-    /// (the allocator pool — drops R13 and XMM5..XMM14 on Win64), but
+    /// Iterates `crate::x86::regalloc::ALL_CORE_REGS` / `ALL_FLOAT_REGS`
+    /// (the allocator pool — drops R13 and XMM5..XMM14 on Win64), and
     /// indexes the slot via `core_reg_position` / `float_reg_position`,
-    /// matching `regalloc.py all_reg_indexes` — a FIXED table that pins
-    /// R14→11 / R15→12 regardless of whether R13 is in the iteration
-    /// pool.  An iteration-position scheme drifts by one for R14/R15
-    /// on Win64 (and shifts the XMM base too), desyncing this routine
-    /// from `save_regs_label` and the `core_reg_index`-driven gcmap.
+    /// which look up positions in the same Win64-aware lists.  This
+    /// mirrors `regalloc.py all_reg_indexes`, which is built from the
+    /// post-`remove(r13)` `all_regs` on Win64 (so R14→10, R15→11).
+    /// `save_regs_label`, the `core_reg_index`-driven gcmap, and the
+    /// post-call pop all consume positions through this same Win64-aware
+    /// list, keeping the three in agreement.
     fn push_all_regs_to_jitframe(
         &mut self,
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        for reg in crate::x86::regalloc::all_core_regs().iter() {
+        for reg in crate::x86::regalloc::ALL_CORE_REGS.iter() {
             if ignored_regs.contains(reg) {
                 continue;
             }
@@ -1463,7 +1530,7 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(reg.value));
         }
         if withfloats {
-            for reg in crate::x86::regalloc::all_float_regs().iter() {
+            for reg in crate::x86::regalloc::ALL_FLOAT_REGS.iter() {
                 let slot = float_reg_position(*reg).expect("push_all_regs: managed x86_64 XMM");
                 let ofs = Self::slot_offset(slot);
                 dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(reg.value));
@@ -1477,7 +1544,7 @@ impl<'a> Assembler386<'a> {
         ignored_regs: &[crate::regloc::RegLoc],
         withfloats: bool,
     ) {
-        for reg in crate::x86::regalloc::all_core_regs().iter() {
+        for reg in crate::x86::regalloc::ALL_CORE_REGS.iter() {
             if ignored_regs.contains(reg) {
                 continue;
             }
@@ -1486,7 +1553,7 @@ impl<'a> Assembler386<'a> {
             dynasm!(self.mc ; .arch x64 ; mov Rq(reg.value), [rbp + ofs]);
         }
         if withfloats {
-            for reg in crate::x86::regalloc::all_float_regs().iter() {
+            for reg in crate::x86::regalloc::ALL_FLOAT_REGS.iter() {
                 let slot = float_reg_position(*reg).expect("pop_all_regs: managed x86_64 XMM");
                 let ofs = Self::slot_offset(slot);
                 dynasm!(self.mc ; .arch x64 ; movsd Rx(reg.value), [rbp + ofs]);
@@ -1765,8 +1832,8 @@ impl<'a> Assembler386<'a> {
         inputargs: &[InputArg],
     ) -> Vec<Loc> {
         let mut locs = Vec::new();
-        let gpr_regs = all_gen_regs();
-        let float_regs = all_float_regs();
+        let gpr_regs = crate::x86::regalloc::ALL_CORE_REGS;
+        let float_regs = crate::x86::regalloc::ALL_FLOAT_REGS;
         let base_ofs = crate::jitframe::FIRST_ITEM_OFFSET as i32;
         let mut input_i = 0usize;
         for &pos in descr.rd_locs() {
@@ -2832,6 +2899,8 @@ impl<'a> Assembler386<'a> {
                 // factor is bound. xmm targets always use MOVSD per
                 // load_from_mem:1649; integer targets pick MOV /
                 // MOVZX{8,16} / MOVSX{8,16,32} based on size+sign.
+                // assembler.py:1645 load_from_mem allows WORD, 1, 2, and
+                // (x86_64) 4; any other size is `not_implemented`.
                 macro_rules! emit_load_scaled {
                     ($scale:tt) => {{
                         if dst.is_xmm {
@@ -2866,8 +2935,11 @@ impl<'a> Assembler386<'a> {
                                             ; mov Rd(dst.value), [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]);
                                     }
                                 }
-                                _ => dynasm!(self.mc ; .arch x64
+                                8 => dynasm!(self.mc ; .arch x64
                                     ; mov Rq(dst.value), [Rq(base.value) + Rq(ofs_reg.value) * $scale + offset]),
+                                other => panic!(
+                                    "load_from_mem: size {other} not in {{1, 2, 4, WORD}}"
+                                ),
                             }
                         }
                     }};
@@ -2906,8 +2978,11 @@ impl<'a> Assembler386<'a> {
                                             ; mov Rd(dst.value), [Rq(base.value) + Rq(ofs_reg.value) + offset]);
                                     }
                                 }
-                                _ => dynasm!(self.mc ; .arch x64
+                                8 => dynasm!(self.mc ; .arch x64
                                     ; mov Rq(dst.value), [Rq(base.value) + Rq(ofs_reg.value) + offset]),
+                                other => panic!(
+                                    "load_from_mem: size {other} not in {{1, 2, 4, WORD}}"
+                                ),
                             }
                         }
                     }};
@@ -4136,8 +4211,8 @@ impl<'a> Assembler386<'a> {
         // into `rd_locs` so the deopt path treats it as a normal stack
         // position (`_decode_pos` in `llmodel.py:422-424`).
         let mut const_stores: Vec<(usize, i64)> = Vec::new();
-        let gpr_regs = all_gen_regs();
-        let float_regs = all_float_regs();
+        let gpr_regs = crate::x86::regalloc::ALL_CORE_REGS;
+        let float_regs = crate::x86::regalloc::ALL_FLOAT_REGS;
         let rd_locs: Vec<u16> = faillocs
             .iter()
             .map(|fl| match fl {
@@ -4288,23 +4363,19 @@ impl<'a> Assembler386<'a> {
     /// Returns recovery stub offsets for post-finalize address fixup.
     fn write_pending_failure_recoveries(&mut self) -> Vec<(majit_ir::DescrRef, usize)> {
         // Emit a shared _push_all_regs_to_frame routine once, then let each
-        // generate_quick_failure() stub call it.
+        // generate_quick_failure() stub call it.  Iterate `ALL_CORE_REGS`
+        // / `ALL_FLOAT_REGS` (Win64-aware: R13 dropped from GPRs, XMM5..14
+        // dropped from FPRs) so save_regs_label, the gcmap built off
+        // `core_reg_index`, and the post-call pop all agree on slot
+        // assignments.
         let save_regs_label = self.mc.new_dynamic_label();
         dynasm!(self.mc ; .arch x64 ; =>save_regs_label);
-        use crate::regloc::*;
-        let gprs = [
-            ECX, EAX, EDX, EBX, ESI, EDI, R8, R9, R10, R12, R13, R14, R15,
-        ];
-        for &reg in &gprs {
+        for &reg in crate::x86::regalloc::ALL_CORE_REGS.iter() {
             let save_slot = core_reg_position(reg).expect("managed x86_64 GPR");
             let ofs = Self::slot_offset(save_slot);
             dynasm!(self.mc ; .arch x64 ; mov [rbp + ofs], Rq(reg.value));
         }
-        let xmms = [
-            XMM0, XMM1, XMM2, XMM3, XMM4, XMM5, XMM6, XMM7, XMM8, XMM9, XMM10, XMM11, XMM12, XMM13,
-            XMM14,
-        ];
-        for &reg in &xmms {
+        for &reg in crate::x86::regalloc::ALL_FLOAT_REGS.iter() {
             let save_slot = float_reg_position(reg).expect("managed x86_64 XMM");
             let ofs = Self::slot_offset(save_slot);
             dynasm!(self.mc ; .arch x64 ; movsd [rbp + ofs], Rx(reg.value));
@@ -6728,13 +6799,13 @@ impl<'a> Assembler386<'a> {
         self.emit_abi_int_arg_from_imm(0, total_size);
         dynasm!(self.mc ; .arch x64 ; mov rax, QWORD slowpath_fn);
         self.emit_abi_call_rax();
-        // pop_gcmap
-        dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
-        // A minor GC inside the slowpath may have moved the current
-        // jitframe; reload rbp from the shadow stack so subsequent
-        // frame-relative loads/stores hit the new location. The
-        // RPython x86 backend mirrors `_reload_frame_if_necessary`
-        // here (assembler.py:2553-2557).
+        // x86/assembler.py:_build_malloc_slowpath order:
+        //   _reload_frame_if_necessary(mc) → _pop_all_regs_from_jitframe(...) → pop_gcmap(mc)
+        // A minor GC inside the slowpath may have moved the jitframe;
+        // reload rbp from the shadow stack first so every subsequent
+        // frame-relative store (pop_all_regs, pop_gcmap) lands on the
+        // new frame. Clearing JF_GCMAP_OFS before the reload would
+        // write into the stale (moved-from) frame.
         self.reload_frame_if_necessary();
         // Move slowpath return into result_loc before pop_all_regs so
         // the pop doesn't overwrite the freshly-allocated payload ptr.
@@ -6745,6 +6816,8 @@ impl<'a> Assembler386<'a> {
             }
         }
         self.pop_all_regs_from_jitframe(&ignored_regs, true);
+        // pop_gcmap on the (post-reload) frame.
+        dynasm!(self.mc ; .arch x64 ; mov QWORD [rbp + gcmap_ofs], 0);
 
         dynasm!(self.mc ; .arch x64 ; =>done);
         if !op.pos.is_none() {

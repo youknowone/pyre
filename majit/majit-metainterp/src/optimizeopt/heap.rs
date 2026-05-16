@@ -2393,22 +2393,10 @@ impl OptHeap {
         //   (2) _getfield(true_force=False) cached match → cancel lazy_set
         // Step (2)'s _getfield check is intentionally AFTER the force,
         // so the cancellation can null out the lazy_set without leaving
-        // a stale pending setfield behind it.
-        //
-        // Pre-aliasing write-after-write quick path: same obj + same
-        // value as the existing lazy_set is unambiguously a no-op
-        // regardless of aliasing — the lazy_set is the most recent
-        // pending write to this descr, and overwriting it with the
-        // same value changes nothing. Keep this as a fast path; do
-        // NOT consult `_getfield` here (that belongs after force).
-        {
-            let cf = self.field_cache(descr);
-            if let Some((lazy_obj, lazy_op)) = &cf.lazy_set {
-                if *lazy_obj == obj && lazy_op.arg(1) == new_value {
-                    return OptimizationResult::Remove;
-                }
-            }
-        }
+        // a stale pending setfield behind it.  The same-obj/same-value
+        // no-op case naturally falls out of step (2): possible_aliasing
+        // is false (same obj), so the lazy_set stays; `_getfield` then
+        // sees the cached value and returns early.
 
         // heap.py:81-83: possible_aliasing → force_lazy_set.
         // RPython: possible_aliasing checks only whether lazy_set targets

@@ -4628,19 +4628,20 @@ impl<'a> RegAlloc<'a> {
         // x86/regalloc.py:1177
         let tp = op.opcode.result_type();
         let result_loc = Loc::Reg(self.force_allocate_reg(op.pos, tp, &[], None, false));
-        // x86/regalloc.py:1178-1183: scale_box/offset_box/size_box are ConstInt
+        // x86/regalloc.py:1178-1186 — scale/offset/size are ConstInt boxes.
+        // `op.getarg(3)` / `op.getarg(4)` raise IndexError if missing in
+        // RPython; `gc/rewrite.rs::emit_gc_load_indexed` lowers every
+        // GC_LOAD_INDEXED with all 5 operands, so the arity check is a
+        // contract assert here.
+        assert_eq!(
+            op.args.len(),
+            5,
+            "GC_LOAD_INDEXED must have 5 operands (ptr, idx, scale, offset, size)"
+        );
         let scale = self.const_value(op.args[2]);
-        let offset = if op.args.len() > 3 {
-            self.const_value(op.args[3])
-        } else {
-            0
-        };
+        let offset = self.const_value(op.args[3]);
         // x86/regalloc.py:1186 `nsize = size_box.value  # negative for "signed"`
-        let nsize = if op.args.len() > 4 {
-            self.const_value(op.args[4])
-        } else {
-            8
-        };
+        let nsize = self.const_value(op.args[4]);
         // x86/regalloc.py:1187 `size_loc = imm(abs(nsize))`
         let size_loc = Loc::Immed(ImmedLoc::new(nsize.unsigned_abs() as i64));
         // x86/regalloc.py:1188-1191 sign_loc = imm1 if nsize < 0 else imm0
