@@ -826,12 +826,12 @@ pub enum OpKind {
     /// fields to avoid re-splitting on every consumer.
     JitMergePoint {
         jitdriver_index: usize,
-        greens_i: Vec<ValueId>,
-        greens_r: Vec<ValueId>,
-        greens_f: Vec<ValueId>,
-        reds_i: Vec<ValueId>,
-        reds_r: Vec<ValueId>,
-        reds_f: Vec<ValueId>,
+        greens_i: Vec<crate::flowspace::model::Variable>,
+        greens_r: Vec<crate::flowspace::model::Variable>,
+        greens_f: Vec<crate::flowspace::model::Variable>,
+        reds_i: Vec<crate::flowspace::model::Variable>,
+        reds_r: Vec<crate::flowspace::model::Variable>,
+        reds_f: Vec<crate::flowspace::model::Variable>,
     },
 
     /// JitDriver loop-header marker — RPython `loop_header` opname.

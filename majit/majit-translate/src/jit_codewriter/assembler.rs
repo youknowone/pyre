@@ -1819,12 +1819,27 @@ impl Assembler {
                     state.code.push(jdindex_byte);
                     'i'
                 };
-                self.emit_list_of_kind(greens_i, RegKind::Int, regallocs, state);
-                self.emit_list_of_kind(greens_r, RegKind::Ref, regallocs, state);
-                self.emit_list_of_kind(greens_f, RegKind::Float, regallocs, state);
-                self.emit_list_of_kind(reds_i, RegKind::Int, regallocs, state);
-                self.emit_list_of_kind(reds_r, RegKind::Ref, regallocs, state);
-                self.emit_list_of_kind(reds_f, RegKind::Float, regallocs, state);
+                let g = graph.expect("encode_op for JitMergePoint requires a graph");
+                let project = |args: &[crate::flowspace::model::Variable]| -> Vec<ValueId> {
+                    args.iter()
+                        .map(|v| {
+                            g.value_id_of(v)
+                                .expect("JitMergePoint arg must be a known Variable on graph")
+                        })
+                        .collect()
+                };
+                let greens_i_vids = project(greens_i);
+                let greens_r_vids = project(greens_r);
+                let greens_f_vids = project(greens_f);
+                let reds_i_vids = project(reds_i);
+                let reds_r_vids = project(reds_r);
+                let reds_f_vids = project(reds_f);
+                self.emit_list_of_kind(&greens_i_vids, RegKind::Int, regallocs, state);
+                self.emit_list_of_kind(&greens_r_vids, RegKind::Ref, regallocs, state);
+                self.emit_list_of_kind(&greens_f_vids, RegKind::Float, regallocs, state);
+                self.emit_list_of_kind(&reds_i_vids, RegKind::Int, regallocs, state);
+                self.emit_list_of_kind(&reds_r_vids, RegKind::Ref, regallocs, state);
+                self.emit_list_of_kind(&reds_f_vids, RegKind::Float, regallocs, state);
                 argcodes.push(jdindex_argcode);
                 argcodes.push('I');
                 argcodes.push('R');

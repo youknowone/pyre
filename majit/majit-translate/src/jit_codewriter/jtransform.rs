@@ -3083,9 +3083,15 @@ impl<'a> Transformer<'a> {
                     split_args_by_kind(greens_raw, self.type_state);
                 let (reds_i, reds_r, reds_f) =
                     split_args_by_kind(&user_args[num_greens..], self.type_state);
+                let to_var = |v: ValueId| graph.must_variable(v);
                 // jtransform.py:1712 final shape is `ops + [op3, op1, op2]`.
                 ops.extend(self.handle_jit_marker__jit_merge_point(
-                    greens_i, greens_r, greens_f, reds_i, reds_r, reds_f,
+                    greens_i.into_iter().map(to_var).collect(),
+                    greens_r.into_iter().map(to_var).collect(),
+                    greens_f.into_iter().map(to_var).collect(),
+                    reds_i.into_iter().map(to_var).collect(),
+                    reds_r.into_iter().map(to_var).collect(),
+                    reds_f.into_iter().map(to_var).collect(),
                 ));
                 Some(ops)
             }
@@ -3109,12 +3115,12 @@ impl<'a> Transformer<'a> {
     /// the marker unchanged.
     fn handle_jit_marker__jit_merge_point(
         &mut self,
-        greens_i: Vec<ValueId>,
-        greens_r: Vec<ValueId>,
-        greens_f: Vec<ValueId>,
-        reds_i: Vec<ValueId>,
-        reds_r: Vec<ValueId>,
-        reds_f: Vec<ValueId>,
+        greens_i: Vec<crate::flowspace::model::Variable>,
+        greens_r: Vec<crate::flowspace::model::Variable>,
+        greens_f: Vec<crate::flowspace::model::Variable>,
+        reds_i: Vec<crate::flowspace::model::Variable>,
+        reds_r: Vec<crate::flowspace::model::Variable>,
+        reds_f: Vec<crate::flowspace::model::Variable>,
     ) -> Vec<SpaceOperation> {
         // jtransform.py:1691-1692 `assert self.portal_jd is not None`
         let jitdriver_index = self
@@ -3797,15 +3803,23 @@ fn remap_op(
             reds_i,
             reds_r,
             reds_f,
-        } => OpKind::JitMergePoint {
-            jitdriver_index: *jitdriver_index,
-            greens_i: remap_list(greens_i, aliases),
-            greens_r: remap_list(greens_r, aliases),
-            greens_f: remap_list(greens_f, aliases),
-            reds_i: remap_list(reds_i, aliases),
-            reds_r: remap_list(reds_r, aliases),
-            reds_f: remap_list(reds_f, aliases),
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = graph
+                    .value_id_of(var)
+                    .expect("JitMergePoint arg must have a backing ValueId");
+                graph.must_variable(remap_value(vid, aliases))
+            };
+            OpKind::JitMergePoint {
+                jitdriver_index: *jitdriver_index,
+                greens_i: greens_i.iter().map(remap_var).collect(),
+                greens_r: greens_r.iter().map(remap_var).collect(),
+                greens_f: greens_f.iter().map(remap_var).collect(),
+                reds_i: reds_i.iter().map(remap_var).collect(),
+                reds_r: reds_r.iter().map(remap_var).collect(),
+                reds_f: reds_f.iter().map(remap_var).collect(),
+            }
+        }
         OpKind::IndirectCall {
             funcptr,
             args,
@@ -5925,14 +5939,19 @@ mod tests {
     fn handle_jit_marker_jit_merge_point_emits_live_merge_live_sequence() {
         // jtransform.py:1707-1712 — return shape is `ops + [op3, op1, op2]`
         // where op3=live_preamble, op1=jit_merge_point, op2=live_recursive.
+        use crate::flowspace::model::Variable;
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_portal_jd(Some(3));
+        let green_i = Variable::new();
+        let red_i_a = Variable::new();
+        let red_i_b = Variable::new();
+        let red_r = Variable::new();
         let ops = transformer.handle_jit_marker__jit_merge_point(
-            vec![ValueId(0)],
+            vec![green_i.clone()],
             vec![],
             vec![],
-            vec![ValueId(1), ValueId(2)],
-            vec![ValueId(3)],
+            vec![red_i_a.clone(), red_i_b.clone()],
+            vec![red_r.clone()],
             vec![],
         );
         assert_eq!(ops.len(), 3, "expect live + merge + live");
@@ -5946,9 +5965,9 @@ mod tests {
                 ..
             } => {
                 assert_eq!(*jitdriver_index, 3);
-                assert_eq!(greens_i, &vec![ValueId(0)]);
-                assert_eq!(reds_i, &vec![ValueId(1), ValueId(2)]);
-                assert_eq!(reds_r, &vec![ValueId(3)]);
+                assert_eq!(greens_i, &vec![green_i]);
+                assert_eq!(reds_i, &vec![red_i_a, red_i_b]);
+                assert_eq!(reds_r, &vec![red_r]);
             }
             other => panic!("expected OpKind::JitMergePoint, got {other:?}"),
         }
@@ -6163,10 +6182,13 @@ mod tests {
                 reds_f,
             } => {
                 assert_eq!(*jitdriver_index, 0);
-                assert_eq!(greens_i, &vec![g1, g2]);
+                let g1_var = graph.must_variable(g1);
+                let g2_var = graph.must_variable(g2);
+                let r1_var = graph.must_variable(r1);
+                assert_eq!(greens_i, &vec![g1_var, g2_var]);
                 assert!(greens_r.is_empty());
                 assert!(greens_f.is_empty());
-                assert_eq!(reds_i, &vec![r1]);
+                assert_eq!(reds_i, &vec![r1_var]);
                 assert!(reds_r.is_empty());
                 assert!(reds_f.is_empty());
             }
