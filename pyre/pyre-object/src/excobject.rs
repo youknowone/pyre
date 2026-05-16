@@ -248,10 +248,16 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
 /// `install_default_builtins`; consumed by `w_exception_new` so each
 /// builtin-raised exception's `ob_header.w_class` points at the
 /// specific class object (rather than the generic `EXCEPTION_TYPE`).
-/// PyPy's equivalent is the `space.w_TypeError`/`space.w_ValueError`/
-/// ... attributes on `ObjSpace` — every exception instance returns
-/// its class through `space.type(w_exc)` unconditionally
-/// (baseobjspace.py:1367 `exception_getclass`).
+/// PyPy's equivalent is the `space.w_TypeError` / `space.w_ValueError`
+/// / ... attributes on `ObjSpace`.
+///
+/// Stored as `thread_local!` because pyre's `W_TypeObject` identities
+/// are also per-thread (each cargo test thread re-runs
+/// `init_typeobjects` and gets its own `W_TypeObject` pointers via
+/// `TYPEOBJECT_CACHE`). A global `AtomicPtr` cache on
+/// `PyType.instantiate` would let one test thread's write race ahead
+/// of another's, causing `exception_match` on thread A to compare
+/// against thread B's W_TypeObject identity — they'd never match.
 const EXC_KIND_COUNT: usize = (ExcKind::SystemError as u8 as usize) + 1;
 
 thread_local! {
