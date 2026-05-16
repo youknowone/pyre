@@ -1389,19 +1389,25 @@ where
                 .target
                 .clone()
                 .expect("link target required for make_link");
-            // `flowcontext.py:42 SpamBlock.dead` mirror: pyre's walker
-            // marks orphan join-point blocks dead when the
-            // emitted_pc_starts skip fires.  Such blocks have no
-            // operations and no exits but still appear as link
-            // targets.  Emit `unreachable` instead of recursing so the
-            // SSARepr stays well-formed (the runtime never reaches the
-            // dead block — its entry pcN label is in a sibling alive
-            // block, and runtime gotos resolve via pcN).
-            if target.borrow().dead {
-                self.emitline(Insn::op("unreachable", Vec::new()));
-                self.emitline(Insn::Unreachable);
-                return;
-            }
+            // RPython parity (reviewer R6): dead blocks are removed
+            // from flow construction by `flowspace/flowcontext.py:455
+            // mergeblock` — the supersede step reroutes every
+            // incoming edge to the newblock via `block.recloseblock(
+            // Link(outputargs, newblock))`, so `make_link` never sees
+            // a dead target.  Pyre's walker mergeblock at
+            // codewriter.rs:1198 does the same reroute.  If a dead
+            // target reaches here, an upstream walker step skipped
+            // the reroute — fail loud so the broken site surfaces
+            // rather than being papered over by a synthetic
+            // `unreachable` emission RPython would never encode.
+            assert!(
+                !target.borrow().dead,
+                "make_link: target block is marked dead but its \
+                 incoming edges weren't rerouted to the supersede \
+                 newblock (flowcontext.py:455 `block.recloseblock(\
+                 Link(outputargs, newblock))`). The walker site that \
+                 produced this link skipped the recloseblock step."
+            );
             let target_is_final = target.borrow().exits.is_empty();
             let uses_last_exception = link_borrow.args.iter().any(|arg| {
                 arg.as_ref()
