@@ -7693,19 +7693,59 @@ impl CodeWriter {
             super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
         super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
 
-        // Phase 3 (b) Slice 2: env-gated diagnostic that compares the
-        // per-kind ceiling each allocator computes.  SSA-side
-        // `alloc_result.num_regs` is `max(coloring)+1` over the
-        // SSARepr's Register operands; graph-side
-        // `_graph_regallocs[kind].num_colors` is the same metric over
-        // the FlowGraph Variables.  If both allocators see the same
-        // interference shape and the same input-arg coloring (which
-        // `enforce_input_args_simulation` should equalise per
-        // `flatten.py:88-100`), the ceilings should match per kind.
-        // Per-graph divergence here is the concrete divergence that
-        // Slice 3 must reconcile before the production source-of-truth
-        // can flip.  Off-default so production stays silent.
+        // Phase 3 (b) Slice 2/3a: env-gated diagnostic that compares
+        // the per-kind ceiling each allocator computes plus the
+        // pre-color Variable set size each one sees.  Slice 3a's
+        // additional `ssa_var_count` / `graph_var_count` lets us
+        // discriminate the divergence root cause:
+        //
+        // - `var_count` MATCH but `num_regs` differs → same Variable
+        //   set, different interference structure → Plan B walker-
+        //   order territory.
+        // - `var_count` DIFFERS → different Variable sets → Sub-plan
+        //   B1 / Plan A record_graph_op coverage gap.
+        //
+        // `ssa_var_count` is the distinct `(Kind, idx)` set across
+        // every `Insn::Op` Register operand + result + nested
+        // `ListOfKind` content in the pre-rename SSARepr.
+        // `graph_var_count` is `_graph_regallocs[kind].coloring.len()`
+        // which `perform_graph_register_allocation` populates with one
+        // entry per pre-allocation graph Variable of that kind.
+        // Off-default so production stays silent.
         if std::env::var_os("PYRE_PHASE3_REGALLOC_DIVERGENCE").is_some() {
+            // Per-kind distinct (Kind, idx) slot index collection.
+            // Kind has exactly 3 variants — index by `Kind as usize`
+            // into a fixed-size `[Vec<u16>; 3]` rather than a HashMap
+            // ([[feedback-no-hashmap-ever]]).  Distinct count =
+            // `sort_unstable + dedup + len`.
+            let mut ssa_slots: [Vec<u16>; 3] = [Vec::new(), Vec::new(), Vec::new()];
+            fn collect_register(op: &super::flatten::Operand, acc: &mut [Vec<u16>; 3]) {
+                match op {
+                    super::flatten::Operand::Register(r) => {
+                        acc[r.kind as usize].push(r.index);
+                    }
+                    super::flatten::Operand::ListOfKind(list) => {
+                        for inner in list.iter() {
+                            collect_register(inner, acc);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            for insn in &ssarepr.insns {
+                if let super::flatten::Insn::Op { args, result, .. } = insn {
+                    for arg in args {
+                        collect_register(arg, &mut ssa_slots);
+                    }
+                    if let Some(r) = result {
+                        ssa_slots[r.kind as usize].push(r.index);
+                    }
+                }
+            }
+            for slots in ssa_slots.iter_mut() {
+                slots.sort_unstable();
+                slots.dedup();
+            }
             for &kind in &super::flatten::Kind::ALL {
                 let ssa = alloc_result.num_regs.get(&kind).copied().unwrap_or(0);
                 let graph = _graph_regallocs
@@ -7713,14 +7753,23 @@ impl CodeWriter {
                     .map(|r| r.num_colors)
                     .unwrap_or(0);
                 if ssa != graph {
+                    let ssa_var_count = ssa_slots[kind as usize].len();
+                    let graph_var_count = _graph_regallocs
+                        .get(&kind)
+                        .map(|r| r.coloring.len())
+                        .unwrap_or(0);
                     eprintln!(
                         "[phase3-regalloc-divergence] graph={:?} kind={:?} ssa_num_regs={} \
-                         graph_num_colors={} delta={:+}",
+                         graph_num_colors={} delta={:+} ssa_var_count={} graph_var_count={} \
+                         var_delta={:+}",
                         code.obj_name.as_str(),
                         kind,
                         ssa,
                         graph,
                         graph as i32 - ssa as i32,
+                        ssa_var_count,
+                        graph_var_count,
+                        graph_var_count as i32 - ssa_var_count as i32,
                     );
                 }
             }
