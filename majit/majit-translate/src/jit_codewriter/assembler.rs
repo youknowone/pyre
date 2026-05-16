@@ -248,68 +248,39 @@ impl Assembler {
     /// constant pools, and register counts.
     ///
     /// RPython assembler.py:34-54.
-    /// RPython: `Assembler.assemble(ssarepr, jitcode, num_regs)`.
     ///
     /// RPython codewriter.py:53-56:
     ///   ssarepr = flatten_graph(graph, regallocs)
     ///   compute_liveness(ssarepr)          ← step 3b
     ///   self.assembler.assemble(ssarepr)   ← step 4
-    /// **Test-only entrypoint — DO NOT use in production code.**
     ///
-    /// PyPy's `Assembler.assemble` always runs against a fully-typed
-    /// `ssarepr` (every Variable has `.concretetype`), so the strict
-    /// `getkind(v.concretetype)` lookup inside
-    /// [`Self::lookup_coloring`] is the only path RPython exercises.
-    /// Pyre production callers go through
-    /// [`Self::assemble_with_types`] /
-    /// [`Self::assemble_with_callcontrol_and_graph`] which engage
-    /// the same strict path.
-    ///
-    /// This no-types overload is a pyre-only divergence retained for
-    /// hand-built test fixtures whose graphs lack a
-    /// `TypeResolutionState` (e.g. `assembler::tests::*` and
-    /// `regalloc::tests::*` that exercise the wire format directly
-    /// from synthesized `SSARepr`s).  When called, lookup falls
-    /// back to a [`KINDS`]-ordered scan with a single-class
-    /// assertion — RPython has no equivalent fallback path.
-    #[doc(hidden)]
+    /// `graph` is mandatory because PyPy's `Assembler.assemble` always
+    /// runs against a fully-typed `ssarepr` (every Variable has
+    /// `.concretetype`).  [`Self::lookup_coloring`] reads the kind
+    /// source via `graph.concretetype(v)` exactly like RPython's
+    /// `flatten.py:382 getcolor` reads `getkind(v.concretetype)`, and
+    /// [`crate::liveness::compute_liveness`] needs the same projection
+    /// to bridge each `FlatOp::Op` operand to its `(kind, color)`.
     pub fn assemble(
-        &mut self,
-        ssarepr: &mut SSARepr,
-        regallocs: &HashMap<RegKind, RegAllocResult>,
-    ) -> JitCodeBody {
-        self.assemble_with_callcontrol_and_graph(ssarepr, regallocs, None, None)
-    }
-
-    /// `assemble`-with-graph entrypoint — the production path.
-    ///
-    /// Each `ValueId`'s backing `Variable.concretetype` is the kind
-    /// source: [`Self::lookup_coloring`] reads it via the snapshotted
-    /// slice on `current_concretetypes` (built from
-    /// [`crate::model::FunctionGraph::concretetype_snapshot`]) just
-    /// like RPython's `flatten.py:382 getcolor` reads
-    /// `getkind(v.concretetype)`.
-    pub fn assemble_with_graph(
         &mut self,
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
         graph: &crate::model::FunctionGraph,
     ) -> JitCodeBody {
-        self.assemble_with_callcontrol_and_graph(ssarepr, regallocs, None, Some(graph))
+        self.assemble_with_callcontrol_and_graph(ssarepr, regallocs, None, graph)
     }
 
-    /// **Test-only entrypoint — DO NOT use in production code.**
-    /// Production callers must use
-    /// [`Self::assemble_with_callcontrol_and_graph`].  See
-    /// [`Self::assemble`] for the rationale.
-    #[doc(hidden)]
+    /// `assemble` overload with an attached [`CallControl`] — the
+    /// production codewriter path threads the callcontrol so descriptor
+    /// emission can reach the rtyper-built `CallDescriptor` cache.
     pub fn assemble_with_callcontrol(
         &mut self,
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
         callcontrol: Option<&CallControl>,
+        graph: &crate::model::FunctionGraph,
     ) -> JitCodeBody {
-        self.assemble_with_callcontrol_and_graph(ssarepr, regallocs, callcontrol, None)
+        self.assemble_with_callcontrol_and_graph(ssarepr, regallocs, callcontrol, graph)
     }
 
     pub fn assemble_with_callcontrol_and_graph(
@@ -317,26 +288,20 @@ impl Assembler {
         ssarepr: &mut SSARepr,
         regallocs: &HashMap<RegKind, RegAllocResult>,
         callcontrol: Option<&CallControl>,
-        graph: Option<&crate::model::FunctionGraph>,
+        graph: &crate::model::FunctionGraph,
     ) -> JitCodeBody {
         // RPython codewriter.py:56: compute_liveness(ssarepr)
         // Must run BEFORE assembly so -live- markers carry the full
         // set of alive registers.  Phase 3 ports the alive set to
-        // [`crate::flatten::Register`]-based identity, so liveness now
+        // [`crate::flatten::Register`]-based identity, so liveness
         // also takes the regalloc result for the `ValueId → Register`
         // bridge on `FlatOp::Op` operands.
         //
-        // The graph is required to project each operand `ValueId` to
-        // its backing `Variable` (for `getkind(v.concretetype)` +
-        // `coloring[Variable]`); when callers (e.g. the legacy
-        // graph-less `assemble` / `assemble_with_callcontrol`
-        // entrypoints kept for test fixtures) supply no graph, skip
-        // the liveness pass entirely — the test fixtures do not
-        // observe `FlatOp::Live` payloads.  Production always reaches
-        // here through `assemble_with_graph`.
-        if let Some(g) = graph {
-            crate::liveness::compute_liveness(ssarepr, regallocs, g);
-        }
+        // PyPy parity: liveness ALWAYS runs after flatten — there is
+        // no graph-less path because every `ssarepr` arriving here is
+        // produced by `flatten_graph(graph, …)` upstream, so the kind
+        // source projection is always available.
+        crate::liveness::compute_liveness(ssarepr, regallocs, graph);
         self.current_graph_name = Some(ssarepr.name.clone());
         // Snapshot the per-value `concretetype` slice so
         // `lookup_coloring` can read it without keeping a graph
@@ -345,8 +310,8 @@ impl Assembler {
         // every Variable carries its kind by attribute, so the
         // assembler reads a per-Variable attribute identical to
         // pyre's per-`ValueId` slice index.
-        self.current_concretetypes = graph.map(|g| g.concretetype_snapshot());
-        self.current_value_variables = graph.map(|g| g.value_variables.clone());
+        self.current_concretetypes = Some(graph.concretetype_snapshot());
+        self.current_value_variables = Some(graph.value_variables.clone());
 
         // Pyre-only diagnostic: under `MAJIT_COVERAGE_AUDIT=1` enumerate
         // every ValueId referenced in `ssarepr.insns` that has no
@@ -396,7 +361,7 @@ impl Assembler {
             if debug_enabled {
                 self.current_flatop_debug = Some(format!("{op:?}"));
             }
-            self.write_insn(op, regallocs, &mut state, callcontrol, graph);
+            self.write_insn(op, regallocs, &mut state, callcontrol, Some(graph));
         }
         self.current_flatop_debug = None;
         ssarepr.insns_pos = Some(insns_pos);
@@ -4022,8 +3987,9 @@ mod tests {
         };
 
         let regallocs = empty_regallocs();
+        let graph = crate::model::FunctionGraph::new("test");
         let mut asm = Assembler::new();
-        let body = asm.assemble(&mut flat, &regallocs);
+        let body = asm.assemble(&mut flat, &regallocs, &graph);
 
         assert_eq!(flat.name, "test");
         assert_eq!(body.c_num_regs_i as usize, 0);
@@ -4046,8 +4012,9 @@ mod tests {
         };
 
         let regallocs = empty_regallocs();
+        let graph = crate::model::FunctionGraph::new("return_host_object");
         let mut asm = Assembler::new();
-        let body = asm.assemble(&mut flat, &regallocs);
+        let body = asm.assemble(&mut flat, &regallocs, &graph);
 
         assert_eq!(body.constants_r, vec![module.identity_id() as i64]);
         assert!(asm.insns.contains_key("ref_return/r"));
@@ -4107,7 +4074,7 @@ mod tests {
             insns_pos: None,
         };
         let mut asm = Assembler::new();
-        let body = asm.assemble(&mut flat, &regallocs);
+        let body = asm.assemble(&mut flat, &regallocs, &graph);
 
         // v0 dies when v1 is defined → they share a register → 1 int reg
         assert_eq!(body.c_num_regs_i as usize, 1);
@@ -4173,7 +4140,7 @@ mod tests {
         // contract requires the same authoritative table that
         // `perform_all_register_allocations` consumed.
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_graph(&mut flat, &regallocs, &rewritten);
+        let _ = asm.assemble(&mut flat, &regallocs, &rewritten);
 
         let key_count = asm
             .insns
@@ -4300,7 +4267,7 @@ mod tests {
         let mut flat = flatten_graph(&rewritten, &regallocs);
 
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_graph(&mut flat, &regallocs, &rewritten);
+        let _ = asm.assemble(&mut flat, &regallocs, &rewritten);
 
         assert!(
             asm.insns.contains_key("setfield_gc_i/rid"),
@@ -4422,7 +4389,7 @@ mod tests {
         let mut flat = flatten_graph(&rewritten, &regallocs);
 
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_graph(&mut flat, &regallocs, &rewritten);
+        let _ = asm.assemble(&mut flat, &regallocs, &rewritten);
 
         assert!(
             asm.insns.contains_key("getfield_gc_i/rd>i"),
@@ -4522,7 +4489,7 @@ mod tests {
         );
 
         let mut asm = Assembler::new();
-        let _ = asm.assemble_with_graph(&mut flat, &regallocs, &graph);
+        let _ = asm.assemble(&mut flat, &regallocs, &graph);
 
         assert!(
             !asm.insns.keys().any(|key| key.starts_with("input_")),
@@ -4550,9 +4517,10 @@ mod tests {
         // Empty regallocs — the test panics before any coloring lookup
         // runs (the assembler rejects OpKind::Input outright).
         let regallocs = HashMap::new();
+        let graph = crate::model::FunctionGraph::new("bad_input");
 
         let mut asm = Assembler::new();
-        let _ = asm.assemble(&mut flat, &regallocs);
+        let _ = asm.assemble(&mut flat, &regallocs, &graph);
     }
 
     /// `rpython/jit/codewriter/jtransform.py:611` —

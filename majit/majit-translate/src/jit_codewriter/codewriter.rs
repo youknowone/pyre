@@ -428,7 +428,7 @@ impl CodeWriter {
             &mut ssarepr,
             &regallocs,
             Some(callcontrol),
-            Some(&rewritten.graph),
+            &rewritten.graph,
         );
 
         // call.py:174-187 get_jitcode_calldescr:
