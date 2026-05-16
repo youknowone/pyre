@@ -42,13 +42,13 @@ fn kind_short_name(kind: RegKind) -> &'static str {
 }
 
 /// `flatten.py:382-391 getcolor` returns either a [`Register`] (printed
-/// as `%i<n>`/`%r<n>`/`%f<n>`) or a [`ConstValue`] (printed as
-/// `$<value>`).  This helper renders the union form for `int_copy`
-/// source operands and `int_return` arguments.
+/// as `%i<n>`/`%r<n>`/`%f<n>`) or a [`crate::flowspace::model::Constant`]
+/// (printed as `$<value>`).  This helper renders the union form for
+/// `int_copy` source operands and `int_return` arguments.
 fn regorconst_repr(arg: &RegOrConst) -> String {
     match arg {
         RegOrConst::Reg(r) => r.repr(),
-        RegOrConst::Const(cv) => format!("${cv}"),
+        RegOrConst::Const(c) => format!("${}", c.value),
     }
 }
 

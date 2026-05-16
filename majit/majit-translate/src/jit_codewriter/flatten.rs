@@ -9,7 +9,7 @@
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-use crate::flowspace::model::ConstValue;
+use crate::flowspace::model::{ConstValue, Constant};
 use crate::model::{
     BlockId, ExitCase, ExitSwitch, FunctionGraph, Link, LinkArg, SpaceOperation, ValueId,
 };
@@ -60,7 +60,7 @@ impl Register {
     }
 }
 
-/// Either a [`Register`] or a [`ConstValue`] — the union returned by
+/// Either a [`Register`] or a [`Constant`] — the union returned by
 /// `flatten.py:382-391 getcolor` (Constants pass through unchanged;
 /// Variables resolve to a `Register(kind, color)`).
 ///
@@ -69,10 +69,17 @@ impl Register {
 /// `int_return src`, etc.  The dst slot of `Move` / `*_pop` /
 /// `last_exception` etc. is always a [`Register`], so those use
 /// `Register` directly.
+///
+/// `Const` carries the full [`Constant`] (not just its `ConstValue`)
+/// so the surrounding `concretetype` field — RPython
+/// `Constant.concretetype` (`flowspace/model.py:354-382`) — survives
+/// the lowering.  Consumers reading kind must call
+/// [`constant_kind`] so they pick up `getkind(c.concretetype)` ahead
+/// of any value-variant guess.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum RegOrConst {
     Reg(Register),
-    Const(ConstValue),
+    Const(Constant),
 }
 
 impl RegOrConst {
@@ -83,7 +90,7 @@ impl RegOrConst {
                 RegKind::Ref => 'r',
                 RegKind::Float => 'f',
             },
-            RegOrConst::Const(cv) => constvalue_kind(cv),
+            RegOrConst::Const(c) => constant_kind(c),
         }
     }
 }
@@ -557,7 +564,7 @@ impl<'a> GraphFlattener<'a> {
                     .expect("getoperand: link-arg Variable must be registered on graph");
                 RegOrConst::Reg(self.getcolor(vid))
             }
-            LinkArg::Const(cv) => RegOrConst::Const(cv.value.clone()),
+            LinkArg::Const(c) => RegOrConst::Const(c.clone()),
         }
     }
 
@@ -660,12 +667,10 @@ impl<'a> GraphFlattener<'a> {
         // `flatten.py:131-138`: read the kind from the return value's
         // `concretetype` (`getkind(v.concretetype)`), then emit the
         // matching `{kind}_return` with `getcolor(v)` as the operand.
-        // For Constant args RPython preserves the Constant verbatim;
-        // pyre's `RegOrConst::Const` mirrors that.  When the only
-        // available kind source is the fallback inputarg (Constant
-        // arg case), fall back to that just like upstream's
-        // `getkind(args[0].concretetype)` does.
-        let resolve_arg_kind = |this: &Self, arg: &LinkArg, fallback: Option<ValueId>| -> char {
+        // For [`LinkArg::Const`] [`constant_kind`] runs
+        // `getkind(c.concretetype)` per upstream parity; for
+        // [`LinkArg::Value`] the regalloc class supplies the kind.
+        let resolve_arg_kind = |this: &Self, arg: &LinkArg| -> char {
             match arg {
                 LinkArg::Value(var) => this
                     .graph
@@ -677,29 +682,12 @@ impl<'a> GraphFlattener<'a> {
                         RegKind::Float => 'f',
                     })
                     .unwrap_or('v'),
-                LinkArg::Const(_) => fallback
-                    .and_then(|value| this.kind_color_of(value))
-                    .map(|(k, _)| match k {
-                        RegKind::Int => 'i',
-                        RegKind::Ref => 'r',
-                        RegKind::Float => 'f',
-                    })
-                    .unwrap_or_else(|| {
-                        panic!("make_return: missing target inputarg kind for Constant")
-                    }),
+                LinkArg::Const(c) => constant_kind(c),
             }
         };
         match args.len() {
             1 => {
-                let kind = resolve_arg_kind(
-                    self,
-                    &args[0],
-                    self.graph
-                        .block(self.graph.returnblock)
-                        .inputarg_value_ids(self.graph)
-                        .first()
-                        .copied(),
-                );
+                let kind = resolve_arg_kind(self, &args[0]);
                 match kind {
                     'v' => self.emitline(FlatOp::VoidReturn),
                     'i' => {
@@ -721,15 +709,7 @@ impl<'a> GraphFlattener<'a> {
                 self.emitline(FlatOp::Live {
                     live_values: Vec::new(),
                 });
-                let _ = resolve_arg_kind(
-                    self,
-                    &args[1],
-                    self.graph
-                        .block(self.graph.exceptblock)
-                        .inputarg_value_ids(self.graph)
-                        .get(1)
-                        .copied(),
-                );
+                let _ = resolve_arg_kind(self, &args[1]);
                 let operand = self.return_operand(&args[1], RegKind::Ref);
                 self.emitline(FlatOp::Raise(operand));
             }
@@ -760,7 +740,7 @@ impl<'a> GraphFlattener<'a> {
                     .expect("return_operand: link-arg Variable must be registered on graph");
                 RegOrConst::Reg(self.getcolor(vid))
             }
-            LinkArg::Const(cv) => RegOrConst::Const(cv.value.clone()),
+            LinkArg::Const(c) => RegOrConst::Const(c.clone()),
         }
     }
 
@@ -862,7 +842,7 @@ impl<'a> GraphFlattener<'a> {
                         None => continue,
                     }
                 }
-                LinkArg::Const(cv) => RegOrConst::Const(cv.value.clone()),
+                LinkArg::Const(c) => RegOrConst::Const(c.clone()),
             };
             // `flatten.py:314 if v == w: continue` — color-level
             // identity skip (post-regalloc Register equality).
@@ -1436,8 +1416,27 @@ pub(crate) fn linkarg_kind(
             Some(v) => value_kind(v, graph, regallocs),
             None => 'v',
         },
-        LinkArg::Const(cv) => constvalue_kind(&cv.value),
+        LinkArg::Const(c) => constant_kind(c),
     }
+}
+
+/// RPython parity for [`Constant`] kind reads — `assembler.py:168` /
+/// `flatten.py:133` use `getkind(c.concretetype)` whenever the surrounding
+/// op needs a kind letter.  When `concretetype` is set we route through
+/// [`crate::model::getkind`]; otherwise fall back to [`constvalue_kind`]
+/// for the pre-rtyper synthesis path that still mints bare
+/// [`ConstValue`]s (e.g. trace-recorder shims).
+pub(crate) fn constant_kind(c: &Constant) -> char {
+    if let Some(ty) = c.concretetype.as_ref() {
+        return match crate::model::getkind(ty) {
+            crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
+            crate::jit_codewriter::type_state::ConcreteType::GcRef => 'r',
+            crate::jit_codewriter::type_state::ConcreteType::Float => 'f',
+            crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
+            crate::jit_codewriter::type_state::ConcreteType::Unknown => constvalue_kind(&c.value),
+        };
+    }
+    constvalue_kind(&c.value)
 }
 
 /// RPython `rpython/rtyper/lltypesystem/lltype.py` + `rpython/jit/codewriter/support.py`
@@ -1470,11 +1469,19 @@ pub(crate) fn constvalue_kind(cv: &ConstValue) -> char {
     }
 }
 
-fn overflow_error_instance() -> ConstValue {
-    ConstValue::HostObject(
-        crate::flowspace::model::HOST_ENV
-            .lookup_standard_exception_instance("OverflowError")
-            .expect("HOST_ENV missing standard OverflowError instance"),
+fn overflow_error_instance() -> Constant {
+    // RPython `flatten.py:166-173 make_exception_link` builds the
+    // overflow reraise Constant with the upstream GcStruct pointer
+    // type (`rclass.OBJECTPTR`) so downstream consumers reading
+    // `getkind(c.concretetype)` see `'ref'`.  Pyre stamps the same
+    // canonical lltype on the Constant here.
+    Constant::with_concretetype(
+        ConstValue::HostObject(
+            crate::flowspace::model::HOST_ENV
+                .lookup_standard_exception_instance("OverflowError")
+                .expect("HOST_ENV missing standard OverflowError instance"),
+        ),
+        crate::translator::rtyper::rclass::OBJECTPTR.clone(),
     )
 }
 
@@ -1585,7 +1592,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flowspace::model::ConstValue;
+    use crate::flowspace::model::{ConstValue, Constant};
     use crate::model::{ExitCase, FunctionGraph, OpKind, SpaceOperation, exception_exitcase};
 
     /// Test helper — build a `regallocs` map that assigns each
@@ -2154,7 +2161,7 @@ mod tests {
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
-                FlatOp::IntReturn(RegOrConst::Const(ConstValue::Int(42)))
+                FlatOp::IntReturn(RegOrConst::Const(c)) if matches!(c.value, ConstValue::Int(42))
             )),
             "final return should preserve Constant link args"
         );
@@ -2289,7 +2296,8 @@ mod tests {
         assert!(
             flat.insns.iter().any(|op| matches!(
                 op,
-                FlatOp::Raise(RegOrConst::Const(ConstValue::HostObject(obj))) if *obj == standard_overflow
+                FlatOp::Raise(RegOrConst::Const(c))
+                    if matches!(&c.value, ConstValue::HostObject(obj) if *obj == standard_overflow)
             )),
             "overflow direct reraises should emit raise Constant(OverflowError-instance)"
         );
@@ -2518,7 +2526,7 @@ mod tests {
             ops,
             vec![FlatOp::Move {
                 dst: int_reg(1),
-                src: RegOrConst::Const(ConstValue::Int(7)),
+                src: RegOrConst::Const(Constant::new(ConstValue::Int(7))),
             }]
         );
     }
@@ -2862,5 +2870,35 @@ mod tests {
             text.contains("reraise") || text.contains("raise"),
             "exception chain must terminate via reraise/raise: {text}",
         );
+    }
+
+    /// `assembler.py:168` parity — a [`Constant`] whose `concretetype` is
+    /// `Signed` must report kind `'i'` even when its value-variant would
+    /// otherwise pick `'r'` (and vice versa).  This is the divergence
+    /// fence for the `LowLevelType`-typed Constants the rtyper produces
+    /// for promoted fnaddrs / OBJECTPTR vtable slots.
+    #[test]
+    fn parity_constant_kind_prefers_concretetype_over_value_variant() {
+        use crate::translator::rtyper::lltypesystem::lltype::LowLevelType;
+        // value-variant says `'r'` (HostObject), concretetype says `'i'`
+        // (Signed) — getkind wins.
+        let signed_host = Constant::with_concretetype(
+            ConstValue::HostObject(
+                crate::flowspace::model::HOST_ENV
+                    .lookup_standard_exception_instance("OverflowError")
+                    .unwrap(),
+            ),
+            LowLevelType::Signed,
+        );
+        assert_eq!(constant_kind(&signed_host), 'i');
+        // value-variant says `'i'` (Int), concretetype says `'r'` (Ptr).
+        let ref_int = Constant::with_concretetype(
+            ConstValue::Int(0),
+            crate::translator::rtyper::rclass::OBJECTPTR.clone(),
+        );
+        assert_eq!(constant_kind(&ref_int), 'r');
+        // No concretetype → fall back to value variant.
+        let bare = Constant::new(ConstValue::Int(7));
+        assert_eq!(constant_kind(&bare), 'i');
     }
 }

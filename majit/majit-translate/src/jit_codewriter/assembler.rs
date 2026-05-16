@@ -889,9 +889,13 @@ impl Assembler {
                     .expect("encode_link_arg_source: link arg Variable must be registered on the graph snapshot");
                 self.lookup_reg_with_kind(vid, regallocs)
             }
-            LinkArg::Const(cv) => {
-                let kind = crate::flatten::constvalue_kind(&cv.value);
-                let byte = self.emit_const(&cv.value, kind, state);
+            LinkArg::Const(c) => {
+                // RPython `assembler.py:168` `kind = getkind(x.concretetype)`
+                // — read the kind off the [`Constant`]'s concretetype
+                // (when set) ahead of the value-variant heuristic so the
+                // constant pool selection matches upstream.
+                let kind = crate::flatten::constant_kind(c);
+                let byte = self.emit_const(&c.value, kind, state);
                 (byte, kind)
             }
         }
@@ -934,8 +938,28 @@ impl Assembler {
                 );
                 r.index as u8
             }
-            crate::flatten::RegOrConst::Const(cv) => {
-                self.emit_const(cv, kind_char_of(expected_kind), state)
+            crate::flatten::RegOrConst::Const(c) => {
+                // RPython `assembler.py:168` reads `getkind(x.concretetype)`
+                // for the Constant operand.  When the Constant carries
+                // a `concretetype` it MUST agree with the surrounding op's
+                // `expected_kind` (the byte-stream argcode is keyed on
+                // that kind, same constraint as the Register branch
+                // above).  When concretetype is absent fall back to the
+                // op's expected kind — that mirrors upstream's behavior
+                // for synthesized constants whose kind only the caller
+                // knows.
+                let const_kind = crate::flatten::constant_kind(c);
+                let kind_char = kind_char_of(expected_kind);
+                if c.concretetype.is_some() {
+                    assert_eq!(
+                        const_kind, kind_char,
+                        "encode_regorconst_source: Constant.concretetype kind {const_kind:?} \
+                         does not match variant-expected kind {kind_char:?} (PyPy \
+                         `assembler.py:168` requires `getkind(x.concretetype)` to coincide \
+                         with the surrounding op's kind)",
+                    );
+                }
+                self.emit_const(&c.value, kind_char, state)
             }
         }
     }
@@ -4004,7 +4028,7 @@ mod tests {
         let mut flat = SSARepr {
             name: "return_host_object".into(),
             insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
-                ConstValue::HostObject(module.clone()),
+                crate::flowspace::model::Constant::new(ConstValue::HostObject(module.clone())),
             ))],
             num_values: 0,
             num_blocks: 1,

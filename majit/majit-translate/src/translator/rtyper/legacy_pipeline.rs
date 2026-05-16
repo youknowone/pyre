@@ -305,7 +305,7 @@ mod tests {
         let flattened = SSARepr {
             name: "consts".into(),
             insns: vec![FlatOp::RefReturn(crate::flatten::RegOrConst::Const(
-                ConstValue::byte_str("hello"),
+                crate::flowspace::model::Constant::new(ConstValue::byte_str("hello")),
             ))],
             num_values: 0,
             num_blocks: 1,
