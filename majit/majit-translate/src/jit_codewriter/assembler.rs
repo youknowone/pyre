@@ -1561,10 +1561,17 @@ impl Assembler {
                 value,
                 ..
             } => {
-                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                let g = graph.expect("encode_op for VableFieldWrite requires a graph");
+                let base_vid = g
+                    .value_id_of(base)
+                    .expect("VableFieldWrite.base must be a known Variable on graph");
+                let value_vid = g
+                    .value_id_of(value)
+                    .expect("VableFieldWrite.value must be a known Variable on graph");
+                let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, value_kind) = self.lookup_reg_with_kind(*value, regallocs);
+                let (reg, value_kind) = self.lookup_reg_with_kind(value_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(value_kind);
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::VableField {

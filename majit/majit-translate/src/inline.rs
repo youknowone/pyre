@@ -558,12 +558,20 @@ fn remap_op_kind(
             field_index,
             value,
             ty,
-        } => OpKind::VableFieldWrite {
-            base: remap(base),
-            field_index: *field_index,
-            value: remap(value),
-            ty: ty.clone(),
-        },
+        } => {
+            let base_vid = source_graph
+                .value_id_of(base)
+                .expect("VableFieldWrite.base must have a backing ValueId in source");
+            let value_vid = source_graph
+                .value_id_of(value)
+                .expect("VableFieldWrite.value must have a backing ValueId in source");
+            OpKind::VableFieldWrite {
+                base: target_graph.must_variable(remap(&base_vid)),
+                field_index: *field_index,
+                value: target_graph.must_variable(remap(&value_vid)),
+                ty: ty.clone(),
+            }
+        }
         OpKind::VableArrayRead {
             base,
             array_index,
@@ -915,7 +923,16 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                 .value_id_of(base)
                 .expect("VableFieldRead.base must be a known Variable on graph"),
         ],
-        OpKind::VableFieldWrite { base, value, .. } => vec![*base, *value],
+        OpKind::VableFieldWrite { base, value, .. } => {
+            let g = graph
+                .expect("VableFieldWrite requires a graph to project Variable to ValueId");
+            vec![
+                g.value_id_of(base)
+                    .expect("VableFieldWrite.base must be a known Variable on graph"),
+                g.value_id_of(value)
+                    .expect("VableFieldWrite.value must be a known Variable on graph"),
+            ]
+        }
         OpKind::VableArrayRead {
             base, elem_index, ..
         } => vec![*base, *elem_index],

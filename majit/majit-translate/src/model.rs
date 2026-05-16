@@ -574,9 +574,9 @@ pub enum OpKind {
     /// Virtualizable field write → writes to boxes, no heap op.
     /// RPython: `setfield_vable_i/r/f`
     VableFieldWrite {
-        base: ValueId,
+        base: crate::flowspace::model::Variable,
         field_index: usize,
-        value: ValueId,
+        value: crate::flowspace::model::Variable,
         ty: ValueType,
     },
     /// Virtualizable array read → reads from boxes.

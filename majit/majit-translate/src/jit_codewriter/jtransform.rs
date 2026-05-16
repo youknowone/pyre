@@ -664,7 +664,7 @@ impl<'a> Transformer<'a> {
             OpKind::FieldWrite {
                 field, value, ty, ..
             } if self.config.lower_virtualizable => {
-                self.rewrite_op_setfield(op, field, *value, ty, graph_name)
+                self.rewrite_op_setfield(op, field, *value, ty, graph_name, graph)
             }
             // ── rewrite_op_getarrayitem ──
             OpKind::ArrayRead {
@@ -1973,6 +1973,7 @@ impl<'a> Transformer<'a> {
         value: ValueId,
         ty: &ValueType,
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         let typed_ty = self.get_value_type(value).unwrap_or_else(|| ty.clone());
         if let Some(vable_field) = self.config.vable_fields.iter().find(|c| c.matches(field)) {
@@ -1984,15 +1985,16 @@ impl<'a> Transformer<'a> {
                 ),
             });
             self.vable_rewrites += 1;
+            let base_vid = match &op.kind {
+                OpKind::FieldWrite { base, .. } => *base,
+                _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
+            };
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableFieldWrite {
-                    base: match &op.kind {
-                        OpKind::FieldWrite { base, .. } => *base,
-                        _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
-                    },
+                    base: graph.must_variable(base_vid),
                     field_index: vable_field.index,
-                    value,
+                    value: graph.must_variable(value),
                     ty: typed_ty,
                 },
             }]);
@@ -3848,12 +3850,20 @@ fn remap_op(
             field_index,
             value,
             ty,
-        } => OpKind::VableFieldWrite {
-            base: remap_value(*base, aliases),
-            field_index: *field_index,
-            value: remap_value(*value, aliases),
-            ty: ty.clone(),
-        },
+        } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("VableFieldWrite.base must have a backing ValueId");
+            let value_vid = graph
+                .value_id_of(value)
+                .expect("VableFieldWrite.value must have a backing ValueId");
+            OpKind::VableFieldWrite {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+                field_index: *field_index,
+                value: graph.must_variable(remap_value(value_vid, aliases)),
+                ty: ty.clone(),
+            }
+        }
         OpKind::VableArrayRead {
             base,
             array_index,
