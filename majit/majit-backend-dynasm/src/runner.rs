@@ -1298,25 +1298,28 @@ impl DynasmBackend {
         // `trace_id` is always a real allocated id (alloc_trace_id starts
         // at 1).  No `0 → root_trace_id` sentinel — that path was a
         // pyre-only deviation removed alongside `normalize_trace_id`.
-
-        if let Some(found) = compiled.fail_descrs.iter().find(|d| {
-            let fd = d
-                .as_fail_descr()
-                .expect("fail_descrs entry must be FailDescr");
-            fd.trace_id() == trace_id && fd.fail_index_per_trace() == fail_index
-        }) {
-            return Some(found.clone());
+        //
+        // `fail_descrs[i].fail_index_per_trace() == i` is enforced at
+        // codegen end (`x86/assembler.rs:1741` / `:1863`,
+        // `aarch64/assembler.rs:1403` / `:1532`); the per-Compiled trace
+        // identity is the `CompiledCode::trace_id` field rather than a
+        // per-descr `trace_id()` read.  Look up by position so the
+        // descr's internal per-emission state is not required — Session 7
+        // singleton FINISH descrs share an Arc across emissions and
+        // would otherwise answer `fail_index_per_trace()` / `trace_id()`
+        // with the trait default `0`.
+        if compiled.trace_id == trace_id {
+            if let Some(found) = compiled.fail_descrs.get(fail_index as usize) {
+                return Some(found.clone());
+            }
         }
         let blocks = token.asmmemmgr_blocks();
         for block in blocks.iter() {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
-                if let Some(found) = bridge.fail_descrs.iter().find(|d| {
-                    let fd = d
-                        .as_fail_descr()
-                        .expect("fail_descrs entry must be FailDescr");
-                    fd.trace_id() == trace_id && fd.fail_index_per_trace() == fail_index
-                }) {
-                    return Some(found.clone());
+                if bridge.trace_id == trace_id {
+                    if let Some(found) = bridge.fail_descrs.get(fail_index as usize) {
+                        return Some(found.clone());
+                    }
                 }
             }
         }
