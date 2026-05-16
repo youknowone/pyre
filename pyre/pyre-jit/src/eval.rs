@@ -2140,6 +2140,8 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     init_callbacks();
     #[cfg(feature = "cranelift")]
     majit_backend_cranelift::register_rebuild_state_after_failure(rebuild_state_after_failure);
+    #[cfg(feature = "cranelift")]
+    majit_backend_cranelift::register_resumedata_deopt(cranelift_resumedata_deopt);
     frame.fix_array_ptrs();
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
     let _frame_guard = pyre_interpreter::eval::install_current_frame(frame);
@@ -5598,6 +5600,36 @@ fn rebuild_state_after_failure(_outputs: &mut [i64], _types: &[majit_ir::Type]) 
     // getvirtual_ptr (resume.py:945) and _prepare_pendingfields (resume.py:993).
     // The Cranelift callback is a no-op; decode_and_restore_guard_failure
     // performs the real resume-data rebuild.
+}
+
+/// On-demand resume callback (Slice QQ-1, pyre-jit side).  Registered
+/// into cranelift via `register_resumedata_deopt` and called from the
+/// six `recovery_layout_ref()` consumer sites once they migrate off
+/// the pre-baked `ExitRecoveryLayout` cache.
+///
+/// PyPy parity target: `pyjitpl.py:3424
+/// MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)`
+/// drives `resume.rebuild_from_resumedata` to materialise virtuals +
+/// replay pending fields from `rd_numb` / `rd_consts` / `rd_virtuals` /
+/// `rd_pendingfields` carried on the `ResumeGuardDescr`.  Pyre wraps
+/// this in a callback because the cranelift backend cannot depend on
+/// `pyre-object` / `pyre-jit-trace` (the frontend types needed for
+/// `PyreBlackholeAllocator`).
+///
+/// IMPLEMENTATION DEFERRED (Slice QQ-2+): construct
+/// `ResumeDataDirectReader` from `descr.payload.rd_*`, drive
+/// `consume_one_section` loop, extract per-frame register banks into
+/// `outputs` (innermost-first concatenation matching the existing
+/// `rebuild_state_after_failure(recovery)` walker).  Until then this
+/// remains a no-op; cranelift consumers continue dispatching through
+/// the recovery_layout path.
+fn cranelift_resumedata_deopt(
+    _descr_addr: usize,
+    _outputs: &mut Vec<i64>,
+    _types: &[majit_ir::Type],
+    _bridge_num_inputs: usize,
+) {
+    // No-op until QQ-2 wires the on-demand decoder.
 }
 
 /// virtual's slot to NONE and appends field values (ob_type, intval).

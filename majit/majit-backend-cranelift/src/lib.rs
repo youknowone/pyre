@@ -13,7 +13,8 @@ pub use compiler::{
     jit_exc_value_raw, register_call_assembler_blackhole, register_call_assembler_bridge,
     register_call_assembler_force, register_call_assembler_unbox_int, register_jitframe_layout,
     register_materialize_str_call, register_materialize_str_plain, register_prologue_probe_addr,
-    register_rebuild_state_after_failure, register_stack_check_addresses, set_gil_hooks,
+    register_rebuild_state_after_failure, register_resumedata_deopt,
+    register_stack_check_addresses, set_gil_hooks,
     set_jitframe_gc_type_id, set_savedata_ref_on_deadframe, take_pending_force_local0,
     take_pending_frame_restore,
 };
