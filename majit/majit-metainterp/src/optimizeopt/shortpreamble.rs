@@ -1139,7 +1139,7 @@ pub(crate) fn classify_short_arg(
     short_args: &[OpRef],
     produced_results: &HashMap<OpRef, OpRef>,
     imported_constants: &mut HashMap<OpRef, OpRef>,
-    short_box_const_values: &HashMap<OpRef, majit_ir::Value>,
+    short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
 ) -> Option<crate::optimizeopt::ImportedShortPureArg> {
     if let Some(slot) = short_inputargs.iter().position(|&i| i == arg) {
         return short_args
@@ -1200,7 +1200,7 @@ impl ProducedShortOp {
         result_map: &HashMap<OpRef, OpRef>,
         produced_results: &mut HashMap<OpRef, OpRef>,
         imported_constants: &mut HashMap<OpRef, OpRef>,
-        short_box_const_values: &HashMap<OpRef, majit_ir::Value>,
+        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let result = match self.kind {
             PreambleOpKind::Pure => self.produce_pure(
@@ -1271,7 +1271,7 @@ impl ProducedShortOp {
         result_map: &HashMap<OpRef, OpRef>,
         produced_results: &mut HashMap<OpRef, OpRef>,
         imported_constants: &mut HashMap<OpRef, OpRef>,
-        short_box_const_values: &HashMap<OpRef, majit_ir::Value>,
+        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         // Result OpRef was fixed before ShortPreambleBuilder construction,
@@ -1376,7 +1376,7 @@ impl ProducedShortOp {
         result_map: &HashMap<OpRef, OpRef>,
         produced_results: &HashMap<OpRef, OpRef>,
         imported_constants: &mut HashMap<OpRef, OpRef>,
-        short_box_const_values: &HashMap<OpRef, majit_ir::Value>,
+        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         let result_type = self.preamble_op.result_type();
@@ -1468,7 +1468,7 @@ impl ProducedShortOp {
         result_map: &HashMap<OpRef, OpRef>,
         produced_results: &HashMap<OpRef, OpRef>,
         imported_constants: &mut HashMap<OpRef, OpRef>,
-        short_box_const_values: &HashMap<OpRef, majit_ir::Value>,
+        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         let result_type = self.preamble_op.result_type();
@@ -1575,7 +1575,7 @@ impl ProducedShortOp {
         result_map: &HashMap<OpRef, OpRef>,
         produced_results: &HashMap<OpRef, OpRef>,
         imported_constants: &mut HashMap<OpRef, OpRef>,
-        short_box_const_values: &HashMap<OpRef, majit_ir::Value>,
+        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     ) -> Option<OpRef> {
         let source = self.preamble_op.pos.get();
         let result_type = self.preamble_op.result_type();

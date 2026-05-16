@@ -497,7 +497,7 @@ impl UnrollOptimizer {
                         exported_infos: std::collections::HashMap::new(),
                         exported_short_boxes: Vec::new(),
                         short_boxes: Vec::new(),
-                        short_box_const_values: std::collections::HashMap::new(),
+                        short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
                         short_preamble: None,
                         renamed_inputargs: state.renamed_inputargs.clone(),
                         renamed_inputarg_types: state.renamed_inputarg_types.clone(),
@@ -1651,7 +1651,7 @@ pub struct ExportedState {
     /// already does this at `optimizer.rs:1927`; bridges and unit tests
     /// remain the open cases). At that point `classify_short_arg` can
     /// read from `ctx.get_constant(arg)` exclusively.
-    pub short_box_const_values: HashMap<OpRef, majit_ir::Value>,
+    pub short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
     /// Short preamble builder for bridge entry.
     pub short_preamble: Option<crate::optimizeopt::shortpreamble::ShortPreamble>,
     /// Renamed inputargs from the preamble.
@@ -1761,7 +1761,7 @@ impl ExportedState {
             exported_infos,
             exported_short_boxes,
             short_boxes,
-            short_box_const_values: HashMap::new(),
+            short_box_const_values: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             short_preamble: None,
             renamed_inputargs,
             renamed_inputarg_types,

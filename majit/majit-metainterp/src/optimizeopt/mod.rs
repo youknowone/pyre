@@ -2309,7 +2309,7 @@ impl OptContext {
         short_args: &[OpRef],
         short_inputargs: &[OpRef],
         short_boxes: &[(OpRef, crate::optimizeopt::shortpreamble::ProducedShortOp)],
-        short_box_const_values: &HashMap<OpRef, majit_ir::Value>,
+        short_box_const_values: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::Value>,
         result_map: &HashMap<OpRef, OpRef>,
         mut imported_constants: &mut HashMap<OpRef, OpRef>,
         exported_infos: &HashMap<OpRef, crate::optimizeopt::info::OpInfo>,
