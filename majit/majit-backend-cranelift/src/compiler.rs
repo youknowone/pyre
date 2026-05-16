@@ -5733,12 +5733,22 @@ fn find_fail_descr_in_fail_descrs(
     trace_id: u64,
     fail_index: u32,
 ) -> Option<Arc<CraneliftFailDescr>> {
-    for descr in fail_descrs {
-        if descr.trace_id() == trace_id
-            && FailDescr::fail_index_per_trace(descr.as_ref()) == fail_index
-        {
+    // Position is the canonical fail_index identity for a trace, matching
+    // PyPy's `assembler.py:227 self.faildescr.index = i` (Python has no
+    // per-emission `fail_index` on the descr itself).  Codegen increments
+    // the `fail_index` counter in lockstep with `fail_descrs.len()` at
+    // compiler.rs:12367 (`let fail_index = fail_descrs.len() as u32`), so
+    // every descr at position `i` has either `fail_index_per_trace == i`
+    // (production guard / external-JUMP) or the trait-default `0`
+    // (singleton FINISH descrs introduced by 7-Tβ3).  Use position
+    // directly so this function does not depend on the descr-internal
+    // accessor.
+    if let Some(descr) = fail_descrs.get(fail_index as usize) {
+        if descr.trace_id() == trace_id {
             return Some(descr.clone());
         }
+    }
+    for descr in fail_descrs {
         let bridge_guard = descr.bridge_ref();
         if let Some(bridge) = bridge_guard.as_ref() {
             if let Some(found) =
@@ -6152,13 +6162,15 @@ fn patch_fail_descr_recovery_layout(
     fail_index: u32,
     recovery_layout: &ExitRecoveryLayout,
 ) -> bool {
-    for descr in fail_descrs {
-        if descr.trace_id() == trace_id
-            && FailDescr::fail_index_per_trace(descr.as_ref()) == fail_index
-        {
+    // Position-based lookup — see `find_fail_descr_in_fail_descrs` above
+    // for the invariant rationale.
+    if let Some(descr) = fail_descrs.get(fail_index as usize) {
+        if descr.trace_id() == trace_id {
             descr.set_recovery_layout(recovery_layout.clone());
             return true;
         }
+    }
+    for descr in fail_descrs {
         let bridge_guard = descr.bridge_ref();
         if let Some(bridge) = bridge_guard.as_ref() {
             if patch_fail_descr_recovery_layout(
