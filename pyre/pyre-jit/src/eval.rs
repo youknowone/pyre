@@ -6069,11 +6069,11 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         bh_write_lowlevel_char(string, index, char, 1);
     }
 
-    fn os_str_concat(&self, _funcptr: i64, str1: i64, str2: i64) -> i64 {
+    fn os_str_concat(&self, str1: i64, str2: i64) -> i64 {
         bh_concat_lowlevel_strings(str1, str2, 1)
     }
 
-    fn os_str_slice(&self, _funcptr: i64, str: i64, start: i64, stop: i64) -> i64 {
+    fn os_str_slice(&self, str: i64, start: i64, stop: i64) -> i64 {
         bh_slice_lowlevel_string(str, start, stop, 1)
     }
 
@@ -6085,11 +6085,11 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         bh_write_lowlevel_char(string, index, char, 4);
     }
 
-    fn os_uni_concat(&self, _funcptr: i64, str1: i64, str2: i64) -> i64 {
+    fn os_uni_concat(&self, str1: i64, str2: i64) -> i64 {
         bh_concat_lowlevel_strings(str1, str2, 4)
     }
 
-    fn os_uni_slice(&self, _funcptr: i64, str: i64, start: i64, stop: i64) -> i64 {
+    fn os_uni_slice(&self, str: i64, start: i64, stop: i64) -> i64 {
         bh_slice_lowlevel_string(str, start, stop, 4)
     }
 

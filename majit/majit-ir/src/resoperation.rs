@@ -518,10 +518,11 @@ pub enum RdVirtualInfo {
         fieldnums: Vec<i16>,
     },
     /// resume.py:781 `VStrConcatInfo` — virtual concatenation of two
-    /// strings. `fieldnums = [left, right]`.  `func` is the OS_STR_CONCAT
-    /// funcptr resolved at trace time via callinfocollection.
+    /// strings. `fieldnums = [left, right]`. The OS_STR_CONCAT funcptr
+    /// is resolved at materialization time via
+    /// `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT)`
+    /// (resume.py:1467-1468); the variant carries no funcptr itself.
     VStrConcatInfo {
-        func: i64,
         fieldnums: Vec<i16>,
     },
     /// resume.py:801 `VStrSliceInfo` — virtual slice of a larger string.
@@ -529,9 +530,9 @@ pub enum RdVirtualInfo {
     /// the backend reader converts to RPython's `(start, start + length)`
     /// before calling the OS_STR_SLICE funcptr — see
     /// `resume.py:1479` and `resume.rs::ResumeDataDirectReader::slice_string`).
-    /// `func` is OS_STR_SLICE.
+    /// OS_STR_SLICE funcptr is resolved via callinfocollection at
+    /// materialization time.
     VStrSliceInfo {
-        func: i64,
         fieldnums: Vec<i16>,
     },
     /// resume.py:817 `VUniPlainInfo` — unicode counterpart of VStrPlain.
@@ -539,17 +540,17 @@ pub enum RdVirtualInfo {
         fieldnums: Vec<i16>,
     },
     /// resume.py:836 `VUniConcatInfo` — unicode counterpart of VStrConcat.
-    /// `func` is OS_UNI_CONCAT.
+    /// OS_UNI_CONCAT funcptr is resolved via callinfocollection at
+    /// materialization time.
     VUniConcatInfo {
-        func: i64,
         fieldnums: Vec<i16>,
     },
     /// resume.py:856 `VUniSliceInfo` — unicode counterpart of `VStrSlice`
     /// (same length-vs-stop convention; backend reader adds
     /// `start + length` before calling the OS_UNI_SLICE funcptr).
-    /// `func` is OS_UNI_SLICE.
+    /// OS_UNI_SLICE funcptr is resolved via callinfocollection at
+    /// materialization time.
     VUniSliceInfo {
-        func: i64,
         fieldnums: Vec<i16>,
     },
     Empty,
@@ -710,47 +711,15 @@ impl PartialEq for RdVirtualInfo {
                 },
             ) => a1 == b1 && a2 == b2,
             (Self::VStrPlainInfo { fieldnums: a }, Self::VStrPlainInfo { fieldnums: b }) => a == b,
-            (
-                Self::VStrConcatInfo {
-                    func: af,
-                    fieldnums: a,
-                },
-                Self::VStrConcatInfo {
-                    func: bf,
-                    fieldnums: b,
-                },
-            ) => af == bf && a == b,
-            (
-                Self::VStrSliceInfo {
-                    func: af,
-                    fieldnums: a,
-                },
-                Self::VStrSliceInfo {
-                    func: bf,
-                    fieldnums: b,
-                },
-            ) => af == bf && a == b,
+            (Self::VStrConcatInfo { fieldnums: a }, Self::VStrConcatInfo { fieldnums: b }) => {
+                a == b
+            }
+            (Self::VStrSliceInfo { fieldnums: a }, Self::VStrSliceInfo { fieldnums: b }) => a == b,
             (Self::VUniPlainInfo { fieldnums: a }, Self::VUniPlainInfo { fieldnums: b }) => a == b,
-            (
-                Self::VUniConcatInfo {
-                    func: af,
-                    fieldnums: a,
-                },
-                Self::VUniConcatInfo {
-                    func: bf,
-                    fieldnums: b,
-                },
-            ) => af == bf && a == b,
-            (
-                Self::VUniSliceInfo {
-                    func: af,
-                    fieldnums: a,
-                },
-                Self::VUniSliceInfo {
-                    func: bf,
-                    fieldnums: b,
-                },
-            ) => af == bf && a == b,
+            (Self::VUniConcatInfo { fieldnums: a }, Self::VUniConcatInfo { fieldnums: b }) => {
+                a == b
+            }
+            (Self::VUniSliceInfo { fieldnums: a }, Self::VUniSliceInfo { fieldnums: b }) => a == b,
             (Self::Empty, Self::Empty) => true,
             _ => false,
         }

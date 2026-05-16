@@ -1114,19 +1114,16 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
 
     // resume.py:347-351 visit_vstrconcat → VStrConcatInfo / VUniConcatInfo
     fn visit_vstrconcat(&mut self, is_unicode: bool) -> Self::VInfo {
-        // funcptr is resolved at the producer (compile.rs ExitVirtualLayout
-        // builder via callinfocollection) — RdVirtualInfo carries the
-        // resolved funcptr alongside fieldnums for the runtime decoder.
-        // The visitor builds the shell with func=0; the producer fills
-        // it before the RdVirtualInfo is committed.
+        // resume.py:347-351 — visitor constructs the shell variant with
+        // no funcptr; the decoder looks up OS_STR_CONCAT / OS_UNI_CONCAT
+        // via `callinfocollection.funcptr_for_oopspec(...)` at
+        // materialization time (resume.py:1467-1468 / 1494-1495).
         Some(if is_unicode {
             majit_ir::RdVirtualInfo::VUniConcatInfo {
-                func: 0,
                 fieldnums: Vec::new(),
             }
         } else {
             majit_ir::RdVirtualInfo::VStrConcatInfo {
-                func: 0,
                 fieldnums: Vec::new(),
             }
         })
@@ -1136,12 +1133,10 @@ impl crate::walkvirtual::VirtualVisitor for RdVirtualInfoBuilder {
     fn visit_vstrslice(&mut self, is_unicode: bool) -> Self::VInfo {
         Some(if is_unicode {
             majit_ir::RdVirtualInfo::VUniSliceInfo {
-                func: 0,
                 fieldnums: Vec::new(),
             }
         } else {
             majit_ir::RdVirtualInfo::VStrSliceInfo {
-                func: 0,
                 fieldnums: Vec::new(),
             }
         })

@@ -301,19 +301,17 @@ pub enum VirtualInfo {
         chars: Vec<VirtualFieldSource>,
     },
     /// resume.py:781 VStrConcatInfo — virtual string concat (left + right).
-    /// `func` is the OS_STR_CONCAT funcptr resolved at trace time
-    /// (resume.py:1467-1469 — RPython looks it up via
-    /// callinfocollection.funcptr_for_oopspec on every decode; pyre
-    /// carries it on the layout because the reader does not have a
-    /// callinfocollection wired up yet).
+    /// OS_STR_CONCAT funcptr is resolved at materialization via
+    /// `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT)`
+    /// (resume.py:1467-1468); the layout carries no funcptr.
     VStrConcat {
-        func: i64,
         left: Box<VirtualFieldSource>,
         right: Box<VirtualFieldSource>,
     },
-    /// resume.py:801 VStrSliceInfo — virtual string slice.
+    /// resume.py:801 VStrSliceInfo — virtual string slice. OS_STR_SLICE
+    /// funcptr resolved via callinfocollection at materialization
+    /// (resume.py:1477-1478).
     VStrSlice {
-        func: i64,
         source: Box<VirtualFieldSource>,
         start: Box<VirtualFieldSource>,
         length: Box<VirtualFieldSource>,
@@ -321,14 +319,16 @@ pub enum VirtualInfo {
     /// resume.py:817 VUniPlainInfo — virtual unicode string.
     VUniPlain { chars: Vec<VirtualFieldSource> },
     /// resume.py:836 VUniConcatInfo — virtual unicode concat.
+    /// OS_UNI_CONCAT funcptr resolved via callinfocollection
+    /// (resume.py:1494-1495).
     VUniConcat {
-        func: i64,
         left: Box<VirtualFieldSource>,
         right: Box<VirtualFieldSource>,
     },
     /// resume.py:856 VUniSliceInfo — virtual unicode slice.
+    /// OS_UNI_SLICE funcptr resolved via callinfocollection
+    /// (resume.py:1504-1505).
     VUniSlice {
-        func: i64,
         source: Box<VirtualFieldSource>,
         start: Box<VirtualFieldSource>,
         length: Box<VirtualFieldSource>,
@@ -543,20 +543,15 @@ impl VirtualInfo {
             VirtualInfo::VStrPlain { chars } => ResumeVirtualLayoutSummary::StrPlain {
                 chars: chars.iter().map(|src| src.layout_summary()).collect(),
             },
-            VirtualInfo::VStrConcat { func, left, right } => {
-                ResumeVirtualLayoutSummary::StrConcat {
-                    func: *func,
-                    left: left.layout_summary(),
-                    right: right.layout_summary(),
-                }
-            }
+            VirtualInfo::VStrConcat { left, right } => ResumeVirtualLayoutSummary::StrConcat {
+                left: left.layout_summary(),
+                right: right.layout_summary(),
+            },
             VirtualInfo::VStrSlice {
-                func,
                 source,
                 start,
                 length,
             } => ResumeVirtualLayoutSummary::StrSlice {
-                func: *func,
                 source: source.layout_summary(),
                 start: start.layout_summary(),
                 length: length.layout_summary(),
@@ -564,20 +559,15 @@ impl VirtualInfo {
             VirtualInfo::VUniPlain { chars } => ResumeVirtualLayoutSummary::UniPlain {
                 chars: chars.iter().map(|src| src.layout_summary()).collect(),
             },
-            VirtualInfo::VUniConcat { func, left, right } => {
-                ResumeVirtualLayoutSummary::UniConcat {
-                    func: *func,
-                    left: left.layout_summary(),
-                    right: right.layout_summary(),
-                }
-            }
+            VirtualInfo::VUniConcat { left, right } => ResumeVirtualLayoutSummary::UniConcat {
+                left: left.layout_summary(),
+                right: right.layout_summary(),
+            },
             VirtualInfo::VUniSlice {
-                func,
                 source,
                 start,
                 length,
             } => ResumeVirtualLayoutSummary::UniSlice {
-                func: *func,
                 source: source.layout_summary(),
                 start: start.layout_summary(),
                 length: length.layout_summary(),

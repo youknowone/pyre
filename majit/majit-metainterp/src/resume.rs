@@ -761,20 +761,15 @@ fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) ->
                     .map(|source| source.to_resume_source())
                     .collect(),
             },
-            ResumeVirtualLayoutSummary::StrConcat { func, left, right } => {
-                VirtualInfo::VStrConcat {
-                    func: *func,
-                    left: Box::new(left.to_resume_source()),
-                    right: Box::new(right.to_resume_source()),
-                }
-            }
+            ResumeVirtualLayoutSummary::StrConcat { left, right } => VirtualInfo::VStrConcat {
+                left: Box::new(left.to_resume_source()),
+                right: Box::new(right.to_resume_source()),
+            },
             ResumeVirtualLayoutSummary::StrSlice {
-                func,
                 source,
                 start,
                 length,
             } => VirtualInfo::VStrSlice {
-                func: *func,
                 source: Box::new(source.to_resume_source()),
                 start: Box::new(start.to_resume_source()),
                 length: Box::new(length.to_resume_source()),
@@ -785,20 +780,15 @@ fn resume_virtual_layout_to_virtual_info(layout: &ResumeVirtualLayoutSummary) ->
                     .map(|source| source.to_resume_source())
                     .collect(),
             },
-            ResumeVirtualLayoutSummary::UniConcat { func, left, right } => {
-                VirtualInfo::VUniConcat {
-                    func: *func,
-                    left: Box::new(left.to_resume_source()),
-                    right: Box::new(right.to_resume_source()),
-                }
-            }
+            ResumeVirtualLayoutSummary::UniConcat { left, right } => VirtualInfo::VUniConcat {
+                left: Box::new(left.to_resume_source()),
+                right: Box::new(right.to_resume_source()),
+            },
             ResumeVirtualLayoutSummary::UniSlice {
-                func,
                 source,
                 start,
                 length,
             } => VirtualInfo::VUniSlice {
-                func: *func,
                 source: Box::new(source.to_resume_source()),
                 start: Box::new(start.to_resume_source()),
                 length: Box::new(length.to_resume_source()),
@@ -1398,21 +1388,16 @@ pub fn rd_virtual_to_virtual_info(
                 .collect();
             VirtualInfo::VStrPlain { chars }
         }
-        majit_ir::RdVirtualInfo::VStrConcatInfo { func, fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrConcatInfo { fieldnums } => {
             let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
-            VirtualInfo::VStrConcat {
-                func: *func,
-                left,
-                right,
-            }
+            VirtualInfo::VStrConcat { left, right }
         }
-        majit_ir::RdVirtualInfo::VStrSliceInfo { func, fieldnums } => {
+        majit_ir::RdVirtualInfo::VStrSliceInfo { fieldnums } => {
             let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
             let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
             VirtualInfo::VStrSlice {
-                func: *func,
                 source,
                 start,
                 length,
@@ -1425,21 +1410,16 @@ pub fn rd_virtual_to_virtual_info(
                 .collect();
             VirtualInfo::VUniPlain { chars }
         }
-        majit_ir::RdVirtualInfo::VUniConcatInfo { func, fieldnums } => {
+        majit_ir::RdVirtualInfo::VUniConcatInfo { fieldnums } => {
             let left = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let right = Box::new(tagged_to_source(fieldnums[1], consts, count));
-            VirtualInfo::VUniConcat {
-                func: *func,
-                left,
-                right,
-            }
+            VirtualInfo::VUniConcat { left, right }
         }
-        majit_ir::RdVirtualInfo::VUniSliceInfo { func, fieldnums } => {
+        majit_ir::RdVirtualInfo::VUniSliceInfo { fieldnums } => {
             let source = Box::new(tagged_to_source(fieldnums[0], consts, count));
             let start = Box::new(tagged_to_source(fieldnums[1], consts, count));
             let length = Box::new(tagged_to_source(fieldnums[2], consts, count));
             VirtualInfo::VUniSlice {
-                func: *func,
                 source,
                 start,
                 length,
@@ -1732,9 +1712,8 @@ impl EncodedResumeData {
                 VirtualInfo::VStrPlain { chars } => majit_ir::RdVirtualInfo::VStrPlainInfo {
                     fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
                 },
-                VirtualInfo::VStrConcat { func, left, right } => {
+                VirtualInfo::VStrConcat { left, right, .. } => {
                     majit_ir::RdVirtualInfo::VStrConcatInfo {
-                        func: *func,
                         fieldnums: fieldnums(
                             [left.as_ref().clone(), right.as_ref().clone()],
                             liveboxes,
@@ -1743,12 +1722,11 @@ impl EncodedResumeData {
                     }
                 }
                 VirtualInfo::VStrSlice {
-                    func,
                     source,
                     start,
                     length,
+                    ..
                 } => majit_ir::RdVirtualInfo::VStrSliceInfo {
-                    func: *func,
                     fieldnums: fieldnums(
                         [
                             source.as_ref().clone(),
@@ -1762,9 +1740,8 @@ impl EncodedResumeData {
                 VirtualInfo::VUniPlain { chars } => majit_ir::RdVirtualInfo::VUniPlainInfo {
                     fieldnums: fieldnums(chars.iter().cloned(), liveboxes, rd_consts),
                 },
-                VirtualInfo::VUniConcat { func, left, right } => {
+                VirtualInfo::VUniConcat { left, right, .. } => {
                     majit_ir::RdVirtualInfo::VUniConcatInfo {
-                        func: *func,
                         fieldnums: fieldnums(
                             [left.as_ref().clone(), right.as_ref().clone()],
                             liveboxes,
@@ -1773,12 +1750,11 @@ impl EncodedResumeData {
                     }
                 }
                 VirtualInfo::VUniSlice {
-                    func,
                     source,
                     start,
                     length,
+                    ..
                 } => majit_ir::RdVirtualInfo::VUniSliceInfo {
-                    func: *func,
                     fieldnums: fieldnums(
                         [
                             source.as_ref().clone(),
@@ -5272,20 +5248,21 @@ pub trait BlackholeAllocator {
     fn bh_strsetitem(&self, string: i64, index: usize, char: i64) {
         let _ = (string, index, char);
     }
-    /// resume.py:1462-1470 concat_strings(str1, str2) — RPython calls
-    /// `funcptr_for_oopspec(OS_STR_CONCAT)`; pyre passes the resolved
-    /// `funcptr` and a `calldescr` so the allocator can dispatch to
-    /// `bh_call_r` (vstring.py-style oopspec invocation).
-    fn os_str_concat(&self, funcptr: i64, str1: i64, str2: i64) -> i64 {
-        let _ = (funcptr, str1, str2);
+    /// resume.py:1462-1470 concat_strings(str1, str2) — implementations
+    /// look up `OS_STR_CONCAT` via `callinfocollection.funcptr_for_oopspec`
+    /// (resume.py:1467-1468) and call it directly.  The variant carries
+    /// no funcptr.
+    fn os_str_concat(&self, str1: i64, str2: i64) -> i64 {
+        let _ = (str1, str2);
         0
     }
     /// resume.py:1472-1480 slice_string(str, start, length) →
     /// `funcptr_for_oopspec(OS_STR_SLICE)(str, start, stop)` where the
     /// caller pre-computes `stop = start + length` (the OS_STR_SLICE
-    /// oopspec signature).
-    fn os_str_slice(&self, funcptr: i64, str: i64, start: i64, stop: i64) -> i64 {
-        let _ = (funcptr, str, start, stop);
+    /// oopspec signature).  Implementations resolve the funcptr via
+    /// `callinfocollection`.
+    fn os_str_slice(&self, str: i64, start: i64, stop: i64) -> i64 {
+        let _ = (str, start, stop);
         0
     }
     /// resume.py:1482-1483 allocate_unicode(length) →
@@ -5300,16 +5277,18 @@ pub trait BlackholeAllocator {
         let _ = (string, index, char);
     }
     /// resume.py:1489-1497 concat_unicodes(str1, str2) →
-    /// `funcptr_for_oopspec(OS_UNI_CONCAT)(str1, str2)`.
-    fn os_uni_concat(&self, funcptr: i64, str1: i64, str2: i64) -> i64 {
-        let _ = (funcptr, str1, str2);
+    /// `funcptr_for_oopspec(OS_UNI_CONCAT)(str1, str2)`. Implementations
+    /// resolve the funcptr via `callinfocollection`.
+    fn os_uni_concat(&self, str1: i64, str2: i64) -> i64 {
+        let _ = (str1, str2);
         0
     }
     /// resume.py:1499-1507 slice_unicode(str, start, length) →
     /// `funcptr_for_oopspec(OS_UNI_SLICE)(str, start, stop)` where the
-    /// caller pre-computes `stop = start + length`.
-    fn os_uni_slice(&self, funcptr: i64, str: i64, start: i64, stop: i64) -> i64 {
-        let _ = (funcptr, str, start, stop);
+    /// caller pre-computes `stop = start + length`.  Implementations
+    /// resolve the funcptr via `callinfocollection`.
+    fn os_uni_slice(&self, str: i64, start: i64, stop: i64) -> i64 {
+        let _ = (str, start, stop);
         0
     }
     /// resume.py:1452 allocate_raw_buffer(func, size)
@@ -5635,36 +5614,34 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
                 vstr_plain_info_allocate(decoder, index, chars, /* is_unicode */ true)
             }
             // resume.py:786-793 VStrConcatInfo.allocate
-            VirtualInfo::VStrConcat { func, left, right } => {
-                let string = decoder.concat_strings(*func, left, right);
+            VirtualInfo::VStrConcat { left, right } => {
+                let string = decoder.concat_strings(left, right);
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
             // resume.py:805-809 VStrSliceInfo.allocate
             VirtualInfo::VStrSlice {
-                func,
                 source,
                 start,
                 length,
             } => {
-                let string = decoder.slice_string(*func, source, start, length);
+                let string = decoder.slice_string(source, start, length);
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
             // resume.py:841-848 VUniConcatInfo.allocate
-            VirtualInfo::VUniConcat { func, left, right } => {
-                let string = decoder.concat_unicodes(*func, left, right);
+            VirtualInfo::VUniConcat { left, right } => {
+                let string = decoder.concat_unicodes(left, right);
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
             // resume.py:860-864 VUniSliceInfo.allocate
             VirtualInfo::VUniSlice {
-                func,
                 source,
                 start,
                 length,
             } => {
-                let string = decoder.slice_unicode(*func, source, start, length);
+                let string = decoder.slice_unicode(source, start, length);
                 decoder.virtuals_cache.set_ptr(index, string);
                 string
             }
@@ -5964,27 +5941,25 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// resume.py:1462-1470 concat_strings(str1num, str2num) — decode
-    /// the two ref sources and dispatch to OS_STR_CONCAT funcptr.
-    /// `funcptr` is supplied by the caller (carried alongside the
-    /// VStrConcat virtual; pyre's RawSlice / VStrConcat layouts both
-    /// carry the funcptr resolved at trace time so the reader does
-    /// not need a callinfocollection).
+    /// the two ref sources and dispatch to OS_STR_CONCAT.  The funcptr
+    /// is resolved by the allocator via
+    /// `callinfocollection.funcptr_for_oopspec(OS_STR_CONCAT)`
+    /// (resume.py:1467-1468); the variant carries no funcptr.
     pub fn concat_strings(
         &mut self,
-        funcptr: i64,
         str1_source: &VirtualFieldSource,
         str2_source: &VirtualFieldSource,
     ) -> i64 {
         let str1 = self.decode_field_source(str1_source);
         let str2 = self.decode_field_source(str2_source);
-        self.allocator.os_str_concat(funcptr, str1, str2)
+        self.allocator.os_str_concat(str1, str2)
     }
 
     /// resume.py:1472-1480 slice_string(strnum, startnum, lengthnum) →
-    /// OS_STR_SLICE funcptr(str, start, start + length).
+    /// OS_STR_SLICE funcptr(str, start, start + length).  Funcptr is
+    /// resolved by the allocator via `callinfocollection`.
     pub fn slice_string(
         &mut self,
-        funcptr: i64,
         str_source: &VirtualFieldSource,
         start_source: &VirtualFieldSource,
         length_source: &VirtualFieldSource,
@@ -5993,7 +5968,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         let start = self.decode_field_source_int(start_source);
         let length = self.decode_field_source_int(length_source);
         let stop = start.wrapping_add(length);
-        self.allocator.os_str_slice(funcptr, str, start, stop)
+        self.allocator.os_str_slice(str, start, stop)
     }
 
     /// resume.py:1482-1483 allocate_unicode(length) → cpu.bh_newunicode.
@@ -6008,16 +5983,16 @@ impl<'a> ResumeDataDirectReader<'a> {
         self.allocator.bh_unicodesetitem(string, index, char);
     }
 
-    /// resume.py:1489-1497 concat_unicodes(str1num, str2num).
+    /// resume.py:1489-1497 concat_unicodes(str1num, str2num).  Funcptr
+    /// is resolved by the allocator via `callinfocollection`.
     pub fn concat_unicodes(
         &mut self,
-        funcptr: i64,
         str1_source: &VirtualFieldSource,
         str2_source: &VirtualFieldSource,
     ) -> i64 {
         let str1 = self.decode_field_source(str1_source);
         let str2 = self.decode_field_source(str2_source);
-        self.allocator.os_uni_concat(funcptr, str1, str2)
+        self.allocator.os_uni_concat(str1, str2)
     }
 
     /// resume.py:1543-1550 setrawbuffer_item(buffer, fieldnum, offset,
@@ -6050,9 +6025,9 @@ impl<'a> ResumeDataDirectReader<'a> {
     }
 
     /// resume.py:1499-1507 slice_unicode(strnum, startnum, lengthnum).
+    /// Funcptr resolved by the allocator via `callinfocollection`.
     pub fn slice_unicode(
         &mut self,
-        funcptr: i64,
         str_source: &VirtualFieldSource,
         start_source: &VirtualFieldSource,
         length_source: &VirtualFieldSource,
@@ -6061,7 +6036,7 @@ impl<'a> ResumeDataDirectReader<'a> {
         let start = self.decode_field_source_int(start_source);
         let length = self.decode_field_source_int(length_source);
         let stop = start.wrapping_add(length);
-        self.allocator.os_uni_slice(funcptr, str, start, stop)
+        self.allocator.os_uni_slice(str, start, stop)
     }
 
     /// `resume.py:1009-1015 setarrayitem(array, index, fieldnum, descr)`

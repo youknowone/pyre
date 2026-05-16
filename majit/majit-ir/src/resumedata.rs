@@ -221,15 +221,18 @@ pub enum ResumeVirtualLayoutSummary {
     StrPlain {
         chars: Vec<ResumeValueLayoutSummary>,
     },
-    /// `resume.py:781 VStrConcatInfo` — virtual string concat.
+    /// `resume.py:781 VStrConcatInfo` — virtual string concat. OS_STR_CONCAT
+    /// funcptr is resolved at materialization via
+    /// `callinfocollection.funcptr_for_oopspec(...)` (resume.py:1467-1468),
+    /// not stored on the summary.
     StrConcat {
-        func: i64,
         left: ResumeValueLayoutSummary,
         right: ResumeValueLayoutSummary,
     },
     /// `resume.py:801 VStrSliceInfo` — virtual slice of a larger string.
+    /// OS_STR_SLICE funcptr resolved via callinfocollection at
+    /// materialization (resume.py:1477-1478).
     StrSlice {
-        func: i64,
         source: ResumeValueLayoutSummary,
         start: ResumeValueLayoutSummary,
         length: ResumeValueLayoutSummary,
@@ -239,14 +242,16 @@ pub enum ResumeVirtualLayoutSummary {
         chars: Vec<ResumeValueLayoutSummary>,
     },
     /// `resume.py:836 VUniConcatInfo` — unicode counterpart.
+    /// OS_UNI_CONCAT funcptr resolved via callinfocollection
+    /// (resume.py:1494-1495).
     UniConcat {
-        func: i64,
         left: ResumeValueLayoutSummary,
         right: ResumeValueLayoutSummary,
     },
     /// `resume.py:856 VUniSliceInfo` — unicode counterpart.
+    /// OS_UNI_SLICE funcptr resolved via callinfocollection
+    /// (resume.py:1504-1505).
     UniSlice {
-        func: i64,
         source: ResumeValueLayoutSummary,
         start: ResumeValueLayoutSummary,
         length: ResumeValueLayoutSummary,
