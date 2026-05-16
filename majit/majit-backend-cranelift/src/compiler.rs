@@ -1428,8 +1428,6 @@ fn write_barrier_if_managed(obj: GcRef) {
     });
 }
 
-
-
 thread_local! {
     /// Per-thread CALL_ASSEMBLER target registry.
     ///
@@ -12887,6 +12885,15 @@ fn collect_guards(
                 if let Some(fd) = d.as_fail_descr() {
                     fd.set_fail_index_per_trace(fail_index);
                     fd.set_trace_id(trace_id);
+                    // Sync fail_arg_types onto the meta side so the
+                    // `FailDescr::fail_arg_types` forwarding accessor
+                    // (guard.rs) returns the codegen-resolved types
+                    // for test scaffolds whose op.descr was synthesised
+                    // empty (or where the optimiser didn't update meta
+                    // post-numbering via store_final_boxes_in_guard).
+                    if fd.fail_arg_types().is_empty() {
+                        fd.set_fail_arg_types(descr.fail_arg_types.clone());
+                    }
                 }
             }
         }
@@ -14019,26 +14026,6 @@ impl majit_backend::Backend for CraneliftBackend {
             });
         }
         find_trace_info_in_fail_descrs(&compiled.fail_descrs, trace_id)
-    }
-
-    fn compiled_guard_frame_stacks(
-        &self,
-        token: &JitCellToken,
-    ) -> Option<Vec<(u32, Vec<majit_backend::ExitFrameLayout>)>> {
-        let compiled = token
-            .compiled
-            .as_ref()
-            .and_then(|compiled| compiled.downcast_ref::<CompiledLoop>())?;
-        let mut result = Vec::new();
-        for descr in &compiled.fail_descrs {
-            if let Some(layout) = descr.recovery_layout_ref() {
-                result.push((
-                    <CraneliftFailDescr as majit_ir::FailDescr>::fail_index_per_trace(descr),
-                    layout.frames.clone(),
-                ));
-            }
-        }
-        Some(result)
     }
 
     fn describe_deadframe(&self, frame: &DeadFrame) -> Option<majit_backend::FailDescrLayout> {
@@ -21683,7 +21670,10 @@ mod tests {
             assert!(recovery.frames[0].slot_types.is_some());
             guard_layouts_seen += 1;
         }
-        assert_eq!(guard_layouts_seen, 2, "expected 2 guards with recovery_layout");
+        assert_eq!(
+            guard_layouts_seen, 2,
+            "expected 2 guards with recovery_layout"
+        );
     }
 
     #[test]
@@ -21755,70 +21745,6 @@ mod tests {
             frame_stack[0].slot_types,
             Some(vec![Type::Int, Type::Ref, Type::Float])
         );
-    }
-
-    #[test]
-    fn test_compiled_guard_frame_stacks_query() {
-        let mut backend = CraneliftBackend::new();
-
-        let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
-        let mut guard1 = mk_op(
-            OpCode::GuardTrue,
-            &[OpRef::input_arg_int(0)],
-            OpRef::NONE.raw(),
-        );
-        guard1.fail_args = Some(smallvec::SmallVec::from_slice(&[
-            OpRef::input_arg_int(0),
-            OpRef::input_arg_int(1),
-        ]));
-        let mut guard2 = mk_op(
-            OpCode::GuardFalse,
-            &[OpRef::input_arg_int(1)],
-            OpRef::NONE.raw(),
-        );
-        guard2.fail_args = Some(smallvec::SmallVec::from_slice(&[OpRef::input_arg_int(1)]));
-        let ops = vec![
-            mk_op(
-                OpCode::Label,
-                &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
-                OpRef::NONE.raw(),
-            ),
-            guard1,
-            guard2,
-            mk_op(
-                OpCode::Finish,
-                &[OpRef::input_arg_int(0)],
-                OpRef::NONE.raw(),
-            ),
-        ];
-
-        backend.set_next_trace_id(502);
-        backend.set_next_header_pc(4000);
-        let mut token = JitCellToken::new(9003);
-        backend.compile_loop(&inputargs, &ops, &mut token).unwrap();
-
-        let frame_stacks = backend
-            .compiled_guard_frame_stacks(&token)
-            .expect("compiled_guard_frame_stacks should return Some");
-
-        // 2 guards have recovery_layout (frame_stacks); the FINISH descr
-        // does NOT — PyPy's Done* descrs inherit AbstractFailDescr
-        // directly without `rd_*` payload, so they have no
-        // recovery_layout to expose (Slice QQ-4 dropped the
-        // backend-local cell that previously masked this parity gap).
-        assert_eq!(frame_stacks.len(), 2);
-        for (fail_index, frames) in &frame_stacks {
-            assert!(
-                !frames.is_empty(),
-                "fail_index={fail_index} should have non-empty frame stack"
-            );
-            assert_eq!(frames[0].trace_id, Some(502));
-            assert_eq!(frames[0].header_pc, Some(4000));
-            // slot_types populated in every frame
-            for frame in frames {
-                assert!(frame.slot_types.is_some());
-            }
-        }
     }
 
     /// Verify that the main opcode dispatch in compile_loop covers all OpCode

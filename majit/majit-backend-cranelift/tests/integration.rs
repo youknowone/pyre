@@ -49,32 +49,16 @@ fn full_mul_u64(a: u64, b: u64) -> (u64, u64) {
 // Test helpers
 // ---------------------------------------------------------------------------
 
-/// Minimal FailDescr for use in Finish ops.
-#[derive(Debug)]
-struct TestFailDescr {
-    index: u32,
-}
-
-impl Descr for TestFailDescr {
-    fn index(&self) -> u32 {
-        self.index
-    }
-    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
-        Some(self)
-    }
-}
-
-impl FailDescr for TestFailDescr {
-    fn fail_index(&self) -> u32 {
-        self.index
-    }
-    fn fail_arg_types(&self) -> &[Type] {
-        &[]
-    }
-}
-
-fn make_descr(index: u32) -> DescrRef {
-    Arc::new(TestFailDescr { index })
+/// Test helper — produces a real `ResumeGuardDescr` (PyPy
+/// `compile.py:840-843 ResumeGuardDescr` family) so that
+/// `recovery_layout` storage routes through the meta-side slot.
+/// Slice OO-half-1 made the meta slot the sole storage; earlier
+/// test scaffolds returned a custom `TestFailDescr` that the
+/// downcast couldn't reach.  `_index` parameter is preserved for
+/// call-site clarity but discarded — every guard descr gets a
+/// fresh global fail_index inside `make_resume_guard_descr_typed`.
+fn make_descr(_index: u32) -> DescrRef {
+    majit_backend::make_resume_guard_descr_typed(Vec::new())
 }
 
 // ---------------------------------------------------------------------------
@@ -2293,79 +2277,6 @@ fn test_compiled_guard_failure_preserves_frame_stack_metadata() {
     );
     let slot_types = innermost.slot_types.as_ref().unwrap();
     assert_eq!(slot_types, &[Type::Int], "guard saves one Int input arg");
-}
-
-// ---------------------------------------------------------------------------
-// Test: Multi-guard trace exposes frame_stacks for all guards
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_compiled_trace_multi_guard_frame_stacks_query() {
-    // Trace: input(x) -> cmp1 = x > 0 -> guard_true(cmp1)
-    //        -> result = x + 1 -> cmp2 = result < 1000
-    //        -> guard_true(cmp2) -> finish(result)
-    let mut rec = Trace::new();
-    let x = rec.record_input_arg(Type::Int);
-
-    let const_0 = OpRef::const_int(0);
-    let const_1 = OpRef::const_int(1);
-    let const_1000 = OpRef::const_int(2);
-
-    let cmp1 = rec.record_op(OpCode::IntGt, &[x, const_0]);
-    rec.record_guard(OpCode::GuardTrue, &[cmp1], Some(make_descr(0)));
-    let result = rec.record_op(OpCode::IntAdd, &[x, const_1]);
-    let cmp2 = rec.record_op(OpCode::IntLt, &[result, const_1000]);
-    rec.record_guard(OpCode::GuardTrue, &[cmp2], Some(make_descr(1)));
-    rec.finish(&[result], make_descr(2));
-    let trace = rec.get_trace();
-
-    let mut backend = CraneliftBackend::new();
-    let mut constants = HashMap::new();
-    constants.insert(OpRef::const_int(0).raw(), 0i64);
-    constants.insert(OpRef::const_int(1).raw(), 1i64);
-    constants.insert(OpRef::const_int(2).raw(), 1000i64);
-    backend.set_constants(constants);
-
-    let mut token = JitCellToken::new(901);
-    backend
-        .compile_loop(&trace.inputargs, &trace.ops, &mut token)
-        .expect("compilation should succeed");
-
-    // Query frame stacks for all guards
-    let stacks = backend
-        .compiled_guard_frame_stacks(&token)
-        .expect("compiled_guard_frame_stacks should return Some");
-
-    // There should be entries for all guards + finish (each gets a fail_descr)
-    // Guards get fail_index 0 and 1, finish gets fail_index 2.
-    // All should have recovery layouts since collect_guards assigns them.
-    assert!(
-        stacks.len() >= 2,
-        "should have frame_stacks for at least 2 guards, got {}",
-        stacks.len()
-    );
-
-    // Each guard's frame_stack should have slot_types
-    for (fail_index, frames) in &stacks {
-        assert!(
-            !frames.is_empty(),
-            "fail_index={fail_index}: frame_stack should not be empty"
-        );
-        let innermost = &frames[frames.len() - 1];
-        assert!(
-            innermost.slot_types.is_some(),
-            "fail_index={fail_index}: innermost frame should have slot_types"
-        );
-    }
-
-    // Verify execution: x=5 -> both guards pass -> finish returns 6
-    let frame = backend.execute_token(&token, &[Value::Int(5)]);
-    assert!(backend.get_latest_descr(&frame).is_finish());
-    assert_eq!(backend.get_int_value(&frame, 0), 6);
-
-    // x=-1 -> first guard fails
-    let frame = backend.execute_token(&token, &[Value::Int(-1)]);
-    assert_eq!(backend.get_latest_descr(&frame).fail_index(), 0);
 }
 
 // ---------------------------------------------------------------------------

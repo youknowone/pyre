@@ -1881,18 +1881,6 @@ pub trait Backend: Send {
         None
     }
 
-    /// Query complete frame-stack layouts for all guards in a compiled loop.
-    ///
-    /// Returns `(fail_index, frame_stack)` pairs for each guard that has
-    /// recovery layout metadata. Backends that populate recovery layouts
-    /// at compile time can override this to expose the frame stacks.
-    fn compiled_guard_frame_stacks(
-        &self,
-        _token: &JitCellToken,
-    ) -> Option<Vec<(u32, Vec<ExitFrameLayout>)>> {
-        None
-    }
-
     /// Patch backend-owned recovery metadata for a specific compiled terminal exit.
     fn update_terminal_exit_recovery_layout(
         &mut self,

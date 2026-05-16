@@ -3831,7 +3831,9 @@ pub fn cranelift_resumedata_deopt(
     //    payload upstream (compile.py:624-662) — they short-circuit
     //    here.  Callers fall back to the recovery_layout walker for
     //    these until the synthetic construction path is restructured.
-    let Some(any) = descr.as_any() else { return false };
+    let Some(any) = descr.as_any() else {
+        return false;
+    };
     let Some(rgd) = any.downcast_ref::<majit_backend::ResumeGuardDescr>() else {
         return false;
     };

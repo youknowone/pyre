@@ -642,7 +642,6 @@ impl CraneliftFailDescr {
             .and_then(|rgd| rgd.recovery_layout())
     }
 
-
     /// Increment the failure counter and return the new value.
     /// Backed by the descr-local `fail_count: AtomicU32` field
     /// (Slice DD) — single relaxed `fetch_add` on the dispatch hot
