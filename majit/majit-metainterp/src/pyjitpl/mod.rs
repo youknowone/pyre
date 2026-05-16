@@ -9646,7 +9646,7 @@ impl<M: Clone> MetaInterp<M> {
                 .unwrap_or(false)
         })?;
         let guard_op = trace.ops.get(guard_op_index)?;
-        let fail_args = guard_op.fail_args.as_ref()?;
+        let fail_args = guard_op.getfailargs()?;
 
         let mut initial_values = HashMap::with_capacity(fail_args.len());
         for (arg, value) in fail_args.iter().zip(fail_values.iter().copied()) {

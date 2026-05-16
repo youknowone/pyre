@@ -887,7 +887,7 @@ mod tests {
         let guard_op = &trace.ops[1]; // after IntAdd
         assert_eq!(guard_op.pos.get(), guard);
         assert!(guard_op.opcode.is_guard());
-        let fail_args = guard_op.fail_args.as_ref().unwrap();
+        let fail_args = guard_op.getfailargs().unwrap();
         assert_eq!(fail_args.len(), 3);
         assert_eq!(fail_args[0], i0);
         assert_eq!(fail_args[1], i1);
@@ -919,13 +919,13 @@ mod tests {
         assert_eq!(guards[1].opcode, OpCode::GuardFalse);
 
         // First guard's fail_args
-        let fa0 = guards[0].fail_args.as_ref().unwrap();
+        let fa0 = guards[0].getfailargs().unwrap();
         assert_eq!(fa0.len(), 2);
         assert_eq!(fa0[0], i0);
         assert_eq!(fa0[1], i1);
 
         // Second guard's fail_args
-        let fa1 = guards[1].fail_args.as_ref().unwrap();
+        let fa1 = guards[1].getfailargs().unwrap();
         assert_eq!(fa1.len(), 2);
         assert_eq!(fa1[0], i0);
         assert_eq!(fa1[1], add);
@@ -1080,7 +1080,7 @@ mod tests {
         rec.close_loop(&[i0]);
         let trace = rec.get_trace();
         let guard = &trace.ops[0];
-        let fail_args = guard.fail_args.as_ref().unwrap();
+        let fail_args = guard.getfailargs().unwrap();
         assert!(fail_args.is_empty());
     }
 
@@ -1244,7 +1244,7 @@ mod tests {
         // Find the guard
         let guard_op = trace.iter_guards().next().unwrap();
         assert_eq!(guard_op.pos.get(), guard);
-        let fa = guard_op.fail_args.as_ref().unwrap();
+        let fa = guard_op.getfailargs().unwrap();
         assert_eq!(fa.len(), 13);
 
         // Verify all fail_args match what we specified

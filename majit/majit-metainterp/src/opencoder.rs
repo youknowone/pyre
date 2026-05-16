@@ -3145,7 +3145,7 @@ mod tests {
         assert_eq!(r1.args[1], iarg(10));
         let r2 = iter.next().unwrap();
         assert_eq!(r2.args[0], iop(11));
-        let fa = r2.fail_args.as_ref().unwrap();
+        let fa = r2.getfailargs().unwrap();
         assert_eq!(fa[0], iarg(10));
         assert_eq!(fa[1], iop(11));
     }

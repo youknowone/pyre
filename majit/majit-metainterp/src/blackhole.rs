@@ -584,7 +584,7 @@ pub(crate) fn blackhole_execute_with_state_ca(
         let guard_idx = start_index.saturating_sub(1);
         let fail_values = ops
             .get(guard_idx)
-            .and_then(|op| op.fail_args.as_ref())
+            .and_then(|op| op.getfailargs())
             .map(|args| {
                 args.iter()
                     .map(|a| {

@@ -713,7 +713,7 @@ mod tests {
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
-        let fa = guards[0].fail_args.as_ref().unwrap();
+        let fa = guards[0].getfailargs().unwrap();
         assert_eq!(fa.len(), 2);
         assert_eq!(fa[0], OpRef::input_arg_int(0));
         assert_eq!(fa[1], OpRef::input_arg_int(1));
@@ -838,8 +838,8 @@ mod tests {
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 2);
 
-        assert_eq!(guards[0].fail_args.as_ref().unwrap().len(), 1);
-        assert_eq!(guards[1].fail_args.as_ref().unwrap().len(), 2);
+        assert_eq!(guards[0].getfailargs().unwrap().len(), 1);
+        assert_eq!(guards[1].getfailargs().unwrap().len(), 2);
     }
 
     #[test]
@@ -1022,7 +1022,7 @@ mod tests {
         let trace = TreeLoop::new(inputargs, ops);
 
         let guard = trace.iter_guards().next().unwrap();
-        let fa = guard.fail_args.as_ref().unwrap();
+        let fa = guard.getfailargs().unwrap();
         // All referenced OpRefs are valid: 0, 1 are inputargs; 2 is the add op
         assert!(fa.iter().all(|r| r.raw() <= 2));
         assert_eq!(fa.len(), 3);
@@ -1063,9 +1063,9 @@ mod tests {
 
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 3);
-        assert_eq!(guards[0].fail_args.as_ref().unwrap().len(), 0);
-        assert_eq!(guards[1].fail_args.as_ref().unwrap().len(), 1);
-        assert_eq!(guards[2].fail_args.as_ref().unwrap().len(), 3);
+        assert_eq!(guards[0].getfailargs().unwrap().len(), 0);
+        assert_eq!(guards[1].getfailargs().unwrap().len(), 1);
+        assert_eq!(guards[2].getfailargs().unwrap().len(), 3);
     }
 
     #[test]
@@ -1566,7 +1566,7 @@ mod tests {
         let guards: Vec<_> = trace.iter_guards().collect();
         assert_eq!(guards.len(), 1);
 
-        let fail_args = guards[0].fail_args.as_ref().unwrap();
+        let fail_args = guards[0].getfailargs().unwrap();
         assert_eq!(fail_args.len(), 2);
         assert_eq!(fail_args[0], i0);
         assert_eq!(fail_args[1], i1);

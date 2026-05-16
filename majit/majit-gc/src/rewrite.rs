@@ -851,7 +851,7 @@ impl GcRewriterImpl {
         if !matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardFalse) {
             return;
         }
-        let fail_args = match op.fail_args.as_ref() {
+        let fail_args = match op.getfailargs() {
             Some(fa) if !fa.is_empty() => fa,
             _ => return,
         };
@@ -868,10 +868,10 @@ impl GcRewriterImpl {
 
         // rewrite.py:466-469 — rewrite failargs + stash the copy-and-changed
         // guard for the next iteration to pick up.
-        let mut new_fail = fail_args.clone();
-        new_fail[idx] = same_pos;
         let mut new_guard = op.clone();
-        new_guard.setfailargs(new_fail);
+        if let Some(ref mut fa) = new_guard.fail_args {
+            fa[idx] = same_pos;
+        }
         // pos is reassigned when emit/emit_result runs on the substituted op.
         new_guard.pos.set(OpRef::NONE);
         st.changed_ops.insert(op_idx, new_guard);
@@ -3919,8 +3919,8 @@ mod tests {
             0,
             "SAME_AS_I uses ConstInt(0) per rewrite.py:421",
         );
-        let gv_fa = gv.fail_args.as_ref().expect("GuardValue inherits failargs");
-        assert_eq!(gv_fa.as_slice(), &[OpRef::int_op(10), OpRef::int_op(11)]);
+        let gv_fa = gv.getfailargs().expect("GuardValue inherits failargs");
+        assert_eq!(gv_fa, &[OpRef::int_op(10), OpRef::int_op(11)]);
     }
 
     #[test]

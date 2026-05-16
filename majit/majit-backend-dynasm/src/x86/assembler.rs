@@ -4714,7 +4714,7 @@ impl<'a> Assembler386<'a> {
                 fail_index,
                 op_index,
                 op.opcode,
-                op.fail_args.as_ref(),
+                op.getfailargs(),
                 descr_fd.fail_arg_types(),
                 faillocs
             );
@@ -5337,7 +5337,7 @@ impl<'a> Assembler386<'a> {
             // op.fail_arg_types only for sharing-path guards
             // (optimizeopt/mod.rs:3068-3088) where op.descr=None.
             let dt = fd.fail_arg_types();
-            let expected_len = op.fail_args.as_ref().map(|fa| fa.len()).unwrap_or(0);
+            let expected_len = op.getfailargs().map(|fa| fa.len()).unwrap_or(0);
             if dt.len() == expected_len && !dt.is_empty() {
                 return dt.to_vec();
             }
@@ -5346,7 +5346,7 @@ impl<'a> Assembler386<'a> {
             let expected_len = if op.opcode == OpCode::Finish || op.opcode == OpCode::Jump {
                 op.args.len()
             } else {
-                op.fail_args.as_ref().map(|fa| fa.len()).unwrap_or(0)
+                op.getfailargs().map(|fa| fa.len()).unwrap_or(0)
             };
             if ts.len() == expected_len {
                 ts.clone()

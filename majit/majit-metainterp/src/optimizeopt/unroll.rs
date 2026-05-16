@@ -4205,7 +4205,7 @@ fn assemble_peeled_trace_with_jump_args(
             let all_refs = op
                 .args
                 .iter()
-                .chain(op.fail_args.as_ref().into_iter().flat_map(|fa| fa.iter()));
+                .chain(op.getfailargs().into_iter().flat_map(|fa| fa.iter()));
             for &arg in all_refs {
                 if !is_trace_runtime_ref(arg, constants) {
                     continue; // skip NONE and constants
@@ -5269,7 +5269,7 @@ mod tests {
         assert_eq!(peeled_guard.opcode, OpCode::GuardTrue);
         let peeled_add_pos = result[0].pos.get();
         assert_eq!(
-            peeled_guard.fail_args.as_ref().unwrap()[0],
+            peeled_guard.getfailargs().unwrap()[0],
             peeled_add_pos,
             "peeled guard's fail_args should reference peeled add"
         );
@@ -5279,7 +5279,7 @@ mod tests {
         assert_eq!(body_guard.opcode, OpCode::GuardTrue);
         let body_add_pos = result[3].pos.get();
         assert_eq!(
-            body_guard.fail_args.as_ref().unwrap()[0],
+            body_guard.getfailargs().unwrap()[0],
             body_add_pos,
             "body guard's fail_args should reference body add"
         );

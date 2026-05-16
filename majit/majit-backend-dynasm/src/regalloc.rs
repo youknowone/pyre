@@ -3768,7 +3768,7 @@ impl<'a> RegAlloc<'a> {
             }
         }
         if opnum != OpCode::CondCallN {
-            if let Some(fail_args) = next_op.fail_args.as_ref() {
+            if let Some(fail_args) = next_op.getfailargs() {
                 if fail_args.iter().any(|a| a.raw() == result.raw()) {
                     return false;
                 }

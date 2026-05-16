@@ -13724,7 +13724,7 @@ fn collect_guards(
                 fail_index,
                 op_idx,
                 op.opcode,
-                op.fail_args.as_ref(),
+                op.getfailargs(),
                 as_fd(&descr).fail_arg_types(),
             );
         }
@@ -13735,7 +13735,7 @@ fn collect_guards(
         // make_a_counter_per_value: for GUARD_VALUE, encode fail_arg
         // index + type tag in status (overrides store_hash).
         if op.opcode == majit_ir::OpCode::GuardValue {
-            if let Some(fa) = op.fail_args.as_ref() {
+            if let Some(fa) = op.getfailargs() {
                 let arg0 = op.arg(0);
                 if let Some(idx) = fa.iter().position(|&r| r == arg0) {
                     let type_tag = match as_fd(&descr).fail_arg_types().get(idx) {
