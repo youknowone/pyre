@@ -4835,15 +4835,23 @@ impl CodeWriter {
                 if block_switch_pending {
                     break;
                 }
-                // Task #227.5 item 6: PcAnchor walker emit retired.
-                // The `Label("pc{N}")` that `emit_mark_label_pc!`
-                // emitted is the per-PC anchor for
-                // `pc_anchor_positions` / `live_marker_indices_by_pc`
-                // (Label-based fallback).  `remove_repeated_live` is
-                // updated to break its merge run on per-PC Labels so
-                // each PC keeps its own `-live-` marker.  Aligns
-                // with upstream RPython which has no per-PC anchor
-                // concept — Labels are the boundary markers.
+                // `emit_mark_label_pc!` just pushed `Insn::PcAnchor
+                // { py_pc }` into the current block's per-block
+                // accumulator (see the same-block arm at codewriter.rs
+                // ~3957).  PcAnchor is pyre's per-Python-PC anchor —
+                // a NEW-DEVIATION from upstream RPython, whose
+                // `flatten.py` only emits `Label(block)` at block
+                // entry (`flatten.py:116`) because RPython's runtime
+                // has no per-PC dispatch concept.  Pyre's blackhole /
+                // bridge dispatch resolves resume PCs through
+                // `pc_anchor_positions` (codewriter.rs:2427) +
+                // `live_marker_indices_by_pc`, both of which scan for
+                // PcAnchor entries, so the per-PC anchor must stay
+                // alongside the upstream-orthodox block Labels until
+                // the dispatcher is refactored to look up by block
+                // identity instead of py_pc.  `remove_repeated_live`
+                // breaks its merge run on PcAnchor so each PC keeps
+                // its own `-live-` marker.
                 depth_at_pc[py_pc] = current_depth;
                 emit_live_placeholder!();
 
@@ -7585,15 +7593,19 @@ impl CodeWriter {
         // newblock's re-walked duplicate.
         //
         // Peel-off optimisation: at every block-switch boundary the
-        // walker emits a defensive `goto Label("pcN") + Unreachable`
+        // walker emits a defensive `goto TLabel("pcN") + Unreachable`
         // pair (the eventual drain order is not known at yield time
         // since `pendingblocks` is mixed push_front / push_back).  This
         // pass strips the pair when the next block actually opens with
-        // `Label("pcN")` for the SAME N — turning a runtime no-op
-        // branch into implicit fall-through.  Upstream `flatten.py:
-        // 106-155 make_link` skips the goto outright via recursive
-        // descent + `seen_blocks` (`flatten.py:110-113`); convergence
-        // arrives when production flips to post-walk `flatten_graph`.
+        // a per-PC anchor for the SAME N — turning a runtime no-op
+        // branch into implicit fall-through.  Pyre's per-PC anchor is
+        // `Insn::PcAnchor { py_pc: N }` (NEW-DEVIATION from upstream;
+        // RPython's per-block `Label(block)` has no per-PC concept);
+        // `strip_walker_block_boundary_goto` unifies both anchor shapes
+        // through `pc_label_name(N)`.  Upstream `flatten.py:106-155
+        // make_link` skips the goto outright via recursive descent +
+        // `seen_blocks` (`flatten.py:110-113`); pyre's two-phase
+        // emit-then-strip approach converges to the same byte stream.
         {
             // RPython parity: `iterblocks` (`flowspace/model.py:55-77`)
             // enumerates every reachable block including dead ones;
