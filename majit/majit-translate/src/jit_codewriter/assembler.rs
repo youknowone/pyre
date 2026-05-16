@@ -1087,22 +1087,37 @@ impl Assembler {
                 reds_f,
                 result_kind,
             } => {
+                let g = graph.expect("encode_op for RecursiveCall requires a graph");
+                let project = |args: &[crate::flowspace::model::Variable]| -> Vec<ValueId> {
+                    args.iter()
+                        .map(|v| {
+                            g.value_id_of(v)
+                                .expect("RecursiveCall arg must be a known Variable on graph")
+                        })
+                        .collect()
+                };
+                let greens_i_vids = project(greens_i);
+                let greens_r_vids = project(greens_r);
+                let greens_f_vids = project(greens_f);
+                let reds_i_vids = project(reds_i);
+                let reds_r_vids = project(reds_r);
+                let reds_f_vids = project(reds_f);
                 let idx = self.emit_const_i(*jd_index as i64, state);
                 state.code.push(idx);
                 argcodes.push('i');
                 // green lists
-                self.emit_list_of_kind(greens_i, RegKind::Int, regallocs, state);
+                self.emit_list_of_kind(&greens_i_vids, RegKind::Int, regallocs, state);
                 argcodes.push('I');
-                self.emit_list_of_kind(greens_r, RegKind::Ref, regallocs, state);
+                self.emit_list_of_kind(&greens_r_vids, RegKind::Ref, regallocs, state);
                 argcodes.push('R');
-                self.emit_list_of_kind(greens_f, RegKind::Float, regallocs, state);
+                self.emit_list_of_kind(&greens_f_vids, RegKind::Float, regallocs, state);
                 argcodes.push('F');
                 // red lists
-                self.emit_list_of_kind(reds_i, RegKind::Int, regallocs, state);
+                self.emit_list_of_kind(&reds_i_vids, RegKind::Int, regallocs, state);
                 argcodes.push('I');
-                self.emit_list_of_kind(reds_r, RegKind::Ref, regallocs, state);
+                self.emit_list_of_kind(&reds_r_vids, RegKind::Ref, regallocs, state);
                 argcodes.push('R');
-                self.emit_list_of_kind(reds_f, RegKind::Float, regallocs, state);
+                self.emit_list_of_kind(&reds_f_vids, RegKind::Float, regallocs, state);
                 argcodes.push('F');
                 let result_key_kind = self.emit_call_result_arg(
                     op.result,

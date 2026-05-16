@@ -706,13 +706,13 @@ pub enum OpKind {
         /// RPython: `jitdriver_sd.index`
         jd_index: usize,
         /// Green args (loop-invariant) split by kind
-        greens_i: Vec<ValueId>,
-        greens_r: Vec<ValueId>,
-        greens_f: Vec<ValueId>,
+        greens_i: Vec<crate::flowspace::model::Variable>,
+        greens_r: Vec<crate::flowspace::model::Variable>,
+        greens_f: Vec<crate::flowspace::model::Variable>,
         /// Red args (loop-variant) split by kind
-        reds_i: Vec<ValueId>,
-        reds_r: Vec<ValueId>,
-        reds_f: Vec<ValueId>,
+        reds_i: Vec<crate::flowspace::model::Variable>,
+        reds_r: Vec<crate::flowspace::model::Variable>,
+        reds_f: Vec<crate::flowspace::model::Variable>,
         /// Result kind
         result_kind: char,
     },

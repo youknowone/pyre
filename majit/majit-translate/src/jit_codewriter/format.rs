@@ -647,12 +647,12 @@ fn op_args_repr(
             ..
         } => {
             let mut parts = vec![format!("${jd_index}")];
-            parts.push(list_of_kind_repr('i', greens_i));
-            parts.push(list_of_kind_repr('r', greens_r));
-            parts.push(list_of_kind_repr('f', greens_f));
-            parts.push(list_of_kind_repr('i', reds_i));
-            parts.push(list_of_kind_repr('r', reds_r));
-            parts.push(list_of_kind_repr('f', reds_f));
+            parts.push(list_of_kind_repr_vars('i', greens_i));
+            parts.push(list_of_kind_repr_vars('r', greens_r));
+            parts.push(list_of_kind_repr_vars('f', greens_f));
+            parts.push(list_of_kind_repr_vars('i', reds_i));
+            parts.push(list_of_kind_repr_vars('r', reds_r));
+            parts.push(list_of_kind_repr_vars('f', reds_f));
             out.push_str(&parts.join(", "));
         }
         _ => {
@@ -941,16 +941,17 @@ mod tests {
 
     #[test]
     fn format_recursive_call_emits_jd_and_six_listofkinds() {
+        use crate::flowspace::model::Variable;
         use crate::model::{OpKind, SpaceOperation};
         let mut ssa = empty_ssa();
         ssa.insns.push(FlatOp::Op(SpaceOperation {
             kind: OpKind::RecursiveCall {
                 jd_index: 0,
-                greens_i: vec![ValueId(1)],
+                greens_i: vec![Variable::new()],
                 greens_r: vec![],
                 greens_f: vec![],
                 reds_i: vec![],
-                reds_r: vec![ValueId(2)],
+                reds_r: vec![Variable::new()],
                 reds_f: vec![],
                 result_kind: 'v',
             },

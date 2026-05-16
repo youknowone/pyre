@@ -856,16 +856,24 @@ fn remap_op_kind(
             reds_r,
             reds_f,
             result_kind,
-        } => OpKind::RecursiveCall {
-            jd_index: *jd_index,
-            greens_i: greens_i.iter().map(remap).collect(),
-            greens_r: greens_r.iter().map(remap).collect(),
-            greens_f: greens_f.iter().map(remap).collect(),
-            reds_i: reds_i.iter().map(remap).collect(),
-            reds_r: reds_r.iter().map(remap).collect(),
-            reds_f: reds_f.iter().map(remap).collect(),
-            result_kind: *result_kind,
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("RecursiveCall arg must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::RecursiveCall {
+                jd_index: *jd_index,
+                greens_i: greens_i.iter().map(remap_var).collect(),
+                greens_r: greens_r.iter().map(remap_var).collect(),
+                greens_f: greens_f.iter().map(remap_var).collect(),
+                reds_i: reds_i.iter().map(remap_var).collect(),
+                reds_r: reds_r.iter().map(remap_var).collect(),
+                reds_f: reds_f.iter().map(remap_var).collect(),
+                result_kind: *result_kind,
+            }
+        }
         OpKind::ConditionalCall {
             condition,
             funcptr,
@@ -1201,12 +1209,18 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             reds_f,
             ..
         } => {
-            let mut refs = greens_i.clone();
-            refs.extend(greens_r);
-            refs.extend(greens_f);
-            refs.extend(reds_i);
-            refs.extend(reds_r);
-            refs.extend(reds_f);
+            let g = graph
+                .expect("RecursiveCall requires a graph to project Variable to ValueId");
+            let project = |var: &crate::flowspace::model::Variable| {
+                g.value_id_of(var)
+                    .expect("RecursiveCall arg must be a known Variable on graph")
+            };
+            let mut refs: Vec<ValueId> = greens_i.iter().map(project).collect();
+            refs.extend(greens_r.iter().map(project));
+            refs.extend(greens_f.iter().map(project));
+            refs.extend(reds_i.iter().map(project));
+            refs.extend(reds_r.iter().map(project));
+            refs.extend(reds_f.iter().map(project));
             refs
         }
     }

@@ -2580,16 +2580,17 @@ impl<'a> Transformer<'a> {
         let mut ops = self.promote_greens(green_args, graph);
 
         // RPython jtransform.py:532-533: recursive_call + -live-
+        let to_var = |v: ValueId| graph.must_variable(v);
         ops.push(SpaceOperation {
             result: op.result,
             kind: OpKind::RecursiveCall {
                 jd_index,
-                greens_i,
-                greens_r,
-                greens_f,
-                reds_i,
-                reds_r,
-                reds_f,
+                greens_i: greens_i.into_iter().map(to_var).collect(),
+                greens_r: greens_r.into_iter().map(to_var).collect(),
+                greens_f: greens_f.into_iter().map(to_var).collect(),
+                reds_i: reds_i.into_iter().map(to_var).collect(),
+                reds_r: reds_r.into_iter().map(to_var).collect(),
+                reds_f: reds_f.into_iter().map(to_var).collect(),
                 result_kind,
             },
         });
@@ -4147,40 +4148,24 @@ fn remap_op(
             reds_r,
             reds_f,
             result_kind,
-        } => OpKind::RecursiveCall {
-            jd_index: *jd_index,
-            greens_i: greens_i
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            greens_r: greens_r
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            greens_f: greens_f
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            reds_i: reds_i
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            reds_r: reds_r
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            reds_f: reds_f
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            result_kind: *result_kind,
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = graph
+                    .value_id_of(var)
+                    .expect("RecursiveCall arg must have a backing ValueId");
+                graph.must_variable(remap_value(vid, aliases))
+            };
+            OpKind::RecursiveCall {
+                jd_index: *jd_index,
+                greens_i: greens_i.iter().map(remap_var).collect(),
+                greens_r: greens_r.iter().map(remap_var).collect(),
+                greens_f: greens_f.iter().map(remap_var).collect(),
+                reds_i: reds_i.iter().map(remap_var).collect(),
+                reds_r: reds_r.iter().map(remap_var).collect(),
+                reds_f: reds_f.iter().map(remap_var).collect(),
+                result_kind: *result_kind,
+            }
+        }
         OpKind::ConditionalCall {
             condition,
             funcptr,
