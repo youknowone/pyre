@@ -94,6 +94,15 @@ impl<K: Eq, V> VecAssoc<K, V> {
         }
     }
 
+    /// `HashMap::entry(k).or_default()` parity — inserts `V::default()`
+    /// when the key is missing.
+    pub fn entry_or_default(&mut self, key: K) -> &mut V
+    where
+        V: Default,
+    {
+        self.entry_or_insert_with(key, V::default)
+    }
+
     /// `HashMap::entry(k).or_insert_with(...)` parity.
     pub fn entry_or_insert_with<F: FnOnce() -> V>(&mut self, key: K, f: F) -> &mut V {
         let idx = match self.entries.iter().position(|(k, _)| k == &key) {
