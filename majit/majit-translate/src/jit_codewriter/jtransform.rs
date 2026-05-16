@@ -658,7 +658,7 @@ impl<'a> Transformer<'a> {
             // falls through to `RewriteResult::Keep` for mutable fields and
             // plain immutables (their purity is carried on the descriptor).
             OpKind::FieldRead { field, ty, .. } => {
-                self.rewrite_op_getfield(op, field, ty, graph_name)
+                self.rewrite_op_getfield(op, field, ty, graph_name, graph)
             }
             // ── rewrite_op_setfield ──
             OpKind::FieldWrite {
@@ -1819,6 +1819,7 @@ impl<'a> Transformer<'a> {
         field: &FieldDescriptor,
         ty: &ValueType,
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         let typed_ty = op
             .result
@@ -1910,7 +1911,7 @@ impl<'a> Transformer<'a> {
                     SpaceOperation {
                         result: None,
                         kind: OpKind::RecordQuasiImmutField {
-                            base: *base,
+                            base: graph.must_variable(*base),
                             field: field.clone(),
                             mutate_field,
                         },
@@ -3698,11 +3699,16 @@ fn remap_op(
             base,
             field,
             mutate_field,
-        } => OpKind::RecordQuasiImmutField {
-            base: remap_value(*base, aliases),
-            field: field.clone(),
-            mutate_field: mutate_field.clone(),
-        },
+        } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("RecordQuasiImmutField.base must have a backing ValueId");
+            OpKind::RecordQuasiImmutField {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+                field: field.clone(),
+                mutate_field: mutate_field.clone(),
+            }
+        }
         OpKind::FieldRead {
             base,
             field,

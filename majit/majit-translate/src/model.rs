@@ -806,7 +806,7 @@ pub enum OpKind {
     /// `inst_` prefix (`quasiimmut.py:11-15`).  Rust structs have no such
     /// prefix, so we use the literal `mutate_<fieldname>` convention.
     RecordQuasiImmutField {
-        base: ValueId,
+        base: crate::flowspace::model::Variable,
         field: FieldDescriptor,
         mutate_field: FieldDescriptor,
     },

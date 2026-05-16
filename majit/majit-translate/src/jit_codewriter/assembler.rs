@@ -1369,7 +1369,11 @@ impl Assembler {
                 field,
                 mutate_field,
             } => {
-                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                let base_vid = graph
+                    .expect("encode_op for RecordQuasiImmutField requires a graph")
+                    .value_id_of(base)
+                    .expect("RecordQuasiImmutField.base must be a known Variable on graph");
+                let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
                 for fd in [field, mutate_field] {
