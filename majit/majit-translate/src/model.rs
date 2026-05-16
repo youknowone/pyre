@@ -431,7 +431,7 @@ pub enum OpKind {
     /// the `ConstInt` → `int_copy` lowering.
     ConstFloat(u64),
     FieldRead {
-        base: ValueId,
+        base: crate::flowspace::model::Variable,
         field: FieldDescriptor,
         ty: ValueType,
         /// RPython `jtransform.py:867-903` may rewrite immutable /
@@ -442,9 +442,9 @@ pub enum OpKind {
         pure: bool,
     },
     FieldWrite {
-        base: ValueId,
+        base: crate::flowspace::model::Variable,
         field: FieldDescriptor,
-        value: ValueId,
+        value: crate::flowspace::model::Variable,
         ty: ValueType,
     },
     ArrayRead {

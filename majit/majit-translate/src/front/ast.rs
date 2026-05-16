@@ -3604,6 +3604,7 @@ fn lower_expr(
                 })
             } else {
                 let base = get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
+                let base_var = graph.must_variable(base);
                 let field_name = member_name(&field.member);
                 let field_type_string =
                     field_type_string_from_expr(&field.base, &field.member, ctx);
@@ -3614,7 +3615,7 @@ fn lower_expr(
                 let result = graph.push_op(
                     *block,
                     OpKind::FieldRead {
-                        base,
+                        base: base_var,
                         field: crate::model::FieldDescriptor::new(
                             field_name,
                             receiver_type_root(&field.base, ctx),
@@ -3695,18 +3696,20 @@ fn lower_expr(
                         );
                     } else {
                         let base = get_value!(lower_expr(graph, block, &field.base, options, ctx)?);
+                        let base_var = graph.must_variable(base);
+                        let value_var = graph.must_variable(value);
                         let field_name = member_name(&field.member);
                         let ty = field_value_type_from_expr(&field.base, &field.member, ctx)
                             .unwrap_or(ValueType::Unknown);
                         graph.push_op(
                             *block,
                             OpKind::FieldWrite {
-                                base,
+                                base: base_var,
                                 field: crate::model::FieldDescriptor::new(
                                     field_name,
                                     receiver_type_root(&field.base, ctx),
                                 ),
-                                value,
+                                value: value_var,
                                 ty,
                             },
                             false,

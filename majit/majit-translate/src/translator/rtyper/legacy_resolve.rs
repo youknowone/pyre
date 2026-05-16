@@ -650,11 +650,12 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let entry = graph.startblock;
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         let v = graph
             .push_op(
                 entry,
                 OpKind::FieldRead {
-                    base,
+                    base: base_var,
                     field: crate::model::FieldDescriptor::new("obj", None),
                     ty: ValueType::Ref,
                     pure: false,

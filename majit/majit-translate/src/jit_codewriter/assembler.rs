@@ -1300,7 +1300,11 @@ impl Assembler {
                 ty,
                 pure,
             } => {
-                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                let base_vid = graph
+                    .expect("encode_op for FieldRead requires a graph")
+                    .value_id_of(base)
+                    .expect("FieldRead.base must be a known Variable on graph");
+                let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
                 let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol));
@@ -1412,10 +1416,17 @@ impl Assembler {
                 field,
                 ty,
             } => {
-                let (reg, kc) = self.lookup_reg_with_kind(*base, regallocs);
+                let g = graph.expect("encode_op for FieldWrite requires a graph");
+                let base_vid = g
+                    .value_id_of(base)
+                    .expect("FieldWrite.base must be a known Variable on graph");
+                let value_vid = g
+                    .value_id_of(value)
+                    .expect("FieldWrite.value must be a known Variable on graph");
+                let (reg, kc) = self.lookup_reg_with_kind(base_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(kc);
-                let (reg, value_kind) = self.lookup_reg_with_kind(*value, regallocs);
+                let (reg, value_kind) = self.lookup_reg_with_kind(value_vid, regallocs);
                 state.code.push(reg);
                 argcodes.push(value_kind);
                 let descr_idx = self.emit_ready_descr(fielddescrof(field, ty, callcontrol));
@@ -4054,11 +4065,12 @@ mod tests {
                 true,
             )
             .unwrap();
+        let base_var = graph.must_variable(base);
         let result = graph
             .push_op(
                 graph.startblock,
                 OpKind::FieldRead {
-                    base,
+                    base: base_var,
                     field: FieldDescriptor::new("value", Some("Cell".to_string())),
                     ty: ValueType::Int,
                     pure: false,
@@ -4160,12 +4172,14 @@ mod tests {
                 true,
             )
             .unwrap();
+        let base_var = graph.must_variable(base);
+        let value_var = graph.must_variable(value);
         graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
-                base,
+                base: base_var.clone(),
                 field: FieldDescriptor::new("x", Some("Point".into())),
-                value,
+                value: value_var,
                 ty: ValueType::Unknown,
             },
             false,
@@ -4272,11 +4286,12 @@ mod tests {
                 true,
             )
             .unwrap();
+        let base_var = graph.must_variable(base);
         let field_result = graph
             .push_op(
                 graph.startblock,
                 OpKind::FieldRead {
-                    base,
+                    base: base_var,
                     field: FieldDescriptor::new("x", Some("Point".into())),
                     ty: ValueType::Unknown,
                     pure: false,

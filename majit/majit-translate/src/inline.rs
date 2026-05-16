@@ -393,23 +393,36 @@ fn remap_op_kind(
             field,
             ty,
             pure,
-        } => OpKind::FieldRead {
-            base: remap(base),
-            field: field.clone(),
-            ty: ty.clone(),
-            pure: *pure,
-        },
+        } => {
+            let base_vid = source_graph
+                .value_id_of(base)
+                .expect("FieldRead.base must have a backing ValueId in source");
+            OpKind::FieldRead {
+                base: target_graph.must_variable(remap(&base_vid)),
+                field: field.clone(),
+                ty: ty.clone(),
+                pure: *pure,
+            }
+        }
         OpKind::FieldWrite {
             base,
             field,
             value,
             ty,
-        } => OpKind::FieldWrite {
-            base: remap(base),
-            field: field.clone(),
-            value: remap(value),
-            ty: ty.clone(),
-        },
+        } => {
+            let base_vid = source_graph
+                .value_id_of(base)
+                .expect("FieldWrite.base must have a backing ValueId in source");
+            let value_vid = source_graph
+                .value_id_of(value)
+                .expect("FieldWrite.value must have a backing ValueId in source");
+            OpKind::FieldWrite {
+                base: target_graph.must_variable(remap(&base_vid)),
+                field: field.clone(),
+                value: target_graph.must_variable(remap(&value_vid)),
+                ty: ty.clone(),
+            }
+        }
         OpKind::ArrayRead {
             base,
             index,
@@ -887,8 +900,22 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             v.extend(reds_f.iter().copied());
             v
         }
-        OpKind::FieldRead { base, .. } => vec![*base],
-        OpKind::FieldWrite { base, value, .. } => vec![*base, *value],
+        OpKind::FieldRead { base, .. } => vec![
+            graph
+                .expect("FieldRead requires a graph to project Variable to ValueId")
+                .value_id_of(base)
+                .expect("FieldRead.base must be a known Variable on graph"),
+        ],
+        OpKind::FieldWrite { base, value, .. } => {
+            let g = graph
+                .expect("FieldWrite requires a graph to project Variable to ValueId");
+            vec![
+                g.value_id_of(base)
+                    .expect("FieldWrite.base must be a known Variable on graph"),
+                g.value_id_of(value)
+                    .expect("FieldWrite.value must be a known Variable on graph"),
+            ]
+        }
         OpKind::ArrayRead { base, index, .. } => vec![*base, *index],
         OpKind::ArrayWrite {
             base, index, value, ..

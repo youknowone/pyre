@@ -664,7 +664,10 @@ impl<'a> Transformer<'a> {
             OpKind::FieldWrite {
                 field, value, ty, ..
             } if self.config.lower_virtualizable => {
-                self.rewrite_op_setfield(op, field, *value, ty, graph_name, graph)
+                let value_vid = graph
+                    .value_id_of(value)
+                    .expect("FieldWrite.value must have a backing ValueId");
+                self.rewrite_op_setfield(op, field, value_vid, ty, graph_name, graph)
             }
             // ── rewrite_op_getarrayitem ──
             OpKind::ArrayRead {
@@ -1832,10 +1835,13 @@ impl<'a> Transformer<'a> {
             if let Some(result) = op.result {
                 // RPython: vable_array_vars[result] = (v_base, arrayfielddescr, arraydescr)
                 // We store the vable base plus the arraydescr properties.
-                let base = match &op.kind {
-                    OpKind::FieldRead { base, .. } => *base,
+                let base_var = match &op.kind {
+                    OpKind::FieldRead { base, .. } => base.clone(),
                     _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
                 };
+                let base = graph
+                    .value_id_of(&base_var)
+                    .expect("FieldRead.base must have a backing ValueId");
                 let itemsize = array_field.array_itemsize.unwrap_or(8);
                 let is_signed = array_field.array_is_signed.unwrap_or(false);
                 self.vable_array_vars
@@ -1852,14 +1858,14 @@ impl<'a> Transformer<'a> {
                 ),
             });
             self.vable_rewrites += 1;
-            let base_vid = match &op.kind {
-                OpKind::FieldRead { base, .. } => *base,
+            let base_var = match &op.kind {
+                OpKind::FieldRead { base, .. } => base.clone(),
                 _ => unreachable!("rewrite_op_getfield called on non-FieldRead op"),
             };
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableFieldRead {
-                    base: graph.must_variable(base_vid),
+                    base: base_var,
                     field_index: vable_field.index,
                     ty: typed_ty.clone(),
                 },
@@ -1887,6 +1893,7 @@ impl<'a> Transformer<'a> {
             else {
                 return RewriteResult::Keep;
             };
+            let base = base.clone();
             if rank.is_quasi_immutable() {
                 // PRE-EXISTING-ADAPTATION: RPython
                 // `quasiimmut.get_mutate_field_name(fieldname)` —
@@ -1914,7 +1921,7 @@ impl<'a> Transformer<'a> {
                     SpaceOperation {
                         result: None,
                         kind: OpKind::RecordQuasiImmutField {
-                            base: graph.must_variable(*base),
+                            base: base.clone(),
                             field: field.clone(),
                             mutate_field,
                         },
@@ -1922,7 +1929,7 @@ impl<'a> Transformer<'a> {
                     SpaceOperation {
                         result: op.result,
                         kind: OpKind::FieldRead {
-                            base: *base,
+                            base: base.clone(),
                             field: field.clone(),
                             ty: typed_ty.clone(),
                             pure: true,
@@ -1942,7 +1949,7 @@ impl<'a> Transformer<'a> {
                 return RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result,
                     kind: OpKind::FieldRead {
-                        base: *base,
+                        base: base.clone(),
                         field: field.clone(),
                         ty: typed_ty.clone(),
                         pure: true,
@@ -1957,7 +1964,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::FieldRead {
-                    base: *base,
+                    base: base.clone(),
                     field: field.clone(),
                     ty: typed_ty,
                     pure: *pure,
@@ -1987,14 +1994,14 @@ impl<'a> Transformer<'a> {
                 ),
             });
             self.vable_rewrites += 1;
-            let base_vid = match &op.kind {
-                OpKind::FieldWrite { base, .. } => *base,
+            let base_var = match &op.kind {
+                OpKind::FieldWrite { base, .. } => base.clone(),
                 _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
             };
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::VableFieldWrite {
-                    base: graph.must_variable(base_vid),
+                    base: base_var,
                     field_index: vable_field.index,
                     value: graph.must_variable(value),
                     ty: typed_ty,
@@ -2002,15 +2009,16 @@ impl<'a> Transformer<'a> {
             }]);
         }
         if &typed_ty != ty {
+            let base_var = match &op.kind {
+                OpKind::FieldWrite { base, .. } => base.clone(),
+                _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
+            };
             return RewriteResult::Replace(vec![SpaceOperation {
                 result: op.result,
                 kind: OpKind::FieldWrite {
-                    base: match &op.kind {
-                        OpKind::FieldWrite { base, .. } => *base,
-                        _ => unreachable!("rewrite_op_setfield called on non-FieldWrite op"),
-                    },
+                    base: base_var,
                     field: field.clone(),
-                    value,
+                    value: graph.must_variable(value),
                     ty: typed_ty,
                 },
             }]);
@@ -3733,23 +3741,36 @@ fn remap_op(
             field,
             ty,
             pure,
-        } => OpKind::FieldRead {
-            base: remap_value(*base, aliases),
-            field: field.clone(),
-            ty: ty.clone(),
-            pure: *pure,
-        },
+        } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("FieldRead.base must have a backing ValueId");
+            OpKind::FieldRead {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+                field: field.clone(),
+                ty: ty.clone(),
+                pure: *pure,
+            }
+        }
         OpKind::FieldWrite {
             base,
             field,
             value,
             ty,
-        } => OpKind::FieldWrite {
-            base: remap_value(*base, aliases),
-            field: field.clone(),
-            value: remap_value(*value, aliases),
-            ty: ty.clone(),
-        },
+        } => {
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("FieldWrite.base must have a backing ValueId");
+            let value_vid = graph
+                .value_id_of(value)
+                .expect("FieldWrite.value must have a backing ValueId");
+            OpKind::FieldWrite {
+                base: graph.must_variable(remap_value(base_vid, aliases)),
+                field: field.clone(),
+                value: graph.must_variable(remap_value(value_vid, aliases)),
+                ty: ty.clone(),
+            }
+        }
         OpKind::ArrayRead {
             base,
             index,
@@ -4548,10 +4569,11 @@ mod tests {
     fn rewrite_graph_tags_vable_fields() {
         let mut graph = FunctionGraph::new("test");
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base,
+                base: base_var,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
                 pure: false,
@@ -4589,11 +4611,12 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let base = graph.alloc_value();
         let index = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         let array = graph
             .push_op(
                 graph.startblock,
                 OpKind::FieldRead {
-                    base,
+                    base: base_var,
                     field: crate::model::FieldDescriptor::new(
                         "locals_stack_w",
                         Some("Frame".into()),
@@ -4649,10 +4672,11 @@ mod tests {
     fn rewrite_graph_requires_matching_field_owner_root() {
         let mut graph = FunctionGraph::new("test");
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base,
+                base: base_var,
                 field: crate::model::FieldDescriptor::new("next_instr", Some("OtherFrame".into())),
                 ty: ValueType::Int,
                 pure: false,
@@ -4682,12 +4706,14 @@ mod tests {
         let mut graph = FunctionGraph::new("test");
         let base = graph.alloc_value();
         let value = graph.alloc_value();
+        let base_var = graph.must_variable(base);
+        let value_var = graph.must_variable(value);
         graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
-                base,
+                base: base_var,
                 field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
-                value,
+                value: value_var,
                 ty: ValueType::Unknown,
             },
             false,
@@ -4752,11 +4778,12 @@ mod tests {
     fn rewrite_graph_types_fieldread_from_result_kind() {
         let mut graph = FunctionGraph::new("test");
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         let result = graph
             .push_op(
                 graph.startblock,
                 OpKind::FieldRead {
-                    base,
+                    base: base_var,
                     field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
                     ty: ValueType::Unknown,
                     pure: false,
@@ -5340,7 +5367,7 @@ mod tests {
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base: hinted,
+                base: graph.must_variable(hinted),
                 field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
                 pure: false,
@@ -5392,7 +5419,7 @@ mod tests {
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base: forced,
+                base: graph.must_variable(forced),
                 field: crate::model::FieldDescriptor::new("next_instr", Some("Frame".into())),
                 ty: ValueType::Int,
                 pure: false,
@@ -5460,7 +5487,7 @@ mod tests {
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base: promoted,
+                base: graph.must_variable(promoted),
                 field: crate::model::FieldDescriptor::new("payload", Some("Box".into())),
                 ty: ValueType::Int,
                 pure: false,
@@ -5497,7 +5524,11 @@ mod tests {
         // the `promoted` result, must have its base resolved back to `v`.
         match &ops[2].kind {
             OpKind::FieldRead { base, .. } => {
-                assert_eq!(*base, v, "promote result must alias back to input arg");
+                assert_eq!(
+                    result.graph.value_id_of(base),
+                    Some(v),
+                    "promote result must alias back to input arg"
+                );
             }
             other => panic!("expected FieldRead, got {other:?}"),
         }
@@ -5569,10 +5600,11 @@ mod tests {
                 true,
             )
             .unwrap();
+        let base_var = graph.must_variable(base);
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base,
+                base: base_var,
                 field: FieldDescriptor::new("value", Some("Cell".to_string())),
                 ty: ValueType::Int,
                 pure: false,
@@ -5639,10 +5671,11 @@ mod tests {
                 true,
             )
             .unwrap();
+        let base_var = graph.must_variable(base);
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base,
+                base: base_var,
                 field: FieldDescriptor::new("x", Some("Point".to_string())),
                 ty: ValueType::Int,
                 pure: false,

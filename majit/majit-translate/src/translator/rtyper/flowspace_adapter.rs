@@ -582,6 +582,7 @@ pub fn translate_op(
     // callsites surface a distinct fail-loud message; producers
     // must pre-register every reachable FunctionPath.
     call_registry: &crate::translator::rtyper::pyre_call_registry::PyreCallRegistry,
+    graph: &crate::model::FunctionGraph,
 ) -> Result<Vec<FlowspaceOp>, TyperError> {
     match &op.kind {
         // ─── Skipped: fully consumed by other adapter infrastructure ───
@@ -667,7 +668,10 @@ pub fn translate_op(
         // `getattr`/`setattr` op into a `getfield_*` / `setfield_*`
         // bytecode keyed on the field's lltype kind.
         OpKind::FieldRead { base, field, .. } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("FieldRead.base must have a backing ValueId");
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "getattr",
@@ -681,8 +685,14 @@ pub fn translate_op(
         OpKind::FieldWrite {
             base, field, value, ..
         } => {
-            let base_hl = lookup_operand(value_map, *base, op, "base")?;
-            let value_hl = lookup_operand(value_map, *value, op, "value")?;
+            let base_vid = graph
+                .value_id_of(base)
+                .expect("FieldWrite.base must have a backing ValueId");
+            let value_vid = graph
+                .value_id_of(value)
+                .expect("FieldWrite.value must have a backing ValueId");
+            let base_hl = lookup_operand(value_map, base_vid, op, "base")?;
+            let value_hl = lookup_operand(value_map, value_vid, op, "value")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 "setattr",
@@ -1651,7 +1661,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                 if let Some(name) = legacy.value_name(vid) {
                     name_to_value.insert(name.to_string(), hlvalue);
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry, legacy)?);
                 continue;
             }
 
@@ -1707,7 +1717,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                         )));
                     }
                 }
-                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+                translated_ops.extend(translate_op(legacy_op, &value_map, call_registry, legacy)?);
                 continue;
             }
 
@@ -1718,7 +1728,7 @@ pub fn function_graph_to_flowspace_with_seed_annotations(
                     value_map.insert(result, Hlvalue::Variable(var));
                 }
             }
-            translated_ops.extend(translate_op(legacy_op, &value_map, call_registry)?);
+            translated_ops.extend(translate_op(legacy_op, &value_map, call_registry, legacy)?);
             if let Some(result) = legacy_op.result {
                 if let Some(name) = legacy.value_name(result) {
                     if let Some(value) = value_map.get(&result).cloned() {
@@ -1872,6 +1882,18 @@ mod tests {
     /// share state with an enclosing annotator.
     fn empty_call_registry() -> PyreCallRegistry {
         PyreCallRegistry::new(Rc::new(Bookkeeper::new()))
+    }
+
+    /// Helper: a fresh `FunctionGraph` with backing Variables pre-allocated
+    /// for `ValueId(0..=high)`.  Used by `translate_op` arms whose
+    /// `OpKind` operand fields now hold a `Variable` and need to be
+    /// projected back to their `ValueId` via `graph.value_id_of`.
+    fn translate_op_test_graph(high: usize) -> crate::model::FunctionGraph {
+        let mut g = crate::model::FunctionGraph::new("translate_op_fixture");
+        if high >= g.next_value() {
+            g.set_next_value(high + 1);
+        }
+        g
     }
 
     #[test]
@@ -2230,7 +2252,8 @@ mod tests {
                 ty: ValueType::Int,
             },
         };
-        let result = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let result = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("Input must translate to skip");
         assert!(
             result.is_empty(),
@@ -2343,7 +2366,8 @@ mod tests {
             result: Some(ValueId(1)),
             kind: OpKind::ConstInt(7),
         };
-        let result = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let result = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("ConstInt must translate to skip");
         assert!(
             result.is_empty(),
@@ -2359,7 +2383,8 @@ mod tests {
             result: Some(ValueId(1)),
             kind: OpKind::ConstFloat(0),
         };
-        let result = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let result = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("ConstFloat must translate to skip");
         assert!(result.is_empty());
     }
@@ -2387,8 +2412,9 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated =
-            translate_op(&op, &value_map, &empty_call_registry()).expect("BinOp arm must lower");
+        let graph = translate_op_test_graph(10);
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+            .expect("BinOp arm must lower");
         assert_eq!(translated.len(), 1, "BinOp lowers to exactly one SpaceOp");
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "add", "opname passes through unchanged");
@@ -2412,7 +2438,8 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect_err("undefined BinOp operand must surface invariant break");
         let msg = format!("{err}");
         assert!(msg.contains("undefined operand"));
@@ -2446,8 +2473,9 @@ mod tests {
             FunctionPathKey::from_segments(["a", "b"]),
             Signature::new(vec!["x".into()], None, None),
         );
+        let graph = translate_op_test_graph(10);
         let translated =
-            translate_op(&op, &value_map, &registry).expect("Call::FunctionPath must lower");
+            translate_op(&op, &value_map, &registry, &graph).expect("Call::FunctionPath must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
         assert_eq!(lowered.opname, "simple_call");
@@ -2482,7 +2510,8 @@ mod tests {
                 result_ty: ValueType::Ref,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("Call::SyntheticTransparentCtor must lower");
         assert_eq!(translated.len(), 1);
         assert_eq!(translated[0].opname, "simple_call");
@@ -2513,8 +2542,9 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let translated =
-            translate_op(&op, &value_map, &empty_call_registry()).expect("Call::Method must lower");
+        let graph = translate_op_test_graph(10);
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
+            .expect("Call::Method must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getattr");
         assert_eq!(translated[1].opname, "simple_call");
@@ -2563,7 +2593,8 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect_err("Call::Indirect must surface rclass invariant break");
         let msg = format!("{err}");
         assert!(
@@ -2595,7 +2626,8 @@ mod tests {
                 result_ty: ValueType::Int,
             },
         };
-        let err = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect_err("IndirectCall must surface rpbc.rs invariant break");
         let msg = format!("{err}");
         assert!(
@@ -2616,16 +2648,17 @@ mod tests {
         value_map.insert(ValueId(1), base_var.clone());
         value_map.insert(ValueId(2), result_var.clone());
 
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(2)),
             kind: OpKind::FieldRead {
-                base: ValueId(1),
+                base: graph.must_variable(ValueId(1)),
                 field: crate::model::FieldDescriptor::new("f", Some("Owner".into())),
                 ty: ValueType::Int,
                 pure: false,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("FieldRead arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -2645,16 +2678,17 @@ mod tests {
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: None,
             kind: OpKind::FieldWrite {
-                base: ValueId(1),
+                base: graph.must_variable(ValueId(1)),
                 field: crate::model::FieldDescriptor::new("g", Some("Owner".into())),
-                value: ValueId(2),
+                value: graph.must_variable(ValueId(2)),
                 ty: ValueType::Int,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("FieldWrite arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -2690,7 +2724,8 @@ mod tests {
                 nolength: false,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("ArrayRead arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -2715,7 +2750,8 @@ mod tests {
                 nolength: false,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("ArrayWrite arm must lower");
         assert_eq!(translated.len(), 1);
         let lowered = &translated[0];
@@ -2743,7 +2779,8 @@ mod tests {
                 array_type_id: None,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("InteriorFieldRead arm must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getitem");
@@ -2782,7 +2819,8 @@ mod tests {
                 array_type_id: None,
             },
         };
-        let translated = translate_op(&op, &value_map, &empty_call_registry())
+        let graph = translate_op_test_graph(10);
+        let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("InteriorFieldWrite arm must lower");
         assert_eq!(translated.len(), 2);
         assert_eq!(translated[0].opname, "getitem");

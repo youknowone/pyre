@@ -6620,10 +6620,11 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("accessor");
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base,
+                base: base_var.clone(),
                 field: crate::model::FieldDescriptor::new("x", Some("Point".into())),
                 ty: ValueType::Int,
                 pure: false,
@@ -6633,9 +6634,9 @@ mod tests {
         graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
-                base,
+                base: base_var.clone(),
                 field: crate::model::FieldDescriptor::new("y", Some("Point".into())),
-                value: base, // dummy
+                value: base_var.clone(), // dummy
                 ty: ValueType::Int,
             },
             false,
@@ -6708,12 +6709,13 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("pure_writer");
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
-                base,
+                base: base_var.clone(),
                 field: crate::model::FieldDescriptor::new("cache", Some("Obj".into())),
-                value: base,
+                value: base_var,
                 ty: ValueType::Int,
             },
             false,
@@ -6801,12 +6803,13 @@ mod tests {
         let mut cc = CallControl::new();
         let mut graph = FunctionGraph::new("rw_same_field");
         let base = graph.alloc_value();
+        let base_var = graph.must_variable(base);
         let field = crate::model::FieldDescriptor::new("x", Some("Point".into()));
         // Both read AND write the same field "x"
         graph.push_op(
             graph.startblock,
             OpKind::FieldRead {
-                base,
+                base: base_var.clone(),
                 field: field.clone(),
                 ty: ValueType::Int,
                 pure: false,
@@ -6816,9 +6819,9 @@ mod tests {
         graph.push_op(
             graph.startblock,
             OpKind::FieldWrite {
-                base,
+                base: base_var.clone(),
                 field: field.clone(),
-                value: base,
+                value: base_var,
                 ty: ValueType::Int,
             },
             false,
