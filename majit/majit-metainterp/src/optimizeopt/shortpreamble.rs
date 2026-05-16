@@ -35,6 +35,7 @@ use std::collections::{HashMap, HashSet};
 
 use majit_ir::{Op, OpCode, OpRef};
 
+use crate::optimizeopt::vec_assoc::VecAssoc;
 use crate::optimizeopt::virtualstate::VirtualState;
 
 /// A recorded preamble operation that bridges must replay.
@@ -431,15 +432,11 @@ impl PreambleOp {
 /// the operations that produce them.
 #[derive(Clone, Debug, Default)]
 pub struct ShortBoxes {
-    /// shortpreamble.py: potential_ops
-    potential_ops: HashMap<OpRef, PotentialShortOp>,
-    /// Ordered insertion list for potential ops, matching shortpreamble.py's
-    /// OrderedDict iteration contract.
-    potential_order: Vec<OpRef>,
-    /// shortpreamble.py: produced_short_boxes
-    produced_short_boxes: HashMap<OpRef, ProducedShortOp>,
-    /// Production order for exported short ops.
-    produced_order: Vec<OpRef>,
+    /// shortpreamble.py:249 self.potential_ops = OrderedDict()
+    potential_ops: VecAssoc<OpRef, PotentialShortOp>,
+    /// shortpreamble.py:250 self.produced_short_boxes = {}
+    /// (insertion order preserved by VecAssoc for deterministic export.)
+    produced_short_boxes: VecAssoc<OpRef, ProducedShortOp>,
     /// shortpreamble.py: const_short_boxes
     const_short_boxes: Vec<PreambleOp>,
     /// RPython shortpreamble.py: Const boxes are directly admissible in
@@ -500,7 +497,6 @@ impl PotentialShortOp {
                         alt.invented_name = true;
                         alt.same_as_source = Some(compound.res);
                         sb.produced_short_boxes.insert(alias, alt.clone());
-                        sb.produced_order.push(alias);
                     }
                     Some(chosen)
                 }
@@ -512,10 +508,8 @@ impl PotentialShortOp {
 impl ShortBoxes {
     pub fn new(num_label_args: usize) -> Self {
         ShortBoxes {
-            potential_ops: HashMap::new(),
-            potential_order: Vec::new(),
-            produced_short_boxes: HashMap::new(),
-            produced_order: Vec::new(),
+            potential_ops: VecAssoc::new(),
+            produced_short_boxes: VecAssoc::new(),
             const_short_boxes: Vec::new(),
             known_constants: HashSet::new(),
             short_inputargs: Vec::new(),
@@ -570,9 +564,6 @@ impl ShortBoxes {
     }
 
     fn add_op(&mut self, result: OpRef, pop: PotentialShortOp) {
-        if !self.potential_ops.contains_key(&result) {
-            self.potential_order.push(result);
-        }
         self.potential_ops.insert(result, pop);
     }
 
@@ -631,9 +622,6 @@ impl ShortBoxes {
         let label_arg_idx = self.lookup_label_arg(arg);
         let mut same_as = Op::new(OpCode::same_as_for_type(arg_type), &[arg]);
         same_as.pos.set(arg);
-        if !self.potential_order.contains(&arg) {
-            self.potential_order.push(arg);
-        }
         self.potential_ops.insert(
             arg,
             PotentialShortOp::Preamble(PreambleOp {
@@ -711,7 +699,6 @@ impl ShortBoxes {
         self.boxes_in_production.insert(result);
         let produced = candidate.add_op_to_short(self, ctx)?;
         self.produced_short_boxes.insert(result, produced.clone());
-        self.produced_order.push(result);
         self.boxes_in_production.remove(&result);
         Some(produced)
     }
@@ -721,18 +708,13 @@ impl ShortBoxes {
         &mut self,
         ctx: &mut crate::optimizeopt::OptContext,
     ) -> Vec<(OpRef, ProducedShortOp)> {
-        let keys = self.potential_order.clone();
+        let keys: Vec<OpRef> = self.potential_ops.iter().map(|(k, _)| *k).collect();
         for key in keys {
             let _ = self.materialize_one(ctx, key);
         }
-        self.produced_order
+        self.produced_short_boxes
             .iter()
-            .filter_map(|key| {
-                self.produced_short_boxes
-                    .get(key)
-                    .cloned()
-                    .map(|produced| (*key, produced))
-            })
+            .map(|(k, v)| (*k, v.clone()))
             .collect()
     }
 
@@ -843,11 +825,11 @@ impl ShortBoxes {
             invented_name: false,
             same_as_source: None,
         });
-        let next = match self.potential_ops.remove(&result) {
+        let next = match self.potential_ops.get(&result) {
             Some(prev) => PotentialShortOp::Compound(CompoundOp {
                 res: result,
                 one: Box::new(pop),
-                two: Box::new(prev),
+                two: Box::new(prev.clone()),
             }),
             None => pop,
         };

@@ -11,9 +11,17 @@
 
 /// Vec-backed associative container with `HashMap`-shaped get / insert /
 /// entry-or-insert / clear methods. Equality on the key uses `==`.
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct VecAssoc<K: Eq, V> {
     entries: Vec<(K, V)>,
+}
+
+impl<K: Eq, V> Default for VecAssoc<K, V> {
+    fn default() -> Self {
+        Self {
+            entries: Vec::new(),
+        }
+    }
 }
 
 impl<K: Eq + Copy, V> VecAssoc<K, V> {
