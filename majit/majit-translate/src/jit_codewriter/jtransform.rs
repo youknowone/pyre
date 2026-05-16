@@ -2223,7 +2223,7 @@ impl<'a> Transformer<'a> {
                     self.handle_residual_call(op, target, descriptor, args, result_ty, graph_name)
                 }
                 crate::call::CallKind::Builtin => {
-                    self.handle_builtin_call(op, target, args, result_ty, graph_name)
+                    self.handle_builtin_call(op, target, args, result_ty, graph_name, graph)
                 }
                 crate::call::CallKind::Recursive => {
                     self.handle_recursive_call(op, target, args, result_ty, graph_name, graph)
@@ -2261,6 +2261,7 @@ impl<'a> Transformer<'a> {
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         // RPython `jtransform.py:484-485`:
         //   oopspec_name, args = support.decode_builtin_call(op)
@@ -2334,7 +2335,8 @@ impl<'a> Transformer<'a> {
         if let Some(base) = user_oopspec.as_deref() {
             // jtransform.py:497 — jit.* oopspecs → __handle_jit_call
             if base.starts_with("jit.") {
-                let result = self._handle_jit_call(base, op, target, args, result_ty, graph_name);
+                let result =
+                    self._handle_jit_call(base, op, target, args, result_ty, graph_name, graph);
                 return prepend_const_prefix(&mut const_prefix_ops, result);
             }
             // NOTE: conditional_call!/conditional_call_elidable!/record_known_result!
@@ -2615,6 +2617,7 @@ impl<'a> Transformer<'a> {
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         match oopspec_name {
             // jtransform.py:1731-1732
@@ -2640,7 +2643,10 @@ impl<'a> Transformer<'a> {
                 });
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: None,
-                    kind: OpKind::AssertGreen { value, kind_char },
+                    kind: OpKind::AssertGreen {
+                        value: graph.must_variable(value),
+                        kind_char,
+                    },
                 }])
             }
             // jtransform.py:1736-1737
@@ -2664,7 +2670,10 @@ impl<'a> Transformer<'a> {
                 });
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result,
-                    kind: OpKind::IsConstant { value, kind_char },
+                    kind: OpKind::IsConstant {
+                        value: graph.must_variable(value),
+                        kind_char,
+                    },
                 }])
             }
             // jtransform.py:1741-1743
@@ -2677,7 +2686,10 @@ impl<'a> Transformer<'a> {
                 });
                 RewriteResult::Replace(vec![SpaceOperation {
                     result: op.result,
-                    kind: OpKind::IsVirtual { value, kind_char },
+                    kind: OpKind::IsVirtual {
+                        value: graph.must_variable(value),
+                        kind_char,
+                    },
                 }])
             }
             // jtransform.py:1744-1747
@@ -3908,18 +3920,33 @@ fn remap_op(
             args_f: remap_list(args_f, aliases),
             result_kind: *result_kind,
         },
-        OpKind::AssertGreen { value, kind_char } => OpKind::AssertGreen {
-            value: remap_value(*value, aliases),
-            kind_char: *kind_char,
-        },
-        OpKind::IsConstant { value, kind_char } => OpKind::IsConstant {
-            value: remap_value(*value, aliases),
-            kind_char: *kind_char,
-        },
-        OpKind::IsVirtual { value, kind_char } => OpKind::IsVirtual {
-            value: remap_value(*value, aliases),
-            kind_char: *kind_char,
-        },
+        OpKind::AssertGreen { value, kind_char } => {
+            let value_vid = graph
+                .value_id_of(value)
+                .expect("AssertGreen.value must have a backing ValueId");
+            OpKind::AssertGreen {
+                value: graph.must_variable(remap_value(value_vid, aliases)),
+                kind_char: *kind_char,
+            }
+        }
+        OpKind::IsConstant { value, kind_char } => {
+            let value_vid = graph
+                .value_id_of(value)
+                .expect("IsConstant.value must have a backing ValueId");
+            OpKind::IsConstant {
+                value: graph.must_variable(remap_value(value_vid, aliases)),
+                kind_char: *kind_char,
+            }
+        }
+        OpKind::IsVirtual { value, kind_char } => {
+            let value_vid = graph
+                .value_id_of(value)
+                .expect("IsVirtual.value must have a backing ValueId");
+            OpKind::IsVirtual {
+                value: graph.must_variable(remap_value(value_vid, aliases)),
+                kind_char: *kind_char,
+            }
+        }
         OpKind::CallElidable {
             funcptr,
             descriptor,

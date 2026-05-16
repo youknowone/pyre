@@ -730,7 +730,7 @@ pub enum OpKind {
     /// jtransform.py:1733 — `{kind}_assert_green(value)`.
     /// Asserts the value is compile-time constant during tracing.
     AssertGreen {
-        value: ValueId,
+        value: crate::flowspace::model::Variable,
         kind_char: char,
     },
     /// jtransform.py:1736 — `current_trace_length()`.
@@ -739,13 +739,13 @@ pub enum OpKind {
     /// jtransform.py:1738 — `{kind}_isconstant(value)`.
     /// Returns whether the value is currently known to be constant.
     IsConstant {
-        value: ValueId,
+        value: crate::flowspace::model::Variable,
         kind_char: char,
     },
     /// jtransform.py:1741 — `{kind}_isvirtual(value)`.
     /// Returns whether the value is currently virtualized.
     IsVirtual {
-        value: ValueId,
+        value: crate::flowspace::model::Variable,
         kind_char: char,
     },
 

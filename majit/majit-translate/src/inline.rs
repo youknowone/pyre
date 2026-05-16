@@ -634,19 +634,34 @@ fn remap_op_kind(
             args_f: args_f.iter().map(remap).collect(),
             result_kind: *result_kind,
         },
-        OpKind::AssertGreen { value, kind_char } => OpKind::AssertGreen {
-            value: remap(value),
-            kind_char: *kind_char,
-        },
+        OpKind::AssertGreen { value, kind_char } => {
+            let value_vid = source_graph
+                .value_id_of(value)
+                .expect("AssertGreen.value must have a backing ValueId in source");
+            OpKind::AssertGreen {
+                value: target_graph.must_variable(remap(&value_vid)),
+                kind_char: *kind_char,
+            }
+        }
         OpKind::CurrentTraceLength => OpKind::CurrentTraceLength,
-        OpKind::IsConstant { value, kind_char } => OpKind::IsConstant {
-            value: remap(value),
-            kind_char: *kind_char,
-        },
-        OpKind::IsVirtual { value, kind_char } => OpKind::IsVirtual {
-            value: remap(value),
-            kind_char: *kind_char,
-        },
+        OpKind::IsConstant { value, kind_char } => {
+            let value_vid = source_graph
+                .value_id_of(value)
+                .expect("IsConstant.value must have a backing ValueId in source");
+            OpKind::IsConstant {
+                value: target_graph.must_variable(remap(&value_vid)),
+                kind_char: *kind_char,
+            }
+        }
+        OpKind::IsVirtual { value, kind_char } => {
+            let value_vid = source_graph
+                .value_id_of(value)
+                .expect("IsVirtual.value must have a backing ValueId in source");
+            OpKind::IsVirtual {
+                value: target_graph.must_variable(remap(&value_vid)),
+                kind_char: *kind_char,
+            }
+        }
         OpKind::Live => OpKind::Live,
         OpKind::JitMergePoint {
             jitdriver_index,
@@ -860,7 +875,12 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
         ],
         OpKind::AssertGreen { value, .. }
         | OpKind::IsConstant { value, .. }
-        | OpKind::IsVirtual { value, .. } => vec![*value],
+        | OpKind::IsVirtual { value, .. } => vec![
+            graph
+                .expect("AssertGreen/IsConstant/IsVirtual require a graph to project Variable")
+                .value_id_of(value)
+                .expect("AssertGreen/IsConstant/IsVirtual.value must be a known Variable on graph"),
+        ],
         OpKind::VtableMethodPtr { receiver, .. } => vec![*receiver],
         OpKind::IndirectCall { funcptr, args, .. } => {
             let mut v = vec![*funcptr];
