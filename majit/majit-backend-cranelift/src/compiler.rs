@@ -1430,35 +1430,6 @@ fn write_barrier_if_managed(obj: GcRef) {
 
 
 
-fn resolve_virtual_field_value(
-    source: &majit_backend::ExitValueSourceLayout,
-    outputs: &[i64],
-) -> Option<i64> {
-    match source {
-        majit_backend::ExitValueSourceLayout::ExitValue(idx) => outputs.get(*idx).copied(),
-        majit_backend::ExitValueSourceLayout::Constant(c) => Some(*c),
-        _ => None,
-    }
-}
-
-/// resolve_virtual_field_value with nested virtual support.
-/// resume.py:1552-1573: TAGVIRTUAL → getvirtual_ptr/int.
-fn resolve_virtual_field_value_with_materialized(
-    source: &majit_backend::ExitValueSourceLayout,
-    outputs: &[i64],
-    materialized: &[GcRef],
-) -> Option<i64> {
-    match source {
-        majit_backend::ExitValueSourceLayout::ExitValue(idx) => outputs.get(*idx).copied(),
-        majit_backend::ExitValueSourceLayout::Constant(c) => Some(*c),
-        majit_backend::ExitValueSourceLayout::Virtual(vidx) => materialized
-            .get(*vidx)
-            .map(|root| root.0 as i64)
-            .filter(|value| *value != 0),
-        _ => None,
-    }
-}
-
 thread_local! {
     /// Per-thread CALL_ASSEMBLER target registry.
     ///
@@ -1609,25 +1580,6 @@ thread_local! {
 /// Take the pending raw local0 value (if any).
 pub fn take_pending_force_local0() -> Option<i64> {
     PENDING_FORCE_LOCAL0.with(|c| c.take())
-}
-
-/// RPython rebuild_state_after_failure parity: callback to materialize
-/// virtual objects in fail_args before bridge dispatch. The Cranelift
-/// backend cannot depend on pyre-object, so the interpreter registers
-/// a callback that creates concrete objects from (type_ptr, raw_value) pairs.
-///
-/// Signature: fn(outputs: &mut [i64], types: &[Type]) — modifies outputs
-/// in-place, replacing null Ref slots with materialized object pointers.
-type RebuildStateAfterFailureFn = fn(&mut [i64], &[majit_ir::Type]);
-
-thread_local! {
-    static REBUILD_STATE_AFTER_FAILURE: std::cell::Cell<Option<RebuildStateAfterFailureFn>> =
-        const { std::cell::Cell::new(None) };
-}
-
-/// Register the virtual materialization callback. Called from pyre-jit init.
-pub fn register_rebuild_state_after_failure(f: RebuildStateAfterFailureFn) {
-    REBUILD_STATE_AFTER_FAILURE.with(|c| c.set(Some(f)));
 }
 
 /// resume.py:763-779 VStrPlainInfo.allocate / resume.py:817-829

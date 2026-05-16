@@ -2139,8 +2139,6 @@ fn eval_with_jit_inner(frame: &mut PyFrame) -> PyResult {
     crate::call_jit::install_jit_call_bridge();
     init_callbacks();
     #[cfg(feature = "cranelift")]
-    majit_backend_cranelift::register_rebuild_state_after_failure(rebuild_state_after_failure);
-    #[cfg(feature = "cranelift")]
     majit_backend_cranelift::register_resumedata_deopt(crate::call_jit::cranelift_resumedata_deopt);
     frame.fix_array_ptrs();
     // Set CURRENT_FRAME so zero-arg super() can find __class__ in the caller.
@@ -5584,22 +5582,6 @@ fn _prepare_next_section(
             RebuiltValue::Unassigned => Value::Void,
         });
     }
-}
-
-/// Guard failure recovery: reconstruct virtual objects from their
-/// field values stored as extra fail_args after null (NONE) slots.
-///
-/// When the optimizer places a virtual in fail_args, it sets the
-/// resume.py:945/993 parity: virtual materialization via rd_virtuals.
-/// Called from Cranelift's guard failure handler via TLS callback.
-/// RPython uses rd_virtuals/rd_pendingfields for precise materialization.
-/// The backend callback itself stays a no-op; runtime restore goes through
-/// rebuild_from_resumedata + materialize_virtual_from_rd.
-fn rebuild_state_after_failure(_outputs: &mut [i64], _types: &[majit_ir::Type]) {
-    // RPython: materialization happens in rebuild_from_resumedata via
-    // getvirtual_ptr (resume.py:945) and _prepare_pendingfields (resume.py:993).
-    // The Cranelift callback is a no-op; decode_and_restore_guard_failure
-    // performs the real resume-data rebuild.
 }
 
 // `cranelift_resumedata_deopt` lives in `call_jit.rs` so it stays
