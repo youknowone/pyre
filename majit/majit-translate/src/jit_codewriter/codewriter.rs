@@ -387,7 +387,6 @@ impl CodeWriter {
             &type_state,
             &crate::jit_codewriter::type_state::TypeResolutionState::new(),
             &post_result_types,
-            &rewritten.synth_kinds,
         );
         // Long-term parity hydration: when the dual-gate Match arm
         // surfaced a `ValueIdToVariable` map, rebind each slot to the

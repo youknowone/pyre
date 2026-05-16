@@ -156,13 +156,6 @@ pub struct GraphTransformResult {
     pub vable_rewrites: usize,
     /// Number of calls classified.
     pub calls_classified: usize,
-    /// ConcreteType for every synthetic ValueId emitted by jtransform
-    /// (Phase C v2 Slice C-2). Callers merge this into their existing
-    /// `TypeResolutionState` so the rewritten graph's kind classification
-    /// stays authoritative without requiring a full `resolve_types`
-    /// rerun.  See `Transformer::synth_kinds`.
-    pub synth_kinds:
-        std::collections::HashMap<ValueId, crate::jit_codewriter::type_state::ConcreteType>,
 }
 
 /// Rewrite a semantic graph with JIT-specific transformations.
@@ -244,15 +237,6 @@ pub struct Transformer<'a> {
     /// RPython: DependencyTracker — caches transitive analysis results.
     /// Shared across all getcalldescr() calls within this transform pass.
     analysis_cache: crate::call::AnalysisCache,
-    /// ValueId → ConcreteType for synthetic ValueIds allocated via
-    /// `fresh_synthetic_value_typed` and for existing result ValueIds
-    /// whose kind is changed by a rewrite in this pass.  RPython
-    /// attaches `concretetype` directly on every `Variable`
-    /// (`flowmodel.py:Variable.__init__`); pyre stamps the equivalent
-    /// table entry here so later operations in the same transform pass,
-    /// and the post-transform type merge, see the rewritten kind.
-    synth_kinds:
-        std::collections::HashMap<ValueId, crate::jit_codewriter::type_state::ConcreteType>,
 }
 
 /// RPython: jtransform.py vable_flags values
@@ -389,7 +373,6 @@ impl<'a> Transformer<'a> {
             vable_rewrites: 0,
             calls_classified: 0,
             analysis_cache: crate::call::AnalysisCache::default(),
-            synth_kinds: std::collections::HashMap::new(),
         }
     }
 
@@ -444,7 +427,6 @@ impl<'a> Transformer<'a> {
             notes: std::mem::take(&mut self.notes),
             vable_rewrites: self.vable_rewrites,
             calls_classified: self.calls_classified,
-            synth_kinds: std::mem::take(&mut self.synth_kinds),
         }
     }
 
@@ -512,39 +494,39 @@ impl<'a> Transformer<'a> {
         graph.alloc_value()
     }
 
-    /// Allocate a fresh synthetic ValueId AND stamp its `ConcreteType`
-    /// into `synth_kinds` (Phase C v2 Slice C-2).  Mirrors RPython's
+    /// Allocate a fresh synthetic ValueId; its backing `Variable`'s
+    /// `concretetype` cell is the authoritative kind source (set up-front
+    /// via `graph.alloc_value_with_type`). Mirrors RPython's
     /// `Variable(concretetype=T)` (`flowmodel.py:Variable.__init__`).
-    /// The Variable backing this slot is created up-front via
-    /// `graph.alloc_value_with_type` so downstream consumers can
-    /// project the synthetic ValueId back to a Variable through
-    /// `graph.must_variable` without a follow-up backfill.
     fn fresh_synthetic_value_typed(
         &mut self,
         graph: &mut FunctionGraph,
         ty: crate::jit_codewriter::type_state::ConcreteType,
     ) -> ValueId {
-        let value = graph.alloc_value_with_type(ty);
-        self.synth_kinds.insert(value, ty);
-        value
+        graph.alloc_value_with_type(ty)
     }
 
     fn stamp_value_kind(
         &mut self,
+        graph: &mut FunctionGraph,
         value: Option<ValueId>,
         ty: crate::jit_codewriter::type_state::ConcreteType,
     ) {
         if let Some(value) = value {
-            self.synth_kinds.insert(value, ty);
+            graph.set_concretetype(value, ty);
         }
     }
 
     /// Stamp the synthetic kind from a `ValueType` source, skipping
     /// `ValueType::Unknown` so the fallback Unknown→Ref defaulting in
-    /// `value_type_to_kind` does not pollute `synth_kinds` with a
-    /// GcRef entry that would mask the real `concretetype` already
-    /// computed by the rtyper for an existing ValueId.
-    fn stamp_value_kind_from_value_type(&mut self, value: Option<ValueId>, result_ty: &ValueType) {
+    /// `value_type_to_kind` does not clobber a real `concretetype`
+    /// already computed by the rtyper for an existing ValueId.
+    fn stamp_value_kind_from_value_type(
+        &mut self,
+        graph: &mut FunctionGraph,
+        value: Option<ValueId>,
+        result_ty: &ValueType,
+    ) {
         let ty = match result_ty {
             ValueType::Int | ValueType::Unsigned | ValueType::Bool | ValueType::State => {
                 crate::jit_codewriter::type_state::ConcreteType::Signed
@@ -554,7 +536,7 @@ impl<'a> Transformer<'a> {
             ValueType::Void => crate::jit_codewriter::type_state::ConcreteType::Void,
             ValueType::Unknown => return,
         };
-        self.stamp_value_kind(value, ty);
+        self.stamp_value_kind(graph, value, ty);
     }
 
     /// RPython `op.result.concretetype` is set by the rtyper, so jtransform
@@ -859,6 +841,7 @@ impl<'a> Transformer<'a> {
                 ..
             } if unop_name == "cast_bool_to_float" => {
                 self.stamp_value_kind(
+                    graph,
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
@@ -943,6 +926,7 @@ impl<'a> Transformer<'a> {
                     other => other,
                 };
                 self.stamp_value_kind(
+                    graph,
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
@@ -972,6 +956,7 @@ impl<'a> Transformer<'a> {
                     || self.get_value_kind_var(graph, rhs) == 'f') =>
             {
                 self.stamp_value_kind(
+                    graph,
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
@@ -1002,6 +987,7 @@ impl<'a> Transformer<'a> {
                     || *result_ty == ValueType::Float) =>
             {
                 self.stamp_value_kind(
+                    graph,
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
@@ -1039,6 +1025,7 @@ impl<'a> Transformer<'a> {
                 ..
             } if unop_name == "neg" && self.get_value_kind_var(graph, operand) == 'f' => {
                 self.stamp_value_kind(
+                    graph,
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
@@ -1233,6 +1220,7 @@ impl<'a> Transformer<'a> {
                 || unop_name == "float_is_true" =>
             {
                 self.stamp_value_kind(
+                    graph,
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
@@ -1325,6 +1313,7 @@ impl<'a> Transformer<'a> {
                 let target = CallTarget::function_path(["cast_uint_to_float"]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 self.stamp_value_kind(
+                    graph,
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
@@ -1362,6 +1351,7 @@ impl<'a> Transformer<'a> {
                 let target = CallTarget::function_path(["cast_float_to_uint"]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 self.stamp_value_kind(
+                    graph,
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
@@ -1400,6 +1390,7 @@ impl<'a> Transformer<'a> {
                 ..
             } if unop_name == "uint_is_true" => {
                 self.stamp_value_kind(
+                    graph,
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
@@ -1494,12 +1485,16 @@ impl<'a> Transformer<'a> {
     /// RPython: `add_in_correct_list(v, lst_i, lst_r, lst_f)` checks
     /// `getkind(v.concretetype)` and appends to the matching list.
     /// Void args are skipped.
-    fn make_three_lists(&self, args: &[ValueId]) -> (Vec<ValueId>, Vec<ValueId>, Vec<ValueId>) {
+    fn make_three_lists(
+        &self,
+        graph: &FunctionGraph,
+        args: &[ValueId],
+    ) -> (Vec<ValueId>, Vec<ValueId>, Vec<ValueId>) {
         let mut args_i = Vec::new();
         let mut args_r = Vec::new();
         let mut args_f = Vec::new();
         for &v in args {
-            let kind = self.get_value_kind(v);
+            let kind = self.get_value_kind(graph, v);
             match kind {
                 'i' => args_i.push(v),
                 'r' => args_r.push(v),
@@ -1523,7 +1518,7 @@ impl<'a> Transformer<'a> {
         Vec<crate::flowspace::model::Variable>,
         Vec<crate::flowspace::model::Variable>,
     ) {
-        let (i_vids, r_vids, f_vids) = self.make_three_lists(args);
+        let (i_vids, r_vids, f_vids) = self.make_three_lists(graph, args);
         let to_var = |v: ValueId| graph.must_variable(v);
         (
             i_vids.into_iter().map(to_var).collect(),
@@ -1558,13 +1553,17 @@ impl<'a> Transformer<'a> {
     /// `jit.assert_green` / `jit.isconstant` / `jit.isvirtual` etc.)
     /// where RPython expects a plain `'r'`, breaking parity at every
     /// such call site.
-    fn get_value_kind(&self, v: ValueId) -> char {
-        let base = if let Some(ct) = self.synth_kinds.get(&v) {
-            ct
+    fn get_value_kind(&self, graph: &FunctionGraph, v: ValueId) -> char {
+        let from_graph = graph.concretetype(v);
+        let base = if !matches!(
+            from_graph,
+            crate::jit_codewriter::type_state::ConcreteType::Unknown
+        ) {
+            from_graph
         } else if let Some(ts) = self.type_state {
-            ts.get(v)
+            ts.get(v).clone()
         } else {
-            &crate::jit_codewriter::type_state::ConcreteType::Unknown
+            crate::jit_codewriter::type_state::ConcreteType::Unknown
         };
         match base {
             crate::jit_codewriter::type_state::ConcreteType::Signed => 'i',
@@ -1580,8 +1579,7 @@ impl<'a> Transformer<'a> {
     /// [`ValueId`] via `graph.value_id_of` and forwards to the kind
     /// lookup.  Call sites that have flipped their operand storage from
     /// `ValueId` to `Variable` (BinOp/UnaryOp post-cluster-3 flip) use
-    /// this overload so the synth_kinds / type_state lookup stays
-    /// untouched while the per-arm dispatch reads the Variable handle
+    /// this overload so the per-arm dispatch reads the Variable handle
     /// directly.
     fn get_value_kind_var(
         &self,
@@ -1591,7 +1589,7 @@ impl<'a> Transformer<'a> {
         let vid = graph
             .value_id_of(var)
             .expect("Variable operand must have a backing ValueId on graph");
-        self.get_value_kind(vid)
+        self.get_value_kind(graph, vid)
     }
 
     fn get_value_type(&self, v: ValueId) -> Option<ValueType> {
@@ -1884,7 +1882,7 @@ impl<'a> Transformer<'a> {
             return RewriteResult::Keep;
         };
         let base = resolve_alias(arg, &self.aliases);
-        let kind_char = self.value_kind(base);
+        let kind_char = self.value_kind(graph, base);
         // jtransform.py:608 `op.args[0].concretetype is not lltype.Void`
         // guard — void args fall through the rewrite (caller may want
         // to keep the original op).
@@ -2574,7 +2572,7 @@ impl<'a> Transformer<'a> {
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
-        graph: &crate::model::FunctionGraph,
+        graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
         // RPython jtransform.py:477-478: get_jitcode(targetgraph)
         //
@@ -2600,7 +2598,7 @@ impl<'a> Transformer<'a> {
         // Split args by kind (RPython make_three_lists)
         let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
         let result_kind = self.resolve_call_result(op.result, result_ty).kind;
-        self.stamp_value_kind_from_value_type(op.result, result_ty);
+        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
 
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -2637,7 +2635,7 @@ impl<'a> Transformer<'a> {
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
-        graph: &crate::model::FunctionGraph,
+        graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
         // RPython jtransform.py:522-534:
         //   jitdriver_sd = callcontrol.jitdriver_sd_from_portal_runner_ptr(funcptr)
@@ -2665,10 +2663,10 @@ impl<'a> Transformer<'a> {
         } else {
             &[]
         };
-        let (greens_i, greens_r, greens_f) = self.make_three_lists(green_args);
-        let (reds_i, reds_r, reds_f) = self.make_three_lists(red_args);
+        let (greens_i, greens_r, greens_f) = self.make_three_lists(graph, green_args);
+        let (reds_i, reds_r, reds_f) = self.make_three_lists(graph, red_args);
         let result_kind = self.resolve_call_result(op.result, result_ty).kind;
-        self.stamp_value_kind_from_value_type(op.result, result_ty);
+        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
 
         self.notes.push(GraphTransformNote {
             function: graph_name.to_string(),
@@ -2717,7 +2715,7 @@ impl<'a> Transformer<'a> {
     ) -> Vec<SpaceOperation> {
         let mut ops = Vec::new();
         for &v in green_args {
-            let kind = self.value_kind(v);
+            let kind = self.value_kind(graph, v);
             if kind == 'v' {
                 continue; // skip void
             }
@@ -2738,9 +2736,9 @@ impl<'a> Transformer<'a> {
     }
 
     /// RPython: `getkind(v.concretetype)` — get the kind of a value.
-    /// Delegates to `get_value_kind()` which consults type_state.
-    fn value_kind(&self, v: ValueId) -> char {
-        self.get_value_kind(v)
+    /// Delegates to `get_value_kind()`.
+    fn value_kind(&self, graph: &FunctionGraph, v: ValueId) -> char {
+        self.get_value_kind(graph, v)
     }
 
     /// RPython: `Transformer.__handle_jit_call(op, oopspec_name, args)` (jtransform.py:1730-1757).
@@ -2772,7 +2770,7 @@ impl<'a> Transformer<'a> {
             // jtransform.py:1733-1735
             "jit.assert_green" => {
                 let value = args[0];
-                let kind_char = self.get_value_kind(value);
+                let kind_char = self.get_value_kind(graph, value);
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
                     detail: format!("jit.assert_green → {kind_char}_assert_green"),
@@ -2799,7 +2797,7 @@ impl<'a> Transformer<'a> {
             // jtransform.py:1738-1740
             "jit.isconstant" => {
                 let value = args[0];
-                let kind_char = self.get_value_kind(value);
+                let kind_char = self.get_value_kind(graph, value);
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
                     detail: format!("jit.isconstant → {kind_char}_isconstant"),
@@ -2815,7 +2813,7 @@ impl<'a> Transformer<'a> {
             // jtransform.py:1741-1743
             "jit.isvirtual" => {
                 let value = args[0];
-                let kind_char = self.get_value_kind(value);
+                let kind_char = self.get_value_kind(graph, value);
                 self.notes.push(GraphTransformNote {
                     function: graph_name.to_string(),
                     detail: format!("jit.isvirtual → {kind_char}_isvirtual"),
@@ -2943,7 +2941,7 @@ impl<'a> Transformer<'a> {
     #[allow(dead_code)]
     fn _rewrite_op_cond_call(
         &mut self,
-        graph: &FunctionGraph,
+        graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
@@ -2953,7 +2951,7 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         // jtransform.py:1666-1672: validate no floats, ≤4+2 args
         for &arg in args {
-            if self.get_value_kind(arg) == 'f' {
+            if self.get_value_kind(graph, arg) == 'f' {
                 panic!("Conditional call does not support floats");
             }
         }
@@ -2992,7 +2990,7 @@ impl<'a> Transformer<'a> {
             "force_ir: no float args in conditional_call"
         );
         let result_kind = resolved_result.kind;
-        self.stamp_value_kind_from_value_type(op.result, result_ty);
+        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
         let rewritten_opname = if is_value {
             "conditional_call_value"
         } else {
@@ -3044,7 +3042,7 @@ impl<'a> Transformer<'a> {
     #[allow(dead_code)]
     fn rewrite_op_jit_conditional_call(
         &mut self,
-        graph: &FunctionGraph,
+        graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
@@ -3060,7 +3058,7 @@ impl<'a> Transformer<'a> {
     #[allow(dead_code)]
     fn rewrite_op_jit_conditional_call_value(
         &mut self,
-        graph: &FunctionGraph,
+        graph: &mut FunctionGraph,
         op: &SpaceOperation,
         target: &CallTarget,
         args: &[ValueId],
@@ -3215,7 +3213,7 @@ impl<'a> Transformer<'a> {
     ) -> RewriteResult {
         // jtransform.py:293-295: validate no floats
         for &arg in args {
-            if self.get_value_kind(arg) == 'f' {
+            if self.get_value_kind(graph, arg) == 'f' {
                 panic!("record_known_result does not support floats");
             }
         }
@@ -3223,7 +3221,7 @@ impl<'a> Transformer<'a> {
         // args[0] = known result, args[1..] = function args
         let result_value = args[0];
         let func_args = if args.len() > 1 { &args[1..] } else { &[] };
-        let result_kind = self.get_value_kind(result_value);
+        let result_kind = self.get_value_kind(graph, result_value);
         let result_ir_type = match result_kind {
             'i' => majit_ir::value::Type::Int,
             'r' => majit_ir::value::Type::Ref,
@@ -3344,7 +3342,7 @@ impl<'a> Transformer<'a> {
         // `result_kind` matches what every downstream consumer sees,
         // instead of falling back to `'r'` from the Unknown default.
         let result_kind = self.resolve_call_result(op.result, result_ty).kind;
-        self.stamp_value_kind_from_value_type(op.result, result_ty);
+        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         // RPython jtransform.py:469-470: residual_call followed by -live-
         // if the call can raise or may call jitcodes.
@@ -3400,12 +3398,12 @@ impl<'a> Transformer<'a> {
         graphs: Option<&[crate::parse::CallPath]>,
         result_ty: &ValueType,
         graph_name: &str,
-        graph: &crate::model::FunctionGraph,
+        graph: &mut crate::model::FunctionGraph,
     ) -> RewriteResult {
         let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
         let resolved_result = self.resolve_call_result(op.result, result_ty);
         let result_kind = resolved_result.kind;
-        self.stamp_value_kind_from_value_type(op.result, result_ty);
+        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
         let non_void_args = resolve_non_void_arg_types(args, self.type_state);
         let result_ir_type = resolved_result.ir_type;
         let cc_mut = self
@@ -3534,7 +3532,7 @@ impl<'a> Transformer<'a> {
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
         let result_kind = self.resolve_call_result(op.result, result_ty).kind;
-        self.stamp_value_kind_from_value_type(op.result, result_ty);
+        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         RewriteResult::Replace(vec![
             funcptr_op,
@@ -3574,7 +3572,7 @@ impl<'a> Transformer<'a> {
         self.calls_classified += 1;
         let (args_i, args_r, args_f) = self.make_three_lists_vars(graph, args);
         let result_kind = self.resolve_call_result(op.result, result_ty).kind;
-        self.stamp_value_kind_from_value_type(op.result, result_ty);
+        self.stamp_value_kind_from_value_type(graph, op.result, result_ty);
         let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, target);
         // RPython: call_may_force always followed by -live-
         RewriteResult::Replace(vec![
@@ -5847,11 +5845,10 @@ mod tests {
         graph.set_return(graph.startblock, None);
 
         let config = GraphTransformConfig::default();
-        // Mark `v` as void-kind via synth_kinds before rewriting.
+        // Mark `v` as void-kind on its backing Variable before
+        // rewriting (mirrors RPython's `v.concretetype = lltype.Void`).
+        graph.set_concretetype(v, crate::jit_codewriter::type_state::ConcreteType::Void);
         let mut transformer = Transformer::new(&config);
-        transformer
-            .synth_kinds
-            .insert(v, crate::jit_codewriter::type_state::ConcreteType::Void);
         // Direct call to rewrite_operation — without setting up the
         // optimize_block plumbing — verifies the Keep result for the
         // void-kind branch in isolation.

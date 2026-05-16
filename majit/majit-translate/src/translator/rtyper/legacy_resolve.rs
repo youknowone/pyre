@@ -383,7 +383,6 @@ pub fn resolve_rewritten_types(
     original_types: &TypeResolutionState,
     rewritten_graph: &FunctionGraph,
     annotations: &AnnotationState,
-    stamped_kinds: &HashMap<ValueId, ConcreteType>,
 ) -> TypeResolutionState {
     let post_result_types = authoritative_result_types(rewritten_graph);
     let post_resolve = resolve_types(rewritten_graph, annotations);
@@ -391,7 +390,6 @@ pub fn resolve_rewritten_types(
         original_types,
         post_resolve,
         post_result_types,
-        stamped_kinds,
     )
 }
 
@@ -886,12 +884,7 @@ mod tests {
         let mut original = TypeResolutionState::new();
         original.set(result, ConcreteType::Void);
 
-        let types = resolve_rewritten_types(
-            &original,
-            &graph,
-            &annotations,
-            &std::collections::HashMap::new(),
-        );
+        let types = resolve_rewritten_types(&original, &graph, &annotations);
 
         assert_eq!(types.get(result), &ConcreteType::GcRef);
     }

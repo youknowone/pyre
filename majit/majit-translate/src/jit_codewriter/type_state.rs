@@ -282,28 +282,23 @@ pub fn apply_from_flowspace_variables(
 ///    on each rewritten op. Authoritative for op-result kinds (since
 ///    the rewriter declares them), so it wins over `original`'s
 ///    operand inferences.
-/// 4. `stamped` — jtransform's `synth_kinds` map: kinds the rewriter
-///    explicitly stamped on synthesized values during lowering
-///    (e.g. `cast_ptr_to_int`'s int-typed result). Wins outright
-///    because the rewriter knows the ground truth.
 ///
-/// Precedence: `stamped` > `post_result` > `post_resolve` > `original`.
-/// `original` only fills in slots that `post_result` doesn't claim,
-/// matching RPython's "single authoritative `op.result.concretetype`"
-/// invariant: a stale pre-rewrite operand kind never overrides a
-/// freshly-declared post-rewrite result kind.
+/// Precedence: `post_result` > `post_resolve` > `original`.  `original`
+/// only fills in slots that `post_result` doesn't claim, matching
+/// RPython's "single authoritative `op.result.concretetype`" invariant:
+/// a stale pre-rewrite operand kind never overrides a freshly-declared
+/// post-rewrite result kind.
 ///
-/// Survives the rtyper cutover (Slice 3): once the real `RPythonTyper`
-/// path produces `original` / `post_resolve`, this function still
-/// reconciles them with `post_result` / `stamped`. Slice 3 relocated
-/// this body from `translator/rtyper/legacy_resolve.rs:360-382` to
-/// keep the legacy graph-walk (`resolve_types`) callable separately
-/// from the merge logic.
+/// jtransform-stamped values are not a separate layer: they were
+/// written straight to each backing `Variable.concretetype` cell via
+/// `graph.set_concretetype` during the transform pass (mirroring
+/// RPython's inline `v.concretetype = T` writes), so they are already
+/// observable via `post_resolve` (which reads them out of the graph)
+/// and via `post_result` (declared on the rewritten op).
 pub fn merge_synth_kinds(
     original: &TypeResolutionState,
     post_resolve: TypeResolutionState,
     post_result: HashMap<ValueId, ConcreteType>,
-    stamped: &HashMap<ValueId, ConcreteType>,
 ) -> TypeResolutionState {
     let mut merged = post_resolve;
 
@@ -319,32 +314,25 @@ pub fn merge_synth_kinds(
     for (value, kind) in post_result {
         merged.set(value, kind);
     }
-    // (3) Synth kinds (jtransform-stamped) override everything — the
-    // rewriter declares these at lowering time with full ground truth.
-    for (&value, kind) in stamped {
-        merged.set(value, kind.clone());
-    }
 
     merged
 }
 
 /// Direct-to-graph variant of [`merge_synth_kinds`].
 ///
-/// Same precedence stack (`stamped > post_result > post_resolve >
-/// original`) but writes the per-value result straight through to
-/// each backing `Variable.concretetype` cell via
-/// `graph.set_concretetype` instead of building a transitional
-/// [`TypeResolutionState`].  Production callers go through this entry
-/// so the graph IS the merge target — no intermediate side table to
-/// thread downstream.  Skips Unknown writes so the
-/// canonical-exceptblock stamp performed elsewhere
+/// Same precedence stack (`post_result > post_resolve > original`) but
+/// writes the per-value result straight through to each backing
+/// `Variable.concretetype` cell via `graph.set_concretetype` instead of
+/// building a transitional [`TypeResolutionState`].  Production callers
+/// go through this entry so the graph IS the merge target — no
+/// intermediate side table to thread downstream.  Skips Unknown writes
+/// so the canonical-exceptblock stamp performed elsewhere
 /// (`augment_canonical_exceptblock_on_graph`) is not clobbered.
 pub fn merge_synth_kinds_into_graph(
     graph: &mut crate::model::FunctionGraph,
     original: &TypeResolutionState,
     post_resolve: &TypeResolutionState,
     post_result: &HashMap<ValueId, ConcreteType>,
-    stamped: &HashMap<ValueId, ConcreteType>,
 ) {
     use crate::model::ConcreteType;
     // (0) `post_resolve` (lower precedence than `original` per the
@@ -364,12 +352,6 @@ pub fn merge_synth_kinds_into_graph(
     }
     // (2) Op-result kinds win over operand inferences.
     for (value, kind) in post_result {
-        if !matches!(kind, ConcreteType::Unknown) {
-            graph.set_concretetype(*value, kind.clone());
-        }
-    }
-    // (3) Synth kinds (jtransform-stamped) override everything.
-    for (value, kind) in stamped {
         if !matches!(kind, ConcreteType::Unknown) {
             graph.set_concretetype(*value, kind.clone());
         }
@@ -499,17 +481,16 @@ mod tests {
 
     #[test]
     fn merge_synth_kinds_post_resolve_starts_as_base() {
-        // No original / post_result / stamped overrides — the merged
-        // state is just `post_resolve`.
+        // No original / post_result overrides — the merged state is
+        // just `post_resolve`.
         let post_resolve = state_from(&[
             (ValueId(1), ConcreteType::Signed),
             (ValueId(2), ConcreteType::Float),
         ]);
         let original = TypeResolutionState::new();
         let post_result: HashMap<ValueId, ConcreteType> = HashMap::new();
-        let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert_eq!(merged.get(ValueId(1)), &ConcreteType::Signed);
         assert_eq!(merged.get(ValueId(2)), &ConcreteType::Float);
     }
@@ -521,9 +502,8 @@ mod tests {
         let post_resolve = TypeResolutionState::new();
         let original = state_from(&[(ValueId(7), ConcreteType::Signed)]);
         let post_result: HashMap<ValueId, ConcreteType> = HashMap::new();
-        let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert_eq!(merged.get(ValueId(7)), &ConcreteType::Signed);
     }
 
@@ -535,9 +515,8 @@ mod tests {
         let mut original = TypeResolutionState::new();
         original.set(ValueId(7), ConcreteType::Unknown);
         let post_result: HashMap<ValueId, ConcreteType> = HashMap::new();
-        let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert!(
             !merged.contains(ValueId(7)),
             "Unknown originals must not seed the merged state"
@@ -551,9 +530,8 @@ mod tests {
         let post_resolve = state_from(&[(ValueId(1), ConcreteType::Signed)]);
         let original = state_from(&[(ValueId(1), ConcreteType::Signed)]);
         let post_result = map_from(&[(ValueId(1), ConcreteType::Float)]);
-        let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert_eq!(merged.get(ValueId(1)), &ConcreteType::Float);
     }
 
@@ -565,39 +543,23 @@ mod tests {
         let post_resolve = TypeResolutionState::new();
         let original = state_from(&[(ValueId(1), ConcreteType::GcRef)]);
         let post_result = map_from(&[(ValueId(1), ConcreteType::Signed)]);
-        let stamped: HashMap<ValueId, ConcreteType> = HashMap::new();
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert_eq!(merged.get(ValueId(1)), &ConcreteType::Signed);
     }
 
     #[test]
-    fn merge_synth_kinds_stamped_overrides_everything() {
-        // stamped is jtransform's ground truth — wins over post_result
-        // (and therefore over post_resolve / original).
-        let post_resolve = state_from(&[(ValueId(1), ConcreteType::Signed)]);
-        let original = state_from(&[(ValueId(1), ConcreteType::Signed)]);
-        let post_result = map_from(&[(ValueId(1), ConcreteType::Float)]);
-        let stamped = map_from(&[(ValueId(1), ConcreteType::GcRef)]);
-
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
-        assert_eq!(merged.get(ValueId(1)), &ConcreteType::GcRef);
-    }
-
-    #[test]
     fn merge_synth_kinds_full_precedence_chain() {
-        // Four ValueIds, each contributed by a different source —
+        // Three ValueIds, each contributed by a different source —
         // confirm each source's lane reaches the merged state.
         let post_resolve = state_from(&[(ValueId(1), ConcreteType::Float)]);
         let original = state_from(&[(ValueId(2), ConcreteType::Signed)]);
         let post_result = map_from(&[(ValueId(3), ConcreteType::GcRef)]);
-        let stamped = map_from(&[(ValueId(4), ConcreteType::Signed)]);
 
-        let merged = merge_synth_kinds(&original, post_resolve, post_result, &stamped);
+        let merged = merge_synth_kinds(&original, post_resolve, post_result);
         assert_eq!(merged.get(ValueId(1)), &ConcreteType::Float);
         assert_eq!(merged.get(ValueId(2)), &ConcreteType::Signed);
         assert_eq!(merged.get(ValueId(3)), &ConcreteType::GcRef);
-        assert_eq!(merged.get(ValueId(4)), &ConcreteType::Signed);
     }
 
     #[test]

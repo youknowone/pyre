@@ -88,7 +88,6 @@ pub fn analyze_function(func: &SemanticFunction, config: &PipelineConfig) -> Pip
         &types,
         &transform_result.graph,
         &annotations,
-        &transform_result.synth_kinds,
     );
 
     // Hydrate per-value `concretetype` cells on each backing
