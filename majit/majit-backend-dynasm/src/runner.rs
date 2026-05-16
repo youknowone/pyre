@@ -1622,6 +1622,7 @@ impl Backend for DynasmBackend {
         ops: &[Op],
         original_token: &JitCellToken,
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
+        _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         let trace_id = self.next_trace_id;
         self.next_trace_id += 1;

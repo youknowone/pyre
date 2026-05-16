@@ -13214,6 +13214,7 @@ impl majit_backend::Backend for CraneliftBackend {
         ops: &[Op],
         original_token: &JitCellToken,
         previous_tokens: &[std::sync::Arc<JitCellToken>],
+        caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         let invalidated_arc = original_token.invalidated.clone();
         let flag_ptr =
@@ -13253,11 +13254,17 @@ impl majit_backend::Backend for CraneliftBackend {
                 fail_descr.fail_index_per_trace()
             )));
         }
-        let caller_layout = source_descr.as_ref().and_then(|d| {
-            d.recovery_layout_ref().clone().map(|mut layout| {
-                layout.frames.pop();
-                layout
-            })
+        // Slice QQ-7: caller_recovery_layout is now passed in by the
+        // metainterp (StoredExitLayout.recovery_layout for the source
+        // guard).  The previous `source_descr.recovery_layout_ref()`
+        // read forced the metainterp to push the layout into the
+        // descr-side cache; threading the layout through the
+        // compile_bridge parameter eliminates that cache dependency.
+        let _ = source_descr; // kept for the trace_id / fail_index_per_trace lookup above
+        let caller_layout = caller_recovery_layout.map(|layout| {
+            let mut popped = layout.clone();
+            popped.frames.pop();
+            popped
         });
         let compiled = self.do_compile(
             inputargs,
@@ -15797,7 +15804,14 @@ mod tests {
         backend.set_next_trace_id(91);
         backend.set_next_header_pc(2000);
         backend
-            .compile_bridge(&fail_descr, &bridge_inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(
+                &fail_descr,
+                &bridge_inputargs,
+                &bridge_ops,
+                &token,
+                &[],
+                None,
+            )
             .unwrap();
 
         let root_layouts = backend
@@ -15938,7 +15952,14 @@ mod tests {
         backend.set_next_trace_id(191);
         backend.set_next_header_pc(2000);
         backend
-            .compile_bridge(&bridge_fail_descr, &inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(
+                &bridge_fail_descr,
+                &inputargs,
+                &bridge_ops,
+                &token,
+                &[],
+                Some(&source_layout),
+            )
             .unwrap();
 
         let bridge_layouts = backend
@@ -16057,7 +16078,7 @@ mod tests {
                 value: majit_backend::ExitValueSourceLayout::ExitValue(0),
             }],
         };
-        assert!(backend.update_fail_descr_recovery_layout(&token, 290, 0, root_layout));
+        assert!(backend.update_fail_descr_recovery_layout(&token, 290, 0, root_layout.clone()));
 
         let bridge_fail_descr = CraneliftFailDescr::new_with_trace_and_kind_and_force_tokens(
             0,
@@ -16085,7 +16106,14 @@ mod tests {
         backend.set_next_trace_id(291);
         backend.set_next_header_pc(2000);
         backend
-            .compile_bridge(&bridge_fail_descr, &inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(
+                &bridge_fail_descr,
+                &inputargs,
+                &bridge_ops,
+                &token,
+                &[],
+                Some(&root_layout),
+            )
             .unwrap();
         assert!(
             backend
@@ -16163,6 +16191,7 @@ mod tests {
                 &bridge_ops,
                 &token,
                 &[],
+                Some(&bridge_source_layout),
             )
             .unwrap();
 
@@ -18773,6 +18802,7 @@ mod tests {
                 &bridge_ops,
                 &token,
                 &[],
+                None,
             )
             .unwrap();
         assert!(bridge_info.code_addr != 0);
@@ -18921,6 +18951,7 @@ mod tests {
                 &bridge_ops,
                 &token,
                 &[],
+                None,
             )
             .unwrap();
 
@@ -19872,7 +19903,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(failed_descr, &inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(failed_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
         let frame = backend.execute_token(&token, &[Value::Int(4)]);
@@ -19942,7 +19973,7 @@ mod tests {
                 ),
             ];
             backend
-                .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[])
+                .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
                 .unwrap();
 
             let frame = backend.execute_token(&token, &[Value::Int(4)]);
@@ -20073,7 +20104,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
         backend.set_constants(HashMap::new());
@@ -20149,7 +20180,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
         backend.set_constants(HashMap::new());
@@ -20251,7 +20282,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
         backend.set_constants(HashMap::new());
@@ -20339,7 +20370,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
         backend.set_constants(HashMap::new());
@@ -20439,7 +20470,7 @@ mod tests {
             ),
         ];
         backend
-            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[])
+            .compile_bridge(guard_descr, &inputargs, &bridge_ops, &token, &[], None)
             .unwrap();
 
         backend.set_constants(HashMap::new());

@@ -1595,6 +1595,7 @@ pub trait Backend: Send {
         ops: &[Op],
         original_token: &JitCellToken,
         previous_tokens: &[std::sync::Arc<JitCellToken>],
+        caller_recovery_layout: Option<&ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError>;
 
     /// Register a freshly-compiled JitCellToken as still reachable from

@@ -8749,6 +8749,15 @@ impl<M: Clone> MetaInterp<M> {
                     optimized_ops.len()
                 );
             }
+            // Slice QQ-7: source guard's recovery_layout is read from
+            // the metainterp's `StoredExitLayout` cache (per-trace,
+            // keyed by per-trace fail_index) and passed to the backend
+            // so the backend doesn't need a descr-side cache.
+            let caller_recovery_layout = compiled
+                .traces
+                .get(&fail_descr.trace_id())
+                .and_then(|tr| tr.exit_layouts.get(&fail_descr.fail_index_per_trace()))
+                .and_then(|sl| sl.recovery_layout.clone());
             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 self.backend.compile_bridge(
                     fail_descr,
@@ -8756,6 +8765,7 @@ impl<M: Clone> MetaInterp<M> {
                     &optimized_ops,
                     &source_jct,
                     previous_tokens,
+                    caller_recovery_layout.as_ref(),
                 )
             })) {
                 Ok(r) => r,

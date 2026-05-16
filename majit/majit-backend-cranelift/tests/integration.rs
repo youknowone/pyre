@@ -336,6 +336,7 @@ fn test_bridge_end_to_end() {
             &bridge_trace.ops,
             &token,
             &[],
+            None,
         )
         .expect("bridge compilation should succeed");
     assert!(bridge_info.code_addr != 0);
@@ -2347,7 +2348,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
         virtual_layouts: vec![],
         pending_field_layouts: vec![],
     };
-    assert!(backend.update_fail_descr_recovery_layout(&token, 910, 0, source_layout));
+    assert!(backend.update_fail_descr_recovery_layout(&token, 910, 0, source_layout.clone()));
 
     // Bridge: takes (i, sum), checks sum > 0, returns sum * 2
     let mut bridge_rec = Trace::new();
@@ -2385,6 +2386,7 @@ fn test_compiled_bridge_guard_failure_has_frame_stack() {
             &bridge_trace.ops,
             &token,
             &[],
+            Some(&source_layout),
         )
         .expect("bridge compilation should succeed");
 

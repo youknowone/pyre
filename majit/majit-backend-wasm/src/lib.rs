@@ -373,6 +373,7 @@ impl majit_backend::Backend for WasmBackend {
         _ops: &[Op],
         _original_token: &JitCellToken,
         _previous_tokens: &[std::sync::Arc<JitCellToken>],
+        _caller_recovery_layout: Option<&majit_backend::ExitRecoveryLayout>,
     ) -> Result<AsmInfo, BackendError> {
         Err(BackendError::Unsupported(
             "wasm backend: bridge compile not yet implemented".into(),

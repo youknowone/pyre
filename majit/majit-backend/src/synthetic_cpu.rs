@@ -103,6 +103,7 @@ impl crate::Backend for SyntheticCpu {
         _ops: &[majit_ir::Op],
         _original_token: &crate::JitCellToken,
         _previous_tokens: &[std::sync::Arc<crate::JitCellToken>],
+        _caller_recovery_layout: Option<&crate::ExitRecoveryLayout>,
     ) -> Result<crate::AsmInfo, crate::BackendError> {
         unreachable!("SyntheticCpu does not compile bridges; only services bh_call_* dispatch")
     }
