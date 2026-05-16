@@ -419,14 +419,6 @@ impl BoxRef {
         Some(IntBoundBorrowMut::new(rc))
     }
 
-    /// `Rc::as_ptr` raw pointer — for debug / logging only.
-    pub fn as_ptr(&self) -> *const Box {
-        Rc::as_ptr(&self.0)
-    }
-
-    pub fn strong_count(&self) -> usize {
-        Rc::strong_count(&self.0)
-    }
 }
 
 impl Clone for BoxRef {
@@ -690,17 +682,6 @@ impl BoxPool {
 
     pub fn clear(&mut self) {
         self.inner.clear();
-    }
-
-    /// Reserve capacity (does not affect `len`).
-    pub fn reserve(&mut self, additional: usize) {
-        self.inner.reserve(additional);
-    }
-
-    pub fn with_capacity(cap: usize) -> Self {
-        Self {
-            inner: Vec::with_capacity(cap),
-        }
     }
 
     /// Index into the slot returning `&Option<BoxRef>` for callers that

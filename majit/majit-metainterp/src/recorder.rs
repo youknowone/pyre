@@ -608,11 +608,13 @@ mod tests {
         let mut rec = Trace::new();
         let i0 = rec.record_input_arg(Type::Int);
         let _add = rec.record_op(OpCode::IntAdd, &[i0, i0]);
-        // Snapshot box pointers before consuming the recorder.
-        let pre_box_at_1 = rec.box_for_position(1).unwrap().as_ptr();
+        // Snapshot the box identity before consuming the recorder.  BoxRef's
+        // `PartialEq` is `Rc::ptr_eq`, so equality below is pointer identity
+        // — matching the H-2.1 invariant the test was already asserting.
+        let pre_box_at_1 = rec.box_for_position(1).unwrap().clone();
         let trace = rec.get_trace();
         assert_eq!(trace.box_pool.len(), 2);
-        assert_eq!(trace.box_pool.get(1).unwrap().as_ptr(), pre_box_at_1);
+        assert_eq!(trace.box_pool.get(1).unwrap(), &pre_box_at_1);
         assert!(trace.box_pool.get(0).unwrap().is_inputarg());
         assert!(trace.box_pool.get(1).unwrap().is_resop());
     }

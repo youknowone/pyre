@@ -1568,7 +1568,7 @@ mod tests {
 
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].opcode, OpCode::CallR);
-        assert_eq!(result[0].pos.ty(), Some(Type::Ref));
+        assert_eq!(result[0].pos.get().ty(), Some(Type::Ref));
     }
 
     #[test]
@@ -1799,9 +1799,9 @@ mod tests {
 
         assert_eq!(result.len(), 2);
         assert_eq!(result[0].opcode, OpCode::CallF);
-        assert_eq!(result[0].pos.ty(), Some(Type::Float));
+        assert_eq!(result[0].pos.get().ty(), Some(Type::Float));
         assert_eq!(result[1].opcode, OpCode::CallN);
-        assert_eq!(result[1].pos.ty(), Some(Type::Void));
+        assert_eq!(result[1].pos.get().ty(), Some(Type::Void));
     }
 
     #[test]
