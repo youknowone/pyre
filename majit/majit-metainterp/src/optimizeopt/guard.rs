@@ -352,7 +352,10 @@ impl Guard {
         crate::compile::copy_all_attributes_from(&my_descr, &donor_descr);
         self.op.rd_resume_position.set(other.op.rd_resume_position.get());
         // guard.py:123: myop.setfailargs(otherop.getfailargs()[:])
-        self.op.fail_args = other.op.fail_args.clone();
+        match other.op.getfailargs() {
+            Some(fa) => self.op.setfailargs(fa.iter().copied().collect()),
+            None => self.op.clearfailargs(),
+        }
         self.op.fail_arg_types = other.op.fail_arg_types.clone();
     }
 
@@ -389,8 +392,14 @@ impl Guard {
         new_ops.push(cmp_op.clone());
         // guard.py:142-144: guard = ResOperation(opnum, [cmp_op], descr)
         let mut guard = Op::new(self.op.opcode, &[cmp_op.pos.get()]);
-        guard.descr = self.op.getdescr();
-        guard.fail_args = self.op.fail_args.clone();
+        if let Some(d) = self.op.getdescr() {
+            guard.setdescr(d);
+        }
+        // guard.py:143: guard.setfailargs(self.op.getfailargs()[:])
+        match self.op.getfailargs() {
+            Some(fa) => guard.setfailargs(fa.iter().copied().collect()),
+            None => guard.clearfailargs(),
+        }
         guard.fail_arg_types = self.op.fail_arg_types.clone();
         guard.rd_resume_position.set(self.op.rd_resume_position.get());
         // compile.py:855 _attrs_ on descr; Arc-clone above shares them.

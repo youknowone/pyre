@@ -4094,7 +4094,11 @@ impl Optimizer {
                 _ => crate::compile::make_resume_guard_copied_descr(last_descr.clone()),
             }
         });
-        op.fail_args = last.fail_args.clone();
+        // optimizer.py:722: guard_op.setfailargs(last_guard_op.getfailargs())
+        match last.getfailargs() {
+            Some(fa) => op.setfailargs(fa.iter().copied().collect()),
+            None => op.clearfailargs(),
+        }
         op.rd_resume_position.set(last.rd_resume_position.get());
         // bridgeopt.py parity: the class-knowledge bitfield baked into
         // rd_numb is indexed by the donor's per-livebox type layout.
@@ -4290,8 +4294,13 @@ impl Optimizer {
         // optimizer.py:776: replace_op_with(op, opnum, [op.getarg(0)], descr)
         let mut newop = Op::new(new_opcode, &[arg0]);
         newop.pos.set(op.pos.get());
-        newop.descr = op.getdescr();
-        newop.fail_args = op.fail_args.clone();
+        if let Some(d) = op.getdescr() {
+            newop.setdescr(d);
+        }
+        match op.getfailargs() {
+            Some(fa) => newop.setfailargs(fa.iter().copied().collect()),
+            None => newop.clearfailargs(),
+        }
         newop.fail_arg_types = op.fail_arg_types.clone();
         // compile.py:855 _attrs_ live on the descr; Arc-clone of
         // op.descr above shares the donor's RdPayload, so newop's

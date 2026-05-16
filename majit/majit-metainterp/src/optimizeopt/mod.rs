@@ -4874,7 +4874,11 @@ impl OptContext {
                 }
                 _ => crate::compile::make_resume_guard_copied_descr(donor_descr),
             });
-            op.fail_args = self.new_operations[idx].fail_args.clone();
+            // optimizer.py:722: guard_op.setfailargs(last_guard_op.getfailargs())
+            match self.new_operations[idx].getfailargs() {
+                Some(fa) => op.setfailargs(fa.iter().copied().collect()),
+                None => op.clearfailargs(),
+            }
             // bridgeopt.py parity: fail_arg_types carry the types the
             // serializer used when writing the class-knowledge bitfield in
             // rd_numb (memo.finish() uses numb_state.livebox_types). A
