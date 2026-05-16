@@ -1053,19 +1053,32 @@ impl UnrollOptimizer {
             // ProducedShortOp list stored on ExportedState at export time.
             //
             // history.py:220 box.type parity: `build_short_preamble_from_produced_boxes`
-            // still consumes the legacy `(i64, Type)` shape; lower the
+            // consumes the legacy `(i64, Type)` shape via VecAssoc; lower the
             // typed `Value` pool back at the call boundary.
             let (consts_p1_bits, consts_p1_types) =
                 crate::optimizeopt::optimizer::lower_typed_constants_to_backend(&consts_p1);
-            let mut loop_constant_types = self.constant_types.clone();
-            for (&k, &tp) in &consts_p1_types {
-                loop_constant_types.entry(k).or_insert(tp);
+            let mut loop_constant_types: crate::optimizeopt::vec_assoc::VecAssoc<
+                u32,
+                majit_ir::Type,
+            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
+            for (&k, &tp) in self.constant_types.iter() {
+                loop_constant_types.insert(k, tp);
+            }
+            for (&k, &tp) in consts_p1_types.iter() {
+                if !loop_constant_types.contains_key(&k) {
+                    loop_constant_types.insert(k, tp);
+                }
+            }
+            let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> =
+                crate::optimizeopt::vec_assoc::VecAssoc::new();
+            for (&k, &v) in consts_p1_bits.iter() {
+                loop_constants.insert(k, v);
             }
             crate::optimizeopt::shortpreamble::build_short_preamble_from_produced_boxes(
                 &exported_end_args,
                 &exported_short_inputargs,
                 &exported_short_boxes_produced,
-                &consts_p1_bits,
+                &loop_constants,
                 &loop_constant_types,
             )
         });
@@ -3091,9 +3104,12 @@ impl OptUnroll {
                             // preamble ops are GC-tracked and survive across
                             // compilations. build_short_preamble_struct scans
                             // all op args to capture referenced constants.
-                            let mut loop_constants: HashMap<u32, i64> = HashMap::new();
-                            let mut loop_constant_types: HashMap<u32, majit_ir::Type> =
-                                optimizer.constant_types.clone();
+                            let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> = crate::optimizeopt::vec_assoc::VecAssoc::new();
+                            let mut loop_constant_types: crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type> =
+                                crate::optimizeopt::vec_assoc::VecAssoc::new();
+                            for (&k, &tp) in optimizer.constant_types.iter() {
+                                loop_constant_types.insert(k, tp);
+                            }
                             for (const_idx, val) in ctx.const_pool.iter() {
                                 let (raw, tp) = match val {
                                     majit_ir::Value::Int(v) => (*v, majit_ir::Type::Int),
@@ -3105,16 +3121,21 @@ impl OptUnroll {
                                 };
                                 let opref = OpRef::const_typed(const_idx, tp);
                                 loop_constants.insert(opref.raw(), raw);
-                                loop_constant_types.entry(opref.raw()).or_insert(tp);
+                                if !loop_constant_types.contains_key(&opref.raw()) {
+                                    loop_constant_types.insert(opref.raw(), tp);
+                                }
                             }
-                            // Merge previous short preamble's constants.
                             // RPython's Const objects survive across compilations
                             // via GC tracing. In majit, we must carry forward
                             // constants from the previous build that may not
                             // exist in the current Phase 2 context.
                             for (&k, &(v, tp)) in &sp.constants {
-                                loop_constants.entry(k).or_insert(v);
-                                loop_constant_types.entry(k).or_insert(tp);
+                                if !loop_constants.contains_key(&k) {
+                                    loop_constants.insert(k, v);
+                                }
+                                if !loop_constant_types.contains_key(&k) {
+                                    loop_constant_types.insert(k, tp);
+                                }
                             }
                             target_token.short_preamble =
                                 Some(builder.build_short_preamble_struct(

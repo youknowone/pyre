@@ -1780,8 +1780,8 @@ fn build_short_preamble_struct_from_ops(
     ops: &[Op],
     used_boxes: &[OpRef],
     jump_args: &[OpRef],
-    loop_constants: &HashMap<u32, i64>,
-    loop_constant_types: &HashMap<u32, majit_ir::Type>,
+    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>,
+    loop_constant_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
 ) -> ShortPreamble {
     let inputarg_idx = |arg: &OpRef| -> Option<usize> {
         short_inputargs.iter().position(|a| a == arg)
@@ -2065,8 +2065,8 @@ impl ShortPreambleBuilder {
 
     pub fn build_short_preamble_struct(
         &self,
-        loop_constants: &HashMap<u32, i64>,
-        loop_constant_types: &HashMap<u32, majit_ir::Type>,
+        loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>,
+        loop_constant_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
     ) -> ShortPreamble {
         let jump_args: Vec<OpRef> = self
             .state
@@ -2501,8 +2501,8 @@ impl ExtendedShortPreambleBuilder {
 
     pub fn build_short_preamble_struct(
         &self,
-        loop_constants: &HashMap<u32, i64>,
-        loop_constant_types: &HashMap<u32, majit_ir::Type>,
+        loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>,
+        loop_constant_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
     ) -> ShortPreamble {
         // short[..len-1] excludes the JUMP sentinel
         let ops: Vec<Op> = self.short[..self.short_ops_len()].to_vec();
@@ -2755,8 +2755,8 @@ pub fn build_short_preamble_from_produced_boxes(
     label_args: &[OpRef],
     short_inputargs: &[OpRef],
     produced: &[(OpRef, ProducedShortOp)],
-    loop_constants: &HashMap<u32, i64>,
-    loop_constant_types: &HashMap<u32, majit_ir::Type>,
+    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>,
+    loop_constant_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
 ) -> ShortPreamble {
     let mut builder = ShortPreambleBuilder::new(label_args, produced, short_inputargs);
     // shortpreamble.py:288 `produce_arg` parity: known_constants holds
@@ -2814,8 +2814,8 @@ pub fn build_short_preamble_from_exported_boxes(
     label_args: &[OpRef],
     short_inputargs: &[OpRef],
     exported_short_boxes: &[PreambleOp],
-    loop_constants: &HashMap<u32, i64>,
-    loop_constant_types: &HashMap<u32, majit_ir::Type>,
+    loop_constants: &crate::optimizeopt::vec_assoc::VecAssoc<u32, i64>,
+    loop_constant_types: &crate::optimizeopt::vec_assoc::VecAssoc<u32, majit_ir::Type>,
 ) -> ShortPreamble {
     let produced =
         produced_short_boxes_from_exported_boxes(label_args, short_inputargs, exported_short_boxes);
@@ -3098,8 +3098,8 @@ mod tests {
             &[OpRef::int_op(0), OpRef::int_op(1)],
             &[OpRef::int_op(10), OpRef::int_op(11)],
             &exported,
-            &HashMap::new(),
-            &HashMap::new(),
+            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
         );
         assert_eq!(sp.ops.len(), 2);
         assert_eq!(sp.ops[0].op.opcode, OpCode::IntAdd);
@@ -3138,8 +3138,8 @@ mod tests {
             &label_args,
             &short_inputargs,
             &exported,
-            &HashMap::new(),
-            &HashMap::new(),
+            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            &crate::optimizeopt::vec_assoc::VecAssoc::new(),
         );
         let opcodes: Vec<OpCode> = sp.ops.iter().map(|entry| entry.op.opcode).collect();
         assert_eq!(opcodes, vec![OpCode::IntAddOvf, OpCode::GuardNoOverflow]);

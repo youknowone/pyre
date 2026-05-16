@@ -3338,7 +3338,16 @@ impl OptContext {
         &self,
     ) -> Option<crate::optimizeopt::shortpreamble::ShortPreamble> {
         self.active_short_preamble_producer.as_ref().map(|builder| {
-            builder.build_short_preamble_struct(&HashMap::new(), &self.constant_types)
+            let empty_loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> =
+                crate::optimizeopt::vec_assoc::VecAssoc::new();
+            let mut loop_constant_types: crate::optimizeopt::vec_assoc::VecAssoc<
+                u32,
+                majit_ir::Type,
+            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
+            for (&k, &tp) in self.constant_types.iter() {
+                loop_constant_types.insert(k, tp);
+            }
+            builder.build_short_preamble_struct(&empty_loop_constants, &loop_constant_types)
         })
     }
 
@@ -3375,11 +3384,12 @@ impl OptContext {
                         majit_ir::Value::Void => majit_ir::Type::Void,
                     }
                 };
-                let mut loop_constants: HashMap<u32, i64> = self
-                    .const_pool
-                    .iter()
-                    .map(|(i, val)| (Self::const_ref_for_value(i, val).raw(), value_to_raw(val)))
-                    .collect();
+                let mut loop_constants: crate::optimizeopt::vec_assoc::VecAssoc<u32, i64> =
+                    crate::optimizeopt::vec_assoc::VecAssoc::new();
+                for (i, val) in self.const_pool.iter() {
+                    loop_constants
+                        .insert(Self::const_ref_for_value(i, val).raw(), value_to_raw(val));
+                }
                 // `initialize_imported_short_preamble_builder_from_exported_ops`
                 // (mod.rs:1693) imports cross-trace constants by allocating a
                 // fresh local OpRef via `alloc_op_position()` and seeding it
@@ -3393,24 +3403,31 @@ impl OptContext {
                 for (idx, b) in self.box_pool.iter_indexed() {
                     if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
                         if let Some(val) = target.const_value() {
-                            loop_constants
-                                .entry(idx as u32)
-                                .or_insert(value_to_raw(&val));
+                            if !loop_constants.contains_key(&(idx as u32)) {
+                                loop_constants.insert(idx as u32, value_to_raw(&val));
+                            }
                         }
                     }
                 }
-                let mut loop_constant_types = self.constant_types.clone();
+                let mut loop_constant_types: crate::optimizeopt::vec_assoc::VecAssoc<
+                    u32,
+                    majit_ir::Type,
+                > = crate::optimizeopt::vec_assoc::VecAssoc::new();
+                for (&k, &tp) in self.constant_types.iter() {
+                    loop_constant_types.insert(k, tp);
+                }
                 for (i, val) in self.const_pool.iter() {
-                    loop_constant_types
-                        .entry(Self::const_ref_for_value(i, val).raw())
-                        .or_insert(value_to_type(val));
+                    let k = Self::const_ref_for_value(i, val).raw();
+                    if !loop_constant_types.contains_key(&k) {
+                        loop_constant_types.insert(k, value_to_type(val));
+                    }
                 }
                 for (idx, b) in self.box_pool.iter_indexed() {
                     if let crate::r#box::Forwarded::Box(target) = &*b.get_forwarded() {
                         if let Some(val) = target.const_value() {
-                            loop_constant_types
-                                .entry(idx as u32)
-                                .or_insert(value_to_type(&val));
+                            if !loop_constant_types.contains_key(&(idx as u32)) {
+                                loop_constant_types.insert(idx as u32, value_to_type(&val));
+                            }
                         }
                     }
                 }
