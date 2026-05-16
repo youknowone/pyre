@@ -448,10 +448,22 @@ mod tests {
     }
 
     #[test]
-    fn pop_top_stays_out_of_shadow_allow_list_until_recursive_jitcode_closes() {
-        // PopTop's top-level arm recurses into a helper jitcode. The current
-        // first unsupported callee opname is `getfield_vable_i/rd>i`; listing
-        // PopTop here would claim parity before the recursive closure is wired.
+    fn pop_top_stays_out_of_shadow_allow_list_until_callee_register_banks_close() {
+        // PopTop's top-level arm decodes cleanly (every opname has a
+        // `dispatch_via_miframe` handler after M4.Cutover Steps 2.2/2.3 +
+        // T2's `getfield_vable_*` ports), but the recursive jitcode it
+        // inlines via `inline_call_r_r/dR>r` (descr[81] → jitcode_index 402)
+        // uses Int register #1 — the walker's sub-call setup only sizes
+        // the callee `WalkContext.registers_i` to length 1 (`reg=1`,
+        // `len=1`).  Under `MAJIT_SHADOW_WALKER=1 raise_catch_loop.py`
+        // this surfaces as `RegisterOutOfRange { pc: 14, reg: 1, len: 1,
+        // bank: "i" }` from inside the inlined arm.  Listing PopTop in
+        // the allow-list before the sub-jitcode register-bank sizing is
+        // fixed in `dispatch_inline_call_dirf_kind` (jitcode_dispatch.rs)
+        // panics the shadow harness on raise_catch.  Pending follow-up
+        // task: thread the callee's `num_regs_i/r/f` through the
+        // inline_call setup so each sub-walk frame gets correctly-sized
+        // register banks before dispatching.
         assert!(!opname_in_shadow_allow_list(&Instruction::PopTop));
     }
 
