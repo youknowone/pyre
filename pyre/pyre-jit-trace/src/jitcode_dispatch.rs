@@ -282,7 +282,8 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// `MIFrame.registers_f` (`pyjitpl.py:177-234`). Mutable so
     /// `float_<binop>/ff>f` and `float_neg/f>f` can land their dst.
     pub registers_f: &'frame mut [OpRef],
-    /// Concrete shadow mirror for `registers_r` (M4.Cutover Step 1).
+    /// Concrete shadow mirror for `registers_r` (M4.Cutover Step 1 +
+    /// Step 2.2).
     ///
     /// Semantic-slot indexed, length equals `registers_r.len()`. At
     /// `dispatch_via_miframe` entry, populated by concatenating
@@ -291,10 +292,23 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// `num_regs_r` and fill arg slots from the parent's slice at the
     /// arg byte indices.
     ///
-    /// Read-only at dispatch time: walker handlers that consume this
-    /// (the M4.Cutover Step 2 set — `raise/r` GUARD_CLASS,
-    /// `last_exception/>i`, future `goto_if_not/iL` once Int-bank
-    /// concrete plumbing lands) read but do not write.
+    /// **Mutable invariant** (Step 2.2): every walker handler that
+    /// writes `registers_r[dst]` MUST also write `concrete_registers_r
+    /// [dst]` in lock-step.  Use the [`write_ref_reg`] helper which
+    /// enforces this contract.  Sites that don't know the result's
+    /// concrete pass `ConcreteValue::Null` — downstream consumers
+    /// (e.g. `raise/r` GUARD_CLASS gate) treat `Null` as "no info,
+    /// skip the guard", matching pre-Step 2.2 behaviour for slots the
+    /// snapshot never populated.  Copy-style handlers (`ref_copy/r>r`,
+    /// `last_exc_value/>r`) propagate the source's concrete.
+    ///
+    /// Step 2.1 was reverted because the slice was immutable: sibling
+    /// handlers like `last_exc_value/>r` rewrote the symbolic register
+    /// without touching the concrete snapshot, so a follow-on `raise/r`
+    /// read a stale concrete and silently skipped the GUARD_CLASS gate
+    /// (Codex P1 review on PR #44).  Step 2.2 makes the slice mutable
+    /// and enforces the lock-step contract so re-enabling walker-side
+    /// GUARD_CLASS is sound.
     ///
     /// Int / Float bank concrete shadow is deferred — those banks are
     /// color-indexed rather than semantic-slot indexed, so they need a
@@ -303,7 +317,7 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// concrete Int) wait on that follow-up slice.
     ///
     /// Reference: [[project-tracer-m4-cutover-decision]] memory.
-    pub concrete_registers_r: &'frame [ConcreteValue],
+    pub concrete_registers_r: &'frame mut [ConcreteValue],
     /// Descr pool for `d`-coded operands. Each `d` argcode in the
     /// jitcode bytes resolves to `descr_refs[2-byte LE index]`.
     /// RPython `Assembler.descrs` (`assembler.py:23`) +
@@ -374,6 +388,24 @@ pub struct WalkContext<'frame, 'static_a: 'frame> {
     /// touches the caller's slot, so per-frame storage is equivalent
     /// to RPython's metainterp-level slot for the catch path.
     pub last_exc_value: Option<OpRef>,
+    /// Concrete shadow companion to [`last_exc_value`] (M4.Cutover
+    /// Step 2.2).  Holds the live `PyObjectRef` of the standing
+    /// exception so `last_exc_value/>r` can propagate the concrete
+    /// into the destination's `concrete_registers_r` slot, and so a
+    /// follow-on `raise/r` reading that destination finds a non-Null
+    /// concrete and emits the correct GUARD_CLASS.
+    ///
+    /// Set by `raise/r` (walker side) alongside `last_exc_value`, by
+    /// the `inline_call` SubRaise arm when it catches at
+    /// `catch_exception/L`, and by `dispatch_via_miframe`'s entry
+    /// from `sym.last_exc_value` when the trait path seeded the
+    /// exception via `seed_raised_exception`.
+    ///
+    /// `ConcreteValue::Null` means "no active exception concrete
+    /// known" — matches `last_exc_value == None` for the common case,
+    /// or means the trait-path seeded only the symbolic OpRef without
+    /// a concrete (e.g. a synthetic test fixture).
+    pub last_exc_value_concrete: ConcreteValue,
 }
 
 /// Outcome of dispatching one opcode. The walker uses this to decide
@@ -925,7 +957,6 @@ fn read_ref_var_list(
 /// `RegisterOutOfRange` via [`read_ref_reg`]; this helper assumes the
 /// OpRef read succeeded, so a missing concrete slot is "stack tail not
 /// yet seeded" not "register byte out of range".
-#[allow(dead_code)]
 fn read_ref_reg_concrete(
     code: &[u8],
     op: &DecodedOp,
@@ -938,6 +969,51 @@ fn read_ref_reg_concrete(
         .get(reg)
         .copied()
         .unwrap_or(ConcreteValue::Null)
+}
+
+/// Write a Ref-bank register and its concrete shadow in lock-step
+/// (M4.Cutover Step 2.2).  Replaces the inlined
+/// `registers_r.get_mut(dst).ok_or(...)?; *slot = value` pattern at
+/// every walker handler that writes `registers_r[dst]`.  The concrete
+/// shadow update is the WHOLE POINT of this helper: post-Step 2.1
+/// revert, the shadow MUST stay in sync with the symbolic side or
+/// downstream consumers (`raise/r` GUARD_CLASS, future
+/// `getfield_gc_r` cache lookups) will silently mis-fire.
+///
+/// `concrete` semantics:
+/// * `ConcreteValue::Ref(ptr)` — the handler knows the concrete result
+///   (e.g. `ref_copy/r>r` propagating from the source slot's shadow,
+///   `raise/r` setting the just-raised exception's concrete).
+/// * `ConcreteValue::Null` — the handler doesn't know (most recorded
+///   ops: field reads, residual calls, …).  Downstream GUARD_CLASS
+///   gates treat Null as "skip the guard", matching pre-Step 2.2
+///   behaviour for slots the snapshot never populated.
+fn write_ref_reg(
+    ctx: &mut WalkContext<'_, '_>,
+    pc: usize,
+    dst: usize,
+    value: OpRef,
+    concrete: ConcreteValue,
+) -> Result<(), DispatchError> {
+    let len = ctx.registers_r.len();
+    let slot = ctx
+        .registers_r
+        .get_mut(dst)
+        .ok_or(DispatchError::RegisterOutOfRange {
+            pc,
+            reg: dst,
+            len,
+            bank: "r",
+        })?;
+    *slot = value;
+    // Snapshot is sized to `registers_r.len()` at dispatch entry, so
+    // a dst-in-bounds OpRef write implies in-bounds for the shadow.
+    // `get_mut` defensively to tolerate sub-walk shadows that lag the
+    // OpRef bank if a future caller mis-sizes them.
+    if let Some(c_slot) = ctx.concrete_registers_r.get_mut(dst) {
+        *c_slot = concrete;
+    }
+    Ok(())
 }
 
 /// Read concrete shadow values for a Ref-bank variadic operand list
@@ -1222,7 +1298,7 @@ pub fn dispatch_via_miframe(
     // Any tail slots beyond `concrete_locals + concrete_stack` get
     // `ConcreteValue::Null` (matches `concrete_value_at`'s fallback
     // at `state.rs:3225`).
-    let concrete_r_snapshot: Vec<ConcreteValue> = {
+    let mut concrete_r_snapshot: Vec<ConcreteValue> = {
         let total = sym.registers_r.len();
         let nlocals = sym.concrete_locals.len();
         (0..total)
@@ -1238,13 +1314,22 @@ pub fn dispatch_via_miframe(
             })
             .collect()
     };
+    // M4.Cutover Step 2.2: seed last_exc_value_concrete from
+    // sym.last_exc_value (the live PyObjectRef written by trait-side
+    // `seed_raised_exception` at `trace_opcode.rs:6646`).  Null when
+    // no active exception, matching `initial_last_exc_value == None`.
+    let initial_last_exc_value_concrete = if sym.last_exc_value.is_null() {
+        ConcreteValue::Null
+    } else {
+        ConcreteValue::Ref(sym.last_exc_value)
+    };
 
     let result = {
         let mut wc = WalkContext {
             registers_r: &mut sym.registers_r,
             registers_i: &mut sym.registers_i,
             registers_f: &mut sym.registers_f,
-            concrete_registers_r: &concrete_r_snapshot,
+            concrete_registers_r: &mut concrete_r_snapshot,
             descr_refs,
             trace_ctx,
             done_with_this_frame_descr_ref,
@@ -1255,6 +1340,7 @@ pub fn dispatch_via_miframe(
             is_top_level,
             sub_jitcode_lookup,
             last_exc_value: initial_last_exc_value,
+            last_exc_value_concrete: initial_last_exc_value_concrete,
         };
         let outcome = walk(jitcode_code, position, &mut wc);
         // Read final last_exc_value before wc drops so the borrow
@@ -1368,17 +1454,11 @@ fn getarrayitem_gc_via_heapcache(
             *slot = result;
         }
         'r' => {
-            let len = ctx.registers_r.len();
-            let slot = ctx
-                .registers_r
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "r",
-                })?;
-            *slot = result;
+            // Recorded op result — walker doesn't compute the concrete
+            // (would need executing against the live heap), so pass
+            // Null.  Downstream raise/r GUARD_CLASS treats Null as
+            // "no info, skip the guard".
+            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
@@ -1591,17 +1671,11 @@ fn getfield_gc_via_heapcache(
             *slot = result;
         }
         'r' => {
-            let len = ctx.registers_r.len();
-            let slot = ctx
-                .registers_r
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "r",
-                })?;
-            *slot = result;
+            // Recorded op result — walker doesn't compute the concrete
+            // (would need executing against the live heap), so pass
+            // Null.  Downstream raise/r GUARD_CLASS treats Null as
+            // "no info, skip the guard".
+            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
@@ -1683,17 +1757,11 @@ fn getfield_vable_via_metainterp(
             *slot = result;
         }
         'r' => {
-            let len = ctx.registers_r.len();
-            let slot = ctx
-                .registers_r
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "r",
-                })?;
-            *slot = result;
+            // Recorded op result — walker doesn't compute the concrete
+            // (would need executing against the live heap), so pass
+            // Null.  Downstream raise/r GUARD_CLASS treats Null as
+            // "no info, skip the guard".
+            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
         }
         'f' => {
             let len = ctx.registers_f.len();
@@ -2502,17 +2570,10 @@ fn write_residual_call_result_to_dst(
 ) -> Result<(), DispatchError> {
     match dst_bank {
         'r' => {
-            let len = ctx.registers_r.len();
-            let slot = ctx
-                .registers_r
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc,
-                    reg: dst,
-                    len,
-                    bank: "r",
-                })?;
-            *slot = result;
+            // Residual call result — walker doesn't execute the call,
+            // so the concrete return value is unknown.  Null in shadow
+            // means downstream GUARD_CLASS gates skip.
+            write_ref_reg(ctx, pc, dst, result, ConcreteValue::Null)?;
         }
         'i' => {
             let len = ctx.registers_i.len();
@@ -3249,7 +3310,7 @@ fn dispatch_inline_call_dr_kind(
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
-            concrete_registers_r: &callee_concrete_r,
+            concrete_registers_r: &mut callee_concrete_r,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -3260,6 +3321,7 @@ fn dispatch_inline_call_dr_kind(
             is_top_level: false,
             sub_jitcode_lookup: ctx.sub_jitcode_lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -3278,17 +3340,13 @@ fn dispatch_inline_call_dr_kind(
             let dst = code[op.pc + 1 + 2 + arg_width] as usize;
             match dst_bank {
                 'r' => {
-                    let len = ctx.registers_r.len();
-                    let slot =
-                        ctx.registers_r
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "r",
-                            })?;
-                    *slot = value;
+                    // inline_call_* dst writeback — `value` is the
+                    // callee's SubReturn OpRef.  The callee's matching
+                    // concrete lived in the sub-walk's concrete shadow
+                    // which has been dropped; future work could thread
+                    // the last concrete through SubReturn (M4.Cutover
+                    // Step 2.3).  Null is safe — downstream gates skip.
+                    write_ref_reg(ctx, op.pc, dst, value, ConcreteValue::Null)?;
                 }
                 'i' => {
                     let len = ctx.registers_i.len();
@@ -3324,6 +3382,17 @@ fn dispatch_inline_call_dr_kind(
         DispatchOutcome::SubRaise { exc } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
+                // Callee's `raise/r` knew the concrete (set on its own
+                // `last_exc_value_concrete`) but the inner WalkContext
+                // has been dropped — the concrete didn't cross the
+                // frame boundary because `DispatchOutcome::SubRaise`
+                // carries only the symbolic OpRef.  Set Null;
+                // downstream walker `raise/r` reading this slot will
+                // find Null and skip GUARD_CLASS, matching the
+                // pre-Step 2.2 fallback.  Threading the concrete
+                // through SubRaise is a follow-up (M4.Cutover Step
+                // 2.3).
+                ctx.last_exc_value_concrete = ConcreteValue::Null;
                 Ok((DispatchOutcome::Continue, target))
             } else {
                 Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
@@ -3427,7 +3496,7 @@ fn dispatch_inline_call_dir_kind(
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
-            concrete_registers_r: &callee_concrete_r,
+            concrete_registers_r: &mut callee_concrete_r,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -3438,6 +3507,7 @@ fn dispatch_inline_call_dir_kind(
             is_top_level: false,
             sub_jitcode_lookup: ctx.sub_jitcode_lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -3454,17 +3524,13 @@ fn dispatch_inline_call_dir_kind(
             let dst = code[op.pc + 1 + 2 + int_width + ref_width] as usize;
             match dst_bank {
                 'r' => {
-                    let len = ctx.registers_r.len();
-                    let slot =
-                        ctx.registers_r
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "r",
-                            })?;
-                    *slot = value;
+                    // inline_call_* dst writeback — `value` is the
+                    // callee's SubReturn OpRef.  The callee's matching
+                    // concrete lived in the sub-walk's concrete shadow
+                    // which has been dropped; future work could thread
+                    // the last concrete through SubReturn (M4.Cutover
+                    // Step 2.3).  Null is safe — downstream gates skip.
+                    write_ref_reg(ctx, op.pc, dst, value, ConcreteValue::Null)?;
                 }
                 'i' => {
                     let len = ctx.registers_i.len();
@@ -3492,6 +3558,17 @@ fn dispatch_inline_call_dir_kind(
         DispatchOutcome::SubRaise { exc } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
+                // Callee's `raise/r` knew the concrete (set on its own
+                // `last_exc_value_concrete`) but the inner WalkContext
+                // has been dropped — the concrete didn't cross the
+                // frame boundary because `DispatchOutcome::SubRaise`
+                // carries only the symbolic OpRef.  Set Null;
+                // downstream walker `raise/r` reading this slot will
+                // find Null and skip GUARD_CLASS, matching the
+                // pre-Step 2.2 fallback.  Threading the concrete
+                // through SubRaise is a follow-up (M4.Cutover Step
+                // 2.3).
+                ctx.last_exc_value_concrete = ConcreteValue::Null;
                 Ok((DispatchOutcome::Continue, target))
             } else {
                 Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
@@ -3604,7 +3681,7 @@ fn dispatch_inline_call_dirf_kind(
             registers_r: &mut callee_regs_r,
             registers_i: &mut callee_regs_i,
             registers_f: &mut callee_regs_f,
-            concrete_registers_r: &callee_concrete_r,
+            concrete_registers_r: &mut callee_concrete_r,
             descr_refs: ctx.descr_refs,
             trace_ctx: ctx.trace_ctx,
             done_with_this_frame_descr_ref: ctx.done_with_this_frame_descr_ref.clone(),
@@ -3615,6 +3692,7 @@ fn dispatch_inline_call_dirf_kind(
             is_top_level: false,
             sub_jitcode_lookup: ctx.sub_jitcode_lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         walk(sub_body.code, 0, &mut sub_wc)?
     };
@@ -3642,17 +3720,13 @@ fn dispatch_inline_call_dirf_kind(
                     *slot = value;
                 }
                 'r' => {
-                    let len = ctx.registers_r.len();
-                    let slot =
-                        ctx.registers_r
-                            .get_mut(dst)
-                            .ok_or(DispatchError::RegisterOutOfRange {
-                                pc: op.pc,
-                                reg: dst,
-                                len,
-                                bank: "r",
-                            })?;
-                    *slot = value;
+                    // inline_call_* dst writeback — `value` is the
+                    // callee's SubReturn OpRef.  The callee's matching
+                    // concrete lived in the sub-walk's concrete shadow
+                    // which has been dropped; future work could thread
+                    // the last concrete through SubReturn (M4.Cutover
+                    // Step 2.3).  Null is safe — downstream gates skip.
+                    write_ref_reg(ctx, op.pc, dst, value, ConcreteValue::Null)?;
                 }
                 'f' => {
                     let len = ctx.registers_f.len();
@@ -3682,6 +3756,17 @@ fn dispatch_inline_call_dirf_kind(
         DispatchOutcome::SubRaise { exc } => {
             if let Some(target) = try_catch_exception_at(code, op.next_pc) {
                 ctx.last_exc_value = Some(exc);
+                // Callee's `raise/r` knew the concrete (set on its own
+                // `last_exc_value_concrete`) but the inner WalkContext
+                // has been dropped — the concrete didn't cross the
+                // frame boundary because `DispatchOutcome::SubRaise`
+                // carries only the symbolic OpRef.  Set Null;
+                // downstream walker `raise/r` reading this slot will
+                // find Null and skip GUARD_CLASS, matching the
+                // pre-Step 2.2 fallback.  Threading the concrete
+                // through SubRaise is a follow-up (M4.Cutover Step
+                // 2.3).
+                ctx.last_exc_value_concrete = ConcreteValue::Null;
                 Ok((DispatchOutcome::Continue, target))
             } else {
                 Ok((DispatchOutcome::SubRaise { exc }, op.next_pc))
@@ -3926,17 +4011,10 @@ fn handle(
             let a = read_int_reg(code, op, 0, ctx)?;
             let result = ctx.trace_ctx.record_op(OpCode::CastIntToPtr, &[a]);
             let dst = code[op.pc + 2] as usize;
-            let len = ctx.registers_r.len();
-            let slot = ctx
-                .registers_r
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "r",
-                })?;
-            *slot = result;
+            // Recorded CastIntToPtr — walker doesn't compute the
+            // concrete pointer value (would need the Int-bank concrete
+            // shadow which Step 2.2 doesn't add).
+            write_ref_reg(ctx, op.pc, dst, result, ConcreteValue::Null)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         // `cast_ptr_to_int/r>i`: Ref-bank → Int-bank cast.
@@ -4102,18 +4180,19 @@ fn handle(
             // `pyjitpl.py:74-90`) pre-populates with the const OpRef.
             // No IR op recorded.
             let src_val = read_ref_reg(code, op, 0, ctx)?;
+            // M4.Cutover Step 2.2: propagate the source slot's concrete
+            // shadow alongside the symbolic OpRef.  This is the
+            // critical chain: catch_exception → seeds last_exc_value
+            // / concrete → `last_exc_value/>r` writes both into
+            // `registers_r[X]` and `concrete_registers_r[X]` →
+            // `ref_copy/r>r` copies X to Y → a follow-on `raise/r`
+            // reads Y and finds the correct concrete to emit
+            // GUARD_CLASS against.  Without this propagation the
+            // copy chain wipes the concrete and silently disables
+            // the guard.
+            let src_concrete = read_ref_reg_concrete(code, op, 0, ctx);
             let dst = code[op.pc + 2] as usize;
-            let len = ctx.registers_r.len();
-            let slot = ctx
-                .registers_r
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "r",
-                })?;
-            *slot = src_val;
+            write_ref_reg(ctx, op.pc, dst, src_val, src_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "ref_return/r" => {
@@ -4229,28 +4308,41 @@ fn handle(
             //   * sub-walk frame → propagate `SubRaise { exc }` to the
             //     caller's `inline_call_*` handler.
             //
-            // GUARD_CLASS emission deferred (was M4.Cutover Step 2.1):
-            // the previous attempt read the concrete exception from
-            // `concrete_registers_r` plumbed by Step 1, but that slice
-            // is a dispatch-entry snapshot and is never updated when
-            // a sibling handler (`last_exc_value/>r`, `int_copy/i>i`,
-            // etc.) rewrites `registers_r[dst]` later in the same
-            // frame's walk.  In exception-heavy flows the symbolic
-            // register carries the current exception OpRef while the
-            // concrete snapshot still holds an old/null value, so the
-            // guard was silently skipped and the walker's
-            // heapcache `class_now_known` state diverged from the
-            // trait-dispatch path that runs `seed_raised_exception`
-            // unconditionally (`trace_opcode.rs:6617-6637`).
-            // Re-enabling walker-side GUARD_CLASS needs a mutable
-            // concrete shadow that tracks every `registers_r[dst]`
-            // write — tracked as M4.Cutover Step 2.2.  Until then,
-            // GUARD_CLASS is emitted only on the trait path; the
-            // walker path is production-inert because
-            // `dispatch_via_miframe` is not yet the production
-            // dispatcher.
+            // M4.Cutover Step 2.2: GUARD_CLASS emission re-enabled.
+            // Step 2.1 was reverted because `concrete_registers_r` was
+            // a dispatch-entry snapshot — sibling handlers rewrote
+            // `registers_r[dst]` without updating the immutable shadow,
+            // so this read found a stale concrete and silently skipped
+            // the guard.  Step 2.2 made the shadow `&mut` and wired
+            // every walker write through [`write_ref_reg`] so the
+            // concrete tracks the symbolic in lock-step.  Read-after-
+            // write now returns the right concrete (or `Null` if the
+            // handler didn't know, in which case the guard skips —
+            // same semantics as the snapshot's tail).
+            //
+            // Mirrors trait-side `seed_raised_exception` at
+            // `trace_opcode.rs:6629-6643`.  Also stashes the concrete
+            // into `ctx.last_exc_value_concrete` so a downstream
+            // `last_exc_value/>r` can propagate it into its dst slot.
             let exc = read_ref_reg(code, op, 0, ctx)?;
+            let concrete_exc = read_ref_reg_concrete(code, op, 0, ctx);
+            if let ConcreteValue::Ref(exc_ptr) = concrete_exc {
+                if !exc_ptr.is_null() && !ctx.trace_ctx.heap_cache().is_class_known(exc) {
+                    let exc_class_ptr = unsafe {
+                        (*(exc_ptr as *const pyre_object::excobject::W_ExceptionObject))
+                            .ob_header
+                            .ob_type
+                    };
+                    let cls_const = ctx.trace_ctx.const_int(exc_class_ptr as usize as i64);
+                    ctx.trace_ctx
+                        .record_guard(OpCode::GuardClass, &[exc, cls_const], 0);
+                    ctx.trace_ctx
+                        .heap_cache_mut()
+                        .class_now_known(exc, majit_ir::GcRef(exc_class_ptr as usize));
+                }
+            }
             ctx.last_exc_value = Some(exc);
+            ctx.last_exc_value_concrete = concrete_exc;
             if ctx.is_top_level {
                 ctx.trace_ctx
                     .finish(&[exc], ctx.exit_frame_with_exception_descr_ref.clone());
@@ -4296,17 +4388,15 @@ fn handle(
                 .last_exc_value
                 .ok_or(DispatchError::LastExcValueWithoutActiveException { pc: op.pc })?;
             let dst = code[op.pc + 1] as usize;
-            let len = ctx.registers_r.len();
-            let slot = ctx
-                .registers_r
-                .get_mut(dst)
-                .ok_or(DispatchError::RegisterOutOfRange {
-                    pc: op.pc,
-                    reg: dst,
-                    len,
-                    bank: "r",
-                })?;
-            *slot = exc;
+            // M4.Cutover Step 2.2: propagate the standing exception's
+            // concrete shadow into the dst slot.  `ctx.last_exc_value_
+            // concrete` is the live `PyObjectRef` (seeded by either the
+            // trait path's `seed_raised_exception` or an earlier walker
+            // `raise/r`).  This lets a follow-on `raise/r` reading
+            // `registers_r[dst]` find a non-Null concrete and emit the
+            // correct GUARD_CLASS.
+            let exc_concrete = ctx.last_exc_value_concrete;
+            write_ref_reg(ctx, op.pc, dst, exc, exc_concrete)?;
             Ok((DispatchOutcome::Continue, op.next_pc))
         }
         "reraise/" => {
@@ -4419,17 +4509,21 @@ mod tests {
         let mut tc = fresh_trace_ctx();
         let oprefs = distinct_const_refs(&mut tc, 3);
         let mut regs_r = oprefs.clone();
-        let concrete = vec![
+        let mut concrete = vec![
             ConcreteValue::Null,
             ConcreteValue::Ref(exc_obj_ptr),
             ConcreteValue::Int(42),
         ];
+        // Snapshot expected values before `&mut concrete` enters wc —
+        // the assertion below cannot read `concrete[reg_idx]` while wc
+        // holds the mutable borrow.
+        let expected: Vec<ConcreteValue> = concrete.clone();
         let descr = done_descr_ref_for_tests();
         let wc = WalkContext {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &concrete,
+            concrete_registers_r: &mut concrete,
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -4440,6 +4534,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
 
         // Synthesize a 2-byte op fixture: `<opcode_byte> <reg_idx>`.
@@ -4457,7 +4552,7 @@ mod tests {
             };
             assert_eq!(
                 read_ref_reg_concrete(&code, &op, 0, &wc),
-                concrete[reg_idx],
+                expected[reg_idx],
                 "reg {} concrete shadow must match the parallel slot",
                 reg_idx,
             );
@@ -4594,7 +4689,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4605,6 +4700,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch hit must dispatch");
@@ -4633,7 +4729,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4644,6 +4740,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
 
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("switch miss must dispatch");
@@ -4671,7 +4768,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4682,6 +4779,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
 
         let err = step(&code, 0, &mut wc).expect_err("non-constant switch value must not guess");
@@ -4798,7 +4896,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4809,6 +4907,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -4946,7 +5045,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -4957,6 +5056,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_r_i must dispatch");
@@ -5042,7 +5142,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5053,6 +5153,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_ir_r must dispatch");
@@ -5132,7 +5233,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5143,6 +5244,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) =
             step(&caller_code, 0, &mut wc).expect("inline_call_irf_r must dispatch");
@@ -5211,7 +5313,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5222,6 +5324,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err =
             step(&caller_code, 0, &mut wc).expect_err("I-list overflow must surface typed error");
@@ -5287,7 +5390,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -5298,6 +5401,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
         assert_eq!(
@@ -5345,7 +5449,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -5356,6 +5460,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("FailDescr at inline_call's d-slot must hit ExpectedJitCodeDescr");
@@ -5384,7 +5489,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -5395,6 +5500,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&caller_code, 0, &mut wc)
             .expect_err("missing sub-jitcode must hit SubJitCodeNotFound");
@@ -5419,7 +5525,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5430,6 +5536,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("live/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -5462,7 +5569,7 @@ mod tests {
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5473,6 +5580,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_return/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -5512,7 +5620,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5523,6 +5631,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("must surface RegisterOutOfRange");
         assert_eq!(
@@ -5556,7 +5665,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -5567,6 +5676,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -5606,7 +5716,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -5617,6 +5727,7 @@ mod tests {
             is_top_level: false,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("int_return/i must dispatch");
@@ -5654,7 +5765,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -5665,6 +5776,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -5707,7 +5819,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: make_fail_descr(1),
@@ -5718,6 +5830,7 @@ mod tests {
             is_top_level: false,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = step(&code, 0, &mut wc).expect("void_return/ must dispatch");
@@ -5745,7 +5858,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5756,6 +5869,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("raise/r must read its operand");
         assert_eq!(
@@ -5786,7 +5900,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5797,6 +5911,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -5827,7 +5942,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5838,6 +5953,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("goto/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -5916,7 +6032,7 @@ mod tests {
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5927,6 +6043,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: Some(active_exc),
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("catch_exception/L with active exc must error");
@@ -5953,7 +6070,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -5964,6 +6081,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("catch_exception/L must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -6002,7 +6120,7 @@ mod tests {
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -6013,6 +6131,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -6043,19 +6162,16 @@ mod tests {
     }
 
     #[test]
-    fn raise_r_does_not_emit_guard_class_until_mutable_concrete_shadow_lands() {
-        // M4.Cutover Step 2.1 was reverted: the previous walker-side
-        // GUARD_CLASS read `concrete_registers_r` (a dispatch-entry
-        // snapshot), but a sibling handler such as `last_exc_value/>r`
-        // can rewrite `registers_r[dst]` mid-walk without updating the
-        // immutable concrete slice — so the guard was silently skipped
-        // on exception-heavy paths and the heapcache state diverged
-        // from the trait path (`trace_opcode.rs:6617-6637
-        // seed_raised_exception`).  Re-enabling walker-side emission
-        // needs a mutable concrete shadow that tracks every
-        // `registers_r[dst]` write (M4.Cutover Step 2.2).  Until then,
-        // the walker handler records only FINISH and the trait path
-        // remains the sole GUARD_CLASS emitter.
+    fn raise_r_emits_guard_class_when_concrete_exc_pinned_in_shadow() {
+        // M4.Cutover Step 2.2: the concrete shadow is now mutable and
+        // tracked by every `registers_r[dst]` write
+        // ([`write_ref_reg`]), so a `raise/r` reading the shadow finds
+        // a reliable concrete pointer.  Allocate a real
+        // `W_ExceptionObject` so the deref against
+        // `ob_header.ob_type` is sound; expect GuardClass + Finish
+        // recorded and the heapcache class-known flag pinned.  Mirrors
+        // trait-side `seed_raised_exception` at `trace_opcode.rs:
+        // 6629-6643`.
         let exc_ptr = pyre_object::excobject::w_exception_new(
             pyre_object::excobject::ExcKind::ValueError,
             "shadow-walker probe",
@@ -6065,9 +6181,14 @@ mod tests {
             .expect("`raise/r` must be in insns table");
         let code = [raise_byte, 0x02];
         let mut tc = fresh_trace_ctx();
+        // Use a non-constant OpRef so the heapcache class-known flag
+        // actually pins. pyre's `is_class_known(constant)` returns
+        // false (`heapcache.rs:1014`) while `class_now_known(constant)`
+        // is a no-op, so constants never round-trip through the
+        // class-pinned cache.
         let exc_box = OpRef::input_arg_ref(0);
         let mut regs: Vec<OpRef> = vec![OpRef::NONE, OpRef::NONE, exc_box, OpRef::NONE];
-        let concrete = vec![
+        let mut concrete = vec![
             ConcreteValue::Null,
             ConcreteValue::Null,
             ConcreteValue::Ref(exc_ptr),
@@ -6080,7 +6201,7 @@ mod tests {
             registers_r: &mut regs,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &concrete,
+            concrete_registers_r: &mut concrete,
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -6091,25 +6212,34 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, _next_pc) = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
         drop(wc);
 
+        // Expect two ops recorded: GuardClass(exc, cls_const) then
+        // Finish(exc) (the GUARD_CLASS precedes FINISH per
+        // `pyjitpl.py:1690-1696`).
         assert_eq!(
             tc.num_ops(),
-            ops_before + 1,
-            "raise/r must record only FINISH until M4.Cutover Step 2.2 \
-             (mutable concrete shadow) re-enables walker-side GUARD_CLASS",
+            ops_before + 2,
+            "raise/r with pinned concrete exc must record GuardClass + Finish",
         );
+        let ops = tc.ops();
+        let guard = &ops[ops_before];
+        assert_eq!(guard.opcode, majit_ir::OpCode::GuardClass);
         assert_eq!(
-            tc.ops().last().expect("recorded op must exist").opcode,
-            majit_ir::OpCode::Finish,
+            guard.args.as_slice()[0],
+            exc_box,
+            "GuardClass arg0 must be the exception OpRef",
         );
+        // After the guard, the heapcache must mark the class as known
+        // so a follow-on raise/r against the same exc_box wouldn't
+        // re-emit GuardClass.
         assert!(
-            !tc.heap_cache().is_class_known(exc_box),
-            "heapcache.class_now_known must NOT fire from the walker \
-             path while GUARD_CLASS emission is deferred",
+            tc.heap_cache().is_class_known(exc_box),
+            "heapcache.class_now_known must fire alongside GuardClass",
         );
     }
 
@@ -6136,7 +6266,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -6147,6 +6277,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: Some(active_exc),
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("reraise/ must dispatch");
         assert_eq!(outcome, DispatchOutcome::Terminate);
@@ -6192,7 +6323,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -6203,6 +6334,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("reraise/ without last_exc_value must error");
         assert_eq!(err, DispatchError::ReraiseWithoutLastExcValue { pc: 0 });
@@ -6228,7 +6360,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -6239,6 +6371,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("raise/r must dispatch");
         assert_eq!(
@@ -6540,7 +6673,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done.clone(),
@@ -6551,6 +6684,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, end_pc) =
             walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -6636,7 +6770,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr_done,
@@ -6648,6 +6782,7 @@ mod tests {
             is_top_level: false,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let ops_before = wc.trace_ctx.num_ops();
         let (outcome, _) = walk(&caller_code, 0, &mut wc).expect("caller must walk to terminator");
@@ -6685,7 +6820,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6696,6 +6831,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -6733,7 +6869,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6744,6 +6880,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("int_copy/i>i must dispatch");
         assert_eq!(
@@ -6772,7 +6909,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6783,6 +6920,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -6810,7 +6948,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [], // empty — index 7 must surface OOR
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6821,6 +6959,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_copy/i>i must read its src operand");
         assert_eq!(
@@ -6869,7 +7008,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6880,6 +7019,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -6916,7 +7056,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6927,6 +7067,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("ref_copy/r>r must dispatch");
         assert_eq!(
@@ -6954,7 +7095,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -6965,6 +7106,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy dst OOR must surface a typed error");
         assert_eq!(
@@ -6991,7 +7133,7 @@ mod tests {
             registers_r: &mut [], // empty — index 7 must surface OOR
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -7002,6 +7144,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("ref_copy/r>r must read its src operand");
         assert_eq!(
@@ -7038,7 +7181,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7049,6 +7192,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -7175,7 +7319,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut regs_f,
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7186,6 +7330,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -7240,7 +7385,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut regs_f,
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7251,6 +7396,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("float_neg/f>f must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7286,7 +7432,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7297,6 +7443,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -7353,7 +7500,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7364,6 +7511,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("cast_int_to_float must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -7405,7 +7553,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7416,6 +7564,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc)
             .unwrap_or_else(|e| panic!("`{opname}` must dispatch — got {:?}", e));
@@ -7453,7 +7602,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7464,6 +7613,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("float_add must read its src operand");
         assert_eq!(
@@ -7490,7 +7640,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7501,6 +7651,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add must read its src operand");
         assert_eq!(
@@ -7529,7 +7680,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -7540,6 +7691,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("int_add dst OOR must surface a typed error");
         assert_eq!(
@@ -7574,7 +7726,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -7585,6 +7737,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("unsupported opname must hit UnsupportedOpname");
@@ -7645,7 +7798,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7656,6 +7809,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
@@ -7791,7 +7945,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7802,6 +7956,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -7845,7 +8000,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7856,6 +8011,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("OS_NOT_IN_TRACE must surface a typed error");
         assert_eq!(
@@ -7890,7 +8046,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7901,6 +8057,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err =
             step(&code, 0, &mut wc).expect_err("OS_JIT_FORCE_VIRTUAL must surface a typed error");
@@ -7930,7 +8087,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7941,6 +8098,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -7979,7 +8137,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -7990,6 +8148,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -8030,7 +8189,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8041,6 +8200,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         // The dst slot must hold the OpRef of the recorded CallR. Each
@@ -8100,7 +8260,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8111,6 +8271,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_r/iRd>r must dispatch");
         drop(wc);
@@ -8159,7 +8320,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8170,6 +8331,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -8217,7 +8379,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8228,6 +8390,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("dst OOR must surface a typed error");
         assert_eq!(
@@ -8258,7 +8421,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8269,6 +8432,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("descr index 5 with pool size 2 must surface DescrIndexOutOfRange");
@@ -8337,7 +8501,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8348,6 +8512,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
@@ -8411,7 +8576,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8422,6 +8587,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_r_i/iRd>i must dispatch");
         drop(wc);
@@ -8497,7 +8663,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8508,6 +8674,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) =
             step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
@@ -8611,7 +8778,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8622,6 +8789,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("residual_call_ir_r/iIRd>r must dispatch");
         drop(wc);
@@ -8659,7 +8827,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8670,6 +8838,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("FailDescr (not CallDescr) must surface ResidualCallDescrNotCallDescr");
@@ -8699,7 +8868,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8710,6 +8879,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc)
             .expect_err("R-list member out of range must surface RegisterOutOfRange");
@@ -8763,7 +8933,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -8774,6 +8944,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &production_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("ReturnValue arm must walk to a terminator");
@@ -8874,7 +9045,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done_descr,
@@ -8885,6 +9056,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &production_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, end_pc) =
             walk(&jc.code, 0, &mut wc).expect("PopTop arm must walk to a terminator");
@@ -8956,7 +9128,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr,
@@ -8967,6 +9139,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&caller_code, 0, &mut wc).expect_err("arity overflow must surface error");
         assert_eq!(
@@ -9037,7 +9210,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -9048,6 +9221,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_r_v with void callee must succeed");
@@ -9097,7 +9271,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -9108,6 +9282,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_r_v with non-void callee must reject");
@@ -9160,7 +9335,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -9171,6 +9346,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, _) =
             walk(&caller_code, 0, &mut wc).expect("inline_call_ir_v with void callee must succeed");
@@ -9221,7 +9397,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -9232,6 +9408,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_ir_v with non-void callee must reject");
@@ -9288,7 +9465,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -9299,6 +9476,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, _) = walk(&caller_code, 0, &mut wc)
             .expect("inline_call_irf_v with void callee must succeed");
@@ -9353,7 +9531,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut regs_f,
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -9364,6 +9542,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &lookup,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = walk(&caller_code, 0, &mut wc)
             .expect_err("inline_call_irf_v with non-void callee must reject");
@@ -9409,7 +9588,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9420,6 +9599,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -9484,7 +9664,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9495,6 +9675,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_i must dispatch");
         let dst_post = wc.registers_i[5];
@@ -9539,7 +9720,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9550,6 +9731,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("getfield_gc_r must dispatch");
         let dst_post = wc.registers_r[6];
@@ -9576,7 +9758,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9587,6 +9769,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let err = step(&code, 0, &mut wc).expect_err("getfield_gc must validate r-reg");
         assert_eq!(
@@ -9631,7 +9814,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9642,6 +9825,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -9704,7 +9888,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9715,6 +9899,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setfield_vable_i must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -9767,7 +9952,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9778,6 +9963,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -9810,7 +9996,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9821,6 +10007,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_i must dispatch");
         drop(wc);
@@ -9875,7 +10062,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9886,6 +10073,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("setfield_gc_r must dispatch");
         drop(wc);
@@ -9921,7 +10109,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9932,6 +10120,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -9981,7 +10170,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -9992,6 +10181,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let _ = step(&code, 0, &mut wc).expect("getarrayitem_gc_r must dispatch");
         let dst_post = wc.registers_r[5];
@@ -10032,7 +10222,7 @@ mod tests {
             registers_r: &mut regs_r,
             registers_i: &mut regs_i,
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &descr_pool,
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: frame_done,
@@ -10043,6 +10233,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         let (outcome, next_pc) = step(&code, 0, &mut wc).expect("setarrayitem_gc_r must dispatch");
         assert_eq!(outcome, DispatchOutcome::Continue);
@@ -10286,7 +10477,7 @@ mod tests {
             registers_r: &mut [],
             registers_i: &mut [],
             registers_f: &mut [],
-            concrete_registers_r: &[],
+            concrete_registers_r: &mut [],
             descr_refs: &[],
             trace_ctx: &mut tc,
             done_with_this_frame_descr_ref: descr.clone(),
@@ -10297,6 +10488,7 @@ mod tests {
             is_top_level: true,
             sub_jitcode_lookup: &no_sub_jitcodes,
             last_exc_value: None,
+            last_exc_value_concrete: ConcreteValue::Null,
         };
         assert_eq!(
             walk(&code, 0, &mut wc),
