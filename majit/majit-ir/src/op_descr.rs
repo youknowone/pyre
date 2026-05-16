@@ -43,11 +43,9 @@ impl Op {
         self.descr = None;
     }
 
-    /// True iff the descr slot is populated. Matches
-    /// `op.getdescr() is not None`.
-    pub fn has_descr(&self) -> bool {
-        self.descr.is_some()
-    }
+    // `has_descr` lives in `resoperation.rs` so the build-script
+    // source analyzer can resolve the bool return type when callers
+    // appear in `!op.has_descr()` patterns inside that file.
 
     /// Project the descr (if any) through a closure operating on a
     /// `&dyn Descr`. `f` may freely return owned values derived from

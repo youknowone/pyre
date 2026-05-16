@@ -1233,8 +1233,23 @@ impl Op {
         newop
     }
 
-    // `getdescr` / `setdescr` / `cleardescr` / `has_descr` /
-    // `project_descr` / `with_*_descr` / `resolved_rd_*` live in
+    /// True iff the descr slot is populated. Matches
+    /// `op.getdescr() is not None`.
+    ///
+    /// This sits in `resoperation.rs` (rather than the sibling
+    /// `op_descr` module hosting the closure-bearing accessors) so the
+    /// build-script source analyzer that reads this file can resolve
+    /// the bool return type when callers in the same file write
+    /// `!op.has_descr()`.
+    pub fn has_descr(&self) -> bool {
+        self.descr.is_some()
+    }
+
+    // `getdescr` / `setdescr` / `cleardescr` /
+    // `project_descr` / `with_*_descr` / `resolved_rd_*` /
+    // `getfailargs` / `setfailargs` / `getfailargs_copy` /
+    // `get_fail_arg_types` / `set_fail_arg_types` /
+    // `has_failargs` / `has_fail_arg_types` live in
     // `crate::op_descr` so the closure-bearing accessors don't have to
     // pass through the build-script source analyzer (which reads
     // `resoperation.rs` for the `RdVirtualInfo` enum and chokes on
