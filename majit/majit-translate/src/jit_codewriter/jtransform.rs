@@ -722,15 +722,28 @@ impl<'a> Transformer<'a> {
                 args,
                 graphs,
                 result_ty,
-            } if self.config.classify_calls => self.lower_indirect_call_op(
-                op,
-                *funcptr,
-                args,
-                graphs.as_deref(),
-                result_ty,
-                graph_name,
-                graph,
-            ),
+            } if self.config.classify_calls => {
+                let funcptr_vid = graph
+                    .value_id_of(funcptr)
+                    .expect("IndirectCall.funcptr must have a backing ValueId");
+                let args_vids: Vec<ValueId> = args
+                    .iter()
+                    .map(|v| {
+                        graph
+                            .value_id_of(v)
+                            .expect("IndirectCall arg must have a backing ValueId")
+                    })
+                    .collect();
+                self.lower_indirect_call_op(
+                    op,
+                    funcptr_vid,
+                    &args_vids,
+                    graphs.as_deref(),
+                    result_ty,
+                    graph_name,
+                    graph,
+                )
+            }
             // ── abort placeholders ──
             OpKind::Abort { kind } => {
                 self.notes.push(GraphTransformNote {
@@ -3825,12 +3838,20 @@ fn remap_op(
             args,
             graphs,
             result_ty,
-        } => OpKind::IndirectCall {
-            funcptr: remap_value(*funcptr, aliases),
-            args: remap_list(args, aliases),
-            graphs: graphs.clone(),
-            result_ty: result_ty.clone(),
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = graph
+                    .value_id_of(var)
+                    .expect("IndirectCall arg/funcptr must have a backing ValueId");
+                graph.must_variable(remap_value(vid, aliases))
+            };
+            OpKind::IndirectCall {
+                funcptr: remap_var(funcptr),
+                args: args.iter().map(remap_var).collect(),
+                graphs: graphs.clone(),
+                result_ty: result_ty.clone(),
+            }
+        }
         OpKind::RecordQuasiImmutField {
             base,
             field,

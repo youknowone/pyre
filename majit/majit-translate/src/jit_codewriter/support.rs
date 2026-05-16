@@ -1169,7 +1169,7 @@ mod tests {
         let op = SpaceOperation {
             result: None,
             kind: OpKind::IndirectCall {
-                funcptr: ValueId(0),
+                funcptr: crate::flowspace::model::Variable::new(),
                 args: vec![],
                 graphs: None,
                 result_ty: crate::model::ValueType::Int,

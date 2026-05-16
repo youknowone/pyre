@@ -559,8 +559,8 @@ pub enum OpKind {
     /// ```
     /// Lowered downstream by `jtransform.py:410-412 rewrite_op_indirect_call`.
     IndirectCall {
-        funcptr: ValueId,
-        args: Vec<ValueId>,
+        funcptr: crate::flowspace::model::Variable,
+        args: Vec<crate::flowspace::model::Variable>,
         graphs: Option<Vec<crate::parse::CallPath>>,
         result_ty: ValueType,
     },

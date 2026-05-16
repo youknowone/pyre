@@ -570,12 +570,20 @@ fn remap_op_kind(
             args,
             graphs,
             result_ty,
-        } => OpKind::IndirectCall {
-            funcptr: remap(funcptr),
-            args: args.iter().map(remap).collect(),
-            graphs: graphs.clone(),
-            result_ty: result_ty.clone(),
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("IndirectCall arg/funcptr must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::IndirectCall {
+                funcptr: remap_var(funcptr),
+                args: args.iter().map(remap_var).collect(),
+                graphs: graphs.clone(),
+                result_ty: result_ty.clone(),
+            }
+        }
         OpKind::RecordQuasiImmutField {
             base,
             field,
@@ -1116,8 +1124,14 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                 .expect("VtableMethodPtr.receiver must be a known Variable on graph"),
         ],
         OpKind::IndirectCall { funcptr, args, .. } => {
-            let mut v = vec![*funcptr];
-            v.extend(args.iter().copied());
+            let g = graph
+                .expect("IndirectCall requires a graph to project Variable to ValueId");
+            let project = |var: &crate::flowspace::model::Variable| {
+                g.value_id_of(var)
+                    .expect("IndirectCall arg/funcptr must be a known Variable on graph")
+            };
+            let mut v = vec![project(funcptr)];
+            v.extend(args.iter().map(project));
             v
         }
         OpKind::RecordQuasiImmutField { base, .. } => vec![

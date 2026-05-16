@@ -2656,16 +2656,16 @@ mod tests {
         value_map.insert(ValueId(1), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::IndirectCall {
-                funcptr: ValueId(1),
-                args: vec![ValueId(2)],
+                funcptr: graph.must_variable(ValueId(1)),
+                args: vec![graph.must_variable(ValueId(2))],
                 graphs: None,
                 result_ty: ValueType::Int,
             },
         };
-        let graph = translate_op_test_graph(10);
         let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect_err("IndirectCall must surface rpbc.rs invariant break");
         let msg = format!("{err}");

@@ -402,11 +402,16 @@ pub fn lower_indirect_calls(
         };
         // The original Call op is now at index `oi + 1` because
         // `class_get_method_ptr` inserted `VtableMethodPtr` at `oi`.
+        let funcptr_var = graph.must_variable(funcptr);
+        let args_vars: Vec<crate::flowspace::model::Variable> = args
+            .iter()
+            .map(|v| graph.must_variable(*v))
+            .collect();
         graph.blocks[bid].operations[oi + 1] = SpaceOperation {
             result,
             kind: OpKind::IndirectCall {
-                funcptr,
-                args,
+                funcptr: funcptr_var,
+                args: args_vars,
                 graphs,
                 result_ty,
             },

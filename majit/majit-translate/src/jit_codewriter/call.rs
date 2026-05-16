@@ -5941,7 +5941,7 @@ mod tests {
         SpaceOperation {
             result: None,
             kind: OpKind::IndirectCall {
-                funcptr: ValueId(0),
+                funcptr: crate::flowspace::model::Variable::new(),
                 args: vec![],
                 graphs,
                 result_ty: ValueType::Void,
