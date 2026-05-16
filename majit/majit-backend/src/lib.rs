@@ -19,8 +19,9 @@ pub mod resume_value;
 pub mod synthetic_cpu;
 
 pub use finish_descrs::{
-    DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrRef,
-    DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
+    DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrMulti,
+    DoneWithThisFrameDescrRef, DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef,
+    PropagateExceptionDescr,
 };
 pub use rd_payload::RdPayload;
 pub use resume_guard_descr::{

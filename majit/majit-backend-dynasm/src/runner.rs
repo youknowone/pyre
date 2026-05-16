@@ -1720,10 +1720,10 @@ impl Backend for DynasmBackend {
         }
         if ajo != 0 {
             Asm::patch_jump_for_descr(guard_fd, bridge_addr);
+            self.register_bridge_addr(Arc::as_ptr(&guard_descr) as *const () as usize, bridge_addr);
         } else if crate::majit_log_enabled() {
             eprintln!("[dynasm-bridge] WARNING: adr_jump_offset=0, bridge NOT patched!");
         }
-        self.register_bridge_addr(Arc::as_ptr(&guard_descr) as *const () as usize, bridge_addr);
 
         // llmodel.py:252 asmmemmgr_blocks parity: store the entire
         // bridge CompiledCode on the owning loop token. This keeps
@@ -2061,6 +2061,7 @@ impl Backend for DynasmBackend {
         // which are module-level singletons not subject to per-loop GC.
         // Treating `None` as "delete" would over-shoot PyPy's lifetime
         // contract.
+        let mut removed_bridge_addr_keys = Vec::new();
         let mut registry = self
             .fail_descr_registry
             .lock()
@@ -2071,10 +2072,24 @@ impl Backend for DynasmBackend {
                 None => return true,
             };
             match majit_backend::descr_owning_jct(dyn_descr) {
-                Some(owner) => owner.number != token.number,
+                Some(owner) if owner.number == token.number => {
+                    removed_bridge_addr_keys.push(Arc::as_ptr(descr) as *const () as usize);
+                    false
+                }
+                Some(_) => true,
                 None => true,
             }
         });
+        drop(registry);
+        if !removed_bridge_addr_keys.is_empty() {
+            let mut bridge_addrs = self
+                .bridge_addr_by_descr
+                .lock()
+                .expect("bridge_addr_by_descr mutex poisoned");
+            for key in removed_bridge_addr_keys {
+                bridge_addrs.remove(&key);
+            }
+        }
     }
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
@@ -2834,6 +2849,10 @@ impl Backend for DynasmBackend {
     ) -> Option<Arc<dyn majit_ir::Descr>> {
         let source_descr =
             Self::try_find_descr(original_token, source_trace_id, source_fail_index)?;
+        let bridge_addr = self.lookup_bridge_addr(Arc::as_ptr(&source_descr) as *const () as usize);
+        if bridge_addr == 0 {
+            return None;
+        }
         Some(source_descr)
     }
 

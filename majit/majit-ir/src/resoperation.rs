@@ -640,7 +640,7 @@ impl PartialEq for RdVirtualInfo {
                 Self::VArrayStructInfo {
                     arraydescr: a_descr,
                     size: a2,
-                    fielddescrs: _,
+                    fielddescrs: a_fielddescrs,
                     fielddescr_indices: a3,
                     field_types: a4,
                     base_size: a4b,
@@ -652,7 +652,7 @@ impl PartialEq for RdVirtualInfo {
                 Self::VArrayStructInfo {
                     arraydescr: b_descr,
                     size: b2,
-                    fielddescrs: _,
+                    fielddescrs: b_fielddescrs,
                     fielddescr_indices: b3,
                     field_types: b4,
                     base_size: b4b,
@@ -664,6 +664,11 @@ impl PartialEq for RdVirtualInfo {
             ) => {
                 opt_descr_ptr_eq(a_descr, b_descr)
                     && a2 == b2
+                    && a_fielddescrs.len() == b_fielddescrs.len()
+                    && a_fielddescrs
+                        .iter()
+                        .zip(b_fielddescrs.iter())
+                        .all(|(a, b)| std::sync::Arc::ptr_eq(a, b))
                     && a3 == b3
                     && a4 == b4
                     && a4b == b4b

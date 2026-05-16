@@ -2223,8 +2223,9 @@ pub(crate) fn patch_backend_terminal_recovery_layouts_for_trace(
 // depending on `majit-metainterp`.  Re-exported here for callers
 // reaching them through `compile::DoneWithThisFrameDescr*` etc.
 pub use majit_backend::{
-    DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrRef,
-    DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef, PropagateExceptionDescr,
+    DoneWithThisFrameDescrFloat, DoneWithThisFrameDescrInt, DoneWithThisFrameDescrMulti,
+    DoneWithThisFrameDescrRef, DoneWithThisFrameDescrVoid, ExitFrameWithExceptionDescrRef,
+    PropagateExceptionDescr,
 };
 
 /// `compile.py:665-674` `def make_and_attach_done_descrs(targets)`.
@@ -2953,11 +2954,10 @@ pub fn make_finish_fail_descr_typed(types: Vec<Type>) -> DescrRef {
         [Type::Float] => Arc::new(DoneWithThisFrameDescrFloat::new()),
         [Type::Ref] => Arc::new(DoneWithThisFrameDescrRef::new()),
         [Type::Int] => Arc::new(DoneWithThisFrameDescrInt::new()),
-        // Multi-result FINISH (pyre extension; PyPy FINISH always carries
-        // 0 or 1 result).  Fall back to a Void-flavoured class type;
-        // backend layout consumers read `fail_arg_types()` from the descr
-        // for any actual slot decoding.
-        _ => Arc::new(DoneWithThisFrameDescrVoid::new()),
+        // Multi-result FINISH is a Pyre extension; preserve the terminal
+        // layout even though PyPy's finish-descr class family has only
+        // 0/1-result concrete subclasses.
+        _ => Arc::new(DoneWithThisFrameDescrMulti::new(types)),
     }
 }
 

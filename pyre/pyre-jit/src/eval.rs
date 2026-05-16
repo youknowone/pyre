@@ -5770,12 +5770,12 @@ pub(crate) struct PyreBlackholeAllocator;
 /// helper.  Pyre's three `bh_setfield_gc_{i,r,f}` impls share the same
 /// size-aware byte-write because pyre objects are raw Rust structs;
 /// the type-keyed dispatch in the trait keeps RPython's call-site
-/// shape (`cpu.bh_setfield_gc_i/r/f`).  `field_offset > 0` is enforced
-/// because offset 0 is the ob_type header set by `allocate_struct` /
-/// `allocate_with_vtable`; never let resume data overwrite it.
+/// shape (`cpu.bh_setfield_gc_i/r/f`). Offset 0 is valid for plain
+/// RPython structs; callers that materialize PyObject headers must avoid
+/// replaying a header-field descr instead of hiding it here.
 fn bh_setfield_gc_byte_write(struct_ptr: i64, value: i64, descr_info: &majit_ir::FieldDescrInfo) {
     let field_offset = descr_info.offset;
-    if struct_ptr == 0 || field_offset == 0 {
+    if struct_ptr == 0 {
         return;
     }
     unsafe {
@@ -5788,6 +5788,111 @@ fn bh_setfield_gc_byte_write(struct_ptr: i64, value: i64, descr_info: &majit_ir:
             _ => (ptr as *mut i64).write(value),
         }
     }
+}
+
+const LOWLEVEL_STRING_LEN_OFFSET: usize = std::mem::size_of::<usize>();
+const LOWLEVEL_STRING_CHARS_OFFSET: usize = 2 * std::mem::size_of::<usize>();
+const LOWLEVEL_STR_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET + 1;
+const LOWLEVEL_UNICODE_BASE_SIZE: usize = LOWLEVEL_STRING_CHARS_OFFSET;
+
+fn bh_alloc_lowlevel_string(length: usize, base_size: usize, item_size: usize) -> i64 {
+    let Some(items_size) = length.checked_mul(item_size) else {
+        return 0;
+    };
+    let Some(total_size) = base_size.checked_add(items_size) else {
+        return 0;
+    };
+    let layout = std::alloc::Layout::from_size_align(total_size, std::mem::align_of::<usize>())
+        .expect("low-level string layout");
+    let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+    if ptr.is_null() {
+        return 0;
+    }
+    unsafe {
+        (ptr.add(LOWLEVEL_STRING_LEN_OFFSET) as *mut usize).write(length);
+    }
+    ptr as i64
+}
+
+fn bh_lowlevel_string_len(string: i64) -> usize {
+    if string == 0 {
+        return 0;
+    }
+    unsafe { *((string as *const u8).add(LOWLEVEL_STRING_LEN_OFFSET) as *const usize) }
+}
+
+fn bh_lowlevel_chars_offset(item_size: usize) -> usize {
+    if item_size == 1 {
+        LOWLEVEL_STR_BASE_SIZE - 1
+    } else {
+        LOWLEVEL_UNICODE_BASE_SIZE
+    }
+}
+
+fn bh_read_lowlevel_string(string: i64, item_size: usize) -> Vec<i64> {
+    let len = bh_lowlevel_string_len(string);
+    let chars_offset = bh_lowlevel_chars_offset(item_size);
+    let mut chars = Vec::with_capacity(len);
+    for index in 0..len {
+        let addr = unsafe { (string as *const u8).add(chars_offset + index * item_size) };
+        let value = unsafe {
+            match item_size {
+                1 => *addr as i64,
+                4 => *(addr as *const u32) as i64,
+                _ => *(addr as *const i64),
+            }
+        };
+        chars.push(value);
+    }
+    chars
+}
+
+fn bh_write_lowlevel_char(string: i64, index: usize, char: i64, item_size: usize) {
+    if string == 0 {
+        return;
+    }
+    let chars_offset = bh_lowlevel_chars_offset(item_size);
+    unsafe {
+        let addr = (string as *mut u8).add(chars_offset + index * item_size);
+        match item_size {
+            1 => addr.write(char as u8),
+            4 => (addr as *mut u32).write(char as u32),
+            _ => (addr as *mut i64).write(char),
+        }
+    }
+}
+
+fn bh_concat_lowlevel_strings(left: i64, right: i64, item_size: usize) -> i64 {
+    let mut chars = bh_read_lowlevel_string(left, item_size);
+    chars.extend(bh_read_lowlevel_string(right, item_size));
+    let (base_size, item_size) = if item_size == 1 {
+        (LOWLEVEL_STR_BASE_SIZE, 1)
+    } else {
+        (LOWLEVEL_UNICODE_BASE_SIZE, 4)
+    };
+    let result = bh_alloc_lowlevel_string(chars.len(), base_size, item_size);
+    for (index, char) in chars.into_iter().enumerate() {
+        bh_write_lowlevel_char(result, index, char, item_size);
+    }
+    result
+}
+
+fn bh_slice_lowlevel_string(string: i64, start: i64, stop: i64, item_size: usize) -> i64 {
+    let chars = bh_read_lowlevel_string(string, item_size);
+    let len = chars.len();
+    let start = start.clamp(0, len as i64) as usize;
+    let stop = stop.clamp(start as i64, len as i64) as usize;
+    let slice = &chars[start..stop];
+    let (base_size, item_size) = if item_size == 1 {
+        (LOWLEVEL_STR_BASE_SIZE, 1)
+    } else {
+        (LOWLEVEL_UNICODE_BASE_SIZE, 4)
+    };
+    let result = bh_alloc_lowlevel_string(slice.len(), base_size, item_size);
+    for (index, char) in slice.iter().copied().enumerate() {
+        bh_write_lowlevel_char(result, index, char, item_size);
+    }
+    result
 }
 
 impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
@@ -5949,6 +6054,38 @@ impl majit_metainterp::resume::BlackholeAllocator for PyreBlackholeAllocator {
         descr: &majit_ir::DescrRef,
     ) {
         self.bh_setinteriorfield_gc_i(array, index, value, descr);
+    }
+
+    fn bh_newstr(&self, length: usize) -> i64 {
+        bh_alloc_lowlevel_string(length, LOWLEVEL_STR_BASE_SIZE, 1)
+    }
+
+    fn bh_strsetitem(&self, string: i64, index: usize, char: i64) {
+        bh_write_lowlevel_char(string, index, char, 1);
+    }
+
+    fn os_str_concat(&self, _funcptr: i64, str1: i64, str2: i64) -> i64 {
+        bh_concat_lowlevel_strings(str1, str2, 1)
+    }
+
+    fn os_str_slice(&self, _funcptr: i64, str: i64, start: i64, stop: i64) -> i64 {
+        bh_slice_lowlevel_string(str, start, stop, 1)
+    }
+
+    fn bh_newunicode(&self, length: usize) -> i64 {
+        bh_alloc_lowlevel_string(length, LOWLEVEL_UNICODE_BASE_SIZE, 4)
+    }
+
+    fn bh_unicodesetitem(&self, string: i64, index: usize, char: i64) {
+        bh_write_lowlevel_char(string, index, char, 4);
+    }
+
+    fn os_uni_concat(&self, _funcptr: i64, str1: i64, str2: i64) -> i64 {
+        bh_concat_lowlevel_strings(str1, str2, 4)
+    }
+
+    fn os_uni_slice(&self, _funcptr: i64, str: i64, start: i64, stop: i64) -> i64 {
+        bh_slice_lowlevel_string(str, start, stop, 4)
     }
 
     /// resume.py:1452-1456 allocate_raw_buffer(func, size)

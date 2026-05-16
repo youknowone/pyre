@@ -279,6 +279,54 @@ impl FailDescr for DoneWithThisFrameDescrFloat {
     }
 }
 
+/// Pyre extension for CPython-compatible multi-result FINISH exits. PyPy's
+/// `_DoneWithThisFrameDescr*` family has only 0/1-result classes, but callers
+/// still need `fail_arg_types()` to preserve the actual terminal layout.
+#[derive(Debug)]
+pub struct DoneWithThisFrameDescrMulti(DoneWithThisFrameDescrBase);
+
+impl DoneWithThisFrameDescrMulti {
+    pub fn new(fail_arg_types: Vec<Type>) -> Self {
+        Self(DoneWithThisFrameDescrBase::new(fail_arg_types))
+    }
+}
+
+impl Descr for DoneWithThisFrameDescrMulti {
+    fn get_descr_index(&self) -> i32 {
+        self.0.descr_index.load(Ordering::Relaxed)
+    }
+    fn set_descr_index(&self, index: i32) {
+        self.0.descr_index.store(index, Ordering::Relaxed);
+    }
+    fn as_fail_descr(&self) -> Option<&dyn FailDescr> {
+        Some(self)
+    }
+}
+
+impl FailDescr for DoneWithThisFrameDescrMulti {
+    fn fail_index(&self) -> u32 {
+        u32::MAX
+    }
+    fn fail_arg_types(&self) -> &[Type] {
+        &self.0.fail_arg_types
+    }
+    fn is_finish(&self) -> bool {
+        true
+    }
+    fn adr_jump_offset(&self) -> usize {
+        self.0.adr_jump_offset()
+    }
+    fn set_adr_jump_offset(&self, offset: usize) {
+        self.0.set_adr_jump_offset(offset);
+    }
+    fn rd_locs(&self) -> &[u16] {
+        self.0.rd_locs()
+    }
+    fn set_rd_locs(&self, locs: Vec<u16>) {
+        self.0.set_rd_locs(locs);
+    }
+}
+
 /// `compile.py:658-662` `class ExitFrameWithExceptionDescrRef(_DoneWithThisFrameDescr)`.
 #[derive(Debug)]
 pub struct ExitFrameWithExceptionDescrRef(DoneWithThisFrameDescrBase);
