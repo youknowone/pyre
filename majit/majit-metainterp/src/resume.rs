@@ -5391,6 +5391,11 @@ impl BlackholeAllocator for NullAllocator {}
 /// metainterp-specific — so they stay here as a trait extension.
 pub trait VirtualInfoBlackholeExt {
     fn is_about_raw(&self) -> bool;
+    /// `resume.py:973 if rd_virtual is not None`: detect the
+    /// `RdVirtualInfo::Empty` placeholder propagated as a zero-shaped
+    /// `VirtualObj` (resume.rs:1446 conversion).  Used by
+    /// `force_all_virtuals` to skip slots that PyPy keeps as `None`.
+    fn is_empty_placeholder(&self) -> bool;
     fn allocate(
         &self,
         decoder: &mut ResumeDataDirectReader,
@@ -5495,6 +5500,22 @@ impl VirtualInfoBlackholeExt for VirtualInfo {
         matches!(
             self,
             VirtualInfo::VRawBuffer { .. } | VirtualInfo::VRawSlice { .. }
+        )
+    }
+
+    fn is_empty_placeholder(&self) -> bool {
+        // The `RdVirtualInfo::Empty` → `VirtualObj` conversion at
+        // `resume.rs:1446` produces this exact shape.
+        matches!(
+            self,
+            VirtualInfo::VirtualObj {
+                descr: None,
+                type_id: 0,
+                known_class: None,
+                fields,
+                fielddescrs,
+                descr_size: 0,
+            } if fields.is_empty() && fielddescrs.is_empty()
         )
     }
 
@@ -6217,6 +6238,12 @@ impl<'a> ResumeDataDirectReader<'a> {
         if let Some(rd_virtuals) = self.rd_virtuals {
             for i in 0..rd_virtuals.len() {
                 let rd_virtual = &rd_virtuals[i];
+                // resume.py:973 `if rd_virtual is not None`: skip empty
+                // slots (Pyre carries them as the `Empty`-derived
+                // placeholder shape).
+                if rd_virtual.is_empty_placeholder() {
+                    continue;
+                }
                 if rd_virtual.is_about_raw() {
                     // resume.py:977: kind == INT
                     self.getvirtual_int(i);
