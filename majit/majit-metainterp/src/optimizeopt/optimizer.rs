@@ -69,7 +69,7 @@ pub struct Optimizer {
     /// a fresh OpRef per emitted guard so OpRef → Op is bijective on
     /// the guard subspace, matching RPython's object-identity keying.
     /// No site re-uses an OpRef across distinct guard ops.
-    replaces_guard: std::collections::HashMap<OpRef, Op>,
+    replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Op>,
     /// optimizer.py: `pendingfields` — heap fields that need to be
     /// written back before the next guard (lazy set forcing).
     pendingfields: Vec<Op>,
@@ -1143,7 +1143,7 @@ impl Optimizer {
             final_num_inputs: 0,
             call_pure_results: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             last_guard_op_idx: None,
-            replaces_guard: std::collections::HashMap::new(),
+            replaces_guard: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             pendingfields: Vec::new(),
             can_replace_guards: true,
             quasi_immutable_deps: Vec::new(),

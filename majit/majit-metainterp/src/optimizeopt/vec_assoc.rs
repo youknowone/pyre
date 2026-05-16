@@ -80,6 +80,13 @@ impl<K: Eq, V> VecAssoc<K, V> {
         self.entries.clear();
     }
 
+    /// `HashMap::remove(k)` parity: remove and return the value if present.
+    /// Order of remaining entries is preserved (uses `Vec::remove`).
+    pub fn remove(&mut self, key: &K) -> Option<V> {
+        let idx = self.entries.iter().position(|(k, _)| k == key)?;
+        Some(self.entries.remove(idx).1)
+    }
+
     pub fn iter(&self) -> impl Iterator<Item = (&K, &V)> {
         self.entries.iter().map(|(k, v)| (k, v))
     }
