@@ -327,6 +327,16 @@ pub struct Assembler386<'a> {
     /// `self.cpu` attribute-access after whole-program translation,
     /// where the `cpu` object's identity is guaranteed by Python.
     cpu_handle: crate::guard::CpuDescrHandle,
+    /// `assembler.py:94 setup()` `self.frame_depth_to_patch = []` —
+    /// list of code-buffer byte offsets at which a placeholder 32-bit
+    /// `0xffffff` was written for the stack-depth check / slowpath
+    /// trampoline.  After materialisation, `patch_stack_checks`
+    /// overwrites each entry with the final frame depth.
+    ///
+    /// Each entry stores an offset *relative to the start of the
+    /// machine-code buffer* (i.e. pre-`rawstart`); `patch_stack_checks`
+    /// adds `rawstart` to obtain the absolute address.
+    frame_depth_to_patch: Vec<usize>,
 }
 
 /// assembler.py GuardToken — represents a pending guard needing
@@ -458,6 +468,7 @@ impl<'a> Assembler386<'a> {
             pending_force_descr: None,
             attached_descrs,
             cpu_handle,
+            frame_depth_to_patch: Vec::new(),
         }
     }
 
@@ -1783,6 +1794,13 @@ impl<'a> Assembler386<'a> {
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
 
+        // assembler.py:556 patch_stack_checks — overwrite the 32-bit
+        // `0xffffff` placeholders in any `_check_frame_depth` /
+        // `_check_frame_depth_debug` emission with the loop's final
+        // absolute frame depth (already includes `JITFRAME_FIXED_SIZE`).
+        // No-op when the assembler did not emit a check (empty list).
+        Self::patch_stack_checks(self.frame_depth, rawstart, &self.frame_depth_to_patch);
+
         // Write resolved entry address for self-recursive CALL_ASSEMBLER
         // trampoline. The JIT code loads from this pointer at runtime.
         unsafe { *self.self_entry_addr_ptr = rawstart + entry.0 };
@@ -1887,6 +1905,13 @@ impl<'a> Assembler386<'a> {
 
         let rawstart = codebuf::buffer_ptr(&buffer) as usize;
         Self::patch_pending_failure_recoveries(rawstart, &stub_offsets);
+
+        // assembler.py:658 patch_stack_checks — same as the loop path,
+        // applied with the bridge's own absolute frame depth.  Bridges
+        // routinely grow the depth past the original loop value; the
+        // patch rewrites the placeholder `0xffffff` immediate(s) so the
+        // CMP at bridge entry reflects the bridge's true requirement.
+        Self::patch_stack_checks(self.frame_depth, rawstart, &self.frame_depth_to_patch);
 
         if crate::majit_dump_enabled() {
             let code = unsafe { std::slice::from_raw_parts(rawstart as *const u8, buffer.len()) };
@@ -4409,6 +4434,34 @@ impl<'a> Assembler386<'a> {
             if let Some(fd) = descr.as_fail_descr() {
                 fd.set_adr_jump_offset(abs_addr);
             }
+        }
+    }
+
+    /// `assembler.py:948 _patch_frame_depth` — overwrite the 32-bit
+    /// `0xffffff` placeholder at `adr` with the finalised frame depth.
+    ///
+    /// PyPy uses `codebuf.MachineCodeBlockWrapper().writeimm32` +
+    /// `copy_to_raw_memory(adr)`; here we write the four little-endian
+    /// bytes directly inside a `with_writable` guard so the page-RW
+    /// permissions match the platform's executable-memory policy.
+    fn patch_frame_depth(adr: usize, allocated_depth: usize) {
+        codebuf::with_writable(adr as *mut u8, 4, || unsafe {
+            (adr as *mut i32).write_unaligned(allocated_depth as i32);
+        });
+    }
+
+    /// `assembler.py:898 patch_stack_checks` — iterate
+    /// `frame_depth_to_patch` and rewrite each placeholder immediate
+    /// with the final `framedepth` (already absolute, including
+    /// `JITFRAME_FIXED_SIZE`).
+    ///
+    /// Takes the patch list by slice rather than via `&self` so the
+    /// caller (which has already consumed `self.mc` through
+    /// `finalize()`) can still drive the patch step without keeping
+    /// `Assembler386` partially moved.
+    fn patch_stack_checks(framedepth: usize, rawstart: usize, offsets: &[usize]) {
+        for &ofs in offsets {
+            Self::patch_frame_depth(rawstart + ofs, framedepth);
         }
     }
 

@@ -543,6 +543,54 @@ pub extern "C" fn dynasm_write_barrier_from_array(obj_ptr: u64) {
     });
 }
 
+/// `_build_frame_realloc_slowpath` parity (assembler.py:143-189):
+/// JIT-side helper invoked when `_check_frame_depth` detects that
+/// `jf_frame.length < expected_depth`.  Allocates a wider JITFRAME,
+/// copies the live slots, threads `jf_forward = new_frame`, and
+/// returns the new pointer; the JIT-emitted slowpath body then writes
+/// `rbp = rax` so subsequent frame-relative loads/stores land on the
+/// reallocated frame.
+///
+/// `old_jf` and the returned pointer are both libc-allocated jitframes
+/// registered with the shadow_stack tracker — matching the runner's
+/// `execute_token` allocation strategy (see `register_libc_jitframe`).
+///
+/// # Safety
+/// - `old_jf` must be a live, `register_libc_jitframe`-tracked
+///   `*mut JitFrame` (i.e. the running loop/bridge's current frame).
+/// - The caller (the JIT-emitted slowpath body) must have already
+///   spilled all live registers into the old frame via
+///   `_push_all_regs_to_jitframe`; this helper relies on the GC seeing
+///   those slots through the gcmap pushed at the same site.
+pub unsafe extern "C" fn dynasm_realloc_frame(
+    old_jf: *mut JitFrame,
+    expected_depth: isize,
+) -> *mut JitFrame {
+    let base_ofs = DynasmBackend::get_baseofs_of_frame_field() as isize;
+    let new_jf = unsafe {
+        majit_backend::jitframe::realloc_frame(
+            old_jf,
+            expected_depth,
+            base_ofs,
+            // `alloc`: libc::calloc to match the runner-allocated frame.
+            |size_bytes| libc::calloc(1, size_bytes as usize) as *mut JitFrame,
+            // `write_barrier`: register the new frame with the shadow
+            // stack tracer.  The old frame stays registered for the
+            // duration of the running call; `jf_forward` is followed
+            // by the collector through `jitframe.py:111-118`.
+            |new_jf| {
+                majit_gc::shadow_stack::register_libc_jitframe(new_jf as usize);
+            },
+        )
+    };
+    if crate::majit_log_enabled() {
+        eprintln!(
+            "[dynasm][realloc-frame] old={old_jf:p} new={new_jf:p} expected_depth={expected_depth}"
+        );
+    }
+    new_jf
+}
+
 /// runner.py:23 AbstractX86CPU — concrete Backend implementation.
 pub struct DynasmBackend {
     /// Next unique trace ID.
