@@ -282,7 +282,7 @@ impl Trace {
             None => Op::new(opcode, args),
         };
         op.pos.set(opref);
-        op.fail_args = Some(smallvec::SmallVec::from_slice(fail_args));
+        op.setfailargs(smallvec::SmallVec::from_slice(fail_args));
         self.ops.push(op);
         self.box_pool
             .push(BoxRef::new_resop(opcode.result_type(), self.op_count));
@@ -318,7 +318,7 @@ impl Trace {
             .rev()
             .find(|op| op.pos.get() == opref)
             .unwrap_or_else(|| panic!("set_op_fail_args: no op with pos {:?}", opref));
-        op.fail_args = Some(smallvec::SmallVec::from_slice(fail_args));
+        op.setfailargs(smallvec::SmallVec::from_slice(fail_args));
     }
 
     /// Set `fail_arg_types` on the last recorded op. Used by

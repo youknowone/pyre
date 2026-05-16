@@ -6009,7 +6009,7 @@ mod tests {
 
     fn make_guard(opcode: OpCode, pos: u32, args: &[OpRef], fail_args: &[OpRef]) -> Op {
         let mut op = make_op(opcode, pos, args);
-        op.fail_args = Some(fail_args.iter().copied().collect());
+        op.setfailargs(fail_args.iter().copied().collect());
         op
     }
 
@@ -6172,10 +6172,10 @@ mod tests {
         is_true.pos.set(i2);
         let mut guard = Op::new(OpCode::GuardTrue, &[i2]);
         guard.pos.set(OpRef::int_op(3));
-        guard.fail_args = Some(vec![i1].into());
+        guard.setfailargs(vec![i1].into());
         let mut finish = Op::new(OpCode::Finish, &[]);
         finish.pos.set(OpRef::int_op(4));
-        finish.fail_args = Some(vec![].into());
+        finish.setfailargs(vec![].into());
         finish.fail_arg_types = Some(vec![]);
 
         let mut constants = HashMap::new();
@@ -6307,7 +6307,7 @@ mod tests {
 
         let mut raw = Op::new(OpCode::GuardTrue, &[i0]);
         raw.pos.set(OpRef::int_op(2));
-        raw.fail_args = Some(vec![].into());
+        raw.setfailargs(vec![].into());
         let mut finish = Op::new(OpCode::Finish, &[i1]);
         finish.pos.set(OpRef::int_op(3));
         let ops = vec![raw, finish];

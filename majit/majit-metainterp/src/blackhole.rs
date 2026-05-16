@@ -3137,8 +3137,7 @@ mod tests {
     #[test]
     fn test_blackhole_initial_exception_fails_guard_no_exception_without_restore() {
         let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::smallvec![OpRef::int_op(0)]);
-
+        guard_op.setfailargs(smallvec::smallvec![OpRef::int_op(0)]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::int_op(0)], OpRef::NONE.raw()),
             guard_op,
@@ -3225,8 +3224,7 @@ mod tests {
     fn test_blackhole_guard_no_exception_fails_with_exception() {
         // RestoreException then GuardNoException should fail.
         let mut guard_op = mk_op(OpCode::GuardNoException, &[], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::smallvec![OpRef::int_op(0)]);
-
+        guard_op.setfailargs(smallvec::smallvec![OpRef::int_op(0)]);
         let ops = vec![
             mk_op(
                 OpCode::Label,
@@ -3285,8 +3283,7 @@ mod tests {
     #[test]
     fn test_blackhole_guard_fails() {
         let mut guard_op = mk_op(OpCode::GuardTrue, &[OpRef::int_op(0)], OpRef::NONE.raw());
-        guard_op.fail_args = Some(smallvec::smallvec![OpRef::int_op(0)]);
-
+        guard_op.setfailargs(smallvec::smallvec![OpRef::int_op(0)]);
         let ops = vec![
             mk_op(OpCode::Label, &[OpRef::int_op(0)], OpRef::NONE.raw()),
             guard_op,

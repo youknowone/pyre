@@ -871,7 +871,7 @@ impl GcRewriterImpl {
         let mut new_fail = fail_args.clone();
         new_fail[idx] = same_pos;
         let mut new_guard = op.clone();
-        new_guard.fail_args = Some(new_fail);
+        new_guard.setfailargs(new_fail);
         // pos is reassigned when emit/emit_result runs on the substituted op.
         new_guard.pos.set(OpRef::NONE);
         st.changed_ops.insert(op_idx, new_guard);

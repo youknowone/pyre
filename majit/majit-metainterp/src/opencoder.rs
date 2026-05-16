@@ -3132,7 +3132,7 @@ mod tests {
         // opencoder.py:362-406 next() routes guard fail_args through the
         // same _untag/_get path as regular args.
         let mut guard = op_at(2, majit_ir::OpCode::GuardTrue, &[iop(1)]);
-        guard.fail_args = Some(vec![iarg(0), iop(1)].into());
+        guard.setfailargs(vec![iarg(0), iop(1)].into());
         let ops = vec![
             op_at(1, majit_ir::OpCode::IntEq, &[iarg(0), iarg(0)]),
             guard,

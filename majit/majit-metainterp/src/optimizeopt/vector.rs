@@ -259,7 +259,7 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
                 *arg = entry.seed;
             }
         }
-        op.fail_args = Some(new_fa);
+        op.setfailargs(new_fa);
     }
 }
 

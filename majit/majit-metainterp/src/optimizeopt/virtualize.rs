@@ -3014,7 +3014,7 @@ mod tests {
                 &[OpRef::input_arg_ref(0), OpRef::int_op(1), OpRef::int_op(2)],
             ),
         ];
-        ops[1].fail_args = Some(Default::default());
+        ops[1].setfailargs(Default::default());
         assign_positions(&mut ops);
 
         let (ops, snapshots) = seed_virtualize_guard_snapshots(&ops);
@@ -4505,8 +4505,7 @@ mod tests {
         let fd = field_descr(10);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.fail_args = Some(vec![OpRef::input_arg_ref(0)].into());
-
+        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()), // pos=0
             Op::with_descr(
@@ -4649,8 +4648,7 @@ mod tests {
     fn test_guard_fail_args_no_virtual_no_rd_numb() {
         // Guard with no virtuals in fail_args should not have rd_numb.
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(10)]);
-        guard.fail_args = Some(vec![OpRef::int_op(20), OpRef::int_op(30)].into());
-
+        guard.setfailargs(vec![OpRef::int_op(20), OpRef::int_op(30)].into());
         let mut ops = vec![guard];
         assign_positions(&mut ops);
 
@@ -4675,8 +4673,7 @@ mod tests {
         let fd = field_descr(10);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.fail_args = Some(vec![OpRef::input_arg_ref(0)].into());
-
+        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], sd.clone()),
             Op::with_descr(
@@ -4731,8 +4728,7 @@ mod tests {
         let fd_b = field_descr(20);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(30)]);
-        guard.fail_args = Some(vec![OpRef::input_arg_ref(0)].into());
-
+        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], sd.clone()),
             Op::with_descr(
@@ -4799,8 +4795,7 @@ mod tests {
         let inner_fd = field_descr(20);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(30)]);
-        guard.fail_args = Some(vec![OpRef::input_arg_ref(0)].into());
-
+        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewWithVtable, &[], outer_sd),
             Op::with_descr(OpCode::New, &[], inner_sd),
@@ -4866,8 +4861,7 @@ mod tests {
         // identity stays TAGVIRTUAL inside rd_virtuals.
         let ad = array_descr(30);
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.fail_args = Some(vec![OpRef::input_arg_ref(0)].into());
-
+        guard.setfailargs(vec![OpRef::input_arg_ref(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::NewArray, &[OpRef::int_op(10)], ad.clone()),
             Op::with_descr(

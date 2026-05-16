@@ -518,7 +518,7 @@ impl TreeLoop {
                 *arg = remap_ref(arg);
             }
             // Prefix ops don't need fail_args (they're not guards).
-            new_op.fail_args = None;
+            new_op.clearfailargs();
             prefix_ops.push(new_op);
         }
 
@@ -817,8 +817,7 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
         let mut g0 = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
-        g0.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
-
+        g0.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let mut g1 = Op::new(OpCode::GuardFalse, &[OpRef::input_arg_int(1)]);
         g1.fail_args = Some(smallvec::smallvec![
             OpRef::input_arg_int(0),
@@ -1035,11 +1034,9 @@ mod tests {
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
 
         let mut g0 = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
-        g0.fail_args = Some(smallvec::smallvec![]);
-
+        g0.setfailargs(smallvec::smallvec![]);
         let mut g1 = Op::new(OpCode::GuardFalse, &[OpRef::input_arg_int(1)]);
-        g1.fail_args = Some(smallvec::smallvec![OpRef::input_arg_int(0)]);
-
+        g1.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let add = Op::new(
             OpCode::IntAdd,
             &[OpRef::input_arg_int(0), OpRef::input_arg_int(1)],
@@ -1228,7 +1225,7 @@ mod tests {
         // history.py:590: fail_args must not contain constants
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg(0)]);
-        guard.fail_args = Some(smallvec::smallvec![OpRef::const_int(0)]);
+        guard.setfailargs(smallvec::smallvec![OpRef::const_int(0)]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);
@@ -1240,7 +1237,7 @@ mod tests {
         // history.py:591: fail_args entries must be in seen
         let inputargs = vec![InputArg::new_int(0)];
         let mut guard = Op::new(OpCode::GuardTrue, &[iarg(0)]);
-        guard.fail_args = Some(smallvec::smallvec![iop(99)]);
+        guard.setfailargs(smallvec::smallvec![iop(99)]);
         guard.setdescr(std::sync::Arc::new(DummyGuardDescr));
         let ops = vec![guard, Op::new(OpCode::Finish, &[])];
         let trace = TreeLoop::new(inputargs, ops);

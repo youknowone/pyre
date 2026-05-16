@@ -2496,7 +2496,7 @@ pub fn compile_tmp_callback(
     //   FINISH(finishargs, descr=jd.portal_finishtoken)].
     let mut guard_op = Op::with_descr(OpCode::GuardNoException, &[], propagate_exc_descr);
     // `compile.py:1144` `operations[1].setfailargs([])` — no fail args.
-    guard_op.fail_args = Some(smallvec![]);
+    guard_op.setfailargs(smallvec![]);
     let finish_op = Op::with_descr(OpCode::Finish, &finishargs, portal_finishtoken);
     let operations = vec![call_op, guard_op, finish_op];
     //

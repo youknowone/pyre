@@ -2338,7 +2338,7 @@ impl GuardRequirement {
                 // — known_class is a ConstPtr to the class.
                 let class_const = ctx.make_constant_ref(*expected_class);
                 let mut op = Op::new(OpCode::GuardClass, &[arg, class_const]);
-                op.fail_args = Some(Default::default());
+                op.setfailargs(Default::default());
                 vec![op]
             }
             GuardRequirement::GuardNonnullClass {
@@ -2374,7 +2374,7 @@ impl GuardRequirement {
                     }
                 };
                 let mut op = Op::new(OpCode::GuardNonnull, &[arg]);
-                op.fail_args = Some(Default::default());
+                op.setfailargs(Default::default());
                 vec![op]
             }
             GuardRequirement::GuardValue {
@@ -2403,7 +2403,7 @@ impl GuardRequirement {
                     Value::Void => unreachable!("LEVEL_CONSTANT cannot be Void"),
                 };
                 let mut op = Op::new(OpCode::GuardValue, &[arg, val_const]);
-                op.fail_args = Some(Default::default());
+                op.setfailargs(Default::default());
                 vec![op]
             }
             GuardRequirement::GuardBounds {
@@ -2436,7 +2436,7 @@ impl GuardRequirement {
                 // unroll.py:335 `isinstance(guard, GuardResOp)`.
                 for op in &mut emitted {
                     if matches!(op.opcode, OpCode::GuardTrue | OpCode::GuardValue) {
-                        op.fail_args = Some(Default::default());
+                        op.setfailargs(Default::default());
                     }
                 }
                 emitted

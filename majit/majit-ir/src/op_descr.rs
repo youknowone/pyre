@@ -150,13 +150,11 @@ impl Op {
     /// `resoperation.py:495 GuardResOp.setfailargs` parity — overwrite
     /// the fail_args slot.  Takes `&mut self` until the `Vec<Rc<Op>>`
     /// migration flips the field to interior-mutable.
-    pub fn setfailargs<I>(&mut self, fail_args: I)
-    where
-        I: IntoIterator<Item = crate::resoperation::OpRef>,
-    {
-        let v: smallvec::SmallVec<[crate::resoperation::OpRef; 3]> =
-            fail_args.into_iter().collect();
-        self.fail_args = Some(v);
+    pub fn setfailargs(
+        &mut self,
+        fail_args: smallvec::SmallVec<[crate::resoperation::OpRef; 3]>,
+    ) {
+        self.fail_args = Some(fail_args);
     }
 
     /// Clear the fail_args slot.  PyPy has no separate `clearfailargs`

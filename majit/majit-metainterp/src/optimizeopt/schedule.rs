@@ -1019,7 +1019,7 @@ pub fn prepare_fail_arguments(
                 *arg = unpacked;
             }
         }
-        vecop.fail_args = Some(new_fail_args);
+        vecop.setfailargs(new_fail_args);
     }
 }
 

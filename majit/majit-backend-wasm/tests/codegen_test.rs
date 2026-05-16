@@ -19,12 +19,12 @@ fn make_op(opcode: OpCode, args: &[OpRef], pos: OpRef) -> Op {
 
 fn make_guard(opcode: OpCode, args: &[OpRef], fail_args: &[OpRef]) -> Op {
     let mut op = Op::new(opcode, args);
-    op.fail_args = Some(smallvec![fail_args[0]; 0]);
+    op.setfailargs(smallvec![fail_args[0]; 0]);
     let mut fa: smallvec::SmallVec<[OpRef; 3]> = smallvec::SmallVec::new();
     for &a in fail_args {
         fa.push(a);
     }
-    op.fail_args = Some(fa);
+    op.setfailargs(fa);
     op
 }
 
@@ -33,7 +33,7 @@ fn test_empty_trace() {
     let inputargs = vec![InputArg::from_type(Type::Int, 0)];
     let ops = vec![{
         let mut op = Op::new(OpCode::Finish, &[OpRef::input_arg_int(0)]);
-        op.fail_args = Some(smallvec![OpRef::input_arg_int(0)]);
+        op.setfailargs(smallvec![OpRef::input_arg_int(0)]);
         op
     }];
     let constants = HashMap::new();
@@ -145,7 +145,7 @@ fn test_float_ops() {
         ),
         {
             let mut op = Op::new(OpCode::Finish, &[OpRef::float_op(7)]);
-            op.fail_args = Some(smallvec![OpRef::float_op(7)]);
+            op.setfailargs(smallvec![OpRef::float_op(7)]);
             op
         },
     ];
@@ -180,7 +180,7 @@ fn test_call_generates_import() {
         ),
         {
             let mut op = Op::new(OpCode::Finish, &[OpRef::int_op(1)]);
-            op.fail_args = Some(smallvec![OpRef::int_op(1)]);
+            op.setfailargs(smallvec![OpRef::int_op(1)]);
             op
         },
     ];
@@ -259,13 +259,13 @@ fn test_guard_types() {
         // GuardNoOverflow (0 args)
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.fail_args = Some(smallvec![OpRef::input_arg_int(0)]);
+            op.setfailargs(smallvec![OpRef::input_arg_int(0)]);
             op
         },
         // GuardNotInvalidated (0 args, always pass)
         {
             let mut op = Op::new(OpCode::GuardNotInvalidated, &[]);
-            op.fail_args = Some(smallvec![OpRef::input_arg_int(0)]);
+            op.setfailargs(smallvec![OpRef::input_arg_int(0)]);
             op
         },
         Op::new(
@@ -481,7 +481,7 @@ fn test_sameas_and_conversions() {
         ),
         {
             let mut op = Op::new(OpCode::Finish, &[OpRef::int_op(9)]);
-            op.fail_args = Some(smallvec![OpRef::int_op(9)]);
+            op.setfailargs(smallvec![OpRef::int_op(9)]);
             op
         },
     ];
@@ -514,7 +514,7 @@ fn test_overflow_ops() {
         ),
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.fail_args = Some(smallvec![OpRef::int_op(2)]);
+            op.setfailargs(smallvec![OpRef::int_op(2)]);
             op
         },
         make_op(
@@ -524,12 +524,12 @@ fn test_overflow_ops() {
         ),
         {
             let mut op = Op::new(OpCode::GuardNoOverflow, &[]);
-            op.fail_args = Some(smallvec![OpRef::int_op(3)]);
+            op.setfailargs(smallvec![OpRef::int_op(3)]);
             op
         },
         {
             let mut op = Op::new(OpCode::Finish, &[OpRef::int_op(2)]);
-            op.fail_args = Some(smallvec![OpRef::int_op(2)]);
+            op.setfailargs(smallvec![OpRef::int_op(2)]);
             op
         },
     ];

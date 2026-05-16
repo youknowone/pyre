@@ -2919,8 +2919,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(100)]),
         ];
         assign_positions(&mut ops, 0);
-        ops[1].fail_args = Some(vec![OpRef::int_op(100)].into());
-
+        ops[1].setfailargs(vec![OpRef::int_op(100)].into());
         let sp = extract_short_preamble(&ops);
 
         assert_eq!(sp.len(), 2);
@@ -2937,8 +2936,7 @@ mod tests {
             Op::new(OpCode::Jump, &[OpRef::int_op(100)]),
         ];
         assign_positions(&mut ops, 0);
-        ops[1].fail_args = Some(vec![OpRef::int_op(100)].into());
-
+        ops[1].setfailargs(vec![OpRef::int_op(100)].into());
         let sp = extract_short_preamble(&ops);
 
         assert!(sp.is_empty());

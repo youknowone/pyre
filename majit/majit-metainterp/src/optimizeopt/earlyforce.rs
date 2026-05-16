@@ -180,7 +180,7 @@ mod tests {
     fn test_earlyforce_guard_not_forced() {
         // GUARD_NOT_FORCED should have its fail_args resolved.
         let mut guard = Op::new(OpCode::GuardNotForced, &[]);
-        guard.fail_args = Some(Default::default());
+        guard.setfailargs(Default::default());
         let mut ops = vec![guard];
         assign_positions(&mut ops);
 

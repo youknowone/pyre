@@ -5383,8 +5383,7 @@ mod tests {
         let field_descr = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(10)]);
-        guard.fail_args = Some(vec![OpRef::int_op(0)].into());
-
+        guard.setfailargs(vec![OpRef::int_op(0)].into());
         let mut ops = vec![
             Op::with_descr(OpCode::New, &[], size_descr),
             Op::with_descr(
@@ -5771,7 +5770,7 @@ mod tests {
             Op::new(OpCode::GuardTrue, &[OpRef::int_op(100)]),
             Op::new(OpCode::Finish, &[]),
         ];
-        ops[1].fail_args = Some(vec![OpRef::int_op(100), OpRef::int_op(101)].into());
+        ops[1].setfailargs(vec![OpRef::int_op(100), OpRef::int_op(101)].into());
         for (i, op) in ops.iter_mut().enumerate() {
             op.pos.set(OpRef::op_typed(i as u32, op.opcode.result_type()));
         }

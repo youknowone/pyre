@@ -3363,7 +3363,7 @@ impl OptUnroll {
                     // store_final_boxes_in_guard repopulates them from the live
                     // snapshot.
                     new_op.setdescr(crate::optimizeopt::make_resume_at_position_descr());
-                    new_op.fail_args = None;
+                    new_op.clearfailargs();
                     new_op.fail_arg_types = None;
                     // unroll.py:409: op.rd_resume_position = patchguardop.rd_resume_position
                     // RPython: patchguardop is always set (from GUARD_FUTURE_CONDITION).
@@ -5255,7 +5255,7 @@ mod tests {
             Op::new(OpCode::IntAdd, &[OpRef::int_op(100), OpRef::int_op(101)]),
             {
                 let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(100)]);
-                guard.fail_args = Some(vec![OpRef::int_op(0)].into()); // refs op0
+                guard.setfailargs(vec![OpRef::int_op(0)].into()); // refs op0
                 guard
             },
             Op::new(OpCode::Jump, &[]),
@@ -6252,7 +6252,7 @@ mod tests {
                     OpCode::GuardValue,
                     &[OpRef::void_op(857), OpRef::const_int(0)],
                 );
-                op.fail_args = Some(vec![OpRef::void_op(857)].into());
+                op.setfailargs(vec![OpRef::void_op(857)].into());
                 op
             },
             Op::new(
@@ -6376,7 +6376,7 @@ mod tests {
         let p2_ops = vec![
             {
                 let mut op = Op::new(OpCode::GuardTrue, &[OpRef::int_op(64)]);
-                op.fail_args = Some(vec![OpRef::int_op(64)].into());
+                op.setfailargs(vec![OpRef::int_op(64)].into());
                 op
             },
             {
@@ -6707,7 +6707,7 @@ mod tests {
         let redirected_tail = vec![
             {
                 let mut op = Op::new(OpCode::GuardTrue, &[OpRef::void_op(3)]);
-                op.fail_args = Some(vec![OpRef::void_op(3)].into());
+                op.setfailargs(vec![OpRef::void_op(3)].into());
                 op
             },
             Op::new(OpCode::Jump, &[OpRef::void_op(3), OpRef::int_op(4)]),
