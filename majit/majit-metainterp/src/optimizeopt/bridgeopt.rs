@@ -57,14 +57,13 @@ pub fn serialize_optimizer_knowledge(
 ) {
     // bridgeopt.py:64-67 `available_boxes = {}` followed by
     // `available_boxes[box] = None` — RPython uses a dict as a
-    // membership set (values are always None). Rust mirrors the dict
-    // shape with `HashMap<OpRef, ()>` rather than `HashSet<OpRef>` to
-    // keep structural parity with the RPython data-structure choice.
-    let available_boxes: std::collections::HashMap<OpRef, ()> = liveboxes
+    // membership set (values are always None). Pyre uses a Vec scanned
+    // linearly: the no-HashMap rule precludes a hash-backed mirror, and
+    // available_boxes per bridge is bounded by the live-box set.
+    let available_boxes: Vec<OpRef> = liveboxes
         .iter()
         .filter_map(|opt| *opt)
         .filter(|opref| numb_state.liveboxes.contains_key(*opref))
-        .map(|opref| (opref, ()))
         .collect();
 
     // bridgeopt.py:74-88: known classes bitfield
@@ -126,8 +125,8 @@ pub fn serialize_optimizer_knowledge(
         .iter()
         .copied()
         .filter(|&(obj, _, val)| {
-            let obj_ok = env.is_const(obj) || available_boxes.contains_key(&obj);
-            let val_ok = env.is_const(val) || available_boxes.contains_key(&val);
+            let obj_ok = env.is_const(obj) || available_boxes.contains(&obj);
+            let val_ok = env.is_const(val) || available_boxes.contains(&val);
             obj_ok && val_ok
         })
         .collect();
@@ -145,8 +144,8 @@ pub fn serialize_optimizer_knowledge(
         .iter()
         .copied()
         .filter(|&(obj, _, _, val)| {
-            let obj_ok = env.is_const(obj) || available_boxes.contains_key(&obj);
-            let val_ok = env.is_const(val) || available_boxes.contains_key(&val);
+            let obj_ok = env.is_const(obj) || available_boxes.contains(&obj);
+            let val_ok = env.is_const(val) || available_boxes.contains(&val);
             obj_ok && val_ok
         })
         .collect();
@@ -169,7 +168,7 @@ pub fn serialize_optimizer_knowledge(
         .loopinvariant_results
         .iter()
         .copied()
-        .filter(|&(_, result)| env.is_const(result) || available_boxes.contains_key(&result))
+        .filter(|&(_, result)| env.is_const(result) || available_boxes.contains(&result))
         .collect();
     numb_state.append_int(filtered_loopinvariant.len() as i64);
     for (const_ptr, result) in &filtered_loopinvariant {
