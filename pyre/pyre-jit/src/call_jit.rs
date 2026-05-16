@@ -3789,6 +3789,149 @@ pub extern "C" fn bh_set_current_exception(exc: i64) {
     pyre_interpreter::eval::set_current_exception(exc as pyre_object::PyObjectRef);
 }
 
+/// On-demand resume callback (Slice QQ-2, pyre-jit side).  Registered
+/// into cranelift via `register_resumedata_deopt` (eval.rs:init_callbacks)
+/// and called from the six `recovery_layout_ref()` consumer sites
+/// once they migrate off the pre-baked `ExitRecoveryLayout` cache
+/// (Slice QQ-3+).
+///
+/// PyPy parity target: `pyjitpl.py:3424
+/// MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)`
+/// drives `resume.rebuild_from_resumedata` to materialise virtuals +
+/// replay pending fields from `rd_numb` / `rd_consts` / `rd_virtuals` /
+/// `rd_pendingfields` carried on the `ResumeGuardDescr`.
+///
+/// `outputs` enters carrying the failing-guard fail_args (the JITed
+/// exit code stored them).  We treat that as the `deadframe` input to
+/// the decoder and replace `*outputs` with the per-section
+/// concatenation that the recovery_layout walker produced before
+/// (innermost-first per `compiler.rs:1481` `recovery.frames.iter().rev()`).
+///
+/// Implementation lives in `call_jit.rs` rather than `eval.rs` because
+/// `pyre-jit-trace`'s build.rs:66 reads `eval.rs` through the JIT
+/// translator's RPython subset, which rejects the trait-object
+/// downcast pattern used here.
+#[cfg(feature = "cranelift")]
+pub fn cranelift_resumedata_deopt(
+    descr_addr: usize,
+    outputs: &mut Vec<i64>,
+    types: &[majit_ir::Type],
+    _bridge_num_inputs: usize,
+) {
+    use majit_backend::Backend;
+    use majit_metainterp::resume;
+
+    // 1. Recover descr Arc.
+    let (driver, driver_vinfo) = crate::eval::driver_pair();
+    let backend = driver.meta_interp().backend();
+    let descr = backend.fail_descr_arc_from_addr(descr_addr);
+
+    // 2. Downcast to ResumeGuardDescr.  Synthetic FINISH /
+    //    ExitFrameWithException / external-JUMP descrs have no `rd_*`
+    //    payload upstream (compile.py:624-662) — they short-circuit
+    //    here.  Callers fall back to the recovery_layout walker for
+    //    these until the synthetic construction path is restructured.
+    let Some(any) = descr.as_any() else { return };
+    let Some(rgd) = any.downcast_ref::<majit_backend::ResumeGuardDescr>() else {
+        return;
+    };
+
+    // 3. Extract resume payload.  Empty rd_numb → nothing to decode.
+    let Some(rd_numb) = rgd.payload.rd_numb() else {
+        return;
+    };
+    if rd_numb.is_empty() {
+        return;
+    }
+    let rd_consts = rgd.payload.rd_consts().unwrap_or(&[]);
+    let rd_virtuals_rcs = rgd.payload.rd_virtuals();
+    let rd_pendingfields = rgd.payload.rd_pendingfields();
+
+    // 4. resume.py:983-991 _prepare_virtuals — convert RdVirtualInfo →
+    //    VirtualInfo so the decoder can materialise lazily.
+    let count = outputs.len() as i32;
+    let rd_virtuals_converted: Option<Vec<resume::VirtualInfo>> = rd_virtuals_rcs.map(|rcs| {
+        rcs.iter()
+            .map(|rd| resume::rd_virtual_to_virtual_info(rd, rd_consts, count))
+            .collect()
+    });
+    let rd_virtuals_slice = rd_virtuals_converted.as_deref();
+
+    // 5. Construct ResumeDataDirectReader.  `outputs` enters as the
+    //    deadframe (the JITed exit code stored fail_args here).
+    //    Snapshot all_liveness once so the slice outlives the reader.
+    let all_liveness = pyre_jit_trace::state::liveness_info_snapshot();
+    let deadframe: Vec<i64> = outputs.clone();
+    let allocator = crate::eval::PyreBlackholeAllocator;
+    let mut reader = resume::ResumeDataDirectReader::new(
+        rd_numb,
+        rd_consts,
+        &all_liveness,
+        &deadframe,
+        Some(types),
+        None,
+        &allocator,
+    );
+
+    // 6. resume.py:1324-1325 — prepare virtuals/pendingfields, then
+    //    consume the vref + vable sections that precede the per-frame
+    //    sections.
+    reader.prepare(rd_virtuals_slice, rd_pendingfields);
+    let vinfo_dyn: &dyn resume::VirtualizableInfo = driver_vinfo.as_ref();
+    let vrefinfo_dyn: &dyn resume::VRefInfo = driver.meta_interp().virtualref_info();
+    reader.consume_vref_and_vable(Some(vrefinfo_dyn), Some(vinfo_dyn), None);
+
+    // 7. resume.py:1339 jitcodes[jitcode_pos] lookup — same shape as
+    //    blackhole_resume_via_rd_numb's resolve_jitcode (line 1891),
+    //    but returns the (jitcode, pc, op_live) triple
+    //    consume_all_sections_into_vec needs to compute the per-section
+    //    liveness offset.
+    let (op_live_i32, _op_catch_exception, _op_rvmprof_code) =
+        pyre_jit_trace::state::blackhole_control_opcodes();
+    // op_live is the `-live-` opcode byte that JitCode::get_live_vars_info
+    // (translate/jit_codewriter/jitcode.rs:477) uses to skip past the
+    // op header.  state.rs returns it as i32 for the
+    // `setup_cached_control_opcodes` API; we narrow here.  A negative
+    // or out-of-range value means the control opcodes were not set up,
+    // which would break the per-section walk — short-circuit to the
+    // recovery_layout fallback instead.
+    if op_live_i32 < 0 || op_live_i32 > 255 {
+        return;
+    }
+    let op_live = op_live_i32 as u8;
+    let resolve_jitcode = |jitcode_index: i32,
+                           pc: i32|
+     -> Option<(
+        std::sync::Arc<majit_metainterp::jitcode::JitCode>,
+        usize,
+        u8,
+    )> {
+        if pc < 0 {
+            return None;
+        }
+        let pyjitcode = pyre_jit_trace::state::pyjitcode_for_jitcode_index(jitcode_index)?;
+        if pyjitcode.has_abort_opcode() {
+            return None;
+        }
+        let jitcode_pc = pyjitcode.metadata.pc_map.get(pc as usize).copied()?;
+        Some((pyjitcode.jitcode.clone(), jitcode_pc, op_live))
+    };
+
+    // 8. Drive the per-section consume loop, appending decoded values
+    //    into a fresh rebuilt vec.  Mirrors the
+    //    `rebuild_state_after_failure(outputs, types, recovery)` walker:
+    //    innermost-first concatenation of (i, r, f) sections.
+    let mut rebuilt: Vec<i64> = Vec::with_capacity(outputs.len());
+    if !reader.consume_all_sections_into_vec(&resolve_jitcode, &mut rebuilt) {
+        // resolve_jitcode failure — leave outputs as-is so the
+        // recovery_layout fallback path can take over.
+        return;
+    }
+
+    // 9. Replace outputs with rebuilt.
+    *outputs = rebuilt;
+}
+
 #[cfg(test)]
 mod tests_bh_normalize_raise {
     use super::*;

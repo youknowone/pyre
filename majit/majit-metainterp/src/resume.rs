@@ -6298,7 +6298,11 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// `resume.py:1324-1325 blackhole_from_resumedata`.
     pub fn consume_all_sections_into_vec(
         &mut self,
-        resolve_jitcode: &dyn Fn(i32, i32) -> Option<(std::sync::Arc<crate::jitcode::JitCode>, usize, u8)>,
+        resolve_jitcode: &dyn Fn(
+            i32,
+            i32,
+        )
+            -> Option<(std::sync::Arc<crate::jitcode::JitCode>, usize, u8)>,
         outputs: &mut Vec<i64>,
     ) -> bool {
         while !self.done_reading() {

@@ -332,7 +332,11 @@ impl ResumeGuardDescr {
     pub fn recovery_layout(&self) -> Option<ExitRecoveryLayout> {
         // Safety: single-threaded JIT (RPython GIL parity); same access
         // contract as the sibling `vector_info` / `rd_locs` UnsafeCells.
-        unsafe { (*self.recovery_layout.get()).as_ref().map(|a| (**a).clone()) }
+        unsafe {
+            (*self.recovery_layout.get())
+                .as_ref()
+                .map(|a| (**a).clone())
+        }
     }
 
     /// Write the cached recovery_layout.  Wraps the layout in an `Arc` to
