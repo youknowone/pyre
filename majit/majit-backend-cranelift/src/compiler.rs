@@ -7681,7 +7681,7 @@ impl CraneliftBackend {
 
         let num_inputs = inputargs.len();
         let known_values = build_known_values_set(inputargs, ops);
-        let type_index = OpTypeIndex::new(inputargs, ops, &self.constant_types);
+        let type_index = OpTypeIndex::new(inputargs, ops);
         let (type_overrides, _op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
         let ref_root_slots =
             build_ref_root_slots(inputargs, ops, &type_index, &type_overrides, &force_tokens)?;
@@ -13118,7 +13118,7 @@ fn collect_guards(
     attached_descrs: majit_backend::AttachedDescrPtrs,
 ) -> Result<(), BackendError> {
     let num_inputs = inputargs.len();
-    let type_index = OpTypeIndex::new(inputargs, ops, constant_types);
+    let type_index = OpTypeIndex::new(inputargs, ops);
     let (type_overrides, op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
 
     // Map Label descr index → block arity, used to distinguish internal vs
@@ -13862,7 +13862,7 @@ fn collect_terminal_exit_layouts(
     source_guard: Option<(u64, u32)>,
     caller_layout: Option<&ExitRecoveryLayout>,
 ) -> Result<Vec<TerminalExitLayout>, BackendError> {
-    let type_index = OpTypeIndex::new(inputargs, ops, constant_types);
+    let type_index = OpTypeIndex::new(inputargs, ops);
     let (type_overrides, _op_def_positions) = build_type_overrides(inputargs, ops, &type_index);
     let mut layouts = Vec::new();
     let mut fail_index = 0u32;

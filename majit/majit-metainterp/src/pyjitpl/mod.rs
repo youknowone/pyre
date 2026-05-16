@@ -7222,11 +7222,8 @@ impl<M: Clone> MetaInterp<M> {
             // `OpTypeIndex::opref_type_at`'s constant_types miss to the
             // hard-panic boundary (`history.py:220` parity), so reuse
             // the saved map instead.
-            let type_index = majit_ir::OpTypeIndex::new(
-                &root_trace.inputargs,
-                &root_trace.ops,
-                &root_trace.constant_types,
-            );
+            let type_index =
+                majit_ir::OpTypeIndex::new(&root_trace.inputargs, &root_trace.ops);
             if let Some((label_index, label)) = root_trace.ops.iter().enumerate().find(|(_, op)| {
                 op.opcode == OpCode::Label
                     && op

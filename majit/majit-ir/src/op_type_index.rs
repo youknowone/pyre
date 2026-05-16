@@ -1,5 +1,4 @@
 use std::borrow::Cow;
-use std::collections::HashMap;
 
 use crate::resoperation::{Op, OpRef};
 use crate::value::{InputArg, Type};
@@ -20,13 +19,6 @@ use crate::value::{InputArg, Type};
 pub struct OpTypeIndex<'a> {
     inputargs: &'a [InputArg],
     ops: &'a [Op],
-    /// Retained as an API parameter for callers; queued for removal in
-    /// the `value_types` side-table drop alongside `OptContext::value_types`
-    /// (P8). Untyped variant retirement made this lookup unreachable from
-    /// `opref_type_at_or_after`, since every constant variant short-circuits
-    /// at `opref.ty()`.
-    #[allow(dead_code)]
-    constant_types: &'a HashMap<u32, Type>,
     /// `inputarg_pos[raw] = slice index in inputargs`, sentinel
     /// [`NO_POS`] for unset slots. `arg.index` raw uniqueness is
     /// enforced at build time, mirroring RPython's backend uniqueness
@@ -48,17 +40,12 @@ pub struct OpTypeIndex<'a> {
 pub const NO_POS: u32 = u32::MAX;
 
 impl<'a> OpTypeIndex<'a> {
-    pub fn new(
-        inputargs: &'a [InputArg],
-        ops: &'a [Op],
-        constant_types: &'a HashMap<u32, Type>,
-    ) -> Self {
+    pub fn new(inputargs: &'a [InputArg], ops: &'a [Op]) -> Self {
         let inputarg_pos = Self::build_inputarg_pos(inputargs);
         let op_pos = Self::build_op_pos(ops);
         Self {
             inputargs,
             ops,
-            constant_types,
             inputarg_pos: Cow::Owned(inputarg_pos),
             op_pos: Cow::Owned(op_pos),
         }
@@ -69,14 +56,12 @@ impl<'a> OpTypeIndex<'a> {
     pub fn from_parts(
         inputargs: &'a [InputArg],
         ops: &'a [Op],
-        constant_types: &'a HashMap<u32, Type>,
         inputarg_pos: &'a [u32],
         op_pos: &'a [u32],
     ) -> Self {
         Self {
             inputargs,
             ops,
-            constant_types,
             inputarg_pos: Cow::Borrowed(inputarg_pos),
             op_pos: Cow::Borrowed(op_pos),
         }

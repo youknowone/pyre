@@ -1543,7 +1543,7 @@ pub(crate) fn infer_terminal_exit_layout(
         return None;
     }
     let fail_index = find_fail_index_for_exit_op(ops, op_index).unwrap_or(u32::MAX);
-    let type_index = majit_ir::OpTypeIndex::new(inputargs, ops, constant_types);
+    let type_index = majit_ir::OpTypeIndex::new(inputargs, ops);
     let exit_types: Vec<Type> = op
         .args
         .iter()

@@ -359,12 +359,7 @@ impl<'a> AssemblerARM64<'a> {
 
     #[inline]
     fn opref_type_at(&self, opref: OpRef, at_op_index: Option<usize>) -> Option<Type> {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         match at_op_index {
             Some(at) => type_index.opref_type_at(opref, at),

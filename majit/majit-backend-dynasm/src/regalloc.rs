@@ -1699,7 +1699,6 @@ impl<'a> RegAlloc<'a> {
         let type_index = OpTypeIndex::from_parts(
             self.inputargs,
             self.operations,
-            &self.constant_types,
             &self.inputarg_pos,
             &self.op_pos,
         );
@@ -5008,12 +5007,7 @@ impl<'a> RegAlloc<'a> {
         } else {
             SAVE_DEFAULT_REGS
         };
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -5104,12 +5098,7 @@ impl<'a> RegAlloc<'a> {
         } else {
             SAVE_DEFAULT_REGS
         };
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -5167,12 +5156,7 @@ impl<'a> RegAlloc<'a> {
             }
         }
 
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -5235,12 +5219,7 @@ impl<'a> RegAlloc<'a> {
             }
         }
 
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -5288,12 +5267,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
         save_regs: u8,
     ) {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -5341,12 +5315,7 @@ impl<'a> RegAlloc<'a> {
         output: &mut Vec<RegAllocOp>,
         save_regs: u8,
     ) {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         self.rm.before_call(
             &[],
@@ -5391,12 +5360,7 @@ impl<'a> RegAlloc<'a> {
     /// or ecx/edx/rax (x86). The slow path may trigger GC.
     /// aarch64/regalloc.py:958 prepare_op_call_malloc_nursery parity.
     fn consider_call_malloc_nursery(&mut self, op: &Op, i: usize, output: &mut Vec<RegAllocOp>) {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         // aarch64/regalloc.py:962: spill_or_move_registers_before_call([r.x0, r.x1])
         self.rm.spill_or_move_registers_before_call(
@@ -5452,12 +5416,7 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
@@ -5510,12 +5469,7 @@ impl<'a> RegAlloc<'a> {
         // aarch64/regalloc.py:984: sizeloc = make_sure_var_in_reg(size_box)
         let size_box = op.args[0];
         let sizeloc = self.make_sure_var_in_reg(size_box, Type::Int, &[], None, false);
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         // aarch64/regalloc.py:985: only move values away from x0/x1.
         // The slow path saves/restores all managed registers except
@@ -5574,12 +5528,7 @@ impl<'a> RegAlloc<'a> {
             return;
         };
         let sizeloc = self.make_sure_var_in_reg(size_arg, Type::Int, &[], None, false);
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
@@ -5623,12 +5572,7 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         // aarch64/regalloc.py:1016
         self.rm.spill_or_move_registers_before_call(
@@ -5674,12 +5618,7 @@ impl<'a> RegAlloc<'a> {
         i: usize,
         output: &mut Vec<RegAllocOp>,
     ) {
-        let type_index = OpTypeIndex::from_parts(
-            self.inputargs,
-            self.operations,
-            &self.constant_types,
-            &self.inputarg_pos,
-            &self.op_pos,
+        let type_index = OpTypeIndex::from_parts(self.inputargs, self.operations, &self.inputarg_pos, &self.op_pos,
         );
         self.rm.spill_or_move_registers_before_call(
             &MALLOC_NURSERY_CLOBBER,
