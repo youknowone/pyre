@@ -832,13 +832,21 @@ fn remap_op_kind(
             args_r,
             args_f,
             result_kind,
-        } => OpKind::InlineCall {
-            jitcode: jitcode.clone(),
-            args_i: args_i.iter().map(remap).collect(),
-            args_r: args_r.iter().map(remap).collect(),
-            args_f: args_f.iter().map(remap).collect(),
-            result_kind: *result_kind,
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("InlineCall arg must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::InlineCall {
+                jitcode: jitcode.clone(),
+                args_i: args_i.iter().map(remap_var).collect(),
+                args_r: args_r.iter().map(remap_var).collect(),
+                args_f: args_f.iter().map(remap_var).collect(),
+                result_kind: *result_kind,
+            }
+        }
         OpKind::RecursiveCall {
             jd_index,
             greens_i,
@@ -1140,9 +1148,15 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
-            let mut refs = args_i.clone();
-            refs.extend(args_r);
-            refs.extend(args_f);
+            let g = graph
+                .expect("InlineCall requires a graph to project Variable to ValueId");
+            let project = |var: &crate::flowspace::model::Variable| {
+                g.value_id_of(var)
+                    .expect("InlineCall arg must be a known Variable on graph")
+            };
+            let mut refs: Vec<ValueId> = args_i.iter().map(project).collect();
+            refs.extend(args_r.iter().map(project));
+            refs.extend(args_f.iter().map(project));
             refs
         }
         OpKind::ConditionalCall {

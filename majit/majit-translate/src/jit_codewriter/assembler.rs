@@ -1017,6 +1017,18 @@ impl Assembler {
                 result_kind,
                 ..
             } => {
+                let g = graph.expect("encode_op for InlineCall requires a graph");
+                let project = |args: &[crate::flowspace::model::Variable]| -> Vec<ValueId> {
+                    args.iter()
+                        .map(|v| {
+                            g.value_id_of(v)
+                                .expect("InlineCall arg must be a known Variable on graph")
+                        })
+                        .collect()
+                };
+                let args_i_vids = project(args_i);
+                let args_r_vids = project(args_r);
+                let args_f_vids = project(args_f);
                 // RPython assembler.py:197-207: jitcode → descrs[index]
                 // The JitCode object IS the descriptor for inline_call.
                 let descr_idx = self.emit_pending_jitcode_descr(jitcode.clone());
@@ -1025,17 +1037,18 @@ impl Assembler {
                 argcodes.push('d');
                 // RPython jtransform.py:422-431: rewrite_call
                 // Only emit the kind sublists that are in 'kinds'.
-                let kinds = self.kinds_suffix(args_i, args_r, args_f, *result_kind);
+                let kinds =
+                    self.kinds_suffix(&args_i_vids, &args_r_vids, &args_f_vids, *result_kind);
                 if kinds.contains('i') {
-                    self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
+                    self.emit_list_of_kind(&args_i_vids, RegKind::Int, regallocs, state);
                     argcodes.push('I');
                 }
                 if kinds.contains('r') {
-                    self.emit_list_of_kind(args_r, RegKind::Ref, regallocs, state);
+                    self.emit_list_of_kind(&args_r_vids, RegKind::Ref, regallocs, state);
                     argcodes.push('R');
                 }
                 if kinds.contains('f') {
-                    self.emit_list_of_kind(args_f, RegKind::Float, regallocs, state);
+                    self.emit_list_of_kind(&args_f_vids, RegKind::Float, regallocs, state);
                     argcodes.push('F');
                 }
                 // Result — see residual_call note below: derive the

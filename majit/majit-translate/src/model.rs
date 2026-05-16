@@ -691,11 +691,11 @@ pub enum OpKind {
         /// assembler snapshots the final descriptor table.
         jitcode: crate::jitcode::JitCodeHandle,
         /// Integer arguments (RPython: ListOfKind('int', ...))
-        args_i: Vec<ValueId>,
+        args_i: Vec<crate::flowspace::model::Variable>,
         /// Reference arguments (RPython: ListOfKind('ref', ...))
-        args_r: Vec<ValueId>,
+        args_r: Vec<crate::flowspace::model::Variable>,
         /// Float arguments (RPython: ListOfKind('float', ...))
-        args_f: Vec<ValueId>,
+        args_f: Vec<crate::flowspace::model::Variable>,
         /// Result kind: 'i', 'r', 'f', or 'v'
         result_kind: char,
     },

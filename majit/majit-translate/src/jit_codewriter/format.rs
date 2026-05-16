@@ -366,6 +366,28 @@ fn list_of_kind_repr(kind_char: char, args: &[ValueId]) -> String {
     format!("{}[{}]", kind_char.to_ascii_uppercase(), parts.join(", "))
 }
 
+/// Variable-typed sibling of [`list_of_kind_repr`].  Used by call-family
+/// `OpKind` variants whose argument slots have been flipped from
+/// `Vec<ValueId>` to `Vec<Variable>` per the upstream-orthodox storage
+/// model.  Variables are rendered using their dense `id` (process-wide
+/// stable per identity), which matches the ValueId-derived numbering for
+/// graphs constructed through `alloc_value_with_variable`.
+fn list_of_kind_repr_vars(
+    kind_char: char,
+    args: &[crate::flowspace::model::Variable],
+) -> String {
+    let kind = match kind_char.to_ascii_lowercase() {
+        'i' => RegKind::Int,
+        'f' => RegKind::Float,
+        _ => RegKind::Ref,
+    };
+    let parts: Vec<String> = args
+        .iter()
+        .map(|v| register_repr_for_kind(ValueId(v.id() as usize), kind))
+        .collect();
+    format!("{}[{}]", kind_char.to_ascii_uppercase(), parts.join(", "))
+}
+
 /// format.py:20-23 — render a `funcptr` slot.
 ///
 /// Upstream emits `$<* struct <name>>` for `Constant(lltype.Ptr(Struct))`
@@ -492,7 +514,7 @@ fn op_name(op: &crate::model::SpaceOperation) -> String {
 /// Encodes the (int, ref, float) arg tuple as a single-character
 /// signature ("i", "r", "f", "ir", "irf", …).  Empty bins drop out so
 /// `(args_i=[a], args_r=[], args_f=[])` produces `"i"`.
-fn kind_signature(args_i: &[ValueId], args_r: &[ValueId], args_f: &[ValueId]) -> String {
+fn kind_signature<T>(args_i: &[T], args_r: &[T], args_f: &[T]) -> String {
     let mut out = String::new();
     if !args_i.is_empty() {
         out.push('i');
@@ -601,13 +623,13 @@ fn op_args_repr(
             };
             let mut parts = vec![head];
             if !args_i.is_empty() {
-                parts.push(list_of_kind_repr('i', args_i));
+                parts.push(list_of_kind_repr_vars('i', args_i));
             }
             if !args_r.is_empty() {
-                parts.push(list_of_kind_repr('r', args_r));
+                parts.push(list_of_kind_repr_vars('r', args_r));
             }
             if !args_f.is_empty() {
-                parts.push(list_of_kind_repr('f', args_f));
+                parts.push(list_of_kind_repr_vars('f', args_f));
             }
             out.push_str(&parts.join(", "));
         }
@@ -884,15 +906,18 @@ mod tests {
 
     #[test]
     fn format_inline_call_emits_jitcode_and_listofkind() {
+        use crate::flowspace::model::Variable;
         use crate::model::{OpKind, SpaceOperation};
         let mut ssa = empty_ssa();
         let callee = std::sync::Arc::new(crate::jitcode::JitCode::new("callee"));
         callee.set_index(7);
+        let red = Variable::new();
+        let red_id = red.id();
         ssa.insns.push(FlatOp::Op(SpaceOperation {
             kind: OpKind::InlineCall {
                 jitcode: crate::jitcode::JitCodeHandle::new(callee),
                 args_i: vec![],
-                args_r: vec![ValueId(1)],
+                args_r: vec![red],
                 args_f: vec![],
                 result_kind: 'v',
             },
@@ -908,7 +933,10 @@ mod tests {
         // identity.  Pyre prints it as `<JitCode #N>` so the parity test
         // sees the same shape.
         assert!(text.contains("<JitCode #7>"), "got: {text}");
-        assert!(text.contains("R[%r1]"));
+        assert!(
+            text.contains(&format!("R[%r{red_id}]")),
+            "expected R[%r{red_id}] in: {text}"
+        );
     }
 
     #[test]

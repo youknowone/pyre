@@ -2223,7 +2223,7 @@ impl<'a> Transformer<'a> {
             let kind = cc.guess_call_kind(op);
             return match kind {
                 crate::call::CallKind::Regular => {
-                    self.handle_regular_call(op, target, args, result_ty, graph_name)
+                    self.handle_regular_call(op, target, args, result_ty, graph_name, graph)
                 }
                 crate::call::CallKind::Residual => {
                     // RPython jtransform.py:456-471:
@@ -2470,6 +2470,7 @@ impl<'a> Transformer<'a> {
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         // RPython jtransform.py:477-478: get_jitcode(targetgraph)
         //
@@ -2503,14 +2504,15 @@ impl<'a> Transformer<'a> {
         });
         self.calls_classified += 1;
         // RPython jtransform.py:480-481: inline_call always followed by -live-
+        let to_var = |v: ValueId| graph.must_variable(v);
         RewriteResult::Replace(vec![
             SpaceOperation {
                 result: op.result,
                 kind: OpKind::InlineCall {
                     jitcode,
-                    args_i,
-                    args_r,
-                    args_f,
+                    args_i: args_i.into_iter().map(to_var).collect(),
+                    args_r: args_r.into_iter().map(to_var).collect(),
+                    args_f: args_f.into_iter().map(to_var).collect(),
                     result_kind,
                 },
             },
@@ -4121,25 +4123,21 @@ fn remap_op(
             args_r,
             args_f,
             result_kind,
-        } => OpKind::InlineCall {
-            jitcode: jitcode.clone(),
-            args_i: args_i
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            args_r: args_r
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            args_f: args_f
-                .iter()
-                .copied()
-                .map(|v| remap_value(v, aliases))
-                .collect(),
-            result_kind: *result_kind,
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = graph
+                    .value_id_of(var)
+                    .expect("InlineCall arg must have a backing ValueId");
+                graph.must_variable(remap_value(vid, aliases))
+            };
+            OpKind::InlineCall {
+                jitcode: jitcode.clone(),
+                args_i: args_i.iter().map(remap_var).collect(),
+                args_r: args_r.iter().map(remap_var).collect(),
+                args_f: args_f.iter().map(remap_var).collect(),
+                result_kind: *result_kind,
+            }
+        }
         OpKind::RecursiveCall {
             jd_index,
             greens_i,
