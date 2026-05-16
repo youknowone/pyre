@@ -698,11 +698,11 @@ impl Optimizer {
         // Non-virtual states advance label_slot without creating entries.
         // Virtual states create entries with fields from label_args.
         // Build a map from inputarg_index to imported_virtual for virtual lookup.
-        let iv_map: std::collections::HashMap<usize, &_> = self
-            .imported_virtuals
-            .iter()
-            .map(|iv| (iv.inputarg_index, iv))
-            .collect();
+        let mut iv_map: crate::optimizeopt::vec_assoc::VecAssoc<usize, &_> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
+        for iv in &self.imported_virtuals {
+            iv_map.insert(iv.inputarg_index, iv);
+        }
         let all_states = self
             .imported_loop_state
             .as_ref()
@@ -715,8 +715,8 @@ impl Optimizer {
         // The map value caches the imported Phase 2 OpRef for the first
         // visit so subsequent revisits resolve to the same box (mirroring
         // RPython's setinfo_from_preamble.get_forwarded sharing).
-        let mut walk_visited: std::collections::HashMap<usize, OpRef> =
-            std::collections::HashMap::new();
+        let mut walk_visited: crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (state_idx, state_info) in all_states.iter().enumerate() {
             if let Some(iv) = iv_map.get(&state_idx) {
                 // Virtual state: process fields recursively, consuming slots
@@ -910,7 +910,7 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut std::collections::HashMap<usize, OpRef>,
+        walk_visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
     ) -> OpRef {
         let key = std::rc::Rc::as_ptr(rc) as usize;
         if let Some(&cached) = walk_visited.get(&key) {
@@ -935,7 +935,7 @@ impl Optimizer {
         imported_label_args: &[OpRef],
         label_slot: &mut usize,
         ctx: &mut OptContext,
-        walk_visited: &mut std::collections::HashMap<usize, OpRef>,
+        walk_visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
     ) -> OpRef {
         use crate::optimizeopt::virtualstate::VirtualStateInfo;
 

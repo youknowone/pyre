@@ -707,7 +707,7 @@ impl VirtualState {
     /// recursive nested Rcs participate in the dedup.
     pub fn count_forced_boxes_for_entry_static(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut std::collections::HashMap<usize, OpRef>,
+        visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
     ) -> usize {
         // RPython virtualstate.py:111 first-visit guard via
         // `position == -1` — every visited node is recorded so a later
@@ -724,20 +724,17 @@ impl VirtualState {
         //   would each return 1 because they don't recurse through
         //   `_rc` and therefore never insert themselves; the dedup
         //   would silently fail and `numnotvirtuals` would over-count.
-        use std::collections::hash_map::Entry;
         let key = Rc::as_ptr(rc) as usize;
-        match visited.entry(key) {
-            Entry::Occupied(_) => return 0,
-            Entry::Vacant(e) => {
-                e.insert(OpRef::NONE);
-            }
+        if visited.contains_key(&key) {
+            return 0;
         }
+        visited.insert(key, OpRef::NONE);
         Self::count_forced_boxes_for_entry(rc, visited)
     }
 
     fn count_forced_boxes_for_entry(
         info: &VirtualStateInfo,
-        visited: &mut std::collections::HashMap<usize, OpRef>,
+        visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
     ) -> usize {
         match info {
             VirtualStateInfo::Constant(_) => 0,
@@ -774,16 +771,13 @@ impl VirtualState {
     /// `is_some()` check, leaking NONE into downstream lookups.
     fn count_forced_boxes_for_entry_rc(
         rc: &Rc<VirtualStateInfoNode>,
-        visited: &mut std::collections::HashMap<usize, OpRef>,
+        visited: &mut crate::optimizeopt::vec_assoc::VecAssoc<usize, OpRef>,
     ) -> usize {
-        use std::collections::hash_map::Entry;
         let key = Rc::as_ptr(rc) as usize;
-        match visited.entry(key) {
-            Entry::Occupied(_) => return 0,
-            Entry::Vacant(e) => {
-                e.insert(OpRef::NONE);
-            }
+        if visited.contains_key(&key) {
+            return 0;
         }
+        visited.insert(key, OpRef::NONE);
         Self::count_forced_boxes_for_entry(rc, visited)
     }
 
