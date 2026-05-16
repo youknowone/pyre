@@ -6228,17 +6228,17 @@ impl<'a> ResumeDataDirectReader<'a> {
     /// Callback-driven sibling of `_prepare_next_section` — drives the
     /// same `enumerate_vars(info, all_liveness, _callback_i/r/f)`
     /// walk (`resume.py:1017-1026`) but lets the caller decide what to
-    /// do with each `(reg_idx, value)` pair.  The standard BH-write
-    /// path is the closure variant in `_prepare_next_section`; the
-    /// on-demand cranelift deopt callback (Slice QQ-2) uses a closure
-    /// that appends to a flat `Vec<i64>` mirroring the recovery_layout
+    /// do with each `(kind, reg_idx, value)` triple.  Three Rust
+    /// FnMut closures cannot share `&mut bh` simultaneously (E0524),
+    /// so the kind dispatch happens INSIDE the single closure rather
+    /// than across three separate ones.  The on-demand cranelift
+    /// deopt callback (Slice QQ-2) uses a closure that appends each
+    /// value to a flat `Vec<i64>` mirroring the recovery_layout
     /// walker's `rebuilt` output.
     pub fn _prepare_next_section_with(
         &mut self,
         info: usize,
-        mut cb_i: impl FnMut(u32, i64),
-        mut cb_r: impl FnMut(u32, i64),
-        mut cb_f: impl FnMut(u32, i64),
+        mut cb: impl FnMut(majit_ir::Type, u32, i64),
     ) {
         use majit_translate::liveness::LivenessIterator;
 
@@ -6259,7 +6259,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             let mut it = LivenessIterator::new(offset, length_i, all_liveness);
             while let Some(reg_idx) = it.next() {
                 let value = self.next_int();
-                cb_i(reg_idx, value);
+                cb(majit_ir::Type::Int, reg_idx, value);
             }
             offset = it.offset;
         }
@@ -6268,7 +6268,7 @@ impl<'a> ResumeDataDirectReader<'a> {
             let mut it = LivenessIterator::new(offset, length_r, all_liveness);
             while let Some(reg_idx) = it.next() {
                 let value = self.next_ref();
-                cb_r(reg_idx, value);
+                cb(majit_ir::Type::Ref, reg_idx, value);
             }
             offset = it.offset;
         }
@@ -6277,11 +6277,45 @@ impl<'a> ResumeDataDirectReader<'a> {
             let mut it = LivenessIterator::new(offset, length_f, all_liveness);
             while let Some(reg_idx) = it.next() {
                 let value = self.next_float();
-                cb_f(reg_idx, value);
+                cb(majit_ir::Type::Float, reg_idx, value);
             }
             // `offset` is the end of the float section; no further use.
             let _ = offset;
         }
+    }
+
+    /// On-demand variant for cranelift's deopt path: walk the resume
+    /// tape section-by-section, append each decoded `(int|ref|float)`
+    /// value into a flat `Vec<i64>` (innermost-first concatenation,
+    /// matching the existing recovery_layout walker's `rebuilt`
+    /// output).  `resolve_jitcode` mirrors `resume.py:1339
+    /// jitcode = jitcodes[jitcode_pos]` and returns the per-PC
+    /// `op_live` byte that `BlackholeInterpreter::get_current_position_info`
+    /// uses to index `all_liveness`.
+    ///
+    /// Caller is expected to drive `prepare(rd_virtuals,
+    /// rd_guard_pendingfields)` + `consume_vref_and_vable` first per
+    /// `resume.py:1324-1325 blackhole_from_resumedata`.
+    pub fn consume_all_sections_into_vec(
+        &mut self,
+        resolve_jitcode: &dyn Fn(i32, i32) -> Option<(std::sync::Arc<crate::jitcode::JitCode>, usize, u8)>,
+        outputs: &mut Vec<i64>,
+    ) -> bool {
+        while !self.done_reading() {
+            // resume.py:1338-1340 read_jitcode_pos_pc.
+            let (jitcode_pos, pc) = self.read_jitcode_pos_pc();
+            let Some((jitcode, resolved_pc, op_live)) = resolve_jitcode(jitcode_pos, pc) else {
+                return false;
+            };
+            // `blackhole.rs:1435 get_current_position_info` parity —
+            // `jitcode.get_live_vars_info(position, op_live)` is the
+            // section info offset for the current PC.
+            let info = jitcode.get_live_vars_info(resolved_pc, op_live);
+            self._prepare_next_section_with(info, |_kind, _reg_idx, value| {
+                outputs.push(value);
+            });
+        }
+        true
     }
 
     /// resume.py:1386 consume_virtualref_info
