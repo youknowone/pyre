@@ -1556,7 +1556,7 @@ impl UnrollOptimizer {
     /// Remap a list of OpRefs through a forwarding mapping.
     /// Constant OpRefs are left unchanged because they are not remapped.
     pub fn map_args(
-        mapping: &std::collections::HashMap<OpRef, OpRef>,
+        mapping: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
         args: &[OpRef],
     ) -> Vec<OpRef> {
         args.iter()
@@ -2234,12 +2234,14 @@ impl ExportedState {
             // Re-share slots that originally aliased: walk the snapshot
             // map and copy each group's first canonical Rc into every
             // peer slot, restoring the pre-GC `Rc::as_ptr` equivalences.
-            let mut canonical_by_old: std::collections::HashMap<usize, Rc<VirtualStateInfoNode>> =
-                std::collections::HashMap::new();
+            let mut canonical_by_old: crate::optimizeopt::vec_assoc::VecAssoc<
+                usize,
+                Rc<VirtualStateInfoNode>,
+            > = crate::optimizeopt::vec_assoc::VecAssoc::new();
             for (slot_idx, &old_ptr) in original_ptrs.iter().enumerate() {
-                let entry = canonical_by_old
-                    .entry(old_ptr)
-                    .or_insert_with(|| Rc::clone(&self.virtual_state.state[slot_idx]));
+                let entry = canonical_by_old.entry_or_insert_with(old_ptr, || {
+                    Rc::clone(&self.virtual_state.state[slot_idx])
+                });
                 if !Rc::ptr_eq(entry, &self.virtual_state.state[slot_idx]) {
                     self.virtual_state.state[slot_idx] = Rc::clone(entry);
                 }
@@ -3235,7 +3237,8 @@ impl OptUnroll {
                 .or_insert(tp);
         }
 
-        let mut mapping: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut mapping: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> =
+            crate::optimizeopt::vec_assoc::VecAssoc::new();
 
         for (i, &short_inputarg) in short_preamble.inputargs.iter().enumerate() {
             if let Some(&jump_arg) = jump_args.get(i) {
@@ -3278,7 +3281,9 @@ impl OptUnroll {
         if let Some(ref phase1) = short_preamble.phase1_inputargs {
             for (i, &phase1_inputarg) in phase1.iter().enumerate() {
                 if let Some(&jump_arg) = jump_args.get(i) {
-                    mapping.entry(phase1_inputarg).or_insert(jump_arg);
+                    if !mapping.contains_key(&phase1_inputarg) {
+                        mapping.insert(phase1_inputarg, jump_arg);
+                    }
                 }
             }
         }
@@ -3438,7 +3443,7 @@ impl OptUnroll {
                         {
                             *jump_arg
                         } else {
-                            mapping[jump_arg]
+                            *mapping.get(jump_arg).expect("mapping missing jump_arg")
                         };
                         ctx.get_box_replacement(mapped)
                     })
@@ -4322,7 +4327,7 @@ fn assemble_peeled_trace_with_jump_args(
             .max(max_p2_pos)
             .saturating_add(1),
     );
-    let mut body_result_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    let mut body_result_remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
     let visible_before_label: std::collections::HashSet<OpRef> = full_label_args
         .iter()
         .copied()
@@ -4338,7 +4343,7 @@ fn assemble_peeled_trace_with_jump_args(
     // RPython's Box identity makes this implicit — the alias's Box is
     // the same Python object that body ops already hold. Pyre's flat
     // OpRef model needs an explicit forwarding registration here.
-    let mut assembly_alias_remap: HashMap<OpRef, OpRef> = HashMap::new();
+    let mut assembly_alias_remap: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
     // Keep the assembly-only alias map separate from the general `_forwarded`
     // walk. PyPy has object identity for these short-preamble boxes; pyre needs
     // the explicit jump_source -> label_arg substitution, but must not follow
@@ -4394,8 +4399,8 @@ fn assemble_peeled_trace_with_jump_args(
         // installed Const forwarding after the guard was emitted, and PyPy keeps
         // the guard's original runtime argument.
         let remap_body_arg = |arg: OpRef,
-                              assembly_alias_remap: &HashMap<OpRef, OpRef>,
-                              body_result_remap: &HashMap<OpRef, OpRef>,
+                              assembly_alias_remap: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
+                              body_result_remap: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
                               seen_body_defs: &std::collections::HashSet<OpRef>,
                               visible_before_label: &std::collections::HashSet<OpRef>|
          -> OpRef {
@@ -4698,7 +4703,7 @@ impl OptUnroll {
     /// closes that collision and lets the Box.type invariant enforce
     /// itself uniformly at `emit()` / `emit_extra()` /
     /// `propagate_from_pass_range`.
-    fn peel_iteration(&self, jump_op: &Op, ctx: &mut OptContext) -> HashMap<OpRef, OpRef> {
+    fn peel_iteration(&self, jump_op: &Op, ctx: &mut OptContext) -> crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> {
         // First pass: reserve peeled-iteration positions, tagged with each
         // source op's result type (Slice 0.5 follow-up — `OpRef.ty()`
         // matches RPython's `box.type` at allocation time).
@@ -4707,7 +4712,7 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut ref_map: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut ref_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (op, &new_pos) in self.buffer.iter().zip(peeled_positions.iter()) {
             ref_map.insert(op.pos.get(), new_pos);
         }
@@ -4753,7 +4758,7 @@ impl OptUnroll {
             .iter()
             .map(|op| ctx.reserve_pos_typed(op.result_type()))
             .collect();
-        let mut orig_ref_map: HashMap<OpRef, OpRef> = HashMap::new();
+        let mut orig_ref_map: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef> = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (op, &new_pos) in self.buffer.iter().zip(body_positions.iter()) {
             orig_ref_map.insert(op.pos.get(), new_pos);
         }
@@ -4793,7 +4798,7 @@ fn fresh_snapshot_key(ctx: &OptContext) -> i32 {
 
 fn remap_snapshot_boxes(
     boxes: &[SnapshotBox],
-    ref_map: &HashMap<OpRef, OpRef>,
+    ref_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
 ) -> Vec<SnapshotBox> {
     boxes
         .iter()
@@ -4804,7 +4809,7 @@ fn remap_snapshot_boxes(
 fn clone_guard_snapshot_remapped(
     ctx: &mut OptContext,
     guard: &mut Op,
-    ref_map: &HashMap<OpRef, OpRef>,
+    ref_map: &crate::optimizeopt::vec_assoc::VecAssoc<OpRef, OpRef>,
 ) {
     let old_pos = guard.rd_resume_position.get();
     if old_pos < 0 {
