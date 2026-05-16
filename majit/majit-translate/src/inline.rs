@@ -475,12 +475,31 @@ fn remap_op_kind(
             args: args.iter().map(remap).collect(),
             result_ty: result_ty.clone(),
         },
-        OpKind::GuardTrue { cond } => OpKind::GuardTrue { cond: remap(cond) },
-        OpKind::GuardFalse { cond } => OpKind::GuardFalse { cond: remap(cond) },
-        OpKind::GuardValue { value, kind_char } => OpKind::GuardValue {
-            value: remap(value),
-            kind_char: *kind_char,
-        },
+        OpKind::GuardTrue { cond } => {
+            let cond_vid = source_graph
+                .value_id_of(cond)
+                .expect("GuardTrue.cond must have a backing ValueId in source graph");
+            OpKind::GuardTrue {
+                cond: target_graph.must_variable(remap(&cond_vid)),
+            }
+        }
+        OpKind::GuardFalse { cond } => {
+            let cond_vid = source_graph
+                .value_id_of(cond)
+                .expect("GuardFalse.cond must have a backing ValueId in source graph");
+            OpKind::GuardFalse {
+                cond: target_graph.must_variable(remap(&cond_vid)),
+            }
+        }
+        OpKind::GuardValue { value, kind_char } => {
+            let value_vid = source_graph
+                .value_id_of(value)
+                .expect("GuardValue.value must have a backing ValueId in source graph");
+            OpKind::GuardValue {
+                value: target_graph.must_variable(remap(&value_vid)),
+                kind_char: *kind_char,
+            }
+        }
         OpKind::VtableMethodPtr {
             receiver,
             trait_root,
@@ -822,9 +841,19 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             base, index, value, ..
         } => vec![*base, *index, *value],
         OpKind::Call { args, .. } => args.clone(),
-        OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![*cond],
-        OpKind::GuardValue { value, .. }
-        | OpKind::AssertGreen { value, .. }
+        OpKind::GuardTrue { cond } | OpKind::GuardFalse { cond } => vec![
+            graph
+                .expect("Guard{True,False} requires a graph to project Variable to ValueId")
+                .value_id_of(cond)
+                .expect("Guard{True,False}.cond must be a known Variable on graph"),
+        ],
+        OpKind::GuardValue { value, .. } => vec![
+            graph
+                .expect("GuardValue requires a graph to project Variable to ValueId")
+                .value_id_of(value)
+                .expect("GuardValue.value must be a known Variable on graph"),
+        ],
+        OpKind::AssertGreen { value, .. }
         | OpKind::IsConstant { value, .. }
         | OpKind::IsVirtual { value, .. } => vec![*value],
         OpKind::VtableMethodPtr { receiver, .. } => vec![*receiver],

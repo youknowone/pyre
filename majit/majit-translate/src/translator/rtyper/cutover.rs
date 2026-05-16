@@ -1986,13 +1986,15 @@ fn fib(n: i64) -> i64 {
         annotations.set(ValueId(1), ValueType::Int);
 
         let mut graph = LegacyGraph::new("guard_passthrough");
+        let inputargs = block_inputargs(&mut graph, &[ValueId(1)]);
+        let v1_var = graph.must_variable(ValueId(1));
         let startblock = Block {
             id: graph.startblock,
-            inputargs: block_inputargs(&mut graph, &[ValueId(1)]),
+            inputargs,
             operations: vec![crate::model::SpaceOperation {
                 result: None,
                 kind: crate::model::OpKind::GuardValue {
-                    value: ValueId(1),
+                    value: v1_var,
                     kind_char: 'i',
                 },
             }],

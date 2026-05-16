@@ -691,7 +691,7 @@ impl<'a> Transformer<'a> {
                 args,
                 result_ty,
             } if self.config.classify_calls => {
-                self.rewrite_op_direct_call(op, target, args, result_ty, graph_name)
+                self.rewrite_op_direct_call(op, target, args, result_ty, graph_name, graph)
             }
             // ── rewrite_op_indirect_call ──
             // RPython jtransform.py:410-412. Pyre's rtyper-equivalent
@@ -713,6 +713,7 @@ impl<'a> Transformer<'a> {
                 graphs.as_deref(),
                 result_ty,
                 graph_name,
+                graph,
             ),
             // ── abort placeholders ──
             OpKind::Abort { kind } => {
@@ -1666,7 +1667,7 @@ impl<'a> Transformer<'a> {
                 // `None` sentinel that aliases the result back to the input
                 // is realized in pyre by `self.aliases.insert(result, base)`
                 // before emitting the replacement ops.
-                self.rewrite_op_hint_guard_value_family(op, target, args, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, target, args, graph_name, graph)
             }
             crate::hints::VirtualizableHintKind::PromoteString => {
                 // `rpython/jit/codewriter/jtransform.py:615-631 promote_string`:
@@ -1732,7 +1733,7 @@ impl<'a> Transformer<'a> {
                 // `<kind>_guard_value` per `jit.py:608-614` +
                 // `getkind(Ptr) == "ref"` (`rpython/jit/metainterp/
                 // history.py:64`).
-                self.rewrite_op_hint_guard_value_family(op, target, args, graph_name)
+                self.rewrite_op_hint_guard_value_family(op, target, args, graph_name, graph)
             }
         }
     }
@@ -1758,6 +1759,7 @@ impl<'a> Transformer<'a> {
         target: &CallTarget,
         args: &[ValueId],
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         let Some(arg) = args.first().copied() else {
             return RewriteResult::Keep;
@@ -1793,7 +1795,7 @@ impl<'a> Transformer<'a> {
             SpaceOperation {
                 result: None,
                 kind: OpKind::GuardValue {
-                    value: base,
+                    value: graph.must_variable(base),
                     kind_char,
                 },
             },
@@ -2133,6 +2135,7 @@ impl<'a> Transformer<'a> {
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         // RPython `jtransform.py:406-408`:
         //   def rewrite_op_direct_call(op): ... handle_%s_call
@@ -2155,7 +2158,7 @@ impl<'a> Transformer<'a> {
         // pyre keys on the direct_call callee identity since the front-end
         // lowers `driver.jit_merge_point(...)` etc. to `CallTarget::Method`.
         if let Some(key) = jit_marker_key_from_target(target) {
-            if let Some(ops) = self.try_handle_jit_marker(key, args) {
+            if let Some(ops) = self.try_handle_jit_marker(key, args, graph) {
                 return RewriteResult::Replace(ops);
             }
         }
@@ -2222,7 +2225,7 @@ impl<'a> Transformer<'a> {
                     self.handle_builtin_call(op, target, args, result_ty, graph_name)
                 }
                 crate::call::CallKind::Recursive => {
-                    self.handle_recursive_call(op, target, args, result_ty, graph_name)
+                    self.handle_recursive_call(op, target, args, result_ty, graph_name, graph)
                 }
             };
         }
@@ -2496,6 +2499,7 @@ impl<'a> Transformer<'a> {
         args: &[ValueId],
         result_ty: &ValueType,
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         // RPython jtransform.py:522-534:
         //   jitdriver_sd = callcontrol.jitdriver_sd_from_portal_runner_ptr(funcptr)
@@ -2538,7 +2542,7 @@ impl<'a> Transformer<'a> {
 
         // RPython jtransform.py:526: promote_greens emits guard_value
         // for each non-void green arg before the recursive_call.
-        let mut ops = self.promote_greens(green_args);
+        let mut ops = self.promote_greens(green_args, graph);
 
         // RPython jtransform.py:532-533: recursive_call + -live-
         ops.push(SpaceOperation {
@@ -2567,7 +2571,11 @@ impl<'a> Transformer<'a> {
     /// This ensures green values are constant before the recursive call.
     ///
     /// RPython jtransform.py:1646-1656.
-    fn promote_greens(&self, green_args: &[ValueId]) -> Vec<SpaceOperation> {
+    fn promote_greens(
+        &self,
+        green_args: &[ValueId],
+        graph: &crate::model::FunctionGraph,
+    ) -> Vec<SpaceOperation> {
         let mut ops = Vec::new();
         for &v in green_args {
             let kind = self.value_kind(v);
@@ -2582,7 +2590,7 @@ impl<'a> Transformer<'a> {
             ops.push(SpaceOperation {
                 result: None,
                 kind: OpKind::GuardValue {
-                    value: v,
+                    value: graph.must_variable(v),
                     kind_char: kind,
                 },
             });
@@ -2922,6 +2930,7 @@ impl<'a> Transformer<'a> {
         &mut self,
         key: JitMarkerKey,
         args: &[ValueId],
+        graph: &crate::model::FunctionGraph,
     ) -> Option<Vec<SpaceOperation>> {
         match key {
             JitMarkerKey::LoopHeader | JitMarkerKey::CanEnterJit => {
@@ -2951,7 +2960,7 @@ impl<'a> Transformer<'a> {
                 // jtransform.py:1695 `ops = self.promote_greens(...)` —
                 // prepends per-green `-live-` + `{kind}_guard_value` pairs.
                 let greens_raw = &user_args[..num_greens];
-                let mut ops = self.promote_greens(greens_raw);
+                let mut ops = self.promote_greens(greens_raw, graph);
                 let (greens_i, greens_r, greens_f) =
                     split_args_by_kind(greens_raw, self.type_state);
                 let (reds_i, reds_r, reds_f) =
@@ -3226,6 +3235,7 @@ impl<'a> Transformer<'a> {
         graphs: Option<&[crate::parse::CallPath]>,
         result_ty: &ValueType,
         graph_name: &str,
+        graph: &crate::model::FunctionGraph,
     ) -> RewriteResult {
         let (args_i, args_r, args_f) = self.make_three_lists(args);
         let resolved_result = self.resolve_call_result(op.result, result_ty);
@@ -3269,7 +3279,7 @@ impl<'a> Transformer<'a> {
                 ops.push(SpaceOperation {
                     result: None,
                     kind: OpKind::GuardValue {
-                        value: funcptr,
+                        value: graph.must_variable(funcptr),
                         kind_char: 'i',
                     },
                 });
@@ -3784,12 +3794,22 @@ fn remap_op(
                 .collect(),
             result_ty: result_ty.clone(),
         },
-        OpKind::GuardTrue { cond } => OpKind::GuardTrue {
-            cond: remap_value(*cond, aliases),
-        },
-        OpKind::GuardFalse { cond } => OpKind::GuardFalse {
-            cond: remap_value(*cond, aliases),
-        },
+        OpKind::GuardTrue { cond } => {
+            let cond_vid = graph
+                .value_id_of(cond)
+                .expect("GuardTrue.cond must have a backing ValueId");
+            OpKind::GuardTrue {
+                cond: graph.must_variable(remap_value(cond_vid, aliases)),
+            }
+        }
+        OpKind::GuardFalse { cond } => {
+            let cond_vid = graph
+                .value_id_of(cond)
+                .expect("GuardFalse.cond must have a backing ValueId");
+            OpKind::GuardFalse {
+                cond: graph.must_variable(remap_value(cond_vid, aliases)),
+            }
+        }
         OpKind::VableFieldRead {
             base,
             field_index,
@@ -5393,7 +5413,11 @@ mod tests {
             OpKind::GuardValue {
                 value, kind_char, ..
             } => {
-                assert_eq!(*value, v, "guard target must remain the input arg");
+                assert_eq!(
+                    result.graph.value_id_of(value),
+                    Some(v),
+                    "guard target must remain the input arg"
+                );
                 assert_eq!(*kind_char, 'r', "default kind without type-state");
             }
             other => panic!("expected GuardValue, got {other:?}"),
@@ -5656,8 +5680,9 @@ mod tests {
     fn try_handle_jit_marker_can_enter_jit_aliases_to_loop_header() {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config).with_portal_jd(Some(2));
+        let graph = crate::model::FunctionGraph::new("test_can_enter_jit_fixture");
         let ops = transformer
-            .try_handle_jit_marker(JitMarkerKey::CanEnterJit, &[])
+            .try_handle_jit_marker(JitMarkerKey::CanEnterJit, &[], &graph)
             .expect("can_enter_jit should dispatch when portal_jd is set");
         assert_eq!(ops.len(), 1);
         match &ops[0].kind {
@@ -5674,7 +5699,9 @@ mod tests {
         let config = GraphTransformConfig::default();
         let transformer = Transformer::new(&config);
         let greens = vec![ValueId(0), ValueId(1), ValueId(2)];
-        let ops = transformer.promote_greens(&greens);
+        let mut graph = crate::model::FunctionGraph::new("test_promote_greens_fixture");
+        graph.set_next_value(3);
+        let ops = transformer.promote_greens(&greens, &graph);
         assert_eq!(ops.len(), 6, "expect 2 ops per green");
         for i in 0..greens.len() {
             assert!(
@@ -5685,7 +5712,7 @@ mod tests {
                 OpKind::GuardValue {
                     value, kind_char, ..
                 } => {
-                    assert_eq!(*value, greens[i]);
+                    assert_eq!(graph.value_id_of(value), Some(greens[i]));
                     assert_eq!(*kind_char, 'r');
                 }
                 other => panic!("slot {i} expected GuardValue, got {other:?}"),
@@ -5697,17 +5724,19 @@ mod tests {
     fn promote_greens_empty_input_yields_empty_output() {
         let config = GraphTransformConfig::default();
         let transformer = Transformer::new(&config);
-        assert!(transformer.promote_greens(&[]).is_empty());
+        let graph = crate::model::FunctionGraph::new("test_promote_greens_empty");
+        assert!(transformer.promote_greens(&[], &graph).is_empty());
     }
 
     #[test]
     fn try_handle_jit_marker_returns_none_without_portal() {
         let config = GraphTransformConfig::default();
         let mut transformer = Transformer::new(&config);
+        let graph = crate::model::FunctionGraph::new("test_no_portal_fixture");
         // No portal_jd set → dispatch is a no-op (caller falls through).
         assert!(
             transformer
-                .try_handle_jit_marker(JitMarkerKey::LoopHeader, &[])
+                .try_handle_jit_marker(JitMarkerKey::LoopHeader, &[], &graph)
                 .is_none()
         );
     }
@@ -5783,8 +5812,13 @@ mod tests {
             .with_type_state(&ts);
 
         let args = [receiver, g1, g2, r1];
+        // promote_greens projects each green ValueId through
+        // graph.must_variable to populate the GuardValue.value field —
+        // grow the backing Variable table to cover ValueId(99).
+        let mut graph = crate::model::FunctionGraph::new("test_jit_merge_point_fixture");
+        graph.set_next_value(100);
         let ops = transformer
-            .try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args)
+            .try_handle_jit_marker(JitMarkerKey::JitMergePoint, &args, &graph)
             .expect("portal_jd + cc + 2-greens + 1-red satisfies dispatch preconditions");
 
         assert_eq!(ops.len(), 7, "promote_greens(2 greens)*2 + merge*3 = 7");
@@ -5795,7 +5829,7 @@ mod tests {
             OpKind::GuardValue {
                 value, kind_char, ..
             } => {
-                assert_eq!(*value, g1);
+                assert_eq!(graph.value_id_of(value), Some(g1));
                 assert_eq!(*kind_char, 'i');
             }
             other => panic!("ops[1] expected GuardValue(g1, 'i'), got {other:?}"),
@@ -5805,7 +5839,7 @@ mod tests {
             OpKind::GuardValue {
                 value, kind_char, ..
             } => {
-                assert_eq!(*value, g2);
+                assert_eq!(graph.value_id_of(value), Some(g2));
                 assert_eq!(*kind_char, 'i');
             }
             other => panic!("ops[3] expected GuardValue(g2, 'i'), got {other:?}"),

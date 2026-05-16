@@ -4423,11 +4423,12 @@ mod tests {
     /// rstr.py:1226-1246`).
     #[test]
     fn op_kind_to_opname_routes_guard_value_kind_chars() {
-        use crate::model::{OpKind, ValueId};
-        let value = ValueId(0);
+        use crate::model::{FunctionGraph, OpKind, ValueId};
+        let graph = FunctionGraph::new("test_guard_value_kind_chars");
+        let value_var = graph.must_variable(ValueId(0));
         let opnames = ['i', 'r', 'f'].map(|kc| {
             op_kind_to_opname(&OpKind::GuardValue {
-                value,
+                value: value_var.clone(),
                 kind_char: kc,
             })
         });
