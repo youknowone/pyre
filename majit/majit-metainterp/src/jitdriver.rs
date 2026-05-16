@@ -3421,60 +3421,68 @@ impl<S: JitState> JitDriver<S> {
 
     pub fn opimpl_getfield_vable_int(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
-        self.meta.opimpl_getfield_vable_int(vable_opref, fielddescr)
+        self.meta
+            .opimpl_getfield_vable_int(pc, vable_opref, fielddescr)
     }
 
     pub fn opimpl_getfield_vable_ref(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
-        self.meta.opimpl_getfield_vable_ref(vable_opref, fielddescr)
+        self.meta
+            .opimpl_getfield_vable_ref(pc, vable_opref, fielddescr)
     }
 
     pub fn opimpl_getfield_vable_float(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
         self.meta
-            .opimpl_getfield_vable_float(vable_opref, fielddescr)
+            .opimpl_getfield_vable_float(pc, vable_opref, fielddescr)
     }
 
     pub fn opimpl_setfield_vable_int(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
         value: OpRef,
         concrete: Value,
     ) {
         self.meta
-            .opimpl_setfield_vable_int(vable_opref, fielddescr, value, concrete);
+            .opimpl_setfield_vable_int(pc, vable_opref, fielddescr, value, concrete);
     }
 
     pub fn opimpl_setfield_vable_ref(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
         value: OpRef,
         concrete: Value,
     ) {
         self.meta
-            .opimpl_setfield_vable_ref(vable_opref, fielddescr, value, concrete);
+            .opimpl_setfield_vable_ref(pc, vable_opref, fielddescr, value, concrete);
     }
 
     pub fn opimpl_setfield_vable_float(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
         value: OpRef,
         concrete: Value,
     ) {
         self.meta
-            .opimpl_setfield_vable_float(vable_opref, fielddescr, value, concrete);
+            .opimpl_setfield_vable_float(pc, vable_opref, fielddescr, value, concrete);
     }
 
     pub fn opimpl_getarrayitem_vable_int(

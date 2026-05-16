@@ -1556,10 +1556,17 @@ fn getfield_vable_via_metainterp(
     let obj = read_ref_reg(code, op, 0, ctx)?;
     let descr = read_descr(code, op, 1, ctx)?;
 
+    // R7 parity: RPython `opimpl_getfield_vable_{i,r,f}(box, fielddescr,
+    // pc)` threads orgpc through `_nonstandard_virtualizable(pc, ...)`
+    // (pyjitpl.py:1167-1186 + :1137).  Pyre's walker has the matching
+    // JitCode PC in `op.pc`; pass it through so the helper signature
+    // stays line-by-line equivalent even if `is_nonstandard_virtualizable`
+    // currently ignores the pc at the leaf (`trace_ctx.rs let _ = pc;`).
+    let pc = op.pc;
     let (result, _value) = match dst_bank {
-        'i' => ctx.trace_ctx.vable_getfield_int(obj, descr),
-        'r' => ctx.trace_ctx.vable_getfield_ref(obj, descr),
-        'f' => ctx.trace_ctx.vable_getfield_float(obj, descr),
+        'i' => ctx.trace_ctx.vable_getfield_int(pc, obj, descr),
+        'r' => ctx.trace_ctx.vable_getfield_ref(pc, obj, descr),
+        'f' => ctx.trace_ctx.vable_getfield_float(pc, obj, descr),
         _ => unreachable!("dst_bank must be 'i', 'r' or 'f'"),
     };
 
@@ -1649,7 +1656,12 @@ fn setfield_vable_via_metainterp(
     };
     let descr = read_descr(code, op, 2, ctx)?;
     let concrete = ctx.trace_ctx.concrete_of_opref(value);
-    ctx.trace_ctx.vable_setfield(obj, descr, value, concrete);
+    // R7 parity: pyjitpl.py:1188-1199 `_opimpl_setfield_vable(box,
+    // valuebox, fielddescr, pc)` threads orgpc through
+    // `_nonstandard_virtualizable(pc, ...)`; walker has `op.pc` for the
+    // JitCode PC, pass through.
+    ctx.trace_ctx
+        .vable_setfield(op.pc, obj, descr, value, concrete);
     Ok((DispatchOutcome::Continue, op.next_pc))
 }
 

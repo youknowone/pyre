@@ -1746,11 +1746,12 @@ impl TraceCtx {
     /// ```
     pub fn vable_getfield_int(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
         let concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(0, vable_opref, &fielddescr, concrete) {
+        if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             // self.opimpl_getfield_gc_i(box, fielddescr)
             let op = self.record_op_with_descr(OpCode::GetfieldGcI, &[vable_opref], fielddescr);
             return (op, Value::Void);
@@ -1790,13 +1791,14 @@ impl TraceCtx {
     /// ```
     pub fn vable_setfield(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
         value: OpRef,
         concrete: Value,
     ) {
         let vable_concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(0, vable_opref, &fielddescr, vable_concrete) {
+        if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, vable_concrete) {
             // self._opimpl_setfield_gc_any(box, valuebox, fielddescr)
             self.record_op_with_descr(OpCode::SetfieldGc, &[vable_opref, value], fielddescr);
             return;
@@ -1832,11 +1834,12 @@ impl TraceCtx {
     /// ```
     pub fn vable_getfield_ref(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
         let concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(0, vable_opref, &fielddescr, concrete) {
+        if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             let op = self.record_op_with_descr(OpCode::GetfieldGcR, &[vable_opref], fielddescr);
             return (op, Value::Void);
         }
@@ -1870,11 +1873,12 @@ impl TraceCtx {
     /// ```
     pub fn vable_getfield_float(
         &mut self,
+        pc: usize,
         vable_opref: OpRef,
         fielddescr: DescrRef,
     ) -> (OpRef, Value) {
         let concrete = self.concrete_of_opref(vable_opref);
-        if self.is_nonstandard_virtualizable(0, vable_opref, &fielddescr, concrete) {
+        if self.is_nonstandard_virtualizable(pc, vable_opref, &fielddescr, concrete) {
             let op = self.record_op_with_descr(OpCode::GetfieldGcF, &[vable_opref], fielddescr);
             return (op, Value::Void);
         }
@@ -2695,7 +2699,7 @@ mod tests {
             fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
                 // Write field 0 to heap
                 let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-                ctx.vable_setfield(self.vable_ref, fd, self.field_val, Value::Int(0));
+                ctx.vable_setfield(0, self.vable_ref, fd, self.field_val, Value::Int(0));
             }
 
             fn sync_virtualizable_after_residual_call(
@@ -2704,7 +2708,7 @@ mod tests {
             ) -> crate::jit_state::ResidualVirtualizableSync {
                 // Re-read field 0 from heap
                 let fd = majit_ir::make_field_descr(0, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-                let (new_ref, _) = ctx.vable_getfield_int(self.vable_ref, fd);
+                let (new_ref, _) = ctx.vable_getfield_int(0, self.vable_ref, fd);
                 crate::jit_state::ResidualVirtualizableSync {
                     updated_fields: vec![(0, new_ref)],
                     forced: false,
@@ -2840,7 +2844,7 @@ mod tests {
 
             fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
                 let fd = majit_ir::make_field_descr(0, 8, Type::Ref, majit_ir::ArrayFlag::Pointer);
-                ctx.vable_setfield(
+                ctx.vable_setfield(0, 
                     self.vable_ref,
                     fd,
                     self.field_val,
@@ -2853,7 +2857,7 @@ mod tests {
                 ctx: &mut TraceCtx,
             ) -> crate::jit_state::ResidualVirtualizableSync {
                 let fd = majit_ir::make_field_descr(0, 8, Type::Ref, majit_ir::ArrayFlag::Pointer);
-                let (new_ref, _) = ctx.vable_getfield_ref(self.vable_ref, fd);
+                let (new_ref, _) = ctx.vable_getfield_ref(0, self.vable_ref, fd);
                 crate::jit_state::ResidualVirtualizableSync {
                     updated_fields: vec![(0, new_ref)],
                     forced: false,
@@ -2925,7 +2929,7 @@ mod tests {
 
             fn sync_virtualizable_before_residual_call(&self, ctx: &mut TraceCtx) {
                 let fd = majit_ir::make_field_descr(0, 8, Type::Float, majit_ir::ArrayFlag::Float);
-                ctx.vable_setfield(self.vable_ref, fd, self.field_val, Value::Float(0.0));
+                ctx.vable_setfield(0, self.vable_ref, fd, self.field_val, Value::Float(0.0));
             }
 
             fn sync_virtualizable_after_residual_call(
@@ -2933,7 +2937,7 @@ mod tests {
                 ctx: &mut TraceCtx,
             ) -> crate::jit_state::ResidualVirtualizableSync {
                 let fd = majit_ir::make_field_descr(0, 8, Type::Float, majit_ir::ArrayFlag::Float);
-                let (new_ref, _) = ctx.vable_getfield_float(self.vable_ref, fd);
+                let (new_ref, _) = ctx.vable_getfield_float(0, self.vable_ref, fd);
                 crate::jit_state::ResidualVirtualizableSync {
                     updated_fields: vec![(0, new_ref)],
                     forced: false,
@@ -3100,10 +3104,10 @@ mod tests {
         );
 
         // getfield with offset=8 → static field 0 → box0
-        let (result, _) = ctx.vable_getfield_int(vable, fd8);
+        let (result, _) = ctx.vable_getfield_int(0, vable, fd8);
         assert_eq!(result, box0);
         // getfield with offset=16 → static field 1 → box1
-        let (result, _) = ctx.vable_getfield_int(vable, fd16);
+        let (result, _) = ctx.vable_getfield_int(0, vable, fd16);
         assert_eq!(result, box1);
 
         // No heap ops should have been emitted
@@ -3140,13 +3144,13 @@ mod tests {
         );
 
         // setfield offset=8 → updates box0
-        ctx.vable_setfield(vable, fd8.clone(), new_val, ph(Type::Int));
+        ctx.vable_setfield(0, vable, fd8.clone(), new_val, ph(Type::Int));
 
         // Box 0 should now be new_val
-        let (result, _) = ctx.vable_getfield_int(vable, fd8);
+        let (result, _) = ctx.vable_getfield_int(0, vable, fd8);
         assert_eq!(result, new_val);
         // Box 1 unchanged
-        let (result, _) = ctx.vable_getfield_int(vable, fd16);
+        let (result, _) = ctx.vable_getfield_int(0, vable, fd16);
         assert_eq!(result, box1);
 
         // No heap ops should have been emitted
@@ -3169,7 +3173,7 @@ mod tests {
         );
 
         let fd8 = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-        let _result = ctx.vable_getfield_int(vable, fd8);
+        let _result = ctx.vable_getfield_int(0, vable, fd8);
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
@@ -3188,7 +3192,7 @@ mod tests {
         );
 
         let fd8 = majit_ir::make_field_descr(8, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-        ctx.vable_setfield(vable, fd8, val, ph(Type::Int));
+        ctx.vable_setfield(0, vable, fd8, val, ph(Type::Int));
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
@@ -3219,7 +3223,7 @@ mod tests {
 
         // Unknown offset (999) → fallback to heap op
         let fd999 = majit_ir::make_field_descr(999, 8, Type::Int, majit_ir::ArrayFlag::Signed);
-        let _result = ctx.vable_getfield_int(vable, fd999);
+        let _result = ctx.vable_getfield_int(0, vable, fd999);
 
         let ops = take_all_ops(ctx);
         assert_eq!(ops.len(), 1);
@@ -3245,7 +3249,7 @@ mod tests {
 
         ctx.init_virtualizable_boxes(&info, vable, ph(Type::Ref), &[box0], &[ph(Type::Ref)], &[]);
 
-        let (result, _) = ctx.vable_getfield_ref(vable, fd8);
+        let (result, _) = ctx.vable_getfield_ref(0, vable, fd8);
         assert_eq!(result, box0);
 
         let ops = take_all_ops(ctx);
@@ -3278,7 +3282,7 @@ mod tests {
             &[],
         );
 
-        let (result, _) = ctx.vable_getfield_float(vable, fd8);
+        let (result, _) = ctx.vable_getfield_float(0, vable, fd8);
         assert_eq!(result, box0);
 
         let ops = take_all_ops(ctx);
@@ -3432,7 +3436,7 @@ mod tests {
         assert_eq!(boxes, vec![box0, box1, vable]);
 
         // After mutation
-        ctx.vable_setfield(vable, fd8, new_val, ph(Type::Int));
+        ctx.vable_setfield(0, vable, fd8, new_val, ph(Type::Int));
         let boxes = ctx.collect_virtualizable_boxes().unwrap();
         assert_eq!(boxes, vec![new_val, box1, vable]);
     }
