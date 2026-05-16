@@ -2049,6 +2049,19 @@ pub struct Variable {
     pub concretetype: Rc<std::cell::RefCell<Option<ConcretetypePlaceholder>>>,
 }
 
+// SAFETY: Variable holds `Rc<Cell<...>>` / `Rc<RefCell<...>>` cells that
+// are inherently `!Send + !Sync`.  pyre and majit-translate are
+// single-threaded throughout (no `std::thread::spawn`, no rayon, no
+// tokio), and the generated `static OnceLock<AllJitCodes>` is never
+// concurrently accessed across threads.  RPython upstream relies on the
+// CPython GIL for the same invariant.  Declaring `Send + Sync` lets
+// Variable flow through types that the compiler must prove `Sync` for
+// the static (e.g. `OpKind` variants carrying a `Variable` operand
+// field after the storage flip).  Any future introduction of real
+// multi-threading must revisit this invariant first.
+unsafe impl Send for Variable {}
+unsafe impl Sync for Variable {}
+
 impl Clone for Variable {
     // RPython has no `clone` at the language level, but downstream
     // code that stores a `Variable` in a Vec and later reuses the
