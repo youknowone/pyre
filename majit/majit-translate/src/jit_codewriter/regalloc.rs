@@ -538,26 +538,15 @@ pub fn perform_register_allocation(graph: &FunctionGraph, kind: RegKind) -> RegA
 
     let mut coloring: HashMap<crate::flowspace::model::Variable, usize> = HashMap::new();
     let mut max_reg = 0usize;
-    // Walk every ValueId minted on the graph and pick those whose
+    // Walk every Variable minted on the graph and pick those whose
     // graph-side concretetype lands in `kind`.  `getcolor` projects
-    // through `graph.variable(vid)` and through the unionfind rep to
-    // recover the chordal coloring entry — matches upstream
-    // `regalloc.py:118 self.coloring[self.unionfind.find_rep(v)]`.
-    for idx in 0..graph.next_value() {
-        let vid = ValueId(idx);
+    // through the unionfind rep to recover the chordal coloring
+    // entry — matches upstream `regalloc.py:118
+    // self.coloring[self.unionfind.find_rep(v)]`.
+    for (vid, var) in graph.iter_variables() {
         if concretetype_to_regkind(&graph.concretetype(vid)) == Some(kind) {
             if let Some(color) = allocator.getcolor(graph, vid) {
-                let var = graph
-                    .variable(vid)
-                    .unwrap_or_else(|| {
-                        panic!(
-                            "perform_register_allocation: ValueId {vid:?} has a regalloc \
-                             color but no backing Variable on the graph; alloc_value_with_type \
-                             must mint a Variable for every slot"
-                        )
-                    })
-                    .clone();
-                coloring.insert(var, color);
+                coloring.insert(var.clone(), color);
                 if color + 1 > max_reg {
                     max_reg = color + 1;
                 }

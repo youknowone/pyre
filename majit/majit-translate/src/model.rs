@@ -2643,6 +2643,23 @@ impl FunctionGraph {
         self.next_value
     }
 
+    /// Iterate every `ValueId` that has a backing
+    /// [`crate::flowspace::model::Variable`] on the graph, yielding
+    /// `(ValueId, &Variable)` pairs in cursor order.  Mirrors the
+    /// upstream RPython convention where regalloc / coloring passes
+    /// walk `Variable` instances directly — pyre's index-keyed
+    /// callers stay terse by routing through this single helper
+    /// instead of `0..next_value()` plus per-slot
+    /// `variable(v)` re-checks.
+    pub fn iter_variables(
+        &self,
+    ) -> impl Iterator<Item = (ValueId, &crate::flowspace::model::Variable)> {
+        self.value_variables
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, opt)| opt.as_ref().map(|var| (ValueId(idx), var)))
+    }
+
     /// Re-seat the ValueId allocator cursor.  Must be called after a
     /// pass that synthesized values outside the graph so subsequent
     /// `alloc_value()` calls do not collide.
