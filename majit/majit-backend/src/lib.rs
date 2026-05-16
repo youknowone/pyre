@@ -693,6 +693,15 @@ pub struct FailDescrLayout {
     pub fail_arg_types: Vec<Type>,
     /// Whether this exit is a FINISH rather than a guard failure.
     pub is_finish: bool,
+    /// `compile.py:658-662 ExitFrameWithExceptionDescrRef` vs
+    /// `compile.py:640-647 DoneWithThisFrameDescrRef`: distinguishes the
+    /// exception-propagation FINISH from a normal-result FINISH that
+    /// happens to carry a single `Type::Ref` slot.  Read from the source
+    /// descr's `FailDescr::is_exit_frame_with_exception()` at layout
+    /// build time so the metainterp synthesis fallback at
+    /// `compile.rs:1132/1417` (when `op.descr` is missing) routes to the
+    /// correct `_DoneWithThisFrameDescr` subclass.
+    pub is_exception_exit: bool,
     /// Exit slot indices that hold rooted GC references.
     pub gc_ref_slots: Vec<usize>,
     /// Exit slot indices that carry opaque FORCE_TOKEN handles.
@@ -734,6 +743,9 @@ pub struct TerminalExitLayout {
     pub exit_types: Vec<Type>,
     /// Whether this exit is a `FINISH` rather than a `JUMP`.
     pub is_finish: bool,
+    /// `compile.py:658-662 ExitFrameWithExceptionDescrRef` discriminator;
+    /// see `FailDescrLayout::is_exception_exit`.
+    pub is_exception_exit: bool,
     /// Exit slot indices that hold rooted GC references.
     pub gc_ref_slots: Vec<usize>,
     /// Exit slot indices that carry opaque FORCE_TOKEN handles.
@@ -1886,6 +1898,7 @@ pub trait Backend: Send {
             trace_info: None,
             fail_arg_types: descr.fail_arg_types().to_vec(),
             is_finish: descr.is_finish(),
+            is_exception_exit: descr.is_exit_frame_with_exception(),
             gc_ref_slots: descr
                 .fail_arg_types()
                 .iter()

@@ -13077,6 +13077,11 @@ fn collect_terminal_exit_layouts(
                 fail_index: if is_finish { fail_index } else { u32::MAX },
                 exit_types,
                 is_finish,
+                is_exception_exit: op
+                    .descr
+                    .as_ref()
+                    .and_then(|d| d.as_fail_descr())
+                    .is_some_and(|fd| fd.is_exit_frame_with_exception()),
                 gc_ref_slots,
                 force_token_slots,
                 recovery_layout,

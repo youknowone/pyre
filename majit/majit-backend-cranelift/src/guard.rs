@@ -901,6 +901,7 @@ impl CraneliftFailDescr {
             trace_info: self.trace_info_ref(),
             fail_arg_types: fail_arg_types.to_vec(),
             is_finish: <Self as FailDescr>::is_finish(self),
+            is_exception_exit: <Self as FailDescr>::is_exit_frame_with_exception(self),
             gc_ref_slots,
             force_token_slots: self.force_token_slots_view().to_vec(),
             recovery_layout: recovery,

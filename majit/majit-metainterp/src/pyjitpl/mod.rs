@@ -213,6 +213,7 @@ impl StoredExitLayout {
             source_op_index: self.source_op_index,
             exit_types: self.resolve_exit_types().to_vec(),
             is_finish: self.resolve_is_finish(),
+            is_exception_exit: self.resolve_is_exception_exit(),
             gc_ref_slots: self.gc_ref_slots.clone(),
             force_token_slots: self.force_token_slots.clone(),
             recovery_layout: self.recovery_layout.clone(),
@@ -283,6 +284,19 @@ impl StoredExitLayout {
             .as_ref()
             .and_then(|d| d.as_fail_descr())
             .is_some_and(|fd| fd.is_finish())
+    }
+
+    /// `compile.py:658-662 ExitFrameWithExceptionDescrRef`: read the
+    /// exception-finish discriminator from the canonical descr.  The
+    /// metainterp synthesis fallback at
+    /// `make_finish_fail_descr_typed([Type::Ref])` consults this so it
+    /// picks the right `_DoneWithThisFrameDescr` subclass when the
+    /// original `op.descr` is unavailable.
+    pub(crate) fn resolve_is_exception_exit(&self) -> bool {
+        self.descr
+            .as_ref()
+            .and_then(|d| d.as_fail_descr())
+            .is_some_and(|fd| fd.is_exit_frame_with_exception())
     }
 }
 
@@ -1559,6 +1573,7 @@ impl<M: Clone> MetaInterp<M> {
                     source_op_index: layout.source_op_index,
                     exit_types,
                     is_finish: layout.is_finish,
+                    is_exception_exit: layout.is_exception_exit,
                     gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
                     recovery_layout: layout.recovery_layout,
@@ -1583,6 +1598,7 @@ impl<M: Clone> MetaInterp<M> {
                 source_op_index: Some(layout.op_index),
                 exit_types: layout.exit_types,
                 is_finish: layout.is_finish,
+                is_exception_exit: layout.is_exception_exit,
                 gc_ref_slots: layout.gc_ref_slots,
                 force_token_slots: layout.force_token_slots,
                 recovery_layout: layout.recovery_layout,
@@ -1629,6 +1645,7 @@ impl<M: Clone> MetaInterp<M> {
                         source_op_index: layout.source_op_index,
                         exit_types: layout.fail_arg_types,
                         is_finish: layout.is_finish,
+                        is_exception_exit: layout.is_exception_exit,
                         gc_ref_slots: layout.gc_ref_slots,
                         force_token_slots: layout.force_token_slots,
                         recovery_layout: layout.recovery_layout,
@@ -1683,6 +1700,7 @@ impl<M: Clone> MetaInterp<M> {
                             source_op_index: Some(layout.op_index),
                             exit_types: layout.exit_types,
                             is_finish: layout.is_finish,
+                            is_exception_exit: layout.is_exception_exit,
                             gc_ref_slots: layout.gc_ref_slots,
                             force_token_slots: layout.force_token_slots,
                             recovery_layout: layout.recovery_layout,
@@ -5607,11 +5625,15 @@ impl<M: Clone> MetaInterp<M> {
             self.staticdata
                 .exit_frame_with_exception_descr_ref
                 .clone()
-                .unwrap_or_else(|| crate::make_finish_fail_descr_typed(finish_arg_types.clone()))
+                .unwrap_or_else(|| {
+                    crate::make_finish_fail_descr_typed(finish_arg_types.clone(), true)
+                })
         } else {
             self.staticdata
                 .done_with_this_frame_descr_from_types(&finish_arg_types)
-                .unwrap_or_else(|| crate::make_finish_fail_descr_typed(finish_arg_types.clone()))
+                .unwrap_or_else(|| {
+                    crate::make_finish_fail_descr_typed(finish_arg_types.clone(), false)
+                })
         };
         recorder.finish(finish_args, finish_descr);
         // Task #70: snapshots live on TraceCtx; rebuild the TreeLoop with
@@ -6403,6 +6425,7 @@ impl<M: Clone> MetaInterp<M> {
                         .or_else(|| trace_layout_ref.and_then(|layout| layout.source_op_index)),
                     exit_types: layout.fail_arg_types,
                     is_finish: layout.is_finish,
+                    is_exception_exit: layout.is_exception_exit,
                     gc_ref_slots: layout.gc_ref_slots,
                     force_token_slots: layout.force_token_slots,
                     recovery_layout: layout.recovery_layout.or_else(|| {
@@ -6420,6 +6443,7 @@ impl<M: Clone> MetaInterp<M> {
                 source_op_index: None,
                 exit_types: result.typed_outputs.iter().map(Value::get_type).collect(),
                 is_finish: result.is_finish,
+                is_exception_exit: result.is_exit_frame_with_exception,
                 gc_ref_slots: result
                     .typed_outputs
                     .iter()
@@ -6543,6 +6567,7 @@ impl<M: Clone> MetaInterp<M> {
                 source_op_index: None,
                 exit_types: exit_types.clone(),
                 is_finish,
+                is_exception_exit: is_exit_frame_with_exception,
                 gc_ref_slots,
                 force_token_slots,
                 recovery_layout: None,
@@ -6568,6 +6593,7 @@ impl<M: Clone> MetaInterp<M> {
                     source_op_index: None,
                     exit_types: exit_types.clone(),
                     is_finish,
+                    is_exception_exit: is_exit_frame_with_exception,
                     gc_ref_slots,
                     force_token_slots,
                     recovery_layout: None,
@@ -6689,6 +6715,7 @@ impl<M: Clone> MetaInterp<M> {
                 source_op_index: None,
                 exit_types: exit_types.clone(),
                 is_finish,
+                is_exception_exit: is_exit_frame_with_exception,
                 gc_ref_slots: gc_ref_slots.clone(),
                 force_token_slots: force_token_slots.clone(),
                 recovery_layout: None,
@@ -6714,6 +6741,7 @@ impl<M: Clone> MetaInterp<M> {
                     source_op_index: None,
                     exit_types: exit_types.clone(),
                     is_finish,
+                    is_exception_exit: is_exit_frame_with_exception,
                     gc_ref_slots,
                     force_token_slots,
                     recovery_layout: None,
@@ -9386,6 +9414,7 @@ impl<M: Clone> MetaInterp<M> {
                         .map(|values| values.iter().map(Value::get_type).collect())
                         .unwrap_or_default(),
                     is_finish: false,
+                    is_exception_exit: false,
                     gc_ref_slots: typed_fail_values
                         .map(|values| {
                             values
@@ -11675,13 +11704,13 @@ impl<M: Clone> MetaInterp<M> {
                     .exit_frame_with_exception_descr_ref
                     .clone()
                     .unwrap_or_else(|| {
-                        crate::make_finish_fail_descr_typed(finish_arg_types.clone())
+                        crate::make_finish_fail_descr_typed(finish_arg_types.clone(), true)
                     })
             } else {
                 self.staticdata
                     .done_with_this_frame_descr_from_types(&finish_arg_types)
                     .unwrap_or_else(|| {
-                        crate::make_finish_fail_descr_typed(finish_arg_types.clone())
+                        crate::make_finish_fail_descr_typed(finish_arg_types.clone(), false)
                     })
             };
             let outcome = self.compile_trace_finish(
@@ -19423,6 +19452,7 @@ mod tests {
             source_op_index: Some(3),
             exit_types: vec![Type::Int],
             is_finish: false,
+            is_exception_exit: false,
             gc_ref_slots: Vec::new(),
             force_token_slots: Vec::new(),
             recovery_layout: None,

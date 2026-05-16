@@ -132,6 +132,12 @@ pub struct CompiledExitLayout {
     pub source_op_index: Option<usize>,
     pub exit_types: Vec<Type>,
     pub is_finish: bool,
+    /// `compile.py:658-662 ExitFrameWithExceptionDescrRef`
+    /// vs `compile.py:640-647 DoneWithThisFrameDescrRef`: distinguishes
+    /// the exception-propagation FINISH so the synthesis fallback at
+    /// `make_finish_fail_descr_typed` routes a `[Type::Ref]` exit to the
+    /// correct `_DoneWithThisFrameDescr` subclass.
+    pub is_exception_exit: bool,
     pub gc_ref_slots: Vec<usize>,
     pub force_token_slots: Vec<usize>,
     pub recovery_layout: Option<ExitRecoveryLayout>,
@@ -1129,7 +1135,10 @@ pub(crate) fn merge_backend_exit_layouts(
             .and_then(|op| op.descr.clone())
             .or_else(|| {
                 Some(if layout.is_finish {
-                    make_finish_fail_descr_typed(layout.fail_arg_types.clone())
+                    make_finish_fail_descr_typed(
+                        layout.fail_arg_types.clone(),
+                        layout.is_exception_exit,
+                    )
                 } else {
                     make_fail_descr_typed(layout.fail_arg_types.clone())
                 })
@@ -1414,7 +1423,7 @@ pub(crate) fn merge_backend_terminal_exit_layouts(
         };
         let descr_from_op = source_op.and_then(|op| op.descr.clone()).or_else(|| {
             Some(if layout.is_finish {
-                make_finish_fail_descr_typed(layout.exit_types.clone())
+                make_finish_fail_descr_typed(layout.exit_types.clone(), layout.is_exception_exit)
             } else {
                 make_fail_descr_typed(layout.exit_types.clone())
             })
@@ -1563,6 +1572,11 @@ pub(crate) fn infer_terminal_exit_layout(
             (*tp == Type::Ref && !force_token_slots.contains(&slot)).then_some(slot)
         })
         .collect();
+    let is_exception_exit = op
+        .descr
+        .as_ref()
+        .and_then(|d| d.as_fail_descr())
+        .is_some_and(|fd| fd.is_exit_frame_with_exception());
     Some(CompiledExitLayout {
         rd_loop_token: owning_key, // compile.py:186
         trace_id,
@@ -1570,6 +1584,7 @@ pub(crate) fn infer_terminal_exit_layout(
         source_op_index: Some(op_index),
         exit_types,
         is_finish,
+        is_exception_exit,
         gc_ref_slots,
         force_token_slots,
         recovery_layout: None,
@@ -2906,12 +2921,19 @@ pub fn make_fail_descr_typed(types: Vec<Type>) -> DescrRef {
 /// `is_finish()` matches `compile.py:658-662 ExitFrameWithExceptionDescrRef`
 /// / `pyjitpl.py:3198-3220 compile_done_with_this_frame` semantics).
 ///
-/// `compile.py:626-647` `_DoneWithThisFrameDescr` family — return the
-/// class-distinct singleton matching the result-type signature so the
-/// metainterp class hierarchy answers `is_finish` and downstream
-/// `is_exit_frame_with_exception` correctly.  `Type::Void` selects the
-/// no-result `DoneWithThisFrameDescrVoid`.
-pub fn make_finish_fail_descr_typed(types: Vec<Type>) -> DescrRef {
+/// `compile.py:626-662` `_DoneWithThisFrameDescr` family — return the
+/// class-distinct singleton matching the result-type signature.
+///
+/// `is_exception_exit` discriminates `compile.py:658-662
+/// ExitFrameWithExceptionDescrRef` (the exception-propagation FINISH
+/// that raises `jitexc.ExitFrameWithExceptionRef`) from the
+/// normal-result `compile.py:640-647 DoneWithThisFrameDescrRef`; both
+/// carry a single `Type::Ref` slot, so the type list alone cannot
+/// distinguish them.
+pub fn make_finish_fail_descr_typed(types: Vec<Type>, is_exception_exit: bool) -> DescrRef {
+    if is_exception_exit {
+        return Arc::new(majit_backend::ExitFrameWithExceptionDescrRef::new());
+    }
     match types.as_slice() {
         [] => Arc::new(DoneWithThisFrameDescrVoid::new()),
         [Type::Float] => Arc::new(DoneWithThisFrameDescrFloat::new()),

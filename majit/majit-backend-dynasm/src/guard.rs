@@ -325,6 +325,7 @@ pub fn layout_for_fail_descr(
         fail_index: fd.fail_index_per_trace(),
         fail_arg_types: fail_arg_types.to_vec(),
         is_finish: fd.is_finish(),
+        is_exception_exit: fd.is_exit_frame_with_exception(),
         trace_id: fd.trace_id(),
         source_op_index: lookup_source_op_index(descr_addr),
         // Forward through `FailDescr::is_gc_ref_slot` / `force_token_slots`
