@@ -2530,6 +2530,22 @@ impl FunctionGraph {
         self.value_variables.get(v.0).and_then(|opt| opt.as_ref())
     }
 
+    /// Variant of [`Self::variable`] that panics when the projection
+    /// fails — for sites that have already guaranteed (via rtyper
+    /// handoff or jtransform synth) that the `ValueId` carries a
+    /// backing Variable.  Centralises the diagnostic and the
+    /// clone so storage-flip producer sites stay terse.
+    pub fn must_variable(&self, v: ValueId) -> crate::flowspace::model::Variable {
+        self.variable(v)
+            .unwrap_or_else(|| {
+                panic!(
+                    "must_variable: ValueId {v:?} has no backing Variable on graph {:?}",
+                    self.name,
+                )
+            })
+            .clone()
+    }
+
     /// Reverse of [`Self::variable`] — recover the dense `ValueId`
     /// for a backing [`crate::flowspace::model::Variable`].  Useful
     /// when an upstream-orthodox Variable-keyed structure

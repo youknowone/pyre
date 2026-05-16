@@ -439,20 +439,37 @@ pub struct RegAllocResult {
 impl RegAllocResult {
     /// Look up the register color assigned to `v` — projects
     /// through `graph.variable(v)` to the backing Variable, then
-    /// reads `coloring[var]`.  Returns `None` when the slot has no
-    /// backing Variable or no coloring (Void / Unknown / different
-    /// kind class).
+    /// delegates to [`Self::color_for_variable`].  Returns `None`
+    /// when the slot has no backing Variable or no coloring (Void
+    /// / Unknown / different kind class).
     pub fn color_for(&self, graph: &crate::model::FunctionGraph, v: ValueId) -> Option<usize> {
         let var = graph.variable(v)?;
+        self.color_for_variable(var)
+    }
+
+    /// Variable-keyed sibling of [`Self::color_for`] — no graph
+    /// indirection needed when the caller already holds a
+    /// [`crate::flowspace::model::Variable`].  Matches upstream
+    /// `coloring: dict[Variable, int]`
+    /// (`tool/algo/regalloc.py:31`).
+    pub fn color_for_variable(
+        &self,
+        var: &crate::flowspace::model::Variable,
+    ) -> Option<usize> {
         self.coloring.get(var).copied()
     }
 
     /// `true` iff `v` has a coloring in this kind class.
     pub fn contains_value(&self, graph: &crate::model::FunctionGraph, v: ValueId) -> bool {
         match graph.variable(v) {
-            Some(var) => self.coloring.contains_key(var),
+            Some(var) => self.contains_variable(var),
             None => false,
         }
+    }
+
+    /// Variable-keyed sibling of [`Self::contains_value`].
+    pub fn contains_variable(&self, var: &crate::flowspace::model::Variable) -> bool {
+        self.coloring.contains_key(var)
     }
 }
 
