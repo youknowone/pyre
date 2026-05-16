@@ -343,7 +343,7 @@ fn linkarg_repr_for_kind(
             .as_value(graph)
             .map(|v| register_repr_for_kind(v, kind))
             .unwrap_or_else(|| "<unbound>".to_string()),
-        crate::model::LinkArg::Const(cv) => format!("${cv}"),
+        crate::model::LinkArg::Const(cv) => format!("${}", cv.value),
     }
 }
 

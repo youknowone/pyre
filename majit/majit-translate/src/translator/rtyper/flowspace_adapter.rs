@@ -1289,7 +1289,11 @@ fn link_arg_to_hlvalue(
             ))
         }),
         None => match arg {
-            LinkArg::Const(cv) => Ok(Hlvalue::Constant(constant_from_constvalue(cv.clone()))),
+            // `LinkArg::Const` now carries the full upstream-orthodox
+            // `Constant` (id + value + concretetype) directly — no need
+            // to round-trip through `constant_from_constvalue` and
+            // mint a fresh id.
+            LinkArg::Const(cv) => Ok(Hlvalue::Constant(cv.clone())),
             LinkArg::Value(_) => Err(TyperError::message(format!(
                 "translate_op: Link.args[{arg_index}] LinkArg::Value Variable not registered \
                  on graph (source block {source_block_id:?} -> target block {target_block_id:?})"
@@ -1325,7 +1329,11 @@ fn link_extravar_to_hlvalue(
             Ok(hlvalue)
         }
         None => match arg {
-            LinkArg::Const(cv) => Ok(Hlvalue::Constant(constant_from_constvalue(cv.clone()))),
+            // `LinkArg::Const` now carries the full upstream-orthodox
+            // `Constant` (id + value + concretetype) directly — no need
+            // to round-trip through `constant_from_constvalue` and
+            // mint a fresh id.
+            LinkArg::Const(cv) => Ok(Hlvalue::Constant(cv.clone())),
             LinkArg::Value(_) => Err(TyperError::message(
                 "link_extravar_to_hlvalue: extravar Variable not registered on graph".to_string(),
             )),

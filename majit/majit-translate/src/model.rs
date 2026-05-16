@@ -982,16 +982,21 @@ pub fn exception_exitcase() -> ExitCase {
 
 /// RPython `Link.args` items are Variables or Constants —
 /// `Link.args: List[Hlvalue]` (`flowspace/model.py:140`) where
-/// `Hlvalue = Variable | Constant`.  Pyre stores the
-/// upstream-orthodox `flowspace::model::Variable` directly so
-/// operand identity at link sites matches upstream line-for-line;
-/// the dense `ValueId` index is projected back via
+/// `Hlvalue = Variable | Constant`.  Both arms carry the
+/// upstream-orthodox flowspace handles directly: `Value` wraps a
+/// [`crate::flowspace::model::Variable`] (concretetype on the inline
+/// cell) and `Const` wraps a [`crate::flowspace::model::Constant`]
+/// (concretetype on the struct field) so type-sensitive renaming /
+/// Void filtering at link sites can read kinds off either arm without
+/// projecting through a side table.
+///
+/// Pyre's dense `ValueId` index is projected back via
 /// `graph.value_id_of(&var)` when downstream readers still key
-/// HashMap<ValueId, _> structures on the legacy index.
+/// `HashMap<ValueId, _>` structures on the legacy index.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LinkArg {
     Value(crate::flowspace::model::Variable),
-    Const(ConstValue),
+    Const(crate::flowspace::model::Constant),
 }
 
 impl LinkArg {
@@ -1041,8 +1046,18 @@ impl LinkArg {
 }
 
 impl From<ConstValue> for LinkArg {
+    /// Wrap a raw [`ConstValue`] in a [`crate::flowspace::model::Constant`]
+    /// with no concretetype attached.  Mirrors RPython
+    /// `Constant(value)` (`flowspace/model.py:354 __init__`) where
+    /// `concretetype` defaults to `None` until the rtyper sets it.
     fn from(value: ConstValue) -> Self {
-        Self::Const(value)
+        Self::Const(crate::flowspace::model::Constant::new(value))
+    }
+}
+
+impl From<crate::flowspace::model::Constant> for LinkArg {
+    fn from(c: crate::flowspace::model::Constant) -> Self {
+        Self::Const(c)
     }
 }
 

@@ -467,7 +467,8 @@ fn converge_link(state: &mut TypeResolutionState, graph: &FunctionGraph, link: &
                 changed |= maybe_seed_concrete_type(state, src_vid, dst_ty);
             }
             LinkArg::Const(value) => {
-                changed |= maybe_seed_concrete_type(state, *dst, const_value_to_concrete(value));
+                changed |=
+                    maybe_seed_concrete_type(state, *dst, const_value_to_concrete(&value.value));
             }
         }
     }
@@ -516,7 +517,7 @@ fn link_arg_concrete_type(
             .as_value(graph)
             .map(|v| state.get(v).clone())
             .unwrap_or(ConcreteType::Unknown),
-        LinkArg::Const(value) => const_value_to_concrete(value),
+        LinkArg::Const(value) => const_value_to_concrete(&value.value),
     }
 }
 

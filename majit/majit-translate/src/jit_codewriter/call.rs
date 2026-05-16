@@ -4563,7 +4563,7 @@ fn resolve_array_identity(
                 };
                 source = next.clone();
             }
-            LinkArg::Const(value) => return const_array_identity(value),
+            LinkArg::Const(value) => return const_array_identity(&value.value),
         }
     }
     None
@@ -6698,7 +6698,7 @@ mod tests {
         phi_sources.insert(base, LinkArg::value(&graph, forwarded));
         phi_sources.insert(
             forwarded,
-            LinkArg::Const(crate::flowspace::model::ConstValue::List(vec![])),
+            LinkArg::from(crate::flowspace::model::ConstValue::List(vec![])),
         );
 
         assert_eq!(

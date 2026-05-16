@@ -557,7 +557,7 @@ impl<'a> GraphFlattener<'a> {
                     .expect("getoperand: link-arg Variable must be registered on graph");
                 RegOrConst::Reg(self.getcolor(vid))
             }
-            LinkArg::Const(cv) => RegOrConst::Const(cv.clone()),
+            LinkArg::Const(cv) => RegOrConst::Const(cv.value.clone()),
         }
     }
 
@@ -760,7 +760,7 @@ impl<'a> GraphFlattener<'a> {
                     .expect("return_operand: link-arg Variable must be registered on graph");
                 RegOrConst::Reg(self.getcolor(vid))
             }
-            LinkArg::Const(cv) => RegOrConst::Const(cv.clone()),
+            LinkArg::Const(cv) => RegOrConst::Const(cv.value.clone()),
         }
     }
 
@@ -862,7 +862,7 @@ impl<'a> GraphFlattener<'a> {
                         None => continue,
                     }
                 }
-                LinkArg::Const(cv) => RegOrConst::Const(cv.clone()),
+                LinkArg::Const(cv) => RegOrConst::Const(cv.value.clone()),
             };
             // `flatten.py:314 if v == w: continue` — color-level
             // identity skip (post-regalloc Register equality).
@@ -1436,7 +1436,7 @@ pub(crate) fn linkarg_kind(
             Some(v) => value_kind(v, graph, regallocs),
             None => 'v',
         },
-        LinkArg::Const(cv) => constvalue_kind(cv),
+        LinkArg::Const(cv) => constvalue_kind(&cv.value),
     }
 }
 
@@ -2144,7 +2144,7 @@ mod tests {
             entry,
             None,
             vec![Link::new_mixed(
-                vec![LinkArg::Const(ConstValue::Int(42))],
+                vec![LinkArg::from(ConstValue::Int(42))],
                 graph.returnblock,
                 None,
             )],
@@ -2512,10 +2512,8 @@ mod tests {
 
     #[test]
     fn insert_renamings_emits_move_for_constant_source() {
-        let ops = run_insert_renamings_with_const(
-            vec![LinkArg::Const(ConstValue::Int(7))],
-            &[ValueId(1)],
-        );
+        let ops =
+            run_insert_renamings_with_const(vec![LinkArg::from(ConstValue::Int(7))], &[ValueId(1)]);
         assert_eq!(
             ops,
             vec![FlatOp::Move {

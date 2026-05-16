@@ -890,8 +890,8 @@ impl Assembler {
                 self.lookup_reg_with_kind(vid, regallocs)
             }
             LinkArg::Const(cv) => {
-                let kind = crate::flatten::constvalue_kind(cv);
-                let byte = self.emit_const(cv, kind, state);
+                let kind = crate::flatten::constvalue_kind(&cv.value);
+                let byte = self.emit_const(&cv.value, kind, state);
                 (byte, kind)
             }
         }

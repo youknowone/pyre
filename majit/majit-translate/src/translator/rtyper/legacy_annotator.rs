@@ -158,7 +158,7 @@ fn link_arg_type(state: &AnnotationState, graph: &FunctionGraph, src: &LinkArg) 
             .as_value(graph)
             .map(|v| state.get(v).clone())
             .unwrap_or(ValueType::Unknown),
-        LinkArg::Const(value) => const_value_type(value),
+        LinkArg::Const(value) => const_value_type(&value.value),
     }
 }
 

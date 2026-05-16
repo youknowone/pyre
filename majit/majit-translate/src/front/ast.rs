@@ -7404,7 +7404,7 @@ fn graph_link_input_value_type(graph: &FunctionGraph, value: ValueId) -> Option<
                     // Unknown, which the rtyper backfills with GcRef
                     // and forces synthetic casts at int/float
                     // operations downstream.
-                    LinkArg::Const(c) => match const_value_value_type(c) {
+                    LinkArg::Const(c) => match const_value_value_type(&c.value) {
                         Some(ty) => ty,
                         None => continue,
                     },
