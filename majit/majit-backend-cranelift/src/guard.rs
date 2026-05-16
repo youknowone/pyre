@@ -635,11 +635,23 @@ impl CraneliftFailDescr {
     /// `None`) return `None`; the recovery_layout walker handles
     /// `None` as the no-recovery path (no virtuals to materialise).
     pub fn recovery_layout_ref(&self) -> Option<ExitRecoveryLayout> {
-        self.meta_descr
-            .as_ref()
-            .and_then(|d| d.as_any())
-            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-            .and_then(|rgd| rgd.recovery_layout())
+        // `compile.py:849` `ResumeGuardCopiedDescr.get_resumestorage():
+        // return prev`.  Chase `prev_descr` until we land on the donor
+        // `ResumeGuardDescr` — otherwise copied descrs would always
+        // return `None` since their `as_any` is the trait default.
+        let mut current = self.meta_descr.as_ref().cloned()?;
+        loop {
+            if let Some(rgd) = current
+                .as_any()
+                .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+            {
+                return rgd.recovery_layout();
+            }
+            match current.prev_descr() {
+                Some(next) => current = next,
+                None => return None,
+            }
+        }
     }
 
     /// Increment the failure counter and return the new value.
@@ -735,13 +747,23 @@ impl CraneliftFailDescr {
     /// chase), `recovery_layout_ref()` returns `None` and the caller
     /// handles the no-recovery path.
     pub fn set_recovery_layout(&self, recovery_layout: ExitRecoveryLayout) {
-        if let Some(rgd) = self
-            .meta_descr
-            .as_ref()
-            .and_then(|d| d.as_any())
-            .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
-        {
-            rgd.set_recovery_layout(recovery_layout);
+        // Match `recovery_layout_ref`: chase `prev_descr` through any
+        // `ResumeGuardCopiedDescr` chain to write into the donor's slot.
+        let Some(mut current) = self.meta_descr.as_ref().cloned() else {
+            return;
+        };
+        loop {
+            if let Some(rgd) = current
+                .as_any()
+                .and_then(|a| a.downcast_ref::<majit_backend::ResumeGuardDescr>())
+            {
+                rgd.set_recovery_layout(recovery_layout);
+                return;
+            }
+            match current.prev_descr() {
+                Some(next) => current = next,
+                None => return,
+            }
         }
     }
 
