@@ -1984,6 +1984,39 @@ pub fn register_call_assembler_blackhole(
 /// instead of a surrogate `(green_key, trace_id, fail_index)` triple.
 static CALL_ASSEMBLER_BRIDGE_FN: OnceLock<fn(*const i64, usize, usize) -> bool> = OnceLock::new();
 
+/// On-demand resume callback (Slice QQ): pyre-jit registers this to
+/// drive `ResumeDataDirectReader` from the failed descr's `rd_numb` /
+/// `rd_consts` / `rd_virtuals` / `rd_pendingfields` so cranelift's
+/// `rebuild_state_after_failure` no longer needs a pre-baked
+/// `ExitRecoveryLayout`.  Mirrors PyPy's `pyjitpl.py:3424
+/// MetaInterp.rebuild_state_after_failure(resumedescr, deadframe)` and
+/// the `resume.py:1312 blackhole_from_resumedata` flow where the
+/// metainterp drives the decoder and the backend just delivers the
+/// deadframe.
+///
+/// Distinct from `REBUILD_STATE_AFTER_FAILURE` (the boxing-only
+/// callback at compiler.rs:2040 that runs AFTER recovery_layout
+/// materialisation to wrap raw refs into PyObject pointers).  This
+/// callback REPLACES the recovery_layout walker entirely.
+///
+/// Args: `(descr_addr, outputs, types, bridge_num_inputs)` — the
+/// callback materialises virtuals + replays pending fields in place,
+/// matching the semantics of the existing
+/// `rebuild_state_after_failure(outputs, types, recovery, ...)` walker.
+/// Until QQ-2 migrates the consumer sites, the callback is registered
+/// but unused; the walker continues to drive deopt through the
+/// recovery_layout cache.
+static RESUMEDATA_DEOPT_FN: OnceLock<fn(usize, &mut Vec<i64>, &[Type], usize)> = OnceLock::new();
+
+/// Register the on-demand resume callback for cranelift deopt
+/// materialisation (Slice QQ-1).  pyre-jit calls this during JIT
+/// boot alongside `register_call_assembler_blackhole` so the
+/// callback is reachable when cranelift consumers migrate off the
+/// `ExitRecoveryLayout` cache.
+pub fn register_resumedata_deopt(f: fn(usize, &mut Vec<i64>, &[Type], usize)) {
+    let _ = RESUMEDATA_DEOPT_FN.set(f);
+}
+
 // Thread-local raw local0 value from CallAssemblerI inputs,
 // for force_fn to re-box before interpreter execution.
 thread_local! {
