@@ -3,7 +3,7 @@
 /// Tracks compilation events, guard failures, and timing data.
 /// Activated via MAJIT_LOG=1 or MAJIT_STATS=1 environment variables.
 /// Prints a summary report on drop.
-use std::collections::HashMap;
+use majit_ir::vec_assoc::VecAssoc;
 use std::time::{Duration, Instant};
 
 /// Whether JIT statistics collection is enabled.
@@ -41,9 +41,9 @@ pub struct Logger {
     /// Number of bridges compiled from guard failures.
     bridges_compiled: u64,
     /// Guard failure counts, keyed by guard index.
-    guard_failures: HashMap<u32, u64>,
+    guard_failures: VecAssoc<u32, u64>,
     /// Loop entry counts, keyed by green key hash.
-    loop_entries: HashMap<u64, u64>,
+    loop_entries: VecAssoc<u64, u64>,
     /// Whether to print the summary on drop.
     print_on_drop: bool,
 }
@@ -56,8 +56,8 @@ impl Logger {
             compiled: Vec::new(),
             aborted: 0,
             bridges_compiled: 0,
-            guard_failures: HashMap::new(),
-            loop_entries: HashMap::new(),
+            guard_failures: VecAssoc::new(),
+            loop_entries: VecAssoc::new(),
             print_on_drop,
         }
     }
@@ -97,12 +97,12 @@ impl Logger {
 
     /// Record a guard failure for the given guard index.
     pub fn log_guard_failure(&mut self, guard_index: u32) {
-        *self.guard_failures.entry(guard_index).or_insert(0) += 1;
+        *self.guard_failures.entry_or_default(guard_index) += 1;
     }
 
     /// Record a loop entry for the given green key.
     pub fn log_loop_entry(&mut self, green_key: u64) {
-        *self.loop_entries.entry(green_key).or_insert(0) += 1;
+        *self.loop_entries.entry_or_default(green_key) += 1;
     }
 
     /// Record a bridge compilation for the given guard index.
@@ -156,12 +156,12 @@ impl Logger {
     }
 
     /// Get guard failure counts.
-    pub fn guard_failure_counts(&self) -> &HashMap<u32, u64> {
+    pub fn guard_failure_counts(&self) -> &VecAssoc<u32, u64> {
         &self.guard_failures
     }
 
     /// Get loop entry counts.
-    pub fn loop_entry_counts(&self) -> &HashMap<u64, u64> {
+    pub fn loop_entry_counts(&self) -> &VecAssoc<u64, u64> {
         &self.loop_entries
     }
 

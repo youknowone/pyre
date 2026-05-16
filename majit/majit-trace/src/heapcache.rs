@@ -5,8 +5,10 @@
 /// read or written in the same trace, we can reuse the cached value.
 ///
 /// Translated from rpython/jit/metainterp/heapcache.py.
-use std::collections::{HashMap, HashSet};
 use std::marker::PhantomData;
+
+use majit_ir::vec_assoc::VecAssoc;
+use majit_ir::vec_set::VecSet;
 
 // Vec<bool> helpers — RPython stores these as FrontendOp flags, not sets.
 #[inline(always)]
@@ -84,10 +86,10 @@ const _HF_VERSION_MAX: u32 = HF_VERSION_MAX;
 
 #[derive(Debug, Default)]
 pub(crate) struct CacheEntry {
-    cache_anything: HashMap<OpRef, OpRef>,
-    cache_seen_allocation: HashMap<OpRef, OpRef>,
-    quasiimmut_seen: Option<HashSet<OpRef>>,
-    quasiimmut_seen_refs: Option<HashSet<usize>>,
+    cache_anything: VecAssoc<OpRef, OpRef>,
+    cache_seen_allocation: VecAssoc<OpRef, OpRef>,
+    quasiimmut_seen: Option<VecSet<OpRef>>,
+    quasiimmut_seen_refs: Option<VecSet<usize>>,
     last_const_box: Option<OpRef>,
 }
 
@@ -122,7 +124,7 @@ impl CacheEntry {
     }
 
     /// heapcache.py:84-88 _getdict
-    pub fn _getdict(&self, seen_alloc: bool) -> &HashMap<OpRef, OpRef> {
+    pub fn _getdict(&self, seen_alloc: bool) -> &VecAssoc<OpRef, OpRef> {
         if seen_alloc {
             &self.cache_seen_allocation
         } else {
@@ -132,7 +134,7 @@ impl CacheEntry {
 
     /// Pyre adapt: Python doesn't need a separate `_mut` accessor;
     /// Rust's borrow checker does.  Mirrors `_getdict`'s body.
-    pub fn _getdict_mut(&mut self, seen_alloc: bool) -> &mut HashMap<OpRef, OpRef> {
+    pub fn _getdict_mut(&mut self, seen_alloc: bool) -> &mut VecAssoc<OpRef, OpRef> {
         if seen_alloc {
             &mut self.cache_seen_allocation
         } else {
@@ -332,13 +334,13 @@ pub struct HeapCache {
     /// same `CacheEntry`, which owns the `cache_anything` /
     /// `cache_seen_allocation` dicts and the `last_const_box`
     /// `_unique_const_heuristic` LRU per heapcache.py:50-104.
-    heap_cache: HashMap<u32, CacheEntry>,
+    heap_cache: VecAssoc<u32, CacheEntry>,
     /// heapcache.py: `cached_arrayitems` — nested map descr → ConstInt-index → CacheEntry.
     /// heapcache.py:557 `cache.get(index, None)` — array cache keyed by
     /// the `ConstInt.getint()` value, not the index Box's identity. Two
     /// distinct ConstInt boxes carrying the same `i64` index land in the
     /// same slot, matching the upstream lookup semantics.
-    heap_array_cache: HashMap<u32, HashMap<i64, CacheEntry>>,
+    heap_array_cache: VecAssoc<u32, VecAssoc<i64, CacheEntry>>,
 
     /// Known class map: object_ref -> class pointer.
     /// RPython: CacheEntry 내부. Vec indexed by OpRef.0.
@@ -346,7 +348,7 @@ pub struct HeapCache {
 
     /// Quasi-immutable fields known in this trace.
     /// heapcache.py: `quasi_immut_known`.
-    quasi_immut_known: HashSet<(OpRef, u32)>,
+    quasi_immut_known: VecSet<(OpRef, u32)>,
 
     /// RPython: FrontendOp flag. Vec<bool> indexed by OpRef.0.
     is_unescaped: Vec<bool>,
@@ -405,10 +407,10 @@ impl HeapCache {
     /// Create a new, empty heap cache.
     pub fn new() -> Self {
         HeapCache {
-            heap_cache: HashMap::new(),
-            heap_array_cache: HashMap::new(),
+            heap_cache: VecAssoc::new(),
+            heap_array_cache: VecAssoc::new(),
             known_class: Vec::new(),
-            quasi_immut_known: HashSet::new(),
+            quasi_immut_known: VecSet::new(),
             is_unescaped: Vec::new(),
             seen_allocation: Vec::new(),
             known_nullity: Vec::new(),
@@ -1491,10 +1493,8 @@ impl HeapCache {
                     let dst_index = dststart + i;
                     let entry = self
                         .heap_array_cache
-                        .entry(descr)
-                        .or_default()
-                        .entry(dst_index)
-                        .or_insert_with(CacheEntry::new);
+                        .entry_or_default(descr)
+                        .entry_or_insert_with(dst_index, CacheEntry::new);
                     // heapcache.py:90-94 `do_write_with_aliasing` —
                     // canonicalise dest, then `_clear_cache_on_write(seen_alloc)`
                     // BEFORE the insert so aliasing entries from prior
@@ -1662,10 +1662,8 @@ impl HeapCache {
         let seen_alloc = self.saw_allocation(array);
         let entry = self
             .heap_array_cache
-            .entry(descr)
-            .or_default()
-            .entry(index_value)
-            .or_insert_with(CacheEntry::new);
+            .entry_or_default(descr)
+            .entry_or_insert_with(index_value, CacheEntry::new);
         // CacheEntry.do_write_with_aliasing internally canonicalises
         // ConstPtr operands via `_unique_const_heuristic`, replicating
         // heapcache.py:577 `indexcache.do_write_with_aliasing(box, ...)`.
@@ -1690,10 +1688,8 @@ impl HeapCache {
         let seen_alloc = self.saw_allocation(array);
         let entry = self
             .heap_array_cache
-            .entry(descr)
-            .or_default()
-            .entry(index_value)
-            .or_insert_with(CacheEntry::new);
+            .entry_or_default(descr)
+            .entry_or_insert_with(index_value, CacheEntry::new);
         let array = entry._unique_const_heuristic(array, oracle);
         entry._getdict_mut(seen_alloc).insert(array, value);
     }

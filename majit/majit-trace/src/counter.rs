@@ -378,7 +378,7 @@ mod tests {
 
 /// counter.py: DeterministicJitCounter for testing.
 pub struct DeterministicJitCounter {
-    counts: std::collections::HashMap<u64, f64>,
+    counts: majit_ir::vec_assoc::VecAssoc<u64, f64>,
     threshold: u32,
     increment: f64,
 }
@@ -386,14 +386,14 @@ pub struct DeterministicJitCounter {
 impl DeterministicJitCounter {
     pub fn new(threshold: u32) -> Self {
         DeterministicJitCounter {
-            counts: std::collections::HashMap::new(),
+            counts: majit_ir::vec_assoc::VecAssoc::new(),
             threshold,
             increment: JitCounter::compute_threshold_static(threshold),
         }
     }
 
     pub fn tick(&mut self, hash: u64) -> bool {
-        let count = self.counts.entry(hash).or_insert(0.0);
+        let count = self.counts.entry_or_default(hash);
         *count += self.increment;
         if *count >= 1.0 {
             *count = 0.0;
