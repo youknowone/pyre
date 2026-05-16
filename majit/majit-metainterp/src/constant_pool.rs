@@ -161,7 +161,7 @@ impl ConstantPool {
         }
     }
 
-    /// Get the type of a constant, if recorded.
+    /// Get the type of a constant.
     ///
     /// `history.py:220/261/307` — ConstInt/ConstFloat/ConstPtr `.type` is
     /// pinned at construction. The typed `OpRef` variant tag carries the
