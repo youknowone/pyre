@@ -1389,25 +1389,21 @@ where
                 .target
                 .clone()
                 .expect("link target required for make_link");
-            // RPython parity (reviewer R6): dead blocks are removed
-            // from flow construction by `flowspace/flowcontext.py:455
-            // mergeblock` — the supersede step reroutes every
-            // incoming edge to the newblock via `block.recloseblock(
-            // Link(outputargs, newblock))`, so `make_link` never sees
-            // a dead target.  Pyre's walker mergeblock at
-            // codewriter.rs:1198 does the same reroute.  If a dead
-            // target reaches here, an upstream walker step skipped
-            // the reroute — fail loud so the broken site surfaces
-            // rather than being papered over by a synthetic
-            // `unreachable` emission RPython would never encode.
-            assert!(
-                !target.borrow().dead,
-                "make_link: target block is marked dead but its \
-                 incoming edges weren't rerouted to the supersede \
-                 newblock (flowcontext.py:455 `block.recloseblock(\
-                 Link(outputargs, newblock))`). The walker site that \
-                 produced this link skipped the recloseblock step."
-            );
+            // `flatten.py:148-155 make_link` has no `target.dead`
+            // check.  RPython `flowspace/flowcontext.py:455 mergeblock`
+            // marks the superseded block dead and reroutes incoming
+            // edges to the newblock via `recloseblock`, but the old
+            // block itself stays linked from any predecessor whose
+            // outgoing edge already named it as target — it serves as
+            // a forwarding stub (`model.py:240-253 recloseblock` only
+            // replaces exits; predecessors retain their original
+            // target reference).  `iterblocks` (`model.py:55-77`)
+            // follows links without filtering on `dead`, so flatten
+            // legitimately recurses through a dead target whose
+            // single exit forwards to the newblock.  Re-asserting
+            // here would reject this legal upstream shape; the
+            // empty-`operations` invariant set by mergeblock is
+            // what carries the "no codegen" semantics.
             let target_is_final = target.borrow().exits.is_empty();
             let uses_last_exception = link_borrow.args.iter().any(|arg| {
                 arg.as_ref()

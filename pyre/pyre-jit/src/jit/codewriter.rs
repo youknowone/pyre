@@ -657,13 +657,28 @@ impl SpamBlockRef {
     }
 
     fn mark_dead(&self) {
-        self.0.borrow_mut().dead = true;
+        let mut spam = self.0.borrow_mut();
+        spam.dead = true;
+        // `flowspace/flowcontext.py:455-457 mergeblock` runs the
+        // tuple `block.dead = True; block.operations = ()` in one
+        // step.  The empty-operations side carries the "this block
+        // contributes no codegen" semantics that `flatten` /
+        // `iterblocks` rely on: dead blocks remain enumerable as
+        // forwarding stubs (predecessors that already named this
+        // block as target follow the single recloseblock link
+        // through it), but their `operations` is the empty tuple so
+        // serialization yields nothing.  Pyre's per-block SSA
+        // accumulator is the moral equivalent of `block.operations`
+        // for the walker emit path, so clearing it here matches
+        // upstream: dead blocks stay in `all_walker_blocks` and the
+        // drain still enumerates them, but they yield no insns.
+        spam.per_block_ssarepr.clear();
         // Mirror onto the underlying flow::Block so flatten_graph and
         // any post-walker graph traversal can see the dead status
         // without needing the SpamBlockRef wrapper (matching upstream
         // `flowcontext.py:42 SpamBlock.dead` which is read during
         // `flatten` via `block.dead` access on the flow Block).
-        self.0.borrow().block.borrow_mut().dead = true;
+        spam.block.borrow_mut().dead = true;
     }
 
     fn dead(&self) -> bool {
@@ -7016,22 +7031,20 @@ impl CodeWriter {
         // descent + `seen_blocks` (`flatten.py:110-113`); convergence
         // arrives when production flips to post-walk `flatten_graph`.
         {
-            // Reviewer R5: drain must skip dead/superseded blocks per
-            // RPython `flowspace/flowcontext.py:455` (the supersede
-            // step sets `block.dead = True; block.operations = ()`
-            // and reroutes incoming edges to the newblock; the dead
-            // block is no longer enumerated for flattening).  Pyre's
-            // per-block SSA accumulator collected insns into the
-            // dead block before supersede fired; without this filter
-            // those insns reach the drained stream and the runtime's
-            // first-wins PC dispatch (`pc_anchor_positions`) lands
-            // on the dead block's PcAnchor instead of the supersede
-            // newblock's re-walked emission — a NEW-DEVIATION from
-            // PyPy where dead blocks contribute nothing to the
-            // final code.
+            // RPython parity: `iterblocks` (`flowspace/model.py:55-77`)
+            // enumerates every reachable block including dead ones;
+            // the "no codegen" semantics ride on `block.operations`
+            // being the empty tuple after `mergeblock` cleared it
+            // (`flowcontext.py:455-457`).  Pyre mirrors that in
+            // `SpamBlockRef::mark_dead` by clearing
+            // `per_block_ssarepr` alongside the `dead` flag, so the
+            // unfiltered drain below yields zero insns from dead
+            // blocks while still preserving their position in walker-
+            // creation order (relevant for the supersede newblock's
+            // first-wins `pc_anchor_positions` lookup since the dead
+            // block's now-empty entry no longer competes).
             let mut blocks: Vec<Vec<super::flatten::Insn>> = all_walker_blocks
                 .iter()
-                .filter(|block| !block.dead())
                 .map(|block| block.per_block_ssarepr())
                 .collect();
             ssarepr.insns = strip_walker_block_boundary_goto(&mut blocks);
