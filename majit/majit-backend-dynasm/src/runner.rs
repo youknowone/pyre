@@ -3604,6 +3604,7 @@ mod tests {
                 &bridge_ops,
                 &token,
                 &[],
+                None,
             )
             .unwrap();
 
@@ -3701,6 +3702,7 @@ mod tests {
                 &bridge_ops,
                 &token,
                 &[],
+                None,
             )
             .unwrap();
 
@@ -3796,6 +3798,7 @@ mod tests {
                 &bridge_ops,
                 &token,
                 &[],
+                None,
             )
             .unwrap();
 
@@ -3985,6 +3988,7 @@ mod tests {
                 &bridge_ops,
                 &token,
                 &[],
+                None,
             )
             .unwrap();
 
@@ -4109,6 +4113,7 @@ mod tests {
                 &bridge_ops,
                 &token,
                 &[],
+                None,
             )
             .unwrap();
 
@@ -4191,6 +4196,7 @@ mod tests {
                 &bridge_ops,
                 &token,
                 &[],
+                None,
             )
             .unwrap();
 
@@ -4291,6 +4297,7 @@ mod tests {
                 &bridge_ops,
                 &token,
                 &[],
+                None,
             )
             .unwrap();
 
