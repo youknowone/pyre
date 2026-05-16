@@ -3494,6 +3494,257 @@ fn lower_stmt_inner(
 
 // ── Expression lowering (block-splitting for control flow) ───────
 
+/// Lower an `if` / `if let` / `if … else if …` expression.
+///
+/// Extracted out of [`lower_expr`] so the recursive descent through an
+/// `else if` chain runs on a small stack frame: [`lower_expr`]'s frame
+/// has to reserve space for every match-arm's locals at once (it
+/// dispatches over the full [`syn::Expr`] surface) and overflows the
+/// default 2 MB thread stack at ~17 nested arms; this helper only
+/// carries the `If`-arm locals so the frame shrinks by roughly an
+/// order of magnitude.  The same shape PyPy's bytecode walker has —
+/// `flowspace/flowcontext.py` keeps each opcode handler in its own
+/// frame rather than one mega-frame for the dispatch loop.
+fn lower_if_expr(
+    graph: &mut FunctionGraph,
+    block: &mut BlockId,
+    if_expr: &syn::ExprIf,
+    options: &AstGraphOptions,
+    ctx: &mut GraphBuildContext,
+) -> Result<Lowered, FlowingError> {
+    // ── if-let desugaring ──
+    // `if let pat = scrutinee { then } else { else }` is exact
+    // syntactic sugar for `match scrutinee { pat => then, _ =>
+    // else }` (Rust Reference, "If let expressions"). We build
+    // the synthetic `Expr::Match` AST and recurse so the
+    // existing `Expr::Match` lowering (the path immediately
+    // below at `syn::Expr::Match(m)`) handles the pattern
+    // dispatch — keeps a single match-emit codepath rather than
+    // duplicating the merge / phi / arm-entry logic.
+    //
+    // Without this desugar, `if_expr.cond` would be lowered as
+    // a regular expression and trip the catch-all `Expr::Let`
+    // arm below, emitting `OpKind::Abort { Let }`. That stub
+    // makes any function carrying an `if let` un-portal-able
+    // (Phase G G.4.4 path A.1) since a BH resume could land on
+    // it and crash on "unknown bhimpl_*".
+    if let syn::Expr::Let(let_expr) = if_expr.cond.as_ref() {
+        let then_expr = syn::Expr::Block(syn::ExprBlock {
+            attrs: vec![],
+            label: None,
+            block: if_expr.then_branch.clone(),
+        });
+        let else_expr: syn::Expr = match &if_expr.else_branch {
+            Some((_, else_branch)) => (**else_branch).clone(),
+            None => syn::parse_quote!({}),
+        };
+        let then_arm = syn::Arm {
+            attrs: vec![],
+            pat: (*let_expr.pat).clone(),
+            guard: None,
+            fat_arrow_token: Default::default(),
+            body: Box::new(then_expr),
+            comma: Some(Default::default()),
+        };
+        let else_arm = syn::Arm {
+            attrs: vec![],
+            pat: syn::parse_quote!(_),
+            guard: None,
+            fat_arrow_token: Default::default(),
+            body: Box::new(else_expr),
+            comma: None,
+        };
+        let synthetic = syn::Expr::Match(syn::ExprMatch {
+            attrs: vec![],
+            match_token: Default::default(),
+            expr: let_expr.expr.clone(),
+            brace_token: Default::default(),
+            arms: vec![then_arm, else_arm],
+        });
+        return lower_expr(graph, block, &synthetic, options, ctx);
+    }
+
+    // RPython `flowspace/flowcontext.py:91,107,364`: unsupported
+    // cond raises `FlowingError`, halting the walk.  A child
+    // that closed its path (`if return_early { ... } else ...`)
+    // also has no truth value — propagate via `get_value!`.
+    let cond = get_value!(lower_expr(graph, block, &if_expr.cond, options, ctx)?);
+
+    let mut then_block = graph.create_block();
+    let mut else_block = graph.create_block();
+
+    // Cat 2.1 Slice 2 / Stage A1: capture the locals frame as it
+    // was when `*block` closed via `set_branch` so a later
+    // cross-block read in the merge block can thread back
+    // through either arm's `Link.args` even when the arm itself
+    // rebinds nothing.  Stored on `Block.framestate` (per-block,
+    // captured at close time) — both exits of one set_branch
+    // share the same pre-branch snapshot, so the per-edge
+    // duplication of Slice 2 collapses into a single field.
+    // RPython parity: `flowspace/flowcontext.py:38
+    // SpamBlock.framestate`.
+    let pre_branch_snapshot = ctx.getstate(0);
+    graph.set_branch(*block, cond, then_block, vec![], else_block, vec![]);
+    graph.block_mut(*block).framestate = Some(pre_branch_snapshot);
+
+    // Stage B1: capture the pre-branch ctx state BEFORE
+    // lowering the then-arm so the else-arm can re-enter
+    // `*block`'s scope.  RPython parity:
+    // `flowspace/flowcontext.py:407-408 record_block(block)`
+    // calls `setstate(block.framestate)` at every block
+    // entry; pyre snapshots the analogue `LocalBindingSnapshot`
+    // here and restores it before the else-arm.  Without this
+    // restore the else-arm sees the then-arm's mutations to
+    // `ctx.local_value_ids` / `local_value_types` etc.
+    let pre_branch_ctx = LocalBindingSnapshot::capture(ctx);
+
+    // Lower then branch — collect result value
+    let then_lowered = lower_stmt_list_with_tail_value(
+        graph,
+        &mut then_block,
+        &if_expr.then_branch.stmts,
+        options,
+        ctx,
+    )?;
+    // Cat 2.1 Slice 2: snapshot then-arm's locals state BEFORE
+    // else-arm lowering mutates `ctx.local_value_ids`.  Used
+    // only if then-arm is open (will `set_goto` to merge); a
+    // closed arm's snapshot is unused.
+    let then_exit_snapshot = ctx.getstate(0);
+
+    // Stage B1: restore pre-branch ctx state before lowering
+    // the else-arm so its `LOAD_FAST`-style reads see the
+    // pre-If bindings, not the then-arm's rebinds.
+    pre_branch_ctx.restore(ctx);
+
+    // Lower else branch.  When the else-branch is itself a chained
+    // `if` (`if … else if …`), recurse through [`lower_if_expr`]
+    // directly rather than going back through [`lower_expr`].  syn's
+    // AST nests each `else if` as `else_branch: Some(Expr::If(_))`,
+    // so a long chain would otherwise drive [`lower_expr`]'s ~70KB
+    // match-frame N levels deep and exhaust the 2 MB default stack.
+    let mut else_lowered = Lowered::no_value();
+    if let Some((_, else_branch)) = &if_expr.else_branch {
+        else_lowered = match else_branch.as_ref() {
+            syn::Expr::If(else_if_expr) => {
+                lower_if_expr(graph, &mut else_block, else_if_expr, options, ctx)?
+            }
+            _ => lower_expr(graph, &mut else_block, else_branch, options, ctx)?,
+        };
+    }
+    let else_exit_snapshot = ctx.getstate(0);
+
+    // RPython `flowspace/flowcontext.py` merges via Link: a
+    // branch whose path is closed (`return`/`raise`/`break`)
+    // does not `goto` the merge — the `is_open` check below
+    // already skips it.  A phi inputarg is introduced when both
+    // arms *produced a value*, mirroring the old all-or-nothing
+    // shape; arity is kept consistent by skipping the closed
+    // arm's goto so only the open arm sends a `vec![value]` to
+    // the one-inputarg merge block.
+    let then_value = then_lowered.value;
+    let else_value = else_lowered.value;
+    let then_open = graph.block(then_block).is_open();
+    let else_open = graph.block(else_block).is_open();
+    let want_phi = then_value.is_some() && else_value.is_some();
+
+    let (merge_block, phi_result) = if want_phi {
+        let (merge, phi_args) = graph.create_block_with_args(1);
+        if then_open {
+            graph.set_goto(then_block, merge, vec![then_value.unwrap()]);
+            graph.block_mut(then_block).framestate = Some(then_exit_snapshot.clone());
+        }
+        if else_open {
+            graph.set_goto(else_block, merge, vec![else_value.unwrap()]);
+            graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
+        }
+        (merge, Some(phi_args[0]))
+    } else {
+        let merge = graph.create_block();
+        if then_open {
+            graph.set_goto(then_block, merge, vec![]);
+            graph.block_mut(then_block).framestate = Some(then_exit_snapshot.clone());
+        }
+        if else_open {
+            graph.set_goto(else_block, merge, vec![]);
+            graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
+        }
+        (merge, None)
+    };
+
+    // FrameState::union-driven merge when both arms reach the
+    // merge block.  Routes through `FrameState::union` for
+    // explicit per-slot classification per RPython
+    // `flowspace/framestate.py:105-128 union`:
+    //   - One-sided None → None-kill (`framestate.py:110-111`):
+    //     the slot is dropped from `ctx` so post-merge reads
+    //     of that name surface as undefined-local.
+    //   - CarryThrough (same vid both arms): kept; the merged
+    //     entry's `value_type` may have widened from `Unknown`
+    //     to a concrete kind via the wildcard rule and the
+    //     source `OpKind`'s `ty` is retagged below to keep
+    //     `graph_value_type` in agreement with the framestate.
+    //   - NeedsPhi (disagreeing vids): eager phi install at
+    //     union time per `framestate.py:113-114 union`'s
+    //     fresh `Variable()` semantics —
+    //     `lazy_install_local_at_current_block` allocates the
+    //     merge-block inputarg, threads per-arm vids onto
+    //     each predecessor's goto args, and rebinds ctx so
+    //     post-merge reads of the name resolve to the new
+    //     phi vid without re-driving the lazy installer.
+    if then_open && else_open {
+        let merged = then_exit_snapshot.union(&else_exit_snapshot, graph).expect(
+            "AST frontend: union is total — entries domain has no UnionError, \
+                 stack / last_exception / blocklist / next_offset are vestigial \
+                 (framestate.py:78 None-return reachable only post-Z4 walker)",
+        );
+        for (slot_idx, slot) in merged.entries.iter().enumerate() {
+            if slot.is_some() {
+                continue;
+            }
+            if let Some(name) = ctx.local_first_bind_order.get(slot_idx).cloned() {
+                ctx.local_value_ids.remove(&name);
+                ctx.local_value_types.remove(&name);
+            }
+        }
+        for (slot_idx, slot_vid) in merged
+            .entries
+            .iter()
+            .enumerate()
+            .filter_map(|(i, e)| e.map(|vid| (i, vid)))
+        {
+            let then_vid = then_exit_snapshot.entries.get(slot_idx).copied().flatten();
+            let is_fresh_phi = then_vid != Some(slot_vid);
+            if is_fresh_phi {
+                let name = ctx.local_first_bind_order[slot_idx].clone();
+                let _ = lazy_install_local_at_current_block(
+                    graph,
+                    ctx,
+                    merge_block,
+                    &name,
+                    Some(slot_vid),
+                );
+            }
+        }
+    }
+
+    *block = merge_block;
+    // If NEITHER arm remains open, the merge block is
+    // unreachable — mark the enclosing path as closed so the
+    // caller stops lowering into it.  RPython parity:
+    // `flowspace/flowcontext.py` never keeps a merge block
+    // reachable when all incoming links closed with
+    // `FlowSignal::Return` / `Raise`.
+    if !then_open && !else_open {
+        Ok(Lowered::path_closed())
+    } else {
+        Ok(Lowered {
+            value: phi_result,
+            path_closed: false,
+        })
+    }
+}
+
 /// Lower an expression, potentially splitting blocks for control flow.
 ///
 /// RPython equivalent: FlowContext.handle_bytecode() + guessbool().
@@ -3912,289 +4163,7 @@ fn lower_expr(
         // Creates: then_block, else_block, merge_block
         // If both branches produce a value, merge_block gets an inputarg
         // (Phi node) that receives the value from each branch via Link args.
-        syn::Expr::If(if_expr) => {
-            // ── if-let desugaring ──
-            // `if let pat = scrutinee { then } else { else }` is exact
-            // syntactic sugar for `match scrutinee { pat => then, _ =>
-            // else }` (Rust Reference, "If let expressions"). We build
-            // the synthetic `Expr::Match` AST and recurse so the
-            // existing `Expr::Match` lowering (the path immediately
-            // below at `syn::Expr::Match(m)`) handles the pattern
-            // dispatch — keeps a single match-emit codepath rather than
-            // duplicating the merge / phi / arm-entry logic.
-            //
-            // Without this desugar, `if_expr.cond` would be lowered as
-            // a regular expression and trip the catch-all `Expr::Let`
-            // arm below, emitting `OpKind::Abort { Let }`. That stub
-            // makes any function carrying an `if let` un-portal-able
-            // (Phase G G.4.4 path A.1) since a BH resume could land on
-            // it and crash on "unknown bhimpl_*".
-            if let syn::Expr::Let(let_expr) = if_expr.cond.as_ref() {
-                let then_expr = syn::Expr::Block(syn::ExprBlock {
-                    attrs: vec![],
-                    label: None,
-                    block: if_expr.then_branch.clone(),
-                });
-                let else_expr: syn::Expr = match &if_expr.else_branch {
-                    Some((_, else_branch)) => (**else_branch).clone(),
-                    None => syn::parse_quote!({}),
-                };
-                let then_arm = syn::Arm {
-                    attrs: vec![],
-                    pat: (*let_expr.pat).clone(),
-                    guard: None,
-                    fat_arrow_token: Default::default(),
-                    body: Box::new(then_expr),
-                    comma: Some(Default::default()),
-                };
-                let else_arm = syn::Arm {
-                    attrs: vec![],
-                    pat: syn::parse_quote!(_),
-                    guard: None,
-                    fat_arrow_token: Default::default(),
-                    body: Box::new(else_expr),
-                    comma: None,
-                };
-                let synthetic = syn::Expr::Match(syn::ExprMatch {
-                    attrs: vec![],
-                    match_token: Default::default(),
-                    expr: let_expr.expr.clone(),
-                    brace_token: Default::default(),
-                    arms: vec![then_arm, else_arm],
-                });
-                return lower_expr(graph, block, &synthetic, options, ctx);
-            }
-
-            // RPython `flowspace/flowcontext.py:91,107,364`: unsupported
-            // cond raises `FlowingError`, halting the walk.  A child
-            // that closed its path (`if return_early { ... } else ...`)
-            // also has no truth value — propagate via `get_value!`.
-            let cond = get_value!(lower_expr(graph, block, &if_expr.cond, options, ctx)?);
-
-            let mut then_block = graph.create_block();
-            let mut else_block = graph.create_block();
-
-            // Cat 2.1 Slice 2 / Stage A1: capture the locals frame as it
-            // was when `*block` closed via `set_branch` so a later
-            // cross-block read in the merge block can thread back
-            // through either arm's `Link.args` even when the arm itself
-            // rebinds nothing.  Stored on `Block.framestate` (per-block,
-            // captured at close time) — both exits of one set_branch
-            // share the same pre-branch snapshot, so the per-edge
-            // duplication of Slice 2 collapses into a single field.
-            // RPython parity: `flowspace/flowcontext.py:38
-            // SpamBlock.framestate`.
-            let pre_branch_snapshot = ctx.getstate(0);
-            graph.set_branch(*block, cond, then_block, vec![], else_block, vec![]);
-            graph.block_mut(*block).framestate = Some(pre_branch_snapshot);
-
-            // Stage B1: capture the pre-branch ctx state BEFORE
-            // lowering the then-arm so the else-arm can re-enter
-            // `*block`'s scope.  RPython parity:
-            // `flowspace/flowcontext.py:407-408 record_block(block)`
-            // calls `setstate(block.framestate)` at every block
-            // entry; pyre snapshots the analogue `LocalBindingSnapshot`
-            // here and restores it before the else-arm.  Without this
-            // restore the else-arm sees the then-arm's mutations to
-            // `ctx.local_value_ids` / `local_value_types` etc.
-            let pre_branch_ctx = LocalBindingSnapshot::capture(ctx);
-
-            // Lower then branch — collect result value
-            let then_lowered = lower_stmt_list_with_tail_value(
-                graph,
-                &mut then_block,
-                &if_expr.then_branch.stmts,
-                options,
-                ctx,
-            )?;
-            // Cat 2.1 Slice 2: snapshot then-arm's locals state BEFORE
-            // else-arm lowering mutates `ctx.local_value_ids`.  Used
-            // only if then-arm is open (will `set_goto` to merge); a
-            // closed arm's snapshot is unused.
-            let then_exit_snapshot = ctx.getstate(0);
-
-            // Stage B1: restore pre-branch ctx state before lowering
-            // the else-arm so its `LOAD_FAST`-style reads see the
-            // pre-If bindings, not the then-arm's rebinds.
-            pre_branch_ctx.restore(ctx);
-
-            // Lower else branch
-            let mut else_lowered = Lowered::no_value();
-            if let Some((_, else_branch)) = &if_expr.else_branch {
-                else_lowered = lower_expr(graph, &mut else_block, else_branch, options, ctx)?;
-            }
-            let else_exit_snapshot = ctx.getstate(0);
-
-            // RPython `flowspace/flowcontext.py` merges via Link: a
-            // branch whose path is closed (`return`/`raise`/`break`)
-            // does not `goto` the merge — the `is_open` check below
-            // already skips it.  A phi inputarg is introduced when both
-            // arms *produced a value*, mirroring the old all-or-nothing
-            // shape; arity is kept consistent by skipping the closed
-            // arm's goto so only the open arm sends a `vec![value]` to
-            // the one-inputarg merge block.
-            let then_value = then_lowered.value;
-            let else_value = else_lowered.value;
-            let then_open = graph.block(then_block).is_open();
-            let else_open = graph.block(else_block).is_open();
-            let want_phi = then_value.is_some() && else_value.is_some();
-
-            let (merge_block, phi_result) = if want_phi {
-                let (merge, phi_args) = graph.create_block_with_args(1);
-                if then_open {
-                    graph.set_goto(then_block, merge, vec![then_value.unwrap()]);
-                    graph.block_mut(then_block).framestate = Some(then_exit_snapshot.clone());
-                }
-                if else_open {
-                    graph.set_goto(else_block, merge, vec![else_value.unwrap()]);
-                    graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
-                }
-                (merge, Some(phi_args[0]))
-            } else {
-                let merge = graph.create_block();
-                if then_open {
-                    graph.set_goto(then_block, merge, vec![]);
-                    graph.block_mut(then_block).framestate = Some(then_exit_snapshot.clone());
-                }
-                if else_open {
-                    graph.set_goto(else_block, merge, vec![]);
-                    graph.block_mut(else_block).framestate = Some(else_exit_snapshot.clone());
-                }
-                (merge, None)
-            };
-
-            // FrameState::union-driven merge when both arms reach the
-            // merge block.  Routes through `FrameState::union` for
-            // explicit per-slot classification per RPython
-            // `flowspace/framestate.py:105-128 union`:
-            //   - One-sided None → None-kill (`framestate.py:110-111`):
-            //     the slot is dropped from `ctx` so post-merge reads
-            //     of that name surface as undefined-local.
-            //   - CarryThrough (same vid both arms): kept; the merged
-            //     entry's `value_type` may have widened from `Unknown`
-            //     to a concrete kind via the wildcard rule and the
-            //     source `OpKind`'s `ty` is retagged below to keep
-            //     `graph_value_type` in agreement with the framestate.
-            //   - NeedsPhi (disagreeing vids): eager phi install at
-            //     union time per `framestate.py:113-114 union`'s
-            //     fresh `Variable()` semantics —
-            //     `lazy_install_local_at_current_block` allocates the
-            //     merge-block inputarg, threads per-arm vids onto
-            //     each predecessor's goto args, and rebinds ctx so
-            //     post-merge reads of the name resolve to the new
-            //     phi vid without re-driving the lazy installer.
-            //
-            // `FrameState::union` returns `Option<FrameState>` per
-            // `framestate.py:78-89`'s `try/except UnionError: return
-            // None` envelope.  Pyre's `entries` carry `Option<ValueId>`
-            // not `Option<Hlvalue>`, so the `framestate.py:117/126
-            // UnionError` paths (SpecTag mismatch, FlowSignal-type
-            // mismatch) cannot be raised against `entries`.  They
-            // remain reachable on the stack / exception projections
-            // once the Z4 walker populates them; until then the union
-            // is total on the AST frontend and the `.expect(...)`
-            // below documents that invariant.  Per-slot type
-            // unification across arms is annotator-side per upstream
-            // `framestate.py:union` (Hlvalue identity only) — there
-            // is no concrete-kind disagreement at union time.
-            if then_open && else_open {
-                // `framestate.py:78` returns `None` from `union` on
-                // any per-projection `UnionError`.  The AST-frontend's
-                // entries domain (ValueId-identity) is total; the
-                // stack / last_exception / blocklist / next_offset
-                // projections are vestigially empty / None / 0, so
-                // `union` is currently infallible at this call site.
-                // The `expect` documents the invariant — when Z4
-                // walker activates the four vestigial projections,
-                // this site needs the upstream `flowcontext.py:431-
-                // 436 mergeblock` candidate-loop fallback (allocate
-                // a fresh SpamBlock when no candidate unioned).
-                let merged = then_exit_snapshot.union(&else_exit_snapshot, graph).expect(
-                    "AST frontend: union is total — entries domain has no UnionError, \
-                         stack / last_exception / blocklist / next_offset are vestigial \
-                         (framestate.py:78 None-return reachable only post-Z4 walker)",
-                );
-                // Carry-through Unknown→concrete widening at the
-                // Type unification across arms is annotator-side per
-                // upstream `framestate.py:union` (Hlvalue identity
-                // only) — no per-slot value_type retag at union time.
-                // The prior carry-through retag block was a
-                // NEW-DEVIATION dependent on the retired
-                // `FrameStateEntry::value_type` field; it has been
-                // removed in Path-Z Slice 2.3.  Convergence: when
-                // pyre's annotator (`crate::annotator`) runs over
-                // AST-frontend graphs, `Variable.annotation` /
-                // `Variable.concretetype` carries the unified type
-                // and downstream consumers read from there.
-                for (slot_idx, slot) in merged.entries.iter().enumerate() {
-                    if slot.is_some() {
-                        continue;
-                    }
-                    // None-kill: name present on at most one side —
-                    // drop from ctx so post-merge reads do not return
-                    // a stale binding.  `local_first_bind_order` /
-                    // `local_first_bind_seen` are graph-wide
-                    // append-only and stay untouched (the slot index
-                    // remains valid; future snapshots push `None` for
-                    // it).  Resolve `slot_idx → name` via
-                    // `local_first_bind_order` per the framestate
-                    // positional-zip invariant.
-                    if let Some(name) = ctx.local_first_bind_order.get(slot_idx).cloned() {
-                        ctx.local_value_ids.remove(&name);
-                        ctx.local_value_types.remove(&name);
-                    }
-                }
-
-                // Eager phi install for every fresh-phi slot.
-                // `flowspace/framestate.py:113-114 union` returns a
-                // fresh `Variable()` whenever per-slot vids
-                // disagree; pyre's `union` already allocated
-                // the fresh ValueId, so we drive the lazy installer
-                // with `Some(slot.value_id)` to emit the Input op +
-                // inputarg + predecessor link args using the same
-                // vid the merged state already refers to.
-                // Carry-through slots agreed on a single vid so no
-                // fresh phi is emitted (`framestate.py:108-109 if w1
-                // == w2: return w1`); first post-merge read of those
-                // names still drives the lazy installer's same-block
-                // reuse path.
-                for (slot_idx, slot_vid) in merged
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .filter_map(|(i, e)| e.map(|vid| (i, vid)))
-                {
-                    let then_vid = then_exit_snapshot.entries.get(slot_idx).copied().flatten();
-                    let is_fresh_phi = then_vid != Some(slot_vid);
-                    if is_fresh_phi {
-                        let name = ctx.local_first_bind_order[slot_idx].clone();
-                        let _ = lazy_install_local_at_current_block(
-                            graph,
-                            ctx,
-                            merge_block,
-                            &name,
-                            Some(slot_vid),
-                        );
-                    }
-                }
-            }
-
-            *block = merge_block;
-            // If NEITHER arm remains open, the merge block is
-            // unreachable — mark the enclosing path as closed so the
-            // caller stops lowering into it.  RPython parity:
-            // `flowspace/flowcontext.py` never keeps a merge block
-            // reachable when all incoming links closed with
-            // `FlowSignal::Return` / `Raise`.
-            if !then_open && !else_open {
-                Ok(Lowered::path_closed())
-            } else {
-                Ok(Lowered {
-                    value: phi_result,
-                    path_closed: false,
-                })
-            }
-        }
+        syn::Expr::If(if_expr) => lower_if_expr(graph, block, if_expr, options, ctx),
 
         // ── return ──
         syn::Expr::Return(ret) => {
