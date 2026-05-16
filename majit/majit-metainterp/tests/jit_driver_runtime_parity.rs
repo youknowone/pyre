@@ -550,6 +550,10 @@ struct VirtualResumeState {
     flag: i64,
     materialized_ref: usize,
     materialize_calls: usize,
+    /// `history.py:125 id(descr)` parity — kept here so the test asserts
+    /// Arc identity rather than numeric `index()` (latter still passes
+    /// for any unrelated descr that happens to share `index()`).
+    expected_descr: Option<majit_ir::DescrRef>,
 }
 
 #[repr(C)]
@@ -578,6 +582,11 @@ struct PendingVirtualWriteState {
     parent_ref: usize,
     child_ref: usize,
     materialize_order: Vec<usize>,
+    /// `history.py:125 id(descr)` parity — Arc identity is the contract;
+    /// numeric `index()` would still pass if reconstruction fabricates a
+    /// different descr with the same index.
+    expected_parent_descr: Option<majit_ir::DescrRef>,
+    expected_child_descr: Option<majit_ir::DescrRef>,
 }
 
 struct MultiFrameResumeState {
@@ -610,6 +619,10 @@ struct NestedVirtualResumeState {
     outer_ref: usize,
     inner_ref: usize,
     materialize_order: Vec<usize>,
+    /// `history.py:125 id(descr)` parity — keep the test sensitive to
+    /// descr Arc identity, not just numeric `index()`.
+    expected_inner_descr: Option<majit_ir::DescrRef>,
+    expected_outer_descr: Option<majit_ir::DescrRef>,
 }
 
 impl JitState for NamedVirtualizableSyncState {
@@ -883,7 +896,11 @@ impl JitState for VirtualResumeState {
         assert_eq!(virtual_index, 0);
         match materialized {
             MaterializedVirtual::Struct { descr, .. } => {
-                assert_eq!(descr.as_ref().map(|d| d.index()), Some(7));
+                let expected = self.expected_descr.as_ref().expect("set in test");
+                assert!(matches!(
+                    descr.as_ref(),
+                    Some(actual) if std::sync::Arc::ptr_eq(actual, expected)
+                ));
             }
             other => panic!("unexpected virtual materialization: {other:?}"),
         }
@@ -1327,11 +1344,19 @@ impl JitState for PendingVirtualWriteState {
         self.materialize_order.push(virtual_index);
         match (virtual_index, materialized) {
             (0, MaterializedVirtual::Struct { descr, .. }) => {
-                assert_eq!(descr.as_ref().map(|d| d.index()), Some(30));
+                let expected = self.expected_parent_descr.as_ref().expect("set in test");
+                assert!(matches!(
+                    descr.as_ref(),
+                    Some(actual) if std::sync::Arc::ptr_eq(actual, expected)
+                ));
                 Some(GcRef(self.parent_ref))
             }
             (1, MaterializedVirtual::Struct { descr, .. }) => {
-                assert_eq!(descr.as_ref().map(|d| d.index()), Some(31));
+                let expected = self.expected_child_descr.as_ref().expect("set in test");
+                assert!(matches!(
+                    descr.as_ref(),
+                    Some(actual) if std::sync::Arc::ptr_eq(actual, expected)
+                ));
                 Some(GcRef(self.child_ref))
             }
             other => panic!("unexpected pending-write virtual materialization: {other:?}"),
@@ -1415,12 +1440,20 @@ impl JitState for NestedVirtualResumeState {
         self.materialize_order.push(virtual_index);
         match (virtual_index, materialized) {
             (0, MaterializedVirtual::Struct { descr, fields, .. }) => {
-                assert_eq!(descr.as_ref().map(|d| d.index()), Some(10));
+                let expected = self.expected_inner_descr.as_ref().expect("set in test");
+                assert!(matches!(
+                    descr.as_ref(),
+                    Some(actual) if std::sync::Arc::ptr_eq(actual, expected)
+                ));
                 assert_eq!(fields, &vec![(0, MaterializedValue::Value(77))]);
                 Some(GcRef(self.inner_ref))
             }
             (1, MaterializedVirtual::Obj { descr, fields, .. }) => {
-                assert_eq!(descr.as_ref().map(|d| d.index()), Some(20));
+                let expected = self.expected_outer_descr.as_ref().expect("set in test");
+                assert!(matches!(
+                    descr.as_ref(),
+                    Some(actual) if std::sync::Arc::ptr_eq(actual, expected)
+                ));
                 assert_eq!(fields[0], (0, MaterializedValue::VirtualRef(0)));
                 assert_eq!(fields[1], (1, MaterializedValue::Value(99)));
                 assert_eq!(
@@ -1772,19 +1805,20 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
         VirtualResumeDriver::descriptor(&[Type::Int, Type::Int], &[Type::Ref, Type::Int])
             .expect("descriptor should build");
     let mut driver = JitDriver::<VirtualResumeState>::with_descriptor(1, descriptor);
+    let typedescr_7: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(7, 0, 0));
     let mut state = VirtualResumeState {
         obj: 0,
         flag: 0,
         materialized_ref: 0xfeedusize,
         materialize_calls: 0,
+        expected_descr: Some(typedescr_7.clone()),
     };
 
     start_guard_failure_trace(&mut driver, 555, &mut state);
 
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 555);
-    let typedescr_7: majit_ir::DescrRef =
-        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(7, 0, 0));
     let virtual_index = resume.add_virtual_struct(
         Some(typedescr_7),
         0,
@@ -1813,6 +1847,10 @@ fn declarative_driver_guard_failure_materializes_virtual_ref_from_resume_state()
 
 #[test]
 fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependency_order() {
+    let inner_typedescr: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(10, 0, 0));
+    let outer_typedescr: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(20, 0, 0));
     let mut state = NestedVirtualResumeState {
         outer: 0,
         inner: 0,
@@ -1820,14 +1858,12 @@ fn jit_state_restore_guard_failure_materializes_nested_virtual_refs_in_dependenc
         outer_ref: 0xbeefusize,
         inner_ref: 0xabbausize,
         materialize_order: Vec::new(),
+        expected_inner_descr: Some(inner_typedescr.clone()),
+        expected_outer_descr: Some(outer_typedescr.clone()),
     };
     let meta = TestMeta { header_pc: 556 };
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 556);
-    let inner_typedescr: majit_ir::DescrRef =
-        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(10, 0, 0));
-    let outer_typedescr: majit_ir::DescrRef =
-        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(20, 0, 0));
     let inner = resume.add_virtual_struct(
         Some(inner_typedescr),
         0,
@@ -1881,20 +1917,22 @@ fn jit_state_restore_guard_failure_replays_pending_writes_with_virtual_target_an
     let mut child_cell = Box::new(PendingRefCell { child: 0 });
     let parent_ref = (&mut *parent_cell as *mut PendingRefCell) as usize;
     let child_ref = (&mut *child_cell as *mut PendingRefCell) as usize;
+    let parent_typedescr: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(30, 0, 0));
+    let child_typedescr: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(31, 0, 0));
     let mut state = PendingVirtualWriteState {
         parent: 0,
         child: 0,
         parent_ref,
         child_ref,
         materialize_order: Vec::new(),
+        expected_parent_descr: Some(parent_typedescr.clone()),
+        expected_child_descr: Some(child_typedescr.clone()),
     };
     let meta = TestMeta { header_pc: 557 };
     let mut resume = ResumeDataVirtualAdder::new();
     resume.push_frame(0, 557);
-    let parent_typedescr: majit_ir::DescrRef =
-        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(30, 0, 0));
-    let child_typedescr: majit_ir::DescrRef =
-        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(31, 0, 0));
     let parent = resume.add_virtual_struct(Some(parent_typedescr), 0, vec![], vec![], 0);
     let child = resume.add_virtual_struct(Some(child_typedescr), 0, vec![], vec![], 0);
     resume.set_slot_virtual(0, parent);

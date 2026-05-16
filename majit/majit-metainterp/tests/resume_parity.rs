@@ -60,6 +60,8 @@ fn resume_py_public_encoding_uses_tagged_numbering() {
 
 #[test]
 fn resume_py_public_roundtrip_recovers_virtualized_state() {
+    let expected_descr: majit_ir::DescrRef =
+        std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(3, 0, 0));
     let rd = ResumeData {
         vable_array: Vec::new(),
         vref_array: Vec::new(),
@@ -74,9 +76,7 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
             ],
         }],
         virtuals: vec![VirtualInfo::VirtualObj {
-            descr: Some(std::sync::Arc::new(majit_ir::descr::SimpleSizeDescr::new(
-                3, 0, 0,
-            ))),
+            descr: Some(expected_descr.clone()),
             type_id: 1,
             known_class: None,
             fields: vec![
@@ -122,7 +122,13 @@ fn resume_py_public_roundtrip_recovers_virtualized_state() {
             fields,
         } => {
             assert_eq!(*type_id, 1);
-            assert_eq!(descr.as_ref().map(|d| d.index()), Some(3));
+            // `history.py:125 id(descr)` parity — Arc identity, not just
+            // a numeric `index()` (which can collide if reconstruction
+            // fabricates a different descr with the same index).
+            assert!(matches!(
+                descr.as_ref(),
+                Some(actual) if std::sync::Arc::ptr_eq(actual, &expected_descr)
+            ));
             assert_eq!(
                 fields,
                 &vec![
