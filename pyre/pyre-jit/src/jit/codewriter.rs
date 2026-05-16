@@ -832,6 +832,12 @@ fn append_exit_tagged(
     link.borrow_mut().prevblock = Some(block.downgrade());
     block.borrow_mut().exits.push(link.clone());
     if std::env::var_os("PYRE_PHASE3_APPEND_EXIT_DIAG").is_some() {
+        let target_addr = link
+            .borrow()
+            .target
+            .as_ref()
+            .map(|t| format!("{:p}", &*t.borrow() as *const _))
+            .unwrap_or_else(|| "<none>".to_string());
         let b = block.borrow();
         let exits_summary: Vec<String> = b
             .exits
@@ -842,9 +848,10 @@ fn append_exit_tagged(
             })
             .collect();
         eprintln!(
-            "[phase3-append-exit] tag={tag} block_addr={:p} ops={} exits_now={} \
-             exitswitch={:?} shape={:?}",
+            "[phase3-append-exit] tag={tag} block_addr={:p} → target_addr={} \
+             ops={} exits_now={} exitswitch={:?} shape={:?}",
             &*b as *const _,
+            target_addr,
             b.operations.len(),
             b.exits.len(),
             b.exitswitch,
@@ -3978,7 +3985,25 @@ impl CodeWriter {
                     // `pendingblocks` (mergeblock-path queuing is
                     // already done by mergeblock itself; joinpoint
                     // match doesn't push automatically).
-                    if target != current_block && !pendingblocks.iter().any(|b| b == &target) {
+                    //
+                    // Gate the re-push on `target.exits.is_empty()`
+                    // matching upstream `flowcontext.py:407-475
+                    // record_block`: a block is added to pendingblocks
+                    // **exactly once** (initial seed + supersede), and
+                    // once popped + walked the walker iterates per-PC
+                    // until a terminator closes the block.  Pyre's
+                    // emit_mark_label_pc! joinpoint-arrival arm can
+                    // hit the same block again via a later sequential
+                    // PC iteration; re-pushing a block that's already
+                    // been fully walked (exits non-empty) would cause
+                    // the outer while-let to pop and re-walk it,
+                    // emitting RETURN_VALUE / ref_return etc. a second
+                    // time and appending a duplicate return link.
+                    // Empty exits == not yet processed → push.
+                    if target != current_block
+                        && !pendingblocks.iter().any(|b| b == &target)
+                        && target.block().borrow().exits.is_empty()
+                    {
                         pendingblocks.push_front(target.clone());
                     }
                     target
