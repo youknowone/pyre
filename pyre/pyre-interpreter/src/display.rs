@@ -1,6 +1,5 @@
 use std::fmt;
 
-use pyre_object::excobject::EXCEPTION_TYPE;
 use pyre_object::pyobject::{
     BOOL_TYPE, ELLIPSIS_TYPE, FLOAT_TYPE, INSTANCE_TYPE, INT_TYPE, LONG_TYPE, MODULE_TYPE,
     NONE_TYPE, PyObjectRef, PyType, STR_TYPE, TYPE_TYPE,
@@ -230,7 +229,7 @@ pub unsafe fn py_repr(obj: PyObjectRef) -> String {
             // FunctionWithFixedCode inherits this and reports as <function>.
             let name = function_get_name(obj);
             format!("<function {name}>")
-        } else if std::ptr::eq(tp, &EXCEPTION_TYPE as *const PyType) {
+        } else if unsafe { pyre_object::is_exception(obj) } {
             // `pypy/module/exceptions/interp_exceptions.py:135-147
             // W_BaseException.descr_repr` →
             //   lgt = len(self.args_w)
@@ -396,7 +395,7 @@ pub unsafe fn py_str(obj: PyObjectRef) -> String {
         // mutations are reflected by subsequent `str(e)` reads.  Pyre
         // previously returned the constructor-time `message` snapshot,
         // which split repr/str apart after the user mutated args.
-        if std::ptr::eq(tp, &EXCEPTION_TYPE as *const PyType) {
+        if unsafe { pyre_object::is_exception(obj) } {
             let args = pyre_object::excobject::w_exception_get_args(obj);
             if args.is_null() {
                 return String::new();

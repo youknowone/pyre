@@ -4,6 +4,7 @@
 //! Concrete types (W_IntObject, W_BoolObject, etc.) embed this header as their
 //! first field, enabling safe pointer casts between `*mut PyObject` and typed pointers.
 
+use std::sync::OnceLock;
 use std::sync::atomic::{AtomicI64, AtomicPtr, Ordering};
 
 /// Type descriptor for Python objects — corresponds to RPython's OBJECT_VTABLE
@@ -237,6 +238,82 @@ pub fn assign_subclass_range(tp: &PyType, min: i64, max: i64) {
     tp.subclassrange_max.store(max, Ordering::Relaxed);
 }
 
+/// Compute preorder subclass IDs for every PyType reachable from
+/// `INSTANCE_TYPE` through the supplied `(subtype, parent)` pairs and
+/// write them via `assign_subclass_range`. Mirrors
+/// `assign_inheritance_ids` (`normalizecalls.py:373-389`) — root gets
+/// `id=1`, then recursive preorder visit advances the counter so
+/// `int_between(parent.min, child.min, parent.max)` holds iff `child`
+/// is in `parent`'s subtree.
+///
+/// Pyre's interpreter-only paths (tests + `run_exec_frame`) skip the
+/// JIT init that normally seeds ranges via `gc.subclass_range`, so
+/// without this helper `ll_isinstance(obj, &EXCEPTION_TYPE)` returns
+/// false (every range stays at the static `0` default). Callers must
+/// invoke this once at startup before any `is_exception` /
+/// `ll_isinstance` call (typically from `init_typeobjects` on the
+/// interpreter side; JIT init then overwrites with identical values
+/// computed from the GC vtable side, which is harmless).
+pub fn compute_subclass_ranges_from(
+    pairs_chains: &[&[(&'static PyType, &'static PyType)]],
+    roots: &[&'static PyType],
+) {
+    // Cumulative pair list — preserves declared order so the resulting
+    // preorder traversal is deterministic.
+    let mut pairs: Vec<(&'static PyType, &'static PyType)> = Vec::new();
+    for chain in pairs_chains {
+        pairs.extend_from_slice(chain);
+    }
+    let mut counter: i64 = 1;
+    for root in roots {
+        visit_preorder(root, &pairs, &mut counter);
+    }
+}
+
+/// Lazy first-caller-wins gate around `compute_subclass_ranges_from`.
+/// Pyre's interpreter-side `init_typeobjects` calls
+/// `compute_subclass_ranges_from(&[object_pairs, interp_pairs], …)`
+/// directly so cross-crate types (e.g. `CODE_TYPE`,
+/// `PYTRACEBACK_TYPE`) get IDs; pyre-object's own tests instead reach
+/// `is_exception` without ever calling `init_typeobjects`, so this
+/// `OnceLock` triggers a fallback init with the object-only pair list
+/// the first time `is_exception` (or any caller that needs it) runs.
+/// After either init runs, subsequent calls are no-ops. JIT init's
+/// later GC-driven `assign_subclass_range` overwrites with identical
+/// values for the object subtree (harmless redundancy).
+static SUBCLASS_RANGES_INIT: OnceLock<()> = OnceLock::new();
+
+pub fn ensure_object_subclass_ranges_initialized() {
+    SUBCLASS_RANGES_INIT.get_or_init(|| {
+        compute_subclass_ranges_from(&[all_foreign_pytypes()], &[&INSTANCE_TYPE]);
+    });
+}
+
+/// Marker called by full-init paths (interpreter `init_typeobjects`,
+/// JIT init) after they've populated subclass ranges across the
+/// complete pair set, so the lazy `ensure_object_subclass_ranges_
+/// initialized` no-ops on subsequent calls instead of overwriting
+/// with the object-only subset.
+pub fn mark_subclass_ranges_initialized() {
+    let _ = SUBCLASS_RANGES_INIT.set(());
+}
+
+fn visit_preorder(
+    node: &'static PyType,
+    pairs: &[(&'static PyType, &'static PyType)],
+    counter: &mut i64,
+) {
+    let min = *counter;
+    *counter += 1;
+    let node_ptr = node as *const PyType;
+    for (subtype, parent) in pairs {
+        if std::ptr::eq(*parent as *const PyType, node_ptr) {
+            visit_preorder(subtype, pairs, counter);
+        }
+    }
+    assign_subclass_range(node, min, *counter);
+}
+
 /// Every built-in `PyType` static that represents a full `PyObject`
 /// subtype (i.e. instances carry `ob_type` at offset 0, matching
 /// `rclass.OBJECT` layout), paired with its parent class.
@@ -286,7 +363,113 @@ pub fn all_foreign_pytypes() -> &'static [(&'static PyType, &'static PyType)] {
         (&crate::propertyobject::PROPERTY_TYPE, &INSTANCE_TYPE),
         (&crate::propertyobject::STATICMETHOD_TYPE, &INSTANCE_TYPE),
         (&crate::propertyobject::CLASSMETHOD_TYPE, &INSTANCE_TYPE),
+        // Exception hierarchy: per-kind PyType statics chain to
+        // `EXCEPTION_TYPE` (the BaseException root) so backend
+        // `GuardClass` at `OB_TYPE_OFFSET` discriminates subclasses.
+        // Order is topological — parent must register before child for
+        // the `all_foreign_pytypes` loop in `pyre-jit/src/eval.rs` that
+        // looks up `parent_tid` via `pytype_to_tid`.
         (&crate::excobject::EXCEPTION_TYPE, &INSTANCE_TYPE),
+        (
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+            &crate::excobject::EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_ARITHMETIC_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_OVERFLOW_ERROR_TYPE,
+            &crate::excobject::EXC_ARITHMETIC_ERROR_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_ZERO_DIVISION_ERROR_TYPE,
+            &crate::excobject::EXC_ARITHMETIC_ERROR_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_TYPE_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_VALUE_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_UNICODE_DECODE_ERROR_TYPE,
+            &crate::excobject::EXC_VALUE_ERROR_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_UNICODE_ENCODE_ERROR_TYPE,
+            &crate::excobject::EXC_VALUE_ERROR_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_NAME_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_INDEX_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_KEY_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_ATTRIBUTE_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_RUNTIME_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_NOT_IMPLEMENTED_ERROR_TYPE,
+            &crate::excobject::EXC_RUNTIME_ERROR_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_RECURSION_ERROR_TYPE,
+            &crate::excobject::EXC_RUNTIME_ERROR_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_STOP_ITERATION_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_IMPORT_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_ASSERTION_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_REFERENCE_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_OS_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_FILE_NOT_FOUND_ERROR_TYPE,
+            &crate::excobject::EXC_OS_ERROR_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_MEMORY_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_SYSTEM_ERROR_TYPE,
+            &crate::excobject::EXC_EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_GENERATOR_EXIT_TYPE,
+            &crate::excobject::EXCEPTION_TYPE,
+        ),
+        (
+            &crate::excobject::EXC_SYSTEM_EXIT_TYPE,
+            &crate::excobject::EXCEPTION_TYPE,
+        ),
         (&crate::sliceobject::SLICE_TYPE, &INSTANCE_TYPE),
         (&crate::setobject::SET_TYPE, &INSTANCE_TYPE),
         (&crate::setobject::FROZENSET_TYPE, &INSTANCE_TYPE),

@@ -902,15 +902,56 @@ thread_local! {
             pyre_object::excobject::W_EXCEPTION_GC_PTR_OFFSETS.to_vec(),
         ));
         debug_assert_eq!(w_exception_tid, W_EXCEPTION_GC_TYPE_ID);
-        majit_gc::GcAllocator::register_vtable_for_type(
-            &mut gc,
-            &pyre_object::excobject::EXCEPTION_TYPE as *const _ as usize,
-            w_exception_tid,
-        );
-        pytype_to_tid.insert(
-            &pyre_object::excobject::EXCEPTION_TYPE as *const _ as usize,
-            w_exception_tid,
-        );
+        // Pre-register every per-ExcKind PyType to the same
+        // `W_ExceptionObject` GC tid — they share one storage layout
+        // (the per-kind discriminator lives in `ob_type`, payload is
+        // identical) so the GC must size them identically.  The
+        // `all_foreign_pytypes` loop below skips entries already in
+        // `pytype_to_tid`, so this pre-registration wins over its
+        // generic `object_subclass(sizeof(PyObject), parent_tid)`
+        // default which would underallocate `W_ExceptionObject`.
+        for kind_idx in 0u8..=(pyre_object::excobject::ExcKind::SystemError as u8) {
+            // Round-trip the byte through the enum so we don't depend
+            // on unsafe transmute; every value in [0, SystemError] is
+            // a valid `ExcKind` variant by construction.
+            let kind = match kind_idx {
+                0 => pyre_object::excobject::ExcKind::BaseException,
+                1 => pyre_object::excobject::ExcKind::Exception,
+                2 => pyre_object::excobject::ExcKind::TypeError,
+                3 => pyre_object::excobject::ExcKind::ValueError,
+                4 => pyre_object::excobject::ExcKind::ZeroDivisionError,
+                5 => pyre_object::excobject::ExcKind::NameError,
+                6 => pyre_object::excobject::ExcKind::IndexError,
+                7 => pyre_object::excobject::ExcKind::KeyError,
+                8 => pyre_object::excobject::ExcKind::AttributeError,
+                9 => pyre_object::excobject::ExcKind::RuntimeError,
+                10 => pyre_object::excobject::ExcKind::StopIteration,
+                11 => pyre_object::excobject::ExcKind::OverflowError,
+                12 => pyre_object::excobject::ExcKind::ArithmeticError,
+                13 => pyre_object::excobject::ExcKind::ImportError,
+                14 => pyre_object::excobject::ExcKind::NotImplementedError,
+                15 => pyre_object::excobject::ExcKind::AssertionError,
+                16 => pyre_object::excobject::ExcKind::ReferenceError,
+                17 => pyre_object::excobject::ExcKind::GeneratorExit,
+                18 => pyre_object::excobject::ExcKind::RecursionError,
+                19 => pyre_object::excobject::ExcKind::OSError,
+                20 => pyre_object::excobject::ExcKind::FileNotFoundError,
+                21 => pyre_object::excobject::ExcKind::UnicodeDecodeError,
+                22 => pyre_object::excobject::ExcKind::UnicodeEncodeError,
+                23 => pyre_object::excobject::ExcKind::SystemExit,
+                24 => pyre_object::excobject::ExcKind::MemoryError,
+                25 => pyre_object::excobject::ExcKind::SystemError,
+                _ => unreachable!(),
+            };
+            let pytype_ptr = pyre_object::excobject::exc_kind_to_pytype(kind)
+                as *const _ as usize;
+            majit_gc::GcAllocator::register_vtable_for_type(
+                &mut gc,
+                pytype_ptr,
+                w_exception_tid,
+            );
+            pytype_to_tid.insert(pytype_ptr, w_exception_tid);
+        }
         // W_GeneratorObject carries `frame_ptr: *mut u8` (opaque
         // PyFrame pointer, owned by the generator) plus three bools.
         // No direct `PyObjectRef` fields; the suspended frame's

@@ -1,12 +1,85 @@
 //! W_ExceptionObject — Python exception instance.
 //!
-//! Each exception carries a `kind` tag (mapping to PyErrorKind) and
-//! a message string. The `ob_type` pointer is `EXCEPTION_TYPE` for all
-//! exception instances; the `kind` field distinguishes the actual type.
+//! Each exception carries a `kind` tag (mapping to PyErrorKind) and a
+//! message string. `ob_type` is the per-subclass `PyType` static
+//! (`EXC_VALUE_ERROR_TYPE`, `EXC_TYPE_ERROR_TYPE`, …) registered with
+//! the appropriate parent in `all_foreign_pytypes`, so backend
+//! `GuardClass` at `OB_TYPE_OFFSET` discriminates exception
+//! subclasses without any IR/backend change — matching RPython
+//! `OBJECT.typeptr = specific class` (`rclass.py:167-174`).
+//! `EXCEPTION_TYPE` is the BaseException root that every per-kind
+//! `PyType` chains up to; `is_exception` is an `ll_isinstance` against
+//! it via the assigned `subclassrange_{min,max}`.
 
 use crate::pyobject::*;
 
-pub static EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("exception");
+pub static EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("BaseException");
+pub static EXC_EXCEPTION_TYPE: PyType = crate::pyobject::new_pytype("Exception");
+pub static EXC_ARITHMETIC_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ArithmeticError");
+pub static EXC_OVERFLOW_ERROR_TYPE: PyType = crate::pyobject::new_pytype("OverflowError");
+pub static EXC_ZERO_DIVISION_ERROR_TYPE: PyType =
+    crate::pyobject::new_pytype("ZeroDivisionError");
+pub static EXC_TYPE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("TypeError");
+pub static EXC_VALUE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ValueError");
+pub static EXC_NAME_ERROR_TYPE: PyType = crate::pyobject::new_pytype("NameError");
+pub static EXC_INDEX_ERROR_TYPE: PyType = crate::pyobject::new_pytype("IndexError");
+pub static EXC_KEY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("KeyError");
+pub static EXC_ATTRIBUTE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("AttributeError");
+pub static EXC_RUNTIME_ERROR_TYPE: PyType = crate::pyobject::new_pytype("RuntimeError");
+pub static EXC_STOP_ITERATION_TYPE: PyType = crate::pyobject::new_pytype("StopIteration");
+pub static EXC_IMPORT_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ImportError");
+pub static EXC_NOT_IMPLEMENTED_ERROR_TYPE: PyType =
+    crate::pyobject::new_pytype("NotImplementedError");
+pub static EXC_ASSERTION_ERROR_TYPE: PyType = crate::pyobject::new_pytype("AssertionError");
+pub static EXC_REFERENCE_ERROR_TYPE: PyType = crate::pyobject::new_pytype("ReferenceError");
+pub static EXC_GENERATOR_EXIT_TYPE: PyType = crate::pyobject::new_pytype("GeneratorExit");
+pub static EXC_RECURSION_ERROR_TYPE: PyType = crate::pyobject::new_pytype("RecursionError");
+pub static EXC_OS_ERROR_TYPE: PyType = crate::pyobject::new_pytype("OSError");
+pub static EXC_FILE_NOT_FOUND_ERROR_TYPE: PyType =
+    crate::pyobject::new_pytype("FileNotFoundError");
+pub static EXC_UNICODE_DECODE_ERROR_TYPE: PyType =
+    crate::pyobject::new_pytype("UnicodeDecodeError");
+pub static EXC_UNICODE_ENCODE_ERROR_TYPE: PyType =
+    crate::pyobject::new_pytype("UnicodeEncodeError");
+pub static EXC_SYSTEM_EXIT_TYPE: PyType = crate::pyobject::new_pytype("SystemExit");
+pub static EXC_MEMORY_ERROR_TYPE: PyType = crate::pyobject::new_pytype("MemoryError");
+pub static EXC_SYSTEM_ERROR_TYPE: PyType = crate::pyobject::new_pytype("SystemError");
+
+/// Per-`ExcKind` `ob_type` resolver. `w_exception_new` writes the
+/// returned pointer into the allocated `W_ExceptionObject` so the
+/// backend's `GuardClass` at `OB_TYPE_OFFSET` matches the actual
+/// subclass.
+#[inline]
+pub fn exc_kind_to_pytype(kind: ExcKind) -> &'static PyType {
+    match kind {
+        ExcKind::BaseException => &EXCEPTION_TYPE,
+        ExcKind::Exception => &EXC_EXCEPTION_TYPE,
+        ExcKind::ArithmeticError => &EXC_ARITHMETIC_ERROR_TYPE,
+        ExcKind::OverflowError => &EXC_OVERFLOW_ERROR_TYPE,
+        ExcKind::ZeroDivisionError => &EXC_ZERO_DIVISION_ERROR_TYPE,
+        ExcKind::TypeError => &EXC_TYPE_ERROR_TYPE,
+        ExcKind::ValueError => &EXC_VALUE_ERROR_TYPE,
+        ExcKind::NameError => &EXC_NAME_ERROR_TYPE,
+        ExcKind::IndexError => &EXC_INDEX_ERROR_TYPE,
+        ExcKind::KeyError => &EXC_KEY_ERROR_TYPE,
+        ExcKind::AttributeError => &EXC_ATTRIBUTE_ERROR_TYPE,
+        ExcKind::RuntimeError => &EXC_RUNTIME_ERROR_TYPE,
+        ExcKind::StopIteration => &EXC_STOP_ITERATION_TYPE,
+        ExcKind::ImportError => &EXC_IMPORT_ERROR_TYPE,
+        ExcKind::NotImplementedError => &EXC_NOT_IMPLEMENTED_ERROR_TYPE,
+        ExcKind::AssertionError => &EXC_ASSERTION_ERROR_TYPE,
+        ExcKind::ReferenceError => &EXC_REFERENCE_ERROR_TYPE,
+        ExcKind::GeneratorExit => &EXC_GENERATOR_EXIT_TYPE,
+        ExcKind::RecursionError => &EXC_RECURSION_ERROR_TYPE,
+        ExcKind::OSError => &EXC_OS_ERROR_TYPE,
+        ExcKind::FileNotFoundError => &EXC_FILE_NOT_FOUND_ERROR_TYPE,
+        ExcKind::UnicodeDecodeError => &EXC_UNICODE_DECODE_ERROR_TYPE,
+        ExcKind::UnicodeEncodeError => &EXC_UNICODE_ENCODE_ERROR_TYPE,
+        ExcKind::SystemExit => &EXC_SYSTEM_EXIT_TYPE,
+        ExcKind::MemoryError => &EXC_MEMORY_ERROR_TYPE,
+        ExcKind::SystemError => &EXC_SYSTEM_ERROR_TYPE,
+    }
+}
 
 /// Numeric tags for exception kinds — must stay in sync with PyErrorKind.
 #[repr(u8)]
@@ -157,7 +230,7 @@ pub fn w_exception_new(kind: ExcKind, message: &str) -> PyObjectRef {
     };
     crate::lltype::malloc_typed(W_ExceptionObject {
         ob_header: PyObject {
-            ob_type: &EXCEPTION_TYPE as *const PyType,
+            ob_type: exc_kind_to_pytype(kind) as *const PyType,
             w_class,
         },
         kind,
@@ -420,11 +493,18 @@ pub fn standard_exc_instance(kind: ExcKind) -> PyObjectRef {
 
 /// Check if an object is an exception instance.
 ///
+/// Uses `ll_isinstance` against the `BaseException` root
+/// (`EXCEPTION_TYPE`); every per-kind exception `PyType` is registered
+/// as a descendant via `all_foreign_pytypes`, so the
+/// `subclassrange_{min,max}` check (`rclass.py:1133-1137`) matches
+/// every subclass without pointer-identity coupling.
+///
 /// # Safety
 /// `obj` must be a valid, non-null pointer to a `PyObject`.
 #[inline]
 pub unsafe fn is_exception(obj: PyObjectRef) -> bool {
-    unsafe { py_type_check(obj, &EXCEPTION_TYPE) }
+    crate::pyobject::ensure_object_subclass_ranges_initialized();
+    unsafe { ll_isinstance(obj, &EXCEPTION_TYPE) }
 }
 
 /// Get the exception kind tag.

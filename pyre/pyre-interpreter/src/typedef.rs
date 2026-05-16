@@ -216,6 +216,23 @@ pub fn r#type(obj: PyObjectRef) -> Option<PyObjectRef> {
 /// Must be called before any getattr on builtin objects.
 pub fn init_typeobjects() {
     TYPEOBJECT_CACHE.get_or_init(|| {
+        // Seed preorder `subclassrange_{min,max}` on every PyType
+        // reachable from `INSTANCE_TYPE` so `ll_isinstance` works on
+        // the interpreter-only test path that skips the JIT init.
+        // JIT init re-computes these via `gc.subclass_range` and
+        // overwrites with identical values (idempotent).  Calling
+        // `mark_subclass_ranges_initialized` afterwards stops the
+        // pyre-object-internal `is_exception` fallback from
+        // overwriting with the object-only subset (which would lose
+        // the cross-crate `CODE_TYPE` / `PYTRACEBACK_TYPE` ranges).
+        pyre_object::pyobject::compute_subclass_ranges_from(
+            &[
+                pyre_object::pyobject::all_foreign_pytypes(),
+                crate::all_foreign_pytypes(),
+            ],
+            &[&pyre_object::INSTANCE_TYPE],
+        );
+        pyre_object::pyobject::mark_subclass_ranges_initialized();
         let mut reg: HashMap<usize, usize> = HashMap::new();
 
         // 'object' first — PyPy: objectobject.py W_ObjectObject.typedef
