@@ -1325,12 +1325,14 @@ fn fresh_ref_value(graph: &mut super::flow::FunctionGraph) -> super::flow::FlowV
 }
 
 fn null_stack_sentinel() -> super::flow::FlowValue {
-    // CPython's PUSH_NULL / LOAD_GLOBAL(push_null) stack marker is a
-    // frontend-only calling-convention sentinel, not a user-visible
-    // Python object and not an RPython flow-graph value.  Keep it out of
-    // graph operations and use it only to preserve the shadow stack's
-    // arity until CALL discards the slot.
-    super::flow::Constant::opaque("push_null", Some(Kind::Ref)).into()
+    // CPython's PUSH_NULL / LOAD_GLOBAL(push_null) stack marker.  The
+    // runtime side emits `PY_NULL = 0` via `emit_pushvalue_ref_const!`;
+    // the symbolic side carries a `Constant(None, Ref)` so any graph
+    // SpaceOp that observes the sentinel (e.g. CALL after a
+    // LOAD_ATTR(method) push when the walker can't statically prove
+    // the slot is unused) lowers cleanly via `flatten_constant_operand`
+    // (`(None, Ref) → ConstRef(0)`) without an `Opaque` detour.
+    super::flow::Constant::none().into()
 }
 
 fn duplicate_shadow_tos(
@@ -8907,7 +8909,7 @@ mod tests {
     }
 
     #[test]
-    fn null_stack_sentinel_is_opaque_ref_constant() {
+    fn null_stack_sentinel_is_none_ref_constant() {
         let value = null_stack_sentinel();
         let FlowValue::Constant(constant) = value else {
             panic!("null stack sentinel must be a Constant");
@@ -8915,7 +8917,7 @@ mod tests {
         assert_eq!(constant.kind, Some(Kind::Ref));
         assert!(matches!(
             constant.value,
-            crate::jit::flow::ConstantValue::Opaque(_)
+            crate::jit::flow::ConstantValue::None
         ));
     }
 

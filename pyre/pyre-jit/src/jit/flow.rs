@@ -303,7 +303,12 @@ impl Constant {
     }
 
     pub fn string(value: impl Into<String>) -> Self {
-        Self::new(ConstantValue::Str(value.into()), None)
+        // RPython's rtyper specializes Python string constants to
+        // `lltype.Ptr(STR)` pointers (Kind::Ref).  Pyre carries the
+        // same post-rtype shape so the canonical `flatten_graph` lowers
+        // string operands through the `(Str, Ref)` arm of
+        // `flatten_constant_operand`.
+        Self::new(ConstantValue::Str(value.into()), Some(Kind::Ref))
     }
 
     pub fn atom(value: Atom) -> Self {

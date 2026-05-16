@@ -2327,6 +2327,18 @@ fn flatten_constant_operand(constant: &super::flow::Constant) -> Operand {
         // sites resolve through the closure-based
         // `flatten_graph_with_lowering` path used today).
         (ConstantValue::Signed(value), Some(Kind::Ref)) => Operand::ConstRef(*value),
+        // Pre-rtype Python string constant.  Upstream RPython's
+        // `rtyper:specialize` substep interns the string into the static
+        // data section and rewrites the Constant to a
+        // `(Signed(addr), Kind::Ref)` post-rtype shape.  Pyre lacks the
+        // rtyper today, so the lowered Insn carries a placeholder
+        // `ConstRef(0)`.  Production callers route LOAD_ATTR /
+        // STORE_ATTR through `emit_abort_permanent!` (codewriter.rs
+        // ~6735, ~6756), so the placeholder is never executed.  When
+        // pyre's string-intern infrastructure lands and LOAD_ATTR
+        // production-flips, swap this arm for `Operand::ConstRef
+        // (intern_pool.resolve(s) as i64)`.
+        (ConstantValue::Str(_), Some(Kind::Ref)) => Operand::ConstRef(0),
         (ConstantValue::Opaque(_), Some(Kind::Ref)) => {
             panic!(
                 "GraphFlattener: opaque ref constants must be resolved \
