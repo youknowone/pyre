@@ -200,13 +200,13 @@ impl Node {
 pub struct DependencyGraph {
     pub nodes: Vec<Node>,
     /// dependency.py:567: memory_refs — node index → MemoryRef
-    pub memory_refs: HashMap<usize, MemoryRef>,
+    pub memory_refs: crate::optimizeopt::vec_assoc::VecAssoc<usize, MemoryRef>,
     /// dependency.py:569: index_vars — OpRef → IndexVar
-    pub index_vars: HashMap<OpRef, IndexVar>,
+    pub index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
     /// dependency.py:571: guards — guard node indices
     pub guards: Vec<usize>,
     /// dependency.py:565: invariant_vars — loop-invariant variables
-    pub invariant_vars: HashMap<OpRef, ()>,
+    pub invariant_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, ()>,
 }
 
 impl DependencyGraph {
@@ -221,10 +221,10 @@ impl DependencyGraph {
 
         let mut graph = DependencyGraph {
             nodes,
-            memory_refs: HashMap::new(),
-            index_vars: HashMap::new(),
+            memory_refs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            index_vars: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             guards: Vec::new(),
-            invariant_vars: HashMap::new(),
+            invariant_vars: crate::optimizeopt::vec_assoc::VecAssoc::new(),
         };
 
         graph.build_dependencies(ops, constant_of);
@@ -550,15 +550,17 @@ impl DependencyGraph {
         let mut used: HashSet<usize> = HashSet::new();
 
         // Group by opcode
-        let mut by_opcode: HashMap<OpCode, Vec<usize>> = HashMap::new();
+        let mut by_opcode: crate::optimizeopt::vec_assoc::VecAssoc<OpCode, Vec<usize>> = crate::optimizeopt::vec_assoc::VecAssoc::new();
         for (i, node) in self.nodes.iter().enumerate() {
             if node.op.opcode.to_vector().is_some() && !node.op.opcode.is_guard() {
-                by_opcode.entry(node.op.opcode).or_default().push(i);
+                by_opcode
+                    .entry_or_insert_with(node.op.opcode, Vec::new)
+                    .push(i);
             }
         }
 
         // For each opcode, find independent pairs/groups
-        for (opcode, indices) in &by_opcode {
+        for (opcode, indices) in by_opcode.iter() {
             let vec_opcode = match opcode.to_vector() {
                 Some(v) => v,
                 None => continue,
@@ -1006,7 +1008,7 @@ impl Dependency {
 /// that define it, enabling def-use chain queries.
 pub struct DefTracker {
     /// OpRef → list of (defining node index, optional memory ref cell)
-    pub defs: HashMap<OpRef, Vec<(usize, Option<usize>)>>,
+    pub defs: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, Vec<(usize, Option<usize>)>>,
     /// Nodes with side effects (non-pure).
     pub non_pure: Vec<usize>,
 }
@@ -1014,7 +1016,7 @@ pub struct DefTracker {
 impl DefTracker {
     pub fn new(_graph: &DependencyGraph) -> Self {
         DefTracker {
-            defs: HashMap::new(),
+            defs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             non_pure: Vec::new(),
         }
     }
@@ -1031,8 +1033,7 @@ impl DefTracker {
             return;
         }
         self.defs
-            .entry(arg)
-            .or_insert_with(Vec::new)
+            .entry_or_insert_with(arg, Vec::new)
             .push((node_idx, None));
     }
 
@@ -1078,9 +1079,9 @@ impl DefTracker {
 /// combinations, and recognizes array access patterns for MemoryRef.
 pub struct IntegralForwardModification<'a> {
     /// OpRef → IndexVar mapping
-    pub index_vars: HashMap<OpRef, IndexVar>,
+    pub index_vars: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, IndexVar>,
     /// Node index → MemoryRef mapping
-    pub memory_refs: HashMap<usize, MemoryRef>,
+    pub memory_refs: crate::optimizeopt::vec_assoc::VecAssoc<usize, MemoryRef>,
     /// Callback to resolve constant OpRef → i64 value.
     /// dependency.py:885-888: is_const_integral + box.getint()
     constant_of: &'a dyn Fn(OpRef) -> Option<i64>,
@@ -1089,8 +1090,8 @@ pub struct IntegralForwardModification<'a> {
 impl<'a> IntegralForwardModification<'a> {
     pub fn new(constant_of: &'a dyn Fn(OpRef) -> Option<i64>) -> Self {
         IntegralForwardModification {
-            index_vars: HashMap::new(),
-            memory_refs: HashMap::new(),
+            index_vars: crate::optimizeopt::vec_assoc::VecAssoc::new(),
+            memory_refs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             constant_of,
         }
     }
