@@ -492,6 +492,11 @@ mod tests {
         // v1 = ConstInt(42)
         // v2 = BinOp(v0, v1)
         // Return v2
+        let regallocs: HashMap<RegKind, RegAllocResult> = HashMap::new();
+        let mut graph = crate::model::FunctionGraph::new("liveness_basic_fixture");
+        graph.set_next_value(3);
+        let lhs_var = graph.must_variable(ValueId(0));
+        let rhs_var = graph.must_variable(ValueId(1));
         let mut flat = SSARepr {
             name: "test".into(),
             insns: vec![
@@ -511,8 +516,8 @@ mod tests {
                     result: Some(ValueId(2)),
                     kind: OpKind::BinOp {
                         op: "add".into(),
-                        lhs: ValueId(0),
-                        rhs: ValueId(1),
+                        lhs: lhs_var,
+                        rhs: rhs_var,
                         result_ty: ValueType::Int,
                     },
                 }),
@@ -529,9 +534,6 @@ mod tests {
         // project each operand `ValueId` through its backing
         // `Variable.concretetype` — supply a fresh FunctionGraph that
         // covers ValueId(0..=2).
-        let regallocs: HashMap<RegKind, RegAllocResult> = HashMap::new();
-        let mut graph = crate::model::FunctionGraph::new("liveness_basic_fixture");
-        graph.set_next_value(3);
         compute_liveness(&mut flat, &regallocs, &graph);
     }
 

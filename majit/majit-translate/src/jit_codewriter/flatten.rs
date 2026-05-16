@@ -941,7 +941,15 @@ impl<'a> GraphFlattener<'a> {
         target: Label,
     ) -> Option<FlatOp> {
         let (name, lhs_vid, rhs_vid) = match kind {
-            crate::model::OpKind::BinOp { op, lhs, rhs, .. } => (op.as_str(), *lhs, *rhs),
+            crate::model::OpKind::BinOp { op, lhs, rhs, .. } => (
+                op.as_str(),
+                self.graph
+                    .value_id_of(lhs)
+                    .expect("BinOp.lhs must have a backing ValueId"),
+                self.graph
+                    .value_id_of(rhs)
+                    .expect("BinOp.rhs must have a backing ValueId"),
+            ),
             _ => return None,
         };
         let opcode = match name {
@@ -1923,13 +1931,15 @@ mod tests {
             )
             .unwrap();
         let value = graph.push_op(entry, OpKind::ConstInt(42), true).unwrap();
+        let input_var = graph.must_variable(input);
+        let value_var = graph.must_variable(value);
         let sum = graph
             .push_op(
                 entry,
                 OpKind::BinOp {
                     op: "add".into(),
-                    lhs: input,
-                    rhs: value,
+                    lhs: input_var,
+                    rhs: value_var,
                     result_ty: crate::model::ValueType::Int,
                 },
                 true,
@@ -2149,13 +2159,15 @@ mod tests {
         let lhs = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
         let rhs = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
         graph.push_op(entry, OpKind::Live, false);
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let sum = graph
             .push_op(
                 entry,
                 OpKind::BinOp {
                     op: "add_ovf".into(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: crate::model::ValueType::Int,
                 },
                 true,
@@ -2225,13 +2237,15 @@ mod tests {
         let lhs = graph.push_op(entry, OpKind::ConstInt(7), true).unwrap();
         let rhs = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
         graph.push_op(entry, OpKind::Live, false);
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let sum = graph
             .push_op(
                 entry,
                 OpKind::BinOp {
                     op: "add_ovf".into(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: crate::model::ValueType::Int,
                 },
                 true,

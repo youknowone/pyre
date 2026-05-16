@@ -4526,12 +4526,13 @@ fn lower_expr(
                         let result_ty = graph_value_type(graph, operand)
                             .filter(|ty| matches!(ty, ValueType::Int | ValueType::Ref))
                             .unwrap_or(ValueType::Int);
+                        let operand_var = graph.must_variable(operand);
                         return Ok(Lowered {
                             value: graph.push_op(
                                 *block,
                                 OpKind::UnaryOp {
                                     op: "invert".into(),
-                                    operand,
+                                    operand: operand_var,
                                     result_ty,
                                 },
                                 true,
@@ -4561,12 +4562,13 @@ fn lower_expr(
                     }
                 }
                 let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+                let operand_var = graph.must_variable(operand);
                 let cond = graph
                     .push_op(
                         *block,
                         OpKind::UnaryOp {
                             op: "bool".into(),
-                            operand,
+                            operand: operand_var,
                             result_ty: ValueType::Bool,
                         },
                         true,
@@ -4636,12 +4638,13 @@ fn lower_expr(
                 });
             }
             let operand = get_value!(lower_expr(graph, block, &u.expr, options, ctx)?);
+            let operand_var = graph.must_variable(operand);
             Ok(Lowered {
                 value: graph.push_op(
                     *block,
                     OpKind::UnaryOp {
                         op: unary_op_name(&u.op).into(),
-                        operand,
+                        operand: operand_var,
                         result_ty: ValueType::Unknown,
                     },
                     true,
@@ -4686,12 +4689,13 @@ fn lower_expr(
                 let is_and = matches!(bin.op, syn::BinOp::And(_));
 
                 let lhs_raw = get_value!(lower_expr(graph, block, &bin.left, options, ctx)?);
+                let lhs_raw_var = graph.must_variable(lhs_raw);
                 let cond = graph
                     .push_op(
                         *block,
                         OpKind::UnaryOp {
                             op: "bool".into(),
-                            operand: lhs_raw,
+                            operand: lhs_raw_var,
                             result_ty: ValueType::Bool,
                         },
                         true,
@@ -4834,12 +4838,14 @@ fn lower_expr(
             let rhs = get_value!(lower_expr(graph, block, &bin.right, options, ctx)?);
             let op_name = binary_op_name(&bin.op);
             let result_ty = binary_result_value_type(graph, lhs, rhs, op_name);
+            let lhs_var = graph.must_variable(lhs);
+            let rhs_var = graph.must_variable(rhs);
             let value = graph.push_op(
                 *block,
                 OpKind::BinOp {
                     op: op_name.into(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty,
                 },
                 true,
@@ -4909,12 +4915,13 @@ fn lower_expr(
             // so each opname routes through the rtyper directly; the
             // adapter at `flowspace_adapter.rs::normalize_unary_op_name`
             // passes them through unchanged.
+            let operand_var = graph.must_variable(operand);
             Ok(Lowered {
                 value: graph.push_op(
                     *block,
                     OpKind::UnaryOp {
                         op,
-                        operand,
+                        operand: operand_var,
                         result_ty,
                     },
                     true,
@@ -5854,12 +5861,14 @@ fn lower_expr(
                                     } else {
                                         "eq"
                                     };
+                                    let lhs_var = graph.must_variable(lhs);
+                                    let rhs_var = graph.must_variable(rhs);
                                     graph.push_op(
                                         *block,
                                         OpKind::BinOp {
                                             op: op_name.into(),
-                                            lhs,
-                                            rhs,
+                                            lhs: lhs_var,
+                                            rhs: rhs_var,
                                             result_ty: ValueType::Unknown,
                                         },
                                         true,

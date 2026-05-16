@@ -755,8 +755,8 @@ impl<'a> Transformer<'a> {
                     result: op.result,
                     kind: OpKind::BinOp {
                         op: canonical.into(),
-                        lhs: *lhs,
-                        rhs: *rhs,
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
                         result_ty: result_ty.clone(),
                     },
                 }])
@@ -812,7 +812,11 @@ impl<'a> Transformer<'a> {
                 // the original `(*operand)` entry — same outcome as
                 // upstream's explicit propagation, without keeping a
                 // redundant alias key.
-                RewriteResult::Identity(*operand)
+                RewriteResult::Identity(
+                    graph
+                        .value_id_of(operand)
+                        .expect("UnaryOp operand must have ValueId on graph"),
+                )
             }
             // RPython `jtransform.py:1592` rename pass:
             //   ('cast_bool_to_float', 'cast_int_to_float'),
@@ -832,7 +836,7 @@ impl<'a> Transformer<'a> {
                     result: op.result,
                     kind: OpKind::UnaryOp {
                         op: "cast_int_to_float".into(),
-                        operand: *operand,
+                        operand: operand.clone(),
                         result_ty: ValueType::Float,
                     },
                 }])
@@ -851,8 +855,8 @@ impl<'a> Transformer<'a> {
                 rhs,
                 result_ty,
             } if (binop_name == "eq" || binop_name == "ne")
-                && self.get_value_kind(*lhs) == 'r'
-                && self.get_value_kind(*rhs) == 'r' =>
+                && self.get_value_kind_var(graph, lhs) == 'r'
+                && self.get_value_kind_var(graph, rhs) == 'r' =>
             {
                 let new_op = if binop_name == "eq" {
                     "ptr_eq"
@@ -863,8 +867,8 @@ impl<'a> Transformer<'a> {
                     result: op.result,
                     kind: OpKind::BinOp {
                         op: new_op.into(),
-                        lhs: *lhs,
-                        rhs: *rhs,
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
                         result_ty: result_ty.clone(),
                     },
                 }])
@@ -896,10 +900,10 @@ impl<'a> Transformer<'a> {
                 rhs,
                 result_ty,
             } if canonical_float_arith_binop(binop_name).is_some()
-                && is_float_rewrite_domain(self.get_value_kind(*lhs))
-                && is_float_rewrite_domain(self.get_value_kind(*rhs))
-                && (self.get_value_kind(*lhs) == 'f'
-                    || self.get_value_kind(*rhs) == 'f'
+                && is_float_rewrite_domain(self.get_value_kind_var(graph, lhs))
+                && is_float_rewrite_domain(self.get_value_kind_var(graph, rhs))
+                && (self.get_value_kind_var(graph, lhs) == 'f'
+                    || self.get_value_kind_var(graph, rhs) == 'f'
                     || *result_ty == ValueType::Float) =>
             {
                 let canonical = match canonical_float_arith_binop(binop_name)
@@ -912,8 +916,8 @@ impl<'a> Transformer<'a> {
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
-                let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, *lhs);
-                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, *rhs);
+                let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, rhs);
                 ops.extend(rhs_ops);
                 ops.push(SpaceOperation {
                     result: op.result,
@@ -932,16 +936,16 @@ impl<'a> Transformer<'a> {
                 rhs,
                 ..
             } if matches!(binop_name.as_str(), "lt" | "le" | "gt" | "ge" | "eq" | "ne")
-                && is_float_rewrite_domain(self.get_value_kind(*lhs))
-                && is_float_rewrite_domain(self.get_value_kind(*rhs))
-                && (self.get_value_kind(*lhs) == 'f' || self.get_value_kind(*rhs) == 'f') =>
+                && is_float_rewrite_domain(self.get_value_kind_var(graph, lhs))
+                && is_float_rewrite_domain(self.get_value_kind_var(graph, rhs))
+                && (self.get_value_kind_var(graph, lhs) == 'f' || self.get_value_kind_var(graph, rhs) == 'f') =>
             {
                 self.stamp_value_kind(
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
-                let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, *lhs);
-                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, *rhs);
+                let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, rhs);
                 ops.extend(rhs_ops);
                 ops.push(SpaceOperation {
                     result: op.result,
@@ -960,22 +964,28 @@ impl<'a> Transformer<'a> {
                 rhs,
                 result_ty,
             } if canonical_float_mod_binop(binop_name).is_some()
-                && is_float_rewrite_domain(self.get_value_kind(*lhs))
-                && is_float_rewrite_domain(self.get_value_kind(*rhs))
-                && (self.get_value_kind(*lhs) == 'f'
-                    || self.get_value_kind(*rhs) == 'f'
+                && is_float_rewrite_domain(self.get_value_kind_var(graph, lhs))
+                && is_float_rewrite_domain(self.get_value_kind_var(graph, rhs))
+                && (self.get_value_kind_var(graph, lhs) == 'f'
+                    || self.get_value_kind_var(graph, rhs) == 'f'
                     || *result_ty == ValueType::Float) =>
             {
                 self.stamp_value_kind(
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
-                let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, *lhs);
-                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, *rhs);
+                let (lhs, mut ops) = self.coerce_operand_to_float_domain(graph, lhs);
+                let (rhs, rhs_ops) = self.coerce_operand_to_float_domain(graph, rhs);
                 ops.extend(rhs_ops);
                 let target = CallTarget::function_path(["ll_math_fmod"]);
                 let (funcptr, funcptr_op) = self.direct_funcptr_value(graph, &target);
                 ops.push(funcptr_op);
+                let lhs_vid = graph
+                    .value_id_of(&lhs)
+                    .expect("coerced lhs has backing ValueId");
+                let rhs_vid = graph
+                    .value_id_of(&rhs)
+                    .expect("coerced rhs has backing ValueId");
                 ops.push(SpaceOperation {
                     result: op.result,
                     kind: OpKind::CallResidual {
@@ -987,7 +997,7 @@ impl<'a> Transformer<'a> {
                         ),
                         args_i: vec![],
                         args_r: vec![],
-                        args_f: vec![lhs, rhs],
+                        args_f: vec![lhs_vid, rhs_vid],
                         result_kind: 'f',
                         indirect_targets: None,
                     },
@@ -1002,7 +1012,7 @@ impl<'a> Transformer<'a> {
                 op: unop_name,
                 operand,
                 ..
-            } if unop_name == "neg" && self.get_value_kind(*operand) == 'f' => {
+            } if unop_name == "neg" && self.get_value_kind_var(graph, operand) == 'f' => {
                 self.stamp_value_kind(
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
@@ -1011,7 +1021,7 @@ impl<'a> Transformer<'a> {
                     result: op.result,
                     kind: OpKind::UnaryOp {
                         op: "float_neg".into(),
-                        operand: *operand,
+                        operand: operand.clone(),
                         result_ty: ValueType::Float,
                     },
                 }])
@@ -1101,8 +1111,8 @@ impl<'a> Transformer<'a> {
                 rhs,
                 result_ty,
             } if matches!(binop_name.as_str(), "mod" | "floordiv" | "div")
-                && self.get_value_kind(*lhs) == 'i'
-                && self.get_value_kind(*rhs) == 'i'
+                && self.get_value_kind_var(graph, lhs) == 'i'
+                && self.get_value_kind_var(graph, rhs) == 'i'
                 && self.binop_result_is_int(op.result, result_ty) =>
             {
                 // **Rust low-level → RPython low-level.**  Pyre's
@@ -1150,8 +1160,14 @@ impl<'a> Transformer<'a> {
                 } else {
                     "floordiv"
                 };
+                let lhs_vid = graph
+                    .value_id_of(lhs)
+                    .expect("BinOp lhs has backing ValueId");
+                let rhs_vid = graph
+                    .value_id_of(rhs)
+                    .expect("BinOp rhs has backing ValueId");
                 RewriteResult::Replace(
-                    self.emit_int_mod_or_floordiv_residual(graph, helper_key, *lhs, *rhs, op.result),
+                    self.emit_int_mod_or_floordiv_residual(graph, helper_key, lhs_vid, rhs_vid, op.result),
                 )
             }
             // RPython `Transformer.rewrite_op_float_is_true(self, op)`
@@ -1188,7 +1204,7 @@ impl<'a> Transformer<'a> {
                 op: unop_name,
                 operand,
                 ..
-            } if (unop_name == "bool" && self.get_value_kind(*operand) == 'f')
+            } if (unop_name == "bool" && self.get_value_kind_var(graph, operand) == 'f')
                 || unop_name == "float_is_true" =>
             {
                 self.stamp_value_kind(
@@ -1199,6 +1215,7 @@ impl<'a> Transformer<'a> {
                     graph,
                     crate::jit_codewriter::type_state::ConcreteType::Float,
                 );
+                let zero_var = graph.must_variable(zero_id);
                 let zero_op = SpaceOperation {
                     result: Some(zero_id),
                     kind: OpKind::ConstFloat(0.0_f64.to_bits()),
@@ -1207,8 +1224,8 @@ impl<'a> Transformer<'a> {
                     result: op.result,
                     kind: OpKind::BinOp {
                         op: "float_ne".into(),
-                        lhs: *operand,
-                        rhs: zero_id,
+                        lhs: operand.clone(),
+                        rhs: zero_var,
                         result_ty: ValueType::Int,
                     },
                 };
@@ -1288,6 +1305,9 @@ impl<'a> Transformer<'a> {
                 );
                 let mut ops = Vec::with_capacity(2);
                 ops.push(funcptr_op);
+                let operand_vid = graph
+                    .value_id_of(operand)
+                    .expect("UnaryOp operand has backing ValueId");
                 ops.push(SpaceOperation {
                     result: op.result,
                     kind: OpKind::CallResidual {
@@ -1297,7 +1317,7 @@ impl<'a> Transformer<'a> {
                             majit_ir::value::Type::Float,
                             EffectInfo::new(ExtraEffect::ElidableCannotRaise, OopSpecIndex::None),
                         ),
-                        args_i: vec![*operand],
+                        args_i: vec![operand_vid],
                         args_r: vec![],
                         args_f: vec![],
                         result_kind: 'f',
@@ -1323,6 +1343,9 @@ impl<'a> Transformer<'a> {
                     op.result,
                     crate::jit_codewriter::type_state::ConcreteType::Signed,
                 );
+                let operand_vid = graph
+                    .value_id_of(operand)
+                    .expect("UnaryOp operand has backing ValueId");
                 let mut ops = Vec::with_capacity(2);
                 ops.push(funcptr_op);
                 ops.push(SpaceOperation {
@@ -1336,7 +1359,7 @@ impl<'a> Transformer<'a> {
                         ),
                         args_i: vec![],
                         args_r: vec![],
-                        args_f: vec![*operand],
+                        args_f: vec![operand_vid],
                         result_kind: 'i',
                         indirect_targets: None,
                     },
@@ -1365,7 +1388,7 @@ impl<'a> Transformer<'a> {
                     result: op.result,
                     kind: OpKind::UnaryOp {
                         op: "int_is_true".into(),
-                        operand: *operand,
+                        operand: operand.clone(),
                         result_ty: ValueType::Int,
                     },
                 }])
@@ -1415,12 +1438,18 @@ impl<'a> Transformer<'a> {
                     _ => None,
                 };
                 if let Some(key) = residual_key {
-                    if self.get_value_kind(*lhs) == 'i'
-                        && self.get_value_kind(*rhs) == 'i'
+                    if self.get_value_kind_var(graph, lhs) == 'i'
+                        && self.get_value_kind_var(graph, rhs) == 'i'
                         && self.binop_result_is_int(op.result, result_ty)
                     {
+                        let lhs_vid = graph
+                            .value_id_of(lhs)
+                            .expect("BinOp lhs has backing ValueId");
+                        let rhs_vid = graph
+                            .value_id_of(rhs)
+                            .expect("BinOp rhs has backing ValueId");
                         return RewriteResult::Replace(
-                            self.emit_int_mod_or_floordiv_residual(graph, key, *lhs, *rhs, op.result),
+                            self.emit_int_mod_or_floordiv_residual(graph, key, lhs_vid, rhs_vid, op.result),
                         );
                     }
                 }
@@ -1428,8 +1457,8 @@ impl<'a> Transformer<'a> {
                     result: op.result,
                     kind: OpKind::BinOp {
                         op: canonical.to_string(),
-                        lhs: *lhs,
-                        rhs: *rhs,
+                        lhs: lhs.clone(),
+                        rhs: rhs.clone(),
                         result_ty: result_ty.clone(),
                     },
                 }])
@@ -1504,6 +1533,25 @@ impl<'a> Transformer<'a> {
             crate::jit_codewriter::type_state::ConcreteType::Void => 'v',
             crate::jit_codewriter::type_state::ConcreteType::Unknown => 'r',
         }
+    }
+
+    /// Variable-keyed sibling of [`Self::get_value_kind`] — projects the
+    /// upstream-orthodox [`Variable`] handle back to the dense
+    /// [`ValueId`] via `graph.value_id_of` and forwards to the kind
+    /// lookup.  Call sites that have flipped their operand storage from
+    /// `ValueId` to `Variable` (BinOp/UnaryOp post-cluster-3 flip) use
+    /// this overload so the synth_kinds / type_state lookup stays
+    /// untouched while the per-arm dispatch reads the Variable handle
+    /// directly.
+    fn get_value_kind_var(
+        &self,
+        graph: &FunctionGraph,
+        var: &crate::flowspace::model::Variable,
+    ) -> char {
+        let vid = graph
+            .value_id_of(var)
+            .expect("Variable operand must have a backing ValueId on graph");
+        self.get_value_kind(vid)
     }
 
     fn get_value_type(&self, v: ValueId) -> Option<ValueType> {
@@ -1587,12 +1635,12 @@ impl<'a> Transformer<'a> {
     fn coerce_operand_to_float_domain(
         &mut self,
         graph: &mut FunctionGraph,
-        value: ValueId,
-    ) -> (ValueId, Vec<SpaceOperation>) {
-        match self.get_value_kind(value) {
-            'f' => (value, Vec::new()),
+        value: &crate::flowspace::model::Variable,
+    ) -> (crate::flowspace::model::Variable, Vec<SpaceOperation>) {
+        match self.get_value_kind_var(graph, value) {
+            'f' => (value.clone(), Vec::new()),
             'i' => self.coerce_operand_to_float(graph, value),
-            _ => (value, Vec::new()),
+            _ => (value.clone(), Vec::new()),
         }
     }
 
@@ -1602,22 +1650,23 @@ impl<'a> Transformer<'a> {
     fn coerce_operand_to_float(
         &mut self,
         graph: &mut FunctionGraph,
-        value: ValueId,
-    ) -> (ValueId, Vec<SpaceOperation>) {
-        if self.get_value_kind(value) != 'i' {
-            return (value, Vec::new());
+        value: &crate::flowspace::model::Variable,
+    ) -> (crate::flowspace::model::Variable, Vec<SpaceOperation>) {
+        if self.get_value_kind_var(graph, value) != 'i' {
+            return (value.clone(), Vec::new());
         }
-        let coerced = self.fresh_synthetic_value_typed(
+        let coerced_vid = self.fresh_synthetic_value_typed(
             graph,
             crate::jit_codewriter::type_state::ConcreteType::Float,
         );
+        let coerced = graph.must_variable(coerced_vid);
         (
             coerced,
             vec![SpaceOperation {
-                result: Some(coerced),
+                result: Some(coerced_vid),
                 kind: OpKind::UnaryOp {
                     op: "cast_int_to_float".into(),
-                    operand: value,
+                    operand: value.clone(),
                     result_ty: ValueType::Float,
                 },
             }],
@@ -4018,21 +4067,34 @@ fn remap_op(
             lhs,
             rhs,
             result_ty,
-        } => OpKind::BinOp {
-            op: op.clone(),
-            lhs: remap_value(*lhs, aliases),
-            rhs: remap_value(*rhs, aliases),
-            result_ty: result_ty.clone(),
-        },
+        } => {
+            let lhs_vid = graph
+                .value_id_of(lhs)
+                .expect("BinOp.lhs must have a backing ValueId");
+            let rhs_vid = graph
+                .value_id_of(rhs)
+                .expect("BinOp.rhs must have a backing ValueId");
+            OpKind::BinOp {
+                op: op.clone(),
+                lhs: graph.must_variable(remap_value(lhs_vid, aliases)),
+                rhs: graph.must_variable(remap_value(rhs_vid, aliases)),
+                result_ty: result_ty.clone(),
+            }
+        }
         OpKind::UnaryOp {
             op,
             operand,
             result_ty,
-        } => OpKind::UnaryOp {
-            op: op.clone(),
-            operand: remap_value(*operand, aliases),
-            result_ty: result_ty.clone(),
-        },
+        } => {
+            let operand_vid = graph
+                .value_id_of(operand)
+                .expect("UnaryOp.operand must have a backing ValueId");
+            OpKind::UnaryOp {
+                op: op.clone(),
+                operand: graph.must_variable(remap_value(operand_vid, aliases)),
+                result_ty: result_ty.clone(),
+            }
+        }
         OpKind::JitDebug { args } => OpKind::JitDebug {
             args: args
                 .iter()
@@ -4321,13 +4383,15 @@ mod tests {
         let mut graph = FunctionGraph::new("bitops");
         let lhs = graph.alloc_value();
         let rhs = graph.alloc_value();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "bitxor".to_string(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -4355,12 +4419,13 @@ mod tests {
                 true,
             )
             .unwrap();
+        let input_var = graph.must_variable(input);
         let alias = graph
             .push_op(
                 graph.startblock,
                 OpKind::UnaryOp {
                     op: "same_as".into(),
-                    operand: input,
+                    operand: input_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -4407,13 +4472,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "add".into(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
                     result_ty: ValueType::Float,
                 },
                 true,
@@ -4438,12 +4505,13 @@ mod tests {
                 result_ty,
             } => {
                 assert_eq!(op, "cast_int_to_float");
-                assert_eq!(*operand, lhs);
+                assert_eq!(*operand, lhs_var);
                 assert_eq!(*result_ty, ValueType::Float);
                 ops[2].result.unwrap()
             }
             other => panic!("expected cast_int_to_float, got {other:?}"),
         };
+        let cast_result_var = transformed.graph.must_variable(cast_result);
         match &ops[3].kind {
             OpKind::BinOp {
                 op,
@@ -4452,8 +4520,8 @@ mod tests {
                 result_ty,
             } => {
                 assert_eq!(op, "float_add");
-                assert_eq!(*rewritten_lhs, cast_result);
-                assert_eq!(*rewritten_rhs, rhs);
+                assert_eq!(*rewritten_lhs, cast_result_var);
+                assert_eq!(*rewritten_rhs, rhs_var);
                 assert_eq!(*result_ty, ValueType::Float);
             }
             other => panic!("expected float_add, got {other:?}"),
@@ -4483,13 +4551,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "eq".into(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -4514,12 +4584,13 @@ mod tests {
                 result_ty,
             } => {
                 assert_eq!(op, "cast_int_to_float");
-                assert_eq!(*operand, rhs);
+                assert_eq!(*operand, rhs_var);
                 assert_eq!(*result_ty, ValueType::Float);
                 ops[2].result.unwrap()
             }
             other => panic!("expected cast_int_to_float, got {other:?}"),
         };
+        let cast_result_var = transformed.graph.must_variable(cast_result);
         match &ops[3].kind {
             OpKind::BinOp {
                 op,
@@ -4528,8 +4599,8 @@ mod tests {
                 result_ty,
             } => {
                 assert_eq!(op, "float_eq");
-                assert_eq!(*rewritten_lhs, lhs);
-                assert_eq!(*rewritten_rhs, cast_result);
+                assert_eq!(*rewritten_lhs, lhs_var);
+                assert_eq!(*rewritten_rhs, cast_result_var);
                 assert_eq!(*result_ty, ValueType::Int);
             }
             other => panic!("expected float_eq, got {other:?}"),
@@ -4559,13 +4630,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "mod".into(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var.clone(),
+                    rhs: rhs_var.clone(),
                     result_ty: ValueType::Float,
                 },
                 true,
@@ -4591,7 +4664,7 @@ mod tests {
                 result_ty,
             } => {
                 assert_eq!(op, "cast_int_to_float");
-                assert_eq!(*operand, lhs);
+                assert_eq!(*operand, lhs_var);
                 assert_eq!(*result_ty, ValueType::Float);
                 ops[2].result.unwrap()
             }
@@ -5012,13 +5085,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "mod".to_string(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -5094,13 +5169,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "mod_assign".to_string(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -5176,13 +5253,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "div_assign".to_string(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -5255,13 +5334,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "div".to_string(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: ValueType::Int,
                 },
                 true,

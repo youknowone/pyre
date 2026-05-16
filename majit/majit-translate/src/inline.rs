@@ -679,21 +679,37 @@ fn remap_op_kind(
             lhs,
             rhs,
             result_ty,
-        } => OpKind::BinOp {
-            op: op.clone(),
-            lhs: remap(lhs),
-            rhs: remap(rhs),
-            result_ty: result_ty.clone(),
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("BinOp operand must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::BinOp {
+                op: op.clone(),
+                lhs: remap_var(lhs),
+                rhs: remap_var(rhs),
+                result_ty: result_ty.clone(),
+            }
+        }
         OpKind::UnaryOp {
             op,
             operand,
             result_ty,
-        } => OpKind::UnaryOp {
-            op: op.clone(),
-            operand: remap(operand),
-            result_ty: result_ty.clone(),
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("UnaryOp operand must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::UnaryOp {
+                op: op.clone(),
+                operand: remap_var(operand),
+                result_ty: result_ty.clone(),
+            }
+        }
         OpKind::VableForce { base } => {
             let base_vid = source_graph
                 .value_id_of(base)
@@ -1118,8 +1134,24 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
                     .expect("VableArrayWrite.value must be a known Variable on graph"),
             ]
         }
-        OpKind::BinOp { lhs, rhs, .. } => vec![*lhs, *rhs],
-        OpKind::UnaryOp { operand, .. } => vec![*operand],
+        OpKind::BinOp { lhs, rhs, .. } => {
+            let g = graph
+                .expect("BinOp requires a graph to project Variable to ValueId");
+            vec![
+                g.value_id_of(lhs)
+                    .expect("BinOp.lhs must be a known Variable on graph"),
+                g.value_id_of(rhs)
+                    .expect("BinOp.rhs must be a known Variable on graph"),
+            ]
+        }
+        OpKind::UnaryOp { operand, .. } => {
+            let g = graph
+                .expect("UnaryOp requires a graph to project Variable to ValueId");
+            vec![
+                g.value_id_of(operand)
+                    .expect("UnaryOp.operand must be a known Variable on graph"),
+            ]
+        }
         OpKind::CallElidable {
             funcptr,
             args_i,

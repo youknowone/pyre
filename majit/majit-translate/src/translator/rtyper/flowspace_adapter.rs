@@ -624,8 +624,14 @@ pub fn translate_op(
             rhs,
             ..
         } => {
-            let l = lookup_operand(value_map, *lhs, op, "lhs")?;
-            let r = lookup_operand(value_map, *rhs, op, "rhs")?;
+            let lhs_vid = graph
+                .value_id_of(lhs)
+                .expect("BinOp.lhs must have a backing ValueId on graph");
+            let rhs_vid = graph
+                .value_id_of(rhs)
+                .expect("BinOp.rhs must have a backing ValueId on graph");
+            let l = lookup_operand(value_map, lhs_vid, op, "lhs")?;
+            let r = lookup_operand(value_map, rhs_vid, op, "rhs")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 normalize_binop_name(opname)?,
@@ -649,7 +655,10 @@ pub fn translate_op(
             operand,
             ..
         } => {
-            let v = lookup_operand(value_map, *operand, op, "operand")?;
+            let operand_vid = graph
+                .value_id_of(operand)
+                .expect("UnaryOp.operand must have a backing ValueId on graph");
+            let v = lookup_operand(value_map, operand_vid, op, "operand")?;
             let result = resolve_result_hlvalue(op, value_map)?;
             Ok(vec![FlowspaceOp::new(
                 normalize_unary_op_name(opname)?,
@@ -2433,16 +2442,16 @@ mod tests {
         value_map.insert(ValueId(2), rhs_var.clone());
         value_map.insert(ValueId(3), result_var.clone());
 
+        let graph = translate_op_test_graph(10);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::BinOp {
                 op: "add".to_string(),
-                lhs: ValueId(1),
-                rhs: ValueId(2),
+                lhs: graph.must_variable(ValueId(1)),
+                rhs: graph.must_variable(ValueId(2)),
                 result_ty: ValueType::Int,
             },
         };
-        let graph = translate_op_test_graph(10);
         let translated = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect("BinOp arm must lower");
         assert_eq!(translated.len(), 1, "BinOp lowers to exactly one SpaceOp");
@@ -2459,16 +2468,16 @@ mod tests {
         let mut value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
         value_map.insert(ValueId(2), Hlvalue::Variable(Variable::new()));
         value_map.insert(ValueId(3), Hlvalue::Variable(Variable::new()));
+        let graph = translate_op_test_graph(100);
         let op = SpaceOperation {
             result: Some(ValueId(3)),
             kind: OpKind::BinOp {
                 op: "add".to_string(),
-                lhs: ValueId(99), // not in value_map
-                rhs: ValueId(2),
+                lhs: graph.must_variable(ValueId(99)), // not in value_map
+                rhs: graph.must_variable(ValueId(2)),
                 result_ty: ValueType::Int,
             },
         };
-        let graph = translate_op_test_graph(10);
         let err = translate_op(&op, &value_map, &empty_call_registry(), &graph)
             .expect_err("undefined BinOp operand must surface invariant break");
         let msg = format!("{err}");
@@ -2867,12 +2876,13 @@ mod tests {
         // context (op variant + arg role) added by the verbose-mode
         // groundwork pass.
         let value_map: HashMap<ValueId, Hlvalue> = HashMap::new();
+        let graph = translate_op_test_graph(100);
         let op = SpaceOperation {
             result: Some(ValueId(100)),
             kind: OpKind::BinOp {
                 op: "add".to_string(),
-                lhs: ValueId(99),
-                rhs: ValueId(0),
+                lhs: graph.must_variable(ValueId(99)),
+                rhs: graph.must_variable(ValueId(0)),
                 result_ty: ValueType::Int,
             },
         };
@@ -3122,8 +3132,8 @@ mod tests {
                 result: Some(ValueId(3)),
                 kind: OpKind::BinOp {
                     op: "add".to_string(),
-                    lhs: ValueId(1),
-                    rhs: ValueId(2),
+                    lhs: graph.must_variable(ValueId(1)),
+                    rhs: graph.must_variable(ValueId(2)),
                     result_ty: ValueType::Int,
                 },
             }],

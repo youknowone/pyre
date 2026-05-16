@@ -163,8 +163,14 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         // keys need `cast_ptr_to_int` insertion in
                         // jtransform, not a type override in the
                         // rtyper.
-                        changed |= maybe_seed_concrete_type(&mut state, *lhs, ConcreteType::Signed);
-                        changed |= maybe_seed_concrete_type(&mut state, *rhs, ConcreteType::Signed);
+                        let lhs_vid = graph
+                            .value_id_of(lhs)
+                            .expect("BinOp.lhs has backing ValueId");
+                        let rhs_vid = graph
+                            .value_id_of(rhs)
+                            .expect("BinOp.rhs has backing ValueId");
+                        changed |= maybe_seed_concrete_type(&mut state, lhs_vid, ConcreteType::Signed);
+                        changed |= maybe_seed_concrete_type(&mut state, rhs_vid, ConcreteType::Signed);
                         if let Some(result) = op.result {
                             // RPython rtyper resolves an `add` whose
                             // operands are both `lltype.Float` to
@@ -179,14 +185,14 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                             // to `float_add` (etc.) and insert
                             // `cast_int_to_float` for mixed int/float
                             // operands, keeping IR/regalloc consistent.
-                            let lhs_float = *state.get(*lhs) == ConcreteType::Float;
-                            let rhs_float = *state.get(*rhs) == ConcreteType::Float;
+                            let lhs_float = *state.get(lhs_vid) == ConcreteType::Float;
+                            let rhs_float = *state.get(rhs_vid) == ConcreteType::Float;
                             let any_float = lhs_float || rhs_float;
                             let both_numeric = matches!(
-                                *state.get(*lhs),
+                                *state.get(lhs_vid),
                                 ConcreteType::Signed | ConcreteType::Float
                             ) && matches!(
-                                *state.get(*rhs),
+                                *state.get(rhs_vid),
                                 ConcreteType::Signed | ConcreteType::Float
                             );
                             // Mirror jtransform's float-rewrite set
@@ -228,13 +234,16 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         operand,
                         ..
                     } if is_int_unop(opname) => {
+                        let operand_vid = graph
+                            .value_id_of(operand)
+                            .expect("UnaryOp.operand has backing ValueId");
                         changed |=
-                            maybe_seed_concrete_type(&mut state, *operand, ConcreteType::Signed);
+                            maybe_seed_concrete_type(&mut state, operand_vid, ConcreteType::Signed);
                         if let Some(result) = op.result {
                             // Same Float-operand override as the BinOp
                             // arm above.  Unary `neg` on a Float
                             // returns Float (`float_neg`).
-                            let operand_float = *state.get(*operand) == ConcreteType::Float;
+                            let operand_float = *state.get(operand_vid) == ConcreteType::Float;
                             if operand_float && opname == "neg" {
                                 if state.get(result) != &ConcreteType::Float {
                                     state.set(result, ConcreteType::Float);
@@ -269,8 +278,11 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         // would surface as `cast_int_to_float/r>f`
                         // at the assembler.  Re-seed Signed here so
                         // pass 2 converges to the same operand kind.
+                        let operand_vid = graph
+                            .value_id_of(operand)
+                            .expect("UnaryOp.operand has backing ValueId");
                         changed |=
-                            maybe_seed_concrete_type(&mut state, *operand, ConcreteType::Signed);
+                            maybe_seed_concrete_type(&mut state, operand_vid, ConcreteType::Signed);
                     }
                     OpKind::UnaryOp {
                         op: opname,
@@ -278,10 +290,13 @@ pub fn resolve_types(graph: &FunctionGraph, annotations: &AnnotationState) -> Ty
                         ..
                     } if is_identity_unop(opname) => {
                         if let Some(result) = op.result {
-                            let operand_ty = state.get(*operand).clone();
+                            let operand_vid = graph
+                                .value_id_of(operand)
+                                .expect("UnaryOp.operand has backing ValueId");
+                            let operand_ty = state.get(operand_vid).clone();
                             let result_ty = state.get(result).clone();
                             changed |= maybe_seed_concrete_type(&mut state, result, operand_ty);
-                            changed |= maybe_seed_concrete_type(&mut state, *operand, result_ty);
+                            changed |= maybe_seed_concrete_type(&mut state, operand_vid, result_ty);
                         }
                     }
                     _ => {}
@@ -709,13 +724,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 entry,
                 OpKind::BinOp {
                     op: "add".to_string(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -754,13 +771,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let result = graph
             .push_op(
                 entry,
                 OpKind::BinOp {
                     op: "bitxor".to_string(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -789,12 +808,13 @@ mod tests {
                 true,
             )
             .unwrap();
+        let value_var = graph.must_variable(value);
         let alias = graph
             .push_op(
                 entry,
                 OpKind::UnaryOp {
                     op: "same_as".to_string(),
-                    operand: value,
+                    operand: value_var,
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -813,12 +833,13 @@ mod tests {
         let mut graph = FunctionGraph::new("same_as_int");
         let entry = graph.startblock;
         let value = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
+        let value_var = graph.must_variable(value);
         let alias = graph
             .push_op(
                 entry,
                 OpKind::UnaryOp {
                     op: "same_as".to_string(),
-                    operand: value,
+                    operand: value_var,
                     result_ty: ValueType::Unknown,
                 },
                 true,
@@ -890,13 +911,15 @@ mod tests {
         let (target, phi_args) = graph.create_block_with_args(1);
         let phi = phi_args[0];
         graph.set_goto(entry, target, vec![src]);
+        let phi_var = graph.must_variable(phi);
+        let one_var = graph.must_variable(one);
         let result = graph
             .push_op(
                 target,
                 OpKind::BinOp {
                     op: "add".to_string(),
-                    lhs: phi,
-                    rhs: one,
+                    lhs: phi_var,
+                    rhs: one_var,
                     result_ty: ValueType::Int,
                 },
                 true,

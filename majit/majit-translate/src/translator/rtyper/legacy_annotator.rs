@@ -86,7 +86,7 @@ pub fn annotate(graph: &FunctionGraph) -> AnnotationState {
             // Propagate annotations through ops in this block
             for op in &block.operations {
                 if let Some(result) = op.result {
-                    let inferred = infer_op_type(&op.kind, &state);
+                    let inferred = infer_op_type(&op.kind, &state, graph);
                     let current = state.get(result).clone();
                     let merged = union_type(&current, &inferred);
                     if merged != current {
@@ -213,7 +213,7 @@ fn is_synthetic_return_void_value(graph: &FunctionGraph, value: ValueId) -> bool
 ///
 /// RPython equivalent: annotator dispatch (e.g., `annotate_int_add`
 /// returns `SomeInteger()`).
-fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
+fn infer_op_type(kind: &OpKind, state: &AnnotationState, graph: &FunctionGraph) -> ValueType {
     match kind {
         OpKind::Input { ty, .. } => ty.clone(),
         OpKind::ConstInt(_) => ValueType::Int,
@@ -249,10 +249,9 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
             if result_ty != &ValueType::Unknown {
                 result_ty.clone()
             } else {
-                state
-                    .types
-                    .get(operand)
-                    .cloned()
+                graph
+                    .value_id_of(operand)
+                    .and_then(|vid| state.types.get(&vid).cloned())
                     .unwrap_or(ValueType::Unknown)
             }
         }
@@ -272,10 +271,9 @@ fn infer_op_type(kind: &OpKind, state: &AnnotationState) -> ValueType {
             if result_ty != &ValueType::Unknown {
                 result_ty.clone()
             } else {
-                state
-                    .types
-                    .get(operand)
-                    .cloned()
+                graph
+                    .value_id_of(operand)
+                    .and_then(|vid| state.types.get(&vid).cloned())
                     .unwrap_or(ValueType::Int)
             }
         }

@@ -608,15 +608,15 @@ pub enum OpKind {
     /// RPython: `int_add`, `int_lt`, etc.
     BinOp {
         op: String,
-        lhs: ValueId,
-        rhs: ValueId,
+        lhs: crate::flowspace::model::Variable,
+        rhs: crate::flowspace::model::Variable,
         result_ty: ValueType,
     },
     /// Unary operation.
     /// RPython: `int_neg`, `bool_not`, etc.
     UnaryOp {
         op: String,
-        operand: ValueId,
+        operand: crate::flowspace::model::Variable,
         result_ty: ValueType,
     },
 
@@ -3240,13 +3240,14 @@ mod tests {
         // BinOp whose result IS read (by `set_return`).  Backward
         // dataflow needs a live consumer of the BinOp result for the
         // pure-op-args→dependencies routing to keep phi_x alive.
+        let phi_x_var = graph.must_variable(phi_x);
         let doubled = graph
             .push_op(
                 merge,
                 OpKind::BinOp {
                     op: "int_add".into(),
-                    lhs: phi_x,
-                    rhs: phi_x,
+                    lhs: phi_x_var.clone(),
+                    rhs: phi_x_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -3287,13 +3288,14 @@ mod tests {
         let merge = graph.create_block();
         graph.set_goto(entry, merge, vec![const_v]);
         let phi_x = install_phi(&mut graph, merge, "x");
+        let phi_x_var = graph.must_variable(phi_x);
         let doubled = graph
             .push_op(
                 merge,
                 OpKind::BinOp {
                     op: "int_add".into(),
-                    lhs: phi_x,
-                    rhs: phi_x,
+                    lhs: phi_x_var.clone(),
+                    rhs: phi_x_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -3419,13 +3421,15 @@ mod tests {
         let entry = graph.startblock;
         let lhs = graph.push_op(entry, OpKind::ConstInt(1), true).unwrap();
         let rhs = graph.push_op(entry, OpKind::ConstInt(2), true).unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let raising = graph
             .push_op(
                 entry,
                 OpKind::BinOp {
                     op: "int_add".into(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: ValueType::Int,
                 },
                 true,

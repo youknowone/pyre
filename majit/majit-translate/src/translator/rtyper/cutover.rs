@@ -1829,7 +1829,7 @@ fn id(x: &Foo) -> &Foo { x }
                 result: Some(ValueId(2)),
                 kind: crate::model::OpKind::UnaryOp {
                     op: "not".into(),
-                    operand: ValueId(1),
+                    operand: graph.must_variable(ValueId(1)),
                     result_ty: ValueType::Int,
                 },
             }],
@@ -1884,7 +1884,7 @@ fn id(x: &Foo) -> &Foo { x }
                 result: Some(ValueId(2)),
                 kind: crate::model::OpKind::UnaryOp {
                     op: "deref".into(),
-                    operand: ValueId(1),
+                    operand: graph.must_variable(ValueId(1)),
                     result_ty: ValueType::Int,
                 },
             }],

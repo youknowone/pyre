@@ -4036,13 +4036,14 @@ mod tests {
                 true,
             )
             .unwrap();
+        let v0_var = graph.must_variable(v0);
         let v1 = graph
             .push_op(
                 entry,
                 OpKind::BinOp {
                     op: "add".into(),
-                    lhs: v0,
-                    rhs: v0,
+                    lhs: v0_var.clone(),
+                    rhs: v0_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -4453,13 +4454,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let lhs_var = graph.must_variable(lhs);
+        let rhs_var = graph.must_variable(rhs);
         let sum = graph
             .push_op(
                 graph.startblock,
                 OpKind::BinOp {
                     op: "add".into(),
-                    lhs,
-                    rhs,
+                    lhs: lhs_var,
+                    rhs: rhs_var,
                     result_ty: ValueType::Int,
                 },
                 true,

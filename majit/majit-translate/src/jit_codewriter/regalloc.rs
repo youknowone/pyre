@@ -612,13 +612,14 @@ mod tests {
                 true,
             )
             .unwrap();
+        let v0_var = graph.must_variable(v0);
         let v1 = graph
             .push_op(
                 entry,
                 OpKind::BinOp {
                     op: "add".into(),
-                    lhs: v0,
-                    rhs: v0,
+                    lhs: v0_var.clone(),
+                    rhs: v0_var,
                     result_ty: ValueType::Int,
                 },
                 true,
@@ -659,13 +660,15 @@ mod tests {
                 true,
             )
             .unwrap();
+        let v0_var = graph.must_variable(v0);
+        let v1_var = graph.must_variable(v1);
         let v2 = graph
             .push_op(
                 entry,
                 OpKind::BinOp {
                     op: "add".into(),
-                    lhs: v0,
-                    rhs: v1,
+                    lhs: v0_var,
+                    rhs: v1_var,
                     result_ty: ValueType::Int,
                 },
                 true,

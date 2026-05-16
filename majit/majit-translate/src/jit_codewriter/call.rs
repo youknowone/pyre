@@ -6884,12 +6884,14 @@ mod tests {
         let mut graph = FunctionGraph::new("divider");
         let a = graph.alloc_value();
         let b = graph.alloc_value();
+        let a_var = graph.must_variable(a);
+        let b_var = graph.must_variable(b);
         graph.push_op(
             graph.startblock,
             OpKind::BinOp {
                 op: "int_floordiv".to_string(),
-                lhs: a,
-                rhs: b,
+                lhs: a_var,
+                rhs: b_var,
                 result_ty: ValueType::Int,
             },
             true,
