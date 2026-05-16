@@ -557,7 +557,8 @@ impl GuardAnalysis {
     /// A guard is hoistable if its arguments are loop-invariant
     /// (not produced by any op in the loop body).
     pub fn analyze(ops: &[Op]) -> Self {
-        let mut body_results: std::collections::HashSet<OpRef> = std::collections::HashSet::new();
+        let mut body_results: majit_ir::vec_set::VecSet<OpRef> =
+            majit_ir::vec_set::VecSet::new();
         for op in ops {
             if !op.pos.get().is_none() {
                 body_results.insert(op.pos.get());
@@ -767,7 +768,7 @@ pub struct VecScheduleState {
     /// schedule.py:38,723: invariant_vector_vars — vector ops created by expand()
     /// for loop-invariant scalars (constants and inputargs). Populated in
     /// expand() (schedule.py:554-555), called from prepare_arguments().
-    pub invariant_vector_vars: std::collections::HashSet<OpRef>,
+    pub invariant_vector_vars: majit_ir::vec_set::VecSet<OpRef>,
     /// schedule.py:532: invariant_oplist — ops to emit before the loop.
     pub invariant_oplist: Vec<Op>,
     /// schedule.py:595: accumulation info.
@@ -789,7 +790,7 @@ impl VecScheduleState {
             costmodel: CostModel::new(),
             expanded_map: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             inputargs: crate::optimizeopt::vec_assoc::VecAssoc::new(),
-            invariant_vector_vars: std::collections::HashSet::new(),
+            invariant_vector_vars: majit_ir::vec_set::VecSet::new(),
             invariant_oplist: Vec::new(),
             accumulation: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             next_pos: start_pos,

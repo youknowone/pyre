@@ -30,8 +30,7 @@
 /// - Only operates on loop bodies (Label..Jump)
 /// - Requires array load/store patterns for memory access vectorization
 /// - Guards in the loop body prevent full vectorization (conservative)
-use std::collections::HashSet;
-
+use majit_ir::vec_set::VecSet;
 use majit_ir::{Op, OpCode, OpRef};
 
 use crate::optimizeopt::{OptContext, Optimization, OptimizationResult};
@@ -266,7 +265,7 @@ fn pre_emit_guard_accum(state: &VecScheduleState, op: &mut Op) {
 
 /// schedule.py:697-736: ensure_args_unpacked — unpack vector-boxed args
 /// for a scalar op, respecting seen/invariant/accumulation state.
-fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut HashSet<OpRef>) {
+fn ensure_args_unpacked(state: &mut VecScheduleState, op: &mut Op, seen: &mut VecSet<OpRef>) {
     // schedule.py:702-706: unpack immediate-use args
     for j in 0..op.args.len() {
         let arg = op.args[j];
@@ -581,7 +580,7 @@ impl VectorizingOptimizer {
         for &arg in &self.label_args {
             sched_state.inputargs.insert(arg, ());
         }
-        let mut seen: HashSet<OpRef> = HashSet::new();
+        let mut seen: VecSet<OpRef> = VecSet::new();
         for &arg in &self.label_args {
             seen.insert(arg);
         }

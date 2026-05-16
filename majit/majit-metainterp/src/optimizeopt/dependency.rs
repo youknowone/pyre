@@ -4,7 +4,9 @@
 //! between operations in a loop body. Used by the vector optimizer to
 //! identify independent operations that can be packed into SIMD instructions.
 
-use std::collections::{BinaryHeap, HashSet};
+use std::collections::BinaryHeap;
+
+use majit_ir::vec_set::VecSet;
 
 use crate::optimizeopt::schedule::Pack;
 use majit_ir::{Op, OpCode, OpRef};
@@ -547,7 +549,7 @@ impl DependencyGraph {
     /// args come from independent sources (no data dependency between them).
     pub fn find_packable_groups(&self) -> Vec<Pack> {
         let mut groups: Vec<Pack> = Vec::new();
-        let mut used: HashSet<usize> = HashSet::new();
+        let mut used: VecSet<usize> = VecSet::new();
 
         // Group by opcode
         let mut by_opcode: crate::optimizeopt::vec_assoc::VecAssoc<OpCode, Vec<usize>> =

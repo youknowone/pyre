@@ -35,8 +35,7 @@
 /// Consecutive guards on different values are kept but, when both lack a
 /// descriptor, the second inherits the first's descriptor so the backend
 /// can share resume data.
-use std::collections::HashSet;
-
+use majit_ir::vec_set::VecSet;
 use majit_ir::{DescrRef, Op, OpCode, OpRef};
 
 use crate::optimizeopt::dependency::IndexVar;
@@ -760,11 +759,11 @@ impl Default for GuardStrengthenOpt {
 
 pub struct OptGuard {
     /// Set of guard conditions already verified in the trace.
-    seen: HashSet<GuardKey>,
+    seen: VecSet<GuardKey>,
 
     /// Set of values known to be truthy (guarded by `guard_true` or
     /// `guard_nonnull`).
-    truthy_values: HashSet<OpRef>,
+    truthy_values: VecSet<OpRef>,
 
     /// guard.py: values with known class (from GuardClass/GuardNonnullClass).
     known_classes: crate::optimizeopt::vec_assoc::VecAssoc<OpRef, majit_ir::GcRef>,
@@ -780,8 +779,8 @@ pub struct OptGuard {
 impl OptGuard {
     pub fn new() -> Self {
         OptGuard {
-            seen: HashSet::new(),
-            truthy_values: HashSet::new(),
+            seen: VecSet::new(),
+            truthy_values: VecSet::new(),
             known_classes: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             known_constants: crate::optimizeopt::vec_assoc::VecAssoc::new(),
             last_guard_descr: None,
