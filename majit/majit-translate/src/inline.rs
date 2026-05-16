@@ -802,14 +802,22 @@ fn remap_op_kind(
             args_r,
             args_f,
             result_kind,
-        } => OpKind::CallElidable {
-            funcptr: remap_call_funcptr(funcptr, &remap),
-            descriptor: descriptor.clone(),
-            args_i: args_i.iter().map(remap).collect(),
-            args_r: args_r.iter().map(remap).collect(),
-            args_f: args_f.iter().map(remap).collect(),
-            result_kind: *result_kind,
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("CallElidable arg must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::CallElidable {
+                funcptr: remap_call_funcptr(funcptr, &remap),
+                descriptor: descriptor.clone(),
+                args_i: args_i.iter().map(remap_var).collect(),
+                args_r: args_r.iter().map(remap_var).collect(),
+                args_f: args_f.iter().map(remap_var).collect(),
+                result_kind: *result_kind,
+            }
+        }
         OpKind::CallResidual {
             funcptr,
             descriptor,
@@ -818,15 +826,23 @@ fn remap_op_kind(
             args_f,
             result_kind,
             indirect_targets,
-        } => OpKind::CallResidual {
-            funcptr: remap_call_funcptr(funcptr, &remap),
-            descriptor: descriptor.clone(),
-            args_i: args_i.iter().map(remap).collect(),
-            args_r: args_r.iter().map(remap).collect(),
-            args_f: args_f.iter().map(remap).collect(),
-            result_kind: *result_kind,
-            indirect_targets: indirect_targets.clone(),
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("CallResidual arg must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::CallResidual {
+                funcptr: remap_call_funcptr(funcptr, &remap),
+                descriptor: descriptor.clone(),
+                args_i: args_i.iter().map(remap_var).collect(),
+                args_r: args_r.iter().map(remap_var).collect(),
+                args_f: args_f.iter().map(remap_var).collect(),
+                result_kind: *result_kind,
+                indirect_targets: indirect_targets.clone(),
+            }
+        }
         OpKind::CallMayForce {
             funcptr,
             descriptor,
@@ -834,14 +850,22 @@ fn remap_op_kind(
             args_r,
             args_f,
             result_kind,
-        } => OpKind::CallMayForce {
-            funcptr: remap_call_funcptr(funcptr, &remap),
-            descriptor: descriptor.clone(),
-            args_i: args_i.iter().map(remap).collect(),
-            args_r: args_r.iter().map(remap).collect(),
-            args_f: args_f.iter().map(remap).collect(),
-            result_kind: *result_kind,
-        },
+        } => {
+            let remap_var = |var: &crate::flowspace::model::Variable| {
+                let vid = source_graph
+                    .value_id_of(var)
+                    .expect("CallMayForce arg must have a backing ValueId in source");
+                target_graph.must_variable(remap(&vid))
+            };
+            OpKind::CallMayForce {
+                funcptr: remap_call_funcptr(funcptr, &remap),
+                descriptor: descriptor.clone(),
+                args_i: args_i.iter().map(remap_var).collect(),
+                args_r: args_r.iter().map(remap_var).collect(),
+                args_f: args_f.iter().map(remap_var).collect(),
+                result_kind: *result_kind,
+            }
+        }
         OpKind::InlineCall {
             jitcode,
             args_i,
@@ -1173,13 +1197,19 @@ pub fn op_value_refs(kind: &OpKind, graph: Option<&crate::model::FunctionGraph>)
             args_f,
             ..
         } => {
+            let g = graph
+                .expect("Call{Elidable,Residual,MayForce} requires a graph to project Variable to ValueId");
+            let project = |var: &crate::flowspace::model::Variable| {
+                g.value_id_of(var)
+                    .expect("Call arg must be a known Variable on graph")
+            };
             let mut refs = match funcptr {
                 CallFuncPtr::Target(_) => Vec::new(),
                 CallFuncPtr::Value(value) => vec![*value],
             };
-            refs.extend(args_i);
-            refs.extend(args_r);
-            refs.extend(args_f);
+            refs.extend(args_i.iter().map(project));
+            refs.extend(args_r.iter().map(project));
+            refs.extend(args_f.iter().map(project));
             refs
         }
         OpKind::InlineCall {

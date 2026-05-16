@@ -1204,17 +1204,29 @@ impl Assembler {
                 let calldescr = descriptor.to_bh_calldescr();
                 let descr_idx = self.emit_ready_descr(crate::jitcode::BhDescr::Call { calldescr });
                 // RPython jtransform.py:422-431: kind-separated sublists
-                let kinds = self.kinds_suffix(args_i, args_r, args_f, *result_kind);
+                let g = graph.expect("encode_op for Call{Elidable,Residual,MayForce} requires a graph");
+                let project = |args: &[crate::flowspace::model::Variable]| -> Vec<ValueId> {
+                    args.iter()
+                        .map(|v| {
+                            g.value_id_of(v)
+                                .expect("Call arg must be a known Variable on graph")
+                        })
+                        .collect()
+                };
+                let args_i_vids = project(args_i);
+                let args_r_vids = project(args_r);
+                let args_f_vids = project(args_f);
+                let kinds = self.kinds_suffix(&args_i_vids, &args_r_vids, &args_f_vids, *result_kind);
                 if kinds.contains('i') {
-                    self.emit_list_of_kind(args_i, RegKind::Int, regallocs, state);
+                    self.emit_list_of_kind(&args_i_vids, RegKind::Int, regallocs, state);
                     argcodes.push('I');
                 }
                 if kinds.contains('r') {
-                    self.emit_list_of_kind(args_r, RegKind::Ref, regallocs, state);
+                    self.emit_list_of_kind(&args_r_vids, RegKind::Ref, regallocs, state);
                     argcodes.push('R');
                 }
                 if kinds.contains('f') {
-                    self.emit_list_of_kind(args_f, RegKind::Float, regallocs, state);
+                    self.emit_list_of_kind(&args_f_vids, RegKind::Float, regallocs, state);
                     argcodes.push('F');
                 }
                 // RPython assembler.py:197-207: descriptor as 2-byte index,
@@ -1899,11 +1911,11 @@ impl Assembler {
     /// `result_kind='f'`) would map to a pyre-only `_r_f` handler that
     /// has no RPython `bhimpl_*_r_f` counterpart (`blackhole.py:1224,1278`
     /// only has `_r_{i,r,v}` / `_ir_*` / `_irf_*`).
-    fn kinds_suffix(
+    fn kinds_suffix<T, U, V>(
         &self,
-        args_i: &[ValueId],
-        _args_r: &[ValueId],
-        args_f: &[ValueId],
+        args_i: &[T],
+        _args_r: &[U],
+        args_f: &[V],
         result_kind: char,
     ) -> &'static str {
         if !args_f.is_empty() || result_kind == 'f' {

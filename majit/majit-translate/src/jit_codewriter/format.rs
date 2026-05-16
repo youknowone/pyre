@@ -593,13 +593,13 @@ fn op_args_repr(
             // jtransform.py:430-433 — emit each ListOfKind only when the
             // matching kind char is in the signature.
             if !args_i.is_empty() {
-                parts.push(list_of_kind_repr('i', args_i));
+                parts.push(list_of_kind_repr_vars('i', args_i));
             }
             if !args_r.is_empty() {
-                parts.push(list_of_kind_repr('r', args_r));
+                parts.push(list_of_kind_repr_vars('r', args_r));
             }
             if !args_f.is_empty() {
-                parts.push(list_of_kind_repr('f', args_f));
+                parts.push(list_of_kind_repr_vars('f', args_f));
             }
             // jtransform.py:434 — descr is the last sublist when set.
             parts.push(format!("{:?}", descriptor.extra_info));
@@ -861,6 +861,7 @@ mod tests {
     fn format_residual_call_emits_descr_and_listofkind() {
         // jtransform.py:414-435 + format.py:27,32-33.
         use crate::call::CallDescriptor;
+        use crate::flowspace::model::Variable;
         use crate::model::{CallFuncPtr, CallTarget, OpKind, SpaceOperation};
         use majit_ir::descr::EffectInfo;
 
@@ -868,12 +869,16 @@ mod tests {
 
         let funcptr = CallTarget::function_path(["foo"]);
         let descriptor = CallDescriptor::known(EffectInfo::default());
+        let int_arg = Variable::new();
+        let ref_arg = Variable::new();
+        let int_arg_id = int_arg.id();
+        let ref_arg_id = ref_arg.id();
         ssa.insns.push(FlatOp::Op(SpaceOperation {
             kind: OpKind::CallResidual {
                 funcptr: CallFuncPtr::Target(funcptr),
                 descriptor,
-                args_i: vec![ValueId(1)],
-                args_r: vec![ValueId(2)],
+                args_i: vec![int_arg],
+                args_r: vec![ref_arg],
                 args_f: vec![],
                 result_kind: 'i',
                 indirect_targets: None,
@@ -893,8 +898,14 @@ mod tests {
             text.contains("$<* function 'foo'>"),
             "expected funcptr slot in: {text}"
         );
-        assert!(text.contains("I[%i1]"), "expected I[%i1] in: {text}");
-        assert!(text.contains("R[%r2]"), "expected R[%r2] in: {text}");
+        assert!(
+            text.contains(&format!("I[%i{int_arg_id}]")),
+            "expected I[%i{int_arg_id}] in: {text}"
+        );
+        assert!(
+            text.contains(&format!("R[%r{ref_arg_id}]")),
+            "expected R[%r{ref_arg_id}] in: {text}"
+        );
         // jtransform.py:430-433 — empty kind slots are dropped, matching
         // upstream where `kinds = "ir"` excludes the F sublist entirely.
         assert!(

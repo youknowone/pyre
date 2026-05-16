@@ -641,9 +641,9 @@ pub enum OpKind {
     CallElidable {
         funcptr: CallFuncPtr,
         descriptor: crate::call::CallDescriptor,
-        args_i: Vec<ValueId>,
-        args_r: Vec<ValueId>,
-        args_f: Vec<ValueId>,
+        args_i: Vec<crate::flowspace::model::Variable>,
+        args_r: Vec<crate::flowspace::model::Variable>,
+        args_f: Vec<crate::flowspace::model::Variable>,
         result_kind: char,
     },
     /// Residual call — has side effects, must be preserved.
@@ -655,9 +655,9 @@ pub enum OpKind {
     CallResidual {
         funcptr: CallFuncPtr,
         descriptor: crate::call::CallDescriptor,
-        args_i: Vec<ValueId>,
-        args_r: Vec<ValueId>,
-        args_f: Vec<ValueId>,
+        args_i: Vec<crate::flowspace::model::Variable>,
+        args_r: Vec<crate::flowspace::model::Variable>,
+        args_f: Vec<crate::flowspace::model::Variable>,
         result_kind: char,
         indirect_targets: Option<IndirectCallTargets>,
     },
@@ -667,9 +667,9 @@ pub enum OpKind {
     CallMayForce {
         funcptr: CallFuncPtr,
         descriptor: crate::call::CallDescriptor,
-        args_i: Vec<ValueId>,
-        args_r: Vec<ValueId>,
-        args_f: Vec<ValueId>,
+        args_i: Vec<crate::flowspace::model::Variable>,
+        args_r: Vec<crate::flowspace::model::Variable>,
+        args_f: Vec<crate::flowspace::model::Variable>,
         result_kind: char,
     },
 
