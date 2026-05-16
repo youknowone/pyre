@@ -7693,6 +7693,39 @@ impl CodeWriter {
             super::regalloc::perform_graph_register_allocation_all_kinds(&graph);
         super::regalloc::enforce_input_args_simulation(&graph, &mut _graph_regallocs);
 
+        // Phase 3 (b) Slice 2: env-gated diagnostic that compares the
+        // per-kind ceiling each allocator computes.  SSA-side
+        // `alloc_result.num_regs` is `max(coloring)+1` over the
+        // SSARepr's Register operands; graph-side
+        // `_graph_regallocs[kind].num_colors` is the same metric over
+        // the FlowGraph Variables.  If both allocators see the same
+        // interference shape and the same input-arg coloring (which
+        // `enforce_input_args_simulation` should equalise per
+        // `flatten.py:88-100`), the ceilings should match per kind.
+        // Per-graph divergence here is the concrete divergence that
+        // Slice 3 must reconcile before the production source-of-truth
+        // can flip.  Off-default so production stays silent.
+        if std::env::var_os("PYRE_PHASE3_REGALLOC_DIVERGENCE").is_some() {
+            for &kind in &super::flatten::Kind::ALL {
+                let ssa = alloc_result.num_regs.get(&kind).copied().unwrap_or(0);
+                let graph = _graph_regallocs
+                    .get(&kind)
+                    .map(|r| r.num_colors)
+                    .unwrap_or(0);
+                if ssa != graph {
+                    eprintln!(
+                        "[phase3-regalloc-divergence] graph={:?} kind={:?} ssa_num_regs={} \
+                         graph_num_colors={} delta={:+}",
+                        code.obj_name.as_str(),
+                        kind,
+                        ssa,
+                        graph,
+                        graph as i32 - ssa as i32,
+                    );
+                }
+            }
+        }
+
         super::regalloc::apply_rename(&mut ssarepr, &alloc_result.rename);
 
         // `flatten.py:88-100` `enforce_input_args` may rotate the
