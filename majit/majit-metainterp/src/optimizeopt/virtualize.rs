@@ -4577,7 +4577,7 @@ mod tests {
         let fd = field_descr(10);
 
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::int_op(20)]);
-        guard.fail_args = Some(
+        guard.setfailargs(
             vec![
                 OpRef::int_op(30),
                 OpRef::input_arg_ref(0),

@@ -4803,7 +4803,7 @@ mod tests {
             &[],
             crate::compile::make_resume_guard_forced_descr_typed(guard_types_a.clone()),
         );
-        guard_a.fail_args = Some(
+        guard_a.setfailargs(
             vec![
                 OpRef::int_op(0),
                 OpRef::int_op(2000),
@@ -4836,7 +4836,7 @@ mod tests {
             &[],
             crate::compile::make_resume_guard_forced_descr_typed(guard_types_b.clone()),
         );
-        guard_b.fail_args = Some(
+        guard_b.setfailargs(
             vec![
                 OpRef::int_op(0),
                 OpRef::int_op(2002),

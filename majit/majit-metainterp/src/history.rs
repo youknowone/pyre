@@ -696,7 +696,7 @@ mod tests {
         // Guards in a trace carry fail_args.
         let inputargs = vec![InputArg::new_int(0), InputArg::new_int(1)];
         let mut guard = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
-        guard.fail_args = Some(smallvec::smallvec![
+        guard.setfailargs(smallvec::smallvec![
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1)
         ]);
@@ -819,7 +819,7 @@ mod tests {
         let mut g0 = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
         g0.setfailargs(smallvec::smallvec![OpRef::input_arg_int(0)]);
         let mut g1 = Op::new(OpCode::GuardFalse, &[OpRef::input_arg_int(1)]);
-        g1.fail_args = Some(smallvec::smallvec![
+        g1.setfailargs(smallvec::smallvec![
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1)
         ]);
@@ -1008,7 +1008,7 @@ mod tests {
         );
         let mut guard_op = Op::new(OpCode::GuardTrue, &[OpRef::int_op(2)]);
         // fail_args referencing input args (0, 1) and the add result (2)
-        guard_op.fail_args = Some(smallvec::smallvec![
+        guard_op.setfailargs(smallvec::smallvec![
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1),
             OpRef::int_op(2)
@@ -1043,7 +1043,7 @@ mod tests {
         );
 
         let mut g2 = Op::new(OpCode::GuardTrue, &[OpRef::input_arg_int(0)]);
-        g2.fail_args = Some(smallvec::smallvec![
+        g2.setfailargs(smallvec::smallvec![
             OpRef::input_arg_int(0),
             OpRef::input_arg_int(1),
             OpRef::int_op(2)

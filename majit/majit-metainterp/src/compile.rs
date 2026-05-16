@@ -2586,7 +2586,7 @@ mod tests {
             fd.set_rd_consts(Some(rd_consts));
         }
         guard.setdescr(descr);
-        guard.fail_args = Some(smallvec::smallvec![
+        guard.setfailargs(smallvec::smallvec![
             OpRef::input_arg_ref(0),
             OpRef::input_arg_int(1)
         ]);
@@ -2635,7 +2635,7 @@ mod tests {
             .unwrap()
             .set_fail_arg_types(fail_arg_types.clone());
         guard.setdescr(descr);
-        guard.fail_args = Some(smallvec::smallvec![
+        guard.setfailargs(smallvec::smallvec![
             OpRef::input_arg_ref(0),
             OpRef::input_arg_ref(1),
             OpRef::input_arg_ref(2),
