@@ -302,10 +302,6 @@ impl DynasmFailDescr {
         }
     }
 
-    /// Build a FailDescrLayout for this descriptor (parity with CraneliftFailDescr::layout).
-    pub fn layout(&self) -> majit_backend::FailDescrLayout {
-        layout_for_fail_descr(self, self as *const Self as *const () as usize)
-    }
 }
 
 /// `compile.py:849` build a FailDescrLayout snapshot for any FailDescr
@@ -313,20 +309,30 @@ impl DynasmFailDescr {
 /// `DescrRef`, so the layout extractor takes the trait object plus the
 /// data-pointer address used to key backend-static side-tables
 /// (`SOURCE_OP_INDEX_TABLE`, `RECOVERY_LAYOUT_TABLE`)).
+///
+/// `fail_index` / `trace_id` are explicit caller arguments rather than
+/// reads off `fd.fail_index_per_trace()` / `fd.trace_id()` so the
+/// `fail_descrs` Vec position can be the identity source.  Singleton
+/// FINISH descrs (`compile.py:623-662 _DoneWithThisFrameDescr` /
+/// `ExitFrameWithExceptionDescrRef`) share an Arc across emissions and
+/// answer the trait-default `0` for both methods; the layout pipeline
+/// must read position from the Vec, not from the descr.
 pub fn layout_for_fail_descr(
     fd: &dyn FailDescr,
     descr_addr: usize,
+    fail_index: u32,
+    trace_id: u64,
 ) -> majit_backend::FailDescrLayout {
     // resume.py:450-488 propagate rd_* so `compiled_exit_layout_from_backend`
     // can reach them after the frontend trace cache evicts the owning
     // `CompiledTrace` entry (pyjitpl/mod.rs:817-845).
     let fail_arg_types = fd.fail_arg_types();
     majit_backend::FailDescrLayout {
-        fail_index: fd.fail_index_per_trace(),
+        fail_index,
         fail_arg_types: fail_arg_types.to_vec(),
         is_finish: fd.is_finish(),
         is_exception_exit: fd.is_exit_frame_with_exception(),
-        trace_id: fd.trace_id(),
+        trace_id,
         source_op_index: lookup_source_op_index(descr_addr),
         // Forward through `FailDescr::is_gc_ref_slot` / `force_token_slots`
         // so concrete descrs that override these (e.g. cranelift descrs

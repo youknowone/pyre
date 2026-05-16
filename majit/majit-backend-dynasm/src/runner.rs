@@ -1996,7 +1996,12 @@ impl Backend for DynasmBackend {
                 Type::Int => Value::Int(raw),
             });
         }
-        let exit_layout = Some(crate::guard::layout_for_fail_descr(descr_fd, descr_addr));
+        let exit_layout = Some(crate::guard::layout_for_fail_descr(
+            descr_fd,
+            descr_addr,
+            descr_fd.fail_index_per_trace(),
+            descr_fd.trace_id(),
+        ));
 
         majit_gc::shadow_stack::unregister_libc_jitframe(jf_ptr as usize);
         unsafe { libc::free(jf_ptr as *mut std::ffi::c_void) };
@@ -2747,14 +2752,18 @@ impl Backend for DynasmBackend {
         token: &JitCellToken,
     ) -> Option<Vec<majit_backend::FailDescrLayout>> {
         let compiled = Self::get_compiled(token);
+        let trace_id = compiled.trace_id;
         Some(
             compiled
                 .fail_descrs
                 .iter()
-                .map(|d| {
+                .enumerate()
+                .map(|(idx, d)| {
                     crate::guard::layout_for_fail_descr(
                         d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
                         Arc::as_ptr(d) as *const () as usize,
+                        idx as u32,
+                        trace_id,
                     )
                 })
                 .collect(),
@@ -2772,10 +2781,13 @@ impl Backend for DynasmBackend {
                 compiled
                     .fail_descrs
                     .iter()
-                    .map(|d| {
+                    .enumerate()
+                    .map(|(idx, d)| {
                         crate::guard::layout_for_fail_descr(
                             d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
                             Arc::as_ptr(d) as *const () as usize,
+                            idx as u32,
+                            trace_id,
                         )
                     })
                     .collect(),
@@ -2790,10 +2802,13 @@ impl Backend for DynasmBackend {
                         bridge
                             .fail_descrs
                             .iter()
-                            .map(|d| {
+                            .enumerate()
+                            .map(|(idx, d)| {
                                 crate::guard::layout_for_fail_descr(
                                     d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
                                     Arc::as_ptr(d) as *const () as usize,
+                                    idx as u32,
+                                    trace_id,
                                 )
                             })
                             .collect(),
@@ -2826,14 +2841,18 @@ impl Backend for DynasmBackend {
             if let Some(bridge) = block.downcast_ref::<CompiledCode>() {
                 let addr = codebuf::buffer_ptr(&bridge.buffer) as usize;
                 if addr == bridge_addr {
+                    let bridge_trace_id = bridge.trace_id;
                     return Some(
                         bridge
                             .fail_descrs
                             .iter()
-                            .map(|d| {
+                            .enumerate()
+                            .map(|(idx, d)| {
                                 crate::guard::layout_for_fail_descr(
                                     d.as_fail_descr().expect("fail_descrs entry is FailDescr"),
                                     Arc::as_ptr(d) as *const () as usize,
+                                    idx as u32,
+                                    bridge_trace_id,
                                 )
                             })
                             .collect(),
