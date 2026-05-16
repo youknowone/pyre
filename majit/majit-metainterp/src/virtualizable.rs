@@ -572,7 +572,7 @@ impl VirtualizableInfo {
     }
 
     /// virtualizable.py:81: vinfo.static_field_by_descrs[fielddescr]
-    /// Descriptor-identity lookup (O(1) via HashMap).
+    /// Descriptor-identity lookup (linear scan via VecAssoc).
     pub fn static_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
         self.static_field_by_descrs
             .get(&descr_identity(descr))
@@ -580,7 +580,7 @@ impl VirtualizableInfo {
     }
 
     /// virtualizable.py:83: vinfo.array_field_by_descrs[arrayfielddescr]
-    /// Descriptor-identity lookup (O(1) via HashMap).
+    /// Descriptor-identity lookup (linear scan via VecAssoc).
     pub fn array_field_by_descr(&self, descr: &DescrRef) -> Option<usize> {
         self.array_field_by_descrs
             .get(&descr_identity(descr))

@@ -14235,7 +14235,7 @@ impl MetaInterpStaticData {
     ///
     /// Pyre's blackhole-side `setup_insns` lives separately in
     /// `crate::blackhole::BlackholeInterpBuilder::setup_insns`.
-    pub fn setup_insns(&mut self, insns: &std::collections::HashMap<String, u8>) {
+    pub fn setup_insns(&mut self, insns: &majit_ir::vec_assoc::VecAssoc<String, u8>) {
         // pyjitpl.py:2228-2229: opcode_names/opcode_implementations init.
         // RPython sizes by `len(insns)` because its assembler assigns
         // opnums sequentially from 0, so `len(insns) == max(opnum) + 1`.
@@ -17079,7 +17079,7 @@ mod metainterp_static_data_tests {
     #[test]
     fn setup_insns_populates_opcode_names() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns = std::collections::HashMap::new();
+        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
         insns.insert("foo".to_string(), 0u8);
         insns.insert("bar".to_string(), 1u8);
         sd.setup_insns(&insns);
@@ -17092,7 +17092,7 @@ mod metainterp_static_data_tests {
     fn setup_insns_caches_opcode_ids_or_minus_one() {
         // pyjitpl.py:2236-2243: each cached id is `insns.get(...) ?? -1`.
         let mut sd = MetaInterpStaticData::new();
-        let mut insns = std::collections::HashMap::new();
+        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
         insns.insert("live/".to_string(), 5u8);
         insns.insert("goto/L".to_string(), 6u8);
         insns.insert("catch_exception/L".to_string(), 7u8);
@@ -17115,7 +17115,7 @@ mod metainterp_static_data_tests {
     #[test]
     fn setup_insns_leaves_missing_opcode_ids_at_minus_one() {
         let mut sd = MetaInterpStaticData::new();
-        let mut insns = std::collections::HashMap::new();
+        let mut insns: majit_ir::vec_assoc::VecAssoc<String, u8> = majit_ir::vec_assoc::VecAssoc::new();
         insns.insert("foo".to_string(), 0u8);
         sd.setup_insns(&insns);
         assert_eq!(sd.op_live, -1);

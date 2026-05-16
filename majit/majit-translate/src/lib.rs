@@ -865,7 +865,7 @@ fn analyze_pipeline_from_parsed(
         opcode_dispatch: Vec::new(),
         jitcodes: Vec::new(),
         jitcodes_by_path: std::collections::HashMap::new(),
-        insns: std::collections::HashMap::new(),
+        insns: majit_ir::vec_assoc::VecAssoc::new(),
         descrs: Vec::new(),
         total_blocks: 0,
         total_ops: 0,
@@ -925,7 +925,7 @@ fn build_canonical_opcode_dispatch(
 ) -> (
     Vec<opcode_dispatch::PipelineOpcodeArm>,
     Vec<std::sync::Arc<jitcode::JitCode>>,
-    std::collections::HashMap<String, u8>,
+    majit_ir::vec_assoc::VecAssoc<String, u8>,
     Vec<jitcode::BhDescr>,
 ) {
     let mut opcode_arms = Vec::new();

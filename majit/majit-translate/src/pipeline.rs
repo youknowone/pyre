@@ -103,7 +103,7 @@ pub struct ProgramPipelineResult {
     /// (the mapping is local to the build-time assembler instance).
     /// Consumed by `BlackholeInterpBuilder::setup_insns` at runtime.
     #[serde(default)]
-    pub insns: std::collections::HashMap<String, u8>,
+    pub insns: majit_ir::vec_assoc::VecAssoc<String, u8>,
     /// RPython: `Assembler.descrs` (assembler.py:23), consumed by
     /// `BlackholeInterpBuilder.setup_descrs(asm.descrs)`
     /// (blackhole.py:59, 102-103). Each 'd'/'j' argcode in a

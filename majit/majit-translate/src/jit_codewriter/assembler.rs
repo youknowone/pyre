@@ -55,7 +55,7 @@ use crate::regalloc::RegAllocResult;
 /// (shared descriptor table, liveness encoding, etc.)
 pub struct Assembler {
     /// RPython: Assembler.insns — map {opcode_key: opcode_number}
-    insns: HashMap<String, u8>,
+    insns: majit_ir::vec_assoc::VecAssoc<String, u8>,
     /// Next candidate for the translator-only `setdefault` fallback
     /// (`assembler.py:220`). RPython grows `self.insns` densely from
     /// zero; pyre keeps canonical / extension `BC_*` bytes reserved for
@@ -154,7 +154,7 @@ impl Assembler {
     /// RPython: `Assembler.__init__()` (assembler.py:21-32).
     pub fn new() -> Self {
         Self {
-            insns: HashMap::new(),
+            insns: majit_ir::vec_assoc::VecAssoc::new(),
             dynamic_byte_cursor: 0,
             descrs: Vec::new(),
             descr_dict: HashMap::new(),
@@ -342,7 +342,7 @@ impl Assembler {
             tlabel_fixups: Vec::new(),
             startpoints: std::collections::HashSet::new(),
             alllabels: std::collections::HashSet::new(),
-            resulttypes: HashMap::new(),
+            resulttypes: majit_ir::vec_assoc::VecAssoc::new(),
         };
 
         // RPython assembler.py:41-44:
@@ -2065,7 +2065,7 @@ impl Assembler {
     /// surfaces exhaustion at the offending registration site instead
     /// of silently wrapping.
     fn get_opnum(&mut self, key: &str) -> u8 {
-        if let Some(&existing) = self.insns.get(key) {
+        if let Some(&existing) = self.insns.get(&key.to_string()) {
             return existing;
         }
         if let Some(num) = crate::insns::insn_byte_opt(key) {
@@ -2550,7 +2550,7 @@ struct AssemblyState {
     alllabels: std::collections::HashSet<usize>,
     /// RPython assembler.py:217-219: map from bytecode offset (after `->`)
     /// to result kind character. Recorded when encoding result registers.
-    resulttypes: HashMap<usize, char>,
+    resulttypes: majit_ir::vec_assoc::VecAssoc<usize, char>,
 }
 
 /// RPython: getkind(v.concretetype)[0] → 'i', 'r', 'f', 'v'.
@@ -3488,7 +3488,7 @@ impl Assembler {
     /// via `register_func_name()`.
     /// RPython: Assembler.insns — the opcode table. Needed by
     /// BlackholeInterpBuilder::setup_insns() to build the dispatch table.
-    pub fn insns(&self) -> &HashMap<String, u8> {
+    pub fn insns(&self) -> &majit_ir::vec_assoc::VecAssoc<String, u8> {
         &self.insns
     }
 

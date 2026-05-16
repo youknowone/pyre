@@ -262,30 +262,34 @@ pub fn jitcode_for_instruction(instruction: &Instruction) -> Option<Arc<JitCode>
 /// bytes can be mapped back to opnames through the inverted view
 /// exposed by `opname_for_byte`.  Matches RPython `setup_insns(insns)`
 /// consumption at `pyjitpl.py:2227-2243`.
-static INSNS_OPNAME_TO_BYTE: LazyLock<HashMap<String, u8>> = LazyLock::new(|| {
-    const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_insns.bin"));
-    let mut table: HashMap<String, u8> = bincode::deserialize(BYTES).unwrap_or_else(|e| {
-        panic!(
-            "pyre-jit-trace: failed to deserialize opcode_insns.bin \
-             ({} bytes): {e}",
-            BYTES.len(),
-        )
-    });
+static INSNS_OPNAME_TO_BYTE: LazyLock<majit_ir::vec_assoc::VecAssoc<String, u8>> =
+    LazyLock::new(|| {
+        const BYTES: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/opcode_insns.bin"));
+        let mut table: majit_ir::vec_assoc::VecAssoc<String, u8> = bincode::deserialize(BYTES)
+            .unwrap_or_else(|e| {
+                panic!(
+                    "pyre-jit-trace: failed to deserialize opcode_insns.bin \
+                     ({} bytes): {e}",
+                    BYTES.len(),
+                )
+            });
     // Overlay the helper-side `_pyre/P` adapter keys so the static
     // decoder shares a key set with the production blackhole builder.
     // pyre_extension_insns() is the same source the runtime builder
     // hands to `setup_insns(...)`.
-    for (key, byte) in majit_translate::insns::pyre_extension_insns() {
-        if let Some(prev) = table.insert(key.to_string(), byte) {
-            assert_eq!(
-                prev, byte,
-                "pyre extension insns: opname {key:?} disagrees with build-time \
-                 pipeline.insns (build={prev}, extension={byte})",
-            );
+        for (key, byte) in majit_translate::insns::pyre_extension_insns() {
+            if let Some(&prev) = table.get(key) {
+                assert_eq!(
+                    prev, byte,
+                    "pyre extension insns: opname {key:?} disagrees with build-time \
+                     pipeline.insns (build={prev}, extension={byte})",
+                );
+            } else {
+                table.insert(key.to_string(), byte);
+            }
         }
-    }
-    table
-});
+        table
+    });
 
 /// Inverted view: `u8` opcode byte → opname string.  Built lazily on
 /// first access from `INSNS_OPNAME_TO_BYTE`.  Upstream `assembler.py:
@@ -307,7 +311,7 @@ static INSNS_BYTE_TO_OPNAME: LazyLock<HashMap<u8, String>> = LazyLock::new(|| {
 });
 
 /// RPython `setup_insns(insns)` — full opname → opcode-byte table.
-pub fn insns_opname_to_byte() -> &'static HashMap<String, u8> {
+pub fn insns_opname_to_byte() -> &'static majit_ir::vec_assoc::VecAssoc<String, u8> {
     &INSNS_OPNAME_TO_BYTE
 }
 
