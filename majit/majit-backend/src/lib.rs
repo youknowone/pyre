@@ -1348,9 +1348,9 @@ impl std::fmt::Debug for JitCellToken {
 // matching RPython's single-interpreter assumption).  `JitCellToken`
 // embeds `Rc<RdVirtualInfo>` and `Box<dyn Any + Send>` which are not
 // automatically `Sync`; marking the parent struct `Send + Sync` here
-// is sound under the same invariant that `DynasmFailDescr` /
-// `CraneliftFailDescr` rely on — a promise held by the JIT scheduler
-// that tokens are only touched from the JIT thread.  Backends store
+// is sound under the same invariant `CraneliftFailDescr` relies on —
+// a promise held by the JIT scheduler that tokens are only touched
+// from the JIT thread.  Backends store
 // `Weak<JitCellToken>` handles for cross-token `find_descr_by_ptr`
 // fallback and need these impls to satisfy their `Send` trait bound.
 unsafe impl Send for JitCellToken {}
@@ -1812,11 +1812,10 @@ pub trait Backend: Send {
     ///
     /// PyPy parity: under the unified ResumeGuardDescr identity the two
     /// paths return the same object, so the fallback is observationally
-    /// identical to the metainterp lookup.  During pyre's split-descr
-    /// gap (Phase E.3+ continued epic) the backend `CraneliftFailDescr`
-    /// / `DynasmFailDescr` already implement `Descr`, so the upcast
-    /// `Arc<BackendFailDescr> → Arc<dyn Descr>` is direct — no proxy
-    /// struct, no field-by-field reconstruction.
+    /// identical to the metainterp lookup.  After Slice 7-Tα7 the
+    /// dynasm backend hands back `ResumeGuardDescr` directly; the
+    /// cranelift backend still upcasts `Arc<CraneliftFailDescr>` →
+    /// `Arc<dyn Descr>` until the parallel Phase 7-Tβ collapse.
     fn compiled_bridge_descr_arc(
         &self,
         _original_token: &JitCellToken,

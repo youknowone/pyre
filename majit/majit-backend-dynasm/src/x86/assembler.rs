@@ -24,7 +24,6 @@ use majit_ir::{
 use crate::arch::*;
 use crate::codebuf;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
-use crate::guard::DynasmFailDescr;
 use crate::jitframe::{
     FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FORWARD_OFS, JF_FRAME_OFS,
     JF_GCMAP_OFS, JF_GUARD_EXC_OFS,

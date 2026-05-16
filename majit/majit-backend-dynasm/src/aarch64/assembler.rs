@@ -16,7 +16,7 @@ use std::sync::Arc;
 use dynasmrt::aarch64::Assembler;
 use dynasmrt::{AssemblyOffset, DynamicLabel, DynasmApi, DynasmLabelApi, ExecutableBuffer, dynasm};
 
-use majit_backend::{BackendError, ExitFrameLayout, ExitRecoveryLayout, ExitValueSourceLayout};
+use majit_backend::BackendError;
 use majit_ir::{
     FailDescr, InputArg, LoopTargetDescr, Op, OpCode, OpRef, OpTypeIndex, TargetArgLoc, Type,
 };
@@ -24,7 +24,6 @@ use majit_ir::{
 use crate::arch::*;
 use crate::codebuf;
 use crate::gcmap::{allocate_gcmap, gcmap_set_bit};
-use crate::guard::DynasmFailDescr;
 use crate::jitframe::{
     FIRST_ITEM_OFFSET, JF_DESCR_OFS, JF_FORCE_DESCR_OFS, JF_FRAME_OFS, JF_GCMAP_OFS,
     JF_GUARD_EXC_OFS,
@@ -4317,7 +4316,7 @@ impl<'a> AssemblerARM64<'a> {
     }
 
     /// FINISH: store result (if any), store descr ptr, return jf_ptr.
-    fn genop_finish(&mut self, op: &Op, fail_index: u32) {
+    fn genop_finish(&mut self, op: &Op, _fail_index: u32) {
         // compiler.rs:9667-9681 parity: trust explicit FINISH types only when
         // they match the actual result arity; otherwise infer from the op args.
         let finish_refs: Vec<OpRef> = op.args.iter().copied().collect();

@@ -3,11 +3,8 @@
 //!
 //! Resume-payload backing store shared between metainterp and backend
 //! crates as part of the Unified-Descr Port (Phase C-1).  Moving the
-//! storage to `majit-backend` is a prerequisite for collapsing the
-//! per-backend FailDescr wrappers (DynasmFailDescr / CraneliftFailDescr)
-//! into a single `ResumeGuardDescr` instance — backends can then
-//! instantiate the unified descr directly without depending on
-//! `majit-metainterp`.
+//! storage to `majit-backend` lets backends instantiate the unified
+//! `ResumeGuardDescr` directly without depending on `majit-metainterp`.
 use std::cell::UnsafeCell;
 use std::rc::Rc;
 use std::sync::Arc;

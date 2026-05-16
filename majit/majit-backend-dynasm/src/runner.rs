@@ -10,14 +10,13 @@ use std::sync::Mutex;
 use std::sync::atomic::Ordering;
 
 use majit_backend::{AsmInfo, Backend, BackendError, DeadFrame, ExitRecoveryLayout, JitCellToken};
-use majit_ir::{Descr, FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
+use majit_ir::{FailDescr, GcRef, InputArg, Op, OpRef, Type, Value};
 
 #[cfg(target_arch = "aarch64")]
 use crate::aarch64::assembler::{AssemblerARM64 as Asm, CompiledCode};
 use crate::arch;
 use crate::codebuf;
 use crate::frame::FrameData;
-use crate::guard::DynasmFailDescr;
 use crate::jitframe::JitFrame;
 #[cfg(target_arch = "x86_64")]
 use crate::x86::assembler::{Assembler386 as Asm, CompiledCode};
@@ -567,11 +566,11 @@ pub struct DynasmBackend {
     /// owning backend — matches the lifetime guarantee RPython gets from
     /// `cpu` being a long-lived Python object.
     descr_attachments: crate::guard::CpuDescrHandle,
-    /// ptr → Arc<DynasmFailDescr> registry enabling cross-token
-    /// resolution of guard fail descriptors. RPython resolves
+    /// ptr → `DescrRef` registry enabling cross-token resolution of
+    /// guard fail descriptors. RPython resolves
     /// `AbstractDescr.show(jf_descr)` via direct pointer dereference,
     /// so the lookup naturally crosses loop/bridge boundaries. Pyre
-    /// wraps each descr in an Arc and stores them in per-token
+    /// keeps each descr as a `DescrRef` and stores them in per-token
     /// `asmmemmgr_blocks`, so a bridge that JUMPs into another
     /// compiled loop can leave the runtime holding a jf_descr whose
     /// owning token is not the one currently executing. This registry
@@ -580,8 +579,7 @@ pub struct DynasmBackend {
         Arc<std::sync::Mutex<std::collections::HashMap<usize, majit_ir::DescrRef>>>,
     /// Backend-internal side-table mapping a source guard descr's
     /// `Arc::as_ptr` address to the entry pointer of the compiled bridge
-    /// patched in for that guard.  Replaces the prior `bridge_addr` field
-    /// on `DynasmFailDescr` — PyPy's `AbstractFailDescr._attrs_`
+    /// patched in for that guard.  PyPy's `AbstractFailDescr._attrs_`
     /// (`history.py:132`) carries no `bridge_addr` slot; once a bridge is
     /// patched in, RPython relies on the in-place machine-code JMP and
     /// recovers structural state from `asmmemmgr_blocks`.  Pyre's
@@ -668,8 +666,7 @@ impl DynasmBackend {
     /// descr's `Arc::as_ptr` address.  Called from `compile_bridge`
     /// immediately after `patch_jump_for_descr` redirects the source
     /// guard at `runner.rs::compile_bridge` to point at the freshly
-    /// compiled bridge.  Replaces the previous `descr.set_bridge_addr`
-    /// write on `DynasmFailDescr`.
+    /// compiled bridge.
     pub fn register_bridge_addr(&self, source_descr_ptr: usize, bridge_addr: usize) {
         self.bridge_addr_by_descr
             .lock()
@@ -755,13 +752,10 @@ impl DynasmBackend {
     /// token boundaries — required when a bridge JUMPs into another
     /// compiled loop and that loop's guard fires before control returns
     /// to the bridge's owning token.
-    /// Register backend `Arc<DynasmFailDescr>` instances into the
-    /// addr→Arc lookup table.  Called from `compile_loop` /
-    /// `compile_bridge` to populate after codegen; also called by test
-    /// helpers that stamp `meta_descr` late, to land the meta-keyed
-    /// entries that the in-codegen call missed because `meta_descr`
-    /// was unset.  Re-running is idempotent: existing entries are
-    /// preserved via `entry().or_insert_with`.
+    /// Register `DescrRef` instances into the addr→`DescrRef` lookup
+    /// table.  Called from `compile_loop` / `compile_bridge` to
+    /// populate after codegen.  Re-running is idempotent: existing
+    /// entries are preserved via `entry().or_insert_with`.
     pub fn register_fail_descrs(&self, descrs: &[majit_ir::DescrRef]) {
         let mut reg = self.fail_descr_registry.lock().unwrap();
         for descr_ref in descrs {
@@ -1082,10 +1076,10 @@ impl DynasmBackend {
     }
 
     /// llmodel.py:412 get_latest_descr parity: resolve a raw jf_descr
-    /// pointer to its Arc<DynasmFailDescr>. Searches root loop
-    /// fail_descrs first, then all bridge fail_descrs stored in
-    /// asmmemmgr_blocks. RPython does this via AbstractDescr.show()
-    /// which works for any descr from any loop/bridge.
+    /// pointer to its `DescrRef`. Searches root loop fail_descrs
+    /// first, then all bridge fail_descrs stored in asmmemmgr_blocks.
+    /// RPython does this via AbstractDescr.show() which works for any
+    /// descr from any loop/bridge.
     ///
     /// `compile.py:618-671` parity: the four `DoneWithThisFrame*`
     /// + `ExitFrameWithExceptionDescrRef` singletons attached to
@@ -1497,22 +1491,11 @@ impl Backend for DynasmBackend {
         // method (descr.rs:779), implemented true on the
         // `ResumeGuardDescr` family (compile.rs:3117/3296/3434/3558/4125).
         //
-        // PRE-EXISTING-ADAPTATION: the actual stamp happens on the
-        // backend-side `DynasmFailDescr`, not the metainterp-side
-        // `ResumeGuardDescr` that lives on the IR op (`op.descr`).
-        // Upstream has one descr object per guard, so `compile.py:183-186`
-        // walks `loop.operations` and writes `op.descr.rd_loop_token`
-        // directly.  Pyre's two-tier descr split (Phase E in the epic)
-        // means the runtime reader (`cpu.get_latest_descr()`) hands back
-        // the backend descr; therefore the canonical stamp must reach
-        // the backend descr.  Convergence requires unifying the two
-        // descr objects per fail (Unified-Descr Port Epic, Sessions 5+).
-        //
-        // The metainterp-side `op.descr.rd_loop_token_clt` is also
-        // stamped in `pyjitpl/mod.rs::record_loop_or_bridge` (compile.py:185
-        // line-by-line counterpart); the backend stamp here is the
-        // pyre-side parallel write that survives the eventual unification
-        // (the unified descr will retain the same `rd_loop_token` field).
+        // `compile.py:183-186` walks `loop.operations` and writes
+        // `op.descr.rd_loop_token` directly.  Pyre's `compiled.fail_descrs`
+        // hold the same `DescrRef`s the metainterp stamped onto each
+        // guard op (Session 6 unification), so the write lands on the
+        // same `ResumeGuardDescr` Arc upstream targets.
         if let Some(clt) = token.compiled_loop_token.as_ref() {
             for descr in &compiled.fail_descrs {
                 if !descr.is_resume_guard() {
@@ -1731,11 +1714,11 @@ impl Backend for DynasmBackend {
         // llmodel.py:252 asmmemmgr_blocks parity: store the entire
         // bridge CompiledCode on the owning loop token. This keeps
         // both the ExecutableBuffer (mapped code) AND the fail_descrs
-        // (Arc<DynasmFailDescr>) alive. Recovery stubs embed raw
-        // pointers to these Arcs — dropping them would create
-        // dangling pointers when a bridge-internal guard fires.
-        // RPython's asmmemmgr ties code blocks and their resume
-        // descriptors to the same compiled_loop_token lifetime.
+        // (DescrRef) alive. Recovery stubs embed raw pointers to
+        // these Arcs — dropping them would create dangling pointers
+        // when a bridge-internal guard fires.  RPython's asmmemmgr
+        // ties code blocks and their resume descriptors to the same
+        // compiled_loop_token lifetime.
         self.register_fail_descrs(&compiled.fail_descrs);
 
         // `compile.py:183-186 record_loop_or_bridge`: a bridge's ResumeDescrs
@@ -2042,13 +2025,13 @@ impl Backend for DynasmBackend {
         Arc::clone(&data.fail_descr)
     }
 
-    /// `fail_descr_registry` is the `addr → Arc<DynasmFailDescr>` table
-    /// populated by `register_fail_descrs` at compile time, keeping every
-    /// emitted descr alive for the lifetime of its owning compiled code
-    /// (mirroring RPython's `cpu` retaining descr objects).  Returning the
-    /// upcast `Arc<dyn FailDescr>` lets the CA bridge entry route descr
-    /// identity into `_trace_and_compile_from_bridge` (compile.py:704-709)
-    /// without going through the `(trace_id, fail_index)` surrogate key.
+    /// `fail_descr_registry` is the `addr → DescrRef` table populated by
+    /// `register_fail_descrs` at compile time, keeping every emitted
+    /// descr alive for the lifetime of its owning compiled code
+    /// (mirroring RPython's `cpu` retaining descr objects).  The cloned
+    /// `DescrRef` lets the CA bridge entry route descr identity into
+    /// `_trace_and_compile_from_bridge` (compile.py:704-709) without
+    /// going through the `(trace_id, fail_index)` surrogate key.
     fn free_loop(&mut self, token: &JitCellToken) {
         // memmgr.py:9 `MemoryManager.alive_loops` parity: when a JCT is
         // evicted, RPython's GC reclaims the token's compiled code and
@@ -2102,10 +2085,11 @@ impl Backend for DynasmBackend {
 
     fn fail_descr_arc_from_addr(&self, descr_addr: usize) -> majit_ir::DescrRef {
         // warmspot.py:1021 cpu.get_latest_descr(deadframe) parity: the
-        // dynasm registry holds a strong Arc for every emitted DynasmFailDescr
-        // through its full lifetime, so a `descr_addr` arriving from the
-        // C-ABI guard-fail path is always present in the table.  A miss
-        // is an invariant violation, not a recoverable runtime mode.
+        // dynasm registry holds a strong DescrRef for every emitted
+        // descr through its full lifetime, so a `descr_addr` arriving
+        // from the C-ABI guard-fail path is always present in the
+        // table.  A miss is an invariant violation, not a recoverable
+        // runtime mode.
         let registry = self
             .fail_descr_registry
             .lock()
@@ -2113,7 +2097,7 @@ impl Backend for DynasmBackend {
         let descr = registry.get(&descr_addr).cloned().unwrap_or_else(|| {
             panic!(
                 "fail_descr_arc_from_addr: descr_addr {descr_addr:#x} not in \
-                 fail_descr_registry — every emitted DynasmFailDescr must be \
+                 fail_descr_registry — every emitted fail descr must be \
                  registered before its address reaches the C-ABI guard-fail boundary"
             )
         });

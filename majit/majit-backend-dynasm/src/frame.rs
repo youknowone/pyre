@@ -7,10 +7,8 @@ use majit_ir::GcRef;
 ///
 /// `fail_descr` carries the metainterp class-distinct Arc identity
 /// (ResumeGuardDescr family for guards, DoneWithThisFrame*/
-/// ExitFrameWithExceptionDescrRef for FINISH exits) — Phase C-1 cascade
-/// step that retires the per-backend `DynasmFailDescr` wrapper at the
-/// `FrameData` boundary.  FailDescr-trait operations on the descr go
-/// through `DescrRef::as_fail_descr`.
+/// ExitFrameWithExceptionDescrRef for FINISH exits).  FailDescr-trait
+/// operations on the descr go through `DescrRef::as_fail_descr`.
 pub struct FrameData {
     /// Raw exit slot values.
     pub(crate) raw_values: Vec<i64>,

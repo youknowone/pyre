@@ -340,9 +340,10 @@ pub fn stack_check_addresses() -> Option<StackCheckAddresses> {
 /// `handle_fail`, and the helper's job is purely to dispatch. pyre
 /// encodes finish descrs as raw-pointer singletons
 /// (`done_with_this_frame_descr_{void,int,ref,float}`,
-/// `exit_frame_with_exception_descr_ref`) and resume-guard descrs as
-/// `DynasmFailDescr`, so this trampoline performs the type dispatch
-/// inline and delegates to one of the `handle_fail_*` helpers below.
+/// `exit_frame_with_exception_descr_ref`) and resume-guard descrs
+/// reach this helper through their `DescrRef`, so this trampoline
+/// performs the type dispatch inline and delegates to one of the
+/// `handle_fail_*` helpers below.
 ///
 /// **Deviation (PRE-EXISTING-ADAPTATION)**: pyre does not yet carry
 /// `FailDescr::handle_fail` as a virtual method because descrs are
@@ -455,11 +456,10 @@ fn handle_fail_dispatch(
     // compile.py:701-717 `AbstractResumeGuardDescr.handle_fail`.
     // Recover the descr identity through the global Weak-registry that
     // `DynasmBackend::register_fail_descrs` populates in lockstep with
-    // its per-backend table.  Avoids casting `descr_raw` to
-    // `*const DynasmFailDescr` — only the trait surface is consumed.
-    // Synthetic test descrs (lib.rs:781 / :803) never register, so the
-    // miss path returns 0, matching the prior cast-based path's "no
-    // blackhole hook installed" exit.
+    // its per-backend table — only the `FailDescr` trait surface is
+    // consumed.  Synthetic test descrs (lib.rs:781 / :803) never
+    // register, so the miss path returns 0, matching the prior
+    // cast-based path's "no blackhole hook installed" exit.
     let descr_arc = match guard::lookup_fail_descr_global(descr_raw) {
         Some(arc) => arc,
         None => return 0,

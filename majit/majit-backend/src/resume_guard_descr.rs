@@ -4,8 +4,10 @@
 //! can instantiate it directly without depending on `majit-metainterp`.
 //!
 //! This is the unified-descr endpoint of the Phase C-1 cascade: with
-//! `ResumeGuardDescr` reachable from backend codegen, the per-backend
-//! `DynasmFailDescr` / `CraneliftFailDescr` wrappers can be retired.
+//! `ResumeGuardDescr` reachable from backend codegen, the dynasm
+//! per-emission wrapper `DynasmFailDescr` was retired (Slice 7-Tα7);
+//! the cranelift counterpart still carries codegen-bound payload
+//! pending Phase 7-Tβ.
 
 use std::any::Any;
 use std::cell::UnsafeCell;
